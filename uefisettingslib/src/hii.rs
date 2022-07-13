@@ -1,8 +1,8 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+mod forms;
 pub mod package;
 mod strings;
-
 // UEFI HII Library
 
 // Implements (partial) decoding of the Form and Strings packages.

@@ -1,19 +1,23 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Seek;
+use std::rc::Rc;
 
-use anyhow::Context;
 use log::debug;
 use log::error;
 
+use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::io::SeekFrom;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 
+use crate::hii::forms;
+use crate::hii::forms::IFROperation;
 use crate::hii::strings;
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -127,13 +131,13 @@ fn get_packages(package_list: &PackageList) -> Result<Vec<Package>> {
     Ok(packages)
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone, BinRead)]
+#[derive(PartialEq, Eq, Copy, Clone, BinRead)]
 #[br(little)]
-struct Guid {
-    data1: u32,
-    data2: u16,
-    data3: u16,
-    data4: [u8; 8],
+pub struct Guid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
 }
 
 // lifted from https://github.com/LongSoft/IFRExtractor-RS/blob/ae9b550a6fe530f3a4911373ce22646043322bbc/src/parser.rs#L34
@@ -157,7 +161,14 @@ impl fmt::Display for Guid {
     }
 }
 
+impl fmt::Debug for Guid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
 type StringMap = HashMap<i32, String>;
+type IFRNodeLink = Rc<RefCell<IFROperation>>;
 
 /// ParsedHiiDB is the 'result' superstruct which will
 /// hold the results of our parsed strings and forms packages.
@@ -166,7 +177,7 @@ pub struct ParsedHiiDB {
     /// for each packagelist the key = packagelist guid string and val = vector of string package hashmaps
     /// each string package hashmap here has its key = string id and val = the string
     pub strings: HashMap<String, Vec<StringMap>>,
-    // TODO: field for forms
+    pub forms: HashMap<String, Vec<IFRNodeLink>>,
 }
 
 /// read_db input (source) is a vector of u8 bytes
@@ -174,11 +185,12 @@ pub struct ParsedHiiDB {
 /// For every package list, we will parse different packages. If package type is
 /// * string -> parse and save data
 /// * form -> parse and save data
-/// * something else (like fonts or animations) -> we dont care about them, so continue to the next package in the package list.
+/// * something else (like fonts or animations) -> we don't care about them, so continue to the next package in the package list.
 /// In the end return a ParsedHiiDB struct which will have the parsed and saved data.
 pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
     let mut res = ParsedHiiDB {
         strings: HashMap::new(),
+        forms: HashMap::new(),
     };
 
     for package_list in get_package_lists(source)? {
@@ -186,6 +198,7 @@ pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
 
         // once filled this will have string maps from each string package in the package list.
         let mut package_list_string_maps: Vec<StringMap> = Vec::new();
+        let mut roots: Vec<IFRNodeLink> = Vec::new();
 
         for package in get_packages(&package_list)? {
             let mut package_cursor = Cursor::new(&package.data);
@@ -199,14 +212,24 @@ pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
                         return Err(why);
                     }
                 },
-                PackageType::Form => {}
+                PackageType::Form => match forms::handle_form_package(&mut package_cursor) {
+                    Ok(root_node) => roots.push(root_node),
+                    Err(why) => {
+                        error!("Can't parse form package {}", why);
+                        // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
+                        return Err(why);
+                    }
+                },
                 _ => continue,
             }
         }
 
         if !package_list_string_maps.is_empty() {
             res.strings
-                .insert(package_list_guid, package_list_string_maps);
+                .insert(package_list_guid.clone(), package_list_string_maps);
+        }
+        if !roots.is_empty() {
+            res.forms.insert(package_list_guid, roots);
         }
     }
     Ok(res)
@@ -219,12 +242,16 @@ mod tests {
     use std::io::Read;
 
     #[test]
-    fn test_read_db() {
+    fn test_read_db_strings() {
         let mut file = File::open("hardware/uefiset/dbdumps/hiidb.bin").unwrap();
         let mut file_contents = Vec::new();
         file.read_to_end(&mut file_contents).unwrap();
         let res = read_db(&file_contents).unwrap();
-        assert_eq!(res.strings.len(), 12); // compare number of package lists which have string type packages
+
+        // compare number of package lists which have string type packages
+        assert_eq!(res.strings.len(), 12);
+
+        // compare a certain string
         assert_eq!(
             res.strings
                 .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
@@ -234,7 +261,9 @@ mod tests {
                 .get(&8)
                 .unwrap(),
             "MMIO Low Base"
-        ); // compare a certain string
+        );
+
+        // compare number of strings in the 0 indexed (1st) package of given package list
         assert_eq!(
             res.strings
                 .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
@@ -243,13 +272,62 @@ mod tests {
                 .unwrap()
                 .len(),
             5714
-        ); // compare number of strings in the 0 indexed (1st) package of given package list
+        );
+
+        // compare number of string packages in this package list
         assert_eq!(
             res.strings
                 .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
                 .unwrap()
                 .len(),
             2
-        ); // compare number of string packages in this package list
+        );
+    }
+
+    #[test]
+    fn test_read_db_forms() {
+        let mut file = File::open("hardware/uefiset/dbdumps/hiidb.bin").unwrap();
+        let mut file_contents = Vec::new();
+        file.read_to_end(&mut file_contents).unwrap();
+        let res = read_db(&file_contents).unwrap();
+
+        let root_node = res
+            .forms
+            .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .borrow();
+
+        // root element should only have one child
+        assert_eq!(root_node.children.len(), 1);
+
+        // root elements's child should be FormSet
+        assert_eq!(
+            root_node.children.get(0).unwrap().borrow().op_code,
+            forms::IFROpCode::FormSet
+        );
+
+        // root elements's child FormSet should have open scope
+        assert!(root_node.children.get(0).unwrap().borrow().open_scope);
+
+        // root_node's child should be able to refer to it's parent which is root_node
+        // root_node has a dummy opcode used only in root nodes so if they match
+        // we can be sure it's referring to the correct node
+        assert_eq!(
+            root_node
+                .children
+                .get(0)
+                .unwrap()
+                .borrow()
+                .parent
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .unwrap()
+                .borrow()
+                .op_code,
+            root_node.op_code
+        );
     }
 }
