@@ -1,8 +1,0 @@
-packages:
-  uefisettingstool:
-    summary: UEFI Settings Manipulation Tool
-    packager: baremetal_security
-    rules:
-      buck:hardware/uefiset/uefisettingstool:uefisettings:
-        'hardware/uefiset/uefisettingstool/uefisettings#binary/uefisettings':
-          path: 'bin/uefisettings'
