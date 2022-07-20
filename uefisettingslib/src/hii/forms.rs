@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
@@ -892,6 +893,263 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
     Ok(())
 }
+
+#[derive(Debug)]
+pub struct Answer {
+    pub question: String,
+    pub help: String,
+    pub answer: String,
+}
+
+/// find_answer accepts the root node, string_packages and possible_question_phrases.
+/// possible_question_phrases is a vector of strings which represent variations of the
+/// same question. So if a single phrase matches then we assume that we have the answer.
+pub fn find_answer<T>(
+    node: Rc<RefCell<IFROperation>>,
+    string_packages: &Vec<HashMap<i32, String>>,
+    possible_question_phrases: &[T],
+) -> Option<Answer>
+where
+    T: AsRef<str>,
+{
+    let current_node = node.borrow();
+
+    // Only Numeric, OneOf and CheckBox are questions.
+    // If our question is found this match expression will return without caring if we found answer.
+    // Otherwise, we will look at children of current_node
+    match &current_node.parsed_data {
+        ParsedOperation::Numeric(parsed) => {
+            let mut res = Answer {
+                question: find_corresponding_string(
+                    parsed.get_question_header().prompt_string_id,
+                    string_packages,
+                )
+                .to_string(),
+                help: find_corresponding_string(
+                    parsed.get_question_header().help_string_id,
+                    string_packages,
+                )
+                .to_string(),
+                answer: String::new(),
+            };
+
+            for phrase in possible_question_phrases {
+                if phrase.as_ref().eq_ignore_ascii_case(res.question.trim()) {
+                    let varstore = find_corresponding_varstore(
+                        Rc::clone(&node),
+                        parsed.get_question_header().var_store_id,
+                    );
+
+                    fn extract<T>(
+                        question_header: &QuestionHeader,
+                        bytes: &Vec<u8>,
+                        res: &mut Answer,
+                    ) where
+                        T: BinRead,
+                        <T as BinRead>::Args: Default,
+                        T: Display,
+                    {
+                        let answer: Result<T> =
+                            extract_efi_data(question_header.var_store_info, bytes);
+                        match answer {
+                            Ok(a) => res.answer.push_str(format!("{a}").as_str()),
+                            Err(_) => res.answer.push_str("Unknown"),
+                        }
+                    }
+
+                    match varstore {
+                        Err(_) => {
+                            res.answer.push_str("Unknown");
+                        }
+                        Ok(bytes) => match &parsed.data {
+                            Range::Range8(_) => {
+                                extract::<u8>(&parsed.get_question_header(), &bytes, &mut res)
+                            }
+                            Range::Range16(_) => {
+                                extract::<u16>(&parsed.get_question_header(), &bytes, &mut res)
+                            }
+                            Range::Range32(_) => {
+                                extract::<u32>(&parsed.get_question_header(), &bytes, &mut res)
+                            }
+                            Range::Range64(_) => {
+                                extract::<u64>(&parsed.get_question_header(), &bytes, &mut res)
+                            }
+                        },
+                    }
+
+                    return Some(res);
+                }
+            }
+        }
+        ParsedOperation::OneOf(parsed) => {
+            let mut res = Answer {
+                question: find_corresponding_string(
+                    parsed.get_question_header().prompt_string_id,
+                    string_packages,
+                )
+                .to_string(),
+                help: find_corresponding_string(
+                    parsed.get_question_header().help_string_id,
+                    string_packages,
+                )
+                .to_string(),
+                answer: String::new(),
+            };
+
+            for phrase in possible_question_phrases {
+                if phrase.as_ref().eq_ignore_ascii_case(res.question.trim()) {
+                    let varstore = find_corresponding_varstore(
+                        Rc::clone(&node),
+                        parsed.get_question_header().var_store_id,
+                    );
+
+                    let mut chosen_value: u64 = 0;
+
+                    fn extract<T>(
+                        question_header: &QuestionHeader,
+                        bytes: &Vec<u8>,
+                        chosen_value: &mut u64,
+                    ) where
+                        T: BinRead,
+                        <T as BinRead>::Args: Default,
+                        T: Display,
+                        T: Into<u64>,
+                    {
+                        let answer: Result<T> =
+                            extract_efi_data(question_header.var_store_info, bytes);
+                        if let Ok(a) = answer {
+                            *chosen_value = a.into();
+                        }
+                    }
+
+                    match varstore {
+                        Err(_) => {
+                            res.answer.push_str("Unknown");
+                            return Some(res);
+                        }
+                        Ok(bytes) => match &parsed.data {
+                            Range::Range8(_) => {
+                                extract::<u8>(
+                                    &parsed.get_question_header(),
+                                    &bytes,
+                                    &mut chosen_value,
+                                );
+                            }
+                            Range::Range16(_) => {
+                                extract::<u16>(
+                                    &parsed.get_question_header(),
+                                    &bytes,
+                                    &mut chosen_value,
+                                );
+                            }
+                            Range::Range32(_) => {
+                                extract::<u32>(
+                                    &parsed.get_question_header(),
+                                    &bytes,
+                                    &mut chosen_value,
+                                );
+                            }
+                            Range::Range64(_) => {
+                                extract::<u64>(
+                                    &parsed.get_question_header(),
+                                    &bytes,
+                                    &mut chosen_value,
+                                );
+                            }
+                        },
+                    }
+
+                    // Some of OneOf's children are OneOfOptions
+
+                    let mut found_option = false;
+                    for child in &node.borrow().children {
+                        match &child.borrow().parsed_data {
+                            ParsedOperation::OneOfOption(o) => {
+                                let current_value: u64 = match o.value {
+                                    TypeValue::NumSize8(c) => c as u64,
+                                    TypeValue::NumSize16(c) => c as u64,
+                                    TypeValue::NumSize32(c) => c as u64,
+                                    TypeValue::NumSize64(c) => c as u64,
+                                    _ => 0,
+                                };
+
+                                if current_value == chosen_value {
+                                    found_option = true;
+                                    res.answer.push_str(find_corresponding_string(
+                                        o.option_string_id,
+                                        string_packages,
+                                    ));
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !found_option {
+                        res.answer.push_str("Unknown");
+                    }
+
+                    return Some(res);
+                }
+            }
+        }
+        ParsedOperation::CheckBox(parsed) => {
+            let mut res = Answer {
+                question: find_corresponding_string(
+                    parsed.get_question_header().prompt_string_id,
+                    string_packages,
+                )
+                .to_string(),
+                help: find_corresponding_string(
+                    parsed.get_question_header().help_string_id,
+                    string_packages,
+                )
+                .to_string(),
+                answer: String::new(),
+            };
+
+            for phrase in possible_question_phrases {
+                if phrase.as_ref().eq_ignore_ascii_case(res.question.trim()) {
+                    let varstore = find_corresponding_varstore(
+                        Rc::clone(&node),
+                        parsed.get_question_header().var_store_id,
+                    );
+
+                    match varstore {
+                        Err(_) => {
+                            res.answer.push_str("Unknown");
+                        }
+                        Ok(v) => {
+                            // for a checkbox size should be of type u8
+                            let answer: Result<u8> =
+                                extract_efi_data(parsed.get_question_header().var_store_info, &v);
+                            match answer {
+                                Ok(a) => res.answer.push_str(format!("{a}").as_str()),
+                                Err(_) => res.answer.push_str("Unknown"),
+                            }
+                        }
+                    }
+
+                    return Some(res);
+                }
+            }
+        }
+
+        _ => {}
+    }
+
+    // Question not found in current_node so look at children
+    for child in &node.borrow().children {
+        if let Some(res) = find_answer(Rc::clone(child), string_packages, possible_question_phrases)
+        {
+            return Some(res);
+        }
+    }
+
+    None
+}
+
 // display returns a String which is our tree like representation of a Forms package
 pub fn display(
     node: Rc<RefCell<IFROperation>>,
@@ -902,6 +1160,21 @@ pub fn display(
     let extra_spaces = "    ".repeat(level);
 
     let current_node = node.borrow();
+
+    // utility function for questions i.e. OneOf, Numeric and Checkbox
+    fn extract<T>(question_header: &QuestionHeader, bytes: &Vec<u8>, answer_disp: &mut String)
+    where
+        T: BinRead,
+        <T as BinRead>::Args: Default,
+        T: Display,
+        T: Into<u64>,
+    {
+        let answer: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
+        match answer {
+            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+            Err(_) => answer_disp.push_str("Unknown"),
+        }
+    }
 
     match &current_node.parsed_data {
         ParsedOperation::Placeholder => {
@@ -951,50 +1224,24 @@ pub fn display(
 
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.get_question_header().var_store_id);
+
+
             match varstore {
                 Err(_) => {
                     answer_disp.push_str("Unknown");
                 }
                 Ok(bytes) => match &parsed.data {
                     Range::Range8(_) => {
-                        let answer: Result<u8> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u8>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                     Range::Range16(_) => {
-                        let answer: Result<u16> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u16>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                     Range::Range32(_) => {
-                        let answer: Result<u32> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u32>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                     Range::Range64(_) => {
-                        let answer: Result<u64> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u64>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                 },
             }
@@ -1027,44 +1274,16 @@ pub fn display(
                 }
                 Ok(bytes) => match &parsed.data {
                     Range::Range8(_) => {
-                        let answer: Result<u8> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u8>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                     Range::Range16(_) => {
-                        let answer: Result<u16> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u16>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                     Range::Range32(_) => {
-                        let answer: Result<u32> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u32>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                     Range::Range64(_) => {
-                        let answer: Result<u64> = extract_efi_data(
-                            parsed.get_question_header().var_store_info,
-                            &bytes,
-                        );
-                        match answer {
-                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                            Err(_) => answer_disp.push_str("Unknown"),
-                        }
+                        extract::<u64>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                     }
                 },
             }
@@ -1096,15 +1315,9 @@ pub fn display(
                 Err(_) => {
                     answer_disp.push_str("Unknown");
                 }
-                Ok(v) => {
+                Ok(bytes) => {
                     // for a checkbox size should be of type u8
-
-                    let answer: Result<u8> =
-                        extract_efi_data(parsed.get_question_header().var_store_info, &v);
-                    match answer {
-                        Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-                        Err(_) => answer_disp.push_str("Unknown"),
-                    }
+                    extract::<u8>(&parsed.get_question_header(), &bytes, &mut answer_disp);
                 }
             }
 

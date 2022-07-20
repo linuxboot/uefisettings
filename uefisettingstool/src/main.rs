@@ -43,9 +43,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    // TODO: dumpdb, questions, change
+    // TODO: dumpdb, change
     ListStrings {},
     ShowIfr {},
+    Questions {},
 }
 
 fn main() -> Result<()> {
@@ -86,6 +87,35 @@ fn main() -> Result<()> {
                         )?
                     )
                 }
+            }
+        }
+
+        Commands::Questions {} => {
+            if let Some(question) = &args.question {
+                let file_contents = get_db_dump_bytes(&args)?;
+                let parsed_db = package::read_db(&file_contents)?;
+                for (guid, package_list) in parsed_db.forms {
+                    for form_package in package_list {
+                        // string_phrases contains just one item (input from user) now, but eventually
+                        // we plan to have a database which whill match similar string
+                        let string_phrases = Vec::from([question.clone()]);
+
+                        if let Some(answer) = forms::find_answer(
+                            form_package,
+                            parsed_db
+                                .strings
+                                .get(&guid)
+                                .context("failed to get string packages using GUID")?,
+                            &string_phrases,
+                        ) {
+                            println!("{:?}", answer);
+                        } else {
+                            println!("Question not found in Packagelist {}", &guid);
+                        }
+                    }
+                }
+            } else {
+                return Err(anyhow!("Please provide the question."));
             }
         }
     }
