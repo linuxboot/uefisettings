@@ -1,19 +1,25 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::rc::Rc;
 use std::rc::Weak;
 
 use log::debug;
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
+use binrw::BinResult;
+use binrw::ReadOptions;
 
 use crate::hii::package::Guid;
 
@@ -304,7 +310,11 @@ pub struct FormSet {
     pub class_guid: Guid,
 }
 
-#[derive(BinRead, Debug, PartialEq)]
+pub trait Question {
+    fn get_question_header(&self) -> QuestionHeader;
+}
+
+#[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 // In the UEFI spec question header's first field is statement header
 // however instead of having a separate nested struct I've combined it together
@@ -324,7 +334,14 @@ pub struct QuestionHeader {
 pub struct OneOf {
     pub question_header: QuestionHeader,
     pub flags: u8,
-    // TODO: also need to store data (should be an enum of differently sized structs) after this if required
+    #[br(parse_with = range_parser, args(flags))]
+    pub data: Range,
+}
+
+impl Question for OneOf {
+    fn get_question_header(&self) -> QuestionHeader {
+        self.question_header
+    }
 }
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -332,7 +349,82 @@ pub struct OneOf {
 pub struct Numeric {
     pub question_header: QuestionHeader,
     pub flags: u8,
-    // TODO: just like OneOf; also need to store data (should be an enum of differently sized structs) after this if required
+    #[br(parse_with = range_parser, args(flags))]
+    pub data: Range,
+}
+
+impl Question for Numeric {
+    fn get_question_header(&self) -> QuestionHeader {
+        self.question_header
+    }
+}
+
+// Note: there is nothing called Range in the spec.
+// It has weird conditions to parse the data field in Numeric and OneOfOption.
+
+#[derive(BinRead, Debug, PartialEq)]
+#[br(little)]
+pub struct Range8 {
+    min_value: u8,
+    max_value: u8,
+    step: u8,
+}
+
+#[derive(BinRead, Debug, PartialEq)]
+#[br(little)]
+pub struct Range16 {
+    min_value: u16,
+    max_value: u16,
+    step: u16,
+}
+
+#[derive(BinRead, Debug, PartialEq)]
+#[br(little)]
+pub struct Range32 {
+    min_value: u32,
+    max_value: u32,
+    step: u32,
+}
+#[derive(BinRead, Debug, PartialEq)]
+#[br(little)]
+pub struct Range64 {
+    min_value: u64,
+    max_value: u64,
+    step: u64,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Range {
+    Range8(Range8),
+    Range16(Range16),
+    Range32(Range32),
+    Range64(Range64),
+}
+
+fn range_parser<R: Read + Seek>(
+    reader: &mut R,
+    _ro: &ReadOptions,
+    args: (u8,),
+) -> BinResult<Range> {
+    match args.0 & 0x0Fu8 {
+        0x01u8 => {
+            let r: Range16 = reader.read_ne()?;
+            Ok(Range::Range16(r))
+        }
+        0x02u8 => {
+            let r: Range32 = reader.read_ne()?;
+            Ok(Range::Range32(r))
+        }
+        0x03u8 => {
+            let r: Range64 = reader.read_ne()?;
+            Ok(Range::Range64(r))
+        }
+
+        _ => {
+            let r: Range8 = reader.read_ne()?;
+            Ok(Range::Range8(r))
+        }
+    }
 }
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -342,16 +434,45 @@ pub struct CheckBox {
     pub flags: u8,
 }
 
+impl Question for CheckBox {
+    fn get_question_header(&self) -> QuestionHeader {
+        self.question_header
+    }
+}
+
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
 pub struct OneOfOption {
     pub option_string_id: u16,
     pub flags: u8,
-    pub value_type: u8,
-
-    // TODO: use binrw's parse_with to make a function which parses this manually
-    // Right now this just defaults to TypeValue's first element which is NumSize8(u8).
+    value_type: u8,
+    #[br(parse_with = type_value_parser, args(value_type))]
     pub value: TypeValue,
+}
+
+trait VariableStore {
+    fn name(&self) -> String;
+    fn guid(&self) -> String;
+    fn size(&self) -> u16;
+
+    /// extract raw bytes from UEFI using the /sys virtual filesystem
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let efi_varstore_filename = format!(
+            "/sys/firmware/efi/efivars/{}-{}",
+            &self.name(),
+            &self.guid().to_ascii_lowercase()
+        );
+
+        // try to read data from varstore
+        let mut file = File::open(&efi_varstore_filename)
+            .context("failed to open sysfs efivars to get varstore bytes")?;
+        let mut buf = vec![0u8; self.size().into()];
+        // only read as much as we require
+        file.read_exact(&mut buf).context(
+            "failed to read bytes from sysfs efivars of size specified by varstore in hiidb",
+        )?;
+        Ok(buf)
+    }
 }
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -363,24 +484,15 @@ pub struct VarStore {
     pub name: binrw::NullString,
 }
 
-impl VarStore {
-    /// extract raw bytes from UEFI using the /sys virtual filesystem
-    pub fn bytes(&self) -> Result<Vec<u8>> {
-        let efi_varstore_filename = format!(
-            "/sys/firmware/efi/efivars/{}-{}",
-            &self.name.to_string(),
-            &self.guid.to_string().to_ascii_lowercase()
-        );
-
-        // try to read data from varstore
-        let mut file = File::open(&efi_varstore_filename)
-            .context("failed to open sysfs efivars to get varstore bytes")?;
-        let mut buf = vec![0u8; self.size.into()];
-        // only read as much as we require
-        file.read_exact(&mut buf).context(
-            "failed to read bytes from sysfs efivars of size specified by varstore in hiidb",
-        )?;
-        Ok(buf)
+impl VariableStore for VarStore {
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+    fn guid(&self) -> String {
+        self.guid.to_string()
+    }
+    fn size(&self) -> u16 {
+        self.size
     }
 }
 
@@ -392,6 +504,17 @@ pub struct VarStoreEfi {
     pub attributes: u32,
     pub size: u16,
     pub name: binrw::NullString,
+}
+impl VariableStore for VarStoreEfi {
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+    fn guid(&self) -> String {
+        self.guid.to_string()
+    }
+    fn size(&self) -> u16 {
+        self.size
+    }
 }
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -407,11 +530,15 @@ pub struct DefaultStore {
 #[br(little)]
 pub struct IFRDefault {
     pub default_id: u16,
-    pub value_type: u8,
+    value_type: u8,
+    // The third field is TypeValue and should be parsed with the following code.
+    // However the structure of IFRDefault and existence of that field varies depending on
+    // what scope the IFRDefault is in, even though the opcode remains the same.
 
-    // TODO: use binrw's parse_with to make a function which parses this manually
-    // Right now this just defaults to TypeValue's first element which is NumSize8(u8).
-    pub value: TypeValue,
+    // Since we are not using TypeValue for IFRDefault right now, we're gonna pretend that field does not exist.
+
+    // #[br(parse_with = type_value_parser, args(value_type))]
+    // pub value: TypeValue,
 }
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -484,8 +611,7 @@ pub struct Ref {
     pub device_path_string_id: u16,
 }
 
-#[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+#[derive(Debug, PartialEq)]
 /// Any structs having TypeValue as a field can have value of one of these types
 /// depending on the value of the value_type
 pub enum TypeValue {
@@ -493,7 +619,7 @@ pub enum TypeValue {
     NumSize16(u16),
     NumSize32(u32),
     NumSize64(u64),
-    // Boolean(bool), - spec unclear ; FIXME
+    Boolean(bool),
     Time(Time),
     Date(Date),
     StringID(u16),
@@ -503,6 +629,43 @@ pub enum TypeValue {
     // Buffer(Vec<u8>),  - spec unclear ; FIXME
     Ref(Ref),
     Unknown(u8),
+}
+
+fn type_value_parser<R: Read + Seek>(
+    reader: &mut R,
+    _ro: &ReadOptions,
+    args: (u8,),
+) -> BinResult<TypeValue> {
+    match args.0 {
+        0x00u8 => {
+            let r: u8 = reader.read_ne()?;
+            Ok(TypeValue::NumSize8(r))
+        }
+        0x01u8 => {
+            let r: u16 = reader.read_ne()?;
+            Ok(TypeValue::NumSize16(r))
+        }
+        0x02u8 => {
+            let r: u32 = reader.read_ne()?;
+            Ok(TypeValue::NumSize32(r))
+        }
+        0x03u8 => {
+            let r: u64 = reader.read_ne()?;
+            Ok(TypeValue::NumSize64(r))
+        }
+        0x04u8 => {
+            let r: u8 = reader.read_ne()?;
+            if r != 0 {
+                return Ok(TypeValue::Boolean(true));
+            }
+            Ok(TypeValue::Boolean(false))
+        }
+        // TODO: handle other types like Date, Time & Ref. We have already made structs for them.
+        _ => {
+            let r: u8 = reader.read_ne()?;
+            Ok(TypeValue::Unknown(r))
+        }
+    }
 }
 
 pub fn handle_form_package(
@@ -728,4 +891,330 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
     }
 
     Ok(())
+}
+// display returns a String which is our tree like representation of a Forms package
+pub fn display(
+    node: Rc<RefCell<IFROperation>>,
+    level: usize,
+    string_packages: &Vec<HashMap<i32, String>>,
+) -> Result<String> {
+    let mut result = String::new();
+    let extra_spaces = "    ".repeat(level);
+
+    let current_node = node.borrow();
+
+    match &current_node.parsed_data {
+        ParsedOperation::Placeholder => {
+            if current_node.op_code == IFROpCode::Unknown(DUMMY_OPCODE) {
+                result.push_str(format!("{extra_spaces}OpCode: ROOT\n").as_str())
+            }
+        }
+        ParsedOperation::Subtitle(parsed) => result.push_str(
+            format!(
+                "{extra_spaces}OpCode: {:?} - S: {}\n",
+                current_node.op_code,
+                find_corresponding_string(parsed.prompt_string_id, string_packages),
+            )
+            .as_str(),
+        ),
+        ParsedOperation::FormSet(parsed) => result.push_str(
+            format!(
+                "{extra_spaces}OpCode: {:?} - {} - GUID {} - ClassGUID {}\n",
+                current_node.op_code,
+                find_corresponding_string(parsed.title_string_id, string_packages),
+                parsed.guid,
+                parsed.class_guid,
+            )
+            .as_str(),
+        ),
+        ParsedOperation::VarStore(parsed) => result.push_str(
+            format!(
+                "{extra_spaces}OpCode: {:?} - Name: {}\n",
+                current_node.op_code,
+                parsed.name.to_string(),
+            )
+            .as_str(),
+        ),
+        ParsedOperation::OneOfOption(parsed) => result.push_str(
+            format!(
+                "{extra_spaces}OpCode: {:?} - S: {}\n{extra_spaces}-ValueType:{}\n{extra_spaces}-Value:{:?}\n",
+                current_node.op_code,
+                find_corresponding_string(parsed.option_string_id, string_packages),
+                parsed.value_type,
+                parsed.value
+            )
+            .as_str(),
+        ),
+
+        ParsedOperation::OneOf(parsed) => {
+            let mut answer_disp = String::new();
+
+            let varstore =
+                find_corresponding_varstore(Rc::clone(&node), parsed.get_question_header().var_store_id);
+            match varstore {
+                Err(_) => {
+                    answer_disp.push_str("Unknown");
+                }
+                Ok(bytes) => match &parsed.data {
+                    Range::Range8(_) => {
+                        let answer: Result<u8> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                    Range::Range16(_) => {
+                        let answer: Result<u16> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                    Range::Range32(_) => {
+                        let answer: Result<u32> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                    Range::Range64(_) => {
+                        let answer: Result<u64> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                },
+            }
+
+            result.push_str(
+                format!(
+                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
+                    current_node.op_code,
+                    find_corresponding_string(
+                        parsed.get_question_header().prompt_string_id,
+                        string_packages
+                    ),
+                    find_corresponding_string(
+                        parsed.get_question_header().help_string_id,
+                        string_packages
+                    ),
+                    parsed.data
+                )
+                .as_str(),
+            );
+        }
+        ParsedOperation::Numeric(parsed) => {
+            let mut answer_disp = String::new();
+
+            let varstore =
+                find_corresponding_varstore(Rc::clone(&node), parsed.get_question_header().var_store_id);
+            match varstore {
+                Err(_) => {
+                    answer_disp.push_str("Unknown");
+                }
+                Ok(bytes) => match &parsed.data {
+                    Range::Range8(_) => {
+                        let answer: Result<u8> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                    Range::Range16(_) => {
+                        let answer: Result<u16> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                    Range::Range32(_) => {
+                        let answer: Result<u32> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                    Range::Range64(_) => {
+                        let answer: Result<u64> = extract_efi_data(
+                            parsed.get_question_header().var_store_info,
+                            &bytes,
+                        );
+                        match answer {
+                            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                            Err(_) => answer_disp.push_str("Unknown"),
+                        }
+                    }
+                },
+            }
+
+            result.push_str(
+                format!(
+                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
+                    current_node.op_code,
+                    find_corresponding_string(
+                        parsed.get_question_header().prompt_string_id,
+                        string_packages
+                    ),
+                    find_corresponding_string(
+                        parsed.get_question_header().help_string_id,
+                        string_packages
+                    ),
+                    parsed.data
+                )
+                .as_str(),
+            );
+        }
+        ParsedOperation::CheckBox(parsed) => {
+            let mut answer_disp = String::new();
+
+            let varstore =
+                find_corresponding_varstore(Rc::clone(&node), parsed.get_question_header().var_store_id);
+
+            match varstore {
+                Err(_) => {
+                    answer_disp.push_str("Unknown");
+                }
+                Ok(v) => {
+                    // for a checkbox size should be of type u8
+
+                    let answer: Result<u8> =
+                        extract_efi_data(parsed.get_question_header().var_store_info, &v);
+                    match answer {
+                        Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
+                        Err(_) => answer_disp.push_str("Unknown"),
+                    }
+                }
+            }
+
+            result.push_str(
+                format!(
+                    "{extra_spaces}OpCode: {:?} - Q: - {} - Help: - {}\n{extra_spaces}-Answer: {answer_disp}\n",
+                    current_node.op_code,
+                    find_corresponding_string(
+                        parsed.get_question_header().prompt_string_id,
+                        string_packages
+                    ),
+                    find_corresponding_string(
+                        parsed.get_question_header().help_string_id,
+                        string_packages
+                    ),
+                )
+                .as_str(),
+            );
+        }
+
+        // TODO: we have already made structs for the most popular opcodes so we should finish the display function for them
+        // however display is only for debugging and a visual representation of the forms for humans
+        _ => result
+            .push_str(format!("{extra_spaces}OpCode: {:?}\n",  current_node.op_code).as_str()),
+    }
+
+    for child in &node.borrow().children {
+        result.push_str(display(Rc::clone(child), level + 1, string_packages)?.as_str());
+    }
+
+    Ok(result)
+}
+
+fn find_corresponding_string<'a>(
+    string_id: u16,
+    string_packages: &'a Vec<HashMap<i32, String>>,
+) -> &'a str {
+    // TODO: accept language pack parameter later
+    // it defaults to the first language pack it can find and the first one is en-US
+
+    for package in string_packages {
+        if let Some(s) = package.get(&(string_id as i32)) {
+            return s;
+        }
+    }
+
+    // in lots of language packs most strings are simply not present
+    // in some cases strings aren't there at all in any language
+
+    // cannot return an error here because its the firmware not following the spec
+
+    debug!("string id: {string_id} not found");
+
+    ""
+}
+
+/// find_corresponding_varstore bubble's up from current node till we find a FormSet.
+/// then it looks for varstores which will be FormSet's children
+fn find_corresponding_varstore(
+    node: Rc<RefCell<IFROperation>>,
+    var_store_id: u16,
+) -> Result<Vec<u8>> {
+    let current_node = node.borrow();
+
+    if current_node.op_code == IFROpCode::FormSet {
+        // look at its children
+
+        for child in &current_node.children {
+            match &child.borrow().parsed_data {
+                ParsedOperation::VarStore(v) => {
+                    if v.var_store_id == var_store_id {
+                        return v.bytes();
+                    }
+                }
+                ParsedOperation::VarStoreEfi(v) => {
+                    if v.var_store_id == var_store_id {
+                        return v.bytes();
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Err(anyhow!("no varstore with matching id found"));
+    }
+
+    match current_node.parent.as_ref() {
+        Some(parent_ref) => match parent_ref.upgrade() {
+            Some(parent_ref_rc) => {
+                find_corresponding_varstore(Rc::clone(&parent_ref_rc), var_store_id)
+            }
+            None => Err(anyhow!("could not upgrade parent_ref Weak<> to get Rc<>")),
+        },
+        None => Err(anyhow!("could not find current node's parent")),
+    }
+}
+
+/// extract_efi_data extracts data of type T at given offset from efivar bytes.
+/// The _size arg here is only used to get the type (and thus size) of our answer.
+fn extract_efi_data<T>(offset: u16, bytes: &Vec<u8>) -> Result<T>
+where
+    T: BinRead,
+    <T as BinRead>::Args: Default,
+{
+    // first 4 bytes are flags provided by the kernel so ignore them
+    // values begin after that
+
+    let mut cursor = Cursor::new(&bytes);
+    cursor.seek(SeekFrom::Current(4 + offset as i64))?;
+
+    let answer: T = cursor.read_ne()?;
+
+    Ok(answer)
 }

@@ -1,6 +1,6 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-mod forms;
+pub mod forms;
 pub mod package;
 mod strings;
 // UEFI HII Library

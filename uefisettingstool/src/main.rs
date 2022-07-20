@@ -4,13 +4,15 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-use anyhow::Context;
 use log::info;
 
+use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
 
+use uefisettingslib::hii::forms;
 use uefisettingslib::hii::package;
 
 const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
@@ -29,6 +31,9 @@ struct Args {
     /// Strings package language code
     lang: Option<String>,
 
+    #[clap(short, long, value_parser)]
+    question: Option<String>,
+
     #[clap(short, long, parse(from_occurrences))]
     debug: usize,
 
@@ -38,8 +43,9 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    // TODO: dumpdb,showifr,questions,change,liststrings
+    // TODO: dumpdb, questions, change
     ListStrings {},
+    ShowIfr {},
 }
 
 fn main() -> Result<()> {
@@ -49,46 +55,73 @@ fn main() -> Result<()> {
 
     match &args.command {
         Commands::ListStrings {} => {
-            // If dbdump's path is provided use that
-            if let Some(dbdump_path) = args.filename.as_deref() {
-                info!("Using database dump from file: {}", dbdump_path.display());
+            let file_contents = get_db_dump_bytes(&args)?;
 
-                let mut file = File::open(&dbdump_path)
-                    .context(format!("opening dbdump from{}", dbdump_path.display()))?;
-
-                // Most Hii DBs are afew hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
-                // Since we're reading the entire DB into a Vec<u8> we need to have a check here.
-                if file
-                    .metadata()
-                    .context("failed to read metadata for open file")?
-                    .len()
-                    > MAX_ALLOWED_FILESIZE
-                {
-                    panic!("File size is too big for the file to be a HII database.");
-                }
-
-                let mut file_contents = Vec::new();
-                match file.read_to_end(&mut file_contents) {
-                    Err(why) => panic!("Couldn't convert file bytes to Vec<u8> : {}", why),
-                    _ => (),
-                };
-
-                for (guid, package_list) in (package::read_db(&file_contents))?.strings {
-                    println!("Packagelist {}", guid);
-                    for string_package in package_list {
-                        println!("- New String Package");
-                        for (string_id_current, string_current) in string_package {
-                            println!("{} : \"{}\"", string_id_current, string_current);
-                        }
+            for (guid, package_list) in (package::read_db(&file_contents))?.strings {
+                println!("Packagelist {}", guid);
+                for string_package in package_list {
+                    println!("- New String Package");
+                    for (string_id_current, string_current) in string_package {
+                        println!("{} : \"{}\"", string_id_current, string_current);
                     }
                 }
-            } else {
-                println!("Please provide the database dump.")
             }
-            // TODO: Otherwise try to extract it
+        }
+        Commands::ShowIfr {} => {
+            let file_contents = get_db_dump_bytes(&args)?;
+            let parsed_db = package::read_db(&file_contents)?;
+
+            for (guid, package_list) in parsed_db.forms {
+                println!("Packagelist {}", &guid);
+                for form_package in package_list {
+                    println!(
+                        "{}",
+                        forms::display(
+                            form_package,
+                            0,
+                            parsed_db
+                                .strings
+                                .get(&guid)
+                                .context("failed to get string packages using GUID")?
+                        )?
+                    )
+                }
+            }
         }
     }
 
     info!("Exiting UEFI Settings Manipulation Tool");
     Ok(())
+}
+
+fn get_db_dump_bytes(args: &Args) -> Result<Vec<u8>> {
+    // If dbdump's path is provided use that
+    if let Some(dbdump_path) = args.filename.as_deref() {
+        info!("Using database dump from file: {}", dbdump_path.display());
+
+        let mut file = File::open(&dbdump_path)
+            .context(format!("opening dbdump from{}", dbdump_path.display()))?;
+
+        // Most Hii DBs are afew hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
+        // Since we're reading the entire DB into a Vec<u8> we need to have a check here.
+        if file
+            .metadata()
+            .context("failed to read metadata for open file")?
+            .len()
+            > MAX_ALLOWED_FILESIZE
+        {
+            return Err(anyhow!(
+                "File size is too big for the file to be a HII database."
+            ));
+        }
+
+        let mut file_contents = Vec::new();
+        file.read_to_end(&mut file_contents)
+            .context("Couldn't convert file bytes to Vec<u8>")?;
+
+        Ok(file_contents)
+    } else {
+        // TODO: Otherwise try to extract it
+        Err(anyhow!("Please provide the database dump."))
+    }
 }
