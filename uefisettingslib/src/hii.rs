@@ -1,5 +1,6 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+pub mod extract;
 pub mod forms;
 pub mod package;
 mod strings;

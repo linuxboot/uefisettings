@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 
 use log::info;
@@ -12,6 +13,7 @@ use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
 
+use uefisettingslib::hii::extract;
 use uefisettingslib::hii::forms;
 use uefisettingslib::hii::package;
 
@@ -43,10 +45,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    // TODO: dumpdb, change
+    // TODO: change
     ListStrings {},
     ShowIfr {},
     Questions {},
+    DumpDB {},
 }
 
 fn main() -> Result<()> {
@@ -118,6 +121,16 @@ fn main() -> Result<()> {
                 return Err(anyhow!("Please provide the question."));
             }
         }
+
+        Commands::DumpDB {} => {
+            if let Some(dbdump_path) = args.filename.as_deref() {
+                let mut file = File::create(dbdump_path)?;
+                file.write_all(&extract::extract_db()?)?;
+                println!("HiiDB written to {}", dbdump_path.display());
+            } else {
+                return Err(anyhow!("Please provide the filename."));
+            }
+        }
     }
 
     info!("Exiting UEFI Settings Manipulation Tool");
@@ -151,7 +164,6 @@ fn get_db_dump_bytes(args: &Args) -> Result<Vec<u8>> {
 
         Ok(file_contents)
     } else {
-        // TODO: Otherwise try to extract it
-        Err(anyhow!("Please provide the database dump."))
+        extract::extract_db()
     }
 }

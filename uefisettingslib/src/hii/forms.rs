@@ -1410,7 +1410,7 @@ fn find_corresponding_varstore(
             }
             None => Err(anyhow!("could not upgrade parent_ref Weak<> to get Rc<>")),
         },
-        None => Err(anyhow!("could not find current node's parent")),
+        None => Err(anyhow!("varstore not found because we reached root")),
     }
 }
 
