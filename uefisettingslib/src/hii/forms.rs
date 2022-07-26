@@ -8,6 +8,8 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::io::Write;
+use std::process::Command;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -20,14 +22,16 @@ use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use binrw::BinResult;
+use binrw::BinWrite;
 use binrw::ReadOptions;
 
+use crate::file_lock::FileLock;
 use crate::hii::package::Guid;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 
 // UEFI Spec v2.9 Page 1844
-#[derive(BinRead, Debug, PartialEq)]
+#[derive(BinRead, Debug, PartialEq, Copy, Clone)]
 #[br(little)]
 pub enum IFROpCode {
     #[br(magic = 0x01u8)]
@@ -312,7 +316,7 @@ pub struct FormSet {
 }
 
 pub trait Question {
-    fn get_question_header(&self) -> QuestionHeader;
+    fn question_header(&self) -> QuestionHeader;
 }
 
 #[derive(BinRead, Debug, PartialEq, Clone, Copy)]
@@ -340,7 +344,7 @@ pub struct OneOf {
 }
 
 impl Question for OneOf {
-    fn get_question_header(&self) -> QuestionHeader {
+    fn question_header(&self) -> QuestionHeader {
         self.question_header
     }
 }
@@ -355,7 +359,7 @@ pub struct Numeric {
 }
 
 impl Question for Numeric {
-    fn get_question_header(&self) -> QuestionHeader {
+    fn question_header(&self) -> QuestionHeader {
         self.question_header
     }
 }
@@ -392,6 +396,13 @@ pub struct Range64 {
     min_value: u64,
     max_value: u64,
     step: u64,
+}
+
+pub enum RangeType {
+    NumSize8(u8),
+    NumSize16(u16),
+    NumSize32(u32),
+    NumSize64(u64),
 }
 
 #[derive(Debug, PartialEq)]
@@ -436,7 +447,7 @@ pub struct CheckBox {
 }
 
 impl Question for CheckBox {
-    fn get_question_header(&self) -> QuestionHeader {
+    fn question_header(&self) -> QuestionHeader {
         self.question_header
     }
 }
@@ -456,16 +467,18 @@ trait VariableStore {
     fn guid(&self) -> String;
     fn size(&self) -> u16;
 
-    /// extract raw bytes from UEFI using the /sys virtual filesystem
-    fn bytes(&self) -> Result<Vec<u8>> {
-        let efi_varstore_filename = format!(
+    fn store_filename(&self) -> String {
+        format!(
             "/sys/firmware/efi/efivars/{}-{}",
             &self.name(),
             &self.guid().to_ascii_lowercase()
-        );
+        )
+    }
 
+    /// extract raw bytes from UEFI using the /sys virtual filesystem
+    fn read_bytes(&self) -> Result<Vec<u8>> {
         // try to read data from varstore
-        let mut file = File::open(&efi_varstore_filename)
+        let mut file = File::open(&self.store_filename())
             .context("failed to open sysfs efivars to get varstore bytes")?;
         let mut buf = vec![0u8; self.size().into()];
         // only read as much as we require
@@ -474,9 +487,70 @@ trait VariableStore {
         )?;
         Ok(buf)
     }
+
+    fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+        // Steps:
+        // * Read bytes
+        // * Seek to 4 + offset
+        // * If checks pass, write your answer
+
+        // We have three layers of checks so as to not accidentially corrupt EFI vars.
+
+        // This file lock also obeyed by other internal s/w that touches EFI vars.
+        // https://www.internalfb.com/code/search?q=repo%3Afbcode%20%2Frun%2Flock%2Fefibootmgr-remount
+
+        // The /run/lock/efibootmgr-remount lock will release automatically on drop.
+        // If something errors out, doesn't matter since we are using the flock syscall to lock it.
+        // Linux will then release it automatically after the program ends.
+
+        const LOCK_FILE_PATH: &str = "/run/lock/efibootmgr-remount";
+        let mut lock = FileLock::new(LOCK_FILE_PATH);
+        lock.lock()?;
+
+        let mut file_ro = File::open(&self.store_filename())
+            .context("Failed to open efivarfs file to get varstore bytes")?;
+
+        let mut file_contents = Vec::new();
+        file_ro
+            .read_to_end(&mut file_contents)
+            .context("Failed to read efivarfs file")?;
+
+        let mut cursor = Cursor::new(file_contents);
+        cursor.seek(SeekFrom::Start(4 + offset as u64))?;
+
+        match data {
+            TypeValue::NumSize8(v) => v.write_to(&mut cursor)?,
+            TypeValue::NumSize16(v) => v.write_to(&mut cursor)?,
+            TypeValue::NumSize32(v) => v.write_to(&mut cursor)?,
+            TypeValue::NumSize64(v) => v.write_to(&mut cursor)?,
+            _ => {}
+        }
+
+        Command::new("mount")
+            .arg("-o")
+            .arg("remount,rw")
+            .arg("efivarfs")
+            .output()?;
+
+        // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
+        // validate temporarily writable.
+        Command::new("/usr/bin/chattr")
+            .arg("-i")
+            .arg(&self.store_filename())
+            .output()?;
+
+        // All checks passed, now we can try to write.
+
+        File::create(&self.store_filename())
+            .context("Failed to open efivarfs file for writing")?
+            .write_all(cursor.get_ref())
+            .context("Failed to write to efivarfs file")?;
+
+        Ok(())
+    }
 }
 
-#[derive(BinRead, Debug, PartialEq)]
+#[derive(BinRead, Debug, PartialEq, Clone)]
 #[br(little)]
 pub struct VarStore {
     pub guid: Guid,
@@ -497,7 +571,7 @@ impl VariableStore for VarStore {
     }
 }
 
-#[derive(BinRead, Debug, PartialEq)]
+#[derive(BinRead, Debug, PartialEq, Clone)]
 #[br(little)]
 pub struct VarStoreEfi {
     pub var_store_id: u16,
@@ -587,7 +661,7 @@ pub struct EqIdValList {
     pub value_list: Vec<u16>,
 }
 
-#[derive(BinRead, Debug, PartialEq)]
+#[derive(BinRead, Debug, PartialEq, Clone)]
 #[br(little)]
 pub struct Time {
     pub hour: u8,
@@ -595,7 +669,7 @@ pub struct Time {
     pub second: u8,
 }
 
-#[derive(BinRead, Debug, PartialEq)]
+#[derive(BinRead, Debug, PartialEq, Clone)]
 #[br(little)]
 pub struct Date {
     pub year: u16,
@@ -603,7 +677,7 @@ pub struct Date {
     pub day: u8,
 }
 
-#[derive(BinRead, Debug, PartialEq)]
+#[derive(BinRead, Debug, PartialEq, Clone)]
 #[br(little)]
 pub struct Ref {
     pub question_id: u16,
@@ -612,7 +686,7 @@ pub struct Ref {
     pub device_path_string_id: u16,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 /// Any structs having TypeValue as a field can have value of one of these types
 /// depending on the value of the value_type
 pub enum TypeValue {
@@ -805,7 +879,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
             // We're not saving these in the struct because we dont know how many there are - could take up a large amount of memory.
             // For non debug uses we will only call this when we want to know the answer to a question.
 
-            match &parsed.bytes() {
+            match &parsed.read_bytes() {
                 Ok(b) => {
                     debug!("Varstore bytes are {:?}", b);
                 }
@@ -894,21 +968,41 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-pub struct Answer {
+pub struct QuestionDescriptor {
     pub question: String,
     pub help: String,
-    pub answer: String,
+    pub value: String,
+    max_value: RangeType,
+    opcode: IFROpCode,
+    possible_options: Vec<AnswerOption>,
+    header: QuestionHeader,
+    varstore: Option<Box<dyn VariableStore>>,
+}
+impl fmt::Debug for QuestionDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuestionObject")
+            .field("question", &self.question)
+            .field("value", &self.value)
+            .field("help", &self.help)
+            .field("possible_options", &self.possible_options)
+            .finish()
+    }
 }
 
-/// find_answer accepts the root node, string_packages and possible_question_phrases.
+#[derive(Debug)]
+struct AnswerOption {
+    value: String,
+    raw_value: TypeValue,
+}
+
+/// find_question accepts the root node, string_packages and possible_question_phrases.
 /// possible_question_phrases is a vector of strings which represent variations of the
 /// same question. So if a single phrase matches then we assume that we have the answer.
-pub fn find_answer<T>(
+pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &Vec<HashMap<i32, String>>,
     possible_question_phrases: &[T],
-) -> Option<Answer>
+) -> Option<QuestionDescriptor>
 where
     T: AsRef<str>,
 {
@@ -917,237 +1011,315 @@ where
     // Only Numeric, OneOf and CheckBox are questions.
     // If our question is found this match expression will return without caring if we found answer.
     // Otherwise, we will look at children of current_node
-    match &current_node.parsed_data {
-        ParsedOperation::Numeric(parsed) => {
-            let mut res = Answer {
-                question: find_corresponding_string(
-                    parsed.get_question_header().prompt_string_id,
-                    string_packages,
-                )
-                .to_string(),
-                help: find_corresponding_string(
-                    parsed.get_question_header().help_string_id,
-                    string_packages,
-                )
-                .to_string(),
-                answer: String::new(),
-            };
 
-            for phrase in possible_question_phrases {
-                if phrase.as_ref().eq_ignore_ascii_case(res.question.trim()) {
+    for phrase in possible_question_phrases {
+        match &current_node.parsed_data {
+            ParsedOperation::Numeric(parsed) => {
+                let question = find_corresponding_string(
+                    parsed.question_header().prompt_string_id,
+                    string_packages,
+                );
+
+                if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
                     let varstore = find_corresponding_varstore(
                         Rc::clone(&node),
-                        parsed.get_question_header().var_store_id,
+                        parsed.question_header().var_store_id,
                     );
 
-                    fn extract<T>(
-                        question_header: &QuestionHeader,
-                        bytes: &Vec<u8>,
-                        res: &mut Answer,
-                    ) where
-                        T: BinRead,
-                        <T as BinRead>::Args: Default,
-                        T: Display,
-                    {
-                        let answer: Result<T> =
-                            extract_efi_data(question_header.var_store_info, bytes);
-                        match answer {
-                            Ok(a) => res.answer.push_str(format!("{a}").as_str()),
-                            Err(_) => res.answer.push_str("Unknown"),
-                        }
-                    }
-
-                    match varstore {
-                        Err(_) => {
-                            res.answer.push_str("Unknown");
-                        }
-                        Ok(bytes) => match &parsed.data {
-                            Range::Range8(_) => {
-                                extract::<u8>(&parsed.get_question_header(), &bytes, &mut res)
-                            }
-                            Range::Range16(_) => {
-                                extract::<u16>(&parsed.get_question_header(), &bytes, &mut res)
-                            }
-                            Range::Range32(_) => {
-                                extract::<u32>(&parsed.get_question_header(), &bytes, &mut res)
-                            }
-                            Range::Range64(_) => {
-                                extract::<u64>(&parsed.get_question_header(), &bytes, &mut res)
-                            }
-                        },
-                    }
+                    let res =
+                        handle_numeric(varstore, parsed, question, string_packages, &current_node);
 
                     return Some(res);
                 }
             }
-        }
-        ParsedOperation::OneOf(parsed) => {
-            let mut res = Answer {
-                question: find_corresponding_string(
-                    parsed.get_question_header().prompt_string_id,
+            ParsedOperation::OneOf(parsed) => {
+                let question = find_corresponding_string(
+                    parsed.question_header().prompt_string_id,
                     string_packages,
-                )
-                .to_string(),
-                help: find_corresponding_string(
-                    parsed.get_question_header().help_string_id,
-                    string_packages,
-                )
-                .to_string(),
-                answer: String::new(),
-            };
+                );
 
-            for phrase in possible_question_phrases {
-                if phrase.as_ref().eq_ignore_ascii_case(res.question.trim()) {
+                if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
                     let varstore = find_corresponding_varstore(
                         Rc::clone(&node),
-                        parsed.get_question_header().var_store_id,
+                        parsed.question_header().var_store_id,
                     );
 
-                    let mut chosen_value: u64 = 0;
-
-                    fn extract<T>(
-                        question_header: &QuestionHeader,
-                        bytes: &Vec<u8>,
-                        chosen_value: &mut u64,
-                    ) where
-                        T: BinRead,
-                        <T as BinRead>::Args: Default,
-                        T: Display,
-                        T: Into<u64>,
-                    {
-                        let answer: Result<T> =
-                            extract_efi_data(question_header.var_store_info, bytes);
-                        if let Ok(a) = answer {
-                            *chosen_value = a.into();
-                        }
-                    }
-
-                    match varstore {
-                        Err(_) => {
-                            res.answer.push_str("Unknown");
-                            return Some(res);
-                        }
-                        Ok(bytes) => match &parsed.data {
-                            Range::Range8(_) => {
-                                extract::<u8>(
-                                    &parsed.get_question_header(),
-                                    &bytes,
-                                    &mut chosen_value,
-                                );
-                            }
-                            Range::Range16(_) => {
-                                extract::<u16>(
-                                    &parsed.get_question_header(),
-                                    &bytes,
-                                    &mut chosen_value,
-                                );
-                            }
-                            Range::Range32(_) => {
-                                extract::<u32>(
-                                    &parsed.get_question_header(),
-                                    &bytes,
-                                    &mut chosen_value,
-                                );
-                            }
-                            Range::Range64(_) => {
-                                extract::<u64>(
-                                    &parsed.get_question_header(),
-                                    &bytes,
-                                    &mut chosen_value,
-                                );
-                            }
-                        },
-                    }
-
-                    // Some of OneOf's children are OneOfOptions
-
-                    let mut found_option = false;
-                    for child in &node.borrow().children {
-                        match &child.borrow().parsed_data {
-                            ParsedOperation::OneOfOption(o) => {
-                                let current_value: u64 = match o.value {
-                                    TypeValue::NumSize8(c) => c as u64,
-                                    TypeValue::NumSize16(c) => c as u64,
-                                    TypeValue::NumSize32(c) => c as u64,
-                                    TypeValue::NumSize64(c) => c as u64,
-                                    _ => 0,
-                                };
-
-                                if current_value == chosen_value {
-                                    found_option = true;
-                                    res.answer.push_str(find_corresponding_string(
-                                        o.option_string_id,
-                                        string_packages,
-                                    ));
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if !found_option {
-                        res.answer.push_str("Unknown");
-                    }
+                    let res = handle_oneof(
+                        varstore,
+                        parsed,
+                        &node,
+                        string_packages,
+                        question,
+                        &current_node,
+                    );
 
                     return Some(res);
                 }
             }
-        }
-        ParsedOperation::CheckBox(parsed) => {
-            let mut res = Answer {
-                question: find_corresponding_string(
-                    parsed.get_question_header().prompt_string_id,
+            ParsedOperation::CheckBox(parsed) => {
+                let question = find_corresponding_string(
+                    parsed.question_header().prompt_string_id,
                     string_packages,
-                )
-                .to_string(),
-                help: find_corresponding_string(
-                    parsed.get_question_header().help_string_id,
-                    string_packages,
-                )
-                .to_string(),
-                answer: String::new(),
-            };
+                );
 
-            for phrase in possible_question_phrases {
-                if phrase.as_ref().eq_ignore_ascii_case(res.question.trim()) {
+                if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
                     let varstore = find_corresponding_varstore(
                         Rc::clone(&node),
-                        parsed.get_question_header().var_store_id,
+                        parsed.question_header().var_store_id,
                     );
 
-                    match varstore {
-                        Err(_) => {
-                            res.answer.push_str("Unknown");
-                        }
-                        Ok(v) => {
-                            // for a checkbox size should be of type u8
-                            let answer: Result<u8> =
-                                extract_efi_data(parsed.get_question_header().var_store_info, &v);
-                            match answer {
-                                Ok(a) => res.answer.push_str(format!("{a}").as_str()),
-                                Err(_) => res.answer.push_str("Unknown"),
-                            }
-                        }
-                    }
+                    let res =
+                        handle_checkbox(varstore, parsed, question, string_packages, &current_node);
 
                     return Some(res);
                 }
             }
-        }
 
-        _ => {}
+            _ => {}
+        }
     }
 
     // Question not found in current_node so look at children
     for child in &node.borrow().children {
-        if let Some(res) = find_answer(Rc::clone(child), string_packages, possible_question_phrases)
+        if let Some(res) =
+            find_question(Rc::clone(child), string_packages, possible_question_phrases)
         {
             return Some(res);
         }
     }
 
     None
+}
+
+fn handle_checkbox(
+    varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
+    parsed: &CheckBox,
+    question: &str,
+    string_packages: &Vec<HashMap<i32, String>>,
+    current_node: &std::cell::Ref<IFROperation>,
+) -> QuestionDescriptor {
+    let mut answer = String::new();
+    match &varstore {
+        Err(_) => {
+            answer.push_str("Unknown");
+        }
+        Ok(vstore) => match vstore.read_bytes() {
+            Err(_) => {
+                answer.push_str("Unknown");
+            }
+            Ok(bytes) => {
+                // for a checkbox size should be of type u8
+                let answer_raw: Result<u8> =
+                    extract_efi_data(parsed.question_header().var_store_info, &bytes);
+                match answer_raw {
+                    Ok(a) => answer.push_str(format!("{a}").as_str()),
+                    Err(_) => answer.push_str("Unknown"),
+                }
+            }
+        },
+    }
+    let res = QuestionDescriptor {
+        question: question.to_string(),
+        value: answer,
+        help: find_corresponding_string(parsed.question_header().help_string_id, string_packages)
+            .to_string(),
+        possible_options: Vec::new(),
+        header: parsed.question_header(),
+        varstore: varstore.ok(),
+        max_value: RangeType::NumSize8(1),
+        opcode: current_node.op_code,
+    };
+    res
+}
+
+fn handle_oneof(
+    varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
+    parsed: &OneOf,
+    node: &Rc<RefCell<IFROperation>>,
+    string_packages: &Vec<HashMap<i32, String>>,
+    question: &str,
+    current_node: &std::cell::Ref<IFROperation>,
+) -> QuestionDescriptor {
+    let mut answer = String::new();
+    let mut chosen_value: u64 = 0;
+    let mut varstore_not_found = false;
+    match &varstore {
+        Err(_) => {
+            answer.push_str("Unknown");
+            varstore_not_found = true;
+        }
+        Ok(vstore) => match vstore.read_bytes() {
+            Err(_) => {
+                answer.push_str("Unknown");
+                varstore_not_found = true;
+            }
+            Ok(bytes) => match &parsed.data {
+                Range::Range8(_) => {
+                    try_read_answer_as_option::<u8>(
+                        &parsed.question_header(),
+                        &bytes,
+                        &mut chosen_value,
+                    );
+                }
+                Range::Range16(_) => {
+                    try_read_answer_as_option::<u16>(
+                        &parsed.question_header(),
+                        &bytes,
+                        &mut chosen_value,
+                    );
+                }
+                Range::Range32(_) => {
+                    try_read_answer_as_option::<u32>(
+                        &parsed.question_header(),
+                        &bytes,
+                        &mut chosen_value,
+                    );
+                }
+                Range::Range64(_) => {
+                    try_read_answer_as_option::<u64>(
+                        &parsed.question_header(),
+                        &bytes,
+                        &mut chosen_value,
+                    );
+                }
+            },
+        },
+    }
+    let mut possible_options = Vec::new();
+    if !varstore_not_found {
+        // Some of OneOf's children are OneOfOptions
+
+        let mut found_option = false;
+        for child in &node.borrow().children {
+            match &child.borrow().parsed_data {
+                ParsedOperation::OneOfOption(o) => {
+                    let current_value: u64 = match o.value {
+                        TypeValue::NumSize8(c) => c as u64,
+                        TypeValue::NumSize16(c) => c as u64,
+                        TypeValue::NumSize32(c) => c as u64,
+                        TypeValue::NumSize64(c) => c as u64,
+                        _ => 0,
+                    };
+
+                    let opt = AnswerOption {
+                        raw_value: o.value.clone(),
+                        value: find_corresponding_string(o.option_string_id, string_packages)
+                            .to_string(),
+                    };
+
+                    if current_value == chosen_value && !found_option {
+                        found_option = true;
+                        answer.push_str(opt.value.trim());
+                        // cannot break here because we want to add all options to possible_options
+                    }
+
+                    possible_options.push(opt);
+                }
+                _ => {}
+            }
+        }
+
+        if !found_option {
+            answer.push_str("Unknown");
+        }
+    }
+    let res = QuestionDescriptor {
+        question: question.trim().to_string(),
+        value: answer,
+        help: find_corresponding_string(parsed.question_header().help_string_id, string_packages)
+            .to_string(),
+        possible_options,
+        header: parsed.question_header(),
+        varstore: varstore.ok(),
+        max_value: match &parsed.data {
+            Range::Range8(r) => RangeType::NumSize8(r.max_value),
+            Range::Range16(r) => RangeType::NumSize16(r.max_value),
+            Range::Range32(r) => RangeType::NumSize32(r.max_value),
+            Range::Range64(r) => RangeType::NumSize64(r.max_value),
+        },
+        opcode: current_node.op_code,
+    };
+    res
+}
+
+fn handle_numeric(
+    varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
+    parsed: &Numeric,
+    question: &str,
+    string_packages: &Vec<HashMap<i32, String>>,
+    current_node: &std::cell::Ref<IFROperation>,
+) -> QuestionDescriptor {
+    let mut answer = String::new();
+
+    match &varstore {
+        Err(_) => {
+            answer.push_str("Unknown");
+        }
+        Ok(vstore) => match vstore.read_bytes() {
+            Err(_) => {
+                answer.push_str("Unknown");
+            }
+            Ok(bytes) => match &parsed.data {
+                Range::Range8(_) => {
+                    try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer)
+                }
+                Range::Range16(_) => {
+                    try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer)
+                }
+                Range::Range32(_) => {
+                    try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer)
+                }
+                Range::Range64(_) => {
+                    try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer)
+                }
+            },
+        },
+    }
+    let res = QuestionDescriptor {
+        question: question.to_string(),
+        value: answer,
+        help: find_corresponding_string(parsed.question_header().help_string_id, string_packages)
+            .to_string(),
+        possible_options: Vec::new(),
+        header: parsed.question_header(),
+        varstore: varstore.ok(),
+        max_value: match &parsed.data {
+            Range::Range8(r) => RangeType::NumSize8(r.max_value),
+            Range::Range16(r) => RangeType::NumSize16(r.max_value),
+            Range::Range32(r) => RangeType::NumSize32(r.max_value),
+            Range::Range64(r) => RangeType::NumSize64(r.max_value),
+        },
+        opcode: current_node.op_code,
+    };
+    res
+}
+
+// utility function for questions i.e. OneOf, Numeric and Checkbox
+fn try_read_answer_as_string<T>(question_header: &QuestionHeader, bytes: &Vec<u8>, ans: &mut String)
+where
+    T: BinRead + Display,
+    <T as BinRead>::Args: Default,
+{
+    let extracted_data: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
+    match extracted_data {
+        Ok(a) => ans.push_str(format!("{a}").as_str()),
+        Err(_) => ans.push_str("Unknown"),
+    }
+}
+
+// utility function for OneOfOptions
+fn try_read_answer_as_option<T>(
+    question_header: &QuestionHeader,
+    bytes: &Vec<u8>,
+    chosen_value: &mut u64,
+) where
+    T: BinRead + Display + Into<u64>,
+    <T as BinRead>::Args: Default,
+{
+    let extracted_data: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
+    if let Ok(a) = extracted_data {
+        *chosen_value = a.into();
+    }
 }
 
 // display returns a String which is our tree like representation of a Forms package
@@ -1160,21 +1332,6 @@ pub fn display(
     let extra_spaces = "    ".repeat(level);
 
     let current_node = node.borrow();
-
-    // utility function for questions i.e. OneOf, Numeric and Checkbox
-    fn extract<T>(question_header: &QuestionHeader, bytes: &Vec<u8>, answer_disp: &mut String)
-    where
-        T: BinRead,
-        <T as BinRead>::Args: Default,
-        T: Display,
-        T: Into<u64>,
-    {
-        let answer: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
-        match answer {
-            Ok(a) => answer_disp.push_str(format!("{a}").as_str()),
-            Err(_) => answer_disp.push_str("Unknown"),
-        }
-    }
 
     match &current_node.parsed_data {
         ParsedOperation::Placeholder => {
@@ -1223,27 +1380,32 @@ pub fn display(
             let mut answer_disp = String::new();
 
             let varstore =
-                find_corresponding_varstore(Rc::clone(&node), parsed.get_question_header().var_store_id);
+                find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
 
 
             match varstore {
                 Err(_) => {
                     answer_disp.push_str("Unknown");
                 }
-                Ok(bytes) => match &parsed.data {
-                    Range::Range8(_) => {
-                        extract::<u8>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                    }
-                    Range::Range16(_) => {
-                        extract::<u16>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                    }
-                    Range::Range32(_) => {
-                        extract::<u32>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                    }
-                    Range::Range64(_) => {
-                        extract::<u64>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                    }
-                },
+                Ok(vstore) => match vstore.read_bytes() {
+                    Err(_) => {
+                        answer_disp.push_str("Unknown");
+                    },
+                    Ok(bytes) => match &parsed.data {
+                        Range::Range8(_) => {
+                            try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer_disp);
+                        }
+                        Range::Range16(_) => {
+                            try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer_disp);
+                        }
+                        Range::Range32(_) => {
+                            try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer_disp);
+                        }
+                        Range::Range64(_) => {
+                            try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer_disp);
+                        }
+                    },
+                }
             }
 
             result.push_str(
@@ -1251,11 +1413,11 @@ pub fn display(
                     "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
                     current_node.op_code,
                     find_corresponding_string(
-                        parsed.get_question_header().prompt_string_id,
+                        parsed.question_header().prompt_string_id,
                         string_packages
                     ),
                     find_corresponding_string(
-                        parsed.get_question_header().help_string_id,
+                        parsed.question_header().help_string_id,
                         string_packages
                     ),
                     parsed.data
@@ -1267,24 +1429,29 @@ pub fn display(
             let mut answer_disp = String::new();
 
             let varstore =
-                find_corresponding_varstore(Rc::clone(&node), parsed.get_question_header().var_store_id);
-            match varstore {
-                Err(_) => {
-                    answer_disp.push_str("Unknown");
-                }
-                Ok(bytes) => match &parsed.data {
-                    Range::Range8(_) => {
-                        extract::<u8>(&parsed.get_question_header(), &bytes, &mut answer_disp);
+                find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
+                match varstore {
+                    Err(_) => {
+                        answer_disp.push_str("Unknown");
                     }
-                    Range::Range16(_) => {
-                        extract::<u16>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                    }
-                    Range::Range32(_) => {
-                        extract::<u32>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                    }
-                    Range::Range64(_) => {
-                        extract::<u64>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                    }
+                    Ok(vstore) => match vstore.read_bytes() {
+                        Err(_) => {
+                            answer_disp.push_str("Unknown");
+                        }
+                        Ok(bytes) => match &parsed.data {
+                            Range::Range8(_) => {
+                                try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer_disp);
+                            }
+                            Range::Range16(_) => {
+                                try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer_disp);
+                            }
+                            Range::Range32(_) => {
+                                try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer_disp);
+                            }
+                            Range::Range64(_) => {
+                                try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer_disp);
+                            }
+                        },
                 },
             }
 
@@ -1293,11 +1460,11 @@ pub fn display(
                     "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
                     current_node.op_code,
                     find_corresponding_string(
-                        parsed.get_question_header().prompt_string_id,
+                        parsed.question_header().prompt_string_id,
                         string_packages
                     ),
                     find_corresponding_string(
-                        parsed.get_question_header().help_string_id,
+                        parsed.question_header().help_string_id,
                         string_packages
                     ),
                     parsed.data
@@ -1309,16 +1476,21 @@ pub fn display(
             let mut answer_disp = String::new();
 
             let varstore =
-                find_corresponding_varstore(Rc::clone(&node), parsed.get_question_header().var_store_id);
+                find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
 
-            match varstore {
-                Err(_) => {
-                    answer_disp.push_str("Unknown");
-                }
-                Ok(bytes) => {
-                    // for a checkbox size should be of type u8
-                    extract::<u8>(&parsed.get_question_header(), &bytes, &mut answer_disp);
-                }
+                match varstore {
+                    Err(_) => {
+                        answer_disp.push_str("Unknown");
+                    }
+                    Ok(vstore) => match vstore.read_bytes() {
+                        Err(_) => {
+                            answer_disp.push_str("Unknown");
+                        },
+                        Ok(bytes) => {
+                            // for a checkbox size should be of type u8
+                            try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer_disp);
+                        }
+                    }
             }
 
             result.push_str(
@@ -1326,11 +1498,11 @@ pub fn display(
                     "{extra_spaces}OpCode: {:?} - Q: - {} - Help: - {}\n{extra_spaces}-Answer: {answer_disp}\n",
                     current_node.op_code,
                     find_corresponding_string(
-                        parsed.get_question_header().prompt_string_id,
+                        parsed.question_header().prompt_string_id,
                         string_packages
                     ),
                     find_corresponding_string(
-                        parsed.get_question_header().help_string_id,
+                        parsed.question_header().help_string_id,
                         string_packages
                     ),
                 )
@@ -1349,6 +1521,93 @@ pub fn display(
     }
 
     Ok(result)
+}
+
+pub fn change_value<T>(
+    node: Rc<RefCell<IFROperation>>,
+    string_packages: &Vec<HashMap<i32, String>>,
+    possible_question_phrases: &[T],
+    new_value: &str,
+) -> Result<bool>
+where
+    T: AsRef<str>,
+{
+    let mut changed = false;
+    let question = find_question(node, string_packages, possible_question_phrases);
+    if let Some(ques) = question {
+        if let Some(varstore) = ques.varstore {
+            if ques.opcode == IFROpCode::OneOf {
+                for option in ques.possible_options {
+                    if option.value.eq_ignore_ascii_case(new_value) {
+                        varstore.write_at_offset(ques.header.var_store_info, option.raw_value)?;
+                        changed = true;
+                        break;
+                    }
+                }
+
+                if !changed {
+                    return Err(anyhow!("Provided value did not match any possible value."));
+                }
+            } else {
+                match ques.max_value {
+                    RangeType::NumSize8(m) => {
+                        let data_to_write = new_value
+                            .parse::<u8>()
+                            .context("value should fit in a u8")?;
+                        if data_to_write > m {
+                            return Err(anyhow!("Provided value exceeded max possible value."));
+                        }
+                        varstore.write_at_offset(
+                            ques.header.var_store_info,
+                            TypeValue::NumSize8(data_to_write),
+                        )?;
+                        changed = true;
+                    }
+                    RangeType::NumSize16(m) => {
+                        let data_to_write = new_value
+                            .parse::<u16>()
+                            .context("value should fit in a u16")?;
+                        if data_to_write > m {
+                            return Err(anyhow!("Provided value exceeded max possible value."));
+                        }
+                        varstore.write_at_offset(
+                            ques.header.var_store_info,
+                            TypeValue::NumSize16(data_to_write),
+                        )?;
+                        changed = true;
+                    }
+                    RangeType::NumSize32(m) => {
+                        let data_to_write = new_value
+                            .parse::<u32>()
+                            .context("value should fit in a u32")?;
+                        if data_to_write > m {
+                            return Err(anyhow!("Provided value exceeded max possible value."));
+                        }
+                        varstore.write_at_offset(
+                            ques.header.var_store_info,
+                            TypeValue::NumSize32(data_to_write),
+                        )?;
+                        changed = true;
+                    }
+                    RangeType::NumSize64(m) => {
+                        let data_to_write = new_value
+                            .parse::<u64>()
+                            .context("value should fit in a u64")?;
+                        if data_to_write > m {
+                            return Err(anyhow!("Provided value exceeded max possible value."));
+                        }
+                        varstore.write_at_offset(
+                            ques.header.var_store_info,
+                            TypeValue::NumSize64(data_to_write),
+                        )?;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(changed)
 }
 
 fn find_corresponding_string<'a>(
@@ -1379,7 +1638,7 @@ fn find_corresponding_string<'a>(
 fn find_corresponding_varstore(
     node: Rc<RefCell<IFROperation>>,
     var_store_id: u16,
-) -> Result<Vec<u8>> {
+) -> Result<Box<dyn VariableStore>> {
     let current_node = node.borrow();
 
     if current_node.op_code == IFROpCode::FormSet {
@@ -1389,12 +1648,12 @@ fn find_corresponding_varstore(
             match &child.borrow().parsed_data {
                 ParsedOperation::VarStore(v) => {
                     if v.var_store_id == var_store_id {
-                        return v.bytes();
+                        return Ok(Box::new(v.clone()));
                     }
                 }
                 ParsedOperation::VarStoreEfi(v) => {
                     if v.var_store_id == var_store_id {
-                        return v.bytes();
+                        return Ok(Box::new(v.clone()));
                     }
                 }
                 _ => {}
@@ -1415,7 +1674,7 @@ fn find_corresponding_varstore(
 }
 
 /// extract_efi_data extracts data of type T at given offset from efivar bytes.
-/// The _size arg here is only used to get the type (and thus size) of our answer.
+/// The <T> type here is used to get the type (and thus size) of our answer.
 fn extract_efi_data<T>(offset: u16, bytes: &Vec<u8>) -> Result<T>
 where
     T: BinRead,

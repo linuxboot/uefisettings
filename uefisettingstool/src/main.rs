@@ -30,11 +30,13 @@ struct Args {
     #[clap(short, long, parse(from_os_str), value_name = "FILE")]
     filename: Option<PathBuf>,
 
-    /// Strings package language code
-    lang: Option<String>,
-
+    /// Question to ask/change
     #[clap(short, long, value_parser)]
     question: Option<String>,
+
+    /// The answer to be set
+    #[clap(short, long, value_parser)]
+    value: Option<String>,
 
     #[clap(short, long, parse(from_occurrences))]
     debug: usize,
@@ -45,11 +47,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    // TODO: change
     ListStrings {},
-    ShowIfr {},
+    ShowIFR {},
     Questions {},
     DumpDB {},
+    Change {},
 }
 
 fn main() -> Result<()> {
@@ -71,7 +73,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::ShowIfr {} => {
+        Commands::ShowIFR {} => {
             let file_contents = get_db_dump_bytes(&args)?;
             let parsed_db = package::read_db(&file_contents)?;
 
@@ -83,10 +85,10 @@ fn main() -> Result<()> {
                         forms::display(
                             form_package,
                             0,
-                            parsed_db
-                                .strings
-                                .get(&guid)
-                                .context("failed to get string packages using GUID")?
+                            parsed_db.strings.get(&guid).context(format!(
+                                "Failed to get string packages using GUID {}",
+                                guid
+                            ))?,
                         )?
                     )
                 }
@@ -103,12 +105,12 @@ fn main() -> Result<()> {
                         // we plan to have a database which whill match similar string
                         let string_phrases = Vec::from([question.clone()]);
 
-                        if let Some(answer) = forms::find_answer(
+                        if let Some(answer) = forms::find_question(
                             form_package,
-                            parsed_db
-                                .strings
-                                .get(&guid)
-                                .context("failed to get string packages using GUID")?,
+                            parsed_db.strings.get(&guid).context(format!(
+                                "Failed to get string packages using GUID {}",
+                                guid
+                            ))?,
                             &string_phrases,
                         ) {
                             println!("{:?}", answer);
@@ -129,6 +131,42 @@ fn main() -> Result<()> {
                 println!("HiiDB written to {}", dbdump_path.display());
             } else {
                 return Err(anyhow!("Please provide the filename."));
+            }
+        }
+
+        Commands::Change {} => {
+            if let Some(question) = &args.question {
+                if let Some(value) = &args.value {
+                    let file_contents = get_db_dump_bytes(&args)?;
+                    let parsed_db = package::read_db(&file_contents)?;
+                    for (guid, package_list) in parsed_db.forms {
+                        for form_package in package_list {
+                            // string_phrases contains just one item (input from user) now, but eventually
+                            // we plan to have a database which whill match similar string
+                            let string_phrases = Vec::from([question.clone()]);
+
+                            let modified = forms::change_value(
+                                form_package,
+                                parsed_db.strings.get(&guid).context(format!(
+                                    "Failed to get string packages using GUID {}",
+                                    guid
+                                ))?,
+                                &string_phrases,
+                                value,
+                            )?;
+
+                            if modified {
+                                println!("Found and changed in packagelist {}", guid);
+                            } else {
+                                println!("Queston not found in {}", guid);
+                            }
+                        }
+                    }
+                } else {
+                    return Err(anyhow!("Please provide the new value."));
+                }
+            } else {
+                return Err(anyhow!("Please provide the question."));
             }
         }
     }
