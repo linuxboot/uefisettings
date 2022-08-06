@@ -5,14 +5,12 @@ use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 
-use log::info;
-
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-
+use log::info;
 use uefisettingslib::hii::extract;
 use uefisettingslib::hii::forms;
 use uefisettingslib::hii::package;

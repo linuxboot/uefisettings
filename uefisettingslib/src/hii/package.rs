@@ -6,15 +6,14 @@ use std::fmt;
 use std::io::Seek;
 use std::rc::Rc;
 
-use log::debug;
-use log::error;
-
 use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::io::SeekFrom;
 use binrw::BinRead;
 use binrw::BinReaderExt;
+use log::debug;
+use log::error;
 
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
@@ -237,9 +236,10 @@ pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs::File;
     use std::io::Read;
+
+    use super::*;
 
     #[test]
     fn test_read_db_strings() {

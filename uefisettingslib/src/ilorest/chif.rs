@@ -5,13 +5,12 @@ use std::ffi::CStr;
 use std::ptr;
 use std::slice;
 
-use log::debug;
-use log::error;
-
 use anyhow::anyhow;
 use anyhow::Result;
 use libloading::Library;
 use libloading::Symbol;
+use log::debug;
+use log::error;
 
 type ByteArray = *mut u8;
 type ChifString = *const i8;

@@ -2,15 +2,14 @@
 
 use std::collections::HashMap;
 
-use log::debug;
-use log::error;
-
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
+use log::debug;
+use log::error;
 
 // UEFI Spec v2.9 Page 1807
 #[derive(BinRead, Debug, PartialEq)]

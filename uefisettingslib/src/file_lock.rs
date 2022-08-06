@@ -2,11 +2,10 @@ use std::fs::File;
 use std::os::unix::prelude::IntoRawFd;
 use std::path::Path;
 
-use log::error;
-
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use log::error;
 use nix::fcntl::flock;
 use nix::fcntl::FlockArg;
 

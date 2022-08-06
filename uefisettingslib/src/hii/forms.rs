@@ -13,8 +13,6 @@ use std::process::Command;
 use std::rc::Rc;
 use std::rc::Weak;
 
-use log::debug;
-
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
@@ -24,6 +22,7 @@ use binrw::BinReaderExt;
 use binrw::BinResult;
 use binrw::BinWrite;
 use binrw::ReadOptions;
+use log::debug;
 
 use crate::file_lock::FileLock;
 use crate::hii::package::Guid;

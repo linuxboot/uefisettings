@@ -4,14 +4,13 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 
-use log::debug;
-
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
+use log::debug;
 use rand::distributions::Alphanumeric;
 use rand::thread_rng;
 use rand::Rng;
