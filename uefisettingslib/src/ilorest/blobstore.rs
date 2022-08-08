@@ -66,11 +66,11 @@ impl<'a> Transport<'a> {
 
             debug!("Sending request using a direct/single-packet write");
 
-            let packet_template =
+            let header_template =
                 self.ilo
                     .prepare_immediate_request(request.len() as u32, &response_key, &namespace);
 
-            let mut packet_to_send = Vec::from(packet_template);
+            let mut packet_to_send = Vec::from(header_template);
             packet_to_send.append(&mut request.to_owned());
 
             rest_resp = self
@@ -85,11 +85,11 @@ impl<'a> Transport<'a> {
 
             self.finalize_multi_packet_write(&request_key, &namespace)?;
 
-            let packet_template =
+            let header_template =
                 self.ilo
                     .prepare_blob_request(&request_key, &response_key, &namespace);
 
-            let packet_to_send = Vec::from(packet_template);
+            let packet_to_send = Vec::from(header_template);
 
             rest_resp = self
                 .exchange_packet(&packet_to_send)
@@ -105,13 +105,16 @@ impl<'a> Transport<'a> {
 
             let blobsize = self.get_blob_size(&response_key, &namespace)?;
 
-            let read_bytes = self.read_multi_packet(blobsize, response_key, namespace)?;
+            let read_bytes = self.read_multi_packet(blobsize, &response_key, &namespace)?;
+
+            // HP's CLI tool deletes this response blob even though it is in the `volatile` blobs namespace.
+            // Note that it only deletes the response blob and not the request blob.
+            // We will emulate this behaviour.
+            self.delete_blob_entry(&response_key, &namespace)?;
 
             return Ok(read_bytes);
-
-            // TODO: delete this response blob even though it is in the `volatile` blobs namespace
         } else if parsed_rest_resp.receive_mode == ResponseReceiveMode::ImmediateResponse as u32 {
-            debug!("Receive Mode is 0- ImmediateResponse");
+            debug!("Receive Mode is 0 - ImmediateResponse");
             // Receive Mode 0 means the data is part of rest response itself
 
             let rest_response_fixed_size = self.ilo.get_rest_response_fixed_size();
@@ -132,8 +135,8 @@ impl<'a> Transport<'a> {
         &self,
 
         data_length: u32,
-        response_key: CString,
-        namespace: CString,
+        response_key: &CStr,
+        namespace: &CStr,
     ) -> Result<Vec<u8>> {
         debug!("Starting multi-packet read");
 
@@ -158,11 +161,11 @@ impl<'a> Transport<'a> {
 
             debug!("Reading new fragment");
 
-            let packet_template =
+            let header_template =
                 self.ilo
                     .prepare_read_fragment(read_block_size, count, &response_key, &namespace);
 
-            let packet_to_send = Vec::from(packet_template);
+            let packet_to_send = Vec::from(header_template);
 
             let mut fragment_bytes = self
                 .exchange_packet(&packet_to_send)
@@ -179,6 +182,8 @@ impl<'a> Transport<'a> {
                 }
             }
 
+            // For reasons we don't know, HPE's python ilorest cli tool increases the header size by 4
+            // https://www.internalfb.com/code/fbsource/[d6af54e3d418]/third-party/pypi/python-ilorest-library/3.0.0/src/redfish/hpilo/risblobstore2.py?lines=239
             let new_read_size = response_header_blob_size + 4;
 
             let mut fragment_bytes_cursor = Cursor::new(&fragment_bytes);
@@ -199,9 +204,9 @@ impl<'a> Transport<'a> {
     fn get_blob_size(&self, key: &CStr, namespace: &CStr) -> Result<u32> {
         debug!("Reading blob info/size. Key: {}", key.to_string_lossy());
 
-        let packet_template = self.ilo.get_key_info(key, namespace);
+        let header_template = self.ilo.get_key_info(key, namespace);
 
-        let packet_to_send = Vec::from(packet_template);
+        let packet_to_send = Vec::from(header_template);
         let blob_info_bytes = self
             .exchange_packet(&packet_to_send)
             .context("Failed while getting blob info")?;
@@ -225,9 +230,9 @@ impl<'a> Transport<'a> {
             request_key.to_string_lossy()
         );
 
-        let packet_template = self.ilo.finalize_blob_write(request_key, namespace);
+        let header_template = self.ilo.finalize_blob_write(request_key, namespace);
 
-        let packet_to_send = Vec::from(packet_template);
+        let packet_to_send = Vec::from(header_template);
 
         self.exchange_packet(&packet_to_send)
             .context("Failed while finalizing write of blob entry")?;
@@ -237,18 +242,31 @@ impl<'a> Transport<'a> {
 
     /// create_blob_entry creates an entry in blobstore2 key-val store
     /// you have to write to the entry later
-    fn create_blob_entry(&self, request_key: &CStr, namespace: &CStr) -> Result<(), anyhow::Error> {
+    fn create_blob_entry(&self, request_key: &CStr, namespace: &CStr) -> Result<()> {
         debug!(
             "Creating new blob entry with key {}",
             request_key.to_string_lossy()
         );
 
-        let packet_template = self.ilo.prepare_new_blob_entry(request_key, namespace);
+        let header_template = self.ilo.prepare_new_blob_entry(request_key, namespace);
 
-        let packet_to_send = Vec::from(packet_template);
+        let packet_to_send = Vec::from(header_template);
 
         self.exchange_packet(&packet_to_send)
             .context("Failed while creating blob entry in key value store")?;
+
+        Ok(())
+    }
+
+    fn delete_blob_entry(&self, key: &CStr, namespace: &CStr) -> Result<()> {
+        debug!("Deleting blob entry with key {}", key.to_string_lossy());
+
+        let header_template = self.ilo.prepare_delete_blob(key, namespace);
+
+        let packet_to_send = Vec::from(header_template);
+
+        self.exchange_packet(&packet_to_send)
+            .context("Failed while deleting blob entry in key value store")?;
 
         Ok(())
     }
@@ -275,11 +293,11 @@ impl<'a> Transport<'a> {
 
             debug!("Writing new fragment");
 
-            let packet_template =
+            let header_template =
                 self.ilo
                     .prepare_write_fragment(write_blob_size, count, request_key, namespace);
 
-            let mut packet_to_send = Vec::from(packet_template);
+            let mut packet_to_send = Vec::from(header_template);
             packet_to_send.extend_from_slice(
                 &data[write_blob_size as usize..write_blob_size as usize + count as usize],
             );

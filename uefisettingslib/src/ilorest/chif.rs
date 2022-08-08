@@ -39,6 +39,8 @@ type GetCreateRequestSizeFunction = fn() -> u32;
 type FinalizeBlobFunction = fn(ChifString, ChifString) -> ByteArray;
 type GetFinalizeRequestSizeFunction = fn() -> u32;
 type GetKeyInfoFunction = fn(ChifString, ChifString) -> ByteArray;
+type DeleteBlobFunction = fn(ChifString, ChifString) -> ByteArray;
+type GetDeleteRequestSizeFunction = fn() -> u32;
 type GetInfoRequestSizeFunction = fn() -> u32;
 type GetReadResponseSizeFunction = fn() -> u32;
 
@@ -81,6 +83,8 @@ pub struct IloRestChif<'a> {
     get_finalize_request_size: Symbol<'a, GetFinalizeRequestSizeFunction>,
     get_create_request_size: Symbol<'a, GetCreateRequestSizeFunction>,
     get_key_info: Symbol<'a, GetKeyInfoFunction>,
+    delete_blob: Symbol<'a, DeleteBlobFunction>,
+    get_delete_request_size: Symbol<'a, GetDeleteRequestSizeFunction>,
     get_info_request_size: Symbol<'a, GetInfoRequestSizeFunction>,
     get_read_response_size: Symbol<'a, GetReadResponseSizeFunction>,
 }
@@ -135,6 +139,9 @@ impl<'a> IloRestChif<'a> {
                 lib.get(b"size_of_infoRequest")?;
             let get_read_response_size: Symbol<GetReadResponseSizeFunction> =
                 lib.get(b"size_of_readResponse")?;
+            let delete_blob: Symbol<DeleteBlobFunction> = lib.get(b"delete_blob")?;
+            let get_delete_request_size: Symbol<GetDeleteRequestSizeFunction> =
+                lib.get(b"size_of_deleteRequest")?;
 
             let handle = ptr::null_mut();
 
@@ -166,6 +173,8 @@ impl<'a> IloRestChif<'a> {
                 get_key_info,
                 get_info_request_size,
                 get_read_response_size,
+                delete_blob,
+                get_delete_request_size,
             }
         };
 
@@ -406,6 +415,21 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
     fn get_read_response_size(&self) -> u32 {
         (self.get_read_response_size)()
     }
+
+    fn prepare_delete_blob(&self, key: &CStr, namespace: &CStr) -> &'a [u8] {
+        // SAFETY: Look at the safety comment in rest_immediate()
+        unsafe {
+            let tmp_struct_pointer = (self.delete_blob)(key.as_ptr(), namespace.as_ptr());
+            slice::from_raw_parts(
+                tmp_struct_pointer,
+                (self.get_delete_request_size)() as usize,
+            )
+        }
+    }
+
+    fn get_delete_request_size(&self) -> u32 {
+        (self.get_delete_request_size)()
+    }
 }
 
 /// IloRestChifInterface is a rusty interface to ilorest_chif functions
@@ -455,6 +479,8 @@ pub trait IloRestChifInterface {
     fn get_key_info(&self, response_key: &CStr, namespace: &CStr) -> &[u8];
     fn get_info_request_size(&self) -> u32;
     fn get_read_response_size(&self) -> u32;
+    fn prepare_delete_blob(&self, key: &CStr, namespace: &CStr) -> &[u8];
+    fn get_delete_request_size(&self) -> u32;
 }
 
 pub fn get_lib(libpath: &str) -> Result<Library> {
