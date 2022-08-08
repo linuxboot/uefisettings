@@ -2,3 +2,4 @@
 
 mod blobstore;
 mod chif;
+pub mod rest;
