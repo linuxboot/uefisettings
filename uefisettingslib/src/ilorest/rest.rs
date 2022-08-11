@@ -3,6 +3,8 @@ use std::ffi::CString;
 
 use anyhow::anyhow;
 use anyhow::Result;
+use httparse::Response;
+use httparse::Status;
 use log::debug;
 
 use crate::ilorest::blobstore::Transport;
@@ -23,33 +25,99 @@ impl RestClient {
             lib_path: lib_path.to_string(),
         }
     }
-
-    pub fn get(&self, endpoint: &str) -> Result<Vec<u8>> {
-        self.exec("GET", endpoint, "")
+    // get request to the endpoint. Returns HTTP status code and response body bytes.
+    pub fn get(&self, endpoint: &str) -> Result<(u16, Vec<u8>)> {
+        let response = self.exec("GET", endpoint, self.default_headers(), "")?;
+        self.parse(response)
     }
 
-    pub fn post(&self, endpoint: &str, body: &str) -> Result<Vec<u8>> {
-        self.exec("POST", endpoint, body)
+    // post request to the endpoint with given JSON body. Returns HTTP status code and response body bytes.
+    pub fn post(&self, endpoint: &str, body: &str) -> Result<(u16, Vec<u8>)> {
+        let mut headers = self.default_headers();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        );
+        let response = self.exec("POST", endpoint, headers, body)?;
+        self.parse(response)
     }
 
-    pub fn patch(&self, endpoint: &str, body: &str) -> Result<Vec<u8>> {
-        self.exec("PATCH", endpoint, body)
+    // patch request to the endpoint with given JSON body. Returns HTTP status code and response body bytes.
+    pub fn patch(&self, endpoint: &str, body: &str) -> Result<(u16, Vec<u8>)> {
+        let mut headers = self.default_headers();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        );
+        let response = self.exec("PATCH", endpoint, headers, body)?;
+        self.parse(response)
     }
 
-    pub fn put(&self, endpoint: &str, body: &str) -> Result<Vec<u8>> {
-        self.exec("PUT", endpoint, body)
+    // put request to the endpoint with given JSON body. Returns HTTP status code and response body bytes.
+    pub fn put(&self, endpoint: &str, body: &str) -> Result<(u16, Vec<u8>)> {
+        let mut headers = self.default_headers();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        );
+        let response = self.exec("PUT", endpoint, headers, body)?;
+        self.parse(response)
     }
 
+    // parse takes in the raw response bytes and parses the HTTP headers.
+    // It returns (response HTTP status code, response body without the HTTP headers)
+    fn parse(&self, raw_response: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+        // for perf reasons, httparse's API forces us to specify max number of headers
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut parsed_response = Response::new(&mut headers);
+
+        let parse_status = parsed_response.parse(&raw_response)?;
+
+        match parse_status {
+            Status::Complete(body_offset) => {
+                // Status::Complete means that the request was fully parsed.
+                // So we know that these optional fields are not none and we
+                // can use unwrap without worrying about panics.
+                debug!(
+                    "Request parsed. Status code: {} Reason: {}, HTTP Version: {}",
+                    parsed_response.code.unwrap(),
+                    parsed_response.reason.unwrap(),
+                    parsed_response.version.unwrap()
+                );
+                debug!(
+                    "Response body is {}",
+                    String::from_utf8_lossy(&raw_response[body_offset..])
+                );
+                Ok((
+                    parsed_response.code.unwrap(),
+                    raw_response[body_offset..].to_vec(),
+                ))
+            }
+            Status::Partial => Err(anyhow!("Failed to parse REST response")),
+        }
+    }
+
+    // default_headers for creating a new REST request
     fn default_headers(&self) -> HashMap<String, String> {
         HashMap::from([
             ("Host".to_string(), "".to_string()),
             ("Accept-Encoding".to_string(), "identity".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            ),
             ("Accept".to_string(), "*/*".to_string()),
             ("Connection".to_string(), "Keep-Alive".to_string()),
         ])
     }
 
-    fn exec(&self, method: &str, endpoint: &str, body: &str) -> Result<Vec<u8>> {
+    fn exec(
+        &self,
+        method: &str,
+        endpoint: &str,
+        headers: HashMap<String, String>,
+        body: &str,
+    ) -> Result<Vec<u8>> {
         // HPE's ilorest CLI tool initializes a new lib instance for every request and since we have
         // no documentation of ilorest_chif.so we will try to replicate the python cli tool.
         // It may or may not be safe to use the same instance/connection for multiple requests.
@@ -68,8 +136,7 @@ impl RestClient {
             ))
         })?;
 
-        let request =
-            self.generate_request_bytes(method, endpoint, body, &(self.default_headers()))?;
+        let request = self.generate_request_bytes(method, endpoint, body, headers)?;
 
         // HPE's ilorest CLI tool has a lot of retries spanning across multiple function calls during transport
         // however we will only have retries at one place, which makes it much simpler.
@@ -106,9 +173,14 @@ impl RestClient {
         method: &str,
         endpoint: &str,
         body: &str,
-        headers: &HashMap<String, String>,
+        mut headers: HashMap<String, String>,
     ) -> Result<Vec<u8>> {
         let mut request_contents = format!("{} {} HTTP/1.1\r\n", method, endpoint);
+        headers.insert(
+            "Content-Length".to_string(),
+            body.as_bytes().len().to_string(),
+        );
+
         for (header_key, header_value) in headers {
             request_contents.push_str(&format!("{}: {}\r\n", header_key, header_value));
         }
