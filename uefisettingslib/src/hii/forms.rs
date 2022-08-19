@@ -973,7 +973,7 @@ pub struct QuestionDescriptor {
     pub value: String,
     max_value: RangeType,
     opcode: IFROpCode,
-    possible_options: Vec<AnswerOption>,
+    pub possible_options: Vec<AnswerOption>,
     header: QuestionHeader,
     varstore: Option<Box<dyn VariableStore>>,
 }
@@ -989,8 +989,8 @@ impl fmt::Debug for QuestionDescriptor {
 }
 
 #[derive(Debug)]
-struct AnswerOption {
-    value: String,
+pub struct AnswerOption {
+    pub value: String,
     raw_value: TypeValue,
 }
 

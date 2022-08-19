@@ -1,181 +1,203 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
+use std::fmt::Debug;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
+use fbthrift::simplejson_protocol;
+use fbthrift::simplejson_protocol::Serializable;
 use log::info;
-use uefisettingslib::hii::extract;
-use uefisettingslib::hii::forms;
-use uefisettingslib::hii::package;
+use uefisettingslib::exports::HiiBackend;
+use uefisettingslib::exports::IloBackend;
+use uefisettingslib::exports::SettingsBackend;
 
 const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[clap(
     name = "uefisettings",
     about = "UEFI Settings Manipulation Tool",
     long_about = None
 )]
-struct Args {
-    /// Path to hii database dump
-    #[clap(short, long, parse(from_os_str), value_name = "FILE")]
-    filename: Option<PathBuf>,
-
-    /// Question to ask/change
-    #[clap(short, long, value_parser)]
-    question: Option<String>,
-
-    /// The answer to be set
-    #[clap(short, long, value_parser)]
-    value: Option<String>,
-
-    #[clap(short, long, parse(from_occurrences))]
-    debug: usize,
-
+struct UefiSettingsToolArgs {
     #[clap(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Commands {
-    ListStrings {},
-    ShowIFR {},
-    Questions {},
-    DumpDB {},
-    Change {},
+    /// Commands which work on machines exposing the UEFI HiiDB
+    Hii(HiiCommand),
+    /// Commands which work on machines having HPE's Ilo BMC
+    Ilo(IloCommand),
+    // TODO: Auto(AutoCommand) after building a backend identifier function
+    // TODO: Get/Set without having to specify Auto
+}
+
+#[derive(Debug, Parser)]
+struct HiiCommand {
+    #[clap(subcommand)]
+    command: HiiSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum HiiSubcommands {
+    /// Get the current value of a question
+    Get {
+        #[clap(value_parser)]
+        question: String,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        machine_readable: bool,
+    },
+    /// Set/change the value of a question
+    Set {
+        #[clap(value_parser)]
+        question: String,
+        #[clap(value_parser)]
+        value: String,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        machine_readable: bool,
+    },
+    /// Show a human readable representation of the Hii Forms
+    ShowIFR {
+        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
+        #[clap(parse(from_os_str), short, long)]
+        filename: Option<PathBuf>,
+    },
+    /// Dump HiiDB into a file
+    ExtractDB {
+        #[clap(parse(from_os_str))]
+        filename: PathBuf,
+    },
+    /// List all strings-id, string pairs in HiiDB
+    ListStrings {
+        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
+        #[clap(parse(from_os_str), short, long)]
+        filename: Option<PathBuf>,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        machine_readable: bool,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct IloCommand {
+    #[clap(subcommand)]
+    command: IloSubcommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum IloSubcommands {
+    /// Get the current value of a question
+    Get {
+        #[clap(value_parser)]
+        question: String,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        machine_readable: bool,
+    },
+    /// Set/change the value of a question
+    Set {
+        #[clap(value_parser)]
+        question: String,
+        #[clap(value_parser)]
+        value: String,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        machine_readable: bool,
+    },
+    /// List bios attributes and their current values
+    ShowAttributes {
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        machine_readable: bool,
+    },
+    // TODO: add more ilo specific commands - GetPending and ShowPendingAttributes
 }
 
 fn main() -> Result<()> {
     env_logger::init();
+    let args = UefiSettingsToolArgs::parse();
 
-    let args = Args::parse();
-
-    match &args.command {
-        Commands::ListStrings {} => {
-            let file_contents = get_db_dump_bytes(&args)?;
-
-            for (guid, package_list) in (package::read_db(&file_contents))?.strings {
-                println!("Packagelist {}", guid);
-                for string_package in package_list {
-                    println!("- New String Package");
-                    for (string_id_current, string_current) in string_package {
-                        println!("{} : \"{}\"", string_id_current, string_current);
-                    }
-                }
-            }
-        }
-        Commands::ShowIFR {} => {
-            let file_contents = get_db_dump_bytes(&args)?;
-            let parsed_db = package::read_db(&file_contents)?;
-
-            for (guid, package_list) in parsed_db.forms {
-                println!("Packagelist {}", &guid);
-                for form_package in package_list {
-                    println!(
-                        "{}",
-                        forms::display(
-                            form_package,
-                            0,
-                            parsed_db.strings.get(&guid).context(format!(
-                                "Failed to get string packages using GUID {}",
-                                guid
-                            ))?,
-                        )?
-                    )
-                }
-            }
-        }
-
-        Commands::Questions {} => {
-            if let Some(question) = &args.question {
-                let file_contents = get_db_dump_bytes(&args)?;
-                let parsed_db = package::read_db(&file_contents)?;
-                for (guid, package_list) in parsed_db.forms {
-                    for form_package in package_list {
-                        // string_phrases contains just one item (input from user) now, but eventually
-                        // we plan to have a database which whill match similar string
-                        let string_phrases = Vec::from([question.clone()]);
-
-                        if let Some(answer) = forms::find_question(
-                            form_package,
-                            parsed_db.strings.get(&guid).context(format!(
-                                "Failed to get string packages using GUID {}",
-                                guid
-                            ))?,
-                            &string_phrases,
-                        ) {
-                            println!("{:?}", answer);
-                        } else {
-                            println!("Question not found in Packagelist {}", &guid);
-                        }
-                    }
-                }
-            } else {
-                return Err(anyhow!("Please provide the question."));
-            }
-        }
-
-        Commands::DumpDB {} => {
-            if let Some(dbdump_path) = args.filename.as_deref() {
-                let mut file = File::create(dbdump_path)?;
-                file.write_all(&extract::extract_db()?)?;
-                println!("HiiDB written to {}", dbdump_path.display());
-            } else {
-                return Err(anyhow!("Please provide the filename."));
-            }
-        }
-
-        Commands::Change {} => {
-            if let Some(question) = &args.question {
-                if let Some(value) = &args.value {
-                    let file_contents = get_db_dump_bytes(&args)?;
-                    let parsed_db = package::read_db(&file_contents)?;
-                    for (guid, package_list) in parsed_db.forms {
-                        for form_package in package_list {
-                            // string_phrases contains just one item (input from user) now, but eventually
-                            // we plan to have a database which whill match similar string
-                            let string_phrases = Vec::from([question.clone()]);
-
-                            let modified = forms::change_value(
-                                form_package,
-                                parsed_db.strings.get(&guid).context(format!(
-                                    "Failed to get string packages using GUID {}",
-                                    guid
-                                ))?,
-                                &string_phrases,
-                                value,
-                            )?;
-
-                            if modified {
-                                println!("Found and changed in packagelist {}", guid);
-                            } else {
-                                println!("Queston not found in {}", guid);
-                            }
-                        }
-                    }
-                } else {
-                    return Err(anyhow!("Please provide the new value."));
-                }
-            } else {
-                return Err(anyhow!("Please provide the question."));
-            }
-        }
+    if let Err(why) = handle_cmds(args) {
+        println!("{{\"error\": \"{:?}\"}}", why);
+        process::exit(1);
     }
 
     info!("Exiting UEFI Settings Manipulation Tool");
     Ok(())
 }
 
-fn get_db_dump_bytes(args: &Args) -> Result<Vec<u8>> {
+fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
+    match &args.command {
+        Commands::Hii(hii_command) => match &hii_command.command {
+            HiiSubcommands::Get {
+                question,
+                machine_readable,
+            } => {
+                let res = HiiBackend::get(question, None)?;
+                print_with_style(res, *machine_readable);
+            }
+            HiiSubcommands::Set {
+                question,
+                value,
+                machine_readable,
+            } => {
+                let res = HiiBackend::set(question, value, None)?;
+                print_with_style(res, *machine_readable);
+            }
+            HiiSubcommands::ShowIFR { filename } => {
+                let res = HiiBackend::show_ifr(&get_db_dump_bytes(filename.as_deref())?)?;
+                println!("{}", res.readable_representation);
+            }
+            HiiSubcommands::ExtractDB { filename } => {
+                let mut file = File::create(filename)?;
+                let res = HiiBackend::extract_db()?;
+                file.write_all(&res.db)?;
+
+                println!("{{\"info\": \"HiiDB written to {:?}\"}}", &filename);
+            }
+            HiiSubcommands::ListStrings {
+                filename,
+                machine_readable,
+            } => {
+                let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
+                print_with_style(res, *machine_readable);
+            }
+        },
+        Commands::Ilo(ilo_command) => match &ilo_command.command {
+            IloSubcommands::Get {
+                question,
+                machine_readable,
+            } => {
+                let res = IloBackend::get(question, None)?;
+                print_with_style(res, *machine_readable);
+            }
+            IloSubcommands::Set {
+                question,
+                value,
+                machine_readable,
+            } => {
+                let res = IloBackend::set(question, value, None)?;
+                print_with_style(res, *machine_readable);
+            }
+            IloSubcommands::ShowAttributes { machine_readable } => {
+                let res = IloBackend::show_attributes()?;
+                print_with_style(res, *machine_readable);
+            }
+        },
+    }
+    Ok(())
+}
+
+fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
     // If dbdump's path is provided use that
-    if let Some(dbdump_path) = args.filename.as_deref() {
+    if let Some(dbdump_path) = filename {
         info!("Using database dump from file: {}", dbdump_path.display());
 
         let mut file = File::open(&dbdump_path)
@@ -200,6 +222,19 @@ fn get_db_dump_bytes(args: &Args) -> Result<Vec<u8>> {
 
         Ok(file_contents)
     } else {
-        extract::extract_db()
+        Ok(HiiBackend::extract_db()?.db)
+    }
+}
+
+// print_with_style either prints as json or with rust's debug pretty-printer
+fn print_with_style<T>(result: T, machine_readable: bool)
+where
+    T: Serializable + Debug,
+{
+    if machine_readable {
+        let buf = simplejson_protocol::serialize(result);
+        println!("{}", String::from_utf8_lossy(&buf));
+    } else {
+        println!("{:#?}", result);
     }
 }
