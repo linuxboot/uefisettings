@@ -2,4 +2,5 @@
 
 mod blobstore;
 mod chif;
+pub mod requests;
 pub mod rest;

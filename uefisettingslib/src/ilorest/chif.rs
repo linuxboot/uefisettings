@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::ffi::CStr;
+use std::path::Path;
 use std::ptr;
 use std::slice;
 
@@ -489,4 +490,24 @@ pub fn get_lib(libpath: &str) -> Result<Library> {
     // Libloading + the compiler will ensure that the loaded symbols will not
     // outlive the Library, preventing the most common memory-safety issues.
     Ok(unsafe { Library::new(libpath)? })
+}
+
+/// find_lib_location returns the location of the ilorest_chif shared object library file
+pub fn find_lib_location() -> Result<String> {
+    let possible_locations = vec![
+        "/usr/lib64",
+        "/usr/local/lib64",
+        "/usr/lib",
+        "/usr/local/lib",
+    ];
+
+    for location in &possible_locations {
+        let lib_path = format!("{}/ilorest_chif.so", location);
+        if Path::new(&lib_path).exists() {
+            debug!("using the shared object file at {}", lib_path);
+            return Ok(lib_path);
+        }
+    }
+
+    Err(anyhow!("Unable to find location of ilorest_chif.so"))
 }
