@@ -511,3 +511,13 @@ pub fn find_lib_location() -> Result<String> {
 
     Err(anyhow!("Unable to find location of ilorest_chif.so"))
 }
+
+/// check_ilo_connectivity pings the BMC to test connectivity
+pub fn check_ilo_connectivity() -> Result<()> {
+    // just the existance of the library isn't enough, we need to ping the Ilo BMC itself
+    let lib = get_lib(&find_lib_location()?)?;
+    let ilo = IloRestChif::new(&lib)?;
+    ilo.ping()
+        .map_err(|code| anyhow!(format!("Unexpected Status Code: {} during ping", code)))?;
+    Ok(())
+}

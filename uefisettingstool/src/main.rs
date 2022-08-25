@@ -16,6 +16,7 @@ use clap::Subcommand;
 use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
+use uefisettingslib::exports::identify_machine;
 use uefisettingslib::exports::HiiBackend;
 use uefisettingslib::exports::IloBackend;
 use uefisettingslib::exports::SettingsBackend;
@@ -41,6 +42,11 @@ enum Commands {
     Ilo(IloCommand),
     // TODO: Auto(AutoCommand) after building a backend identifier function
     // TODO: Get/Set without having to specify Auto
+    /// Auto-identify backend and display hardware/bios-information
+    Identify {
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -56,7 +62,7 @@ enum HiiSubcommands {
         #[clap(value_parser)]
         question: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
-        machine_readable: bool,
+        json: bool,
     },
     /// Set/change the value of a question
     Set {
@@ -65,7 +71,7 @@ enum HiiSubcommands {
         #[clap(value_parser)]
         value: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
-        machine_readable: bool,
+        json: bool,
     },
     /// Show a human readable representation of the Hii Forms
     ShowIFR {
@@ -84,7 +90,7 @@ enum HiiSubcommands {
         #[clap(parse(from_os_str), short, long)]
         filename: Option<PathBuf>,
         #[clap(short = 'j', long = "json", action, value_parser)]
-        machine_readable: bool,
+        json: bool,
     },
 }
 
@@ -101,7 +107,7 @@ enum IloSubcommands {
         #[clap(value_parser)]
         question: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
-        machine_readable: bool,
+        json: bool,
     },
     /// Set/change the value of a question
     Set {
@@ -110,12 +116,12 @@ enum IloSubcommands {
         #[clap(value_parser)]
         value: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
-        machine_readable: bool,
+        json: bool,
     },
     /// List bios attributes and their current values
     ShowAttributes {
         #[clap(short = 'j', long = "json", action, value_parser)]
-        machine_readable: bool,
+        json: bool,
     },
     // TODO: add more ilo specific commands - GetPending and ShowPendingAttributes
 }
@@ -136,20 +142,17 @@ fn main() -> Result<()> {
 fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
     match &args.command {
         Commands::Hii(hii_command) => match &hii_command.command {
-            HiiSubcommands::Get {
-                question,
-                machine_readable,
-            } => {
+            HiiSubcommands::Get { question, json } => {
                 let res = HiiBackend::get(question, None)?;
-                print_with_style(res, *machine_readable);
+                print_with_style(res, *json);
             }
             HiiSubcommands::Set {
                 question,
                 value,
-                machine_readable,
+                json,
             } => {
                 let res = HiiBackend::set(question, value, None)?;
-                print_with_style(res, *machine_readable);
+                print_with_style(res, *json);
             }
             HiiSubcommands::ShowIFR { filename } => {
                 let res = HiiBackend::show_ifr(&get_db_dump_bytes(filename.as_deref())?)?;
@@ -162,35 +165,33 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
 
                 println!("{{\"info\": \"HiiDB written to {:?}\"}}", &filename);
             }
-            HiiSubcommands::ListStrings {
-                filename,
-                machine_readable,
-            } => {
+            HiiSubcommands::ListStrings { filename, json } => {
                 let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
-                print_with_style(res, *machine_readable);
+                print_with_style(res, *json);
             }
         },
         Commands::Ilo(ilo_command) => match &ilo_command.command {
-            IloSubcommands::Get {
-                question,
-                machine_readable,
-            } => {
+            IloSubcommands::Get { question, json } => {
                 let res = IloBackend::get(question, None)?;
-                print_with_style(res, *machine_readable);
+                print_with_style(res, *json);
             }
             IloSubcommands::Set {
                 question,
                 value,
-                machine_readable,
+                json,
             } => {
                 let res = IloBackend::set(question, value, None)?;
-                print_with_style(res, *machine_readable);
+                print_with_style(res, *json);
             }
-            IloSubcommands::ShowAttributes { machine_readable } => {
+            IloSubcommands::ShowAttributes { json } => {
                 let res = IloBackend::show_attributes()?;
-                print_with_style(res, *machine_readable);
+                print_with_style(res, *json);
             }
         },
+        Commands::Identify { json } => {
+            let res = identify_machine()?;
+            print_with_style(res, *json);
+        }
     }
     Ok(())
 }
@@ -227,11 +228,11 @@ fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
 }
 
 // print_with_style either prints as json or with rust's debug pretty-printer
-fn print_with_style<T>(result: T, machine_readable: bool)
+fn print_with_style<T>(result: T, json: bool)
 where
     T: Serializable + Debug,
 {
-    if machine_readable {
+    if json {
         let buf = simplejson_protocol::serialize(result);
         println!("{}", String::from_utf8_lossy(&buf));
     } else {

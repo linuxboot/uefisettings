@@ -6,6 +6,17 @@ enum Backend {
 
 // --- Backend: auto ---
 
+struct MachineInfo {
+  1: set<Backend> backend;
+  2: string bios_vendor;
+  3: string bios_version;
+  4: string bios_release;
+  5: string bios_date;
+  6: string product_name;
+  7: string product_family;
+  8: string product_version;
+}
+
 struct Question {
   1: string name;
   2: string answer;

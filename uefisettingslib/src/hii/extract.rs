@@ -9,6 +9,9 @@ use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 
+pub const OCP_HIIDB_PATH: &str =
+    "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
+
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
 struct HiiDBEFIVar {
@@ -24,18 +27,14 @@ pub fn extract_db() -> Result<Vec<u8>> {
     // I haven't seen any documentation on extracting HiiDB anywhere on the internet
     // So this is directly based on what hiitool does.
 
-    const OCP_HIIDB: &str = "HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
-
-    let efivar_filename = format!("/sys/firmware/efi/efivars/{}", OCP_HIIDB);
-
     // try to read data from varstore
     let mut efivar_file =
-        File::open(&efivar_filename).context(format!("Failed to open {efivar_filename}"))?;
+        File::open(OCP_HIIDB_PATH).context(format!("Failed to open {OCP_HIIDB_PATH}"))?;
 
     let mut efivar_contents = Vec::new();
     efivar_file
         .read_to_end(&mut efivar_contents)
-        .context(format!("Failed to read efivar file, {}", efivar_filename))?;
+        .context(format!("Failed to read efivar file, {}", OCP_HIIDB_PATH))?;
 
     let mut efivar_cursor = Cursor::new(&efivar_contents);
     let db_info: HiiDBEFIVar = efivar_cursor.read_ne()?;

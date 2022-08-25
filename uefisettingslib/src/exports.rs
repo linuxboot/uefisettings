@@ -1,7 +1,12 @@
+use std::collections::BTreeSet;
 use std::fmt::Write;
+use std::fs;
+use std::path::Path;
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use log::debug;
 use serde_json::Value;
 use uefisettingslib_api::Backend;
 use uefisettingslib_api::GetResponse;
@@ -9,12 +14,14 @@ use uefisettingslib_api::HiiDatabase;
 use uefisettingslib_api::HiiShowIfrResponse;
 use uefisettingslib_api::HiiStringsPackage;
 use uefisettingslib_api::IloAttributes;
+use uefisettingslib_api::MachineInfo;
 use uefisettingslib_api::Question;
 use uefisettingslib_api::SetResponse;
 
 use crate::hii::extract;
 use crate::hii::forms;
 use crate::hii::package;
+use crate::ilorest::chif;
 use crate::ilorest::requests;
 
 /// SettingsBackend is a trait which should be satisfied by all backends (like ilo, hii)
@@ -271,5 +278,51 @@ impl SettingsBackend for IloBackend {
         // TODO add more debug/hidden OEM settings here based on machine_type
 
         Ok(resp)
+    }
+}
+
+// auto-identify backend and get hardware/bios-information
+pub fn identify_machine() -> Result<MachineInfo> {
+    let mut backend = BTreeSet::new();
+
+    if Path::new(extract::OCP_HIIDB_PATH).exists() {
+        backend.insert(Backend::Hii);
+    }
+    if chif::check_ilo_connectivity().is_ok() {
+        debug!("Backend Identified: Hii");
+        backend.insert(Backend::Ilo);
+    }
+
+    if backend.is_empty() {
+        return Err(anyhow!("Cannot identify backend"));
+    } else {
+        debug!("Supported Backends: {:?}", backend);
+    }
+
+    let resp = MachineInfo {
+        backend,
+        // the entries in /sys/class/dmi/id/ are plaintext and populated by the kernel
+        bios_vendor: read_file_contents(Path::new("/sys/class/dmi/id/bios_vendor")),
+        bios_version: read_file_contents(Path::new("/sys/class/dmi/id/bios_version")),
+        bios_release: read_file_contents(Path::new("/sys/class/dmi/id/bios_release")),
+        bios_date: read_file_contents(Path::new("/sys/class/dmi/id/bios_date")),
+        product_name: read_file_contents(Path::new("/sys/class/dmi/id/product_name")),
+        product_family: read_file_contents(Path::new("/sys/class/dmi/id/product_family")),
+        product_version: read_file_contents(Path::new("/sys/class/dmi/id/product_version")),
+        ..Default::default()
+    };
+
+    Ok(resp)
+}
+
+// read_file_contents is a wrapper over std::fs::read_to_string but it
+// returns an empty string if file can't be read / doesn't exist
+fn read_file_contents(file_path: &Path) -> String {
+    match fs::read_to_string(file_path) {
+        Ok(contents) => contents.trim().to_owned(),
+        Err(why) => {
+            debug!("Can't read {:?} because {}", file_path, why);
+            "".to_owned()
+        }
     }
 }
