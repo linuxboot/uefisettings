@@ -20,6 +20,8 @@ use uefisettingslib::exports::identify_machine;
 use uefisettingslib::exports::HiiBackend;
 use uefisettingslib::exports::IloBackend;
 use uefisettingslib::exports::SettingsBackend;
+use uefisettingslib_api::Backend;
+use uefisettingslib_api::MachineInfo;
 
 const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
@@ -44,6 +46,22 @@ enum Commands {
     // TODO: Get/Set without having to specify Auto
     /// Auto-identify backend and display hardware/bios-information
     Identify {
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        json: bool,
+    },
+    /// Auto-identify backend and get the current value of a question
+    Get {
+        #[clap(value_parser)]
+        question: String,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        json: bool,
+    },
+    /// Auto-identify backend and set/change the value of a question
+    Set {
+        #[clap(value_parser)]
+        question: String,
+        #[clap(value_parser)]
+        value: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
     },
@@ -192,8 +210,46 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             let res = identify_machine()?;
             print_with_style(res, *json);
         }
+        Commands::Get { question, json } => {
+            let machine = identify_machine()?;
+            if prioritize_backend(&machine, *json) == Backend::Ilo {
+                let res = IloBackend::get(question, None)?;
+                print_with_style(res, *json);
+            } else {
+                let res = HiiBackend::get(question, None)?;
+                print_with_style(res, *json);
+            }
+        }
+        Commands::Set {
+            question,
+            value,
+            json,
+        } => {
+            let machine = identify_machine()?;
+            if prioritize_backend(&machine, *json) == Backend::Ilo {
+                let res = IloBackend::set(question, value, None)?;
+                print_with_style(res, *json);
+            } else {
+                let res = HiiBackend::set(question, value, None)?;
+                print_with_style(res, *json);
+            }
+        }
     }
     Ok(())
+}
+
+fn prioritize_backend(machine: &MachineInfo, json: bool) -> Backend {
+    if machine.backend.len() > 1 && !json {
+        println!("Multiple backends found: {:#?}", machine.backend);
+        println!("Using the Ilo backend");
+    }
+    // ilo is prioritized because its more structured than hii if there are multiple supported backends
+    // identify_machine will error out if there are no backends so we can be sure that it has atleast 1
+    if machine.backend.contains(&Backend::Ilo) {
+        Backend::Ilo
+    } else {
+        Backend::Hii
+    }
 }
 
 fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
