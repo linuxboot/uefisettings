@@ -33,12 +33,14 @@ struct SetResponse {
   2: Backend backend;
   3: Question question; // this will be the newly modified question
   4: bool modified;
+  5: bool is_translated; // is the question/answer in the spellings database
 }
 
 struct GetResponse {
   1: string selector;
   2: Backend backend;
   3: Question question;
+  4: bool is_translated; // is the question/answer in the spellings database
 }
 
 struct Error {

@@ -23,6 +23,11 @@ use crate::hii::forms;
 use crate::hii::package;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
+use crate::translation::get_qa_variations_hii;
+use crate::translation::get_qa_variations_ilo;
+use crate::translation::translate_response;
+use crate::translation::HiiTranslation;
+use crate::translation::IloTranslation;
 
 /// SettingsBackend is a trait which should be satisfied by all backends (like ilo, hii)
 pub trait SettingsBackend {
@@ -105,38 +110,83 @@ impl SettingsBackend for HiiBackend {
         let db_bytes = extract::extract_db()?;
         let parsed_db = package::read_db(&db_bytes)?;
 
+        let hii_translation = get_qa_variations_hii(question, new_value);
+        let (question_variations, new_value_variations, is_translated) = match hii_translation {
+            HiiTranslation::Translated {
+                question_variations,
+                answer_variations,
+            } => (question_variations, answer_variations, true),
+            HiiTranslation::NotTranslated {
+                question_variations,
+                answer_variations,
+            } => (question_variations, answer_variations, false),
+        };
+
         for (guid, package_list) in parsed_db.forms {
+            let string_packages = parsed_db
+                .strings
+                .get(&guid)
+                .context(format!("Failed to get string packages using GUID {}", guid))?;
+
             for form_package in package_list {
-                // string_phrases contains just one item (input from user) now, but eventually
-                // we plan to have a database which whill match similar strings
-                let string_phrases = Vec::from([question.to_owned()]);
+                // try to find the question
+                if let Some(question_descriptor) =
+                    forms::find_question(form_package, string_packages, &question_variations)
+                {
+                    let mut modified = false;
+                    // if the question_descriptor provides options then set the closest one from new_value_variations
+                    // (example whatever matches from [Enabled, Enable])
+                    // else try setting the new_value because it might be some arbitrary value like a number
+                    // (will return error if doesn't match constraints)
+                    if !(question_descriptor.possible_options.is_empty()) {
+                        // This is different from modified because if varstore doesn't exist for the question
+                        // then we can't set answers but it isn't an error.
+                        let mut found_option = false;
+                        for opt in &(question_descriptor.possible_options) {
+                            if found_option {
+                                break;
+                            }
+                            for variation in &new_value_variations {
+                                if variation.eq_ignore_ascii_case(&(opt.value)) {
+                                    found_option = true;
+                                    modified =
+                                        forms::change_value(&question_descriptor, &(opt.value))?;
+                                    break;
+                                }
+                            }
+                        }
+                        // if not a single option matched then error out
+                        // we went though all options and if it still wasnt modified then this isnt in the options
+                        if !found_option {
+                            return Err(forms::ChangeValueError::InvalidOption.into());
+                        }
+                    } else {
+                        modified = forms::change_value(&question_descriptor, new_value)?
+                    }
 
-                let modified = forms::change_value(
-                    form_package,
-                    parsed_db
-                        .strings
-                        .get(&guid)
-                        .context(format!("Failed to get string packages using GUID {}", guid))?,
-                    &string_phrases,
-                    new_value,
-                )?;
-
-                if modified {
-                    let set_resp = SetResponse {
-                        selector: guid.to_owned(),
-                        backend: Backend::Hii,
-                        question: Question {
-                            name: question.to_owned(),
-                            answer: new_value.to_owned(),
+                    if modified {
+                        let mut set_resp = SetResponse {
+                            selector: guid.to_owned(),
+                            backend: Backend::Hii,
+                            is_translated,
+                            question: Question {
+                                name: question_descriptor.question,
+                                answer: new_value.to_owned(),
+                                help: question_descriptor.help,
+                                ..Default::default()
+                            },
+                            modified: true,
                             ..Default::default()
-                        },
-                        modified: true,
-                        ..Default::default()
-                    };
-                    // TODO: make find_question call here so we can fill in the options as well
+                        };
 
-                    resp.push(set_resp)
+                        for opt in question_descriptor.possible_options {
+                            set_resp.question.options.push(opt.value)
+                        }
+
+                        resp.push(set_resp);
+                    }
                 }
+                // question not found in this form package
             }
         }
 
@@ -148,37 +198,51 @@ impl SettingsBackend for HiiBackend {
 
         let mut resp = Vec::new();
 
+        let hii_translation = get_qa_variations_hii(question, "");
+        let (question_variations, is_translated) = match hii_translation {
+            HiiTranslation::Translated {
+                question_variations,
+                ..
+            } => (question_variations, true),
+            HiiTranslation::NotTranslated {
+                question_variations,
+                ..
+            } => (question_variations, false),
+        };
+
         let db_bytes = extract::extract_db()?;
         let parsed_db = package::read_db(&db_bytes)?;
 
         for (guid, package_list) in parsed_db.forms {
             for form_package in package_list {
-                // string_phrases contains just one item (input from user) now, but eventually
-                // we plan to have a database which whill match similar strings
-                let string_phrases = Vec::from([question]);
-
-                if let Some(answer) = forms::find_question(
+                if let Some(question_descriptor) = forms::find_question(
                     form_package,
                     parsed_db
                         .strings
                         .get(&guid)
                         .context(format!("Failed to get string packages using GUID {}", guid))?,
-                    &string_phrases,
+                    &question_variations,
                 ) {
                     let mut get_resp = GetResponse {
                         selector: guid.to_owned(),
                         backend: Backend::Hii,
+                        is_translated,
                         // mapping the hii module's QuestionDescriptor to thrift codegen's Question
                         question: Question {
-                            name: answer.question,
-                            answer: answer.value,
-                            help: answer.help,
+                            name: question_descriptor.question,
+                            answer: question_descriptor.value,
+                            help: question_descriptor.help,
                             ..Default::default()
                         },
                         ..Default::default()
                     };
 
-                    for opt in answer.possible_options {
+                    if is_translated {
+                        get_resp.question.answer =
+                            translate_response(question, &get_resp.question.answer, Backend::Hii);
+                    }
+
+                    for opt in question_descriptor.possible_options {
                         get_resp.question.options.push(opt.value)
                     }
 
@@ -224,19 +288,29 @@ impl SettingsBackend for IloBackend {
 
         let mut resp = Vec::new();
 
+        let ilo_translation = get_qa_variations_ilo(question, new_value);
+        let (translated_question, translated_new_value, is_translated) = match ilo_translation {
+            IloTranslation::Translated {
+                translated_question,
+                translated_answer,
+            } => (translated_question, translated_answer, true),
+            IloTranslation::NotTranslated { question, answer } => (question, answer, false),
+        };
+
         let machine_type = requests::identify_hpe_machine_type()?;
         let ilo_device = requests::get_device_instance(machine_type);
 
         let current_bios_settings = ilo_device.get_current_settings()?;
-        if let Some(Value::String(_)) = current_bios_settings.get(question) {
-            ilo_device.update_setting(question, new_value)?;
+        if let Some(Value::String(_)) = current_bios_settings.get(&translated_question) {
+            ilo_device.update_setting(&translated_question, &translated_new_value)?;
 
             let set_resp = SetResponse {
                 selector: ilo_device.settings_selector(),
                 backend: Backend::Ilo,
+                is_translated,
                 question: Question {
-                    name: question.to_owned(),
-                    answer: new_value.to_owned(),
+                    name: translated_question.to_owned(), // real question that was sent to ilo
+                    answer: new_value.to_owned(),         // canonical answer
                     ..Default::default()
                 },
                 modified: true,
@@ -259,18 +333,33 @@ impl SettingsBackend for IloBackend {
         let machine_type = requests::identify_hpe_machine_type()?;
         let ilo_device = requests::get_device_instance(machine_type);
 
+        let ilo_translation = get_qa_variations_ilo(question, "");
+        let (translated_question, is_translated) = match ilo_translation {
+            IloTranslation::Translated {
+                translated_question,
+                ..
+            } => (translated_question, true),
+            IloTranslation::NotTranslated { question, .. } => (question, false),
+        };
+
         let current_bios_settings = ilo_device.get_current_settings()?;
-        if let Some(Value::String(s)) = current_bios_settings.get(question) {
-            let get_resp = GetResponse {
+        if let Some(Value::String(s)) = current_bios_settings.get(&translated_question) {
+            let mut get_resp = GetResponse {
                 selector: ilo_device.settings_selector(),
                 backend: Backend::Ilo,
+                is_translated,
                 question: Question {
-                    name: question.to_owned(),
+                    name: translated_question.to_owned(), // the question that was sent to ilo
                     answer: s.to_owned(),
                     ..Default::default()
                 },
                 ..Default::default()
             };
+
+            if is_translated {
+                get_resp.question.answer =
+                    translate_response(question, &get_resp.question.answer, Backend::Ilo);
+            }
 
             resp.push(get_resp)
         }
@@ -281,7 +370,7 @@ impl SettingsBackend for IloBackend {
     }
 }
 
-// auto-identify backend and get hardware/bios-information
+/// auto-identify backend and get hardware/bios-information
 pub fn identify_machine() -> Result<MachineInfo> {
     let mut backend = BTreeSet::new();
 
@@ -315,8 +404,8 @@ pub fn identify_machine() -> Result<MachineInfo> {
     Ok(resp)
 }
 
-// read_file_contents is a wrapper over std::fs::read_to_string but it
-// returns an empty string if file can't be read / doesn't exist
+/// read_file_contents is a wrapper over std::fs::read_to_string but it
+/// returns an empty string if file can't be read / doesn't exist
 fn read_file_contents(file_path: &Path) -> String {
     match fs::read_to_string(file_path) {
         Ok(contents) => contents.trim().to_owned(),

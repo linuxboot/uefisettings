@@ -16,6 +16,7 @@ use clap::Subcommand;
 use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
+use spellings_db::consts::translation_db;
 use uefisettingslib::exports::identify_machine;
 use uefisettingslib::exports::HiiBackend;
 use uefisettingslib::exports::IloBackend;
@@ -62,6 +63,11 @@ enum Commands {
         question: String,
         #[clap(value_parser)]
         value: String,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        json: bool,
+    },
+    /// Show the translation/spellings database for questions and answers
+    ShowTranslations {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
     },
@@ -233,6 +239,9 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 let res = HiiBackend::set(question, value, None)?;
                 print_with_style(res, *json);
             }
+        }
+        Commands::ShowTranslations { json } => {
+            print_with_style(&*translation_db, *json);
         }
     }
     Ok(())

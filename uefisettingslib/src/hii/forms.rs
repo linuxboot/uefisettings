@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
@@ -23,6 +24,7 @@ use binrw::BinResult;
 use binrw::BinWrite;
 use binrw::ReadOptions;
 use log::debug;
+use thiserror::Error;
 
 use crate::file_lock::FileLock;
 use crate::hii::package::Guid;
@@ -660,7 +662,7 @@ pub struct EqIdValList {
     pub value_list: Vec<u16>,
 }
 
-#[derive(BinRead, Debug, PartialEq, Clone)]
+#[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 pub struct Time {
     pub hour: u8,
@@ -668,7 +670,7 @@ pub struct Time {
     pub second: u8,
 }
 
-#[derive(BinRead, Debug, PartialEq, Clone)]
+#[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 pub struct Date {
     pub year: u16,
@@ -676,7 +678,7 @@ pub struct Date {
     pub day: u8,
 }
 
-#[derive(BinRead, Debug, PartialEq, Clone)]
+#[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 pub struct Ref {
     pub question_id: u16,
@@ -685,7 +687,7 @@ pub struct Ref {
     pub device_path_string_id: u16,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 /// Any structs having TypeValue as a field can have value of one of these types
 /// depending on the value of the value_type
 pub enum TypeValue {
@@ -1000,7 +1002,7 @@ pub struct AnswerOption {
 pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &Vec<HashMap<i32, String>>,
-    possible_question_phrases: &[T],
+    possible_question_phrases: &HashSet<T>,
 ) -> Option<QuestionDescriptor>
 where
     T: AsRef<str>,
@@ -1522,85 +1524,88 @@ pub fn display(
     Ok(result)
 }
 
-pub fn change_value<T>(
-    node: Rc<RefCell<IFROperation>>,
-    string_packages: &Vec<HashMap<i32, String>>,
-    possible_question_phrases: &[T],
-    new_value: &str,
-) -> Result<bool>
-where
-    T: AsRef<str>,
-{
-    let mut changed = false;
-    let question = find_question(node, string_packages, possible_question_phrases);
-    if let Some(ques) = question {
-        if let Some(varstore) = ques.varstore {
-            if ques.opcode == IFROpCode::OneOf {
-                for option in ques.possible_options {
-                    if option.value.eq_ignore_ascii_case(new_value) {
-                        varstore.write_at_offset(ques.header.var_store_info, option.raw_value)?;
-                        changed = true;
-                        break;
-                    }
-                }
+#[derive(Error, Debug)]
+pub enum ChangeValueError {
+    #[error("provided value did not match any possible option")]
+    InvalidOption,
+    #[error("provided value exceeded max possible value")]
+    ExceededMaxValue,
 
-                if !changed {
-                    return Err(anyhow!("Provided value did not match any possible value."));
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+pub fn change_value(
+    question: &QuestionDescriptor,
+    new_value: &str,
+) -> Result<bool, ChangeValueError> {
+    let mut changed = false;
+    if let Some(varstore) = &question.varstore {
+        if question.opcode == IFROpCode::OneOf {
+            for option in &question.possible_options {
+                if option.value.eq_ignore_ascii_case(new_value) {
+                    varstore.write_at_offset(question.header.var_store_info, option.raw_value)?;
+                    changed = true;
+                    break;
                 }
-            } else {
-                match ques.max_value {
-                    RangeType::NumSize8(m) => {
-                        let data_to_write = new_value
-                            .parse::<u8>()
-                            .context("value should fit in a u8")?;
-                        if data_to_write > m {
-                            return Err(anyhow!("Provided value exceeded max possible value."));
-                        }
-                        varstore.write_at_offset(
-                            ques.header.var_store_info,
-                            TypeValue::NumSize8(data_to_write),
-                        )?;
-                        changed = true;
+            }
+
+            if !changed {
+                return Err(ChangeValueError::InvalidOption);
+            }
+        } else {
+            match question.max_value {
+                RangeType::NumSize8(m) => {
+                    let data_to_write = new_value
+                        .parse::<u8>()
+                        .context("value should fit in a u8")?;
+                    if data_to_write > m {
+                        return Err(ChangeValueError::ExceededMaxValue);
                     }
-                    RangeType::NumSize16(m) => {
-                        let data_to_write = new_value
-                            .parse::<u16>()
-                            .context("value should fit in a u16")?;
-                        if data_to_write > m {
-                            return Err(anyhow!("Provided value exceeded max possible value."));
-                        }
-                        varstore.write_at_offset(
-                            ques.header.var_store_info,
-                            TypeValue::NumSize16(data_to_write),
-                        )?;
-                        changed = true;
+                    varstore.write_at_offset(
+                        question.header.var_store_info,
+                        TypeValue::NumSize8(data_to_write),
+                    )?;
+                    changed = true;
+                }
+                RangeType::NumSize16(m) => {
+                    let data_to_write = new_value
+                        .parse::<u16>()
+                        .context("value should fit in a u16")?;
+                    if data_to_write > m {
+                        return Err(ChangeValueError::ExceededMaxValue);
                     }
-                    RangeType::NumSize32(m) => {
-                        let data_to_write = new_value
-                            .parse::<u32>()
-                            .context("value should fit in a u32")?;
-                        if data_to_write > m {
-                            return Err(anyhow!("Provided value exceeded max possible value."));
-                        }
-                        varstore.write_at_offset(
-                            ques.header.var_store_info,
-                            TypeValue::NumSize32(data_to_write),
-                        )?;
-                        changed = true;
+                    varstore.write_at_offset(
+                        question.header.var_store_info,
+                        TypeValue::NumSize16(data_to_write),
+                    )?;
+                    changed = true;
+                }
+                RangeType::NumSize32(m) => {
+                    let data_to_write = new_value
+                        .parse::<u32>()
+                        .context("value should fit in a u32")?;
+                    if data_to_write > m {
+                        return Err(ChangeValueError::ExceededMaxValue);
                     }
-                    RangeType::NumSize64(m) => {
-                        let data_to_write = new_value
-                            .parse::<u64>()
-                            .context("value should fit in a u64")?;
-                        if data_to_write > m {
-                            return Err(anyhow!("Provided value exceeded max possible value."));
-                        }
-                        varstore.write_at_offset(
-                            ques.header.var_store_info,
-                            TypeValue::NumSize64(data_to_write),
-                        )?;
-                        changed = true;
+                    varstore.write_at_offset(
+                        question.header.var_store_info,
+                        TypeValue::NumSize32(data_to_write),
+                    )?;
+                    changed = true;
+                }
+                RangeType::NumSize64(m) => {
+                    let data_to_write = new_value
+                        .parse::<u64>()
+                        .context("value should fit in a u64")?;
+                    if data_to_write > m {
+                        return Err(ChangeValueError::ExceededMaxValue);
                     }
+                    varstore.write_at_offset(
+                        question.header.var_store_info,
+                        TypeValue::NumSize64(data_to_write),
+                    )?;
+                    changed = true;
                 }
             }
         }
