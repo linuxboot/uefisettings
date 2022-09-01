@@ -27,6 +27,7 @@ use log::debug;
 use thiserror::Error;
 
 use crate::file_lock::FileLock;
+use crate::hii::efivarfs::EfivarsMountGuard;
 use crate::hii::package::Guid;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
@@ -527,11 +528,8 @@ trait VariableStore {
             _ => {}
         }
 
-        Command::new("mount")
-            .arg("-o")
-            .arg("remount,rw")
-            .arg("efivarfs")
-            .output()?;
+        let efifs = EfivarsMountGuard {};
+        efifs.mount()?;
 
         // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
         // validate temporarily writable.

@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::os::unix::prelude::IntoRawFd;
 use std::path::Path;
 
@@ -26,7 +26,12 @@ impl FileLock {
     }
 
     pub fn lock(&mut self) -> Result<()> {
-        let file = File::open(&self.path).context(format!("failed to open {}", &self.path))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&self.path)
+            .context(format!("failed to open or create {}", &self.path))?;
 
         self.file_descriptor = file.into_raw_fd();
 
