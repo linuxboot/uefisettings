@@ -1,3 +1,6 @@
+namespace py3 hardware.uefiset.translations
+namespace cpp2 hardware.uefiset.translations
+
 // Hii and HPE/Ilo have different spellings for the same questions/attributes and their answers.
 // Different OCP vendors also have their own version spellings as well.
 // This file aims to have one canonical spelling for each common setting and then map it to different spellings.
@@ -29,6 +32,15 @@ const map<string, QuestionMapping> translation_db = {
     ilo_question = IloQuestion{
       question = "TpmState",
       answer_replacements = {"Enabled": "PresentEnabled"},
+    },
+  },
+  "Security Device Support": QuestionMapping{
+    hii_question = HiiQuestion{
+      question_variations = ["Security Device Support"],
+      answer_replacements = {
+        "Enabled": ["Enabled", "Enable"],
+        "Disabled": ["Disabled", "Disable"],
+      },
     },
   },
   "TXT Support": QuestionMapping{
