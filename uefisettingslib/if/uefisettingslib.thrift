@@ -36,11 +36,19 @@ struct SetResponse {
   5: bool is_translated; // is the question/answer in the spellings database
 }
 
+struct SetResponseList {
+  1: list<SetResponse> responses;
+}
+
 struct GetResponse {
   1: string selector;
   2: Backend backend;
   3: Question question;
   4: bool is_translated; // is the question/answer in the spellings database
+}
+
+struct GetResponseList {
+  1: list<GetResponse> responses;
 }
 
 struct Error {

@@ -10,6 +10,7 @@ use log::debug;
 use serde_json::Value;
 use uefisettingslib_api::Backend;
 use uefisettingslib_api::GetResponse;
+use uefisettingslib_api::GetResponseList;
 use uefisettingslib_api::HiiDatabase;
 use uefisettingslib_api::HiiShowIfrResponse;
 use uefisettingslib_api::HiiStringsPackage;
@@ -17,6 +18,7 @@ use uefisettingslib_api::IloAttributes;
 use uefisettingslib_api::MachineInfo;
 use uefisettingslib_api::Question;
 use uefisettingslib_api::SetResponse;
+use uefisettingslib_api::SetResponseList;
 
 use crate::hii::extract;
 use crate::hii::forms;
@@ -32,9 +34,9 @@ use crate::translation::IloTranslation;
 /// SettingsBackend is a trait which should be satisfied by all backends (like ilo, hii)
 pub trait SettingsBackend {
     /// set changes the value of the UEFI question/attribute
-    fn set(question: &str, new_value: &str, selector: Option<&str>) -> Result<Vec<SetResponse>>;
+    fn set(question: &str, new_value: &str, selector: Option<&str>) -> Result<SetResponseList>;
     /// get displays the value of the UEFI question/attribute
-    fn get(question: &str, selector: Option<&str>) -> Result<Vec<GetResponse>>;
+    fn get(question: &str, selector: Option<&str>) -> Result<GetResponseList>;
 }
 
 pub struct HiiBackend {}
@@ -102,7 +104,7 @@ impl HiiBackend {
 }
 
 impl SettingsBackend for HiiBackend {
-    fn set(question: &str, new_value: &str, _selector: Option<&str>) -> Result<Vec<SetResponse>> {
+    fn set(question: &str, new_value: &str, _selector: Option<&str>) -> Result<SetResponseList> {
         // TODO: use selector to only change values which match question + selector
 
         let mut resp = Vec::new();
@@ -190,10 +192,13 @@ impl SettingsBackend for HiiBackend {
             }
         }
 
-        Ok(resp)
+        Ok(SetResponseList {
+            responses: resp,
+            ..Default::default()
+        })
     }
 
-    fn get(question: &str, _selector: Option<&str>) -> Result<Vec<GetResponse>> {
+    fn get(question: &str, _selector: Option<&str>) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
 
         let mut resp = Vec::new();
@@ -251,7 +256,10 @@ impl SettingsBackend for HiiBackend {
             }
         }
 
-        Ok(resp)
+        Ok(GetResponseList {
+            responses: resp,
+            ..Default::default()
+        })
     }
 }
 
@@ -283,7 +291,7 @@ impl IloBackend {
 }
 
 impl SettingsBackend for IloBackend {
-    fn set(question: &str, new_value: &str, _selector: Option<&str>) -> Result<Vec<SetResponse>> {
+    fn set(question: &str, new_value: &str, _selector: Option<&str>) -> Result<SetResponseList> {
         // TODO: use selector to only change values which match question + selector
 
         let mut resp = Vec::new();
@@ -322,10 +330,13 @@ impl SettingsBackend for IloBackend {
 
         // TODO add more debug/hidden OEM settings here based on machine_type
 
-        Ok(resp)
+        Ok(SetResponseList {
+            responses: resp,
+            ..Default::default()
+        })
     }
 
-    fn get(question: &str, _selector: Option<&str>) -> Result<Vec<GetResponse>> {
+    fn get(question: &str, _selector: Option<&str>) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
 
         let mut resp = Vec::new();
@@ -366,7 +377,10 @@ impl SettingsBackend for IloBackend {
 
         // TODO add more debug/hidden OEM settings here based on machine_type
 
-        Ok(resp)
+        Ok(GetResponseList {
+            responses: resp,
+            ..Default::default()
+        })
     }
 }
 

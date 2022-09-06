@@ -155,7 +155,13 @@ fn main() -> Result<()> {
     let args = UefiSettingsToolArgs::parse();
 
     if let Err(why) = handle_cmds(args) {
-        println!("{{\"error\": \"{:?}\"}}", why);
+        print_with_style(
+            uefisettingslib_api::Error {
+                error_message: format!("{}", why),
+                ..Default::default()
+            },
+            true,
+        );
         process::exit(1);
     }
 
