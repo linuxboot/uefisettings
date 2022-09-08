@@ -27,7 +27,7 @@ struct Question {
 struct SetResponse {
   // selector values:
   // hii - the selector will be the packagelist (TODO: change to form@packagelist).
-  // ilo - the selector will be iloname-endpoint (for example ilo5-bios or ilo5-debug).
+  // ilo - the selector will be iloname-endpoint (for example bios or debug).
   1: string selector;
 
   2: Backend backend;

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::fs;
@@ -25,6 +26,9 @@ use crate::hii::forms;
 use crate::hii::package;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
+use crate::ilorest::requests::Ilo5Dev;
+use crate::ilorest::requests::IloDevice;
+use crate::ilorest::requests::RedfishAttributes;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::get_qa_variations_ilo;
 use crate::translation::translate_response;
@@ -273,18 +277,80 @@ impl IloBackend {
         let machine_type = requests::identify_hpe_machine_type()?;
         let ilo_device = requests::get_device_instance(machine_type);
 
-        let mut ilo_settings = IloAttributes {
-            selector: ilo_device.settings_selector(),
+        // Regular BIOS Settings
+        let ilo_bios_settings = IloAttributes {
+            selector: ilo_device.bios_settings_selector(),
+            attributes: btreemap_from_redfish_attributes(ilo_device.get_current_bios_settings()?),
             ..Default::default()
         };
-        for (key, value) in ilo_device.get_current_settings()? {
-            if let Value::String(v) = value {
-                ilo_settings.attributes.insert(key, v);
-            }
-        }
-        resp.push(ilo_settings);
+        resp.push(ilo_bios_settings);
 
-        // TODO: show hidden OEM settings based on the device type
+        if machine_type != IloDevice::Ilo4 {
+            // Debug Settings
+            let ilo_debug_settings = IloAttributes {
+                selector: Ilo5Dev::debug_settings_selector(),
+                attributes: btreemap_from_redfish_attributes(Ilo5Dev::get_current_debug_settings(
+                    machine_type,
+                )?),
+                ..Default::default()
+            };
+            resp.push(ilo_debug_settings);
+
+            // Service Settings
+            let ilo_service_settings = IloAttributes {
+                selector: Ilo5Dev::service_settings_selector(),
+                attributes: btreemap_from_redfish_attributes(
+                    Ilo5Dev::get_current_service_settings(machine_type)?,
+                ),
+                ..Default::default()
+            };
+            resp.push(ilo_service_settings);
+        }
+
+        Ok(resp)
+    }
+
+    /// list bios pending changes to attributes provided by ilo
+    pub fn show_pending_attributes() -> Result<Vec<IloAttributes>> {
+        let mut resp = Vec::new();
+
+        let machine_type = requests::identify_hpe_machine_type()?;
+        let ilo_device = requests::get_device_instance(machine_type);
+
+        // Regular BIOS Settings
+        let ilo_bios_settings = IloAttributes {
+            selector: ilo_device.bios_settings_selector(),
+            attributes: compare_redfish_attributes(
+                ilo_device.get_current_bios_settings()?,
+                ilo_device.get_pending_bios_settings()?,
+            ),
+            ..Default::default()
+        };
+        resp.push(ilo_bios_settings);
+
+        if machine_type != IloDevice::Ilo4 {
+            // Debug Settings
+            let ilo_debug_settings = IloAttributes {
+                selector: Ilo5Dev::debug_settings_selector(),
+                attributes: compare_redfish_attributes(
+                    Ilo5Dev::get_current_debug_settings(machine_type)?,
+                    Ilo5Dev::get_pending_debug_settings(machine_type)?,
+                ),
+                ..Default::default()
+            };
+            resp.push(ilo_debug_settings);
+
+            // Service Settings
+            let ilo_service_settings = IloAttributes {
+                selector: Ilo5Dev::service_settings_selector(),
+                attributes: compare_redfish_attributes(
+                    Ilo5Dev::get_current_service_settings(machine_type)?,
+                    Ilo5Dev::get_pending_service_settings(machine_type)?,
+                ),
+                ..Default::default()
+            };
+            resp.push(ilo_service_settings);
+        }
 
         Ok(resp)
     }
@@ -308,12 +374,13 @@ impl SettingsBackend for IloBackend {
         let machine_type = requests::identify_hpe_machine_type()?;
         let ilo_device = requests::get_device_instance(machine_type);
 
-        let current_bios_settings = ilo_device.get_current_settings()?;
+        // BIOS Settings
+        let current_bios_settings = ilo_device.get_current_bios_settings()?;
         if let Some(Value::String(_)) = current_bios_settings.get(&translated_question) {
-            ilo_device.update_setting(&translated_question, &translated_new_value)?;
+            ilo_device.update_bios_setting(&translated_question, &translated_new_value)?;
 
             let set_resp = SetResponse {
-                selector: ilo_device.settings_selector(),
+                selector: ilo_device.bios_settings_selector(),
                 backend: Backend::Ilo,
                 is_translated,
                 question: Question {
@@ -328,7 +395,59 @@ impl SettingsBackend for IloBackend {
             resp.push(set_resp)
         }
 
-        // TODO add more debug/hidden OEM settings here based on machine_type
+        if machine_type != IloDevice::Ilo4 {
+            // Debug Settings
+            if let Some(Value::String(_)) =
+                Ilo5Dev::get_current_debug_settings(machine_type)?.get(&translated_question)
+            {
+                Ilo5Dev::update_debug_setting(
+                    machine_type,
+                    &translated_question,
+                    &translated_new_value,
+                )?;
+
+                let set_resp = SetResponse {
+                    selector: Ilo5Dev::debug_settings_selector(),
+                    backend: Backend::Ilo,
+                    is_translated,
+                    question: Question {
+                        name: translated_question.to_owned(), // real question that was sent to ilo
+                        answer: new_value.to_owned(),         // canonical answer
+                        ..Default::default()
+                    },
+                    modified: true,
+                    ..Default::default()
+                };
+
+                resp.push(set_resp)
+            }
+
+            // Service Settings
+            if let Some(Value::String(_)) =
+                Ilo5Dev::get_current_service_settings(machine_type)?.get(&translated_question)
+            {
+                Ilo5Dev::update_service_setting(
+                    machine_type,
+                    &translated_question,
+                    &translated_new_value,
+                )?;
+
+                let set_resp = SetResponse {
+                    selector: Ilo5Dev::service_settings_selector(),
+                    backend: Backend::Ilo,
+                    is_translated,
+                    question: Question {
+                        name: translated_question.to_owned(), // real question that was sent to ilo
+                        answer: new_value.to_owned(),         // canonical answer
+                        ..Default::default()
+                    },
+                    modified: true,
+                    ..Default::default()
+                };
+
+                resp.push(set_resp)
+            }
+        }
 
         Ok(SetResponseList {
             responses: resp,
@@ -353,29 +472,44 @@ impl SettingsBackend for IloBackend {
             IloTranslation::NotTranslated { question, .. } => (question, false),
         };
 
-        let current_bios_settings = ilo_device.get_current_settings()?;
-        if let Some(Value::String(s)) = current_bios_settings.get(&translated_question) {
-            let mut get_resp = GetResponse {
-                selector: ilo_device.settings_selector(),
-                backend: Backend::Ilo,
-                is_translated,
-                question: Question {
-                    name: translated_question.to_owned(), // the question that was sent to ilo
-                    answer: s.to_owned(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            if is_translated {
-                get_resp.question.answer =
-                    translate_response(question, &get_resp.question.answer, Backend::Ilo);
-            }
-
-            resp.push(get_resp)
+        let mut setting_collections = vec![(
+            ilo_device.get_current_bios_settings()?,
+            ilo_device.bios_settings_selector(),
+        )];
+        if machine_type != IloDevice::Ilo4 {
+            setting_collections.push((
+                Ilo5Dev::get_current_debug_settings(machine_type)?,
+                Ilo5Dev::debug_settings_selector(),
+            ));
+            setting_collections.push((
+                Ilo5Dev::get_current_service_settings(machine_type)?,
+                Ilo5Dev::service_settings_selector(),
+            ));
         }
 
-        // TODO add more debug/hidden OEM settings here based on machine_type
+        // look for the question in all settings collections including bios and hidden collections like debug, service
+        for (attributes, settings_selector) in setting_collections {
+            if let Some(Value::String(s)) = attributes.get(&translated_question) {
+                let mut get_resp = GetResponse {
+                    selector: settings_selector,
+                    backend: Backend::Ilo,
+                    is_translated,
+                    question: Question {
+                        name: translated_question.to_owned(), // the question that was sent to ilo
+                        answer: s.to_owned(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+
+                if is_translated {
+                    get_resp.question.answer =
+                        translate_response(question, &get_resp.question.answer, Backend::Ilo);
+                }
+
+                resp.push(get_resp)
+            }
+        }
 
         Ok(GetResponseList {
             responses: resp,
@@ -428,4 +562,31 @@ fn read_file_contents(file_path: &Path) -> String {
             "".to_owned()
         }
     }
+}
+
+fn btreemap_from_redfish_attributes(attributes: RedfishAttributes) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (key, value) in attributes {
+        if let Value::String(v) = value {
+            map.insert(key, v);
+        }
+    }
+    map
+}
+
+fn compare_redfish_attributes(
+    old_attributes: RedfishAttributes,
+    new_attributes: RedfishAttributes,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (key, value) in &new_attributes {
+        if let Value::String(new_value) = value {
+            if let Some(Value::String(old_value)) = old_attributes.get(key) {
+                if !old_value.eq(new_value) {
+                    map.insert(key.to_owned(), new_value.to_owned());
+                }
+            }
+        }
+    }
+    map
 }

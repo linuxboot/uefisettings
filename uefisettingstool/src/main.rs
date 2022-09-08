@@ -147,7 +147,11 @@ enum IloSubcommands {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
     },
-    // TODO: add more ilo specific commands - GetPending and ShowPendingAttributes
+    /// List all pending changes that will take effect after reboot
+    ShowPendingAttributes {
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -215,6 +219,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             }
             IloSubcommands::ShowAttributes { json } => {
                 let res = IloBackend::show_attributes()?;
+                print_with_style(res, *json);
+            }
+            IloSubcommands::ShowPendingAttributes { json } => {
+                let res = IloBackend::show_pending_attributes()?;
                 print_with_style(res, *json);
             }
         },

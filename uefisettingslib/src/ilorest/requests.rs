@@ -13,7 +13,7 @@ use crate::ilorest::rest::RestClient;
 
 // HPE just dumps everything into one big key-val pair in some ilo4 endpoints
 // including bios settings and excessive stuff. We want to ignore this excessive stuff.
-const ILO4_IGNORED_KEYS: [&str; 7] = [
+const ILO4_IGNORED_KEYS: [&str; 8] = [
     "links",
     "Type",
     "SettingsResult",
@@ -21,12 +21,15 @@ const ILO4_IGNORED_KEYS: [&str; 7] = [
     "Description",
     "AttributeRegistry",
     "SettingsObject",
+    "Name",
 ];
 
 // The returned message should contain this if updating bios settings worked
 const SUCCESS_MSG: &str = "SystemResetRequired";
 
-#[derive(Debug, PartialEq)]
+// IloDevice isn't exactly an enum for ilo version or an HPE server version or even redfish version
+// its a combination of those
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum IloDevice {
     Ilo4,
     Ilo5,
@@ -71,95 +74,130 @@ pub fn get_device_instance(ilo_machine_type: IloDevice) -> Box<dyn IloDev> {
 }
 
 pub trait IloDev {
-    fn update_setting(&self, attribute: &str, new_value: &str) -> Result<()>;
-    fn get_pending_settings(&self) -> Result<RedfishAttributes>;
-    fn get_current_settings(&self) -> Result<RedfishAttributes>;
-    fn settings_selector(&self) -> String;
+    fn update_bios_setting(&self, attribute: &str, new_value: &str) -> Result<()>;
+    fn get_pending_bios_settings(&self) -> Result<RedfishAttributes>;
+    fn get_current_bios_settings(&self) -> Result<RedfishAttributes>;
+    fn bios_settings_selector(&self) -> String;
 }
 
 pub struct Ilo5Dev;
 
-impl IloDev for Ilo5Dev {
-    fn update_setting(&self, attribute: &str, new_value: &str) -> Result<()> {
-        let client = RestClient::new(&find_lib_location()?);
-
-        let update_struct = RedfishUpdateAttribute {
-            attributes: HashMap::from([(
-                attribute.to_string(),
-                Value::String(new_value.to_string()),
-            )]),
-        };
-        let serialized = serde_json::to_string(&update_struct)
-            .context("failed while serializing RedfishUpdateAttribute to json")?;
-        debug!("Serialized RedfishUpdateAttribute is {} ", serialized);
-
-        let (status, body) = client.patch("/redfish/v1/systems/1/bios/settings/", &serialized)?;
-        if status != HTTPStatusCode::Ok as u16 {
-            return Err(anyhow!(
-                "Unexpected HTTP Status Code while fetching current bios settings"
-            ));
-        }
-
-        let deserialized: RedfishPatchResult = serde_json::from_str(&remove_null_bytes(&body))
-            .context("failed while deserializing response json to RedfishPatchResult")?;
-        debug!("Deserialized RedfishPatchResult = {:?}", deserialized);
-
-        // It worked if the error's message_extended_info field is [RedfishMessage { message_id: "iLO.2.14.SystemResetRequired" }]
-        for msg in deserialized.error.message_extended_info {
-            debug!("msg is = {:?}", msg.message_id_ilo5);
-            if msg.message_id_ilo5.contains(SUCCESS_MSG) {
-                return Ok(());
+impl Ilo5Dev {
+    pub fn get_current_debug_settings(ilo_machine_type: IloDevice) -> Result<RedfishAttributes> {
+        match ilo_machine_type {
+            IloDevice::Ilo5 => redfish::get_attributes("/redfish/v1/systems/1/bios/gubed/"),
+            IloDevice::Ilo5Gen10Plus => {
+                redfish::get_attributes("/redfish/v1/systems/1/bios/oem/hpe/gubed")
             }
+            _ => Err(anyhow!("Invalid ilo_machine_type, Ilo5 required")),
         }
-
-        Err(anyhow!(
-            "message_extended_info field does not have expected message after updating ilo5 settings"
-        ))
     }
 
-    fn get_pending_settings(&self) -> Result<RedfishAttributes> {
-        let client = RestClient::new(&find_lib_location()?);
-
-        let (status, body) = client.get("/redfish/v1/systems/1/bios/settings/")?;
-        if status != HTTPStatusCode::Ok as u16 {
-            return Err(anyhow!(
-                "Unexpected HTTP Status Code while fetching pending bios settings"
-            ));
+    pub fn get_pending_debug_settings(ilo_machine_type: IloDevice) -> Result<RedfishAttributes> {
+        match ilo_machine_type {
+            IloDevice::Ilo5 => {
+                redfish::get_attributes("/redfish/v1/systems/1/bios/gubed/settings/")
+            }
+            IloDevice::Ilo5Gen10Plus => {
+                redfish::get_attributes("/redfish/v1/systems/1/bios/oem/hpe/gubed/settings/")
+            }
+            _ => Err(anyhow!("Invalid ilo_machine_type, Ilo5 required")),
         }
-
-        let deserialized: RedfishPendingSettings = serde_json::from_str(&remove_null_bytes(&body))
-            .context("failed while deserializing response json to RedfishPendingSettings")?;
-        debug!("Browsing {:?}", deserialized.name);
-
-        Ok(deserialized.attributes)
     }
 
-    fn get_current_settings(&self) -> Result<RedfishAttributes> {
-        let client = RestClient::new(&find_lib_location()?);
-
-        let (status, body) = client.get("/redfish/v1/systems/1/bios/")?;
-        if status != HTTPStatusCode::Ok as u16 {
-            return Err(anyhow!(
-                "Unexpected HTTP Status Code while fetching current bios settings"
-            ));
+    pub fn update_debug_setting(
+        ilo_machine_type: IloDevice,
+        attribute: &str,
+        new_value: &str,
+    ) -> Result<()> {
+        match ilo_machine_type {
+            IloDevice::Ilo5 => redfish::update_attribute(
+                "/redfish/v1/systems/1/bios/gubed/settings/",
+                attribute,
+                new_value,
+            ),
+            IloDevice::Ilo5Gen10Plus => redfish::update_attribute(
+                "/redfish/v1/systems/1/bios/oem/hpe/gubed/settings/",
+                attribute,
+                new_value,
+            ),
+            _ => Err(anyhow!("Invalid ilo_machine_type, Ilo5 required")),
         }
-
-        let deserialized: RedfishCurrentSettings = serde_json::from_str(&remove_null_bytes(&body))
-            .context("failed while deserializing response json to RedfishCurrentSettings")?;
-        debug!("Browsing {:?}", deserialized.name);
-
-        Ok(deserialized.attributes)
     }
 
-    fn settings_selector(&self) -> String {
-        "ilo5-bios".to_owned()
+    pub fn debug_settings_selector() -> String {
+        "debug".to_owned()
+    }
+
+    pub fn get_current_service_settings(ilo_machine_type: IloDevice) -> Result<RedfishAttributes> {
+        match ilo_machine_type {
+            IloDevice::Ilo5 => redfish::get_attributes("/redfish/v1/systems/1/bios/service/"),
+            IloDevice::Ilo5Gen10Plus => {
+                redfish::get_attributes("/redfish/v1/systems/1/bios/oem/hpe/service")
+            }
+            _ => Err(anyhow!("Invalid ilo_machine_type, Ilo5 required")),
+        }
+    }
+
+    pub fn get_pending_service_settings(ilo_machine_type: IloDevice) -> Result<RedfishAttributes> {
+        match ilo_machine_type {
+            IloDevice::Ilo5 => {
+                redfish::get_attributes("/redfish/v1/systems/1/bios/service/settings/")
+            }
+            IloDevice::Ilo5Gen10Plus => {
+                redfish::get_attributes("/redfish/v1/systems/1/bios/oem/hpe/service/settings/")
+            }
+            _ => Err(anyhow!("Invalid ilo_machine_type, Ilo5 required")),
+        }
+    }
+
+    pub fn update_service_setting(
+        ilo_machine_type: IloDevice,
+        attribute: &str,
+        new_value: &str,
+    ) -> Result<()> {
+        match ilo_machine_type {
+            IloDevice::Ilo5 => redfish::update_attribute(
+                "/redfish/v1/systems/1/bios/service/settings/",
+                attribute,
+                new_value,
+            ),
+            IloDevice::Ilo5Gen10Plus => redfish::update_attribute(
+                "/redfish/v1/systems/1/bios/oem/hpe/service/settings/",
+                attribute,
+                new_value,
+            ),
+            _ => Err(anyhow!("Invalid ilo_machine_type, Ilo5 required")),
+        }
+    }
+
+    pub fn service_settings_selector() -> String {
+        "service".to_owned()
+    }
+}
+
+impl IloDev for Ilo5Dev {
+    fn update_bios_setting(&self, attribute: &str, new_value: &str) -> Result<()> {
+        redfish::update_attribute("/redfish/v1/systems/1/bios/settings/", attribute, new_value)
+    }
+
+    fn get_pending_bios_settings(&self) -> Result<RedfishAttributes> {
+        redfish::get_attributes("/redfish/v1/systems/1/bios/settings/")
+    }
+
+    fn get_current_bios_settings(&self) -> Result<RedfishAttributes> {
+        redfish::get_attributes("/redfish/v1/systems/1/bios/")
+    }
+
+    fn bios_settings_selector(&self) -> String {
+        "bios".to_owned()
     }
 }
 
 pub struct Ilo4Dev;
 
 impl IloDev for Ilo4Dev {
-    fn update_setting(&self, attribute: &str, new_value: &str) -> Result<()> {
+    fn update_bios_setting(&self, attribute: &str, new_value: &str) -> Result<()> {
         let client = RestClient::new(&find_lib_location()?);
 
         let update_struct =
@@ -194,7 +232,7 @@ impl IloDev for Ilo4Dev {
         ))
     }
 
-    fn get_pending_settings(&self) -> Result<RedfishAttributes> {
+    fn get_pending_bios_settings(&self) -> Result<RedfishAttributes> {
         let client = RestClient::new(&find_lib_location()?);
 
         let (status, body) = client.get("/redfish/v1/systems/1/bios/settings/")?;
@@ -215,7 +253,7 @@ impl IloDev for Ilo4Dev {
         Ok(deserialized)
     }
 
-    fn get_current_settings(&self) -> Result<RedfishAttributes> {
+    fn get_current_bios_settings(&self) -> Result<RedfishAttributes> {
         let client = RestClient::new(&find_lib_location()?);
 
         let (status, body) = client.get("/redfish/v1/systems/1/bios/")?;
@@ -236,8 +274,69 @@ impl IloDev for Ilo4Dev {
         Ok(deserialized)
     }
 
-    fn settings_selector(&self) -> String {
-        "ilo4-bios".to_owned()
+    fn bios_settings_selector(&self) -> String {
+        "bios".to_owned()
+    }
+}
+
+mod redfish {
+    // redfish 1.6+ is standardized
+    // Right now this will only be used for Ilo5Dev{} but in the future Ilo6 could possibly re-use this
+
+    use super::*;
+
+    pub fn get_attributes(endpoint: &str) -> Result<RedfishAttributes> {
+        let client = RestClient::new(&find_lib_location()?);
+
+        let (status, body) = client.get(endpoint)?;
+        if status != HTTPStatusCode::Ok as u16 {
+            return Err(anyhow!(
+                "Unexpected HTTP Status Code while fetching {endpoint}"
+            ));
+        }
+
+        let deserialized: RedfishSettings = serde_json::from_str(&remove_null_bytes(&body))
+            .context("failed while deserializing response to RedfishSettings")?;
+        debug!("Browsing {:?}", deserialized.name);
+
+        Ok(deserialized.attributes)
+    }
+
+    pub fn update_attribute(endpoint: &str, attribute: &str, new_value: &str) -> Result<()> {
+        let client = RestClient::new(&find_lib_location()?);
+
+        let update_struct = RedfishUpdateAttribute {
+            attributes: HashMap::from([(
+                attribute.to_string(),
+                Value::String(new_value.to_string()),
+            )]),
+        };
+        let serialized = serde_json::to_string(&update_struct)
+            .context("failed while serializing RedfishUpdateAttribute to json")?;
+        debug!("Serialized RedfishUpdateAttribute is {} ", serialized);
+
+        let (status, body) = client.patch(endpoint, &serialized)?;
+        if status != HTTPStatusCode::Ok as u16 {
+            return Err(anyhow!(
+                "Unexpected HTTP Status Code while fetching current bios settings"
+            ));
+        }
+
+        let deserialized: RedfishPatchResult = serde_json::from_str(&remove_null_bytes(&body))
+            .context("failed while deserializing response json to RedfishPatchResult")?;
+        debug!("Deserialized RedfishPatchResult = {:?}", deserialized);
+
+        // It worked if the error's message_extended_info field is [RedfishMessage { message_id: "iLO.2.14.SystemResetRequired" }]
+        for msg in deserialized.error.message_extended_info {
+            debug!("msg is = {:?}", msg.message_id_ilo5);
+            if msg.message_id_ilo5.contains(SUCCESS_MSG) {
+                return Ok(());
+            }
+        }
+
+        Err(anyhow!(
+            "message_extended_info field does not have expected message after updating ilo5 settings"
+        ))
     }
 }
 
@@ -275,38 +374,11 @@ enum HTTPStatusCode {
 // HPE's Gen10 and Gen10+ have different OEM specific hidden routes but the way to change/view bios settings is the same
 
 // RedfishAttribute is used in both ilo4 and ilo5
-type RedfishAttributes = HashMap<String, Value>;
+pub type RedfishAttributes = HashMap<String, Value>;
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
-pub struct RedfishPendingSettings {
-    #[serde(rename = "@odata.context")]
-    pub odata_context: String,
-    #[serde(rename = "@odata.etag")]
-    pub odata_etag: String,
-    #[serde(rename = "@odata.id")]
-    pub odata_id: String,
-    #[serde(rename = "@odata.type")]
-    pub odata_type: String,
-    pub attribute_registry: String,
-    pub attributes: RedfishAttributes,
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
-pub struct RedfishCurrentSettings {
-    #[serde(rename = "@Redfish.Settings")]
-    pub redfish_settings: RedfishSettingsInfo,
-    #[serde(rename = "@odata.context")]
-    pub odata_context: String,
-    #[serde(rename = "@odata.etag")]
-    pub odata_etag: String,
-    #[serde(rename = "@odata.id")]
-    pub odata_id: String,
-    #[serde(rename = "@odata.type")]
-    pub odata_type: String,
+pub struct RedfishSettings {
     pub attribute_registry: String,
     pub attributes: RedfishAttributes,
     pub id: String,
