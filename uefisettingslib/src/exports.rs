@@ -23,6 +23,7 @@ use uefisettingslib_api::SetResponseList;
 
 use crate::hii::extract;
 use crate::hii::forms;
+use crate::hii::forms::list_questions;
 use crate::hii::package;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
@@ -104,6 +105,42 @@ impl HiiBackend {
         }
 
         Ok(resp)
+    }
+
+    pub fn list_questions(db_bytes: &[u8]) -> Result<Vec<Question>> {
+        let mut res = Vec::new();
+        let parsed_db = package::read_db(db_bytes)?;
+        for (guid, package_list) in parsed_db.forms {
+            let string_packages = parsed_db
+                .strings
+                .get(&guid)
+                .context(format!("Failed to get string packages using GUID {}", guid))?;
+
+            for form_package in package_list {
+                //  TODO: show form name, package list guid in the final response as well
+
+                for question_descriptor in list_questions(form_package, string_packages) {
+                    let mut question = Question {
+                        name: question_descriptor.question,
+                        answer: question_descriptor.value,
+                        help: question_descriptor.help,
+                        ..Default::default()
+                    };
+                    for opt in question_descriptor.possible_options {
+                        question.options.push(opt.value);
+                    }
+                    // dont show it if everything is empty
+                    if !(question.name.is_empty()
+                        && question.answer.is_empty()
+                        && question.help.is_empty()
+                        && question.options.is_empty())
+                    {
+                        res.push(question);
+                    }
+                }
+            }
+        }
+        Ok(res)
     }
 }
 

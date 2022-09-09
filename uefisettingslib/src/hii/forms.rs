@@ -994,6 +994,80 @@ pub struct AnswerOption {
     raw_value: TypeValue,
 }
 
+// list_questions returns a list of QuestionDescriptors in a form package
+// node should be the form_package node
+pub fn list_questions(
+    node: Rc<RefCell<IFROperation>>,
+    string_packages: &Vec<HashMap<i32, String>>,
+) -> Vec<QuestionDescriptor> {
+    let mut res = Vec::new();
+
+    let current_node = node.borrow();
+
+    match &current_node.parsed_data {
+        ParsedOperation::Numeric(parsed) => {
+            let question = find_corresponding_string(
+                parsed.question_header().prompt_string_id,
+                string_packages,
+            );
+
+            let varstore = find_corresponding_varstore(
+                Rc::clone(&node),
+                parsed.question_header().var_store_id,
+            );
+
+            let question_descriptor =
+                handle_numeric(varstore, parsed, question, string_packages, &current_node);
+            res.push(question_descriptor);
+        }
+        ParsedOperation::OneOf(parsed) => {
+            let question = find_corresponding_string(
+                parsed.question_header().prompt_string_id,
+                string_packages,
+            );
+
+            let varstore = find_corresponding_varstore(
+                Rc::clone(&node),
+                parsed.question_header().var_store_id,
+            );
+
+            let question_descriptor = handle_oneof(
+                varstore,
+                parsed,
+                &node,
+                string_packages,
+                question,
+                &current_node,
+            );
+            res.push(question_descriptor);
+        }
+        ParsedOperation::CheckBox(parsed) => {
+            let question = find_corresponding_string(
+                parsed.question_header().prompt_string_id,
+                string_packages,
+            );
+
+            let varstore = find_corresponding_varstore(
+                Rc::clone(&node),
+                parsed.question_header().var_store_id,
+            );
+
+            let question_descriptor =
+                handle_checkbox(varstore, parsed, question, string_packages, &current_node);
+            res.push(question_descriptor);
+        }
+
+        _ => {}
+    }
+
+    // Now look inside current node's children for more questions
+    for child in &node.borrow().children {
+        res.extend(list_questions(Rc::clone(child), string_packages));
+    }
+
+    res
+}
+
 /// find_question accepts the root node, string_packages and possible_question_phrases.
 /// possible_question_phrases is a vector of strings which represent variations of the
 /// same question. So if a single phrase matches then we assume that we have the answer.

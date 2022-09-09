@@ -116,6 +116,14 @@ enum HiiSubcommands {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
     },
+    /// List questions HiiDB. Note that these are not all possible questions, because we don't parse certain non-useful question types.
+    ListQuestions {
+        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
+        #[clap(parse(from_os_str), short, long)]
+        filename: Option<PathBuf>,
+        #[clap(short = 'j', long = "json", action, value_parser)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -201,6 +209,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             }
             HiiSubcommands::ListStrings { filename, json } => {
                 let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
+                print_with_style(res, *json);
+            }
+            HiiSubcommands::ListQuestions { filename, json } => {
+                let res = HiiBackend::list_questions(&get_db_dump_bytes(filename.as_deref())?)?;
                 print_with_style(res, *json);
             }
         },
