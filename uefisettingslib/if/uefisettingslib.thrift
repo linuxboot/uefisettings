@@ -1,3 +1,6 @@
+namespace py3 hardware.uefiset
+namespace cpp2 hardware.uefiset
+
 enum Backend {
   Unknown = 0,
   Hii = 1,

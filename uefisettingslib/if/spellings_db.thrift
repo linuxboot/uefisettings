@@ -20,8 +20,16 @@ struct IloQuestion {
   2: optional map<string, string> answer_replacements; // ex rename Enabled -> PresentEnabled before trying to set
 }
 
+// Canonical Question Names
+// These are defined as constants so its eazy to change them once here instead of changing them everywhere in tooling
+const string CQ_TPM_STATE = "TPM State";
+const string CQ_SECURITY_DEVICE_SUPPORT = "Security Device Support";
+const string CQ_HYPER_THREADING = "Hyper Threading";
+const string CQ_TXT_SUPPORT = "TXT Support";
+const string CQ_VT_D = "VTd";
+
 const map<string, QuestionMapping> translation_db = {
-  "TPM State": QuestionMapping{
+  CQ_TPM_STATE: QuestionMapping{
     hii_question = HiiQuestion{
       question_variations = ["TPM State"],
       answer_replacements = {
@@ -34,7 +42,7 @@ const map<string, QuestionMapping> translation_db = {
       answer_replacements = {"Enabled": "PresentEnabled"},
     },
   },
-  "Security Device Support": QuestionMapping{
+  CQ_SECURITY_DEVICE_SUPPORT: QuestionMapping{
     hii_question = HiiQuestion{
       question_variations = ["Security Device Support"],
       answer_replacements = {
@@ -43,7 +51,7 @@ const map<string, QuestionMapping> translation_db = {
       },
     },
   },
-  "TXT Support": QuestionMapping{
+  CQ_TXT_SUPPORT: QuestionMapping{
     hii_question = HiiQuestion{
       question_variations = ["TXT Support", "Enable Intel(R) TXT"],
       answer_replacements = {
@@ -53,7 +61,7 @@ const map<string, QuestionMapping> translation_db = {
     },
     ilo_question = IloQuestion{question = "IntelTxt"},
   },
-  "Hyper Threading": QuestionMapping{
+  CQ_HYPER_THREADING: QuestionMapping{
     hii_question = HiiQuestion{
       question_variations = [
         "Hyper-Threading",
@@ -66,7 +74,7 @@ const map<string, QuestionMapping> translation_db = {
       },
     },
   },
-  "VTd": QuestionMapping{
+  CQ_VT_D: QuestionMapping{
     hii_question = HiiQuestion{
       question_variations = [
         "(VT-d)",
