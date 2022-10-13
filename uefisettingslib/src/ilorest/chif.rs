@@ -294,8 +294,8 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
         unsafe {
             let tmp_struct_pointer = (self.rest_immediate)(
                 request_body_and_header_size,
-                response_key.as_ptr(),
-                namespace.as_ptr(),
+                response_key.as_ptr() as *const i8,
+                namespace.as_ptr() as *const i8,
             );
             slice::from_raw_parts(
                 tmp_struct_pointer,
@@ -313,9 +313,9 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
             let tmp_struct_pointer = (self.rest_immediate_blob_desc)(
-                request_key.as_ptr(),
-                response_key.as_ptr(),
-                namespace.as_ptr(),
+                request_key.as_ptr() as *const i8,
+                response_key.as_ptr() as *const i8,
+                namespace.as_ptr() as *const i8,
             );
             slice::from_raw_parts(
                 tmp_struct_pointer,
@@ -335,8 +335,10 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
     fn prepare_new_blob_entry(&self, request_key: &CStr, namespace: &CStr) -> &[u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer =
-                (self.create_not_blobentry)(request_key.as_ptr(), namespace.as_ptr());
+            let tmp_struct_pointer = (self.create_not_blobentry)(
+                request_key.as_ptr() as *const i8,
+                namespace.as_ptr() as *const i8,
+            );
             slice::from_raw_parts(
                 tmp_struct_pointer,
                 (self.get_create_request_size)() as usize,
@@ -356,8 +358,8 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
             let tmp_struct_pointer = (self.write_fragment)(
                 write_block_size,
                 count,
-                request_key.as_ptr(),
-                namespace.as_ptr(),
+                request_key.as_ptr() as *const i8,
+                namespace.as_ptr() as *const i8,
             );
             slice::from_raw_parts(tmp_struct_pointer, (self.get_write_request_size)() as usize)
         }
@@ -375,8 +377,8 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
             let tmp_struct_pointer = (self.read_fragment)(
                 read_block_size,
                 count,
-                response_key.as_ptr(),
-                namespace.as_ptr(),
+                response_key.as_ptr() as *const i8,
+                namespace.as_ptr() as *const i8,
             );
             slice::from_raw_parts(tmp_struct_pointer, (self.get_read_request_size)() as usize)
         }
@@ -385,7 +387,10 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
     fn finalize_blob_write(&self, request_key: &CStr, namespace: &CStr) -> &[u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer = (self.finalize_blob)(request_key.as_ptr(), namespace.as_ptr());
+            let tmp_struct_pointer = (self.finalize_blob)(
+                request_key.as_ptr() as *const i8,
+                namespace.as_ptr() as *const i8,
+            );
             slice::from_raw_parts(
                 tmp_struct_pointer,
                 (self.get_finalize_request_size)() as usize,
@@ -404,7 +409,10 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
     fn get_key_info(&self, response_key: &CStr, namespace: &CStr) -> &'a [u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer = (self.get_key_info)(response_key.as_ptr(), namespace.as_ptr());
+            let tmp_struct_pointer = (self.get_key_info)(
+                response_key.as_ptr() as *const i8,
+                namespace.as_ptr() as *const i8,
+            );
             slice::from_raw_parts(tmp_struct_pointer, (self.get_info_request_size)() as usize)
         }
     }
@@ -420,7 +428,8 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
     fn prepare_delete_blob(&self, key: &CStr, namespace: &CStr) -> &'a [u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer = (self.delete_blob)(key.as_ptr(), namespace.as_ptr());
+            let tmp_struct_pointer =
+                (self.delete_blob)(key.as_ptr() as *const i8, namespace.as_ptr() as *const i8);
             slice::from_raw_parts(
                 tmp_struct_pointer,
                 (self.get_delete_request_size)() as usize,
