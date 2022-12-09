@@ -536,7 +536,8 @@ trait VariableStore {
         Command::new("/usr/bin/chattr")
             .arg("-i")
             .arg(&self.store_filename())
-            .output()?;
+            .output()
+            .context("Failed to run /usr/bin/chattr")?;
 
         // All checks passed, now we can try to write.
 
