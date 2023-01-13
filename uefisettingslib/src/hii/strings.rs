@@ -73,7 +73,7 @@ pub fn handle_string_package(
         .context("failed to parse string package header")?;
     debug!(
         "String package language is {} and language name is {:?}",
-        string_header.language.into_string(),
+        string_header.language.to_string(),
         string_header.language_name
     );
 
@@ -112,7 +112,7 @@ pub fn handle_string_package(
                     null_str, string_id_current
                 );
                 // save string here id changes later
-                string_map.insert(string_id_current, null_str.into_string());
+                string_map.insert(string_id_current, null_str.to_string());
                 string_id_current += 1;
             }
             StringBlockType::Skip2 => {

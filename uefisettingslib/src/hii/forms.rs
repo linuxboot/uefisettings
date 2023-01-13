@@ -23,6 +23,7 @@ use binrw::BinReaderExt;
 use binrw::BinResult;
 use binrw::BinWrite;
 use binrw::ReadOptions;
+use binrw::WriteOptions;
 use log::debug;
 use thiserror::Error;
 
@@ -520,11 +521,12 @@ trait VariableStore {
         let mut cursor = Cursor::new(file_contents);
         cursor.seek(SeekFrom::Start(4 + offset as u64))?;
 
+        let write_options = WriteOptions::new(binrw::endian::Endian::Little);
         match data {
-            TypeValue::NumSize8(v) => v.write_to(&mut cursor)?,
-            TypeValue::NumSize16(v) => v.write_to(&mut cursor)?,
-            TypeValue::NumSize32(v) => v.write_to(&mut cursor)?,
-            TypeValue::NumSize64(v) => v.write_to(&mut cursor)?,
+            TypeValue::NumSize8(v) => v.write_options(&mut cursor, &write_options, ())?,
+            TypeValue::NumSize16(v) => v.write_options(&mut cursor, &write_options, ())?,
+            TypeValue::NumSize32(v) => v.write_options(&mut cursor, &write_options, ())?,
+            TypeValue::NumSize64(v) => v.write_options(&mut cursor, &write_options, ())?,
             _ => {}
         }
 
