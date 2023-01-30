@@ -533,8 +533,7 @@ trait VariableStore {
             _ => {}
         }
 
-        let efifs = EfivarsMountGuard {};
-        efifs.mount()?;
+        let _efifs = EfivarsMountGuard::new().context("Failed to create efivars fs mount guard")?;
 
         // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
         // validate temporarily writable.
