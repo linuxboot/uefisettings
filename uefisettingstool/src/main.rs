@@ -169,7 +169,7 @@ fn main() -> Result<()> {
     if let Err(why) = handle_cmds(args) {
         print_with_style(
             uefisettingslib_api::Error {
-                error_message: format!("{}", why),
+                error_message: format!("{:#}", why),
                 ..Default::default()
             },
             true,

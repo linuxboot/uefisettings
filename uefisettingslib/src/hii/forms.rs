@@ -10,7 +10,6 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-use std::process::Command;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -25,8 +24,10 @@ use binrw::BinWrite;
 use binrw::ReadOptions;
 use binrw::WriteOptions;
 use log::debug;
+use log::error;
 use thiserror::Error;
 
+use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
 use crate::hii::efivarfs::EfivarsMountGuard;
 use crate::hii::package::Guid;
@@ -510,7 +511,9 @@ trait VariableStore {
         let mut lock = FileLock::new(LOCK_FILE_PATH);
         lock.lock()?;
 
-        let mut file_ro = File::open(&self.store_filename())
+        let store_filename = self.store_filename();
+
+        let mut file_ro = File::open(&store_filename)
             .context("Failed to open efivarfs file to get varstore bytes")?;
 
         let mut file_contents = Vec::new();
@@ -535,15 +538,12 @@ trait VariableStore {
 
         // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
         // validate temporarily writable.
-        Command::new("/usr/bin/chattr")
-            .arg("-i")
-            .arg(&self.store_filename())
-            .output()
-            .context("Failed to run /usr/bin/chattr")?;
+        let _immutability_attribute_guard = EfivarsImmutabilityGuard::new(&store_filename)
+            .context("failed to create immutability attribute guard")?;
 
         // All checks passed, now we can try to write.
-
-        File::create(&self.store_filename())
+        debug!("Writing value to {}", &store_filename);
+        File::create(&store_filename)
             .context("Failed to open efivarfs file for writing")?
             .write_all(cursor.get_ref())
             .context("Failed to write to efivarfs file")?;
