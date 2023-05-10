@@ -1,5 +1,5 @@
-namespace py3 hardware.uefiset.translations
-namespace cpp2 hardware.uefiset.translations
+namespace py3 hardware.uefisettings.translations
+namespace cpp2 hardware.uefisettings.translations
 
 // Hii and HPE/Ilo have different spellings for the same questions/attributes and their answers.
 // Different OCP vendors also have their own version spellings as well.

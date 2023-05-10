@@ -1,13 +1,11 @@
-namespace py3 hardware.uefiset
-namespace cpp2 hardware.uefiset
+namespace py3 hardware.uefisettings
+namespace cpp2 hardware.uefisettings
 
 enum Backend {
   Unknown = 0,
   Hii = 1,
   Ilo = 2,
 }
-
-// --- Backend: auto ---
 
 struct MachineInfo {
   1: set<Backend> backend;

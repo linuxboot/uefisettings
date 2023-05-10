@@ -1,0 +1,27 @@
+[package]
+name = "uefisettings"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "uefisettings"
+path = "src/lib/lib.rs"
+
+[dependencies]
+uefisettings_thrift = { path = "thrift/rust/uefisettings_thrift" }
+spellings_db_thrift = { path = "thrift/rust/spellings_db_thrift" }
+anyhow = "1.0"
+fbthrift = "0.0"
+clap = { package = "clap", version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+log = { version = "0.4", features = ["kv_unstable", "kv_unstable_std"] }
+serde = { version = "1.0", features = ["derive", "rc"]}
+serde_json = { version = "1.0", features = ["float_roundtrip", "unbounded_depth"] }
+nix = "0.26"
+tempfile = "3.5"
+libloading = "0.8"
+httparse = "1.8"
+binrw = "0.10"
+rand = { version = "0.8", features = ["small_rng"] }
+proc-mounts = "0.3"
+thiserror = "1.0"
+env_logger = "0.10"
