@@ -12,6 +12,12 @@
 ## Install
 
 ```sh
+cargo install uefisettings
+```
+
+## Build manually
+
+```sh
 cd /tmp
 git clone https://github.com/linuxboot/uefisettings
 cd uefisettings
