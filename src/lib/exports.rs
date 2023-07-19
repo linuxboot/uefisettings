@@ -22,17 +22,17 @@ use anyhow::Result;
 use log::debug;
 use serde_json::Value;
 
-use uefisettings_thrift::Backend;
-use uefisettings_thrift::GetResponse;
-use uefisettings_thrift::GetResponseList;
-use uefisettings_thrift::HiiDatabase;
-use uefisettings_thrift::HiiShowIfrResponse;
-use uefisettings_thrift::HiiStringsPackage;
-use uefisettings_thrift::IloAttributes;
-use uefisettings_thrift::MachineInfo;
-use uefisettings_thrift::Question;
-use uefisettings_thrift::SetResponse;
-use uefisettings_thrift::SetResponseList;
+use uefisettings_backend_thrift::Backend;
+use uefisettings_backend_thrift::GetResponse;
+use uefisettings_backend_thrift::GetResponseList;
+use uefisettings_backend_thrift::HiiDatabase;
+use uefisettings_backend_thrift::HiiShowIfrResponse;
+use uefisettings_backend_thrift::HiiStringsPackage;
+use uefisettings_backend_thrift::IloAttributes;
+use uefisettings_backend_thrift::MachineInfo;
+use uefisettings_backend_thrift::Question;
+use uefisettings_backend_thrift::SetResponse;
+use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii::extract;
 use crate::hii::forms;

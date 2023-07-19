@@ -26,13 +26,13 @@ use clap::Subcommand;
 use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
-use spellings_db_thrift::consts::translation_db;
+use uefisettings_spellings_db_thrift::consts::translation_db;
 use uefisettings::exports::identify_machine;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IloBackend;
 use uefisettings::exports::SettingsBackend;
-use uefisettings_thrift::Backend;
-use uefisettings_thrift::MachineInfo;
+use uefisettings_backend_thrift::Backend;
+use uefisettings_backend_thrift::MachineInfo;
 
 const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
 
     if let Err(why) = handle_cmds(args) {
         print_with_style(
-            uefisettings_thrift::Error {
+            uefisettings_backend_thrift::Error {
                 error_message: format!("{:#}", why),
                 ..Default::default()
             },

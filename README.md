@@ -133,5 +133,5 @@ vi thrift/spellings_db.thrift
 # Re-generate the rust file from the thrift file.
 cargo install fbthrift_compiler
 ~/.cargo/bin/compiler thrift/spellings_db.thrift
-mv lib.rs thrift/rust/spellings_db_thrift/spellings_db.rs
+mv lib.rs thrift/rust/uefisettings_spellings_db_thrift/spellings_db.rs
 ```

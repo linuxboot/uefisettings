@@ -1,0 +1,15 @@
+[package]
+name = "uefisettings_backend_thrift"
+description = "Backend interface definition DB for the tool to read/get/extract and write/change/modify BIOS/UEFI settings from Linux terminal."
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+homepage = "https://github.com/linuxboot/uefisettings"
+
+[dependencies]
+anyhow = "1.0"
+fbthrift = "0.0"
+
+[lib]
+name = "uefisettings_backend_thrift"
+path = "uefisettings_backend.rs"

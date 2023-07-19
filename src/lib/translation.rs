@@ -15,8 +15,8 @@ use std::collections::HashSet;
 use log::debug;
 use log::info;
 
-use spellings_db_thrift::consts::translation_db;
-use uefisettings_thrift::Backend;
+use uefisettings_spellings_db_thrift::consts::translation_db;
+use uefisettings_backend_thrift::Backend;
 
 pub enum HiiTranslation {
     Translated {
