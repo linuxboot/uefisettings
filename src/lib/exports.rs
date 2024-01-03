@@ -36,6 +36,8 @@ use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii::extract;
 use crate::hii::forms;
+use crate::hii::forms::IFROperation;
+use crate::hii::forms::ParsedOperation;
 use crate::hii::forms::list_questions;
 use crate::hii::package;
 use crate::ilorest::chif;
@@ -76,7 +78,7 @@ impl HiiBackend {
 
         let mut readable_representation = String::new();
 
-        let parsed_db = package::read_db(db_bytes)?;
+        let parsed_db = package::parse_db(db_bytes)?;
 
         for (guid, package_list) in parsed_db.forms {
             write!(readable_representation, "Packagelist {}", &guid)?;
@@ -102,7 +104,7 @@ impl HiiBackend {
     /// list all strings-id, string pairs in HiiDB
     pub fn list_strings(db_bytes: &[u8]) -> Result<Vec<HiiStringsPackage>> {
         let mut resp = Vec::new();
-        let parsed_db = package::read_db(db_bytes)?;
+        let parsed_db = package::parse_db(db_bytes)?;
 
         for (guid, package_list) in parsed_db.strings {
             for string_package in package_list {
@@ -122,7 +124,7 @@ impl HiiBackend {
 
     pub fn list_questions(db_bytes: &[u8]) -> Result<Vec<Question>> {
         let mut res = Vec::new();
-        let parsed_db = package::read_db(db_bytes)?;
+        let parsed_db = package::parse_db(db_bytes)?;
         for (guid, package_list) in parsed_db.forms {
             let string_packages = parsed_db
                 .strings
@@ -164,7 +166,7 @@ impl SettingsBackend for HiiBackend {
         let mut resp = Vec::new();
 
         let db_bytes = extract::extract_db()?;
-        let parsed_db = package::read_db(&db_bytes)?;
+        let parsed_db = package::parse_db(&db_bytes)?;
 
         let hii_translation = get_qa_variations_hii(question, new_value);
         let (question_variations, new_value_variations, is_translated) = match hii_translation {
@@ -270,7 +272,10 @@ impl SettingsBackend for HiiBackend {
         };
 
         let db_bytes = extract::extract_db()?;
-        let parsed_db = package::read_db(&db_bytes)?;
+        fn _parse_node_filter(node: &IFROperation, question: &str) -> bool {
+            return true;
+        }
+        let parsed_db = package::parse_db_with_filter(&db_bytes, |node| _parse_node_filter(node, question))?;
 
         for (guid, package_list) in parsed_db.forms {
             for form_package in package_list {

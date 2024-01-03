@@ -189,14 +189,22 @@ pub struct ParsedHiiDB {
     pub forms: HashMap<String, Vec<IFRNodeLink>>,
 }
 
-/// read_db input (source) is a vector of u8 bytes
+/// parse_db input (source) is a vector of u8 bytes
 /// In hiidb, we have package lists (with unique guids) which have multiple packages of different types including string, form and end type packages.
 /// For every package list, we will parse different packages. If package type is
 /// * string -> parse and save data
 /// * form -> parse and save data
 /// * something else (like fonts or animations) -> we don't care about them, so continue to the next package in the package list.
 /// In the end return a ParsedHiiDB struct which will have the parsed and saved data.
-pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
+pub fn parse_db(source: &[u8]) -> Result<ParsedHiiDB> {
+	fn filter_accept_all(node: &IFROperation) -> bool {
+		return true
+	}
+	return parse_db_with_filter(source, filter_accept_all)
+}
+
+/// parse_db_with_filter is the same as parse_db, but allows to filter which nodes to parse and which to skip.
+pub fn parse_db_with_filter(source: &[u8], filter_func: impl Fn(&IFROperation) -> bool) -> Result<ParsedHiiDB> {
     let mut res = ParsedHiiDB {
         strings: HashMap::new(),
         forms: HashMap::new(),
@@ -256,7 +264,7 @@ mod tests {
         let mut file = File::open("hardware/uefiset/dbdumps/hiidb.bin").unwrap();
         let mut file_contents = Vec::new();
         file.read_to_end(&mut file_contents).unwrap();
-        let res = read_db(&file_contents).unwrap();
+        let res = parse_db(&file_contents).unwrap();
 
         // compare number of package lists which have string type packages
         assert_eq!(res.strings.len(), 12);
@@ -299,7 +307,7 @@ mod tests {
         let mut file = File::open("hardware/uefiset/dbdumps/hiidb.bin").unwrap();
         let mut file_contents = Vec::new();
         file.read_to_end(&mut file_contents).unwrap();
-        let res = read_db(&file_contents).unwrap();
+        let res = parse_db(&file_contents).unwrap();
 
         let root_node = res
             .forms

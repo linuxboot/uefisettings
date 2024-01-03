@@ -887,7 +887,8 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
             // We're not saving these in the struct because we don't know how many there are - could take up a large amount of memory.
             // For non debug uses we will only call this when we want to know the answer to a question.
 
-            match &parsed.read_bytes() {
+			if log::Level::Debug <= log::max_level() {
+				match &parsed.read_bytes() {
                 Ok(b) => {
                     debug!("Varstore bytes are {:?}", b);
                 }
@@ -895,6 +896,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
                     debug!("Failed to read uefi varstore {}", why);
                 }
             }
+		}
 
             node.parsed_data = ParsedOperation::VarStore(parsed);
         }
