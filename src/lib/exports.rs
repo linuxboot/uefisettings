@@ -142,7 +142,7 @@ impl HiiBackend {
                     for opt in question_descriptor.possible_options {
                         question.options.push(opt.value);
                     }
-                    // dont show it if everything is empty
+                    // don't show it if everything is empty
                     if !(question.name.is_empty()
                         && question.answer.is_empty()
                         && question.help.is_empty()
@@ -212,7 +212,7 @@ impl SettingsBackend for HiiBackend {
                             }
                         }
                         // if not a single option matched then error out
-                        // we went though all options and if it still wasnt modified then this isnt in the options
+                        // we went though all options and if it still wasn't modified then this isn't in the options
                         if !found_option {
                             return Err(forms::ChangeValueError::InvalidOption.into());
                         }

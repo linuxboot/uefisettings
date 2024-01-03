@@ -289,7 +289,7 @@ fn prioritize_backend(machine: &MachineInfo, json: bool) -> Backend {
         println!("Using the Ilo backend");
     }
     // ilo is prioritized because its more structured than hii if there are multiple supported backends
-    // identify_machine will error out if there are no backends so we can be sure that it has atleast 1
+    // identify_machine will error out if there are no backends so we can be sure that it has at least 1
     if machine.backend.contains(&Backend::Ilo) {
         Backend::Ilo
     } else {
@@ -305,7 +305,7 @@ fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
         let mut file = File::open(&dbdump_path)
             .context(format!("opening dbdump from{}", dbdump_path.display()))?;
 
-        // Most Hii DBs are afew hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
+        // Most Hii DBs are a few hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
         // Since we're reading the entire DB into a Vec<u8> we need to have a check here.
         if file
             .metadata()

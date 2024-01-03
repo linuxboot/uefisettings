@@ -121,7 +121,7 @@ impl<'a> Transport<'a> {
 
             // HP's CLI tool deletes this response blob even though it is in the `volatile` blobs namespace.
             // Note that it only deletes the response blob and not the request blob.
-            // We will emulate this behaviour.
+            // We will emulate this behavior.
             self.delete_blob_entry(&response_key, &namespace)?;
 
             return Ok(read_bytes);
