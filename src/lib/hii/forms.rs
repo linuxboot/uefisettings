@@ -31,8 +31,6 @@ use binrw::BinRead;
 use binrw::BinReaderExt;
 use binrw::BinResult;
 use binrw::BinWrite;
-use binrw::ReadOptions;
-use binrw::WriteOptions;
 use log::debug;
 use log::error;
 use thiserror::Error;
@@ -429,7 +427,7 @@ pub enum Range {
 
 fn range_parser<R: Read + Seek>(
     reader: &mut R,
-    _ro: &ReadOptions,
+	_endian: binrw::Endian,
     args: (u8,),
 ) -> BinResult<Range> {
     match args.0 & 0x0Fu8 {
@@ -531,12 +529,11 @@ trait VariableStore {
         let mut cursor = Cursor::new(file_contents);
         cursor.seek(SeekFrom::Start(4 + offset as u64))?;
 
-        let write_options = WriteOptions::new(binrw::endian::Endian::Little);
         match data {
-            TypeValue::NumSize8(v) => v.write_options(&mut cursor, &write_options, ())?,
-            TypeValue::NumSize16(v) => v.write_options(&mut cursor, &write_options, ())?,
-            TypeValue::NumSize32(v) => v.write_options(&mut cursor, &write_options, ())?,
-            TypeValue::NumSize64(v) => v.write_options(&mut cursor, &write_options, ())?,
+            TypeValue::NumSize8(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
+            TypeValue::NumSize16(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
+            TypeValue::NumSize32(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
+            TypeValue::NumSize64(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
             _ => {}
         }
 
@@ -716,7 +713,7 @@ pub enum TypeValue {
 
 fn type_value_parser<R: Read + Seek>(
     reader: &mut R,
-    _ro: &ReadOptions,
+	_endian: binrw::Endian,
     args: (u8,),
 ) -> BinResult<TypeValue> {
     match args.0 {
@@ -1193,7 +1190,7 @@ fn handle_checkbox(
             Ok(bytes) => {
                 // for a checkbox size should be of type u8
                 let answer_raw: Result<u8> =
-                    extract_efi_data(parsed.question_header().var_store_info, &bytes);
+                    extract_efi_data::<u8>(parsed.question_header().var_store_info, &bytes);
                 match answer_raw {
                     Ok(a) => answer.push_str(format!("{a}").as_str()),
                     Err(_) => answer.push_str("Unknown"),
@@ -1381,7 +1378,7 @@ fn handle_numeric(
 fn try_read_answer_as_string<T>(question_header: &QuestionHeader, bytes: &Vec<u8>, ans: &mut String)
 where
     T: BinRead + Display,
-    <T as BinRead>::Args: Default,
+    for<'a> <T as BinRead>::Args<'a>: Default,
 {
     let extracted_data: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
     match extracted_data {
@@ -1397,7 +1394,7 @@ fn try_read_answer_as_option<T>(
     chosen_value: &mut u64,
 ) where
     T: BinRead + Display + Into<u64>,
-    <T as BinRead>::Args: Default,
+    for<'a> <T as BinRead>::Args<'a>: Default,
 {
     let extracted_data: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
     if let Ok(a) = extracted_data {
@@ -1764,7 +1761,7 @@ fn find_corresponding_varstore(
 fn extract_efi_data<T>(offset: u16, bytes: &Vec<u8>) -> Result<T>
 where
     T: BinRead,
-    <T as BinRead>::Args: Default,
+    for<'a> <T as BinRead>::Args<'a>: Default,
 {
     // first 4 bytes are flags provided by the kernel so ignore them
     // values begin after that
