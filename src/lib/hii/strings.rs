@@ -100,7 +100,7 @@ pub fn handle_string_package(
             Err(why) => {
                 error!("Can't read block header {}", why);
                 // We can also break because if there is an error here we loose track of string_id_current
-                // and want to immidiately stop parsing this string package anything beyond this wont be useful.
+                // and want to immediately stop parsing this string package anything beyond this wont be useful.
                 return Err(why.into());
             }
             Ok(p) => p,
@@ -157,10 +157,10 @@ pub fn handle_string_package(
                 return Err(anyhow!("Unhandled block type"));
                 // If we encounter any unhandled String Info Block Types type,
                 // we cannot parse the rest of the package. This is because string_id_current
-                // is changed by each block and subsiquent blocks need an updated value.
+                // is changed by each block and subsequent blocks need an updated value.
 
                 // They're not used in any of the dumps we have encountered so far.
-                // Hiilib doesn't handle the rest either.
+                // Hii lib doesn't handle the rest either.
             }
         }
     }

@@ -49,7 +49,7 @@ pub enum IloDevice {
 }
 
 /// identify_hpe_machine_type tries to identify the kind of HPE machine.
-/// However, this is just the best guess. Even if we can't correctly differenciate between
+/// However, this is just the best guess. Even if we can't correctly differentiate between
 /// ilo5 with Gen10 vs ilo5 with Gen10+ or some other variant, we can still get/set bios settings.
 pub fn identify_hpe_machine_type() -> Result<IloDevice> {
     let client = RestClient::new(&find_lib_location()?);
@@ -357,7 +357,7 @@ fn remove_null_bytes(body: &[u8]) -> String {
     // CStr::from_bytes_with_nul fails if there are interior null bytes before the final one.
     // CStr::from_bytes_until_nul exists but its a nightly feature.
 
-    // Can't do body_str = body_str.trim_matches(char::from(0)).to_owned() either because apparantly
+    // Can't do body_str = body_str.trim_matches(char::from(0)).to_owned() either because apparently
     // the C lib is doing a buffer over-read and there are some random strings after the null bytes in ilo4.
 
     let body = String::from_utf8_lossy(body);

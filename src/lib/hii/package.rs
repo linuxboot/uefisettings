@@ -89,7 +89,7 @@ fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
 
     let mut used_bytes = db_cursor
         .stream_position()
-        .context("failed to find current positon of db_cursor")?;
+        .context("failed to find current position of db_cursor")?;
 
     while used_bytes < db_size {
         let package_list: PackageList = match db_cursor.read_ne() {
@@ -105,7 +105,7 @@ fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
 
         used_bytes = db_cursor
             .stream_position()
-            .context("failed to find current positon of db_cursor")?;
+            .context("failed to find current position of db_cursor")?;
         debug!("Current db_cursor stream position is {}", used_bytes);
     }
 
