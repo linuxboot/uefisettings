@@ -878,21 +878,22 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
             debug!("VarStore is {:?}", &parsed);
 
-            // We HAVE to ignore errors while reading varstores from /sys/firmware/efi/efivars/{name}-{guid}
-            // because the file might not exist even if the db says it does.
-            // In many cases it will not exist and we'll just use the default value instead.
-            // If we are running this in a virtual machine (or sandcastle) then /sys/firmware/efi/efivars won't exist.
-            // Or we might not have perms to read it but thats on the caller of the lib to make sure its okay.
+            if log::Level::Debug <= log::max_level() {
+                // We HAVE to ignore errors while reading varstores from /sys/firmware/efi/efivars/{name}-{guid}
+                // because the file might not exist even if the db says it does.
+                // In many cases it will not exist and we'll just use the default value instead.
+                // If we are running this in a virtual machine (or sandcastle) then /sys/firmware/efi/efivars won't exist.
+                // Or we might not have perms to read it but thats on the caller of the lib to make sure its okay.
 
-            // We're not saving these in the struct because we don't know how many there are - could take up a large amount of memory.
-            // For non debug uses we will only call this when we want to know the answer to a question.
-
-            match &parsed.read_bytes() {
-                Ok(b) => {
-                    debug!("Varstore bytes are {:?}", b);
-                }
-                Err(why) => {
-                    debug!("Failed to read uefi varstore {}", why);
+                // We're not saving these in the struct because we don't know how many there are - could take up a large amount of memory.
+                // For non debug uses we will only call this when we want to know the answer to a question.
+                match &parsed.read_bytes() {
+                    Ok(b) => {
+                        debug!("Varstore bytes are {:?}", b);
+                    }
+                    Err(why) => {
+                        debug!("Failed to read uefi varstore {}", why);
+                    }
                 }
             }
 
