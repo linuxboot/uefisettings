@@ -508,10 +508,7 @@ trait VariableStore {
         // * Seek to 4 + offset
         // * If checks pass, write your answer
 
-        // We have three layers of checks so as to not accidentially corrupt EFI vars.
-
-        // This file lock also obeyed by other internal s/w that touches EFI vars.
-        // https://www.internalfb.com/code/search?q=repo%3Afbcode%20%2Frun%2Flock%2Fefibootmgr-remount
+        // We have three layers of checks so as to not accidentally corrupt EFI vars.
 
         // The /run/lock/efibootmgr-remount lock will release automatically on drop.
         // If something errors out, doesn't matter since we are using the flock syscall to lock it.

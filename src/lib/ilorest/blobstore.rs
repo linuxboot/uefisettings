@@ -195,7 +195,7 @@ impl<'a> Transport<'a> {
             }
 
             // For reasons we don't know, HPE's python ilorest cli tool increases the header size by 4
-            // https://www.internalfb.com/code/fbsource/[d6af54e3d418]/third-party/pypi/python-ilorest-library/3.0.0/src/redfish/hpilo/risblobstore2.py?lines=239
+            // https://github.com/HewlettPackard/python-ilorest-library/blob/2028d9585a619f90ffb322d81197f793fdf45236/src/redfish/hpilo/risblobstore2.py#L287
             let new_read_size = response_header_blob_size + 4;
 
             let mut fragment_bytes_cursor = Cursor::new(&fragment_bytes);
