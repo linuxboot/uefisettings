@@ -1,0 +1,12 @@
+[package]
+name = "uefisettings_thrift_srcs"
+description = "Thrift source files of the uefisettings tool."
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+homepage = "https://github.com/linuxboot/uefisettings"
+include = ["*.thrift"]
+
+[[example]]
+name = "uefisettings_thrift_srcs"
+path = "*.thrift"
