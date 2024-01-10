@@ -1,0 +1,1 @@
+../../thrift/uefisettings_backend.thrift

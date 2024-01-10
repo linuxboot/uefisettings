@@ -1,0 +1,1 @@
+../../thrift/uefisettings_spellings_db.thrift
