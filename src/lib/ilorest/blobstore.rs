@@ -46,6 +46,7 @@ enum ResponseReceiveMode {
 /// so the user can make requests without worrying about fragmented reads/writes, packet handling, etc.
 /// Usage:
 /// ```no_run
+/// use fbthrift::Transport;
 /// let lib = get_lib("/usr/lib64/ilorest_chif.so")?;
 /// let ilo = IloRestChif::new(&lib)?;
 /// let transport = Transport::new(&ilo)?;

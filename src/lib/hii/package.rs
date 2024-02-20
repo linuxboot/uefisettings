@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
 use std::io::Seek;
 use std::rc::Rc;
 
@@ -253,7 +254,12 @@ mod tests {
 
     #[test]
     fn test_read_db_strings() {
-        let mut file = File::open("hardware/uefiset/dbdumps/hiidb.bin").unwrap();
+        let file_path = "testdata/hiidb.bin";
+        if !fs::metadata(file_path).is_ok() {
+            // The BIOS firmware we tested on was proprietary, thus I'm not sure we're allowed to share even the HiiDB. Keeping the test here for anybody how has the HiiDB this is tested on; or feel free to modify the test to use GALAGOPRO or any other free UEFI firmware.
+            return;
+        }
+        let mut file = File::open(file_path).unwrap();
         let mut file_contents = Vec::new();
         file.read_to_end(&mut file_contents).unwrap();
         let res = read_db(&file_contents).unwrap();
@@ -296,7 +302,12 @@ mod tests {
 
     #[test]
     fn test_read_db_forms() {
-        let mut file = File::open("hardware/uefiset/dbdumps/hiidb.bin").unwrap();
+        let file_path = "testdata/hiidb.bin";
+        if !fs::metadata(file_path).is_ok() {
+            // The BIOS firmware we tested on was proprietary, thus I'm not sure we're allowed to share even the HiiDB. Keeping the test here for anybody how has the HiiDB this is tested on; or feel free to modify the test to use GALAGOPRO or any other free UEFI firmware.
+            return;
+        }
+        let mut file = File::open(file_path).unwrap();
         let mut file_contents = Vec::new();
         file.read_to_end(&mut file_contents).unwrap();
         let res = read_db(&file_contents).unwrap();
