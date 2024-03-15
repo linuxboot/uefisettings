@@ -26,13 +26,13 @@ use clap::Subcommand;
 use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
-use uefisettings_spellings_db_thrift::consts::translation_db;
 use uefisettings::exports::identify_machine;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IloBackend;
 use uefisettings::exports::SettingsBackend;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
+use uefisettings_spellings_db_thrift::consts::translation_db;
 
 const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 

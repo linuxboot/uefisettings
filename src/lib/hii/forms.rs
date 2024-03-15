@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::fmt::format;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
@@ -427,7 +428,7 @@ pub enum Range {
 
 fn range_parser<R: Read + Seek>(
     reader: &mut R,
-	_endian: binrw::Endian,
+    _endian: binrw::Endian,
     args: (u8,),
 ) -> BinResult<Range> {
     match args.0 & 0x0Fu8 {
@@ -490,13 +491,16 @@ trait VariableStore {
     /// extract raw bytes from UEFI using the /sys virtual filesystem
     fn read_bytes(&self) -> Result<Vec<u8>> {
         // try to read data from varstore
-        let mut file = File::open(&self.store_filename())
-            .context("failed to open sysfs efivars to get varstore bytes")?;
+        let mut file = File::open(&self.store_filename()).context(format!(
+            "failed to open sysfs efivars '{}' to get varstore bytes",
+            self.store_filename()
+        ))?;
         let mut buf = vec![0u8; self.size().into()];
         // only read as much as we require
-        file.read_exact(&mut buf).context(
-            "failed to read bytes from sysfs efivars of size specified by varstore in hiidb",
-        )?;
+        file.read_exact(&mut buf).context(format!(
+            "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
+            self.store_filename()
+        ))?;
         Ok(buf)
     }
 
@@ -519,21 +523,29 @@ trait VariableStore {
         let store_filename = self.store_filename();
 
         let mut file_ro = File::open(&store_filename)
-            .context("Failed to open efivarfs file to get varstore bytes")?;
+            .context(format!("Failed to open efivarfs file '{}' to get varstore bytes", store_filename))?;
 
         let mut file_contents = Vec::new();
         file_ro
             .read_to_end(&mut file_contents)
-            .context("Failed to read efivarfs file")?;
+            .context(format!("Failed to read efivarfs file '{}'", store_filename))?;
 
         let mut cursor = Cursor::new(file_contents);
         cursor.seek(SeekFrom::Start(4 + offset as u64))?;
 
         match data {
-            TypeValue::NumSize8(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
-            TypeValue::NumSize16(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
-            TypeValue::NumSize32(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
-            TypeValue::NumSize64(v) => v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?,
+            TypeValue::NumSize8(v) => {
+                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
+            }
+            TypeValue::NumSize16(v) => {
+                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
+            }
+            TypeValue::NumSize32(v) => {
+                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
+            }
+            TypeValue::NumSize64(v) => {
+                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
+            }
             _ => {}
         }
 
@@ -713,7 +725,7 @@ pub enum TypeValue {
 
 fn type_value_parser<R: Read + Seek>(
     reader: &mut R,
-	_endian: binrw::Endian,
+    _endian: binrw::Endian,
     args: (u8,),
 ) -> BinResult<TypeValue> {
     match args.0 {
@@ -1180,12 +1192,12 @@ fn handle_checkbox(
 ) -> QuestionDescriptor {
     let mut answer = String::new();
     match &varstore {
-        Err(_) => {
-            answer.push_str("Unknown");
+        Err(e) => {
+            answer.push_str(format!("<VarStoreError: {}>", e).as_str());
         }
         Ok(vstore) => match vstore.read_bytes() {
-            Err(_) => {
-                answer.push_str("Unknown");
+            Err(e) => {
+                answer.push_str(format!("<VStoreError: {}>", e).as_str());
             }
             Ok(bytes) => {
                 // for a checkbox size should be of type u8
@@ -1193,7 +1205,7 @@ fn handle_checkbox(
                     extract_efi_data::<u8>(parsed.question_header().var_store_info, &bytes);
                 match answer_raw {
                     Ok(a) => answer.push_str(format!("{a}").as_str()),
-                    Err(_) => answer.push_str("Unknown"),
+                    Err(e) => answer.push_str(format!("ExtractEFIDataError: {}", e).as_str()),
                 }
             }
         },
@@ -1224,13 +1236,13 @@ fn handle_oneof(
     let mut chosen_value: u64 = 0;
     let mut varstore_not_found = false;
     match &varstore {
-        Err(_) => {
-            answer.push_str("Unknown");
+        Err(e) => {
+            answer.push_str(format!("<VarStoreError: {}>", e).as_str());
             varstore_not_found = true;
         }
         Ok(vstore) => match vstore.read_bytes() {
-            Err(_) => {
-                answer.push_str("Unknown");
+            Err(e) => {
+                answer.push_str(format!("<VStoreError: {}>", e).as_str());
                 varstore_not_found = true;
             }
             Ok(bytes) => match &parsed.data {
@@ -1265,44 +1277,44 @@ fn handle_oneof(
             },
         },
     }
+
     let mut possible_options = Vec::new();
-    if !varstore_not_found {
-        // Some of OneOf's children are OneOfOptions
+    // Some of OneOf's children are OneOfOptions
 
-        let mut found_option = false;
-        for child in &node.borrow().children {
-            match &child.borrow().parsed_data {
-                ParsedOperation::OneOfOption(o) => {
-                    let current_value: u64 = match o.value {
-                        TypeValue::NumSize8(c) => c as u64,
-                        TypeValue::NumSize16(c) => c as u64,
-                        TypeValue::NumSize32(c) => c as u64,
-                        TypeValue::NumSize64(c) => c as u64,
-                        _ => 0,
-                    };
+    let mut found_option = false;
+    for child in &node.borrow().children {
+        match &child.borrow().parsed_data {
+            ParsedOperation::OneOfOption(o) => {
+                let current_value: u64 = match o.value {
+                    TypeValue::NumSize8(c) => c as u64,
+                    TypeValue::NumSize16(c) => c as u64,
+                    TypeValue::NumSize32(c) => c as u64,
+                    TypeValue::NumSize64(c) => c as u64,
+                    _ => 0,
+                };
 
-                    let opt = AnswerOption {
-                        raw_value: o.value.clone(),
-                        value: find_corresponding_string(o.option_string_id, string_packages)
-                            .to_string(),
-                    };
+                let opt = AnswerOption {
+                    raw_value: o.value.clone(),
+                    value: find_corresponding_string(o.option_string_id, string_packages)
+                        .to_string(),
+                };
 
-                    if current_value == chosen_value && !found_option {
-                        found_option = true;
-                        answer.push_str(opt.value.trim());
-                        // cannot break here because we want to add all options to possible_options
-                    }
-
-                    possible_options.push(opt);
+                if !varstore_not_found && current_value == chosen_value && !found_option {
+                    found_option = true;
+                    answer.push_str(opt.value.trim());
+                    // cannot break here because we want to add all options to possible_options
                 }
-                _ => {}
+
+                possible_options.push(opt);
             }
+            _ => {}
         }
 
-        if !found_option {
-            answer.push_str("Unknown");
-        }
     }
+	if answer.is_empty() {
+		answer.push_str("Unknown");
+	}
+
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
         value: answer,
@@ -1332,12 +1344,12 @@ fn handle_numeric(
     let mut answer = String::new();
 
     match &varstore {
-        Err(_) => {
-            answer.push_str("Unknown");
+        Err(e) => {
+            answer.push_str(format!("<VarStoreError: {}>", e).as_str());
         }
         Ok(vstore) => match vstore.read_bytes() {
-            Err(_) => {
-                answer.push_str("Unknown");
+            Err(e) => {
+                answer.push_str(format!("<VStoreError: {}>", e).as_str());
             }
             Ok(bytes) => match &parsed.data {
                 Range::Range8(_) => {
@@ -1383,7 +1395,7 @@ where
     let extracted_data: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
     match extracted_data {
         Ok(a) => ans.push_str(format!("{a}").as_str()),
-        Err(_) => ans.push_str("Unknown"),
+        Err(e) => ans.push_str(format!("Error: {}", e).as_str()),
     }
 }
 
@@ -1464,12 +1476,12 @@ pub fn display(
 
 
             match varstore {
-                Err(_) => {
-                    answer_disp.push_str("Unknown");
+                Err(e) => {
+                    answer_disp.push_str(format!("<VarStoreError: {}>", e).as_str());
                 }
                 Ok(vstore) => match vstore.read_bytes() {
-                    Err(_) => {
-                        answer_disp.push_str("Unknown");
+                    Err(e) => {
+						answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
                     },
                     Ok(bytes) => match &parsed.data {
                         Range::Range8(_) => {
@@ -1511,12 +1523,12 @@ pub fn display(
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
                 match varstore {
-                    Err(_) => {
-                        answer_disp.push_str("Unknown");
+                    Err(e) => {
+						answer_disp.push_str(format!("<VarStoreError: {}>", e).as_str());
                     }
                     Ok(vstore) => match vstore.read_bytes() {
-                        Err(_) => {
-                            answer_disp.push_str("Unknown");
+                        Err(e) => {
+							answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
                         }
                         Ok(bytes) => match &parsed.data {
                             Range::Range8(_) => {
@@ -1559,12 +1571,12 @@ pub fn display(
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
 
                 match varstore {
-                    Err(_) => {
-                        answer_disp.push_str("Unknown");
+                    Err(e) => {
+						answer_disp.push_str(format!("<VarStoreError: {}>", e).as_str());
                     }
                     Ok(vstore) => match vstore.read_bytes() {
-                        Err(_) => {
-                            answer_disp.push_str("Unknown");
+                        Err(e) => {
+							answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
                         },
                         Ok(bytes) => {
                             // for a checkbox size should be of type u8
