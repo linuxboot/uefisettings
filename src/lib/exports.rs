@@ -569,7 +569,7 @@ impl SettingsBackend for IloBackend {
 }
 
 /// auto-identify backend and get hardware/bios-information
-pub fn identify_machine() -> Result<MachineInfo> {
+pub fn identify_machine() -> MachineInfo {
     let mut backend = BTreeSet::new();
 
     if Path::new(extract::OCP_HIIDB_PATH).exists() {
@@ -581,12 +581,12 @@ pub fn identify_machine() -> Result<MachineInfo> {
     }
 
     if backend.is_empty() {
-        return Err(anyhow!("Cannot identify backend"));
+        backend.insert(Backend::Unknown);
     } else {
         debug!("Supported Backends: {:?}", backend);
     }
 
-    let resp = MachineInfo {
+    MachineInfo {
         backend,
         // the entries in /sys/class/dmi/id/ are plaintext and populated by the kernel
         bios_vendor: read_file_contents(Path::new("/sys/class/dmi/id/bios_vendor")),
@@ -597,9 +597,7 @@ pub fn identify_machine() -> Result<MachineInfo> {
         product_family: read_file_contents(Path::new("/sys/class/dmi/id/product_family")),
         product_version: read_file_contents(Path::new("/sys/class/dmi/id/product_version")),
         ..Default::default()
-    };
-
-    Ok(resp)
+    }
 }
 
 /// read_file_contents is a wrapper over std::fs::read_to_string but it

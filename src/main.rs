@@ -249,11 +249,14 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             }
         },
         Commands::Identify { json } => {
-            let res = identify_machine()?;
-            print_with_style(res, *json);
+            let machine = identify_machine();
+            print_with_style(machine, *json);
         }
         Commands::Get { question, json } => {
-            let machine = identify_machine()?;
+            let machine = identify_machine();
+            if machine.backend.contains(&Backend::Unknown) {
+                return Err(anyhow!("unknown backend"));
+            }
             if prioritize_backend(&machine, *json) == Backend::Ilo {
                 let res = IloBackend::get(question, None)?;
                 print_with_style(res, *json);
@@ -267,7 +270,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             value,
             json,
         } => {
-            let machine = identify_machine()?;
+            let machine = identify_machine();
+            if machine.backend.contains(&Backend::Unknown) {
+                return Err(anyhow!("unknown backend"));
+            }
             if prioritize_backend(&machine, *json) == Backend::Ilo {
                 let res = IloBackend::set(question, value, None)?;
                 print_with_style(res, *json);
@@ -289,7 +295,7 @@ fn prioritize_backend(machine: &MachineInfo, json: bool) -> Backend {
         println!("Using the Ilo backend");
     }
     // ilo is prioritized because its more structured than hii if there are multiple supported backends
-    // identify_machine will error out if there are no backends so we can be sure that it has at least 1
+    // only those two are supported for now
     if machine.backend.contains(&Backend::Ilo) {
         Backend::Ilo
     } else {
