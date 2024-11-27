@@ -11,21 +11,21 @@ name = "uefisettings"
 path = "src/lib/lib.rs"
 
 [dependencies]
-uefisettings_backend_thrift = { path = "thrift/rust/uefisettings_backend_thrift", version = ">=0.1.0" }
-uefisettings_spellings_db_thrift = { path = "thrift/rust/uefisettings_spellings_db_thrift", version = ">=0.1.0" }
-anyhow = ">=1.0"
+uefisettings_backend_thrift = { path = "thrift/rust/uefisettings_backend_thrift", version = "0.1.0" }
+uefisettings_spellings_db_thrift = { path = "thrift/rust/uefisettings_spellings_db_thrift", version = "0.1.0" }
+anyhow = "1.0"
 fbthrift = ">=0.0"
-clap = { package = "clap", version = ">=3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
-log = { version = ">=0.4", features = ["kv_unstable", "kv_unstable_std"] }
-serde = { version = ">=1.0", features = ["derive", "rc"]}
-serde_json = { version = ">=1.0", features = ["float_roundtrip", "unbounded_depth"] }
-nix = { version = ">=0.26", features = ["fs", "ioctl", "mount"] }
-tempfile = ">=3.5"
-libloading = ">=0.8"
-httparse = ">=1.8"
-binrw = ">=0.10"
-rand = { version = ">=0.8", features = ["small_rng"] }
-proc-mounts = ">=0.3"
-thiserror = ">=1.0"
-env_logger = ">=0.10"
+clap = { package = "clap", version = "3.2.25", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+log = { version = "0.4", features = ["kv_unstable", "kv_unstable_std"] }
+serde = { version = "1.0", features = ["derive", "rc"]}
+serde_json = { version = "1.0", features = ["float_roundtrip", "unbounded_depth"] }
+nix = { version = "0.27", features = ["fs", "ioctl", "mount"] }
+tempfile = "3.5"
+libloading = "0.8"
+httparse = "1.8"
+binrw = "0.13"
+rand = { version = "0.8", features = ["small_rng"] }
+proc-mounts = "0.3"
+thiserror = "1.0"
+env_logger = "0.10"
 
