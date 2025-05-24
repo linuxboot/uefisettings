@@ -4,7 +4,6 @@
 #![recursion_limit = "100000000"]
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, unused_crate_dependencies)]
 
-pub use self::errors::*;
 pub use self::types::*;
 
 /// Thrift type definitions for `uefisettings_backend`.

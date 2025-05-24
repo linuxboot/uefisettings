@@ -14,7 +14,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
-use std::fmt::format;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;

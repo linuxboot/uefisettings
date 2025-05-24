@@ -5,7 +5,6 @@
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, unused_crate_dependencies)]
 
 pub use self::consts::*;
-pub use self::errors::*;
 pub use self::types::*;
 
 /// Constant definitions for `uefisettings_spellings_db`.

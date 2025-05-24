@@ -13,7 +13,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
 use std::io::Seek;
 use std::rc::Rc;
 
