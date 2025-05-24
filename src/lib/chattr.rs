@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::ffi::c_long;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -26,7 +27,7 @@ const FS_IOC_GETFLAGS: u8 = 1;
 const FS_IOC_SETFLAGS: u8 = 2;
 
 // full list of flags https://github.com/torvalds/linux/blob/master/include/uapi/linux/fs.h#L239
-pub const FS_IMMUTABLE_FL: i64 = 0x00000010; // Immutable file
+pub const FS_IMMUTABLE_FL: i32 = 0x00000010; // Immutable file
 
 nix::ioctl_read!(
     ioctl_fs_get_attrs,
@@ -43,7 +44,7 @@ nix::ioctl_write_ptr!(
 );
 
 /// returns all extended fs attributes for the given path as a set of bit flags
-pub fn get_all_attrs(path: impl AsRef<Path>) -> Result<i64> {
+pub fn get_all_attrs(path: impl AsRef<Path>) -> Result<i32> {
     let path = path.as_ref();
     let file = OpenOptions::new()
         .write(false)
@@ -54,21 +55,19 @@ pub fn get_all_attrs(path: impl AsRef<Path>) -> Result<i64> {
             path.to_string_lossy()
         ))?;
     let fd = file.as_raw_fd();
-    let mut attrs = 0i64;
-    // SAFETY c_long is guaranteed to be i32 or i64 (https://doc.rust-lang.org/std/os/raw/type.c_long.html)
-    // This tool is linux specific and do not support 32bit systems, so we can assume that it's always i64
-    let attrs_ptr = &mut attrs as *mut i64;
+    let mut attrs: c_long = 0;
+    let attrs_ptr = &mut attrs as *mut c_long;
 
     unsafe {
         ioctl_fs_get_attrs(fd, attrs_ptr).context("ioctl failed")?;
     }
 
-    Ok(attrs)
+    Ok(attrs as i32)
 }
 
 /// writes extended fs attributes for the given path as a set of bit flags
 /// all existing attributes will be overwritten
-pub fn set_all_attrs(path: impl AsRef<Path>, attrs: i64) -> Result<()> {
+pub fn set_all_attrs(path: impl AsRef<Path>, attrs: i32) -> Result<()> {
     let path = path.as_ref();
     let file = OpenOptions::new()
         .write(false)
@@ -79,10 +78,8 @@ pub fn set_all_attrs(path: impl AsRef<Path>, attrs: i64) -> Result<()> {
             path.to_string_lossy()
         ))?;
     let fd = file.as_raw_fd();
-    let mut tmp = attrs;
-    // SAFETY c_long is guaranteed to be i32 or i64 (https://doc.rust-lang.org/std/os/raw/type.c_long.html)
-    // This tool is linux specific and do not support 32bit systems, so we can assume that it's always i64
-    let attrs_ptr = &mut tmp as *mut i64;
+    let mut tmp = attrs as c_long;
+    let attrs_ptr = &mut tmp as *mut c_long;
     unsafe {
         ioctl_fs_set_attrs(fd, attrs_ptr).context("ioctl failed")?;
     }
@@ -127,7 +124,7 @@ macro_rules! clear_attrs {
 
 pub struct EfivarsImmutabilityGuard {
     path: PathBuf,
-    attrs_before_writing: i64,
+    attrs_before_writing: i32,
 }
 
 impl EfivarsImmutabilityGuard {
@@ -180,7 +177,7 @@ pub mod tests {
 
     use super::*;
     //in the tests we expect that FS_NODUMP_FL is initially cleared, might be a weak assumption..
-    pub const FS_NODUMP_FL: i64 = 0x00000040; // do not dump file
+    pub const FS_NODUMP_FL: i32 = 0x00000040; // do not dump file
     #[test]
     fn test_get_all_attrs() -> Result<()> {
         let test_file = tempfile::NamedTempFile::new().expect("Failed to create test file");
