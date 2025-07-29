@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::env::var;
 use std::fmt;
 use std::fmt::format;
 use std::fmt::Display;
@@ -496,6 +497,7 @@ trait VariableStore {
             self.store_filename()
         ))?;
         let mut buf = vec![0u8; self.size().into()];
+        debug!("buffer size: {}",self.size());
         // only read as much as we require
         file.read_exact(&mut buf).context(format!(
             "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
@@ -1233,7 +1235,7 @@ fn handle_oneof(
     current_node: &std::cell::Ref<IFROperation>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
-    let mut chosen_value: u64 = 0;
+    let mut chosen_value: u64 = u64::MAX;
     let mut varstore_not_found = false;
     match &varstore {
         Err(e) => {
@@ -1278,6 +1280,18 @@ fn handle_oneof(
         },
     }
 
+    if chosen_value == u64::MAX {
+        // No answer was provided, so using the default value instead.
+        for child in &node.borrow().children {
+            match &child.borrow().parsed_data {
+                ParsedOperation::IFRDefault(o) => {
+                    chosen_value = u64::from(o.default_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut possible_options = Vec::new();
     // Some of OneOf's children are OneOfOptions
 
@@ -1309,7 +1323,6 @@ fn handle_oneof(
             }
             _ => {}
         }
-
     }
 	if answer.is_empty() {
 		answer.push_str("Unknown");
@@ -1392,10 +1405,11 @@ where
     T: BinRead + Display,
     for<'a> <T as BinRead>::Args<'a>: Default,
 {
-    let extracted_data: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
+    let offset = question_header.var_store_info;
+    let extracted_data: Result<T> = extract_efi_data(offset, bytes);
     match extracted_data {
         Ok(a) => ans.push_str(format!("{a}").as_str()),
-        Err(e) => ans.push_str(format!("Error: {}", e).as_str()),
+        Err(e) => ans.push_str(format!("<ExtractEFIDataError: {} (offset: {}; buflen: {})>", e, offset, bytes.len()).as_str())
     }
 }
 
@@ -1474,14 +1488,13 @@ pub fn display(
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
 
-
             match varstore {
                 Err(e) => {
                     answer_disp.push_str(format!("<VarStoreError: {}>", e).as_str());
                 }
                 Ok(vstore) => match vstore.read_bytes() {
                     Err(e) => {
-						answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
+                        answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
                     },
                     Ok(bytes) => match &parsed.data {
                         Range::Range8(_) => {
