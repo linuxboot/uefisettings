@@ -16,6 +16,7 @@ use std::fmt;
 use std::fs;
 use std::io::Seek;
 use std::rc::Rc;
+use std::io::Read;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -93,6 +94,25 @@ fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
         .context("failed to find current position of db_cursor")?;
 
     while used_bytes < db_size {
+        // Stop parsing if fewer than 20 bytes remain — not enough for a package list header.
+        // Also handle trailing padding (all 0x00 or 0xFF), which isn't a valid package list.
+        let remaining = (db_size - used_bytes) as usize;
+
+        if remaining < 20 {
+            debug!("Less than 20 bytes remaining, stopping parse.");
+            break;
+        }
+
+        let mut header_buf = [0u8; 20];
+        db_cursor.read_exact(&mut header_buf)?;
+        db_cursor.seek(SeekFrom::Current(-20))?; // rewind
+
+        let looks_like_padding = header_buf.iter().all(|&b| b == 0x00 || b == 0xFF);
+        if looks_like_padding {
+            debug!("Padding detected at offset {}, stopping parse.", used_bytes);
+            break;
+        }
+        
         let package_list: PackageList = match db_cursor.read_ne() {
             Err(why) => {
                 error!("Can't parse more package lists: {}", why);
