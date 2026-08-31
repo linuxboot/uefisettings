@@ -44,6 +44,7 @@ use crate::hii::package::Guid;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
+const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
 
 fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; EFIVARFS_HEADER_SIZE + payload_size];
@@ -305,6 +306,7 @@ pub enum ParsedOperation {
     CheckBox(CheckBox),
     OneOfOption(OneOfOption),
     VarStore(VarStore),
+    VarStoreNameValue(VarStoreNameValue),
     VarStoreEfi(VarStoreEfi),
     DefaultStore(DefaultStore),
     IFRDefault(IFRDefault),
@@ -487,6 +489,8 @@ trait VariableStore {
     fn name(&self) -> String;
     fn guid(&self) -> String;
     fn size(&self) -> u16;
+    fn kind(&self) -> VariableStoreKind;
+    fn is_runtime_accessible(&self) -> bool;
 
     fn store_filename(&self) -> String {
         format!(
@@ -498,6 +502,12 @@ trait VariableStore {
 
     /// extract raw bytes from UEFI using the /sys virtual filesystem
     fn read_bytes(&self) -> Result<Vec<u8>> {
+        if self.kind() == VariableStoreKind::EfiVariable && !self.is_runtime_accessible() {
+            return Err(anyhow!(
+                "EFI variable is boot-service-only and is not readable from efivarfs"
+            ));
+        }
+
         // try to read data from varstore
         let mut file = File::open(&self.store_filename()).context(format!(
             "failed to open sysfs efivars '{}' to get varstore bytes",
@@ -513,6 +523,16 @@ trait VariableStore {
     }
 
     fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+        if self.kind() == VariableStoreKind::EfiVariable && !self.is_runtime_accessible() {
+            return Err(anyhow!(
+                "EFI variable is boot-service-only and cannot be written through efivarfs"
+            ));
+        }
+
+        self.write_efivarfs_at_offset(offset, data)
+    }
+
+    fn write_efivarfs_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
         // Steps:
         // * Read bytes
         // * Seek to 4 + offset
@@ -575,6 +595,272 @@ trait VariableStore {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum VariableStoreKind {
+    Buffer,
+    EfiVariable,
+}
+
+#[cfg(test)]
+mod non_efi_varstore_tests {
+    use super::*;
+
+    struct TestVariableStore {
+        kind: VariableStoreKind,
+    }
+
+    struct FileBackedBufferVarStore {
+        path: String,
+        size: u16,
+    }
+
+    impl VariableStore for TestVariableStore {
+        fn name(&self) -> String {
+            "TestVarStore".to_string()
+        }
+
+        fn guid(&self) -> String {
+            "00000000-0000-0000-0000-000000000000".to_string()
+        }
+
+        fn size(&self) -> u16 {
+            1
+        }
+
+        fn kind(&self) -> VariableStoreKind {
+            self.kind
+        }
+
+        fn is_runtime_accessible(&self) -> bool {
+            self.kind == VariableStoreKind::EfiVariable
+        }
+
+        fn read_bytes(&self) -> Result<Vec<u8>> {
+            Err(anyhow!("simulated efivarfs read failure"))
+        }
+
+        fn write_efivarfs_at_offset(&self, _offset: u16, _data: TypeValue) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl VariableStore for FileBackedBufferVarStore {
+        fn name(&self) -> String {
+            "TestBufferVarStore".to_string()
+        }
+
+        fn guid(&self) -> String {
+            "00000000-0000-0000-0000-000000000000".to_string()
+        }
+
+        fn size(&self) -> u16 {
+            self.size
+        }
+
+        fn kind(&self) -> VariableStoreKind {
+            VariableStoreKind::Buffer
+        }
+
+        fn is_runtime_accessible(&self) -> bool {
+            false
+        }
+
+        fn store_filename(&self) -> String {
+            self.path.clone()
+        }
+    }
+
+    fn efi_varstore(attributes: u32) -> VarStoreEfi {
+        VarStoreEfi {
+            var_store_id: 1,
+            guid: Guid {
+                data1: 0,
+                data2: 0,
+                data3: 0,
+                data4: [0; 8],
+            },
+            attributes,
+            size: 1,
+            name: "TestVarStore".into(),
+        }
+    }
+
+    #[test]
+    fn boot_service_only_varstore_is_reported_as_unavailable() {
+        for attributes in [0x2, 0x3] {
+            let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(efi_varstore(attributes)));
+
+            assert_eq!(
+                read_current_value_bytes(&varstore).unwrap_err(),
+                "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_service_only_varstore_read_is_rejected() {
+        for attributes in [0x2, 0x3] {
+            assert_eq!(
+                efi_varstore(attributes).read_bytes().unwrap_err().to_string(),
+                "EFI variable is boot-service-only and is not readable from efivarfs"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_service_only_varstore_write_is_rejected() {
+        for attributes in [0x2, 0x3] {
+            assert_eq!(
+                efi_varstore(attributes)
+                    .write_at_offset(0, TypeValue::NumSize8(1))
+                    .unwrap_err()
+                    .to_string(),
+                "EFI variable is boot-service-only and cannot be written through efivarfs"
+            );
+        }
+    }
+
+    #[test]
+    fn efi_varstore_runtime_access_does_not_require_nonvolatile_storage() {
+        for attributes in [0x6, 0x7] {
+            let varstore = efi_varstore(attributes);
+
+            assert_eq!(varstore.kind(), VariableStoreKind::EfiVariable);
+            assert!(varstore.is_runtime_accessible());
+        }
+    }
+
+    #[test]
+    fn runtime_varstore_read_failure_remains_an_error() {
+        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(TestVariableStore {
+            kind: VariableStoreKind::EfiVariable,
+        }));
+
+        assert_eq!(
+            read_current_value_bytes(&varstore).unwrap_err(),
+            "<VStoreError: simulated efivarfs read failure>"
+        );
+    }
+
+    #[test]
+    fn buffer_varstore_with_efivarfs_backing_is_read() {
+        let bytes = vec![0x07, 0x00, 0x00, 0x00, 0x01];
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(FileBackedBufferVarStore {
+            path: file.path().to_string_lossy().into_owned(),
+            size: 1,
+        }));
+
+        assert_eq!(read_current_value_bytes(&varstore).unwrap(), bytes);
+    }
+
+    #[test]
+    fn buffer_varstore_without_efivarfs_backing_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(FileBackedBufferVarStore {
+            path: directory
+                .path()
+                .join("missing-efivarfs-variable")
+                .to_string_lossy()
+                .into_owned(),
+            size: 1,
+        }));
+
+        assert_eq!(
+            read_current_value_bytes(&varstore).unwrap_err(),
+            "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
+        );
+    }
+
+    #[test]
+    fn question_without_varstore_is_reported_as_unavailable() {
+        let node = Rc::new(RefCell::new(IFROperation {
+            op_code: IFROpCode::Unknown(DUMMY_OPCODE),
+            length: 0,
+            open_scope: false,
+            data: Vec::new(),
+            parent: None,
+            children: Vec::new(),
+            parsed_data: ParsedOperation::Placeholder,
+        }));
+
+        let error = find_corresponding_varstore(node, 0).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "question is callback-driven or temporary and has no varstore"
+        );
+    }
+
+    #[test]
+    fn change_value_allows_buffer_varstore_with_efivarfs_backing() {
+        let question = QuestionDescriptor {
+            question: "SHA-1 PCR Bank".to_string(),
+            help: String::new(),
+            value: "Disabled".to_string(),
+            max_value: RangeType::NumSize8(1),
+            opcode: IFROpCode::OneOf,
+            possible_options: vec![AnswerOption {
+                value: "Enabled".to_string(),
+                raw_value: TypeValue::NumSize8(1),
+            }],
+            header: QuestionHeader {
+                prompt_string_id: 0,
+                help_string_id: 0,
+                question_id: 0,
+                var_store_id: 1,
+                var_store_info: 0,
+                question_flags: 0,
+            },
+            varstore: Some(Box::new(TestVariableStore {
+                kind: VariableStoreKind::Buffer,
+            })),
+        };
+
+        assert!(change_value(&question, "Enabled").unwrap());
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+            .unwrap_or(false)
+    })
+}
+
+fn read_current_value_bytes(
+    varstore: &Result<Box<dyn VariableStore>>,
+) -> std::result::Result<Vec<u8>, String> {
+    match varstore {
+        Err(error) => Err(format!("<ValueUnavailable: {}>", error)),
+        Ok(varstore) => {
+            if varstore.kind() == VariableStoreKind::EfiVariable
+                && !varstore.is_runtime_accessible()
+            {
+                return Err(
+                    "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>"
+                        .to_string(),
+                );
+            }
+
+            match varstore.read_bytes() {
+                Ok(bytes) => Ok(bytes),
+                Err(error)
+                    if varstore.kind() == VariableStoreKind::Buffer && is_not_found(&error) =>
+                {
+                    Err(
+                        "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
+                            .to_string(),
+                    )
+                }
+                Err(error) => Err(format!("<VStoreError: {}>", error)),
+            }
+        }
+    }
+}
+
 #[derive(BinRead, Debug, PartialEq, Clone)]
 #[br(little)]
 pub struct VarStore {
@@ -582,6 +868,13 @@ pub struct VarStore {
     pub var_store_id: u16,
     pub size: u16,
     pub name: binrw::NullString,
+}
+
+#[derive(BinRead, Debug, PartialEq, Clone)]
+#[br(little)]
+pub struct VarStoreNameValue {
+    pub var_store_id: u16,
+    pub guid: Guid,
 }
 
 impl VariableStore for VarStore {
@@ -593,6 +886,12 @@ impl VariableStore for VarStore {
     }
     fn size(&self) -> u16 {
         self.size
+    }
+    fn kind(&self) -> VariableStoreKind {
+        VariableStoreKind::Buffer
+    }
+    fn is_runtime_accessible(&self) -> bool {
+        false
     }
 }
 
@@ -614,6 +913,12 @@ impl VariableStore for VarStoreEfi {
     }
     fn size(&self) -> u16 {
         self.size
+    }
+    fn kind(&self) -> VariableStoreKind {
+        VariableStoreKind::EfiVariable
+    }
+    fn is_runtime_accessible(&self) -> bool {
+        (self.attributes & EFI_VARIABLE_RUNTIME_ACCESS) != 0
     }
 }
 
@@ -916,6 +1221,13 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
             node.parsed_data = ParsedOperation::VarStore(parsed);
         }
+        IFROpCode::VarStoreNameValue => {
+            let parsed: VarStoreNameValue = data_cursor
+                .read_ne()
+                .context("Failed to parse VarStoreNameValue's data")?;
+            debug!("VarStoreNameValue is {:?}", parsed);
+            node.parsed_data = ParsedOperation::VarStoreNameValue(parsed);
+        }
         IFROpCode::VarStoreEfi => {
             // this is implemented in hiilib and the docs for this are relatively clear
             // so I implemented this but I haven't seen it being used anywhere in the dbdumps I have
@@ -1199,24 +1511,17 @@ fn handle_checkbox(
     current_node: &std::cell::Ref<IFROperation>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
-    match &varstore {
-        Err(e) => {
-            answer.push_str(format!("<VarStoreError: {}>", e).as_str());
+    match read_current_value_bytes(&varstore) {
+        Err(reason) => answer.push_str(&reason),
+        Ok(bytes) => {
+            // for a checkbox size should be of type u8
+            let answer_raw: Result<u8> =
+                extract_efi_data::<u8>(parsed.question_header().var_store_info, &bytes);
+            match answer_raw {
+                Ok(a) => answer.push_str(format!("{a}").as_str()),
+                Err(e) => answer.push_str(format!("ExtractEFIDataError: {}", e).as_str()),
+            }
         }
-        Ok(vstore) => match vstore.read_bytes() {
-            Err(e) => {
-                answer.push_str(format!("<VStoreError: {}>", e).as_str());
-            }
-            Ok(bytes) => {
-                // for a checkbox size should be of type u8
-                let answer_raw: Result<u8> =
-                    extract_efi_data::<u8>(parsed.question_header().var_store_info, &bytes);
-                match answer_raw {
-                    Ok(a) => answer.push_str(format!("{a}").as_str()),
-                    Err(e) => answer.push_str(format!("ExtractEFIDataError: {}", e).as_str()),
-                }
-            }
-        },
     }
     let res = QuestionDescriptor {
         question: question.to_string(),
@@ -1243,46 +1548,40 @@ fn handle_oneof(
     let mut answer = String::new();
     let mut chosen_value: u64 = u64::MAX;
     let mut varstore_not_found = false;
-    match &varstore {
-        Err(e) => {
-            answer.push_str(format!("<VarStoreError: {}>", e).as_str());
+    match read_current_value_bytes(&varstore) {
+        Err(reason) => {
+            answer.push_str(&reason);
             varstore_not_found = true;
         }
-        Ok(vstore) => match vstore.read_bytes() {
-            Err(e) => {
-                answer.push_str(format!("<VStoreError: {}>", e).as_str());
-                varstore_not_found = true;
+        Ok(bytes) => match &parsed.data {
+            Range::Range8(_) => {
+                try_read_answer_as_option::<u8>(
+                    &parsed.question_header(),
+                    &bytes,
+                    &mut chosen_value,
+                );
             }
-            Ok(bytes) => match &parsed.data {
-                Range::Range8(_) => {
-                    try_read_answer_as_option::<u8>(
-                        &parsed.question_header(),
-                        &bytes,
-                        &mut chosen_value,
-                    );
-                }
-                Range::Range16(_) => {
-                    try_read_answer_as_option::<u16>(
-                        &parsed.question_header(),
-                        &bytes,
-                        &mut chosen_value,
-                    );
-                }
-                Range::Range32(_) => {
-                    try_read_answer_as_option::<u32>(
-                        &parsed.question_header(),
-                        &bytes,
-                        &mut chosen_value,
-                    );
-                }
-                Range::Range64(_) => {
-                    try_read_answer_as_option::<u64>(
-                        &parsed.question_header(),
-                        &bytes,
-                        &mut chosen_value,
-                    );
-                }
-            },
+            Range::Range16(_) => {
+                try_read_answer_as_option::<u16>(
+                    &parsed.question_header(),
+                    &bytes,
+                    &mut chosen_value,
+                );
+            }
+            Range::Range32(_) => {
+                try_read_answer_as_option::<u32>(
+                    &parsed.question_header(),
+                    &bytes,
+                    &mut chosen_value,
+                );
+            }
+            Range::Range64(_) => {
+                try_read_answer_as_option::<u64>(
+                    &parsed.question_header(),
+                    &bytes,
+                    &mut chosen_value,
+                );
+            }
         },
     }
 
@@ -1362,28 +1661,21 @@ fn handle_numeric(
 ) -> QuestionDescriptor {
     let mut answer = String::new();
 
-    match &varstore {
-        Err(e) => {
-            answer.push_str(format!("<VarStoreError: {}>", e).as_str());
-        }
-        Ok(vstore) => match vstore.read_bytes() {
-            Err(e) => {
-                answer.push_str(format!("<VStoreError: {}>", e).as_str());
+    match read_current_value_bytes(&varstore) {
+        Err(reason) => answer.push_str(&reason),
+        Ok(bytes) => match &parsed.data {
+            Range::Range8(_) => {
+                try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer)
             }
-            Ok(bytes) => match &parsed.data {
-                Range::Range8(_) => {
-                    try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer)
-                }
-                Range::Range16(_) => {
-                    try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer)
-                }
-                Range::Range32(_) => {
-                    try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer)
-                }
-                Range::Range64(_) => {
-                    try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer)
-                }
-            },
+            Range::Range16(_) => {
+                try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer)
+            }
+            Range::Range32(_) => {
+                try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer)
+            }
+            Range::Range64(_) => {
+                try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer)
+            }
         },
     }
     let res = QuestionDescriptor {
@@ -1474,6 +1766,13 @@ pub fn display(
                 "{extra_spaces}OpCode: {:?} - Name: {}\n",
                 current_node.op_code,
                 parsed.name.to_string(),
+            )
+            .as_str(),
+        ),
+        ParsedOperation::VarStoreNameValue(parsed) => result.push_str(
+            format!(
+                "{extra_spaces}OpCode: {:?} - Id: {} - Guid: {}\n",
+                current_node.op_code, parsed.var_store_id, parsed.guid,
             )
             .as_str(),
         ),
@@ -1753,6 +2052,12 @@ fn find_corresponding_varstore(
     node: Rc<RefCell<IFROperation>>,
     var_store_id: u16,
 ) -> Result<Box<dyn VariableStore>> {
+    if var_store_id == 0 {
+        return Err(anyhow!(
+            "question is callback-driven or temporary and has no varstore"
+        ));
+    }
+
     let current_node = node.borrow();
 
     if current_node.op_code == IFROpCode::FormSet {
@@ -1770,10 +2075,20 @@ fn find_corresponding_varstore(
                         return Ok(Box::new(v.clone()));
                     }
                 }
+                ParsedOperation::VarStoreNameValue(v) => {
+                    if v.var_store_id == var_store_id {
+                        return Err(anyhow!(
+                            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
-        return Err(anyhow!("no varstore with matching id found"));
+        return Err(anyhow!(
+            "no supported varstore with matching id {:#06x} found",
+            var_store_id
+        ));
     }
 
     match current_node.parent.as_ref() {
