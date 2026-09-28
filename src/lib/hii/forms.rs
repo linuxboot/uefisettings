@@ -43,6 +43,13 @@ use crate::hii::efivarfs::EfivarsMountGuard;
 use crate::hii::package::Guid;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
+const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
+
+fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; EFIVARFS_HEADER_SIZE + payload_size];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
 
 // UEFI Spec v2.9 Page 1844
 #[derive(BinRead, Debug, PartialEq, Copy, Clone)]
@@ -496,10 +503,9 @@ trait VariableStore {
             "failed to open sysfs efivars '{}' to get varstore bytes",
             self.store_filename()
         ))?;
-        let mut buf = vec![0u8; self.size().into()];
-        debug!("buffer size: {}",self.size());
-        // only read as much as we require
-        file.read_exact(&mut buf).context(format!(
+        debug!("buffer size: {}", self.size());
+        // efivarfs prepends a 4-byte attributes field to the variable payload.
+        let buf = read_efivarfs_bytes(&mut file, self.size().into()).context(format!(
             "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
             self.store_filename()
         ))?;
@@ -1797,4 +1803,22 @@ where
     let answer: T = cursor.read_ne()?;
 
     Ok(answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_efivarfs_bytes_includes_attributes_and_complete_payload() {
+        let payload = 95u16.to_le_bytes();
+        let mut efivarfs_data = 7u32.to_le_bytes().to_vec();
+        efivarfs_data.extend_from_slice(&payload);
+
+        let mut reader = Cursor::new(&efivarfs_data);
+        let bytes = read_efivarfs_bytes(&mut reader, payload.len()).unwrap();
+
+        assert_eq!(bytes, efivarfs_data);
+        assert_eq!(extract_efi_data::<u16>(0, &bytes).unwrap(), 95);
+    }
 }
