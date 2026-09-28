@@ -939,6 +939,7 @@ dependencies = [
  "env_logger",
  "fbthrift",
  "httparse",
+ "libc",
  "libloading",
  "log",
  "nix",

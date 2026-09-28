@@ -11,6 +11,7 @@ name = "uefisettings"
 path = "src/lib/lib.rs"
 
 [dependencies]
+libc = "0.2"
 uefisettings_backend_thrift = { path = "thrift/rust/uefisettings_backend_thrift", version = "0.1.0" }
 uefisettings_spellings_db_thrift = { path = "thrift/rust/uefisettings_spellings_db_thrift", version = "0.1.0" }
 anyhow = "1.0"
