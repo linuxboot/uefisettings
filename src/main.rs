@@ -12,6 +12,7 @@
 
 use std::fmt::Debug;
 use std::fs::File;
+use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
@@ -177,7 +178,11 @@ fn main() -> Result<()> {
     let args = UefiSettingsToolArgs::parse();
 
     if let Err(why) = handle_cmds(args) {
-        print_with_style(
+        if is_broken_pipe(&why) {
+            return Ok(());
+        }
+
+        let _ = print_with_style(
             uefisettings_backend_thrift::Error {
                 error_message: format!("{:#}", why),
                 ..Default::default()
@@ -196,7 +201,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
         Commands::Hii(hii_command) => match &hii_command.command {
             HiiSubcommands::Get { question, json } => {
                 let res = HiiBackend::get(question, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
             HiiSubcommands::Set {
                 question,
@@ -204,32 +209,35 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 json,
             } => {
                 let res = HiiBackend::set(question, value, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
             HiiSubcommands::ShowIFR { filename } => {
                 let res = HiiBackend::show_ifr(&get_db_dump_bytes(filename.as_deref())?)?;
-                println!("{}", res.readable_representation);
+                print_line(format_args!("{}", res.readable_representation))?;
             }
             HiiSubcommands::ExtractDB { filename } => {
                 let mut file = File::create(filename)?;
                 let res = HiiBackend::extract_db()?;
                 file.write_all(&res.db)?;
 
-                println!("{{\"info\": \"HiiDB written to {:?}\"}}", &filename);
+                print_line(format_args!(
+                    "{{\"info\": \"HiiDB written to {:?}\"}}",
+                    &filename
+                ))?;
             }
             HiiSubcommands::ListStrings { filename, json } => {
                 let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
             HiiSubcommands::ListQuestions { filename, json } => {
                 let res = HiiBackend::list_questions(&get_db_dump_bytes(filename.as_deref())?)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
         },
         Commands::Ilo(ilo_command) => match &ilo_command.command {
             IloSubcommands::Get { question, json } => {
                 let res = IloBackend::get(question, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
             IloSubcommands::Set {
                 question,
@@ -237,32 +245,32 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 json,
             } => {
                 let res = IloBackend::set(question, value, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
             IloSubcommands::ShowAttributes { json } => {
                 let res = IloBackend::show_attributes()?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
             IloSubcommands::ShowPendingAttributes { json } => {
                 let res = IloBackend::show_pending_attributes()?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
         },
         Commands::Identify { json } => {
             let machine = identify_machine();
-            print_with_style(machine, *json);
+            print_with_style(machine, *json)?;
         }
         Commands::Get { question, json } => {
             let machine = identify_machine();
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
-            if prioritize_backend(&machine, *json) == Backend::Ilo {
+            if prioritize_backend(&machine, *json)? == Backend::Ilo {
                 let res = IloBackend::get(question, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             } else {
                 let res = HiiBackend::get(question, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
         }
         Commands::Set {
@@ -274,32 +282,35 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
-            if prioritize_backend(&machine, *json) == Backend::Ilo {
+            if prioritize_backend(&machine, *json)? == Backend::Ilo {
                 let res = IloBackend::set(question, value, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             } else {
                 let res = HiiBackend::set(question, value, None)?;
-                print_with_style(res, *json);
+                print_with_style(res, *json)?;
             }
         }
         Commands::ShowTranslations { json } => {
-            print_with_style(&*translation_db, *json);
+            print_with_style(&*translation_db, *json)?;
         }
     }
     Ok(())
 }
 
-fn prioritize_backend(machine: &MachineInfo, json: bool) -> Backend {
+fn prioritize_backend(machine: &MachineInfo, json: bool) -> Result<Backend> {
     if machine.backend.len() > 1 && !json {
-        println!("Multiple backends found: {:#?}", machine.backend);
-        println!("Using the Ilo backend");
+        print_line(format_args!(
+            "Multiple backends found: {:#?}",
+            machine.backend
+        ))?;
+        print_line(format_args!("Using the Ilo backend"))?;
     }
     // ilo is prioritized because its more structured than hii if there are multiple supported backends
     // only those two are supported for now
     if machine.backend.contains(&Backend::Ilo) {
-        Backend::Ilo
+        Ok(Backend::Ilo)
     } else {
-        Backend::Hii
+        Ok(Backend::Hii)
     }
 }
 
@@ -334,15 +345,71 @@ fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
     }
 }
 
+fn print_line(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "{}", arguments)
+}
+
 // print_with_style either prints as json or with rust's debug pretty-printer
-fn print_with_style<T>(result: T, json: bool)
+fn print_with_style<T>(result: T, json: bool) -> io::Result<()>
 where
+    T: Serializable + Debug,
+{
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_with_style(&mut output, result, json)
+}
+
+fn write_with_style<W, T>(output: &mut W, result: T, json: bool) -> io::Result<()>
+where
+    W: Write,
     T: Serializable + Debug,
 {
     if json {
         let buf = simplejson_protocol::serialize(result);
-        println!("{}", String::from_utf8_lossy(&buf));
+        writeln!(output, "{}", String::from_utf8_lossy(&buf))
     } else {
-        println!("{:#?}", result);
+        writeln!(output, "{:#?}", result)
+    }
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .map(|error| error.kind() == io::ErrorKind::BrokenPipe)
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed pipe"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_with_style_returns_broken_pipe() {
+        let mut output = BrokenPipeWriter;
+        let error = write_with_style(
+            &mut output,
+            uefisettings_backend_thrift::Error::default(),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(is_broken_pipe(&error.into()));
     }
 }
