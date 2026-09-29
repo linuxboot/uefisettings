@@ -45,6 +45,16 @@ use crate::hii::package::Guid;
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
 
+/// IFR_OPERATION_HEADER_SIZE is the size of EFI_IFR_OP_HEADER, which starts
+/// every IFR operation (IFROperation): OpCode (8 bits), Length (7 bits) and
+/// Scope (1 bit). UEFI Spec v2.10 §33.3.8.2.1 defines Length as "the number of
+/// bytes in the opcode, including this header"; §33.3.8.1 gives it as 2-127
+/// bytes, so "opcode" is the whole operation, not the OpCode byte (IFROpCode).
+///
+/// Example: Length includes the header, so an operation carries
+/// `length - IFR_OPERATION_HEADER_SIZE` bytes of data.
+const IFR_OPERATION_HEADER_SIZE: u8 = 2;
+
 fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; EFIVARFS_HEADER_SIZE + payload_size];
     reader.read_exact(&mut bytes)?;
@@ -268,11 +278,21 @@ pub struct IFROperation {
     pub op_code: IFROpCode,
     #[br(restore_position, map = |x: u8| x  & 0x7F)]
     // only store the first 7 bits and then move the cursor back to position before this field
-    length: u8, // size of the entire header
+    //
+    // the assert below rejects a length below the header size, because binrw
+    // computes `count` further down without a bounds check (debug builds panic
+    // on underflow, release builds wrap); no upper bound is needed, as a 7-bit
+    // length reserves at most 125 bytes
+    #[br(assert(
+        length >= IFR_OPERATION_HEADER_SIZE,
+        "invalid IFR operation length {}",
+        length
+    ))]
+    length: u8, // size of the entire operation, including the header
     #[br(map = |x: u8| x & 0x80 != 0)]
     // read 8 bits, discard all of them except the last one
     pub open_scope: bool,
-    #[br(count = length - 2)] // first 3 fields make up 16 bits = 2 bytes
+    #[br(count = length - IFR_OPERATION_HEADER_SIZE)]
     data: Vec<u8>,
 
     // the following fields will not be parsed by binrw and when an instance of this struct is created
@@ -1820,5 +1840,70 @@ mod tests {
 
         assert_eq!(bytes, efivarfs_data);
         assert_eq!(extract_efi_data::<u16>(0, &bytes).unwrap(), 95);
+    }
+
+    /// An IFR operation Length below the header size is rejected as an
+    /// invalid length before binrw computes the size of the operation's data
+    /// from it.
+    #[test]
+    fn operation_length_below_header_size_is_an_error() {
+        for length in [0, IFR_OPERATION_HEADER_SIZE - 1] {
+            let data = vec![0x0E, length]; // FormSet
+            let mut cursor = Cursor::new(&data);
+
+            let err = format!("{:#}", handle_form_package(&mut cursor).unwrap_err());
+
+            let want = format!("invalid IFR operation length {} at 0x", length);
+            assert!(err.contains(&want), "length {}: {}", length, err);
+        }
+    }
+
+    /// An IFR operation of Length 0 is an error even when 254 bytes (what a
+    /// wrapped `length - IFR_OPERATION_HEADER_SIZE` would read) and an End
+    /// operation follow it.
+    #[test]
+    fn operation_length_zero_before_254_bytes_and_end_is_an_error() {
+        let wrapped_count = 0u8.wrapping_sub(IFR_OPERATION_HEADER_SIZE);
+        let data = [
+            &[0x0E, 0x00][..],                       // FormSet: Length 0
+            &vec![0x00; usize::from(wrapped_count)], // 254 bytes
+            &[0x29, IFR_OPERATION_HEADER_SIZE],      // End
+        ]
+        .concat();
+        let mut cursor = Cursor::new(&data);
+
+        let err = format!("{:#}", handle_form_package(&mut cursor).unwrap_err());
+
+        let want = "invalid IFR operation length 0 at 0x";
+        assert!(err.contains(want), "{}", err);
+    }
+
+    /// An IFR operation of exactly the header size, like End, is parsed.
+    #[test]
+    fn operation_of_header_size_is_parsed() {
+        let form_set_data = [
+            &[0x11; 16][..],           // Guid
+            &[0x01, 0x00, 0x02, 0x00], // FormSetTitle, Help
+            &[0x01],                   // Flags: one ClassGuid
+            &[0x22; 16],               // ClassGuid
+        ]
+        .concat();
+        let form_set_length =
+            IFR_OPERATION_HEADER_SIZE + u8::try_from(form_set_data.len()).unwrap();
+        let data = [
+            &[0x0E, 0x80 | form_set_length][..], // FormSet: Length, Scope
+            &form_set_data,
+            &[0x29, IFR_OPERATION_HEADER_SIZE], // End
+        ]
+        .concat();
+        let mut cursor = Cursor::new(&data);
+
+        let root = handle_form_package(&mut cursor).unwrap();
+
+        let root = root.borrow();
+        assert_eq!(root.children.len(), 1);
+        let form_set = root.children[0].borrow();
+        assert_eq!(form_set.op_code, IFROpCode::FormSet);
+        assert!(form_set.children.is_empty());
     }
 }
