@@ -32,7 +32,6 @@ use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use binrw::BinResult;
-use binrw::BinWrite;
 use log::debug;
 use log::error;
 use thiserror::Error;
@@ -60,6 +59,44 @@ fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<V
     let mut bytes = vec![0u8; EFIVARFS_HEADER_SIZE + payload_size];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+fn update_efivarfs_bytes(
+    bytes: &mut [u8],
+    payload_size: u16,
+    offset: u16,
+    data: TypeValue,
+) -> Result<()> {
+    let encoded = match data {
+        TypeValue::NumSize8(value) => value.to_le_bytes().to_vec(),
+        TypeValue::NumSize16(value) => value.to_le_bytes().to_vec(),
+        TypeValue::NumSize32(value) => value.to_le_bytes().to_vec(),
+        TypeValue::NumSize64(value) => value.to_le_bytes().to_vec(),
+        _ => return Err(anyhow!("unsupported value type for efivarfs write")),
+    };
+    let payload = bytes
+        .get_mut(EFIVARFS_HEADER_SIZE..)
+        .context("efivarfs file is missing its attributes header")?;
+    if payload.len() < usize::from(payload_size) {
+        return Err(anyhow!(
+            "efivarfs payload is shorter than the declared varstore: {} < {} bytes",
+            payload.len(),
+            payload_size
+        ));
+    }
+
+    let start = usize::from(offset);
+    let end = start + encoded.len();
+    if end > usize::from(payload_size) {
+        return Err(anyhow!(
+            "write at offset {} with width {} exceeds varstore size {}",
+            offset,
+            encoded.len(),
+            payload_size
+        ));
+    }
+    payload[start..end].copy_from_slice(&encoded);
+    Ok(())
 }
 
 // UEFI Spec v2.9 Page 1844
@@ -578,24 +615,7 @@ trait VariableStore {
             .read_to_end(&mut file_contents)
             .context(format!("Failed to read efivarfs file '{}'", store_filename))?;
 
-        let mut cursor = Cursor::new(file_contents);
-        cursor.seek(SeekFrom::Start(4 + offset as u64))?;
-
-        match data {
-            TypeValue::NumSize8(v) => {
-                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
-            }
-            TypeValue::NumSize16(v) => {
-                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
-            }
-            TypeValue::NumSize32(v) => {
-                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
-            }
-            TypeValue::NumSize64(v) => {
-                v.write_options(&mut cursor, binrw::endian::Endian::Little, ())?
-            }
-            _ => {}
-        }
+        update_efivarfs_bytes(&mut file_contents, self.size(), offset, data)?;
 
         let _efifs = EfivarsMountGuard::new().context("Failed to create efivars fs mount guard")?;
 
@@ -608,7 +628,7 @@ trait VariableStore {
         debug!("Writing value to {}", &store_filename);
         File::create(&store_filename)
             .context("Failed to open efivarfs file for writing")?
-            .write_all(cursor.get_ref())
+            .write_all(&file_contents)
             .context("Failed to write to efivarfs file")?;
 
         Ok(())
@@ -2143,6 +2163,112 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn variable_bytes(payload_size: usize) -> Vec<u8> {
+        let mut bytes = 7u32.to_le_bytes().to_vec();
+        bytes.extend(vec![0xa5; payload_size]);
+        bytes
+    }
+
+    #[test]
+    fn writes_each_integer_width_at_end_of_varstore() {
+        for (data, encoded) in [
+            (TypeValue::NumSize8(95), 95u8.to_le_bytes().to_vec()),
+            (TypeValue::NumSize16(259), 259u16.to_le_bytes().to_vec()),
+            (
+                TypeValue::NumSize32(123456),
+                123456u32.to_le_bytes().to_vec(),
+            ),
+            (
+                TypeValue::NumSize64(u64::MAX),
+                u64::MAX.to_le_bytes().to_vec(),
+            ),
+        ] {
+            let mut bytes = variable_bytes(42);
+            let mut expected = bytes.clone();
+            let offset = 42 - encoded.len();
+            expected[EFIVARFS_HEADER_SIZE + offset..].copy_from_slice(&encoded);
+            update_efivarfs_bytes(&mut bytes, 42, offset as u16, data).unwrap();
+            assert_eq!(bytes, expected);
+        }
+    }
+
+    #[test]
+    fn trailing_thermal_fields_do_not_overlap() {
+        let mut bytes = variable_bytes(42);
+        update_efivarfs_bytes(&mut bytes, 42, 38, TypeValue::NumSize16(95)).unwrap();
+        update_efivarfs_bytes(&mut bytes, 42, 40, TypeValue::NumSize16(90)).unwrap();
+        assert_eq!(extract_efi_data::<u16>(38, &bytes).unwrap(), 95);
+        assert_eq!(extract_efi_data::<u16>(40, &bytes).unwrap(), 90);
+        assert_eq!(&bytes[..4], &7u32.to_le_bytes());
+    }
+
+    #[test]
+    fn rejects_writes_past_declared_size_without_changing_bytes() {
+        for (size, offset, data) in [
+            (42, 42, TypeValue::NumSize8(1)),
+            (42, 41, TypeValue::NumSize16(1)),
+            (42, 39, TypeValue::NumSize32(1)),
+            (42, 35, TypeValue::NumSize64(1)),
+            (0, 0, TypeValue::NumSize8(1)),
+            (42, u16::MAX, TypeValue::NumSize64(1)),
+        ] {
+            let mut bytes = variable_bytes(64);
+            let original = bytes.clone();
+            assert!(update_efivarfs_bytes(&mut bytes, size, offset, data).is_err());
+            assert_eq!(bytes, original);
+        }
+    }
+
+    #[test]
+    fn rejects_short_payload_even_when_requested_field_fits() {
+        for offset in [0, 40] {
+            let mut bytes = variable_bytes(39);
+            let original = bytes.clone();
+            assert!(
+                update_efivarfs_bytes(&mut bytes, 42, offset, TypeValue::NumSize16(1)).is_err()
+            );
+            assert_eq!(bytes, original);
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_attributes_header() {
+        for length in 0..EFIVARFS_HEADER_SIZE {
+            let mut bytes = vec![0xa5; length];
+            let original = bytes.clone();
+            assert!(update_efivarfs_bytes(&mut bytes, 1, 0, TypeValue::NumSize8(1)).is_err());
+            assert_eq!(bytes, original);
+        }
+    }
+
+    #[test]
+    fn preserves_bytes_beyond_declared_varstore() {
+        let mut bytes = variable_bytes(50);
+        let original = bytes.clone();
+        update_efivarfs_bytes(&mut bytes, 42, 40, TypeValue::NumSize16(95)).unwrap();
+        assert_eq!(&bytes[46..], &original[46..]);
+        assert_eq!(&bytes[..44], &original[..44]);
+        assert_eq!(bytes.len(), original.len());
+    }
+
+    #[test]
+    fn writes_small_and_maximum_sized_varstores() {
+        for size in [1, 2, u16::MAX] {
+            let mut bytes = variable_bytes(usize::from(size));
+            update_efivarfs_bytes(&mut bytes, size, size - 1, TypeValue::NumSize8(95)).unwrap();
+            assert_eq!(bytes.len(), EFIVARFS_HEADER_SIZE + usize::from(size));
+            assert_eq!(bytes.last(), Some(&95));
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_value_instead_of_silent_noop() {
+        let mut bytes = variable_bytes(42);
+        let original = bytes.clone();
+        assert!(update_efivarfs_bytes(&mut bytes, 42, 0, TypeValue::Boolean(true)).is_err());
+        assert_eq!(bytes, original);
+    }
 
     #[test]
     fn read_efivarfs_bytes_includes_attributes_and_complete_payload() {
