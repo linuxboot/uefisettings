@@ -456,6 +456,57 @@ pub enum Range {
     Range64(Range64),
 }
 
+struct NumericRange {
+    minimum: i128,
+    maximum: i128,
+    bits: u32,
+}
+
+impl NumericRange {
+    fn from_ifr(range: &Range, flags: u8) -> Self {
+        let (minimum, maximum, bits) = match range {
+            Range::Range8(range) => (u64::from(range.min_value), u64::from(range.max_value), 8),
+            Range::Range16(range) => (u64::from(range.min_value), u64::from(range.max_value), 16),
+            Range::Range32(range) => (u64::from(range.min_value), u64::from(range.max_value), 32),
+            Range::Range64(range) => (range.min_value, range.max_value, 64),
+        };
+        let decode = |value: u64| {
+            if flags & 0x30 == 0 {
+                i128::from(((value << (64 - bits)) as i64) >> (64 - bits))
+            } else {
+                i128::from(value)
+            }
+        };
+        Self {
+            minimum: decode(minimum),
+            maximum: decode(maximum),
+            bits,
+        }
+    }
+
+    fn parse_value(&self, value: &str) -> Result<TypeValue, ChangeValueError> {
+        if self.minimum > self.maximum {
+            return Err(ChangeValueError::InvalidNumericRange);
+        }
+        let value = value
+            .parse::<i128>()
+            .context("value should be a decimal integer")?;
+        if value < self.minimum {
+            return Err(ChangeValueError::BelowMinValue);
+        }
+        if value > self.maximum {
+            return Err(ChangeValueError::ExceededMaxValue);
+        }
+        match self.bits {
+            8 => Ok(TypeValue::NumSize8(value as u8)),
+            16 => Ok(TypeValue::NumSize16(value as u16)),
+            32 => Ok(TypeValue::NumSize32(value as u32)),
+            64 => Ok(TypeValue::NumSize64(value as u64)),
+            _ => Err(ChangeValueError::InvalidNumericRange),
+        }
+    }
+}
+
 fn range_parser<R: Read + Seek>(
     reader: &mut R,
     _endian: binrw::Endian,
@@ -819,6 +870,7 @@ mod non_efi_varstore_tests {
             help: String::new(),
             value: "Disabled".to_string(),
             max_value: RangeType::NumSize8(1),
+            numeric_range: None,
             opcode: IFROpCode::OneOf,
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
@@ -1331,6 +1383,7 @@ pub struct QuestionDescriptor {
     pub help: String,
     pub value: String,
     max_value: RangeType,
+    numeric_range: Option<NumericRange>,
     opcode: IFROpCode,
     pub possible_options: Vec<AnswerOption>,
     header: QuestionHeader,
@@ -1552,6 +1605,7 @@ fn handle_checkbox(
         header: parsed.question_header(),
         varstore: varstore.ok(),
         max_value: RangeType::NumSize8(1),
+        numeric_range: None,
         opcode: current_node.op_code,
     };
     res
@@ -1667,6 +1721,7 @@ fn handle_oneof(
             Range::Range32(r) => RangeType::NumSize32(r.max_value),
             Range::Range64(r) => RangeType::NumSize64(r.max_value),
         },
+        numeric_range: None,
         opcode: current_node.op_code,
     };
     res
@@ -1683,17 +1738,29 @@ fn handle_numeric(
 
     match read_current_value_bytes(&varstore) {
         Err(reason) => answer.push_str(&reason),
-        Ok(bytes) => match &parsed.data {
-            Range::Range8(_) => {
+        Ok(bytes) => match (&parsed.data, parsed.flags & 0x30 == 0) {
+            (Range::Range8(_), true) => {
+                try_read_answer_as_string::<i8>(&parsed.question_header(), &bytes, &mut answer)
+            }
+            (Range::Range16(_), true) => {
+                try_read_answer_as_string::<i16>(&parsed.question_header(), &bytes, &mut answer)
+            }
+            (Range::Range32(_), true) => {
+                try_read_answer_as_string::<i32>(&parsed.question_header(), &bytes, &mut answer)
+            }
+            (Range::Range64(_), true) => {
+                try_read_answer_as_string::<i64>(&parsed.question_header(), &bytes, &mut answer)
+            }
+            (Range::Range8(_), false) => {
                 try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer)
             }
-            Range::Range16(_) => {
+            (Range::Range16(_), false) => {
                 try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer)
             }
-            Range::Range32(_) => {
+            (Range::Range32(_), false) => {
                 try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer)
             }
-            Range::Range64(_) => {
+            (Range::Range64(_), false) => {
                 try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer)
             }
         },
@@ -1712,6 +1779,7 @@ fn handle_numeric(
             Range::Range32(r) => RangeType::NumSize32(r.max_value),
             Range::Range64(r) => RangeType::NumSize64(r.max_value),
         },
+        numeric_range: Some(NumericRange::from_ifr(&parsed.data, parsed.flags)),
         opcode: current_node.op_code,
     };
     res
@@ -1959,6 +2027,10 @@ pub enum ChangeValueError {
     InvalidOption,
     #[error("provided value exceeded max possible value")]
     ExceededMaxValue,
+    #[error("provided value is below the minimum possible value")]
+    BelowMinValue,
+    #[error("numeric question has an invalid range")]
+    InvalidNumericRange,
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -1982,6 +2054,10 @@ pub fn change_value(
             if !changed {
                 return Err(ChangeValueError::InvalidOption);
             }
+        } else if let Some(range) = &question.numeric_range {
+            let data = range.parse_value(new_value)?;
+            varstore.write_at_offset(question.header.var_store_info, data)?;
+            changed = true;
         } else {
             match question.max_value {
                 RangeType::NumSize8(m) => {
@@ -2220,5 +2296,252 @@ mod tests {
         let form_set = root.children[0].borrow();
         assert_eq!(form_set.op_code, IFROpCode::FormSet);
         assert!(form_set.children.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod write_validation_tests {
+    use super::*;
+
+    type RecordedWrites = Rc<RefCell<Vec<(u16, TypeValue)>>>;
+
+    struct RecordingVarStore {
+        bytes: Vec<u8>,
+        writes: RecordedWrites,
+    }
+
+    impl VariableStore for RecordingVarStore {
+        fn name(&self) -> String {
+            "NumericTest".to_string()
+        }
+
+        fn guid(&self) -> String {
+            "00000000-0000-0000-0000-000000000000".to_string()
+        }
+
+        fn size(&self) -> u16 {
+            42
+        }
+
+        fn kind(&self) -> VariableStoreKind {
+            VariableStoreKind::Buffer
+        }
+
+        fn is_runtime_accessible(&self) -> bool {
+            false
+        }
+
+        fn read_bytes(&self) -> Result<Vec<u8>> {
+            Ok(self.bytes.clone())
+        }
+
+        fn write_efivarfs_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+            self.writes.borrow_mut().push((offset, data));
+            Ok(())
+        }
+    }
+
+    fn numeric_question(
+        bits: u32,
+        minimum: u64,
+        maximum: u64,
+        step: u64,
+        display: u8,
+        initial: u64,
+    ) -> (QuestionDescriptor, RecordedWrites) {
+        let (width_code, range) = match bits {
+            8 => (
+                0,
+                Range::Range8(Range8 {
+                    min_value: minimum as u8,
+                    max_value: maximum as u8,
+                    step: step as u8,
+                }),
+            ),
+            16 => (
+                1,
+                Range::Range16(Range16 {
+                    min_value: minimum as u16,
+                    max_value: maximum as u16,
+                    step: step as u16,
+                }),
+            ),
+            32 => (
+                2,
+                Range::Range32(Range32 {
+                    min_value: minimum as u32,
+                    max_value: maximum as u32,
+                    step: step as u32,
+                }),
+            ),
+            64 => (
+                3,
+                Range::Range64(Range64 {
+                    min_value: minimum,
+                    max_value: maximum,
+                    step,
+                }),
+            ),
+            _ => panic!("invalid test width"),
+        };
+        let parsed = Numeric {
+            question_header: QuestionHeader {
+                prompt_string_id: 0,
+                help_string_id: 0,
+                question_id: 1,
+                var_store_id: 1,
+                var_store_info: 2,
+                question_flags: 0,
+            },
+            flags: width_code | display,
+            data: range,
+        };
+        let node = RefCell::new(IFROperation {
+            op_code: IFROpCode::Numeric,
+            length: 0,
+            open_scope: false,
+            data: Vec::new(),
+            parent: None,
+            children: Vec::new(),
+            parsed_data: ParsedOperation::Placeholder,
+        });
+        let mut bytes = vec![0; EFIVARFS_HEADER_SIZE + 42];
+        bytes[..EFIVARFS_HEADER_SIZE].copy_from_slice(&7u32.to_le_bytes());
+        let width = (bits / 8) as usize;
+        bytes[6..6 + width].copy_from_slice(&initial.to_le_bytes()[..width]);
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let store = RecordingVarStore {
+            bytes,
+            writes: Rc::clone(&writes),
+        };
+        let question = handle_numeric(
+            Ok(Box::new(store)),
+            &parsed,
+            "Numeric test",
+            &Vec::new(),
+            &node.borrow(),
+        );
+        (question, writes)
+    }
+
+    fn encoded_value(bits: u32, value: i128) -> TypeValue {
+        match bits {
+            8 => TypeValue::NumSize8(value as u8),
+            16 => TypeValue::NumSize16(value as u16),
+            32 => TypeValue::NumSize32(value as u32),
+            64 => TypeValue::NumSize64(value as u64),
+            _ => panic!("invalid test width"),
+        }
+    }
+
+    #[test]
+    fn rejects_unsigned_out_of_range_values_before_writing() {
+        for bits in [8, 16, 32, 64] {
+            let (question, writes) = numeric_question(bits, 10, 20, 2, 0x10, 10);
+            assert!(matches!(
+                change_value(&question, "9"),
+                Err(ChangeValueError::BelowMinValue)
+            ));
+            assert!(matches!(
+                change_value(&question, "21"),
+                Err(ChangeValueError::ExceededMaxValue)
+            ));
+            for value in [
+                "-1",
+                "not-a-number",
+                "340282366920938463463374607431768211455",
+            ] {
+                assert!(change_value(&question, value).is_err());
+            }
+            assert!(writes.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn accepts_unsigned_boundaries_and_does_not_treat_step_as_a_constraint() {
+        for bits in [8, 16, 32, 64] {
+            for step in [0, 2] {
+                for display in [0x10, 0x20] {
+                    let (question, writes) = numeric_question(bits, 10, 20, step, display, 10);
+                    for value in [10, 11, 20] {
+                        assert!(change_value(&question, &value.to_string()).unwrap());
+                    }
+                    assert_eq!(
+                        *writes.borrow(),
+                        vec![
+                            (2, encoded_value(bits, 10)),
+                            (2, encoded_value(bits, 11)),
+                            (2, encoded_value(bits, 20)),
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validates_signed_bounds_and_encodes_negative_values() {
+        for bits in [8, 16, 32, 64] {
+            let (question, writes) =
+                numeric_question(bits, (-10i64) as u64, 10, 1, 0, (-3i64) as u64);
+            assert_eq!(question.value, "-3");
+            assert!(matches!(
+                change_value(&question, "-11"),
+                Err(ChangeValueError::BelowMinValue)
+            ));
+            assert!(matches!(
+                change_value(&question, "11"),
+                Err(ChangeValueError::ExceededMaxValue)
+            ));
+            assert!(writes.borrow().is_empty());
+            for value in [-10, 0, 10] {
+                assert!(change_value(&question, &value.to_string()).unwrap());
+            }
+            assert_eq!(
+                *writes.borrow(),
+                vec![
+                    (2, encoded_value(bits, -10)),
+                    (2, encoded_value(bits, 0)),
+                    (2, encoded_value(bits, 10)),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn supports_full_signed_range_at_each_width() {
+        for bits in [8, 16, 32, 64] {
+            let minimum = -(1i128 << (bits - 1));
+            let maximum = (1i128 << (bits - 1)) - 1;
+            let (question, writes) =
+                numeric_question(bits, minimum as u64, maximum as u64, 1, 0, 0);
+            assert!(change_value(&question, &minimum.to_string()).unwrap());
+            assert!(change_value(&question, &maximum.to_string()).unwrap());
+            assert!(change_value(&question, &(minimum - 1).to_string()).is_err());
+            assert!(change_value(&question, &(maximum + 1).to_string()).is_err());
+            assert_eq!(writes.borrow().len(), 2);
+        }
+    }
+
+    #[test]
+    fn supports_unsigned_64_bit_values_above_signed_maximum() {
+        let (question, writes) = numeric_question(64, u64::MAX - 2, u64::MAX, 1, 0x10, u64::MAX);
+        assert_eq!(question.value, u64::MAX.to_string());
+        assert!(change_value(&question, &u64::MAX.to_string()).unwrap());
+        assert_eq!(*writes.borrow(), vec![(2, TypeValue::NumSize64(u64::MAX))]);
+        assert!(change_value(&question, "18446744073709551616").is_err());
+        assert_eq!(writes.borrow().len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_numeric_ranges_without_writing() {
+        for bits in [8, 16, 32, 64] {
+            let (question, writes) = numeric_question(bits, 20, 10, 1, 0x10, 0);
+            assert!(matches!(
+                change_value(&question, "15"),
+                Err(ChangeValueError::InvalidNumericRange)
+            ));
+            assert!(writes.borrow().is_empty());
+        }
     }
 }
