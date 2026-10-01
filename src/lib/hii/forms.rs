@@ -2051,6 +2051,8 @@ pub enum ChangeValueError {
     BelowMinValue,
     #[error("numeric question has an invalid range")]
     InvalidNumericRange,
+    #[error("question '{0}' has no supported writable varstore")]
+    NoWritableVarStore(String),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -2060,6 +2062,12 @@ pub fn change_value(
     question: &QuestionDescriptor,
     new_value: &str,
 ) -> Result<bool, ChangeValueError> {
+    if question.varstore.is_none() {
+        return Err(ChangeValueError::NoWritableVarStore(
+            question.question.clone(),
+        ));
+    }
+
     let mut changed = false;
     if let Some(varstore) = &question.varstore {
         if question.opcode == IFROpCode::OneOf {
@@ -2422,6 +2430,51 @@ mod tests {
         let form_set = root.children[0].borrow();
         assert_eq!(form_set.op_code, IFROpCode::FormSet);
         assert!(form_set.children.is_empty());
+    }
+
+    fn question_without_varstore(opcode: IFROpCode) -> QuestionDescriptor {
+        QuestionDescriptor {
+            question: "Unsupported question".to_string(),
+            help: String::new(),
+            value: String::new(),
+            max_value: RangeType::NumSize8(1),
+            numeric_range: None,
+            opcode,
+            possible_options: vec![AnswerOption {
+                value: "Enabled".to_string(),
+                raw_value: TypeValue::NumSize8(1),
+            }],
+            header: QuestionHeader {
+                prompt_string_id: 0,
+                help_string_id: 0,
+                question_id: 1,
+                var_store_id: 0,
+                var_store_info: 0,
+                question_flags: 0,
+            },
+            varstore: None,
+        }
+    }
+
+    #[test]
+    fn rejects_numeric_question_without_writable_storage() {
+        let question = question_without_varstore(IFROpCode::Numeric);
+
+        assert!(matches!(
+            change_value(&question, "1"),
+            Err(ChangeValueError::NoWritableVarStore(name))
+                if name == "Unsupported question"
+        ));
+    }
+
+    #[test]
+    fn rejects_oneof_question_without_writable_storage() {
+        let question = question_without_varstore(IFROpCode::OneOf);
+
+        assert!(matches!(
+            change_value(&question, "Enabled"),
+            Err(ChangeValueError::NoWritableVarStore(_))
+        ));
     }
 }
 
