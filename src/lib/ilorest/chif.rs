@@ -64,8 +64,16 @@ const CHIF_STATUS_CODE_SUCCESS: u32 = 0;
 
 /// IloRestChif holds functions which are exported by ilorest_chif.so
 /// ```no_run
+/// # mod chif {
+/// #     include!("chif.rs");
+/// # }
+/// # use chif::get_lib;
+/// # use chif::IloRestChif;
+/// # fn main() -> anyhow::Result<()> {
 /// let lib = get_lib("/usr/lib64/ilorest_chif.so")?;
 /// let ilo = IloRestChif::new(&lib)?;
+/// # Ok(())
+/// # }
 /// ```
 /// This will load the ilorest_chif.so library, initialize it and create a new handle/connection to the ilo BMC.
 pub struct IloRestChif<'a> {

@@ -658,8 +658,10 @@ trait VariableStore {
 
         let store_filename = self.store_filename();
 
-        let mut file_ro = File::open(&store_filename)
-            .context(format!("Failed to open efivarfs file '{}' to get varstore bytes", store_filename))?;
+        let mut file_ro = File::open(&store_filename).context(format!(
+            "Failed to open efivarfs file '{}' to get varstore bytes",
+            store_filename
+        ))?;
 
         let mut file_contents = Vec::new();
         file_ro
@@ -792,7 +794,10 @@ mod non_efi_varstore_tests {
     fn boot_service_only_varstore_read_is_rejected() {
         for attributes in [0x2, 0x3] {
             assert_eq!(
-                efi_varstore(attributes).read_bytes().unwrap_err().to_string(),
+                efi_varstore(attributes)
+                    .read_bytes()
+                    .unwrap_err()
+                    .to_string(),
                 "EFI variable is boot-service-only and is not readable from efivarfs"
             );
         }
@@ -1723,9 +1728,9 @@ fn handle_oneof(
             _ => {}
         }
     }
-	if answer.is_empty() {
-		answer.push_str("Unknown");
-	}
+    if answer.is_empty() {
+        answer.push_str("Unknown");
+    }
 
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
@@ -1815,7 +1820,15 @@ where
     let extracted_data: Result<T> = extract_efi_data(offset, bytes);
     match extracted_data {
         Ok(a) => ans.push_str(format!("{a}").as_str()),
-        Err(e) => ans.push_str(format!("<ExtractEFIDataError: {} (offset: {}; buflen: {})>", e, offset, bytes.len()).as_str())
+        Err(e) => ans.push_str(
+            format!(
+                "<ExtractEFIDataError: {} (offset: {}; buflen: {})>",
+                e,
+                offset,
+                bytes.len()
+            )
+            .as_str(),
+        ),
     }
 }
 

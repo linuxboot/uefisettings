@@ -46,11 +46,25 @@ enum ResponseReceiveMode {
 /// so the user can make requests without worrying about fragmented reads/writes, packet handling, etc.
 /// Usage:
 /// ```no_run
-/// use fbthrift::Transport;
+/// # mod ilorest {
+/// #     pub mod blobstore {
+/// #         include!("blobstore.rs");
+/// #     }
+/// #     pub mod chif {
+/// #         include!("chif.rs");
+/// #     }
+/// # }
+/// # use ilorest::blobstore::Transport;
+/// # use ilorest::chif::get_lib;
+/// # use ilorest::chif::IloRestChif;
+/// # fn main() -> anyhow::Result<()> {
+/// # let request_bytes: &[u8] = &[];
 /// let lib = get_lib("/usr/lib64/ilorest_chif.so")?;
 /// let ilo = IloRestChif::new(&lib)?;
 /// let transport = Transport::new(&ilo)?;
 /// let response = transport.make_request(request_bytes)?;
+/// # Ok(())
+/// # }
 /// ```
 
 pub struct Transport<'a> {
