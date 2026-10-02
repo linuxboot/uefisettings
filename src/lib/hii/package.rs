@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn test_read_db_strings() {
         let file_path = "testdata/hiidb.bin";
-        if !fs::metadata(file_path).is_ok() {
+        if fs::metadata(file_path).is_err() {
             // The BIOS firmware we tested on was proprietary, thus I'm not sure we're allowed to share even the HiiDB. Keeping the test here for anybody how has the HiiDB this is tested on; or feel free to modify the test to use GALAGOPRO or any other free UEFI firmware.
             return;
         }
@@ -859,7 +859,7 @@ mod tests {
             res.strings
                 .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
                 .unwrap()
-                .get(0)
+                .first()
                 .unwrap()
                 .get(&8)
                 .unwrap(),
@@ -871,7 +871,7 @@ mod tests {
             res.strings
                 .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
                 .unwrap()
-                .get(0)
+                .first()
                 .unwrap()
                 .len(),
             5714
@@ -890,7 +890,7 @@ mod tests {
     #[test]
     fn test_read_db_forms() {
         let file_path = "testdata/hiidb.bin";
-        if !fs::metadata(file_path).is_ok() {
+        if fs::metadata(file_path).is_err() {
             // The BIOS firmware we tested on was proprietary, thus I'm not sure we're allowed to share even the HiiDB. Keeping the test here for anybody how has the HiiDB this is tested on; or feel free to modify the test to use GALAGOPRO or any other free UEFI firmware.
             return;
         }
@@ -903,7 +903,7 @@ mod tests {
             .forms
             .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
             .unwrap()
-            .get(0)
+            .first()
             .unwrap()
             .borrow();
 
@@ -912,12 +912,12 @@ mod tests {
 
         // root elements's child should be FormSet
         assert_eq!(
-            root_node.children.get(0).unwrap().borrow().op_code,
+            root_node.children.first().unwrap().borrow().op_code,
             forms::IFROpCode::FormSet
         );
 
         // root elements's child FormSet should have open scope
-        assert!(root_node.children.get(0).unwrap().borrow().open_scope);
+        assert!(root_node.children.first().unwrap().borrow().open_scope);
 
         // root_node's child should be able to refer to it's parent which is root_node
         // root_node has a dummy opcode used only in root nodes so if they match
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(
             root_node
                 .children
-                .get(0)
+                .first()
                 .unwrap()
                 .borrow()
                 .parent

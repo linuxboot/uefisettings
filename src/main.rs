@@ -319,7 +319,7 @@ fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
     if let Some(dbdump_path) = filename {
         info!("Using database dump from file: {}", dbdump_path.display());
 
-        let mut file = File::open(&dbdump_path)
+        let mut file = File::open(dbdump_path)
             .context(format!("opening dbdump from{}", dbdump_path.display()))?;
 
         // Most Hii DBs are a few hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
