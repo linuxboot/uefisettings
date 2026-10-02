@@ -26,7 +26,7 @@ use crate::ilorest::chif::IloRestChifInterface;
 
 const MAX_ALLOWED_REQUEST_ATTEMPTS: u32 = 10;
 
-/// RestClient allows you to make GET/POST/PUT/PATCH requests to the ILO BMC's Redfish API over Blobstore2
+/// RestClient allows you to make GET/PATCH requests to the ILO BMC's Redfish API over Blobstore2
 pub struct RestClient {
     lib_path: String,
 }
@@ -43,17 +43,6 @@ impl RestClient {
         self.parse(response)
     }
 
-    // post request to the endpoint with given JSON body. Returns HTTP status code and response body bytes.
-    pub fn post(&self, endpoint: &str, body: &str) -> Result<(u16, Vec<u8>)> {
-        let mut headers = self.default_headers();
-        headers.insert(
-            "Content-Type".to_string(),
-            "application/json; charset=utf-8".to_string(),
-        );
-        let response = self.exec("POST", endpoint, headers, body)?;
-        self.parse(response)
-    }
-
     // patch request to the endpoint with given JSON body. Returns HTTP status code and response body bytes.
     pub fn patch(&self, endpoint: &str, body: &str) -> Result<(u16, Vec<u8>)> {
         let mut headers = self.default_headers();
@@ -62,17 +51,6 @@ impl RestClient {
             "application/json; charset=utf-8".to_string(),
         );
         let response = self.exec("PATCH", endpoint, headers, body)?;
-        self.parse(response)
-    }
-
-    // put request to the endpoint with given JSON body. Returns HTTP status code and response body bytes.
-    pub fn put(&self, endpoint: &str, body: &str) -> Result<(u16, Vec<u8>)> {
-        let mut headers = self.default_headers();
-        headers.insert(
-            "Content-Type".to_string(),
-            "application/json; charset=utf-8".to_string(),
-        );
-        let response = self.exec("PUT", endpoint, headers, body)?;
         self.parse(response)
     }
 
@@ -188,10 +166,7 @@ impl RestClient {
         mut headers: HashMap<String, String>,
     ) -> Result<Vec<u8>> {
         let mut request_contents = format!("{} {} HTTP/1.1\r\n", method, endpoint);
-        headers.insert(
-            "Content-Length".to_string(),
-            body.as_bytes().len().to_string(),
-        );
+        headers.insert("Content-Length".to_string(), body.len().to_string());
 
         for (header_key, header_value) in headers {
             request_contents.push_str(&format!("{}: {}\r\n", header_key, header_value));
