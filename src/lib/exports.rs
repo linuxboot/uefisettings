@@ -195,8 +195,6 @@ impl SettingsBackend for HiiBackend {
                     // else try setting the new_value because it might be some arbitrary value like a number
                     // (will return error if doesn't match constraints)
                     if !(question_descriptor.possible_options.is_empty()) {
-                        // This is different from modified because if varstore doesn't exist for the question
-                        // then we can't set answers but it isn't an error.
                         let mut found_option = false;
                         for opt in &(question_descriptor.possible_options) {
                             if found_option {
