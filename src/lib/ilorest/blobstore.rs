@@ -70,9 +70,7 @@ impl<'a> Transport<'a> {
         let response_key = CString::new(gen_random_str(10))?;
         let namespace = CString::new("volatile")?;
 
-        let rest_resp;
-
-        if (request.len() as u32)
+        let rest_resp = if (request.len() as u32)
             < (self.ilo.get_max_write_size() + self.ilo.get_immediate_request_size())
         {
             // No need to create a keyval store entry, we can send it directly
@@ -86,9 +84,8 @@ impl<'a> Transport<'a> {
             let mut packet_to_send = Vec::from(header_template);
             packet_to_send.append(&mut request.to_owned());
 
-            rest_resp = self
-                .exchange_packet(&packet_to_send)
-                .context("Failed to get rest response")?;
+            self.exchange_packet(&packet_to_send)
+                .context("Failed to get rest response")?
         } else {
             debug!("Sending request using a multi-packet write");
 
@@ -104,10 +101,9 @@ impl<'a> Transport<'a> {
 
             let packet_to_send = Vec::from(header_template);
 
-            rest_resp = self
-                .exchange_packet(&packet_to_send)
-                .context("Failed to get rest response")?;
-        }
+            self.exchange_packet(&packet_to_send)
+                .context("Failed to get rest response")?
+        };
 
         let mut rest_resp_cursor = Cursor::new(&rest_resp);
         let parsed_rest_resp: IloFixedResponse = rest_resp_cursor.read_le()?;
@@ -163,12 +159,7 @@ impl<'a> Transport<'a> {
         let mut read_data_buffer: Vec<u8> = Vec::new();
 
         while bytes_read < data_length {
-            let count;
-            if (max_read_size - read_request_size) < (data_length - bytes_read) {
-                count = max_read_size - read_request_size;
-            } else {
-                count = data_length - bytes_read;
-            }
+            let count = (max_read_size - read_request_size).min(data_length - bytes_read);
 
             let read_block_size = bytes_read;
 
@@ -176,7 +167,7 @@ impl<'a> Transport<'a> {
 
             let header_template =
                 self.ilo
-                    .prepare_read_fragment(read_block_size, count, &response_key, &namespace);
+                    .prepare_read_fragment(read_block_size, count, response_key, namespace);
 
             let packet_to_send = Vec::from(header_template);
 
@@ -189,10 +180,7 @@ impl<'a> Transport<'a> {
             // Even if it does execute it'll be useless and we aren't sending the result anywhere, just parsing it ourselves.
 
             if read_response_size as usize > fragment_bytes.len() {
-                let num_more_zeros = read_response_size as usize - fragment_bytes.len();
-                for _ in 0..num_more_zeros {
-                    fragment_bytes.push(0u8);
-                }
+                fragment_bytes.resize(read_response_size as usize, 0);
             }
 
             // For reasons we don't know, HPE's python ilorest cli tool increases the header size by 4
@@ -295,12 +283,7 @@ impl<'a> Transport<'a> {
         let mut bytes_written: u32 = 0;
 
         while bytes_written < data_length {
-            let count: u32;
-            if (max_write_size - write_request_size) < (data_length - bytes_written) {
-                count = max_write_size - write_request_size;
-            } else {
-                count = data_length - bytes_written;
-            }
+            let count = (max_write_size - write_request_size).min(data_length - bytes_written);
 
             let write_blob_size = bytes_written;
 
@@ -354,9 +337,7 @@ impl<'a> Transport<'a> {
 
                 Ok(recv_buf)
             }
-            Err(status_code) => {
-                return Err(anyhow!("Unexpected Status code: {}", status_code));
-            }
+            Err(status_code) => Err(anyhow!("Unexpected Status code: {}", status_code)),
         }
     }
 }

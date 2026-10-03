@@ -16,7 +16,6 @@ use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
