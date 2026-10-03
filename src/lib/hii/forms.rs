@@ -2225,7 +2225,7 @@ fn find_corresponding_varstore(
 }
 
 /// extract_efi_data extracts data of type T at given offset from efivar bytes.
-/// The <T> type here is used to get the type (and thus size) of our answer.
+/// The `T` type here is used to get the type (and thus size) of our answer.
 fn extract_efi_data<T>(offset: u16, bytes: &Vec<u8>) -> Result<T>
 where
     T: BinRead,

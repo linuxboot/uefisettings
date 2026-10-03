@@ -31,7 +31,7 @@ pub enum HiiTranslation {
 
 /// get_qa_variations_hii translates canonical questions and answers into possible hii variants
 /// If any part isn't in the translation database, it doesn't fail it just returns the original values in required form.
-/// Ex: the canonical question "Hyper Threading" -> ["Hyper-Threading", "Enable LP", "Hyper-Threading [ALL]"]
+/// Ex: the canonical question "Hyper Threading" -> ["Hyper-Threading", "Enable LP", "Hyper-Threading \[ALL\]"]
 /// and for it the canonical answer "Enabled" -> ["Enabled", "Enable"].
 pub fn get_qa_variations_hii(question: &str, answer: &str) -> HiiTranslation {
     let mut question_variations = HashSet::from([question.to_owned()]);

@@ -315,7 +315,7 @@ type IFRNodeLink = Rc<RefCell<IFROperation>>;
 /// ParsedHiiDB is the 'result' superstruct which will
 /// hold the results of our parsed strings and forms packages.
 pub struct ParsedHiiDB {
-    /// HashMap<packagelist_guid_string, Vec<StringMap>>
+    /// `HashMap<packagelist_guid_string, Vec<StringMap>>`
     /// for each packagelist the key = packagelist guid string and val = vector of string package hashmaps
     /// each string package hashmap here has its key = string id and val = the string
     pub strings: HashMap<String, Vec<StringMap>>,
