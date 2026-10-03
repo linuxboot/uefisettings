@@ -453,6 +453,7 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
 }
 
 /// IloRestChifInterface is a rusty interface to ilorest_chif functions
+#[allow(dead_code)]
 pub trait IloRestChifInterface {
     fn ping(&self) -> Result<(), u32>;
     fn exchange_packet(&self, send_buf: &[u8]) -> Result<Vec<u8>, u32>;

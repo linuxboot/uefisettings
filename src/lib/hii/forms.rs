@@ -13,9 +13,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::env::var;
 use std::fmt;
-use std::fmt::format;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
@@ -330,7 +328,7 @@ pub struct IFROperation {
     #[br(map = |x: u8| x & 0x80 != 0)]
     // read 8 bits, discard all of them except the last one
     pub open_scope: bool,
-    #[br(count = length - IFR_OPERATION_HEADER_SIZE)]
+    #[br(count = usize::from(length - IFR_OPERATION_HEADER_SIZE))]
     data: Vec<u8>,
 
     // the following fields will not be parsed by binrw and when an instance of this struct is created
@@ -356,7 +354,8 @@ impl fmt::Debug for IFROperation {
     }
 }
 
-#[derive(Debug)]
+#[allow(dead_code)]
+#[derive(Debug, Default)]
 pub enum ParsedOperation {
     FormSet(FormSet),
     OneOf(OneOf),
@@ -374,12 +373,8 @@ pub enum ParsedOperation {
     QuestionRef1(QuestionRef1),
     EqIdVal(EqIdVal),
     EqIdValList(EqIdValList),
+    #[default]
     Placeholder,
-}
-impl Default for ParsedOperation {
-    fn default() -> Self {
-        ParsedOperation::Placeholder
-    }
 }
 
 // Documentation for subsequent structs at:
@@ -617,7 +612,7 @@ trait VariableStore {
         }
 
         // try to read data from varstore
-        let mut file = File::open(&self.store_filename()).context(format!(
+        let mut file = File::open(self.store_filename()).context(format!(
             "failed to open sysfs efivars '{}' to get varstore bytes",
             self.store_filename()
         ))?;
@@ -658,8 +653,10 @@ trait VariableStore {
 
         let store_filename = self.store_filename();
 
-        let mut file_ro = File::open(&store_filename)
-            .context(format!("Failed to open efivarfs file '{}' to get varstore bytes", store_filename))?;
+        let mut file_ro = File::open(&store_filename).context(format!(
+            "Failed to open efivarfs file '{}' to get varstore bytes",
+            store_filename
+        ))?;
 
         let mut file_contents = Vec::new();
         file_ro
@@ -792,7 +789,10 @@ mod non_efi_varstore_tests {
     fn boot_service_only_varstore_read_is_rejected() {
         for attributes in [0x2, 0x3] {
             assert_eq!(
-                efi_varstore(attributes).read_bytes().unwrap_err().to_string(),
+                efi_varstore(attributes)
+                    .read_bytes()
+                    .unwrap_err()
+                    .to_string(),
                 "EFI variable is boot-service-only and is not readable from efivarfs"
             );
         }
@@ -1079,7 +1079,7 @@ pub struct EqIdVal {
 pub struct EqIdValList {
     pub question_id: u16,
     pub list_length: u16,
-    #[br(count = list_length)]
+    #[br(count = usize::from(list_length))]
     pub value_list: Vec<u16>,
 }
 
@@ -1108,6 +1108,7 @@ pub struct Ref {
     pub device_path_string_id: u16,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Clone, Copy)]
 /// Any structs having TypeValue as a field can have value of one of these types
 /// depending on the value of the value_type
@@ -1198,12 +1199,9 @@ pub fn handle_form_package(
             let current_scope_clone = Rc::clone(&current_scope);
             match current_scope_clone.borrow().parent.as_ref() {
                 Some(parent_ref) => {
-                    match parent_ref.upgrade() {
-                        Some(parent_ref_rc) => {
-                            // current_scope = current_scope 's parent
-                            current_scope = Rc::clone(&parent_ref_rc);
-                        }
-                        None => {}
+                    if let Some(parent_ref_rc) = parent_ref.upgrade() {
+                        // current_scope = current_scope 's parent
+                        current_scope = Rc::clone(&parent_ref_rc);
                     }
 
                     debug!(
@@ -1430,7 +1428,7 @@ pub struct AnswerOption {
 // node should be the form_package node
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
 ) -> Vec<QuestionDescriptor> {
     let mut res = Vec::new();
 
@@ -1505,7 +1503,7 @@ pub fn list_questions(
 /// same question. So if a single phrase matches then we assume that we have the answer.
 pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
     possible_question_phrases: &HashSet<T>,
 ) -> Option<QuestionDescriptor>
 where
@@ -1600,7 +1598,7 @@ fn handle_checkbox(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &CheckBox,
     question: &str,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
     current_node: &std::cell::Ref<IFROperation>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
@@ -1635,7 +1633,7 @@ fn handle_oneof(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &OneOf,
     node: &Rc<RefCell<IFROperation>>,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
 ) -> QuestionDescriptor {
@@ -1682,11 +1680,8 @@ fn handle_oneof(
     if chosen_value == u64::MAX {
         // No answer was provided, so using the default value instead.
         for child in &node.borrow().children {
-            match &child.borrow().parsed_data {
-                ParsedOperation::IFRDefault(o) => {
-                    chosen_value = u64::from(o.default_id);
-                }
-                _ => {}
+            if let ParsedOperation::IFRDefault(o) = &child.borrow().parsed_data {
+                chosen_value = u64::from(o.default_id);
             }
         }
     }
@@ -1696,36 +1691,32 @@ fn handle_oneof(
 
     let mut found_option = false;
     for child in &node.borrow().children {
-        match &child.borrow().parsed_data {
-            ParsedOperation::OneOfOption(o) => {
-                let current_value: u64 = match o.value {
-                    TypeValue::NumSize8(c) => c as u64,
-                    TypeValue::NumSize16(c) => c as u64,
-                    TypeValue::NumSize32(c) => c as u64,
-                    TypeValue::NumSize64(c) => c as u64,
-                    _ => 0,
-                };
+        if let ParsedOperation::OneOfOption(o) = &child.borrow().parsed_data {
+            let current_value: u64 = match o.value {
+                TypeValue::NumSize8(c) => c as u64,
+                TypeValue::NumSize16(c) => c as u64,
+                TypeValue::NumSize32(c) => c as u64,
+                TypeValue::NumSize64(c) => c,
+                _ => 0,
+            };
 
-                let opt = AnswerOption {
-                    raw_value: o.value.clone(),
-                    value: find_corresponding_string(o.option_string_id, string_packages)
-                        .to_string(),
-                };
+            let opt = AnswerOption {
+                raw_value: o.value,
+                value: find_corresponding_string(o.option_string_id, string_packages).to_string(),
+            };
 
-                if !varstore_not_found && current_value == chosen_value && !found_option {
-                    found_option = true;
-                    answer.push_str(opt.value.trim());
-                    // cannot break here because we want to add all options to possible_options
-                }
-
-                possible_options.push(opt);
+            if !varstore_not_found && current_value == chosen_value && !found_option {
+                found_option = true;
+                answer.push_str(opt.value.trim());
+                // cannot break here because we want to add all options to possible_options
             }
-            _ => {}
+
+            possible_options.push(opt);
         }
     }
-	if answer.is_empty() {
-		answer.push_str("Unknown");
-	}
+    if answer.is_empty() {
+        answer.push_str("Unknown");
+    }
 
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
@@ -1751,7 +1742,7 @@ fn handle_numeric(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &Numeric,
     question: &str,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
     current_node: &std::cell::Ref<IFROperation>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
@@ -1815,7 +1806,15 @@ where
     let extracted_data: Result<T> = extract_efi_data(offset, bytes);
     match extracted_data {
         Ok(a) => ans.push_str(format!("{a}").as_str()),
-        Err(e) => ans.push_str(format!("<ExtractEFIDataError: {} (offset: {}; buflen: {})>", e, offset, bytes.len()).as_str())
+        Err(e) => ans.push_str(
+            format!(
+                "<ExtractEFIDataError: {} (offset: {}; buflen: {})>",
+                e,
+                offset,
+                bytes.len()
+            )
+            .as_str(),
+        ),
     }
 }
 
@@ -1873,7 +1872,7 @@ pub fn display(
             format!(
                 "{extra_spaces}OpCode: {:?} - Name: {}\n",
                 current_node.op_code,
-                parsed.name.to_string(),
+                parsed.name,
             )
             .as_str(),
         ),
@@ -2051,6 +2050,8 @@ pub enum ChangeValueError {
     BelowMinValue,
     #[error("numeric question has an invalid range")]
     InvalidNumericRange,
+    #[error("question '{0}' has no supported writable varstore")]
+    NoWritableVarStore(String),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -2060,6 +2061,12 @@ pub fn change_value(
     question: &QuestionDescriptor,
     new_value: &str,
 ) -> Result<bool, ChangeValueError> {
+    if question.varstore.is_none() {
+        return Err(ChangeValueError::NoWritableVarStore(
+            question.question.clone(),
+        ));
+    }
+
     let mut changed = false;
     if let Some(varstore) = &question.varstore {
         if question.opcode == IFROpCode::OneOf {
@@ -2139,10 +2146,7 @@ pub fn change_value(
     Ok(changed)
 }
 
-fn find_corresponding_string<'a>(
-    string_id: u16,
-    string_packages: &'a Vec<HashMap<i32, String>>,
-) -> &'a str {
+fn find_corresponding_string(string_id: u16, string_packages: &[HashMap<i32, String>]) -> &str {
     // TODO: accept language pack parameter later
     // it defaults to the first language pack it can find and the first one is en-US
 
@@ -2422,6 +2426,51 @@ mod tests {
         let form_set = root.children[0].borrow();
         assert_eq!(form_set.op_code, IFROpCode::FormSet);
         assert!(form_set.children.is_empty());
+    }
+
+    fn question_without_varstore(opcode: IFROpCode) -> QuestionDescriptor {
+        QuestionDescriptor {
+            question: "Unsupported question".to_string(),
+            help: String::new(),
+            value: String::new(),
+            max_value: RangeType::NumSize8(1),
+            numeric_range: None,
+            opcode,
+            possible_options: vec![AnswerOption {
+                value: "Enabled".to_string(),
+                raw_value: TypeValue::NumSize8(1),
+            }],
+            header: QuestionHeader {
+                prompt_string_id: 0,
+                help_string_id: 0,
+                question_id: 1,
+                var_store_id: 0,
+                var_store_info: 0,
+                question_flags: 0,
+            },
+            varstore: None,
+        }
+    }
+
+    #[test]
+    fn rejects_numeric_question_without_writable_storage() {
+        let question = question_without_varstore(IFROpCode::Numeric);
+
+        assert!(matches!(
+            change_value(&question, "1"),
+            Err(ChangeValueError::NoWritableVarStore(name))
+                if name == "Unsupported question"
+        ));
+    }
+
+    #[test]
+    fn rejects_oneof_question_without_writable_storage() {
+        let question = question_without_varstore(IFROpCode::OneOf);
+
+        assert!(matches!(
+            change_value(&question, "Enabled"),
+            Err(ChangeValueError::NoWritableVarStore(_))
+        ));
     }
 }
 
