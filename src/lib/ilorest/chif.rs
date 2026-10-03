@@ -63,7 +63,10 @@ const CHIF_STATUS_CODE_SUCCESS: u32 = 0;
 // InvalidArgument = 22 - not sure, just my guess after some experimentation
 
 /// IloRestChif holds functions which are exported by ilorest_chif.so
-/// ```no_run
+///
+/// This example requires the proprietary CHIF library and an iLO device.
+///
+/// ```ignore
 /// let lib = get_lib("/usr/lib64/ilorest_chif.so")?;
 /// let ilo = IloRestChif::new(&lib)?;
 /// ```

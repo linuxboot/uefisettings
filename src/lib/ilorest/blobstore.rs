@@ -45,7 +45,10 @@ enum ResponseReceiveMode {
 /// Transport uses the rust bindings to ilorest_chif.so to handle Blobstore2 logic
 /// so the user can make requests without worrying about fragmented reads/writes, packet handling, etc.
 /// Usage:
-/// ```no_run
+///
+/// This example requires the proprietary CHIF library and an iLO device.
+///
+/// ```ignore
 /// use fbthrift::Transport;
 /// let lib = get_lib("/usr/lib64/ilorest_chif.so")?;
 /// let ilo = IloRestChif::new(&lib)?;
