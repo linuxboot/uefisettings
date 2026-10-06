@@ -5,6 +5,7 @@ version = "0.1.5"
 edition = "2021"
 license = "BSD-3-Clause"
 homepage = "https://github.com/linuxboot/uefisettings"
+exclude = ["/.github/"]
 
 [lib]
 name = "uefisettings"
