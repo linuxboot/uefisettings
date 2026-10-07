@@ -26,6 +26,11 @@
 #![warn(missing_docs)]
 
 use std::fs;
+use std::fs::File;
+use std::io;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::process::Command;
 use std::process::Stdio;
 
@@ -50,6 +55,21 @@ pub const HIIDB_VARIABLE: &str =
 /// `Backend::Unknown` in `thrift/uefisettings_backend.thrift`.
 pub const BACKEND_UNKNOWN: i32 = 0;
 
+/// `Backend::Hii` in `thrift/uefisettings_backend.thrift`.
+pub const BACKEND_HII: i32 = 1;
+
+/// The variable that holds the answers of the main form of EDK2's DriverSample, which the
+/// HII scenarios load: `MyIfrNVData`, with the formset GUID as its vendor.
+pub const DRIVER_SAMPLE_VARIABLE: &str =
+    "/sys/firmware/efi/efivars/MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d";
+
+/// Size of the attributes that efivarfs puts before the data of a variable.
+pub const EFIVARFS_HEADER_SIZE: usize = 4;
+
+/// The prefix of the answer of a question whose value the HII backend cannot read
+/// (`src/lib/hii/forms.rs`).
+pub const UNAVAILABLE: &str = "<ValueUnavailable";
+
 /// Panics unless this process runs in a QEMU test guest, whose kernel command line has
 /// [`TEST_PARAMETER`].
 #[track_caller]
@@ -62,6 +82,27 @@ pub fn require_test_vm() {
         "not a QEMU test guest: the kernel command line {cmdline:?} lacks {TEST_PARAMETER}; \
          run these tests through tests/qemu/run.sh"
     );
+}
+
+/// Questions of the main form of EDK2's DriverSample that the HII tests use, and the
+/// offsets of their answers in the data of [`DRIVER_SAMPLE_VARIABLE`].
+pub mod driver_sample {
+    /// A one-of question whose options "My one-of text #1", "#2" and "#3" store 0, 1 and 3.
+    pub const ONE_OF: &str = "My Keyword Namespace Test";
+    /// Offset of the 8-bit answer of [`ONE_OF`].
+    pub const ONE_OF_OFFSET: usize = 91;
+    /// A check box, which the form shows twice, both times on one field.
+    pub const CHECK_BOX: &str = "Activate this check box";
+    /// Offset of the 8-bit answer of [`CHECK_BOX`].
+    pub const CHECK_BOX_OFFSET: usize = 92;
+    /// A numeric question from 0 to 243 in steps of 1.
+    pub const NUMERIC: &str = "How old are you? (Step)";
+    /// Offset of the 8-bit answer of [`NUMERIC`].
+    pub const NUMERIC_OFFSET: usize = 85;
+    /// A one-of question whose options "3F8", "2F8", "3E8" and "2E8" store those numbers.
+    pub const SERIAL_PORT: &str = "Serial port IO address";
+    /// Offset of the 16-bit little-endian answer of [`SERIAL_PORT`].
+    pub const SERIAL_PORT_OFFSET: usize = 194;
 }
 
 /// How a `uefisettings` run exited, and what it printed.
@@ -140,4 +181,90 @@ pub struct MachineInfo {
 pub struct ErrorObject {
     /// The error chain.
     pub error_message: String,
+}
+
+/// A question as `hii list-questions --json` prints it, and as `get` and `set` print it in
+/// their responses (`Question`).
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct Question {
+    /// The prompt.
+    pub name: String,
+    /// The current answer.
+    pub answer: String,
+    /// The answers that a one-of question accepts.
+    pub options: Vec<String>,
+}
+
+/// Output of `get --json` and `set --json` (`GetResponseList` and `SetResponseList`).
+#[derive(Debug, Deserialize)]
+pub struct Responses {
+    /// One response per matching question.
+    pub responses: Vec<Response>,
+}
+
+/// One response of `get --json` or `set --json` (`GetResponse` or `SetResponse`).
+#[derive(Debug, Deserialize)]
+pub struct Response {
+    /// The backend that answered.
+    pub backend: i32,
+    /// The question, with its answer after the command.
+    pub question: Question,
+    /// Whether a `set` changed the answer; `get` does not print it.
+    #[serde(default)]
+    pub modified: bool,
+}
+
+/// Runs `uefisettings` with `args`, a `get` or `set` command; panics unless it exits with 0
+/// and prints exactly one response, from `backend`. Returns the question of the response,
+/// and whether it was modified.
+#[track_caller]
+pub fn single_response(args: &[&str], backend: i32) -> (Question, bool) {
+    let Responses { responses } = json(args);
+    let [response] = <[Response; 1]>::try_from(responses)
+        .unwrap_or_else(|responses| panic!("{args:?}: expected one response: {responses:#?}"));
+    assert_eq!(response.backend, backend, "{args:?}: {response:#?}");
+    (response.question, response.modified)
+}
+
+/// The data of an efivarfs variable, without the attributes, or `None` if it does not
+/// exist.
+#[track_caller]
+pub fn variable_data(path: &str) -> Option<Vec<u8>> {
+    require_test_vm();
+    match fs::read(path) {
+        Ok(bytes) => {
+            assert!(bytes.len() >= EFIVARFS_HEADER_SIZE, "{path}: {bytes:02x?}");
+            Some(bytes[EFIVARFS_HEADER_SIZE..].to_vec())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot read {path}: {error}"),
+    }
+}
+
+/// Reads the HII database where the `HiiDB` variable points, through `/dev/mem`, as
+/// `uefisettings` does. Panics if the variable does not exist.
+#[track_caller]
+pub fn read_published_database() -> io::Result<Vec<u8>> {
+    let hiidb = variable_data(HIIDB_VARIABLE).expect("the HiiDB variable does not exist");
+    let (length, address) = hiidb.split_at(size_of::<u32>());
+    let length = u32::from_le_bytes(length.try_into().expect("HiiDB holds no length"));
+    let address = u64::from_le_bytes(address.try_into().expect("HiiDB holds no 64-bit address"));
+    let mut database = vec![0; length.try_into().expect("the length exceeds usize")];
+    let mut mem = File::open("/dev/mem")?;
+    mem.seek(SeekFrom::Start(address))?;
+    mem.read_exact(&mut database)?;
+    Ok(database)
+}
+
+/// The bytes that differ between `before` and `after`, which have the same length, as
+/// (offset, new value) pairs.
+pub fn changed_bytes(before: &[u8], after: &[u8]) -> Vec<(usize, u8)> {
+    assert_eq!(before.len(), after.len(), "the variable changed its size");
+    before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter(|(_, (old, new))| old != new)
+        .map(|(offset, (_, &new))| (offset, new))
+        .collect()
 }

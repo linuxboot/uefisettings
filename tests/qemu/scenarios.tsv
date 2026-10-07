@@ -1,5 +1,14 @@
 # The scenarios of tests/qemu/run.sh, one per line, in tab-separated columns:
 #   name         the name, which run.sh takes as an argument
+#   drivers      UEFI drivers on the ESP that the firmware loads before the kernel, in
+#                order and separated by ";": a path, then optionally " " and its argument
+#   variables    UEFI variables to create first: a JSON file of tests/qemu/vars in the
+#                format of virt-fw-vars --set-json
 #   boots        the boots, separated by ",", which share one UEFI variable store: each is a
 #                test binary of tests/qemu/guest/tests, then "/" and a libtest filter if any
-boot-smoke	boot_smoke
+# "-" leaves a column empty.
+boot-smoke	-	-	boot_smoke
+hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii,hii_write,hii_persistence
+hii-reserved	/DriverSample.efi;/publish-hiidb.efi reserved	my-ifr-nv-data.json	hii
+hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard
+hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access

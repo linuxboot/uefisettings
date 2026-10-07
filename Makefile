@@ -26,8 +26,11 @@
 #
 # A CI host runs make setup && make -k under timeout, as nothing bounds the time
 # that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'. It
-# may keep target/qemu-test/kernel-rpms between runs: tests/qemu/fetch-kernel.sh
-# downloads only the RPMs that are missing there or fail their sha256 check.
+# may keep target/qemu-test/kernel-rpms and target/qemu-test/driver-sample
+# between runs: tests/qemu/fetch-kernel.sh downloads only the RPMs that are
+# missing there or fail their sha256 check, and tests/qemu/run.sh builds
+# DriverSample only when it is missing, so delete target/qemu-test/driver-sample
+# after a change to build-driver-sample.sh.
 
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
@@ -54,7 +57,7 @@ export RUSTFLAGS := -D warnings
 unexport CARGO_ENCODED_RUSTFLAGS
 
 # The targets that the checks build for, comma-separated as rustup takes them.
-TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl
+TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi
 comma := ,
 
 CHECKS := fmt clippy-x86_64 clippy-aarch64 test doc qemu-lint qemu
@@ -99,10 +102,12 @@ test: toolchain
 doc: toolchain
 	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --locked
 
-# The checks of the QEMU test crate that boot no guest.
+# The checks of the QEMU test crates that boot no guest.
 qemu-lint: toolchain
 	cargo fmt --check --manifest-path tests/qemu/guest/Cargo.toml
 	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --locked --manifest-path tests/qemu/guest/Cargo.toml
+	cargo fmt --check --manifest-path tests/qemu/publish-hiidb/Cargo.toml
+	cargo clippy --locked --release --target x86_64-unknown-uefi --manifest-path tests/qemu/publish-hiidb/Cargo.toml -- -D warnings
 
 # Boots the scenarios of tests/qemu/scenarios.tsv under KVM, with logs in
 # target/qemu-test/<UTC time>/; see tests/qemu/README.md.

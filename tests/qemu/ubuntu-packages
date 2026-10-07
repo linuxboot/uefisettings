@@ -1,7 +1,13 @@
+build-essential
 busybox-static
 cpio
 curl
+git
 jq
+nasm
 ovmf
+python3
+python3-virt-firmware
 qemu-system-x86
 rpm2cpio
+uuid-dev

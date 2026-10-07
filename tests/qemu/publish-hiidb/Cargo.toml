@@ -1,0 +1,14 @@
+[package]
+name = "publish-hiidb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "BSD-3-Clause"
+publish = false
+description = "UEFI driver: publishes the HII database through the HiiDB variable, the way OCP firmware does"
+
+[dependencies]
+uefi = { version = "0.41", features = ["alloc"] }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.41", features = ["global_allocator", "panic_handler"] }
