@@ -1,0 +1,6 @@
+busybox-static
+cpio
+jq
+ovmf
+qemu-system-x86
+rpm2cpio

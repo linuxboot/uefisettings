@@ -1,0 +1,5 @@
+# The scenarios of tests/qemu/run.sh, one per line, in tab-separated columns:
+#   name         the name, which run.sh takes as an argument
+#   boots        the boots, separated by ",", which share one UEFI variable store: each is a
+#                test binary of tests/qemu/guest/tests, then "/" and a libtest filter if any
+boot-smoke	boot_smoke

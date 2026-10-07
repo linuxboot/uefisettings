@@ -1,5 +1,5 @@
 # Continuous integration of uefisettings for pushes to main and pull requests:
-# lints, tests and docs.
+# lints, tests, docs and the QEMU tests.
 name: ci
 
 on:
@@ -70,3 +70,36 @@ jobs:
       - *checkout
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
       - run: cargo doc --no-deps --document-private-items --locked
+
+  qemu:
+    # Boots the scenarios of tests/qemu/scenarios.tsv under KVM; see
+    # tests/qemu/README.md.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - *checkout
+      # Opens /dev/kvm to the runner user, as GitHub's changelog of 2024-04-02
+      # gives it: https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/
+      - run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: sudo apt-get update
+      - run: xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes --no-install-recommends
+      # The runner image picks the package versions; this logs them.
+      - run: xargs --arg-file=tests/qemu/ubuntu-packages dpkg-query --show
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --target x86_64-unknown-linux-musl --no-self-update
+      - run: cargo fmt --check --manifest-path tests/qemu/guest/Cargo.toml
+      - run: cargo doc --no-deps --document-private-items --locked --manifest-path tests/qemu/guest/Cargo.toml
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/qemu-test/kernel-rpms
+          key: qemu-kernel-${{ hashFiles('tests/qemu/kernel.sha256') }}
+      - run: tests/qemu/run.sh
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qemu-test-logs
+          path: target/qemu-test/*/*/*.log

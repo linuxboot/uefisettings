@@ -1,0 +1,25 @@
+[package]
+name = "uefisettings-qemu-guest"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+publish = false
+description = "Tests of uefisettings that run inside the QEMU test guests (tests/qemu/run.sh)"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# The tests run only in the QEMU test guests, so they build only with this feature, which
+# tests/qemu/run.sh enables, and `cargo test --workspace` elsewhere builds no test binary
+# of this crate. Each file in tests/ needs a [[test]] entry that requires the feature.
+[features]
+test-vm = []
+
+# The library has no unit tests.
+[lib]
+test = false
+
+[[test]]
+name = "boot_smoke"
+required-features = ["test-vm"]
