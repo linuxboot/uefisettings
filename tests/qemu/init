@@ -1,0 +1,71 @@
+#!/bin/busybox sh
+# Copyright 2023 Meta Platforms, Inc. and affiliates.
+#
+# Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# PID 1 of the QEMU test guests, which tests/qemu/run.sh puts in their initramfs. It
+# mounts what uefisettings needs, runs the test binary that uefisettings.test= on the
+# kernel command line names (with the libtest filter from uefisettings.filter=, if any)
+# and then the health checks, both writing to the second serial port. It prints both exit
+# codes on the console and powers off.
+
+/bin/busybox --install -s /bin
+# uefisettings locks a file in /run/lock before it writes a setting.
+mkdir -p /dev /proc /run/lock /sys /tmp
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+
+test=
+filter=
+read -r cmdline < /proc/cmdline
+for parameter in $cmdline; do
+    case $parameter in
+    uefisettings.test=*) test=${parameter#*=} ;;
+    uefisettings.filter=*) filter=${parameter#*=} ;;
+    esac
+done
+
+# The firmware writes to both serial ports and may leave a line unfinished, so the
+# start and exit lines begin with a newline. run.sh prints the second port from the start
+# line on.
+printf '\nuefisettings-qemu-test: start %s %s\n' "$test" "$filter" > /dev/ttyS1
+"/tests/$test" --test-threads=1 ${filter:+"$filter"} > /dev/ttyS1 2>&1
+test_status=$?
+# The kernel is not tainted (TAINT_* in include/linux/panic.h), kept its whole log (the
+# first /dev/kmsg record has sequence number 0) and logged no error: each /dev/kmsg record
+# starts with facility << 3 | level, and the kernel's own facility is 0. /dev/kmsg keeps
+# the records that a log clear hides from dmesg. A read of it returns one record, fails if
+# the record does not fit and waits at the end of the log, so dd copies the records into
+# a FIFO, awk stops at a record that init writes last, and then dd is killed. The shell
+# opens the FIFO for dd, so awk also stops if dd cannot open /dev/kmsg.
+health_status=0
+{
+    read -r taint < /proc/sys/kernel/tainted
+    [ "$taint" = 0 ] || { echo "the kernel is tainted: $taint"; health_status=1; }
+    dd if=/dev/kmsg bs=8192 count=1 2> /dev/null | grep -q '^[0-9]*,0,' || {
+        echo "the first kernel log record is gone, or /dev/kmsg cannot be read"
+        health_status=1
+    }
+    read -r end < /proc/sys/kernel/random/uuid
+    echo "uefisettings-qemu-test: end of log $end" > /dev/kmsg
+    mkfifo /tmp/kmsg
+    dd if=/dev/kmsg bs=8192 2> /dev/null > /tmp/kmsg &
+    awk -v end="$end" '
+        index($0, end) { found = 1; exit }
+        /^[0-3],/ { print; error = 1 }
+        END { if (!found) print "cannot read the kernel log"; exit !found || error }' /tmp/kmsg ||
+        health_status=1
+    kill "$!" 2> /dev/null
+} > /dev/ttyS1 2>&1
+printf '\nuefisettings-qemu-test: exit %s %s\n' "$test_status" "$health_status"
+poweroff -f

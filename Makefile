@@ -10,8 +10,9 @@
 #
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# The checks of uefisettings. They need GNU make and bash, and rustup while
-# RUST_TOOLCHAIN is set, as it is by default:
+# The checks of uefisettings. They need GNU make and bash, rustup while
+# RUST_TOOLCHAIN is set, as it is by default, and for qemu an x86_64 host with
+# /dev/kvm and what tests/qemu/README.md lists:
 #   make                 every check of CHECKS, stopping at the first that fails
 #   make -k              every check of CHECKS, even after one fails
 #   make <check>...      the named checks, e.g. make clippy-aarch64 doc
@@ -20,10 +21,13 @@
 #                        targets that the checks use
 #   make help            the checks
 # make -n <check> prints the commands of a check without running them. The
-# checks install nothing themselves.
+# checks install nothing themselves. qemu needs qemu-lint, so under make -k a
+# qemu-lint failure skips the qemu boots.
 #
 # A CI host runs make setup && make -k under timeout, as nothing bounds the time
-# that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'.
+# that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'. It
+# may keep target/qemu-test/kernel-rpms between runs: tests/qemu/fetch-kernel.sh
+# downloads only the RPMs that are missing there or fail their sha256 check.
 
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
@@ -50,10 +54,10 @@ export RUSTFLAGS := -D warnings
 unexport CARGO_ENCODED_RUSTFLAGS
 
 # The targets that the checks build for, comma-separated as rustup takes them.
-TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl
 comma := ,
 
-CHECKS := fmt clippy-x86_64 clippy-aarch64 test doc
+CHECKS := fmt clippy-x86_64 clippy-aarch64 test doc qemu-lint qemu
 
 .PHONY: check help setup toolchain $(CHECKS)
 
@@ -94,3 +98,13 @@ test: toolchain
 
 doc: toolchain
 	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --locked
+
+# The checks of the QEMU test crate that boot no guest.
+qemu-lint: toolchain
+	cargo fmt --check --manifest-path tests/qemu/guest/Cargo.toml
+	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --locked --manifest-path tests/qemu/guest/Cargo.toml
+
+# Boots the scenarios of tests/qemu/scenarios.tsv under KVM, with logs in
+# target/qemu-test/<UTC time>/; see tests/qemu/README.md.
+qemu: qemu-lint
+	tests/qemu/run.sh
