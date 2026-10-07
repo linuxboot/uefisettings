@@ -33,5 +33,5 @@ env_logger = "0.10"
 
 # thrift/ is a package of its own; its generated crates build as dependencies, unlinted.
 [workspace]
-members = ["tests/qemu/guest"]
+members = ["tests/qemu/guest", "tests/qemu/publish-hiidb"]
 exclude = ["thrift"]

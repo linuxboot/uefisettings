@@ -88,15 +88,22 @@ jobs:
       - run: xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes --no-install-recommends
       # The runner image picks the package versions; this logs them.
       - run: xargs --arg-file=tests/qemu/ubuntu-packages dpkg-query --show
-      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --target x86_64-unknown-linux-musl --no-self-update
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt --target x86_64-unknown-linux-musl,x86_64-unknown-uefi --no-self-update
       - run: cargo fmt --check --manifest-path tests/qemu/guest/Cargo.toml
       - run: cargo doc --no-deps --document-private-items --locked --manifest-path tests/qemu/guest/Cargo.toml
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: cargo fmt --check --manifest-path tests/qemu/publish-hiidb/Cargo.toml
+      - run: cargo clippy --locked --release --target x86_64-unknown-uefi --manifest-path tests/qemu/publish-hiidb/Cargo.toml -- -D warnings
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/qemu-test/kernel-rpms
           key: qemu-kernel-${{ hashFiles('tests/qemu/kernel.sha256') }}
+      # The script pins the EDK2 commit, so its hash identifies the build.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/qemu-test/driver-sample
+          key: driver-sample-${{ hashFiles('tests/qemu/build-driver-sample.sh') }}
       - run: tests/qemu/run.sh
       - if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

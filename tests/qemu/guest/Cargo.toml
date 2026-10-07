@@ -23,3 +23,23 @@ test = false
 [[test]]
 name = "boot_smoke"
 required-features = ["test-vm"]
+
+[[test]]
+name = "hii"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_devmem_guard"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_no_runtime_access"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_persistence"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_write"
+required-features = ["test-vm"]
