@@ -10,59 +10,33 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::fs::OpenOptions;
-use std::os::unix::prelude::IntoRawFd;
-use std::path::Path;
+//! A guest whose firmware runs publish-hiidb from a `Driver####` load option that puts the
+//! HII database in loader data, which `/dev/mem` refuses to read: the HII commands fail
+//! with an error object.
 
-use anyhow::anyhow;
-use anyhow::Context;
-use anyhow::Result;
-use log::error;
-use nix::fcntl::flock;
-use nix::fcntl::FlockArg;
+use std::fs;
+use std::io;
 
-pub struct FileLock {
-    path: String,
-    file_descriptor: i32,
+use uefisettings_qemu_guest::json_error;
+use uefisettings_qemu_guest::read_published_database;
+use uefisettings_qemu_guest::require_test_vm;
+
+#[test]
+fn dev_mem_refuses_to_read_the_database() {
+    let error = read_published_database().expect_err("/dev/mem served the database");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
 }
 
-impl FileLock {
-    pub fn new<T>(file_path: T) -> Self
-    where
-        T: AsRef<Path> + ToString,
-    {
-        Self {
-            file_descriptor: -1,
-            path: file_path.to_string(),
-        }
-    }
-
-    pub fn lock(&mut self) -> Result<()> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)
-            .context(format!("failed to open or create {}", &self.path))?;
-
-        self.file_descriptor = file.into_raw_fd();
-
-        match flock(self.file_descriptor, FlockArg::LockExclusiveNonblock) {
-            Err(_) => Err(anyhow!(format!(
-                "failed to get lock on fd {} path {}",
-                &self.file_descriptor, &self.path
-            ))),
-            Ok(_) => Ok(()),
-        }
-    }
+#[test]
+fn list_questions_fails() {
+    json_error(&["hii", "list-questions", "--json"]);
 }
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        if self.file_descriptor != -1 {
-            if let Err(error_code) = flock(self.file_descriptor, FlockArg::UnlockNonblock) {
-                error!("file lock unlock failed with error code {}", error_code)
-            }
-        }
-    }
+
+#[test]
+fn extract_db_fails() {
+    require_test_vm();
+    let path = "/tmp/hiidb.bin";
+    let error = fs::metadata(path).expect_err("the file exists before extract-db");
+    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+    json_error(&["hii", "extract-db", path]);
 }

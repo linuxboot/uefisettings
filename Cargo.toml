@@ -5,6 +5,7 @@ version = "0.1.5"
 edition = "2021"
 license = "BSD-3-Clause"
 homepage = "https://github.com/linuxboot/uefisettings"
+exclude = ["/.github/", "/tests/qemu/"]
 
 [lib]
 name = "uefisettings"
@@ -30,3 +31,7 @@ proc-mounts = "0.3"
 thiserror = "1.0"
 env_logger = "0.10"
 
+# thrift/ is a package of its own; its generated crates build as dependencies, unlinted.
+[workspace]
+members = ["tests/qemu/guest", "tests/qemu/publish-hiidb"]
+exclude = ["thrift"]

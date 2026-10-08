@@ -141,3 +141,7 @@ cargo install fbthrift_compiler
 ~/.cargo/bin/compiler thrift/uefisettings_spellings_db.thrift
 mv lib.rs thrift/rust/uefisettings_spellings_db_thrift/uefisettings_spellings_db.rs
 ```
+
+## QEMU tests
+
+End-to-end tests boot QEMU guests and run `uefisettings` against emulated firmware; [`tests/qemu/README.md`](https://github.com/linuxboot/uefisettings/blob/main/tests/qemu/README.md) explains how to run them.

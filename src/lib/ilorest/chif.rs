@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::ffi::c_char;
 use std::ffi::c_void;
 use std::ffi::CStr;
 use std::path::Path;
@@ -24,7 +25,7 @@ use log::debug;
 use log::error;
 
 type ByteArray = *mut u8;
-type ChifString = *const i8;
+type ChifString = *const c_char;
 
 type ChifInitializeFunction = fn() -> ();
 type ChifCreateFunction = fn(*const *mut c_void) -> u32;
@@ -64,8 +65,16 @@ const CHIF_STATUS_CODE_SUCCESS: u32 = 0;
 
 /// IloRestChif holds functions which are exported by ilorest_chif.so
 /// ```no_run
+/// # mod chif {
+/// #     include!("chif.rs");
+/// # }
+/// # use chif::get_lib;
+/// # use chif::IloRestChif;
+/// # fn main() -> anyhow::Result<()> {
 /// let lib = get_lib("/usr/lib64/ilorest_chif.so")?;
 /// let ilo = IloRestChif::new(&lib)?;
+/// # Ok(())
+/// # }
 /// ```
 /// This will load the ilorest_chif.so library, initialize it and create a new handle/connection to the ilo BMC.
 pub struct IloRestChif<'a> {
@@ -259,10 +268,6 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
         Ok(())
     }
 
-    fn get_max_buffer_size(&self) -> u32 {
-        (self.get_max_buffer_size)()
-    }
-
     fn get_read_request_size(&self) -> u32 {
         (self.get_read_request_size)()
     }
@@ -304,8 +309,8 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
         unsafe {
             let tmp_struct_pointer = (self.rest_immediate)(
                 request_body_and_header_size,
-                response_key.as_ptr() as *const i8,
-                namespace.as_ptr() as *const i8,
+                response_key.as_ptr(),
+                namespace.as_ptr(),
             );
             slice::from_raw_parts(
                 tmp_struct_pointer,
@@ -323,9 +328,9 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
             let tmp_struct_pointer = (self.rest_immediate_blob_desc)(
-                request_key.as_ptr() as *const i8,
-                response_key.as_ptr() as *const i8,
-                namespace.as_ptr() as *const i8,
+                request_key.as_ptr(),
+                response_key.as_ptr(),
+                namespace.as_ptr(),
             );
             slice::from_raw_parts(
                 tmp_struct_pointer,
@@ -338,17 +343,11 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
         (self.get_rest_immediate_request_size)()
     }
 
-    fn get_blob_request_size(&self) -> u32 {
-        (self.get_rest_blob_request_size)()
-    }
-
     fn prepare_new_blob_entry(&self, request_key: &CStr, namespace: &CStr) -> &[u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer = (self.create_not_blobentry)(
-                request_key.as_ptr() as *const i8,
-                namespace.as_ptr() as *const i8,
-            );
+            let tmp_struct_pointer =
+                (self.create_not_blobentry)(request_key.as_ptr(), namespace.as_ptr());
             slice::from_raw_parts(
                 tmp_struct_pointer,
                 (self.get_create_request_size)() as usize,
@@ -368,8 +367,8 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
             let tmp_struct_pointer = (self.write_fragment)(
                 write_block_size,
                 count,
-                request_key.as_ptr() as *const i8,
-                namespace.as_ptr() as *const i8,
+                request_key.as_ptr(),
+                namespace.as_ptr(),
             );
             slice::from_raw_parts(tmp_struct_pointer, (self.get_write_request_size)() as usize)
         }
@@ -387,8 +386,8 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
             let tmp_struct_pointer = (self.read_fragment)(
                 read_block_size,
                 count,
-                response_key.as_ptr() as *const i8,
-                namespace.as_ptr() as *const i8,
+                response_key.as_ptr(),
+                namespace.as_ptr(),
             );
             slice::from_raw_parts(tmp_struct_pointer, (self.get_read_request_size)() as usize)
         }
@@ -397,10 +396,7 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
     fn finalize_blob_write(&self, request_key: &CStr, namespace: &CStr) -> &[u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer = (self.finalize_blob)(
-                request_key.as_ptr() as *const i8,
-                namespace.as_ptr() as *const i8,
-            );
+            let tmp_struct_pointer = (self.finalize_blob)(request_key.as_ptr(), namespace.as_ptr());
             slice::from_raw_parts(
                 tmp_struct_pointer,
                 (self.get_finalize_request_size)() as usize,
@@ -408,27 +404,12 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
         }
     }
 
-    fn get_finalize_request_size(&self) -> u32 {
-        (self.get_finalize_request_size)()
-    }
-
-    fn get_create_request_size(&self) -> u32 {
-        (self.get_create_request_size)()
-    }
-
     fn get_key_info(&self, response_key: &CStr, namespace: &CStr) -> &'a [u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer = (self.get_key_info)(
-                response_key.as_ptr() as *const i8,
-                namespace.as_ptr() as *const i8,
-            );
+            let tmp_struct_pointer = (self.get_key_info)(response_key.as_ptr(), namespace.as_ptr());
             slice::from_raw_parts(tmp_struct_pointer, (self.get_info_request_size)() as usize)
         }
-    }
-
-    fn get_info_request_size(&self) -> u32 {
-        (self.get_info_request_size)()
     }
 
     fn get_read_response_size(&self) -> u32 {
@@ -438,17 +419,12 @@ impl<'a> IloRestChifInterface for IloRestChif<'a> {
     fn prepare_delete_blob(&self, key: &CStr, namespace: &CStr) -> &'a [u8] {
         // SAFETY: Look at the safety comment in rest_immediate()
         unsafe {
-            let tmp_struct_pointer =
-                (self.delete_blob)(key.as_ptr() as *const i8, namespace.as_ptr() as *const i8);
+            let tmp_struct_pointer = (self.delete_blob)(key.as_ptr(), namespace.as_ptr());
             slice::from_raw_parts(
                 tmp_struct_pointer,
                 (self.get_delete_request_size)() as usize,
             )
         }
-    }
-
-    fn get_delete_request_size(&self) -> u32 {
-        (self.get_delete_request_size)()
     }
 }
 
@@ -457,7 +433,6 @@ pub trait IloRestChifInterface {
     fn ping(&self) -> Result<(), u32>;
     fn exchange_packet(&self, send_buf: &[u8]) -> Result<Vec<u8>, u32>;
     fn set_recv_timeout(&self, timeout: u32) -> Result<(), u32>;
-    fn get_max_buffer_size(&self) -> u32;
     fn get_read_request_size(&self) -> u32;
     fn get_response_header_blob_size(&self) -> u32;
     fn get_max_read_size(&self) -> u32;
@@ -477,7 +452,6 @@ pub trait IloRestChifInterface {
         namespace: &CStr,
     ) -> &[u8];
     fn get_immediate_request_size(&self) -> u32;
-    fn get_blob_request_size(&self) -> u32;
     fn prepare_new_blob_entry(&self, request_key: &CStr, namespace: &CStr) -> &[u8];
     fn prepare_write_fragment(
         &self,
@@ -494,13 +468,9 @@ pub trait IloRestChifInterface {
         namespace: &CStr,
     ) -> &[u8];
     fn finalize_blob_write(&self, request_key: &CStr, namespace: &CStr) -> &[u8];
-    fn get_finalize_request_size(&self) -> u32;
-    fn get_create_request_size(&self) -> u32;
     fn get_key_info(&self, response_key: &CStr, namespace: &CStr) -> &[u8];
-    fn get_info_request_size(&self) -> u32;
     fn get_read_response_size(&self) -> u32;
     fn prepare_delete_blob(&self, key: &CStr, namespace: &CStr) -> &[u8];
-    fn get_delete_request_size(&self) -> u32;
 }
 
 pub fn get_lib(libpath: &str) -> Result<Library> {

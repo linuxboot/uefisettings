@@ -10,59 +10,13 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::fs::OpenOptions;
-use std::os::unix::prelude::IntoRawFd;
-use std::path::Path;
+//! Links publish-hiidb as a boot service driver: OVMF loads the image of a
+//! `Driver####` load option only if it is a driver (`BmIsLoadOptionPeHeaderValid`
+//! in EDK2's `BmLoadOption.c`), and it runs those options before it starts the
+//! kernel that QEMU's `-kernel` passes it.
 
-use anyhow::anyhow;
-use anyhow::Context;
-use anyhow::Result;
-use log::error;
-use nix::fcntl::flock;
-use nix::fcntl::FlockArg;
-
-pub struct FileLock {
-    path: String,
-    file_descriptor: i32,
-}
-
-impl FileLock {
-    pub fn new<T>(file_path: T) -> Self
-    where
-        T: AsRef<Path> + ToString,
-    {
-        Self {
-            file_descriptor: -1,
-            path: file_path.to_string(),
-        }
-    }
-
-    pub fn lock(&mut self) -> Result<()> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)
-            .context(format!("failed to open or create {}", &self.path))?;
-
-        self.file_descriptor = file.into_raw_fd();
-
-        match flock(self.file_descriptor, FlockArg::LockExclusiveNonblock) {
-            Err(_) => Err(anyhow!(format!(
-                "failed to get lock on fd {} path {}",
-                &self.file_descriptor, &self.path
-            ))),
-            Ok(_) => Ok(()),
-        }
-    }
-}
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        if self.file_descriptor != -1 {
-            if let Err(error_code) = flock(self.file_descriptor, FlockArg::UnlockNonblock) {
-                error!("file lock unlock failed with error code {}", error_code)
-            }
-        }
+fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "uefi") {
+        println!("cargo:rustc-link-arg-bins=/subsystem:efi_boot_service_driver");
     }
 }

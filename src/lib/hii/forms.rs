@@ -13,9 +13,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::env::var;
 use std::fmt;
-use std::fmt::format;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
@@ -33,7 +31,6 @@ use binrw::BinRead;
 use binrw::BinReaderExt;
 use binrw::BinResult;
 use log::debug;
-use log::error;
 use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
@@ -330,7 +327,7 @@ pub struct IFROperation {
     #[br(map = |x: u8| x & 0x80 != 0)]
     // read 8 bits, discard all of them except the last one
     pub open_scope: bool,
-    #[br(count = length - IFR_OPERATION_HEADER_SIZE)]
+    #[br(count = usize::from(length - IFR_OPERATION_HEADER_SIZE))]
     data: Vec<u8>,
 
     // the following fields will not be parsed by binrw and when an instance of this struct is created
@@ -356,7 +353,7 @@ impl fmt::Debug for IFROperation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum ParsedOperation {
     FormSet(FormSet),
     OneOf(OneOf),
@@ -365,21 +362,23 @@ pub enum ParsedOperation {
     VarStore(VarStore),
     VarStoreNameValue(VarStoreNameValue),
     VarStoreEfi(VarStoreEfi),
+    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     DefaultStore(DefaultStore),
     IFRDefault(IFRDefault),
+    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     Form(Form),
+    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     Text(Text),
     Subtitle(Subtitle),
     Numeric(Numeric),
+    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     QuestionRef1(QuestionRef1),
+    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     EqIdVal(EqIdVal),
+    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     EqIdValList(EqIdValList),
+    #[default]
     Placeholder,
-}
-impl Default for ParsedOperation {
-    fn default() -> Self {
-        ParsedOperation::Placeholder
-    }
 }
 
 // Documentation for subsequent structs at:
@@ -617,7 +616,7 @@ trait VariableStore {
         }
 
         // try to read data from varstore
-        let mut file = File::open(&self.store_filename()).context(format!(
+        let mut file = File::open(self.store_filename()).context(format!(
             "failed to open sysfs efivars '{}' to get varstore bytes",
             self.store_filename()
         ))?;
@@ -658,8 +657,10 @@ trait VariableStore {
 
         let store_filename = self.store_filename();
 
-        let mut file_ro = File::open(&store_filename)
-            .context(format!("Failed to open efivarfs file '{}' to get varstore bytes", store_filename))?;
+        let mut file_ro = File::open(&store_filename).context(format!(
+            "Failed to open efivarfs file '{}' to get varstore bytes",
+            store_filename
+        ))?;
 
         let mut file_contents = Vec::new();
         file_ro
@@ -792,7 +793,10 @@ mod non_efi_varstore_tests {
     fn boot_service_only_varstore_read_is_rejected() {
         for attributes in [0x2, 0x3] {
             assert_eq!(
-                efi_varstore(attributes).read_bytes().unwrap_err().to_string(),
+                efi_varstore(attributes)
+                    .read_bytes()
+                    .unwrap_err()
+                    .to_string(),
                 "EFI variable is boot-service-only and is not readable from efivarfs"
             );
         }
@@ -1079,7 +1083,7 @@ pub struct EqIdVal {
 pub struct EqIdValList {
     pub question_id: u16,
     pub list_length: u16,
-    #[br(count = list_length)]
+    #[br(count = usize::from(list_length))]
     pub value_list: Vec<u16>,
 }
 
@@ -1117,13 +1121,20 @@ pub enum TypeValue {
     NumSize32(u32),
     NumSize64(u64),
     Boolean(bool),
+    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Time(Time),
+    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Date(Date),
+    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     StringID(u16),
+    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Other,
+    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Undefined,
+    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Action(u16),
     // Buffer(Vec<u8>),  - spec unclear ; FIXME
+    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Ref(Ref),
     Unknown(u8),
 }
@@ -1198,12 +1209,9 @@ pub fn handle_form_package(
             let current_scope_clone = Rc::clone(&current_scope);
             match current_scope_clone.borrow().parent.as_ref() {
                 Some(parent_ref) => {
-                    match parent_ref.upgrade() {
-                        Some(parent_ref_rc) => {
-                            // current_scope = current_scope 's parent
-                            current_scope = Rc::clone(&parent_ref_rc);
-                        }
-                        None => {}
+                    if let Some(parent_ref_rc) = parent_ref.upgrade() {
+                        // current_scope = current_scope 's parent
+                        current_scope = Rc::clone(&parent_ref_rc);
                     }
 
                     debug!(
@@ -1682,11 +1690,8 @@ fn handle_oneof(
     if chosen_value == u64::MAX {
         // No answer was provided, so using the default value instead.
         for child in &node.borrow().children {
-            match &child.borrow().parsed_data {
-                ParsedOperation::IFRDefault(o) => {
-                    chosen_value = u64::from(o.default_id);
-                }
-                _ => {}
+            if let ParsedOperation::IFRDefault(o) = &child.borrow().parsed_data {
+                chosen_value = u64::from(o.default_id);
             }
         }
     }
@@ -1696,36 +1701,32 @@ fn handle_oneof(
 
     let mut found_option = false;
     for child in &node.borrow().children {
-        match &child.borrow().parsed_data {
-            ParsedOperation::OneOfOption(o) => {
-                let current_value: u64 = match o.value {
-                    TypeValue::NumSize8(c) => c as u64,
-                    TypeValue::NumSize16(c) => c as u64,
-                    TypeValue::NumSize32(c) => c as u64,
-                    TypeValue::NumSize64(c) => c as u64,
-                    _ => 0,
-                };
+        if let ParsedOperation::OneOfOption(o) = &child.borrow().parsed_data {
+            let current_value: u64 = match o.value {
+                TypeValue::NumSize8(c) => c as u64,
+                TypeValue::NumSize16(c) => c as u64,
+                TypeValue::NumSize32(c) => c as u64,
+                TypeValue::NumSize64(c) => c,
+                _ => 0,
+            };
 
-                let opt = AnswerOption {
-                    raw_value: o.value.clone(),
-                    value: find_corresponding_string(o.option_string_id, string_packages)
-                        .to_string(),
-                };
+            let opt = AnswerOption {
+                raw_value: o.value,
+                value: find_corresponding_string(o.option_string_id, string_packages).to_string(),
+            };
 
-                if !varstore_not_found && current_value == chosen_value && !found_option {
-                    found_option = true;
-                    answer.push_str(opt.value.trim());
-                    // cannot break here because we want to add all options to possible_options
-                }
-
-                possible_options.push(opt);
+            if !varstore_not_found && current_value == chosen_value && !found_option {
+                found_option = true;
+                answer.push_str(opt.value.trim());
+                // cannot break here because we want to add all options to possible_options
             }
-            _ => {}
+
+            possible_options.push(opt);
         }
     }
-	if answer.is_empty() {
-		answer.push_str("Unknown");
-	}
+    if answer.is_empty() {
+        answer.push_str("Unknown");
+    }
 
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
@@ -1815,7 +1816,15 @@ where
     let extracted_data: Result<T> = extract_efi_data(offset, bytes);
     match extracted_data {
         Ok(a) => ans.push_str(format!("{a}").as_str()),
-        Err(e) => ans.push_str(format!("<ExtractEFIDataError: {} (offset: {}; buflen: {})>", e, offset, bytes.len()).as_str())
+        Err(e) => ans.push_str(
+            format!(
+                "<ExtractEFIDataError: {} (offset: {}; buflen: {})>",
+                e,
+                offset,
+                bytes.len()
+            )
+            .as_str(),
+        ),
     }
 }
 
@@ -1873,7 +1882,7 @@ pub fn display(
             format!(
                 "{extra_spaces}OpCode: {:?} - Name: {}\n",
                 current_node.op_code,
-                parsed.name.to_string(),
+                parsed.name,
             )
             .as_str(),
         ),
@@ -2139,10 +2148,7 @@ pub fn change_value(
     Ok(changed)
 }
 
-fn find_corresponding_string<'a>(
-    string_id: u16,
-    string_packages: &'a Vec<HashMap<i32, String>>,
-) -> &'a str {
+fn find_corresponding_string(string_id: u16, string_packages: &Vec<HashMap<i32, String>>) -> &str {
     // TODO: accept language pack parameter later
     // it defaults to the first language pack it can find and the first one is en-US
 
@@ -2219,7 +2225,7 @@ fn find_corresponding_varstore(
 }
 
 /// extract_efi_data extracts data of type T at given offset from efivar bytes.
-/// The <T> type here is used to get the type (and thus size) of our answer.
+/// The `T` type here is used to get the type (and thus size) of our answer.
 fn extract_efi_data<T>(offset: u16, bytes: &Vec<u8>) -> Result<T>
 where
     T: BinRead,
