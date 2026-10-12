@@ -13,3 +13,9 @@ fbthrift = "0.0"
 [lib]
 name = "uefisettings_backend_thrift"
 path = "uefisettings_backend.rs"
+
+# uefisettings_backend.thrift declares no exception, so the generated errors module is
+# empty, and rustc reports its glob re-export, `pub use self::errors::*`, as an unused
+# import. The allow sits here because regenerating the crate replaces only the .rs file.
+[lints.rust]
+unused_imports = "allow"
