@@ -141,3 +141,24 @@ cargo install fbthrift_compiler
 ~/.cargo/bin/compiler thrift/uefisettings_spellings_db.thrift
 mv lib.rs thrift/rust/uefisettings_spellings_db_thrift/uefisettings_spellings_db.rs
 ```
+
+## Checks
+
+The `Makefile` in the root of the repository runs the checks that a change should pass: rustfmt, clippy for x86_64 and aarch64, the tests, the docs and the QEMU tests.
+
+The checks need GNU make and bash, and rustup unless `make RUST_TOOLCHAIN=` runs them on the cargo of `PATH`.
+
+```sh
+make setup           # once: installs, through rustup, the Rust toolchain, components and targets of the checks
+make                 # every check, stopping at the first that fails
+make -k              # every check, even after one fails
+make <check>...      # the named checks, e.g. make clippy-aarch64 doc
+make RUST_TOOLCHAIN= # the checks on the cargo of PATH
+make help            # lists the checks
+```
+
+`make qemu`, the QEMU tests, also needs an x86_64 host with `/dev/kvm` and the packages that [`tests/qemu/README.md`](tests/qemu/README.md) lists.
+
+## QEMU tests
+
+End-to-end tests boot QEMU guests and run `uefisettings` against emulated firmware; [`tests/qemu/README.md`](tests/qemu/README.md) explains how to run them.

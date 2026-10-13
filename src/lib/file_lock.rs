@@ -42,18 +42,17 @@ impl FileLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&self.path)
             .context(format!("failed to open or create {}", &self.path))?;
 
         self.file_descriptor = file.into_raw_fd();
 
         match flock(self.file_descriptor, FlockArg::LockExclusiveNonblock) {
-            Err(_) => {
-                return Err(anyhow!(format!(
-                    "failed to get lock on fd {} path {}",
-                    &self.file_descriptor, &self.path
-                )));
-            }
+            Err(_) => Err(anyhow!(format!(
+                "failed to get lock on fd {} path {}",
+                &self.file_descriptor, &self.path
+            ))),
             Ok(_) => Ok(()),
         }
     }
@@ -61,11 +60,8 @@ impl FileLock {
 impl Drop for FileLock {
     fn drop(&mut self) {
         if self.file_descriptor != -1 {
-            match flock(self.file_descriptor, FlockArg::UnlockNonblock) {
-                Err(error_code) => {
-                    error!("file lock unlock failed with error code {}", error_code)
-                }
-                Ok(_) => {}
+            if let Err(error_code) = flock(self.file_descriptor, FlockArg::UnlockNonblock) {
+                error!("file lock unlock failed with error code {}", error_code)
             }
         }
     }

@@ -16,7 +16,6 @@ use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
@@ -60,7 +59,7 @@ pub trait SettingsBackend {
 pub struct HiiBackend {}
 
 impl HiiBackend {
-    /// extract_db extracts HiiDB from efivarfs and returns it in bytes (in HiiDatabase's db field which is Vec<u8>)
+    /// extract_db extracts HiiDB from efivarfs and returns it in bytes (in HiiDatabase's db field which is `Vec<u8>`)
     pub fn extract_db() -> Result<HiiDatabase> {
         let resp = HiiDatabase {
             db: extract::extract_db()?,

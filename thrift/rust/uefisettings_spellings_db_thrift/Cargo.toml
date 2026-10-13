@@ -14,3 +14,9 @@ once_cell = "1.17"
 [lib]
 name = "uefisettings_spellings_db_thrift"
 path = "uefisettings_spellings_db.rs"
+
+# uefisettings_spellings_db.thrift declares no exception, so the generated errors module
+# is empty, and rustc reports its glob re-export, `pub use self::errors::*`, as an unused
+# import. The allow sits here because regenerating the crate replaces only the .rs file.
+[lints.rust]
+unused_imports = "allow"

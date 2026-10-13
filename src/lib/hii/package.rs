@@ -13,7 +13,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
 use std::io::Seek;
 use std::rc::Rc;
 
@@ -316,7 +315,7 @@ type IFRNodeLink = Rc<RefCell<IFROperation>>;
 /// ParsedHiiDB is the 'result' superstruct which will
 /// hold the results of our parsed strings and forms packages.
 pub struct ParsedHiiDB {
-    /// HashMap<packagelist_guid_string, Vec<StringMap>>
+    /// `HashMap<packagelist_guid_string, Vec<StringMap>>`
     /// for each packagelist the key = packagelist guid string and val = vector of string package hashmaps
     /// each string package hashmap here has its key = string id and val = the string
     pub strings: HashMap<String, Vec<StringMap>>,
@@ -329,6 +328,7 @@ pub struct ParsedHiiDB {
 /// * string -> parse and save data
 /// * form -> parse and save data
 /// * something else (like fonts or animations) -> we don't care about them, so continue to the next package in the package list.
+///
 /// In the end return a ParsedHiiDB struct which will have the parsed and saved data.
 pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
     let mut res = ParsedHiiDB {
@@ -380,6 +380,7 @@ pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::fs::File;
     use std::io::Read;
 
@@ -841,7 +842,7 @@ mod tests {
     #[test]
     fn test_read_db_strings() {
         let file_path = "testdata/hiidb.bin";
-        if !fs::metadata(file_path).is_ok() {
+        if fs::metadata(file_path).is_err() {
             // The BIOS firmware we tested on was proprietary, thus I'm not sure we're allowed to share even the HiiDB. Keeping the test here for anybody how has the HiiDB this is tested on; or feel free to modify the test to use GALAGOPRO or any other free UEFI firmware.
             return;
         }
@@ -858,7 +859,7 @@ mod tests {
             res.strings
                 .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
                 .unwrap()
-                .get(0)
+                .first()
                 .unwrap()
                 .get(&8)
                 .unwrap(),
@@ -870,7 +871,7 @@ mod tests {
             res.strings
                 .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
                 .unwrap()
-                .get(0)
+                .first()
                 .unwrap()
                 .len(),
             5714
@@ -889,7 +890,7 @@ mod tests {
     #[test]
     fn test_read_db_forms() {
         let file_path = "testdata/hiidb.bin";
-        if !fs::metadata(file_path).is_ok() {
+        if fs::metadata(file_path).is_err() {
             // The BIOS firmware we tested on was proprietary, thus I'm not sure we're allowed to share even the HiiDB. Keeping the test here for anybody how has the HiiDB this is tested on; or feel free to modify the test to use GALAGOPRO or any other free UEFI firmware.
             return;
         }
@@ -902,7 +903,7 @@ mod tests {
             .forms
             .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
             .unwrap()
-            .get(0)
+            .first()
             .unwrap()
             .borrow();
 
@@ -911,12 +912,12 @@ mod tests {
 
         // root elements's child should be FormSet
         assert_eq!(
-            root_node.children.get(0).unwrap().borrow().op_code,
+            root_node.children.first().unwrap().borrow().op_code,
             forms::IFROpCode::FormSet
         );
 
         // root elements's child FormSet should have open scope
-        assert!(root_node.children.get(0).unwrap().borrow().open_scope);
+        assert!(root_node.children.first().unwrap().borrow().open_scope);
 
         // root_node's child should be able to refer to it's parent which is root_node
         // root_node has a dummy opcode used only in root nodes so if they match
@@ -924,7 +925,7 @@ mod tests {
         assert_eq!(
             root_node
                 .children
-                .get(0)
+                .first()
                 .unwrap()
                 .borrow()
                 .parent
