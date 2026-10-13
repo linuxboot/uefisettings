@@ -98,7 +98,9 @@ fn update_efivarfs_bytes(
 
 // UEFI Spec v2.9 Page 1844
 #[derive(BinRead, Debug, PartialEq, Copy, Clone)]
-#[br(little)]
+// binrw tries the variants in order; by default it collects every miss's
+// error in a Vec that grows up to 100 entries and is dropped per opcode
+#[br(little, return_unexpected_error)]
 pub enum IFROpCode {
     #[br(magic = 0x01u8)]
     Form,

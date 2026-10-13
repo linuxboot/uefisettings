@@ -38,7 +38,8 @@ struct StringPackageHeader {
 
 // UEFI Spec v2.9 Page 1809
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+// no Vec of per-variant errors per block; see forms::IFROpCode
+#[br(little, return_unexpected_error)]
 enum StringBlockType {
     #[br(magic = 0x00u8)]
     End,

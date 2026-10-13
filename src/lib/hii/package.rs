@@ -122,7 +122,8 @@ struct Package {
 
 // UEFI Spec v2.9 Page 1790
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+// no Vec of per-variant errors per package; see forms::IFROpCode
+#[br(little, return_unexpected_error)]
 enum PackageType {
     #[br(magic = 0x01u8)]
     Guid,
