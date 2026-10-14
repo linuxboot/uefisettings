@@ -159,6 +159,8 @@ make help            # lists the checks
 
 `make qemu`, the QEMU tests, also needs an x86_64 host with `/dev/kvm` and the packages that [`tests/qemu/README.md`](tests/qemu/README.md) lists.
 
+GitHub Actions runs the checks on every pull request and every push to main, as [`.github/workflows/checks.yml`](.github/workflows/checks.yml) describes.
+
 ## QEMU tests
 
 End-to-end tests boot QEMU guests and run `uefisettings` against emulated firmware; [`tests/qemu/README.md`](tests/qemu/README.md) explains how to run them.
