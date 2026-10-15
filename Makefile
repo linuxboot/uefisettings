@@ -11,18 +11,19 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # The checks of uefisettings. They need GNU make and bash, rustup while
-# RUST_TOOLCHAIN is set, as it is by default, and for qemu an x86_64 host with
-# /dev/kvm and what tests/qemu/README.md lists:
+# RUST_TOOLCHAIN is set, as it is by default, and for test-e2e-qemu an x86_64
+# host with /dev/kvm and what tests/qemu/README.md lists:
 #   make                 every check of CHECKS, stopping at the first that fails
 #   make -k              every check of CHECKS, even after one fails
 #   make <check>...      the named checks, e.g. make clippy-aarch64 doc
+#   make lint            the checks of LINTS
+#   make lint test       every check but test-e2e-qemu
 #   make RUST_TOOLCHAIN= the checks on the cargo of PATH
 #   make setup           installs, through rustup, the toolchain, components and
 #                        targets that the checks use
 #   make help            the checks
 # make -n <check> prints the commands of a check without running them. The
-# checks install nothing themselves. qemu needs qemu-lint, so under make -k a
-# qemu-lint failure skips the qemu boots.
+# checks install nothing themselves.
 #
 # A CI host runs make setup && make -k under timeout, as nothing bounds the time
 # that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'. It
@@ -60,15 +61,21 @@ unexport CARGO_ENCODED_RUSTFLAGS
 TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi
 comma := ,
 
-CHECKS := fmt clippy-x86_64 clippy-aarch64 test doc qemu-lint qemu
+# CI runs lint test and test-e2e-qemu: a new check joins LINTS or gets a CI job.
+LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-uefi doc
+CHECKS := $(LINTS) test test-e2e-qemu
 
-.PHONY: check help setup toolchain $(CHECKS)
+.PHONY: check lint help setup toolchain $(CHECKS)
 
 check: $(CHECKS)
+
+lint: $(LINTS)
 
 help:
 	@echo "checks: $(CHECKS)"
 	@echo "make runs every check; make <check>... runs the named ones."
+	@echo "make lint runs $(LINTS)."
+	@echo "make lint test runs every check but test-e2e-qemu."
 	@echo "make -k runs every check, even after one fails."
 	@echo "make -n <check> prints the commands of a check without running them."
 	@echo "make RUST_TOOLCHAIN= runs the checks on the cargo of PATH."
@@ -90,26 +97,24 @@ endif
 toolchain:
 	@scripts/check-toolchain.sh '$(RUST_TOOLCHAIN)' '$(TARGETS)'
 
+# Covers the workspace's QEMU test crates too.
 fmt: toolchain
 	cargo fmt --check
 
 clippy-x86_64 clippy-aarch64: clippy-%: toolchain
 	cargo clippy --locked --workspace --all-targets --all-features --target $*-unknown-linux-gnu -- -D warnings
 
+# publish-hiidb, the one crate built for UEFI.
+clippy-uefi: toolchain
+	cargo clippy --locked --release --target x86_64-unknown-uefi --manifest-path tests/qemu/publish-hiidb/Cargo.toml -- -D warnings
+
 test: toolchain
 	scripts/assert-tests-ran.sh cargo test --locked
 
 doc: toolchain
-	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --locked
-
-# The checks of the QEMU test crates that boot no guest.
-qemu-lint: toolchain
-	cargo fmt --check --manifest-path tests/qemu/guest/Cargo.toml
-	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --locked --manifest-path tests/qemu/guest/Cargo.toml
-	cargo fmt --check --manifest-path tests/qemu/publish-hiidb/Cargo.toml
-	cargo clippy --locked --release --target x86_64-unknown-uefi --manifest-path tests/qemu/publish-hiidb/Cargo.toml -- -D warnings
+	RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
 
 # Boots the scenarios of tests/qemu/scenarios.tsv under KVM, with logs in
 # target/qemu-test/<UTC time>/; see tests/qemu/README.md.
-qemu: qemu-lint
+test-e2e-qemu: toolchain
 	tests/qemu/run.sh

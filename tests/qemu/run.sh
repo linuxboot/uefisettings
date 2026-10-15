@@ -62,6 +62,7 @@ mapfile -t named < <(awk -F '\t' '$1 !~ /^(#|$)/ {
 
 echo "run.sh: start $(date -u +%FT%TZ), logs in $run"
 mkdir -p "$run/initramfs/bin" "$run/initramfs/tests" "$run/esp"
+grep --max-count=1 '^model name' /proc/cpuinfo
 "$qemu" --version
 "$busybox" --help | sed -n 1p
 
