@@ -31,9 +31,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Every check but the boots.
-      - run: make -k -o qemu
+      - run: make -k lint test
 
-  qemu:
+  test-e2e-qemu:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -66,7 +66,7 @@ jobs:
             target/qemu-test/driver-sample
           key: qemu-inputs-${{ hashFiles('tests/qemu/kernel.sha256', 'tests/qemu/build-driver-sample.sh') }}
 
-      - run: make qemu
+      - run: make test-e2e-qemu
 
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
