@@ -99,7 +99,8 @@ cargo test --release --locked --target "$target" --features test-vm --test '*' -
 # The initramfs gets uefisettings, the test binaries, busybox and init. The ESP gets the
 # HII fixture: publish-hiidb and EDK2's DriverSample.
 unnamed=()
-while read -r name path; do
+# read fails on a last line without a newline, which still counts.
+while read -r name path || [[ -n $name ]]; do
     case $name in
     uefisettings) cp "$path" "$run/initramfs/bin/" ;;
     publish-hiidb) cp "$path" "$run/esp/" ;;
@@ -128,7 +129,8 @@ fi
 cp "$guest/usr/bin/busybox" "$run/initramfs/bin/busybox"
 
 failed=()
-while IFS=$'\t' read -r -u 3 name drivers variables boots; do
+# read fails on a last line without a newline, which still counts.
+while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
     [[ -z $name || $name == \#* ]] && continue
     (($# == 0)) || [[ " $* " == *" $name "* ]] || continue
     dir=$run/$name
