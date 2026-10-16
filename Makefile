@@ -11,13 +11,15 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # The checks of uefisettings. They need GNU make and bash, rustup while
-# RUST_TOOLCHAIN is set, as it is by default, and for test-e2e-qemu an x86_64
-# host with /dev/kvm and what tests/qemu/README.md lists:
+# RUST_TOOLCHAIN is set, as it is by default, for test-i686 an x86 host with
+# gcc's 32-bit libraries, which README.md names, and for test-e2e-qemu an
+# x86_64 host with /dev/kvm and what tests/qemu/README.md lists:
 #   make                 every check of CHECKS, stopping at the first that fails
 #   make -k              every check of CHECKS, even after one fails
 #   make <check>...      the named checks, e.g. make clippy-aarch64 doc
 #   make lint            the checks of LINTS
-#   make lint test       every check but test-e2e-qemu
+#   make lint test test-i686
+#                        every check but test-e2e-qemu
 #   make RUST_TOOLCHAIN= the checks on the cargo of PATH
 #   make setup           installs, through rustup, the toolchain, components and
 #                        targets that the checks use
@@ -61,9 +63,10 @@ unexport CARGO_ENCODED_RUSTFLAGS
 TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi
 comma := ,
 
-# CI runs lint test and test-e2e-qemu: a new check joins LINTS or gets a CI job.
+# CI runs lint test test-i686 and test-e2e-qemu: a new check joins LINTS or CI
+# runs it too.
 LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi doc
-CHECKS := $(LINTS) test test-e2e-qemu
+CHECKS := $(LINTS) test test-i686 test-e2e-qemu
 
 .PHONY: check lint help setup toolchain $(CHECKS)
 
@@ -75,7 +78,7 @@ help:
 	@echo "checks: $(CHECKS)"
 	@echo "make runs every check; make <check>... runs the named ones."
 	@echo "make lint runs $(LINTS)."
-	@echo "make lint test runs every check but test-e2e-qemu."
+	@echo "make lint test test-i686 runs every check but test-e2e-qemu."
 	@echo "make -k runs every check, even after one fails."
 	@echo "make -n <check> prints the commands of a check without running them."
 	@echo "make RUST_TOOLCHAIN= runs the checks on the cargo of PATH."
@@ -110,6 +113,11 @@ clippy-uefi: toolchain
 
 test: toolchain
 	scripts/assert-tests-ran.sh cargo test --locked
+
+# The tests on 32-bit glibc, where off_t is signed and has 32 bits; this
+# host runs them.
+test-i686: toolchain
+	scripts/assert-tests-ran.sh cargo test --locked --target i686-unknown-linux-gnu
 
 doc: toolchain
 	RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
