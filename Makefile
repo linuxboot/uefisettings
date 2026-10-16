@@ -58,11 +58,11 @@ export RUSTFLAGS := -D warnings
 unexport CARGO_ENCODED_RUSTFLAGS
 
 # The targets that the checks build for, comma-separated as rustup takes them.
-TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi
+TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi
 comma := ,
 
 # CI runs lint test and test-e2e-qemu: a new check joins LINTS or gets a CI job.
-LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-uefi doc
+LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi doc
 CHECKS := $(LINTS) test test-e2e-qemu
 
 .PHONY: check lint help setup toolchain $(CHECKS)
@@ -101,7 +101,7 @@ toolchain:
 fmt: toolchain
 	cargo fmt --check
 
-clippy-x86_64 clippy-aarch64: clippy-%: toolchain
+clippy-x86_64 clippy-aarch64 clippy-i686: clippy-%: toolchain
 	cargo clippy --locked --workspace --all-targets --all-features --target $*-unknown-linux-gnu -- -D warnings
 
 # publish-hiidb, the one crate built for UEFI.
