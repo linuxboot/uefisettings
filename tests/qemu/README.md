@@ -22,6 +22,10 @@ It needs an x86_64 host with `/dev/kvm` and, on Ubuntu 24.04, the packages of
 xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes
 ```
 
+The guest's kernel, firmware and busybox do not come from the host: they are the packages
+that [`guest-packages-x86_64`](guest-packages-x86_64) pins, which
+[`fetch-packages.sh`](fetch-packages.sh) downloads.
+
 `run.sh` alone runs the scenarios on the active toolchain of rustup, which then needs the
 musl and UEFI targets:
 
@@ -32,9 +36,9 @@ tests/qemu/run.sh boot-smoke    # the named scenarios
 ```
 
 Elsewhere, the environment variables in the header of [`run.sh`](run.sh) give the paths
-of QEMU, the OVMF code and variable images, a static busybox and the directory of
+of QEMU and the directory of
 DriverSample.efi, and these tools must be on `PATH`: `virt-fw-vars`, `jq` and `cpio` for
-`run.sh`; `curl`, `rpm2cpio` and `cpio` for [`fetch-kernel.sh`](fetch-kernel.sh); and,
+`run.sh`; `curl`, `rpm2cpio`, `cpio`, `ar`, `tar` and `zstd` for `fetch-packages.sh`; and,
 unless DriverSample.efi is already built, `gcc`, `g++`, `make`, `git`, `nasm`, `python3`
 and the libuuid headers for [`build-driver-sample.sh`](build-driver-sample.sh).
 
