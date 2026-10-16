@@ -18,6 +18,8 @@
 //! `rt-data` (the default) and `reserved` as E820 reserved ranges, which
 //! `/dev/mem` serves under `CONFIG_STRICT_DEVMEM`; `loader-data` becomes System
 //! RAM, which it refuses.
+//! The driver also puts the CRC-32 of the database in the volatile `HiiDBCrc32`
+//! variable, for the tests to check what `uefisettings` extracts.
 
 #![cfg_attr(target_os = "uefi", no_std, no_main)]
 #![deny(unsafe_code)]
@@ -51,6 +53,11 @@ const HIIDB_VENDOR: Guid = guid!("1b838190-4625-4ead-abc9-cd5e6af18fe0");
 /// Attributes of that variable: volatile and readable at runtime.
 const HIIDB_ATTRIBUTES: VariableAttributes =
     VariableAttributes::BOOTSERVICE_ACCESS.union(VariableAttributes::RUNTIME_ACCESS);
+/// Name of the variable that holds the CRC-32 of the database, for the tests
+/// only, with the attributes of `HiiDB`.
+const HIIDB_CRC32_NAME: &CStr16 = cstr16!("HiiDBCrc32");
+/// Vendor GUID of that variable, which the tests own.
+const HIIDB_CRC32_VENDOR: Guid = guid!("de145b29-c3cd-455f-91de-a76237b67c52");
 
 /// A failed step and the firmware's status.
 type Failure = (&'static str, Status);
@@ -96,6 +103,9 @@ fn memory_type() -> Option<MemoryType> {
 /// Copies the exported HII database into pages of `memory_type` and points
 /// `HiiDB` at them. Returns the address and length of the copy.
 ///
+/// It first puts the CRC-32 of the database in `HiiDBCrc32`, so that `HiiDB`
+/// never exists without it.
+///
 /// The pages are never freed: the OS reads them after boot.
 fn publish(memory_type: MemoryType) -> Result<(u64, u32), Failure> {
     let export = boot::get_handle_for_protocol::<HiiDatabase>()
@@ -104,6 +114,17 @@ fn publish(memory_type: MemoryType) -> Result<(u64, u32), Failure> {
         .map_err(|error| ("exporting the HII database", error.status()))?;
     let length = u32::try_from(export.len())
         .map_err(|_| ("the HII database exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
+
+    let crc32 = boot::calculate_crc32(&export)
+        .map_err(|error| ("computing the CRC-32 of the HII database", error.status()))?;
+    runtime::set_variable(
+        HIIDB_CRC32_NAME,
+        &VariableVendor(HIIDB_CRC32_VENDOR),
+        HIIDB_ATTRIBUTES,
+        &crc32.to_le_bytes(),
+    )
+    .map_err(|error| ("setting the HiiDBCrc32 variable", error.status()))?;
+
     let pages = export.len().div_ceil(PAGE_SIZE);
     let base = boot::allocate_pages(AllocateType::AnyPages, memory_type, pages)
         .map_err(|error| ("allocating pages", error.status()))?;
