@@ -13,7 +13,7 @@
 
 # Builds DriverSample.efi, EDK2's sample HII driver
 # (MdeModulePkg/Universal/DriverSampleDxe), which the QEMU tests load into OVMF
-# for its HII forms. The source is the edk2-stable202508 tag, checked against
+# for its HII forms. The source is the edk2-stable202608 tag, checked against
 # its commit. DriverSample is BSD-2-Clause-Patent, so EDK2's License.txt is
 # copied next to it as DriverSample-License.txt.
 # Needs gcc, g++, make, nasm, python3, git and the libuuid headers; on Ubuntu
@@ -29,8 +29,8 @@ if (($# != 1)); then
     exit 2
 fi
 out=$(realpath -m -- "$1")
-tag=edk2-stable202508
-commit=d46aa46c8361194521391aa581593e556c707c6e
+tag=edk2-stable202608
+commit=2970e5699ba6267f3384ffab20f96647578aebc8
 jobs=${JOBS:-$(nproc)}
 
 work=$(mktemp -d)
