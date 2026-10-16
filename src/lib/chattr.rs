@@ -228,6 +228,14 @@ pub mod tests {
             get_all_attrs(test_file.path()).context("No error expected from get_attrs")?;
         // checking that FS_NODUMP_FL is set
         assert_eq!(attrs_after_set & FS_NODUMP_FL, FS_NODUMP_FL);
+        // checking that clearing a flag that no new file has or inherits, so that clearing it
+        // needs no capability, keeps FS_NODUMP_FL, the only flag that the owner may set on both
+        // ZFS and tmpfs
+        clear_attrs!(test_file.path(), FS_IMMUTABLE_FL)
+            .context("No error expected from clear_attrs")?;
+        let attrs_after_other_clear =
+            get_all_attrs(test_file.path()).context("No error expected from get_attrs")?;
+        assert_eq!(attrs_after_other_clear & FS_NODUMP_FL, FS_NODUMP_FL);
         clear_attrs!(test_file.path(), FS_NODUMP_FL, FS_NODUMP_FL)
             .context("No error expected from clear_attrs")?;
         let attrs_after_clear =
@@ -235,7 +243,7 @@ pub mod tests {
         // checking that FS_NODUMP_FL is cleared
         assert_eq!(attrs_after_clear & FS_NODUMP_FL, 0);
         // checking that everything else is still the same
-        assert_eq!(attrs_after_set & !FS_NODUMP_FL, attrs & !FS_NODUMP_FL);
+        assert_eq!(attrs_after_clear & !FS_NODUMP_FL, attrs & !FS_NODUMP_FL);
         Ok(())
     }
 }
