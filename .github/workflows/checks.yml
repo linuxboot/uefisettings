@@ -25,13 +25,18 @@ jobs:
         with:
           persist-credentials: false
 
+      # gcc's 32-bit libraries, which test-i686 links with.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-multilib
+
       - run: make setup
 
       # After setup: the key covers installed toolchains.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Every check but the boots.
-      - run: make -k lint test
+      - run: make -k lint test test-i686
 
   test-e2e-qemu:
     runs-on: ubuntu-24.04
