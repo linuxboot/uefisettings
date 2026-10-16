@@ -17,27 +17,27 @@
 #
 # Usage: tests/qemu/run.sh [SCENARIO...]
 #
-# Environment variables, which default to the paths of the Ubuntu 24.04 packages:
+# The guest's kernel, firmware and busybox are the packages of
+# tests/qemu/guest-packages-x86_64.
+#
+# Environment variables:
 #   QEMU       the qemu-system-x86_64 to run (qemu-system-x86_64 from PATH), or a wrapper
 #              that execs it: the timeout of a boot signals that program, not its children
-#   OVMF_CODE  OVMF code image (/usr/share/OVMF/OVMF_CODE_4M.fd)
-#   OVMF_VARS  OVMF variable store, which each scenario copies (/usr/share/OVMF/OVMF_VARS_4M.fd)
-#   BUSYBOX    static busybox for the initramfs (/usr/bin/busybox)
 #   DRIVER_SAMPLE_DIR  the directory of DriverSample.efi, which build-driver-sample.sh
 #              fills if the file is missing (target/qemu-test/driver-sample)
 
 set -euo pipefail
 
 qemu=${QEMU:-qemu-system-x86_64}
-ovmf_code=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}
-ovmf_vars=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}
-busybox=${BUSYBOX:-/usr/bin/busybox}
 
 here=$(realpath "$(dirname "$0")")
 repo=$(realpath "$here/../..")
 out=$repo/target/qemu-test
 driver_sample=${DRIVER_SAMPLE_DIR:-$out/driver-sample}
 run=$out/$(date -u +%Y%m%dT%H%M%SZ)
+guest=$run/guest
+ovmf_code=$guest/usr/share/OVMF/OVMF_CODE_4M.fd
+ovmf_vars=$guest/usr/share/OVMF/OVMF_VARS_4M.fd
 target=x86_64-unknown-linux-musl
 
 # Every row has the 4 columns that the header of scenarios.tsv lists and the loop below
@@ -64,7 +64,6 @@ echo "run.sh: start $(date -u +%FT%TZ), logs in $run"
 mkdir -p "$run/initramfs/bin" "$run/initramfs/tests" "$run/esp"
 grep --max-count=1 '^model name' /proc/cpuinfo
 "$qemu" --version
-"$busybox" --help | sed -n 1p
 
 # virt-fw-vars has no --version option, so this asks the Python that its first line names,
 # the one that runs it, for the version of virt-firmware. Another first line, or a failure,
@@ -114,19 +113,19 @@ if ((${#unnamed[@]} > 0)); then
     echo "no scenario boots the test binaries ${unnamed[*]}; add them to scenarios.tsv" >&2
     exit 1
 fi
-cp "$busybox" "$run/initramfs/bin/busybox"
 cp "$here/init" "$run/initramfs/init"
 if [[ ! -f $driver_sample/DriverSample.efi ]]; then
     "$here/build-driver-sample.sh" "$driver_sample"
 fi
 cp "$driver_sample/DriverSample.efi" "$run/esp/"
 
-"$here/fetch-kernel.sh" "$out/kernel-rpms" "$run/kernel"
-vmlinuz=$(echo "$run"/kernel/lib/modules/*/vmlinuz)
+"$here/fetch-packages.sh" "$here/guest-packages-x86_64" "$out/packages" "$guest"
+vmlinuz=$(echo "$guest"/lib/modules/*/vmlinuz)
 if [[ ! -f $vmlinuz ]]; then
-    echo "expected the vmlinuz of exactly one kernel in $run/kernel" >&2
+    echo "expected the vmlinuz of exactly one kernel in $guest" >&2
     exit 1
 fi
+cp "$guest/usr/bin/busybox" "$run/initramfs/bin/busybox"
 
 failed=()
 while IFS=$'\t' read -r -u 3 name drivers variables boots; do

@@ -29,8 +29,8 @@
 #
 # A CI host runs make setup && make -k under timeout, as nothing bounds the time
 # that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'. It
-# may keep target/qemu-test/kernel-rpms and target/qemu-test/driver-sample
-# between runs: tests/qemu/fetch-kernel.sh downloads only the RPMs that are
+# may keep target/qemu-test/packages and target/qemu-test/driver-sample
+# between runs: tests/qemu/fetch-packages.sh downloads only the packages that are
 # missing there or fail their sha256 check, and tests/qemu/run.sh builds
 # DriverSample only when it is missing, so delete target/qemu-test/driver-sample
 # after a change to build-driver-sample.sh.

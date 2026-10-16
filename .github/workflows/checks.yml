@@ -62,14 +62,14 @@ jobs:
       # profile and logs errors; the builds take about a minute without it.
       - run: make setup
 
-      # Kernel RPMs and DriverSample.efi. Saved only on success, as run.sh reuses
-      # DriverSample.efi unchecked.
+      # The guest's packages and DriverSample.efi. Saved only on success, as run.sh
+      # reuses DriverSample.efi unchecked.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            target/qemu-test/kernel-rpms
+            target/qemu-test/packages
             target/qemu-test/driver-sample
-          key: qemu-inputs-${{ hashFiles('tests/qemu/kernel.sha256', 'tests/qemu/build-driver-sample.sh') }}
+          key: qemu-inputs-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh') }}
 
       - run: make test-e2e-qemu
 
