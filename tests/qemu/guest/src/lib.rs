@@ -13,10 +13,10 @@
 //! Helpers of the tests that run inside the QEMU test guests.
 //!
 //! `tests/qemu/run.sh` builds this crate's test binaries for musl and boots each scenario
-//! under OVMF, with the binaries and a static `uefisettings` in the initramfs.
+//! under EDK2's firmware, with the binaries and a static `uefisettings` in the initramfs.
 //! `tests/qemu/init` runs the test binary that the boot's kernel command line names, then
 //! checks the kernel's health. The tests assert inside the guest; libtest reports their
-//! outcomes on the second serial port.
+//! outcomes on the test terminal.
 //!
 //! Every helper and test that reads the machine's files or runs `uefisettings` calls
 //! [`require_test_vm`] first, so on any other machine the tests fail before they touch
@@ -26,10 +26,13 @@
 #![warn(missing_docs)]
 
 use std::fs;
+use std::fs::File;
 use std::io;
 use std::ops::RangeInclusive;
+use std::os::unix::fs::FileExt;
 use std::process::Command;
 use std::process::Stdio;
+use std::slice;
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -67,6 +70,10 @@ pub const DRIVER_SAMPLE_VARIABLE: &str =
 
 /// Size of the attributes that efivarfs puts before the data of a variable.
 pub const EFIVARFS_HEADER_SIZE: usize = 4;
+
+/// Linux's EFAULT (`include/uapi/asm-generic/errno-base.h`), with which `/dev/mem`'s read()
+/// refuses memory that the kernel does not map.
+pub const EFAULT: i32 = 14;
 
 /// The prefix of the answer of a question whose value the HII backend cannot read
 /// (`src/lib/hii/forms.rs`).
@@ -269,6 +276,16 @@ pub fn published_database() -> PublishedDatabase {
         address: u64::from_le_bytes(address.try_into().expect("HiiDB holds no 64-bit address")),
         crc32: u32::from_le_bytes(crc32.try_into().expect("HiiDBCrc32 holds no CRC-32")),
     }
+}
+
+/// Reads the byte at physical `address` with read() of `/dev/mem`, which `uefisettings` tries
+/// before mmap().
+#[track_caller]
+pub fn read_dev_mem_byte(address: u64) -> io::Result<u8> {
+    require_test_vm();
+    let mut byte = 0;
+    File::open("/dev/mem")?.read_exact_at(slice::from_mut(&mut byte), address)?;
+    Ok(byte)
 }
 
 /// Whether `address` is in a System RAM range of `/proc/iomem`, which `/dev/mem` refuses to
