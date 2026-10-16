@@ -88,8 +88,8 @@ for i in "${!files[@]}"; do
     # The -f test keeps the sha256sum of uutils (Ubuntu 26.04) from printing "FAILED open
     # or read" for a missing file, which it does even with --status.
     if ! { [[ -f $file ]] && sha256sum --check --status <<<"$sum  $file"; } 2>/dev/null; then
-        # --max-time ends a try that stalls: kernel-core, the biggest package at about
-        # 21 MB, takes 300 s only below 70 kB/s. curl makes up to 4 tries with waits of 1,
+        # --max-time ends a try that stalls: the i686 kernel, the biggest package at about
+        # 52 MB, takes 300 s only below 175 kB/s. curl makes up to 4 tries with waits of 1,
         # 2 and 4 s between them, 1207 s in all, but waits longer when the server sends a
         # Retry-After header, so timeout stops curl after 1210 s and kills it 10 s later.
         # Without --foreground, timeout would move curl into a process group of its own,

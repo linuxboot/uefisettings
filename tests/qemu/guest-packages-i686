@@ -1,0 +1,4 @@
+# The kernel, firmware and busybox of the i686 guests, in the format of fetch-packages.sh.
+0d6241268f9344a998c3339c11e527ea8048d409d6c770f67c573707606a3f2e https://deb.debian.org/debian/pool/main/l/linux-signed-i386/linux-image-6.1.0-50-686-pae_6.1.176-1_i386.deb https://snapshot.debian.org/archive/debian/20260704T211317Z/pool/main/l/linux-signed-i386/linux-image-6.1.0-50-686-pae_6.1.176-1_i386.deb
+45fb466babfad1f5a51c65d656ba338ae46a7b8bbcda61234b79753a7359d423 https://archive.ubuntu.com/ubuntu/pool/universe/e/edk2/ovmf-ia32_2024.02-2ubuntu0.10_all.deb https://launchpad.net/ubuntu/+archive/primary/+files/ovmf-ia32_2024.02-2ubuntu0.10_all.deb
+39c410d5bc570ce2a4e14055bcf021afbae75bc0efe850634138234828b3416a https://archive.ubuntu.com/ubuntu/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_i386.deb https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_i386.deb
