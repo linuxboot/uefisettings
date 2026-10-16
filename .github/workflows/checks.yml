@@ -17,8 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The image of test-e2e-qemu too: one image, one migration.
   lint-and-test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,8 +39,10 @@ jobs:
       # Every check but the boots.
       - run: make -k lint test test-i686
 
+  # QEMU 9.0 and newer fault unaligned loads from Device memory as arm64 does, which the
+  # aarch64 guests check; Ubuntu 24.04 has QEMU 8.2.
   test-e2e-qemu:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,23 +65,24 @@ jobs:
       # profile and logs errors; the builds take about a minute without it.
       - run: make setup
 
-      # The guest's packages and DriverSample.efi. Saved only on success, as run.sh
-      # reuses DriverSample.efi unchecked.
+      # The guests' packages and each architecture's DriverSample.efi, keyed also on the
+      # apt packages and the runner image (this file) that build DriverSample. Saved only
+      # on success, as run.sh reuses DriverSample.efi unchecked.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/qemu-test/packages
-            target/qemu-test/driver-sample
-          key: qemu-inputs-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh') }}
+            target/qemu-test/*/driver-sample
+          key: qemu-inputs-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh', 'tests/qemu/ubuntu-packages', '.github/workflows/checks.yml') }}
 
-      - run: make test-e2e-qemu
+      - run: make -k test-e2e-qemu
 
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qemu-test-logs
           path: |
-            target/qemu-test/*/*/*.log
-            target/qemu-test/*/executables
+            target/qemu-test/*/*/*/*.log
+            target/qemu-test/*/*/executables
           if-no-files-found: ignore
           retention-days: 14

@@ -29,10 +29,10 @@
 #
 # A CI host runs make setup && make -k under timeout, as nothing bounds the time
 # that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'. It
-# may keep target/qemu-test/packages and target/qemu-test/driver-sample
+# may keep target/qemu-test/packages and target/qemu-test/*/driver-sample
 # between runs: tests/qemu/fetch-packages.sh downloads only the packages that are
 # missing there or fail their sha256 check, and tests/qemu/run.sh builds
-# DriverSample only when it is missing, so delete target/qemu-test/driver-sample
+# DriverSample only when it is missing, so delete target/qemu-test/*/driver-sample
 # after a change to build-driver-sample.sh.
 
 SHELL := bash
@@ -60,15 +60,16 @@ export RUSTFLAGS := -D warnings
 unexport CARGO_ENCODED_RUSTFLAGS
 
 # The targets that the checks build for, comma-separated as rustup takes them.
-TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi
+TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi,i686-unknown-linux-musl,i686-unknown-uefi,aarch64-unknown-linux-musl,aarch64-unknown-uefi
 comma := ,
 
-# CI runs lint test test-i686 and test-e2e-qemu: a new check joins LINTS or CI
-# runs it too.
+# CI runs lint test test-i686 and test-e2e-qemu: a new check joins LINTS or
+# QEMU_TESTS or CI runs it too.
 LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi doc
+QEMU_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
 CHECKS := $(LINTS) test test-i686 test-e2e-qemu
 
-.PHONY: check lint help setup toolchain $(CHECKS)
+.PHONY: check lint help setup toolchain $(CHECKS) $(QEMU_TESTS)
 
 check: $(CHECKS)
 
@@ -78,6 +79,7 @@ help:
 	@echo "checks: $(CHECKS)"
 	@echo "make runs every check; make <check>... runs the named ones."
 	@echo "make lint runs $(LINTS)."
+	@echo "make test-e2e-qemu runs $(QEMU_TESTS)."
 	@echo "make lint test test-i686 runs every check but test-e2e-qemu."
 	@echo "make -k runs every check, even after one fails."
 	@echo "make -n <check> prints the commands of a check without running them."
@@ -122,7 +124,9 @@ test-i686: toolchain
 doc: toolchain
 	RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
 
-# Boots the scenarios of tests/qemu/scenarios.tsv under KVM, with logs in
-# target/qemu-test/<UTC time>/; see tests/qemu/README.md.
-test-e2e-qemu: toolchain
-	tests/qemu/run.sh
+test-e2e-qemu: $(QEMU_TESTS)
+
+# Boots the scenarios of tests/qemu/scenarios.tsv on one architecture, with logs in
+# target/qemu-test/<architecture>/<UTC time>/; see tests/qemu/README.md.
+$(QEMU_TESTS): test-e2e-qemu-%: toolchain
+	tests/qemu/run.sh $*
