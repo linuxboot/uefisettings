@@ -27,7 +27,7 @@ use uefisettings_qemu_guest::driver_sample::ONE_OF_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json;
-use uefisettings_qemu_guest::read_published_database;
+use uefisettings_qemu_guest::published_database;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::variable_data;
@@ -100,15 +100,18 @@ fn driver_sample_variable_holds_the_defaults() {
 
 #[test]
 fn extract_db_copies_the_published_database() {
-    let published = read_published_database()
-        .unwrap_or_else(|error| panic!("cannot read the published database: {error}"));
+    let published = published_database();
     let path = "/tmp/hiidb.bin";
     let output = uefisettings(&["hii", "extract-db", path]);
     assert_eq!(output.code, Some(0), "{output:#?}");
     let extracted = fs::read(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
-    assert!(
-        extracted == published,
-        "{path} differs from the published database"
+    assert_eq!(
+        (extracted.len(), crc32fast::hash(&extracted)),
+        (
+            usize::try_from(published.length).expect("the length exceeds usize"),
+            published.crc32
+        ),
+        "{path} differs from the published database, as (length, CRC-32)"
     );
 }
 

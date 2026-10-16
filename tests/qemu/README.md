@@ -63,6 +63,7 @@ run two drivers from the ESP before the kernel, through `Driver####` load option
   the first run;
 - `publish-hiidb.efi`, from [`publish-hiidb/`](publish-hiidb/), which points the `HiiDB`
   variable at a copy of the HII database, the way the firmware of OCP machines does.
+  It also puts the CRC-32 of the database in the `HiiDBCrc32` variable for the tests.
 
 [`vars/my-ifr-nv-data.json`](vars/my-ifr-nv-data.json) creates DriverSample's variable
 first, with runtime access, so that efivarfs shows it, and with DriverSample's defaults at
