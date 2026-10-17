@@ -75,7 +75,22 @@ jobs:
             target/qemu-test/*/driver-sample
           key: qemu-inputs-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh', 'tests/qemu/ubuntu-packages', '.github/workflows/checks.yml') }}
 
-      - run: make -k test-e2e-qemu
+      - run: make -k test-e2e-qemu-x86_64 test-e2e-qemu-i686
+
+      # DO NOT MERGE: diagnostics for the reset on AMD runners.
+      - if: always()
+        run: tests/qemu/ci-diag-reset.sh
+
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reset-diag
+          path: |
+            target/qemu-test/diag
+            target/qemu-test/x86_64/*/*/*.log
+            target/qemu-test/i686/*/*/*.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
