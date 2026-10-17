@@ -1,0 +1,4 @@
+# The kernel, firmware and busybox of the x86_64 guests, in the format of fetch-packages.sh.
+ab1418c266e2b4b26090ab13e96c249a6bbe7a6fadca09c4e98c9ff477a5d58f https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/x86_64/os/Packages/k/kernel-core-6.17.1-300.fc43.x86_64.rpm https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/43/Everything/x86_64/os/Packages/k/kernel-core-6.17.1-300.fc43.x86_64.rpm
+78a6a3a4ffa666f1cb25e9069e4ec9270b5ceac7987b6eefc2674bd3f58a1473 https://archive.ubuntu.com/ubuntu/pool/main/e/edk2/ovmf_2024.02-2ubuntu0.10_all.deb https://launchpad.net/ubuntu/+archive/primary/+files/ovmf_2024.02-2ubuntu0.10_all.deb
+944b2728f53ceb3916cec2c962873c9951e612408099601751db2a0a5d81e0ed https://archive.ubuntu.com/ubuntu/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_amd64.deb https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_amd64.deb
