@@ -6,13 +6,13 @@ machine that runs them.
 
 ## Running
 
-`make qemu` runs the checks of the QEMU test crates and then every scenario, on the Rust
+`make test-e2e-qemu` runs every scenario, on the Rust
 toolchain and targets that `make setup` installs (see the Checks section of the
 repository's README):
 
 ```sh
 make setup    # once
-make qemu
+make test-e2e-qemu
 ```
 
 It needs an x86_64 host with `/dev/kvm` and, on Ubuntu 24.04, the packages of
