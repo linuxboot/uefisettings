@@ -4,4 +4,4 @@ version = 3
 
 [[package]]
 name = "uefisettings_thrift_srcs"
-version = "0.1.0"
+version = "0.1.6"
