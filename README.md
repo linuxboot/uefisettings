@@ -144,7 +144,7 @@ mv lib.rs thrift/rust/uefisettings_spellings_db_thrift/uefisettings_spellings_db
 
 ## Checks
 
-The `Makefile` in the root of the repository runs the checks that a change should pass: the lints (`make lint`: rustfmt, clippy for x86_64, aarch64 and UEFI, and the docs), the tests (`make test`) and the QEMU tests (`make test-e2e-qemu`).
+The `Makefile` in the root of the repository runs the checks that a change should pass: the lints (`make lint`: rustfmt, clippy for x86_64, aarch64, i686 and UEFI, and the docs), the tests (`make test`, and `make test-i686` on 32-bit glibc) and the QEMU tests (`make test-e2e-qemu`).
 
 The checks need GNU make and bash, and rustup unless `make RUST_TOOLCHAIN=` runs them on the cargo of `PATH`.
 
@@ -153,10 +153,12 @@ make setup           # once: installs, through rustup, the Rust toolchain, compo
 make                 # every check, stopping at the first that fails
 make -k              # every check, even after one fails
 make <check>...      # the named checks, e.g. make clippy-aarch64 doc
-make lint test       # every check but the QEMU tests
+make lint test test-i686 # every check but the QEMU tests
 make RUST_TOOLCHAIN= # the checks on the cargo of PATH
 make help            # lists the checks
 ```
+
+`make test-i686` also needs an x86 host (x86_64 or i686), which runs the i686 test binaries, and gcc's 32-bit libraries (Ubuntu: `gcc-multilib`, or, next to the `gcc-aarch64-linux-gnu` of [`tests/qemu/ubuntu-packages`](tests/qemu/ubuntu-packages), which conflicts with it, `libc6-dev-i386` and `lib32gcc-<gcc version>-dev`; Fedora: `glibc-devel.i686`).
 
 `make test-e2e-qemu`, the QEMU tests, also needs an x86_64 host with `/dev/kvm` and the packages that [`tests/qemu/README.md`](tests/qemu/README.md) lists.
 

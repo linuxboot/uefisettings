@@ -27,7 +27,8 @@ use uefisettings_qemu_guest::driver_sample::ONE_OF_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json;
-use uefisettings_qemu_guest::read_published_database;
+use uefisettings_qemu_guest::published_database;
+use uefisettings_qemu_guest::read_dev_mem_byte;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::variable_data;
@@ -36,7 +37,12 @@ use uefisettings_qemu_guest::Question;
 use uefisettings_qemu_guest::Responses;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
+use uefisettings_qemu_guest::EFAULT;
 use uefisettings_qemu_guest::UNAVAILABLE;
+
+/// Linux's SIGBUS on arm64 (`include/uapi/asm-generic/signal.h`).
+#[cfg(target_arch = "aarch64")]
+const SIGBUS: i32 = 7;
 
 /// The questions of the tests with their default answers and options, and how many times
 /// the HII database lists each.
@@ -58,7 +64,7 @@ const DEFAULTS: [(&str, &str, &[&str], usize); 4] = [
 
 /// Questions whose values the HII backend cannot read from Linux: on DriverSample's
 /// variable without runtime access, on its name/value store, and on the RAM disk form of
-/// OVMF, which has no store.
+/// the firmware, which has no store.
 const UNAVAILABLE_QUESTIONS: [&str; 4] = [
     "How tall are you? (Hex)",
     "NameValueVar0",
@@ -100,15 +106,61 @@ fn driver_sample_variable_holds_the_defaults() {
 
 #[test]
 fn extract_db_copies_the_published_database() {
-    let published = read_published_database()
-        .unwrap_or_else(|error| panic!("cannot read the published database: {error}"));
+    let published = published_database();
     let path = "/tmp/hiidb.bin";
     let output = uefisettings(&["hii", "extract-db", path]);
     assert_eq!(output.code, Some(0), "{output:#?}");
     let extracted = fs::read(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
-    assert!(
-        extracted == published,
-        "{path} differs from the published database"
+    assert_eq!(
+        (extracted.len(), crc32fast::hash(&extracted)),
+        (
+            usize::try_from(published.length).expect("the length exceeds usize"),
+            published.crc32
+        ),
+        "{path} differs from the published database, as (length, CRC-32)"
+    );
+}
+
+/// read() of `/dev/mem` serves the database only on x86_64: arm64 Linux maps neither
+/// runtime services data nor reserved memory, and 32-bit x86 Linux nothing above its low
+/// memory, so there `extract_db_copies_the_published_database` passes only through the
+/// fallback of `uefisettings` to mmap().
+#[test]
+fn dev_mem_read_serves_the_database_only_on_x86_64() {
+    let address = published_database().address;
+    let errno = read_dev_mem_byte(address)
+        .err()
+        .map(|error| error.raw_os_error());
+    let expected = if cfg!(target_arch = "x86_64") {
+        None
+    } else {
+        Some(Some(EFAULT))
+    };
+    assert_eq!(errno, expected, "read() of /dev/mem at {address:#x}: errno");
+}
+
+/// The emulator faults a 64-bit load from the mapped database, which publish-hiidb puts at an
+/// unaligned address, as arm64 hardware faults unaligned wide loads from Device memory
+/// (<https://github.com/linuxboot/uefisettings/pull/12>); so a load like that in `uefisettings`
+/// fails `extract_db_copies_the_published_database`.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn unaligned_wide_load_from_the_mapped_database_faults() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let address = published_database().address;
+    let status = Command::new("/bin/busybox")
+        .args(["devmem", &format!("{address:#x}"), "64"])
+        .stdout(Stdio::null())
+        .status()
+        .expect("cannot run busybox devmem");
+    assert_eq!(
+        status.signal(),
+        Some(SIGBUS),
+        "devmem at {address:#x}: {status}; QEMU before 9.0 does not fault unaligned loads from \
+         Device memory"
     );
 }
 
@@ -163,7 +215,7 @@ fn show_ifr_shows_the_formsets() {
         .filter_map(|line| line.trim_start().strip_prefix("OpCode: FormSet - "))
         .filter_map(|line| line.split_once(" - GUID ").map(|(name, _)| name))
         .collect();
-    // DriverSample's two formsets and one of OVMF.
+    // DriverSample's two formsets and one of the firmware.
     for name in [
         "Browser Testcase Engine",
         "ABC Information Sample",
