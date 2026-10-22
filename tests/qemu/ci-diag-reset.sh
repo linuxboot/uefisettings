@@ -1,19 +1,39 @@
 #!/bin/bash
 # The runner user writes the output files; sudo only reads them.
 # shellcheck disable=SC2024
-# DO NOT MERGE: diagnostics for the i686 guests that reset during hii_write on GitHub's AMD
-# runners (EPYC 7763, 9V74 and 9V45; KVM nested under Hyper-V), second round: which layer
-# fails. Boots the guests of the last tests/qemu/run.sh run of each x86 architecture, mostly
-# as run.sh does (a hii boot, then the write boot, on one fresh copy of the hii scenario's
-# variable store), with QEMU's KVM-exit and memory-slot tracing and a verbose guest kernel:
-# - host traces (sudo) of KVM, its MMU and Hyper-V's flush hypercalls, also for -smp 1;
-# - forensics: QEMU pauses on the reset instead of ending, and ci-diag-qmp.py saves every
-#   vCPU's registers and guest RAM at a marker just before the first write and RAM again
-#   after the reset, which ci-diag-pagewalk.py compares along the exception path;
-# - writes to a memory slot without firmware: the guest toggles the memory decoding of an
-#   ivshmem-plain device, so QEMU deletes and adds the slot of its BAR;
-# - one write boot per guest kernel parameter or CPU feature left out.
+# DO NOT MERGE: diagnostics for the i686 guests that reset on GitHub's AMD runners (EPYC 7763,
+# 9V74 and 9V45; KVM nested under Hyper-V), third round. In the second (CI run 39767911331)
+# i686 guests died, and no x86_64 one, without firmware: when QEMU deleted a memory slot (an
+# ivshmem-plain BAR whose memory decoding the guest turned off), and when QMP stopped the
+# VM, read its registers and let it go on, after which QEMU writes them back, a PAE vCPU's
+# PDPTRs too (QEMU v10.2.0 target/i386/kvm/kvm.c:5316-5321), and KVM unloads the vCPU's
+# roots (Linux v7.0 arch/x86/kvm/x86.c:12449-12477). This round counts deaths: DIAG_REPS
+# boots per cell, round-robin over the cells of each architecture, all with one vCPU and
+# host traces.
+# - Triggers: memslot (200 deletions of the BAR's slot); sync (5 pauses, each with a register
+#   read); for the plain 6.1 guest also sync-plain (5 pauses without one).
+# - i686 guests: c1, Debian's 6.1 as is, whose PAE page directory pointer tables come from a
+#   32-byte slab (Linux v6.1.176 arch/x86/mm/pgtable.c:365-401) and whose CR3 changes on a context
+#   switch only; c2, the same with pti=on, whose tables take whole pages and whose CR3 changes
+#   at each kernel entry and exit too; c3, the same with two processes that ping-pong over
+#   FIFOs (sub-page tables, frequent CR3 changes); c4, openSUSE's 7.2 kernel-pae, whose tables
+#   take whole pages (Linux commit 780f97e30930, v6.16) and whose CR3 changes rarely.
+# - x86_64 controls: memslot and sync.
+# - Host traces also have kprobes on kvm_mmu_reset_context and shutdown_interception, and
+#   QEMU's log the vCPU ioctls.
+# - Other controls: a triple fault on purpose per architecture, the i686 write boot (base-1),
+#   DIAG_REPS write boots under pti=on and tests/qemu/run.sh's i686 scenarios under pti=on.
+# Decision rule, per cell of DIAG_REPS boots: "dies" if at least 8 in 10 die, "survives" if at
+# most 1 in 10 dies and the others end their test, else "mixed"; a cell cut short by the
+# deadline is "incomplete", and sync-plain "invalid" if QEMU wrote registers back in any of
+# its running periods; a boot that neither dies nor ends its test fails the harness.
 # Writes everything to target/qemu-test/diag/.
+#
+# DIAG_REPS: boots per cell (default 10). DIAG_TRACE_KB: the host trace's buffer per CPU in
+# KiB (default 131072). DIAG_SLOW: a factor for every boot's timeout and the deadline, for a
+# run under emulation (default 1). DIAG_RUN_SH=no leaves out tests/qemu/run.sh, which builds
+# with cargo. DIAG_ONLY: the boots to run, as ARCH/LABEL separated by commas or spaces (e.g.
+# "i686/tripfault,i686/c1-sync"; default all).
 #
 # Usage: tests/qemu/ci-diag-reset.sh
 
@@ -23,30 +43,49 @@ here=$(realpath "$(dirname "$0")")
 repo=$(realpath "$here/../..")
 out=$repo/target/qemu-test/diag
 tracing=/sys/kernel/tracing
+reps=${DIAG_REPS:-10}
+trace_kb=${DIAG_TRACE_KB:-131072}
+slow=${DIAG_SLOW:-1}
+for value in "$reps" "$trace_kb" "$slow"; do
+    if [[ ! $value =~ ^[1-9][0-9]*$ ]]; then
+        echo "ci-diag-reset.sh: DIAG_REPS, DIAG_TRACE_KB and DIAG_SLOW take positive integers, not '$value'" >&2
+        exit 2
+    fi
+done
+# The pauses of tests/sync, on the kernel command line of its boots.
+sync_pauses=5
+# No boot starts after 70 minutes, so that the job (120 minutes, of which the build and
+# tests/qemu/run.sh take about 35) uploads what the boots found.
+deadline=$((SECONDS + 4200 * slow))
 rm -rf "$out"
 mkdir -p "$out"
 
 {
     uname -a
+    id
+    sudo --version | head -n 1
+    readlink -f "$(command -v sudo)"
+    sudo -n env | grep '^PATH='
     grep -m1 '^model name' /proc/cpuinfo
     grep -m1 '^flags' /proc/cpuinfo
-    for p in /sys/module/kvm_amd/parameters/* /sys/module/kvm_intel/parameters/* \
-        /sys/module/kvm/parameters/*; do
-        [[ -r $p ]] && echo "$p=$(cat "$p")"
-    done
+    # Some parameters are root's only.
+    sudo sh -c 'for p in /sys/module/kvm_amd/parameters/* /sys/module/kvm_intel/parameters/* \
+        /sys/module/kvm/parameters/*; do [ -e "$p" ] && echo "$p=$(cat "$p")"; done'
     qemu-system-x86_64 --version
     dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' qemu-system-x86 libc6 libglib2.0-0t64
     apt-cache policy qemu-system-x86
     sha256sum /usr/bin/qemu-system-i386 /usr/bin/qemu-system-x86_64
     python3 --version
     sudo ls "$tracing/events/hyperv" "$tracing/events/kvmmmu"
-    echo "kprobe target: $(sudo grep -w svm_load_mmu_pgd "$tracing/available_filter_functions")"
+    sudo ls /sys/kernel/btf
+    echo "kprobe targets: $(sudo grep -w -E 'svm_load_mmu_pgd|kvm_mmu_reset_context|shutdown_interception' \
+        "$tracing/available_filter_functions" | tr '\n' ' ')"
 } >"$out/facts.txt" 2>&1
 sudo dmesg >"$out/dmesg-before.txt" 2>&1
 # The host traces need sudo (GitHub's runners have it without a password); without, the
-# boots run untraced and the summary says so.
+# boots run untraced and the summary says so. tracefs is root's only, so sudo looks at it.
 host_traces=no
-sudo -n true 2>>"$out/facts.txt" && [[ -d $tracing/events ]] && host_traces=yes
+sudo -n true 2>>"$out/facts.txt" && sudo test -d "$tracing/events" && host_traces=yes
 amd_host=no
 [[ -d /sys/module/kvm_amd ]] && amd_host=yes
 echo "host traces: $host_traces" >>"$out/facts.txt"
@@ -71,26 +110,23 @@ harness_fail() {
 [[ $host_traces == yes && $amd_host == yes ]] &&
     echo Y | sudo tee /sys/module/kvm_amd/parameters/dump_invalid_vmcb >>"$out/facts.txt"
 
-# host_trace_start MODE: full (KVM, its MMU, Hyper-V's flush hypercalls and, through a kprobe,
-# each NPT root that KVM loads for a vCPU) or cr (KVM's control register accesses only, for
-# the CR4 that the guest kernel set). A flush clears what a vCPU uses only if its address
-# space (hyperv_nested_flush_guest_mapping*: "address space") is the root that the vCPU loaded:
-# svm_load_mmu_pgd(vcpu, root_hpa, root_level), Linux v7.0 arch/x86/kvm/svm/svm.c:4442,
-# called from kvm_mmu_load_pgd (arch/x86/kvm/mmu.h:148-157). No tracepoint carries the root.
+# host_trace_start MODE: full (KVM, its MMU, Hyper-V's flush hypercalls and the kprobes below)
+# or cr (KVM's control register accesses only, for the CR4 that the guest kernel set). A
+# flush clears what a vCPU uses only if its address space (hyperv_nested_flush_guest_mapping*:
+# "address space") is the root that the vCPU loaded.
 host_trace_start() {
     # An array, so that the sh -c below gets the names on one line. Task switches have no event
     # of their own (Linux v7.0 arch/x86/kvm/trace.h): kvm_exit shows them, as "reason
     # task_switch" (arch/x86/include/uapi/asm/svm.h:212).
-    local events=(kvm/kvm_cr)
+    local events=(kvm/kvm_cr) clock name
     [[ $1 == full ]] && events=(kvm/kvm_entry kvm/kvm_exit kvm/kvm_userspace_exit
         kvm/kvm_inj_exception kvm/kvm_inj_virq kvm/kvm_emulate_insn kvm/kvm_msr kvm/kvm_cr
         kvm/kvm_page_fault kvm/kvm_mmio kvm/kvm_pio
         kvmmmu/kvm_mmu_zap_all_fast kvmmmu/kvm_mmu_spte_requested kvmmmu/handle_mmio_page_fault
         kvmmmu/mark_mmio_spte kvmmmu/fast_page_fault hyperv)
-    local clock
-    # 128 MiB per CPU: overwrite mode keeps each CPU's newest events only, and the attribution
-    # declares a window that lost events undetermined (run 39281579400's write boots wrote
-    # 0.5-1.1 million events, all kept in 64 MiB).
+    # 128 MiB per CPU by default: overwrite mode keeps each CPU's newest events only, and the
+    # attribution declares a window that lost events undetermined (run 39281579400's write
+    # boots wrote 0.5-1.1 million events, all kept in 64 MiB).
     # The global clock, as the attribution orders events of different threads, and so of
     # different CPUs, which the default local clock does not keep in sync (Linux v7.0
     # Documentation/trace/ftrace.rst:540-545). An event that this kernel lacks, such as
@@ -100,7 +136,7 @@ host_trace_start() {
         echo >$tracing/trace
         echo global >$tracing/trace_clock
         echo 1 >$tracing/options/overwrite
-        echo 131072 >$tracing/buffer_size_kb
+        echo $trace_kb >$tracing/buffer_size_kb
         echo 4096 >$tracing/saved_cmdlines_size
         echo 0 >$tracing/events/enable
         for e in ${events[*]}; do
@@ -115,11 +151,14 @@ host_trace_start() {
     echo "trace_clock: $clock" >>"$out/host-trace.log"
     [[ $clock == *"[global]"* ]] || harness_fail "trace_clock is not global: $clock"
     [[ $1 == full ]] || return 0
-    load_mmu_pgd_kprobe add
+    for name in "${kprobes[@]}"; do
+        kprobe_add "$name" && continue
+        # On AMD each of them is part of the verdict; Intel lacks the svm_* ones.
+        [[ $amd_host == no ]] || harness_fail "an AMD host, but no kvmdiag/$name kprobe"
+    done
     flush_events=$(events_enabled hyperv/hyperv_nested_flush_guest_mapping hyperv/hyperv_nested_flush_guest_mapping_range)
     [[ $(events_enabled kvm/kvm_entry kvm/kvm_exit kvmmmu/kvm_mmu_zap_all_fast) == traced ]] ||
         harness_fail "KVM's entry, exit or root zap events are not traced"
-    [[ $kprobe_placed == yes ]] && events_enabled kvmdiag/load_mmu_pgd >/dev/null
     # On an AMD host with the enlightened NPT flush, the attribution needs the flushes.
     [[ $flush_events == traced || $amd_host == no ]] ||
         ! grep -q "$enlightened_flush" "$out/dmesg-before.txt" ||
@@ -142,48 +181,80 @@ events_enabled() {
     echo "$state"
 }
 
-# load_mmu_pgd_kprobe add|remove: the kprobe of host_trace_start, with each fetch syntax
-# tried in turn and every refusal logged; without it, the root stays undetermined.
-kprobe_placed=no
-load_mmu_pgd_kprobe() {
-    local fetch remaining
-    if [[ $1 == remove ]]; then
-        [[ $kprobe_placed == yes ]] || return 0
-        sudo sh -c "echo 0 >$tracing/events/kvmdiag/load_mmu_pgd/enable; echo -:kvmdiag/load_mmu_pgd >>$tracing/kprobe_events" \
-            >>"$out/host-trace.log" 2>&1 || harness_fail "removing the svm_load_mmu_pgd kprobe failed"
-        kprobe_placed=no
-        remaining=$(sudo cat "$tracing/kprobe_events")
-        echo "kprobe_events after removal: ${remaining:-empty}" >>"$out/host-trace.log"
-        [[ $remaining != *kvmdiag/load_mmu_pgd* ]] || harness_fail "the svm_load_mmu_pgd kprobe is still registered"
-        return
-    fi
+# The kprobes of a full trace, kvmdiag/NAME, each placed by the first of its definitions that
+# the kernel takes, every refusal logged. The BTF-typed ones (CONFIG_PROBE_EVENTS_BTF_ARGS,
+# which the runners' 7.0.0-1017-azure has) name the vCPU; without, the event's thread does.
+# - load_mmu_pgd: the NPT root that KVM loads for a vCPU, svm_load_mmu_pgd(vcpu, root_hpa,
+#   root_level), Linux v7.0 arch/x86/kvm/svm/svm.c:4442, called from kvm_mmu_load_pgd
+#   (arch/x86/kvm/mmu.h:148-157); no tracepoint carries the root.
+# - mmu_reset: kvm_mmu_reset_context(vcpu), which unloads the vCPU's roots
+#   (arch/x86/kvm/mmu/mmu.c:6043-6047, 6083-6092).
+# - shutdown: shutdown_interception(vcpu), before it INITs the vCPU (svm.c:2081-2109), with
+#   the CR3 that svm_handle_exit copied from the VMCB on this exit (svm.c:3606-3610). KVM
+#   calls the VMCB undefined after a SHUTDOWN intercept (svm.c:2087-2088): a lead, not proof.
+kprobes=(load_mmu_pgd mmu_reset shutdown)
+kprobes_placed=()
+kprobe_definitions() {
     # shellcheck disable=SC2016 # kprobe_events fetch arguments, not shell expansions
-    for fetch in 'root_hpa=$arg2:x64 root_level=$arg3:s32' 'root_hpa=%si:x64 root_level=%dx:s32'; do
-        if sudo sh -c "echo 'p:kvmdiag/load_mmu_pgd svm_load_mmu_pgd $fetch' >>$tracing/kprobe_events" \
-            2>>"$out/host-trace.log"; then
-            kprobe_placed=yes
-            sudo sh -c "echo 1 >$tracing/events/kvmdiag/load_mmu_pgd/enable" >>"$out/host-trace.log" 2>&1 &&
-                echo "kprobe svm_load_mmu_pgd: $fetch" >>"$out/host-trace.log" && return
+    case $1 in
+    load_mmu_pgd)
+        printf '%s\n' 'svm_load_mmu_pgd vcpu_id=vcpu->vcpu_id root_hpa=root_hpa:x64 root_level=root_level:s32' \
+            'svm_load_mmu_pgd root_hpa=$arg2:x64 root_level=$arg3:s32' \
+            'svm_load_mmu_pgd root_hpa=%si:x64 root_level=%dx:s32'
+        ;;
+    mmu_reset) printf '%s\n' 'kvm_mmu_reset_context vcpu_id=vcpu->vcpu_id' 'kvm_mmu_reset_context' ;;
+    shutdown) printf '%s\n' 'shutdown_interception vcpu_id=vcpu->vcpu_id cr3=vcpu->arch.cr3:x64' ;;
+    esac
+}
+
+# kprobe_add NAME: places kvmdiag/NAME and enables it; false if no definition takes.
+kprobe_add() {
+    local name=$1 definition
+    while read -r definition; do
+        if sudo sh -c "echo 'p:kvmdiag/$name $definition' >>$tracing/kprobe_events" 2>>"$out/host-trace.log"; then
+            kprobes_placed+=("$name")
+            echo "kprobe ${definition%% *}: $definition" >>"$out/host-trace.log"
+            sudo sh -c "echo 1 >$tracing/events/kvmdiag/$name/enable" >>"$out/host-trace.log" 2>&1
+            [[ $(events_enabled "kvmdiag/$name") == traced ]] && return 0
+            harness_fail "the kvmdiag/$name kprobe is placed but not enabled"
+            return 1
         fi
-        echo "kprobe svm_load_mmu_pgd refused: $fetch: $(sudo tail -n 2 "$tracing/error_log" | tr '\n' ' ')" \
+        echo "kprobe ${definition%% *} refused: $definition: $(sudo tail -n 2 "$tracing/error_log" | tr '\n' ' ')" \
             >>"$out/host-trace.log"
+    done < <(kprobe_definitions "$name")
+    return 1
+}
+
+# kprobes_remove: removes the kprobes that kprobe_add placed, and checks that none is left.
+kprobes_remove() {
+    local name remaining
+    for name in "${kprobes_placed[@]}"; do
+        sudo sh -c "echo 0 >$tracing/events/kvmdiag/$name/enable; echo -:kvmdiag/$name >>$tracing/kprobe_events" \
+            >>"$out/host-trace.log" 2>&1 || harness_fail "removing the kvmdiag/$name kprobe failed"
     done
+    kprobes_placed=()
+    remaining=$(sudo cat "$tracing/kprobe_events")
+    echo "kprobe_events after removal: ${remaining:-empty}" >>"$out/host-trace.log"
+    [[ $remaining != *kvmdiag/* ]] || harness_fail "kvmdiag kprobes are still registered: $remaining"
 }
 
 # host_trace_stop LABEL DIR MODE VCPUS: saves the trace as LABEL's and, for MODE full, writes
 # ci-diag-attribution.py's verdict to DIR/attribution.txt, from the whole trace rather than
-# from the tail that is kept, and keeps each of the VCPUS vCPU threads' own tail.
+# from the tail that is kept (trace_tail lines, and vcpu_tail of each of the VCPUS vCPU
+# threads' own).
+trace_tail=2000000
+vcpu_tail=500000
 host_trace_stop() {
     local trace=$out/$1.host-kvm-trace.txt n tid
     sudo sh -c "echo 0 >$tracing/tracing_on; cat $tracing/trace" >"$trace" 2>>"$out/host-trace.log"
-    load_mmu_pgd_kprobe remove
+    kprobes_remove
     grep -a -q -E 'kvm_(exit|cr):' "$trace" || harness_fail "$1: host trace without KVM events"
     if [[ $3 == full ]]; then
         python3 "$here/ci-diag-attribution.py" --probe-log "$out/host-trace.log" --dmesg "$out/dmesg-before.txt" \
             --flush-events "$flush_events" "$trace" >"$2/attribution.txt" 2>&1 ||
             harness_fail "$1: ci-diag-attribution.py failed, see $2/attribution.txt"
     fi
-    tail -n 2000000 "$trace" | gzip >"$trace.gz" || harness_fail "$1: compressing the host trace failed"
+    tail -n "$trace_tail" "$trace" | gzip >"$trace.gz" || harness_fail "$1: compressing the host trace failed"
     # Each vCPU thread's own tail too, which the other's lines cannot push out. The thread is
     # the one of the vCPU's kvm_exit lines, by its id, which a line has even when its name is
     # not known ("<...>"); kvm_inj_exception and others have no vCPU field.
@@ -195,7 +266,7 @@ host_trace_stop() {
                 harness_fail "$1: no vCPU $n thread found in the host trace"
                 continue
             fi
-            grep -a -E -- "-$tid +\[[0-9]+\]" "$trace" | tail -n 500000 |
+            grep -a -E -- "-$tid +\[[0-9]+\]" "$trace" | tail -n "$vcpu_tail" |
                 gzip >"$out/$1.host-kvm-trace.vcpu$n.txt.gz" || harness_fail "$1: compressing vCPU $n's trace failed"
             require "$out/$1.host-kvm-trace.vcpu$n.txt.gz"
         done
@@ -239,8 +310,8 @@ select_arch() {
     } >"$out/$arch/facts.txt" 2>&1
     cp "$run"/esp/*.efi "$run/initramfs/bin/uefisettings" "$run"/initramfs/tests/* \
         "$out/$arch/binaries/"
-    # The kernel's symbols, for the addresses in the traces and the RAM dumps (Debian's i686
-    # package has them, Fedora's x86_64 one does not).
+    # The kernel's symbols, for the addresses in the traces (Debian's i686 package has them,
+    # Fedora's x86_64 one does not).
     if compgen -G "$guest/boot/System.map-*" >/dev/null; then
         cp "$guest"/boot/System.map-* "$out/$arch/binaries/" || harness_fail "$arch: copying System.map failed"
     else
@@ -249,104 +320,48 @@ select_arch() {
     stepwise_initrd "$out/$arch"
 }
 
-# stepwise_initrd DIR: DIR/stepwise-initrd.img, a guest that marks each step of a write on
-# its terminal before it takes it: writes without uefisettings first (a new variable and an
-# update of Timeout, no chattr; then, if busybox has chattr, the ioctl alone and an update of
-# DriverSample's variable), then uefisettings with debug logs for its write path; with
-# diag.cpu=N, every step and the unbound workqueues (efi_rts_wq, which makes the runtime
-# calls) run on CPU N; with diag.pause, it prints the marker of ci-diag-qmp.py and sleeps
-# before the first write. Output goes straight to the terminal: a reset loses anything
-# buffered. And DIR/stepwise-initrd.img's tests/memslot toggles the memory decoding of the
-# ivshmem-plain device, so QEMU deletes and adds the memory slot of its BAR, no firmware
-# involved.
+# stepwise_initrd DIR: DIR/stepwise-initrd.img, the run's initramfs with the tests of this
+# diag, which mark each step on the terminal as they go (a reset loses anything buffered):
+# - memslot toggles the memory decoding of the ivshmem-plain device 200 times, so QEMU deletes
+#   and adds the memory slot of its BAR each time, no firmware involved;
+# - sync prints the pause marker of ci-diag-qmp.py diag.pauses times, sleeping after each;
+# - tripfault resets the guest through the emergency reboot, a triple fault with reboot=t;
+# - with diag.stress, memslot and sync first start two processes that ping-pong a byte over
+#   two FIFOs, so the CPU switches between their address spaces at each round trip.
 stepwise_initrd() {
     rm -rf "$1/stepwise-initramfs"
     cp -r "$run/initramfs" "$1/stepwise-initramfs"
-    cat >"$1/stepwise-initramfs/tests/stepwise" <<'EOF'
-#!/bin/busybox sh
-v=/sys/firmware/efi/efivars
-driver_sample=$v/MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d
-new=$v/ExecutorOneDiag-6a1e0f3c-2b7d-4c55-9e1a-0d3f2c4b5a69
+    # Sourced by the tests, not run.
+    cat >"$1/stepwise-initramfs/tests/step-and-stress" <<'EOF'
 step() {
     read -r uptime _ < /proc/uptime
     echo "step $uptime: $*"
     sync
 }
-cpu=
-pause=
+stress=
+pauses=0
 read -r cmdline < /proc/cmdline
 for parameter in $cmdline; do
     case $parameter in
-    diag.cpu=*) cpu=${parameter#*=} ;;
-    diag.pause) pause=yes ;;
+    diag.stress) stress=yes ;;
+    diag.pauses=*) pauses=${parameter#*=} ;;
     esac
 done
-on_cpu() {
-    if [ -n "$cpu" ]; then busybox taskset "$((1 << cpu))" "$@"; else "$@"; fi
-}
-if [ -n "$cpu" ]; then
-    printf '%x\n' "$((1 << cpu))" > /sys/devices/virtual/workqueue/cpumask
-    step "pinned to CPU $cpu; unbound workqueue cpumask $(cat /sys/devices/virtual/workqueue/cpumask)"
-fi
-step "efivarfs: $(ls $v | wc -l) variables; busybox chattr applets: $(busybox --list | grep -c -x -e chattr -e lsattr)"
 step "$(grep -m 1 '^address sizes' /proc/cpuinfo)"
-step "read the DriverSample variable"
-hexdump -C "$driver_sample" | head -2
-if [ -n "$pause" ]; then
-    echo "diag: pause"
-    sleep 3
+stress_report() { :; }
+if [ -n "$stress" ]; then
+    mkfifo /tmp/ping /tmp/pong
+    ( exec 3<>/tmp/ping 4<>/tmp/pong; while read -r _ <&3; do echo >&4; done ) &
+    ( exec 3<>/tmp/ping 4<>/tmp/pong; n=0; echo >&3
+      while read -r _ <&4; do n=$((n + 1)); [ $((n % 1000)) = 0 ] && echo $n > /tmp/round-trips; echo >&3; done ) &
+    sleep 1
+    step "stress: $(cat /tmp/round-trips 2>/dev/null || echo 0) round trips in about a second"
+    stress_report() { step "stress: $(cat /tmp/round-trips 2>/dev/null || echo 0) round trips"; }
 fi
-step "create a new 4-byte variable through efivarfs (SetVariable, no chattr)"
-printf '\007\000\000\000ABCD' > /tmp/new
-on_cpu dd if=/tmp/new of="$new" bs=8 count=1 2>&1
-step "created: $(hexdump -C "$new" | head -1)"
-# efivarfs makes the variables that it does not know immutable, a new one too, but not the
-# global ones such as Timeout: an update without chattr.
-timeout_var=$v/Timeout-8be4df61-93ca-11d2-aa0d-00e098032b8c
-# efivarfs files do not seek, so hexdump reads them from a pipe.
-old=0
-if [ -e "$timeout_var" ]; then
-    set -- $(cat "$timeout_var" | hexdump -s 4 -n 2 -e '2/1 "%u "')
-    [ $# = 2 ] && old=$(($1 + 256 * $2))
-fi
-new_timeout=$(((old + 1) % 65536))
-step "update Timeout $old -> $new_timeout through efivarfs dd (SetVariable update, no chattr)"
-printf "\\007\\000\\000\\000\\$(printf %o $((new_timeout % 256)))\\$(printf %o $((new_timeout / 256)))" > /tmp/timeout
-on_cpu dd if=/tmp/timeout of="$timeout_var" bs=6 count=1 2>&1
-step "updated: $(hexdump -C "$timeout_var" | head -1)"
-if busybox --list | grep -q -x chattr; then
-    step "busybox chattr -i on the DriverSample variable (ioctl only)"
-    busybox chattr -i "$driver_sample" 2>&1
-    step "flags: $(busybox lsattr "$driver_sample" 2>&1)"
-    cp "$driver_sample" /tmp/ds
-    old=$(hexdump -s 96 -n 1 -e '1/1 "%u"' /tmp/ds)
-    case $old in
-    0 | 1)
-        step "update the check box byte $old -> $((1 - old)) through efivarfs dd (no uefisettings)"
-        printf "\\$((1 - old))" | dd of=/tmp/ds bs=1 seek=96 conv=notrunc 2>&1
-        dd if=/tmp/ds of="$driver_sample" bs="$(wc -c < /tmp/ds)" count=1 2>&1
-        step "updated: $(cat "$driver_sample" | hexdump -s 96 -n 1 -e '1/1 "%u"')"
-        ;;
-    *) step "check box byte is '$old', not 0 or 1: no dd update" ;;
-    esac
-fi
-step "uefisettings identify"
-on_cpu /bin/uefisettings identify --json 2>&1
-step "uefisettings hii extract-db"
-on_cpu /bin/uefisettings hii extract-db /tmp/hiidb.bin 2>&1
-step "uefisettings set the check box to 0 (chattr + SetVariable)"
-on_cpu /bin/uefisettings set "Activate this check box" 0 --json 2>&1
-step "uefisettings set done"
-hexdump -C "$driver_sample" | head -8
-step "end"
 EOF
     cat >"$1/stepwise-initramfs/tests/memslot" <<'EOF'
 #!/bin/busybox sh
-step() {
-    read -r uptime _ < /proc/uptime
-    echo "step $uptime: $*"
-    sync
-}
+. /tests/step-and-stress
 dev=
 for d in /sys/bus/pci/devices/*; do
     [ "$(cat "$d/vendor")" = 0x1af4 ] && [ "$(cat "$d/device")" = 0x1110 ] && dev=$d
@@ -367,16 +382,38 @@ off=$(($1 & ~2))
 on=$(($1 | 2))
 i=0
 while [ $i -lt 200 ]; do
-    # dd's own messages, but not its errors, filtered out; memslot_verdict catches a write
-    # that does not take.
+    # dd's own messages, but not its errors, filtered out; boot_verdict catches a write that
+    # does not take.
     printf "\\$(printf %o $off)" | dd of="$dev/config" bs=1 seek=4 count=1 conv=notrunc 2>&1 | grep -v -e 'records in' -e 'records out'
     printf "\\$(printf %o $on)" | dd of="$dev/config" bs=1 seek=4 count=1 conv=notrunc 2>&1 | grep -v -e 'records in' -e 'records out'
     i=$((i + 1))
     [ $((i % 50)) = 0 ] && step "toggled the memory decoding $i times"
 done
+stress_report
 step "end"
 EOF
-    chmod +x "$1/stepwise-initramfs/tests/stepwise" "$1/stepwise-initramfs/tests/memslot"
+    cat >"$1/stepwise-initramfs/tests/sync" <<'EOF'
+#!/bin/busybox sh
+. /tests/step-and-stress
+i=1
+while [ $i -le "$pauses" ]; do
+    echo "diag: pause $i"
+    sleep 2
+    step "resumed $i"
+    i=$((i + 1))
+done
+stress_report
+step "end"
+EOF
+    cat >"$1/stepwise-initramfs/tests/tripfault" <<'EOF'
+#!/bin/busybox sh
+. /tests/step-and-stress
+sleep 2
+step "emergency reboot"
+echo b > /proc/sysrq-trigger
+EOF
+    chmod +x "$1/stepwise-initramfs/tests/memslot" "$1/stepwise-initramfs/tests/sync" \
+        "$1/stepwise-initramfs/tests/tripfault"
     (cd "$1/stepwise-initramfs" && find . | cpio --create --format=newc --quiet) \
         >"$1/stepwise-initrd.img"
 }
@@ -387,27 +424,28 @@ fresh_store() {
         --output "$1" 2>>"$out/virt-fw-vars.log"
 }
 
-# boot LABEL STORE QEMU HOST_TRACE FORENSICS INITRD APPEND QEMU-ARG...: one guest boot.
-# HOST_TRACE is no or a mode of host_trace_start. With FORENSICS=yes, QEMU pauses on a reset
-# instead of ending, its test terminal and QMP are sockets that ci-diag-qmp.py serves, and
-# ci-diag-pagewalk.py reports on the RAM dumps, walking also the RIPs of the host trace's
-# shutdown exits.
+# boot LABEL STORE QEMU HOST_TRACE PAUSE KERNEL INITRD APPEND QEMU-ARG...: one guest boot of
+# at most boot_timeout seconds, with its verdict in its DIR/verdict.txt (see boot_verdict).
+# HOST_TRACE is no or a mode of host_trace_start. PAUSE is no or a --pause mode of
+# ci-diag-qmp.py, which then serves the test terminal and QMP on sockets while QEMU pauses on
+# a reset instead of ending.
+boot_timeout=$((180 * slow))
 boot() {
-    local label=$1 store=$2 qemu=$3 host_trace=$4 forensics=$5 initrd=$6 append=$7
-    local rc start end dir=$out/$arch/$label sockets supervisor='' terminal control
-    local trace=$out/$arch-${label//\//-} rips guest_maxphyaddr
-    local traces=trace:kvm_run_exit,trace:kvm_run_exit_system_event,trace:qemu_system_shutdown_request,trace:qemu_system_powerdown_request,trace:kvm_set_user_memory
-    shift 7
+    local label=$1 store=$2 qemu=$3 host_trace=$4 pause=$5 kernel=$6 initrd=$7 append=$8
+    local rc start end dir=$out/$arch/$label sockets supervisor='' terminal control test
+    local trace=$out/$arch-${label//\//-}
+    local traces=trace:kvm_run_exit,trace:kvm_run_exit_system_event,trace:qemu_system_shutdown_request,trace:qemu_system_powerdown_request,trace:kvm_set_user_memory,trace:kvm_vcpu_ioctl,trace:vm_state_notify
+    shift 8
     mkdir -p "$dir"
     boots=$((boots + 1))
-    if [[ $forensics == yes ]]; then
+    if [[ $pause != no ]]; then
         # Unix socket paths have a limit of 108 bytes, which $dir can pass.
         sockets=$(mktemp -d /tmp/diag.XXXXXX)
         terminal=(-chardev "socket,id=tty,path=$sockets/terminal,server=on,wait=on")
         control=(-action 'reboot=shutdown,shutdown=pause' -qmp "unix:$sockets/qmp,server=on,wait=off")
         python3 "$here/ci-diag-qmp.py" --terminal-socket "$sockets/terminal" \
             --qmp-socket "$sockets/qmp" --terminal-log "$dir/test.log" --out "$dir" \
-            --ram-mib 1024 >"$dir/qmp.log" 2>&1 &
+            --pause "$pause" >"$dir/qmp.log" 2>&1 &
         supervisor=$!
     else
         terminal=(-chardev "file,id=tty,path=$dir/test.log")
@@ -417,12 +455,12 @@ boot() {
     [[ $host_trace != no ]] && host_trace_start "$host_trace"
     start=$(date +%s.%N)
     # debug-threads names the vCPU threads (CPU N/KVM) for the host trace's lines.
-    timeout --foreground -k 10 180 "$qemu" -machine q35 "$@" -name debug-threads=on \
+    timeout --foreground -k 10 "$boot_timeout" "$qemu" -machine q35 "$@" -name debug-threads=on \
         -nodefaults -no-user-config "${control[@]}" -display none -sandbox on -m 1024 \
         -drive "if=pflash,format=raw,unit=0,readonly=on,file=$guest/$firmware" \
         -drive "if=pflash,format=raw,unit=1,file=$store" \
         -drive "if=virtio,format=raw,readonly=on,file=fat:$run/esp" \
-        -kernel "$vmlinuz" -initrd "$initrd" -append "console=ttyS0 uefisettings.tty=ttyS1 $append" \
+        -kernel "$kernel" -initrd "$initrd" -append "console=ttyS0 uefisettings.tty=ttyS1 $append" \
         -serial "file:$dir/console.log" \
         "${terminal[@]}" -serial chardev:tty \
         -d "guest_errors,unimp,$traces" -D "$dir/qemu.log" </dev/null >"$dir/qemu.stdout" 2>&1
@@ -433,7 +471,7 @@ boot() {
         wait "$supervisor"
         echo "ci-diag-qmp.py exited with $?" >>"$dir/qmp.log"
         rm -rf "$sockets"
-        forensics_reports "$dir" "$trace"
+        require "$dir/qmp.log"
     fi
     [[ $host_trace != no ]] && require "$trace.host-kvm-trace.txt.gz"
     [[ $host_trace == full ]] && require "$dir/attribution.txt"
@@ -445,11 +483,17 @@ boot() {
     fi
     gzip "$dir/qemu.log" || harness_fail "$arch $label: gzip of qemu.log failed"
     require "$dir/qemu.log.gz" || return
+    test=${append##*uefisettings.test=}
+    test=${test%% *}
+    boot_verdict "$dir" "$test" >"$dir/verdict.txt"
+    sregs2_writes "$dir/qemu.log.gz" >"$dir/sregs2.txt" ||
+        harness_fail "$arch $label: counting the KVM_SET_SREGS2 calls failed"
     {
         echo "== $arch $label: $qemu -machine q35 $* -append ... $append; store $store"
-        echo "firmware $guest/$firmware; kernel $vmlinuz; initrd $initrd"
+        echo "firmware $guest/$firmware; kernel $kernel; initrd $initrd"
         echo "exit $rc after $(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.1f", b - a }') s"
         tr -d '\r' <"$dir/console.log" | grep -a 'uefisettings-qemu-test: exit' || echo "no exit line"
+        pti_line "$dir"
         tr -d '\r' <"$dir/test.log" | grep -a -E '^test result|^step ' | tail -4 || true
         # With -no-reboot, a reset (triple fault: KVM exit 8; reset port: exit 2) logs no
         # shutdown request; a guest poweroff logs reason=6.
@@ -457,14 +501,103 @@ boot() {
         echo "memory slot changes: $(zcat "$dir/qemu.log.gz" | grep -a -c '^kvm_set_user_memory')"
         echo "last kvm_run_exit lines:"
         zcat "$dir/qemu.log.gz" | grep -a kvm_run_exit | tail -4
-        [[ -f $dir/shutdown-reason.txt ]] && echo "forensics: shutdown $(cat "$dir/shutdown-reason.txt")"
-        [[ -f $dir/pagewalk.txt ]] && grep -a -c DIFFERS "$dir/pagewalk.txt" | sed 's/^/forensics: structures that differ: /'
+        echo "QEMU KVM_SET_SREGS2 per running period: $(cat "$dir/sregs2.txt")"
+        [[ -f $dir/qmp.log ]] && echo "qmp: $(grep -c ': resumed$' "$dir/qmp.log") pauses resumed;" \
+            "$(grep -a -E 'shutdown:|exited with' "$dir/qmp.log" | tr '\n' ' ')"
+        # Each vCPU's CR3 when QMP read the registers, from "info registers -a".
+        for registers in "$dir"/registers-*.txt; do
+            [[ -f $registers ]] || continue
+            awk -v pause="${registers##*registers-}" '/^CPU#/ { cpu = $1 }
+                match($0, /CR3=[0-9a-f]+/) { cr3 = substr($0, RSTART + 4, RLENGTH - 4)
+                    printf "registers at pause %s: %s CR3=%s (offset in its page 0x%s)\n", pause + 0, cpu, cr3, substr(cr3, length(cr3) - 2) }' "$registers"
+        done
         [[ -f $dir/attribution.txt ]] && cat "$dir/attribution.txt"
-        # The CR4 that each vCPU's kernel set last: a CPUID mask changes it only through Linux.
-        [[ -f $trace.host-kvm-trace.txt.gz ]] && zcat "$trace.host-kvm-trace.txt.gz" |
-            sed -n -E 's/.*CPU ([0-9]+)\/KVM-.*kvm_cr: cr_write 4 = (0x[0-9a-f]+).*/vCPU \1 CR4 \2/p' | awk '{last[$2] = $0} END {for (c in last) print "last " last[c]}'
-        [[ $label == memslot* ]] && memslot_verdict "$dir"
+        if [[ -f $trace.host-kvm-trace.txt.gz ]]; then
+            zcat "$trace.host-kvm-trace.txt.gz" | awk '/ mmu_reset: / { n++ } END { print "host kvm_mmu_reset_context calls in the kept trace: " n + 0 }'
+            zcat "$trace.host-kvm-trace.txt.gz" |
+                sed -n -E 's/.* shutdown: .*vcpu_id=([0-9]+) cr3=0x([0-9a-f]+).*/shutdown probe: vcpu \1 VMCB CR3 0x\2/p'
+            # The CR4 that each vCPU's kernel set last: a CPUID mask changes it only through Linux.
+            zcat "$trace.host-kvm-trace.txt.gz" |
+                sed -n -E 's/.*CPU ([0-9]+)\/KVM-.*kvm_cr: cr_write 4 = (0x[0-9a-f]+).*/vCPU \1 CR4 \2/p' | awk '{last[$2] = $0} END {for (c in last) print "last " last[c]}'
+        fi
+        echo "verdict: $(cat "$dir/verdict.txt")"
     } >>"$out/summary.txt"
+}
+
+# sregs2_writes QEMU_LOG_GZ: the register writes of QEMU (KVM_SET_SREGS2, which carries a PAE
+# vCPU's PDPTRs: _IOW(KVMIO, 0xcd, struct kvm_sregs2) = 0x4140aecd,
+# include/uapi/linux/kvm.h:1480) in each period that the VM ran, from its start to the first
+# pause and on from each cont, as numbers separated by spaces; false if the log has no period.
+sregs2_writes() {
+    zcat "$1" | awk '/^vm_state_notify running 1 / { n[++runs] = 0 }
+        /^kvm_vcpu_ioctl .* type 0x4140aecd,/ { n[runs]++ }
+        END { if (runs == 0) exit 1; for (i = 1; i <= runs; i++) printf "%s%d", (i > 1 ? " " : ""), n[i]; print "" }'
+}
+
+# pti_line DIR: the first "page tables isolation" line of DIR's console, or a note that it has
+# none. grep reads the file itself: at the end of a pipe, grep -m 1 would leave its writer to
+# die of SIGPIPE, which pipefail reports as no match.
+pti_line() {
+    grep -a -m 1 'page tables isolation' "$1/console.log" | tr -d '\r' || echo "no page table isolation line"
+}
+
+# boot_verdict DIR TEST: "died", "survived" or "other", then why, for the boot in DIR of the
+# guest test TEST. A guest that resets (a KVM exit 8) before the end of its test died; one
+# that ends it survived if the test did what it should: memslot's 200 deletions of its BAR's
+# slot, sync's pauses, a hii test's pass. Anything else (a hang, an unassigned BAR, a failed
+# test) is other.
+boot_verdict() {
+    local dir=$1 test=$2 resets ended bar deletes=0 resumed
+    resets=$(zcat "$dir/qemu.log.gz" | grep -a -c -E '^kvm_run_exit cpu_index [0-9]+, reason 8$')
+    case $test in
+    memslot | sync | tripfault) ended=$(tr -d '\r' <"$dir/test.log" | grep -a -c '^step .*: end$') ;;
+    *) ended=$(tr -d '\r' <"$dir/console.log" | grep -a -c '^uefisettings-qemu-test: exit 0 0$') ;;
+    esac
+    if [[ $test == memslot ]]; then
+        bar=$(tr -d '\r' <"$dir/test.log" | sed -n -E 's/.*, BAR 2 (0x[0-9a-f]+) .*/\1/p' | head -n 1)
+        # QEMU's trace prints the address without the resource file's leading zeros.
+        [[ -n $bar ]] && bar=$(printf '0x%x' "$bar")
+        [[ -n $bar ]] && ((bar != 0)) && deletes=$(zcat "$dir/qemu.log.gz" |
+            grep -a -c -E "^kvm_set_user_memory AddrSpace#0 .* gpa=$bar size=0x0 ")
+    fi
+    if ((resets > 0 && ended == 0)); then
+        case $test in
+        memslot) echo "died: KVM exit 8 after $deletes deletions of the slot at BAR 2 ${bar:-none}" ;;
+        sync) echo "died: KVM exit 8 after $(grep -c ': resumed$' "$dir/qmp.log") resumed pauses" ;;
+        *) echo "died: KVM exit 8" ;;
+        esac
+        return
+    fi
+    if ((ended == 0)); then
+        echo "other: no reset, and the test did not end well (last: $(tr -d '\r' <"$dir/test.log" |
+            grep -a '^step ' | tail -n 1)$(tr -d '\r' <"$dir/console.log" | grep -a 'uefisettings-qemu-test: exit' | tail -n 1))"
+        return
+    fi
+    case $test in
+    memslot)
+        if [[ -n $bar ]] && ((bar != 0 && deletes >= 200)); then
+            echo "survived: $deletes deletions of the slot at BAR 2 $bar"
+        else
+            echo "other: vacuous: BAR 2 '${bar:-none}', $deletes deletions of its slot"
+        fi
+        ;;
+    sync)
+        resumed=$(grep -c ': resumed$' "$dir/qmp.log")
+        if ((resumed == sync_pauses)); then
+            echo "survived: $resumed pauses"
+        else
+            echo "other: vacuous: $resumed of $sync_pauses pauses"
+        fi
+        ;;
+    *) echo "survived: the test passed" ;;
+    esac
+}
+
+# in_time LABEL: false, with a line in the summary, once the deadline has passed.
+in_time() {
+    ((SECONDS <= deadline)) && return 0
+    echo "skipped after the deadline: $1" | tee -a "$out/cells.txt" >>"$out/summary.txt"
+    return 1
 }
 
 # vcpus QEMU-ARG...: the vCPU count of the -smp in QEMU-ARG.
@@ -489,113 +622,331 @@ require() {
     return "$missing"
 }
 
-# forensics_reports DIR TRACE: checks what ci-diag-qmp.py saved for the boot in DIR, runs
-# ci-diag-pagewalk.py on it (walking also the RIPs of TRACE's shutdown exits) and compresses
-# the RAM dumps.
-forensics_reports() {
-    local dir=$1 trace=$2 rips guest_maxphyaddr dump
-    require "$dir/qmp.log" "$dir/shutdown-reason.txt"
-    tr -d '\r' <"$dir/test.log" | grep -a -q 'diag: pause' &&
-        require "$dir/registers-before.txt" "$dir/ram-before.bin"
-    [[ -f $dir/shutdown-reason.txt && $(<"$dir/shutdown-reason.txt") == guest-reset ]] &&
-        require "$dir/ram-after.bin"
-    if [[ -f $dir/registers-before.txt && -f $dir/ram-before.bin ]]; then
-        rips=()
-        [[ -f $trace.host-kvm-trace.txt.gz ]] && mapfile -t rips < <(zcat "$trace.host-kvm-trace.txt.gz" |
-            sed -n -E 's/.*kvm_exit: vcpu ([0-9]+) reason shutdown rip (0x[0-9a-f]+).*/--address=shutdown-rip-vcpu\1=\2/p')
-        # The guest's width, which QEMU sets to 36 bits for a CPU without long mode
-        # (QEMU v10.2.0 target/i386/cpu.c:9475-9479), else the host's.
-        guest_maxphyaddr=$(tr -d '\r' <"$dir/test.log" |
-            sed -n -E 's/.*address sizes\s*: ([0-9]+) bits physical.*/\1/p' | head -n 1)
-        python3 "$here/ci-diag-pagewalk.py" --maxphyaddr "${guest_maxphyaddr:-$host_maxphyaddr}" "${rips[@]}" \
-            "$dir/registers-before.txt" "$dir"/ram-*.bin >"$dir/pagewalk.txt" 2>&1 ||
-            harness_fail "$dir: ci-diag-pagewalk.py failed, see pagewalk.txt"
-    fi
-    for dump in "$dir"/ram-before.bin "$dir"/ram-after.bin; do
-        [[ -f $dump ]] || continue
-        gzip -1 "$dump" || harness_fail "$dir: gzip of $dump failed"
-        require "$dump.gz"
-    done
-}
-
-# pair LABEL QEMU HOST_TRACE FORENSICS INITRD APPEND QEMU-ARG...: a hii boot and then the
-# given boot on one fresh store, as run.sh boots the hii scenario.
+# pair LABEL HOST_TRACE APPEND QEMU-ARG...: a hii boot and then a hii_write one with APPEND on
+# one fresh store, as run.sh boots the hii scenario; the write boot's verdict must be
+# "survived" or "died".
 pair() {
-    local label=$1 qemu=$2 host_trace=$3 forensics=$4 initrd=$5 append=$6
-    shift 6
+    local label=$1 host_trace=$2 append=$3
+    shift 3
+    wanted "$label" || return 0
+    in_time "$arch $label" || return 0
     mkdir -p "$out/$arch/$label"
     fresh_store "$out/$arch/$label/vars.fd"
-    boot "$label/1-hii" "$out/$arch/$label/vars.fd" "$qemu" no no "$hii_initrd" \
+    boot "$label/1-hii" "$out/$arch/$label/vars.fd" "$apt_qemu" no no "$vmlinuz" "$hii_initrd" \
         "uefisettings.test=hii panic=-1" "$@"
-    boot "$label/2-write" "$out/$arch/$label/vars.fd" "$qemu" "$host_trace" "$forensics" \
-        "$initrd" "$append" "$@"
-}
-
-# memslot_verdict DIR: whether DIR's tests/memslot boot changed memory slots at all: its BAR 2
-# needs an address, and each of the 200 toggles a deletion of the BAR's slot.
-memslot_verdict() {
-    local bar deletes
-    bar=$(tr -d '\r' <"$1/test.log" | sed -n -E 's/.*, BAR 2 (0x[0-9a-f]+) .*/\1/p' | head -n 1)
-    deletes=0
-    # QEMU's trace prints the address without the resource file's leading zeros.
-    [[ -n $bar ]] && bar=$(printf '0x%x' "$bar")
-    [[ -n $bar ]] && ((bar != 0)) && deletes=$(zcat "$1/qemu.log.gz" |
-        grep -a -c -E "^kvm_set_user_memory AddrSpace#0 .* gpa=$bar size=0x0 ")
-    if [[ -n $bar ]] && ((bar != 0 && deletes >= 200)); then
-        echo "memslot: valid, $deletes deletions of the slot at BAR 2 $bar"
+    boot "$label/2-write" "$out/$arch/$label/vars.fd" "$apt_qemu" "$host_trace" no "$vmlinuz" \
+        "$hii_initrd" "$write $append" "$@"
+    expect_verdict "$out/$arch/$label/2-write" died survived
+    # The write boot's PTI as its kernel command line asks, on with pti=on and off without.
+    if [[ ! -f $out/$arch/$label/2-write/console.log ]]; then
+        return
+    elif grep -a -q 'page tables isolation: .*enabled' "$out/$arch/$label/2-write/console.log"; then
+        [[ " $append " == *" pti=on "* ]] || harness_fail "$arch $label: PTI without pti=on"
     else
-        harness_fail "memslot $1: vacuous: BAR 2 '${bar:-none}', $deletes deletions of its slot"
+        [[ " $append " != *" pti=on "* ]] || harness_fail "$arch $label: pti=on, but no PTI line"
     fi
 }
 
-# memslot LABEL HOST_TRACE QEMU-ARG...: one boot of tests/memslot, which toggles the memory
-# decoding of an ivshmem-plain device with a 4 MiB RAM BAR.
-memslot() {
-    local label=$1 host_trace=$2
-    shift 2
-    mkdir -p "$out/$arch/$label"
-    fresh_store "$out/$arch/$label/vars.fd"
-    boot "$label" "$out/$arch/$label/vars.fd" "$apt_qemu" "$host_trace" no \
-        "$out/$arch/stepwise-initrd.img" "ignore_loglevel panic=-1 uefisettings.test=memslot" "$@" \
-        -object memory-backend-ram,id=shm,size=4M -device ivshmem-plain,memdev=shm
+# tripfault: a triple fault on purpose, which the host trace and the attribution must show.
+tripfault() {
+    wanted tripfault || return 0
+    mkdir -p "$out/$arch/tripfault"
+    fresh_store "$out/$arch/tripfault/vars.fd"
+    boot tripfault "$out/$arch/tripfault/vars.fd" "$apt_qemu" full no "$vmlinuz" "$out/$arch/stepwise-initrd.img" \
+        "ignore_loglevel panic=-1 reboot=t uefisettings.test=tripfault" "${smp1[@]}"
+    expect_verdict "$out/$arch/tripfault" died
+}
+
+# wanted LABEL: whether DIAG_ONLY names the arch's LABEL, or is empty.
+wanted() {
+    [[ -z ${DIAG_ONLY:-} || " ${DIAG_ONLY//,/ } " == *" $arch/$1 "* ]]
+}
+
+# verdict_of DIR: the verdict of DIR's boot, or "other: no verdict".
+verdict_of() {
+    if [[ -f $1/verdict.txt ]]; then
+        cat "$1/verdict.txt"
+    else
+        echo "other: no verdict"
+    fi
+}
+
+# expect_verdict DIR VERDICT...: a harness failure unless DIR's boot has one of VERDICT.
+expect_verdict() {
+    local dir=$1 verdict
+    shift
+    verdict=$(verdict_of "$dir")
+    [[ " $* " == *" ${verdict%%:*} "* ]] || harness_fail "$dir: verdict $verdict, not $*"
+}
+
+# The cells of the arch at hand: cell NAME TEST PAUSE KERNEL APPEND QEMU-ARGS registers one,
+# run_cells boots each DIAG_REPS times round-robin, with full host traces; a cell whose first
+# boot's verdict is other boots no more, and no cell starts a boot after the deadline.
+cell_names=()
+declare -A cell_test cell_pause cell_kernel cell_append cell_args cell_died cell_survived cell_other cell_skipped
+cell() {
+    wanted "$1" || return 0
+    cell_names+=("$1")
+    cell_test[$1]=$2
+    cell_pause[$1]=$3
+    cell_kernel[$1]=$4
+    cell_append[$1]=$5
+    cell_args[$1]=$6
+    cell_died[$1]=0
+    cell_survived[$1]=0
+    cell_other[$1]=0
+    cell_skipped[$1]=0
+}
+
+run_cells() {
+    local n name label args verdict first
+    for ((n = 1; n <= reps; n++)); do
+        for name in "${cell_names[@]}"; do
+            first=$(verdict_of "$out/$arch/$name/1")
+            if ((n > 1)) && [[ $first == other* ]]; then
+                echo "skipped, as its cell's first boot is other: $arch $name/$n" |
+                    tee -a "$out/cells.txt" >>"$out/summary.txt"
+                cell_skipped[$name]=$((cell_skipped[$name] + 1))
+                continue
+            fi
+            if ! in_time "$arch $name/$n"; then
+                cell_skipped[$name]=$((cell_skipped[$name] + 1))
+                continue
+            fi
+            label=$name/$n
+            read -r -a args <<<"${cell_args[$name]}"
+            mkdir -p "$out/$arch/$label"
+            fresh_store "$out/$arch/$label/vars.fd"
+            # The whole trace of a cell's first boot; less of the others'.
+            trace_tail=2000000 vcpu_tail=500000
+            ((n > 1)) && trace_tail=200000 vcpu_tail=100000
+            boot "$label" "$out/$arch/$label/vars.fd" "$apt_qemu" full "${cell_pause[$name]}" \
+                "${cell_kernel[$name]}" "$out/$arch/stepwise-initrd.img" \
+                "ignore_loglevel panic=-1 uefisettings.test=${cell_test[$name]} diag.pauses=$sync_pauses ${cell_append[$name]}" \
+                "${args[@]}"
+            verdict=$(verdict_of "$out/$arch/$label")
+            case $verdict in
+            died*) cell_died[$name]=$((cell_died[$name] + 1)) ;;
+            survived*) cell_survived[$name]=$((cell_survived[$name] + 1)) ;;
+            *)
+                cell_other[$name]=$((cell_other[$name] + 1))
+                harness_fail "$arch $label: $verdict"
+                ;;
+            esac
+        done
+    done
+    trace_tail=2000000 vcpu_tail=500000
+    for name in "${cell_names[@]}"; do
+        report_cell "$name"
+    done
+    cell_names=()
+}
+
+# kernel_release KERNEL: the release of a kernel image, from its path: Debian's
+# boot/vmlinuz-RELEASE or lib/modules/RELEASE/vmlinuz.
+kernel_release() {
+    local base=${1##*/}
+    if [[ $base == vmlinuz ]]; then
+        base=${1%/vmlinuz}
+        echo "${base##*/}"
+    else
+        echo "${base#vmlinuz-}"
+    fi
+}
+
+# stress_round_trips DIR: the round trips that the stressor of DIR's boot made in about its
+# first second, or nothing without that line.
+stress_round_trips() {
+    tr -d '\r' <"$1/test.log" |
+        sed -n -E 's/^step [0-9.]+: stress: ([0-9]+) round trips in about a second$/\1/p' | head -n 1
+}
+
+# cell_boot_proof NAME K: why boot K of cell NAME does not show that what its verdict depends
+# on took place, or nothing: the cell's kernel booted (its "Linux version" line); PTI is on
+# with pti=on and off without (its "page tables isolation" line); the stressor made at least
+# 1000 round trips in its first second with diag.stress; a death came after the trigger began
+# (a deletion of the BAR's slot; a QMP stop); QEMU's KVM_SET_SREGS2 counts exist for a cell with
+# pauses, are all 0 for plain pauses, and show a write-back after a pause with a register read.
+cell_boot_proof() {
+    local name=$1 dir=$out/$arch/$1/$2 release trips count verdict after
+    release=$(kernel_release "${cell_kernel[$name]}")
+    # Each grep reads the file itself: grep -q at the end of a pipe exits at its first match, and
+    # under pipefail the writer's SIGPIPE would make the match read as a failure.
+    if ! grep -a -q -F "Linux version $release " "$dir/console.log"; then
+        echo "boot $2: no 'Linux version $release' line"
+        return
+    fi
+    if [[ " ${cell_append[$name]} " == *" pti=on "* ]]; then
+        grep -a -q 'page tables isolation: .*enabled' "$dir/console.log" ||
+            { echo "boot $2: no PTI line"; return; }
+    elif grep -a -q 'page tables isolation: .*enabled' "$dir/console.log"; then
+        echo "boot $2: PTI without pti=on"
+        return
+    fi
+    if [[ " ${cell_append[$name]} " == *" diag.stress "* ]]; then
+        trips=$(stress_round_trips "$dir")
+        if [[ ! $trips =~ ^[0-9]+$ ]] || ((trips < 1000)); then
+            echo "boot $2: the stressor did not run (round trips: ${trips:-no line})"
+            return
+        fi
+    fi
+    verdict=$(verdict_of "$dir")
+    if [[ $verdict == died* ]]; then
+        case ${cell_test[$name]} in
+        memslot)
+            if [[ ! $verdict =~ after\ ([0-9]+)\ deletions ]] || ((BASH_REMATCH[1] == 0)); then
+                echo "boot $2: died before the first deletion"
+                return
+            fi
+            ;;
+        sync)
+            grep -q ': pause 1: stopped$' "$dir/qmp.log" || { echo "boot $2: died before the first pause"; return; }
+            ;;
+        esac
+    fi
+    [[ ${cell_pause[$name]} == no ]] && return
+    count=missing
+    [[ -f $dir/sregs2.txt ]] && count=$(<"$dir/sregs2.txt")
+    if [[ ! $count =~ ^[0-9]+( [0-9]+)*$ ]]; then
+        echo "boot $2: no KVM_SET_SREGS2 counts"
+        return
+    fi
+    case ${cell_pause[$name]} in
+    plain) [[ $count != *[1-9]* ]] || echo "boot $2: QEMU wrote registers back in a plain pause" ;;
+    registers)
+        # The periods from the first cont on: all but the first.
+        if grep -q ': pause 1: resumed$' "$dir/qmp.log"; then
+            after=
+            [[ $count == *" "* ]] && after=${count#* }
+            [[ $after == *[1-9]* ]] || echo "boot $2: no register write-back after a pause"
+        fi
+        ;;
+    esac
+}
+
+# report_cell NAME: the counts of a cell and its class by the decision rule of the header: it
+# decides only on all DIAG_REPS boots of a cell, and only if each of them proves what its
+# verdict depends on (cell_boot_proof); with the KVM_SET_SREGS2 counts per running period of
+# each boot of a cell with pauses, and the stressor's round trips of each of a stressed one.
+report_cell() {
+    local name=$1 died=${cell_died[$1]} survived=${cell_survived[$1]} other=${cell_other[$1]}
+    local n=$((cell_died[$1] + cell_survived[$1] + cell_other[$1])) class proof='' details='' counts='' trips='' k count
+    for ((k = 1; k <= reps; k++)); do
+        [[ -f $out/$arch/$name/$k/verdict.txt ]] || continue
+        [[ -z $proof ]] && proof=$(cell_boot_proof "$name" "$k")
+        count=missing
+        [[ -f $out/$arch/$name/$k/sregs2.txt ]] && count=$(<"$out/$arch/$name/$k/sregs2.txt")
+        counts+="[$count]"
+        trips+="[$(stress_round_trips "$out/$arch/$name/$k")]"
+    done
+    [[ ${cell_pause[$1]} != no ]] && details+="; KVM_SET_SREGS2 per running period: ${counts:-none}"
+    [[ " ${cell_append[$1]} " == *" diag.stress "* ]] && details+="; stressor round trips in the first second: ${trips:-none}"
+    if ((other > 0)); then
+        class=harness
+    elif ((n < reps)); then
+        class="incomplete, $n of $reps boots"
+    elif [[ -n $proof ]]; then
+        class="invalid, $proof"
+    elif ((died * 10 >= 8 * n)); then
+        class=dies
+    elif ((died * 10 <= n && died + survived == n)); then
+        class=survives
+    else
+        class=mixed
+    fi
+    echo "cell $arch $name: $n boots: $died died, $survived survived, $other other, ${cell_skipped[$1]} skipped: $class$details" |
+        tee -a "$out/cells.txt" >>"$out/summary.txt"
 }
 
 write="ignore_loglevel efi=debug uefisettings.test=hii_write uefisettings.filter=--nocapture panic=-1"
-stepwise="ignore_loglevel panic=-1 uefisettings.test=stepwise RUST_LOG=info,uefisettings::chattr=debug,uefisettings::hii::efivarfs=debug,uefisettings::hii::extract=debug"
-kvm=(-accel kvm -cpu host -smp 2)
-# The physical address width for a guest that does not print its own: -cpu host with long
-# mode passes the host's through.
-host_maxphyaddr=$(sed -n -E 's/^address sizes\s*: ([0-9]+) bits physical.*/\1/p' /proc/cpuinfo | head -n 1)
+# The cells' and triple faults' QEMU, without the VMware backdoor port, whose handler reads the
+# registers (QEMU v10.2.0 hw/i386/vmport.c:93-107), so that QEMU writes them back: openSUSE's
+# and Fedora's kernels probe it (8 more KVM_SET_SREGS2 a boot here), Debian's 6.1 does not.
+smp1=(-accel kvm -cpu host -smp 1 -machine vmport=off)
+ivshmem='-object memory-backend-ram,id=shm,size=4M -device ivshmem-plain,memdev=shm'
 
 if select_arch i686; then
-    stepwise_img=$out/$arch/stepwise-initrd.img
-    pair base-1 "$apt_qemu" full no "$hii_initrd" "$write" "${kvm[@]}"
-    pair smp1 "$apt_qemu" full no "$hii_initrd" "$write" -accel kvm -cpu host -smp 1
-    pair forensics-smp1 "$apt_qemu" full yes "$stepwise_img" "$stepwise diag.pause" -accel kvm -cpu host -smp 1
-    pair forensics-smp2 "$apt_qemu" full yes "$stepwise_img" "$stepwise diag.pause" "${kvm[@]}"
-    memslot memslot full "${kvm[@]}"
-    memslot memslot-smp1 no -accel kvm -cpu host -smp 1
-    # pti=on, as AMD needs no page table isolation, so the guest runs without it.
-    for parameter in pti=on idle=poll nohz=off; do
-        pair "param-$parameter" "$apt_qemu" cr no "$hii_initrd" "$write $parameter" "${kvm[@]}"
+    # c4's kernel: openSUSE Tumbleweed's i586 port, kernel-pae 7.2.11-1.1, checked against the
+    # sha256 of ci-diag-packages-i686, unpacked outside $out, as its modules would bloat the
+    # artifact.
+    opensuse=$repo/target/qemu-test/diag-opensuse
+    rm -rf "$opensuse"
+    if "$here/fetch-packages.sh" "$here/ci-diag-packages-i686" "$repo/target/qemu-test/packages" \
+        "$opensuse" >>"$out/i686/facts.txt" 2>&1; then
+        opensuse_vmlinuz=$opensuse/usr/lib/modules/7.2.11-1-pae/vmlinuz
+        sha256sum "$opensuse_vmlinuz" >>"$out/i686/facts.txt" 2>&1
+        grep -E '^CONFIG_(X86_PAE|MITIGATION_PAGE_TABLE_ISOLATION|EFI_STUB)=' \
+            "$opensuse/usr/lib/modules/7.2.11-1-pae/config" >>"$out/i686/facts.txt" 2>&1
+    else
+        harness_fail "fetching openSUSE's kernel-pae failed, see i686/facts.txt"
+        opensuse_vmlinuz=
+    fi
+    boot_timeout=$((90 * slow))
+    tripfault
+    cell c1-memslot memslot no "$vmlinuz" "" "${smp1[*]} $ivshmem"
+    cell c2-memslot memslot no "$vmlinuz" "pti=on" "${smp1[*]} $ivshmem"
+    cell c3-memslot memslot no "$vmlinuz" "diag.stress" "${smp1[*]} $ivshmem"
+    [[ -n $opensuse_vmlinuz ]] && cell c4-memslot memslot no "$opensuse_vmlinuz" "" "${smp1[*]} $ivshmem"
+    cell c1-sync sync registers "$vmlinuz" "" "${smp1[*]}"
+    cell c2-sync sync registers "$vmlinuz" "pti=on" "${smp1[*]}"
+    cell c3-sync sync registers "$vmlinuz" "diag.stress" "${smp1[*]}"
+    [[ -n $opensuse_vmlinuz ]] && cell c4-sync sync registers "$opensuse_vmlinuz" "" "${smp1[*]}"
+    cell c1-sync-plain sync plain "$vmlinuz" "" "${smp1[*]}"
+    run_cells
+    boot_timeout=$((180 * slow))
+    pair base-1 full "" -accel kvm -cpu host -smp 2
+    for ((n = 1; n <= reps; n++)); do
+        pair "pti-write-$n" full "pti=on" -accel kvm -cpu host -smp 2
     done
-    # The CR4 bits that Linux sets and the firmware does not: PSE, PGE, UMIP, FSGSBASE,
-    # OSXSAVE, SMEP and SMAP.
-    for features in -pge -smep,-smap -pse -umip -fsgsbase -xsave; do
-        # No comma in the label, which ends up in paths in QEMU options.
-        pair "cpu${features//,/}" "$apt_qemu" cr no "$hii_initrd" "$write" -accel kvm -cpu "host,$features" -smp 2
-    done
-    pair smm-off "$apt_qemu" cr no "$hii_initrd" "$write" "${kvm[@]}" -machine smm=off
 fi
 if select_arch x86_64; then
-    pair base-1 "$apt_qemu" no no "$hii_initrd" "$write" "${kvm[@]}"
-    memslot memslot no "${kvm[@]}"
+    boot_timeout=$((90 * slow))
+    tripfault
+    cell memslot memslot no "$vmlinuz" "" "${smp1[*]} $ivshmem"
+    cell sync sync registers "$vmlinuz" "" "${smp1[*]}"
+    run_cells
+    boot_timeout=$((180 * slow))
+fi
+
+# tests/qemu/run.sh's i686 scenarios under pti=on: its QEMU from PATH is a wrapper that adds
+# pti=on to the guest's kernel command line (run.sh allows a wrapper that execs QEMU) and logs
+# each command line, as run.sh's "quiet" guests do not print their PTI line.
+arch=i686
+if [[ ${DIAG_RUN_SH:-yes} == yes ]] && wanted run.sh && in_time "tests/qemu/run.sh i686 with pti=on"; then
+    wrapper=$(mktemp -d)
+    cat >"$wrapper/qemu-system-i386" <<'EOF'
+#!/bin/bash
+args=()
+while (($# > 0)); do
+    if [[ $1 == -append ]]; then
+        args+=("$1" "$2 pti=on")
+        echo "$2 pti=on" >>"$DIAG_APPEND_LOG"
+        shift 2
+    else
+        args+=("$1")
+        shift
+    fi
+done
+exec /usr/bin/qemu-system-i386 "${args[@]}"
+EOF
+    chmod +x "$wrapper/qemu-system-i386"
+    : >"$out/run-sh-i686-pti-appends.log"
+    PATH=$wrapper:$PATH DIAG_APPEND_LOG=$out/run-sh-i686-pti-appends.log "$here/run.sh" i686 >"$out/run-sh-i686-pti.log" 2>&1
+    echo "== tests/qemu/run.sh i686 with pti=on: exit $? $(grep -E '^run.sh: (FAILED|end)' "$out/run-sh-i686-pti.log" | tr '\n' ' ')" |
+        tee -a "$out/cells.txt" >>"$out/summary.txt"
+    boots_sh=$(grep -c . "$out/run-sh-i686-pti-appends.log")
+    boots_pti=$(grep -c ' pti=on$' "$out/run-sh-i686-pti-appends.log")
+    echo "tests/qemu/run.sh: $boots_sh QEMU command lines, $boots_pti with pti=on" | tee -a "$out/cells.txt" >>"$out/summary.txt"
+    ((boots_sh > 0 && boots_pti == boots_sh)) || harness_fail "tests/qemu/run.sh's boots did not all get pti=on"
+    rm -rf "$wrapper"
 fi
 
 sudo dmesg >"$out/dmesg-after.txt" 2>&1
 # However the variants above end, a diag that booted nothing has nothing to show.
 ((boots > 0)) || harness_fail "no boot ran"
 cat "$out/summary.txt"
+echo "== cells"
+cat "$out/cells.txt"
 if ((harness_failures > 0)); then
     echo "ci-diag-reset.sh: $harness_failures harness failures" >&2
     exit 1

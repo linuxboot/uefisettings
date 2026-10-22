@@ -2,15 +2,20 @@
 """DO NOT MERGE: supervises one diagnostic guest boot over QMP.
 
 QEMU runs with its test terminal on a socket chardev (server, wait) and QMP on a socket,
-both of which this connects to. It copies the terminal to TERMINAL_LOG. When the guest
-prints the pause marker, it stops the VM, saves every vCPU's registers and guest RAM, and
-resumes it. When the guest resets (QEMU runs with -action reboot=shutdown,shutdown=pause,
-so a triple fault pauses the VM), it saves guest RAM again and quits QEMU; on any other
-shutdown it just quits. Registers do not survive the reset: KVM on AMD INITs the vCPU on a
-SHUTDOWN intercept (Linux v7.0 arch/x86/kvm/svm/svm.c, shutdown_interception).
+both of which this connects to. It copies the terminal to TERMINAL_LOG. Each line that the
+guest prints with the pause marker stops the VM and resumes it; in between, --pause decides:
+
+- registers: saves every vCPU's registers ("info registers" reads them from KVM, which
+  marks the vCPU dirty, so QEMU writes them back before it runs again: kvm_cpu_exec, QEMU
+  v10.2.0 accel/kvm/kvm-all.c:2913-2931, 3171-3176);
+- plain: nothing.
+
+When the guest resets (QEMU runs with -action reboot=shutdown,shutdown=pause, so a triple
+fault pauses the VM) or shuts down otherwise, it records the reason and quits QEMU.
 """
 
 import argparse
+import enum
 import json
 import logging
 import select
@@ -24,11 +29,15 @@ logger = logging.getLogger(__name__)
 PAUSE_MARKER = b"diag: pause"
 CONNECT_DEADLINE_SECONDS = 60.0
 CONNECT_RETRY_SECONDS = 0.1
-GUEST_RESET_REASON = "guest-reset"
 
 
 class SupervisorError(Exception):
     pass
+
+
+class Pause(enum.Enum):
+    REGISTERS = "registers"
+    PLAIN = "plain"
 
 
 def connect_unix(path: Path) -> socket.socket:
@@ -85,12 +94,18 @@ class Qmp:
         return output
 
 
-def save_state(qmp: Qmp, out: Path, label: str, ram_bytes: int) -> None:
-    """Saves the registers of every vCPU and all guest RAM, from physical address 0."""
-    (out / f"registers-{label}.txt").write_text(qmp.human("info registers -a"))
-    dump = out / f"ram-{label}.bin"
-    qmp.execute("pmemsave", {"val": 0, "size": ram_bytes, "filename": str(dump)})
-    logger.info("saved %s state", label)
+def pause(qmp: Qmp, mode: Pause, count: int, out: Path) -> None:
+    """Stops the VM at the guest's pause number count and resumes it, per mode."""
+    qmp.execute("stop")
+    logger.info("pause %d: stopped", count)
+    match mode:
+        case Pause.REGISTERS:
+            (out / f"registers-{count}.txt").write_text(qmp.human("info registers -a"))
+            logger.info("pause %d: saved the registers", count)
+        case Pause.PLAIN:
+            pass
+    qmp.execute("cont")
+    logger.info("pause %d: resumed", count)
 
 
 def supervise(
@@ -98,14 +113,14 @@ def supervise(
     qmp: Qmp,
     terminal_log: Path,
     out: Path,
-    ram_bytes: int,
+    mode: Pause,
 ) -> None:
-    paused_once = False
-    seen = b""
+    pauses = 0
+    line = b""
     with terminal_log.open("ab") as log:
         while True:
             for event in qmp.events:
-                if handle_event(event, qmp, out, ram_bytes):
+                if handle_event(event, qmp, out):
                     return
             qmp.events.clear()
             # select() does not see messages that an earlier read left in the buffer.
@@ -124,21 +139,20 @@ def supervise(
                 return
             log.write(chunk)
             log.flush()
-            seen = (seen + chunk)[-4096:]
-            if not paused_once and PAUSE_MARKER in seen:
-                paused_once = True
-                qmp.execute("stop")
-                save_state(qmp, out, "before", ram_bytes)
-                qmp.execute("cont")
+            # Whole lines, so that each marker counts once however the terminal splits it.
+            *lines, line = (line + chunk).split(b"\n")
+            for complete in lines:
+                if PAUSE_MARKER in complete:
+                    pauses += 1
+                    pause(qmp, mode, pauses, out)
 
 
-def handle_event(event: dict, qmp: Qmp, out: Path, ram_bytes: int) -> bool:
+def handle_event(event: dict, qmp: Qmp, out: Path) -> bool:
     """Handles one QMP event; true when the boot is over."""
     match event:
         case {"event": "SHUTDOWN", "data": {"reason": reason}}:
             (out / "shutdown-reason.txt").write_text(reason + "\n")
-            if reason == GUEST_RESET_REASON:
-                save_state(qmp, out, "after", ram_bytes)
+            logger.info("shutdown: %s", reason)
             qmp.execute("quit")
             return True
         case {"event": _}:
@@ -153,8 +167,8 @@ def main() -> None:
     parser.add_argument("--terminal-socket", type=Path, required=True)
     parser.add_argument("--qmp-socket", type=Path, required=True)
     parser.add_argument("--terminal-log", type=Path, required=True)
-    parser.add_argument("--out", type=Path, required=True, help="directory for the dumps")
-    parser.add_argument("--ram-mib", type=int, required=True)
+    parser.add_argument("--out", type=Path, required=True, help="directory for the registers")
+    parser.add_argument("--pause", type=Pause, choices=list(Pause), required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="ci-diag-qmp: %(message)s")
 
@@ -165,7 +179,7 @@ def main() -> None:
         raise SupervisorError(f"QMP greeting: {greeting}")
     qmp.execute("qmp_capabilities")
     try:
-        supervise(terminal, qmp, args.terminal_log, args.out, args.ram_mib << 20)
+        supervise(terminal, qmp, args.terminal_log, args.out, args.pause)
     finally:
         terminal.close()
         qmp.sock.close()

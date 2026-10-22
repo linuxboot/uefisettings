@@ -5,18 +5,24 @@ KVM flushes the nested mappings of a root it loads (Linux v7.0 arch/x86/kvm/mmu/
 kvm_mmu_load, then svm_flush_tlb_current, arch/x86/kvm/svm/svm.c:4031-4045, which calls
 hyperv_flush_guest_mapping on that root when Hyper-V's enlightened NPT TLB is on). For the
 vCPU that exits with SHUTDOWN, this takes its fatal entry (its last kvm_entry before the
-exit), the root that its thread loaded last before that entry (the kvmdiag/load_mmu_pgd
-kprobe on svm_load_mmu_pgd, svm.c:4442), the last kvm_mmu_zap_all_fast before the entry and
-the hyperv_nested_flush_guest_mapping* hypercalls between the zap and the entry. The zap and
-its flushes run in whichever thread changed the memory map, the dying vCPU's own after its
-MMIO exit or another one, so they are matched by time across all threads:
+exit), the root that it loaded last before that entry (the kvmdiag/load_mmu_pgd
+kprobe on svm_load_mmu_pgd, svm.c:4442), the last event before the entry that drops the
+vCPU's root (the anchor) and the hyperv_nested_flush_guest_mapping* hypercalls between the
+anchor and the entry. Two events drop roots: kvm_mmu_zap_all_fast, which makes every root
+obsolete (mmu.c:6787-6825) and runs in whichever thread changed the memory map, the dying
+vCPU's own after its MMIO exit or another one, so it is matched by time across all threads;
+and kvm_mmu_reset_context (the kvmdiag/mmu_reset kprobe), which unloads the roots of one vCPU
+(mmu.c:6043-6047, 6083-6092), e.g. when userspace writes a PAE vCPU's PDPTRs back (Linux v7.0
+arch/x86/kvm/x86.c:12449-12477), so it counts only for the dying vCPU. Either way the vCPU
+loads a root before it enters again (kvm_mmu_load, mmu.c:6050-6080, which then flushes it).
+A root load or a reset belongs to the vCPU of its vcpu_id field, which the BTF-typed kprobes
+record, and else to the vCPU of its thread:
 
 - events lost in the window (ftrace's overwrite mode keeps each CPU's newest events only, so a
-  CPU whose oldest kept event is newer than the zap may have lost a root load or a flush):
+  CPU whose oldest kept event is newer than the anchor may have lost a root load or a flush):
   undetermined;
 - no root observed: undetermined;
-- a root loaded before the zap: L1, as the zap makes every root obsolete and a vCPU loads a
-  new one before it enters again (the zap's own flushes target those old roots, so they do
+- a root loaded before the anchor: L1 (the zap's own flushes target the old roots, so they do
   not count);
 - no "Hyper-V enlightened NPT TLB flush enabled" in dmesg: undetermined, as KVM then flushes
   without the hypercall (svm.c:4041, svm_onhyperv.h:18-24);
@@ -40,8 +46,11 @@ HEADER = re.compile(r"^# entries-in-buffer/entries-written: (?P<kept>\d+)/(?P<wr
 SHUTDOWN = re.compile(r"^vcpu (?P<vcpu>\d+) reason shutdown\b")
 ENTRY = re.compile(r"^vcpu (?P<vcpu>\d+),")
 ROOT = re.compile(r"\broot_hpa=(?P<root>0x[0-9a-f]+)")
+VCPU_ID = re.compile(r"\bvcpu_id=(?P<vcpu>-?\d+)")
 FLUSH = re.compile(r"^address space (?P<space>[0-9a-f]+) ret (?P<ret>-?\d+)")
 FLUSH_EVENTS = ("hyperv_nested_flush_guest_mapping", "hyperv_nested_flush_guest_mapping_range")
+ZAP_EVENT = "kvm_mmu_zap_all_fast"
+RESET_EVENT = "mmu_reset"
 PROBE_LOG = "kprobe svm_load_mmu_pgd"
 ENLIGHTENED_FLUSH = "Hyper-V enlightened NPT TLB flush enabled"
 
@@ -108,6 +117,13 @@ def probe_reason(probe_log: Path | None) -> str:
     return "; ".join(dict.fromkeys(lines)) or "host-trace.log has no kprobe line"
 
 
+def belongs(event: Event, vcpu: int, thread: int) -> bool:
+    """Whether a kprobe event of one vCPU, by its vcpu_id field or else its thread, is vcpu's."""
+    if (found := VCPU_ID.search(event.fields)) is not None:
+        return int(found["vcpu"]) == vcpu
+    return event.tid == thread
+
+
 def attribute(trace: Trace, shutdown: Event, vcpu: int, reason: str, enlightened: bool, flushes_traced: bool) -> str:
     """The verdict on one SHUTDOWN exit of vcpu, with the evidence it rests on."""
     events = trace.events
@@ -124,7 +140,7 @@ def attribute(trace: Trace, shutdown: Event, vcpu: int, reason: str, enlightened
         (event, found["root"])
         for event in before
         if event.name == "load_mmu_pgd"
-        and event.tid == entry.tid
+        and belongs(event, vcpu, entry.tid)
         and event.time <= entry.time
         and (found := ROOT.search(event.fields))
     ]
@@ -132,16 +148,25 @@ def attribute(trace: Trace, shutdown: Event, vcpu: int, reason: str, enlightened
         lost = trace.losses()
         return f"vcpu {vcpu}: undetermined: no root observed ({reason}{'; ' + lost if lost else ''})"
     load, root = roots[-1]
-    zaps = [event for event in before if event.name == "kvm_mmu_zap_all_fast" and event.time <= entry.time]
-    if not zaps:
-        return f"vcpu {vcpu}: undetermined: no kvm_mmu_zap_all_fast before its fatal entry at {entry.time:.6f}"
-    zap = zaps[-1]
-    if (lost := trace.lost_since(zap.time)) is not None:
-        return f"vcpu {vcpu}: undetermined: events may be lost after the zap at {zap.time:.6f} ({lost})"
-    if load.time < zap.time:
+    anchors = [
+        event
+        for event in before
+        if event.time <= entry.time
+        and (event.name == ZAP_EVENT or (event.name == RESET_EVENT and belongs(event, vcpu, entry.tid)))
+    ]
+    if not anchors:
         return (
-            f"vcpu {vcpu}: L1: entered on a root loaded before the zap (root {root} loaded at"
-            f" {load.time:.6f}, zap in thread {zap.tid} at {zap.time:.6f}, fatal entry in thread"
+            f"vcpu {vcpu}: undetermined: no kvm_mmu_zap_all_fast, nor kvm_mmu_reset_context of it,"
+            f" before its fatal entry at {entry.time:.6f}"
+        )
+    anchor = anchors[-1]
+    kind = "zap" if anchor.name == ZAP_EVENT else "reset"
+    if (lost := trace.lost_since(anchor.time)) is not None:
+        return f"vcpu {vcpu}: undetermined: events may be lost after the {kind} at {anchor.time:.6f} ({lost})"
+    if load.time < anchor.time:
+        return (
+            f"vcpu {vcpu}: L1: entered on a root loaded before the {kind} (root {root} loaded at"
+            f" {load.time:.6f}, {kind} in thread {anchor.tid} at {anchor.time:.6f}, fatal entry in thread"
             f" {entry.tid} at {entry.time:.6f}, shutdown at {shutdown.time:.6f})"
         )
     if not enlightened:
@@ -151,15 +176,17 @@ def attribute(trace: Trace, shutdown: Event, vcpu: int, reason: str, enlightened
     flushes = [
         (event, int(found["space"], 16), int(found["ret"]))
         for event in before
-        if event.name in FLUSH_EVENTS and zap.time <= event.time <= entry.time and (found := FLUSH.match(event.fields))
+        if event.name in FLUSH_EVENTS
+        and anchor.time <= event.time <= entry.time
+        and (found := FLUSH.match(event.fields))
     ]
     listed = ", ".join(
         f"{space:#x} ret {ret} in thread {event.tid} at {event.time:.6f}" for event, space, ret in flushes
     )
     evidence = (
-        f"zap in thread {zap.tid} at {zap.time:.6f}, root {root} loaded at {load.time:.6f},"
+        f"{kind} in thread {anchor.tid} at {anchor.time:.6f}, root {root} loaded at {load.time:.6f},"
         f" fatal entry in thread {entry.tid}"
-        f" at {entry.time:.6f}, shutdown at {shutdown.time:.6f}; flushes between zap and entry: {listed or 'none'}"
+        f" at {entry.time:.6f}, shutdown at {shutdown.time:.6f}; flushes between {kind} and entry: {listed or 'none'}"
     )
     if any(space == int(root, 16) and ret == 0 for _, space, ret in flushes):
         return f"vcpu {vcpu}: L0: a matching flush preceded the fault ({evidence})"

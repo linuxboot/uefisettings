@@ -1,0 +1,3 @@
+# DO NOT MERGE: the kernel of ci-diag-reset.sh's c4 cells, in the format of fetch-packages.sh:
+# openSUSE Tumbleweed's i586 port, kernel-pae 7.2.11-1.1 (whose sha512 its repodata lists).
+266f45dd1adf2793976c0c1716e54a067cc3d7327496e0122929b8f185c3c000 https://download.opensuse.org/ports/i586/tumbleweed/repo/oss/i686/kernel-pae-7.2.11-1.1.i686.rpm
