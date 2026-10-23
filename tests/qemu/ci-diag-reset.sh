@@ -2,38 +2,39 @@
 # The runner user writes the output files; sudo only reads them.
 # shellcheck disable=SC2024
 # DO NOT MERGE: diagnostics for the i686 guests that reset on GitHub's AMD runners (EPYC 7763,
-# 9V74 and 9V45; KVM nested under Hyper-V), third round. In the second (CI run 39767911331)
-# i686 guests died, and no x86_64 one, without firmware: when QEMU deleted a memory slot (an
-# ivshmem-plain BAR whose memory decoding the guest turned off), and when QMP stopped the
-# VM, read its registers and let it go on, after which QEMU writes them back, a PAE vCPU's
-# PDPTRs too (QEMU v10.2.0 target/i386/kvm/kvm.c:5316-5321), and KVM unloads the vCPU's
-# roots (Linux v7.0 arch/x86/kvm/x86.c:12449-12477). This round counts deaths: DIAG_REPS
-# boots per cell, round-robin over the cells of each architecture, all with one vCPU and
-# host traces.
-# - Triggers: memslot (200 deletions of the BAR's slot); sync (5 pauses, each with a register
-#   read); for the plain 6.1 guest also sync-plain (5 pauses without one).
-# - i686 guests: c1, Debian's 6.1 as is, whose PAE page directory pointer tables come from a
-#   32-byte slab (Linux v6.1.176 arch/x86/mm/pgtable.c:365-401) and whose CR3 changes on a context
-#   switch only; c2, the same with pti=on, whose tables take whole pages and whose CR3 changes
-#   at each kernel entry and exit too; c3, the same with two processes that ping-pong over
-#   FIFOs (sub-page tables, frequent CR3 changes); c4, openSUSE's 7.2 kernel-pae, whose tables
-#   take whole pages (Linux commit 780f97e30930, v6.16) and whose CR3 changes rarely.
-# - x86_64 controls: memslot and sync.
-# - Host traces also have kprobes on kvm_mmu_reset_context and shutdown_interception, and
-#   QEMU's log the vCPU ioctls.
-# - Other controls: a triple fault on purpose per architecture, the i686 write boot (base-1),
-#   DIAG_REPS write boots under pti=on and tests/qemu/run.sh's i686 scenarios under pti=on.
+# 9V74 and 9V45; KVM nested under Hyper-V), fourth round. In the third (CI run 39936216534) a
+# PAE vCPU whose page directory pointer table does not start a page died at its first entry
+# after KVM reloaded its MMU, on a memory slot's deletion (memslot) and on QEMU's register
+# write-back after a QMP stop and register read (sync); whole-page tables (pti=on; openSUSE's
+# 7.2) and x86_64 survived. The runners' KVM (Ubuntu's linux-azure) clears the guest CR3's low
+# 12 bits at each NPT root load for a vCPU without CR4.PCIDE, the PAE table's address bits 5-11
+# among them (https://bugs.launchpad.net/bugs/2106673). This round decides what the third left
+# open:
+# - c3, Debian's 6.1 with two processes that ping-pong over FIFOs (sub-page tables, frequent
+#   CR3 changes), under memslot, DIAG_REPS boots with host traces: one hang made the third
+#   round's cell "harness";
+# - tests/qemu/run.sh's i686 scenarios under pti=on, 3 times, and its aarch64 scenarios as
+#   they are, as a control off the nested-KVM path (TCG), all through make as CI runs them
+#   (run_suite); the job's own make step before this script is the i686 run without pti=on.
+# A cell is a guest test and kernel command line, booted round-robin with the others, each
+# boot with a verdict; the host traces of KVM, its MMU, Hyper-V's flush hypercalls and
+# kprobes on svm_load_mmu_pgd, kvm_mmu_reset_context and shutdown_interception go through
+# ci-diag-attribution.py.
 # Decision rule, per cell of DIAG_REPS boots: "dies" if at least 8 in 10 die, "survives" if at
-# most 1 in 10 dies and the others end their test, else "mixed"; a cell cut short by the
-# deadline is "incomplete", and sync-plain "invalid" if QEMU wrote registers back in any of
-# its running periods; a boot that neither dies nor ends its test fails the harness.
+# most 1 in 10 dies and the others end their test, else "mixed"; a boot that its timeout ends
+# after its test started its trigger (memslot printed its BAR, just before its first toggle;
+# sync's first QMP stop), without a reset or the end of its test, "hung", is neither; a cell
+# cut short by the deadline is "incomplete", one whose boots do not show their controls (the
+# kernel's "Linux version" line, PTI as asked, the stressor's round trips) "invalid"; any other
+# boot that neither dies nor ends its test fails the harness. pti=on is a containment candidate
+# only if all 3 i686 runs under pti=on pass, every boot provably with pti=on.
 # Writes everything to target/qemu-test/diag/.
 #
 # DIAG_REPS: boots per cell (default 10). DIAG_TRACE_KB: the host trace's buffer per CPU in
 # KiB (default 131072). DIAG_SLOW: a factor for every boot's timeout and the deadline, for a
 # run under emulation (default 1). DIAG_RUN_SH=no leaves out tests/qemu/run.sh, which builds
-# with cargo. DIAG_ONLY: the boots to run, as ARCH/LABEL separated by commas or spaces (e.g.
-# "i686/tripfault,i686/c1-sync"; default all).
+# with cargo; DIAG_ONLY does not limit those. DIAG_ONLY: the cells' boots to run, as ARCH/LABEL
+# separated by commas or spaces (e.g. "i686/c3-memslot"; default all).
 #
 # Usage: tests/qemu/ci-diag-reset.sh
 
@@ -186,7 +187,9 @@ events_enabled() {
 # which the runners' 7.0.0-1017-azure has) name the vCPU; without, the event's thread does.
 # - load_mmu_pgd: the NPT root that KVM loads for a vCPU, svm_load_mmu_pgd(vcpu, root_hpa,
 #   root_level), Linux v7.0 arch/x86/kvm/svm/svm.c:4442, called from kvm_mmu_load_pgd
-#   (arch/x86/kvm/mmu.h:148-157); no tracepoint carries the root.
+#   (arch/x86/kvm/mmu.h:148-157); no tracepoint carries the root. The BTF-typed one adds the
+#   guest CR3 that the vCPU runs on (the VMCB's, svm.c:3606-3610), for each walk NPF after
+#   the load to be set against the PDPT's place in its page.
 # - mmu_reset: kvm_mmu_reset_context(vcpu), which unloads the vCPU's roots
 #   (arch/x86/kvm/mmu/mmu.c:6043-6047, 6083-6092).
 # - shutdown: shutdown_interception(vcpu), before it INITs the vCPU (svm.c:2081-2109), with
@@ -198,7 +201,7 @@ kprobe_definitions() {
     # shellcheck disable=SC2016 # kprobe_events fetch arguments, not shell expansions
     case $1 in
     load_mmu_pgd)
-        printf '%s\n' 'svm_load_mmu_pgd vcpu_id=vcpu->vcpu_id root_hpa=root_hpa:x64 root_level=root_level:s32' \
+        printf '%s\n' 'svm_load_mmu_pgd vcpu_id=vcpu->vcpu_id root_hpa=root_hpa:x64 root_level=root_level:s32 cr3=vcpu->arch.cr3:x64' \
             'svm_load_mmu_pgd root_hpa=$arg2:x64 root_level=$arg3:s32' \
             'svm_load_mmu_pgd root_hpa=%si:x64 root_level=%dx:s32'
         ;;
@@ -274,21 +277,19 @@ host_trace_stop() {
     rm -f "$trace"
 }
 
-# select_arch ARCH: run.sh's table, for the architectures that run under KVM.
+# select_arch ARCH: run.sh's table, for the architecture that this diag runs under KVM (i686).
 select_arch() {
     arch=$1
     case $arch in
-    x86_64)
-        qemu_name='qemu-system-x86_64'
-        firmware=usr/share/OVMF/OVMF_CODE_4M.fd
-        firmware_vars=usr/share/OVMF/OVMF_VARS_4M.fd
-        vmlinuz_pattern='lib/modules/*/vmlinuz'
-        ;;
     i686)
         qemu_name='qemu-system-i386'
         firmware=usr/share/OVMF/OVMF32_CODE_4M.fd
         firmware_vars=usr/share/OVMF/OVMF32_VARS_4M.fd
         vmlinuz_pattern='boot/vmlinuz-*'
+        ;;
+    *)
+        harness_fail "select_arch: no row for $arch"
+        return 1
         ;;
     esac
     local runs=()
@@ -298,7 +299,6 @@ select_arch() {
         return 1
     fi
     run=$(dirname "$(dirname "${runs[-1]}")")
-    hii_initrd=$run/hii/initrd.img
     guest=$repo/target/qemu-test/$arch/guest
     vmlinuz=$guest/$(cd "$guest" && compgen -G "$vmlinuz_pattern")
     apt_qemu=/usr/bin/$qemu_name
@@ -310,8 +310,7 @@ select_arch() {
     } >"$out/$arch/facts.txt" 2>&1
     cp "$run"/esp/*.efi "$run/initramfs/bin/uefisettings" "$run"/initramfs/tests/* \
         "$out/$arch/binaries/"
-    # The kernel's symbols, for the addresses in the traces (Debian's i686 package has them,
-    # Fedora's x86_64 one does not).
+    # The kernel's symbols, for the addresses in the traces (Debian's i686 package has them).
     if compgen -G "$guest/boot/System.map-*" >/dev/null; then
         cp "$guest"/boot/System.map-* "$out/$arch/binaries/" || harness_fail "$arch: copying System.map failed"
     else
@@ -325,7 +324,6 @@ select_arch() {
 # - memslot toggles the memory decoding of the ivshmem-plain device 200 times, so QEMU deletes
 #   and adds the memory slot of its BAR each time, no firmware involved;
 # - sync prints the pause marker of ci-diag-qmp.py diag.pauses times, sleeping after each;
-# - tripfault resets the guest through the emergency reboot, a triple fault with reboot=t;
 # - with diag.stress, memslot and sync first start two processes that ping-pong a byte over
 #   two FIFOs, so the CPU switches between their address spaces at each round trip.
 stepwise_initrd() {
@@ -405,15 +403,7 @@ done
 stress_report
 step "end"
 EOF
-    cat >"$1/stepwise-initramfs/tests/tripfault" <<'EOF'
-#!/bin/busybox sh
-. /tests/step-and-stress
-sleep 2
-step "emergency reboot"
-echo b > /proc/sysrq-trigger
-EOF
-    chmod +x "$1/stepwise-initramfs/tests/memslot" "$1/stepwise-initramfs/tests/sync" \
-        "$1/stepwise-initramfs/tests/tripfault"
+    chmod +x "$1/stepwise-initramfs/tests/memslot" "$1/stepwise-initramfs/tests/sync"
     (cd "$1/stepwise-initramfs" && find . | cpio --create --format=newc --quiet) \
         >"$1/stepwise-initrd.img"
 }
@@ -485,7 +475,7 @@ boot() {
     require "$dir/qemu.log.gz" || return
     test=${append##*uefisettings.test=}
     test=${test%% *}
-    boot_verdict "$dir" "$test" >"$dir/verdict.txt"
+    boot_verdict "$dir" "$test" "$rc" >"$dir/verdict.txt"
     sregs2_writes "$dir/qemu.log.gz" >"$dir/sregs2.txt" ||
         harness_fail "$arch $label: counting the KVM_SET_SREGS2 calls failed"
     {
@@ -541,16 +531,19 @@ pti_line() {
     grep -a -m 1 'page tables isolation' "$1/console.log" | tr -d '\r' || echo "no page table isolation line"
 }
 
-# boot_verdict DIR TEST: "died", "survived" or "other", then why, for the boot in DIR of the
-# guest test TEST. A guest that resets (a KVM exit 8) before the end of its test died; one
-# that ends it survived if the test did what it should: memslot's 200 deletions of its BAR's
-# slot, sync's pauses, a hii test's pass. Anything else (a hang, an unassigned BAR, a failed
-# test) is other.
+# boot_verdict DIR TEST RC: "died", "hung", "survived" or "other", then why, for the boot in DIR
+# of the guest test TEST, whose QEMU exited with RC. A guest that resets (a KVM exit 8) before
+# the end of its test died; one that its timeout (RC 124) ended after its test started its
+# trigger (memslot printed its BAR, just before its first toggle; sync's first QMP stop),
+# without a reset or the end of its test, hung; one that ends its test survived if the test
+# did what it should: memslot's 200 deletions of its BAR's slot, sync's pauses, a hii test's
+# pass. Anything else (an unassigned BAR, a failed test, a hang before the trigger) is other.
+# The deletions count the BAR's slot from the start: Debian's 6.1 makes 8 while it boots.
 boot_verdict() {
-    local dir=$1 test=$2 resets ended bar deletes=0 resumed
+    local dir=$1 test=$2 rc=$3 resets ended bar deletes=0 resumed
     resets=$(zcat "$dir/qemu.log.gz" | grep -a -c -E '^kvm_run_exit cpu_index [0-9]+, reason 8$')
     case $test in
-    memslot | sync | tripfault) ended=$(tr -d '\r' <"$dir/test.log" | grep -a -c '^step .*: end$') ;;
+    memslot | sync) ended=$(tr -d '\r' <"$dir/test.log" | grep -a -c '^step .*: end$') ;;
     *) ended=$(tr -d '\r' <"$dir/console.log" | grep -a -c '^uefisettings-qemu-test: exit 0 0$') ;;
     esac
     if [[ $test == memslot ]]; then
@@ -566,6 +559,12 @@ boot_verdict() {
         sync) echo "died: KVM exit 8 after $(grep -c ': resumed$' "$dir/qmp.log") resumed pauses" ;;
         *) echo "died: KVM exit 8" ;;
         esac
+        return
+    fi
+    if ((ended == 0 && rc == 124)) && { [[ $test == memslot ]] && ((deletes > 0)) ||
+        { [[ $test == sync ]] && grep -q ': pause 1: stopped$' "$dir/qmp.log"; }; }; then
+        echo "hung: timeout, no reset and no end, after $([[ $test == memslot ]] && echo "$deletes deletions of the slot at BAR 2 $bar" ||
+            echo "$(grep -c ': resumed$' "$dir/qmp.log") resumed pauses") (last: $(tr -d '\r' <"$dir/test.log" | grep -a '^step ' | tail -n 1))"
         return
     fi
     if ((ended == 0)); then
@@ -622,41 +621,6 @@ require() {
     return "$missing"
 }
 
-# pair LABEL HOST_TRACE APPEND QEMU-ARG...: a hii boot and then a hii_write one with APPEND on
-# one fresh store, as run.sh boots the hii scenario; the write boot's verdict must be
-# "survived" or "died".
-pair() {
-    local label=$1 host_trace=$2 append=$3
-    shift 3
-    wanted "$label" || return 0
-    in_time "$arch $label" || return 0
-    mkdir -p "$out/$arch/$label"
-    fresh_store "$out/$arch/$label/vars.fd"
-    boot "$label/1-hii" "$out/$arch/$label/vars.fd" "$apt_qemu" no no "$vmlinuz" "$hii_initrd" \
-        "uefisettings.test=hii panic=-1" "$@"
-    boot "$label/2-write" "$out/$arch/$label/vars.fd" "$apt_qemu" "$host_trace" no "$vmlinuz" \
-        "$hii_initrd" "$write $append" "$@"
-    expect_verdict "$out/$arch/$label/2-write" died survived
-    # The write boot's PTI as its kernel command line asks, on with pti=on and off without.
-    if [[ ! -f $out/$arch/$label/2-write/console.log ]]; then
-        return
-    elif grep -a -q 'page tables isolation: .*enabled' "$out/$arch/$label/2-write/console.log"; then
-        [[ " $append " == *" pti=on "* ]] || harness_fail "$arch $label: PTI without pti=on"
-    else
-        [[ " $append " != *" pti=on "* ]] || harness_fail "$arch $label: pti=on, but no PTI line"
-    fi
-}
-
-# tripfault: a triple fault on purpose, which the host trace and the attribution must show.
-tripfault() {
-    wanted tripfault || return 0
-    mkdir -p "$out/$arch/tripfault"
-    fresh_store "$out/$arch/tripfault/vars.fd"
-    boot tripfault "$out/$arch/tripfault/vars.fd" "$apt_qemu" full no "$vmlinuz" "$out/$arch/stepwise-initrd.img" \
-        "ignore_loglevel panic=-1 reboot=t uefisettings.test=tripfault" "${smp1[@]}"
-    expect_verdict "$out/$arch/tripfault" died
-}
-
 # wanted LABEL: whether DIAG_ONLY names the arch's LABEL, or is empty.
 wanted() {
     [[ -z ${DIAG_ONLY:-} || " ${DIAG_ONLY//,/ } " == *" $arch/$1 "* ]]
@@ -671,19 +635,11 @@ verdict_of() {
     fi
 }
 
-# expect_verdict DIR VERDICT...: a harness failure unless DIR's boot has one of VERDICT.
-expect_verdict() {
-    local dir=$1 verdict
-    shift
-    verdict=$(verdict_of "$dir")
-    [[ " $* " == *" ${verdict%%:*} "* ]] || harness_fail "$dir: verdict $verdict, not $*"
-}
-
 # The cells of the arch at hand: cell NAME TEST PAUSE KERNEL APPEND QEMU-ARGS registers one,
 # run_cells boots each DIAG_REPS times round-robin, with full host traces; a cell whose first
 # boot's verdict is other boots no more, and no cell starts a boot after the deadline.
 cell_names=()
-declare -A cell_test cell_pause cell_kernel cell_append cell_args cell_died cell_survived cell_other cell_skipped
+declare -A cell_test cell_pause cell_kernel cell_append cell_args cell_died cell_hung cell_survived cell_other cell_skipped
 cell() {
     wanted "$1" || return 0
     cell_names+=("$1")
@@ -693,6 +649,7 @@ cell() {
     cell_append[$1]=$5
     cell_args[$1]=$6
     cell_died[$1]=0
+    cell_hung[$1]=0
     cell_survived[$1]=0
     cell_other[$1]=0
     cell_skipped[$1]=0
@@ -727,6 +684,7 @@ run_cells() {
             verdict=$(verdict_of "$out/$arch/$label")
             case $verdict in
             died*) cell_died[$name]=$((cell_died[$name] + 1)) ;;
+            hung*) cell_hung[$name]=$((cell_hung[$name] + 1)) ;;
             survived*) cell_survived[$name]=$((cell_survived[$name] + 1)) ;;
             *)
                 cell_other[$name]=$((cell_other[$name] + 1))
@@ -764,9 +722,10 @@ stress_round_trips() {
 # cell_boot_proof NAME K: why boot K of cell NAME does not show that what its verdict depends
 # on took place, or nothing: the cell's kernel booted (its "Linux version" line); PTI is on
 # with pti=on and off without (its "page tables isolation" line); the stressor made at least
-# 1000 round trips in its first second with diag.stress; a death came after the trigger began
-# (a deletion of the BAR's slot; a QMP stop); QEMU's KVM_SET_SREGS2 counts exist for a cell with
-# pauses, are all 0 for plain pauses, and show a write-back after a pause with a register read.
+# 1000 round trips in its first second with diag.stress; a death came after its test started
+# its trigger (memslot printed its BAR; a QMP stop); QEMU's KVM_SET_SREGS2 counts exist for a
+# cell with pauses, are all 0 for plain pauses, and show a write-back after a pause with a
+# register read.
 cell_boot_proof() {
     local name=$1 dir=$out/$arch/$1/$2 release trips count verdict after
     release=$(kernel_release "${cell_kernel[$name]}")
@@ -795,7 +754,7 @@ cell_boot_proof() {
         case ${cell_test[$name]} in
         memslot)
             if [[ ! $verdict =~ after\ ([0-9]+)\ deletions ]] || ((BASH_REMATCH[1] == 0)); then
-                echo "boot $2: died before the first deletion"
+                echo "boot $2: died before its test printed its BAR"
                 return
             fi
             ;;
@@ -829,8 +788,8 @@ cell_boot_proof() {
 # verdict depends on (cell_boot_proof); with the KVM_SET_SREGS2 counts per running period of
 # each boot of a cell with pauses, and the stressor's round trips of each of a stressed one.
 report_cell() {
-    local name=$1 died=${cell_died[$1]} survived=${cell_survived[$1]} other=${cell_other[$1]}
-    local n=$((cell_died[$1] + cell_survived[$1] + cell_other[$1])) class proof='' details='' counts='' trips='' k count
+    local name=$1 died=${cell_died[$1]} hung=${cell_hung[$1]} survived=${cell_survived[$1]} other=${cell_other[$1]}
+    local n=$((cell_died[$1] + cell_hung[$1] + cell_survived[$1] + cell_other[$1])) class proof='' details='' counts='' trips='' k count
     for ((k = 1; k <= reps; k++)); do
         [[ -f $out/$arch/$name/$k/verdict.txt ]] || continue
         [[ -z $proof ]] && proof=$(cell_boot_proof "$name" "$k")
@@ -854,91 +813,86 @@ report_cell() {
     else
         class=mixed
     fi
-    echo "cell $arch $name: $n boots: $died died, $survived survived, $other other, ${cell_skipped[$1]} skipped: $class$details" |
+    echo "cell $arch $name: $n boots: $died died, $hung hung, $survived survived, $other other, ${cell_skipped[$1]} skipped: $class$details" |
         tee -a "$out/cells.txt" >>"$out/summary.txt"
 }
 
-write="ignore_loglevel efi=debug uefisettings.test=hii_write uefisettings.filter=--nocapture panic=-1"
-# The cells' and triple faults' QEMU, without the VMware backdoor port, whose handler reads the
+# The cells' QEMU, without the VMware backdoor port, whose handler reads the
 # registers (QEMU v10.2.0 hw/i386/vmport.c:93-107), so that QEMU writes them back: openSUSE's
 # and Fedora's kernels probe it (8 more KVM_SET_SREGS2 a boot here), Debian's 6.1 does not.
 smp1=(-accel kvm -cpu host -smp 1 -machine vmport=off)
 ivshmem='-object memory-backend-ram,id=shm,size=4M -device ivshmem-plain,memdev=shm'
 
-if select_arch i686; then
-    # c4's kernel: openSUSE Tumbleweed's i586 port, kernel-pae 7.2.11-1.1, checked against the
-    # sha256 of ci-diag-packages-i686, unpacked outside $out, as its modules would bloat the
-    # artifact.
-    opensuse=$repo/target/qemu-test/diag-opensuse
-    rm -rf "$opensuse"
-    if "$here/fetch-packages.sh" "$here/ci-diag-packages-i686" "$repo/target/qemu-test/packages" \
-        "$opensuse" >>"$out/i686/facts.txt" 2>&1; then
-        opensuse_vmlinuz=$opensuse/usr/lib/modules/7.2.11-1-pae/vmlinuz
-        sha256sum "$opensuse_vmlinuz" >>"$out/i686/facts.txt" 2>&1
-        grep -E '^CONFIG_(X86_PAE|MITIGATION_PAGE_TABLE_ISOLATION|EFI_STUB)=' \
-            "$opensuse/usr/lib/modules/7.2.11-1-pae/config" >>"$out/i686/facts.txt" 2>&1
-    else
-        harness_fail "fetching openSUSE's kernel-pae failed, see i686/facts.txt"
-        opensuse_vmlinuz=
-    fi
-    boot_timeout=$((90 * slow))
-    tripfault
-    cell c1-memslot memslot no "$vmlinuz" "" "${smp1[*]} $ivshmem"
-    cell c2-memslot memslot no "$vmlinuz" "pti=on" "${smp1[*]} $ivshmem"
-    cell c3-memslot memslot no "$vmlinuz" "diag.stress" "${smp1[*]} $ivshmem"
-    [[ -n $opensuse_vmlinuz ]] && cell c4-memslot memslot no "$opensuse_vmlinuz" "" "${smp1[*]} $ivshmem"
-    cell c1-sync sync registers "$vmlinuz" "" "${smp1[*]}"
-    cell c2-sync sync registers "$vmlinuz" "pti=on" "${smp1[*]}"
-    cell c3-sync sync registers "$vmlinuz" "diag.stress" "${smp1[*]}"
-    [[ -n $opensuse_vmlinuz ]] && cell c4-sync sync registers "$opensuse_vmlinuz" "" "${smp1[*]}"
-    cell c1-sync-plain sync plain "$vmlinuz" "" "${smp1[*]}"
-    run_cells
-    boot_timeout=$((180 * slow))
-    pair base-1 full "" -accel kvm -cpu host -smp 2
-    for ((n = 1; n <= reps; n++)); do
-        pair "pti-write-$n" full "pti=on" -accel kvm -cpu host -smp 2
-    done
-fi
-if select_arch x86_64; then
-    boot_timeout=$((90 * slow))
-    tripfault
-    cell memslot memslot no "$vmlinuz" "" "${smp1[*]} $ivshmem"
-    cell sync sync registers "$vmlinuz" "" "${smp1[*]}"
-    run_cells
-    boot_timeout=$((180 * slow))
-fi
-
-# tests/qemu/run.sh's i686 scenarios under pti=on: its QEMU from PATH is a wrapper that adds
-# pti=on to the guest's kernel command line (run.sh allows a wrapper that execs QEMU) and logs
-# each command line, as run.sh's "quiet" guests do not print their PTI line.
-arch=i686
-if [[ ${DIAG_RUN_SH:-yes} == yes ]] && wanted run.sh && in_time "tests/qemu/run.sh i686 with pti=on"; then
-    wrapper=$(mktemp -d)
-    cat >"$wrapper/qemu-system-i386" <<'EOF'
+# run_suite SUITE LABEL [pti]: tests/qemu/run.sh's scenarios on the architecture SUITE as CI
+# runs them, through make test-e2e-qemu-SUITE, which pins the toolchain (Makefile:48-52; run.sh
+# alone took the runner's default one, without i686-unknown-linux-musl, in CI run 39936216534),
+# its output in LABEL.log. With pti, the QEMU of PATH is a wrapper that adds pti=on to the
+# guest's kernel command line (run.sh allows a wrapper that execs QEMU) and logs each command
+# line to LABEL-appends.log: run.sh's "quiet" guests print no PTI line, so each boot that
+# run.sh started ("run.sh: NAME boot N: SPEC", run.sh:218, whose SPEC has no space; a failed
+# boot adds "run.sh: NAME boot N: QEMU: ..." lines, run.sh:250) must have a logged command
+# line ending in pti=on.
+run_suite() {
+    local suite=$1 label=$2 pti=${3:-} rc started lines with_pti wrapper='' qemu_bin
+    in_time "$label" || return 0
+    : >"$out/$label-appends.log"
+    if [[ $pti == pti ]]; then
+        case $suite in
+        i686) qemu_bin='qemu-system-i386' ;;
+        *)
+            harness_fail "$label: no QEMU wrapper for $suite"
+            return
+            ;;
+        esac
+        wrapper=$(mktemp -d)
+        # The wrapper's own text, with $qemu_bin filled in.
+        cat >"$wrapper/$qemu_bin" <<WRAPPER
 #!/bin/bash
 args=()
-while (($# > 0)); do
-    if [[ $1 == -append ]]; then
-        args+=("$1" "$2 pti=on")
-        echo "$2 pti=on" >>"$DIAG_APPEND_LOG"
+while ((\$# > 0)); do
+    if [[ \$1 == -append ]]; then
+        args+=("\$1" "\$2 pti=on")
+        echo "\$2 pti=on" >>"\$DIAG_APPEND_LOG"
         shift 2
     else
-        args+=("$1")
+        args+=("\$1")
         shift
     fi
 done
-exec /usr/bin/qemu-system-i386 "${args[@]}"
-EOF
-    chmod +x "$wrapper/qemu-system-i386"
-    : >"$out/run-sh-i686-pti-appends.log"
-    PATH=$wrapper:$PATH DIAG_APPEND_LOG=$out/run-sh-i686-pti-appends.log "$here/run.sh" i686 >"$out/run-sh-i686-pti.log" 2>&1
-    echo "== tests/qemu/run.sh i686 with pti=on: exit $? $(grep -E '^run.sh: (FAILED|end)' "$out/run-sh-i686-pti.log" | tr '\n' ' ')" |
+exec /usr/bin/$qemu_bin "\${args[@]}"
+WRAPPER
+        chmod +x "$wrapper/$qemu_bin"
+    fi
+    PATH=${wrapper:+$wrapper:}$PATH DIAG_APPEND_LOG=$out/$label-appends.log make -C "$repo" "test-e2e-qemu-$suite" \
+        >"$out/$label.log" 2>&1
+    rc=$?
+    started=$(grep -c -E '^run.sh: [^ ]+ boot [0-9]+: [^ ]+$' "$out/$label.log")
+    echo "== $label: make test-e2e-qemu-$suite exit $rc, $started boots started; $(grep -E '^run.sh: (FAILED|end)' "$out/$label.log" | tr '\n' ' ')" |
         tee -a "$out/cells.txt" >>"$out/summary.txt"
-    boots_sh=$(grep -c . "$out/run-sh-i686-pti-appends.log")
-    boots_pti=$(grep -c ' pti=on$' "$out/run-sh-i686-pti-appends.log")
-    echo "tests/qemu/run.sh: $boots_sh QEMU command lines, $boots_pti with pti=on" | tee -a "$out/cells.txt" >>"$out/summary.txt"
-    ((boots_sh > 0 && boots_pti == boots_sh)) || harness_fail "tests/qemu/run.sh's boots did not all get pti=on"
-    rm -rf "$wrapper"
+    ((started > 0)) || harness_fail "$label: run.sh started no boot, see $label.log"
+    if [[ -n $wrapper ]]; then
+        lines=$(grep -c . "$out/$label-appends.log")
+        with_pti=$(grep -c ' pti=on$' "$out/$label-appends.log")
+        echo "$label: $lines QEMU command lines, $with_pti with pti=on, for $started boots" |
+            tee -a "$out/cells.txt" >>"$out/summary.txt"
+        ((lines == started && with_pti == started)) || harness_fail "$label: not every boot got pti=on"
+        rm -rf "$wrapper"
+    fi
+}
+
+# The fourth round: c3 under memslot (DIAG_REPS boots), then run.sh's i686 suite 3 times under
+# pti=on, and its aarch64 suite as it is.
+if select_arch i686; then
+    boot_timeout=$((90 * slow))
+    cell c3-memslot memslot no "$vmlinuz" "diag.stress" "${smp1[*]} $ivshmem"
+    run_cells
+    boot_timeout=$((180 * slow))
+fi
+if [[ ${DIAG_RUN_SH:-yes} == yes ]]; then
+    for n in 1 2 3; do
+        run_suite i686 "run-sh-i686-pti-$n" pti
+    done
+    run_suite aarch64 run-sh-aarch64
 fi
 
 sudo dmesg >"$out/dmesg-after.txt" 2>&1
