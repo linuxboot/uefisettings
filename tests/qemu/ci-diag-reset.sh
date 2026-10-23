@@ -2,39 +2,39 @@
 # The runner user writes the output files; sudo only reads them.
 # shellcheck disable=SC2024
 # DO NOT MERGE: diagnostics for the i686 guests that reset on GitHub's AMD runners (EPYC 7763,
-# 9V74 and 9V45; KVM nested under Hyper-V), fourth round. In the third (CI run 39936216534) a
+# 9V74 and 9V45; KVM nested under Hyper-V), fifth round. In the third (CI run 39936216534) a
 # PAE vCPU whose page directory pointer table does not start a page died at its first entry
 # after KVM reloaded its MMU, on a memory slot's deletion (memslot) and on QEMU's register
-# write-back after a QMP stop and register read (sync); whole-page tables (pti=on; openSUSE's
-# 7.2) and x86_64 survived. The runners' KVM (Ubuntu's linux-azure) clears the guest CR3's low
-# 12 bits at each NPT root load for a vCPU without CR4.PCIDE, the PAE table's address bits 5-11
-# among them (https://bugs.launchpad.net/bugs/2106673). This round decides what the third left
-# open:
-# - c3, Debian's 6.1 with two processes that ping-pong over FIFOs (sub-page tables, frequent
-#   CR3 changes), under memslot, DIAG_REPS boots with host traces: one hang made the third
-#   round's cell "harness";
-# - tests/qemu/run.sh's i686 scenarios under pti=on, 3 times, and its aarch64 scenarios as
-#   they are, as a control off the nested-KVM path (TCG), all through make as CI runs them
-#   (run_suite); the job's own make step before this script is the i686 run without pti=on.
+# write-back after a QMP stop and register read (sync): c1, Debian's 6.1, in 10 of 10 boots
+# under each. The runners' KVM (Ubuntu's linux-azure) clears the guest CR3's low 12 bits at
+# each NPT root load for a vCPU without CR4.PCIDE, the PAE table's address bits 5-11 among them
+# (https://bugs.launchpad.net/bugs/2106673). This round tests that as the cause: c1 under
+# memslot and sync, DIAG_REPS boots each, on a kvm-amd.ko built from the runners' exact source
+# (ci-diag-kvm-amd.sh) as shipped ("stock", the control), then with a fix that leaves those
+# bits alone in PAE paging ("poc"), then the shipped module is loaded again. If the cause is
+# right, stock dies and poc survives; poc dying, or mixed, would falsify the mask as the cause;
+# a poc whose VMRUN fails ("refused"), with stock not refused, would point to Hyper-V rejecting
+# CR3 bits 5-11 of a PAE guest. Each boot's summary also gives the page offsets of the first
+# guest page walk that faults after each root zap: the mask moves a PAE vCPU's PDPT to the
+# start of its page (PDPTE[3] at offset 0x018), the fix leaves it where the guest put it.
 # A cell is a guest test and kernel command line, booted round-robin with the others, each
-# boot with a verdict; the host traces of KVM, its MMU, Hyper-V's flush hypercalls and
-# kprobes on svm_load_mmu_pgd, kvm_mmu_reset_context and shutdown_interception go through
-# ci-diag-attribution.py.
+# boot with a verdict, here with host traces of KVM's events but no kprobes (events): those of
+# a full trace need BTF, which the rebuilt module lacks.
 # Decision rule, per cell of DIAG_REPS boots: "dies" if at least 8 in 10 die, "survives" if at
 # most 1 in 10 dies and the others end their test, else "mixed"; a boot that its timeout ends
 # after its test started its trigger (memslot printed its BAR, just before its first toggle;
 # sync's first QMP stop), without a reset or the end of its test, "hung", is neither; a cell
-# cut short by the deadline is "incomplete", one whose boots do not show their controls (the
-# kernel's "Linux version" line, PTI as asked, the stressor's round trips) "invalid"; any other
-# boot that neither dies nor ends its test fails the harness. pti=on is a containment candidate
-# only if all 3 i686 runs under pti=on pass, every boot provably with pti=on.
+# with a boot whose VMRUN failed (KVM exit 9) is "refused" and boots no more, as that boot
+# decides it (each such boot waits out its timeout); a cell cut short by the deadline is
+# "incomplete", one whose boots do not show their controls (the kernel's "Linux version" line,
+# PTI as asked, the stressor's round trips) "invalid"; any other boot that neither dies nor ends
+# its test fails the harness.
 # Writes everything to target/qemu-test/diag/.
 #
 # DIAG_REPS: boots per cell (default 10). DIAG_TRACE_KB: the host trace's buffer per CPU in
 # KiB (default 131072). DIAG_SLOW: a factor for every boot's timeout and the deadline, for a
-# run under emulation (default 1). DIAG_RUN_SH=no leaves out tests/qemu/run.sh, which builds
-# with cargo; DIAG_ONLY does not limit those. DIAG_ONLY: the cells' boots to run, as ARCH/LABEL
-# separated by commas or spaces (e.g. "i686/c3-memslot"; default all).
+# run under emulation (default 1). DIAG_ONLY: the cells' boots to run, as ARCH/LABEL separated
+# by commas or spaces (e.g. "i686/c1-memslot-poc"; default all).
 #
 # Usage: tests/qemu/ci-diag-reset.sh
 
@@ -111,8 +111,9 @@ harness_fail() {
 [[ $host_traces == yes && $amd_host == yes ]] &&
     echo Y | sudo tee /sys/module/kvm_amd/parameters/dump_invalid_vmcb >>"$out/facts.txt"
 
-# host_trace_start MODE: full (KVM, its MMU, Hyper-V's flush hypercalls and the kprobes below)
-# or cr (KVM's control register accesses only, for the CR4 that the guest kernel set). A
+# host_trace_start MODE: full (KVM, its MMU, Hyper-V's flush hypercalls and the kprobes below),
+# events (the same without the kprobes) or cr (KVM's control register accesses only, for the
+# CR4 that the guest kernel set). A
 # flush clears what a vCPU uses only if its address space (hyperv_nested_flush_guest_mapping*:
 # "address space") is the root that the vCPU loaded.
 host_trace_start() {
@@ -120,7 +121,7 @@ host_trace_start() {
     # of their own (Linux v7.0 arch/x86/kvm/trace.h): kvm_exit shows them, as "reason
     # task_switch" (arch/x86/include/uapi/asm/svm.h:212).
     local events=(kvm/kvm_cr) clock name
-    [[ $1 == full ]] && events=(kvm/kvm_entry kvm/kvm_exit kvm/kvm_userspace_exit
+    [[ $1 == full || $1 == events ]] && events=(kvm/kvm_entry kvm/kvm_exit kvm/kvm_userspace_exit
         kvm/kvm_inj_exception kvm/kvm_inj_virq kvm/kvm_emulate_insn kvm/kvm_msr kvm/kvm_cr
         kvm/kvm_page_fault kvm/kvm_mmio kvm/kvm_pio
         kvmmmu/kvm_mmu_zap_all_fast kvmmmu/kvm_mmu_spte_requested kvmmmu/handle_mmio_page_fault
@@ -151,12 +152,14 @@ host_trace_start() {
     clock=$(sudo cat "$tracing/trace_clock")
     echo "trace_clock: $clock" >>"$out/host-trace.log"
     [[ $clock == *"[global]"* ]] || harness_fail "trace_clock is not global: $clock"
-    [[ $1 == full ]] || return 0
-    for name in "${kprobes[@]}"; do
-        kprobe_add "$name" && continue
-        # On AMD each of them is part of the verdict; Intel lacks the svm_* ones.
-        [[ $amd_host == no ]] || harness_fail "an AMD host, but no kvmdiag/$name kprobe"
-    done
+    [[ $1 == cr ]] && return 0
+    if [[ $1 == full ]]; then
+        for name in "${kprobes[@]}"; do
+            kprobe_add "$name" && continue
+            # On AMD each of them is part of the verdict; Intel lacks the svm_* ones.
+            [[ $amd_host == no ]] || harness_fail "an AMD host, but no kvmdiag/$name kprobe"
+        done
+    fi
     flush_events=$(events_enabled hyperv/hyperv_nested_flush_guest_mapping hyperv/hyperv_nested_flush_guest_mapping_range)
     [[ $(events_enabled kvm/kvm_entry kvm/kvm_exit kvmmmu/kvm_mmu_zap_all_fast) == traced ]] ||
         harness_fail "KVM's entry, exit or root zap events are not traced"
@@ -188,12 +191,14 @@ events_enabled() {
 # - load_mmu_pgd: the NPT root that KVM loads for a vCPU, svm_load_mmu_pgd(vcpu, root_hpa,
 #   root_level), Linux v7.0 arch/x86/kvm/svm/svm.c:4442, called from kvm_mmu_load_pgd
 #   (arch/x86/kvm/mmu.h:148-157); no tracepoint carries the root. The BTF-typed one adds the
-#   guest CR3 that the vCPU runs on (the VMCB's, svm.c:3606-3610), for each walk NPF after
+#   guest CR3 that the vCPU runs on (the VMCB's, svm.c:3606-3610; on linux-azure, only while
+#   its CR3 intercepts are off), for each walk NPF after
 #   the load to be set against the PDPT's place in its page.
 # - mmu_reset: kvm_mmu_reset_context(vcpu), which unloads the vCPU's roots
 #   (arch/x86/kvm/mmu/mmu.c:6043-6047, 6083-6092).
 # - shutdown: shutdown_interception(vcpu), before it INITs the vCPU (svm.c:2081-2109), with
-#   the CR3 that svm_handle_exit copied from the VMCB on this exit (svm.c:3606-3610). KVM
+#   the CR3 that svm_handle_exit copied from the VMCB on this exit (svm.c:3606-3610; on
+#   linux-azure, only while its CR3 intercepts are off). KVM
 #   calls the VMCB undefined after a SHUTDOWN intercept (svm.c:2087-2088): a lead, not proof.
 kprobes=(load_mmu_pgd mmu_reset shutdown)
 kprobes_placed=()
@@ -243,8 +248,8 @@ kprobes_remove() {
 
 # host_trace_stop LABEL DIR MODE VCPUS: saves the trace as LABEL's and, for MODE full, writes
 # ci-diag-attribution.py's verdict to DIR/attribution.txt, from the whole trace rather than
-# from the tail that is kept (trace_tail lines, and vcpu_tail of each of the VCPUS vCPU
-# threads' own).
+# from the tail that is kept (trace_tail lines, and for MODE full or events vcpu_tail of each
+# of the VCPUS vCPU threads' own).
 trace_tail=2000000
 vcpu_tail=500000
 host_trace_stop() {
@@ -261,7 +266,7 @@ host_trace_stop() {
     # Each vCPU thread's own tail too, which the other's lines cannot push out. The thread is
     # the one of the vCPU's kvm_exit lines, by its id, which a line has even when its name is
     # not known ("<...>"); kvm_inj_exception and others have no vCPU field.
-    if [[ $3 == full ]]; then
+    if [[ $3 != cr ]]; then
         for ((n = 0; n < $4; n++)); do
             tid=$(grep -a -E "kvm_exit: vcpu $n " "$trace" | tail -n 1 |
                 sed -E 's/^.*-([0-9]+) +\[[0-9]+\].*$/\1/')
@@ -503,7 +508,11 @@ boot() {
         done
         [[ -f $dir/attribution.txt ]] && cat "$dir/attribution.txt"
         if [[ -f $trace.host-kvm-trace.txt.gz ]]; then
-            zcat "$trace.host-kvm-trace.txt.gz" | awk '/ mmu_reset: / { n++ } END { print "host kvm_mmu_reset_context calls in the kept trace: " n + 0 }'
+            [[ $host_trace == full ]] &&
+                zcat "$trace.host-kvm-trace.txt.gz" | awk '/ mmu_reset: / { n++ } END { print "host kvm_mmu_reset_context calls in the kept trace: " n + 0 }'
+            echo "host first faulting guest page walk after each root zap, by offset in its page: $(walk_offsets "$trace.host-kvm-trace.txt.gz")"
+            # linux-azure intercepts them after it changed the CR3 of a root load.
+            zcat "$trace.host-kvm-trace.txt.gz" | awk '/ kvm_cr: cr_(read|write) 3 = / { n++ } END { print "host kvm_cr CR3 accesses in the kept trace: " n + 0 }'
             zcat "$trace.host-kvm-trace.txt.gz" |
                 sed -n -E 's/.* shutdown: .*vcpu_id=([0-9]+) cr3=0x([0-9a-f]+).*/shutdown probe: vcpu \1 VMCB CR3 0x\2/p'
             # The CR4 that each vCPU's kernel set last: a CPUID mask changes it only through Linux.
@@ -512,6 +521,26 @@ boot() {
         fi
         echo "verdict: $(cat "$dir/verdict.txt")"
     } >>"$out/summary.txt"
+}
+
+# walk_offsets TRACE_GZ: the offsets in their page of the first guest page walk that faults
+# (PFERR_GUEST_PAGE, bit 33 of kvm_page_fault's error code) after each root zap
+# (kvm_mmu_zap_all_fast) in TRACE_GZ, as 0xOFFSET:COUNT, or none. A PAE vCPU's walk starts at
+# its PDPT; the error code's hex digit 8 holds bits 32-35, done in text as mawk has no strtonum.
+# On SVM the error code is the #NPF's (Linux v7.0 arch/x86/kvm/svm/svm.c:1956); on VMX it is
+# the EPT violation's exit qualification (vmx/vmx.c:6052), where no line counts.
+walk_offsets() {
+    local offsets
+    offsets=$(zcat "$1" | awk '/ kvm_mmu_zap_all_fast: / { armed = 1; next }
+        armed && / kvm_page_fault: / {
+            code = $0; sub(/.* error_code 0x/, "", code)
+            if (length(code) < 9 || substr(code, length(code) - 8, 1) !~ /[2367abef]/) next
+            address = $0; sub(/.* address 0x/, "", address); sub(/ .*/, "", address)
+            n[substr(address, length(address) - 2)]++
+            armed = 0
+        }
+        END { for (o in n) print "0x" o ":" n[o] }' | sort | tr '\n' ' ')
+    echo "${offsets:-none}"
 }
 
 # sregs2_writes QEMU_LOG_GZ: the register writes of QEMU (KVM_SET_SREGS2, which carries a PAE
@@ -531,16 +560,25 @@ pti_line() {
     grep -a -m 1 'page tables isolation' "$1/console.log" | tr -d '\r' || echo "no page table isolation line"
 }
 
-# boot_verdict DIR TEST RC: "died", "hung", "survived" or "other", then why, for the boot in DIR
-# of the guest test TEST, whose QEMU exited with RC. A guest that resets (a KVM exit 8) before
-# the end of its test died; one that its timeout (RC 124) ended after its test started its
-# trigger (memslot printed its BAR, just before its first toggle; sync's first QMP stop),
-# without a reset or the end of its test, hung; one that ends its test survived if the test
-# did what it should: memslot's 200 deletions of its BAR's slot, sync's pauses, a hii test's
-# pass. Anything else (an unassigned BAR, a failed test, a hang before the trigger) is other.
+# boot_verdict DIR TEST RC: "refused", "died", "hung", "survived" or "other", then why, for the
+# boot in DIR of the guest test TEST, whose QEMU exited with RC. A guest whose VMRUN failed
+# (KVM_EXIT_FAIL_ENTRY, 9: QEMU v10.2.0 prints "KVM: entry failed" and stops the VM,
+# target/i386/kvm/kvm.c:6117-6133, accel/kvm/kvm-all.c:3337-3339) was refused. One that resets
+# (a KVM exit 8) before the end of its test died; one that its timeout (RC 124) ended after its
+# test started its trigger (memslot printed its BAR, just before its first toggle; sync's first
+# QMP stop), without a reset or the end of its test, hung; one that ends its test survived if
+# the test did what it should: memslot's 200 deletions of its BAR's slot, sync's pauses, a hii
+# test's pass. Anything else (an unassigned BAR, a failed test, a hang before the trigger) is
+# other.
 # The deletions count the BAR's slot from the start: Debian's 6.1 makes 8 while it boots.
 boot_verdict() {
-    local dir=$1 test=$2 rc=$3 resets ended bar deletes=0 resumed
+    local dir=$1 test=$2 rc=$3 refusals resets ended bar deletes=0 resumed
+    # grep -c reads to the end: grep -q would leave zcat to die of SIGPIPE (see pti_line).
+    refusals=$(zcat "$dir/qemu.log.gz" | grep -a -c -E '^kvm_run_exit cpu_index [0-9]+, reason 9$')
+    if ((refusals > 0)); then
+        echo "refused: KVM exit 9 ($(grep -a -m 1 'KVM: entry failed' "$dir/qemu.stdout" || echo 'no QEMU message'))"
+        return
+    fi
     resets=$(zcat "$dir/qemu.log.gz" | grep -a -c -E '^kvm_run_exit cpu_index [0-9]+, reason 8$')
     case $test in
     memslot | sync) ended=$(tr -d '\r' <"$dir/test.log" | grep -a -c '^step .*: end$') ;;
@@ -636,10 +674,12 @@ verdict_of() {
 }
 
 # The cells of the arch at hand: cell NAME TEST PAUSE KERNEL APPEND QEMU-ARGS registers one,
-# run_cells boots each DIAG_REPS times round-robin, with full host traces; a cell whose first
-# boot's verdict is other boots no more, and no cell starts a boot after the deadline.
+# run_cells boots each DIAG_REPS times round-robin, with host traces of mode cell_trace (see
+# host_trace_start); a cell whose first boot's verdict is other, or that had a refused boot,
+# boots no more, and no cell starts a boot after the deadline.
 cell_names=()
-declare -A cell_test cell_pause cell_kernel cell_append cell_args cell_died cell_hung cell_survived cell_other cell_skipped
+cell_trace=full
+declare -A cell_test cell_pause cell_kernel cell_append cell_args cell_died cell_hung cell_survived cell_refused cell_other cell_skipped
 cell() {
     wanted "$1" || return 0
     cell_names+=("$1")
@@ -651,6 +691,7 @@ cell() {
     cell_died[$1]=0
     cell_hung[$1]=0
     cell_survived[$1]=0
+    cell_refused[$1]=0
     cell_other[$1]=0
     cell_skipped[$1]=0
 }
@@ -666,6 +707,12 @@ run_cells() {
                 cell_skipped[$name]=$((cell_skipped[$name] + 1))
                 continue
             fi
+            if ((cell_refused[$name] > 0)); then
+                echo "skipped, as its cell had a refused boot: $arch $name/$n" |
+                    tee -a "$out/cells.txt" >>"$out/summary.txt"
+                cell_skipped[$name]=$((cell_skipped[$name] + 1))
+                continue
+            fi
             if ! in_time "$arch $name/$n"; then
                 cell_skipped[$name]=$((cell_skipped[$name] + 1))
                 continue
@@ -677,7 +724,7 @@ run_cells() {
             # The whole trace of a cell's first boot; less of the others'.
             trace_tail=2000000 vcpu_tail=500000
             ((n > 1)) && trace_tail=200000 vcpu_tail=100000
-            boot "$label" "$out/$arch/$label/vars.fd" "$apt_qemu" full "${cell_pause[$name]}" \
+            boot "$label" "$out/$arch/$label/vars.fd" "$apt_qemu" "$cell_trace" "${cell_pause[$name]}" \
                 "${cell_kernel[$name]}" "$out/$arch/stepwise-initrd.img" \
                 "ignore_loglevel panic=-1 uefisettings.test=${cell_test[$name]} diag.pauses=$sync_pauses ${cell_append[$name]}" \
                 "${args[@]}"
@@ -686,6 +733,7 @@ run_cells() {
             died*) cell_died[$name]=$((cell_died[$name] + 1)) ;;
             hung*) cell_hung[$name]=$((cell_hung[$name] + 1)) ;;
             survived*) cell_survived[$name]=$((cell_survived[$name] + 1)) ;;
+            refused*) cell_refused[$name]=$((cell_refused[$name] + 1)) ;;
             *)
                 cell_other[$name]=$((cell_other[$name] + 1))
                 harness_fail "$arch $label: $verdict"
@@ -788,8 +836,8 @@ cell_boot_proof() {
 # verdict depends on (cell_boot_proof); with the KVM_SET_SREGS2 counts per running period of
 # each boot of a cell with pauses, and the stressor's round trips of each of a stressed one.
 report_cell() {
-    local name=$1 died=${cell_died[$1]} hung=${cell_hung[$1]} survived=${cell_survived[$1]} other=${cell_other[$1]}
-    local n=$((cell_died[$1] + cell_hung[$1] + cell_survived[$1] + cell_other[$1])) class proof='' details='' counts='' trips='' k count
+    local name=$1 died=${cell_died[$1]} hung=${cell_hung[$1]} survived=${cell_survived[$1]} refused=${cell_refused[$1]} other=${cell_other[$1]}
+    local n=$((cell_died[$1] + cell_hung[$1] + cell_survived[$1] + cell_refused[$1] + cell_other[$1])) class proof='' details='' counts='' trips='' k count
     for ((k = 1; k <= reps; k++)); do
         [[ -f $out/$arch/$name/$k/verdict.txt ]] || continue
         [[ -z $proof ]] && proof=$(cell_boot_proof "$name" "$k")
@@ -802,6 +850,8 @@ report_cell() {
     [[ " ${cell_append[$1]} " == *" diag.stress "* ]] && details+="; stressor round trips in the first second: ${trips:-none}"
     if ((other > 0)); then
         class=harness
+    elif ((refused > 0)); then
+        class=refused
     elif ((n < reps)); then
         class="incomplete, $n of $reps boots"
     elif [[ -n $proof ]]; then
@@ -813,7 +863,7 @@ report_cell() {
     else
         class=mixed
     fi
-    echo "cell $arch $name: $n boots: $died died, $hung hung, $survived survived, $other other, ${cell_skipped[$1]} skipped: $class$details" |
+    echo "cell $arch $name: $n boots: $died died, $hung hung, $survived survived, $refused refused, $other other, ${cell_skipped[$1]} skipped: $class$details" |
         tee -a "$out/cells.txt" >>"$out/summary.txt"
 }
 
@@ -823,76 +873,110 @@ report_cell() {
 smp1=(-accel kvm -cpu host -smp 1 -machine vmport=off)
 ivshmem='-object memory-backend-ram,id=shm,size=4M -device ivshmem-plain,memdev=shm'
 
-# run_suite SUITE LABEL [pti]: tests/qemu/run.sh's scenarios on the architecture SUITE as CI
-# runs them, through make test-e2e-qemu-SUITE, which pins the toolchain (Makefile:48-52; run.sh
-# alone took the runner's default one, without i686-unknown-linux-musl, in CI run 39936216534),
-# its output in LABEL.log. With pti, the QEMU of PATH is a wrapper that adds pti=on to the
-# guest's kernel command line (run.sh allows a wrapper that execs QEMU) and logs each command
-# line to LABEL-appends.log: run.sh's "quiet" guests print no PTI line, so each boot that
-# run.sh started ("run.sh: NAME boot N: SPEC", run.sh:218, whose SPEC has no space; a failed
-# boot adds "run.sh: NAME boot N: QEMU: ..." lines, run.sh:250) must have a logged command
-# line ending in pti=on.
-run_suite() {
-    local suite=$1 label=$2 pti=${3:-} rc started lines with_pti wrapper='' qemu_bin
-    in_time "$label" || return 0
-    : >"$out/$label-appends.log"
-    if [[ $pti == pti ]]; then
-        case $suite in
-        i686) qemu_bin='qemu-system-i386' ;;
-        *)
-            harness_fail "$label: no QEMU wrapper for $suite"
-            return
-            ;;
-        esac
-        wrapper=$(mktemp -d)
-        # The wrapper's own text, with $qemu_bin filled in.
-        cat >"$wrapper/$qemu_bin" <<WRAPPER
-#!/bin/bash
-args=()
-while ((\$# > 0)); do
-    if [[ \$1 == -append ]]; then
-        args+=("\$1" "\$2 pti=on")
-        echo "\$2 pti=on" >>"\$DIAG_APPEND_LOG"
-        shift 2
-    else
-        args+=("\$1")
-        shift
+# kmod's modinfo, by its path: the runner user's PATH need not have /usr/sbin.
+modinfo=/usr/sbin/modinfo
+
+# kvm_amd_loadable: whether this runner can take kvm-amd.ko as built by ci-diag-kvm-amd.sh: the
+# kernel it is for, with kvm_amd loaded, no lockdown and no signature enforcement (an unsigned
+# module then loads and taints the kernel), each logged.
+kvm_amd_loadable() {
+    local lockdown sig_enforce
+    lockdown=$(sudo cat /sys/kernel/security/lockdown 2>&1)
+    sig_enforce=$(cat /sys/module/module/parameters/sig_enforce 2>&1)
+    echo "kernel $(uname -r); lockdown: $lockdown; module.sig_enforce: $sig_enforce" |
+        tee -a "$out/facts.txt" >>"$out/summary.txt"
+    if [[ $(uname -r) != 7.0.0-1017-azure || ! -d /sys/module/kvm_amd ]]; then
+        harness_fail "the kvm-amd.ko builds are for 7.0.0-1017-azure with kvm_amd loaded, not $(uname -r)"
+        return 1
     fi
-done
-exec /usr/bin/$qemu_bin "\${args[@]}"
-WRAPPER
-        chmod +x "$wrapper/$qemu_bin"
-    fi
-    PATH=${wrapper:+$wrapper:}$PATH DIAG_APPEND_LOG=$out/$label-appends.log make -C "$repo" "test-e2e-qemu-$suite" \
-        >"$out/$label.log" 2>&1
-    rc=$?
-    started=$(grep -c -E '^run.sh: [^ ]+ boot [0-9]+: [^ ]+$' "$out/$label.log")
-    echo "== $label: make test-e2e-qemu-$suite exit $rc, $started boots started; $(grep -E '^run.sh: (FAILED|end)' "$out/$label.log" | tr '\n' ' ')" |
-        tee -a "$out/cells.txt" >>"$out/summary.txt"
-    ((started > 0)) || harness_fail "$label: run.sh started no boot, see $label.log"
-    if [[ -n $wrapper ]]; then
-        lines=$(grep -c . "$out/$label-appends.log")
-        with_pti=$(grep -c ' pti=on$' "$out/$label-appends.log")
-        echo "$label: $lines QEMU command lines, $with_pti with pti=on, for $started boots" |
-            tee -a "$out/cells.txt" >>"$out/summary.txt"
-        ((lines == started && with_pti == started)) || harness_fail "$label: not every boot got pti=on"
-        rm -rf "$wrapper"
+    if [[ $lockdown != *"[none]"* || $sig_enforce != N ]]; then
+        harness_fail "this kernel may refuse an unsigned kvm-amd.ko"
+        return 1
     fi
 }
 
-# The fourth round: c3 under memslot (DIAG_REPS boots), then run.sh's i686 suite 3 times under
-# pti=on, and its aarch64 suite as it is.
+# kvm_amd_build: builds kvm-amd.ko as shipped and with the fix to $out/kvm-amd
+# (ci-diag-kvm-amd.sh), comparing the first with the module that modprobe loads.
+kvm_amd_build() {
+    local shipped
+    if ! shipped=$("$modinfo" -n kvm_amd 2>&1); then
+        harness_fail "modinfo finds no kvm_amd: $shipped"
+        return 1
+    fi
+    if ! TMPDIR=$repo/target/qemu-test "$here/ci-diag-kvm-amd.sh" "$repo/target/qemu-test/kvm-amd-downloads" \
+        "$out/kvm-amd" "$shipped" >"$out/kvm-amd-build.log" 2>&1; then
+        harness_fail "building kvm-amd.ko failed, see kvm-amd-build.log"
+        return 1
+    fi
+    cat "$out/kvm-amd/comparison.txt" >>"$out/summary.txt"
+}
+
+# kvm_amd_params: kvm_amd's parameters as NAME=VALUE lines; some are root's only.
+kvm_amd_params() {
+    sudo sh -c 'cd /sys/module/kvm_amd/parameters && for p in *; do echo "$p=$(cat "$p")"; done'
+}
+
+# load_kvm_amd KO: replaces the running kvm_amd with KO, a kvm-amd.ko, or with the shipped one for
+# "shipped", with the options that modprobe gives it (/etc/modprobe.d); true if the running
+# module then is KO's (its srcversion), /dev/kvm is open to this user again, and, with
+# dump_invalid_vmcb on again, the module has the parameters that the shipped one had
+# (kvm_amd_shipped_params).
+load_kvm_amd() {
+    local ko=$1 options='' want running params
+    if [[ -d /sys/module/kvm_amd ]] && ! sudo rmmod kvm_amd 2>>"$out/kvm-amd-load.log"; then
+        harness_fail "kvm_amd: rmmod failed, see kvm-amd-load.log"
+        return 1
+    fi
+    if [[ $ko == shipped ]]; then
+        sudo modprobe kvm_amd 2>>"$out/kvm-amd-load.log"
+        want=$("$modinfo" -F srcversion kvm_amd)
+    else
+        options=$(sudo modprobe -n -v kvm_amd | sed -n -E 's/^insmod [^ ]*\/kvm-amd\.ko[^ ]* *//p')
+        # shellcheck disable=SC2086 # modprobe's options, a word each
+        sudo insmod "$ko" $options 2>>"$out/kvm-amd-load.log"
+        want=$("$modinfo" -F srcversion "$ko")
+    fi
+    running=$(cat /sys/module/kvm_amd/srcversion 2>&1)
+    echo "kvm_amd: loaded ${ko#"$out/"}${options:+ with $options}: srcversion $running (want $want), taint '$(cat /sys/module/kvm_amd/taint 2>&1)'" |
+        tee -a "$out/cells.txt" >>"$out/summary.txt"
+    sudo dmesg | tail -n 5 >>"$out/kvm-amd-load.log"
+    if [[ $running != "$want" ]]; then
+        harness_fail "kvm_amd: the running module's srcversion is '$running', not $want"
+        return 1
+    fi
+    # Unloading kvm_amd removes /dev/kvm and loading it adds the node again (kvm_exit and
+    # kvm_init, Linux v7.0 virt/kvm/kvm_main.c:6547, 6583), root's only until udev applies
+    # checks.yml's rule.
+    sudo udevadm settle --timeout=30 2>>"$out/kvm-amd-load.log"
+    if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+        harness_fail "kvm_amd: /dev/kvm is not open to $(id -un) after the load: $(ls -l /dev/kvm 2>&1)"
+        return 1
+    fi
+    echo Y | sudo tee /sys/module/kvm_amd/parameters/dump_invalid_vmcb >/dev/null
+    params=$(kvm_amd_params)
+    if [[ $params != "$kvm_amd_shipped_params" ]]; then
+        diff <(echo "$kvm_amd_shipped_params") <(echo "$params") >>"$out/kvm-amd-load.log"
+        harness_fail "kvm_amd: ${ko#"$out/"} has other parameters than the shipped one, see kvm-amd-load.log"
+        return 1
+    fi
+}
+
+# The fifth round: c1 under memslot and sync on kvm-amd.ko as shipped (stock), then with the fix
+# (poc), then the shipped module again.
 if select_arch i686; then
     boot_timeout=$((90 * slow))
-    cell c3-memslot memslot no "$vmlinuz" "diag.stress" "${smp1[*]} $ivshmem"
-    run_cells
-    boot_timeout=$((180 * slow))
-fi
-if [[ ${DIAG_RUN_SH:-yes} == yes ]]; then
-    for n in 1 2 3; do
-        run_suite i686 "run-sh-i686-pti-$n" pti
-    done
-    run_suite aarch64 run-sh-aarch64
+    cell_trace=events
+    if kvm_amd_loadable && kvm_amd_build; then
+        echo Y | sudo tee /sys/module/kvm_amd/parameters/dump_invalid_vmcb >/dev/null
+        kvm_amd_shipped_params=$(kvm_amd_params)
+        for variant in stock poc; do
+            load_kvm_amd "$out/kvm-amd/$variant/kvm-amd.ko" || continue
+            cell "c1-memslot-$variant" memslot no "$vmlinuz" "" "${smp1[*]} $ivshmem"
+            cell "c1-sync-$variant" sync registers "$vmlinuz" "" "${smp1[*]}"
+            run_cells
+        done
+        load_kvm_amd shipped
+    fi
 fi
 
 sudo dmesg >"$out/dmesg-after.txt" 2>&1
