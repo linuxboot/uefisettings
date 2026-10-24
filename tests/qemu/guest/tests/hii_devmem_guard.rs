@@ -17,14 +17,15 @@
 use std::fs;
 use std::io;
 
+use uefisettings_qemu_guest::is_system_ram;
 use uefisettings_qemu_guest::json_error;
-use uefisettings_qemu_guest::read_published_database;
+use uefisettings_qemu_guest::published_database;
 use uefisettings_qemu_guest::require_test_vm;
 
 #[test]
-fn dev_mem_refuses_to_read_the_database() {
-    let error = read_published_database().expect_err("/dev/mem served the database");
-    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+fn the_database_is_in_system_ram() {
+    let address = published_database().address;
+    assert!(is_system_ram(address), "{address:#x} is not System RAM");
 }
 
 #[test]

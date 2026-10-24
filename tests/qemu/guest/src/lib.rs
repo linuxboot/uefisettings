@@ -13,10 +13,10 @@
 //! Helpers of the tests that run inside the QEMU test guests.
 //!
 //! `tests/qemu/run.sh` builds this crate's test binaries for musl and boots each scenario
-//! under OVMF, with the binaries and a static `uefisettings` in the initramfs.
+//! under EDK2's firmware, with the binaries and a static `uefisettings` in the initramfs.
 //! `tests/qemu/init` runs the test binary that the boot's kernel command line names, then
 //! checks the kernel's health. The tests assert inside the guest; libtest reports their
-//! outcomes on the second serial port.
+//! outcomes on the test terminal.
 //!
 //! Every helper and test that reads the machine's files or runs `uefisettings` calls
 //! [`require_test_vm`] first, so on any other machine the tests fail before they touch
@@ -28,11 +28,11 @@
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
+use std::ops::RangeInclusive;
+use std::os::unix::fs::FileExt;
 use std::process::Command;
 use std::process::Stdio;
+use std::slice;
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -52,6 +52,11 @@ pub const EFIVARS: &str = "/sys/firmware/efi/efivars";
 pub const HIIDB_VARIABLE: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 
+/// The variable in which publish-hiidb puts the CRC-32 of the HII database that
+/// [`HIIDB_VARIABLE`] points at.
+pub const HIIDB_CRC32_VARIABLE: &str =
+    "/sys/firmware/efi/efivars/HiiDBCrc32-de145b29-c3cd-455f-91de-a76237b67c52";
+
 /// `Backend::Unknown` in `thrift/uefisettings_backend.thrift`.
 pub const BACKEND_UNKNOWN: i32 = 0;
 
@@ -65,6 +70,10 @@ pub const DRIVER_SAMPLE_VARIABLE: &str =
 
 /// Size of the attributes that efivarfs puts before the data of a variable.
 pub const EFIVARFS_HEADER_SIZE: usize = 4;
+
+/// Linux's EFAULT (`include/uapi/asm-generic/errno-base.h`), with which `/dev/mem`'s read()
+/// refuses memory that the kernel does not map.
+pub const EFAULT: i32 = 14;
 
 /// The prefix of the answer of a question whose value the HII backend cannot read
 /// (`src/lib/hii/forms.rs`).
@@ -241,19 +250,67 @@ pub fn variable_data(path: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Reads the HII database where the `HiiDB` variable points, through `/dev/mem`, as
-/// `uefisettings` does. Panics if the variable does not exist.
+/// The HII database that publish-hiidb published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PublishedDatabase {
+    /// Its length, from [`HIIDB_VARIABLE`].
+    pub length: u32,
+    /// Its physical address, from [`HIIDB_VARIABLE`].
+    pub address: u64,
+    /// Its CRC-32, from [`HIIDB_CRC32_VARIABLE`], for the tests to compare: read() of
+    /// `/dev/mem` serves the database only on x86 below the end of Linux's low memory, and
+    /// mmap() needs unsafe code, which this crate forbids.
+    pub crc32: u32,
+}
+
+/// The HII database that [`HIIDB_VARIABLE`] and [`HIIDB_CRC32_VARIABLE`] describe. Panics
+/// if either variable does not exist or has the wrong size.
 #[track_caller]
-pub fn read_published_database() -> io::Result<Vec<u8>> {
+pub fn published_database() -> PublishedDatabase {
     let hiidb = variable_data(HIIDB_VARIABLE).expect("the HiiDB variable does not exist");
     let (length, address) = hiidb.split_at(size_of::<u32>());
-    let length = u32::from_le_bytes(length.try_into().expect("HiiDB holds no length"));
-    let address = u64::from_le_bytes(address.try_into().expect("HiiDB holds no 64-bit address"));
-    let mut database = vec![0; length.try_into().expect("the length exceeds usize")];
-    let mut mem = File::open("/dev/mem")?;
-    mem.seek(SeekFrom::Start(address))?;
-    mem.read_exact(&mut database)?;
-    Ok(database)
+    let crc32 =
+        variable_data(HIIDB_CRC32_VARIABLE).expect("the HiiDBCrc32 variable does not exist");
+    PublishedDatabase {
+        length: u32::from_le_bytes(length.try_into().expect("HiiDB holds no length")),
+        address: u64::from_le_bytes(address.try_into().expect("HiiDB holds no 64-bit address")),
+        crc32: u32::from_le_bytes(crc32.try_into().expect("HiiDBCrc32 holds no CRC-32")),
+    }
+}
+
+/// Reads the byte at physical `address` with read() of `/dev/mem`, which `uefisettings` tries
+/// before mmap().
+#[track_caller]
+pub fn read_dev_mem_byte(address: u64) -> io::Result<u8> {
+    require_test_vm();
+    let mut byte = 0;
+    File::open("/dev/mem")?.read_exact_at(slice::from_mut(&mut byte), address)?;
+    Ok(byte)
+}
+
+/// Whether `address` is in a System RAM range of `/proc/iomem`, which `/dev/mem` refuses to
+/// read and map under `CONFIG_STRICT_DEVMEM` (`devmem_is_allowed()`), except in x86's first
+/// MiB.
+#[track_caller]
+pub fn is_system_ram(address: u64) -> bool {
+    require_test_vm();
+    let iomem = fs::read_to_string("/proc/iomem").expect("cannot read /proc/iomem");
+    iomem
+        .lines()
+        .filter_map(|line| line.trim_start().strip_suffix(" : System RAM"))
+        .map(parse_iomem_range)
+        .any(|range| range.contains(&address))
+}
+
+/// Parses a range of `/proc/iomem`, `<start>-<end>` in hexadecimal.
+fn parse_iomem_range(range: &str) -> RangeInclusive<u64> {
+    let bounds = range
+        .split_once('-')
+        .map(|(start, end)| (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16)));
+    let Some((Ok(start), Ok(end))) = bounds else {
+        panic!("/proc/iomem: cannot parse the range {range:?}");
+    };
+    start..=end
 }
 
 /// The bytes that differ between `before` and `after`, which have the same length, as

@@ -11,13 +11,15 @@
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # The checks of uefisettings. They need GNU make and bash, rustup while
-# RUST_TOOLCHAIN is set, as it is by default, and for test-e2e-qemu an x86_64
-# host with /dev/kvm and what tests/qemu/README.md lists:
+# RUST_TOOLCHAIN is set, as it is by default, for test-i686 an x86 host with
+# gcc's 32-bit libraries, which README.md names, and for test-e2e-qemu an
+# x86_64 host with /dev/kvm and what tests/qemu/README.md lists:
 #   make                 every check of CHECKS, stopping at the first that fails
 #   make -k              every check of CHECKS, even after one fails
 #   make <check>...      the named checks, e.g. make clippy-aarch64 doc
 #   make lint            the checks of LINTS
-#   make lint test       every check but test-e2e-qemu
+#   make lint test test-i686
+#                        every check but test-e2e-qemu
 #   make RUST_TOOLCHAIN= the checks on the cargo of PATH
 #   make setup           installs, through rustup, the toolchain, components and
 #                        targets that the checks use
@@ -27,10 +29,10 @@
 #
 # A CI host runs make setup && make -k under timeout, as nothing bounds the time
 # that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'. It
-# may keep target/qemu-test/kernel-rpms and target/qemu-test/driver-sample
-# between runs: tests/qemu/fetch-kernel.sh downloads only the RPMs that are
+# may keep target/qemu-test/packages and target/qemu-test/*/driver-sample
+# between runs: tests/qemu/fetch-packages.sh downloads only the packages that are
 # missing there or fail their sha256 check, and tests/qemu/run.sh builds
-# DriverSample only when it is missing, so delete target/qemu-test/driver-sample
+# DriverSample only when it is missing, so delete target/qemu-test/*/driver-sample
 # after a change to build-driver-sample.sh.
 
 SHELL := bash
@@ -58,14 +60,16 @@ export RUSTFLAGS := -D warnings
 unexport CARGO_ENCODED_RUSTFLAGS
 
 # The targets that the checks build for, comma-separated as rustup takes them.
-TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi
+TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi,i686-unknown-linux-musl,i686-unknown-uefi,aarch64-unknown-linux-musl,aarch64-unknown-uefi
 comma := ,
 
-# CI runs lint test and test-e2e-qemu: a new check joins LINTS or gets a CI job.
-LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-uefi doc
-CHECKS := $(LINTS) test test-e2e-qemu
+# CI runs lint test test-i686 and test-e2e-qemu: a new check joins LINTS or
+# QEMU_TESTS or CI runs it too.
+LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi doc
+QEMU_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
+CHECKS := $(LINTS) test test-i686 test-e2e-qemu
 
-.PHONY: check lint help setup toolchain $(CHECKS)
+.PHONY: check lint help setup toolchain $(CHECKS) $(QEMU_TESTS)
 
 check: $(CHECKS)
 
@@ -75,7 +79,8 @@ help:
 	@echo "checks: $(CHECKS)"
 	@echo "make runs every check; make <check>... runs the named ones."
 	@echo "make lint runs $(LINTS)."
-	@echo "make lint test runs every check but test-e2e-qemu."
+	@echo "make test-e2e-qemu runs $(QEMU_TESTS)."
+	@echo "make lint test test-i686 runs every check but test-e2e-qemu."
 	@echo "make -k runs every check, even after one fails."
 	@echo "make -n <check> prints the commands of a check without running them."
 	@echo "make RUST_TOOLCHAIN= runs the checks on the cargo of PATH."
@@ -101,7 +106,7 @@ toolchain:
 fmt: toolchain
 	cargo fmt --check
 
-clippy-x86_64 clippy-aarch64: clippy-%: toolchain
+clippy-x86_64 clippy-aarch64 clippy-i686: clippy-%: toolchain
 	cargo clippy --locked --workspace --all-targets --all-features --target $*-unknown-linux-gnu -- -D warnings
 
 # publish-hiidb, the one crate built for UEFI.
@@ -111,10 +116,17 @@ clippy-uefi: toolchain
 test: toolchain
 	scripts/assert-tests-ran.sh cargo test --locked
 
+# The tests on 32-bit glibc, where off_t is signed and has 32 bits; this
+# host runs them.
+test-i686: toolchain
+	scripts/assert-tests-ran.sh cargo test --locked --target i686-unknown-linux-gnu
+
 doc: toolchain
 	RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
 
-# Boots the scenarios of tests/qemu/scenarios.tsv under KVM, with logs in
-# target/qemu-test/<UTC time>/; see tests/qemu/README.md.
-test-e2e-qemu: toolchain
-	tests/qemu/run.sh
+test-e2e-qemu: $(QEMU_TESTS)
+
+# Boots the scenarios of tests/qemu/scenarios.tsv on one architecture, with logs in
+# target/qemu-test/<architecture>/<UTC time>/; see tests/qemu/README.md.
+$(QEMU_TESTS): test-e2e-qemu-%: toolchain
+	tests/qemu/run.sh $*
