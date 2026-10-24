@@ -12,12 +12,16 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as `publish-hiidb.efi [rt-data|reserved|loader-data]`:
-//! it copies the HII database into pages of that memory type and points the
-//! volatile `HiiDB` variable at them as `{ u32 length; u64 address }`, the way
+//! it copies the HII database into pages of that memory type, one byte in, and points
+//! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
 //! `rt-data` (the default) and `reserved` as E820 reserved ranges, which
 //! `/dev/mem` serves under `CONFIG_STRICT_DEVMEM`; `loader-data` becomes System
 //! RAM, which it refuses.
+//! arm64 Linux maps neither `rt-data` nor `reserved`, so `/dev/mem` serves them only
+//! to mmap(), as 32-bit x86 Linux does above its low memory.
+//! The driver also puts the CRC-32 of the database in the volatile `HiiDBCrc32`
+//! variable, for the tests to check what `uefisettings` extracts.
 
 #![cfg_attr(target_os = "uefi", no_std, no_main)]
 #![deny(unsafe_code)]
@@ -51,6 +55,16 @@ const HIIDB_VENDOR: Guid = guid!("1b838190-4625-4ead-abc9-cd5e6af18fe0");
 /// Attributes of that variable: volatile and readable at runtime.
 const HIIDB_ATTRIBUTES: VariableAttributes =
     VariableAttributes::BOOTSERVICE_ACCESS.union(VariableAttributes::RUNTIME_ACCESS);
+/// Name of the variable that holds the CRC-32 of the database, for the tests
+/// only, with the attributes of `HiiDB`.
+const HIIDB_CRC32_NAME: &CStr16 = cstr16!("HiiDBCrc32");
+/// Vendor GUID of that variable, which the tests own.
+const HIIDB_CRC32_VENDOR: Guid = guid!("de145b29-c3cd-455f-91de-a76237b67c52");
+
+/// Where the copy starts in its pages: an unaligned start makes `uefisettings`
+/// read the first page from an unaligned address, which arm64 Device memory
+/// faults for wide loads (<https://github.com/linuxboot/uefisettings/pull/12>).
+const COPY_OFFSET: usize = 1;
 
 /// A failed step and the firmware's status.
 type Failure = (&'static str, Status);
@@ -59,7 +73,7 @@ type Failure = (&'static str, Status);
 /// build is a driver.
 #[cfg(not(target_os = "uefi"))]
 fn main() {
-    panic!("publish-hiidb is a UEFI driver: build it for x86_64-unknown-uefi");
+    panic!("publish-hiidb is a UEFI driver: build it for a UEFI target");
 }
 
 #[entry]
@@ -93,8 +107,11 @@ fn memory_type() -> Option<MemoryType> {
     }
 }
 
-/// Copies the exported HII database into pages of `memory_type` and points
-/// `HiiDB` at them. Returns the address and length of the copy.
+/// Copies the exported HII database into pages of `memory_type` at `COPY_OFFSET`
+/// and points `HiiDB` at the copy. Returns the address and length of the copy.
+///
+/// It first puts the CRC-32 of the database in `HiiDBCrc32`, so that `HiiDB`
+/// never exists without it.
 ///
 /// The pages are never freed: the OS reads them after boot.
 fn publish(memory_type: MemoryType) -> Result<(u64, u32), Failure> {
@@ -104,22 +121,35 @@ fn publish(memory_type: MemoryType) -> Result<(u64, u32), Failure> {
         .map_err(|error| ("exporting the HII database", error.status()))?;
     let length = u32::try_from(export.len())
         .map_err(|_| ("the HII database exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
-    let pages = export.len().div_ceil(PAGE_SIZE);
+
+    let crc32 = boot::calculate_crc32(&export)
+        .map_err(|error| ("computing the CRC-32 of the HII database", error.status()))?;
+    runtime::set_variable(
+        HIIDB_CRC32_NAME,
+        &VariableVendor(HIIDB_CRC32_VENDOR),
+        HIIDB_ATTRIBUTES,
+        &crc32.to_le_bytes(),
+    )
+    .map_err(|error| ("setting the HiiDBCrc32 variable", error.status()))?;
+
+    let pages = (COPY_OFFSET + export.len()).div_ceil(PAGE_SIZE);
     let base = boot::allocate_pages(AllocateType::AnyPages, memory_type, pages)
         .map_err(|error| ("allocating pages", error.status()))?;
+    let copy = base.as_ptr().wrapping_add(COPY_OFFSET);
     #[expect(
         unsafe_code,
         reason = "the pages from allocate_pages() are only reachable through a raw pointer"
     )]
     // SAFETY: `allocate_pages` returned `pages * PAGE_SIZE` bytes that nothing
     // else references, and UEFI identity-maps memory, so the address is a
-    // valid pointer. `export` fits in them and does not overlap them.
+    // valid pointer. `export` fits in them after `COPY_OFFSET` and does not
+    // overlap them.
     unsafe {
         ptr::write_bytes(base.as_ptr(), 0, pages * PAGE_SIZE);
-        ptr::copy_nonoverlapping(export.as_ptr(), base.as_ptr(), export.len());
+        ptr::copy_nonoverlapping(export.as_ptr(), copy, export.len());
     }
-    // `usize` is 64 bits wide on x86_64-unknown-uefi.
-    let address = base.as_ptr().addr() as u64;
+    // `usize` has at most 64 bits on the UEFI targets.
+    let address = copy.addr() as u64;
 
     let mut data = [0; size_of::<u32>() + size_of::<u64>()];
     data[..4].copy_from_slice(&length.to_le_bytes());

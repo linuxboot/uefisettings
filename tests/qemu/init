@@ -14,8 +14,8 @@
 # PID 1 of the QEMU test guests, which tests/qemu/run.sh puts in their initramfs. It
 # mounts what uefisettings needs, runs the test binary that uefisettings.test= on the
 # kernel command line names (with the libtest filter from uefisettings.filter=, if any)
-# and then the health checks, both writing to the second serial port. It prints both exit
-# codes on the console and powers off.
+# and then the health checks, both writing to the terminal that uefisettings.tty= names.
+# It prints both exit codes on the console and powers off.
 
 /bin/busybox --install -s /bin
 # uefisettings locks a file in /run/lock before it writes a setting.
@@ -23,22 +23,28 @@ mkdir -p /dev /proc /run/lock /sys /tmp
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
+# The modules that run.sh copies, which the guest's kernel has not built in.
+for module in /lib/modules/*.ko; do
+    [ -e "$module" ] && insmod "$module"
+done
 mount -t efivarfs efivarfs /sys/firmware/efi/efivars
 
 test=
 filter=
+tty=
 read -r cmdline < /proc/cmdline
 for parameter in $cmdline; do
     case $parameter in
     uefisettings.test=*) test=${parameter#*=} ;;
     uefisettings.filter=*) filter=${parameter#*=} ;;
+    uefisettings.tty=*) tty=/dev/${parameter#*=} ;;
     esac
 done
 
-# The firmware writes to both serial ports and may leave a line unfinished, so the
-# start and exit lines begin with a newline. run.sh prints the second port from the start
-# line on.
-printf '\nuefisettings-qemu-test: start %s %s\n' "$test" "$filter" > /dev/ttyS1
+# The firmware writes to the console and that terminal and may leave a line unfinished, so
+# the start and exit lines begin with a newline. run.sh prints the terminal's output from
+# the start line on.
+printf '\nuefisettings-qemu-test: start %s %s\n' "$test" "$filter" > "$tty"
 # The health checks judge only the test: the kernel log and taint of the boot depend on
 # the host, e.g. a RETBleed error on Intel hosts that hide IBRS from the guest.
 read -r start < /proc/sys/kernel/random/uuid
@@ -46,7 +52,7 @@ echo "uefisettings-qemu-test: start of test $start" > /dev/kmsg
 # cat, not read: busybox read reads a byte at a time, and numeric sysctls answer only a
 # read at offset 0, so read would get only the first digit.
 taint=$(cat /proc/sys/kernel/tainted /sys/kernel/warn_count)
-"/tests/$test" --test-threads=1 ${filter:+"$filter"} > /dev/ttyS1 2>&1
+"/tests/$test" --test-threads=1 ${filter:+"$filter"} > "$tty" 2>&1
 test_status=$?
 # The test added no taint (TAINT_* in include/linux/panic.h) or warning (a repeated WARN
 # adds no taint bit), and the kernel kept its log
@@ -75,6 +81,6 @@ health_status=0
         END { if (!found) print "cannot read the kernel log"; exit !found || error }' /tmp/kmsg ||
         health_status=1
     kill "$!" 2> /dev/null
-} > /dev/ttyS1 2>&1
+} > "$tty" 2>&1
 printf '\nuefisettings-qemu-test: exit %s %s\n' "$test_status" "$health_status"
 poweroff -f

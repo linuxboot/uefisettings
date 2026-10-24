@@ -1,0 +1,4 @@
+# The kernel, firmware and busybox of the aarch64 guests, in the format of fetch-packages.sh.
+9328e61443dcd71e5671806fbef4345eb15a988229b011340fac8b856315c3ee https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Everything/aarch64/os/Packages/k/kernel-core-6.17.1-300.fc43.aarch64.rpm https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/43/Everything/aarch64/os/Packages/k/kernel-core-6.17.1-300.fc43.aarch64.rpm
+fad8e80e929cd00dae8c5c8e5dd3ec85f37d9a832eea776957e5e2cf86ef2ab5 https://archive.ubuntu.com/ubuntu/pool/main/e/edk2/qemu-efi-aarch64_2024.02-2ubuntu0.10_all.deb https://launchpad.net/ubuntu/+archive/primary/+files/qemu-efi-aarch64_2024.02-2ubuntu0.10_all.deb
+d96535e0402c011e0ee43449799df2f4504d44b842e4f2b3a6cbc845508eaafc https://ports.ubuntu.com/ubuntu-ports/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_arm64.deb https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_arm64.deb

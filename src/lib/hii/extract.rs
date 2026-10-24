@@ -197,13 +197,14 @@ fn copy_mapped_page(file: &File, offset: u64, dst: &mut [u8]) -> Result<usize> {
     let offset_in_page = usize::try_from(offset % page_size as u64)?;
     let len = (page_size - offset_in_page).min(dst.len());
     let page_base = offset - offset_in_page as u64;
-    let map_base = libc::off_t::try_from(page_base)
-        .with_context(|| format!("Mapping offset 0x{page_base:x} does not fit off_t"))?;
+    // mmap64(), as off_t is signed and has 32 bits on most 32-bit glibc targets.
+    let map_base = libc::off64_t::try_from(page_base)
+        .with_context(|| format!("Mapping offset 0x{page_base:x} does not fit off64_t"))?;
 
     // SAFETY: addr = NULL lets the kernel pick an unused address range, so the
     // new PROT_READ mapping cannot alias any Rust allocation (including dst).
     let mapped = unsafe {
-        libc::mmap(
+        libc::mmap64(
             ptr::null_mut(),
             page_size,
             libc::PROT_READ,
@@ -356,7 +357,7 @@ mod tests {
         }
     }
 
-    /// The offset also fails the off_t check; the overflow error must win.
+    /// The offset also fails the off64_t check; the overflow error must win.
     #[test]
     fn read_mapped_rejects_overflowing_range() {
         let (file, _) = mapped_fixture(16);
