@@ -5,8 +5,7 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 homepage = "https://github.com/linuxboot/uefisettings"
-include = ["*.thrift"]
+include = ["*.thrift", "lib.rs"]
 
-[[example]]
-name = "uefisettings_thrift_srcs"
-path = "*.thrift"
+[lib]
+path = "lib.rs"
