@@ -20,3 +20,5 @@ mod strings;
 // Implements (partial) decoding of the Form and Strings packages.
 // See the "Human Interface Infrastructure" section of the UEFI spec:
 // https://uefi.org/specifications
+
+pub(crate) use efivarfs::EfivarReader;

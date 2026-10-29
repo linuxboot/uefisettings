@@ -39,6 +39,7 @@ use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::QuestionDescriptor;
 use crate::hii::package;
+use crate::hii::EfivarReader;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
 use crate::ilorest::requests::Ilo5Dev;
@@ -106,7 +107,7 @@ impl HiiBackend {
         let mut readable_representation = String::new();
 
         let parsed_db = package::read_db(db_bytes)?;
-        let mut reader = forms::EfivarReader::default();
+        let mut reader = EfivarReader::default();
 
         for list in parsed_db {
             list.check_form_strings()?;
@@ -165,7 +166,7 @@ impl HiiBackend {
         let include = options.include;
         let mut res = Vec::new();
         let parsed_db = package::read_db(db_bytes)?;
-        let mut reader = forms::EfivarReader::default();
+        let mut reader = EfivarReader::default();
         for list in parsed_db {
             list.check_form_strings()?;
 
@@ -251,7 +252,7 @@ impl HiiBackend {
         let mut selected = Vec::new();
         let mut excluded = IncludedStates::empty();
         // one cache for the selection, which ends before the first write
-        let mut reader = forms::EfivarReader::default();
+        let mut reader = EfivarReader::default();
         for list in parsed_db {
             for form_package in list.forms {
                 // try to find the question
@@ -358,7 +359,7 @@ impl HiiBackend {
 
         let db_bytes = extract::extract_db()?;
         let parsed_db = package::read_db(&db_bytes)?;
-        let mut reader = forms::EfivarReader::default();
+        let mut reader = EfivarReader::default();
 
         let mut excluded = IncludedStates::empty();
         for list in parsed_db {

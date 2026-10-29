@@ -10,10 +10,13 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -29,6 +32,7 @@ use thiserror::Error;
 use crate::hii::package::Guid;
 
 pub(super) const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
+pub(super) const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
 
 /// `<name>-<lowercase GUID>` with '!' for each '/', as Linux v7.2 fs/efivarfs/vars.c
 /// efivar_get_utf8name() names a variable's file: always exactly one path component.
@@ -76,6 +80,69 @@ fn open_error(path: &Path, name: &EfivarFileName, error: io::Error) -> anyhow::E
         io::ErrorKind::NotFound => EfivarNotFound { name: name.clone() }.into(),
         _ => anyhow::Error::new(error)
             .context(format!("failed to open efivar file '{}'", path.display())),
+    }
+}
+
+pub(super) fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; EFIVARFS_HEADER_SIZE + payload_size];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Reads the efivar file `name` in `dir`: its attributes field and `size` payload bytes.
+fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Result<Vec<u8>> {
+    let mut file = open_efivar(dir, name)?;
+    debug!("buffer size: {}", size);
+    // efivarfs prepends a 4-byte attributes field to the variable payload.
+    read_efivarfs_bytes(&mut file, size.into()).with_context(|| {
+        format!(
+            "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
+            dir.join(name).display()
+        )
+    })
+}
+
+/// The arguments of read_efivar after its directory, which an EfivarReader fixes.
+#[derive(PartialEq, Eq, Hash)]
+pub(super) struct EfivarRange {
+    pub(super) name: EfivarFileName,
+    pub(super) size: u16,
+}
+
+/// Reads the efivar ranges of one command, each once, keeping the outcomes:
+/// Linux v7.2 efivarfs sleeps once a non-root user has read 100 times within a second
+/// (fs/efivarfs/file.c, kernel/user.c).
+pub(crate) struct EfivarReader {
+    efivars: PathBuf,
+    pub(super) outcomes: HashMap<EfivarRange, Result<Vec<u8>>>,
+}
+
+impl Default for EfivarReader {
+    /// Reads this machine's efivarfs.
+    fn default() -> Self {
+        Self::new(PathBuf::from(EFIVARS_MOUNT_POINT))
+    }
+}
+
+impl EfivarReader {
+    /// Reads the efivar files in `efivars`.
+    pub(super) fn new(efivars: PathBuf) -> Self {
+        Self {
+            efivars,
+            outcomes: HashMap::new(),
+        }
+    }
+
+    /// read_efivar of `range` in these efivars, read once.
+    pub(super) fn read(
+        &mut self,
+        range: EfivarRange,
+    ) -> std::result::Result<&[u8], &anyhow::Error> {
+        let efivars = &self.efivars;
+        self.outcomes
+            .entry(range)
+            .or_insert_with_key(|range| read_efivar(efivars, &range.name, range.size))
+            .as_deref()
     }
 }
 

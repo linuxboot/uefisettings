@@ -23,7 +23,6 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -42,7 +41,10 @@ use crate::file_lock::FileLock;
 use crate::hii::efivarfs::open_efivar;
 use crate::hii::efivarfs::EfivarFileName;
 use crate::hii::efivarfs::EfivarNotFound;
+use crate::hii::efivarfs::EfivarRange;
+use crate::hii::efivarfs::EfivarReader;
 use crate::hii::efivarfs::EfivarsMountGuard;
+use crate::hii::efivarfs::EFIVARFS_HEADER_SIZE;
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::package::Guid;
 use conditions::option_state;
@@ -72,7 +74,6 @@ mod defaults;
 pub(crate) mod ifr_fixtures;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
-const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
 const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
 // UEFI 2.10 §33.3.8.3.47
 const EFI_IFR_NUMERIC_SIZE: u8 = 0x03;
@@ -109,25 +110,6 @@ const EDKII_BIT_FIELD_VALUE_BITS: u32 = 32;
 /// Example: Length includes the header, so an operation carries
 /// `length - IFR_OPERATION_HEADER_SIZE` bytes of data.
 const IFR_OPERATION_HEADER_SIZE: u8 = 2;
-
-fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<Vec<u8>> {
-    let mut bytes = vec![0u8; EFIVARFS_HEADER_SIZE + payload_size];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes)
-}
-
-/// Reads the efivar file `name` in `dir`: its attributes field and `size` payload bytes.
-fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Result<Vec<u8>> {
-    let mut file = open_efivar(dir, name)?;
-    debug!("buffer size: {}", size);
-    // efivarfs prepends a 4-byte attributes field to the variable payload.
-    read_efivarfs_bytes(&mut file, size.into()).with_context(|| {
-        format!(
-            "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
-            dir.join(name).display()
-        )
-    })
-}
 
 fn update_efivarfs_bytes(
     bytes: &mut [u8],
@@ -1167,13 +1149,6 @@ mod non_efi_varstore_tests {
     }
 }
 
-/// The arguments of read_efivar after its directory, which an EfivarReader fixes.
-#[derive(PartialEq, Eq, Hash)]
-struct EfivarRange {
-    name: EfivarFileName,
-    size: u16,
-}
-
 impl EfivarRange {
     /// The efivar bytes that hold the value of `store`.
     fn of(store: &dyn VariableStore) -> Self {
@@ -1184,39 +1159,7 @@ impl EfivarRange {
     }
 }
 
-/// Reads the efivar ranges of one command, each once, keeping the outcomes:
-/// Linux v7.2 efivarfs sleeps once a non-root user has read 100 times within a second
-/// (fs/efivarfs/file.c, kernel/user.c).
-pub(crate) struct EfivarReader {
-    efivars: PathBuf,
-    outcomes: HashMap<EfivarRange, Result<Vec<u8>>>,
-}
-
-impl Default for EfivarReader {
-    /// Reads this machine's efivarfs.
-    fn default() -> Self {
-        Self::new(PathBuf::from(EFIVARS_MOUNT_POINT))
-    }
-}
-
 impl EfivarReader {
-    /// Reads the efivar files in `efivars`.
-    fn new(efivars: PathBuf) -> Self {
-        Self {
-            efivars,
-            outcomes: HashMap::new(),
-        }
-    }
-
-    /// read_efivar of `range` in these efivars, read once.
-    fn read(&mut self, range: EfivarRange) -> std::result::Result<&[u8], &anyhow::Error> {
-        let efivars = &self.efivars;
-        self.outcomes
-            .entry(range)
-            .or_insert_with_key(|range| read_efivar(efivars, &range.name, range.size))
-            .as_deref()
-    }
-
     /// Why the efivar of `store` is missing, if a read of it found it so.
     fn missing(&self, store: &dyn VariableStore) -> Option<&EfivarNotFound> {
         self.outcomes
@@ -3937,6 +3880,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hii::efivarfs::read_efivarfs_bytes;
 
     fn variable_bytes(payload_size: usize) -> Vec<u8> {
         let mut bytes = 7u32.to_le_bytes().to_vec();
