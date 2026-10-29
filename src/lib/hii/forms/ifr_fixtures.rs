@@ -370,7 +370,7 @@ pub(super) fn question_descriptor(
     let mut reader = efivars.reader();
     let walk = &mut FormPackageWalk::new(&strings, &mut reader);
     match &current.parsed_data {
-        ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, node, "", &current, walk),
+        ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", &current, walk),
         ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", &current, walk),
         ParsedOperation::CheckBox(parsed) => handle_checkbox(store, parsed, "", &current, walk),
         other => panic!("not a question: {other:?}"),

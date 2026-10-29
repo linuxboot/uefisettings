@@ -1958,8 +1958,7 @@ fn list_questions_in(
                 parsed.question_header().var_store_id,
             );
 
-            let question_descriptor =
-                handle_oneof(varstore, parsed, &node, question, &current_node, walk);
+            let question_descriptor = handle_oneof(varstore, parsed, question, &current_node, walk);
             res.push(question_descriptor);
         }
         ParsedOperation::CheckBox(parsed) => {
@@ -2054,7 +2053,7 @@ where
                         parsed.question_header().var_store_id,
                     );
 
-                    let res = handle_oneof(varstore, parsed, &node, question, &current_node, walk);
+                    let res = handle_oneof(varstore, parsed, question, &current_node, walk);
 
                     return Some(res);
                 }
@@ -2139,7 +2138,6 @@ fn handle_checkbox(
 fn handle_oneof(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &OneOf,
-    node: &Rc<RefCell<IFROperation>>,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
     walk: &mut FormPackageWalk<'_>,
@@ -2188,7 +2186,7 @@ fn handle_oneof(
     let mut found_option = false;
     // TODO: collect OneOfOptions nested in SuppressIf/GrayOutIf/DisableIf, as question_scope
     // does; get, list-questions and set miss them.
-    for child in &node.borrow().children {
+    for child in &current_node.children {
         if let ParsedOperation::OneOfOption(o) = &child.borrow().parsed_data {
             let opt = AnswerOption {
                 raw_value: o.value,
