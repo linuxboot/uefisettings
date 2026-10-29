@@ -31,8 +31,11 @@ use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
 
 /// Why the HII backend cannot read the questions on DriverSample's variable
 /// (`src/lib/hii/forms.rs`).
-const NO_CONFIG_ACCESS: &str =
-    "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
+/// Its name is spelled out, not derived from [`DRIVER_SAMPLE_VARIABLE`], to pin the
+/// expected output.
+const NO_CONFIG_ACCESS: &str = "<ValueUnavailable: no EFI variable \
+    MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d; \
+    HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
 
 /// The answer of [`CHECK_BOX`], whose listings are both flagged `CHECKBOX_DEFAULT` in
 /// DriverSample's Vfr.vfr.

@@ -847,6 +847,7 @@ enum VariableStoreKind {
 mod non_efi_varstore_tests {
     use super::ifr_fixtures::*;
     use super::*;
+    use crate::hii::efivarfs::tests::EFI_GLOBAL_VARIABLE;
 
     struct TestVariableStore {
         kind: VariableStoreKind,
@@ -962,13 +963,22 @@ mod non_efi_varstore_tests {
     }
 
     #[test]
-    fn efi_varstore_without_efivar_file_is_a_read_error() {
+    fn efi_varstore_without_efivar_file_is_unavailable() {
+        let store = VarStoreEfi {
+            var_store_id: 1,
+            guid: EFI_GLOBAL_VARIABLE,
+            attributes: 0x7,
+            size: 1,
+            name: "Missing".into(),
+        };
+
         assert_eq!(
-            read(efi_variable("Missing", 1), &Efivars::new()),
+            read(store, &Efivars::new()),
             Err(
-                "<VStoreError: no EFI variable Missing-00000000-0000-0000-0000-000000000000>"
+                "<ValueUnavailable: no EFI variable Missing-8be4df61-93ca-11d2-aa0d-00e098032b8c>"
                     .to_string()
-            )
+            ),
+            "runtime EFI variable without an efivar file"
         );
     }
 
@@ -998,13 +1008,14 @@ mod non_efi_varstore_tests {
     }
 
     #[test]
-    fn buffer_varstore_without_efivarfs_backing_is_unavailable() {
+    fn buffer_varstore_without_efivarfs_backing_names_the_missing_variable() {
         assert_eq!(
             read(buffer("Buffer", 1), &Efivars::new()),
-            Err(
-                "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
-                    .to_string()
-            )
+            Err("<ValueUnavailable: no EFI variable \
+                 Buffer-00000000-0000-0000-0000-000000000000; \
+                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
+                .to_string()),
+            "buffer VarStore without an efivar file"
         );
     }
 
@@ -1158,19 +1169,20 @@ fn read_current_value_bytes<'a>(
 
     reader
         .read(EfivarRange::of(store.as_ref()))
-        .map_err(|error| read_failure_reason(store.kind(), error))
+        .map_err(|error| Cow::Owned(read_failure_reason(store.kind(), error)))
 }
 
 /// Why a question on a VarStore of `kind` has no value, its efivar file having failed with
 /// `error`.
-fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> Cow<'static, str> {
-    match (kind, error.downcast_ref::<EfivarNotFound>()) {
-        (VariableStoreKind::Buffer, Some(_)) => Cow::Borrowed(
-            "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> String {
+    let Some(missing) = error.downcast_ref::<EfivarNotFound>() else {
+        return format!("<VStoreError: {error}>");
+    };
+    match kind {
+        VariableStoreKind::Buffer => format!(
+            "<ValueUnavailable: {missing}; HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
         ),
-        (VariableStoreKind::Buffer, None) | (VariableStoreKind::EfiVariable, _) => {
-            Cow::Owned(format!("<VStoreError: {}>", error))
-        }
+        VariableStoreKind::EfiVariable => format!("<ValueUnavailable: {missing}>"),
     }
 }
 
@@ -1197,8 +1209,9 @@ mod efivar_reader_tests {
     use super::ifr_fixtures::*;
     use super::*;
 
-    const BUFFER_UNAVAILABLE: &str =
-        "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
+    const MISSING_BUFFER: &str = "<ValueUnavailable: no EFI variable \
+        Missing-00000000-0000-0000-0000-000000000000; \
+        HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
     const BOOT_SERVICE_ONLY: &str = "<ValueUnavailable: EFI variable \
          Setup-00000000-0000-0000-0000-000000000000 is boot-service-only \
          (no EFI_VARIABLE_RUNTIME_ACCESS)>";
@@ -1320,13 +1333,13 @@ mod efivar_reader_tests {
 
         assert_eq!(
             question_bytes(&question, missing(), &mut reader),
-            Err(BUFFER_UNAVAILABLE.to_string()),
+            Err(MISSING_BUFFER.to_string()),
             "first call"
         );
         efivars.write(&missing(), &[0]);
         assert_eq!(
             question_bytes(&question, missing(), &mut reader),
-            Err(BUFFER_UNAVAILABLE.to_string()),
+            Err(MISSING_BUFFER.to_string()),
             "call after the file appeared"
         );
         assert_eq!(
@@ -1339,7 +1352,7 @@ mod efivar_reader_tests {
     #[test]
     fn missing_file_reason_follows_each_store_kind() {
         const MISSING_EFI_VARIABLE: &str =
-            "<VStoreError: no EFI variable Missing-00000000-0000-0000-0000-000000000000>";
+            "<ValueUnavailable: no EFI variable Missing-00000000-0000-0000-0000-000000000000>";
         let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
         let question = node.borrow();
         let efivars = Efivars::new();
@@ -1350,7 +1363,7 @@ mod efivar_reader_tests {
                 efi_variable("Missing", 1),
                 MISSING_EFI_VARIABLE,
             ),
-            ("buffer after it", buffer("Missing", 1), BUFFER_UNAVAILABLE),
+            ("buffer after it", buffer("Missing", 1), MISSING_BUFFER),
             (
                 "EFI variable after the buffer",
                 efi_variable("Missing", 1),

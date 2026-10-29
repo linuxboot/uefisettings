@@ -200,7 +200,7 @@ pub mod tests {
 
     use super::*;
 
-    const EFI_GLOBAL_VARIABLE: Guid = Guid {
+    pub(crate) const EFI_GLOBAL_VARIABLE: Guid = Guid {
         data1: 0x8BE4_DF61,
         data2: 0x93CA,
         data3: 0x11D2,
