@@ -129,8 +129,6 @@ enum PackageType {
     Guid,
     #[br(magic = 0x02u8)]
     Form,
-    #[br(magic = 0x03u8)]
-    KeyboardLayout,
     #[br(magic = 0x04u8)]
     Strings,
     #[br(magic = 0x05u8)]
@@ -141,6 +139,8 @@ enum PackageType {
     SimpleFonts,
     #[br(magic = 0x08u8)]
     DevicePath,
+    #[br(magic = 0x09u8)]
+    KeyboardLayout,
     #[br(magic = 0xDFu8)]
     End,
     Unknown(u8),
@@ -635,6 +635,25 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].package_type, PackageType::Unknown(0xE0));
         assert_eq!(packages[0].data, [0xAA, 0xBB]);
+    }
+
+    /// A package of Type 0x09 is a keyboard layout package, while 0x03, which
+    /// UEFI Spec v2.10 §33.3.1.1 leaves undefined, is an unknown one.
+    #[test]
+    fn test_package_types_follow_the_spec() {
+        for (package_type, want) in [
+            (0x09, PackageType::KeyboardLayout),
+            (0x03, PackageType::Unknown(0x03)),
+        ] {
+            let case = format!("Type {:#04x}", package_type);
+            let lists = get_package_lists(&package_list(&[0x04, 0x00, 0x00, package_type]))
+                .unwrap_or_else(|e| panic!("split list of {}: {:#}", case, e));
+
+            let got = get_packages(&lists[0]).unwrap_or_else(|e| panic!("{}: {:#}", case, e));
+
+            assert_eq!(got.len(), 1, "{}", case);
+            assert_eq!(got[0].package_type, want, "{}", case);
+        }
     }
 
     /// A package list whose packages fill its PackageLength without an End
