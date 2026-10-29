@@ -16,7 +16,6 @@ use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
-use anyhow::Context;
 use anyhow::Result;
 use log::debug;
 use serde_json::Value;
@@ -78,16 +77,18 @@ impl HiiBackend {
         let parsed_db = package::read_db(db_bytes)?;
         let mut reader = forms::EfivarReader::default();
 
-        for (guid, package_list) in parsed_db.forms {
-            write!(readable_representation, "Packagelist {}", &guid)?;
-            for form_package in package_list {
+        for list in parsed_db {
+            list.check_form_strings()?;
+            // no header for a list without forms
+            if list.forms.is_empty() {
+                continue;
+            }
+            write!(readable_representation, "Packagelist {}", list.guid)?;
+            for form_package in list.forms {
                 readable_representation.push_str(&forms::display(
                     form_package,
                     0,
-                    parsed_db
-                        .strings
-                        .get(&guid)
-                        .context(format!("Failed to get string packages using GUID {}", guid))?,
+                    &list.strings,
                     &mut reader,
                 )?);
             }
@@ -105,10 +106,10 @@ impl HiiBackend {
         let mut resp = Vec::new();
         let parsed_db = package::read_db(db_bytes)?;
 
-        for (guid, package_list) in parsed_db.strings {
-            for string_package in package_list {
+        for list in parsed_db {
+            for string_package in list.strings {
                 let mut p = HiiStringsPackage {
-                    package_list: guid.to_owned(),
+                    package_list: list.guid.to_string(),
                     ..Default::default()
                 };
                 for (string_id, string) in string_package {
@@ -125,17 +126,13 @@ impl HiiBackend {
         let mut res = Vec::new();
         let parsed_db = package::read_db(db_bytes)?;
         let mut reader = forms::EfivarReader::default();
-        for (guid, package_list) in parsed_db.forms {
-            let string_packages = parsed_db
-                .strings
-                .get(&guid)
-                .context(format!("Failed to get string packages using GUID {}", guid))?;
+        for list in parsed_db {
+            list.check_form_strings()?;
 
-            for form_package in package_list {
+            for form_package in list.forms {
                 //  TODO: show form name, package list guid in the final response as well
 
-                for question_descriptor in
-                    list_questions(form_package, string_packages, &mut reader)
+                for question_descriptor in list_questions(form_package, &list.strings, &mut reader)
                 {
                     let mut question = Question {
                         name: question_descriptor.question,
@@ -169,6 +166,10 @@ impl SettingsBackend for HiiBackend {
 
         let db_bytes = extract::extract_db()?;
         let parsed_db = package::read_db(&db_bytes)?;
+        // all lists before the first write, so that no error follows a write
+        parsed_db
+            .iter()
+            .try_for_each(package::ParsedPackageList::check_form_strings)?;
 
         let hii_translation = get_qa_variations_hii(question, new_value);
         let (question_variations, new_value_variations, is_translated) = match hii_translation {
@@ -182,17 +183,12 @@ impl SettingsBackend for HiiBackend {
             } => (question_variations, answer_variations, false),
         };
 
-        for (guid, package_list) in parsed_db.forms {
-            let string_packages = parsed_db
-                .strings
-                .get(&guid)
-                .context(format!("Failed to get string packages using GUID {}", guid))?;
-
-            for form_package in package_list {
+        for list in parsed_db {
+            for form_package in list.forms {
                 // try to find the question
                 if let Some(question_descriptor) = forms::find_question(
                     form_package,
-                    string_packages,
+                    &list.strings,
                     &question_variations,
                     // fresh per lookup: change_value may have written a variable an
                     // earlier lookup read
@@ -231,7 +227,8 @@ impl SettingsBackend for HiiBackend {
 
                     if modified {
                         let mut set_resp = SetResponse {
-                            selector: guid.to_owned(),
+                            // TODO: GUIDs repeat, also in errors; identify lists by HiiDB index
+                            selector: list.guid.to_string(),
                             backend: Backend::Hii,
                             is_translated,
                             question: Question {
@@ -282,19 +279,18 @@ impl SettingsBackend for HiiBackend {
         let parsed_db = package::read_db(&db_bytes)?;
         let mut reader = forms::EfivarReader::default();
 
-        for (guid, package_list) in parsed_db.forms {
-            for form_package in package_list {
+        for list in parsed_db {
+            list.check_form_strings()?;
+
+            for form_package in list.forms {
                 if let Some(question_descriptor) = forms::find_question(
                     form_package,
-                    parsed_db
-                        .strings
-                        .get(&guid)
-                        .context(format!("Failed to get string packages using GUID {}", guid))?,
+                    &list.strings,
                     &question_variations,
                     &mut reader,
                 ) {
                     let mut get_resp = GetResponse {
-                        selector: guid.to_owned(),
+                        selector: list.guid.to_string(),
                         backend: Backend::Hii,
                         is_translated,
                         // mapping the hii module's QuestionDescriptor to thrift codegen's Question
@@ -648,4 +644,110 @@ fn compare_redfish_attributes(
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hii::package::hiidb_fixtures::en_strings_list;
+    use crate::hii::package::hiidb_fixtures::en_strings_package;
+    use crate::hii::package::hiidb_fixtures::form_set_package;
+    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::END_ONLY_FORM_PACKAGE;
+    use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+
+    use super::*;
+
+    /// A package list with GUID `guid` holding a FormSet titled by the
+    /// one-character string `title` of its own strings package.
+    fn form_set_list(guid: [u8; 16], title: u8) -> Vec<u8> {
+        let packages = [
+            form_set_package(),
+            en_strings_package(title),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(guid, &packages.concat())
+    }
+
+    /// show_ifr titles the FormSet of each package list with the strings of
+    /// that list, in HiiDB order, duplicate GUIDs included.
+    #[test]
+    fn test_show_ifr_titles_form_sets_with_their_own_strings_in_hiidb_order() {
+        let hiidb = [
+            form_set_list([0x33; 16], b'A'),
+            form_set_list([0x11; 16], b'C'),
+            form_set_list([0x33; 16], b'B'),
+        ]
+        .concat();
+
+        let ifr = HiiBackend::show_ifr(&hiidb)
+            .expect("show the IFR")
+            .readable_representation;
+
+        let got: Vec<(&str, &str)> = ifr
+            .split("Packagelist ")
+            .skip(1)
+            .map(|list| {
+                let title = list
+                    .split("FormSet - ")
+                    .nth(1)
+                    .and_then(|form_set| form_set.split(" - GUID").next());
+                (list.get(..36).unwrap_or(list), title.unwrap_or(""))
+            })
+            .collect();
+        let want = [
+            ("33333333-3333-3333-3333-333333333333", "A"),
+            ("11111111-1111-1111-1111-111111111111", "C"),
+            ("33333333-3333-3333-3333-333333333333", "B"),
+        ];
+        assert_eq!(got, want, "package lists and FormSet titles in {ifr:?}");
+    }
+
+    /// list_strings returns the strings packages in HiiDB order, duplicate
+    /// GUIDs included.
+    #[test]
+    fn test_list_strings_keeps_hiidb_order() {
+        let hiidb = [
+            en_strings_list([0x33; 16], b'A'),
+            en_strings_list([0x11; 16], b'C'),
+            en_strings_list([0x33; 16], b'B'),
+        ]
+        .concat();
+
+        let got: Vec<(String, BTreeMap<i32, String>)> = HiiBackend::list_strings(&hiidb)
+            .expect("list the strings")
+            .into_iter()
+            .map(|package| (package.package_list, package.string_package))
+            .collect();
+
+        let want = [
+            ("33333333-3333-3333-3333-333333333333", "A"),
+            ("11111111-1111-1111-1111-111111111111", "C"),
+            ("33333333-3333-3333-3333-333333333333", "B"),
+        ]
+        .map(|(guid, string)| (guid.to_string(), BTreeMap::from([(1, string.to_string())])));
+        assert_eq!(got, want, "strings packages in HiiDB order");
+    }
+
+    /// show_ifr and list_questions fail for a package list with forms but no
+    /// strings packages, rather than use those of a list of the same GUID.
+    #[test]
+    fn test_forms_without_strings_are_an_error() {
+        let forms_only = [&END_ONLY_FORM_PACKAGE[..], &END_PACKAGE].concat();
+        let hiidb = [
+            package_list_with_guid([0x44; 16], &forms_only),
+            en_strings_list([0x44; 16], b'S'),
+        ]
+        .concat();
+        let want = "Failed to get string packages using GUID 44444444-4444-4444-4444-444444444444";
+
+        let Err(err) = HiiBackend::show_ifr(&hiidb) else {
+            panic!("show_ifr used the strings of another list");
+        };
+        assert_eq!(format!("{err:#}"), want, "show_ifr");
+
+        let Err(err) = HiiBackend::list_questions(&hiidb) else {
+            panic!("list_questions used the strings of another list");
+        };
+        assert_eq!(format!("{err:#}"), want, "list_questions");
+    }
 }

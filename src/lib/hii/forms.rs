@@ -52,7 +52,7 @@ use defaults::FormSetDefaultIds;
 
 mod defaults;
 #[cfg(test)]
-mod ifr_fixtures;
+pub(crate) mod ifr_fixtures;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();

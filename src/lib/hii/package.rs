@@ -323,33 +323,38 @@ impl fmt::Debug for Guid {
 type StringMap = HashMap<i32, String>;
 type IFRNodeLink = Rc<RefCell<IFROperation>>;
 
-/// ParsedHiiDB is the 'result' superstruct which will
-/// hold the results of our parsed strings and forms packages.
-pub struct ParsedHiiDB {
-    /// `HashMap<packagelist_guid_string, Vec<StringMap>>`
-    /// for each packagelist the key = packagelist guid string and val = vector of string package hashmaps
-    /// each string package hashmap here has its key = string id and val = the string
-    pub strings: HashMap<String, Vec<StringMap>>,
-    pub forms: HashMap<String, Vec<IFRNodeLink>>,
+/// String map (string id -> string) per strings package and IFR root per form
+/// package of one package list.
+pub struct ParsedPackageList {
+    pub guid: Guid,
+    pub strings: Vec<StringMap>,
+    pub forms: Vec<IFRNodeLink>,
+}
+
+impl ParsedPackageList {
+    /// Fails if the list has forms but no strings packages.
+    pub fn check_form_strings(&self) -> Result<()> {
+        ensure!(
+            self.forms.is_empty() || !self.strings.is_empty(),
+            "Failed to get string packages using GUID {}",
+            self.guid
+        );
+        Ok(())
+    }
 }
 
 /// read_db input (source) is a vector of u8 bytes
-/// In hiidb, we have package lists (with unique guids) which have multiple packages of different types including string, form and end type packages.
+/// In hiidb, we have package lists which have multiple packages of different types including string, form and end type packages.
 /// For every package list, we will parse different packages. If package type is
 /// * string -> parse and save data
 /// * form -> parse and save data
 /// * something else (like fonts or animations) -> we don't care about them, so continue to the next package in the package list.
 ///
-/// In the end return a ParsedHiiDB struct which will have the parsed and saved data.
-pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
-    let mut res = ParsedHiiDB {
-        strings: HashMap::new(),
-        forms: HashMap::new(),
-    };
+/// In the end return the parsed package lists in HiiDB order; GUIDs may repeat.
+pub fn read_db(source: &[u8]) -> Result<Vec<ParsedPackageList>> {
+    let mut res = Vec::new();
 
     for package_list in get_package_lists(source)? {
-        let package_list_guid = package_list.guid.to_string();
-
         // once filled this will have string maps from each string package in the package list.
         let mut package_list_string_maps: Vec<StringMap> = Vec::new();
         let mut roots: Vec<IFRNodeLink> = Vec::new();
@@ -378,16 +383,17 @@ pub fn read_db(source: &[u8]) -> Result<ParsedHiiDB> {
             }
         }
 
-        if !package_list_string_maps.is_empty() {
-            res.strings
-                .insert(package_list_guid.clone(), package_list_string_maps);
-        }
-        if !roots.is_empty() {
-            res.forms.insert(package_list_guid, roots);
-        }
+        res.push(ParsedPackageList {
+            guid: package_list.guid,
+            strings: package_list_string_maps,
+            forms: roots,
+        });
     }
     Ok(res)
 }
+
+#[cfg(test)]
+pub(crate) mod hiidb_fixtures;
 
 #[cfg(test)]
 mod tests {
@@ -395,15 +401,8 @@ mod tests {
     use std::fs::File;
     use std::io::Read;
 
+    use super::hiidb_fixtures::*;
     use super::*;
-
-    /// END_PACKAGE is an EFI_HII_PACKAGE_HEADER with Length 4 and Type
-    /// End (0xDF), the package that terminates a package list.
-    ///
-    /// Example: get_packages stops at END_PACKAGE without returning it, so
-    /// it yields no packages for the PackageList that get_package_lists
-    /// parses from `package_list(&END_PACKAGE)`.
-    const END_PACKAGE: [u8; 4] = [0x04, 0x00, 0x00, 0xDF];
 
     /// OPAQUE_PACKAGE is a package with Length 6, that is, 2 bytes of data:
     /// 0xAA 0xBB. Its Type 0xE0 is in the range that UEFI Spec v2.10 §33.3.1.1
@@ -414,15 +413,6 @@ mod tests {
     /// `Unknown(0xE0)` with data `[0xAA, 0xBB]`.
     const OPAQUE_PACKAGE: [u8; 6] = [0x06, 0x00, 0x00, 0xE0, 0xAA, 0xBB];
 
-    /// encode_package_list encodes a package list header with the given
-    /// GUID and PackageLength, followed by `packages`, whatever their size.
-    ///
-    /// Example: `encode_package_list([0x11; 16], 24, &END_PACKAGE)` is
-    /// `package_list(&END_PACKAGE)`.
-    fn encode_package_list(guid: [u8; 16], length: u32, packages: &[u8]) -> Vec<u8> {
-        [&guid[..], &length.to_le_bytes(), packages].concat()
-    }
-
     /// package_list encodes a package list with GUID 11..11 whose
     /// PackageLength covers its header and `packages`.
     ///
@@ -430,17 +420,6 @@ mod tests {
     /// PackageLength 24.
     fn package_list(packages: &[u8]) -> Vec<u8> {
         package_list_with_guid([0x11; 16], packages)
-    }
-
-    /// package_list_with_guid encodes a package list with the given GUID
-    /// whose PackageLength covers its header and `packages`.
-    ///
-    /// Example: `package_list_with_guid([0x22; 16], &END_PACKAGE)` is a
-    /// package list with GUID 22222222-2222-2222-2222-222222222222 that
-    /// holds only the End package.
-    fn package_list_with_guid(guid: [u8; 16], packages: &[u8]) -> Vec<u8> {
-        let length = PACKAGE_LIST_HEADER_SIZE + u32::try_from(packages.len()).unwrap();
-        encode_package_list(guid, length, packages)
     }
 
     /// package_list_header encodes a bare package list header with the
@@ -468,49 +447,20 @@ mod tests {
         encode_package_list([0x00; 16], length, &packages)
     }
 
-    /// strings_package_header encodes a bare EFI_HII_PACKAGE_HEADER of Type
-    /// strings (0x04) with the given 24-bit Length.
-    ///
-    /// Example: `package_list(&strings_package_header(0))` holds a package
-    /// that is shorter than its own header.
-    fn strings_package_header(length: u32) -> Vec<u8> {
-        [&length.to_le_bytes()[..3], &[0x04]].concat()
+    /// Pairs each list's GUID with its string maps, in order.
+    fn strings_of_lists(lists: Vec<ParsedPackageList>) -> Vec<(String, Vec<StringMap>)> {
+        lists
+            .into_iter()
+            .map(|list| (list.guid.to_string(), list.strings))
+            .collect()
     }
 
-    /// en_strings_package encodes a strings package for language "en" that
-    /// holds string ID 1, the one-character string of the ASCII `letter`.
-    ///
-    /// Example: read_db's `strings` maps "11111111-1111-1111-1111-111111111111"
-    /// to `[{1: "A"}]` for
-    /// `package_list(&[en_strings_package(b'A'), END_PACKAGE.to_vec()].concat())`.
-    fn en_strings_package(letter: u8) -> Vec<u8> {
-        let language = [
-            &[0x00; 32][..],     // LanguageWindow
-            &1u16.to_le_bytes(), // LanguageName
-            b"en\0",             // Language
-        ]
-        .concat();
-
-        let strings = [
-            &[0x14, letter, 0x00, 0x00, 0x00][..], // EFI_HII_SIBT_STRING_UCS2 `letter`
-            &[0x00],                               // EFI_HII_SIBT_END
-        ]
-        .concat();
-
-        // HdrSize covers the package header, HdrSize and StringInfoOffset
-        // (a u32 each) and `language`; the strings follow the header.
-        let hdr_size = PACKAGE_HEADER_SIZE
-            + u32::try_from(2 * std::mem::size_of::<u32>() + language.len()).unwrap();
-        let length = hdr_size + u32::try_from(strings.len()).unwrap();
-
-        [
-            &strings_package_header(length)[..],
-            &hdr_size.to_le_bytes(), // HdrSize
-            &hdr_size.to_le_bytes(), // StringInfoOffset
-            &language,
-            &strings,
-        ]
-        .concat()
+    /// Returns the first list with GUID `guid`.
+    fn list_with_guid<'a>(lists: &'a [ParsedPackageList], guid: &str) -> &'a ParsedPackageList {
+        lists
+            .iter()
+            .find(|list| list.guid.to_string() == guid)
+            .unwrap_or_else(|| panic!("find package list {guid}"))
     }
 
     /// A PackageLength below the header size is rejected as an invalid
@@ -745,28 +695,31 @@ mod tests {
     /// with one.
     #[test]
     fn test_read_db_reads_lists_without_end_package() {
-        let b_packages = [en_strings_package(b'B'), END_PACKAGE.to_vec()].concat();
         let hiidb = [
             package_list_with_guid([0x11; 16], &en_strings_package(b'A')),
             package_list_with_guid([0x22; 16], &OPAQUE_PACKAGE),
-            package_list_with_guid([0x33; 16], &b_packages),
+            en_strings_list([0x33; 16], b'B'),
         ]
         .concat();
 
-        let db = read_db(&hiidb).expect("read the HiiDB");
+        let lists = read_db(&hiidb).expect("read the HiiDB");
 
-        let want = HashMap::from([
+        assert!(
+            lists.iter().all(|list| list.forms.is_empty()),
+            "forms of the lists"
+        );
+        let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
                 vec![HashMap::from([(1, "A".to_string())])],
             ),
+            ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
                 vec![HashMap::from([(1, "B".to_string())])],
             ),
-        ]);
-        assert_eq!(db.strings, want, "strings of the lists");
-        assert!(db.forms.is_empty(), "forms of the lists");
+        ];
+        assert_eq!(strings_of_lists(lists), want, "strings of the lists");
     }
 
     /// Zero padding after the last package list, as edk2 leaves it (see
@@ -930,36 +883,142 @@ mod tests {
     }
 
     /// read_db returns the strings of every package list of a zero-padded
-    /// HiiDB, each under the GUID of its list, and no entry for a list
-    /// without strings.
+    /// HiiDB, each with the GUID of its list.
     #[test]
-    fn test_read_db_keys_strings_by_list_guid_in_padded_hiidb() {
-        let a_packages = [en_strings_package(b'A'), END_PACKAGE.to_vec()].concat();
-        let b_packages = [en_strings_package(b'B'), END_PACKAGE.to_vec()].concat();
+    fn test_read_db_reads_strings_of_every_list_in_padded_hiidb() {
         // the list without strings sits between the lists with strings, so a
         // read_db that stops before the last list loses the string "B"
         let hiidb = [
-            package_list_with_guid([0x11; 16], &a_packages),
+            en_strings_list([0x11; 16], b'A'),
             package_list_with_guid([0x22; 16], &END_PACKAGE),
-            package_list_with_guid([0x33; 16], &b_packages),
+            en_strings_list([0x33; 16], b'B'),
             vec![0x00; 16],
         ]
         .concat();
 
-        let db = read_db(&hiidb).unwrap();
+        let lists = read_db(&hiidb).expect("read the HiiDB");
 
-        let want = HashMap::from([
+        assert!(
+            lists.iter().all(|list| list.forms.is_empty()),
+            "forms of the lists"
+        );
+        let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
                 vec![HashMap::from([(1, "A".to_string())])],
+            ),
+            ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
+            (
+                "33333333-3333-3333-3333-333333333333".to_string(),
+                vec![HashMap::from([(1, "B".to_string())])],
+            ),
+        ];
+        assert_eq!(strings_of_lists(lists), want, "strings of the lists");
+    }
+
+    /// read_db keeps package lists in HiiDB order, duplicate GUIDs included.
+    #[test]
+    fn test_read_db_keeps_hiidb_order_and_duplicate_guids() {
+        let hiidb = [
+            en_strings_list([0x33; 16], b'A'),
+            en_strings_list([0x11; 16], b'C'),
+            en_strings_list([0x33; 16], b'B'),
+        ]
+        .concat();
+
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+
+        let want = vec![
+            (
+                "33333333-3333-3333-3333-333333333333".to_string(),
+                vec![HashMap::from([(1, "A".to_string())])],
+            ),
+            (
+                "11111111-1111-1111-1111-111111111111".to_string(),
+                vec![HashMap::from([(1, "C".to_string())])],
             ),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
                 vec![HashMap::from([(1, "B".to_string())])],
             ),
-        ]);
-        assert_eq!(db.strings, want);
-        assert!(db.forms.is_empty());
+        ];
+        assert_eq!(
+            strings_of_lists(lists),
+            want,
+            "lists in HiiDB order, duplicates kept"
+        );
+    }
+
+    /// read_db keeps the forms of a package list with its own strings, not
+    /// with those of a later list of the same GUID.
+    #[test]
+    fn test_read_db_keeps_forms_with_strings_of_their_list() {
+        let hiidb = [
+            package_list_with_guid(
+                [0x33; 16],
+                &[
+                    &END_ONLY_FORM_PACKAGE[..],
+                    &en_strings_package(b'A'),
+                    &END_PACKAGE,
+                ]
+                .concat(),
+            ),
+            en_strings_list([0x33; 16], b'B'),
+        ]
+        .concat();
+
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+
+        let got: Vec<(usize, Vec<StringMap>)> = lists
+            .into_iter()
+            .map(|list| (list.forms.len(), list.strings))
+            .collect();
+        let want = vec![
+            (1, vec![HashMap::from([(1, "A".to_string())])]),
+            (0, vec![HashMap::from([(1, "B".to_string())])]),
+        ];
+        assert_eq!(got, want, "forms stay with the strings of their list");
+    }
+
+    /// check_form_strings fails only for a list with forms but no strings
+    /// packages.
+    #[test]
+    fn test_check_form_strings_fails_for_forms_without_strings() {
+        let forms_only = [&END_ONLY_FORM_PACKAGE[..], &END_PACKAGE].concat();
+        let both = [
+            &END_ONLY_FORM_PACKAGE[..],
+            &en_strings_package(b'A'),
+            &END_PACKAGE,
+        ]
+        .concat();
+        let hiidb = [
+            package_list_with_guid([0x11; 16], &forms_only),
+            package_list_with_guid([0x22; 16], &END_PACKAGE),
+            en_strings_list([0x33; 16], b'A'),
+            package_list_with_guid([0x44; 16], &both),
+        ]
+        .concat();
+
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+
+        let got: Vec<Option<String>> = lists
+            .iter()
+            .map(|list| {
+                list.check_form_strings()
+                    .err()
+                    .map(|err| format!("{err:#}"))
+            })
+            .collect();
+        let want = vec![
+            Some(
+                "Failed to get string packages using GUID 11111111-1111-1111-1111-111111111111"
+                    .to_string(),
+            ),
+            None,
+            None,
+            None,
+        ];
+        assert_eq!(got, want, "forms only, neither, strings only, both");
     }
 
     #[test]
@@ -975,13 +1034,16 @@ mod tests {
         let res = read_db(&file_contents).unwrap();
 
         // compare number of package lists which have string type packages
-        assert_eq!(res.strings.len(), 12);
+        assert_eq!(
+            res.iter().filter(|list| !list.strings.is_empty()).count(),
+            12,
+            "package lists with strings"
+        );
 
         // compare a certain string
         assert_eq!(
-            res.strings
-                .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
-                .unwrap()
+            list_with_guid(&res, "ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
+                .strings
                 .first()
                 .unwrap()
                 .get(&8)
@@ -991,9 +1053,8 @@ mod tests {
 
         // compare number of strings in the 0 indexed (1st) package of given package list
         assert_eq!(
-            res.strings
-                .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
-                .unwrap()
+            list_with_guid(&res, "ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
+                .strings
                 .first()
                 .unwrap()
                 .len(),
@@ -1002,9 +1063,8 @@ mod tests {
 
         // compare number of string packages in this package list
         assert_eq!(
-            res.strings
-                .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
-                .unwrap()
+            list_with_guid(&res, "ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
+                .strings
                 .len(),
             2
         );
@@ -1022,10 +1082,8 @@ mod tests {
         file.read_to_end(&mut file_contents).unwrap();
         let res = read_db(&file_contents).unwrap();
 
-        let root_node = res
+        let root_node = list_with_guid(&res, "ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
             .forms
-            .get("ABBCE13D-E25A-4D9F-A1F9-2F7710786892")
-            .unwrap()
             .first()
             .unwrap()
             .borrow();

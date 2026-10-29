@@ -315,7 +315,7 @@ pub(super) fn try_parse_question(
 }
 
 /// An EFI_IFR_FORM_SET holding `children`.
-pub(super) fn form_set(children: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn form_set(children: &[Vec<u8>]) -> Vec<u8> {
     [
         operation(FORM_SET, true, &form_set_data()),
         children.concat(),
