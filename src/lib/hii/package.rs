@@ -148,12 +148,10 @@ enum PackageType {
 
 /// get_package_lists splits a HiiDB into its package lists. Of each list it
 /// validates only the PackageLength, which must cover the header and end
-/// within the HiiDB; the packages inside, including the End package that
-/// every list needs, are validated by get_packages, so a header-only
-/// package list without an End package is accepted here. It ignores
-/// trailing padding (see is_padding), and fails if the HiiDB is empty or
-/// padding only, if a PackageLength is invalid, or if a tail that is not
-/// padding is too short for a package list header.
+/// within the HiiDB; the packages inside are validated by get_packages. It
+/// ignores trailing padding (see is_padding), and fails if the HiiDB is
+/// empty or padding only, if a PackageLength is invalid, or if a tail that
+/// is not padding is too short for a package list header.
 ///
 /// Example: a HiiDB of two package lists followed by 64 zero bytes yields
 /// the two lists, while one with 32 zero bytes between the lists fails.
@@ -231,8 +229,9 @@ fn is_padding(bytes: &[u8]) -> bool {
 
 /// get_packages splits a package list into its packages, excluding the
 /// End package that terminates it; bytes after the End package are
-/// ignored. It fails on a package whose Length is invalid and on a list
-/// that ends without an End package.
+/// ignored, and a list without one ends at its PackageLength. It fails on a
+/// package whose Length is invalid and on a list that ends inside a package
+/// header.
 ///
 /// Example: a package list of a strings package, a form package and the
 /// End package yields the strings package and the form package.
@@ -247,6 +246,17 @@ fn get_packages(package_list: &PackageList) -> Result<Vec<Package>> {
         .context("failed to convert package list size into u64")?;
 
     loop {
+        // UEFI Spec v2.10 §33.3.1.1 requires an End package, but the HiiDB of
+        // <https://github.com/linuxboot/uefisettings/issues/16> omits it, and
+        // PackageLength bounds the list.
+        if pl_cursor.position() == pl_size {
+            debug!(
+                "Package List {} ends without an End package",
+                package_list.guid
+            );
+            break;
+        }
+
         // Cannot underflow: every package read so far had
         // `length <= available`, so the position stays <= pl_size.
         let available = pl_size - pl_cursor.position();
@@ -255,7 +265,7 @@ fn get_packages(package_list: &PackageList) -> Result<Vec<Package>> {
                 error!("Can't parse more packages in this package list {}", why);
                 // Fail: returning the packages parsed so far would give the
                 // caller `Ok` without the unparsable package or any package
-                // after it, and accept a list that ends without an End package.
+                // after it.
                 return Err(why.into());
             }
             Ok(p) => p,
@@ -388,7 +398,7 @@ mod tests {
     use super::*;
 
     /// END_PACKAGE is an EFI_HII_PACKAGE_HEADER with Length 4 and Type
-    /// End (0xDF), the package that terminates every package list.
+    /// End (0xDF), the package that terminates a package list.
     ///
     /// Example: get_packages stops at END_PACKAGE without returning it, so
     /// it yields no packages for the PackageList that get_package_lists
@@ -627,24 +637,98 @@ mod tests {
         assert_eq!(packages[0].data, [0xAA, 0xBB]);
     }
 
-    /// A package list that ends without an End package, whether it is
-    /// empty or holds other packages, is an error rather than yielding the
-    /// packages before its end: the read of the missing End package runs
-    /// out of bytes.
+    /// A package list whose packages fill its PackageLength without an End
+    /// package, whether it is empty or holds packages, yields those packages.
     #[test]
-    fn test_list_without_end_package_is_an_error() {
-        for packages in [&[][..], &OPAQUE_PACKAGE] {
-            let lists = get_package_lists(&package_list(packages)).unwrap();
+    fn test_list_without_end_package_is_parsed() {
+        let two_packages = [OPAQUE_PACKAGE; 2].concat();
+        for (packages, want) in [
+            (&[][..], 0),
+            (&OPAQUE_PACKAGE[..], 1),
+            (&two_packages[..], 2),
+        ] {
+            let case = format!("packages {:02x?}", packages);
+            let lists = get_package_lists(&package_list(packages))
+                .unwrap_or_else(|e| panic!("split list of {}: {:#}", case, e));
 
-            let err = get_packages(&lists[0]).unwrap_err();
+            let got = get_packages(&lists[0]).unwrap_or_else(|e| panic!("{}: {:#}", case, e));
+
+            assert_eq!(got.len(), want, "{}", case);
+            for package in got {
+                assert_eq!(package.package_type, PackageType::Unknown(0xE0), "{}", case);
+                assert_eq!(package.data, [0xAA, 0xBB], "{}", case);
+            }
+        }
+    }
+
+    /// A package list that ends inside a package header is an error rather
+    /// than the end of the list: the read of that header runs out of bytes.
+    #[test]
+    fn test_list_ending_in_package_header_is_an_error() {
+        for partial in 1..PACKAGE_HEADER_SIZE {
+            let partial = usize::try_from(partial).expect("convert header size into usize");
+            let packages = [&OPAQUE_PACKAGE[..], &OPAQUE_PACKAGE[..partial]].concat();
+            let lists = get_package_lists(&package_list(&packages))
+                .unwrap_or_else(|e| panic!("split list with {} header bytes: {:#}", partial, e));
+
+            let Err(err) = get_packages(&lists[0]) else {
+                panic!("{} header bytes: list parsed", partial);
+            };
 
             assert!(
-                err.downcast_ref::<binrw::Error>().unwrap().is_eof(),
-                "packages {:02x?}: {}",
-                packages,
+                err.downcast_ref::<binrw::Error>()
+                    .is_some_and(binrw::Error::is_eof),
+                "{} header bytes: {:#}",
+                partial,
                 err
             );
         }
+    }
+
+    /// The End package ends its package list before PackageLength does: the
+    /// bytes after it are not read as packages.
+    #[test]
+    fn test_end_package_ends_list_before_its_length() {
+        // Length 0xABABAB exceeds the bytes, so they fail as a package
+        let unparsable = [0xAB; 5];
+        let packages = [&OPAQUE_PACKAGE[..], &END_PACKAGE, &unparsable].concat();
+        let lists = get_package_lists(&package_list(&packages)).expect("split the HiiDB");
+
+        let got = get_packages(&lists[0]).expect("read the packages before the End package");
+
+        assert_eq!(got.len(), 1, "count of packages before the End package");
+        let case = "package before the End package";
+        assert_eq!(got[0].package_type, PackageType::Unknown(0xE0), "{}", case);
+        assert_eq!(got[0].data, [0xAA, 0xBB], "{}", case);
+    }
+
+    /// read_db reads package lists that end without End packages, as in
+    /// <https://github.com/linuxboot/uefisettings/issues/16>, next to a list
+    /// with one.
+    #[test]
+    fn test_read_db_reads_lists_without_end_package() {
+        let b_packages = [en_strings_package(b'B'), END_PACKAGE.to_vec()].concat();
+        let hiidb = [
+            package_list_with_guid([0x11; 16], &en_strings_package(b'A')),
+            package_list_with_guid([0x22; 16], &OPAQUE_PACKAGE),
+            package_list_with_guid([0x33; 16], &b_packages),
+        ]
+        .concat();
+
+        let db = read_db(&hiidb).expect("read the HiiDB");
+
+        let want = HashMap::from([
+            (
+                "11111111-1111-1111-1111-111111111111".to_string(),
+                vec![HashMap::from([(1, "A".to_string())])],
+            ),
+            (
+                "33333333-3333-3333-3333-333333333333".to_string(),
+                vec![HashMap::from([(1, "B".to_string())])],
+            ),
+        ]);
+        assert_eq!(db.strings, want, "strings of the lists");
+        assert!(db.forms.is_empty(), "forms of the lists");
     }
 
     /// Zero padding after the last package list, as edk2 leaves it (see
