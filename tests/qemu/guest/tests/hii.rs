@@ -80,24 +80,24 @@ const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
     (
         "NEST_BIT check box",
         [
-            "<ValueUnavailable: EFI variable is boot-service-only \
-             (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: 1>",
+            "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: 1>",
             "<ValueUnavailable: EDKII bit-field value not decoded> <IFR default: 1>",
         ],
     ),
     (
         "NEST_BIT one-of",
         [
-            "<ValueUnavailable: EFI variable is boot-service-only \
-             (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: LargeBootList>",
+            "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: LargeBootList>",
             "<ValueUnavailable: EDKII bit-field value not decoded> <IFR default: LargeBootList>",
         ],
     ),
     (
         "NEST_BIT numeric",
         [
-            "<ValueUnavailable: EFI variable is boot-service-only \
-             (no EFI_VARIABLE_RUNTIME_ACCESS)>",
+            "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>",
             "<ValueUnavailable: EDKII bit-field value not decoded> <IFR default: 6>",
         ],
     ),

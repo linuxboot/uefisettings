@@ -15,6 +15,9 @@
 //! and compares DriverSample's variable before and after. `hii_persistence.rs` checks the
 //! new answers in the next boot.
 
+use std::ffi::OsStr;
+use std::path::Path;
+
 use uefisettings_qemu_guest::changed_bytes;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
@@ -27,6 +30,7 @@ use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::variable_data;
+use uefisettings_qemu_guest::ErrorObject;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
 
@@ -55,11 +59,17 @@ fn set(prefix: &[&str], question: &str, answer: &str) -> Vec<(usize, u8)> {
 }
 
 /// Checks that `hii set` refuses `answer` for `question` without changing the variable.
+/// Returns the error that `hii set` printed.
 #[track_caller]
-fn refuse(question: &str, answer: &str) {
+fn refuse(question: &str, answer: &str) -> ErrorObject {
     let before = driver_sample_data();
-    json_error(&["hii", "set", question, answer, "--json"]);
-    assert_eq!(changed_bytes(&before, &driver_sample_data()), []);
+    let error = json_error(&["hii", "set", question, answer, "--json"]);
+    assert_eq!(
+        changed_bytes(&before, &driver_sample_data()),
+        [],
+        "{question} = {answer}"
+    );
+    error
 }
 
 #[test]
@@ -82,6 +92,30 @@ fn generic_set_check_box_is_stored() {
 #[test]
 fn set_check_box_to_2_is_refused() {
     refuse(CHECK_BOX, "2");
+}
+
+#[test]
+fn set_boot_service_only_question_is_refused_naming_its_variable() {
+    // On MyEfiVar, which DriverSample's Vfr.vfr declares without EFI_VARIABLE_RUNTIME_ACCESS
+    const QUESTION: &str = "How tall are you? (Hex)";
+    const VARIABLE: &str =
+        "/sys/firmware/efi/efivars/MyEfiVar-a04a27f4-df00-4d42-b552-39511302113d";
+    let file_name = Path::new(VARIABLE)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("file name of the variable");
+
+    let error = refuse(QUESTION, "1");
+
+    assert_eq!(
+        error.error_message,
+        format!(
+            "EFI variable {file_name} is boot-service-only and cannot be written through efivarfs"
+        ),
+        "{QUESTION}"
+    );
+    // and wrote nothing: the variable is still invisible to Linux
+    assert_eq!(variable_data(VARIABLE), None, "{VARIABLE} is visible");
 }
 
 #[test]

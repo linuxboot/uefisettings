@@ -761,7 +761,8 @@ trait VariableStore {
     fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
         if self.kind() == VariableStoreKind::EfiVariable && !self.is_runtime_accessible() {
             return Err(anyhow!(
-                "EFI variable is boot-service-only and cannot be written through efivarfs"
+                "EFI variable {} is boot-service-only and cannot be written through efivarfs",
+                self.efivar_file_name()
             ));
         }
 
@@ -907,10 +908,10 @@ mod non_efi_varstore_tests {
         for attributes in [0x2, 0x3] {
             assert_eq!(
                 read(efi_varstore(attributes), &Efivars::new()),
-                Err(
-                    "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>"
-                        .to_string()
-                ),
+                Err("<ValueUnavailable: EFI variable \
+                     TestVarStore-00000000-0000-0000-0000-000000000000 is boot-service-only \
+                     (no EFI_VARIABLE_RUNTIME_ACCESS)>"
+                    .to_string()),
                 "attributes {attributes:#x}"
             );
         }
@@ -924,7 +925,9 @@ mod non_efi_varstore_tests {
                     .write_at_offset(0, TypeValue::NumSize8(1))
                     .unwrap_err()
                     .to_string(),
-                "EFI variable is boot-service-only and cannot be written through efivarfs"
+                "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is \
+                 boot-service-only and cannot be written through efivarfs",
+                "attributes {attributes:#x}"
             );
         }
     }
@@ -1146,9 +1149,11 @@ fn read_current_value_bytes<'a>(
         Err(error) => return Err(Cow::Owned(format!("<ValueUnavailable: {}>", error))),
     };
     if store.kind() == VariableStoreKind::EfiVariable && !store.is_runtime_accessible() {
-        return Err(Cow::Borrowed(
-            "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>",
-        ));
+        return Err(Cow::Owned(format!(
+            "<ValueUnavailable: EFI variable {} is boot-service-only \
+             (no EFI_VARIABLE_RUNTIME_ACCESS)>",
+            store.efivar_file_name()
+        )));
     }
 
     reader
@@ -1194,8 +1199,9 @@ mod efivar_reader_tests {
 
     const BUFFER_UNAVAILABLE: &str =
         "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
-    const BOOT_SERVICE_ONLY: &str =
-        "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>";
+    const BOOT_SERVICE_ONLY: &str = "<ValueUnavailable: EFI variable \
+         Setup-00000000-0000-0000-0000-000000000000 is boot-service-only \
+         (no EFI_VARIABLE_RUNTIME_ACCESS)>";
 
     /// read_question_bytes of `store`, owned.
     fn question_bytes(
