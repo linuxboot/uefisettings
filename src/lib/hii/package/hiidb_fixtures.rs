@@ -76,6 +76,16 @@ fn package_header(package_type: u8, length: u32) -> Vec<u8> {
 /// "11111111-1111-1111-1111-111111111111" for
 /// `package_list(&[en_strings_package(b'A'), END_PACKAGE.to_vec()].concat())`.
 pub(crate) fn en_strings_package(letter: u8) -> Vec<u8> {
+    let strings = [
+        &[0x14, letter, 0x00, 0x00, 0x00][..], // EFI_HII_SIBT_STRING_UCS2 `letter`
+        &[0x00],                               // EFI_HII_SIBT_END
+    ]
+    .concat();
+    en_strings_package_with_blocks(&strings)
+}
+
+/// An "en" strings package whose string blocks are `blocks`, valid or not.
+pub(super) fn en_strings_package_with_blocks(blocks: &[u8]) -> Vec<u8> {
     let language = [
         &[0x00; 32][..],     // LanguageWindow
         &1u16.to_le_bytes(), // LanguageName
@@ -83,24 +93,18 @@ pub(crate) fn en_strings_package(letter: u8) -> Vec<u8> {
     ]
     .concat();
 
-    let strings = [
-        &[0x14, letter, 0x00, 0x00, 0x00][..], // EFI_HII_SIBT_STRING_UCS2 `letter`
-        &[0x00],                               // EFI_HII_SIBT_END
-    ]
-    .concat();
-
     // HdrSize covers the package header, HdrSize and StringInfoOffset
     // (a u32 each) and `language`; the strings follow the header.
     let hdr_size = PACKAGE_HEADER_SIZE
         + u32::try_from(2 * std::mem::size_of::<u32>() + language.len()).unwrap();
-    let length = hdr_size + u32::try_from(strings.len()).unwrap();
+    let length = hdr_size + u32::try_from(blocks.len()).unwrap();
 
     [
         &strings_package_header(length)[..],
         &hdr_size.to_le_bytes(), // HdrSize
         &hdr_size.to_le_bytes(), // StringInfoOffset
         &language,
-        &strings,
+        blocks,
     ]
     .concat()
 }

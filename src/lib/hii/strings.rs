@@ -19,7 +19,6 @@ use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
-use log::error;
 
 // UEFI Spec v2.9 Page 1807
 #[derive(BinRead, Debug, PartialEq)]
@@ -97,27 +96,19 @@ pub fn handle_string_package(
     loop {
         // for every block the first 8 bits are the block type
 
-        let block_type: StringBlockType = match package_cursor.read_ne() {
-            Err(why) => {
-                error!("Can't read block header {}", why);
-                // We can also break because if there is an error here we loose track of string_id_current
-                // and want to immediately stop parsing this string package anything beyond this wont be useful.
-                return Err(why.into());
-            }
-            Ok(p) => p,
-        };
+        // We can also break because if there is an error here we loose track of string_id_current
+        // and want to immediately stop parsing this string package anything beyond this wont be useful.
+        let block_type: StringBlockType = package_cursor
+            .read_ne()
+            .context("failed to read a string block type")?;
         debug!("Blocktype is {:?}", block_type);
 
         match block_type {
             StringBlockType::StringUcs2 => {
-                let null_str: binrw::NullWideString = match package_cursor.read_ne() {
-                    Err(why) => {
-                        error!("Can't read null-terminated 16-bit string: {}", why);
-                        // Or we can break;
-                        return Err(why.into());
-                    }
-                    Ok(p) => p,
-                };
+                // Or we can break;
+                let null_str: binrw::NullWideString = package_cursor
+                    .read_ne()
+                    .context("failed to read a null-terminated 16-bit string")?;
                 debug!(
                     "Null-terminated 16-bit string is {:?} and its id is {}",
                     null_str, string_id_current
@@ -127,25 +118,18 @@ pub fn handle_string_package(
                 string_id_current += 1;
             }
             StringBlockType::Skip2 => {
-                let skip_count: u16 = match package_cursor.read_ne() {
-                    Err(why) => {
-                        error!("Can't read skip count {}", why);
-                        // Or we can break;
-                        return Err(why.into());
-                    }
-                    Ok(p) => p,
-                };
+                // Or we can break;
+                let skip_count: u16 = package_cursor
+                    .read_ne()
+                    .context("failed to read a Skip2 count")?;
                 string_id_current += skip_count as i32;
                 debug!("Skip count is {}", skip_count);
             }
             StringBlockType::Skip1 => {
-                let skip_count: u8 = match package_cursor.read_ne() {
-                    Err(why) => {
-                        // Or we can break;
-                        return Err(why.into());
-                    }
-                    Ok(p) => p,
-                };
+                // Or we can break;
+                let skip_count: u8 = package_cursor
+                    .read_ne()
+                    .context("failed to read a Skip1 count")?;
                 string_id_current += skip_count as i32;
                 debug!("Skip count is {}", skip_count);
             }
@@ -153,7 +137,6 @@ pub fn handle_string_package(
                 break;
             }
             _ => {
-                error!("Unhandled block type");
                 // Or we can break;
                 return Err(anyhow!("Unhandled block type"));
                 // If we encounter any unhandled String Info Block Types type,

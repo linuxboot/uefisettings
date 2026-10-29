@@ -24,7 +24,6 @@ use binrw::io::SeekFrom;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
-use log::error;
 
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
@@ -188,15 +187,13 @@ fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
         }
 
         let available = db_size - used_bytes;
-        let package_list: PackageList = match db_cursor.read_ne_args(AvailableBytes(available)) {
-            Err(why) => {
-                error!("Can't parse more package lists: {}", why);
-                // Fail: returning the lists parsed so far would give the caller
-                // `Ok` without the unparsable list or any list after it.
-                return Err(why.into());
-            }
-            Ok(p) => p,
-        };
+        // Fail: returning the lists parsed so far would give the caller
+        // `Ok` without the unparsable list or any list after it.
+        let package_list: PackageList = db_cursor
+            .read_ne_args(AvailableBytes(available))
+            .with_context(|| {
+                format!("failed to parse the package list at offset {used_bytes:#x}")
+            })?;
         debug!("Package List GUID is {}", package_list.guid);
         package_lists.push(package_list);
 
@@ -260,16 +257,10 @@ fn get_packages(package_list: &PackageList) -> Result<Vec<Package>> {
         // Cannot underflow: every package read so far had
         // `length <= available`, so the position stays <= pl_size.
         let available = pl_size - pl_cursor.position();
-        let package: Package = match pl_cursor.read_ne_args(AvailableBytes(available)) {
-            Err(why) => {
-                error!("Can't parse more packages in this package list {}", why);
-                // Fail: returning the packages parsed so far would give the
-                // caller `Ok` without the unparsable package or any package
-                // after it.
-                return Err(why.into());
-            }
-            Ok(p) => p,
-        };
+        // Fail: returning the packages parsed so far would give the
+        // caller `Ok` without the unparsable package or any package
+        // after it.
+        let package: Package = pl_cursor.read_ne_args(AvailableBytes(available))?;
 
         debug!(
             "Package List {}. This package type is {:?}",
@@ -352,44 +343,47 @@ impl ParsedPackageList {
 ///
 /// In the end return the parsed package lists in HiiDB order; GUIDs may repeat.
 pub fn read_db(source: &[u8]) -> Result<Vec<ParsedPackageList>> {
-    let mut res = Vec::new();
+    // into_iter frees each raw list once parsed, lowering peak memory
+    get_package_lists(source)?
+        .into_iter()
+        .map(|package_list| {
+            read_package_list(&package_list)
+                .with_context(|| format!("failed to parse package list {}", package_list.guid))
+        })
+        .collect()
+}
 
-    for package_list in get_package_lists(source)? {
-        // once filled this will have string maps from each string package in the package list.
-        let mut package_list_string_maps: Vec<StringMap> = Vec::new();
-        let mut roots: Vec<IFRNodeLink> = Vec::new();
+/// Parses the strings and form packages of a package list and skips the others.
+fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
+    // once filled this will have string maps from each string package in the package list.
+    let mut package_list_string_maps: Vec<StringMap> = Vec::new();
+    let mut roots: Vec<IFRNodeLink> = Vec::new();
 
-        for package in get_packages(&package_list)? {
-            let mut package_cursor = Cursor::new(&package.data);
+    for package in get_packages(package_list)? {
+        let mut package_cursor = Cursor::new(&package.data);
 
-            match package.package_type {
-                PackageType::Strings => match strings::handle_string_package(&mut package_cursor) {
-                    Ok(string_map) => package_list_string_maps.push(string_map),
-                    Err(why) => {
-                        error!("Can't parse as string header {}", why);
-                        // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
-                        return Err(why);
-                    }
-                },
-                PackageType::Form => match forms::handle_form_package(&mut package_cursor) {
-                    Ok(root_node) => roots.push(root_node),
-                    Err(why) => {
-                        error!("Can't parse form package {}", why);
-                        // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
-                        return Err(why);
-                    }
-                },
-                _ => continue,
+        match package.package_type {
+            PackageType::Strings => {
+                // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
+                let string_map = strings::handle_string_package(&mut package_cursor)
+                    .context("failed to parse a strings package")?;
+                package_list_string_maps.push(string_map);
             }
+            PackageType::Form => {
+                // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
+                let root_node = forms::handle_form_package(&mut package_cursor)
+                    .context("failed to parse a form package")?;
+                roots.push(root_node);
+            }
+            _ => continue,
         }
-
-        res.push(ParsedPackageList {
-            guid: package_list.guid,
-            strings: package_list_string_maps,
-            forms: roots,
-        });
     }
-    Ok(res)
+
+    Ok(ParsedPackageList {
+        guid: package_list.guid,
+        strings: package_list_string_maps,
+        forms: roots,
+    })
 }
 
 #[cfg(test)]
@@ -1019,6 +1013,112 @@ mod tests {
             None,
         ];
         assert_eq!(got, want, "forms only, neither, strings only, both");
+    }
+
+    /// read_db errors name the package list whose packages it cannot parse.
+    #[test]
+    fn test_read_db_error_names_the_package_list() {
+        // Length 256 exceeds the 6 bytes left in the list
+        let hiidb = package_list_with_guid([0x22; 16], &[0x00, 0x01, 0x00, 0xE0, 0xAA, 0xBB]);
+        let Err(err) = read_db(&hiidb) else {
+            panic!("read_db parsed a package beyond its list");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("failed to parse package list 22222222-2222-2222-2222-222222222222: "),
+            "error names the list: {msg}"
+        );
+        assert!(
+            msg.contains("invalid package length 256 (6 bytes available)"),
+            "error keeps its cause: {msg}"
+        );
+        assert_eq!(
+            msg.matches("22222222-2222-2222-2222-222222222222").count(),
+            1,
+            "error names the list once: {msg}"
+        );
+    }
+
+    /// read_db errors in a string block name the package list, the strings
+    /// package and the read that failed.
+    #[test]
+    fn test_read_db_error_names_the_strings_package_and_block() {
+        let cases: [(&[u8], &str); 4] = [
+            (&[], "failed to read a string block type"),
+            // EFI_HII_SIBT_STRING_UCS2 "A" without its null terminator
+            (
+                &[0x14, b'A', 0x00],
+                "failed to read a null-terminated 16-bit string",
+            ),
+            // EFI_HII_SIBT_SKIP2 with 1 of the 2 bytes of its count
+            (&[0x21, 0x05], "failed to read a Skip2 count"),
+            // EFI_HII_SIBT_SKIP1 without its count
+            (&[0x22], "failed to read a Skip1 count"),
+        ];
+        for (blocks, read) in cases {
+            let package = en_strings_package_with_blocks(blocks);
+            let hiidb =
+                package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat());
+
+            let Err(err) = read_db(&hiidb) else {
+                panic!("read_db parsed the string blocks {blocks:02x?}");
+            };
+
+            let msg = format!("{err:#}");
+            let want = format!(
+                "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+                 failed to parse a strings package: {read}: "
+            );
+            assert!(msg.starts_with(&want), "blocks {blocks:02x?}: {msg}");
+            assert!(
+                err.chain().any(|cause| cause.is::<binrw::Error>()),
+                "blocks {blocks:02x?} keep the cause: {msg}"
+            );
+        }
+    }
+
+    /// read_db errors in a form package name the package list and the form
+    /// package.
+    #[test]
+    fn test_read_db_error_names_the_form_package() {
+        // an IFR End op without its length byte
+        let form_package = [0x05, 0x00, 0x00, 0x02, 0x29];
+        let hiidb = package_list_with_guid([0x22; 16], &form_package);
+
+        let Err(err) = read_db(&hiidb) else {
+            panic!("read_db parsed a truncated IFR op");
+        };
+
+        let msg = format!("{err:#}");
+        let want = "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+                    failed to parse a form package: ";
+        assert!(
+            msg.starts_with(want),
+            "error names the list and package: {msg}"
+        );
+        assert!(
+            err.chain().any(|cause| cause.is::<binrw::Error>()),
+            "error keeps its cause: {msg}"
+        );
+    }
+
+    /// read_db names the offset of a package list whose header it cannot
+    /// parse.
+    #[test]
+    fn test_read_db_error_names_the_offset_of_an_unparsable_list() {
+        let list = package_list(&END_PACKAGE);
+        let hiidb = [&list[..], &package_list_header(0)].concat();
+
+        let Err(err) = read_db(&hiidb) else {
+            panic!("read_db parsed a package list shorter than its header");
+        };
+
+        let msg = format!("{err:#}");
+        let want = format!(
+            "failed to parse the package list at offset {:#x}: invalid package list length 0 ",
+            list.len()
+        );
+        assert!(msg.starts_with(&want), "error names the offset: {msg}");
     }
 
     #[test]
