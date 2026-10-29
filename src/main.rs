@@ -29,6 +29,9 @@ use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
 use uefisettings::exports::identify_machine;
+use uefisettings::exports::DumpEfivarsOptions;
+use uefisettings::exports::EfivarDump;
+use uefisettings::exports::EfivarRedaction;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
@@ -140,6 +143,18 @@ enum HiiSubcommands {
     ExtractDB {
         #[clap(parse(from_os_str))]
         filename: PathBuf,
+    },
+    /// Copy the EFI variables that the HiiDB's questions read into a new directory, for --efivars on another machine
+    DumpEfivars {
+        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
+        #[clap(parse(from_os_str), short, long)]
+        filename: Option<PathBuf>,
+        /// Copy whole EFI variables, not only the bytes that questions decode; the others can hold secrets such as password hashes
+        #[clap(long)]
+        unredacted: bool,
+        /// The directory to create
+        #[clap(parse(from_os_str), value_name = "DIR")]
+        directory: PathBuf,
     },
     /// List all strings-id, string pairs in HiiDB
     ListStrings {
@@ -371,6 +386,27 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     &filename
                 ))?;
             }
+            HiiSubcommands::DumpEfivars {
+                filename,
+                unredacted,
+                directory,
+            } => {
+                let mut options = DumpEfivarsOptions::default();
+                options.redaction = match unredacted {
+                    true => EfivarRedaction::Unredacted,
+                    false => EfivarRedaction::DecodedBytes,
+                };
+                let dump = HiiBackend::dump_efivars(
+                    &get_db_dump_bytes(filename.as_deref())?,
+                    directory,
+                    &options,
+                )?;
+                eprintln!("{}", dump_warning(directory, options.redaction));
+                print_line(format_args!(
+                    "{}",
+                    dump_report(directory, options.redaction, dump)
+                ))?;
+            }
             HiiSubcommands::ListStrings { filename, json } => {
                 let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
                 print_with_style(res, *json)?;
@@ -512,6 +548,43 @@ fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
         Ok(file_contents)
     } else {
         Ok(HiiBackend::extract_db()?.db)
+    }
+}
+
+/// What dump-efivars prints on stdout about `dump` into `dir`.
+fn dump_report(dir: &Path, redaction: EfivarRedaction, dump: EfivarDump) -> serde_json::Value {
+    serde_json::json!({
+        "info": format!(
+            "copied {} of the {} EFI variables that questions read to {}",
+            dump.copied.len(),
+            dump.copied.len() + dump.missing.len(),
+            dir.display()
+        ),
+        "directory": dir.display().to_string(),
+        "redaction": redaction,
+        "copied": dump.copied,
+        "missing": dump.missing,
+    })
+}
+
+/// What dump-efivars warns on stderr about a dump into `dir`.
+fn dump_warning(dir: &Path, redaction: EfivarRedaction) -> String {
+    match redaction {
+        EfivarRedaction::DecodedBytes => format!(
+            "warning: {} is redacted to the bytes that questions decode, whose values can still \
+             be secrets; share it only with people you trust",
+            dir.display()
+        ),
+        EfivarRedaction::Unredacted => format!(
+            "warning: {} holds whole EFI variables, not redacted, which can hold secrets such as \
+             password hashes; share it only with people you trust",
+            dir.display()
+        ),
+        _ => format!(
+            "warning: {} holds EFI variables, which can hold secrets such as password hashes; \
+             share it only with people you trust",
+            dir.display()
+        ),
     }
 }
 
@@ -741,6 +814,92 @@ mod tests {
             panic!("not get: {parsed:?}");
         };
         assert_eq!(filename, Some(PathBuf::from("hiidb.bin")), "get -f");
+    }
+
+    #[test]
+    fn dump_efivars_takes_a_directory() {
+        let cases = [
+            ("DIR", vec!["dump-efivars", "out"], None, false),
+            (
+                "-f and --unredacted",
+                vec!["dump-efivars", "-f", "hiidb.bin", "--unredacted", "out"],
+                Some(PathBuf::from("hiidb.bin")),
+                true,
+            ),
+        ];
+
+        for (case, args, want_filename, want_unredacted) in cases {
+            let parsed = hii(&args).expect("parse dump-efivars");
+            let HiiSubcommands::DumpEfivars {
+                filename,
+                unredacted,
+                directory,
+            } = parsed
+            else {
+                panic!("{case}: not dump-efivars: {parsed:?}");
+            };
+
+            assert_eq!(
+                (filename, unredacted, directory),
+                (want_filename, want_unredacted, PathBuf::from("out")),
+                "{case}"
+            );
+        }
+        let error = hii(&["dump-efivars"]).expect_err("parse dump-efivars without DIR");
+        assert_eq!(
+            error.kind(),
+            clap::ErrorKind::MissingRequiredArgument,
+            "no DIR"
+        );
+    }
+
+    #[test]
+    fn dump_report_is_json_of_the_dump() {
+        let mut dump = EfivarDump::default();
+        dump.copied = vec!["Setup-guid".to_string()];
+        dump.missing = vec!["Gone-guid".to_string()];
+        let cases = [
+            ("redacted", EfivarRedaction::DecodedBytes, "decoded-bytes"),
+            ("unredacted", EfivarRedaction::Unredacted, "unredacted"),
+        ];
+
+        for (case, redaction, json) in cases {
+            let report = dump_report(Path::new("out"), redaction, dump.clone()).to_string();
+
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&report).expect("parse the report"),
+                serde_json::json!({
+                    "info": "copied 1 of the 2 EFI variables that questions read to out",
+                    "directory": "out",
+                    "redaction": json,
+                    "copied": ["Setup-guid"],
+                    "missing": ["Gone-guid"],
+                }),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn dump_warning_names_redaction_and_secrets() {
+        let cases = [
+            (
+                "redacted",
+                EfivarRedaction::DecodedBytes,
+                "warning: out is redacted to the bytes that questions decode, whose values can \
+                 still be secrets; share it only with people you trust",
+            ),
+            (
+                "unredacted",
+                EfivarRedaction::Unredacted,
+                "warning: out holds whole EFI variables, not redacted, which can hold secrets \
+                 such as password hashes; share it only with people you trust",
+            ),
+        ];
+
+        for (case, redaction, warning) in cases {
+            assert_eq!(dump_warning(Path::new("out"), redaction), warning, "{case}");
+        }
     }
 
     #[test]

@@ -61,6 +61,8 @@ SUBCOMMANDS:
 
 ```plain
 SUBCOMMANDS:
+    dump-efivars    Copy the EFI variables that the HiiDB's questions read into a new
+                        directory, for --efivars on another machine
     extract-db      Dump HiiDB into a file
     get             Get the current value of a question
     help            Print this message or the help of the given subcommand(s)
@@ -78,6 +80,29 @@ SUBCOMMANDS:
     set                Set/change the value of a question
     show-attributes    List bios attributes and their current values
 ```
+
+---
+
+## Inspecting a machine's settings elsewhere
+
+`hii dump-efivars` copies the EFI variables that the HiiDB's questions read, so that `hii get`,
+`hii list-questions` and `hii show-ifr` can answer from them on another machine:
+
+```sh
+# on the machine to inspect
+uefisettings hii extract-db hiidb.bin
+uefisettings hii dump-efivars -f hiidb.bin efivars
+# on any machine
+uefisettings hii list-questions -f hiidb.bin --efivars efivars
+```
+
+The dump keeps only the bytes that questions decode unless `--unredacted` is given; even those
+can be secrets, so share it only with people you trust. A redacted dump zeroes every other byte,
+so read it with the HiiDB it was dumped from (-f): another HiiDB, or a later uefisettings that
+decodes more, reads those zeros as values.
+
+Never copy a dump into /sys/firmware/efi/efivars: its files are in efivarfs's write format, so
+they would create absent variables and overwrite writable ones, such as BootOrder and Timeout.
 
 ---
 

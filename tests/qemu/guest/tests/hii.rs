@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 use serde::Deserialize;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
@@ -45,6 +46,7 @@ use uefisettings_qemu_guest::Responses;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
 use uefisettings_qemu_guest::EFAULT;
+use uefisettings_qemu_guest::EFIVARFS_HEADER_SIZE;
 use uefisettings_qemu_guest::UNAVAILABLE;
 
 /// Linux's SIGBUS on arm64 (`include/uapi/asm-generic/signal.h`).
@@ -139,6 +141,14 @@ const INCLUDE_ALL: [&str; 2] = ["--include", "grayed-out,suppressed,disabled"];
 
 /// The answer of a question whose value `--no-efivars` leaves unread, before its IFR default.
 const NOT_READ: &str = "<ValueUnavailable: EFI variables not read>";
+
+/// What `hii dump-efivars` prints.
+#[derive(Debug, Deserialize)]
+struct Dump {
+    directory: String,
+    redaction: String,
+    copied: Vec<String>,
+}
 
 /// One string package of `hii list-strings --json` (`HiiStringsPackage`).
 #[derive(Debug, Deserialize)]
@@ -477,4 +487,84 @@ fn no_efivars_reads_no_question_value() {
             "show-ifr answer {live:?} with --no-efivars"
         );
     }
+}
+
+#[test]
+fn dumped_efivars_answer_as_efivarfs() {
+    let variable = DRIVER_SAMPLE_VARIABLE
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .expect("a variable path");
+    let mode = |path: &str| {
+        let metadata =
+            fs::metadata(path).unwrap_or_else(|error| panic!("cannot stat {path}: {error}"));
+        metadata.permissions().mode() & 0o777
+    };
+    for (dir, unredacted) in [("/tmp/efivars", false), ("/tmp/efivars-whole", true)] {
+        let flags: &[&str] = if unredacted { &["--unredacted"] } else { &[] };
+        let dump: Dump = json(&[&["hii", "dump-efivars"], flags, &[dir]].concat());
+        let path = format!("{dir}/{variable}");
+        let dumped = fs::read(&path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
+        let live = fs::read(DRIVER_SAMPLE_VARIABLE).expect("cannot read the DriverSample variable");
+        let redaction = if unredacted {
+            "unredacted"
+        } else {
+            "decoded-bytes"
+        };
+
+        assert_eq!(
+            (dump.directory.as_str(), dump.redaction.as_str()),
+            (dir, redaction),
+            "{dump:#?}"
+        );
+        assert!(dump.copied.iter().any(|name| name == variable), "{dump:#?}");
+        assert_eq!((mode(dir), mode(&path)), (0o700, 0o600), "{dir}: modes");
+        if unredacted {
+            assert_eq!(dumped, live, "{path}");
+        } else {
+            assert_eq!(dumped.len(), live.len(), "{path}: length");
+            assert!(
+                dumped
+                    .iter()
+                    .zip(&live)
+                    .all(|(dumped, live)| dumped == live || *dumped == 0),
+                "{path}: a byte neither copied nor zero"
+            );
+            for offset in [
+                ONE_OF_OFFSET,
+                CHECK_BOX_OFFSET,
+                NUMERIC_OFFSET,
+                SERIAL_PORT_OFFSET,
+                SERIAL_PORT_OFFSET + 1,
+            ] {
+                let offset = EFIVARFS_HEADER_SIZE + offset;
+                assert_eq!(dumped[offset], live[offset], "{path}: byte {offset}");
+            }
+        }
+        for command in [
+            vec!["hii", "list-questions", "--json"],
+            [&["hii", "list-questions", "--json"][..], &INCLUDE_ALL].concat(),
+            vec!["hii", "show-ifr"],
+            vec!["hii", "get", ONE_OF, "--json"],
+            [
+                &["hii", "get", SERIAL_PORT, "--json"][..],
+                &INCLUDE_SUPPRESSED,
+            ]
+            .concat(),
+        ] {
+            let live = uefisettings(&command);
+            let replayed = uefisettings(&[&command[..], &["--efivars", dir]].concat());
+            assert_eq!(
+                (replayed.code, replayed.stdout),
+                (live.code, live.stdout),
+                "{command:?} --efivars {dir}"
+            );
+        }
+    }
+    let error = json_error(&["hii", "dump-efivars", "/tmp/efivars"]);
+    assert_eq!(
+        error.error_message,
+        "failed to create efivars directory '/tmp/efivars': File exists (os error 17)",
+        "second dump into /tmp/efivars"
+    );
 }

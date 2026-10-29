@@ -1,0 +1,837 @@
+// Copyright 2023 Meta Platforms, Inc. and affiliates.
+//
+// Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+//
+// 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::fs::DirBuilder;
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::path::PathBuf;
+
+use anyhow::Context;
+use anyhow::Result;
+use log::warn;
+use serde::Serialize;
+
+use crate::hii::efivarfs::open_efivar;
+use crate::hii::efivarfs::DecodedValue;
+use crate::hii::efivarfs::EfivarFileName;
+use crate::hii::efivarfs::EfivarNotFound;
+use crate::hii::efivarfs::EfivarReader;
+use crate::hii::efivarfs::EfivarSource;
+use crate::hii::efivarfs::EFIVARFS_HEADER_SIZE;
+use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
+use crate::hii::forms::list_questions;
+use crate::hii::forms::IncludedStates;
+use crate::hii::package::ParsedPackageList;
+
+/// The largest efivar file that read_efivar_file reads, far above EDK2's largest EFI variables:
+/// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
+/// (OvmfPkgX64.dsc), as of edk2-stable202508.
+const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Which bytes of an efivar file a dump keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum EfivarRedaction {
+    /// The attributes field and the payload bytes that questions decode; the others become zero.
+    #[default]
+    DecodedBytes,
+    /// Every byte.
+    Unredacted,
+}
+
+/// The efivar files that a dump copied, and those that its questions read but do not exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct EfivarDump {
+    /// The names of the efivar files copied into the dump directory
+    pub copied: Vec<String>,
+    /// The names of the efivar files that questions read but this machine's efivarfs lacks
+    pub missing: Vec<String>,
+}
+
+/// Copies the efivar files that the questions of `package_lists` read from this machine's
+/// efivarfs into the new directory `dir`, as `redaction` says.
+pub(crate) fn dump_efivars(
+    package_lists: Vec<ParsedPackageList>,
+    dir: &Path,
+    redaction: EfivarRedaction,
+) -> Result<EfivarDump> {
+    copy_efivars(
+        &decoded_bytes(package_lists)?,
+        Path::new(EFIVARS_MOUNT_POINT),
+        dir,
+        redaction,
+    )
+}
+
+/// The payload bytes that the questions of `package_lists`, in any state, decode, by efivar
+/// file, found without reading any.
+fn decoded_bytes(
+    package_lists: Vec<ParsedPackageList>,
+) -> Result<BTreeMap<EfivarFileName, Vec<DecodedValue>>> {
+    let mut reader = EfivarReader::new(EfivarSource::Disabled)?;
+    for list in package_lists {
+        list.check_form_strings()?;
+        for form_package in list.forms {
+            list_questions(
+                form_package,
+                &list.strings,
+                IncludedStates::all(),
+                &mut reader,
+            );
+        }
+    }
+    Ok(reader.decoded)
+}
+
+/// Copies the efivar files that `decoded` names from `efivars` into the new directory `dir`,
+/// keeping, as `redaction` says, only their `decoded` payload bytes.
+fn copy_efivars(
+    decoded: &BTreeMap<EfivarFileName, Vec<DecodedValue>>,
+    efivars: &Path,
+    dir: &Path,
+    redaction: EfivarRedaction,
+) -> Result<EfivarDump> {
+    let mut partial = PartialDump::create(dir)?;
+    let mut dump = EfivarDump::default();
+    for (name, values) in decoded {
+        let file = match open_efivar(efivars, name) {
+            Ok(file) => file,
+            Err(error) if error.is::<EfivarNotFound>() => {
+                dump.missing.push(name.to_string());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let bytes = file
+            .metadata()
+            .and_then(|metadata| read_efivar_file(&file, metadata.len()))
+            .with_context(|| {
+                format!(
+                    "failed to read efivar file '{}'",
+                    efivars.join(name).display()
+                )
+            })?;
+        let bytes = match redaction {
+            EfivarRedaction::DecodedBytes => keep_decoded(&bytes, values),
+            EfivarRedaction::Unredacted => bytes,
+        };
+        partial.write(name, &bytes)?;
+        dump.copied.push(name.to_string());
+    }
+    partial.commit();
+    Ok(dump)
+}
+
+/// The bytes of the efivar `file`, of `size` bytes by its metadata, in one read() unless it grew
+/// since: each efivarfs read() reads the whole variable from the firmware (Linux v7.2
+/// fs/efivarfs/file.c efivarfs_file_read()). A file of more than MAX_EFIVAR_FILE_SIZE bytes, by
+/// its metadata or as read, is an error.
+fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8>> {
+    if size > MAX_EFIVAR_FILE_SIZE {
+        return Err(efivar_file_too_large());
+    }
+    // one byte past the maximum, so that a file that grew past it shows
+    let mut file = file.take(MAX_EFIVAR_FILE_SIZE + 1);
+    let size = usize::try_from(size).map_err(io::Error::other)?;
+    // one byte more than its size, so that a read() that fills it shows the file grew
+    let capacity = size.saturating_add(1);
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity)?;
+    bytes.resize(capacity, 0);
+    let read = loop {
+        match file.read(&mut bytes) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => break result?,
+        }
+    };
+    bytes.truncate(read);
+    if read > size {
+        file.read_to_end(&mut bytes)?;
+    }
+    if file.limit() == 0 {
+        return Err(efivar_file_too_large());
+    }
+    Ok(bytes)
+}
+
+/// read_efivar_file's error for a file of more than MAX_EFIVAR_FILE_SIZE bytes.
+fn efivar_file_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::FileTooLarge,
+        format!("longer than its maximum of {MAX_EFIVAR_FILE_SIZE} bytes"),
+    )
+}
+
+/// The efivar file `bytes` with each payload byte zeroed unless one of `values` decodes it from
+/// these bytes.
+fn keep_decoded(bytes: &[u8], values: &[DecodedValue]) -> Vec<u8> {
+    let mut kept = vec![0; bytes.len()];
+    let payload = values
+        .iter()
+        .filter(|decoded| decoded.decodes_from(bytes.len()))
+        .map(|decoded| {
+            EFIVARFS_HEADER_SIZE + decoded.value.start..EFIVARFS_HEADER_SIZE + decoded.value.end
+        });
+    for range in std::iter::once(0..EFIVARFS_HEADER_SIZE).chain(payload) {
+        let end = range.end.min(bytes.len());
+        let start = range.start.min(end);
+        if let (Some(to), Some(from)) = (kept.get_mut(start..end), bytes.get(start..end)) {
+            to.copy_from_slice(from);
+        }
+    }
+    kept
+}
+
+/// A dump directory being written: dropped before commit, it removes its files and itself.
+struct PartialDump<'a> {
+    dir: &'a Path,
+    files: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl<'a> PartialDump<'a> {
+    /// Creates `dir`, which must not exist, for its owner only.
+    fn create(dir: &'a Path) -> Result<Self> {
+        DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("failed to create efivars directory '{}'", dir.display()))?;
+        Ok(Self {
+            dir,
+            files: Vec::new(),
+            committed: false,
+        })
+    }
+
+    /// Writes `bytes` to the new efivar file `name`, for its owner only.
+    fn write(&mut self, name: &EfivarFileName, bytes: &[u8]) -> Result<()> {
+        let path = self.dir.join(name);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to create efivar file '{}'", path.display()))?;
+        self.files.push(path);
+        file.write_all(bytes).with_context(|| {
+            format!(
+                "failed to write efivar file '{}'",
+                self.dir.join(name).display()
+            )
+        })
+    }
+
+    /// Keeps the dump.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PartialDump<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for file in &self.files {
+            if let Err(error) = fs::remove_file(file) {
+                warn!("failed to remove {}: {error}", file.display());
+            }
+        }
+        if let Err(error) = fs::remove_dir(self.dir) {
+            warn!("failed to remove {}: {error}", self.dir.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
+    use std::fs::File;
+    use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
+    use std::rc::Rc;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::hii::forms::handle_form_package;
+    use crate::hii::forms::ifr_fixtures::checkbox;
+    use crate::hii::forms::ifr_fixtures::checkbox_on;
+    use crate::hii::forms::ifr_fixtures::conditional;
+    use crate::hii::forms::ifr_fixtures::form;
+    use crate::hii::forms::ifr_fixtures::form_set;
+    use crate::hii::forms::ifr_fixtures::ifr_true;
+    use crate::hii::forms::ifr_fixtures::operation;
+    use crate::hii::forms::ifr_fixtures::parse_form_set;
+    use crate::hii::forms::ifr_fixtures::var_store_efi;
+    use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::NIL_GUID;
+    use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+    use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
+    use crate::hii::forms::IFROperation;
+
+    /// Attributes 7, then payload bytes 1 to 10.
+    const SETUP: [u8; 14] = [7, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    /// SETUP's size, as its metadata gives it.
+    const SETUP_SIZE: u64 = SETUP.len() as u64;
+
+    /// The efivar file name of the variable `name` of the nil GUID.
+    fn efivar(name: &str) -> EfivarFileName {
+        EfivarFileName::new(name, NIL_GUID)
+    }
+
+    /// A directory holding the efivar file of each (name, contents), as efivarfs does.
+    fn efivars(files: &[(&EfivarFileName, &[u8])]) -> TempDir {
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        for (name, contents) in files {
+            fs::write(dir.path().join(name), contents).expect("write efivar file");
+        }
+        dir
+    }
+
+    /// A directory to dump into, as "dump" in a new directory, which does not exist yet.
+    fn dump_dir() -> (TempDir, PathBuf) {
+        let parent = tempfile::tempdir().expect("create parent directory");
+        let dir = parent.path().join("dump");
+        (parent, dir)
+    }
+
+    /// `names`, each decoded at its first payload byte, of a 1-byte VarStore.
+    fn first_bytes(names: &[&EfivarFileName]) -> BTreeMap<EfivarFileName, Vec<DecodedValue>> {
+        names
+            .iter()
+            .map(|&name| {
+                (
+                    name.clone(),
+                    vec![DecodedValue {
+                        size: 1,
+                        value: 0..1,
+                    }],
+                )
+            })
+            .collect()
+    }
+
+    /// The package list of `form_package`, with no strings.
+    fn package_list(form_package: &Rc<RefCell<IFROperation>>) -> ParsedPackageList {
+        ParsedPackageList {
+            guid: NIL_GUID,
+            strings: vec![HashMap::new()],
+            forms: vec![Rc::clone(form_package)],
+        }
+    }
+
+    /// The answers and states that list_questions gives for the questions of `form_package`,
+    /// reading the efivar files in `efivars`.
+    fn answers(form_package: &Rc<RefCell<IFROperation>>, efivars: &Path) -> Vec<String> {
+        let source = EfivarSource::Directory(efivars.to_path_buf());
+        list_questions(
+            Rc::clone(form_package),
+            &[HashMap::new()],
+            IncludedStates::all(),
+            &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),
+        )
+        .into_iter()
+        .map(|(question, state)| format!("{}{}", question.value, state.annotation()))
+        .collect()
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("list directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 file name")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn efivar_files_read_whole() {
+        let live = efivars(&[(&efivar("Setup"), &SETUP), (&efivar("Empty"), &[])]);
+        let read = |name: &EfivarFileName| {
+            let file = File::open(live.path().join(name)).expect("open the efivar file");
+            let size = file.metadata().expect("stat the efivar file").len();
+            read_efivar_file(&file, size).expect("read the efivar file")
+        };
+
+        assert_eq!(read(&efivar("Setup")), SETUP, "Setup");
+        assert_eq!(read(&efivar("Empty")), [0; 0], "empty file");
+    }
+
+    /// A file longer than its metadata says, as an efivar written after open_efivar's fstat,
+    /// still reads whole: procfs gives /proc/version the size 0.
+    #[test]
+    fn efivar_files_longer_than_their_size_read_whole() {
+        let path = Path::new("/proc/version");
+        let file = File::open(path).expect("open /proc/version");
+        let size = file.metadata().expect("stat /proc/version").len();
+        assert_eq!(size, 0, "size");
+
+        let bytes = read_efivar_file(&file, size).expect("read /proc/version");
+
+        assert!(bytes.len() > 1, "/proc/version: {bytes:?}");
+        assert_eq!(
+            bytes,
+            fs::read(path).expect("read /proc/version"),
+            "contents"
+        );
+    }
+
+    /// A reader that gives one of `results` per read(), then end of file, counting its read()s.
+    struct ScriptedReader {
+        results: VecDeque<io::Result<Vec<u8>>>,
+        reads: usize,
+    }
+
+    impl ScriptedReader {
+        fn new(results: Vec<io::Result<Vec<u8>>>) -> Self {
+            Self {
+                results: results.into(),
+                reads: 0,
+            }
+        }
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            let chunk = match self.results.pop_front() {
+                None => return Ok(0),
+                Some(result) => result?,
+            };
+            buf.get_mut(..chunk.len())
+                .expect("the scripted chunk fits the read() buffer")
+                .copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn efivar_file_reads_in_one_read() {
+        let whole: &[u8] = &SETUP;
+        for (case, results, expected) in [
+            ("whole", vec![Ok(SETUP.to_vec())], whole),
+            (
+                "short read, as end of file",
+                vec![Ok(SETUP[..6].to_vec()), Ok(SETUP[6..].to_vec())],
+                &SETUP[..6],
+            ),
+        ] {
+            let mut reader = ScriptedReader::new(results);
+
+            let bytes = read_efivar_file(&mut reader, SETUP_SIZE).expect("read the efivar file");
+
+            assert_eq!(bytes, expected, "{case}: bytes");
+            assert_eq!(reader.reads, 1, "{case}: read() calls");
+        }
+    }
+
+    #[test]
+    fn efivar_file_read_retries_eintr() {
+        let mut reader = ScriptedReader::new(vec![
+            Err(io::ErrorKind::Interrupted.into()),
+            Ok(SETUP.to_vec()),
+        ]);
+
+        let bytes = read_efivar_file(&mut reader, SETUP_SIZE).expect("read the efivar file");
+
+        assert_eq!(bytes, SETUP, "bytes");
+        assert_eq!(
+            reader.reads, 2,
+            "read() calls: the interrupted one and the read"
+        );
+    }
+
+    #[test]
+    fn efivar_file_grown_since_its_metadata_reads_to_the_end() {
+        let mut reader =
+            ScriptedReader::new(vec![Ok(SETUP[..5].to_vec()), Ok(SETUP[5..].to_vec())]);
+
+        let bytes = read_efivar_file(&mut reader, 4).expect("read the efivar file");
+
+        assert_eq!(bytes, SETUP, "bytes");
+        assert_eq!(
+            reader.reads, 3,
+            "read() calls: size + 1 bytes, the rest, end of file"
+        );
+    }
+
+    /// A file of more than MAX_EFIVAR_FILE_SIZE bytes by its metadata is refused unread.
+    #[test]
+    fn efivar_file_larger_than_its_maximum_is_refused_unread() {
+        let mut reader = ScriptedReader::new(vec![Ok(SETUP.to_vec())]);
+
+        let error = read_efivar_file(&mut reader, MAX_EFIVAR_FILE_SIZE + 1)
+            .expect_err("read a file larger than the maximum");
+
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::FileTooLarge,
+            "a file larger than the maximum by its metadata: {error}"
+        );
+        assert_eq!(reader.reads, 0, "read() calls");
+    }
+
+    /// A file that grew since its metadata reads to the end up to MAX_EFIVAR_FILE_SIZE bytes, and
+    /// is refused once it holds more.
+    #[test]
+    fn efivar_file_grown_past_its_maximum_is_refused() {
+        let max = usize::try_from(MAX_EFIVAR_FILE_SIZE).expect("a usize maximum");
+        for (case, length, want) in [
+            ("grown to the maximum", MAX_EFIVAR_FILE_SIZE, Some(max)),
+            (
+                "grown one byte past the maximum",
+                MAX_EFIVAR_FILE_SIZE + 1,
+                None,
+            ),
+        ] {
+            let read = read_efivar_file(io::repeat(7).take(length), SETUP_SIZE);
+
+            match (read, want) {
+                (Ok(bytes), Some(want)) => assert_eq!(bytes.len(), want, "{case}: length"),
+                (Err(error), None) => {
+                    assert_eq!(error.kind(), io::ErrorKind::FileTooLarge, "{case}: {error}")
+                }
+                (read, want) => panic!(
+                    "{case}: read {:?} bytes, want {want:?}",
+                    read.map(|bytes| bytes.len())
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn redacted_dump_keeps_the_decoded_bytes() {
+        let live = efivars(&[(&efivar("Setup"), &SETUP)]);
+        let (_parent, dir) = dump_dir();
+        let decoded = |value| DecodedValue { size: 10, value };
+        let decoded = BTreeMap::from([(
+            efivar("Setup"),
+            vec![decoded(1..3), decoded(6..7), decoded(9..10)],
+        )]);
+
+        let dump = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
+            .expect("dump efivars");
+
+        assert_eq!(
+            dump,
+            EfivarDump {
+                copied: vec![efivar("Setup").to_string()],
+                missing: Vec::new(),
+            },
+            "dump"
+        );
+        assert_eq!(
+            fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 0, 2, 3, 0, 0, 0, 7, 0, 0, 10],
+            "attributes, payload offsets 1, 2, 6 and 9"
+        );
+    }
+
+    #[test]
+    fn unredacted_dump_copies_whole_files() {
+        let live = efivars(&[(&efivar("Setup"), &SETUP)]);
+        let (_parent, dir) = dump_dir();
+        let decoded = first_bytes(&[&efivar("Setup")]);
+
+        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
+            .expect("dump efivars");
+
+        assert_eq!(
+            fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+            SETUP,
+            "unredacted"
+        );
+    }
+
+    #[test]
+    fn dump_is_for_its_owner_only() {
+        let live = efivars(&[(&efivar("Setup"), &SETUP)]);
+        let (_parent, dir) = dump_dir();
+        let decoded = first_bytes(&[&efivar("Setup")]);
+        let mode = |path: &Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+
+        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
+            .expect("dump efivars");
+
+        assert_eq!(mode(&dir), 0o700, "directory mode");
+        assert_eq!(mode(&dir.join(efivar("Setup"))), 0o600, "file mode");
+    }
+
+    #[test]
+    fn dump_refuses_an_existing_directory() {
+        let live = efivars(&[(&efivar("Setup"), &SETUP)]);
+        let existing = efivars(&[(&efivar("Kept"), b"kept")]);
+        let decoded = first_bytes(&[&efivar("Setup")]);
+
+        let error = copy_efivars(
+            &decoded,
+            live.path(),
+            existing.path(),
+            EfivarRedaction::Unredacted,
+        )
+        .expect_err("dump into an existing directory");
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "failed to create efivars directory '{}': File exists (os error 17)",
+                existing.path().display()
+            ),
+            "error"
+        );
+        assert_eq!(
+            file_names(existing.path()),
+            [efivar("Kept").to_string()],
+            "existing directory"
+        );
+    }
+
+    #[test]
+    fn dump_lists_missing_variables() {
+        let live = efivars(&[(&efivar("Setup"), &SETUP)]);
+        let (_parent, dir) = dump_dir();
+        let decoded = first_bytes(&[&efivar("Missing"), &efivar("Setup")]);
+
+        let dump = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
+            .expect("dump efivars");
+
+        assert_eq!(
+            dump,
+            EfivarDump {
+                copied: vec![efivar("Setup").to_string()],
+                missing: vec![efivar("Missing").to_string()],
+            },
+            "dump"
+        );
+        assert!(
+            !dir.join(efivar("Missing")).exists(),
+            "file of the missing variable"
+        );
+    }
+
+    #[test]
+    fn failed_dump_removes_what_it_wrote() {
+        let live = efivars(&[(&efivar("A"), &SETUP)]);
+        fs::create_dir(live.path().join(efivar("B"))).expect("create a directory as B");
+        let (_parent, dir) = dump_dir();
+        let decoded = first_bytes(&[&efivar("A"), &efivar("B")]);
+
+        let error = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
+            .expect_err("dump a directory as a variable");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "efivar file '{}' is not a regular file",
+                live.path().join(efivar("B")).display()
+            ),
+            "error"
+        );
+        assert!(!dir.exists(), "dump directory after the failure");
+    }
+
+    #[test]
+    fn dump_files_stay_in_the_dump_directory() {
+        let crafted = EfivarFileName::new("../x", NIL_GUID);
+        let live = efivars(&[(&crafted, &SETUP)]);
+        let (parent, dir) = dump_dir();
+        let decoded = first_bytes(&[&crafted]);
+
+        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
+            .expect("dump efivars");
+
+        assert_eq!(file_names(&dir), [crafted.to_string()], "dump directory");
+        assert_eq!(file_names(parent.path()), ["dump"], "its parent");
+    }
+
+    #[test]
+    fn redacted_dump_answers_as_its_source() {
+        let bytes = form_set(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 4),
+            operation(CHECKBOX, false, &checkbox(1, 0x00)),
+            operation(CHECKBOX, false, &checkbox(3, 0x00)),
+        ]);
+        let form_package =
+            handle_form_package(&mut Cursor::new(&bytes)).expect("parse the form package");
+        let live = efivars(&[(&efivar("Setup"), &[7, 0, 0, 0, 0xAA, 1, 0xBB, 0])]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded =
+            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
+            .expect("dump efivars");
+
+        assert_eq!(
+            fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 0, 1, 0, 0],
+            "dumped Setup"
+        );
+        assert_eq!(
+            answers(&form_package, &dir),
+            ["1", "0"],
+            "answers from the dump"
+        );
+        assert_eq!(
+            answers(&form_package, &dir),
+            answers(&form_package, live.path()),
+            "answers from the source"
+        );
+    }
+
+    #[test]
+    fn redacted_dump_keeps_no_byte_past_the_var_store() {
+        let bytes = form_set(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 4),
+            operation(CHECKBOX, false, &checkbox(1, 0x00)),
+            operation(CHECKBOX, false, &checkbox(6, 0x00)),
+        ]);
+        let form_package =
+            handle_form_package(&mut Cursor::new(&bytes)).expect("parse the form package");
+        let live = efivars(&[(
+            &efivar("Setup"),
+            &[7, 0, 0, 0, 0xAA, 1, 0xBB, 0, 0xCC, 0, 1, 0xDD],
+        )]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded =
+            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
+            .expect("dump efivars");
+
+        assert_eq!(
+            fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+            "dumped Setup: not the byte at 6, past the VarStore's 4"
+        );
+        assert_eq!(
+            answers(&form_package, &dir),
+            [
+                "1",
+                "<ExtractEFIDataError: failed to fill whole buffer (offset: 6; buflen: 8)> \
+                 <IFR default: 0>"
+            ],
+            "answers from the dump"
+        );
+        assert_eq!(
+            answers(&form_package, &dir),
+            answers(&form_package, live.path()),
+            "answers from the source"
+        );
+    }
+
+    #[test]
+    fn redacted_dump_keeps_no_byte_of_a_file_shorter_than_its_var_store() {
+        let form_package = parse_form_set(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 2),
+            var_store_efi(2, "Short", NV_BS_RT, 4),
+            form(1, &[checkbox_on(1, 3, 1), checkbox_on(2, 3, 2)]),
+        ]);
+        let live = efivars(&[
+            (&efivar("Setup"), &[7, 0, 0, 0, 1, 0xAA]),
+            // 3 of the 4 payload bytes that read_efivar reads
+            (&efivar("Short"), &[7, 0, 0, 0, 1, 0xBB, 0xCC]),
+        ]);
+        let (_parent, dir) = dump_dir();
+        let answers_in = |efivars: &Path| -> Vec<String> {
+            answers(&form_package, efivars)
+                .into_iter()
+                .map(|answer| answer.replace(&efivars.display().to_string(), "DIR"))
+                .collect()
+        };
+
+        let decoded =
+            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
+            .expect("dump efivars");
+
+        assert_eq!(
+            fs::read(dir.join(efivar("Short"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 0, 0, 0],
+            "dumped Short: attributes only, as no question decodes it"
+        );
+        assert_eq!(
+            fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 1, 0],
+            "dumped Setup: its question's byte"
+        );
+        assert_eq!(
+            answers_in(&dir),
+            answers_in(live.path()),
+            "answers from the dump and from the source"
+        );
+    }
+
+    #[test]
+    fn redacted_dump_keeps_the_bytes_of_suppressed_questions() {
+        let form_package = parse_form_set(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 2),
+            var_store_efi(2, "Hidden", NV_BS_RT, 2),
+            form(
+                1,
+                &[
+                    checkbox_on(1, 3, 1),
+                    conditional(SUPPRESS_IF, ifr_true(), &[checkbox_on(2, 3, 2)]),
+                ],
+            ),
+        ]);
+        let live = efivars(&[
+            (&efivar("Setup"), &[7, 0, 0, 0, 1, 0xAA]),
+            (&efivar("Hidden"), &[7, 0, 0, 0, 1, 0xBB]),
+        ]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded =
+            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        let dump = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
+            .expect("dump efivars");
+
+        assert_eq!(
+            dump.copied,
+            [efivar("Hidden").to_string(), efivar("Setup").to_string()],
+            "copied files"
+        );
+        assert_eq!(
+            fs::read(dir.join(efivar("Hidden"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 1, 0],
+            "dumped Hidden: the suppressed question's byte only"
+        );
+        assert_eq!(
+            answers(&form_package, &dir),
+            ["1", "1 <suppressed>"],
+            "answers from the dump"
+        );
+        assert_eq!(
+            answers(&form_package, &dir),
+            answers(&form_package, live.path()),
+            "answers from the source"
+        );
+    }
+}

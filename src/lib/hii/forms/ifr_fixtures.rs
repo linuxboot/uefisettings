@@ -25,10 +25,10 @@ use crate::hii::efivarfs::EfivarSource;
 pub(super) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
 
 pub(super) const ONE_OF: u8 = 0x05;
-pub(super) const CHECKBOX: u8 = 0x06;
+pub(crate) const CHECKBOX: u8 = 0x06;
 pub(super) const NUMERIC: u8 = 0x07;
 
-pub(super) const SUPPRESS_IF: u8 = 0x0A;
+pub(crate) const SUPPRESS_IF: u8 = 0x0A;
 pub(super) const GRAY_OUT_IF: u8 = 0x19;
 pub(super) const DISABLE_IF: u8 = 0x1E;
 
@@ -69,7 +69,7 @@ pub(super) const PROMPT: &str = "Prompt";
 /// The reason `unavailable()` gives.
 pub(super) const UNAVAILABLE: &str = "<ValueUnavailable: no VarStore 1>";
 
-pub(super) const NIL_GUID: Guid = Guid {
+pub(crate) const NIL_GUID: Guid = Guid {
     data1: 0,
     data2: 0,
     data3: 0,
@@ -215,7 +215,7 @@ pub(super) fn strings() -> Vec<HashMap<i32, String>> {
     ])]
 }
 
-pub(super) fn operation(op_code: u8, open_scope: bool, data: &[u8]) -> Vec<u8> {
+pub(crate) fn operation(op_code: u8, open_scope: bool, data: &[u8]) -> Vec<u8> {
     let length = u8::try_from(usize::from(IFR_OPERATION_HEADER_SIZE) + data.len())
         .ok()
         .filter(|length| length & 0x80 == 0)
@@ -261,7 +261,7 @@ pub(super) fn ifr_default_2(default_id: u16, expression: Vec<u8>) -> Vec<u8> {
 }
 
 /// `body` in the scope of a SUPPRESS_IF, GRAY_OUT_IF or DISABLE_IF on `condition`.
-pub(super) fn conditional(op_code: u8, condition: Vec<u8>, body: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn conditional(op_code: u8, condition: Vec<u8>, body: &[Vec<u8>]) -> Vec<u8> {
     [
         operation(op_code, true, &[]),
         condition,
@@ -271,7 +271,7 @@ pub(super) fn conditional(op_code: u8, condition: Vec<u8>, body: &[Vec<u8>]) -> 
     .concat()
 }
 
-pub(super) fn ifr_true() -> Vec<u8> {
+pub(crate) fn ifr_true() -> Vec<u8> {
     operation(TRUE, false, &[])
 }
 
@@ -453,7 +453,7 @@ pub(crate) fn form(form_id: u16, body: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Parses a FormSet holding `body`, and returns the root.
-pub(super) fn parse_form_set(body: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
+pub(crate) fn parse_form_set(body: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
     let data = form_set(body);
     handle_form_package(&mut Cursor::new(&data)).expect("parse the form package")
 }
@@ -470,7 +470,7 @@ pub(super) fn find_op(
     op.children.iter().find_map(|child| find_op(child, data))
 }
 
-pub(super) fn checkbox(offset: u16, flags: u8) -> Vec<u8> {
+pub(crate) fn checkbox(offset: u16, flags: u8) -> Vec<u8> {
     [question_header(offset), vec![flags]].concat()
 }
 

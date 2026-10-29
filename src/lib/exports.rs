@@ -39,7 +39,9 @@ use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::QuestionDescriptor;
 use crate::hii::package;
+pub use crate::hii::EfivarDump;
 use crate::hii::EfivarReader;
+pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
@@ -100,6 +102,14 @@ pub struct ListQuestionsOptions {
 pub struct ShowIfrOptions {
     /// Where to read question values
     pub efivars: EfivarSource,
+}
+
+/// The options of HiiBackend::dump_efivars.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct DumpEfivarsOptions {
+    /// Which bytes of each efivar file to keep
+    pub redaction: EfivarRedaction,
 }
 
 impl HiiBackend {
@@ -215,6 +225,16 @@ impl HiiBackend {
             }
         }
         Ok(res)
+    }
+
+    /// Copies the efivar files that the questions of the HiiDB `db_bytes` read into the new
+    /// directory `dir`, in efivarfs format, as `options` say
+    pub fn dump_efivars(
+        db_bytes: &[u8],
+        dir: &Path,
+        options: &DumpEfivarsOptions,
+    ) -> Result<EfivarDump> {
+        crate::hii::dump_efivars(package::read_db(db_bytes)?, dir, options.redaction)
     }
 }
 

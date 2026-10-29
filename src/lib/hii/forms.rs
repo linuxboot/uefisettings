@@ -953,7 +953,8 @@ mod non_efi_varstore_tests {
         store: impl VariableStore + 'static,
         efivars: &Efivars,
     ) -> std::result::Result<Vec<u8>, String> {
-        read_current_value_bytes(&Ok(Box::new(store)), &mut efivars.reader())
+        // these tests check reasons, which no value range changes
+        read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut efivars.reader())
             .map(<[u8]>::to_vec)
             .map_err(Cow::into_owned)
     }
@@ -1176,8 +1177,10 @@ impl EfivarReader {
 }
 
 /// Returns the bytes of `varstore`'s efivar file, or why a question on it has no value.
+/// The caller decodes the payload bytes `value`.
 fn read_current_value_bytes<'a>(
     varstore: &Result<Box<dyn VariableStore>>,
+    value: std::ops::Range<usize>,
     reader: &'a mut EfivarReader,
 ) -> std::result::Result<&'a [u8], Cow<'static, str>> {
     let store = match varstore {
@@ -1192,7 +1195,7 @@ fn read_current_value_bytes<'a>(
     }
 
     reader
-        .read(EfivarRange::of(store.as_ref()))
+        .read(EfivarRange::of(store.as_ref()), value)
         .map_err(|error| Cow::Owned(read_failure_reason(store.kind(), error)))
 }
 
@@ -1245,7 +1248,7 @@ fn read_question_bytes<'a>(
             question.op_code
         )));
     };
-    let bytes = read_current_value_bytes(varstore, reader)?;
+    let bytes = read_current_value_bytes(varstore, value.clone(), reader)?;
     // edk2-stable202608 SetupBrowserDxe/IfrParse.c reads the VarOffset of such a question in bits
     // TODO: decode bit fields by the width in their Flags, not their Range32 (UINT32 storage)
     if refers_to_bit_field(question) {
@@ -1276,8 +1279,11 @@ fn stored_value(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod efivar_reader_tests {
+    use std::collections::BTreeMap;
+
     use super::ifr_fixtures::*;
     use super::*;
+    use crate::hii::efivarfs::DecodedValue;
 
     const MISSING_BUFFER: &str = "<ValueUnavailable: no EFI variable \
         Missing-00000000-0000-0000-0000-000000000000; \
@@ -1742,6 +1748,54 @@ mod efivar_reader_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn reads_keep_the_bytes_their_question_decodes() {
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(3, 0x00), &[]);
+        let question = node.borrow();
+        let (_root, bit_field_node) =
+            parse_question_in_guid(BIT_VARSTORE_GUID, CHECKBOX, &checkbox(15, 0x00), &[]);
+        let bit_field = bit_field_node.borrow();
+        let (root, _node) = parse_question(&[], CHECKBOX, &checkbox(3, 0x00), &[]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let mut reader = disabled_reader();
+        let hidden = DeclaredVarStore {
+            runtime_accessible: false,
+            ..efi_variable("Hidden", 4)
+        };
+
+        question_bytes(&question, efi_variable("Setup", 4), &mut reader).expect_err("Setup");
+        question_bytes(&bit_field, efi_variable("Bits", 4), &mut reader).expect_err("Bits");
+        question_bytes(&question, hidden, &mut reader).expect_err("boot-service-only");
+        read_question_bytes(&question, &Err(anyhow!("no VarStore 1")), &mut reader)
+            .expect_err("no VarStore");
+        assert_eq!(
+            question_bytes(&form_set.borrow(), efi_variable("FormSet", 4), &mut reader),
+            Err("<ValueUnavailable: FormSet value not decoded>".to_string()),
+            "FORM_SET"
+        );
+
+        assert_eq!(
+            reader.decoded,
+            BTreeMap::from([
+                (
+                    efi_variable("Bits", 4).efivar_file_name(),
+                    vec![DecodedValue {
+                        size: 4,
+                        value: 1..2
+                    }]
+                ),
+                (
+                    efi_variable("Setup", 4).efivar_file_name(),
+                    vec![DecodedValue {
+                        size: 4,
+                        value: 3..4
+                    }]
+                ),
+            ]),
+            "decoded bytes: only of variables read"
+        );
     }
 }
 

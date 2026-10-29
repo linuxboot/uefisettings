@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -17,6 +18,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
+use std::ops::Range;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
@@ -45,7 +47,7 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 
 /// `<name>-<lowercase GUID>` with '!' for each '/', as Linux v7.2 fs/efivarfs/vars.c
 /// efivar_get_utf8name() names a variable's file: always exactly one path component.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct EfivarFileName(String);
 
 impl EfivarFileName {
@@ -223,12 +225,30 @@ pub(super) struct EfivarRange {
     pub(super) size: u16,
 }
 
+/// The payload bytes `value` that a question decodes from an efivar file, of which read_efivar
+/// reads `size` payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DecodedValue {
+    pub(super) size: u16,
+    pub(super) value: Range<usize>,
+}
+
+impl DecodedValue {
+    /// Whether this value decodes from an efivar file of `len` bytes: read_efivar reads the
+    /// attributes field and `size` payload bytes, so it fails on a shorter file.
+    pub(super) fn decodes_from(&self, len: usize) -> bool {
+        len >= EFIVARFS_HEADER_SIZE + usize::from(self.size)
+    }
+}
+
 /// Reads the efivar ranges of one command, each once, keeping the outcomes:
 /// Linux v7.2 efivarfs sleeps once a non-root user has read 100 times within a second
 /// (fs/efivarfs/file.c, kernel/user.c).
 pub(crate) struct EfivarReader {
     source: EfivarSource,
     pub(super) outcomes: HashMap<EfivarRange, Result<Vec<u8>>>,
+    /// The payload bytes that the callers of read decode, by efivar file
+    pub(super) decoded: BTreeMap<EfivarFileName, Vec<DecodedValue>>,
 }
 
 impl EfivarReader {
@@ -238,14 +258,26 @@ impl EfivarReader {
         Ok(Self {
             source,
             outcomes: HashMap::new(),
+            decoded: BTreeMap::new(),
         })
     }
 
     /// read_efivar of `range` in this source, read once.
+    /// The caller decodes the payload bytes `value`, which this records in `decoded` with
+    /// `range.size` unless they end past the `range.size` bytes that read_efivar reads, where they
+    /// never decode. The file is recorded either way, so that a dump answers as its source.
     pub(super) fn read(
         &mut self,
         range: EfivarRange,
+        value: Range<usize>,
     ) -> std::result::Result<&[u8], &anyhow::Error> {
+        let decoded = self.decoded.entry(range.name.clone()).or_default();
+        if value.end <= usize::from(range.size) {
+            decoded.push(DecodedValue {
+                size: range.size,
+                value,
+            });
+        }
         let source = &self.source;
         self.outcomes
             .entry(range)
@@ -695,12 +727,48 @@ pub mod tests {
             size: 1,
         };
 
-        let error = reader.read(range).expect_err("read without efivars");
+        let error = reader.read(range, 0..1).expect_err("read without efivars");
 
         assert_eq!(
             error.downcast_ref::<EfivarsNotRead>(),
             Some(&EfivarsNotRead),
             "Disabled: {error:#}"
+        );
+    }
+
+    #[test]
+    fn reader_keeps_the_decoded_bytes_of_every_read() {
+        let mut reader =
+            EfivarReader::new(EfivarSource::Disabled).expect("create a reader without efivars");
+        let setup = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+        let other = EfivarFileName::new("Other", EFI_GLOBAL_VARIABLE);
+        let past = EfivarFileName::new("Past", EFI_GLOBAL_VARIABLE);
+        let reads = [
+            (&setup, 1, 0..1),
+            (&setup, 4, 2..4),
+            (&other, 2, 0..2),
+            (&other, 2, 1..2),
+            (&other, 2, 1..3), // ends one byte past Size
+            (&past, 2, 3..5),
+        ];
+        let decoded = |size, value| DecodedValue { size, value };
+
+        for (name, size, value) in reads {
+            let range = EfivarRange {
+                name: name.clone(),
+                size,
+            };
+            reader.read(range, value).expect_err("read without efivars");
+        }
+
+        assert_eq!(
+            reader.decoded,
+            BTreeMap::from([
+                (other, vec![decoded(2, 0..2), decoded(2, 1..2)]),
+                (past, vec![]),
+                (setup, vec![decoded(1, 0..1), decoded(4, 2..4)])
+            ]),
+            "decoded bytes of six reads of three files, without values past their sizes"
         );
     }
 
