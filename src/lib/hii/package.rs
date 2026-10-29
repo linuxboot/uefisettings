@@ -685,6 +685,25 @@ mod tests {
         }
     }
 
+    /// A parse error renders as main puts it into the JSON error_message:
+    /// with its context but without the ANSI escapes or banner of binrw's
+    /// verbose-backtrace feature (off in Cargo.toml).
+    #[test]
+    fn test_parse_error_renders_without_ansi_or_banner() {
+        let lists =
+            get_package_lists(&package_list(&OPAQUE_PACKAGE[..2])).expect("split the HiiDB");
+        let Err(err) = get_packages(&lists[0]) else {
+            panic!("list ending in a package header parsed");
+        };
+
+        let rendered = format!("{:#}", err);
+
+        let context = "While parsing field 'length' in Package";
+        assert!(rendered.contains(context), "context in {:?}", rendered);
+        assert!(!rendered.contains('\x1b'), "escape in {:?}", rendered);
+        assert!(!rendered.contains('━'), "banner in {:?}", rendered);
+    }
+
     /// The End package ends its package list before PackageLength does: the
     /// bytes after it are not read as packages.
     #[test]

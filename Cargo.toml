@@ -25,7 +25,9 @@ nix = { version = "0.27", features = ["fs", "ioctl", "mount"] }
 tempfile = "3.5"
 libloading = "0.8"
 httparse = "1.8"
-binrw = "0.13"
+# binrw's default verbose-backtrace feature puts ANSI bold codes and a banner into its
+# errors, which main prints as JSON (https://github.com/linuxboot/uefisettings/issues/16).
+binrw = { version = "0.13", default-features = false, features = ["std"] }
 rand = { version = "0.8", features = ["small_rng"] }
 proc-mounts = "0.3"
 thiserror = "1.0"
