@@ -51,6 +51,10 @@ const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
 const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
 // UEFI 2.10 §33.3.8.3.47
+const EFI_IFR_NUMERIC_SIZE: u8 = 0x03;
+const EFI_IFR_NUMERIC_SIZE_1: u8 = 0x00;
+const EFI_IFR_NUMERIC_SIZE_2: u8 = 0x01;
+const EFI_IFR_NUMERIC_SIZE_4: u8 = 0x02;
 const EFI_IFR_DISPLAY: u8 = 0x30;
 const EFI_IFR_DISPLAY_INT_DEC: u8 = 0x00;
 // UEFI 2.10 §33.3.8.3.51
@@ -445,11 +449,11 @@ pub struct QuestionHeader {
 }
 
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+#[br(little, import(encoding: RangeEncoding))]
 pub struct OneOf {
     pub question_header: QuestionHeader,
     pub flags: u8,
-    #[br(parse_with = range_parser, args(flags))]
+    #[br(parse_with = range_parser, args(flags, encoding))]
     pub data: Range,
 }
 
@@ -460,11 +464,11 @@ impl Question for OneOf {
 }
 
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+#[br(little, import(encoding: RangeEncoding))]
 pub struct Numeric {
     pub question_header: QuestionHeader,
     pub flags: u8,
-    #[br(parse_with = range_parser, args(flags))]
+    #[br(parse_with = range_parser, args(flags, encoding))]
     pub data: Range,
 }
 
@@ -663,29 +667,40 @@ fn refers_to_bit_field(question: &IFROperation) -> bool {
         })
 }
 
+/// How a NUMERIC or ONE_OF stores its MinValue, MaxValue and Step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RangeEncoding {
+    /// In the size of EFI_IFR_NUMERIC_SIZE in its Flags.
+    NumericSize,
+    /// As UINT32, as edk2-stable202608 VfrSyntax.g stores them for an EDKII bit varstore field,
+    /// whose Flags hold its width in bits.
+    EdkiiBitField,
+}
+
+impl RangeEncoding {
+    fn from_question(question: &IFROperation) -> Self {
+        if refers_to_bit_field(question) {
+            Self::EdkiiBitField
+        } else {
+            Self::NumericSize
+        }
+    }
+}
+
 fn range_parser<R: Read + Seek>(
     reader: &mut R,
     _endian: binrw::Endian,
-    args: (u8,),
+    (flags, encoding): (u8, RangeEncoding),
 ) -> BinResult<Range> {
-    match args.0 & 0x0Fu8 {
-        0x01u8 => {
-            let r: Range16 = reader.read_ne()?;
-            Ok(Range::Range16(r))
-        }
-        0x02u8 => {
-            let r: Range32 = reader.read_ne()?;
-            Ok(Range::Range32(r))
-        }
-        0x03u8 => {
-            let r: Range64 = reader.read_ne()?;
-            Ok(Range::Range64(r))
-        }
-
-        _ => {
-            let r: Range8 = reader.read_ne()?;
-            Ok(Range::Range8(r))
-        }
+    match encoding {
+        RangeEncoding::EdkiiBitField => Ok(Range::Range32(reader.read_ne()?)),
+        RangeEncoding::NumericSize => match flags & EFI_IFR_NUMERIC_SIZE {
+            EFI_IFR_NUMERIC_SIZE_1 => Ok(Range::Range8(reader.read_ne()?)),
+            EFI_IFR_NUMERIC_SIZE_2 => Ok(Range::Range16(reader.read_ne()?)),
+            EFI_IFR_NUMERIC_SIZE_4 => Ok(Range::Range32(reader.read_ne()?)),
+            // EFI_IFR_NUMERIC_SIZE_8, the only value left
+            _ => Ok(Range::Range64(reader.read_ne()?)),
+        },
     }
 }
 
@@ -1086,6 +1101,7 @@ fn read_question_bytes(
 ) -> std::result::Result<Vec<u8>, String> {
     let bytes = read_current_value_bytes(varstore)?;
     // edk2-stable202608 SetupBrowserDxe/IfrParse.c reads the VarOffset of such a question in bits
+    // TODO: decode bit fields by the width in their Flags, not their Range32 (UINT32 storage)
     if refers_to_bit_field(question) {
         return Err("<ValueUnavailable: EDKII bit-field value not decoded>".to_string());
     }
@@ -1418,6 +1434,10 @@ pub fn handle_form_package(
             continue;
         }
 
+        // set current_node's parent
+        // before handle_opcode: RangeEncoding::from_question reads it
+        current_node.borrow_mut().parent = Some(Rc::downgrade(&current_scope));
+
         handle_opcode(Rc::clone(&current_node)).context(format!(
             "Failed to parse op_code {:?} properly",
             &current_node.borrow().op_code,
@@ -1428,9 +1448,6 @@ pub fn handle_form_package(
             .borrow_mut()
             .children
             .push(Rc::clone(&current_node));
-
-        // set current_node's parent
-        current_node.borrow_mut().parent = Some(Rc::downgrade(&current_scope));
 
         if current_node.borrow().open_scope {
             current_scope = Rc::clone(&current_node);
@@ -1457,7 +1474,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
         IFROpCode::OneOf => {
             let parsed: OneOf = data_cursor
-                .read_ne()
+                .read_ne_args((RangeEncoding::from_question(&node),))
                 .context("Failed to parse OneOf's data")?;
             debug!("OneOf is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOf(parsed);
@@ -1557,7 +1574,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         }
         IFROpCode::Numeric => {
             let parsed: Numeric = data_cursor
-                .read_ne()
+                .read_ne_args((RangeEncoding::from_question(&node),))
                 .context("Failed to parse Numeric's data")?;
             debug!("Numeric is {:?}", parsed);
             node.parsed_data = ParsedOperation::Numeric(parsed);
@@ -2030,6 +2047,7 @@ fn handle_numeric(
             Range::Range32(r) => RangeType::NumSize32(r.max_value),
             Range::Range64(r) => RangeType::NumSize64(r.max_value),
         },
+        // TODO: None for bit fields: from_ifr reads EFI_IFR_DISPLAY from EDKII bit-field Flags
         numeric_range: Some(NumericRange::from_ifr(&parsed.data, parsed.flags)),
         opcode: current_node.op_code,
     };
@@ -2674,6 +2692,159 @@ mod question_value_tests {
                 want,
                 "{name}"
             );
+        }
+    }
+
+    /// The Range of the NUMERIC or ONE_OF `question`.
+    fn question_range(question: &IFROperation) -> &Range {
+        match &question.parsed_data {
+            ParsedOperation::Numeric(parsed) => &parsed.data,
+            ParsedOperation::OneOf(parsed) => &parsed.data,
+            other => panic!("not a NUMERIC or ONE_OF: {other:?}"),
+        }
+    }
+
+    /// A NUMERIC or ONE_OF at VarOffset 0 with `flags` and the MinValue, MaxValue and Step of
+    /// `range`, in its size.
+    fn range_question(flags: u8, range: &Range) -> Vec<u8> {
+        let values = match range {
+            Range::Range8(r) => [r.min_value, r.max_value, r.step]
+                .map(u8::to_le_bytes)
+                .concat(),
+            Range::Range16(r) => [r.min_value, r.max_value, r.step]
+                .map(u16::to_le_bytes)
+                .concat(),
+            Range::Range32(r) => [r.min_value, r.max_value, r.step]
+                .map(u32::to_le_bytes)
+                .concat(),
+            Range::Range64(r) => [r.min_value, r.max_value, r.step]
+                .map(u64::to_le_bytes)
+                .concat(),
+        };
+        [question_header(0), vec![flags], values].concat()
+    }
+
+    /// An EDKII bit varstore field's Range is UINT32, whatever its width in Flags.
+    #[test]
+    fn bit_field_range_is_uint32() {
+        let want = Range::Range32(Range32 {
+            min_value: 0,
+            max_value: 300,
+            step: 1,
+        });
+        let cases = [
+            ("3-bit UINT_DEC", 0x43),
+            ("19-bit UINT_HEX", 0x93),
+            ("19-bit INT_DEC", 0x13),
+            ("1-bit UINT_DEC", 0x41),
+            ("17-bit UINT_DEC", 0x51),
+            ("12-bit UINT_DEC", 0x4C),
+            ("zero width", 0x40),
+            ("33-bit width", 0x61),
+        ];
+        for op_code in [NUMERIC, ONE_OF] {
+            for (name, flags) in cases {
+                let data = range_question(flags, &want);
+                let (_root, question) =
+                    try_parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &[])
+                        .unwrap_or_else(|e| panic!("parse {name}, op {op_code:#04x}: {e:#}"));
+
+                assert_eq!(
+                    question_range(&question.borrow()),
+                    &want,
+                    "{name}, op {op_code:#04x}"
+                );
+            }
+        }
+    }
+
+    /// A question outside an EDKII bit varstore field's GUID has the Range size of
+    /// EFI_IFR_NUMERIC_SIZE, also right after such a field and in another GUID.
+    #[test]
+    fn non_bit_field_range_has_efi_ifr_numeric_size() {
+        let want = Range::Range64(Range64 {
+            min_value: 0,
+            max_value: 1 << 40,
+            step: 1,
+        });
+        let data = range_question(0x13, &want); // UINT64 UINT_DEC
+        let bit_field = [
+            operation(GUID, true, &BIT_VARSTORE_GUID),
+            operation(NUMERIC, true, &uint32_range_question(0, 0x42)),
+            END.to_vec(), // End of the NUMERIC
+            END.to_vec(), // End of the GUID
+        ]
+        .concat();
+        let cases = [("alone", vec![]), ("after a bit field", vec![bit_field])];
+        for op_code in [NUMERIC, ONE_OF] {
+            for (name, declarations) in &cases {
+                let (_root, question) = try_parse_question(declarations, op_code, &data, &[])
+                    .unwrap_or_else(|e| panic!("parse {name}, op {op_code:#04x}: {e:#}"));
+
+                assert_eq!(
+                    question_range(&question.borrow()),
+                    &want,
+                    "{name}, op {op_code:#04x}"
+                );
+            }
+
+            let (_root, question) = try_parse_question_in_guid(OTHER_GUID, op_code, &data, &[])
+                .unwrap_or_else(|e| panic!("parse other GUID, op {op_code:#04x}: {e:#}"));
+
+            assert_eq!(
+                question_range(&question.borrow()),
+                &want,
+                "other GUID, op {op_code:#04x}"
+            );
+        }
+    }
+
+    /// Reserved Flags bits 2-3 do not change the Range size that EFI_IFR_NUMERIC_SIZE gives.
+    #[test]
+    fn reserved_flags_bits_do_not_change_range_size() {
+        let uint8 = Range::Range8(Range8 {
+            min_value: 0,
+            max_value: 10,
+            step: 1,
+        });
+        let uint16 = Range::Range16(Range16 {
+            min_value: 0,
+            max_value: 300,
+            step: 1,
+        });
+        let uint32 = Range::Range32(Range32 {
+            min_value: 0,
+            max_value: 300,
+            step: 1,
+        });
+        let uint64 = Range::Range64(Range64 {
+            min_value: 0,
+            max_value: 1 << 40,
+            step: 1,
+        });
+        let cases = [
+            ("UINT8", 0x00, &uint8),
+            ("UINT8 with reserved bit 2", 0x04, &uint8),
+            ("UINT16", 0x01, &uint16),
+            ("UINT16 with reserved bit 2", 0x05, &uint16),
+            ("UINT32", 0x02, &uint32),
+            ("UINT32 with reserved bits 2-3", 0x0E, &uint32),
+            ("UINT64", 0x03, &uint64),
+            ("UINT64 with reserved bit 2", 0x07, &uint64),
+            ("UINT64 with reserved bits 2-3", 0x0F, &uint64),
+        ];
+        for op_code in [NUMERIC, ONE_OF] {
+            for (name, flags, want) in cases {
+                let data = range_question(flags, want);
+                let (_root, question) = try_parse_question(&[], op_code, &data, &[])
+                    .unwrap_or_else(|e| panic!("parse {name}, op {op_code:#04x}: {e:#}"));
+
+                assert_eq!(
+                    question_range(&question.borrow()),
+                    want,
+                    "{name}, op {op_code:#04x}"
+                );
+            }
         }
     }
 }

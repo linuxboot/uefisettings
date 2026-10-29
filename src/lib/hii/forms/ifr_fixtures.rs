@@ -38,7 +38,7 @@ pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
 pub(super) const FORM_MAP: u8 = 0x5D;
 
-const GUID: u8 = 0x5F;
+pub(super) const GUID: u8 = 0x5F;
 
 /// EDKII_IFR_BIT_VARSTORE_GUID 82DDD68B-9163-4187-9B27-20A8FD60A71D as stored.
 pub(super) const BIT_VARSTORE_GUID: [u8; 16] = [
@@ -196,6 +196,9 @@ fn form_set_data() -> Vec<u8> {
     .concat()
 }
 
+/// The root of a parsed form package, which owns the parents, and its question.
+type RootAndQuestion = (Rc<RefCell<IFROperation>>, Rc<RefCell<IFROperation>>);
+
 /// Parses a FormSet holding `declarations` and then one question, and
 /// returns the root, which owns the parents, and that question.
 pub(super) fn parse_question(
@@ -203,7 +206,17 @@ pub(super) fn parse_question(
     op_code: u8,
     data: &[u8],
     children: &[Vec<u8>],
-) -> (Rc<RefCell<IFROperation>>, Rc<RefCell<IFROperation>>) {
+) -> RootAndQuestion {
+    try_parse_question(declarations, op_code, data, children).expect("parse the form package")
+}
+
+/// `parse_question`, returning the error of an unparsable form package.
+pub(super) fn try_parse_question(
+    declarations: &[Vec<u8>],
+    op_code: u8,
+    data: &[u8],
+    children: &[Vec<u8>],
+) -> Result<RootAndQuestion> {
     let data = form_set(&[
         declarations.concat(),
         operation(op_code, true, data),
@@ -211,7 +224,7 @@ pub(super) fn parse_question(
         END.to_vec(), // End of the question
     ]);
 
-    let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
+    let root = handle_form_package(&mut Cursor::new(&data))?;
 
     let form_set = Rc::clone(&root.borrow().children[0]);
     let question = Rc::clone(&form_set.borrow().children[declarations.len()]);
@@ -220,7 +233,7 @@ pub(super) fn parse_question(
         children.len(),
         "children of the parsed question"
     );
-    (root, question)
+    Ok((root, question))
 }
 
 /// An EFI_IFR_FORM_SET holding `children`.
@@ -327,7 +340,17 @@ pub(super) fn parse_question_in_guid(
     op_code: u8,
     data: &[u8],
     children: &[Vec<u8>],
-) -> (Rc<RefCell<IFROperation>>, Rc<RefCell<IFROperation>>) {
+) -> RootAndQuestion {
+    try_parse_question_in_guid(guid, op_code, data, children).expect("parse the form package")
+}
+
+/// `parse_question_in_guid`, returning the error of an unparsable form package.
+pub(super) fn try_parse_question_in_guid(
+    guid: [u8; 16],
+    op_code: u8,
+    data: &[u8],
+    children: &[Vec<u8>],
+) -> Result<RootAndQuestion> {
     let data = form_set(&[
         operation(GUID, true, &guid),
         operation(op_code, true, data),
@@ -336,10 +359,10 @@ pub(super) fn parse_question_in_guid(
         END.to_vec(), // End of the GUID
     ]);
 
-    let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
+    let root = handle_form_package(&mut Cursor::new(&data))?;
 
     let form_set = Rc::clone(&root.borrow().children[0]);
     let guid = Rc::clone(&form_set.borrow().children[0]);
     let question = Rc::clone(&guid.borrow().children[0]);
-    (root, question)
+    Ok((root, question))
 }
