@@ -24,6 +24,8 @@ use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
 
+// TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
+// open_efivar, so efivarfs paths and missing-variable errors have one source.
 pub const OCP_HIIDB_PATH: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 

@@ -37,7 +37,9 @@ use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
+use crate::hii::efivarfs::open_efivar;
 use crate::hii::efivarfs::EfivarFileName;
+use crate::hii::efivarfs::EfivarNotFound;
 use crate::hii::efivarfs::EfivarsMountGuard;
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::package::Guid;
@@ -93,6 +95,19 @@ fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<V
     let mut bytes = vec![0u8; EFIVARFS_HEADER_SIZE + payload_size];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+/// Reads the efivar file `name` in `dir`: its attributes field and `size` payload bytes.
+fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Result<Vec<u8>> {
+    let mut file = open_efivar(dir, name)?;
+    debug!("buffer size: {}", size);
+    // efivarfs prepends a 4-byte attributes field to the variable payload.
+    read_efivarfs_bytes(&mut file, size.into()).with_context(|| {
+        format!(
+            "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
+            dir.join(name).display()
+        )
+    })
 }
 
 fn update_efivarfs_bytes(
@@ -749,20 +764,12 @@ trait VariableStore {
             ));
         }
 
-        let path = Path::new(EFIVARS_MOUNT_POINT).join(self.efivar_file_name());
-
         // try to read data from varstore
-        let mut file = File::open(&path).context(format!(
-            "failed to open sysfs efivars '{}' to get varstore bytes",
-            path.display()
-        ))?;
-        debug!("buffer size: {}", self.size());
-        // efivarfs prepends a 4-byte attributes field to the variable payload.
-        let buf = read_efivarfs_bytes(&mut file, self.size().into()).context(format!(
-            "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
-            path.display()
-        ))?;
-        Ok(buf)
+        read_efivar(
+            Path::new(EFIVARS_MOUNT_POINT),
+            &self.efivar_file_name(),
+            self.size(),
+        )
     }
 
     fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
@@ -791,18 +798,16 @@ trait VariableStore {
         let mut lock = FileLock::new(LOCK_FILE_PATH);
         lock.lock()?;
 
-        let store_filename = Path::new(EFIVARS_MOUNT_POINT).join(self.efivar_file_name());
+        let efivars = Path::new(EFIVARS_MOUNT_POINT);
+        let file_name = self.efivar_file_name();
+        let path = efivars.join(&file_name);
 
-        let mut file_ro = File::open(&store_filename).context(format!(
-            "Failed to open efivarfs file '{}' to get varstore bytes",
-            store_filename.display()
-        ))?;
+        let mut file_ro = open_efivar(efivars, &file_name)?;
 
         let mut file_contents = Vec::new();
-        file_ro.read_to_end(&mut file_contents).context(format!(
-            "Failed to read efivarfs file '{}'",
-            store_filename.display()
-        ))?;
+        file_ro
+            .read_to_end(&mut file_contents)
+            .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
         update_efivarfs_bytes(&mut file_contents, self.size(), offset, data)?;
 
@@ -810,12 +815,12 @@ trait VariableStore {
 
         // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
         // validate temporarily writable.
-        let _immutability_attribute_guard = EfivarsImmutabilityGuard::new(&store_filename)
+        let _immutability_attribute_guard = EfivarsImmutabilityGuard::new(&path)
             .context("failed to create immutability attribute guard")?;
 
         // All checks passed, now we can try to write.
-        debug!("Writing value to {}", store_filename.display());
-        File::create(&store_filename)
+        debug!("Writing value to {}", path.display());
+        File::create(&path)
             .context("Failed to open efivarfs file for writing")?
             .write_all(&file_contents)
             .context("Failed to write to efivarfs file")?;
@@ -841,8 +846,9 @@ mod non_efi_varstore_tests {
         kind: VariableStoreKind,
     }
 
+    /// Reads its efivar file in `dir`.
     struct FileBackedBufferVarStore {
-        path: PathBuf,
+        dir: PathBuf,
         size: u16,
     }
 
@@ -898,7 +904,36 @@ mod non_efi_varstore_tests {
         }
 
         fn read_bytes(&self) -> Result<Vec<u8>> {
-            read_efivarfs_bytes(&mut File::open(&self.path)?, self.size.into())
+            read_efivar(&self.dir, &self.efivar_file_name(), self.size)
+        }
+    }
+
+    /// Its read fails with io NotFound, though no efivar file is missing.
+    struct NotFoundReadVarStore;
+
+    impl VariableStore for NotFoundReadVarStore {
+        fn name(&self) -> String {
+            "NotFoundRead".to_string()
+        }
+
+        fn guid(&self) -> Guid {
+            NIL_GUID
+        }
+
+        fn size(&self) -> u16 {
+            1
+        }
+
+        fn kind(&self) -> VariableStoreKind {
+            VariableStoreKind::Buffer
+        }
+
+        fn is_runtime_accessible(&self) -> bool {
+            false
+        }
+
+        fn read_bytes(&self) -> Result<Vec<u8>> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
         }
     }
 
@@ -978,14 +1013,25 @@ mod non_efi_varstore_tests {
     }
 
     #[test]
+    fn not_found_read_error_is_not_a_missing_variable() {
+        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(NotFoundReadVarStore));
+
+        assert_eq!(
+            read_current_value_bytes(&varstore).unwrap_err(),
+            "<VStoreError: entity not found>"
+        );
+    }
+
+    #[test]
     fn buffer_varstore_with_efivarfs_backing_is_read() {
         let bytes = vec![0x07, 0x00, 0x00, 0x00, 0x01];
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(&bytes).unwrap();
-        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(FileBackedBufferVarStore {
-            path: file.path().to_path_buf(),
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileBackedBufferVarStore {
+            dir: directory.path().to_path_buf(),
             size: 1,
-        }));
+        };
+        std::fs::write(directory.path().join(store.efivar_file_name()), &bytes).unwrap();
+        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(store));
 
         assert_eq!(read_current_value_bytes(&varstore).unwrap(), bytes);
     }
@@ -994,7 +1040,7 @@ mod non_efi_varstore_tests {
     fn buffer_varstore_without_efivarfs_backing_is_unavailable() {
         let directory = tempfile::tempdir().unwrap();
         let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(FileBackedBufferVarStore {
-            path: directory.path().join("missing-efivarfs-variable"),
+            dir: directory.path().to_path_buf(),
             size: 1,
         }));
 
@@ -1084,15 +1130,6 @@ mod non_efi_varstore_tests {
     }
 }
 
-fn is_not_found(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .map(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
-            .unwrap_or(false)
-    })
-}
-
 fn read_current_value_bytes(
     varstore: &Result<Box<dyn VariableStore>>,
 ) -> std::result::Result<Vec<u8>, String> {
@@ -1111,7 +1148,8 @@ fn read_current_value_bytes(
             match varstore.read_bytes() {
                 Ok(bytes) => Ok(bytes),
                 Err(error)
-                    if varstore.kind() == VariableStoreKind::Buffer && is_not_found(&error) =>
+                    if varstore.kind() == VariableStoreKind::Buffer
+                        && error.downcast_ref::<EfivarNotFound>().is_some() =>
                 {
                     Err(
                         "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"

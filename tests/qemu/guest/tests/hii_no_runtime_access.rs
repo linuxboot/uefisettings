@@ -81,6 +81,10 @@ fn get_reports_the_check_box_as_unavailable() {
 
 #[test]
 fn set_fails() {
-    json_error(&["hii", "set", CHECK_BOX, "0", "--json"]);
+    let error = json_error(&["hii", "set", CHECK_BOX, "0", "--json"]);
+    assert_eq!(
+        error.error_message,
+        "no EFI variable MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d"
+    );
     assert_eq!(variable_data(DRIVER_SAMPLE_VARIABLE), None);
 }

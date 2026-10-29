@@ -11,6 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::fmt;
+use std::fs::File;
+use std::io;
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -22,6 +24,7 @@ use log::warn;
 use nix::mount::mount;
 use nix::mount::MsFlags;
 use proc_mounts::MountIter;
+use thiserror::Error;
 
 use crate::hii::package::Guid;
 
@@ -51,6 +54,28 @@ impl AsRef<Path> for EfivarFileName {
 impl fmt::Display for EfivarFileName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("no EFI variable {name}")]
+pub(super) struct EfivarNotFound {
+    pub(super) name: EfivarFileName,
+}
+
+/// Opens the efivar file `name` in `dir` for reading. A missing file is EfivarNotFound without
+/// context, so the error names the variable.
+pub(super) fn open_efivar(dir: &Path, name: &EfivarFileName) -> Result<File> {
+    let path = dir.join(name);
+    File::open(&path).map_err(|error| open_error(&path, name, error))
+}
+
+/// open_efivar's error for `error` from opening the efivar file `name` at `path`.
+fn open_error(path: &Path, name: &EfivarFileName, error: io::Error) -> anyhow::Error {
+    match error.kind() {
+        io::ErrorKind::NotFound => EfivarNotFound { name: name.clone() }.into(),
+        _ => anyhow::Error::new(error)
+            .context(format!("failed to open efivar file '{}'", path.display())),
     }
 }
 
@@ -166,6 +191,8 @@ fn to_ms_flags(options: &[String]) -> MsFlags {
 #[cfg(test)]
 pub mod tests {
     use std::ffi::OsStr;
+    use std::fs;
+    use std::io::Read;
     use std::path::Component;
 
     use anyhow::Context;
@@ -200,6 +227,98 @@ pub mod tests {
                 "VarStore name {name:?}"
             );
         }
+    }
+
+    #[test]
+    fn open_efivar_opens_the_named_file() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+        fs::write(dir.path().join(&name), b"data").expect("write efivar file");
+        let mut contents = String::new();
+
+        open_efivar(dir.path(), &name)
+            .expect("open efivar file")
+            .read_to_string(&mut contents)
+            .expect("read efivar file");
+
+        assert_eq!(contents, "data");
+    }
+
+    #[test]
+    fn open_efivar_returns_a_missing_file_as_efivar_not_found() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+
+        let error = open_efivar(dir.path(), &name).expect_err("open missing efivar file");
+
+        assert_eq!(
+            format!("{error:#}"),
+            "no EFI variable Setup-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+            "Display of the missing-file error"
+        );
+        assert_eq!(
+            error
+                .downcast::<EfivarNotFound>()
+                .expect("downcast to EfivarNotFound"),
+            EfivarNotFound { name },
+            "EfivarNotFound of the missing file"
+        );
+    }
+
+    #[test]
+    fn open_efivar_keeps_other_errors_with_the_path() {
+        let not_a_dir = tempfile::NamedTempFile::new().expect("create file");
+        let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+
+        let error = open_efivar(not_a_dir.path(), &name).expect_err("open efivar file in a file");
+
+        assert!(
+            error.downcast_ref::<EfivarNotFound>().is_none(),
+            "{error:#} is EfivarNotFound"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .map(io::Error::kind),
+            Some(io::ErrorKind::NotADirectory),
+            "root cause of opening in a file"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "failed to open efivar file '{}'",
+                not_a_dir.path().join(&name).display()
+            ),
+            "message of opening in a file"
+        );
+    }
+
+    #[test]
+    fn open_error_keeps_permission_errors_with_the_path() {
+        let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+        let path = Path::new(EFIVARS_MOUNT_POINT).join(&name);
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+
+        let error = open_error(&path, &name, denied);
+
+        assert!(
+            error.downcast_ref::<EfivarNotFound>().is_none(),
+            "{error:#} is EfivarNotFound"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied),
+            "root cause of the permission error"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("failed to open efivar file '{}'", path.display()),
+            "message of the permission error"
+        );
     }
 
     #[test]
