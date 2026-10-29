@@ -12,6 +12,10 @@
 
 //! IFR byte builders and question answers shared by the tests of forms.rs and its modules.
 
+use std::fs;
+
+use tempfile::TempDir;
+
 use super::*;
 
 pub(super) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
@@ -38,6 +42,8 @@ pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
 pub(super) const FORM_MAP: u8 = 0x5D;
 
+pub(super) const VAR_STORE_EFI: u8 = 0x26;
+
 pub(super) const GUID: u8 = 0x5F;
 
 /// EDKII_IFR_BIT_VARSTORE_GUID 82DDD68B-9163-4187-9B27-20A8FD60A71D as stored.
@@ -60,14 +66,17 @@ pub(super) const NIL_GUID: Guid = Guid {
     data4: [0; 8],
 };
 
-/// Serves `payload` after the efivarfs attributes field.
-struct MemVarStore {
-    payload: Vec<u8>,
+/// A VarStore declared without IFR bytes.
+pub(super) struct DeclaredVarStore {
+    pub(super) name: &'static str,
+    pub(super) size: u16,
+    pub(super) kind: VariableStoreKind,
+    pub(super) runtime_accessible: bool,
 }
 
-impl VariableStore for MemVarStore {
+impl VariableStore for DeclaredVarStore {
     fn name(&self) -> String {
-        "MemVarStore".to_string()
+        self.name.to_string()
     }
 
     fn guid(&self) -> Guid {
@@ -75,30 +84,92 @@ impl VariableStore for MemVarStore {
     }
 
     fn size(&self) -> u16 {
-        u16::try_from(self.payload.len()).expect("test payload fits a VarStore Size")
+        self.size
     }
 
     fn kind(&self) -> VariableStoreKind {
-        VariableStoreKind::EfiVariable
+        self.kind
     }
 
     fn is_runtime_accessible(&self) -> bool {
-        true
-    }
-
-    fn read_bytes(&self) -> Result<Vec<u8>> {
-        Ok([&7u32.to_le_bytes()[..], &self.payload].concat())
+        self.runtime_accessible
     }
 }
 
-pub(super) fn mem_var_store(payload: &[u8]) -> Result<Box<dyn VariableStore>> {
-    Ok(Box::new(MemVarStore {
-        payload: payload.to_vec(),
-    }))
+/// A directory of efivar files, as efivarfs is.
+pub(super) struct Efivars(TempDir);
+
+impl Efivars {
+    pub(super) fn new() -> Self {
+        Self(tempfile::tempdir().expect("create efivars directory"))
+    }
+
+    /// Makes `payload`, after the efivarfs attributes field, the efivar file of `store`.
+    pub(super) fn write(&self, store: &dyn VariableStore, payload: &[u8]) {
+        fs::write(
+            self.0.path().join(store.efivar_file_name()),
+            efivarfs_bytes(payload),
+        )
+        .expect("write efivar file");
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    /// A fresh EfivarReader of these efivar files.
+    /// The reader holds only the path: keep `self` alive while it reads.
+    pub(super) fn reader(&self) -> EfivarReader {
+        EfivarReader::new(self.path().to_path_buf())
+    }
 }
 
-pub(super) fn unavailable() -> Result<Box<dyn VariableStore>> {
-    Err(anyhow!("no VarStore 1"))
+/// A question's VarStore, and the efivars that hold its value.
+pub(super) struct VarStoreFixture {
+    pub(super) store: Result<Box<dyn VariableStore>>,
+    pub(super) efivars: Efivars,
+}
+
+/// `payload` after the efivarfs attributes field.
+pub(super) fn efivarfs_bytes(payload: &[u8]) -> Vec<u8> {
+    [&7u32.to_le_bytes()[..], payload].concat()
+}
+
+/// A runtime-accessible EFI variable `name` of `size` bytes.
+pub(super) fn efi_variable(name: &'static str, size: usize) -> DeclaredVarStore {
+    DeclaredVarStore {
+        name,
+        size: u16::try_from(size).expect("test size fits a VarStore Size"),
+        kind: VariableStoreKind::EfiVariable,
+        runtime_accessible: true,
+    }
+}
+
+/// A buffer VarStore `name` of `size` bytes.
+pub(super) fn buffer(name: &'static str, size: usize) -> DeclaredVarStore {
+    DeclaredVarStore {
+        kind: VariableStoreKind::Buffer,
+        runtime_accessible: false,
+        ..efi_variable(name, size)
+    }
+}
+
+/// An EFI variable VarStore whose efivar file holds `payload`.
+pub(super) fn var_store_of(payload: &[u8]) -> VarStoreFixture {
+    let store = efi_variable("VarStore", payload.len());
+    let efivars = Efivars::new();
+    efivars.write(&store, payload);
+    VarStoreFixture {
+        store: Ok(Box::new(store)),
+        efivars,
+    }
+}
+
+pub(super) fn unavailable() -> VarStoreFixture {
+    VarStoreFixture {
+        store: Err(anyhow!("no VarStore 1")),
+        efivars: Efivars::new(),
+    }
 }
 
 pub(super) fn strings() -> Vec<HashMap<i32, String>> {
@@ -292,15 +363,16 @@ pub(super) fn one_of_data() -> Vec<u8> {
 /// The QuestionDescriptor that list-questions, get and set use for `node`.
 pub(super) fn question_descriptor(
     node: &Rc<RefCell<IFROperation>>,
-    var_store: Result<Box<dyn VariableStore>>,
+    VarStoreFixture { store, efivars }: VarStoreFixture,
 ) -> QuestionDescriptor {
     let current = node.borrow();
     let strings = strings();
-    let walk = &mut FormPackageWalk::new(&strings);
+    let mut reader = efivars.reader();
+    let walk = &mut FormPackageWalk::new(&strings, &mut reader);
     match &current.parsed_data {
-        ParsedOperation::OneOf(parsed) => handle_oneof(var_store, parsed, node, "", &current, walk),
-        ParsedOperation::Numeric(parsed) => handle_numeric(var_store, parsed, "", &current, walk),
-        ParsedOperation::CheckBox(parsed) => handle_checkbox(var_store, parsed, "", &current, walk),
+        ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, node, "", &current, walk),
+        ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", &current, walk),
+        ParsedOperation::CheckBox(parsed) => handle_checkbox(store, parsed, "", &current, walk),
         other => panic!("not a question: {other:?}"),
     }
 }
@@ -311,7 +383,7 @@ pub(super) fn answer(
     op_code: u8,
     data: &[u8],
     children: &[Vec<u8>],
-    var_store: Result<Box<dyn VariableStore>>,
+    var_store: VarStoreFixture,
 ) -> String {
     let (_root, node) = parse_question(declarations, op_code, data, children);
     question_descriptor(&node, var_store).value
@@ -334,7 +406,7 @@ pub(super) fn answer_in_guid(
     op_code: u8,
     data: &[u8],
     children: &[Vec<u8>],
-    var_store: Result<Box<dyn VariableStore>>,
+    var_store: VarStoreFixture,
 ) -> String {
     let (_root, question) = parse_question_in_guid(guid, op_code, data, children);
     question_descriptor(&question, var_store).value

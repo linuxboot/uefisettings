@@ -76,6 +76,7 @@ impl HiiBackend {
         let mut readable_representation = String::new();
 
         let parsed_db = package::read_db(db_bytes)?;
+        let mut reader = forms::EfivarReader::default();
 
         for (guid, package_list) in parsed_db.forms {
             write!(readable_representation, "Packagelist {}", &guid)?;
@@ -87,6 +88,7 @@ impl HiiBackend {
                         .strings
                         .get(&guid)
                         .context(format!("Failed to get string packages using GUID {}", guid))?,
+                    &mut reader,
                 )?);
             }
         }
@@ -122,6 +124,7 @@ impl HiiBackend {
     pub fn list_questions(db_bytes: &[u8]) -> Result<Vec<Question>> {
         let mut res = Vec::new();
         let parsed_db = package::read_db(db_bytes)?;
+        let mut reader = forms::EfivarReader::default();
         for (guid, package_list) in parsed_db.forms {
             let string_packages = parsed_db
                 .strings
@@ -131,7 +134,9 @@ impl HiiBackend {
             for form_package in package_list {
                 //  TODO: show form name, package list guid in the final response as well
 
-                for question_descriptor in list_questions(form_package, string_packages) {
+                for question_descriptor in
+                    list_questions(form_package, string_packages, &mut reader)
+                {
                     let mut question = Question {
                         name: question_descriptor.question,
                         answer: question_descriptor.value,
@@ -185,9 +190,14 @@ impl SettingsBackend for HiiBackend {
 
             for form_package in package_list {
                 // try to find the question
-                if let Some(question_descriptor) =
-                    forms::find_question(form_package, string_packages, &question_variations)
-                {
+                if let Some(question_descriptor) = forms::find_question(
+                    form_package,
+                    string_packages,
+                    &question_variations,
+                    // fresh per lookup: change_value may have written a variable an
+                    // earlier lookup read
+                    &mut forms::EfivarReader::default(),
+                ) {
                     let mut modified = false;
                     // if the question_descriptor provides options then set the closest one from new_value_variations
                     // (example whatever matches from [Enabled, Enable])
@@ -270,6 +280,7 @@ impl SettingsBackend for HiiBackend {
 
         let db_bytes = extract::extract_db()?;
         let parsed_db = package::read_db(&db_bytes)?;
+        let mut reader = forms::EfivarReader::default();
 
         for (guid, package_list) in parsed_db.forms {
             for form_package in package_list {
@@ -280,6 +291,7 @@ impl SettingsBackend for HiiBackend {
                         .get(&guid)
                         .context(format!("Failed to get string packages using GUID {}", guid))?,
                     &question_variations,
+                    &mut reader,
                 ) {
                     let mut get_resp = GetResponse {
                         selector: guid.to_owned(),

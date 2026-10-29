@@ -678,9 +678,15 @@ mod tests {
         let want = "<ValueUnavailable: no supported varstore with matching id 0x0001 found> \
                     <IFR default (DefaultId 0x0001): 4>";
 
-        let listed = list_questions(Rc::clone(&root), &strings());
-        let found = find_question(root, &strings(), &HashSet::from([PROMPT]))
-            .expect("find the question by its prompt");
+        let efivars = Efivars::new();
+        let listed = list_questions(Rc::clone(&root), &strings(), &mut efivars.reader());
+        let found = find_question(
+            root,
+            &strings(),
+            &HashSet::from([PROMPT]),
+            &mut efivars.reader(),
+        )
+        .expect("find the question by its prompt");
 
         let answers: Vec<&str> = listed
             .iter()
@@ -702,7 +708,7 @@ mod tests {
         let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
         let unavailable = "<ValueUnavailable: varstore not found because we reached root>";
 
-        let listed = list_questions(root, &strings());
+        let listed = list_questions(root, &strings(), &mut Efivars::new().reader());
 
         let answers: Vec<&str> = listed.iter().map(|q| q.value.as_str()).collect();
         assert_eq!(
@@ -739,7 +745,7 @@ mod tests {
         let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
         let unavailable = "<ValueUnavailable: no supported varstore with matching id 0x0001 found>";
 
-        let listed = list_questions(root, &strings());
+        let listed = list_questions(root, &strings(), &mut Efivars::new().reader());
 
         let answers: Vec<&str> = listed
             .iter()
@@ -776,7 +782,7 @@ mod tests {
         );
         let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
 
-        let listed = list_questions(root, &strings());
+        let listed = list_questions(root, &strings(), &mut Efivars::new().reader());
 
         let answers: Vec<&str> = listed.iter().map(|q| q.value.as_str()).collect();
         assert_eq!(

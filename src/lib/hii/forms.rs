@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -22,6 +23,7 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -756,22 +758,6 @@ trait VariableStore {
         EfivarFileName::new(&self.name(), self.guid())
     }
 
-    /// extract raw bytes from UEFI using the /sys virtual filesystem
-    fn read_bytes(&self) -> Result<Vec<u8>> {
-        if self.kind() == VariableStoreKind::EfiVariable && !self.is_runtime_accessible() {
-            return Err(anyhow!(
-                "EFI variable is boot-service-only and is not readable from efivarfs"
-            ));
-        }
-
-        // try to read data from varstore
-        read_efivar(
-            Path::new(EFIVARS_MOUNT_POINT),
-            &self.efivar_file_name(),
-            self.size(),
-        )
-    }
-
     fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
         if self.kind() == VariableStoreKind::EfiVariable && !self.is_runtime_accessible() {
             return Err(anyhow!(
@@ -837,19 +823,11 @@ enum VariableStoreKind {
 
 #[cfg(test)]
 mod non_efi_varstore_tests {
-    use std::path::PathBuf;
-
-    use super::ifr_fixtures::NIL_GUID;
+    use super::ifr_fixtures::*;
     use super::*;
 
     struct TestVariableStore {
         kind: VariableStoreKind,
-    }
-
-    /// Reads its efivar file in `dir`.
-    struct FileBackedBufferVarStore {
-        dir: PathBuf,
-        size: u16,
     }
 
     impl VariableStore for TestVariableStore {
@@ -873,67 +851,8 @@ mod non_efi_varstore_tests {
             self.kind == VariableStoreKind::EfiVariable
         }
 
-        fn read_bytes(&self) -> Result<Vec<u8>> {
-            Err(anyhow!("simulated efivarfs read failure"))
-        }
-
         fn write_efivarfs_at_offset(&self, _offset: u16, _data: TypeValue) -> Result<()> {
             Ok(())
-        }
-    }
-
-    impl VariableStore for FileBackedBufferVarStore {
-        fn name(&self) -> String {
-            "TestBufferVarStore".to_string()
-        }
-
-        fn guid(&self) -> Guid {
-            NIL_GUID
-        }
-
-        fn size(&self) -> u16 {
-            self.size
-        }
-
-        fn kind(&self) -> VariableStoreKind {
-            VariableStoreKind::Buffer
-        }
-
-        fn is_runtime_accessible(&self) -> bool {
-            false
-        }
-
-        fn read_bytes(&self) -> Result<Vec<u8>> {
-            read_efivar(&self.dir, &self.efivar_file_name(), self.size)
-        }
-    }
-
-    /// Its read fails with io NotFound, though no efivar file is missing.
-    struct NotFoundReadVarStore;
-
-    impl VariableStore for NotFoundReadVarStore {
-        fn name(&self) -> String {
-            "NotFoundRead".to_string()
-        }
-
-        fn guid(&self) -> Guid {
-            NIL_GUID
-        }
-
-        fn size(&self) -> u16 {
-            1
-        }
-
-        fn kind(&self) -> VariableStoreKind {
-            VariableStoreKind::Buffer
-        }
-
-        fn is_runtime_accessible(&self) -> bool {
-            false
-        }
-
-        fn read_bytes(&self) -> Result<Vec<u8>> {
-            Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
         }
     }
 
@@ -952,27 +871,26 @@ mod non_efi_varstore_tests {
         }
     }
 
-    #[test]
-    fn boot_service_only_varstore_is_reported_as_unavailable() {
-        for attributes in [0x2, 0x3] {
-            let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(efi_varstore(attributes)));
-
-            assert_eq!(
-                read_current_value_bytes(&varstore).unwrap_err(),
-                "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>"
-            );
-        }
+    /// read_current_value_bytes of `store` with a fresh EfivarReader of `efivars`.
+    fn read(
+        store: impl VariableStore + 'static,
+        efivars: &Efivars,
+    ) -> std::result::Result<Vec<u8>, String> {
+        read_current_value_bytes(&Ok(Box::new(store)), &mut efivars.reader())
+            .map(<[u8]>::to_vec)
+            .map_err(Cow::into_owned)
     }
 
     #[test]
-    fn boot_service_only_varstore_read_is_rejected() {
+    fn boot_service_only_varstore_is_reported_as_unavailable() {
         for attributes in [0x2, 0x3] {
             assert_eq!(
-                efi_varstore(attributes)
-                    .read_bytes()
-                    .unwrap_err()
-                    .to_string(),
-                "EFI variable is boot-service-only and is not readable from efivarfs"
+                read(efi_varstore(attributes), &Efivars::new()),
+                Err(
+                    "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>"
+                        .to_string()
+                ),
+                "attributes {attributes:#x}"
             );
         }
     }
@@ -1001,52 +919,68 @@ mod non_efi_varstore_tests {
     }
 
     #[test]
-    fn runtime_varstore_read_failure_remains_an_error() {
-        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(TestVariableStore {
-            kind: VariableStoreKind::EfiVariable,
-        }));
+    fn short_efivar_file_is_a_read_error() {
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Short", 2), &[1]);
+        let want = format!(
+            "<VStoreError: failed to read bytes from sysfs efivars '{}' of size specified by \
+             varstore in hiidb>",
+            efivars
+                .path()
+                .join("Short-00000000-0000-0000-0000-000000000000")
+                .display()
+        );
 
+        for store in [efi_variable("Short", 2), buffer("Short", 2)] {
+            let kind = store.kind;
+            assert_eq!(read(store, &efivars), Err(want.clone()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn efi_varstore_without_efivar_file_is_a_read_error() {
         assert_eq!(
-            read_current_value_bytes(&varstore).unwrap_err(),
-            "<VStoreError: simulated efivarfs read failure>"
+            read(efi_variable("Missing", 1), &Efivars::new()),
+            Err(
+                "<VStoreError: no EFI variable Missing-00000000-0000-0000-0000-000000000000>"
+                    .to_string()
+            )
         );
     }
 
     #[test]
     fn not_found_read_error_is_not_a_missing_variable() {
-        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(NotFoundReadVarStore));
+        let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("failed to read bytes");
 
         assert_eq!(
-            read_current_value_bytes(&varstore).unwrap_err(),
-            "<VStoreError: entity not found>"
+            read_failure_reason(VariableStoreKind::Buffer, &error),
+            "<VStoreError: failed to read bytes>",
+            "a NotFound io::Error under a context"
         );
     }
 
     #[test]
     fn buffer_varstore_with_efivarfs_backing_is_read() {
-        let bytes = vec![0x07, 0x00, 0x00, 0x00, 0x01];
-        let directory = tempfile::tempdir().unwrap();
-        let store = FileBackedBufferVarStore {
-            dir: directory.path().to_path_buf(),
-            size: 1,
-        };
-        std::fs::write(directory.path().join(store.efivar_file_name()), &bytes).unwrap();
-        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(store));
+        let efivars = Efivars::new();
+        let store = buffer("Buffer", 1);
+        efivars.write(&store, &[1]);
 
-        assert_eq!(read_current_value_bytes(&varstore).unwrap(), bytes);
+        assert_eq!(
+            read(store, &efivars),
+            Ok(efivarfs_bytes(&[1])),
+            "buffer VarStore with an efivar file"
+        );
     }
 
     #[test]
     fn buffer_varstore_without_efivarfs_backing_is_unavailable() {
-        let directory = tempfile::tempdir().unwrap();
-        let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(FileBackedBufferVarStore {
-            dir: directory.path().to_path_buf(),
-            size: 1,
-        }));
-
         assert_eq!(
-            read_current_value_bytes(&varstore).unwrap_err(),
-            "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
+            read(buffer("Buffer", 1), &Efivars::new()),
+            Err(
+                "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
+                    .to_string()
+            )
         );
     }
 
@@ -1130,51 +1064,324 @@ mod non_efi_varstore_tests {
     }
 }
 
-fn read_current_value_bytes(
-    varstore: &Result<Box<dyn VariableStore>>,
-) -> std::result::Result<Vec<u8>, String> {
-    match varstore {
-        Err(error) => Err(format!("<ValueUnavailable: {}>", error)),
-        Ok(varstore) => {
-            if varstore.kind() == VariableStoreKind::EfiVariable
-                && !varstore.is_runtime_accessible()
-            {
-                return Err(
-                    "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>"
-                        .to_string(),
-                );
-            }
+/// The arguments of read_efivar after its directory, which an EfivarReader fixes.
+#[derive(PartialEq, Eq, Hash)]
+struct EfivarRange {
+    name: EfivarFileName,
+    size: u16,
+}
 
-            match varstore.read_bytes() {
-                Ok(bytes) => Ok(bytes),
-                Err(error)
-                    if varstore.kind() == VariableStoreKind::Buffer
-                        && error.downcast_ref::<EfivarNotFound>().is_some() =>
-                {
-                    Err(
-                        "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
-                            .to_string(),
-                    )
-                }
-                Err(error) => Err(format!("<VStoreError: {}>", error)),
-            }
+impl EfivarRange {
+    /// The efivar bytes that hold the value of `store`.
+    fn of(store: &dyn VariableStore) -> Self {
+        Self {
+            name: store.efivar_file_name(),
+            size: store.size(),
+        }
+    }
+}
+
+/// Reads the efivar ranges of one command, each once, keeping the outcomes:
+/// Linux v7.2 efivarfs sleeps once a non-root user has read 100 times within a second
+/// (fs/efivarfs/file.c, kernel/user.c).
+pub(crate) struct EfivarReader {
+    efivars: PathBuf,
+    outcomes: HashMap<EfivarRange, Result<Vec<u8>>>,
+}
+
+impl Default for EfivarReader {
+    /// Reads this machine's efivarfs.
+    fn default() -> Self {
+        Self::new(PathBuf::from(EFIVARS_MOUNT_POINT))
+    }
+}
+
+impl EfivarReader {
+    /// Reads the efivar files in `efivars`.
+    fn new(efivars: PathBuf) -> Self {
+        Self {
+            efivars,
+            outcomes: HashMap::new(),
+        }
+    }
+
+    /// read_efivar of `range` in these efivars, read once.
+    fn read(&mut self, range: EfivarRange) -> std::result::Result<&[u8], &anyhow::Error> {
+        let efivars = &self.efivars;
+        self.outcomes
+            .entry(range)
+            .or_insert_with_key(|range| read_efivar(efivars, &range.name, range.size))
+            .as_deref()
+    }
+}
+
+/// Returns the bytes of `varstore`'s efivar file, or why a question on it has no value.
+fn read_current_value_bytes<'a>(
+    varstore: &Result<Box<dyn VariableStore>>,
+    reader: &'a mut EfivarReader,
+) -> std::result::Result<&'a [u8], Cow<'static, str>> {
+    let store = match varstore {
+        Ok(store) => store,
+        Err(error) => return Err(Cow::Owned(format!("<ValueUnavailable: {}>", error))),
+    };
+    if store.kind() == VariableStoreKind::EfiVariable && !store.is_runtime_accessible() {
+        return Err(Cow::Borrowed(
+            "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>",
+        ));
+    }
+
+    reader
+        .read(EfivarRange::of(store.as_ref()))
+        .map_err(|error| read_failure_reason(store.kind(), error))
+}
+
+/// Why a question on a VarStore of `kind` has no value, its efivar file having failed with
+/// `error`.
+fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> Cow<'static, str> {
+    match (kind, error.downcast_ref::<EfivarNotFound>()) {
+        (VariableStoreKind::Buffer, Some(_)) => Cow::Borrowed(
+            "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+        ),
+        (VariableStoreKind::Buffer, None) | (VariableStoreKind::EfiVariable, _) => {
+            Cow::Owned(format!("<VStoreError: {}>", error))
         }
     }
 }
 
 /// Returns the question's efivarfs file (4 attribute bytes, then the VarStore), or why its
 /// value cannot be read.
-fn read_question_bytes(
+fn read_question_bytes<'a>(
     question: &IFROperation,
     varstore: &Result<Box<dyn VariableStore>>,
-) -> std::result::Result<Vec<u8>, String> {
-    let bytes = read_current_value_bytes(varstore)?;
+    reader: &'a mut EfivarReader,
+) -> std::result::Result<&'a [u8], Cow<'static, str>> {
+    let bytes = read_current_value_bytes(varstore, reader)?;
     // edk2-stable202608 SetupBrowserDxe/IfrParse.c reads the VarOffset of such a question in bits
     // TODO: decode bit fields by the width in their Flags, not their Range32 (UINT32 storage)
     if refers_to_bit_field(question) {
-        return Err("<ValueUnavailable: EDKII bit-field value not decoded>".to_string());
+        return Err(Cow::Borrowed(
+            "<ValueUnavailable: EDKII bit-field value not decoded>",
+        ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod efivar_reader_tests {
+    use super::ifr_fixtures::*;
+    use super::*;
+
+    const BUFFER_UNAVAILABLE: &str =
+        "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
+    const BOOT_SERVICE_ONLY: &str =
+        "<ValueUnavailable: EFI variable is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>";
+
+    /// read_question_bytes of `store`, owned.
+    fn question_bytes(
+        question: &IFROperation,
+        store: DeclaredVarStore,
+        reader: &mut EfivarReader,
+    ) -> std::result::Result<Vec<u8>, String> {
+        read_question_bytes(question, &Ok(Box::new(store)), reader)
+            .map(<[u8]>::to_vec)
+            .map_err(Cow::into_owned)
+    }
+
+    #[test]
+    fn variable_read_through_two_stores_is_read_once() {
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
+        let question = node.borrow();
+        let ParsedOperation::CheckBox(parsed) = &question.parsed_data else {
+            panic!("not a CHECKBOX: {:?}", question.parsed_data);
+        };
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Setup", 1), &[42]);
+        let mut reader = efivars.reader();
+
+        assert_eq!(
+            question_bytes(&question, efi_variable("Setup", 1), &mut reader),
+            Ok(efivarfs_bytes(&[42])),
+            "read_question_bytes"
+        );
+        efivars.write(&efi_variable("Setup", 1), &[43]);
+        let answer = display_answer::<u8>(
+            &question,
+            &parsed.question_header(),
+            &Ok(Box::new(efi_variable("Setup", 1))),
+            &mut reader,
+        );
+
+        assert_eq!(answer, "42", "display_answer after the file changed");
+    }
+
+    #[test]
+    fn stores_of_one_file_and_size_share_one_read() {
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
+        let question = node.borrow();
+        let efivars = Efivars::new();
+        let mut reader = efivars.reader();
+
+        efivars.write(&efi_variable("Setup", 1), &[0]);
+        assert_eq!(
+            question_bytes(
+                &question,
+                DeclaredVarStore {
+                    runtime_accessible: false,
+                    ..efi_variable("Setup", 1)
+                },
+                &mut reader
+            ),
+            Err(BOOT_SERVICE_ONLY.to_string()),
+            "boot-service-only"
+        );
+        efivars.write(&efi_variable("Setup", 1), &[1]);
+        assert_eq!(
+            question_bytes(&question, buffer("Setup", 1), &mut reader),
+            Ok(efivarfs_bytes(&[1])),
+            "buffer after a boot-service-only store"
+        );
+        efivars.write(&efi_variable("Setup", 1), &[2]);
+        assert_eq!(
+            question_bytes(&question, efi_variable("Setup", 1), &mut reader),
+            Ok(efivarfs_bytes(&[1])),
+            "runtime EFI variable after the buffer"
+        );
+    }
+
+    #[test]
+    fn other_files_sizes_and_fresh_reads_read_again() {
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
+        let question = node.borrow();
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Setup", 2), &[1, 2]);
+        efivars.write(&efi_variable("Other", 1), &[3]);
+        let mut reader = efivars.reader();
+
+        assert_eq!(
+            question_bytes(&question, efi_variable("Setup", 1), &mut reader),
+            Ok(efivarfs_bytes(&[1])),
+            "first"
+        );
+        efivars.write(&efi_variable("Setup", 2), &[4, 5]);
+        let cases: [(&str, DeclaredVarStore, &[u8]); 3] = [
+            ("other name", efi_variable("Other", 1), &[3]),
+            ("other size", efi_variable("Setup", 2), &[4, 5]),
+            ("first again", efi_variable("Setup", 1), &[1]),
+        ];
+        for (case, store, want) in cases {
+            assert_eq!(
+                question_bytes(&question, store, &mut reader),
+                Ok(efivarfs_bytes(want)),
+                "{case}"
+            );
+        }
+
+        assert_eq!(
+            question_bytes(&question, efi_variable("Setup", 1), &mut efivars.reader()),
+            Ok(efivarfs_bytes(&[4])),
+            "fresh EfivarReader"
+        );
+    }
+
+    #[test]
+    fn missing_buffer_variable_is_read_once() {
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
+        let question = node.borrow();
+        let missing = || buffer("Missing", 1);
+        let efivars = Efivars::new();
+        let mut reader = efivars.reader();
+
+        assert_eq!(
+            question_bytes(&question, missing(), &mut reader),
+            Err(BUFFER_UNAVAILABLE.to_string()),
+            "first call"
+        );
+        efivars.write(&missing(), &[0]);
+        assert_eq!(
+            question_bytes(&question, missing(), &mut reader),
+            Err(BUFFER_UNAVAILABLE.to_string()),
+            "call after the file appeared"
+        );
+        assert_eq!(
+            question_bytes(&question, missing(), &mut efivars.reader()),
+            Ok(efivarfs_bytes(&[0])),
+            "fresh EfivarReader"
+        );
+    }
+
+    #[test]
+    fn missing_file_reason_follows_each_store_kind() {
+        const MISSING_EFI_VARIABLE: &str =
+            "<VStoreError: no EFI variable Missing-00000000-0000-0000-0000-000000000000>";
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
+        let question = node.borrow();
+        let efivars = Efivars::new();
+        let mut reader = efivars.reader();
+        let cases = [
+            (
+                "EFI variable",
+                efi_variable("Missing", 1),
+                MISSING_EFI_VARIABLE,
+            ),
+            ("buffer after it", buffer("Missing", 1), BUFFER_UNAVAILABLE),
+            (
+                "EFI variable after the buffer",
+                efi_variable("Missing", 1),
+                MISSING_EFI_VARIABLE,
+            ),
+        ];
+
+        for (case, store, want) in cases {
+            assert_eq!(
+                question_bytes(&question, store, &mut reader),
+                Err(want.to_string()),
+                "{case}"
+            );
+        }
+        assert_eq!(reader.outcomes.len(), 1, "cached outcomes");
+    }
+
+    #[test]
+    fn list_questions_and_display_share_one_read() {
+        let var_store_efi = operation(
+            VAR_STORE_EFI,
+            false,
+            &[
+                &1u16.to_le_bytes()[..], // VarStoreId
+                &[0; 16],                // Guid
+                &7u32.to_le_bytes(),     // Attributes
+                &2u16.to_le_bytes(),     // Size
+                b"Setup\0",
+            ]
+            .concat(),
+        );
+        let first = operation(CHECKBOX, false, &checkbox(0, 0x00));
+        let (root, _second) =
+            parse_question(&[var_store_efi, first], CHECKBOX, &checkbox(1, 0x00), &[]);
+        let show = |reader: &mut EfivarReader| {
+            display(Rc::clone(&root), 0, &strings(), reader).expect("display the form package")
+        };
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Setup", 2), &[1, 0]);
+        let mut reader = efivars.reader();
+        let shown_before = show(&mut efivars.reader());
+
+        let listed: Vec<String> = list_questions(Rc::clone(&root), &strings(), &mut reader)
+            .into_iter()
+            .map(|question| question.value)
+            .collect();
+        efivars.write(&efi_variable("Setup", 2), &[0, 1]);
+        let shown = show(&mut reader);
+
+        assert_eq!(listed, ["1", "0"], "list_questions");
+        assert_eq!(reader.outcomes.len(), 1, "files read by two questions");
+        assert_eq!(shown, shown_before, "display after list_questions");
+        assert_ne!(
+            show(&mut efivars.reader()),
+            shown_before,
+            "display of the changed file"
+        );
+    }
 }
 
 #[derive(BinRead, Debug, PartialEq, Clone)]
@@ -1569,25 +1776,6 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
             debug!("VarStore is {:?}", &parsed);
 
-            if log::Level::Debug <= log::max_level() {
-                // We HAVE to ignore errors while reading varstores from /sys/firmware/efi/efivars/{name}-{guid}
-                // because the file might not exist even if the db says it does.
-                // In many cases it will not exist and we'll just use the default value instead.
-                // If we are running this in a virtual machine (or sandcastle) then /sys/firmware/efi/efivars won't exist.
-                // Or we might not have perms to read it but thats on the caller of the lib to make sure its okay.
-
-                // We're not saving these in the struct because we don't know how many there are - could take up a large amount of memory.
-                // For non debug uses we will only call this when we want to know the answer to a question.
-                match &parsed.read_bytes() {
-                    Ok(b) => {
-                        debug!("Varstore bytes are {:?}", b);
-                    }
-                    Err(why) => {
-                        debug!("Failed to read uefi varstore {}", why);
-                    }
-                }
-            }
-
             node.parsed_data = ParsedOperation::VarStore(parsed);
         }
         IFROpCode::VarStoreNameValue => {
@@ -1711,8 +1899,9 @@ pub struct AnswerOption {
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &[HashMap<i32, String>],
+    reader: &mut EfivarReader,
 ) -> Vec<QuestionDescriptor> {
-    list_questions_in(node, &mut FormPackageWalk::new(string_packages))
+    list_questions_in(node, &mut FormPackageWalk::new(string_packages, reader))
 }
 
 /// What walking the ops of a form package takes besides them.
@@ -1720,13 +1909,15 @@ struct FormPackageWalk<'a> {
     /// The string packages of the form package's package list
     string_packages: &'a [HashMap<i32, String>],
     default_ids: FormSetDefaultIds,
+    reader: &'a mut EfivarReader,
 }
 
 impl<'a> FormPackageWalk<'a> {
-    fn new(string_packages: &'a [HashMap<i32, String>]) -> Self {
-        FormPackageWalk {
+    fn new(string_packages: &'a [HashMap<i32, String>], reader: &'a mut EfivarReader) -> Self {
+        Self {
             string_packages,
             default_ids: FormSetDefaultIds::default(),
+            reader,
         }
     }
 }
@@ -1805,6 +1996,7 @@ pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &[HashMap<i32, String>],
     possible_question_phrases: &HashSet<T>,
+    reader: &mut EfivarReader,
 ) -> Option<QuestionDescriptor>
 where
     T: AsRef<str>,
@@ -1812,7 +2004,7 @@ where
     find_question_in(
         node,
         possible_question_phrases,
-        &mut FormPackageWalk::new(string_packages),
+        &mut FormPackageWalk::new(string_packages, reader),
     )
 }
 
@@ -1907,15 +2099,13 @@ fn handle_checkbox(
     walk: &mut FormPackageWalk<'_>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
-    let available = match read_question_bytes(current_node, &varstore) {
+    let available = match read_question_bytes(current_node, &varstore, walk.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             false
         }
         // for a checkbox size should be of type u8
-        Ok(bytes) => {
-            try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer)
-        }
+        Ok(bytes) => try_read_answer_as_string::<u8>(&parsed.question_header(), bytes, &mut answer),
     };
     if !available {
         let default_ids = walk.default_ids.of(current_node);
@@ -1957,23 +2147,23 @@ fn handle_oneof(
     let mut answer = String::new();
     // None, with the reason in `answer`, when the current value cannot be read: any u64,
     // all ones too, can be stored.
-    let chosen_value = match read_question_bytes(current_node, &varstore) {
+    let chosen_value = match read_question_bytes(current_node, &varstore, walk.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             None
         }
         Ok(bytes) => match &parsed.data {
             Range::Range8(_) => {
-                try_read_answer_as_option::<u8>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_option::<u8>(&parsed.question_header(), bytes, &mut answer)
             }
             Range::Range16(_) => {
-                try_read_answer_as_option::<u16>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_option::<u16>(&parsed.question_header(), bytes, &mut answer)
             }
             Range::Range32(_) => {
-                try_read_answer_as_option::<u32>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_option::<u32>(&parsed.question_header(), bytes, &mut answer)
             }
             Range::Range64(_) => {
-                try_read_answer_as_option::<u64>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_option::<u64>(&parsed.question_header(), bytes, &mut answer)
             }
         },
     };
@@ -2053,7 +2243,7 @@ fn handle_numeric(
 ) -> QuestionDescriptor {
     let mut answer = String::new();
 
-    let available = match read_question_bytes(current_node, &varstore) {
+    let available = match read_question_bytes(current_node, &varstore, walk.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             false
@@ -2066,28 +2256,28 @@ fn handle_numeric(
                 .is_some(),
         ) {
             (Range::Range8(_), true) => {
-                try_read_answer_as_string::<i8>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<i8>(&parsed.question_header(), bytes, &mut answer)
             }
             (Range::Range16(_), true) => {
-                try_read_answer_as_string::<i16>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<i16>(&parsed.question_header(), bytes, &mut answer)
             }
             (Range::Range32(_), true) => {
-                try_read_answer_as_string::<i32>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<i32>(&parsed.question_header(), bytes, &mut answer)
             }
             (Range::Range64(_), true) => {
-                try_read_answer_as_string::<i64>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<i64>(&parsed.question_header(), bytes, &mut answer)
             }
             (Range::Range8(_), false) => {
-                try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<u8>(&parsed.question_header(), bytes, &mut answer)
             }
             (Range::Range16(_), false) => {
-                try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<u16>(&parsed.question_header(), bytes, &mut answer)
             }
             (Range::Range32(_), false) => {
-                try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<u32>(&parsed.question_header(), bytes, &mut answer)
             }
             (Range::Range64(_), false) => {
-                try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer)
+                try_read_answer_as_string::<u64>(&parsed.question_header(), bytes, &mut answer)
             }
         },
     };
@@ -2184,7 +2374,7 @@ mod question_value_tests {
     #[test]
     fn readable_checkbox_shows_no_default() {
         assert_eq!(
-            answer(&[], CHECKBOX, &checkbox(0, 0x01), &[], mem_var_store(&[0])),
+            answer(&[], CHECKBOX, &checkbox(0, 0x01), &[], var_store_of(&[0])),
             "0",
             "readable CHECKBOX"
         );
@@ -2193,18 +2383,14 @@ mod question_value_tests {
     #[test]
     fn checkbox_past_var_store_shows_bracketed_error_and_default() {
         assert_eq!(
-            answer(&[], CHECKBOX, &checkbox(1, 0x01), &[], mem_var_store(&[0])),
+            answer(&[], CHECKBOX, &checkbox(1, 0x01), &[], var_store_of(&[0])),
             "<ExtractEFIDataError: failed to fill whole buffer (offset: 1; buflen: 5)> \
              <IFR default: 1>",
             "CHECKBOX past its VarStore"
         );
     }
 
-    fn one_of_value(
-        data: &[u8],
-        children: &[Vec<u8>],
-        var_store: Result<Box<dyn VariableStore>>,
-    ) -> String {
+    fn one_of_value(data: &[u8], children: &[Vec<u8>], var_store: VarStoreFixture) -> String {
         answer(&[], ONE_OF, data, children, var_store)
     }
 
@@ -2236,7 +2422,7 @@ mod question_value_tests {
             ifr_default(0x0000, 0),
         ];
 
-        let got = one_of_value(&data, &children, mem_var_store(&u64::MAX.to_le_bytes()));
+        let got = one_of_value(&data, &children, var_store_of(&u64::MAX.to_le_bytes()));
 
         assert_eq!(got, "AllOnes", "ONE_OF storing all ones");
     }
@@ -2247,7 +2433,7 @@ mod question_value_tests {
     fn one_of_past_var_store_shows_extraction_error() {
         let (data, children) = uint8_one_of(8);
         let declarations = [default_store(0x0000), default_store(0x0001)];
-        let var_store = mem_var_store(&[1; 8]);
+        let var_store = var_store_of(&[1; 8]);
 
         let got = answer(&declarations, ONE_OF, &data, &children, var_store);
 
@@ -2272,7 +2458,7 @@ mod question_value_tests {
     fn one_of_shows_stored_option() {
         let (data, children) = uint8_one_of(7);
 
-        let got = one_of_value(&data, &children, mem_var_store(&[0, 0, 0, 0, 0, 0, 0, 1]));
+        let got = one_of_value(&data, &children, var_store_of(&[0, 0, 0, 0, 0, 0, 0, 1]));
 
         assert_eq!(got, "Enabled", "ONE_OF storing option 1");
     }
@@ -2286,13 +2472,13 @@ mod question_value_tests {
             (
                 "BOOLEAN options",
                 vec![one_of_option(5, 0x04, &[0]), one_of_option(6, 0x04, &[1])],
-                mem_var_store(&[1]),
+                var_store_of(&[1]),
                 "Enabled",
             ),
             (
                 "DATE option before a UINT8 option of 0",
                 vec![one_of_option(5, 0x06, &[0]), one_of_option(6, 0x00, &[0])],
-                mem_var_store(&[0]),
+                var_store_of(&[0]),
                 "Enabled",
             ),
             (
@@ -2325,7 +2511,7 @@ mod question_value_tests {
             "unreadable ONE_OF"
         );
         assert_eq!(
-            answer(&[], ONE_OF, &one_of_data(), &children, mem_var_store(&[0])),
+            answer(&[], ONE_OF, &one_of_data(), &children, var_store_of(&[0])),
             "Disabled",
             "readable ONE_OF"
         );
@@ -2450,7 +2636,7 @@ mod question_value_tests {
             "unreadable NUMERIC"
         );
         assert_eq!(
-            answer(&[], NUMERIC, &data, &children, mem_var_store(&[7])),
+            answer(&[], NUMERIC, &data, &children, var_store_of(&[7])),
             "7",
             "readable NUMERIC"
         );
@@ -2610,7 +2796,6 @@ mod question_value_tests {
     /// show-ifr does not decode a readable EDKII bit varstore field either.
     #[test]
     fn show_ifr_answer_of_bit_field_is_not_decoded() {
-        let store = || mem_var_store(&[0x00, 0x00, 0x00, 0x01]);
         for (guid, want) in [
             (BIT_VARSTORE_GUID, BIT_FIELD_NOT_DECODED),
             (OTHER_GUID, "1"),
@@ -2621,7 +2806,14 @@ mod question_value_tests {
                 panic!("not a CHECKBOX: {:?}", question.parsed_data);
             };
 
-            let got = display_answer::<u8>(&question, &parsed.question_header(), &store());
+            let VarStoreFixture { store, efivars } = var_store_of(&[0x00, 0x00, 0x00, 0x01]);
+
+            let got = display_answer::<u8>(
+                &question,
+                &parsed.question_header(),
+                &store,
+                &mut efivars.reader(),
+            );
 
             assert_eq!(got, want, "GUID {guid:02X?}");
         }
@@ -2693,7 +2885,7 @@ mod question_value_tests {
     /// default is shown, as for any value that cannot be read.
     #[test]
     fn readable_bit_field_question_shows_its_default() {
-        let store = || mem_var_store(&[0x00, 0xC8, 0x0C, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let store = || var_store_of(&[0x00, 0xC8, 0x0C, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
         let one_of_children = || {
             vec![
                 one_of_option(5, 0x02, &0u32.to_le_bytes()),
@@ -2923,7 +3115,21 @@ mod question_value_tests {
 pub fn display(
     node: Rc<RefCell<IFROperation>>,
     level: usize,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
+    reader: &mut EfivarReader,
+) -> Result<String> {
+    display_in(
+        node,
+        level,
+        &mut FormPackageWalk::new(string_packages, reader),
+    )
+}
+
+/// Displays `node` as display does, with `walk`.
+fn display_in(
+    node: Rc<RefCell<IFROperation>>,
+    level: usize,
+    walk: &mut FormPackageWalk<'_>,
 ) -> Result<String> {
     let mut result = String::new();
     let extra_spaces = "    ".repeat(level);
@@ -2940,7 +3146,7 @@ pub fn display(
             format!(
                 "{extra_spaces}OpCode: {:?} - S: {}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.prompt_string_id, string_packages),
+                find_corresponding_string(parsed.prompt_string_id, walk.string_packages),
             )
             .as_str(),
         ),
@@ -2948,7 +3154,7 @@ pub fn display(
             format!(
                 "{extra_spaces}OpCode: {:?} - {} - GUID {} - ClassGUID {}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.title_string_id, string_packages),
+                find_corresponding_string(parsed.title_string_id, walk.string_packages),
                 parsed.guid,
                 parsed.class_guid,
             )
@@ -2973,7 +3179,7 @@ pub fn display(
             format!(
                 "{extra_spaces}OpCode: {:?} - S: {}\n{extra_spaces}-ValueType:{}\n{extra_spaces}-Value:{:?}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.option_string_id, string_packages),
+                find_corresponding_string(parsed.option_string_id, walk.string_packages),
                 parsed.value_type,
                 parsed.value
             )
@@ -2985,10 +3191,18 @@ pub fn display(
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
             let header = parsed.question_header();
             let answer_disp = match &parsed.data {
-                Range::Range8(_) => display_answer::<u8>(&current_node, &header, &varstore),
-                Range::Range16(_) => display_answer::<u16>(&current_node, &header, &varstore),
-                Range::Range32(_) => display_answer::<u32>(&current_node, &header, &varstore),
-                Range::Range64(_) => display_answer::<u64>(&current_node, &header, &varstore),
+                Range::Range8(_) => {
+                    display_answer::<u8>(&current_node, &header, &varstore, walk.reader)
+                }
+                Range::Range16(_) => {
+                    display_answer::<u16>(&current_node, &header, &varstore, walk.reader)
+                }
+                Range::Range32(_) => {
+                    display_answer::<u32>(&current_node, &header, &varstore, walk.reader)
+                }
+                Range::Range64(_) => {
+                    display_answer::<u64>(&current_node, &header, &varstore, walk.reader)
+                }
             };
 
             result.push_str(
@@ -2997,11 +3211,11 @@ pub fn display(
                     current_node.op_code,
                     find_corresponding_string(
                         parsed.question_header().prompt_string_id,
-                        string_packages
+                        walk.string_packages
                     ),
                     find_corresponding_string(
                         parsed.question_header().help_string_id,
-                        string_packages
+                        walk.string_packages
                     ),
                     parsed.data
                 )
@@ -3013,10 +3227,18 @@ pub fn display(
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
             let header = parsed.question_header();
             let answer_disp = match &parsed.data {
-                Range::Range8(_) => display_answer::<u8>(&current_node, &header, &varstore),
-                Range::Range16(_) => display_answer::<u16>(&current_node, &header, &varstore),
-                Range::Range32(_) => display_answer::<u32>(&current_node, &header, &varstore),
-                Range::Range64(_) => display_answer::<u64>(&current_node, &header, &varstore),
+                Range::Range8(_) => {
+                    display_answer::<u8>(&current_node, &header, &varstore, walk.reader)
+                }
+                Range::Range16(_) => {
+                    display_answer::<u16>(&current_node, &header, &varstore, walk.reader)
+                }
+                Range::Range32(_) => {
+                    display_answer::<u32>(&current_node, &header, &varstore, walk.reader)
+                }
+                Range::Range64(_) => {
+                    display_answer::<u64>(&current_node, &header, &varstore, walk.reader)
+                }
             };
 
             result.push_str(
@@ -3025,11 +3247,11 @@ pub fn display(
                     current_node.op_code,
                     find_corresponding_string(
                         parsed.question_header().prompt_string_id,
-                        string_packages
+                        walk.string_packages
                     ),
                     find_corresponding_string(
                         parsed.question_header().help_string_id,
-                        string_packages
+                        walk.string_packages
                     ),
                     parsed.data
                 )
@@ -3040,8 +3262,12 @@ pub fn display(
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
             // for a checkbox size should be of type u8
-            let answer_disp =
-                display_answer::<u8>(&current_node, &parsed.question_header(), &varstore);
+            let answer_disp = display_answer::<u8>(
+                &current_node,
+                &parsed.question_header(),
+                &varstore,
+                walk.reader,
+            );
 
             result.push_str(
                 format!(
@@ -3049,11 +3275,11 @@ pub fn display(
                     current_node.op_code,
                     find_corresponding_string(
                         parsed.question_header().prompt_string_id,
-                        string_packages
+                        walk.string_packages
                     ),
                     find_corresponding_string(
                         parsed.question_header().help_string_id,
-                        string_packages
+                        walk.string_packages
                     ),
                 )
                 .as_str(),
@@ -3067,7 +3293,7 @@ pub fn display(
     }
 
     for child in &node.borrow().children {
-        result.push_str(display(Rc::clone(child), level + 1, string_packages)?.as_str());
+        result.push_str(display_in(Rc::clone(child), level + 1, walk)?.as_str());
     }
 
     Ok(result)
@@ -3078,16 +3304,17 @@ fn display_answer<T>(
     question: &IFROperation,
     question_header: &QuestionHeader,
     varstore: &Result<Box<dyn VariableStore>>,
+    reader: &mut EfivarReader,
 ) -> String
 where
     T: BinRead + Display,
     for<'a> <T as BinRead>::Args<'a>: Default,
 {
     let mut answer = String::new();
-    match read_question_bytes(question, varstore) {
+    match read_question_bytes(question, varstore, reader) {
         Err(reason) => answer.push_str(&reason),
         Ok(bytes) => {
-            try_read_answer_as_string::<T>(question_header, &bytes, &mut answer);
+            try_read_answer_as_string::<T>(question_header, bytes, &mut answer);
         }
     }
     answer
@@ -3488,7 +3715,6 @@ mod write_validation_tests {
     type RecordedWrites = Rc<RefCell<Vec<(u16, TypeValue)>>>;
 
     struct RecordingVarStore {
-        bytes: Vec<u8>,
         writes: RecordedWrites,
     }
 
@@ -3513,23 +3739,24 @@ mod write_validation_tests {
             false
         }
 
-        fn read_bytes(&self) -> Result<Vec<u8>> {
-            Ok(self.bytes.clone())
-        }
-
         fn write_efivarfs_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
             self.writes.borrow_mut().push((offset, data));
             Ok(())
         }
     }
 
-    fn recording_store() -> (Result<Box<dyn VariableStore>>, RecordedWrites) {
+    fn recording_store() -> (VarStoreFixture, RecordedWrites) {
         let writes = RecordedWrites::default();
         let store = RecordingVarStore {
-            bytes: vec![0; EFIVARFS_HEADER_SIZE + 42],
             writes: Rc::clone(&writes),
         };
-        (Ok(Box::new(store)), writes)
+        let efivars = Efivars::new();
+        efivars.write(&store, &[0; 42]);
+        let fixture = VarStoreFixture {
+            store: Ok(Box::new(store)),
+            efivars,
+        };
+        (fixture, writes)
     }
 
     fn numeric_question(
@@ -3596,21 +3823,21 @@ mod write_validation_tests {
             children: Vec::new(),
             parsed_data: ParsedOperation::Placeholder,
         });
-        let mut bytes = vec![0; EFIVARFS_HEADER_SIZE + 42];
-        bytes[..EFIVARFS_HEADER_SIZE].copy_from_slice(&7u32.to_le_bytes());
+        let mut payload = vec![0; 42];
         let width = (bits / 8) as usize;
-        bytes[6..6 + width].copy_from_slice(&initial.to_le_bytes()[..width]);
+        payload[2..2 + width].copy_from_slice(&initial.to_le_bytes()[..width]);
         let writes = Rc::new(RefCell::new(Vec::new()));
         let store = RecordingVarStore {
-            bytes,
             writes: Rc::clone(&writes),
         };
+        let efivars = Efivars::new();
+        efivars.write(&store, &payload);
         let question = handle_numeric(
             Ok(Box::new(store)),
             &parsed,
             "Numeric test",
             &node.borrow(),
-            &mut FormPackageWalk::new(&[]),
+            &mut FormPackageWalk::new(&[], &mut efivars.reader()),
         );
         (question, writes)
     }
