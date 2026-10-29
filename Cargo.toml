@@ -31,6 +31,7 @@ binrw = { version = "0.13", default-features = false, features = ["std"] }
 rand = { version = "0.8", features = ["small_rng"] }
 proc-mounts = "0.3"
 thiserror = "1.0"
+bitflags = "2.4.1"
 env_logger = "0.10"
 
 # thrift/ is a package of its own; its generated crates build as dependencies that clippy

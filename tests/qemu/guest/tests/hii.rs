@@ -21,6 +21,11 @@ use std::fs;
 use serde::Deserialize;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
+use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
+use uefisettings_qemu_guest::driver_sample::INCLUDE_SUPPRESSED;
+use uefisettings_qemu_guest::driver_sample::MATCH2;
+use uefisettings_qemu_guest::driver_sample::MATCH2_OFFSET;
+use uefisettings_qemu_guest::driver_sample::MATCH2_REASON;
 use uefisettings_qemu_guest::driver_sample::NUMERIC;
 use uefisettings_qemu_guest::driver_sample::NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF;
@@ -28,6 +33,7 @@ use uefisettings_qemu_guest::driver_sample::ONE_OF_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json;
+use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::published_database;
 use uefisettings_qemu_guest::read_dev_mem_byte;
 use uefisettings_qemu_guest::single_response;
@@ -45,22 +51,47 @@ use uefisettings_qemu_guest::UNAVAILABLE;
 #[cfg(target_arch = "aarch64")]
 const SIGBUS: i32 = 7;
 
+/// A question of [`DEFAULTS`].
+struct DefaultQuestion {
+    name: &'static str,
+    options: &'static [&'static str],
+    /// Without INCLUDE_SUPPRESSED
+    answers: &'static [&'static str],
+    /// With INCLUDE_SUPPRESSED; `get` with the flag returns the first
+    suppressed_answers: &'static [&'static str],
+}
+
 /// The questions of the tests with their default answers and options, and how many times
 /// the HII database lists each.
-const DEFAULTS: [(&str, &str, &[&str], usize); 4] = [
-    (
-        ONE_OF,
-        "My one-of text #2",
-        &[
+const DEFAULTS: [DefaultQuestion; 4] = [
+    DefaultQuestion {
+        name: ONE_OF,
+        options: &[
             "My one-of text #1",
             "My one-of text #2",
             "My one-of text #3",
         ],
-        1,
-    ),
-    (CHECK_BOX, "1", &[], 2),
-    (NUMERIC, "18", &[], 1),
-    (SERIAL_PORT, "3F8", &["3F8", "2F8", "3E8", "2E8"], 1),
+        answers: &["My one-of text #2"],
+        suppressed_answers: &["My one-of text #2"],
+    },
+    DefaultQuestion {
+        name: CHECK_BOX,
+        options: &[],
+        answers: &["1"],
+        suppressed_answers: &["1", "1 <suppressed>"],
+    },
+    DefaultQuestion {
+        name: NUMERIC,
+        options: &[],
+        answers: &["18"],
+        suppressed_answers: &["18"],
+    },
+    DefaultQuestion {
+        name: SERIAL_PORT,
+        options: &["3F8", "2F8", "3E8", "2E8"],
+        answers: &[],
+        suppressed_answers: &["3F8 <suppressed>"],
+    },
 ];
 
 /// Questions whose values the HII backend cannot read from Linux: on DriverSample's
@@ -133,6 +164,7 @@ fn driver_sample_variable_holds_the_defaults() {
         data[SERIAL_PORT_OFFSET..SERIAL_PORT_OFFSET + 2],
         0x3f8u16.to_le_bytes()
     );
+    assert_eq!(data[MATCH2_OFFSET], 0, "{MATCH2}");
 }
 
 #[test]
@@ -197,14 +229,35 @@ fn unaligned_wide_load_from_the_mapped_database_faults() {
 
 #[test]
 fn list_questions_lists_the_defaults() {
-    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
-    for (name, answer, options, times) in DEFAULTS {
-        let expected = question(name, answer, options);
-        let listed = questions
-            .iter()
-            .filter(|&question| question == &expected)
-            .count();
-        assert_eq!(listed, times, "{expected:?} in {questions:#?}");
+    for flags in [&[][..], &INCLUDE_SUPPRESSED] {
+        let questions: Vec<Question> =
+            json(&[&["hii", "list-questions", "--json"][..], flags].concat());
+        for DefaultQuestion {
+            name,
+            options,
+            answers,
+            suppressed_answers,
+        } in DEFAULTS
+        {
+            let answers = if flags.is_empty() {
+                answers
+            } else {
+                suppressed_answers
+            };
+            let expected: Vec<Question> = answers
+                .iter()
+                .map(|answer| question(name, answer, options))
+                .collect();
+            let listed: Vec<&Question> = questions
+                .iter()
+                .filter(|question| question.name == name)
+                .collect();
+            assert_eq!(
+                listed,
+                expected.iter().collect::<Vec<_>>(),
+                "{name} {flags:?}"
+            );
+        }
     }
 }
 
@@ -244,7 +297,7 @@ fn list_strings_lists_the_prompts() {
         .flat_map(|package| package.string_package.values())
         .map(String::as_str)
         .collect();
-    for (name, ..) in DEFAULTS {
+    for DefaultQuestion { name, .. } in DEFAULTS {
         assert!(strings.contains(&name), "{name:?} is not listed");
     }
 }
@@ -296,10 +349,36 @@ fn show_translations_prints_the_spellings_database() {
 
 #[test]
 fn get_returns_the_defaults() {
-    for (name, answer, options, _) in DEFAULTS {
-        let (got, _) = single_response(&["hii", "get", name, "--json"], BACKEND_HII);
-        assert_eq!(got, question(name, answer, options));
+    for DefaultQuestion {
+        name,
+        options,
+        suppressed_answers,
+        ..
+    } in DEFAULTS
+    {
+        let (got, _) = single_response(
+            &[&["hii", "get", name, "--json"][..], &INCLUDE_SUPPRESSED].concat(),
+            BACKEND_HII,
+        );
+        assert_eq!(
+            got,
+            question(name, suppressed_answers[0], options),
+            "{name}"
+        );
     }
+}
+
+#[test]
+fn get_refuses_a_suppressed_question_by_default() {
+    let error = json_error(&["hii", "get", SERIAL_PORT, "--json"]);
+    assert_eq!(
+        error.error_message,
+        format!(
+            "question {SERIAL_PORT:?} is suppressed; also include suppressed questions to select \
+             it"
+        ),
+        "{SERIAL_PORT}"
+    );
 }
 
 #[test]
@@ -314,4 +393,18 @@ fn get_reports_unreadable_questions_as_unavailable() {
 fn get_of_an_unknown_question_returns_no_answers() {
     let Responses { responses } = json(&["hii", "get", "No Such Question", "--json"]);
     assert!(responses.is_empty(), "{responses:#?}");
+}
+
+/// get shows a question that a condition it cannot evaluate may gray out, with its possible
+/// states and why; including grayed-out questions selects it for sure.
+#[test]
+fn get_shows_a_question_that_may_be_grayed_out_with_its_states() {
+    let annotation = format!(" <selectable or grayed-out: {MATCH2_REASON}>");
+    for flags in [&[][..], &INCLUDE_GRAYED_OUT] {
+        let (got, _) = single_response(
+            &[&["hii", "get", MATCH2, "--json"][..], flags].concat(),
+            BACKEND_HII,
+        );
+        assert_eq!(got.answer, format!("0{annotation}"), "{flags:?}: {got:#?}");
+    }
 }

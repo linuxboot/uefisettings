@@ -19,11 +19,19 @@ use std::rc::Weak;
 use binrw::BinRead;
 use thiserror::Error;
 
+use super::conditions::evaluate_condition;
+use super::conditions::evaluate_value;
+use super::conditions::option_state;
+use super::conditions::skips_scope;
+use super::conditions::ExpressionInputs;
+use super::conditions::QuestionValues;
+use super::conditions::Truth;
 use super::find_corresponding_string;
 use super::IFRDefault;
 use super::IFROpCode;
 use super::IFROperation;
 use super::IfrDefaultValue;
+use super::IncludedStates;
 use super::ParsedOperation;
 
 // UEFI 2.10 §33.3.8.3.9, §33.3.8.3.51
@@ -64,64 +72,16 @@ pub(super) enum DefaultError {
     DefaultValueMissing,
     #[error("EFI_IFR_DEFAULT_2 without EFI_IFR_VALUE")]
     ValueOpMissing,
-    #[error("EFI_IFR_VALUE expression not evaluated")]
-    ValueExpression,
-    #[error("EFI_IFR_SUPPRESS_IF condition not evaluated")]
-    SuppressIfCondition,
+    #[error("EFI_IFR_VALUE expression not evaluated: {0}")]
+    ValueExpression(String),
+    #[error("EFI_IFR_SUPPRESS_IF condition not evaluated: {0}")]
+    SuppressIfCondition(String),
     #[error("EFI_IFR_ONE_OF_OPTION Type {0:#04x} value not decoded")]
     OptionType(u8),
 }
 
-/// Returns the value of a constant single-op expression.
-// TODO: evaluate other expressions; until then their SUPPRESS_IF options and EFI_IFR_VALUE
-// defaults are unknown, and their form-set DISABLE_IF scopes are walked.
-fn constant_expression(op: &IFROperation) -> Option<u64> {
-    if op.open_scope {
-        return None;
-    }
-    match op.op_code {
-        IFROpCode::False | IFROpCode::Zero => Some(0),
-        IFROpCode::True | IFROpCode::One => Some(1),
-        IFROpCode::Ones => Some(u64::MAX),
-        IFROpCode::Uint8 => op.data.first().map(|&b| b.into()),
-        IFROpCode::Uint16 => op.data.first_chunk().map(|&b| u16::from_le_bytes(b).into()),
-        IFROpCode::Uint32 => op.data.first_chunk().map(|&b| u32::from_le_bytes(b).into()),
-        IFROpCode::Uint64 => op.data.first_chunk().map(|&b| u64::from_le_bytes(b)),
-        _ => None,
-    }
-}
-
-/// Returns the value of a scope's condition, if constant.
-fn constant_condition(op: &IFROperation) -> Option<u64> {
-    op.children
-        .first()
-        .and_then(|condition| constant_expression(&condition.borrow()))
-}
-
-/// Whether the SUPPRESS_IFs around an op show it.
-#[derive(Clone, Copy)]
-enum Visibility {
-    Shown,
-    Suppressed,
-    Unknown,
-}
-
-impl Visibility {
-    /// Returns the visibility in a SUPPRESS_IF on `condition`: any true one suppresses.
-    fn suppressed_by(self, condition: Option<u64>) -> Self {
-        match (self, condition) {
-            (Visibility::Suppressed, _) => Visibility::Suppressed,
-            (_, Some(0)) => self,
-            (_, Some(_)) => Visibility::Suppressed,
-            (_, None) => Visibility::Unknown,
-        }
-    }
-}
-
 /// What question_scope takes from the scope of an op nested in a question.
 enum NestedScope {
-    /// The question's ops, hidden if the SUPPRESS_IF condition is true
-    SuppressIf,
     /// Nothing: the ops belong to the nested op (a statement, a question, a DEFAULT's value,
     /// vendor data)
     Own,
@@ -131,11 +91,9 @@ enum NestedScope {
 
 impl NestedScope {
     /// Classifies an op as edk2-stable202608 SetupBrowserDxe/IfrParse.c attaches the ops in its
-    /// scope, except an opcode above EFI_IFR_MATCH2_OP (0x64), whose scope IfrParse.c skips.
-    // TODO: skip such scopes here and in form_set_default_ids.
+    /// scope.
     fn of(op_code: IFROpCode) -> Self {
         match op_code {
-            IFROpCode::SuppressIf => Self::SuppressIf,
             IFROpCode::Default
             | IFROpCode::Subtitle
             | IFROpCode::Text
@@ -154,6 +112,7 @@ impl NestedScope {
             IFROpCode::Form
             | IFROpCode::Image
             | IFROpCode::OneOfOption
+            | IFROpCode::SuppressIf
             | IFROpCode::Locked
             | IFROpCode::FormSet
             | IFROpCode::NoSubmitIf
@@ -240,30 +199,53 @@ impl NestedScope {
     }
 }
 
-/// Returns the ops in the question's scope in IFR order, with their visibility.
+/// Returns the ops in the question's scope in IFR order.
 // TODO: drop options and expressions (e.g. EFI_IFR_DEFAULT_2's EFI_IFR_VALUE) under a true
 // DISABLE_IF, as UEFI 2.10 §33.3.8.3.14 says, for firmware that does; edk2-stable202608
 // IfrParse.c keeps them inside a question, as this does.
-fn question_scope(question: &IFROperation) -> Vec<(Rc<RefCell<IFROperation>>, Visibility)> {
-    fn walk(
-        op: &IFROperation,
-        visibility: Visibility,
-        scope: &mut Vec<(Rc<RefCell<IFROperation>>, Visibility)>,
-    ) {
+pub(super) fn question_scope(question: &IFROperation) -> Vec<Rc<RefCell<IFROperation>>> {
+    fn walk(op: &IFROperation, scope: &mut Vec<Rc<RefCell<IFROperation>>>) {
         for child in &op.children {
-            scope.push((Rc::clone(child), visibility));
+            if skips_scope(&child.borrow()) {
+                continue;
+            }
+            scope.push(Rc::clone(child));
             let child = child.borrow();
-            let visibility = match NestedScope::of(child.op_code) {
-                NestedScope::SuppressIf => visibility.suppressed_by(constant_condition(&child)),
-                NestedScope::Own => continue,
-                NestedScope::Question => visibility,
-            };
-            walk(&child, visibility, scope);
+            match NestedScope::of(child.op_code) {
+                NestedScope::Own => {}
+                NestedScope::Question => walk(&child, scope),
+            }
         }
     }
     let mut scope = Vec::new();
-    walk(question, Visibility::Shown, &mut scope);
+    walk(question, &mut scope);
     scope
+}
+
+/// Whether edk2-stable202608 SetupBrowserDxe shows an option.
+enum OptionVisibility {
+    Shown,
+    /// A SUPPRESS_IF hides it
+    Suppressed,
+    /// Why it is not known
+    Unknown(String),
+}
+
+/// Returns whether edk2-stable202608 SetupBrowserDxe shows the option `op`.
+fn option_visibility(
+    op: &IFROperation,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> OptionVisibility {
+    let state = option_state(op, inputs);
+    let shown = IncludedStates::empty();
+    match (state.is_allowed(shown), state.may_be_allowed(shown)) {
+        (true, _) => OptionVisibility::Shown,
+        (false, true) => {
+            let reasons: Vec<&str> = state.reasons().collect();
+            OptionVisibility::Unknown(reasons.join("; "))
+        }
+        (false, false) => OptionVisibility::Suppressed,
+    }
 }
 
 /// form_set_default_ids of the FormSet of the last question asked about: questions come FormSet
@@ -273,14 +255,18 @@ pub(super) struct FormSetDefaultIds(Option<(Rc<RefCell<IFROperation>>, Vec<Defau
 
 impl FormSetDefaultIds {
     /// Returns form_set_default_ids of the question's FormSet, or STANDARD outside FormSets.
-    pub(super) fn of(&mut self, question: &IFROperation) -> &[DefaultId] {
+    pub(super) fn of(
+        &mut self,
+        question: &IFROperation,
+        inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+    ) -> &[DefaultId] {
         let Some(form_set) = form_set_of(question) else {
             return &[DefaultId::STANDARD];
         };
         let entry = match self.0.take() {
             Some((known, default_ids)) if Rc::ptr_eq(&known, &form_set) => (known, default_ids),
             _ => {
-                let default_ids = form_set_default_ids(&form_set.borrow());
+                let default_ids = form_set_default_ids(&form_set.borrow(), inputs);
                 (form_set, default_ids)
             }
         };
@@ -301,28 +287,39 @@ fn form_set_of(op: &IFROperation) -> Option<Rc<RefCell<IFROperation>>> {
 }
 
 /// Returns STANDARD, then the DefaultIds of the DEFAULTSTOREs in `form_set`, ascending.
-fn form_set_default_ids(form_set: &IFROperation) -> Vec<DefaultId> {
-    // Nested ones too (UEFI 2.10 §33.2.5.1), except under a constant true DISABLE_IF
+fn form_set_default_ids(
+    form_set: &IFROperation,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Vec<DefaultId> {
+    // Nested ones too (UEFI 2.10 §33.2.5.1), except under a true DISABLE_IF
     // outside forms (§33.3.8.3.14), the only one edk2-stable202608
     // SetupBrowserDxe/IfrParse.c evaluates while parsing.
-    fn walk(op: &IFROperation, in_form: bool, default_ids: &mut Vec<DefaultId>) {
+    fn walk(
+        op: &IFROperation,
+        in_form: bool,
+        default_ids: &mut Vec<DefaultId>,
+        inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+    ) {
         for child in &op.children {
             let child = child.borrow();
+            if skips_scope(&child) {
+                continue;
+            }
             if let ParsedOperation::DefaultStore(store) = &child.parsed_data {
                 default_ids.push(store.default_id);
             }
             if !in_form
                 && child.op_code == IFROpCode::DisableIf
-                && constant_condition(&child).is_some_and(|v| v != 0)
+                && evaluate_condition(&child, inputs) == Truth::Known(true)
             {
                 continue;
             }
             let in_form = in_form || matches!(child.op_code, IFROpCode::Form | IFROpCode::FormMap);
-            walk(&child, in_form, default_ids);
+            walk(&child, in_form, default_ids, inputs);
         }
     }
     let mut default_ids = Vec::new();
-    walk(form_set, false, &mut default_ids);
+    walk(form_set, false, &mut default_ids, inputs);
     default_ids.sort_unstable();
     default_ids.dedup();
     default_ids.retain(|&id| id != DefaultId::STANDARD);
@@ -331,7 +328,11 @@ fn form_set_default_ids(form_set: &IFROperation) -> Vec<DefaultId> {
 }
 
 /// Returns the value of the EFI_IFR_DEFAULT `op`.
-fn ifr_default_value(op: &IFROperation, default: &IFRDefault) -> Result<u64, DefaultError> {
+fn ifr_default_value(
+    op: &IFROperation,
+    default: &IFRDefault,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Result<u64, DefaultError> {
     let value = op
         .children
         .iter()
@@ -346,19 +347,20 @@ fn ifr_default_value(op: &IFROperation, default: &IFRDefault) -> Result<u64, Def
             IfrDefaultValue::Missing => Err(DefaultError::DefaultValueMissing),
         };
     };
-    let constant = match value.borrow().children.as_slice() {
-        [expression] => constant_expression(&expression.borrow()),
-        _ => None,
-    };
-    constant.ok_or(DefaultError::ValueExpression)
+    let value = value.borrow();
+    evaluate_value(&value, inputs).map_err(DefaultError::ValueExpression)
 }
 
 /// Returns the question's default and its DefaultId, trying STANDARD, then the declared
 /// DEFAULTSTOREs ascending (edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault).
-fn question_default(question: &IFROperation, default_ids: &[DefaultId]) -> Option<QuestionDefault> {
+fn question_default(
+    question: &IFROperation,
+    default_ids: &[DefaultId],
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Option<QuestionDefault> {
     let scope = question_scope(question);
     default_ids.iter().find_map(|&default_id| {
-        default_for_id(question, &scope, default_id)
+        default_for_id(question, &scope, default_id, inputs)
             .map(|value| QuestionDefault { default_id, value })
     })
 }
@@ -367,15 +369,16 @@ fn question_default(question: &IFROperation, default_ids: &[DefaultId]) -> Optio
 /// EFI_IFR_ONE_OF_OPTION, then CHECKBOX Flags (UEFI 2.10 §33.3.8.3.9, §33.3.8.3.47).
 fn default_for_id(
     question: &IFROperation,
-    scope: &[(Rc<RefCell<IFROperation>>, Visibility)],
+    scope: &[Rc<RefCell<IFROperation>>],
     default_id: DefaultId,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> Option<Result<u64, DefaultError>> {
     // EFI_IFR_DEFAULT, wherever it is in the question's scope
-    let ifr_default = scope.iter().find_map(|(op, _)| {
+    let ifr_default = scope.iter().find_map(|op| {
         let op = op.borrow();
         match &op.parsed_data {
             ParsedOperation::IFRDefault(default) if default.default_id == default_id => {
-                Some(ifr_default_value(&op, default))
+                Some(ifr_default_value(&op, default, inputs))
             }
             _ => None,
         }
@@ -389,7 +392,7 @@ fn default_for_id(
         DefaultId::MANUFACTURING => (EFI_IFR_OPTION_DEFAULT_MFG, EFI_IFR_CHECKBOX_DEFAULT_MFG),
         _ => return None,
     };
-    let option_default = scope.iter().find_map(|(op, visibility)| {
+    let option_default = scope.iter().find_map(|op| {
         let op = op.borrow();
         let ParsedOperation::OneOfOption(option) = &op.parsed_data else {
             return None;
@@ -397,15 +400,17 @@ fn default_for_id(
         if option.flags & option_flag == 0 {
             return None;
         }
-        match visibility {
-            Visibility::Suppressed => None,
-            Visibility::Unknown => Some(Err(DefaultError::SuppressIfCondition)),
-            Visibility::Shown => Some(
+        match option_visibility(&op, inputs) {
+            OptionVisibility::Shown => Some(
                 option
                     .value
                     .as_u64()
                     .ok_or(DefaultError::OptionType(option.value_type)),
             ),
+            OptionVisibility::Suppressed => None,
+            OptionVisibility::Unknown(reason) => {
+                Some(Err(DefaultError::SuppressIfCondition(reason)))
+            }
         }
     });
     if option_default.is_some() {
@@ -424,17 +429,19 @@ fn default_for_id(
 
 /// Appends the question's default, a value shown by `text`, to the reason its current
 /// value is unavailable.
-pub(super) fn push_default<E: fmt::Display>(
+pub(super) fn push_default<V: QuestionValues, E: fmt::Display>(
     answer: &mut String,
     question: &IFROperation,
     default_ids: &[DefaultId],
-    text: impl FnOnce(u64) -> Result<String, E>,
+    inputs: &mut ExpressionInputs<'_, V>,
+    text: impl FnOnce(u64, &mut ExpressionInputs<'_, V>) -> Result<String, E>,
 ) {
-    let Some(QuestionDefault { default_id, value }) = question_default(question, default_ids)
+    let Some(QuestionDefault { default_id, value }) =
+        question_default(question, default_ids, inputs)
     else {
         return;
     };
-    let value = match value.map(text) {
+    let value = match value.map(|value| text(value, inputs)) {
         Ok(Ok(shown)) => shown,
         Ok(Err(reason)) => format!("unknown ({reason})"),
         Err(reason) => format!("unknown ({reason})"),
@@ -451,10 +458,11 @@ pub(super) fn option_text(
     question: &IFROperation,
     value: u64,
     string_packages: &[HashMap<i32, String>],
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> Result<Option<String>, DefaultError> {
     question_scope(question)
         .iter()
-        .find_map(|(op, visibility)| {
+        .find_map(|op| {
             let op = op.borrow();
             let ParsedOperation::OneOfOption(option) = &op.parsed_data else {
                 return None;
@@ -462,15 +470,17 @@ pub(super) fn option_text(
             if option.value.as_u64() != Some(value) {
                 return None;
             }
-            match visibility {
-                Visibility::Suppressed => None,
-                Visibility::Unknown => Some(Err(DefaultError::SuppressIfCondition)),
-                Visibility::Shown => Some(Ok(find_corresponding_string(
+            match option_visibility(&op, inputs) {
+                OptionVisibility::Shown => Some(Ok(find_corresponding_string(
                     option.option_string_id,
                     string_packages,
                 )
                 .trim()
                 .to_string())),
+                OptionVisibility::Suppressed => None,
+                OptionVisibility::Unknown(reason) => {
+                    Some(Err(DefaultError::SuppressIfCondition(reason)))
+                }
             }
         })
         .transpose()
@@ -478,18 +488,27 @@ pub(super) fn option_text(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::collections::HashSet;
     use std::rc::Rc;
 
     use binrw::io::Cursor;
 
+    use super::super::conditions::QuestionValue;
+    use super::super::conditions::ValueKind;
     use super::super::find_question;
     use super::super::handle_form_package;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::IncludedStates;
+    use super::super::Selection;
 
     /// The MethodIdentifier of the test EFI_IFR_FORM_MAP method.
     const METHOD_IDENTIFIER: [u8; 16] = [0x33; 16];
+
+    /// Why a condition on question 1, the question of `parse_question()`, is not evaluated.
+    const QUESTION_1_UNAVAILABLE: &str = "EqIdVal of question 0x0001: <ValueUnavailable: no \
+                                          supported varstore with matching id 0x0001 found>";
 
     #[test]
     fn checkbox_default_comes_from_default_then_flags() {
@@ -645,6 +664,30 @@ mod tests {
         );
     }
 
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes declares no DEFAULTSTORE in the
+    /// scope of an opcode above EFI_IFR_MATCH2_OP.
+    #[test]
+    fn default_store_in_an_unknown_opcode_scope_is_not_declared() {
+        let children = [flagged_option(5, 0x00, 0), flagged_option(6, 0x20, 1)];
+        let in_scope = |op_code: u8| {
+            [
+                operation(op_code, true, &[]),
+                default_store(0x0001),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let mfg_default = format!("{UNAVAILABLE} <IFR default (DefaultId 0x0001): Enabled>");
+        let cases = [
+            ("opcode 0x00", in_scope(0x00), mfg_default.as_str()),
+            ("opcode 0x65", in_scope(0x65), UNAVAILABLE),
+            ("opcode 0x70", in_scope(0x70), UNAVAILABLE),
+        ];
+        for (name, scope, want) in cases {
+            assert_eq!(one_of_default(&[scope], &children), want, "{name}");
+        }
+    }
+
     #[test]
     fn declared_default_stores_are_tried_in_ascending_order() {
         let data = uint8_numeric(0x10, 0, 10);
@@ -679,18 +722,25 @@ mod tests {
                     <IFR default (DefaultId 0x0001): 4>";
 
         let efivars = Efivars::new();
-        let listed = list_questions(Rc::clone(&root), &strings(), &mut efivars.reader());
-        let found = find_question(
+        let listed = list_questions(
+            Rc::clone(&root),
+            &strings(),
+            IncludedStates::empty(),
+            &mut efivars.reader(),
+        );
+        let Selection::Picked(found, _) = find_question(
             root,
             &strings(),
             &HashSet::from([PROMPT]),
+            IncludedStates::empty(),
             &mut efivars.reader(),
-        )
-        .expect("find the question by its prompt");
+        ) else {
+            panic!("find the question by its prompt");
+        };
 
         let answers: Vec<&str> = listed
             .iter()
-            .map(|question| question.value.as_str())
+            .map(|(question, _)| question.value.as_str())
             .collect();
         assert_eq!(answers, [want], "list_questions");
         assert_eq!(found.value, want, "find_question");
@@ -708,9 +758,14 @@ mod tests {
         let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
         let unavailable = "<ValueUnavailable: varstore not found because we reached root>";
 
-        let listed = list_questions(root, &strings(), &mut Efivars::new().reader());
+        let listed = list_questions(
+            root,
+            &strings(),
+            IncludedStates::empty(),
+            &mut Efivars::new().reader(),
+        );
 
-        let answers: Vec<&str> = listed.iter().map(|q| q.value.as_str()).collect();
+        let answers: Vec<&str> = listed.iter().map(|(q, _)| q.value.as_str()).collect();
         assert_eq!(
             answers,
             [format!("{unavailable} <IFR default: 4>")],
@@ -745,11 +800,16 @@ mod tests {
         let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
         let unavailable = "<ValueUnavailable: no supported varstore with matching id 0x0001 found>";
 
-        let listed = list_questions(root, &strings(), &mut Efivars::new().reader());
+        let listed = list_questions(
+            root,
+            &strings(),
+            IncludedStates::empty(),
+            &mut Efivars::new().reader(),
+        );
 
         let answers: Vec<&str> = listed
             .iter()
-            .map(|question| question.value.as_str())
+            .map(|(question, _)| question.value.as_str())
             .collect();
         assert_eq!(
             answers,
@@ -782,9 +842,14 @@ mod tests {
         );
         let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
 
-        let listed = list_questions(root, &strings(), &mut Efivars::new().reader());
+        let listed = list_questions(
+            root,
+            &strings(),
+            IncludedStates::empty(),
+            &mut Efivars::new().reader(),
+        );
 
-        let answers: Vec<&str> = listed.iter().map(|q| q.value.as_str()).collect();
+        let answers: Vec<&str> = listed.iter().map(|(q, _)| q.value.as_str()).collect();
         assert_eq!(
             answers,
             [
@@ -869,7 +934,8 @@ mod tests {
             flagged_option(5, 0x10, 0),
         ];
         let unknown = format!(
-            "{UNAVAILABLE} <IFR default: unknown (EFI_IFR_SUPPRESS_IF condition not evaluated)>"
+            "{UNAVAILABLE} <IFR default: unknown (EFI_IFR_SUPPRESS_IF condition not evaluated: \
+             {QUESTION_1_UNAVAILABLE})>"
         );
 
         assert_eq!(
@@ -900,18 +966,84 @@ mod tests {
     }
 
     #[test]
-    fn option_flag_under_multi_op_condition_gives_unknown_default() {
+    fn option_flag_under_multi_op_condition_follows_it() {
+        let false_not = [
+            operation(FALSE, true, &[]),
+            operation(NOT, false, &[]),
+            END.to_vec(),
+        ]
+        .concat();
+        let cases = [
+            ("TRUE NOT", true_not(), "Enabled"),
+            ("FALSE NOT", false_not, "Disabled"),
+        ];
+        for (name, condition, default) in cases {
+            let children = [
+                conditional(SUPPRESS_IF, condition, &[flagged_option(6, 0x10, 1)]),
+                flagged_option(5, 0x10, 0),
+            ];
+
+            assert_eq!(
+                one_of_default(&[], &children),
+                format!("{UNAVAILABLE} <IFR default: {default}>"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A SUPPRESS_IF on the value of another question decides the default once that value is
+    /// known.
+    #[test]
+    fn option_flag_under_condition_on_a_known_value_follows_it() {
         let children = [
-            conditional(SUPPRESS_IF, true_not(), &[flagged_option(6, 0x10, 1)]),
+            conditional(
+                SUPPRESS_IF,
+                eq_id_val_of(2, 1),
+                &[flagged_option(6, 0x10, 1)],
+            ),
             flagged_option(5, 0x10, 0),
         ];
+        let unreadable = QuestionValue::Unreadable {
+            kind: ValueKind::Uint,
+            reason: "r".to_string(),
+        };
+        let cases = [
+            ("question 2 is 1", QuestionValue::Uint(1), "Disabled"),
+            ("question 2 is 0", QuestionValue::Uint(0), "Enabled"),
+            (
+                "question 2 unreadable",
+                unreadable,
+                "unknown (EFI_IFR_SUPPRESS_IF condition not evaluated: EqIdVal of question \
+                 0x0002: r)",
+            ),
+        ];
+        for (name, value, default) in cases {
+            let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), &children);
+            let values = MapValues(HashMap::from([(2, value)]));
+
+            assert_eq!(
+                question_descriptor_with(&question, unavailable(), &values).value,
+                format!("{UNAVAILABLE} <IFR default: {default}>"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_2_on_a_known_value_is_evaluated() {
+        let question_ref1 = operation(QUESTION_REF1, false, &2u16.to_le_bytes());
+        let children = [
+            flagged_option(5, 0x10, 0),
+            flagged_option(6, 0x00, 1),
+            ifr_default_2(0x0000, question_ref1),
+        ];
+        let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), &children);
+        let values = MapValues(HashMap::from([(2, QuestionValue::Uint(1))]));
 
         assert_eq!(
-            one_of_default(&[], &children),
-            format!(
-                "{UNAVAILABLE} <IFR default: unknown (EFI_IFR_SUPPRESS_IF condition not evaluated)>"
-            ),
-            "flagged option in multi-op SUPPRESS_IF"
+            question_descriptor_with(&question, unavailable(), &values).value,
+            format!("{UNAVAILABLE} <IFR default: Enabled>"),
+            "DEFAULT_2 of question 2"
         );
     }
 
@@ -1019,7 +1151,8 @@ mod tests {
         assert_eq!(
             one_of_default(&[], &children),
             format!(
-                "{UNAVAILABLE} <IFR default: unknown (EFI_IFR_VALUE expression not evaluated)>"
+                "{UNAVAILABLE} <IFR default: unknown (EFI_IFR_VALUE expression not evaluated: \
+                 {QUESTION_1_UNAVAILABLE})>"
             ),
             "non-constant DEFAULT_2"
         );
@@ -1129,6 +1262,10 @@ mod tests {
     /// hides, as edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption finds it.
     #[test]
     fn one_of_default_text_skips_suppressed_options() {
+        let unevaluated = format!(
+            " <IFR default: unknown (EFI_IFR_SUPPRESS_IF condition not evaluated: \
+             {QUESTION_1_UNAVAILABLE})>"
+        );
         let cases = [
             (
                 "suppressed duplicate first",
@@ -1149,7 +1286,7 @@ mod tests {
                     conditional(SUPPRESS_IF, eq_id_val(), &[flagged_option(5, 0x00, 1)]),
                     flagged_option(6, 0x10, 1),
                 ],
-                " <IFR default: unknown (EFI_IFR_SUPPRESS_IF condition not evaluated)>",
+                unevaluated.as_str(),
             ),
             (
                 "shown before unevaluated duplicate",

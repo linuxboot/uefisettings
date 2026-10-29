@@ -21,6 +21,11 @@ use std::path::Path;
 use uefisettings_qemu_guest::changed_bytes;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
+use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
+use uefisettings_qemu_guest::driver_sample::INCLUDE_SUPPRESSED;
+use uefisettings_qemu_guest::driver_sample::MATCH2;
+use uefisettings_qemu_guest::driver_sample::MATCH2_OFFSET;
+use uefisettings_qemu_guest::driver_sample::MATCH2_REASON;
 use uefisettings_qemu_guest::driver_sample::NUMERIC;
 use uefisettings_qemu_guest::driver_sample::NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF;
@@ -42,56 +47,71 @@ fn driver_sample_data() -> Vec<u8> {
 /// Sets `question` to `answer` with `set` and checks that `get` returns it, both after
 /// `prefix`: `["hii"]` for the HII commands, `[]` for the generic ones. Returns the bytes of
 /// the variable that changed.
+/// `(flags, annotation)`: the flags of both commands, and the annotation that ends both answers.
 #[track_caller]
-fn set(prefix: &[&str], question: &str, answer: &str) -> Vec<(usize, u8)> {
+fn set(
+    prefix: &[&str],
+    question: &str,
+    answer: &str,
+    (flags, annotation): (&[&str], &str),
+) -> Vec<(usize, u8)> {
     let before = driver_sample_data();
+    let answered = format!("{answer}{annotation}");
     let (set, modified) = single_response(
-        &[prefix, &["set", question, answer, "--json"]].concat(),
+        &[prefix, &["set", question, answer, "--json"], flags].concat(),
         BACKEND_HII,
     );
-    assert_eq!((set.answer.as_str(), modified), (answer, true), "{set:#?}");
+    assert_eq!(
+        (set.answer.as_str(), modified),
+        (answered.as_str(), true),
+        "{set:#?}"
+    );
     let (got, _) = single_response(
-        &[prefix, &["get", question, "--json"]].concat(),
+        &[prefix, &["get", question, "--json"], flags].concat(),
         BACKEND_HII,
     );
-    assert_eq!(got.answer, answer, "{got:#?}");
+    assert_eq!(got.answer, answered, "{got:#?}");
     changed_bytes(&before, &driver_sample_data())
 }
 
+/// What `set` takes and answers for a question that no condition hides.
+const SELECTABLE: (&[&str], &str) = (&[], "");
+
 /// Checks that `hii set` refuses `answer` for `question` without changing the variable.
+/// `flags` go to `hii set`.
 /// Returns the error that `hii set` printed.
 #[track_caller]
-fn refuse(question: &str, answer: &str) -> ErrorObject {
+fn refuse(question: &str, answer: &str, flags: &[&str]) -> ErrorObject {
     let before = driver_sample_data();
-    let error = json_error(&["hii", "set", question, answer, "--json"]);
+    let error = json_error(&[&["hii", "set", question, answer, "--json"][..], flags].concat());
     assert_eq!(
         changed_bytes(&before, &driver_sample_data()),
         [],
-        "{question} = {answer}"
+        "{question} = {answer} {flags:?}"
     );
     error
 }
 
 #[test]
 fn set_one_of_is_stored() {
-    let changed = set(&["hii"], ONE_OF, "My one-of text #3");
+    let changed = set(&["hii"], ONE_OF, "My one-of text #3", SELECTABLE);
     assert_eq!(changed, [(ONE_OF_OFFSET, 3)]);
 }
 
 #[test]
 fn set_one_of_to_an_unknown_option_is_refused() {
-    refuse(ONE_OF, "Bogus");
+    refuse(ONE_OF, "Bogus", &[]);
 }
 
 #[test]
 fn generic_set_check_box_is_stored() {
-    let changed = set(&[], CHECK_BOX, "0");
+    let changed = set(&[], CHECK_BOX, "0", SELECTABLE);
     assert_eq!(changed, [(CHECK_BOX_OFFSET, 0)]);
 }
 
 #[test]
 fn set_check_box_to_2_is_refused() {
-    refuse(CHECK_BOX, "2");
+    refuse(CHECK_BOX, "2", &[]);
 }
 
 #[test]
@@ -105,7 +125,7 @@ fn set_boot_service_only_question_is_refused_naming_its_variable() {
         .and_then(OsStr::to_str)
         .expect("file name of the variable");
 
-    let error = refuse(QUESTION, "1");
+    let error = refuse(QUESTION, "1", &[]);
 
     assert_eq!(
         error.error_message,
@@ -120,20 +140,63 @@ fn set_boot_service_only_question_is_refused_naming_its_variable() {
 
 #[test]
 fn set_numeric_to_its_maximum_is_stored() {
-    let changed = set(&["hii"], NUMERIC, "243");
+    let changed = set(&["hii"], NUMERIC, "243", SELECTABLE);
     assert_eq!(changed, [(NUMERIC_OFFSET, 243)]);
 }
 
 #[test]
 fn set_numeric_above_its_maximum_is_refused() {
-    refuse(NUMERIC, "244");
+    refuse(NUMERIC, "244", &[]);
 }
 
 #[test]
 fn set_16_bit_one_of_is_stored() {
     // The only 16-bit question on a variable that Linux can write. The form grays it out
-    // and hides it, but the library ignores that. 0x3F8 becomes 0x2F8: only the high byte
-    // changes.
-    let changed = set(&["hii"], SERIAL_PORT, "2F8");
+    // and hides it, so set selects it only with INCLUDE_SUPPRESSED. 0x3F8 becomes 0x2F8:
+    // only the high byte changes.
+    let changed = set(
+        &["hii"],
+        SERIAL_PORT,
+        "2F8",
+        (&INCLUDE_SUPPRESSED, " <suppressed>"),
+    );
     assert_eq!(changed, [(SERIAL_PORT_OFFSET + 1, 0x02)]);
+}
+
+#[test]
+fn set_of_a_suppressed_question_is_refused_unless_suppressed_is_included() {
+    // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList ranks SuppressIf
+    // above GrayOutIf, so including grayed-out questions is not enough for this one, which is
+    // both.
+    let excluded = format!(
+        "question {SERIAL_PORT:?} is suppressed; also include suppressed questions to select it"
+    );
+    for flags in [&[][..], &INCLUDE_GRAYED_OUT] {
+        assert_eq!(
+            refuse(SERIAL_PORT, "2E8", flags).error_message,
+            excluded,
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn set_of_a_question_that_may_be_grayed_out_is_refused_unless_grayed_out_is_included() {
+    let undetermined = format!(
+        "cannot tell whether question {MATCH2:?} is grayed-out: {MATCH2_REASON}; also include \
+         grayed-out questions to select it regardless"
+    );
+    assert_eq!(
+        refuse(MATCH2, "5", &[]).error_message,
+        undetermined,
+        "{MATCH2} without flags"
+    );
+
+    let annotation = format!(" <selectable or grayed-out: {MATCH2_REASON}>");
+    let changed = set(&["hii"], MATCH2, "5", (&INCLUDE_GRAYED_OUT, &annotation));
+    assert_eq!(
+        changed,
+        [(MATCH2_OFFSET, 5)],
+        "{MATCH2} {INCLUDE_GRAYED_OUT:?}"
+    );
 }

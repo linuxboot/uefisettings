@@ -45,11 +45,28 @@ use crate::hii::efivarfs::EfivarNotFound;
 use crate::hii::efivarfs::EfivarsMountGuard;
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::package::Guid;
+use conditions::option_state;
+use conditions::question_state;
+use conditions::select;
+use conditions::skips_scope;
+use conditions::ExpressionInputs;
+use conditions::QuestionValues;
+use conditions::StateEvaluation;
+use conditions::VarStoreValues;
 use defaults::option_text;
 use defaults::push_default;
+use defaults::question_scope;
 use defaults::DefaultId;
 use defaults::FormSetDefaultIds;
 
+pub use conditions::IncludedStates;
+pub use conditions::QuestionState;
+pub use conditions::SelectionError;
+
+pub(crate) use conditions::Choice;
+pub(crate) use conditions::Selection;
+
+mod conditions;
 mod defaults;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
@@ -426,11 +443,9 @@ pub enum ParsedOperation {
     Text(Text),
     Subtitle(Subtitle),
     Numeric(Numeric),
-    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     QuestionRef1(QuestionRef1),
-    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     EqIdVal(EqIdVal),
-    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
+    EqIdId(EqIdId),
     EqIdValList(EqIdValList),
     #[default]
     Placeholder,
@@ -737,6 +752,48 @@ impl Question for CheckBox {
     }
 }
 
+/// A question whose value get reads and set writes.
+#[derive(Clone, Copy)]
+enum ValueQuestion<'a> {
+    OneOf(&'a OneOf),
+    Numeric(&'a Numeric),
+    CheckBox(&'a CheckBox),
+}
+
+impl ValueQuestion<'_> {
+    fn header(self) -> QuestionHeader {
+        match self {
+            ValueQuestion::OneOf(question) => question.question_header(),
+            ValueQuestion::Numeric(question) => question.question_header(),
+            ValueQuestion::CheckBox(question) => question.question_header(),
+        }
+    }
+}
+
+/// Returns `op` as a ONE_OF, NUMERIC or CHECKBOX.
+fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
+    match &op.parsed_data {
+        ParsedOperation::OneOf(question) => Some(ValueQuestion::OneOf(question)),
+        ParsedOperation::Numeric(question) => Some(ValueQuestion::Numeric(question)),
+        ParsedOperation::CheckBox(question) => Some(ValueQuestion::CheckBox(question)),
+        ParsedOperation::FormSet(_)
+        | ParsedOperation::OneOfOption(_)
+        | ParsedOperation::VarStore(_)
+        | ParsedOperation::VarStoreNameValue(_)
+        | ParsedOperation::VarStoreEfi(_)
+        | ParsedOperation::DefaultStore(_)
+        | ParsedOperation::IFRDefault(_)
+        | ParsedOperation::Form(_)
+        | ParsedOperation::Text(_)
+        | ParsedOperation::Subtitle(_)
+        | ParsedOperation::QuestionRef1(_)
+        | ParsedOperation::EqIdVal(_)
+        | ParsedOperation::EqIdId(_)
+        | ParsedOperation::EqIdValList(_)
+        | ParsedOperation::Placeholder => None,
+    }
+}
+
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
 pub struct OneOfOption {
@@ -758,14 +815,17 @@ trait VariableStore {
         EfivarFileName::new(&self.name(), self.guid())
     }
 
-    fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+    /// Refuses an EFI variable without EFI_VARIABLE_RUNTIME_ACCESS, which efivarfs neither
+    /// lists nor writes (UEFI 2.10 §8.2.2, §8.2.3).
+    fn check_runtime_access(&self) -> std::result::Result<(), BootServiceOnlyVariable> {
         if self.kind() == VariableStoreKind::EfiVariable && !self.is_runtime_accessible() {
-            return Err(anyhow!(
-                "EFI variable {} is boot-service-only and cannot be written through efivarfs",
-                self.efivar_file_name()
-            ));
+            return Err(BootServiceOnlyVariable(self.efivar_file_name()));
         }
+        Ok(())
+    }
 
+    fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+        self.check_runtime_access()?;
         self.write_efivarfs_at_offset(offset, data)
     }
 
@@ -836,6 +896,12 @@ impl VariableNotExported {
         }
     }
 }
+
+/// An EFI variable without EFI_VARIABLE_RUNTIME_ACCESS, which set refuses and get shows as
+/// unavailable.
+#[derive(Error, Debug)]
+#[error("EFI variable {0} is boot-service-only and cannot be written through efivarfs")]
+struct BootServiceOnlyVariable(EfivarFileName);
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum VariableStoreKind {
@@ -1080,6 +1146,7 @@ mod non_efi_varstore_tests {
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 raw_value: TypeValue::NumSize8(1),
+                state: StateEvaluation::selectable(),
             }],
             header: QuestionHeader {
                 prompt_string_id: 0,
@@ -1093,6 +1160,7 @@ mod non_efi_varstore_tests {
                 kind: VariableStoreKind::Buffer,
             })),
             refers_to_bit_field: false,
+            value_state: StateEvaluation::selectable(),
         };
 
         assert!(change_value(&question, "Enabled").unwrap());
@@ -1148,6 +1216,15 @@ impl EfivarReader {
             .or_insert_with_key(|range| read_efivar(efivars, &range.name, range.size))
             .as_deref()
     }
+
+    /// Why the efivar of `store` is missing, if a read of it found it so.
+    fn missing(&self, store: &dyn VariableStore) -> Option<&EfivarNotFound> {
+        self.outcomes
+            .get(&EfivarRange::of(store))?
+            .as_ref()
+            .err()?
+            .downcast_ref()
+    }
 }
 
 /// Returns the bytes of `varstore`'s efivar file, or why a question on it has no value.
@@ -1159,11 +1236,10 @@ fn read_current_value_bytes<'a>(
         Ok(store) => store,
         Err(error) => return Err(Cow::Owned(format!("<ValueUnavailable: {}>", error))),
     };
-    if store.kind() == VariableStoreKind::EfiVariable && !store.is_runtime_accessible() {
+    if let Err(BootServiceOnlyVariable(name)) = store.check_runtime_access() {
         return Err(Cow::Owned(format!(
-            "<ValueUnavailable: EFI variable {} is boot-service-only \
-             (no EFI_VARIABLE_RUNTIME_ACCESS)>",
-            store.efivar_file_name()
+            "<ValueUnavailable: EFI variable {name} is boot-service-only \
+             (no EFI_VARIABLE_RUNTIME_ACCESS)>"
         )));
     }
 
@@ -1406,10 +1482,15 @@ mod efivar_reader_tests {
         let mut reader = efivars.reader();
         let shown_before = show(&mut efivars.reader());
 
-        let listed: Vec<String> = list_questions(Rc::clone(&root), &strings(), &mut reader)
-            .into_iter()
-            .map(|question| question.value)
-            .collect();
+        let listed: Vec<String> = list_questions(
+            Rc::clone(&root),
+            &strings(),
+            IncludedStates::empty(),
+            &mut reader,
+        )
+        .into_iter()
+        .map(|(question, _)| question.value)
+        .collect();
         efivars.write(&efi_variable("Setup", 2), &[0, 1]);
         let shown = show(&mut reader);
 
@@ -1570,6 +1651,13 @@ pub struct QuestionRef1 {
 pub struct EqIdVal {
     pub question_id: u16,
     pub value: u16,
+}
+
+#[derive(BinRead, Debug, PartialEq)]
+#[br(little)]
+pub struct EqIdId {
+    pub question_id_1: u16,
+    pub question_id_2: u16,
 }
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -1890,6 +1978,13 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
             debug!("EqIdVal is {:?}", parsed);
             node.parsed_data = ParsedOperation::EqIdVal(parsed);
         }
+        IFROpCode::EqIdId => {
+            let parsed: EqIdId = data_cursor
+                .read_ne()
+                .context("failed to parse EqIdId's data")?;
+            debug!("EqIdId is {:?}", parsed);
+            node.parsed_data = ParsedOperation::EqIdId(parsed);
+        }
         IFROpCode::EqIdValList => {
             let parsed: EqIdValList = data_cursor
                 .read_ne()
@@ -1916,6 +2011,8 @@ pub struct QuestionDescriptor {
     /// Whether the question is an EDKII bit varstore field, whose VarOffset edk2-stable202608
     /// SetupBrowserDxe/IfrParse.c reads in bits
     refers_to_bit_field: bool,
+    /// The state of the option that `value` names: selectable if none does
+    pub(crate) value_state: StateEvaluation,
 }
 impl fmt::Debug for QuestionDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1932,202 +2029,442 @@ impl fmt::Debug for QuestionDescriptor {
 pub struct AnswerOption {
     pub value: String,
     raw_value: TypeValue,
+    pub(crate) state: StateEvaluation,
+}
+
+impl QuestionDescriptor {
+    /// The texts of the options that `include` certainly allows: those that get lists and set
+    /// takes.
+    pub(crate) fn listed_options(&self, include: IncludedStates) -> Vec<String> {
+        self.possible_options
+            .iter()
+            .filter(|option| option.state.is_allowed(include))
+            .map(|option| option.value.clone())
+            .collect()
+    }
+
+    /// Returns the option whose text is one of `texts`, ignoring ASCII case, that select()
+    /// picks with `include`, or None if no option has such a text.
+    pub(crate) fn select_option(
+        &self,
+        texts: &HashSet<String>,
+        include: IncludedStates,
+    ) -> std::result::Result<Option<&AnswerOption>, SelectionError> {
+        let matches: Vec<(&AnswerOption, StateEvaluation)> = self
+            .possible_options
+            .iter()
+            .filter(|option| {
+                texts
+                    .iter()
+                    .any(|text| text.eq_ignore_ascii_case(&option.value))
+            })
+            .map(|option| (option, option.state.clone()))
+            .collect();
+        let Some(&(first, _)) = matches.first() else {
+            return Ok(None);
+        };
+        let question = self.question.clone();
+        match select(matches, include) {
+            Selection::Picked(option, _) => Ok(Some(option)),
+            Selection::Undetermined {
+                likely: (option, _),
+                reasons,
+                states,
+            } => Err(SelectionError::OptionUndetermined {
+                question,
+                option: option.value.clone(),
+                states,
+                reasons,
+            }),
+            Selection::Excluded(states) => Err(SelectionError::OptionExcluded {
+                question,
+                option: first.value.clone(),
+                states,
+            }),
+            Selection::NotFound => Ok(None),
+        }
+    }
 }
 
 // list_questions returns a list of QuestionDescriptors in a form package
+// with their states, of the questions in a state that `include` may allow
 // node should be the form_package node
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &[HashMap<i32, String>],
+    include: IncludedStates,
     reader: &mut EfivarReader,
-) -> Vec<QuestionDescriptor> {
-    list_questions_in(node, &mut FormPackageWalk::new(string_packages, reader))
+) -> Vec<(QuestionDescriptor, StateEvaluation)> {
+    let values = VarStoreValues::new(&node);
+    list_questions_in(
+        &node,
+        &mut FormPackageWalk::new(string_packages, reader, &values, include),
+    )
 }
 
 /// What walking the ops of a form package takes besides them.
-struct FormPackageWalk<'a> {
+struct FormPackageWalk<'a, V> {
     /// The string packages of the form package's package list
     string_packages: &'a [HashMap<i32, String>],
     default_ids: FormSetDefaultIds,
-    reader: &'a mut EfivarReader,
+    inputs: ExpressionInputs<'a, V>,
+    include: IncludedStates,
 }
 
-impl<'a> FormPackageWalk<'a> {
-    fn new(string_packages: &'a [HashMap<i32, String>], reader: &'a mut EfivarReader) -> Self {
+impl<'a, V> FormPackageWalk<'a, V> {
+    fn new(
+        string_packages: &'a [HashMap<i32, String>],
+        reader: &'a mut EfivarReader,
+        values: &'a V,
+        include: IncludedStates,
+    ) -> Self {
         Self {
             string_packages,
             default_ids: FormSetDefaultIds::default(),
-            reader,
+            inputs: ExpressionInputs { reader, values },
+            include,
         }
     }
 }
 
 /// Lists questions as list_questions does, with `walk`.
 fn list_questions_in(
-    node: Rc<RefCell<IFROperation>>,
-    walk: &mut FormPackageWalk<'_>,
-) -> Vec<QuestionDescriptor> {
-    let mut res = Vec::new();
-
-    let current_node = node.borrow();
-
-    match &current_node.parsed_data {
-        ParsedOperation::Numeric(parsed) => {
-            let question = find_corresponding_string(
-                parsed.question_header().prompt_string_id,
-                walk.string_packages,
-            );
-
-            let varstore = find_corresponding_varstore(
-                Rc::clone(&node),
-                parsed.question_header().var_store_id,
-            );
-
-            let question_descriptor =
-                handle_numeric(varstore, parsed, question, &current_node, walk);
-            res.push(question_descriptor);
-        }
-        ParsedOperation::OneOf(parsed) => {
-            let question = find_corresponding_string(
-                parsed.question_header().prompt_string_id,
-                walk.string_packages,
-            );
-
-            let varstore = find_corresponding_varstore(
-                Rc::clone(&node),
-                parsed.question_header().var_store_id,
-            );
-
-            let question_descriptor = handle_oneof(varstore, parsed, question, &current_node, walk);
-            res.push(question_descriptor);
-        }
-        ParsedOperation::CheckBox(parsed) => {
-            let question = find_corresponding_string(
-                parsed.question_header().prompt_string_id,
-                walk.string_packages,
-            );
-
-            let varstore = find_corresponding_varstore(
-                Rc::clone(&node),
-                parsed.question_header().var_store_id,
-            );
-
-            let question_descriptor =
-                handle_checkbox(varstore, parsed, question, &current_node, walk);
-            res.push(question_descriptor);
-        }
-
-        _ => {}
-    }
+    node: &Rc<RefCell<IFROperation>>,
+    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+) -> Vec<(QuestionDescriptor, StateEvaluation)> {
+    let mut res: Vec<_> = listed_question(node, walk).into_iter().collect();
 
     // Now look inside current node's children for more questions
+    // TODO: skip the scopes that skips_scope names, as questions_named does.
     for child in &node.borrow().children {
-        res.extend(list_questions_in(Rc::clone(child), walk));
+        res.extend(list_questions_in(child, walk));
     }
 
     res
 }
 
+/// Returns the QuestionDescriptor and states of a ONE_OF, NUMERIC or CHECKBOX in a state that
+/// `walk.include` may allow.
+fn listed_question(
+    question: &Rc<RefCell<IFROperation>>,
+    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+) -> Option<(QuestionDescriptor, StateEvaluation)> {
+    let op = question.borrow();
+    let value_question = value_question(&op)?;
+    let state = question_state(&op, &mut walk.inputs);
+    if !state.may_be_allowed(walk.include) {
+        return None;
+    }
+    let descriptor = describe_question(question, &op, value_question, walk);
+    Some((descriptor, state))
+}
+
 /// find_question accepts the root node, string_packages and possible_question_phrases.
 /// possible_question_phrases is a vector of strings which represent variations of the
 /// same question. So if a single phrase matches then we assume that we have the answer.
+/// Of the matching questions, it selects one as select does.
 pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &[HashMap<i32, String>],
     possible_question_phrases: &HashSet<T>,
+    include: IncludedStates,
     reader: &mut EfivarReader,
-) -> Option<QuestionDescriptor>
+) -> Selection<QuestionDescriptor>
 where
     T: AsRef<str>,
 {
+    let values = VarStoreValues::new(&node);
     find_question_in(
-        node,
+        &node,
         possible_question_phrases,
-        &mut FormPackageWalk::new(string_packages, reader),
+        &mut FormPackageWalk::new(string_packages, reader, &values, include),
     )
 }
 
 /// Finds a question as find_question does, with `walk`.
 fn find_question_in<T>(
-    node: Rc<RefCell<IFROperation>>,
+    node: &Rc<RefCell<IFROperation>>,
     possible_question_phrases: &HashSet<T>,
-    walk: &mut FormPackageWalk<'_>,
-) -> Option<QuestionDescriptor>
+    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+) -> Selection<QuestionDescriptor>
 where
     T: AsRef<str>,
 {
-    let current_node = node.borrow();
+    let questions = questions_named(node, walk.string_packages, possible_question_phrases);
+    let ops: Vec<std::cell::Ref<IFROperation>> =
+        questions.iter().map(|question| question.borrow()).collect();
+    let matches = questions
+        .iter()
+        .zip(&ops)
+        .filter_map(|(question, op)| {
+            let value_question = value_question(op)?;
+            let state = question_state(op, &mut walk.inputs);
+            Some(((question, op, value_question), state))
+        })
+        .collect();
+    select(matches, walk.include)
+        .map(|(question, op, value_question)| describe_question(question, op, value_question, walk))
+}
 
-    // Only Numeric, OneOf and CheckBox are questions.
-    // If our question is found this match expression will return without caring if we found answer.
-    // Otherwise, we will look at children of current_node
-
-    for phrase in possible_question_phrases {
-        match &current_node.parsed_data {
-            ParsedOperation::Numeric(parsed) => {
-                let question = find_corresponding_string(
-                    parsed.question_header().prompt_string_id,
-                    walk.string_packages,
-                );
-
-                if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
-                    let varstore = find_corresponding_varstore(
-                        Rc::clone(&node),
-                        parsed.question_header().var_store_id,
-                    );
-
-                    let res = handle_numeric(varstore, parsed, question, &current_node, walk);
-
-                    return Some(res);
-                }
-            }
-            ParsedOperation::OneOf(parsed) => {
-                let question = find_corresponding_string(
-                    parsed.question_header().prompt_string_id,
-                    walk.string_packages,
-                );
-
-                if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
-                    let varstore = find_corresponding_varstore(
-                        Rc::clone(&node),
-                        parsed.question_header().var_store_id,
-                    );
-
-                    let res = handle_oneof(varstore, parsed, question, &current_node, walk);
-
-                    return Some(res);
-                }
-            }
-            ParsedOperation::CheckBox(parsed) => {
-                let question = find_corresponding_string(
-                    parsed.question_header().prompt_string_id,
-                    walk.string_packages,
-                );
-
-                if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
-                    let varstore = find_corresponding_varstore(
-                        Rc::clone(&node),
-                        parsed.question_header().var_store_id,
-                    );
-
-                    let res = handle_checkbox(varstore, parsed, question, &current_node, walk);
-
-                    return Some(res);
-                }
-            }
-
-            _ => {}
+/// set's choice of the selection of a form package: that of Selection::for_set, unless the
+/// efivar of the match that set would write, or of the likely match, is missing or
+/// boot-service-only, which --include cannot make writable: then VariableNotExported, as
+/// `reader` found it, or BootServiceOnlyVariable.
+pub(crate) fn choice_for_set(
+    selection: Selection<QuestionDescriptor>,
+    question: &str,
+    reader: &EfivarReader,
+) -> Result<Choice<QuestionDescriptor>> {
+    let store = match &selection {
+        Selection::Picked(descriptor, _)
+        | Selection::Undetermined {
+            likely: (descriptor, _),
+            ..
+        } => descriptor.varstore.as_deref(),
+        Selection::Excluded(_) | Selection::NotFound => None,
+    };
+    if let Some(store) = store {
+        store.check_runtime_access()?;
+        if let Some(missing) = reader.missing(store) {
+            return Err(VariableNotExported(missing.clone()).into());
         }
     }
+    Ok(selection.for_set(question)?)
+}
 
-    // Question not found in current_node so look at children
-    for child in &node.borrow().children {
-        if let Some(res) = find_question_in(Rc::clone(child), possible_question_phrases, walk) {
-            return Some(res);
-        }
+#[cfg(test)]
+mod choice_for_set_tests {
+    use super::ifr_fixtures::*;
+    use super::*;
+
+    /// The text of write_at_offset's refusal of the boot-service-only efivar Present.
+    const PRESENT_BOOT_SERVICE_ONLY: &str = "EFI variable \
+        Present-00000000-0000-0000-0000-000000000000 is boot-service-only and cannot be written \
+        through efivarfs";
+    /// The EfivarNotFound of the efivar Missing.
+    const MISSING_NOT_FOUND: &str = "no EFI variable Missing-00000000-0000-0000-0000-000000000000";
+    /// Why the EQ_ID_VAL on question 2, on the efivar Missing, is not evaluated.
+    const MISSING_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI variable \
+        Missing-00000000-0000-0000-0000-000000000000>";
+
+    /// set's choice for PROMPT in the form package `root`, where only the efivar Present, of
+    /// 1 byte, exists.
+    fn choice_in(root: &Rc<RefCell<IFROperation>>) -> Result<Choice<QuestionDescriptor>> {
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Present", 1), &[0]);
+        let mut reader = efivars.reader();
+        let values = VarStoreValues::new(root);
+        let selection = find_question_in(
+            root,
+            &HashSet::from([PROMPT]),
+            &mut FormPackageWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
+        );
+        choice_for_set(selection, PROMPT, &reader)
     }
 
-    None
+    /// set's choice for PROMPT, prompting question 1 on VarStore `own` under a SUPPRESS_IF on
+    /// question 2, which is on VarStore 2; VarStore 3 is VarStore 1 without runtime access,
+    /// and only their efivar exists.
+    fn choice(own: u16) -> Result<Choice<QuestionDescriptor>> {
+        choice_in(&parse_form_set(&[
+            var_store_efi(1, "Present", NV_BS_RT, 1),
+            var_store_efi(2, "Missing", NV_BS_RT, 1),
+            var_store_efi(3, "Present", NV_BS, 1),
+            form(
+                1,
+                &[
+                    checkbox_on(2, 5, 2),
+                    conditional(SUPPRESS_IF, eq_id_val_of(2, 1), &[checkbox_on(1, 3, own)]),
+                ],
+            ),
+        ]))
+    }
+
+    /// set's choice for PROMPT, prompting a selectable ONE_OF on VarStore 1, after the
+    /// VarStores `var_stores`, whose option Enabled is under a SUPPRESS_IF on question 2 of
+    /// VarStore `input`.
+    fn picked_choice(var_stores: &[Vec<u8>], input: u16) -> Result<Choice<QuestionDescriptor>> {
+        let (root, _question) = parse_question(
+            &[var_stores, &[checkbox_on(2, 5, input)]].concat(),
+            ONE_OF,
+            &one_of_data(),
+            &[
+                flagged_option(5, 0x00, 0),
+                conditional(
+                    SUPPRESS_IF,
+                    eq_id_val_of(2, 1),
+                    &[flagged_option(6, 0x00, 1)],
+                ),
+            ],
+        );
+        choice_in(&root)
+    }
+
+    #[test]
+    fn undetermined_match_on_a_missing_efivar_is_not_exported() {
+        let error = choice(2).expect_err("set refuses question 1");
+        assert_eq!(
+            error
+                .downcast_ref::<VariableNotExported>()
+                .map(|error| error.0.to_string())
+                .as_deref(),
+            Some(MISSING_NOT_FOUND),
+            "question 1 on the missing VarStore: {error:#}"
+        );
+    }
+
+    #[test]
+    fn undetermined_match_on_a_present_efivar_is_undetermined() {
+        let error = choice(1).expect_err("set refuses question 1");
+        assert_eq!(
+            error.downcast_ref::<SelectionError>(),
+            Some(&SelectionError::Undetermined {
+                question: PROMPT.to_string(),
+                states: IncludedStates::SUPPRESSED,
+                reasons: vec![MISSING_INPUT.to_string()],
+            }),
+            "question 1 on the present VarStore"
+        );
+    }
+
+    #[test]
+    fn picked_match_on_a_missing_efivar_is_not_exported() {
+        let error = picked_choice(&[var_store_efi(1, "Missing", NV_BS_RT, 1)], 1)
+            .expect_err("set refuses the ONE_OF");
+        assert_eq!(
+            error
+                .downcast_ref::<VariableNotExported>()
+                .map(|error| error.0.to_string())
+                .as_deref(),
+            Some(MISSING_NOT_FOUND),
+            "the ONE_OF on the missing VarStore: {error:#}"
+        );
+    }
+
+    #[test]
+    fn picked_match_on_a_present_efivar_is_chosen() {
+        let choice = picked_choice(&[var_store_efi(1, "Present", NV_BS_RT, 1)], 1);
+        assert!(
+            matches!(choice, Ok(Choice::Chosen(..))),
+            "the ONE_OF on the present VarStore: {choice:?}"
+        );
+    }
+
+    #[test]
+    fn picked_match_with_a_missing_condition_input_is_chosen() {
+        let choice = picked_choice(
+            &[
+                var_store_efi(1, "Present", NV_BS_RT, 1),
+                var_store_efi(2, "Missing", NV_BS_RT, 1),
+            ],
+            2,
+        );
+        let Ok(Choice::Chosen(descriptor, _)) = choice else {
+            panic!("the ONE_OF on the present VarStore: {choice:?}");
+        };
+        let enabled = HashSet::from(["Enabled".to_string()]);
+        let selected = |include| {
+            descriptor
+                .select_option(&enabled, include)
+                .map(|option| option.map(|option| option.value.as_str()))
+        };
+
+        assert_eq!(
+            selected(IncludedStates::empty()),
+            Err(SelectionError::OptionUndetermined {
+                question: PROMPT.to_string(),
+                option: "Enabled".to_string(),
+                states: IncludedStates::SUPPRESSED,
+                reasons: vec![MISSING_INPUT.to_string()],
+            }),
+            "Enabled without --include"
+        );
+        assert_eq!(
+            selected(IncludedStates::SUPPRESSED),
+            Ok(Some("Enabled")),
+            "Enabled with --include suppressed"
+        );
+    }
+
+    #[test]
+    fn match_on_a_boot_service_only_store_is_refused() {
+        let cases = [
+            ("undetermined", choice(3)),
+            (
+                "picked",
+                picked_choice(&[var_store_efi(1, "Present", NV_BS, 1)], 1),
+            ),
+        ];
+        for (case, choice) in cases {
+            assert_eq!(
+                choice.map_err(|error| error.to_string()).err().as_deref(),
+                Some(PRESENT_BOOT_SERVICE_ONLY),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, whose
+/// prompt is one of `phrases`, ignoring ASCII case and surrounding whitespace.
+fn questions_named<T>(
+    node: &Rc<RefCell<IFROperation>>,
+    string_packages: &[HashMap<i32, String>],
+    phrases: &HashSet<T>,
+) -> Vec<Rc<RefCell<IFROperation>>>
+where
+    T: AsRef<str>,
+{
+    fn walk<T: AsRef<str>>(
+        node: &Rc<RefCell<IFROperation>>,
+        string_packages: &[HashMap<i32, String>],
+        phrases: &HashSet<T>,
+        found: &mut Vec<Rc<RefCell<IFROperation>>>,
+    ) {
+        let op = node.borrow();
+        if skips_scope(&op) {
+            return;
+        }
+        let prompt = prompt(&op, string_packages).trim();
+        // Only Numeric, OneOf and CheckBox are questions.
+        if value_question(&op).is_some()
+            && phrases
+                .iter()
+                .any(|phrase| phrase.as_ref().eq_ignore_ascii_case(prompt))
+        {
+            found.push(Rc::clone(node));
+        }
+        for child in &op.children {
+            walk(child, string_packages, phrases, found);
+        }
+    }
+    let mut found = Vec::new();
+    walk(node, string_packages, phrases, &mut found);
+    found
+}
+
+/// Returns the prompt of a ONE_OF, NUMERIC or CHECKBOX, empty for other ops.
+fn prompt<'a>(op: &IFROperation, string_packages: &'a [HashMap<i32, String>]) -> &'a str {
+    value_question(op).map_or("", |question| {
+        find_corresponding_string(question.header().prompt_string_id, string_packages)
+    })
+}
+
+/// Returns the QuestionDescriptor of `question`, whose op `op` is `value_question`.
+fn describe_question(
+    question: &Rc<RefCell<IFROperation>>,
+    op: &std::cell::Ref<IFROperation>,
+    value_question: ValueQuestion<'_>,
+    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+) -> QuestionDescriptor {
+    let header = value_question.header();
+    let prompt = find_corresponding_string(header.prompt_string_id, walk.string_packages);
+    let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
+    match value_question {
+        ValueQuestion::OneOf(parsed) => handle_oneof(varstore, parsed, prompt, op, walk),
+        ValueQuestion::Numeric(parsed) => handle_numeric(varstore, parsed, prompt, op, walk),
+        ValueQuestion::CheckBox(parsed) => handle_checkbox(varstore, parsed, prompt, op, walk),
+    }
 }
 
 fn handle_checkbox(
@@ -2135,10 +2472,10 @@ fn handle_checkbox(
     parsed: &CheckBox,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
-    walk: &mut FormPackageWalk<'_>,
+    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
-    let available = match read_question_bytes(current_node, &varstore, walk.reader) {
+    let available = match read_question_bytes(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             false
@@ -2147,13 +2484,14 @@ fn handle_checkbox(
         Ok(bytes) => try_read_answer_as_string::<u8>(&parsed.question_header(), bytes, &mut answer),
     };
     if !available {
-        let default_ids = walk.default_ids.of(current_node);
+        let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
         push_default(
             &mut answer,
             current_node,
             default_ids,
+            &mut walk.inputs,
             // FALSE or TRUE (UEFI 2.10 §33.3.8.3.9)
-            |v| Ok::<_, Infallible>(u8::from(v != 0).to_string()),
+            |v, _| Ok::<_, Infallible>(u8::from(v != 0).to_string()),
         );
     }
     let res = QuestionDescriptor {
@@ -2171,6 +2509,7 @@ fn handle_checkbox(
         max_value: RangeType::NumSize8(1),
         numeric_range: None,
         opcode: current_node.op_code,
+        value_state: StateEvaluation::selectable(),
     };
     res
 }
@@ -2180,12 +2519,12 @@ fn handle_oneof(
     parsed: &OneOf,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
-    walk: &mut FormPackageWalk<'_>,
+    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
     // None, with the reason in `answer`, when the current value cannot be read: any u64,
     // all ones too, can be stored.
-    let chosen_value = match read_question_bytes(current_node, &varstore, walk.reader) {
+    let chosen_value = match read_question_bytes(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             None
@@ -2207,43 +2546,66 @@ fn handle_oneof(
     };
 
     if chosen_value.is_none() {
-        let default_ids = walk.default_ids.of(current_node);
+        let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
         match numeric_format(current_node, parsed.flags, &parsed.data) {
-            Ok(format) => push_default(&mut answer, current_node, default_ids, |v| {
-                option_text(current_node, format.cut(v), walk.string_packages).map(|option| {
-                    option.unwrap_or_else(|| format!("{} (no matching option)", format.decode(v)))
-                })
-            }),
-            Err(error) => push_default(&mut answer, current_node, default_ids, |_| {
-                Err::<String, _>(error)
-            }),
+            Ok(format) => push_default(
+                &mut answer,
+                current_node,
+                default_ids,
+                &mut walk.inputs,
+                |v, inputs| {
+                    option_text(current_node, format.cut(v), walk.string_packages, inputs).map(
+                        |option| {
+                            option.unwrap_or_else(|| {
+                                format!("{} (no matching option)", format.decode(v))
+                            })
+                        },
+                    )
+                },
+            ),
+            Err(error) => push_default(
+                &mut answer,
+                current_node,
+                default_ids,
+                &mut walk.inputs,
+                |_, _| Err::<String, _>(error),
+            ),
         }
     }
 
     let mut possible_options = Vec::new();
     // Some of OneOf's children are OneOfOptions
 
-    let mut found_option = false;
-    // TODO: collect OneOfOptions nested in SuppressIf/GrayOutIf/DisableIf, as question_scope
-    // does; get, list-questions and set miss them.
-    for child in &current_node.children {
-        if let ParsedOperation::OneOfOption(o) = &child.borrow().parsed_data {
-            let opt = AnswerOption {
+    for op in question_scope(current_node) {
+        let op = op.borrow();
+        if let ParsedOperation::OneOfOption(o) = &op.parsed_data {
+            possible_options.push(AnswerOption {
                 raw_value: o.value,
                 value: find_corresponding_string(o.option_string_id, walk.string_packages)
                     .to_string(),
-            };
-
-            let chosen = matches!((chosen_value, o.value.as_u64()), (Some(a), Some(b)) if a == b);
-            if chosen && !found_option {
-                found_option = true;
-                answer.push_str(opt.value.trim());
-                // cannot break here because we want to add all options to possible_options
-            }
-
-            possible_options.push(opt);
+                state: option_state(&op, &mut walk.inputs),
+            });
         }
     }
+    let chosen: Vec<&AnswerOption> = possible_options
+        .iter()
+        .filter(
+            |opt| matches!((chosen_value, opt.raw_value.as_u64()), (Some(a), Some(b)) if a == b),
+        )
+        .collect();
+    // the first that may be shown, as edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption
+    // finds it, else the first, which a SUPPRESS_IF hides
+    let value_state = match chosen
+        .iter()
+        .find(|opt| opt.state.may_be_allowed(IncludedStates::empty()))
+        .or(chosen.first())
+    {
+        Some(opt) => {
+            answer.push_str(opt.value.trim());
+            opt.state.clone()
+        }
+        None => StateEvaluation::selectable(),
+    };
     if answer.is_empty() {
         answer.push_str("Unknown");
     }
@@ -2268,6 +2630,7 @@ fn handle_oneof(
         },
         numeric_range: None,
         opcode: current_node.op_code,
+        value_state,
     };
     res
 }
@@ -2277,11 +2640,11 @@ fn handle_numeric(
     parsed: &Numeric,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
-    walk: &mut FormPackageWalk<'_>,
+    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
 
-    let available = match read_question_bytes(current_node, &varstore, walk.reader) {
+    let available = match read_question_bytes(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             false
@@ -2320,11 +2683,17 @@ fn handle_numeric(
         },
     };
     if !available {
-        let default_ids = walk.default_ids.of(current_node);
-        push_default(&mut answer, current_node, default_ids, |v| {
-            numeric_format(current_node, parsed.flags, &parsed.data)
-                .map(|format| format.decode(v).to_string())
-        });
+        let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
+        push_default(
+            &mut answer,
+            current_node,
+            default_ids,
+            &mut walk.inputs,
+            |v, _| {
+                numeric_format(current_node, parsed.flags, &parsed.data)
+                    .map(|format| format.decode(v).to_string())
+            },
+        );
     }
     let res = QuestionDescriptor {
         question: question.to_string(),
@@ -2347,6 +2716,7 @@ fn handle_numeric(
         // TODO: None for bit fields: from_ifr reads EFI_IFR_DISPLAY from EDKII bit-field Flags
         numeric_range: Some(NumericRange::from_ifr(&parsed.data, parsed.flags)),
         opcode: current_node.op_code,
+        value_state: StateEvaluation::selectable(),
     };
     res
 }
@@ -2969,15 +3339,27 @@ mod question_value_tests {
         }
     }
 
-    /// A ONE_OF bit field of width 33 shows its default as unknown for its width.
+    /// A ONE_OF bit field of width 33 shows its default as unknown for its width, unless the
+    /// default itself is unknown, whose reason shows instead.
     #[test]
     fn one_of_bit_field_width_33_default_is_unknown() {
         let reason = "EDKII bit-field width 33, not 1 to 32";
-        let cases = [(
-            "constant DEFAULT",
-            uint32_default(0x0000, 1),
-            format!("{UNAVAILABLE} <IFR default: unknown ({reason})>"),
-        )];
+        let cases = [
+            (
+                "constant DEFAULT",
+                uint32_default(0x0000, 1),
+                format!("{UNAVAILABLE} <IFR default: unknown ({reason})>"),
+            ),
+            (
+                "non-constant DEFAULT_2",
+                ifr_default_2(0x0000, eq_id_val()),
+                format!(
+                    "{UNAVAILABLE} <IFR default: unknown (EFI_IFR_VALUE expression not \
+                     evaluated: EqIdVal of question 0x0001: <ValueUnavailable: no supported \
+                     varstore with matching id 0x0001 found>)>"
+                ),
+            ),
+        ];
         for (name, default, want) in cases {
             assert_eq!(
                 answer_in_guid(
@@ -3150,24 +3532,13 @@ mod question_value_tests {
 
 // display returns a String which is our tree like representation of a Forms package
 // TODO: show the default of an unreadable OneOf, Numeric or CheckBox, as list_questions does.
+// TODO: show the state that the conditions give each question and option, as list-questions
+// does.
 pub fn display(
     node: Rc<RefCell<IFROperation>>,
     level: usize,
     string_packages: &[HashMap<i32, String>],
     reader: &mut EfivarReader,
-) -> Result<String> {
-    display_in(
-        node,
-        level,
-        &mut FormPackageWalk::new(string_packages, reader),
-    )
-}
-
-/// Displays `node` as display does, with `walk`.
-fn display_in(
-    node: Rc<RefCell<IFROperation>>,
-    level: usize,
-    walk: &mut FormPackageWalk<'_>,
 ) -> Result<String> {
     let mut result = String::new();
     let extra_spaces = "    ".repeat(level);
@@ -3184,7 +3555,7 @@ fn display_in(
             format!(
                 "{extra_spaces}OpCode: {:?} - S: {}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.prompt_string_id, walk.string_packages),
+                find_corresponding_string(parsed.prompt_string_id, string_packages),
             )
             .as_str(),
         ),
@@ -3192,7 +3563,7 @@ fn display_in(
             format!(
                 "{extra_spaces}OpCode: {:?} - {} - GUID {} - ClassGUID {}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.title_string_id, walk.string_packages),
+                find_corresponding_string(parsed.title_string_id, string_packages),
                 parsed.guid,
                 parsed.class_guid,
             )
@@ -3217,7 +3588,7 @@ fn display_in(
             format!(
                 "{extra_spaces}OpCode: {:?} - S: {}\n{extra_spaces}-ValueType:{}\n{extra_spaces}-Value:{:?}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.option_string_id, walk.string_packages),
+                find_corresponding_string(parsed.option_string_id, string_packages),
                 parsed.value_type,
                 parsed.value
             )
@@ -3230,16 +3601,16 @@ fn display_in(
             let header = parsed.question_header();
             let answer_disp = match &parsed.data {
                 Range::Range8(_) => {
-                    display_answer::<u8>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u8>(&current_node, &header, &varstore, reader)
                 }
                 Range::Range16(_) => {
-                    display_answer::<u16>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u16>(&current_node, &header, &varstore, reader)
                 }
                 Range::Range32(_) => {
-                    display_answer::<u32>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u32>(&current_node, &header, &varstore, reader)
                 }
                 Range::Range64(_) => {
-                    display_answer::<u64>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u64>(&current_node, &header, &varstore, reader)
                 }
             };
 
@@ -3249,11 +3620,11 @@ fn display_in(
                     current_node.op_code,
                     find_corresponding_string(
                         parsed.question_header().prompt_string_id,
-                        walk.string_packages
+                        string_packages
                     ),
                     find_corresponding_string(
                         parsed.question_header().help_string_id,
-                        walk.string_packages
+                        string_packages
                     ),
                     parsed.data
                 )
@@ -3266,16 +3637,16 @@ fn display_in(
             let header = parsed.question_header();
             let answer_disp = match &parsed.data {
                 Range::Range8(_) => {
-                    display_answer::<u8>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u8>(&current_node, &header, &varstore, reader)
                 }
                 Range::Range16(_) => {
-                    display_answer::<u16>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u16>(&current_node, &header, &varstore, reader)
                 }
                 Range::Range32(_) => {
-                    display_answer::<u32>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u32>(&current_node, &header, &varstore, reader)
                 }
                 Range::Range64(_) => {
-                    display_answer::<u64>(&current_node, &header, &varstore, walk.reader)
+                    display_answer::<u64>(&current_node, &header, &varstore, reader)
                 }
             };
 
@@ -3285,11 +3656,11 @@ fn display_in(
                     current_node.op_code,
                     find_corresponding_string(
                         parsed.question_header().prompt_string_id,
-                        walk.string_packages
+                        string_packages
                     ),
                     find_corresponding_string(
                         parsed.question_header().help_string_id,
-                        walk.string_packages
+                        string_packages
                     ),
                     parsed.data
                 )
@@ -3304,7 +3675,7 @@ fn display_in(
                 &current_node,
                 &parsed.question_header(),
                 &varstore,
-                walk.reader,
+                reader,
             );
 
             result.push_str(
@@ -3313,11 +3684,11 @@ fn display_in(
                     current_node.op_code,
                     find_corresponding_string(
                         parsed.question_header().prompt_string_id,
-                        walk.string_packages
+                        string_packages
                     ),
                     find_corresponding_string(
                         parsed.question_header().help_string_id,
-                        walk.string_packages
+                        string_packages
                     ),
                 )
                 .as_str(),
@@ -3331,7 +3702,7 @@ fn display_in(
     }
 
     for child in &node.borrow().children {
-        result.push_str(display_in(Rc::clone(child), level + 1, walk)?.as_str());
+        result.push_str(display(Rc::clone(child), level + 1, string_packages, reader)?.as_str());
     }
 
     Ok(result)
@@ -3370,6 +3741,8 @@ pub enum ChangeValueError {
     InvalidNumericRange,
     #[error("setting EDKII bit-field values is not supported")]
     UnsupportedBitField,
+    #[error(transparent)]
+    Selection(#[from] SelectionError),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -3386,17 +3759,13 @@ pub fn change_value(
     let mut changed = false;
     if let Some(varstore) = &question.varstore {
         if question.opcode == IFROpCode::OneOf {
-            for option in &question.possible_options {
-                if option.value.eq_ignore_ascii_case(new_value) {
-                    varstore.write_at_offset(question.header.var_store_info, option.raw_value)?;
-                    changed = true;
-                    break;
-                }
-            }
-
-            if !changed {
-                return Err(ChangeValueError::InvalidOption);
-            }
+            let option = question
+                .select_option(
+                    &HashSet::from([new_value.to_owned()]),
+                    IncludedStates::empty(),
+                )?
+                .ok_or(ChangeValueError::InvalidOption)?;
+            return change_option(question, option);
         } else if let Some(range) = &question.numeric_range {
             let data = range.parse_value(new_value)?;
             varstore.write_at_offset(question.header.var_store_info, data)?;
@@ -3460,6 +3829,23 @@ pub fn change_value(
     }
 
     Ok(changed)
+}
+
+/// Writes `option`, one of the possible_options of the ONE_OF `question`; Ok(false) without a
+/// VarStore.
+pub fn change_option(
+    question: &QuestionDescriptor,
+    option: &AnswerOption,
+) -> Result<bool, ChangeValueError> {
+    // writes take VarOffset in bytes
+    if question.refers_to_bit_field {
+        return Err(ChangeValueError::UnsupportedBitField);
+    }
+    let Some(varstore) = &question.varstore else {
+        return Ok(false);
+    };
+    varstore.write_at_offset(question.header.var_store_info, option.raw_value)?;
+    Ok(true)
 }
 
 fn find_corresponding_string(string_id: u16, string_packages: &[HashMap<i32, String>]) -> &str {
@@ -3808,8 +4194,6 @@ mod write_validation_tests {
     use super::ifr_fixtures::*;
     use super::*;
 
-    type RecordedWrites = Rc<RefCell<Vec<(u16, TypeValue)>>>;
-
     struct RecordingVarStore {
         writes: RecordedWrites,
     }
@@ -3933,7 +4317,12 @@ mod write_validation_tests {
             &parsed,
             "Numeric test",
             &node.borrow(),
-            &mut FormPackageWalk::new(&[], &mut efivars.reader()),
+            &mut FormPackageWalk::new(
+                &[],
+                &mut efivars.reader(),
+                &MapValues(HashMap::new()),
+                IncludedStates::empty(),
+            ),
         );
         (question, writes)
     }
@@ -4114,6 +4503,31 @@ mod write_validation_tests {
                 matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
                 "{name}, GUID {BIT_VARSTORE_GUID:02X?} without VarStore: {changed:?}"
             );
+
+            // set writes a ONE_OF's option as change_option does, not as change_value does
+            let (_root, node) =
+                parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &children);
+            let (store, writes) = recording_store();
+            let question = question_descriptor(&node, store);
+            for option in &question.possible_options {
+                let changed = change_option(&question, option);
+                assert!(
+                    matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
+                    "{name}: change_option {:?}: {changed:?}",
+                    option.value
+                );
+            }
+            assert!(writes.borrow().is_empty(), "{name}: change_option");
+
+            let question = question_descriptor(&node, unavailable());
+            for option in &question.possible_options {
+                let changed = change_option(&question, option);
+                assert!(
+                    matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
+                    "{name}: change_option {:?} without VarStore: {changed:?}",
+                    option.value
+                );
+            }
 
             let other_guid = OTHER_GUID;
             let (store, writes) = recording_store();

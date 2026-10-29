@@ -22,14 +22,19 @@ use std::process;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
 use uefisettings::exports::identify_machine;
+use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IloBackend;
+use uefisettings::exports::IncludedStates;
+use uefisettings::exports::ListQuestionsOptions;
+use uefisettings::exports::SetOptions;
 use uefisettings::exports::SettingsBackend;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
@@ -67,6 +72,8 @@ enum Commands {
         question: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
+        #[clap(flatten)]
+        include: IncludeArgs,
     },
     /// Auto-identify backend and set/change the value of a question
     Set {
@@ -76,6 +83,8 @@ enum Commands {
         value: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
+        #[clap(flatten)]
+        include: IncludeArgs,
     },
     /// Show the translation/spellings database for questions and answers
     ShowTranslations {
@@ -98,6 +107,8 @@ enum HiiSubcommands {
         question: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
+        #[clap(flatten)]
+        include: IncludeArgs,
     },
     /// Set/change the value of a question
     Set {
@@ -107,6 +118,8 @@ enum HiiSubcommands {
         value: String,
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
+        #[clap(flatten)]
+        include: IncludeArgs,
     },
     /// Show a human readable representation of the Hii Forms
     ShowIFR {
@@ -134,7 +147,80 @@ enum HiiSubcommands {
         filename: Option<PathBuf>,
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
+        #[clap(flatten)]
+        include: IncludeArgs,
     },
+}
+
+#[derive(Debug, Args)]
+struct IncludeArgs {
+    /// Also select questions that conditions gray out, suppress or disable. The edk2 setup
+    /// browser (edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList) ranks
+    /// DisableIf > SuppressIf > GrayOutIf, so a question that is both grayed out and suppressed
+    /// counts as suppressed.
+    #[clap(long, value_enum, value_delimiter = ',')]
+    include: Vec<IncludeState>,
+}
+
+impl IncludeArgs {
+    fn states(&self) -> IncludedStates {
+        self.include
+            .iter()
+            .copied()
+            .map(IncludedStates::from)
+            .collect()
+    }
+
+    /// Fails if any state is included: Ilo attributes have no IFR conditions.
+    fn refuse_on_ilo(&self) -> Result<()> {
+        match self.include.as_slice() {
+            [] => Ok(()),
+            [..] => Err(anyhow!(
+                "--include applies to the HII backend, not to the Ilo backend of this machine"
+            )),
+        }
+    }
+}
+
+impl From<&IncludeArgs> for GetOptions {
+    fn from(args: &IncludeArgs) -> Self {
+        let mut options = Self::default();
+        options.include = args.states();
+        options
+    }
+}
+
+impl From<&IncludeArgs> for SetOptions {
+    fn from(args: &IncludeArgs) -> Self {
+        let mut options = Self::default();
+        options.include = args.states();
+        options
+    }
+}
+
+impl From<&IncludeArgs> for ListQuestionsOptions {
+    fn from(args: &IncludeArgs) -> Self {
+        let mut options = Self::default();
+        options.include = args.states();
+        options
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum IncludeState {
+    GrayedOut,
+    Suppressed,
+    Disabled,
+}
+
+impl From<IncludeState> for IncludedStates {
+    fn from(state: IncludeState) -> Self {
+        match state {
+            IncludeState::GrayedOut => IncludedStates::GRAYED_OUT,
+            IncludeState::Suppressed => IncludedStates::SUPPRESSED,
+            IncludeState::Disabled => IncludedStates::DISABLED,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -199,16 +285,21 @@ fn main() -> Result<()> {
 fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
     match &args.command {
         Commands::Hii(hii_command) => match &hii_command.command {
-            HiiSubcommands::Get { question, json } => {
-                let res = HiiBackend::get(question, None)?;
+            HiiSubcommands::Get {
+                question,
+                json,
+                include,
+            } => {
+                let res = HiiBackend::get_using(question, None, &GetOptions::from(include))?;
                 print_with_style(res, *json)?;
             }
             HiiSubcommands::Set {
                 question,
                 value,
                 json,
+                include,
             } => {
-                let res = HiiBackend::set(question, value, None)?;
+                let res = HiiBackend::set_using(question, value, None, &SetOptions::from(include))?;
                 print_with_style(res, *json)?;
             }
             HiiSubcommands::ShowIFR { filename } => {
@@ -229,8 +320,15 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
                 print_with_style(res, *json)?;
             }
-            HiiSubcommands::ListQuestions { filename, json } => {
-                let res = HiiBackend::list_questions(&get_db_dump_bytes(filename.as_deref())?)?;
+            HiiSubcommands::ListQuestions {
+                filename,
+                json,
+                include,
+            } => {
+                let res = HiiBackend::list_questions_using(
+                    &get_db_dump_bytes(filename.as_deref())?,
+                    &ListQuestionsOptions::from(include),
+                )?;
                 print_with_style(res, *json)?;
             }
         },
@@ -260,16 +358,21 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             let machine = identify_machine();
             print_with_style(machine, *json)?;
         }
-        Commands::Get { question, json } => {
+        Commands::Get {
+            question,
+            json,
+            include,
+        } => {
             let machine = identify_machine();
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
             if prioritize_backend(&machine, *json)? == Backend::Ilo {
+                include.refuse_on_ilo()?;
                 let res = IloBackend::get(question, None)?;
                 print_with_style(res, *json)?;
             } else {
-                let res = HiiBackend::get(question, None)?;
+                let res = HiiBackend::get_using(question, None, &GetOptions::from(include))?;
                 print_with_style(res, *json)?;
             }
         }
@@ -277,16 +380,18 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             question,
             value,
             json,
+            include,
         } => {
             let machine = identify_machine();
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
             if prioritize_backend(&machine, *json)? == Backend::Ilo {
+                include.refuse_on_ilo()?;
                 let res = IloBackend::set(question, value, None)?;
                 print_with_style(res, *json)?;
             } else {
-                let res = HiiBackend::set(question, value, None)?;
+                let res = HiiBackend::set_using(question, value, None, &SetOptions::from(include))?;
                 print_with_style(res, *json)?;
             }
         }
@@ -396,6 +501,65 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// The --include of `uefisettings set Q V` with `args` after it.
+    fn include_of(args: &[&str]) -> IncludeArgs {
+        let command = [&["uefisettings", "set", "Q", "V"][..], args].concat();
+        let parsed = UefiSettingsToolArgs::try_parse_from(&command)
+            .unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
+        let Commands::Set { include, .. } = parsed.command else {
+            panic!("{command:?} is no set: {parsed:?}");
+        };
+        include
+    }
+
+    #[test]
+    fn include_maps_each_state_to_its_flag() {
+        let cases = [
+            ("no flag", vec![], IncludedStates::empty()),
+            (
+                "grayed-out",
+                vec!["--include", "grayed-out"],
+                IncludedStates::GRAYED_OUT,
+            ),
+            (
+                "suppressed",
+                vec!["--include", "suppressed"],
+                IncludedStates::SUPPRESSED,
+            ),
+            (
+                "disabled",
+                vec!["--include", "disabled"],
+                IncludedStates::DISABLED,
+            ),
+            (
+                "all three",
+                vec!["--include", "grayed-out,suppressed,disabled"],
+                IncludedStates::all(),
+            ),
+            (
+                "repeated",
+                vec!["--include", "grayed-out", "--include", "disabled"],
+                IncludedStates::GRAYED_OUT | IncludedStates::DISABLED,
+            ),
+        ];
+        for (name, args, states) in cases {
+            let include = include_of(&args);
+            assert_eq!(include.states(), states, "{name}");
+            assert_eq!(GetOptions::from(&include).include, states, "{name}: get");
+            assert_eq!(SetOptions::from(&include).include, states, "{name}: set");
+            assert_eq!(
+                ListQuestionsOptions::from(&include).include,
+                states,
+                "{name}: list-questions"
+            );
+            assert_eq!(
+                include.refuse_on_ilo().is_ok(),
+                args.is_empty(),
+                "{name}: refuse_on_ilo"
+            );
         }
     }
 

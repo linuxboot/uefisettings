@@ -1027,6 +1027,7 @@ version = "0.1.6"
 dependencies = [
  "anyhow",
  "binrw",
+ "bitflags 2.4.1",
  "clap",
  "env_logger",
  "fbthrift",

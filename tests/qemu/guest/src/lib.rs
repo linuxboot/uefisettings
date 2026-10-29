@@ -112,6 +112,22 @@ pub mod driver_sample {
     pub const SERIAL_PORT: &str = "Serial port IO address";
     /// Offset of the 16-bit little-endian answer of [`SERIAL_PORT`].
     pub const SERIAL_PORT_OFFSET: usize = 194;
+    /// The flag that makes `get`, `set` and `hii list-questions` select questions that a
+    /// SUPPRESS_IF hides too: [`SERIAL_PORT`], which the form grays out and suppresses while
+    /// the serial port is off, and the second [`CHECK_BOX`], whose form is suppressed while
+    /// BootOrderLarge is 0.
+    pub const INCLUDE_SUPPRESSED: [&str; 2] = ["--include", "suppressed"];
+    /// A numeric question from 0 to 243 in a `grayoutif match2 (...)`, which the library does
+    /// not evaluate: it may be grayed out.
+    pub const MATCH2: &str = "Match2 Test";
+    /// Offset of the 8-bit answer of [`MATCH2`].
+    pub const MATCH2_OFFSET: usize = 203;
+    /// Why the condition of [`MATCH2`] is not evaluated: its first op is a stringref, which the
+    /// library does not evaluate.
+    pub const MATCH2_REASON: &str = "StringRef1 not evaluated";
+    /// The flag that makes `get` and `set` select questions that a GRAY_OUT_IF may gray out
+    /// too, such as [`MATCH2`].
+    pub const INCLUDE_GRAYED_OUT: [&str; 2] = ["--include", "grayed-out"];
 }
 
 /// How a `uefisettings` run exited, and what it printed.

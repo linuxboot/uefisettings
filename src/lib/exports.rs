@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
@@ -35,6 +36,8 @@ use uefisettings_backend_thrift::SetResponseList;
 use crate::hii::extract;
 use crate::hii::forms;
 use crate::hii::forms::list_questions;
+use crate::hii::forms::Choice;
+use crate::hii::forms::QuestionDescriptor;
 use crate::hii::package;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
@@ -47,6 +50,10 @@ use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
 use crate::translation::IloTranslation;
 
+pub use crate::hii::forms::IncludedStates;
+pub use crate::hii::forms::QuestionState;
+pub use crate::hii::forms::SelectionError;
+
 /// SettingsBackend is a trait which should be satisfied by all backends (like ilo, hii)
 pub trait SettingsBackend {
     /// set changes the value of the UEFI question/attribute
@@ -56,6 +63,30 @@ pub trait SettingsBackend {
 }
 
 pub struct HiiBackend {}
+
+/// The options of HiiBackend::get_using.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct GetOptions {
+    /// The states of the questions to select and of the options to list too
+    pub include: IncludedStates,
+}
+
+/// The options of HiiBackend::set_using.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct SetOptions {
+    /// The states of the questions and options to select too
+    pub include: IncludedStates,
+}
+
+/// The options of HiiBackend::list_questions_using.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ListQuestionsOptions {
+    /// The states of the questions and options to list too
+    pub include: IncludedStates,
+}
 
 impl HiiBackend {
     /// extract_db extracts HiiDB from efivarfs and returns it in bytes (in HiiDatabase's db field which is `Vec<u8>`)
@@ -123,6 +154,15 @@ impl HiiBackend {
     }
 
     pub fn list_questions(db_bytes: &[u8]) -> Result<Vec<Question>> {
+        Self::list_questions_using(db_bytes, &ListQuestionsOptions::default())
+    }
+
+    /// list_questions with `options`
+    pub fn list_questions_using(
+        db_bytes: &[u8],
+        options: &ListQuestionsOptions,
+    ) -> Result<Vec<Question>> {
+        let include = options.include;
         let mut res = Vec::new();
         let parsed_db = package::read_db(db_bytes)?;
         let mut reader = forms::EfivarReader::default();
@@ -132,17 +172,18 @@ impl HiiBackend {
             for form_package in list.forms {
                 //  TODO: show form name, package list guid in the final response as well
 
-                for question_descriptor in list_questions(form_package, &list.strings, &mut reader)
+                for (question_descriptor, state) in
+                    list_questions(form_package, &list.strings, include, &mut reader)
                 {
-                    let mut question = Question {
+                    let question = Question {
+                        options: question_descriptor.listed_options(include),
                         name: question_descriptor.question,
-                        answer: question_descriptor.value,
+                        answer: question_descriptor.value
+                            + &question_descriptor.value_state.option_annotation()
+                            + &state.annotation(),
                         help: question_descriptor.help,
                         ..Default::default()
                     };
-                    for opt in question_descriptor.possible_options {
-                        question.options.push(opt.value);
-                    }
                     // don't show it if everything is empty
                     if !(question.name.is_empty()
                         && question.answer.is_empty()
@@ -159,8 +200,25 @@ impl HiiBackend {
 }
 
 impl SettingsBackend for HiiBackend {
-    fn set(question: &str, new_value: &str, _selector: Option<&str>) -> Result<SetResponseList> {
+    fn set(question: &str, new_value: &str, selector: Option<&str>) -> Result<SetResponseList> {
+        Self::set_using(question, new_value, selector, &SetOptions::default())
+    }
+
+    fn get(question: &str, selector: Option<&str>) -> Result<GetResponseList> {
+        Self::get_using(question, selector, &GetOptions::default())
+    }
+}
+
+impl HiiBackend {
+    /// set with `options`
+    pub fn set_using(
+        question: &str,
+        new_value: &str,
+        _selector: Option<&str>,
+        options: &SetOptions,
+    ) -> Result<SetResponseList> {
         // TODO: use selector to only change values which match question + selector
+        let include = options.include;
 
         let mut resp = Vec::new();
 
@@ -187,72 +245,83 @@ impl SettingsBackend for HiiBackend {
         // question has a varstore, and aborts on the first write error even if another match is
         // writable; report what was written and what failed, and fail unless every match was
         // written.
+
+        // Every form package selects its question and option before the first write, so that a
+        // selection error leaves every variable unchanged.
+        let mut selected = Vec::new();
+        let mut excluded = IncludedStates::empty();
+        // one cache for the selection, which ends before the first write
+        let mut reader = forms::EfivarReader::default();
         for list in parsed_db {
             for form_package in list.forms {
                 // try to find the question
-                if let Some(question_descriptor) = forms::find_question(
+                let selection = forms::find_question(
                     form_package,
                     &list.strings,
                     &question_variations,
-                    // fresh per lookup: change_value may have written a variable an
-                    // earlier lookup read
-                    &mut forms::EfivarReader::default(),
-                ) {
-                    let mut modified = false;
-                    // if the question_descriptor provides options then set the closest one from new_value_variations
-                    // (example whatever matches from [Enabled, Enable])
-                    // else try setting the new_value because it might be some arbitrary value like a number
-                    // (will return error if doesn't match constraints)
-                    if !(question_descriptor.possible_options.is_empty()) {
-                        // This is different from modified because if varstore doesn't exist for the question
-                        // then we can't set answers but it isn't an error.
-                        let mut found_option = false;
-                        for opt in &(question_descriptor.possible_options) {
-                            if found_option {
-                                break;
-                            }
-                            for variation in &new_value_variations {
-                                if variation.eq_ignore_ascii_case(&(opt.value)) {
-                                    found_option = true;
-                                    modified =
-                                        forms::change_value(&question_descriptor, &(opt.value))?;
-                                    break;
-                                }
-                            }
+                    include,
+                    &mut reader,
+                );
+                match forms::choice_for_set(selection, question, &reader)? {
+                    Choice::Chosen(question_descriptor, state) => {
+                        if !(question_descriptor.possible_options.is_empty()) {
+                            chosen_option(&question_descriptor, &new_value_variations, include)?;
                         }
-                        // if not a single option matched then error out
-                        // we went though all options and if it still wasn't modified then this isn't in the options
-                        if !found_option {
-                            return Err(forms::ChangeValueError::InvalidOption.into());
-                        }
-                    } else {
-                        modified = forms::change_value(&question_descriptor, new_value)?
+                        selected.push((list.guid.to_string(), question_descriptor, state));
                     }
-
-                    if modified {
-                        let mut set_resp = SetResponse {
-                            // TODO: GUIDs repeat, also in errors; identify lists by HiiDB index
-                            selector: list.guid.to_string(),
-                            backend: Backend::Hii,
-                            is_translated,
-                            question: Question {
-                                name: question_descriptor.question,
-                                answer: new_value.to_owned(),
-                                help: question_descriptor.help,
-                                ..Default::default()
-                            },
-                            modified: true,
-                            ..Default::default()
-                        };
-
-                        for opt in question_descriptor.possible_options {
-                            set_resp.question.options.push(opt.value)
-                        }
-
-                        resp.push(set_resp);
-                    }
+                    // question not found in this form package
+                    // or only in states that `include` does not allow
+                    Choice::Skipped(states) => excluded |= states,
                 }
-                // question not found in this form package
+            }
+        }
+        if selected.is_empty() && !excluded.is_empty() {
+            return Err(SelectionError::Excluded {
+                question: question.to_owned(),
+                states: excluded,
+            }
+            .into());
+        }
+        drop(reader);
+
+        for (guid, question_descriptor, state) in selected {
+            // if the question_descriptor provides options then set the closest one from new_value_variations
+            // (example whatever matches from [Enabled, Enable])
+            // else try setting the new_value because it might be some arbitrary value like a number
+            // (will return error if doesn't match constraints)
+            let (modified, option_annotation) =
+                if !(question_descriptor.possible_options.is_empty()) {
+                    let option =
+                        chosen_option(&question_descriptor, &new_value_variations, include)?;
+                    (
+                        forms::change_option(&question_descriptor, option)?,
+                        option.state.option_annotation(),
+                    )
+                } else {
+                    (
+                        forms::change_value(&question_descriptor, new_value)?,
+                        String::new(),
+                    )
+                };
+
+            if modified {
+                let set_resp = SetResponse {
+                    // TODO: GUIDs repeat, also in errors; identify lists by HiiDB index
+                    selector: guid,
+                    backend: Backend::Hii,
+                    is_translated,
+                    question: Question {
+                        options: question_descriptor.listed_options(include),
+                        name: question_descriptor.question,
+                        answer: new_value.to_owned() + &option_annotation + &state.annotation(),
+                        help: question_descriptor.help,
+                        ..Default::default()
+                    },
+                    modified: true,
+                    ..Default::default()
+                };
+
+                resp.push(set_resp);
             }
         }
 
@@ -262,8 +331,16 @@ impl SettingsBackend for HiiBackend {
         })
     }
 
-    fn get(question: &str, _selector: Option<&str>) -> Result<GetResponseList> {
+    /// get with `options`
+    pub fn get_using(
+        question: &str,
+        _selector: Option<&str>,
+        options: &GetOptions,
+    ) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
+        // TODO: take a form@packagelist selector to pick one of the form packages that select
+        // the question
+        let include = options.include;
 
         let mut resp = Vec::new();
 
@@ -283,42 +360,57 @@ impl SettingsBackend for HiiBackend {
         let parsed_db = package::read_db(&db_bytes)?;
         let mut reader = forms::EfivarReader::default();
 
+        let mut excluded = IncludedStates::empty();
         for list in parsed_db {
             list.check_form_strings()?;
 
             for form_package in list.forms {
-                if let Some(question_descriptor) = forms::find_question(
+                let selection = forms::find_question(
                     form_package,
                     &list.strings,
                     &question_variations,
+                    include,
                     &mut reader,
-                ) {
-                    let mut get_resp = GetResponse {
-                        selector: list.guid.to_string(),
-                        backend: Backend::Hii,
-                        is_translated,
-                        // mapping the hii module's QuestionDescriptor to thrift codegen's Question
-                        question: Question {
-                            name: question_descriptor.question,
-                            answer: question_descriptor.value,
-                            help: question_descriptor.help,
-                            ..Default::default()
-                        },
+                );
+                let (question_descriptor, state) = match selection.for_get() {
+                    Choice::Chosen(question_descriptor, state) => (question_descriptor, state),
+                    Choice::Skipped(states) => {
+                        excluded |= states;
+                        continue;
+                    }
+                };
+                let mut get_resp = GetResponse {
+                    selector: list.guid.to_string(),
+                    backend: Backend::Hii,
+                    is_translated,
+                    // mapping the hii module's QuestionDescriptor to thrift codegen's Question
+                    question: Question {
+                        options: question_descriptor.listed_options(include),
+                        name: question_descriptor.question,
+                        answer: question_descriptor.value,
+                        help: question_descriptor.help,
                         ..Default::default()
-                    };
+                    },
+                    ..Default::default()
+                };
 
-                    if is_translated {
-                        get_resp.question.answer =
-                            translate_response(question, &get_resp.question.answer, Backend::Hii);
-                    }
-
-                    for opt in question_descriptor.possible_options {
-                        get_resp.question.options.push(opt.value)
-                    }
-
-                    resp.push(get_resp)
+                if is_translated {
+                    get_resp.question.answer =
+                        translate_response(question, &get_resp.question.answer, Backend::Hii);
                 }
+                // after translate_response, which matches whole answers
+                get_resp.question.answer += &question_descriptor.value_state.option_annotation();
+                get_resp.question.answer += &state.annotation();
+
+                resp.push(get_resp)
             }
+        }
+        if resp.is_empty() && !excluded.is_empty() {
+            return Err(SelectionError::Excluded {
+                question: question.to_owned(),
+                states: excluded,
+            }
+            .into());
         }
 
         Ok(GetResponseList {
@@ -326,6 +418,18 @@ impl SettingsBackend for HiiBackend {
             ..Default::default()
         })
     }
+}
+
+/// The option of `question` that set writes for one of `texts`.
+fn chosen_option<'a>(
+    question: &'a QuestionDescriptor,
+    texts: &HashSet<String>,
+    include: IncludedStates,
+) -> Result<&'a forms::AnswerOption> {
+    // if not a single option matched then error out
+    question
+        .select_option(texts, include)?
+        .ok_or_else(|| forms::ChangeValueError::InvalidOption.into())
 }
 
 pub struct IloBackend {}

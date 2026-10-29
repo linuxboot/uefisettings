@@ -16,6 +16,9 @@ use std::fs;
 
 use tempfile::TempDir;
 
+use super::conditions::QuestionValue;
+use super::conditions::QuestionValues;
+use super::conditions::VarStoreValues;
 use super::*;
 
 pub(super) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
@@ -33,9 +36,10 @@ const ONE_OF_OPTION: u8 = 0x09;
 const FORM_SET: u8 = 0x0E;
 const EQ_ID_VAL: u8 = 0x12;
 pub(super) const NOT: u8 = 0x17;
+pub(super) const QUESTION_REF1: u8 = 0x40;
 const UINT8: u8 = 0x42;
 pub(super) const TRUE: u8 = 0x46;
-const FALSE: u8 = 0x47;
+pub(super) const FALSE: u8 = 0x47;
 const ONES: u8 = 0x54;
 const VALUE: u8 = 0x5A;
 pub(super) const DEFAULT: u8 = 0x5B;
@@ -43,6 +47,11 @@ const DEFAULT_STORE: u8 = 0x5C;
 pub(super) const FORM_MAP: u8 = 0x5D;
 
 pub(super) const VAR_STORE_EFI: u8 = 0x26;
+
+/// EFI variable Attributes: non-volatile, boot service and runtime access.
+pub(super) const NV_BS_RT: u32 = 0x07;
+/// EFI variable Attributes: non-volatile and boot service access only.
+pub(super) const NV_BS: u32 = 0x03;
 
 pub(super) const GUID: u8 = 0x5F;
 
@@ -66,12 +75,17 @@ pub(super) const NIL_GUID: Guid = Guid {
     data4: [0; 8],
 };
 
+/// The VarOffsets and values written to a VarStore.
+pub(super) type RecordedWrites = Rc<RefCell<Vec<(u16, TypeValue)>>>;
+
 /// A VarStore declared without IFR bytes.
+/// Writes go to `writes`, not to efivarfs.
 pub(super) struct DeclaredVarStore {
     pub(super) name: &'static str,
     pub(super) size: u16,
     pub(super) kind: VariableStoreKind,
     pub(super) runtime_accessible: bool,
+    pub(super) writes: RecordedWrites,
 }
 
 impl VariableStore for DeclaredVarStore {
@@ -93,6 +107,11 @@ impl VariableStore for DeclaredVarStore {
 
     fn is_runtime_accessible(&self) -> bool {
         self.runtime_accessible
+    }
+
+    fn write_efivarfs_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+        self.writes.borrow_mut().push((offset, data));
+        Ok(())
     }
 }
 
@@ -142,6 +161,7 @@ pub(super) fn efi_variable(name: &'static str, size: usize) -> DeclaredVarStore 
         size: u16::try_from(size).expect("test size fits a VarStore Size"),
         kind: VariableStoreKind::EfiVariable,
         runtime_accessible: true,
+        writes: RecordedWrites::default(),
     }
 }
 
@@ -156,13 +176,20 @@ pub(super) fn buffer(name: &'static str, size: usize) -> DeclaredVarStore {
 
 /// An EFI variable VarStore whose efivar file holds `payload`.
 pub(super) fn var_store_of(payload: &[u8]) -> VarStoreFixture {
+    recording_var_store(payload).0
+}
+
+/// var_store_of `payload`, and the writes to its VarStore.
+pub(super) fn recording_var_store(payload: &[u8]) -> (VarStoreFixture, RecordedWrites) {
     let store = efi_variable("VarStore", payload.len());
+    let writes = Rc::clone(&store.writes);
     let efivars = Efivars::new();
     efivars.write(&store, payload);
-    VarStoreFixture {
+    let fixture = VarStoreFixture {
         store: Ok(Box::new(store)),
         efivars,
-    }
+    };
+    (fixture, writes)
 }
 
 pub(super) fn unavailable() -> VarStoreFixture {
@@ -258,6 +285,34 @@ pub(super) fn eq_id_val() -> Vec<u8> {
     operation(EQ_ID_VAL, false, &[0x01, 0x00, 0x01, 0x00])
 }
 
+/// EFI_IFR_EQ_ID_VAL: question `question_id` equals `value`.
+pub(super) fn eq_id_val_of(question_id: u16, value: u16) -> Vec<u8> {
+    let data = [question_id.to_le_bytes(), value.to_le_bytes()].concat();
+    operation(EQ_ID_VAL, false, &data)
+}
+
+/// The ops of an expression with the Scope bit on the op at `scope_at`, and an End after the
+/// last: edk2-stable202608 VfrCompile sets the bit on the first op, AMI firmware on a later one.
+pub(super) fn scoped_expression(ops: &[Vec<u8>], scope_at: usize) -> Vec<u8> {
+    let mut ops = ops.to_vec();
+    ops[scope_at][1] |= 0x80;
+    [ops.concat(), END.to_vec()].concat()
+}
+
+/// Answers from a map, whatever the referrer.
+pub(super) struct MapValues(pub(super) HashMap<u16, QuestionValue>);
+
+impl QuestionValues for MapValues {
+    fn value(
+        &self,
+        _referrer: &IFROperation,
+        id: u16,
+        _reader: &mut EfivarReader,
+    ) -> Option<QuestionValue> {
+        self.0.get(&id).cloned()
+    }
+}
+
 pub(super) fn default_store(default_id: u16) -> Vec<u8> {
     let data = [&[0x08, 0x00][..], &default_id.to_le_bytes()].concat();
     operation(DEFAULT_STORE, false, &data)
@@ -334,6 +389,80 @@ pub(super) fn question_header(offset: u16) -> Vec<u8> {
     .concat()
 }
 
+/// Prompt 3, Help 4, QuestionId `question_id`, VarStoreId 1, VarOffset `offset`.
+pub(super) fn question_header_of(question_id: u16, offset: u16) -> Vec<u8> {
+    question_header_on(question_id, 3, 1, offset)
+}
+
+/// Prompt `prompt`, Help 4, QuestionId `question_id`, VarStoreId `var_store_id`, VarOffset
+/// `offset`.
+fn question_header_on(question_id: u16, prompt: u16, var_store_id: u16, offset: u16) -> Vec<u8> {
+    [
+        &prompt.to_le_bytes()[..],
+        &[0x04, 0x00],
+        &question_id.to_le_bytes(),
+        &var_store_id.to_le_bytes(),
+        &offset.to_le_bytes(),
+        &[0x00],
+    ]
+    .concat()
+}
+
+/// A CHECKBOX op of QuestionId `question_id` at VarOffset `offset`.
+pub(super) fn checkbox_op(question_id: u16, offset: u16) -> Vec<u8> {
+    let data = [question_header_of(question_id, offset), vec![0x00]].concat();
+    operation(CHECKBOX, false, &data)
+}
+
+/// A CHECKBOX op of QuestionId `question_id`, prompted string `prompt`, at VarOffset 0 of
+/// VarStore `var_store_id`.
+pub(super) fn checkbox_on(question_id: u16, prompt: u16, var_store_id: u16) -> Vec<u8> {
+    let data = [
+        question_header_on(question_id, prompt, var_store_id, 0),
+        vec![0x00],
+    ]
+    .concat();
+    operation(CHECKBOX, false, &data)
+}
+
+/// A VARSTORE_EFI of `id` named `name`, of NIL_GUID, with `attributes`, of `size` bytes.
+pub(super) fn var_store_efi(id: u16, name: &str, attributes: u32, size: u16) -> Vec<u8> {
+    let data = [
+        &id.to_le_bytes()[..],
+        &[0; 16], // Guid
+        &attributes.to_le_bytes(),
+        &size.to_le_bytes(),
+        name.as_bytes(),
+        &[0x00],
+    ]
+    .concat();
+    operation(VAR_STORE_EFI, false, &data)
+}
+
+/// An EFI_IFR_FORM of `form_id` holding `body`.
+pub(super) fn form(form_id: u16, body: &[Vec<u8>]) -> Vec<u8> {
+    let data = [form_id.to_le_bytes(), [0x01, 0x00]].concat();
+    [operation(FORM, true, &data), body.concat(), END.to_vec()].concat()
+}
+
+/// Parses a FormSet holding `body`, and returns the root.
+pub(super) fn parse_form_set(body: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
+    let data = form_set(body);
+    handle_form_package(&mut Cursor::new(&data)).expect("parse the form package")
+}
+
+/// Returns the first op under `node`, in IFR order, with `data`.
+pub(super) fn find_op(
+    node: &Rc<RefCell<IFROperation>>,
+    data: &[u8],
+) -> Option<Rc<RefCell<IFROperation>>> {
+    let op = node.borrow();
+    if op.data == data {
+        return Some(Rc::clone(node));
+    }
+    op.children.iter().find_map(|child| find_op(child, data))
+}
+
 pub(super) fn checkbox(offset: u16, flags: u8) -> Vec<u8> {
     [question_header(offset), vec![flags]].concat()
 }
@@ -363,12 +492,30 @@ pub(super) fn one_of_data() -> Vec<u8> {
 /// The QuestionDescriptor that list-questions, get and set use for `node`.
 pub(super) fn question_descriptor(
     node: &Rc<RefCell<IFROperation>>,
+    var_store: VarStoreFixture,
+) -> QuestionDescriptor {
+    question_descriptor_with(node, var_store, &VarStoreValues::new(&root_of(node)))
+}
+
+/// Returns the root of the tree of `node`.
+fn root_of(node: &Rc<RefCell<IFROperation>>) -> Rc<RefCell<IFROperation>> {
+    let parent = node.borrow().parent.as_ref().and_then(Weak::upgrade);
+    match parent {
+        Some(parent) => root_of(&parent),
+        None => Rc::clone(node),
+    }
+}
+
+/// The QuestionDescriptor of `node`, with the values that conditions refer to from `values`.
+pub(super) fn question_descriptor_with(
+    node: &Rc<RefCell<IFROperation>>,
     VarStoreFixture { store, efivars }: VarStoreFixture,
+    values: &impl QuestionValues,
 ) -> QuestionDescriptor {
     let current = node.borrow();
     let strings = strings();
     let mut reader = efivars.reader();
-    let walk = &mut FormPackageWalk::new(&strings, &mut reader);
+    let walk = &mut FormPackageWalk::new(&strings, &mut reader, values, IncludedStates::empty());
     match &current.parsed_data {
         ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", &current, walk),
         ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", &current, walk),

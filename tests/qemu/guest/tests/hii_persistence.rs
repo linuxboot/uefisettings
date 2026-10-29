@@ -16,6 +16,11 @@
 
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
+use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
+use uefisettings_qemu_guest::driver_sample::INCLUDE_SUPPRESSED;
+use uefisettings_qemu_guest::driver_sample::MATCH2;
+use uefisettings_qemu_guest::driver_sample::MATCH2_OFFSET;
+use uefisettings_qemu_guest::driver_sample::MATCH2_REASON;
 use uefisettings_qemu_guest::driver_sample::NUMERIC;
 use uefisettings_qemu_guest::driver_sample::NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF;
@@ -28,12 +33,24 @@ use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
 
 /// The questions that `hii_write.rs` sets and their new answers.
-const ANSWERS: [(&str, &str); 4] = [
-    (ONE_OF, "My one-of text #3"),
-    (CHECK_BOX, "0"),
-    (NUMERIC, "243"),
-    (SERIAL_PORT, "2F8"),
-];
+/// Each comes with the flags that make `get` select it.
+fn answers() -> [(&'static str, &'static [&'static str], String); 5] {
+    [
+        (ONE_OF, &[], "My one-of text #3".to_string()),
+        (CHECK_BOX, &[], "0".to_string()),
+        (NUMERIC, &[], "243".to_string()),
+        (
+            SERIAL_PORT,
+            &INCLUDE_SUPPRESSED,
+            "2F8 <suppressed>".to_string(),
+        ),
+        (
+            MATCH2,
+            &INCLUDE_GRAYED_OUT,
+            format!("5 <selectable or grayed-out: {MATCH2_REASON}>"),
+        ),
+    ]
+}
 
 #[test]
 fn driver_sample_variable_keeps_the_new_answers() {
@@ -45,20 +62,27 @@ fn driver_sample_variable_keeps_the_new_answers() {
         data[SERIAL_PORT_OFFSET..SERIAL_PORT_OFFSET + 2],
         0x2f8u16.to_le_bytes()
     );
+    assert_eq!(data[MATCH2_OFFSET], 5, "{MATCH2}");
 }
 
 #[test]
 fn get_returns_the_new_answers() {
-    for (question, answer) in ANSWERS {
-        let (got, _) = single_response(&["hii", "get", question, "--json"], BACKEND_HII);
-        assert_eq!(got.answer, answer, "{got:#?}");
+    for (question, flags, answer) in answers() {
+        let (got, _) = single_response(
+            &[&["hii", "get", question, "--json"][..], flags].concat(),
+            BACKEND_HII,
+        );
+        assert_eq!(got.answer, answer, "{question} {flags:?}: {got:#?}");
     }
 }
 
 #[test]
 fn generic_get_returns_the_new_answers() {
-    for (question, answer) in ANSWERS {
-        let (got, _) = single_response(&["get", question, "--json"], BACKEND_HII);
-        assert_eq!(got.answer, answer, "{got:#?}");
+    for (question, flags, answer) in answers() {
+        let (got, _) = single_response(
+            &[&["get", question, "--json"][..], flags].concat(),
+            BACKEND_HII,
+        );
+        assert_eq!(got.answer, answer, "{question} {flags:?}: {got:#?}");
     }
 }

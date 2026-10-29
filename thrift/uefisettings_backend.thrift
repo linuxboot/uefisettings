@@ -37,7 +37,13 @@ struct Question {
   // NUMERIC or CHECKBOX declares a default, by " <IFR default: v>" or
   // " <IFR default (DefaultId 0x0001): v>", v being "unknown (<reason>)" if undetermined;
   // firmware Callback/ALTCFG defaults may differ.
+  // hii answers end with " <s>" if IFR conditions put the question in state s (grayed-out,
+  // suppressed or disabled), or with " <s1 or s2: reasons>" if the reasons leave its state
+  // undetermined among s1, s2, ... (selectable too).
+  // The stored option's state precedes it: " <option s>" or " <option s1 or s2: reasons>".
   2: string answer;
+  // hii - the ONE_OF options that set takes: those that IFR conditions certainly leave
+  // selectable or in a state that --include allows.
   3: list<string> options;
   4: string help;
 }

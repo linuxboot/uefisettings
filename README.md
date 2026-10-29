@@ -101,6 +101,7 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
 * Library (`hii`) in Rust partially implements the UEFI Hii specification.
 * It parses the HiiDB op-codes into a DOM tree like representation which can be read by machines and humans.
 * It can ask questions about UEFI settings from HiiDB and get their answers.
+* `get`, `set` and `hii list-questions` evaluate the `suppressif`, `grayoutif` and `disableif` conditions of questions as EDK2's setup browser does, and select only questions that none of them suppresses, grays out or disables, unless `--include` names that state (`grayed-out`, `suppressed`, `disabled`); an answer ends with the state of a question that is not selectable. Where a condition cannot be evaluated from Linux, `set` refuses the question, while `get` and `hii list-questions` show it with the states it may be in and why. A one-of option in a `suppressif` counts as suppressed.
 * Change UEFI settings by calculating the correct offsets and writing to entries in `efivarfs`.
 
 ### For HPE hardware
