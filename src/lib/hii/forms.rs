@@ -44,6 +44,7 @@ use crate::hii::efivarfs::EfivarNotFound;
 use crate::hii::efivarfs::EfivarRange;
 use crate::hii::efivarfs::EfivarReader;
 use crate::hii::efivarfs::EfivarsMountGuard;
+use crate::hii::efivarfs::EfivarsNotRead;
 use crate::hii::efivarfs::EFIVARFS_HEADER_SIZE;
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::package::Guid;
@@ -996,8 +997,7 @@ mod non_efi_varstore_tests {
         let efivars = Efivars::new();
         efivars.write(&efi_variable("Short", 2), &[1]);
         let want = format!(
-            "<VStoreError: failed to read bytes from sysfs efivars '{}' of size specified by \
-             varstore in hiidb>",
+            "<VStoreError: failed to read efivar file '{}'>",
             efivars
                 .path()
                 .join("Short-00000000-0000-0000-0000-000000000000")
@@ -1194,6 +1194,9 @@ fn read_current_value_bytes<'a>(
 /// Why a question on a VarStore of `kind` has no value, its efivar file having failed with
 /// `error`.
 fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> String {
+    if error.downcast_ref::<EfivarsNotRead>().is_some() {
+        return format!("<ValueUnavailable: {error}>");
+    }
     let Some(missing) = error.downcast_ref::<EfivarNotFound>() else {
         return format!("<VStoreError: {error}>");
     };
@@ -1234,6 +1237,7 @@ mod efivar_reader_tests {
     const BOOT_SERVICE_ONLY: &str = "<ValueUnavailable: EFI variable \
          Setup-00000000-0000-0000-0000-000000000000 is boot-service-only \
          (no EFI_VARIABLE_RUNTIME_ACCESS)>";
+    const NOT_READ: &str = "<ValueUnavailable: EFI variables not read>";
 
     /// read_question_bytes of `store`, owned.
     fn question_bytes(
@@ -1398,6 +1402,105 @@ mod efivar_reader_tests {
             );
         }
         assert_eq!(reader.outcomes.len(), 1, "cached outcomes");
+    }
+
+    #[test]
+    fn disabled_source_leaves_every_value_unread() {
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
+        let question = node.borrow();
+        let mut reader = disabled_reader();
+        let cases = [
+            ("EFI variable", efi_variable("Setup", 1), NOT_READ),
+            ("buffer", buffer("Setup", 1), NOT_READ),
+            (
+                "boot-service-only EFI variable",
+                DeclaredVarStore {
+                    runtime_accessible: false,
+                    ..efi_variable("Setup", 1)
+                },
+                BOOT_SERVICE_ONLY,
+            ),
+        ];
+
+        for (case, store, want) in cases {
+            assert_eq!(
+                question_bytes(&question, store, &mut reader),
+                Err(want.to_string()),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_source_shows_the_ifr_default() {
+        let (root, _node) = parse_question(
+            &[var_store_efi(1, "Setup", NV_BS_RT, 1)],
+            CHECKBOX,
+            &checkbox(0, 0x01),
+            &[],
+        );
+
+        let listed: Vec<String> = list_questions(
+            root,
+            &strings(),
+            IncludedStates::empty(),
+            &mut disabled_reader(),
+        )
+        .into_iter()
+        .map(|(question, _)| question.value)
+        .collect();
+
+        assert_eq!(
+            listed,
+            [format!("{NOT_READ} <IFR default: 1>")],
+            "list_questions without efivars"
+        );
+    }
+
+    /// The state annotations that list_questions gives, with every state included, to question
+    /// 2, to question 1 under a SUPPRESS_IF on question 2 being 1, and to question 3 under a
+    /// SUPPRESS_IF TRUE, all on the 2-byte efivar Setup, read through `reader`.
+    fn suppressed_states(reader: &mut EfivarReader) -> Vec<String> {
+        let root = parse_form_set(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 2),
+            form(
+                1,
+                &[
+                    checkbox_on(2, 5, 1),
+                    conditional(SUPPRESS_IF, eq_id_val_of(2, 1), &[checkbox_op(1, 1)]),
+                    conditional(SUPPRESS_IF, ifr_true(), &[checkbox_op(3, 1)]),
+                ],
+            ),
+        ]);
+        list_questions(root, &strings(), IncludedStates::all(), reader)
+            .into_iter()
+            .map(|(_, state)| state.annotation())
+            .collect()
+    }
+
+    #[test]
+    fn disabled_source_leaves_value_conditions_undetermined() {
+        let efivars = Efivars::new();
+        let undetermined = " <selectable or suppressed: EqIdVal of question 0x0002: \
+            <ValueUnavailable: EFI variables not read>>";
+
+        efivars.write(&efi_variable("Setup", 2), &[1, 0]);
+        assert_eq!(
+            suppressed_states(&mut efivars.reader()),
+            ["", " <suppressed>", " <suppressed>"],
+            "question 2 is 1"
+        );
+        efivars.write(&efi_variable("Setup", 2), &[0, 0]);
+        assert_eq!(
+            suppressed_states(&mut efivars.reader()),
+            ["", "", " <suppressed>"],
+            "question 2 is 0"
+        );
+        assert_eq!(
+            suppressed_states(&mut disabled_reader()),
+            ["", undetermined, " <suppressed>"],
+            "Disabled"
+        );
     }
 
     #[test]

@@ -22,3 +22,4 @@ mod strings;
 // https://uefi.org/specifications
 
 pub(crate) use efivarfs::EfivarReader;
+pub use efivarfs::EfivarSource;

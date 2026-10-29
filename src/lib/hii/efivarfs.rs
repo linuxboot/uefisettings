@@ -12,9 +12,14 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -24,8 +29,10 @@ use anyhow::Result;
 use log::debug;
 use log::error;
 use log::warn;
+use nix::fcntl::OFlag;
 use nix::mount::mount;
 use nix::mount::MsFlags;
+use nix::sys::stat::Mode;
 use proc_mounts::MountIter;
 use thiserror::Error;
 
@@ -33,6 +40,8 @@ use crate::hii::package::Guid;
 
 pub(super) const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
 pub(super) const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
+/// The directory of this process's file descriptors, through which reopen opens a located file.
+const PROC_SELF_FD: &str = "/proc/self/fd";
 
 /// `<name>-<lowercase GUID>` with '!' for each '/', as Linux v7.2 fs/efivarfs/vars.c
 /// efivar_get_utf8name() names a variable's file: always exactly one path component.
@@ -69,9 +78,51 @@ pub(super) struct EfivarNotFound {
 
 /// Opens the efivar file `name` in `dir` for reading. A missing file is EfivarNotFound without
 /// context, so the error names the variable.
+/// A symlink or other non-regular file is an error, so a directory of efivar files cannot send
+/// a read elsewhere or block it. The check is on the file that is then read: an O_PATH
+/// descriptor opens no file (open(2)), so a device node runs no driver open, and reopening it
+/// through /proc/self/fd opens the very file checked, whatever the path names by then.
 pub(super) fn open_efivar(dir: &Path, name: &EfivarFileName) -> Result<File> {
     let path = dir.join(name);
-    File::open(&path).map_err(|error| open_error(&path, name, error))
+    let location = locate(&path).map_err(|error| open_error(&path, name, error))?;
+    let metadata = location
+        .metadata()
+        .with_context(|| format!("failed to stat efivar file '{}'", path.display()))?;
+    check_regular_file(&path, &metadata)?;
+    reopen(&location).map_err(|error| reopen_error(&path, error))
+}
+
+/// An O_PATH descriptor of `path`, of the link itself if it is a symlink.
+fn locate(path: &Path) -> io::Result<File> {
+    // not OpenOptions::custom_flags, which clears O_ACCMODE: musl defines it to include O_PATH
+    let fd = nix::fcntl::open(
+        path,
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    // SAFETY: open() returned `fd` as a new descriptor that nothing else owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Opens the file of the O_PATH descriptor `location` for reading, whatever its path names now.
+fn reopen(location: &File) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        // a file under a write lease fails at once instead of waiting lease-break-time
+        // (Linux v7.2 fs/locks.c); efivarfs_file_read() ignores O_NONBLOCK
+        .custom_flags(libc::O_NONBLOCK)
+        .open(Path::new(PROC_SELF_FD).join(location.as_raw_fd().to_string()))
+}
+
+/// Fails unless `metadata`, of the efivar file at `path`, is a regular file's.
+fn check_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "efivar file '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// open_efivar's error for `error` from opening the efivar file `name` at `path`.
@@ -81,6 +132,19 @@ fn open_error(path: &Path, name: &EfivarFileName, error: io::Error) -> anyhow::E
         _ => anyhow::Error::new(error)
             .context(format!("failed to open efivar file '{}'", path.display())),
     }
+}
+
+/// open_efivar's error for `error` from reopening the efivar file at `path`.
+fn reopen_error(path: &Path, error: io::Error) -> anyhow::Error {
+    let hint = match error.kind() {
+        // the descriptor is open, so NotFound means /proc/self/fd is missing
+        io::ErrorKind::NotFound => ", which is missing: is /proc mounted?",
+        _ => "",
+    };
+    anyhow::Error::new(error).context(format!(
+        "failed to open efivar file '{}' through {PROC_SELF_FD}{hint}",
+        path.display()
+    ))
 }
 
 pub(super) fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) -> Result<Vec<u8>> {
@@ -94,13 +158,63 @@ fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Result<Vec<u8>> 
     let mut file = open_efivar(dir, name)?;
     debug!("buffer size: {}", size);
     // efivarfs prepends a 4-byte attributes field to the variable payload.
-    read_efivarfs_bytes(&mut file, size.into()).with_context(|| {
-        format!(
-            "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
-            dir.join(name).display()
-        )
-    })
+    read_efivarfs_bytes(&mut file, size.into())
+        .with_context(|| format!("failed to read efivar file '{}'", dir.join(name).display()))
 }
+
+/// Where question values are read: the efivar files of this machine or of a directory, or none.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum EfivarSource {
+    /// This machine's efivarfs.
+    #[default]
+    System,
+    /// A directory of efivar files in efivarfs format, such as a copy of another machine's.
+    Directory(PathBuf),
+    /// No efivar files: each value shows as unavailable (get and list-questions add its IFR
+    /// default) and conditions on values stay undetermined.
+    Disabled,
+}
+
+impl EfivarSource {
+    /// Fails if this is a Directory that is not a directory: every efivar file in it would read
+    /// as missing, or fail to open.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::System | Self::Disabled => Ok(()),
+            Self::Directory(dir) => match fs::metadata(dir) {
+                Ok(metadata) if metadata.is_dir() => Ok(()),
+                Ok(_) => Err(EfivarsNotADirectory(dir.clone()).into()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Err(EfivarsNotADirectory(dir.clone()).into())
+                }
+                Err(error) => Err(anyhow::Error::new(error).context(format!(
+                    "failed to stat efivars directory {}",
+                    dir.display()
+                ))),
+            },
+        }
+    }
+
+    /// read_efivar of `range` in this source.
+    fn read(&self, range: &EfivarRange) -> Result<Vec<u8>> {
+        match self {
+            Self::System => read_efivar(Path::new(EFIVARS_MOUNT_POINT), &range.name, range.size),
+            Self::Directory(dir) => read_efivar(dir, &range.name, range.size),
+            Self::Disabled => Err(EfivarsNotRead.into()),
+        }
+    }
+}
+
+/// Why EfivarSource::validate refuses a Directory.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("efivars directory {} is not a directory", .0.display())]
+pub(super) struct EfivarsNotADirectory(PathBuf);
+
+/// The outcome of every efivar range under EfivarSource::Disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("EFI variables not read")]
+pub(super) struct EfivarsNotRead;
 
 /// The arguments of read_efivar after its directory, which an EfivarReader fixes.
 #[derive(PartialEq, Eq, Hash)]
@@ -113,35 +227,29 @@ pub(super) struct EfivarRange {
 /// Linux v7.2 efivarfs sleeps once a non-root user has read 100 times within a second
 /// (fs/efivarfs/file.c, kernel/user.c).
 pub(crate) struct EfivarReader {
-    efivars: PathBuf,
+    source: EfivarSource,
     pub(super) outcomes: HashMap<EfivarRange, Result<Vec<u8>>>,
 }
 
-impl Default for EfivarReader {
-    /// Reads this machine's efivarfs.
-    fn default() -> Self {
-        Self::new(PathBuf::from(EFIVARS_MOUNT_POINT))
-    }
-}
-
 impl EfivarReader {
-    /// Reads the efivar files in `efivars`.
-    pub(super) fn new(efivars: PathBuf) -> Self {
-        Self {
-            efivars,
+    /// Reads the efivar files of `source`, which EfivarSource::validate accepts.
+    pub(crate) fn new(source: EfivarSource) -> Result<Self> {
+        source.validate()?;
+        Ok(Self {
+            source,
             outcomes: HashMap::new(),
-        }
+        })
     }
 
-    /// read_efivar of `range` in these efivars, read once.
+    /// read_efivar of `range` in this source, read once.
     pub(super) fn read(
         &mut self,
         range: EfivarRange,
     ) -> std::result::Result<&[u8], &anyhow::Error> {
-        let efivars = &self.efivars;
+        let source = &self.source;
         self.outcomes
             .entry(range)
-            .or_insert_with_key(|range| read_efivar(efivars, &range.name, range.size))
+            .or_insert_with_key(|range| source.read(range))
             .as_deref()
     }
 }
@@ -258,12 +366,17 @@ fn to_ms_flags(options: &[String]) -> MsFlags {
 #[cfg(test)]
 pub mod tests {
     use std::ffi::OsStr;
+    use std::ffi::OsString;
     use std::fs;
     use std::io::Read;
     use std::path::Component;
 
     use anyhow::Context;
     use anyhow::Result;
+    use nix::errno::Errno;
+    use nix::sys::inotify::AddWatchFlags;
+    use nix::sys::inotify::InitFlags;
+    use nix::sys::inotify::Inotify;
 
     use super::*;
 
@@ -385,6 +498,209 @@ pub mod tests {
             error.to_string(),
             format!("failed to open efivar file '{}'", path.display()),
             "message of the permission error"
+        );
+    }
+
+    #[test]
+    fn open_efivar_refuses_a_symlink() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+        let path = dir.path().join(&name);
+        fs::write(dir.path().join("target"), b"data").expect("write the link's target");
+        std::os::unix::fs::symlink("target", &path).expect("link the efivar file");
+
+        let error = open_efivar(dir.path(), &name).expect_err("open a symlink");
+
+        assert_eq!(
+            error.to_string(),
+            format!("efivar file '{}' is not a regular file", path.display()),
+            "symlink"
+        );
+    }
+
+    #[test]
+    fn open_efivar_refuses_a_non_regular_file() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let directory = EfivarFileName::new("Directory", EFI_GLOBAL_VARIABLE);
+        let fifo = EfivarFileName::new("Fifo", EFI_GLOBAL_VARIABLE);
+        fs::create_dir(dir.path().join(&directory)).expect("create a directory");
+        nix::unistd::mkfifo(&dir.path().join(&fifo), nix::sys::stat::Mode::S_IRWXU)
+            .expect("create a FIFO");
+        // a writer, so that an open of the FIFO that is not O_PATH returns instead of blocking
+        let _writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(&fifo))
+            .expect("hold the FIFO open");
+
+        for (case, name) in [("directory", directory), ("FIFO", fifo)] {
+            let error = open_efivar(dir.path(), &name).expect_err("open a non-regular file");
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "efivar file '{}' is not a regular file",
+                    dir.path().join(&name).display()
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    /// open_efivar opens no non-regular file: the check is Metadata::is_file of an O_PATH
+    /// descriptor, false for a device node as for the directory, FIFO and symlink here, which a
+    /// test can create without root.
+    #[test]
+    fn open_efivar_opens_no_non_regular_file() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let regular = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+        let directory = EfivarFileName::new("Directory", EFI_GLOBAL_VARIABLE);
+        let fifo = EfivarFileName::new("Fifo", EFI_GLOBAL_VARIABLE);
+        let symlink = EfivarFileName::new("Symlink", EFI_GLOBAL_VARIABLE);
+        fs::write(dir.path().join(&regular), [7, 0, 0, 0]).expect("write the efivar file");
+        fs::create_dir(dir.path().join(&directory)).expect("create a directory");
+        nix::unistd::mkfifo(&dir.path().join(&fifo), nix::sys::stat::Mode::S_IRWXU)
+            .expect("create a FIFO");
+        std::os::unix::fs::symlink(&regular, dir.path().join(&symlink)).expect("create a symlink");
+        // a writer, so that an open of the FIFO that is not O_PATH returns instead of blocking
+        let _writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(&fifo))
+            .expect("hold the FIFO open");
+        let opens = Inotify::init(InitFlags::IN_NONBLOCK).expect("create an inotify instance");
+        opens
+            .add_watch(dir.path(), AddWatchFlags::IN_OPEN)
+            .expect("watch the opens in the directory");
+
+        open_efivar(dir.path(), &regular).expect("open the regular file");
+        for (case, name) in [
+            ("directory", &directory),
+            ("FIFO", &fifo),
+            ("symlink", &symlink),
+        ] {
+            let opened = open_efivar(dir.path(), name);
+
+            assert!(opened.is_err(), "{case}: {opened:?}");
+        }
+
+        let opened: Vec<OsString> = match opens.read_events() {
+            Ok(events) => events.into_iter().filter_map(|event| event.name).collect(),
+            Err(Errno::EAGAIN) => Vec::new(),
+            Err(error) => panic!("read the inotify events: {error}"),
+        };
+        assert_eq!(
+            opened,
+            [OsString::from(regular.to_string())],
+            "opened files"
+        );
+    }
+
+    /// reopen opens the file that open_efivar checked, though another now has its path.
+    #[test]
+    fn reopen_reads_the_located_file_not_its_path() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+        let path = dir.path().join(&name);
+        fs::write(&path, b"checked").expect("write the efivar file");
+        let location = locate(&path).expect("locate the efivar file");
+        fs::write(dir.path().join("swapped"), b"swapped").expect("write another file");
+        fs::rename(dir.path().join("swapped"), &path).expect("swap the efivar file");
+        let mut contents = String::new();
+
+        reopen(&location)
+            .expect("reopen the located file")
+            .read_to_string(&mut contents)
+            .expect("read the located file");
+
+        assert_eq!(contents, "checked", "contents");
+    }
+
+    #[test]
+    fn reopen_error_asks_for_proc_only_when_it_is_missing() {
+        let path =
+            Path::new(EFIVARS_MOUNT_POINT).join(EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE));
+
+        for (case, kind, through) in [
+            (
+                "missing",
+                io::ErrorKind::NotFound,
+                "/proc/self/fd, which is missing: is /proc mounted?",
+            ),
+            (
+                "would block on a lease",
+                io::ErrorKind::WouldBlock,
+                "/proc/self/fd",
+            ),
+        ] {
+            let error = reopen_error(&path, io::Error::from(kind));
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to open efivar file '{}' through {through}",
+                    path.display()
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<io::Error>()
+                    .map(io::Error::kind),
+                Some(kind),
+                "{case}: cause"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_source_must_be_a_directory() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let file = dir.path().join("file");
+        fs::write(&file, b"").expect("write a file");
+        let missing = dir.path().join("missing");
+
+        for (case, source) in [
+            ("System", EfivarSource::System),
+            ("Disabled", EfivarSource::Disabled),
+            (
+                "directory",
+                EfivarSource::Directory(dir.path().to_path_buf()),
+            ),
+        ] {
+            source
+                .validate()
+                .unwrap_or_else(|error| panic!("validate {case}: {error:#}"));
+        }
+        for (case, path) in [("file", &file), ("missing", &missing)] {
+            let error = EfivarSource::Directory(path.clone())
+                .validate()
+                .expect_err("validate a directory that is not one");
+
+            assert_eq!(
+                error.to_string(),
+                format!("efivars directory {} is not a directory", path.display()),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_source_reads_no_efivar() {
+        let mut reader =
+            EfivarReader::new(EfivarSource::Disabled).expect("create a reader without efivars");
+        let range = EfivarRange {
+            name: EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE),
+            size: 1,
+        };
+
+        let error = reader.read(range).expect_err("read without efivars");
+
+        assert_eq!(
+            error.downcast_ref::<EfivarsNotRead>(),
+            Some(&EfivarsNotRead),
+            "Disabled: {error:#}"
         );
     }
 

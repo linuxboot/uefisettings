@@ -40,6 +40,7 @@ use crate::hii::forms::Choice;
 use crate::hii::forms::QuestionDescriptor;
 use crate::hii::package;
 use crate::hii::EfivarReader;
+pub use crate::hii::EfivarSource;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
 use crate::ilorest::requests::Ilo5Dev;
@@ -71,6 +72,8 @@ pub struct HiiBackend {}
 pub struct GetOptions {
     /// The states of the questions to select and of the options to list too
     pub include: IncludedStates,
+    /// Where to read question values
+    pub efivars: EfivarSource,
 }
 
 /// The options of HiiBackend::set_using.
@@ -87,6 +90,16 @@ pub struct SetOptions {
 pub struct ListQuestionsOptions {
     /// The states of the questions and options to list too
     pub include: IncludedStates,
+    /// Where to read question values
+    pub efivars: EfivarSource,
+}
+
+/// The options of HiiBackend::show_ifr_using.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ShowIfrOptions {
+    /// Where to read question values
+    pub efivars: EfivarSource,
 }
 
 impl HiiBackend {
@@ -101,13 +114,18 @@ impl HiiBackend {
 
     /// show_ifr returns a human readable representation of the forms in Hii
     pub fn show_ifr(db_bytes: &[u8]) -> Result<HiiShowIfrResponse> {
+        Self::show_ifr_using(db_bytes, &ShowIfrOptions::default())
+    }
+
+    /// show_ifr with `options`
+    pub fn show_ifr_using(db_bytes: &[u8], options: &ShowIfrOptions) -> Result<HiiShowIfrResponse> {
         // We depend on the caller to provide us with the hiidb instead of calling extract here
         // because they might want to provide a file instead.
 
         let mut readable_representation = String::new();
 
+        let mut reader = EfivarReader::new(options.efivars.clone())?;
         let parsed_db = package::read_db(db_bytes)?;
-        let mut reader = EfivarReader::default();
 
         for list in parsed_db {
             list.check_form_strings()?;
@@ -165,8 +183,8 @@ impl HiiBackend {
     ) -> Result<Vec<Question>> {
         let include = options.include;
         let mut res = Vec::new();
+        let mut reader = EfivarReader::new(options.efivars.clone())?;
         let parsed_db = package::read_db(db_bytes)?;
-        let mut reader = EfivarReader::default();
         for list in parsed_db {
             list.check_form_strings()?;
 
@@ -206,7 +224,12 @@ impl SettingsBackend for HiiBackend {
     }
 
     fn get(question: &str, selector: Option<&str>) -> Result<GetResponseList> {
-        Self::get_using(question, selector, &GetOptions::default())
+        Self::get_using(
+            &extract::extract_db()?,
+            question,
+            selector,
+            &GetOptions::default(),
+        )
     }
 }
 
@@ -252,7 +275,7 @@ impl HiiBackend {
         let mut selected = Vec::new();
         let mut excluded = IncludedStates::empty();
         // one cache for the selection, which ends before the first write
-        let mut reader = EfivarReader::default();
+        let mut reader = EfivarReader::new(EfivarSource::System)?;
         for list in parsed_db {
             for form_package in list.forms {
                 // try to find the question
@@ -332,8 +355,9 @@ impl HiiBackend {
         })
     }
 
-    /// get with `options`
+    /// get from the HiiDB `db_bytes`, with `options`
     pub fn get_using(
+        db_bytes: &[u8],
         question: &str,
         _selector: Option<&str>,
         options: &GetOptions,
@@ -357,9 +381,8 @@ impl HiiBackend {
             } => (question_variations, false),
         };
 
-        let db_bytes = extract::extract_db()?;
-        let parsed_db = package::read_db(&db_bytes)?;
-        let mut reader = EfivarReader::default();
+        let mut reader = EfivarReader::new(options.efivars.clone())?;
+        let parsed_db = package::read_db(db_bytes)?;
 
         let mut excluded = IncludedStates::empty();
         for list in parsed_db {
@@ -757,8 +780,13 @@ fn compare_redfish_attributes(
 
 #[cfg(test)]
 mod tests {
+    use crate::hii::forms::ifr_fixtures::checkbox_on;
+    use crate::hii::forms::ifr_fixtures::form;
+    use crate::hii::forms::ifr_fixtures::var_store_efi;
+    use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::en_strings_package;
+    use crate::hii::package::hiidb_fixtures::form_package;
     use crate::hii::package::hiidb_fixtures::form_set_package;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::END_ONLY_FORM_PACKAGE;
@@ -835,6 +863,126 @@ mod tests {
         ]
         .map(|(guid, string)| (guid.to_string(), BTreeMap::from([(1, string.to_string())])));
         assert_eq!(got, want, "strings packages in HiiDB order");
+    }
+
+    /// get, list-questions and show-ifr read question values from the source that their
+    /// options name.
+    #[test]
+    fn options_name_the_efivar_source() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                form(1, &[checkbox_on(1, 1, 1)]),
+            ]),
+            en_strings_package(b'Q'),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let efivars = tempfile::tempdir().expect("create efivars directory");
+        fs::write(
+            efivars
+                .path()
+                .join("Setup-00000000-0000-0000-0000-000000000000"),
+            [7, 0, 0, 0, 1],
+        )
+        .expect("write efivar file");
+        // show-ifr adds no IFR default
+        let cases = [
+            (
+                "Directory",
+                EfivarSource::Directory(efivars.path().to_path_buf()),
+                "1",
+                "1",
+            ),
+            (
+                "Disabled",
+                EfivarSource::Disabled,
+                "<ValueUnavailable: EFI variables not read> <IFR default: 0>",
+                "<ValueUnavailable: EFI variables not read>",
+            ),
+        ];
+
+        for (case, efivars, want, want_shown) in cases {
+            let get_options = GetOptions {
+                efivars: efivars.clone(),
+                ..GetOptions::default()
+            };
+            let list_options = ListQuestionsOptions {
+                efivars: efivars.clone(),
+                ..ListQuestionsOptions::default()
+            };
+            let got = HiiBackend::get_using(&hiidb, "Q", None, &get_options).expect("get");
+            let listed =
+                HiiBackend::list_questions_using(&hiidb, &list_options).expect("list questions");
+            let ifr = HiiBackend::show_ifr_using(&hiidb, &ShowIfrOptions { efivars })
+                .expect("show the IFR")
+                .readable_representation;
+
+            let answers: Vec<&str> = got
+                .responses
+                .iter()
+                .map(|response| response.question.answer.as_str())
+                .collect();
+            assert_eq!(answers, [want], "{case}: get");
+            let answers: Vec<&str> = listed
+                .iter()
+                .map(|question| question.answer.as_str())
+                .collect();
+            assert_eq!(answers, [want], "{case}: list-questions");
+            assert!(
+                ifr.contains(&format!("-Answer: {want_shown}\n")),
+                "{case}: show-ifr {ifr:?}"
+            );
+        }
+    }
+
+    /// get, list-questions and show-ifr refuse an efivars directory that is not one, rather
+    /// than read every question as missing.
+    #[test]
+    fn options_refuse_an_efivars_directory_that_is_not_one() {
+        let hiidb = package_list_with_guid(
+            [0x55; 16],
+            &[
+                form_set_package(),
+                en_strings_package(b'Q'),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let missing = tempfile::tempdir()
+            .expect("create directory")
+            .path()
+            .join("missing");
+        let want = format!("efivars directory {} is not a directory", missing.display());
+        let efivars = EfivarSource::Directory(missing);
+        let get_options = GetOptions {
+            efivars: efivars.clone(),
+            ..GetOptions::default()
+        };
+        let list_options = ListQuestionsOptions {
+            efivars: efivars.clone(),
+            ..ListQuestionsOptions::default()
+        };
+
+        let errors = [
+            (
+                "get",
+                HiiBackend::get_using(&hiidb, "Q", None, &get_options).map(drop),
+            ),
+            (
+                "list-questions",
+                HiiBackend::list_questions_using(&hiidb, &list_options).map(drop),
+            ),
+            (
+                "show-ifr",
+                HiiBackend::show_ifr_using(&hiidb, &ShowIfrOptions { efivars }).map(drop),
+            ),
+        ];
+        for (case, result) in errors {
+            let error = result.expect_err("read from a directory that is not one");
+
+            assert_eq!(error.to_string(), want, "{case}");
+        }
     }
 
     /// show_ifr and list_questions fail for a package list with forms but no

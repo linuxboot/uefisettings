@@ -29,6 +29,7 @@ use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
 use uefisettings::exports::identify_machine;
+use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IloBackend;
@@ -36,6 +37,7 @@ use uefisettings::exports::IncludedStates;
 use uefisettings::exports::ListQuestionsOptions;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SettingsBackend;
+use uefisettings::exports::ShowIfrOptions;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 use uefisettings_spellings_db_thrift::consts::translation_db;
@@ -105,10 +107,15 @@ enum HiiSubcommands {
     Get {
         #[clap(value_parser)]
         question: String,
+        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
+        #[clap(parse(from_os_str), short, long)]
+        filename: Option<PathBuf>,
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
         #[clap(flatten)]
         include: IncludeArgs,
+        #[clap(flatten)]
+        efivars: EfivarArgs,
     },
     /// Set/change the value of a question
     Set {
@@ -126,6 +133,8 @@ enum HiiSubcommands {
         /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
         #[clap(parse(from_os_str), short, long)]
         filename: Option<PathBuf>,
+        #[clap(flatten)]
+        efivars: EfivarArgs,
     },
     /// Dump HiiDB into a file
     ExtractDB {
@@ -149,7 +158,37 @@ enum HiiSubcommands {
         json: bool,
         #[clap(flatten)]
         include: IncludeArgs,
+        #[clap(flatten)]
+        efivars: EfivarArgs,
     },
+}
+
+/// Where get, show-ifr and list-questions read question values.
+#[derive(Debug, Args)]
+struct EfivarArgs {
+    /// Read question values from the efivar files in this directory (efivarfs format) instead of this machine's efivarfs
+    #[clap(
+        long,
+        value_name = "DIR",
+        parse(from_os_str),
+        conflicts_with = "no-efivars"
+    )]
+    efivars: Option<PathBuf>,
+    /// Read no question values from EFI variables: each shows as unavailable (get and list-questions add its IFR default) and conditions on values stay undetermined (the HiiDB still comes from --filename or this machine)
+    #[clap(long)]
+    no_efivars: bool,
+}
+
+impl EfivarArgs {
+    /// The source these flags name.
+    fn source(&self) -> Result<EfivarSource> {
+        match (&self.efivars, self.no_efivars) {
+            (None, false) => Ok(EfivarSource::System),
+            (None, true) => Ok(EfivarSource::Disabled),
+            (Some(dir), false) => Ok(EfivarSource::Directory(dir.clone())),
+            (Some(_), true) => Err(anyhow!("--efivars and --no-efivars conflict")),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -287,10 +326,21 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
         Commands::Hii(hii_command) => match &hii_command.command {
             HiiSubcommands::Get {
                 question,
+                filename,
                 json,
                 include,
+                efivars,
             } => {
-                let res = HiiBackend::get_using(question, None, &GetOptions::from(include))?;
+                let mut options = GetOptions::from(include);
+                options.efivars = efivars.source()?;
+                // before the HiiDB is read
+                options.efivars.validate()?;
+                let res = HiiBackend::get_using(
+                    &get_db_dump_bytes(filename.as_deref())?,
+                    question,
+                    None,
+                    &options,
+                )?;
                 print_with_style(res, *json)?;
             }
             HiiSubcommands::Set {
@@ -302,8 +352,13 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 let res = HiiBackend::set_using(question, value, None, &SetOptions::from(include))?;
                 print_with_style(res, *json)?;
             }
-            HiiSubcommands::ShowIFR { filename } => {
-                let res = HiiBackend::show_ifr(&get_db_dump_bytes(filename.as_deref())?)?;
+            HiiSubcommands::ShowIFR { filename, efivars } => {
+                let mut options = ShowIfrOptions::default();
+                options.efivars = efivars.source()?;
+                // before the HiiDB is read
+                options.efivars.validate()?;
+                let res =
+                    HiiBackend::show_ifr_using(&get_db_dump_bytes(filename.as_deref())?, &options)?;
                 print_line(format_args!("{}", res.readable_representation))?;
             }
             HiiSubcommands::ExtractDB { filename } => {
@@ -324,10 +379,15 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 filename,
                 json,
                 include,
+                efivars,
             } => {
+                let mut options = ListQuestionsOptions::from(include);
+                options.efivars = efivars.source()?;
+                // before the HiiDB is read
+                options.efivars.validate()?;
                 let res = HiiBackend::list_questions_using(
                     &get_db_dump_bytes(filename.as_deref())?,
-                    &ListQuestionsOptions::from(include),
+                    &options,
                 )?;
                 print_with_style(res, *json)?;
             }
@@ -372,7 +432,12 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 let res = IloBackend::get(question, None)?;
                 print_with_style(res, *json)?;
             } else {
-                let res = HiiBackend::get_using(question, None, &GetOptions::from(include))?;
+                let res = HiiBackend::get_using(
+                    &get_db_dump_bytes(None)?,
+                    question,
+                    None,
+                    &GetOptions::from(include),
+                )?;
                 print_with_style(res, *json)?;
             }
         }
@@ -492,6 +557,9 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
 
+    const READING_COMMANDS: [&[&str]; 3] =
+        [&["get", "Question"], &["show-ifr"], &["list-questions"]];
+
     struct BrokenPipeWriter;
 
     impl Write for BrokenPipeWriter {
@@ -561,6 +629,118 @@ mod tests {
                 "{name}: refuse_on_ilo"
             );
         }
+    }
+
+    /// The hii subcommand that `args`, after `uefisettings hii`, parse to.
+    fn hii(args: &[&str]) -> clap::Result<HiiSubcommands> {
+        let argv = [&["uefisettings", "hii"][..], args].concat();
+        UefiSettingsToolArgs::try_parse_from(argv).map(|parsed| match parsed.command {
+            Commands::Hii(hii) => hii.command,
+            other => panic!("not a hii command: {other:?}"),
+        })
+    }
+
+    /// The efivar flags of a get, show-ifr or list-questions.
+    fn efivar_args(command: &HiiSubcommands) -> &EfivarArgs {
+        match command {
+            HiiSubcommands::Get { efivars, .. }
+            | HiiSubcommands::ShowIFR { efivars, .. }
+            | HiiSubcommands::ListQuestions { efivars, .. } => efivars,
+            other => panic!("no efivar flags: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn efivar_flags_name_their_source() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let dir_arg = dir.path().to_str().expect("UTF-8 temporary path");
+        let missing = dir.path().join("missing");
+        let missing_arg = missing.to_str().expect("UTF-8 temporary path");
+        let cases = [
+            ("no flag", vec![], EfivarSource::System),
+            ("--no-efivars", vec!["--no-efivars"], EfivarSource::Disabled),
+            (
+                "--efivars",
+                vec!["--efivars", dir_arg],
+                EfivarSource::Directory(dir.path().to_path_buf()),
+            ),
+            // EfivarSource::validate checks the directory
+            (
+                "--efivars of a missing directory",
+                vec!["--efivars", missing_arg],
+                EfivarSource::Directory(missing.clone()),
+            ),
+        ];
+
+        for command in READING_COMMANDS {
+            for (case, flags, want) in &cases {
+                let parsed = hii(&[command, &flags[..]].concat()).expect("parse the flags");
+                let source = efivar_args(&parsed).source().expect("name the source");
+
+                assert_eq!(&source, want, "{command:?} {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn efivar_flags_conflict() {
+        for command in READING_COMMANDS {
+            let error = hii(&[command, &["--efivars", "dir", "--no-efivars"]].concat())
+                .expect_err("parse both flags");
+
+            assert_eq!(
+                error.kind(),
+                clap::ErrorKind::ArgumentConflict,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_efivars_fail_before_the_hiidb_is_read() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let missing = dir.path().join("missing");
+        let missing_arg = missing.to_str().expect("UTF-8 temporary path");
+        let db = dir.path().join("no-hiidb");
+        let db_arg = db.to_str().expect("UTF-8 temporary path");
+
+        for command in READING_COMMANDS {
+            let argv = [
+                &["uefisettings", "hii"][..],
+                command,
+                &["-f", db_arg, "--efivars", missing_arg],
+            ]
+            .concat();
+            let args = UefiSettingsToolArgs::try_parse_from(argv).expect("parse the flags");
+
+            let error = handle_cmds(args).expect_err("read with a missing efivars directory");
+
+            assert_eq!(
+                error.to_string(),
+                format!("efivars directory {} is not a directory", missing.display()),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_takes_no_efivar_flags() {
+        for flags in [&["--no-efivars"][..], &["--efivars", "dir"]] {
+            let error = hii(&[&["set", "Question", "Value"][..], flags].concat())
+                .expect_err("parse an efivar flag of set");
+
+            assert_eq!(error.kind(), clap::ErrorKind::UnknownArgument, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn hii_get_takes_a_hiidb_file() {
+        let parsed = hii(&["get", "Question", "-f", "hiidb.bin"]).expect("parse get -f");
+
+        let HiiSubcommands::Get { filename, .. } = parsed else {
+            panic!("not get: {parsed:?}");
+        };
+        assert_eq!(filename, Some(PathBuf::from("hiidb.bin")), "get -f");
     }
 
     #[test]

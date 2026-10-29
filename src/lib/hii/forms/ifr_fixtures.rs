@@ -20,6 +20,7 @@ use super::conditions::QuestionValue;
 use super::conditions::QuestionValues;
 use super::conditions::VarStoreValues;
 use super::*;
+use crate::hii::efivarfs::EfivarSource;
 
 pub(super) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
 
@@ -49,7 +50,7 @@ pub(super) const FORM_MAP: u8 = 0x5D;
 const VAR_STORE_EFI: u8 = 0x26;
 
 /// EFI variable Attributes: non-volatile, boot service and runtime access.
-pub(super) const NV_BS_RT: u32 = 0x07;
+pub(crate) const NV_BS_RT: u32 = 0x07;
 /// EFI variable Attributes: non-volatile and boot service access only.
 pub(super) const NV_BS: u32 = 0x03;
 
@@ -139,8 +140,14 @@ impl Efivars {
     /// A fresh EfivarReader of these efivar files.
     /// The reader holds only the path: keep `self` alive while it reads.
     pub(super) fn reader(&self) -> EfivarReader {
-        EfivarReader::new(self.path().to_path_buf())
+        EfivarReader::new(EfivarSource::Directory(self.path().to_path_buf()))
+            .expect("create a reader of the efivars directory")
     }
+}
+
+/// A fresh EfivarReader of EfivarSource::Disabled.
+pub(super) fn disabled_reader() -> EfivarReader {
+    EfivarReader::new(EfivarSource::Disabled).expect("create a reader without efivars")
 }
 
 /// A question's VarStore, and the efivars that hold its value.
@@ -416,7 +423,7 @@ pub(super) fn checkbox_op(question_id: u16, offset: u16) -> Vec<u8> {
 
 /// A CHECKBOX op of QuestionId `question_id`, prompted string `prompt`, at VarOffset 0 of
 /// VarStore `var_store_id`.
-pub(super) fn checkbox_on(question_id: u16, prompt: u16, var_store_id: u16) -> Vec<u8> {
+pub(crate) fn checkbox_on(question_id: u16, prompt: u16, var_store_id: u16) -> Vec<u8> {
     let data = [
         question_header_on(question_id, prompt, var_store_id, 0),
         vec![0x00],
@@ -426,7 +433,7 @@ pub(super) fn checkbox_on(question_id: u16, prompt: u16, var_store_id: u16) -> V
 }
 
 /// A VARSTORE_EFI of `id` named `name`, of NIL_GUID, with `attributes`, of `size` bytes.
-pub(super) fn var_store_efi(id: u16, name: &str, attributes: u32, size: u16) -> Vec<u8> {
+pub(crate) fn var_store_efi(id: u16, name: &str, attributes: u32, size: u16) -> Vec<u8> {
     let data = [
         &id.to_le_bytes()[..],
         &[0; 16], // Guid
@@ -440,7 +447,7 @@ pub(super) fn var_store_efi(id: u16, name: &str, attributes: u32, size: u16) -> 
 }
 
 /// An EFI_IFR_FORM of `form_id` holding `body`.
-pub(super) fn form(form_id: u16, body: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn form(form_id: u16, body: &[Vec<u8>]) -> Vec<u8> {
     let data = [form_id.to_le_bytes(), [0x01, 0x00]].concat();
     [operation(FORM, true, &data), body.concat(), END.to_vec()].concat()
 }

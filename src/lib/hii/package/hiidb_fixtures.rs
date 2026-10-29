@@ -112,7 +112,13 @@ pub(super) fn en_strings_package_with_blocks(blocks: &[u8]) -> Vec<u8> {
 /// A form package holding an EFI_IFR_FORM_SET titled by string ID 1 and no
 /// forms.
 pub(crate) fn form_set_package() -> Vec<u8> {
-    let ifr = form_set(&[]);
+    form_package(&[])
+}
+
+/// A form package holding an EFI_IFR_FORM_SET titled by string ID 1 that holds
+/// `children`.
+pub(crate) fn form_package(children: &[Vec<u8>]) -> Vec<u8> {
+    let ifr = form_set(children);
     let length = PACKAGE_HEADER_SIZE + u32::try_from(ifr.len()).unwrap();
     [package_header(0x02, length), ifr].concat()
 }

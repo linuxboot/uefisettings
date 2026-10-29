@@ -134,6 +134,12 @@ const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
     ),
 ];
 
+/// The flag that makes `get` and `hii list-questions` select questions in every state.
+const INCLUDE_ALL: [&str; 2] = ["--include", "grayed-out,suppressed,disabled"];
+
+/// The answer of a question whose value `--no-efivars` leaves unread, before its IFR default.
+const NOT_READ: &str = "<ValueUnavailable: EFI variables not read>";
+
 /// One string package of `hii list-strings --json` (`HiiStringsPackage`).
 #[derive(Debug, Deserialize)]
 struct StringPackage {
@@ -406,5 +412,69 @@ fn get_shows_a_question_that_may_be_grayed_out_with_its_states() {
             BACKEND_HII,
         );
         assert_eq!(got.answer, format!("0{annotation}"), "{flags:?}: {got:#?}");
+    }
+}
+
+/// With --no-efivars, get, list-questions and show-ifr read no question value: each value that
+/// they read from efivarfs without the flag shows as not read.
+#[test]
+fn no_efivars_reads_no_question_value() {
+    for name in [ONE_OF, CHECK_BOX, NUMERIC] {
+        let (got, _) =
+            single_response(&["hii", "get", name, "--json", "--no-efivars"], BACKEND_HII);
+        assert!(got.answer.starts_with(NOT_READ), "get {name}: {got:#?}");
+    }
+
+    let listed = |flags: &[&str]| -> Vec<Question> {
+        json(
+            &[
+                &["hii", "list-questions", "--json"][..],
+                &INCLUDE_ALL,
+                flags,
+            ]
+            .concat(),
+        )
+    };
+    let (live, unread) = (listed(&[]), listed(&["--no-efivars"]));
+    assert_eq!(live.len(), unread.len(), "list-questions: questions");
+    let read: Vec<(&Question, &Question)> = live
+        .iter()
+        .zip(&unread)
+        .filter(|(live, _)| !live.answer.starts_with('<'))
+        .collect();
+    assert!(!read.is_empty(), "list-questions reads no value");
+    for (live, unread) in read {
+        assert!(
+            unread.answer.starts_with(NOT_READ),
+            "list-questions {:?}: {:?} with --no-efivars, {:?} without",
+            live.name,
+            unread.answer,
+            live.answer
+        );
+    }
+
+    let answers = |flags: &[&str]| -> Vec<String> {
+        let output = uefisettings(&[&["hii", "show-ifr"][..], flags].concat());
+        assert_eq!(output.code, Some(0), "show-ifr {flags:?}: {output:#?}");
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("-Answer: "))
+            .map(str::to_owned)
+            .collect()
+    };
+    let (live, unread) = (answers(&[]), answers(&["--no-efivars"]));
+    assert_eq!(live.len(), unread.len(), "show-ifr: answers");
+    let read: Vec<(&String, &String)> = live
+        .iter()
+        .zip(&unread)
+        .filter(|(live, _)| !live.starts_with('<'))
+        .collect();
+    assert!(!read.is_empty(), "show-ifr reads no value");
+    for (live, unread) in read {
+        assert_eq!(
+            unread, NOT_READ,
+            "show-ifr answer {live:?} with --no-efivars"
+        );
     }
 }
