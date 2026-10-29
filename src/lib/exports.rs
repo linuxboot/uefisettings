@@ -183,6 +183,10 @@ impl SettingsBackend for HiiBackend {
             } => (question_variations, answer_variations, false),
         };
 
+        // TODO: set returns {"responses":[]} and exits 0 when no question matches or no matching
+        // question has a varstore, and aborts on the first write error even if another match is
+        // writable; report what was written and what failed, and fail unless every match was
+        // written.
         for list in parsed_db {
             for form_package in list.forms {
                 // try to find the question

@@ -26,6 +26,9 @@ use log::debug;
 
 // TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
 // open_efivar, so efivarfs paths and missing-variable errors have one source.
+// A missing HiiDB variable fails every command that reads the live HII database with only
+// extract_db's open error; say instead that the firmware does not export its HII database, as
+// VariableNotExported says for a missing varstore variable.
 pub const OCP_HIIDB_PATH: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 

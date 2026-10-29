@@ -788,7 +788,7 @@ trait VariableStore {
         let file_name = self.efivar_file_name();
         let path = efivars.join(&file_name);
 
-        let mut file_ro = open_efivar(efivars, &file_name)?;
+        let mut file_ro = open_efivar(efivars, &file_name).map_err(VariableNotExported::explain)?;
 
         let mut file_contents = Vec::new();
         file_ro
@@ -812,6 +812,27 @@ trait VariableStore {
             .context("Failed to write to efivarfs file")?;
 
         Ok(())
+    }
+}
+
+/// set's error for a missing efivar file: firmware that keeps the variable from the OS, e.g.
+/// boot-service-only, leaves no file to rewrite.
+#[derive(Error, Debug)]
+#[error(
+    "{0}: the firmware has not created it or does not expose it to the OS, so its questions \
+     cannot be set from Linux; change them in the firmware setup, or ask the board vendor for \
+     firmware that exposes it; see https://github.com/linuxboot/uefisettings/issues/2"
+)]
+struct VariableNotExported(EfivarNotFound);
+
+impl VariableNotExported {
+    /// Turns open_efivar's EfivarNotFound into VariableNotExported; other errors pass through
+    /// unchanged.
+    fn explain(error: anyhow::Error) -> anyhow::Error {
+        match error.downcast::<EfivarNotFound>() {
+            Ok(not_found) => Self(not_found).into(),
+            Err(error) => error,
+        }
     }
 }
 
@@ -3637,6 +3658,64 @@ mod tests {
 
         assert_eq!(bytes, efivarfs_data);
         assert_eq!(extract_efi_data::<u16>(0, &bytes).unwrap(), 95);
+    }
+
+    #[test]
+    fn missing_efivar_is_explained_as_not_exported() {
+        let name = EfivarFileName::new(
+            "Setup",
+            Guid {
+                data1: 0xec87d643,
+                data2: 0xeba4,
+                data3: 0x4bb5,
+                data4: [0xa1, 0xe5, 0x3f, 0x3e, 0x36, 0xb2, 0x0d, 0xa9],
+            },
+        );
+
+        let error = VariableNotExported::explain(EfivarNotFound { name }.into());
+
+        assert!(
+            error.downcast_ref::<VariableNotExported>().is_some(),
+            "{error:#} is not VariableNotExported"
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "no EFI variable Setup-ec87d643-eba4-4bb5-a1e5-3f3e36b20da9: the firmware has not \
+             created it or does not expose it to the OS, so its questions cannot be set from \
+             Linux; change them in the firmware setup, or ask the board vendor for firmware that \
+             exposes it; see https://github.com/linuxboot/uefisettings/issues/2",
+            "message of the missing variable"
+        );
+    }
+
+    #[test]
+    fn other_efivar_open_failure_is_not_explained_as_not_exported() {
+        // ENOTDIR: the directory is a regular file
+        let not_a_dir = tempfile::NamedTempFile::new().expect("create a file");
+        let name = EfivarFileName::new("Setup", ifr_fixtures::NIL_GUID);
+
+        let open_error = open_efivar(not_a_dir.path(), &name).expect_err("open below a file");
+        let expected = format!("{open_error:#}");
+
+        let error = VariableNotExported::explain(open_error);
+
+        assert!(
+            error.downcast_ref::<VariableNotExported>().is_none(),
+            "{error:#} is VariableNotExported"
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            expected,
+            "message of the open failure below a file"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotADirectory),
+            "root cause of the open failure below a file"
+        );
     }
 
     /// An IFR operation Length below the header size is rejected as an

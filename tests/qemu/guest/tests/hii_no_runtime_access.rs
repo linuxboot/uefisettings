@@ -15,6 +15,9 @@
 //! not see it: the questions on it are unavailable and cannot be set.
 //! Their answers end with the default that their IFR declares.
 
+use std::ffi::OsStr;
+use std::path::Path;
+
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::NUMERIC;
 use uefisettings_qemu_guest::driver_sample::ONE_OF;
@@ -80,11 +83,23 @@ fn get_reports_the_check_box_as_unavailable() {
 }
 
 #[test]
-fn set_fails() {
-    let error = json_error(&["hii", "set", CHECK_BOX, "0", "--json"]);
-    assert_eq!(
-        error.error_message,
-        "no EFI variable MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d"
-    );
+fn set_fails_naming_the_missing_variable() {
+    let file_name = Path::new(DRIVER_SAMPLE_VARIABLE)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("file name of the variable");
+    for (name, value) in [(CHECK_BOX, "0"), (ONE_OF, "My one-of text #1")] {
+        let error = json_error(&["hii", "set", name, value, "--json"]);
+        assert_eq!(
+            error.error_message,
+            format!(
+                "no EFI variable {file_name}: the firmware has not created it or does not expose \
+                 it to the OS, so its questions cannot be set from Linux; change them in the \
+                 firmware setup, or ask the board vendor for firmware that exposes it; see \
+                 https://github.com/linuxboot/uefisettings/issues/2"
+            ),
+            "{name}"
+        );
+    }
     assert_eq!(variable_data(DRIVER_SAMPLE_VARIABLE), None);
 }
