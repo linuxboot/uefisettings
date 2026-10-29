@@ -32,6 +32,11 @@ struct MachineInfo {
 
 struct Question {
   1: string name;
+  // answer values:
+  // hii - the current value; if unreadable, the reason, followed, only if the IFR of a ONE_OF,
+  // NUMERIC or CHECKBOX declares a default, by " <IFR default: v>" or
+  // " <IFR default (DefaultId 0x0001): v>", v being "unknown (<reason>)" if undetermined;
+  // firmware Callback/ALTCFG defaults may differ.
   2: string answer;
   3: list<string> options;
   4: string help;

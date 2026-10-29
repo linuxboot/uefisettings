@@ -15,6 +15,7 @@
 //! read, so the answers are DriverSample's defaults.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 
 use serde::Deserialize;
@@ -70,6 +71,36 @@ const UNAVAILABLE_QUESTIONS: [&str; 4] = [
     "NameValueVar0",
     "Disk Memory Type:",
     "Size (Hex):",
+];
+
+/// The answers of the questions on bit fields of DriverSample's EFI variable, which lacks
+/// runtime access, and then of its variable, which the HII backend reads but whose bit fields
+/// it does not decode; each ends with the default of Vfr.vfr if it has one.
+const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
+    (
+        "NEST_BIT check box",
+        [
+            "<ValueUnavailable: EFI variable is boot-service-only \
+             (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: 1>",
+            "<ValueUnavailable: EDKII bit-field value not decoded> <IFR default: 1>",
+        ],
+    ),
+    (
+        "NEST_BIT one-of",
+        [
+            "<ValueUnavailable: EFI variable is boot-service-only \
+             (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: LargeBootList>",
+            "<ValueUnavailable: EDKII bit-field value not decoded> <IFR default: LargeBootList>",
+        ],
+    ),
+    (
+        "NEST_BIT numeric",
+        [
+            "<ValueUnavailable: EFI variable is boot-service-only \
+             (no EFI_VARIABLE_RUNTIME_ACCESS)>",
+            "<ValueUnavailable: EDKII bit-field value not decoded> <IFR default: 6>",
+        ],
+    ),
 ];
 
 /// One string package of `hii list-strings --json` (`HiiStringsPackage`).
@@ -193,6 +224,19 @@ fn list_questions_reports_unreadable_questions_as_unavailable() {
 }
 
 #[test]
+fn list_questions_reports_bit_field_questions_with_their_defaults() {
+    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
+    for (name, answers) in BIT_FIELD_QUESTIONS {
+        let listed: Vec<&str> = questions
+            .iter()
+            .filter(|question| question.name == name)
+            .map(|question| question.answer.as_str())
+            .collect();
+        assert_eq!(listed, answers, "{name}");
+    }
+}
+
+#[test]
 fn list_strings_lists_the_prompts() {
     let packages: Vec<StringPackage> = json(&["hii", "list-strings", "--json"]);
     let strings: Vec<&str> = packages
@@ -223,6 +267,25 @@ fn show_ifr_shows_the_formsets() {
     ] {
         assert!(formsets.contains(&name), "{name:?} is not in {formsets:?}");
     }
+    // The NEST_BIT check box, one-of and numeric on DriverSample's variable.
+    let mut op_code = "";
+    let mut not_decoded = BTreeSet::new();
+    for line in output.stdout.lines().map(str::trim_start) {
+        if let Some((name, _)) = line
+            .strip_prefix("OpCode: ")
+            .and_then(|op| op.split_once(" - "))
+        {
+            op_code = name;
+        }
+        if line == "-Answer: <ValueUnavailable: EDKII bit-field value not decoded>" {
+            not_decoded.insert(op_code);
+        }
+    }
+    assert_eq!(
+        not_decoded,
+        BTreeSet::from(["CheckBox", "Numeric", "OneOf"]),
+        "{output:#?}"
+    );
 }
 
 #[test]

@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
@@ -37,10 +38,39 @@ use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
 use crate::hii::efivarfs::EfivarsMountGuard;
 use crate::hii::package::Guid;
+use defaults::option_text;
+use defaults::push_default;
+use defaults::DefaultId;
+use defaults::FormSetDefaultIds;
+
+mod defaults;
+#[cfg(test)]
+mod ifr_fixtures;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
 const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
+// UEFI 2.10 §33.3.8.3.47
+const EFI_IFR_DISPLAY: u8 = 0x30;
+const EFI_IFR_DISPLAY_INT_DEC: u8 = 0x00;
+// UEFI 2.10 §33.3.8.3.51
+const EFI_IFR_TYPE_NUM_SIZE_8: u8 = 0x00;
+const EFI_IFR_TYPE_NUM_SIZE_16: u8 = 0x01;
+const EFI_IFR_TYPE_NUM_SIZE_32: u8 = 0x02;
+const EFI_IFR_TYPE_NUM_SIZE_64: u8 = 0x03;
+const EFI_IFR_TYPE_BOOLEAN: u8 = 0x04;
+const EFI_IFR_TYPE_OTHER: u8 = 0x08;
+// edk2-stable202608 MdeModulePkg/Include/Guid/MdeModuleHii.h; the GUID is
+// 82DDD68B-9163-4187-9B27-20A8FD60A71D, here in its EFI_GUID byte order
+const EDKII_IFR_BIT_VARSTORE_GUID: [u8; 16] = [
+    0x8B, 0xD6, 0xDD, 0x82, 0x63, 0x91, 0x87, 0x41, 0x9B, 0x27, 0x20, 0xA8, 0xFD, 0x60, 0xA7, 0x1D,
+];
+const EDKII_IFR_DISPLAY_BIT: u8 = 0xC0;
+const EDKII_IFR_DISPLAY_INT_DEC_BIT: u8 = 0x00;
+const EDKII_IFR_NUMERIC_SIZE_BIT: u8 = 0x3F;
+// edk2-stable202608 BaseTools VfrCompile stores bit-field values as UINT32 (VfrSyntax.g) and
+// caps their width at MAX_BIT_WIDTH 32 (VfrUtilityLib.h)
+const EDKII_BIT_FIELD_VALUE_BITS: u32 = 32;
 
 /// IFR_OPERATION_HEADER_SIZE is the size of EFI_IFR_OP_HEADER, which starts
 /// every IFR operation (IFROperation): OpCode (8 bits), Length (7 bits) and
@@ -364,7 +394,6 @@ pub enum ParsedOperation {
     VarStore(VarStore),
     VarStoreNameValue(VarStoreNameValue),
     VarStoreEfi(VarStoreEfi),
-    #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
     DefaultStore(DefaultStore),
     IFRDefault(IFRDefault),
     #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
@@ -502,23 +531,17 @@ struct NumericRange {
 
 impl NumericRange {
     fn from_ifr(range: &Range, flags: u8) -> Self {
-        let (minimum, maximum, bits) = match range {
-            Range::Range8(range) => (u64::from(range.min_value), u64::from(range.max_value), 8),
-            Range::Range16(range) => (u64::from(range.min_value), u64::from(range.max_value), 16),
-            Range::Range32(range) => (u64::from(range.min_value), u64::from(range.max_value), 32),
-            Range::Range64(range) => (range.min_value, range.max_value, 64),
+        let (minimum, maximum) = match range {
+            Range::Range8(range) => (u64::from(range.min_value), u64::from(range.max_value)),
+            Range::Range16(range) => (u64::from(range.min_value), u64::from(range.max_value)),
+            Range::Range32(range) => (u64::from(range.min_value), u64::from(range.max_value)),
+            Range::Range64(range) => (range.min_value, range.max_value),
         };
-        let decode = |value: u64| {
-            if flags & 0x30 == 0 {
-                i128::from(((value << (64 - bits)) as i64) >> (64 - bits))
-            } else {
-                i128::from(value)
-            }
-        };
+        let format = NumericFormat::from_ifr(range, flags);
         Self {
-            minimum: decode(minimum),
-            maximum: decode(maximum),
-            bits,
+            minimum: format.decode(minimum),
+            maximum: format.decode(maximum),
+            bits: format.bits,
         }
     }
 
@@ -543,6 +566,101 @@ impl NumericRange {
             _ => Err(ChangeValueError::InvalidNumericRange),
         }
     }
+}
+
+/// The stored width in bits, 1 to 64, of a NUMERIC or ONE_OF value, and, if
+/// EFI_IFR_DISPLAY_INT_DEC signs it, the width of its type.
+#[derive(Clone, Copy)]
+struct NumericFormat {
+    bits: u32,
+    signed_type_bits: Option<u32>,
+}
+
+/// Why the Flags of a NUMERIC or ONE_OF give no value format.
+#[derive(Debug, Error)]
+enum NumericFormatError {
+    #[error("EDKII bit-field width {0}, not 1 to 32")]
+    BitFieldWidth(u8),
+}
+
+impl NumericFormat {
+    /// Returns the format that the Range and EFI_IFR_DISPLAY give (UEFI 2.10 §33.3.8.3.47).
+    fn from_ifr(range: &Range, flags: u8) -> Self {
+        let bits = match range {
+            Range::Range8(_) => 8,
+            Range::Range16(_) => 16,
+            Range::Range32(_) => 32,
+            Range::Range64(_) => 64,
+        };
+        Self {
+            bits,
+            signed_type_bits: (flags & EFI_IFR_DISPLAY == EFI_IFR_DISPLAY_INT_DEC).then_some(bits),
+        }
+    }
+
+    /// Returns the format of an EDKII bit varstore field's IFR default, from its Flags.
+    fn from_bit_field_flags(flags: u8) -> Result<Self, NumericFormatError> {
+        let width = flags & EDKII_IFR_NUMERIC_SIZE_BIT;
+        let bits = u32::from(width);
+        if !(1..=EDKII_BIT_FIELD_VALUE_BITS).contains(&bits) {
+            return Err(NumericFormatError::BitFieldWidth(width));
+        }
+        // edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault copies the EFI_IFR_DEFAULT,
+        // Type UINT32 here, and DisplayEngineDxe/ProcessOptions.c PrintFormattedNumber signs by
+        // that Type; IfrParse.c types the question by the bytes it spans and GetBitsQuestionValue
+        // copies no Type, so a byte-aligned 8-bit INT_DEC 0xFF shows 255 as a default and -1 when
+        // read after a parse
+        let signed = flags & EDKII_IFR_DISPLAY_BIT == EDKII_IFR_DISPLAY_INT_DEC_BIT;
+        Ok(Self {
+            bits,
+            signed_type_bits: signed.then_some(EDKII_BIT_FIELD_VALUE_BITS),
+        })
+    }
+
+    /// Returns `value` cut to `bits` bits.
+    fn cut(self, value: u64) -> u64 {
+        let unused = 64 - self.bits;
+        value << unused >> unused
+    }
+
+    /// Returns `value` cut to `bits` bits and, if signed, sign-extended from its type width.
+    fn decode(self, value: u64) -> i128 {
+        let value = self.cut(value);
+        match self.signed_type_bits {
+            Some(type_bits) => {
+                let unused = 64 - type_bits;
+                i128::from((value << unused).cast_signed() >> unused)
+            }
+            None => i128::from(value),
+        }
+    }
+}
+
+/// Returns the format of the question's IFR default, from EDKII bit-field Flags if it has them.
+fn numeric_format(
+    question: &IFROperation,
+    flags: u8,
+    range: &Range,
+) -> Result<NumericFormat, NumericFormatError> {
+    if refers_to_bit_field(question) {
+        NumericFormat::from_bit_field_flags(flags)
+    } else {
+        Ok(NumericFormat::from_ifr(range, flags))
+    }
+}
+
+/// Whether the question is wrapped in the GUID op that marks an EDKII bit varstore field;
+/// edk2-stable202608 BaseTools VfrSyntax.g wraps each such question in its own.
+fn refers_to_bit_field(question: &IFROperation) -> bool {
+    question
+        .parent
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .is_some_and(|parent| {
+            let parent = parent.borrow();
+            parent.op_code == IFROpCode::Guid
+                && parent.data.starts_with(&EDKII_IFR_BIT_VARSTORE_GUID)
+        })
 }
 
 fn range_parser<R: Read + Seek>(
@@ -913,6 +1031,7 @@ mod non_efi_varstore_tests {
             varstore: Some(Box::new(TestVariableStore {
                 kind: VariableStoreKind::Buffer,
             })),
+            refers_to_bit_field: false,
         };
 
         assert!(change_value(&question, "Enabled").unwrap());
@@ -957,6 +1076,20 @@ fn read_current_value_bytes(
             }
         }
     }
+}
+
+/// Returns the question's efivarfs file (4 attribute bytes, then the VarStore), or why its
+/// value cannot be read.
+fn read_question_bytes(
+    question: &IFROperation,
+    varstore: &Result<Box<dyn VariableStore>>,
+) -> std::result::Result<Vec<u8>, String> {
+    let bytes = read_current_value_bytes(varstore)?;
+    // edk2-stable202608 SetupBrowserDxe/IfrParse.c reads the VarOffset of such a question in bits
+    if refers_to_bit_field(question) {
+        return Err("<ValueUnavailable: EDKII bit-field value not decoded>".to_string());
+    }
+    Ok(bytes)
 }
 
 #[derive(BinRead, Debug, PartialEq, Clone)]
@@ -1024,7 +1157,7 @@ impl VariableStore for VarStoreEfi {
 #[br(little)]
 pub struct DefaultStore {
     pub name_string_id: u16,
-    pub default_id: u16,
+    pub default_id: DefaultId,
 }
 
 // IFRDefault is called IFRDefault instead of Default like the opcode because we don't want
@@ -1032,16 +1165,43 @@ pub struct DefaultStore {
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
 pub struct IFRDefault {
-    pub default_id: u16,
+    pub default_id: DefaultId,
     value_type: u8,
-    // The third field is TypeValue and should be parsed with the following code.
-    // However the structure of IFRDefault and existence of that field varies depending on
-    // what scope the IFRDefault is in, even though the opcode remains the same.
+    #[br(parse_with = default_value_parser, args(value_type))]
+    value: IfrDefaultValue,
+}
 
-    // Since we are not using TypeValue for IFRDefault right now, we're gonna pretend that field does not exist.
+/// The Value of an EFI_IFR_DEFAULT.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum IfrDefaultValue {
+    Decoded(TypeValue),
+    /// Absent from EFI_IFR_DEFAULT_2 (Type EFI_IFR_TYPE_OTHER), whose value is a nested
+    /// EFI_IFR_VALUE.
+    InValueOp,
+    /// Of a Type other than numeric, boolean and EFI_IFR_TYPE_OTHER.
+    NotDecoded,
+    /// Length leaves no room for a value of Type.
+    Missing,
+}
 
-    // #[br(parse_with = type_value_parser, args(value_type))]
-    // pub value: TypeValue,
+fn default_value_parser<R: Read + Seek>(
+    reader: &mut R,
+    endian: binrw::Endian,
+    args: (u8,),
+) -> BinResult<IfrDefaultValue> {
+    match args.0 {
+        EFI_IFR_TYPE_NUM_SIZE_8
+        | EFI_IFR_TYPE_NUM_SIZE_16
+        | EFI_IFR_TYPE_NUM_SIZE_32
+        | EFI_IFR_TYPE_NUM_SIZE_64
+        | EFI_IFR_TYPE_BOOLEAN => match type_value_parser(reader, endian, args) {
+            Ok(value) => Ok(IfrDefaultValue::Decoded(value)),
+            Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
+            Err(error) => Err(error),
+        },
+        EFI_IFR_TYPE_OTHER => Ok(IfrDefaultValue::InValueOp),
+        _ => Ok(IfrDefaultValue::NotDecoded),
+    }
 }
 
 #[derive(BinRead, Debug, PartialEq)]
@@ -1139,6 +1299,27 @@ pub enum TypeValue {
     #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Ref(Ref),
     Unknown(u8),
+}
+
+impl TypeValue {
+    /// Returns a numeric or boolean value as an unsigned integer.
+    fn as_u64(self) -> Option<u64> {
+        match self {
+            TypeValue::NumSize8(v) => Some(v.into()),
+            TypeValue::NumSize16(v) => Some(v.into()),
+            TypeValue::NumSize32(v) => Some(v.into()),
+            TypeValue::NumSize64(v) => Some(v),
+            TypeValue::Boolean(v) => Some(v.into()),
+            TypeValue::Time(_)
+            | TypeValue::Date(_)
+            | TypeValue::StringID(_)
+            | TypeValue::Other
+            | TypeValue::Undefined
+            | TypeValue::Action(_)
+            | TypeValue::Ref(_)
+            | TypeValue::Unknown(_) => None,
+        }
+    }
 }
 
 fn type_value_parser<R: Read + Seek>(
@@ -1418,6 +1599,9 @@ pub struct QuestionDescriptor {
     pub possible_options: Vec<AnswerOption>,
     header: QuestionHeader,
     varstore: Option<Box<dyn VariableStore>>,
+    /// Whether the question is an EDKII bit varstore field, whose VarOffset edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c reads in bits
+    refers_to_bit_field: bool,
 }
 impl fmt::Debug for QuestionDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1440,7 +1624,31 @@ pub struct AnswerOption {
 // node should be the form_package node
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
+) -> Vec<QuestionDescriptor> {
+    list_questions_in(node, &mut FormPackageWalk::new(string_packages))
+}
+
+/// What walking the ops of a form package takes besides them.
+struct FormPackageWalk<'a> {
+    /// The string packages of the form package's package list
+    string_packages: &'a [HashMap<i32, String>],
+    default_ids: FormSetDefaultIds,
+}
+
+impl<'a> FormPackageWalk<'a> {
+    fn new(string_packages: &'a [HashMap<i32, String>]) -> Self {
+        FormPackageWalk {
+            string_packages,
+            default_ids: FormSetDefaultIds::default(),
+        }
+    }
+}
+
+/// Lists questions as list_questions does, with `walk`.
+fn list_questions_in(
+    node: Rc<RefCell<IFROperation>>,
+    walk: &mut FormPackageWalk<'_>,
 ) -> Vec<QuestionDescriptor> {
     let mut res = Vec::new();
 
@@ -1450,7 +1658,7 @@ pub fn list_questions(
         ParsedOperation::Numeric(parsed) => {
             let question = find_corresponding_string(
                 parsed.question_header().prompt_string_id,
-                string_packages,
+                walk.string_packages,
             );
 
             let varstore = find_corresponding_varstore(
@@ -1459,34 +1667,13 @@ pub fn list_questions(
             );
 
             let question_descriptor =
-                handle_numeric(varstore, parsed, question, string_packages, &current_node);
+                handle_numeric(varstore, parsed, question, &current_node, walk);
             res.push(question_descriptor);
         }
         ParsedOperation::OneOf(parsed) => {
             let question = find_corresponding_string(
                 parsed.question_header().prompt_string_id,
-                string_packages,
-            );
-
-            let varstore = find_corresponding_varstore(
-                Rc::clone(&node),
-                parsed.question_header().var_store_id,
-            );
-
-            let question_descriptor = handle_oneof(
-                varstore,
-                parsed,
-                &node,
-                string_packages,
-                question,
-                &current_node,
-            );
-            res.push(question_descriptor);
-        }
-        ParsedOperation::CheckBox(parsed) => {
-            let question = find_corresponding_string(
-                parsed.question_header().prompt_string_id,
-                string_packages,
+                walk.string_packages,
             );
 
             let varstore = find_corresponding_varstore(
@@ -1495,7 +1682,22 @@ pub fn list_questions(
             );
 
             let question_descriptor =
-                handle_checkbox(varstore, parsed, question, string_packages, &current_node);
+                handle_oneof(varstore, parsed, &node, question, &current_node, walk);
+            res.push(question_descriptor);
+        }
+        ParsedOperation::CheckBox(parsed) => {
+            let question = find_corresponding_string(
+                parsed.question_header().prompt_string_id,
+                walk.string_packages,
+            );
+
+            let varstore = find_corresponding_varstore(
+                Rc::clone(&node),
+                parsed.question_header().var_store_id,
+            );
+
+            let question_descriptor =
+                handle_checkbox(varstore, parsed, question, &current_node, walk);
             res.push(question_descriptor);
         }
 
@@ -1504,7 +1706,7 @@ pub fn list_questions(
 
     // Now look inside current node's children for more questions
     for child in &node.borrow().children {
-        res.extend(list_questions(Rc::clone(child), string_packages));
+        res.extend(list_questions_in(Rc::clone(child), walk));
     }
 
     res
@@ -1515,8 +1717,24 @@ pub fn list_questions(
 /// same question. So if a single phrase matches then we assume that we have the answer.
 pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &Vec<HashMap<i32, String>>,
+    string_packages: &[HashMap<i32, String>],
     possible_question_phrases: &HashSet<T>,
+) -> Option<QuestionDescriptor>
+where
+    T: AsRef<str>,
+{
+    find_question_in(
+        node,
+        possible_question_phrases,
+        &mut FormPackageWalk::new(string_packages),
+    )
+}
+
+/// Finds a question as find_question does, with `walk`.
+fn find_question_in<T>(
+    node: Rc<RefCell<IFROperation>>,
+    possible_question_phrases: &HashSet<T>,
+    walk: &mut FormPackageWalk<'_>,
 ) -> Option<QuestionDescriptor>
 where
     T: AsRef<str>,
@@ -1532,7 +1750,7 @@ where
             ParsedOperation::Numeric(parsed) => {
                 let question = find_corresponding_string(
                     parsed.question_header().prompt_string_id,
-                    string_packages,
+                    walk.string_packages,
                 );
 
                 if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
@@ -1541,8 +1759,7 @@ where
                         parsed.question_header().var_store_id,
                     );
 
-                    let res =
-                        handle_numeric(varstore, parsed, question, string_packages, &current_node);
+                    let res = handle_numeric(varstore, parsed, question, &current_node, walk);
 
                     return Some(res);
                 }
@@ -1550,7 +1767,7 @@ where
             ParsedOperation::OneOf(parsed) => {
                 let question = find_corresponding_string(
                     parsed.question_header().prompt_string_id,
-                    string_packages,
+                    walk.string_packages,
                 );
 
                 if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
@@ -1559,14 +1776,7 @@ where
                         parsed.question_header().var_store_id,
                     );
 
-                    let res = handle_oneof(
-                        varstore,
-                        parsed,
-                        &node,
-                        string_packages,
-                        question,
-                        &current_node,
-                    );
+                    let res = handle_oneof(varstore, parsed, &node, question, &current_node, walk);
 
                     return Some(res);
                 }
@@ -1574,7 +1784,7 @@ where
             ParsedOperation::CheckBox(parsed) => {
                 let question = find_corresponding_string(
                     parsed.question_header().prompt_string_id,
-                    string_packages,
+                    walk.string_packages,
                 );
 
                 if phrase.as_ref().eq_ignore_ascii_case(question.trim()) {
@@ -1583,8 +1793,7 @@ where
                         parsed.question_header().var_store_id,
                     );
 
-                    let res =
-                        handle_checkbox(varstore, parsed, question, string_packages, &current_node);
+                    let res = handle_checkbox(varstore, parsed, question, &current_node, walk);
 
                     return Some(res);
                 }
@@ -1596,9 +1805,7 @@ where
 
     // Question not found in current_node so look at children
     for child in &node.borrow().children {
-        if let Some(res) =
-            find_question(Rc::clone(child), string_packages, possible_question_phrases)
-        {
+        if let Some(res) = find_question_in(Rc::clone(child), possible_question_phrases, walk) {
             return Some(res);
         }
     }
@@ -1610,30 +1817,42 @@ fn handle_checkbox(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &CheckBox,
     question: &str,
-    string_packages: &Vec<HashMap<i32, String>>,
     current_node: &std::cell::Ref<IFROperation>,
+    walk: &mut FormPackageWalk<'_>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
-    match read_current_value_bytes(&varstore) {
-        Err(reason) => answer.push_str(&reason),
-        Ok(bytes) => {
-            // for a checkbox size should be of type u8
-            let answer_raw: Result<u8> =
-                extract_efi_data::<u8>(parsed.question_header().var_store_info, &bytes);
-            match answer_raw {
-                Ok(a) => answer.push_str(format!("{a}").as_str()),
-                Err(e) => answer.push_str(format!("ExtractEFIDataError: {}", e).as_str()),
-            }
+    let available = match read_question_bytes(current_node, &varstore) {
+        Err(reason) => {
+            answer.push_str(&reason);
+            false
         }
+        // for a checkbox size should be of type u8
+        Ok(bytes) => {
+            try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer)
+        }
+    };
+    if !available {
+        let default_ids = walk.default_ids.of(current_node);
+        push_default(
+            &mut answer,
+            current_node,
+            default_ids,
+            // FALSE or TRUE (UEFI 2.10 §33.3.8.3.9)
+            |v| Ok::<_, Infallible>(u8::from(v != 0).to_string()),
+        );
     }
     let res = QuestionDescriptor {
         question: question.to_string(),
         value: answer,
-        help: find_corresponding_string(parsed.question_header().help_string_id, string_packages)
-            .to_string(),
+        help: find_corresponding_string(
+            parsed.question_header().help_string_id,
+            walk.string_packages,
+        )
+        .to_string(),
         possible_options: Vec::new(),
         header: parsed.question_header(),
         varstore: varstore.ok(),
+        refers_to_bit_field: refers_to_bit_field(current_node),
         max_value: RangeType::NumSize8(1),
         numeric_range: None,
         opcode: current_node.op_code,
@@ -1645,56 +1864,45 @@ fn handle_oneof(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &OneOf,
     node: &Rc<RefCell<IFROperation>>,
-    string_packages: &Vec<HashMap<i32, String>>,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
+    walk: &mut FormPackageWalk<'_>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
-    let mut chosen_value: u64 = u64::MAX;
-    let mut varstore_not_found = false;
-    match read_current_value_bytes(&varstore) {
+    // None, with the reason in `answer`, when the current value cannot be read: any u64,
+    // all ones too, can be stored.
+    let chosen_value = match read_question_bytes(current_node, &varstore) {
         Err(reason) => {
             answer.push_str(&reason);
-            varstore_not_found = true;
+            None
         }
         Ok(bytes) => match &parsed.data {
             Range::Range8(_) => {
-                try_read_answer_as_option::<u8>(
-                    &parsed.question_header(),
-                    &bytes,
-                    &mut chosen_value,
-                );
+                try_read_answer_as_option::<u8>(&parsed.question_header(), &bytes, &mut answer)
             }
             Range::Range16(_) => {
-                try_read_answer_as_option::<u16>(
-                    &parsed.question_header(),
-                    &bytes,
-                    &mut chosen_value,
-                );
+                try_read_answer_as_option::<u16>(&parsed.question_header(), &bytes, &mut answer)
             }
             Range::Range32(_) => {
-                try_read_answer_as_option::<u32>(
-                    &parsed.question_header(),
-                    &bytes,
-                    &mut chosen_value,
-                );
+                try_read_answer_as_option::<u32>(&parsed.question_header(), &bytes, &mut answer)
             }
             Range::Range64(_) => {
-                try_read_answer_as_option::<u64>(
-                    &parsed.question_header(),
-                    &bytes,
-                    &mut chosen_value,
-                );
+                try_read_answer_as_option::<u64>(&parsed.question_header(), &bytes, &mut answer)
             }
         },
-    }
+    };
 
-    if chosen_value == u64::MAX {
-        // No answer was provided, so using the default value instead.
-        for child in &node.borrow().children {
-            if let ParsedOperation::IFRDefault(o) = &child.borrow().parsed_data {
-                chosen_value = u64::from(o.default_id);
-            }
+    if chosen_value.is_none() {
+        let default_ids = walk.default_ids.of(current_node);
+        match numeric_format(current_node, parsed.flags, &parsed.data) {
+            Ok(format) => push_default(&mut answer, current_node, default_ids, |v| {
+                option_text(current_node, format.cut(v), walk.string_packages).map(|option| {
+                    option.unwrap_or_else(|| format!("{} (no matching option)", format.decode(v)))
+                })
+            }),
+            Err(error) => push_default(&mut answer, current_node, default_ids, |_| {
+                Err::<String, _>(error)
+            }),
         }
     }
 
@@ -1702,22 +1910,18 @@ fn handle_oneof(
     // Some of OneOf's children are OneOfOptions
 
     let mut found_option = false;
+    // TODO: collect OneOfOptions nested in SuppressIf/GrayOutIf/DisableIf, as question_scope
+    // does; get, list-questions and set miss them.
     for child in &node.borrow().children {
         if let ParsedOperation::OneOfOption(o) = &child.borrow().parsed_data {
-            let current_value: u64 = match o.value {
-                TypeValue::NumSize8(c) => c as u64,
-                TypeValue::NumSize16(c) => c as u64,
-                TypeValue::NumSize32(c) => c as u64,
-                TypeValue::NumSize64(c) => c,
-                _ => 0,
-            };
-
             let opt = AnswerOption {
                 raw_value: o.value,
-                value: find_corresponding_string(o.option_string_id, string_packages).to_string(),
+                value: find_corresponding_string(o.option_string_id, walk.string_packages)
+                    .to_string(),
             };
 
-            if !varstore_not_found && current_value == chosen_value && !found_option {
+            let chosen = matches!((chosen_value, o.value.as_u64()), (Some(a), Some(b)) if a == b);
+            if chosen && !found_option {
                 found_option = true;
                 answer.push_str(opt.value.trim());
                 // cannot break here because we want to add all options to possible_options
@@ -1733,11 +1937,15 @@ fn handle_oneof(
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
         value: answer,
-        help: find_corresponding_string(parsed.question_header().help_string_id, string_packages)
-            .to_string(),
+        help: find_corresponding_string(
+            parsed.question_header().help_string_id,
+            walk.string_packages,
+        )
+        .to_string(),
         possible_options,
         header: parsed.question_header(),
         varstore: varstore.ok(),
+        refers_to_bit_field: refers_to_bit_field(current_node),
         max_value: match &parsed.data {
             Range::Range8(r) => RangeType::NumSize8(r.max_value),
             Range::Range16(r) => RangeType::NumSize16(r.max_value),
@@ -1754,14 +1962,23 @@ fn handle_numeric(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &Numeric,
     question: &str,
-    string_packages: &Vec<HashMap<i32, String>>,
     current_node: &std::cell::Ref<IFROperation>,
+    walk: &mut FormPackageWalk<'_>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
 
-    match read_current_value_bytes(&varstore) {
-        Err(reason) => answer.push_str(&reason),
-        Ok(bytes) => match (&parsed.data, parsed.flags & 0x30 == 0) {
+    let available = match read_question_bytes(current_node, &varstore) {
+        Err(reason) => {
+            answer.push_str(&reason);
+            false
+        }
+        // read_question_bytes refuses bit-field questions, so the Range gives the width
+        Ok(bytes) => match (
+            &parsed.data,
+            NumericFormat::from_ifr(&parsed.data, parsed.flags)
+                .signed_type_bits
+                .is_some(),
+        ) {
             (Range::Range8(_), true) => {
                 try_read_answer_as_string::<i8>(&parsed.question_header(), &bytes, &mut answer)
             }
@@ -1787,15 +2004,26 @@ fn handle_numeric(
                 try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer)
             }
         },
+    };
+    if !available {
+        let default_ids = walk.default_ids.of(current_node);
+        push_default(&mut answer, current_node, default_ids, |v| {
+            numeric_format(current_node, parsed.flags, &parsed.data)
+                .map(|format| format.decode(v).to_string())
+        });
     }
     let res = QuestionDescriptor {
         question: question.to_string(),
         value: answer,
-        help: find_corresponding_string(parsed.question_header().help_string_id, string_packages)
-            .to_string(),
+        help: find_corresponding_string(
+            parsed.question_header().help_string_id,
+            walk.string_packages,
+        )
+        .to_string(),
         possible_options: Vec::new(),
         header: parsed.question_header(),
         varstore: varstore.ok(),
+        refers_to_bit_field: refers_to_bit_field(current_node),
         max_value: match &parsed.data {
             Range::Range8(r) => RangeType::NumSize8(r.max_value),
             Range::Range16(r) => RangeType::NumSize16(r.max_value),
@@ -1809,43 +2037,649 @@ fn handle_numeric(
 }
 
 // utility function for questions i.e. OneOf, Numeric and Checkbox
-fn try_read_answer_as_string<T>(question_header: &QuestionHeader, bytes: &Vec<u8>, ans: &mut String)
+fn try_read_answer_as_string<T>(
+    question_header: &QuestionHeader,
+    bytes: &[u8],
+    ans: &mut String,
+) -> bool
 where
     T: BinRead + Display,
     for<'a> <T as BinRead>::Args<'a>: Default,
 {
-    let offset = question_header.var_store_info;
-    let extracted_data: Result<T> = extract_efi_data(offset, bytes);
-    match extracted_data {
-        Ok(a) => ans.push_str(format!("{a}").as_str()),
-        Err(e) => ans.push_str(
-            format!(
-                "<ExtractEFIDataError: {} (offset: {}; buflen: {})>",
-                e,
-                offset,
-                bytes.len()
-            )
-            .as_str(),
-        ),
+    if let Some(a) = try_read_answer::<T>(question_header, bytes, ans) {
+        ans.push_str(format!("{a}").as_str());
+        true
+    } else {
+        false
     }
 }
 
 // utility function for OneOfOptions
 fn try_read_answer_as_option<T>(
     question_header: &QuestionHeader,
-    bytes: &Vec<u8>,
-    chosen_value: &mut u64,
-) where
-    T: BinRead + Display + Into<u64>,
+    bytes: &[u8],
+    ans: &mut String,
+) -> Option<u64>
+where
+    T: BinRead + Into<u64>,
     for<'a> <T as BinRead>::Args<'a>: Default,
 {
-    let extracted_data: Result<T> = extract_efi_data(question_header.var_store_info, bytes);
-    if let Ok(a) = extracted_data {
-        *chosen_value = a.into();
+    try_read_answer::<T>(question_header, bytes, ans).map(Into::into)
+}
+
+/// Returns the answer at the question's VarOffset, or appends why it cannot be read to `ans`.
+fn try_read_answer<T>(question_header: &QuestionHeader, bytes: &[u8], ans: &mut String) -> Option<T>
+where
+    T: BinRead,
+    for<'a> <T as BinRead>::Args<'a>: Default,
+{
+    let offset = question_header.var_store_info;
+    let extracted_data: Result<T> = extract_efi_data(offset, bytes);
+    match extracted_data {
+        Ok(a) => Some(a),
+        Err(e) => {
+            let len = bytes.len();
+            ans.push_str(&format!(
+                "<ExtractEFIDataError: {e} (offset: {offset}; buflen: {len})>"
+            ));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod question_value_tests {
+    use super::ifr_fixtures::*;
+    use super::*;
+
+    const BIT_FIELD_NOT_DECODED: &str = "<ValueUnavailable: EDKII bit-field value not decoded>";
+
+    #[test]
+    fn readable_checkbox_shows_no_default() {
+        assert_eq!(
+            answer(&[], CHECKBOX, &checkbox(0, 0x01), &[], mem_var_store(&[0])),
+            "0",
+            "readable CHECKBOX"
+        );
+    }
+
+    #[test]
+    fn checkbox_past_var_store_shows_bracketed_error_and_default() {
+        assert_eq!(
+            answer(&[], CHECKBOX, &checkbox(1, 0x01), &[], mem_var_store(&[0])),
+            "<ExtractEFIDataError: failed to fill whole buffer (offset: 1; buflen: 5)> \
+             <IFR default: 1>",
+            "CHECKBOX past its VarStore"
+        );
+    }
+
+    fn one_of_value(
+        data: &[u8],
+        children: &[Vec<u8>],
+        var_store: Result<Box<dyn VariableStore>>,
+    ) -> String {
+        answer(&[], ONE_OF, data, children, var_store)
+    }
+
+    /// A UINT8 ONE_OF of options Disabled (0) and Enabled (1) whose
+    /// manufacturing EFI_IFR_DEFAULT (DefaultId 1) has Value 0.
+    fn uint8_one_of(offset: u16) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let data = [&question_header(offset)[..], &[0x00, 0x00, 0x01, 0x01]].concat();
+        let children = vec![
+            one_of_option(5, 0x00, &[0]),
+            one_of_option(6, 0x00, &[1]),
+            ifr_default(0x0001, 0),
+        ];
+        (data, children)
+    }
+
+    #[test]
+    fn one_of_storing_all_ones_shows_that_option() {
+        let data = [
+            &question_header(0)[..],
+            &[0x03],                 // Flags: UINT64
+            &0u64.to_le_bytes(),     // MinValue
+            &u64::MAX.to_le_bytes(), // MaxValue
+            &1u64.to_le_bytes(),     // Step
+        ]
+        .concat();
+        let children = [
+            one_of_option(5, 0x03, &0u64.to_le_bytes()),
+            one_of_option(7, 0x03, &u64::MAX.to_le_bytes()),
+            ifr_default(0x0000, 0),
+        ];
+
+        let got = one_of_value(&data, &children, mem_var_store(&u64::MAX.to_le_bytes()));
+
+        assert_eq!(got, "AllOnes", "ONE_OF storing all ones");
+    }
+
+    /// The DefaultId (1 = Enabled) is not a value, and nothing is shown as
+    /// the current value when it cannot be read.
+    #[test]
+    fn one_of_past_var_store_shows_extraction_error() {
+        let (data, children) = uint8_one_of(8);
+        let declarations = [default_store(0x0000), default_store(0x0001)];
+        let var_store = mem_var_store(&[1; 8]);
+
+        let got = answer(&declarations, ONE_OF, &data, &children, var_store);
+
+        assert_eq!(
+            got,
+            "<ExtractEFIDataError: failed to fill whole buffer (offset: 8; buflen: 12)> \
+             <IFR default (DefaultId 0x0001): Disabled>",
+            "ONE_OF past its VarStore"
+        );
+    }
+
+    #[test]
+    fn one_of_without_var_store_shows_only_the_reason() {
+        let (data, children) = uint8_one_of(0);
+
+        let got = one_of_value(&data, &children, unavailable());
+
+        assert_eq!(got, UNAVAILABLE, "ONE_OF without VarStore");
+    }
+
+    #[test]
+    fn one_of_shows_stored_option() {
+        let (data, children) = uint8_one_of(7);
+
+        let got = one_of_value(&data, &children, mem_var_store(&[0, 0, 0, 0, 0, 0, 0, 1]));
+
+        assert_eq!(got, "Enabled", "ONE_OF storing option 1");
+    }
+
+    /// A ONE_OF answers the option whose value, decoded as defaults are, is the
+    /// stored one: a BOOLEAN option TRUE is 1, and an option of another Type
+    /// matches nothing, not even an unreadable value.
+    #[test]
+    fn one_of_matches_options_by_their_decoded_value() {
+        let cases = [
+            (
+                "BOOLEAN options",
+                vec![one_of_option(5, 0x04, &[0]), one_of_option(6, 0x04, &[1])],
+                mem_var_store(&[1]),
+                "Enabled",
+            ),
+            (
+                "DATE option before a UINT8 option of 0",
+                vec![one_of_option(5, 0x06, &[0]), one_of_option(6, 0x00, &[0])],
+                mem_var_store(&[0]),
+                "Enabled",
+            ),
+            (
+                "DATE option without a current value",
+                vec![one_of_option(5, 0x06, &[0])],
+                unavailable(),
+                UNAVAILABLE,
+            ),
+        ];
+        for (name, children, var_store, want) in cases {
+            assert_eq!(
+                answer(&[], ONE_OF, &one_of_data(), &children, var_store),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_of_shows_default_only_without_current_value() {
+        let children = [
+            one_of_option(5, 0x00, &[0]),
+            one_of_option(6, 0x00, &[1]),
+            ifr_default(0x0000, 1),
+        ];
+
+        assert_eq!(
+            one_of_default(&[], &children),
+            format!("{UNAVAILABLE} <IFR default: Enabled>"),
+            "unreadable ONE_OF"
+        );
+        assert_eq!(
+            answer(&[], ONE_OF, &one_of_data(), &children, mem_var_store(&[0])),
+            "Disabled",
+            "readable ONE_OF"
+        );
+    }
+
+    #[test]
+    fn one_of_default_without_option_shows_its_value() {
+        let children = [one_of_option(5, 0x00, &[0]), ifr_default(0x0000, 7)];
+
+        assert_eq!(
+            one_of_default(&[], &children),
+            format!("{UNAVAILABLE} <IFR default: 7 (no matching option)>"),
+            "ONE_OF default without option"
+        );
+    }
+
+    /// A ONE_OF default is cut to the ONE_OF's width before it is matched to an
+    /// option, and a CHECKBOX has only FALSE and TRUE (UEFI 2.10 §33.3.8.3.9).
+    #[test]
+    fn one_of_and_checkbox_defaults_are_cut_to_question_values() {
+        // Type UINT16, Value 0x0101 and 0x0107
+        let uint16_default = |value: u16| {
+            let data = [&[0x00, 0x00, 0x01][..], &value.to_le_bytes()].concat();
+            operation(DEFAULT, false, &data)
+        };
+        let options = || vec![one_of_option(5, 0x00, &[0]), one_of_option(6, 0x00, &[1])];
+        let cases = [
+            (
+                "UINT16 default of a UINT8 ONE_OF",
+                ONE_OF,
+                one_of_data(),
+                [options(), vec![uint16_default(0x0101)]].concat(),
+                " <IFR default: Enabled>",
+            ),
+            (
+                "UINT16 default of a UINT8 ONE_OF without its option",
+                ONE_OF,
+                one_of_data(),
+                [options(), vec![uint16_default(0x0107)]].concat(),
+                " <IFR default: 7 (no matching option)>",
+            ),
+            (
+                "ONES default of a UINT8 ONE_OF",
+                ONE_OF,
+                one_of_data(),
+                vec![
+                    one_of_option(5, 0x00, &[0]),
+                    one_of_option(7, 0x00, &[0xFF]),
+                    ifr_default_2(0x0000, ifr_ones()),
+                ],
+                " <IFR default: AllOnes>",
+            ),
+            (
+                "ONES default of a CHECKBOX",
+                CHECKBOX,
+                checkbox(0, 0x00),
+                vec![ifr_default_2(0x0000, ifr_ones())],
+                " <IFR default: 1>",
+            ),
+            (
+                "UINT8 2 default of a CHECKBOX",
+                CHECKBOX,
+                checkbox(0, 0x00),
+                vec![ifr_default(0x0000, 2)],
+                " <IFR default: 1>",
+            ),
+        ];
+        for (name, op_code, data, children, suffix) in cases {
+            assert_eq!(
+                answer(&[], op_code, &data, &children, unavailable()),
+                format!("{UNAVAILABLE}{suffix}"),
+                "{name}"
+            );
+        }
+    }
+
+    /// Fails every read with an error other than a short read.
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    impl Seek for FailingReader {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn default_value_read_failure_other_than_short_read_is_an_error() {
+        let short = default_value_parser(
+            &mut Cursor::new(&[0x00][..]),
+            binrw::Endian::Little,
+            (0x01,),
+        );
+        let failed = default_value_parser(&mut FailingReader, binrw::Endian::Little, (0x00,));
+
+        assert!(
+            matches!(short, Ok(IfrDefaultValue::Missing)),
+            "short read: {short:?}"
+        );
+        assert!(
+            matches!(
+                &failed,
+                Err(binrw::Error::Io(error)) if error.kind() == std::io::ErrorKind::Other
+            ),
+            "failed read: {failed:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_shows_default_only_without_current_value() {
+        let data = uint8_numeric(0x10, 0, 10);
+        let children = [ifr_default(0x0000, 5)];
+
+        assert_eq!(
+            answer(&[], NUMERIC, &data, &children, unavailable()),
+            format!("{UNAVAILABLE} <IFR default: 5>"),
+            "unreadable NUMERIC"
+        );
+        assert_eq!(
+            answer(&[], NUMERIC, &data, &children, mem_var_store(&[7])),
+            "7",
+            "readable NUMERIC"
+        );
+    }
+
+    #[test]
+    fn signed_numeric_default_is_signed() {
+        let got = answer(
+            &[],
+            NUMERIC,
+            &uint8_numeric(0x00, 0xFB, 5),
+            &[ifr_default(0x0000, 0xFF)],
+            unavailable(),
+        );
+
+        assert_eq!(
+            got,
+            format!("{UNAVAILABLE} <IFR default: -1>"),
+            "signed UINT8 NUMERIC"
+        );
+    }
+
+    #[test]
+    fn signed_uint16_numeric_default_is_signed() {
+        let data = [
+            &question_header(0)[..],
+            &[0x01],                 // Flags: UINT16, EFI_IFR_DISPLAY_INT_DEC
+            &(-10i16).to_le_bytes(), // MinValue
+            &10i16.to_le_bytes(),    // MaxValue
+            &1u16.to_le_bytes(),     // Step
+        ]
+        .concat();
+        // Type UINT16, Value 0xFFFE
+        let default = operation(DEFAULT, false, &[0x00, 0x00, 0x01, 0xFE, 0xFF]);
+
+        let got = answer(&[], NUMERIC, &data, &[default], unavailable());
+
+        assert_eq!(
+            got,
+            format!("{UNAVAILABLE} <IFR default: -2>"),
+            "signed UINT16 NUMERIC"
+        );
+    }
+
+    #[test]
+    fn unsigned_numeric_default_is_cut_to_question_size() {
+        // Type UINT16, Value 0x01FF
+        let default = operation(DEFAULT, false, &[0x00, 0x00, 0x01, 0xFF, 0x01]);
+
+        let got = answer(
+            &[],
+            NUMERIC,
+            &uint8_numeric(0x10, 0, 10),
+            &[default],
+            unavailable(),
+        );
+
+        assert_eq!(
+            got,
+            format!("{UNAVAILABLE} <IFR default: 255>"),
+            "UINT16 default of a UINT8 NUMERIC"
+        );
+    }
+
+    /// The answer of a NUMERIC with `flags`, Range UINT32 0..=300 and a UINT32
+    /// standard default of `default`, in the scope of an EFI_IFR_GUID of `guid`.
+    fn numeric_in_guid_answer(guid: [u8; 16], flags: u8, default: u32) -> String {
+        answer_in_guid(
+            guid,
+            NUMERIC,
+            &uint32_range_question(0, flags),
+            &[uint32_default(0x0000, default)],
+            unavailable(),
+        )
+    }
+
+    /// A bit-field default is cut to the width in EDKII_IFR_NUMERIC_SIZE_BIT, 1 to 32, and
+    /// EDKII_IFR_DISPLAY_INT_DEC_BIT signs it as a UINT32.
+    #[test]
+    fn bit_field_numeric_default_has_edkii_width_and_display() {
+        let cases = [
+            (
+                "12-bit UINT_DEC",
+                BIT_VARSTORE_GUID,
+                0x4C,
+                200,
+                " <IFR default: 200>",
+            ),
+            (
+                "8-bit INT_DEC all ones",
+                BIT_VARSTORE_GUID,
+                0x08,
+                0xFF,
+                " <IFR default: 255>",
+            ),
+            (
+                "12-bit UINT_DEC all ones",
+                BIT_VARSTORE_GUID,
+                0x4C,
+                0xFFF,
+                " <IFR default: 4095>",
+            ),
+            (
+                "12-bit UINT_HEX all ones",
+                BIT_VARSTORE_GUID,
+                0x8C,
+                0xFFF,
+                " <IFR default: 4095>",
+            ),
+            (
+                "12-bit INT_DEC all ones",
+                BIT_VARSTORE_GUID,
+                0x0C,
+                0xFFF,
+                " <IFR default: 4095>",
+            ),
+            (
+                "12-bit INT_DEC over 2047",
+                BIT_VARSTORE_GUID,
+                0x0C,
+                3000,
+                " <IFR default: 3000>",
+            ),
+            (
+                "32-bit INT_DEC all ones",
+                BIT_VARSTORE_GUID,
+                0x20,
+                u32::MAX,
+                " <IFR default: -1>",
+            ),
+            (
+                "zero width",
+                BIT_VARSTORE_GUID,
+                0x40,
+                1,
+                " <IFR default: unknown (EDKII bit-field width 0, not 1 to 32)>",
+            ),
+            (
+                "33-bit width",
+                BIT_VARSTORE_GUID,
+                0x61,
+                1,
+                " <IFR default: unknown (EDKII bit-field width 33, not 1 to 32)>",
+            ),
+            // Flags 0x00: UINT8 INT_DEC
+            ("other GUID", OTHER_GUID, 0x00, 0xC8, " <IFR default: -56>"),
+        ];
+        for (name, guid, flags, default, suffix) in cases {
+            assert_eq!(
+                numeric_in_guid_answer(guid, flags, default),
+                format!("{UNAVAILABLE}{suffix}"),
+                "{name}"
+            );
+        }
+    }
+
+    /// show-ifr does not decode a readable EDKII bit varstore field either.
+    #[test]
+    fn show_ifr_answer_of_bit_field_is_not_decoded() {
+        let store = || mem_var_store(&[0x00, 0x00, 0x00, 0x01]);
+        for (guid, want) in [
+            (BIT_VARSTORE_GUID, BIT_FIELD_NOT_DECODED),
+            (OTHER_GUID, "1"),
+        ] {
+            let (_root, node) = parse_question_in_guid(guid, CHECKBOX, &checkbox(3, 0x00), &[]);
+            let question = node.borrow();
+            let ParsedOperation::CheckBox(parsed) = &question.parsed_data else {
+                panic!("not a CHECKBOX: {:?}", question.parsed_data);
+            };
+
+            let got = display_answer::<u8>(&question, &parsed.question_header(), &store());
+
+            assert_eq!(got, want, "GUID {guid:02X?}");
+        }
+    }
+
+    /// An unmatched ONE_OF default is the number that its Flags, those of a NUMERIC (UEFI
+    /// 2.10 §33.3.8.3.50), display, as for a NUMERIC default.
+    #[test]
+    fn unmatched_one_of_default_is_displayed_as_its_flags_say() {
+        let cases = [
+            (
+                "12-bit INT_DEC over 2047",
+                BIT_VARSTORE_GUID,
+                0x0C,
+                3000,
+                "3000",
+            ),
+            (
+                "12-bit INT_DEC all ones",
+                BIT_VARSTORE_GUID,
+                0x0C,
+                u32::MAX,
+                "4095",
+            ),
+            (
+                "32-bit INT_DEC all ones",
+                BIT_VARSTORE_GUID,
+                0x20,
+                u32::MAX,
+                "-1",
+            ),
+            (
+                "32-bit UINT_DEC all ones",
+                BIT_VARSTORE_GUID,
+                0x60,
+                u32::MAX,
+                "4294967295",
+            ),
+            // Flags 0x02: UINT32 INT_DEC; 0x12: UINT32 UINT_DEC
+            ("UINT32 INT_DEC all ones", OTHER_GUID, 0x02, u32::MAX, "-1"),
+            (
+                "UINT32 UINT_DEC all ones",
+                OTHER_GUID,
+                0x12,
+                u32::MAX,
+                "4294967295",
+            ),
+        ];
+        for (name, guid, flags, default, number) in cases {
+            let children = [
+                one_of_option(5, 0x02, &0u32.to_le_bytes()),
+                uint32_default(0x0000, default),
+            ];
+            assert_eq!(
+                answer_in_guid(
+                    guid,
+                    ONE_OF,
+                    &uint32_range_question(0, flags),
+                    &children,
+                    unavailable()
+                ),
+                format!("{UNAVAILABLE} <IFR default: {number} (no matching option)>"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A readable EDKII bit varstore field's stored value is not decoded, and its
+    /// default is shown, as for any value that cannot be read.
+    #[test]
+    fn readable_bit_field_question_shows_its_default() {
+        let store = || mem_var_store(&[0x00, 0xC8, 0x0C, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let one_of_children = || {
+            vec![
+                one_of_option(5, 0x02, &0u32.to_le_bytes()),
+                one_of_option(6, 0x02, &1u32.to_le_bytes()),
+            ]
+        };
+        let cases = [
+            (
+                "12-bit UINT_DEC NUMERIC",
+                NUMERIC,
+                uint32_range_question(4, 0x4C),
+                vec![uint32_default(0x0000, 200)],
+                " <IFR default: 200>",
+            ),
+            (
+                "CHECKBOX",
+                CHECKBOX,
+                checkbox(4, 0x01),
+                vec![],
+                " <IFR default: 1>",
+            ),
+            (
+                "2-bit UINT_DEC ONE_OF",
+                ONE_OF,
+                uint32_range_question(4, 0x42),
+                [one_of_children(), vec![uint32_default(0x0000, 1)]].concat(),
+                " <IFR default: Enabled>",
+            ),
+            (
+                "2-bit ONE_OF default cut to its width",
+                ONE_OF,
+                uint32_range_question(4, 0x42),
+                [one_of_children(), vec![uint32_default(0x0000, 0b101)]].concat(),
+                " <IFR default: Enabled>",
+            ),
+        ];
+        for (name, op_code, data, children, suffix) in cases {
+            assert_eq!(
+                answer_in_guid(BIT_VARSTORE_GUID, op_code, &data, &children, store()),
+                format!("{BIT_FIELD_NOT_DECODED}{suffix}"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A ONE_OF bit field of width 33 shows its default as unknown for its width.
+    #[test]
+    fn one_of_bit_field_width_33_default_is_unknown() {
+        let reason = "EDKII bit-field width 33, not 1 to 32";
+        let cases = [(
+            "constant DEFAULT",
+            uint32_default(0x0000, 1),
+            format!("{UNAVAILABLE} <IFR default: unknown ({reason})>"),
+        )];
+        for (name, default, want) in cases {
+            assert_eq!(
+                answer_in_guid(
+                    BIT_VARSTORE_GUID,
+                    ONE_OF,
+                    // Flags: EDKII_IFR_DISPLAY_UINT_DEC_BIT, width 33
+                    &uint32_range_question(0, 0x61),
+                    &[default],
+                    unavailable()
+                ),
+                want,
+                "{name}"
+            );
+        }
     }
 }
 
 // display returns a String which is our tree like representation of a Forms package
+// TODO: show the default of an unreadable OneOf, Numeric or CheckBox, as list_questions does.
 pub fn display(
     node: Rc<RefCell<IFROperation>>,
     level: usize,
@@ -1907,35 +2741,15 @@ pub fn display(
         ),
 
         ParsedOperation::OneOf(parsed) => {
-            let mut answer_disp = String::new();
-
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
-
-            match varstore {
-                Err(e) => {
-                    answer_disp.push_str(format!("<VarStoreError: {}>", e).as_str());
-                }
-                Ok(vstore) => match vstore.read_bytes() {
-                    Err(e) => {
-                        answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
-                    },
-                    Ok(bytes) => match &parsed.data {
-                        Range::Range8(_) => {
-                            try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer_disp);
-                        }
-                        Range::Range16(_) => {
-                            try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer_disp);
-                        }
-                        Range::Range32(_) => {
-                            try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer_disp);
-                        }
-                        Range::Range64(_) => {
-                            try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer_disp);
-                        }
-                    },
-                }
-            }
+            let header = parsed.question_header();
+            let answer_disp = match &parsed.data {
+                Range::Range8(_) => display_answer::<u8>(&current_node, &header, &varstore),
+                Range::Range16(_) => display_answer::<u16>(&current_node, &header, &varstore),
+                Range::Range32(_) => display_answer::<u32>(&current_node, &header, &varstore),
+                Range::Range64(_) => display_answer::<u64>(&current_node, &header, &varstore),
+            };
 
             result.push_str(
                 format!(
@@ -1955,34 +2769,15 @@ pub fn display(
             );
         }
         ParsedOperation::Numeric(parsed) => {
-            let mut answer_disp = String::new();
-
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
-                match varstore {
-                    Err(e) => {
-						answer_disp.push_str(format!("<VarStoreError: {}>", e).as_str());
-                    }
-                    Ok(vstore) => match vstore.read_bytes() {
-                        Err(e) => {
-							answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
-                        }
-                        Ok(bytes) => match &parsed.data {
-                            Range::Range8(_) => {
-                                try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer_disp);
-                            }
-                            Range::Range16(_) => {
-                                try_read_answer_as_string::<u16>(&parsed.question_header(), &bytes, &mut answer_disp);
-                            }
-                            Range::Range32(_) => {
-                                try_read_answer_as_string::<u32>(&parsed.question_header(), &bytes, &mut answer_disp);
-                            }
-                            Range::Range64(_) => {
-                                try_read_answer_as_string::<u64>(&parsed.question_header(), &bytes, &mut answer_disp);
-                            }
-                        },
-                },
-            }
+            let header = parsed.question_header();
+            let answer_disp = match &parsed.data {
+                Range::Range8(_) => display_answer::<u8>(&current_node, &header, &varstore),
+                Range::Range16(_) => display_answer::<u16>(&current_node, &header, &varstore),
+                Range::Range32(_) => display_answer::<u32>(&current_node, &header, &varstore),
+                Range::Range64(_) => display_answer::<u64>(&current_node, &header, &varstore),
+            };
 
             result.push_str(
                 format!(
@@ -2002,25 +2797,11 @@ pub fn display(
             );
         }
         ParsedOperation::CheckBox(parsed) => {
-            let mut answer_disp = String::new();
-
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
-
-                match varstore {
-                    Err(e) => {
-						answer_disp.push_str(format!("<VarStoreError: {}>", e).as_str());
-                    }
-                    Ok(vstore) => match vstore.read_bytes() {
-                        Err(e) => {
-							answer_disp.push_str(format!("<VStoreError: {}>", e).as_str());
-                        },
-                        Ok(bytes) => {
-                            // for a checkbox size should be of type u8
-                            try_read_answer_as_string::<u8>(&parsed.question_header(), &bytes, &mut answer_disp);
-                        }
-                    }
-            }
+            // for a checkbox size should be of type u8
+            let answer_disp =
+                display_answer::<u8>(&current_node, &parsed.question_header(), &varstore);
 
             result.push_str(
                 format!(
@@ -2052,6 +2833,26 @@ pub fn display(
     Ok(result)
 }
 
+/// Returns the answer that show-ifr shows: the question's value as `T`, or why it cannot be read.
+fn display_answer<T>(
+    question: &IFROperation,
+    question_header: &QuestionHeader,
+    varstore: &Result<Box<dyn VariableStore>>,
+) -> String
+where
+    T: BinRead + Display,
+    for<'a> <T as BinRead>::Args<'a>: Default,
+{
+    let mut answer = String::new();
+    match read_question_bytes(question, varstore) {
+        Err(reason) => answer.push_str(&reason),
+        Ok(bytes) => {
+            try_read_answer_as_string::<T>(question_header, &bytes, &mut answer);
+        }
+    }
+    answer
+}
+
 #[derive(Error, Debug)]
 pub enum ChangeValueError {
     #[error("provided value did not match any possible option")]
@@ -2062,6 +2863,8 @@ pub enum ChangeValueError {
     BelowMinValue,
     #[error("numeric question has an invalid range")]
     InvalidNumericRange,
+    #[error("setting EDKII bit-field values is not supported")]
+    UnsupportedBitField,
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -2071,6 +2874,10 @@ pub fn change_value(
     question: &QuestionDescriptor,
     new_value: &str,
 ) -> Result<bool, ChangeValueError> {
+    // writes take VarOffset in bytes
+    if question.refers_to_bit_field {
+        return Err(ChangeValueError::UnsupportedBitField);
+    }
     let mut changed = false;
     if let Some(varstore) = &question.varstore {
         if question.opcode == IFROpCode::OneOf {
@@ -2150,7 +2957,7 @@ pub fn change_value(
     Ok(changed)
 }
 
-fn find_corresponding_string(string_id: u16, string_packages: &Vec<HashMap<i32, String>>) -> &str {
+fn find_corresponding_string(string_id: u16, string_packages: &[HashMap<i32, String>]) -> &str {
     // TODO: accept language pack parameter later
     // it defaults to the first language pack it can find and the first one is en-US
 
@@ -2228,7 +3035,7 @@ fn find_corresponding_varstore(
 
 /// extract_efi_data extracts data of type T at given offset from efivar bytes.
 /// The `T` type here is used to get the type (and thus size) of our answer.
-fn extract_efi_data<T>(offset: u16, bytes: &Vec<u8>) -> Result<T>
+fn extract_efi_data<T>(offset: u16, bytes: &[u8]) -> Result<T>
 where
     T: BinRead,
     for<'a> <T as BinRead>::Args<'a>: Default,
@@ -2435,6 +3242,7 @@ mod tests {
 
 #[cfg(test)]
 mod write_validation_tests {
+    use super::ifr_fixtures::*;
     use super::*;
 
     type RecordedWrites = Rc<RefCell<Vec<(u16, TypeValue)>>>;
@@ -2473,6 +3281,15 @@ mod write_validation_tests {
             self.writes.borrow_mut().push((offset, data));
             Ok(())
         }
+    }
+
+    fn recording_store() -> (Result<Box<dyn VariableStore>>, RecordedWrites) {
+        let writes = RecordedWrites::default();
+        let store = RecordingVarStore {
+            bytes: vec![0; EFIVARFS_HEADER_SIZE + 42],
+            writes: Rc::clone(&writes),
+        };
+        (Ok(Box::new(store)), writes)
     }
 
     fn numeric_question(
@@ -2552,8 +3369,8 @@ mod write_validation_tests {
             Ok(Box::new(store)),
             &parsed,
             "Numeric test",
-            &Vec::new(),
             &node.borrow(),
+            &mut FormPackageWalk::new(&[]),
         );
         (question, writes)
     }
@@ -2676,6 +3493,73 @@ mod write_validation_tests {
                 Err(ChangeValueError::InvalidNumericRange)
             ));
             assert!(writes.borrow().is_empty());
+        }
+    }
+
+    /// set refuses an EDKII bit varstore field, with or without a VarStore, and writes nothing.
+    #[test]
+    fn bit_field_question_is_not_set() {
+        let one_of_children = vec![
+            one_of_option(5, 0x02, &0u32.to_le_bytes()),
+            one_of_option(6, 0x02, &1u32.to_le_bytes()),
+        ];
+        let cases = [
+            (
+                "18-bit NUMERIC",
+                NUMERIC,
+                uint32_range_question(12, 0x52),
+                vec![],
+                "5",
+                (12, TypeValue::NumSize32(5)),
+            ),
+            (
+                "CHECKBOX",
+                CHECKBOX,
+                checkbox(3, 0x00),
+                vec![],
+                "1",
+                (3, TypeValue::NumSize8(1)),
+            ),
+            (
+                "2-bit ONE_OF",
+                ONE_OF,
+                uint32_range_question(8, 0x42),
+                one_of_children,
+                "Enabled",
+                (8, TypeValue::NumSize32(1)),
+            ),
+        ];
+        for (name, op_code, data, children, value, write) in cases {
+            let set = |guid, var_store| {
+                let (_root, node) = parse_question_in_guid(guid, op_code, &data, &children);
+                change_value(&question_descriptor(&node, var_store), value)
+            };
+
+            let (store, writes) = recording_store();
+            let changed = set(BIT_VARSTORE_GUID, store);
+            assert!(
+                matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
+                "{name}, GUID {BIT_VARSTORE_GUID:02X?}: {changed:?}"
+            );
+            assert!(
+                writes.borrow().is_empty(),
+                "{name}, GUID {BIT_VARSTORE_GUID:02X?}"
+            );
+
+            let changed = set(BIT_VARSTORE_GUID, unavailable());
+            assert!(
+                matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
+                "{name}, GUID {BIT_VARSTORE_GUID:02X?} without VarStore: {changed:?}"
+            );
+
+            let other_guid = OTHER_GUID;
+            let (store, writes) = recording_store();
+            let changed = set(other_guid, store);
+            assert!(
+                matches!(changed, Ok(true)),
+                "{name}, GUID {other_guid:02X?}: {changed:?}"
+            );
+            assert_eq!(*writes.borrow(), [write], "{name}, GUID {other_guid:02X?}");
         }
     }
 }

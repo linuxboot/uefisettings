@@ -13,8 +13,11 @@
 //! A guest whose firmware runs DriverSample from a `Driver####` load option without first
 //! creating its variable, so DriverSample creates it without runtime access and Linux does
 //! not see it: the questions on it are unavailable and cannot be set.
+//! Their answers end with the default that their IFR declares.
 
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
+use uefisettings_qemu_guest::driver_sample::NUMERIC;
+use uefisettings_qemu_guest::driver_sample::ONE_OF;
 use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
@@ -22,7 +25,27 @@ use uefisettings_qemu_guest::variable_data;
 use uefisettings_qemu_guest::Question;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
-use uefisettings_qemu_guest::UNAVAILABLE;
+
+/// Why the HII backend cannot read the questions on DriverSample's variable
+/// (`src/lib/hii/forms.rs`).
+const NO_CONFIG_ACCESS: &str =
+    "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
+
+/// The answer of [`CHECK_BOX`], whose listings are both flagged `CHECKBOX_DEFAULT` in
+/// DriverSample's Vfr.vfr.
+fn check_box_answer() -> String {
+    format!("{NO_CONFIG_ACCESS} <IFR default: 1>")
+}
+
+/// The answers that `hii list-questions` gives for the questions named `name`.
+fn listed_answers(name: &str) -> Vec<String> {
+    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
+    questions
+        .into_iter()
+        .filter(|question| question.name == name)
+        .map(|question| question.answer)
+        .collect()
+}
 
 #[test]
 fn driver_sample_variable_is_not_visible() {
@@ -31,24 +54,29 @@ fn driver_sample_variable_is_not_visible() {
 
 #[test]
 fn list_questions_reports_the_check_box_as_unavailable() {
-    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
-    let listed: Vec<&Question> = questions
-        .iter()
-        .filter(|question| question.name == CHECK_BOX)
-        .collect();
-    assert!(
-        listed.len() == 2
-            && listed
-                .iter()
-                .all(|question| question.answer.starts_with(UNAVAILABLE)),
-        "{listed:#?}"
+    assert_eq!(
+        listed_answers(CHECK_BOX),
+        [check_box_answer(), check_box_answer()]
     );
+}
+
+#[test]
+fn list_questions_reports_numeric_and_one_of_defaults() {
+    // The standard defaults in DriverSample's Vfr.vfr: `default = 18` and the option
+    // flagged DEFAULT.
+    for (name, default) in [(NUMERIC, "18"), (ONE_OF, "My one-of text #2")] {
+        assert_eq!(
+            listed_answers(name),
+            [format!("{NO_CONFIG_ACCESS} <IFR default: {default}>")],
+            "{name}"
+        );
+    }
 }
 
 #[test]
 fn get_reports_the_check_box_as_unavailable() {
     let (got, _) = single_response(&["hii", "get", CHECK_BOX, "--json"], BACKEND_HII);
-    assert!(got.answer.starts_with(UNAVAILABLE), "{got:#?}");
+    assert_eq!(got.answer, check_box_answer(), "{got:#?}");
 }
 
 #[test]
