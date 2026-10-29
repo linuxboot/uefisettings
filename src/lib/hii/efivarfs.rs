@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::fmt;
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -22,7 +23,36 @@ use nix::mount::mount;
 use nix::mount::MsFlags;
 use proc_mounts::MountIter;
 
-const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
+use crate::hii::package::Guid;
+
+pub(super) const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
+
+/// `<name>-<lowercase GUID>` with '!' for each '/', as Linux v7.2 fs/efivarfs/vars.c
+/// efivar_get_utf8name() names a variable's file: always exactly one path component.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct EfivarFileName(String);
+
+impl EfivarFileName {
+    pub(super) fn new(name: &str, guid: Guid) -> Self {
+        Self(format!(
+            "{}-{}",
+            name.replace('/', "!"),
+            guid.to_string().to_ascii_lowercase()
+        ))
+    }
+}
+
+impl AsRef<Path> for EfivarFileName {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl fmt::Display for EfivarFileName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 pub struct EfivarsMountGuard {
     original_flags: MsFlags,
@@ -135,10 +165,43 @@ fn to_ms_flags(options: &[String]) -> MsFlags {
 
 #[cfg(test)]
 pub mod tests {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
     use anyhow::Context;
     use anyhow::Result;
 
     use super::*;
+
+    const EFI_GLOBAL_VARIABLE: Guid = Guid {
+        data1: 0x8BE4_DF61,
+        data2: 0x93CA,
+        data3: 0x11D2,
+        data4: [0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
+    };
+
+    #[test]
+    fn efivar_file_name_is_one_path_component() {
+        for (name, expected) in [
+            ("Setup", "Setup-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            ("a/b", "a!b-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            ("../x", "..!x-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            ("/etc/x", "!etc!x-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            ("..", "..-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            ("", "-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+        ] {
+            let file_name = EfivarFileName::new(name, EFI_GLOBAL_VARIABLE);
+            let path: &Path = file_name.as_ref();
+
+            assert_eq!(file_name.to_string(), expected, "VarStore name {name:?}");
+            assert_eq!(
+                path.components().collect::<Vec<_>>(),
+                [Component::Normal(OsStr::new(expected))],
+                "VarStore name {name:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_get_current_mount_flags_not_mounted() -> Result<()> {
         assert!(

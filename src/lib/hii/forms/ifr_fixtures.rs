@@ -53,6 +53,13 @@ pub(super) const PROMPT: &str = "Prompt";
 /// The reason `unavailable()` gives.
 pub(super) const UNAVAILABLE: &str = "<ValueUnavailable: no VarStore 1>";
 
+pub(super) const NIL_GUID: Guid = Guid {
+    data1: 0,
+    data2: 0,
+    data3: 0,
+    data4: [0; 8],
+};
+
 /// Serves `payload` after the efivarfs attributes field.
 struct MemVarStore {
     payload: Vec<u8>,
@@ -63,8 +70,8 @@ impl VariableStore for MemVarStore {
         "MemVarStore".to_string()
     }
 
-    fn guid(&self) -> String {
-        "00000000-0000-0000-0000-000000000000".to_string()
+    fn guid(&self) -> Guid {
+        NIL_GUID
     }
 
     fn size(&self) -> u16 {

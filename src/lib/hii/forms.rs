@@ -21,6 +21,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::path::Path;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -36,7 +37,9 @@ use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
+use crate::hii::efivarfs::EfivarFileName;
 use crate::hii::efivarfs::EfivarsMountGuard;
+use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::package::Guid;
 use defaults::option_text;
 use defaults::push_default;
@@ -729,17 +732,13 @@ pub struct OneOfOption {
 
 trait VariableStore {
     fn name(&self) -> String;
-    fn guid(&self) -> String;
+    fn guid(&self) -> Guid;
     fn size(&self) -> u16;
     fn kind(&self) -> VariableStoreKind;
     fn is_runtime_accessible(&self) -> bool;
 
-    fn store_filename(&self) -> String {
-        format!(
-            "/sys/firmware/efi/efivars/{}-{}",
-            &self.name(),
-            &self.guid().to_ascii_lowercase()
-        )
+    fn efivar_file_name(&self) -> EfivarFileName {
+        EfivarFileName::new(&self.name(), self.guid())
     }
 
     /// extract raw bytes from UEFI using the /sys virtual filesystem
@@ -750,16 +749,18 @@ trait VariableStore {
             ));
         }
 
+        let path = Path::new(EFIVARS_MOUNT_POINT).join(self.efivar_file_name());
+
         // try to read data from varstore
-        let mut file = File::open(self.store_filename()).context(format!(
+        let mut file = File::open(&path).context(format!(
             "failed to open sysfs efivars '{}' to get varstore bytes",
-            self.store_filename()
+            path.display()
         ))?;
         debug!("buffer size: {}", self.size());
         // efivarfs prepends a 4-byte attributes field to the variable payload.
         let buf = read_efivarfs_bytes(&mut file, self.size().into()).context(format!(
             "failed to read bytes from sysfs efivars '{}' of size specified by varstore in hiidb",
-            self.store_filename()
+            path.display()
         ))?;
         Ok(buf)
     }
@@ -790,17 +791,18 @@ trait VariableStore {
         let mut lock = FileLock::new(LOCK_FILE_PATH);
         lock.lock()?;
 
-        let store_filename = self.store_filename();
+        let store_filename = Path::new(EFIVARS_MOUNT_POINT).join(self.efivar_file_name());
 
         let mut file_ro = File::open(&store_filename).context(format!(
             "Failed to open efivarfs file '{}' to get varstore bytes",
-            store_filename
+            store_filename.display()
         ))?;
 
         let mut file_contents = Vec::new();
-        file_ro
-            .read_to_end(&mut file_contents)
-            .context(format!("Failed to read efivarfs file '{}'", store_filename))?;
+        file_ro.read_to_end(&mut file_contents).context(format!(
+            "Failed to read efivarfs file '{}'",
+            store_filename.display()
+        ))?;
 
         update_efivarfs_bytes(&mut file_contents, self.size(), offset, data)?;
 
@@ -812,7 +814,7 @@ trait VariableStore {
             .context("failed to create immutability attribute guard")?;
 
         // All checks passed, now we can try to write.
-        debug!("Writing value to {}", &store_filename);
+        debug!("Writing value to {}", store_filename.display());
         File::create(&store_filename)
             .context("Failed to open efivarfs file for writing")?
             .write_all(&file_contents)
@@ -830,6 +832,9 @@ enum VariableStoreKind {
 
 #[cfg(test)]
 mod non_efi_varstore_tests {
+    use std::path::PathBuf;
+
+    use super::ifr_fixtures::NIL_GUID;
     use super::*;
 
     struct TestVariableStore {
@@ -837,7 +842,7 @@ mod non_efi_varstore_tests {
     }
 
     struct FileBackedBufferVarStore {
-        path: String,
+        path: PathBuf,
         size: u16,
     }
 
@@ -846,8 +851,8 @@ mod non_efi_varstore_tests {
             "TestVarStore".to_string()
         }
 
-        fn guid(&self) -> String {
-            "00000000-0000-0000-0000-000000000000".to_string()
+        fn guid(&self) -> Guid {
+            NIL_GUID
         }
 
         fn size(&self) -> u16 {
@@ -876,8 +881,8 @@ mod non_efi_varstore_tests {
             "TestBufferVarStore".to_string()
         }
 
-        fn guid(&self) -> String {
-            "00000000-0000-0000-0000-000000000000".to_string()
+        fn guid(&self) -> Guid {
+            NIL_GUID
         }
 
         fn size(&self) -> u16 {
@@ -892,8 +897,8 @@ mod non_efi_varstore_tests {
             false
         }
 
-        fn store_filename(&self) -> String {
-            self.path.clone()
+        fn read_bytes(&self) -> Result<Vec<u8>> {
+            read_efivarfs_bytes(&mut File::open(&self.path)?, self.size.into())
         }
     }
 
@@ -978,7 +983,7 @@ mod non_efi_varstore_tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&bytes).unwrap();
         let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(FileBackedBufferVarStore {
-            path: file.path().to_string_lossy().into_owned(),
+            path: file.path().to_path_buf(),
             size: 1,
         }));
 
@@ -989,11 +994,7 @@ mod non_efi_varstore_tests {
     fn buffer_varstore_without_efivarfs_backing_is_unavailable() {
         let directory = tempfile::tempdir().unwrap();
         let varstore: Result<Box<dyn VariableStore>> = Ok(Box::new(FileBackedBufferVarStore {
-            path: directory
-                .path()
-                .join("missing-efivarfs-variable")
-                .to_string_lossy()
-                .into_owned(),
+            path: directory.path().join("missing-efivarfs-variable"),
             size: 1,
         }));
 
@@ -1001,6 +1002,36 @@ mod non_efi_varstore_tests {
             read_current_value_bytes(&varstore).unwrap_err(),
             "<ValueUnavailable: HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
         );
+    }
+
+    #[test]
+    fn crafted_varstore_name_stays_in_efivarfs() {
+        for name in ["../T/ou", "/etc/passwd", "a/b", ".."] {
+            let var_store = VarStore {
+                guid: NIL_GUID,
+                var_store_id: 1,
+                size: 1,
+                name: name.into(),
+            };
+            let var_store_efi = VarStoreEfi {
+                var_store_id: 1,
+                guid: NIL_GUID,
+                attributes: 0x7,
+                size: 1,
+                name: name.into(),
+            };
+            for file_name in [
+                var_store.efivar_file_name(),
+                var_store_efi.efivar_file_name(),
+            ] {
+                let path = Path::new(EFIVARS_MOUNT_POINT).join(file_name);
+                assert_eq!(
+                    path.parent(),
+                    Some(Path::new(EFIVARS_MOUNT_POINT)),
+                    "VarStore name {name:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1128,8 +1159,8 @@ impl VariableStore for VarStore {
     fn name(&self) -> String {
         self.name.to_string()
     }
-    fn guid(&self) -> String {
-        self.guid.to_string()
+    fn guid(&self) -> Guid {
+        self.guid
     }
     fn size(&self) -> u16 {
         self.size
@@ -1155,8 +1186,8 @@ impl VariableStore for VarStoreEfi {
     fn name(&self) -> String {
         self.name.to_string()
     }
-    fn guid(&self) -> String {
-        self.guid.to_string()
+    fn guid(&self) -> Guid {
+        self.guid
     }
     fn size(&self) -> u16 {
         self.size
@@ -3428,8 +3459,8 @@ mod write_validation_tests {
             "NumericTest".to_string()
         }
 
-        fn guid(&self) -> String {
-            "00000000-0000-0000-0000-000000000000".to_string()
+        fn guid(&self) -> Guid {
+            NIL_GUID
         }
 
         fn size(&self) -> u16 {
