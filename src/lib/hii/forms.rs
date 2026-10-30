@@ -552,7 +552,7 @@ impl Range {
 struct NumericRange {
     minimum: i128,
     maximum: i128,
-    bits: u32,
+    format: NumericFormat,
 }
 
 impl NumericRange {
@@ -567,7 +567,7 @@ impl NumericRange {
         Self {
             minimum: format.decode(minimum),
             maximum: format.decode(maximum),
-            bits: format.bits,
+            format,
         }
     }
 
@@ -584,11 +584,21 @@ impl NumericRange {
         if value > self.maximum {
             return Err(ChangeValueError::ExceededMaxValue);
         }
-        match self.bits {
-            8 => Ok(TypeValue::NumSize8(value as u8)),
-            16 => Ok(TypeValue::NumSize16(value as u16)),
-            32 => Ok(TypeValue::NumSize32(value as u32)),
-            64 => Ok(TypeValue::NumSize64(value as u64)),
+        let stored = self
+            .format
+            .encode(value)
+            .ok_or(ChangeValueError::InvalidNumericRange)?;
+        match self.format.bits {
+            8 => Ok(TypeValue::NumSize8(
+                u8::try_from(stored).map_err(|_| ChangeValueError::InvalidNumericRange)?,
+            )),
+            16 => Ok(TypeValue::NumSize16(
+                u16::try_from(stored).map_err(|_| ChangeValueError::InvalidNumericRange)?,
+            )),
+            32 => Ok(TypeValue::NumSize32(
+                u32::try_from(stored).map_err(|_| ChangeValueError::InvalidNumericRange)?,
+            )),
+            64 => Ok(TypeValue::NumSize64(stored)),
             _ => Err(ChangeValueError::InvalidNumericRange),
         }
     }
@@ -642,6 +652,16 @@ impl NumericFormat {
     fn cut(self, value: u64) -> u64 {
         let unused = 64 - self.bits;
         value << unused >> unused
+    }
+
+    /// Returns the stored bits that decode to `value`, or None if no stored bits do.
+    fn encode(self, value: i128) -> Option<u64> {
+        let stored = match self.signed_type_bits {
+            Some(_) => i64::try_from(value).ok()?.cast_unsigned(),
+            None => u64::try_from(value).ok()?,
+        };
+        let stored = self.cut(stored);
+        (self.decode(stored) == value).then_some(stored)
     }
 
     /// Returns `value` cut to `bits` bits and, if signed, sign-extended from its type width.
@@ -5589,6 +5609,65 @@ mod write_validation_tests {
                 "{name}, GUID {other_guid:02X?}: {changed:?}"
             );
             assert_eq!(*writes.borrow(), [write], "{name}, GUID {other_guid:02X?}");
+        }
+    }
+
+    /// encode inverts decode on every stored value of both 8-bit formats, and refuses the
+    /// numbers just outside their ranges, which the `as` casts it replaced wrapped.
+    #[test]
+    fn encode_inverts_decode_at_8_bits() {
+        for signed_type_bits in [None, Some(8)] {
+            let format = NumericFormat {
+                bits: 8,
+                signed_type_bits,
+            };
+            for stored in 0..=u64::from(u8::MAX) {
+                let value = format.decode(stored);
+                assert_eq!(
+                    format.encode(value),
+                    Some(stored),
+                    "{signed_type_bits:?}, stored {stored}"
+                );
+            }
+            let outside = match signed_type_bits {
+                Some(_) => [-129, 128],
+                None => [-1, 256],
+            };
+            for value in outside {
+                assert_eq!(format.encode(value), None, "{signed_type_bits:?}, {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_covers_64_bits() {
+        let unsigned = NumericFormat {
+            bits: 64,
+            signed_type_bits: None,
+        };
+        let signed = NumericFormat {
+            bits: 64,
+            signed_type_bits: Some(64),
+        };
+        let cases = [
+            (
+                "unsigned u64::MAX",
+                unsigned,
+                i128::from(u64::MAX),
+                Some(u64::MAX),
+            ),
+            ("unsigned -1", unsigned, -1, None),
+            (
+                "signed i64::MIN",
+                signed,
+                i128::from(i64::MIN),
+                Some(1 << 63),
+            ),
+            ("signed -1", signed, -1, Some(u64::MAX)),
+            ("signed u64::MAX", signed, i128::from(u64::MAX), None),
+        ];
+        for (name, format, value, want) in cases {
+            assert_eq!(format.encode(value), want, "{name}");
         }
     }
 }
