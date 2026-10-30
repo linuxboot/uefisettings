@@ -12,3 +12,4 @@ hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii,hii_wri
 hii-reserved	/DriverSample.efi;/publish-hiidb.efi reserved	my-ifr-nv-data.json	hii
 hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard
 hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access
+hii-global-variables	/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables

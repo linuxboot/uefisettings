@@ -155,6 +155,15 @@ pub(super) fn read_efivarfs_bytes<R: Read>(reader: &mut R, payload_size: usize) 
     Ok(bytes)
 }
 
+/// The attribute word of efivar file bytes, which Linux v7.2 fs/efivarfs/file.c
+/// efivarfs_file_read() copies as a native u32 before the payload; None for fewer bytes.
+pub(super) fn efivar_attributes(bytes: &[u8]) -> Option<u32> {
+    bytes
+        .first_chunk::<EFIVARFS_HEADER_SIZE>()
+        .copied()
+        .map(u32::from_ne_bytes)
+}
+
 /// Reads the efivar file `name` in `dir`: its attributes field and `size` payload bytes.
 fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Result<Vec<u8>> {
     let mut file = open_efivar(dir, name)?;
@@ -418,6 +427,19 @@ pub mod tests {
         data3: 0x11D2,
         data4: [0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
     };
+
+    #[test]
+    fn efivar_attributes_are_the_first_native_u32() {
+        let bytes = [&0x6u32.to_ne_bytes()[..], &[0x2A]].concat();
+        assert_eq!(
+            efivar_attributes(&bytes),
+            Some(0x6),
+            "attributes and payload"
+        );
+        for length in 0..EFIVARFS_HEADER_SIZE {
+            assert_eq!(efivar_attributes(&bytes[..length]), None, "{length} bytes");
+        }
+    }
 
     #[test]
     fn efivar_file_name_is_one_path_component() {

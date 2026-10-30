@@ -36,6 +36,7 @@ use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
+use crate::hii::efivarfs::efivar_attributes;
 use crate::hii::efivarfs::open_efivar;
 use crate::hii::efivarfs::EfivarFileName;
 use crate::hii::efivarfs::EfivarNotFound;
@@ -73,7 +74,9 @@ mod defaults;
 pub(crate) mod ifr_fixtures;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
+const EFI_VARIABLE_NON_VOLATILE: u32 = 0x00000001;
 const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
+const MISSING_ATTRIBUTES_HEADER: &str = "efivarfs file is missing its attributes header";
 // UEFI 2.10 §33.3.8.3.47
 const EFI_IFR_NUMERIC_SIZE: u8 = 0x03;
 const EFI_IFR_NUMERIC_SIZE_1: u8 = 0x00;
@@ -125,7 +128,7 @@ fn update_efivarfs_bytes(
     };
     let payload = bytes
         .get_mut(EFIVARFS_HEADER_SIZE..)
-        .context("efivarfs file is missing its attributes header")?;
+        .context(MISSING_ATTRIBUTES_HEADER)?;
     if payload.len() < usize::from(payload_size) {
         return Err(anyhow!(
             "efivarfs payload is shorter than the declared varstore: {} < {} bytes",
@@ -844,6 +847,9 @@ trait VariableStore {
             .read_to_end(&mut file_contents)
             .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
+        let attributes = efivar_attributes(&file_contents).context(MISSING_ATTRIBUTES_HEADER)?;
+        check_non_volatile(&file_name, attributes)?;
+
         update_efivarfs_bytes(&mut file_contents, self.size(), offset, data)?;
 
         let _efifs = EfivarsMountGuard::new().context("Failed to create efivars fs mount guard")?;
@@ -890,6 +896,29 @@ impl VariableNotExported {
 #[derive(Error, Debug)]
 #[error("EFI variable {0} is boot-service-only and cannot be written through efivarfs")]
 struct BootServiceOnlyVariable(EfivarFileName);
+
+/// Refuses an EFI variable without EFI_VARIABLE_NON_VOLATILE, which efivarfs cannot write
+/// (UEFI 2.10 §8.2.3).
+/// Takes the efivar file's attribute word, which Linux passes to SetVariable(), not
+/// VARSTORE_EFI's Attributes; check_runtime_access cannot, as a boot-service-only variable has
+/// no file.
+fn check_non_volatile(
+    name: &EfivarFileName,
+    attributes: u32,
+) -> std::result::Result<(), VolatileVariable> {
+    if attributes & EFI_VARIABLE_NON_VOLATILE == 0 {
+        return Err(VolatileVariable(name.clone()));
+    }
+    Ok(())
+}
+
+/// An EFI variable without EFI_VARIABLE_NON_VOLATILE, which set refuses.
+#[derive(Error, Debug)]
+#[error(
+    "EFI variable {0} is volatile (no EFI_VARIABLE_NON_VOLATILE) and cannot be written through \
+     efivarfs"
+)]
+struct VolatileVariable(EfivarFileName);
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum VariableStoreKind {
@@ -986,6 +1015,42 @@ mod non_efi_varstore_tests {
                 "attributes {attributes:#x}"
             );
         }
+    }
+
+    #[test]
+    fn volatile_efivar_is_refused() {
+        let name = EfivarFileName::new("TestVarStore", NIL_GUID);
+        let cases = [
+            (
+                BS_RT,
+                Err(
+                    "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is volatile \
+                     (no EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs"
+                        .to_string(),
+                ),
+            ),
+            (NV_BS_RT, Ok(())),
+        ];
+        for (attributes, want) in cases {
+            assert_eq!(
+                check_non_volatile(&name, attributes).map_err(|error| error.to_string()),
+                want,
+                "attributes {attributes:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn volatile_efivar_is_read() {
+        let efivars = Efivars::new();
+        let store = efi_variable("Volatile", 1);
+        efivars.write_attributed(&store, BS_RT, &[1]);
+
+        assert_eq!(
+            read(store, &efivars),
+            Ok(efivar_file_bytes(BS_RT, &[1])),
+            "efivar file with attributes BS_RT"
+        );
     }
 
     #[test]
@@ -1173,6 +1238,12 @@ impl EfivarReader {
             .as_ref()
             .err()?
             .downcast_ref()
+    }
+
+    /// The attribute word of the efivar of `store`, if a read of it succeeded; None skips set's
+    /// check of it before the first write.
+    fn attributes(&self, store: &dyn VariableStore) -> Option<u32> {
+        efivar_attributes(self.outcomes.get(&EfivarRange::of(store))?.as_ref().ok()?)
     }
 }
 
@@ -2501,9 +2572,9 @@ where
 }
 
 /// set's choice of the selection of a form package: that of Selection::for_set, unless the
-/// efivar of the match that set would write, or of the likely match, is missing or
-/// boot-service-only, which --include cannot make writable: then VariableNotExported, as
-/// `reader` found it, or BootServiceOnlyVariable.
+/// efivar of the match that set would write, or of the likely match, is missing,
+/// boot-service-only or volatile, which --include cannot make writable: then
+/// VariableNotExported, as `reader` found it, BootServiceOnlyVariable or VolatileVariable.
 pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
@@ -2521,6 +2592,9 @@ pub(crate) fn choice_for_set(
         store.check_runtime_access()?;
         if let Some(missing) = reader.missing(store) {
             return Err(VariableNotExported(missing.clone()).into());
+        }
+        if let Some(attributes) = reader.attributes(store) {
+            check_non_volatile(&store.efivar_file_name(), attributes)?;
         }
     }
     Ok(selection.for_set(question)?)
@@ -2544,8 +2618,16 @@ mod choice_for_set_tests {
     /// set's choice for PROMPT in the form package `root`, where only the efivar Present, of
     /// 1 byte, exists.
     fn choice_in(root: &Rc<RefCell<IFROperation>>) -> Result<Choice<QuestionDescriptor>> {
+        choice_attributed(root, NV_BS_RT)
+    }
+
+    /// choice_in, with the attribute word `attributes` in the efivar file of Present.
+    fn choice_attributed(
+        root: &Rc<RefCell<IFROperation>>,
+        attributes: u32,
+    ) -> Result<Choice<QuestionDescriptor>> {
         let efivars = Efivars::new();
-        efivars.write(&efi_variable("Present", 1), &[0]);
+        efivars.write_attributed(&efi_variable("Present", 1), attributes, &[0]);
         let mut reader = efivars.reader();
         let values = VarStoreValues::new(root);
         let selection = find_question_in(
@@ -2578,6 +2660,11 @@ mod choice_for_set_tests {
     /// VarStores `var_stores`, whose option Enabled is under a SUPPRESS_IF on question 2 of
     /// VarStore `input`.
     fn picked_choice(var_stores: &[Vec<u8>], input: u16) -> Result<Choice<QuestionDescriptor>> {
+        choice_in(&picked_one_of(var_stores, input))
+    }
+
+    /// The form package of picked_choice.
+    fn picked_one_of(var_stores: &[Vec<u8>], input: u16) -> Rc<RefCell<IFROperation>> {
         let (root, _question) = parse_question(
             &[var_stores, &[checkbox_on(2, 5, input)]].concat(),
             ONE_OF,
@@ -2591,7 +2678,7 @@ mod choice_for_set_tests {
                 ),
             ],
         );
-        choice_in(&root)
+        root
     }
 
     #[test]
@@ -2677,6 +2764,27 @@ mod choice_for_set_tests {
             selected(IncludedStates::SUPPRESSED),
             Ok(Some("Enabled")),
             "Enabled with --include suppressed"
+        );
+    }
+
+    #[test]
+    fn match_on_a_volatile_efivar_is_refused() {
+        // VARSTORE_EFI's Attributes say NV: the efivar file's attribute word decides
+        let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS_RT, 1)], 1);
+
+        let volatile = choice_attributed(&root, BS_RT);
+        assert_eq!(
+            volatile.map_err(|error| error.to_string()).err().as_deref(),
+            Some(
+                "EFI variable Present-00000000-0000-0000-0000-000000000000 is volatile \
+                 (no EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs"
+            ),
+            "efivar file with attributes BS_RT"
+        );
+        let non_volatile = choice_attributed(&root, NV_BS_RT);
+        assert!(
+            matches!(non_volatile, Ok(Choice::Chosen(..))),
+            "efivar file with attributes NV_BS_RT: {non_volatile:?}"
         );
     }
 

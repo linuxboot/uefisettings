@@ -11,7 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
-//! `Driver####` load option runs as `publish-hiidb.efi [rt-data|reserved|loader-data]`:
+//! `Driver####` load option runs as
+//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -22,11 +23,15 @@
 //! to mmap(), as 32-bit x86 Linux does above its low memory.
 //! The driver also puts the CRC-32 of the database in the volatile `HiiDBCrc32`
 //! variable, for the tests to check what `uefisettings` extracts.
+//! `rt-data-global-variable-forms` is `rt-data`, with the package lists of
+//! [`global_variable_forms`] after those that the firmware exports.
 
 #![cfg_attr(target_os = "uefi", no_std, no_main)]
 #![deny(unsafe_code)]
 
 extern crate alloc;
+
+mod global_variable_forms;
 
 use core::ptr;
 
@@ -78,11 +83,13 @@ fn main() {
 
 #[entry]
 fn efi_main() -> Status {
-    let Some(memory_type) = memory_type() else {
-        println!("usage: publish-hiidb [rt-data|reserved|loader-data]");
+    let Some((memory_type, database)) = load_option() else {
+        println!(
+            "usage: publish-hiidb [rt-data|reserved|loader-data|rt-data-global-variable-forms]"
+        );
         return Status::INVALID_PARAMETER;
     };
-    match publish(memory_type) {
+    match publish(memory_type, database) {
         Ok((address, length)) => {
             println!("publish-hiidb: {length} bytes at {address:#x}, type {memory_type:?}");
             Status::SUCCESS
@@ -94,31 +101,55 @@ fn efi_main() -> Status {
     }
 }
 
-/// The memory type that the optional data of the load option, a NUL-terminated
+/// The memory type and database that the optional data of the load option, a NUL-terminated
 /// UCS-2 string, names: `rt-data` if there is none, or `None` if it is invalid.
-fn memory_type() -> Option<MemoryType> {
+fn load_option() -> Option<(MemoryType, Database)> {
     let image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok()?;
+    let rt_data = MemoryType::RUNTIME_SERVICES_DATA;
     match image.load_options_as_cstr16() {
-        Err(LoadOptionsError::NotSet) => Some(MemoryType::RUNTIME_SERVICES_DATA),
-        Ok(option) if option == cstr16!("rt-data") => Some(MemoryType::RUNTIME_SERVICES_DATA),
-        Ok(option) if option == cstr16!("reserved") => Some(MemoryType::RESERVED),
-        Ok(option) if option == cstr16!("loader-data") => Some(MemoryType::LOADER_DATA),
+        Err(LoadOptionsError::NotSet) => Some((rt_data, Database::Exported)),
+        Ok(option) if option == cstr16!("rt-data") => Some((rt_data, Database::Exported)),
+        Ok(option) if option == cstr16!("reserved") => {
+            Some((MemoryType::RESERVED, Database::Exported))
+        }
+        Ok(option) if option == cstr16!("loader-data") => {
+            Some((MemoryType::LOADER_DATA, Database::Exported))
+        }
+        Ok(option) if option == cstr16!("rt-data-global-variable-forms") => {
+            Some((rt_data, Database::WithGlobalVariableForms))
+        }
         _ => None,
     }
 }
 
-/// Copies the exported HII database into pages of `memory_type` at `COPY_OFFSET`
-/// and points `HiiDB` at the copy. Returns the address and length of the copy.
+/// The HII database that publish-hiidb copies.
+#[derive(Clone, Copy, Debug)]
+enum Database {
+    /// The one that the firmware exports.
+    Exported,
+    /// That one, then the package lists of [`global_variable_forms`].
+    WithGlobalVariableForms,
+}
+
+/// Copies `database` into pages of `memory_type` at `COPY_OFFSET` and points `HiiDB` at
+/// the copy. Returns the address and length of the copy.
 ///
 /// It first puts the CRC-32 of the database in `HiiDBCrc32`, so that `HiiDB`
 /// never exists without it.
 ///
 /// The pages are never freed: the OS reads them after boot.
-fn publish(memory_type: MemoryType) -> Result<(u64, u32), Failure> {
-    let export = boot::get_handle_for_protocol::<HiiDatabase>()
+fn publish(memory_type: MemoryType, database: Database) -> Result<(u64, u32), Failure> {
+    let mut export = boot::get_handle_for_protocol::<HiiDatabase>()
         .and_then(boot::open_protocol_exclusive::<HiiDatabase>)
         .and_then(|database| database.export_all_raw())
-        .map_err(|error| ("exporting the HII database", error.status()))?;
+        .map_err(|error| ("exporting the HII database", error.status()))?
+        .into_vec();
+    match database {
+        Database::Exported => {}
+        Database::WithGlobalVariableForms => {
+            export.extend(global_variable_forms::package_lists());
+        }
+    }
     let length = u32::try_from(export.len())
         .map_err(|_| ("the HII database exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
 

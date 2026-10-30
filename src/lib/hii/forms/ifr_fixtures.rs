@@ -53,6 +53,8 @@ const VAR_STORE_EFI: u8 = 0x26;
 pub(crate) const NV_BS_RT: u32 = 0x07;
 /// EFI variable Attributes: non-volatile and boot service access only.
 pub(super) const NV_BS: u32 = 0x03;
+/// EFI variable Attributes: boot service and runtime access, volatile.
+pub(super) const BS_RT: u32 = 0x06;
 
 pub(super) const GUID: u8 = 0x5F;
 
@@ -126,9 +128,19 @@ impl Efivars {
 
     /// Makes `payload`, after the efivarfs attributes field, the efivar file of `store`.
     pub(super) fn write(&self, store: &dyn VariableStore, payload: &[u8]) {
+        self.write_attributed(store, NV_BS_RT, payload);
+    }
+
+    /// Makes the attribute word `attributes` and then `payload` the efivar file of `store`.
+    pub(super) fn write_attributed(
+        &self,
+        store: &dyn VariableStore,
+        attributes: u32,
+        payload: &[u8],
+    ) {
         fs::write(
             self.0.path().join(store.efivar_file_name()),
-            efivarfs_bytes(payload),
+            efivar_file_bytes(attributes, payload),
         )
         .expect("write efivar file");
     }
@@ -158,7 +170,12 @@ pub(super) struct VarStoreFixture {
 
 /// `payload` after the efivarfs attributes field.
 pub(super) fn efivarfs_bytes(payload: &[u8]) -> Vec<u8> {
-    [&7u32.to_le_bytes()[..], payload].concat()
+    efivar_file_bytes(NV_BS_RT, payload)
+}
+
+/// The attribute word `attributes`, as efivarfs gives it, then `payload`.
+pub(super) fn efivar_file_bytes(attributes: u32, payload: &[u8]) -> Vec<u8> {
+    [&attributes.to_ne_bytes()[..], payload].concat()
 }
 
 /// A runtime-accessible EFI variable `name` of `size` bytes.

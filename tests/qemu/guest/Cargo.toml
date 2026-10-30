@@ -36,6 +36,10 @@ name = "hii_devmem_guard"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_global_variables"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_no_runtime_access"
 required-features = ["test-vm"]
 

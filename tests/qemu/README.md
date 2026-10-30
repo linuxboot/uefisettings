@@ -81,3 +81,9 @@ run two drivers from the ESP before the kernel, through `Driver####` load option
 [`vars/my-ifr-nv-data.json`](vars/my-ifr-nv-data.json) creates DriverSample's variable
 first, with runtime access, so that efivarfs shows it, and with DriverSample's defaults at
 that commit.
+
+`publish-hiidb.efi rt-data-global-variable-forms` publishes, after the firmware's own
+package lists, those of
+[`publish-hiidb/src/global_variable_forms.rs`](publish-hiidb/src/global_variable_forms.rs):
+forms whose questions sit on EFI global variables of the firmware, some of them volatile,
+under VarStores that declare every one non-volatile.
