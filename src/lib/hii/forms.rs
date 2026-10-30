@@ -2471,14 +2471,17 @@ impl QuestionDescriptor {
             .collect()
     }
 
-    /// Returns the option whose text is one of `texts`, ignoring ASCII case, that select()
-    /// picks with `include`, or None if no option has such a text.
+    /// Returns the option that select() picks with `include` among those whose text is one of
+    /// `texts` ignoring ASCII case, or, if there are none, among those whose text is one of
+    /// `texts` ignoring surrounding whitespace too (get shows the text trimmed), or None if there
+    /// are none either. So a text as stored never picks an option that differs from it only by
+    /// such whitespace.
     pub(crate) fn select_option(
         &self,
         texts: &HashSet<String>,
         include: IncludedStates,
     ) -> std::result::Result<Option<&AnswerOption>, SelectionError> {
-        let matches: Vec<(&AnswerOption, StateEvaluation)> = self
+        let stored: Vec<&AnswerOption> = self
             .possible_options
             .iter()
             .filter(|option| {
@@ -2486,6 +2489,21 @@ impl QuestionDescriptor {
                     .iter()
                     .any(|text| text.eq_ignore_ascii_case(&option.value))
             })
+            .collect();
+        let candidates = if stored.is_empty() {
+            self.possible_options
+                .iter()
+                .filter(|option| {
+                    texts
+                        .iter()
+                        .any(|text| text.trim().eq_ignore_ascii_case(option.value.trim()))
+                })
+                .collect()
+        } else {
+            stored
+        };
+        let matches: Vec<(&AnswerOption, StateEvaluation)> = candidates
+            .into_iter()
             .map(|option| (option, option.state.clone()))
             .collect();
         let Some(&(first, _)) = matches.first() else {
@@ -4742,6 +4760,63 @@ mod tests {
             Selection::NotFound,
             "another name"
         );
+    }
+
+    /// select_option takes an option by the text that get shows, which is the option's string
+    /// trimmed, by that string as stored, and by either with other surrounding whitespace or
+    /// ASCII case. When some option's string is the text as stored, ignoring ASCII case, it
+    /// takes only such an option.
+    #[test]
+    fn options_are_selected_by_the_text_that_get_shows() {
+        let options = [
+            flagged_option(5, 0x00, 0),
+            flagged_option(PADDED_ENABLED, 0x00, 1),
+        ];
+        let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), &options);
+        let shown = question_descriptor(&question, var_store_of(&[1]));
+        assert_eq!(shown.value, "Enabled", "the text get shows");
+        assert_eq!(
+            shown.listed_options(IncludedStates::empty()),
+            ["Disabled", "Enabled "],
+            "listed options"
+        );
+        let select = |question: &QuestionDescriptor, text: &str| {
+            question
+                .select_option(&HashSet::from([text.to_string()]), IncludedStates::empty())
+                .unwrap_or_else(|error| panic!("select {text:?}: {error}"))
+                .map(|option| option.value.clone())
+        };
+
+        for text in [shown.value.as_str(), "Enabled ", " enabled"] {
+            assert_eq!(
+                select(&shown, text).as_deref(),
+                Some("Enabled "),
+                "{text:?}"
+            );
+        }
+        assert_eq!(select(&shown, "Enable"), None, "another text");
+
+        let enabled = flagged_option(6, 0x00, 2);
+        let padded = flagged_option(PADDED_ENABLED, 0x00, 1);
+        let orders = [
+            ("padded first", [padded.clone(), enabled.clone()]),
+            ("padded last", [enabled, padded]),
+        ];
+        for (order, options) in orders {
+            let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), &options);
+            let twins = question_descriptor(&question, var_store_of(&[1]));
+            for (text, want) in [
+                ("Enabled", "Enabled"),
+                ("Enabled ", "Enabled "),
+                ("enabled", "Enabled"),
+            ] {
+                assert_eq!(
+                    select(&twins, text).as_deref(),
+                    Some(want),
+                    "{order}: {text:?}"
+                );
+            }
+        }
     }
 
     fn variable_bytes(payload_size: usize) -> Vec<u8> {

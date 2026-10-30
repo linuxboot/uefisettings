@@ -67,6 +67,8 @@ pub(super) const OTHER_GUID: [u8; 16] = [0x33; 16];
 
 /// The prompt of `question_header()`.
 pub(super) const PROMPT: &str = "Prompt";
+/// The string id of "Enabled " with a trailing space, as firmware may store an option's text.
+pub(super) const PADDED_ENABLED: u16 = 8;
 
 /// The reason `unavailable()` gives.
 pub(super) const UNAVAILABLE: &str = "<ValueUnavailable: no VarStore 1>";
@@ -283,6 +285,7 @@ pub(super) fn strings() -> Vec<HashMap<i32, String>> {
         (5, "Disabled".to_string()),
         (6, "Enabled".to_string()),
         (7, "AllOnes".to_string()),
+        (PADDED_ENABLED.into(), "Enabled ".to_string()),
     ])]
 }
 
