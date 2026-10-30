@@ -145,7 +145,8 @@ fn set_boot_service_only_question_is_refused_naming_its_variable() {
     assert_eq!(
         error.error_message,
         format!(
-            "EFI variable {file_name} is boot-service-only and cannot be written through efivarfs"
+            "EFI variable {file_name} is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), \
+             which efivarfs neither lists nor writes"
         ),
         "{QUESTION}"
     );

@@ -113,7 +113,8 @@ const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
         "NEST_BIT check box",
         [
             "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
-             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: 1>",
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists \
+             nor writes> <IFR default: 1>",
             "1",
         ],
     ),
@@ -121,7 +122,8 @@ const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
         "NEST_BIT one-of",
         [
             "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
-             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: LargeBootList>",
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists \
+             nor writes> <IFR default: LargeBootList>",
             "LargeBootList",
         ],
     ),
@@ -129,7 +131,8 @@ const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
         "NEST_BIT numeric",
         [
             "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
-             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>",
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists \
+             nor writes>",
             "6",
         ],
     ),

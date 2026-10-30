@@ -970,7 +970,10 @@ impl VariableNotExported {
 /// An EFI variable without EFI_VARIABLE_RUNTIME_ACCESS, which set refuses and get shows as
 /// unavailable.
 #[derive(Error, Debug)]
-#[error("EFI variable {0} is boot-service-only and cannot be written through efivarfs")]
+#[error(
+    "EFI variable {0} is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs \
+     neither lists nor writes"
+)]
 struct BootServiceOnlyVariable(EfivarFileName);
 
 /// Refuses an EFI variable without EFI_VARIABLE_NON_VOLATILE, which efivarfs cannot write
@@ -1071,11 +1074,26 @@ mod non_efi_varstore_tests {
                 read(efi_varstore(attributes), &Efivars::new()),
                 Err("<ValueUnavailable: EFI variable \
                      TestVarStore-00000000-0000-0000-0000-000000000000 is boot-service-only \
-                     (no EFI_VARIABLE_RUNTIME_ACCESS)>"
+                     (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists nor writes>"
                     .to_string()),
                 "attributes {attributes:#x}"
             );
         }
+    }
+
+    /// get shows a boot-service-only variable by the text of set's refusal of it.
+    #[test]
+    fn boot_service_only_text_is_shared_by_get_and_set() {
+        let refusal = efi_varstore(0x3)
+            .write_at_offset(0, &[1])
+            .expect_err("write a boot-service-only variable")
+            .to_string();
+
+        assert_eq!(
+            read(efi_varstore(0x3), &Efivars::new()),
+            Err(format!("<ValueUnavailable: {refusal}>")),
+            "attributes 0x3"
+        );
     }
 
     #[test]
@@ -1087,7 +1105,8 @@ mod non_efi_varstore_tests {
                     .unwrap_err()
                     .to_string(),
                 "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is \
-                 boot-service-only and cannot be written through efivarfs",
+                 boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither \
+                 lists nor writes",
                 "attributes {attributes:#x}"
             );
         }
@@ -1322,11 +1341,8 @@ fn read_current_value_bytes<'a>(
         Ok(store) => store,
         Err(error) => return Err(Cow::Owned(format!("<ValueUnavailable: {}>", error))),
     };
-    if let Err(BootServiceOnlyVariable(name)) = store.check_runtime_access() {
-        return Err(Cow::Owned(format!(
-            "<ValueUnavailable: EFI variable {name} is boot-service-only \
-             (no EFI_VARIABLE_RUNTIME_ACCESS)>"
-        )));
+    if let Err(refusal) = store.check_runtime_access() {
+        return Err(Cow::Owned(format!("<ValueUnavailable: {refusal}>")));
     }
 
     reader
@@ -1491,7 +1507,7 @@ mod efivar_reader_tests {
         HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
     const BOOT_SERVICE_ONLY: &str = "<ValueUnavailable: EFI variable \
          Setup-00000000-0000-0000-0000-000000000000 is boot-service-only \
-         (no EFI_VARIABLE_RUNTIME_ACCESS)>";
+         (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists nor writes>";
     const NOT_READ: &str = "<ValueUnavailable: EFI variables not read>";
 
     /// read_question_bytes of `store`, owned.
@@ -2860,8 +2876,8 @@ mod choice_for_set_tests {
 
     /// The text of write_at_offset's refusal of the boot-service-only efivar Present.
     const PRESENT_BOOT_SERVICE_ONLY: &str = "EFI variable \
-        Present-00000000-0000-0000-0000-000000000000 is boot-service-only and cannot be written \
-        through efivarfs";
+        Present-00000000-0000-0000-0000-000000000000 is boot-service-only \
+        (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists nor writes";
     /// The EfivarNotFound of the efivar Missing.
     const MISSING_NOT_FOUND: &str = "no EFI variable Missing-00000000-0000-0000-0000-000000000000";
     /// Why the EQ_ID_VAL on question 2, on the efivar Missing, is not evaluated.
