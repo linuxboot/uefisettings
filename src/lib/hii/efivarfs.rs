@@ -78,20 +78,31 @@ pub(super) struct EfivarNotFound {
     pub(super) name: EfivarFileName,
 }
 
-/// Opens the efivar file `name` in `dir` for reading. A missing file is EfivarNotFound without
-/// context, so the error names the variable.
-/// A symlink or other non-regular file is an error, so a directory of efivar files cannot send
-/// a read elsewhere or block it. The check is on the file that is then read: an O_PATH
+/// Opens the efivar file `name` in `dir` for reading, as open_regular_file does. A missing file
+/// is EfivarNotFound without context, so the error names the variable.
+pub(super) fn open_efivar(dir: &Path, name: &EfivarFileName) -> Result<File> {
+    open_regular_file(&dir.join(name), "efivar file")?
+        .ok_or_else(|| EfivarNotFound { name: name.clone() }.into())
+}
+
+/// Opens the regular file at `path`, which errors call `noun`, for reading; None if it does not
+/// exist. A symlink or other non-regular file is an error, so a directory of efivar files cannot
+/// send a read elsewhere or block it. The check is on the file that is then read: an O_PATH
 /// descriptor opens no file (open(2)), so a device node runs no driver open, and reopening it
 /// through /proc/self/fd opens the very file checked, whatever the path names by then.
-pub(super) fn open_efivar(dir: &Path, name: &EfivarFileName) -> Result<File> {
-    let path = dir.join(name);
-    let location = locate(&path).map_err(|error| open_error(&path, name, error))?;
+fn open_regular_file(path: &Path, noun: &str) -> Result<Option<File>> {
+    let location = match locate(path) {
+        Ok(location) => location,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(open_error(path, noun, error)),
+    };
     let metadata = location
         .metadata()
-        .with_context(|| format!("failed to stat efivar file '{}'", path.display()))?;
-    check_regular_file(&path, &metadata)?;
-    reopen(&location).map_err(|error| reopen_error(&path, error))
+        .with_context(|| format!("failed to stat {noun} '{}'", path.display()))?;
+    check_regular_file(path, &metadata, noun)?;
+    reopen(&location)
+        .map(Some)
+        .map_err(|error| reopen_error(path, noun, error))
 }
 
 /// An O_PATH descriptor of `path`, of the link itself if it is a symlink.
@@ -116,35 +127,28 @@ fn reopen(location: &File) -> io::Result<File> {
         .open(Path::new(PROC_SELF_FD).join(location.as_raw_fd().to_string()))
 }
 
-/// Fails unless `metadata`, of the efivar file at `path`, is a regular file's.
-fn check_regular_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+/// Fails unless `metadata`, of the `noun` at `path`, is a regular file's.
+fn check_regular_file(path: &Path, metadata: &fs::Metadata, noun: &str) -> Result<()> {
     if !metadata.is_file() {
-        return Err(anyhow!(
-            "efivar file '{}' is not a regular file",
-            path.display()
-        ));
+        return Err(anyhow!("{noun} '{}' is not a regular file", path.display()));
     }
     Ok(())
 }
 
-/// open_efivar's error for `error` from opening the efivar file `name` at `path`.
-fn open_error(path: &Path, name: &EfivarFileName, error: io::Error) -> anyhow::Error {
-    match error.kind() {
-        io::ErrorKind::NotFound => EfivarNotFound { name: name.clone() }.into(),
-        _ => anyhow::Error::new(error)
-            .context(format!("failed to open efivar file '{}'", path.display())),
-    }
+/// open_regular_file's error for `error` from opening the `noun` at `path`.
+fn open_error(path: &Path, noun: &str, error: io::Error) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!("failed to open {noun} '{}'", path.display()))
 }
 
-/// open_efivar's error for `error` from reopening the efivar file at `path`.
-fn reopen_error(path: &Path, error: io::Error) -> anyhow::Error {
+/// open_regular_file's error for `error` from reopening the `noun` at `path`.
+fn reopen_error(path: &Path, noun: &str, error: io::Error) -> anyhow::Error {
     let hint = match error.kind() {
         // the descriptor is open, so NotFound means /proc/self/fd is missing
         io::ErrorKind::NotFound => ", which is missing: is /proc mounted?",
         _ => "",
     };
     anyhow::Error::new(error).context(format!(
-        "failed to open efivar file '{}' through {PROC_SELF_FD}{hint}",
+        "failed to open {noun} '{}' through {PROC_SELF_FD}{hint}",
         path.display()
     ))
 }
@@ -534,12 +538,8 @@ pub mod tests {
         let path = Path::new(EFIVARS_MOUNT_POINT).join(&name);
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
 
-        let error = open_error(&path, &name, denied);
+        let error = open_error(&path, "efivar file", denied);
 
-        assert!(
-            error.downcast_ref::<EfivarNotFound>().is_none(),
-            "{error:#} is EfivarNotFound"
-        );
         assert_eq!(
             error
                 .root_cause()
@@ -687,7 +687,7 @@ pub mod tests {
                 "/proc/self/fd",
             ),
         ] {
-            let error = reopen_error(&path, io::Error::from(kind));
+            let error = reopen_error(&path, "efivar file", io::Error::from(kind));
 
             assert_eq!(
                 error.to_string(),
