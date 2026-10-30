@@ -381,10 +381,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 let res = HiiBackend::extract_db()?;
                 file.write_all(&res.db)?;
 
-                print_line(format_args!(
-                    "{{\"info\": \"HiiDB written to {:?}\"}}",
-                    &filename
-                ))?;
+                print_line(format_args!("{}", extract_db_report(filename)))?;
             }
             HiiSubcommands::DumpEfivars {
                 filename,
@@ -549,6 +546,11 @@ fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
     } else {
         Ok(HiiBackend::extract_db()?.db)
     }
+}
+
+/// What extract-db prints on stdout about the HiiDB written to `path`.
+fn extract_db_report(path: &Path) -> serde_json::Value {
+    serde_json::json!({ "info": format!("HiiDB written to {}", path.display()) })
 }
 
 /// What dump-efivars prints on stdout about `dump` into `dir`.
@@ -850,6 +852,17 @@ mod tests {
             error.kind(),
             clap::ErrorKind::MissingRequiredArgument,
             "no DIR"
+        );
+    }
+
+    #[test]
+    fn extract_db_report_is_json_of_the_path() {
+        let report = extract_db_report(Path::new("db \"q\" \\ x.bin")).to_string();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report).expect("parse the report"),
+            serde_json::json!({ "info": "HiiDB written to db \"q\" \\ x.bin" }),
+            "a path holding a quote and a backslash"
         );
     }
 

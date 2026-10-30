@@ -187,8 +187,12 @@ fn driver_sample_variable_holds_the_defaults() {
 fn extract_db_copies_the_published_database() {
     let published = published_database();
     let path = "/tmp/hiidb.bin";
-    let output = uefisettings(&["hii", "extract-db", path]);
-    assert_eq!(output.code, Some(0), "{output:#?}");
+    let report: serde_json::Value = json(&["hii", "extract-db", path]);
+    assert_eq!(
+        report,
+        serde_json::json!({ "info": format!("HiiDB written to {path}") }),
+        "extract-db report"
+    );
     let extracted = fs::read(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
     assert_eq!(
         (extracted.len(), crc32fast::hash(&extracted)),
