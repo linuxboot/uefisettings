@@ -14,7 +14,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::fs::DirBuilder;
 use std::fs::OpenOptions;
-use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
@@ -31,6 +30,7 @@ use serde::Serialize;
 
 use crate::hii::efivarfs::open_efivar;
 use crate::hii::efivarfs::open_regular_file;
+use crate::hii::efivarfs::read_efivar_file;
 use crate::hii::efivarfs::DecodedValue;
 use crate::hii::efivarfs::EfivarFileName;
 use crate::hii::efivarfs::EfivarNotFound;
@@ -44,10 +44,6 @@ use crate::hii::package::read_db;
 use crate::hii::package::read_db_bytes;
 use crate::hii::package::ParsedPackageList;
 
-/// The largest efivar file that read_efivar_file reads, far above EDK2's largest EFI variables:
-/// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
-/// (OvmfPkgX64.dsc), as of edk2-stable202508.
-const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// The file of an efivars dump that holds the HiiDB that its efivars were dumped with.
 const DUMP_HIIDB: &str = "hiidb.bin";
 /// The file of an efivars dump that describes it: a DumpManifest as JSON.
@@ -252,46 +248,6 @@ fn write_dump(
     Ok(dump)
 }
 
-/// The bytes of the efivar `file`, of `size` bytes by its metadata, in one read() unless it grew
-/// since: each efivarfs read() reads the whole variable from the firmware (Linux v7.2
-/// fs/efivarfs/file.c efivarfs_file_read()). A file of more than MAX_EFIVAR_FILE_SIZE bytes, by
-/// its metadata or as read, is an error.
-fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8>> {
-    if size > MAX_EFIVAR_FILE_SIZE {
-        return Err(efivar_file_too_large());
-    }
-    // one byte past the maximum, so that a file that grew past it shows
-    let mut file = file.take(MAX_EFIVAR_FILE_SIZE + 1);
-    let size = usize::try_from(size).map_err(io::Error::other)?;
-    // one byte more than its size, so that a read() that fills it shows the file grew
-    let capacity = size.saturating_add(1);
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(capacity)?;
-    bytes.resize(capacity, 0);
-    let read = loop {
-        match file.read(&mut bytes) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => break result?,
-        }
-    };
-    bytes.truncate(read);
-    if read > size {
-        file.read_to_end(&mut bytes)?;
-    }
-    if file.limit() == 0 {
-        return Err(efivar_file_too_large());
-    }
-    Ok(bytes)
-}
-
-/// read_efivar_file's error for a file of more than MAX_EFIVAR_FILE_SIZE bytes.
-fn efivar_file_too_large() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::FileTooLarge,
-        format!("longer than its maximum of {MAX_EFIVAR_FILE_SIZE} bytes"),
-    )
-}
-
 /// The efivar file `bytes` with each payload byte zeroed unless one of `values` decodes it from
 /// these bytes.
 fn keep_decoded(bytes: &[u8], values: &[DecodedValue]) -> Vec<u8> {
@@ -375,8 +331,6 @@ impl Drop for PartialDump<'_> {
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::collections::VecDeque;
-    use std::fs::File;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
     use std::rc::Rc;
@@ -384,6 +338,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::hii::efivarfs::tests::SETUP;
     use crate::hii::forms::handle_form_set;
     use crate::hii::forms::ifr_fixtures::checkbox;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
@@ -400,10 +355,6 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::IFROperation;
 
-    /// Attributes 7, then payload bytes 1 to 10.
-    const SETUP: [u8; 14] = [7, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-    /// SETUP's size, as its metadata gives it.
-    const SETUP_SIZE: u64 = SETUP.len() as u64;
     /// The HiiDB that write_dump saves; it does not parse it.
     const HIIDB: &[u8] = b"a HiiDB";
 
@@ -482,161 +433,6 @@ mod tests {
             .collect();
         names.sort();
         names
-    }
-
-    #[test]
-    fn efivar_files_read_whole() {
-        let live = efivars(&[(&efivar("Setup"), &SETUP), (&efivar("Empty"), &[])]);
-        let read = |name: &EfivarFileName| {
-            let file = File::open(live.path().join(name)).expect("open the efivar file");
-            let size = file.metadata().expect("stat the efivar file").len();
-            read_efivar_file(&file, size).expect("read the efivar file")
-        };
-
-        assert_eq!(read(&efivar("Setup")), SETUP, "Setup");
-        assert_eq!(read(&efivar("Empty")), [0; 0], "empty file");
-    }
-
-    /// A file longer than its metadata says, as an efivar written after open_efivar's fstat,
-    /// still reads whole: procfs gives /proc/version the size 0.
-    #[test]
-    fn efivar_files_longer_than_their_size_read_whole() {
-        let path = Path::new("/proc/version");
-        let file = File::open(path).expect("open /proc/version");
-        let size = file.metadata().expect("stat /proc/version").len();
-        assert_eq!(size, 0, "size");
-
-        let bytes = read_efivar_file(&file, size).expect("read /proc/version");
-
-        assert!(bytes.len() > 1, "/proc/version: {bytes:?}");
-        assert_eq!(
-            bytes,
-            fs::read(path).expect("read /proc/version"),
-            "contents"
-        );
-    }
-
-    /// A reader that gives one of `results` per read(), then end of file, counting its read()s.
-    struct ScriptedReader {
-        results: VecDeque<io::Result<Vec<u8>>>,
-        reads: usize,
-    }
-
-    impl ScriptedReader {
-        fn new(results: Vec<io::Result<Vec<u8>>>) -> Self {
-            Self {
-                results: results.into(),
-                reads: 0,
-            }
-        }
-    }
-
-    impl Read for ScriptedReader {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.reads += 1;
-            let chunk = match self.results.pop_front() {
-                None => return Ok(0),
-                Some(result) => result?,
-            };
-            buf.get_mut(..chunk.len())
-                .expect("the scripted chunk fits the read() buffer")
-                .copy_from_slice(&chunk);
-            Ok(chunk.len())
-        }
-    }
-
-    #[test]
-    fn efivar_file_reads_in_one_read() {
-        let whole: &[u8] = &SETUP;
-        for (case, results, expected) in [
-            ("whole", vec![Ok(SETUP.to_vec())], whole),
-            (
-                "short read, as end of file",
-                vec![Ok(SETUP[..6].to_vec()), Ok(SETUP[6..].to_vec())],
-                &SETUP[..6],
-            ),
-        ] {
-            let mut reader = ScriptedReader::new(results);
-
-            let bytes = read_efivar_file(&mut reader, SETUP_SIZE).expect("read the efivar file");
-
-            assert_eq!(bytes, expected, "{case}: bytes");
-            assert_eq!(reader.reads, 1, "{case}: read() calls");
-        }
-    }
-
-    #[test]
-    fn efivar_file_read_retries_eintr() {
-        let mut reader = ScriptedReader::new(vec![
-            Err(io::ErrorKind::Interrupted.into()),
-            Ok(SETUP.to_vec()),
-        ]);
-
-        let bytes = read_efivar_file(&mut reader, SETUP_SIZE).expect("read the efivar file");
-
-        assert_eq!(bytes, SETUP, "bytes");
-        assert_eq!(
-            reader.reads, 2,
-            "read() calls: the interrupted one and the read"
-        );
-    }
-
-    #[test]
-    fn efivar_file_grown_since_its_metadata_reads_to_the_end() {
-        let mut reader =
-            ScriptedReader::new(vec![Ok(SETUP[..5].to_vec()), Ok(SETUP[5..].to_vec())]);
-
-        let bytes = read_efivar_file(&mut reader, 4).expect("read the efivar file");
-
-        assert_eq!(bytes, SETUP, "bytes");
-        assert_eq!(
-            reader.reads, 3,
-            "read() calls: size + 1 bytes, the rest, end of file"
-        );
-    }
-
-    /// A file of more than MAX_EFIVAR_FILE_SIZE bytes by its metadata is refused unread.
-    #[test]
-    fn efivar_file_larger_than_its_maximum_is_refused_unread() {
-        let mut reader = ScriptedReader::new(vec![Ok(SETUP.to_vec())]);
-
-        let error = read_efivar_file(&mut reader, MAX_EFIVAR_FILE_SIZE + 1)
-            .expect_err("read a file larger than the maximum");
-
-        assert_eq!(
-            error.kind(),
-            io::ErrorKind::FileTooLarge,
-            "a file larger than the maximum by its metadata: {error}"
-        );
-        assert_eq!(reader.reads, 0, "read() calls");
-    }
-
-    /// A file that grew since its metadata reads to the end up to MAX_EFIVAR_FILE_SIZE bytes, and
-    /// is refused once it holds more.
-    #[test]
-    fn efivar_file_grown_past_its_maximum_is_refused() {
-        let max = usize::try_from(MAX_EFIVAR_FILE_SIZE).expect("a usize maximum");
-        for (case, length, want) in [
-            ("grown to the maximum", MAX_EFIVAR_FILE_SIZE, Some(max)),
-            (
-                "grown one byte past the maximum",
-                MAX_EFIVAR_FILE_SIZE + 1,
-                None,
-            ),
-        ] {
-            let read = read_efivar_file(io::repeat(7).take(length), SETUP_SIZE);
-
-            match (read, want) {
-                (Ok(bytes), Some(want)) => assert_eq!(bytes.len(), want, "{case}: length"),
-                (Err(error), None) => {
-                    assert_eq!(error.kind(), io::ErrorKind::FileTooLarge, "{case}: {error}")
-                }
-                (read, want) => panic!(
-                    "{case}: read {:?} bytes, want {want:?}",
-                    read.map(|bytes| bytes.len())
-                ),
-            }
-        }
     }
 
     #[test]
