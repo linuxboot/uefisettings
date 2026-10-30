@@ -2042,23 +2042,23 @@ fn type_value_parser<R: Read + Seek>(
     args: (u8,),
 ) -> BinResult<TypeValue> {
     match args.0 {
-        0x00u8 => {
+        EFI_IFR_TYPE_NUM_SIZE_8 => {
             let r: u8 = reader.read_ne()?;
             Ok(TypeValue::NumSize8(r))
         }
-        0x01u8 => {
+        EFI_IFR_TYPE_NUM_SIZE_16 => {
             let r: u16 = reader.read_ne()?;
             Ok(TypeValue::NumSize16(r))
         }
-        0x02u8 => {
+        EFI_IFR_TYPE_NUM_SIZE_32 => {
             let r: u32 = reader.read_ne()?;
             Ok(TypeValue::NumSize32(r))
         }
-        0x03u8 => {
+        EFI_IFR_TYPE_NUM_SIZE_64 => {
             let r: u64 = reader.read_ne()?;
             Ok(TypeValue::NumSize64(r))
         }
-        0x04u8 => {
+        EFI_IFR_TYPE_BOOLEAN => {
             let r: u8 = reader.read_ne()?;
             if r != 0 {
                 return Ok(TypeValue::Boolean(true));
