@@ -337,7 +337,7 @@ fn form_set_data() -> Vec<u8> {
 }
 
 /// The root of a parsed form package, which owns the parents, and its question.
-type RootAndQuestion = (Rc<RefCell<IFROperation>>, Rc<RefCell<IFROperation>>);
+pub(super) type RootAndQuestion = (Rc<RefCell<IFROperation>>, Rc<RefCell<IFROperation>>);
 
 /// Parses a FormSet holding `declarations` and then one question, and
 /// returns the root, which owns the parents, and that question.

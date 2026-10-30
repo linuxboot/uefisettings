@@ -16,11 +16,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
-use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
@@ -545,6 +543,18 @@ pub enum Range {
     Range64(Range64),
 }
 
+impl Range {
+    /// The size in bytes of the value, and of each of MinValue, MaxValue and Step.
+    fn size(&self) -> u8 {
+        match self {
+            Range::Range8(_) => 1,
+            Range::Range16(_) => 2,
+            Range::Range32(_) => 4,
+            Range::Range64(_) => 8,
+        }
+    }
+}
+
 struct NumericRange {
     minimum: i128,
     maximum: i128,
@@ -608,12 +618,7 @@ enum NumericFormatError {
 impl NumericFormat {
     /// Returns the format that the Range and EFI_IFR_DISPLAY give (UEFI 2.10 §33.3.8.3.47).
     fn from_ifr(range: &Range, flags: u8) -> Self {
-        let bits = match range {
-            Range::Range8(_) => 8,
-            Range::Range16(_) => 16,
-            Range::Range32(_) => 32,
-            Range::Range64(_) => 64,
-        };
+        let bits = u32::from(range.size()) * u8::BITS;
         Self {
             bits,
             signed_type_bits: (flags & EFI_IFR_DISPLAY == EFI_IFR_DISPLAY_INT_DEC).then_some(bits),
@@ -1208,13 +1213,38 @@ fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> String
     }
 }
 
-/// Returns the question's efivarfs file (4 attribute bytes, then the VarStore), or why its
-/// value cannot be read.
+/// The payload bytes that hold the value of `question`, if it is a ONE_OF, NUMERIC or CHECKBOX,
+/// where edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes places it: an EDKII bit
+/// varstore field, whose VarOffset and width count bits, spans the bytes of its bits.
+fn value_bytes(question: &IFROperation) -> Option<std::ops::Range<usize>> {
+    let value_question = value_question(question)?;
+    let (size, bits) = match value_question {
+        ValueQuestion::OneOf(OneOf { flags, data, .. })
+        | ValueQuestion::Numeric(Numeric { flags, data, .. }) => {
+            (usize::from(data.size()), flags & EDKII_IFR_NUMERIC_SIZE_BIT)
+        }
+        ValueQuestion::CheckBox(_) => (std::mem::size_of::<u8>(), 1),
+    };
+    let offset = usize::from(value_question.header().var_store_info);
+    if refers_to_bit_field(question) {
+        Some(offset / 8..(offset + usize::from(bits)).div_ceil(8))
+    } else {
+        Some(offset..offset + size)
+    }
+}
+
+/// Returns the value_bytes of the question, or why its value cannot be read.
 fn read_question_bytes<'a>(
     question: &IFROperation,
     varstore: &Result<Box<dyn VariableStore>>,
     reader: &'a mut EfivarReader,
 ) -> std::result::Result<&'a [u8], Cow<'static, str>> {
+    let Some(value) = value_bytes(question) else {
+        return Err(Cow::Owned(format!(
+            "<ValueUnavailable: {:?} value not decoded>",
+            question.op_code
+        )));
+    };
     let bytes = read_current_value_bytes(varstore, reader)?;
     // edk2-stable202608 SetupBrowserDxe/IfrParse.c reads the VarOffset of such a question in bits
     // TODO: decode bit fields by the width in their Flags, not their Range32 (UINT32 storage)
@@ -1223,7 +1253,25 @@ fn read_question_bytes<'a>(
             "<ValueUnavailable: EDKII bit-field value not decoded>",
         ));
     }
-    Ok(bytes)
+    let offset = value.start;
+    bytes
+        .get(EFIVARFS_HEADER_SIZE..)
+        .and_then(|payload| payload.get(value))
+        .ok_or_else(|| {
+            Cow::Owned(format!(
+                "<ExtractEFIDataError: failed to fill whole buffer (offset: {offset}; buflen: {})>",
+                bytes.len()
+            ))
+        })
+}
+
+/// The little-endian integer that `bytes`, the value_bytes of a question that is not a bit
+/// field, store.
+fn stored_value(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .rev()
+        .fold(0, |value, byte| (value << 8) | u64::from(*byte))
 }
 
 #[cfg(test)]
@@ -1254,22 +1302,18 @@ mod efivar_reader_tests {
     fn variable_read_through_two_stores_is_read_once() {
         let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
         let question = node.borrow();
-        let ParsedOperation::CheckBox(parsed) = &question.parsed_data else {
-            panic!("not a CHECKBOX: {:?}", question.parsed_data);
-        };
         let efivars = Efivars::new();
         efivars.write(&efi_variable("Setup", 1), &[42]);
         let mut reader = efivars.reader();
 
         assert_eq!(
             question_bytes(&question, efi_variable("Setup", 1), &mut reader),
-            Ok(efivarfs_bytes(&[42])),
+            Ok(vec![42]),
             "read_question_bytes"
         );
         efivars.write(&efi_variable("Setup", 1), &[43]);
-        let answer = display_answer::<u8>(
+        let answer = display_answer(
             &question,
-            &parsed.question_header(),
             &Ok(Box::new(efi_variable("Setup", 1))),
             &mut reader,
         );
@@ -1300,13 +1344,13 @@ mod efivar_reader_tests {
         efivars.write(&efi_variable("Setup", 1), &[1]);
         assert_eq!(
             question_bytes(&question, buffer("Setup", 1), &mut reader),
-            Ok(efivarfs_bytes(&[1])),
+            Ok(vec![1]),
             "buffer after a boot-service-only store"
         );
         efivars.write(&efi_variable("Setup", 1), &[2]);
         assert_eq!(
             question_bytes(&question, efi_variable("Setup", 1), &mut reader),
-            Ok(efivarfs_bytes(&[1])),
+            Ok(vec![1]),
             "runtime EFI variable after the buffer"
         );
     }
@@ -1322,26 +1366,26 @@ mod efivar_reader_tests {
 
         assert_eq!(
             question_bytes(&question, efi_variable("Setup", 1), &mut reader),
-            Ok(efivarfs_bytes(&[1])),
+            Ok(vec![1]),
             "first"
         );
         efivars.write(&efi_variable("Setup", 2), &[4, 5]);
         let cases: [(&str, DeclaredVarStore, &[u8]); 3] = [
             ("other name", efi_variable("Other", 1), &[3]),
-            ("other size", efi_variable("Setup", 2), &[4, 5]),
+            ("other size", efi_variable("Setup", 2), &[4]),
             ("first again", efi_variable("Setup", 1), &[1]),
         ];
         for (case, store, want) in cases {
             assert_eq!(
                 question_bytes(&question, store, &mut reader),
-                Ok(efivarfs_bytes(want)),
+                Ok(want.to_vec()),
                 "{case}"
             );
         }
 
         assert_eq!(
             question_bytes(&question, efi_variable("Setup", 1), &mut efivars.reader()),
-            Ok(efivarfs_bytes(&[4])),
+            Ok(vec![4]),
             "fresh EfivarReader"
         );
     }
@@ -1367,7 +1411,7 @@ mod efivar_reader_tests {
         );
         assert_eq!(
             question_bytes(&question, missing(), &mut efivars.reader()),
-            Ok(efivarfs_bytes(&[0])),
+            Ok(vec![0]),
             "fresh EfivarReader"
         );
     }
@@ -1540,6 +1584,164 @@ mod efivar_reader_tests {
             shown_before,
             "display of the changed file"
         );
+    }
+
+    /// A NUMERIC or ONE_OF at VarOffset `offset` whose MinValue, MaxValue and Step take `size`
+    /// bytes, as `flags` says.
+    fn sized_question(offset: u16, flags: u8, size: usize) -> Vec<u8> {
+        [question_header(offset), vec![flags], vec![0; 3 * size]].concat()
+    }
+
+    /// Where setup_question puts its question.
+    #[derive(Clone, Copy)]
+    enum Placement {
+        /// In the FormSet, so that its VarOffset counts bytes
+        FormSet,
+        /// In an EDKII bit varstore GUID op, so that its VarOffset and width count bits
+        BitVarStoreGuid,
+    }
+
+    /// Parses a FormSet holding the 16-byte VARSTORE_EFI "Setup" and then one question, put
+    /// where `placement` says; returns the root and the question.
+    fn setup_question(placement: Placement, op_code: u8, data: &[u8]) -> RootAndQuestion {
+        let var_store = var_store_efi(1, "Setup", NV_BS_RT, 16);
+        match placement {
+            Placement::FormSet => parse_question(&[var_store], op_code, data, &[]),
+            Placement::BitVarStoreGuid => {
+                let bytes = form_set(&[
+                    var_store,
+                    operation(GUID, true, &BIT_VARSTORE_GUID),
+                    operation(op_code, false, data),
+                    END.to_vec(), // End of the GUID
+                ]);
+                let root =
+                    handle_form_package(&mut Cursor::new(&bytes)).expect("parse the form package");
+                let guid = Rc::clone(&root.borrow().children[0].borrow().children[1]);
+                let question = Rc::clone(&guid.borrow().children[0]);
+                (root, question)
+            }
+        }
+    }
+
+    /// The questions that value_bytes_are_where_the_value_is_stored and
+    /// questions_decode_only_their_value_bytes check: name, parsed question, value_bytes.
+    fn value_questions() -> Vec<(&'static str, RootAndQuestion, std::ops::Range<usize>)> {
+        let in_form_set = |op_code, data: &[u8]| setup_question(Placement::FormSet, op_code, data);
+        let bit_field =
+            |op_code, data: &[u8]| setup_question(Placement::BitVarStoreGuid, op_code, data);
+        vec![
+            (
+                "CHECKBOX at 3",
+                in_form_set(CHECKBOX, &checkbox(3, 0x00)),
+                3..4,
+            ),
+            (
+                "UINT8 ONE_OF at 0",
+                in_form_set(ONE_OF, &one_of_data()),
+                0..1,
+            ),
+            (
+                "UINT16 NUMERIC at 6",
+                in_form_set(NUMERIC, &sized_question(6, EFI_IFR_NUMERIC_SIZE_2, 2)),
+                6..8,
+            ),
+            (
+                "UINT32 ONE_OF at 5",
+                in_form_set(ONE_OF, &uint32_range_question(5, EFI_IFR_NUMERIC_SIZE_4)),
+                5..9,
+            ),
+            (
+                "UINT64 NUMERIC at 1",
+                // EFI_IFR_NUMERIC_SIZE_8
+                in_form_set(NUMERIC, &sized_question(1, 0x03, 8)),
+                1..9,
+            ),
+            (
+                "5-bit NUMERIC at bit 13",
+                bit_field(NUMERIC, &uint32_range_question(13, 5)),
+                1..3,
+            ),
+            (
+                "3-bit ONE_OF at bit 16",
+                bit_field(ONE_OF, &uint32_range_question(16, 3)),
+                2..3,
+            ),
+            (
+                "bit-field CHECKBOX at bit 15",
+                bit_field(CHECKBOX, &checkbox(15, 0x00)),
+                1..2,
+            ),
+            (
+                "bit-field CHECKBOX at bit 16",
+                bit_field(CHECKBOX, &checkbox(16, 0x00)),
+                2..3,
+            ),
+        ]
+    }
+
+    #[test]
+    fn value_bytes_are_where_the_value_is_stored() {
+        for (case, (_root, question), expected) in value_questions() {
+            assert_eq!(value_bytes(&question.borrow()), Some(expected), "{case}");
+        }
+        let (root, _question) = parse_question(&[], CHECKBOX, &checkbox(3, 0x00), &[]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        assert_eq!(value_bytes(&form_set.borrow()), None, "FORM_SET");
+    }
+
+    #[test]
+    fn ops_without_value_bytes_are_not_decoded() {
+        let (root, _question) = parse_question(&[], CHECKBOX, &checkbox(3, 0x00), &[]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+
+        assert_eq!(
+            question_bytes(
+                &form_set.borrow(),
+                efi_variable("FormSet", 4),
+                &mut disabled_reader()
+            ),
+            Err("<ValueUnavailable: FormSet value not decoded>".to_string()),
+            "FORM_SET"
+        );
+    }
+
+    #[test]
+    fn questions_decode_only_their_value_bytes() {
+        for (case, (root, question), value) in value_questions() {
+            let show = |outside: u8, inside: u8| {
+                let payload: Vec<u8> = (0..16)
+                    .map(|offset| match value.contains(&offset) {
+                        true => inside,
+                        false => outside,
+                    })
+                    .collect();
+                let efivars = Efivars::new();
+                efivars.write(&efi_variable("Setup", 16), &payload);
+                let mut reader = efivars.reader();
+                let root = Rc::clone(&root);
+                let listed: Vec<String> = list_questions(
+                    Rc::clone(&root),
+                    &strings(),
+                    IncludedStates::empty(),
+                    &mut reader,
+                )
+                .into_iter()
+                .map(|(question, _)| question.value)
+                .collect();
+                let shown = display(root, 0, &strings(), &mut reader).expect("display");
+                (listed, shown)
+            };
+
+            assert_eq!(show(0x00, 0x01), show(0xFF, 0x01), "{case}: other bytes");
+            // read_question_bytes refuses bit fields
+            if !refers_to_bit_field(&question.borrow()) {
+                assert_ne!(
+                    show(0x00, 0x01).1,
+                    show(0x00, 0x00).1,
+                    "{case}: value bytes"
+                );
+            }
+        }
     }
 }
 
@@ -2518,8 +2720,10 @@ fn handle_checkbox(
             answer.push_str(&reason);
             false
         }
-        // for a checkbox size should be of type u8
-        Ok(bytes) => try_read_answer_as_string::<u8>(&parsed.question_header(), bytes, &mut answer),
+        Ok(bytes) => {
+            answer.push_str(&stored_value(bytes).to_string());
+            true
+        }
     };
     if !available {
         let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
@@ -2567,20 +2771,7 @@ fn handle_oneof(
             answer.push_str(&reason);
             None
         }
-        Ok(bytes) => match &parsed.data {
-            Range::Range8(_) => {
-                try_read_answer_as_option::<u8>(&parsed.question_header(), bytes, &mut answer)
-            }
-            Range::Range16(_) => {
-                try_read_answer_as_option::<u16>(&parsed.question_header(), bytes, &mut answer)
-            }
-            Range::Range32(_) => {
-                try_read_answer_as_option::<u32>(&parsed.question_header(), bytes, &mut answer)
-            }
-            Range::Range64(_) => {
-                try_read_answer_as_option::<u64>(&parsed.question_header(), bytes, &mut answer)
-            }
-        },
+        Ok(bytes) => Some(stored_value(bytes)),
     };
 
     if chosen_value.is_none() {
@@ -2688,37 +2879,11 @@ fn handle_numeric(
             false
         }
         // read_question_bytes refuses bit-field questions, so the Range gives the width
-        Ok(bytes) => match (
-            &parsed.data,
-            NumericFormat::from_ifr(&parsed.data, parsed.flags)
-                .signed_type_bits
-                .is_some(),
-        ) {
-            (Range::Range8(_), true) => {
-                try_read_answer_as_string::<i8>(&parsed.question_header(), bytes, &mut answer)
-            }
-            (Range::Range16(_), true) => {
-                try_read_answer_as_string::<i16>(&parsed.question_header(), bytes, &mut answer)
-            }
-            (Range::Range32(_), true) => {
-                try_read_answer_as_string::<i32>(&parsed.question_header(), bytes, &mut answer)
-            }
-            (Range::Range64(_), true) => {
-                try_read_answer_as_string::<i64>(&parsed.question_header(), bytes, &mut answer)
-            }
-            (Range::Range8(_), false) => {
-                try_read_answer_as_string::<u8>(&parsed.question_header(), bytes, &mut answer)
-            }
-            (Range::Range16(_), false) => {
-                try_read_answer_as_string::<u16>(&parsed.question_header(), bytes, &mut answer)
-            }
-            (Range::Range32(_), false) => {
-                try_read_answer_as_string::<u32>(&parsed.question_header(), bytes, &mut answer)
-            }
-            (Range::Range64(_), false) => {
-                try_read_answer_as_string::<u64>(&parsed.question_header(), bytes, &mut answer)
-            }
-        },
+        Ok(bytes) => {
+            let format = NumericFormat::from_ifr(&parsed.data, parsed.flags);
+            answer.push_str(&format.decode(stored_value(bytes)).to_string());
+            true
+        }
     };
     if !available {
         let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
@@ -2759,59 +2924,10 @@ fn handle_numeric(
     res
 }
 
-// utility function for questions i.e. OneOf, Numeric and Checkbox
-fn try_read_answer_as_string<T>(
-    question_header: &QuestionHeader,
-    bytes: &[u8],
-    ans: &mut String,
-) -> bool
-where
-    T: BinRead + Display,
-    for<'a> <T as BinRead>::Args<'a>: Default,
-{
-    if let Some(a) = try_read_answer::<T>(question_header, bytes, ans) {
-        ans.push_str(format!("{a}").as_str());
-        true
-    } else {
-        false
-    }
-}
-
-// utility function for OneOfOptions
-fn try_read_answer_as_option<T>(
-    question_header: &QuestionHeader,
-    bytes: &[u8],
-    ans: &mut String,
-) -> Option<u64>
-where
-    T: BinRead + Into<u64>,
-    for<'a> <T as BinRead>::Args<'a>: Default,
-{
-    try_read_answer::<T>(question_header, bytes, ans).map(Into::into)
-}
-
-/// Returns the answer at the question's VarOffset, or appends why it cannot be read to `ans`.
-fn try_read_answer<T>(question_header: &QuestionHeader, bytes: &[u8], ans: &mut String) -> Option<T>
-where
-    T: BinRead,
-    for<'a> <T as BinRead>::Args<'a>: Default,
-{
-    let offset = question_header.var_store_info;
-    let extracted_data: Result<T> = extract_efi_data(offset, bytes);
-    match extracted_data {
-        Ok(a) => Some(a),
-        Err(e) => {
-            let len = bytes.len();
-            ans.push_str(&format!(
-                "<ExtractEFIDataError: {e} (offset: {offset}; buflen: {len})>"
-            ));
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod question_value_tests {
+    use std::io::SeekFrom;
+
     use super::ifr_fixtures::*;
     use super::*;
 
@@ -3248,18 +3364,10 @@ mod question_value_tests {
         ] {
             let (_root, node) = parse_question_in_guid(guid, CHECKBOX, &checkbox(3, 0x00), &[]);
             let question = node.borrow();
-            let ParsedOperation::CheckBox(parsed) = &question.parsed_data else {
-                panic!("not a CHECKBOX: {:?}", question.parsed_data);
-            };
 
             let VarStoreFixture { store, efivars } = var_store_of(&[0x00, 0x00, 0x00, 0x01]);
 
-            let got = display_answer::<u8>(
-                &question,
-                &parsed.question_header(),
-                &store,
-                &mut efivars.reader(),
-            );
+            let got = display_answer(&question, &store, &mut efivars.reader());
 
             assert_eq!(got, want, "GUID {guid:02X?}");
         }
@@ -3636,21 +3744,7 @@ pub fn display(
         ParsedOperation::OneOf(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
-            let header = parsed.question_header();
-            let answer_disp = match &parsed.data {
-                Range::Range8(_) => {
-                    display_answer::<u8>(&current_node, &header, &varstore, reader)
-                }
-                Range::Range16(_) => {
-                    display_answer::<u16>(&current_node, &header, &varstore, reader)
-                }
-                Range::Range32(_) => {
-                    display_answer::<u32>(&current_node, &header, &varstore, reader)
-                }
-                Range::Range64(_) => {
-                    display_answer::<u64>(&current_node, &header, &varstore, reader)
-                }
-            };
+            let answer_disp = display_answer(&current_node, &varstore, reader);
 
             result.push_str(
                 format!(
@@ -3672,21 +3766,7 @@ pub fn display(
         ParsedOperation::Numeric(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
-            let header = parsed.question_header();
-            let answer_disp = match &parsed.data {
-                Range::Range8(_) => {
-                    display_answer::<u8>(&current_node, &header, &varstore, reader)
-                }
-                Range::Range16(_) => {
-                    display_answer::<u16>(&current_node, &header, &varstore, reader)
-                }
-                Range::Range32(_) => {
-                    display_answer::<u32>(&current_node, &header, &varstore, reader)
-                }
-                Range::Range64(_) => {
-                    display_answer::<u64>(&current_node, &header, &varstore, reader)
-                }
-            };
+            let answer_disp = display_answer(&current_node, &varstore, reader);
 
             result.push_str(
                 format!(
@@ -3708,13 +3788,7 @@ pub fn display(
         ParsedOperation::CheckBox(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
-            // for a checkbox size should be of type u8
-            let answer_disp = display_answer::<u8>(
-                &current_node,
-                &parsed.question_header(),
-                &varstore,
-                reader,
-            );
+            let answer_disp = display_answer(&current_node, &varstore, reader);
 
             result.push_str(
                 format!(
@@ -3746,25 +3820,16 @@ pub fn display(
     Ok(result)
 }
 
-/// Returns the answer that show-ifr shows: the question's value as `T`, or why it cannot be read.
-fn display_answer<T>(
+/// Returns the answer that show-ifr shows: the question's value, or why it cannot be read.
+fn display_answer(
     question: &IFROperation,
-    question_header: &QuestionHeader,
     varstore: &Result<Box<dyn VariableStore>>,
     reader: &mut EfivarReader,
-) -> String
-where
-    T: BinRead + Display,
-    for<'a> <T as BinRead>::Args<'a>: Default,
-{
-    let mut answer = String::new();
+) -> String {
     match read_question_bytes(question, varstore, reader) {
-        Err(reason) => answer.push_str(&reason),
-        Ok(bytes) => {
-            try_read_answer_as_string::<T>(question_header, bytes, &mut answer);
-        }
+        Err(reason) => reason.into_owned(),
+        Ok(bytes) => stored_value(bytes).to_string(),
     }
-    answer
 }
 
 #[derive(Error, Debug)]
@@ -3962,24 +4027,6 @@ fn find_corresponding_varstore(
     }
 }
 
-/// extract_efi_data extracts data of type T at given offset from efivar bytes.
-/// The `T` type here is used to get the type (and thus size) of our answer.
-fn extract_efi_data<T>(offset: u16, bytes: &[u8]) -> Result<T>
-where
-    T: BinRead,
-    for<'a> <T as BinRead>::Args<'a>: Default,
-{
-    // first 4 bytes are flags provided by the kernel so ignore them
-    // values begin after that
-
-    let mut cursor = Cursor::new(&bytes);
-    cursor.seek(SeekFrom::Current(4 + offset as i64))?;
-
-    let answer: T = cursor.read_ne()?;
-
-    Ok(answer)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4019,8 +4066,8 @@ mod tests {
         let mut bytes = variable_bytes(42);
         update_efivarfs_bytes(&mut bytes, 42, 38, TypeValue::NumSize16(95)).unwrap();
         update_efivarfs_bytes(&mut bytes, 42, 40, TypeValue::NumSize16(90)).unwrap();
-        assert_eq!(extract_efi_data::<u16>(38, &bytes).unwrap(), 95);
-        assert_eq!(extract_efi_data::<u16>(40, &bytes).unwrap(), 90);
+        assert_eq!(stored_value(&bytes[EFIVARFS_HEADER_SIZE + 38..][..2]), 95);
+        assert_eq!(stored_value(&bytes[EFIVARFS_HEADER_SIZE + 40..][..2]), 90);
         assert_eq!(&bytes[..4], &7u32.to_le_bytes());
     }
 
@@ -4101,7 +4148,7 @@ mod tests {
         let bytes = read_efivarfs_bytes(&mut reader, payload.len()).unwrap();
 
         assert_eq!(bytes, efivarfs_data);
-        assert_eq!(extract_efi_data::<u16>(0, &bytes).unwrap(), 95);
+        assert_eq!(stored_value(&bytes[EFIVARFS_HEADER_SIZE..]), 95);
     }
 
     #[test]
@@ -4340,7 +4387,7 @@ mod write_validation_tests {
             data: Vec::new(),
             parent: None,
             children: Vec::new(),
-            parsed_data: ParsedOperation::Placeholder,
+            parsed_data: ParsedOperation::Numeric(parsed),
         });
         let mut payload = vec![0; 42];
         let width = (bits / 8) as usize;
@@ -4351,11 +4398,15 @@ mod write_validation_tests {
         };
         let efivars = Efivars::new();
         efivars.write(&store, &payload);
+        let current = node.borrow();
+        let ParsedOperation::Numeric(parsed) = &current.parsed_data else {
+            panic!("not a NUMERIC: {:?}", current.parsed_data);
+        };
         let question = handle_numeric(
             Ok(Box::new(store)),
-            &parsed,
+            parsed,
             "Numeric test",
-            &node.borrow(),
+            &current,
             &mut FormPackageWalk::new(
                 &[],
                 &mut efivars.reader(),

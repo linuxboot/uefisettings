@@ -27,15 +27,12 @@ use thiserror::Error;
 
 use super::find_corresponding_varstore;
 use super::read_question_bytes;
-use super::try_read_answer;
+use super::stored_value;
 use super::value_question;
 use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
-use super::Numeric;
-use super::OneOf;
 use super::ParsedOperation;
-use super::Range;
 use super::ValueQuestion;
 use super::VariableStore;
 
@@ -653,29 +650,19 @@ fn question_value(
             }
         }
     };
-    let header = value_question.header();
-    let mut reason = String::new();
-    let value = match value_question {
-        ValueQuestion::CheckBox(_) => {
-            try_read_answer::<u8>(&header, bytes, &mut reason).map(QuestionValue::Boolean)
+    match (value_question, bytes) {
+        (ValueQuestion::CheckBox(_), [byte]) => QuestionValue::Boolean(*byte),
+        (ValueQuestion::CheckBox(_), _) => QuestionValue::Unreadable {
+            kind,
+            reason: format!(
+                "<ValueUnavailable: CHECKBOX value of {} bytes>",
+                bytes.len()
+            ),
+        },
+        (ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_), _) => {
+            QuestionValue::Uint(stored_value(bytes))
         }
-        ValueQuestion::OneOf(OneOf { data, .. }) | ValueQuestion::Numeric(Numeric { data, .. }) => {
-            match data {
-                Range::Range8(_) => {
-                    try_read_answer::<u8>(&header, bytes, &mut reason).map(u64::from)
-                }
-                Range::Range16(_) => {
-                    try_read_answer::<u16>(&header, bytes, &mut reason).map(u64::from)
-                }
-                Range::Range32(_) => {
-                    try_read_answer::<u32>(&header, bytes, &mut reason).map(u64::from)
-                }
-                Range::Range64(_) => try_read_answer::<u64>(&header, bytes, &mut reason),
-            }
-            .map(QuestionValue::Uint)
-        }
-    };
-    value.unwrap_or(QuestionValue::Unreadable { kind, reason })
+    }
 }
 
 /// The truth of a condition.
