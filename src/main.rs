@@ -13,14 +13,12 @@
 use std::fmt::Debug;
 use std::fs::File;
 use std::io;
-use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
 use anyhow::anyhow;
-use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use clap::Parser;
@@ -44,8 +42,6 @@ use uefisettings::exports::ShowIfrOptions;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 use uefisettings_spellings_db_thrift::consts::translation_db;
-
-const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[clap(
@@ -518,34 +514,7 @@ fn prioritize_backend(machine: &MachineInfo, json: bool) -> Result<Backend> {
 }
 
 fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
-    // If dbdump's path is provided use that
-    if let Some(dbdump_path) = filename {
-        info!("Using database dump from file: {}", dbdump_path.display());
-
-        let mut file = File::open(dbdump_path)
-            .context(format!("opening dbdump from{}", dbdump_path.display()))?;
-
-        // Most Hii DBs are a few hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
-        // Since we're reading the entire DB into a Vec<u8> we need to have a check here.
-        if file
-            .metadata()
-            .context("failed to read metadata for open file")?
-            .len()
-            > MAX_ALLOWED_FILESIZE
-        {
-            return Err(anyhow!(
-                "File size is too big for the file to be a HII database."
-            ));
-        }
-
-        let mut file_contents = Vec::new();
-        file.read_to_end(&mut file_contents)
-            .context("Couldn't convert file bytes to Vec<u8>")?;
-
-        Ok(file_contents)
-    } else {
-        Ok(HiiBackend::extract_db()?.db)
-    }
+    HiiBackend::read_hiidb(filename)
 }
 
 /// What extract-db prints on stdout about the HiiDB written to `path`.

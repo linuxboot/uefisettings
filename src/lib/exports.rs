@@ -120,6 +120,14 @@ impl HiiBackend {
         Ok(resp)
     }
 
+    /// Reads the HiiDB in the file `filename`, or this machine's.
+    pub fn read_hiidb(filename: Option<&Path>) -> Result<Vec<u8>> {
+        match filename {
+            Some(filename) => package::read_db_file(filename),
+            None => extract::extract_db(),
+        }
+    }
+
     /// show_ifr returns a human readable representation of the forms in Hii
     pub fn show_ifr(db_bytes: &[u8]) -> Result<HiiShowIfrResponse> {
         Self::show_ifr_using(db_bytes, &ShowIfrOptions::default())

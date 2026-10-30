@@ -13,9 +13,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
 use std::io::Seek;
+use std::path::Path;
 use std::rc::Rc;
 
+use anyhow::anyhow;
 use anyhow::ensure;
 use anyhow::Context;
 use anyhow::Result;
@@ -24,10 +28,14 @@ use binrw::io::SeekFrom;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
+use log::info;
 
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
 use crate::hii::strings;
+
+/// The largest HiiDB file that read_db_bytes reads.
+const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
 /// PACKAGE_LIST_HEADER_SIZE is the size of EFI_HII_PACKAGE_LIST_HEADER:
 /// PackageListGuid (16 bytes) + PackageLength (4 bytes).
@@ -332,6 +340,36 @@ impl ParsedPackageList {
         );
         Ok(())
     }
+}
+
+/// The HiiDB in the file at `path`.
+pub(crate) fn read_db_file(path: &Path) -> Result<Vec<u8>> {
+    info!("Using database dump from file: {}", path.display());
+
+    let mut file = File::open(path).context(format!("opening dbdump from{}", path.display()))?;
+    read_db_bytes(&mut file)
+}
+
+/// The HiiDB in `file`.
+pub(crate) fn read_db_bytes(file: &mut File) -> Result<Vec<u8>> {
+    // Most Hii DBs are a few hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
+    // Since we're reading the entire DB into a Vec<u8> we need to have a check here.
+    if file
+        .metadata()
+        .context("failed to read metadata for open file")?
+        .len()
+        > MAX_ALLOWED_FILESIZE
+    {
+        return Err(anyhow!(
+            "File size is too big for the file to be a HII database."
+        ));
+    }
+
+    let mut file_contents = Vec::new();
+    file.read_to_end(&mut file_contents)
+        .context("Couldn't convert file bytes to Vec<u8>")?;
+
+    Ok(file_contents)
 }
 
 /// read_db input (source) is a vector of u8 bytes
