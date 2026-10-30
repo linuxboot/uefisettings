@@ -2152,7 +2152,7 @@ pub fn handle_form_package(
     loop {
         let node: IFROperation = package_cursor
             .read_ne()
-            .context("Failed to parse IFR operation")?;
+            .context("failed to parse IFR operation")?;
 
         let current_node = Rc::new(RefCell::new(node));
 
@@ -2195,7 +2195,7 @@ pub fn handle_form_package(
         current_node.borrow_mut().parent = Some(Rc::downgrade(&current_scope));
 
         handle_opcode(Rc::clone(&current_node)).context(format!(
-            "Failed to parse op_code {:?} properly",
+            "failed to parse op_code {:?} properly",
             &current_node.borrow().op_code,
         ))?;
 
@@ -2223,7 +2223,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         IFROpCode::FormSet => {
             let parsed: FormSet = data_cursor
                 .read_ne()
-                .context("Failed to parse FormSet's data")?;
+                .context("failed to parse FormSet's data")?;
             debug!("FormSet is {:?}", parsed);
             node.parsed_data = ParsedOperation::FormSet(parsed);
         }
@@ -2231,28 +2231,28 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         IFROpCode::OneOf => {
             let parsed: OneOf = data_cursor
                 .read_ne_args((RangeEncoding::from_question(&node),))
-                .context("Failed to parse OneOf's data")?;
+                .context("failed to parse OneOf's data")?;
             debug!("OneOf is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOf(parsed);
         }
         IFROpCode::CheckBox => {
             let parsed: CheckBox = data_cursor
                 .read_ne()
-                .context("Failed to parse CheckBox's data")?;
+                .context("failed to parse CheckBox's data")?;
             debug!("CheckBox is {:?}", parsed);
             node.parsed_data = ParsedOperation::CheckBox(parsed);
         }
         IFROpCode::OneOfOption => {
             let parsed: OneOfOption = data_cursor
                 .read_ne()
-                .context("Failed to parse OneOfOption's data")?;
+                .context("failed to parse OneOfOption's data")?;
             debug!("OneOfOption is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOfOption(parsed);
         }
         IFROpCode::VarStore => {
             let parsed: VarStore = data_cursor
                 .read_ne()
-                .context("Failed to parse VarStore's data")?;
+                .context("failed to parse VarStore's data")?;
 
             debug!("VarStore is {:?}", &parsed);
 
@@ -2261,7 +2261,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         IFROpCode::VarStoreNameValue => {
             let parsed: VarStoreNameValue = data_cursor
                 .read_ne()
-                .context("Failed to parse VarStoreNameValue's data")?;
+                .context("failed to parse VarStoreNameValue's data")?;
             debug!("VarStoreNameValue is {:?}", parsed);
             node.parsed_data = ParsedOperation::VarStoreNameValue(parsed);
         }
@@ -2270,63 +2270,63 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
             // so I implemented this but I haven't seen it being used anywhere in the dbdumps I have
             let parsed: VarStoreEfi = data_cursor
                 .read_ne()
-                .context("Failed to parse VarStoreEfi's data")?;
+                .context("failed to parse VarStoreEfi's data")?;
             debug!("VarStoreEfi is {:?}", parsed);
             node.parsed_data = ParsedOperation::VarStoreEfi(parsed);
         }
         IFROpCode::DefaultStore => {
             let parsed: DefaultStore = data_cursor
                 .read_ne()
-                .context("Failed to parse DefaultStore's data")?;
+                .context("failed to parse DefaultStore's data")?;
             debug!("DefaultStore is {:?}", parsed);
             node.parsed_data = ParsedOperation::DefaultStore(parsed);
         }
         IFROpCode::Default => {
             let parsed: IFRDefault = data_cursor
                 .read_ne()
-                .context("Failed to parse Default's data")?;
+                .context("failed to parse Default's data")?;
             debug!("Default is {:?}", parsed);
             node.parsed_data = ParsedOperation::IFRDefault(parsed);
         }
         IFROpCode::Form => {
             let parsed: Form = data_cursor
                 .read_ne()
-                .context("Failed to parse Form's data")?;
+                .context("failed to parse Form's data")?;
             debug!("Form is {:?}", parsed);
             node.parsed_data = ParsedOperation::Form(parsed);
         }
         IFROpCode::Text => {
             let parsed: Text = data_cursor
                 .read_ne()
-                .context("Failed to parse Text's data")?;
+                .context("failed to parse Text's data")?;
             debug!("Text is {:?}", parsed);
             node.parsed_data = ParsedOperation::Text(parsed);
         }
         IFROpCode::Subtitle => {
             let parsed: Subtitle = data_cursor
                 .read_ne()
-                .context("Failed to parse Subtitle's data")?;
+                .context("failed to parse Subtitle's data")?;
             debug!("Subtitle is {:?}", parsed);
             node.parsed_data = ParsedOperation::Subtitle(parsed);
         }
         IFROpCode::Numeric => {
             let parsed: Numeric = data_cursor
                 .read_ne_args((RangeEncoding::from_question(&node),))
-                .context("Failed to parse Numeric's data")?;
+                .context("failed to parse Numeric's data")?;
             debug!("Numeric is {:?}", parsed);
             node.parsed_data = ParsedOperation::Numeric(parsed);
         }
         IFROpCode::QuestionRef1 => {
             let parsed: QuestionRef1 = data_cursor
                 .read_ne()
-                .context("Failed to parse QuestionRef1's data")?;
+                .context("failed to parse QuestionRef1's data")?;
             debug!("QuestionRef1 is {:?}", parsed);
             node.parsed_data = ParsedOperation::QuestionRef1(parsed);
         }
         IFROpCode::EqIdVal => {
             let parsed: EqIdVal = data_cursor
                 .read_ne()
-                .context("Failed to parse EqIdVal's data")?;
+                .context("failed to parse EqIdVal's data")?;
             debug!("EqIdVal is {:?}", parsed);
             node.parsed_data = ParsedOperation::EqIdVal(parsed);
         }
@@ -2340,7 +2340,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         IFROpCode::EqIdValList => {
             let parsed: EqIdValList = data_cursor
                 .read_ne()
-                .context("Failed to parse EqIdValList's data")?;
+                .context("failed to parse EqIdValList's data")?;
             debug!("EqIdValList is {:?}", parsed);
             node.parsed_data = ParsedOperation::EqIdValList(parsed);
         }

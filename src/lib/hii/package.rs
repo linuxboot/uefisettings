@@ -1077,6 +1077,83 @@ mod tests {
         }
     }
 
+    /// read_db names a string block type that it does not handle, and the code of one that UEFI
+    /// 2.10 §33.3.6.2 does not define.
+    #[test]
+    fn test_read_db_error_names_an_unhandled_string_block_type() {
+        let cases: [(&[u8], &str); 2] = [
+            // EFI_HII_SIBT_STRING_SCSU "A"
+            (
+                &[0x10, b'A', 0x00],
+                "unhandled string block type StringScsu",
+            ),
+            (&[0x41], "unknown string block type 0x41"),
+        ];
+        for (blocks, want) in cases {
+            let package = en_strings_package_with_blocks(blocks);
+            let hiidb =
+                package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat());
+
+            let Err(err) = read_db(&hiidb) else {
+                panic!("read_db parsed the string blocks {blocks:02x?}");
+            };
+
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+                     failed to parse a strings package: {want}"
+                ),
+                "blocks {blocks:02x?}"
+            );
+        }
+    }
+
+    /// The contexts that read_db gives a form package's parse error are lowercase, for each op
+    /// that handle_opcode parses.
+    #[test]
+    fn test_read_db_form_error_contexts_are_lowercase() {
+        let ops = [
+            (0x01, "Form"),
+            (0x02, "Subtitle"),
+            (0x03, "Text"),
+            (0x05, "OneOf"),
+            (0x06, "CheckBox"),
+            (0x07, "Numeric"),
+            (0x09, "OneOfOption"),
+            (0x0E, "FormSet"),
+            (0x12, "EqIdVal"),
+            (0x13, "EqIdId"),
+            (0x14, "EqIdValList"),
+            (0x24, "VarStore"),
+            (0x25, "VarStoreNameValue"),
+            (0x26, "VarStoreEfi"),
+            (0x40, "QuestionRef1"),
+            (0x5B, "Default"),
+            (0x5C, "DefaultStore"),
+        ];
+        for (op_code, name) in ops {
+            // an op of Length 2: none of its data bytes
+            let form_package = [0x06, 0x00, 0x00, 0x02, op_code, 0x02];
+            let hiidb = package_list_with_guid([0x22; 16], &form_package);
+
+            let Err(err) = read_db(&hiidb) else {
+                panic!("read_db parsed a {name} op without data");
+            };
+
+            let msg = format!("{err:#}");
+            let want = format!(
+                "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+                 failed to parse a form package: failed to parse op_code {name} properly: \
+                 failed to parse {name}'s data: "
+            );
+            assert!(
+                msg.starts_with(&want),
+                "{name}: lowercase contexts up to {name}'s data: {msg}"
+            );
+        }
+    }
+
     /// read_db errors in a form package name the package list and the form
     /// package.
     #[test]

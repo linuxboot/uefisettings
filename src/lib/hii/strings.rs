@@ -136,9 +136,23 @@ pub fn handle_string_package(
             StringBlockType::End => {
                 break;
             }
-            _ => {
+            StringBlockType::Unknown(code) => {
+                return Err(anyhow!("unknown string block type {code:#04x}"));
+            }
+            StringBlockType::StringScsu
+            | StringBlockType::StringScsuFont
+            | StringBlockType::StringsScsu
+            | StringBlockType::StringsScsuFont
+            | StringBlockType::StringUcs2Font
+            | StringBlockType::StringsUcs2
+            | StringBlockType::StringsUcs2Font
+            | StringBlockType::Duplicate
+            | StringBlockType::Ext1
+            | StringBlockType::Ext2
+            | StringBlockType::Ext4
+            | StringBlockType::Font => {
                 // Or we can break;
-                return Err(anyhow!("Unhandled block type"));
+                return Err(anyhow!("unhandled string block type {block_type:?}"));
                 // If we encounter any unhandled String Info Block Types type,
                 // we cannot parse the rest of the package. This is because string_id_current
                 // is changed by each block and subsequent blocks need an updated value.
