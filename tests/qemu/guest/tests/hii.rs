@@ -591,6 +591,46 @@ fn dumped_efivars_answer_as_efivarfs() {
             );
         }
     }
+    let list = ["hii", "list-questions", "--json"];
+    let live = uefisettings(&list);
+    let matching = uefisettings(
+        &[
+            &list[..],
+            &["-f", "/tmp/hiidb.bin", "--efivars", "/tmp/efivars"],
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        (matching.code, matching.stdout),
+        (live.code, live.stdout.clone()),
+        "-f /tmp/hiidb.bin --efivars /tmp/efivars"
+    );
+    let foreign = "/tmp/hiidb-foreign.bin";
+    fs::write(foreign, [&hiidb[..], b"x"].concat()).expect("cannot write a foreign HiiDB");
+    let error = json_error(&[&list[..], &["-f", foreign, "--efivars", "/tmp/efivars"]].concat());
+    assert!(
+        error.error_message.starts_with(&format!(
+            "'{foreign}' is not the HiiDB that the efivars dump '/tmp/efivars' was dumped with"
+        )),
+        "-f {foreign} --efivars /tmp/efivars: {error:?}"
+    );
+    // without -f, --efivars reads the dump's hiidb.bin, and only while its manifest exists
+    fs::write("/tmp/efivars-whole/hiidb.bin", b"not a HiiDB").expect("cannot overwrite hiidb.bin");
+    let error = json_error(&[&list[..], &["--efivars", "/tmp/efivars-whole"]].concat());
+    assert!(
+        error
+            .error_message
+            .starts_with("failed to parse the package list"),
+        "--efivars of a dump with a garbage hiidb.bin: {error:?}"
+    );
+    fs::remove_file("/tmp/efivars-whole/uefisettings-dump.json")
+        .expect("cannot remove the manifest");
+    let plain = uefisettings(&[&list[..], &["--efivars", "/tmp/efivars-whole"]].concat());
+    assert_eq!(
+        (plain.code, plain.stdout),
+        (live.code, live.stdout),
+        "--efivars of a dump without its manifest"
+    );
     let error = json_error(&["hii", "dump-efivars", "/tmp/efivars"]);
     assert_eq!(
         error.error_message,

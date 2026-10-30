@@ -177,7 +177,7 @@ enum HiiSubcommands {
 /// Where get, show-ifr and list-questions read question values.
 #[derive(Debug, Args)]
 struct EfivarArgs {
-    /// Read question values from the efivar files in this directory (efivarfs format) instead of this machine's efivarfs
+    /// Read question values from the efivar files in this directory (efivarfs format) instead of this machine's efivarfs; without --filename, also the HiiDB if dump-efivars wrote the directory
     #[clap(
         long,
         value_name = "DIR",
@@ -347,7 +347,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let res = HiiBackend::get_using(
-                    &get_db_dump_bytes(filename.as_deref())?,
+                    &HiiBackend::read_hiidb(filename.as_deref(), &options.efivars)?,
                     question,
                     None,
                     &options,
@@ -368,8 +368,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 options.efivars = efivars.source()?;
                 // before the HiiDB is read
                 options.efivars.validate()?;
-                let res =
-                    HiiBackend::show_ifr_using(&get_db_dump_bytes(filename.as_deref())?, &options)?;
+                let res = HiiBackend::show_ifr_using(
+                    &HiiBackend::read_hiidb(filename.as_deref(), &options.efivars)?,
+                    &options,
+                )?;
                 print_line(format_args!("{}", res.readable_representation))?;
             }
             HiiSubcommands::ExtractDB { filename } => {
@@ -415,7 +417,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let res = HiiBackend::list_questions_using(
-                    &get_db_dump_bytes(filename.as_deref())?,
+                    &HiiBackend::read_hiidb(filename.as_deref(), &options.efivars)?,
                     &options,
                 )?;
                 print_with_style(res, *json)?;
@@ -514,7 +516,7 @@ fn prioritize_backend(machine: &MachineInfo, json: bool) -> Result<Backend> {
 }
 
 fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
-    HiiBackend::read_hiidb(filename)
+    HiiBackend::read_hiidb(filename, &EfivarSource::System)
 }
 
 /// What extract-db prints on stdout about the HiiDB written to `path`.

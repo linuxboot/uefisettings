@@ -41,6 +41,7 @@ pub use crate::hii::EfivarDump;
 use crate::hii::EfivarReader;
 pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
+use crate::hii::SavedDump;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
 use crate::ilorest::requests::Ilo5Dev;
@@ -120,11 +121,24 @@ impl HiiBackend {
         Ok(resp)
     }
 
-    /// Reads the HiiDB in the file `filename`, or this machine's.
-    pub fn read_hiidb(filename: Option<&Path>) -> Result<Vec<u8>> {
-        match filename {
-            Some(filename) => package::read_db_file(filename),
-            None => extract::extract_db(),
+    /// Reads the HiiDB that get, list-questions and show-ifr read with `efivars`: the file
+    /// `filename` if given, else the one that an efivars dump in `efivars` saved, else this
+    /// machine's. A redacted dump refuses another `filename`, whose questions would read its zeros
+    /// as values.
+    pub fn read_hiidb(filename: Option<&Path>, efivars: &EfivarSource) -> Result<Vec<u8>> {
+        let dump = match efivars {
+            EfivarSource::Directory(dir) => SavedDump::open(dir)?,
+            EfivarSource::System | EfivarSource::Disabled => None,
+        };
+        match (filename, dump) {
+            (Some(filename), None) => package::read_db_file(filename),
+            (Some(filename), Some(dump)) => {
+                let hiidb = package::read_db_file(filename)?;
+                dump.check_hiidb(&hiidb, filename)?;
+                Ok(hiidb)
+            }
+            (None, Some(dump)) => dump.read_hiidb(),
+            (None, None) => extract::extract_db(),
         }
     }
 
@@ -972,6 +986,91 @@ mod tests {
                 ifr.contains(&format!("-Answer: {want_shown}\n")),
                 "{case}: show-ifr {ifr:?}"
             );
+        }
+    }
+
+    /// read_hiidb reads `filename` if given, else the HiiDB that an efivars dump saved; a
+    /// redacted dump refuses another `filename`.
+    #[test]
+    fn read_hiidb_reads_the_file_or_the_dump() {
+        let dump = |redaction: &str| {
+            let dir = tempfile::tempdir().expect("create a dump directory");
+            fs::write(dir.path().join("hiidb.bin"), b"saved HiiDB").expect("write the HiiDB");
+            fs::write(
+                dir.path().join("uefisettings-dump.json"),
+                format!(r#"{{"format": 1, "uefisettings": "0.1.6", "redaction": "{redaction}"}}"#),
+            )
+            .expect("write the manifest");
+            dir
+        };
+        let (redacted, unredacted) = (dump("decoded-bytes"), dump("unredacted"));
+        let plain = tempfile::tempdir().expect("create an efivars directory");
+        fs::write(plain.path().join("hiidb.bin"), b"saved HiiDB").expect("write a HiiDB");
+        let files = tempfile::tempdir().expect("create a directory");
+        let (saved, other) = (
+            files.path().join("saved.bin"),
+            files.path().join("other.bin"),
+        );
+        fs::write(&saved, b"saved HiiDB").expect("write the saved HiiDB");
+        fs::write(&other, b"other HiiDB").expect("write another HiiDB");
+        let directory = |dir: &tempfile::TempDir| EfivarSource::Directory(dir.path().to_path_buf());
+        let refused = format!(
+            "'{}' is not the HiiDB that the efivars dump '{}' was dumped with",
+            other.display(),
+            redacted.path().display()
+        );
+
+        for (case, filename, efivars, want) in [
+            ("a dump", None, directory(&redacted), Ok("saved HiiDB")),
+            (
+                "the HiiDB of a redacted dump",
+                Some(&saved),
+                directory(&redacted),
+                Ok("saved HiiDB"),
+            ),
+            (
+                "another HiiDB, an unredacted dump",
+                Some(&other),
+                directory(&unredacted),
+                Ok("other HiiDB"),
+            ),
+            (
+                "a HiiDB, a directory without a manifest",
+                Some(&other),
+                directory(&plain),
+                Ok("other HiiDB"),
+            ),
+            (
+                "a HiiDB, no efivars",
+                Some(&other),
+                EfivarSource::Disabled,
+                Ok("other HiiDB"),
+            ),
+            (
+                "a HiiDB, efivarfs",
+                Some(&other),
+                EfivarSource::System,
+                Ok("other HiiDB"),
+            ),
+            (
+                "another HiiDB, a redacted dump",
+                Some(&other),
+                directory(&redacted),
+                Err(&refused),
+            ),
+        ] {
+            let got = HiiBackend::read_hiidb(filename.map(|path| path.as_path()), &efivars);
+
+            match (got, want) {
+                (Ok(db), Ok(want)) => assert_eq!(db, want.as_bytes(), "{case}"),
+                (Err(error), Err(want)) => {
+                    assert!(format!("{error:#}").starts_with(want), "{case}: {error:#}")
+                }
+                (got, want) => panic!(
+                    "{case}: got {:?}, want {want:?}",
+                    got.map_err(|error| format!("{error:#}"))
+                ),
+            }
         }
     }
 

@@ -25,5 +25,6 @@ mod strings;
 pub(crate) use efivar_dump::dump_efivars;
 pub use efivar_dump::EfivarDump;
 pub use efivar_dump::EfivarRedaction;
+pub(crate) use efivar_dump::SavedDump;
 pub(crate) use efivarfs::EfivarReader;
 pub use efivarfs::EfivarSource;

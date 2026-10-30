@@ -90,7 +90,7 @@ pub(super) fn open_efivar(dir: &Path, name: &EfivarFileName) -> Result<File> {
 /// send a read elsewhere or block it. The check is on the file that is then read: an O_PATH
 /// descriptor opens no file (open(2)), so a device node runs no driver open, and reopening it
 /// through /proc/self/fd opens the very file checked, whatever the path names by then.
-fn open_regular_file(path: &Path, noun: &str) -> Result<Option<File>> {
+pub(super) fn open_regular_file(path: &Path, noun: &str) -> Result<Option<File>> {
     let location = match locate(path) {
         Ok(location) => location,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
