@@ -2146,6 +2146,10 @@ pub fn handle_form_package(
     }));
 
     let mut current_scope = Rc::clone(&root);
+    // The scopes open inside an op that skips_scope names, its own scope counted: their ops are not
+    // decoded, as edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes skips them unread
+    // (InUnknownScope, UnknownDepth).
+    let mut skipped_depth: usize = 0;
 
     // this loop will terminate when it sees the IFR:End opcode as a child of FormSet
     // if input data is malformed then it will exit on erroring out cause none of the magic bytes match
@@ -2160,6 +2164,7 @@ pub fn handle_form_package(
 
         // end of current scope
         if current_node.borrow().op_code == IFROpCode::End {
+            skipped_depth = skipped_depth.saturating_sub(1);
             let current_scope_clone = Rc::clone(&current_scope);
             match current_scope_clone.borrow().parent.as_ref() {
                 Some(parent_ref) => {
@@ -2194,10 +2199,12 @@ pub fn handle_form_package(
         // before handle_opcode: RangeEncoding::from_question reads it
         current_node.borrow_mut().parent = Some(Rc::downgrade(&current_scope));
 
-        handle_opcode(Rc::clone(&current_node)).context(format!(
-            "failed to parse op_code {:?} properly",
-            &current_node.borrow().op_code,
-        ))?;
+        if skipped_depth == 0 {
+            handle_opcode(Rc::clone(&current_node)).context(format!(
+                "failed to parse op_code {:?} properly",
+                &current_node.borrow().op_code,
+            ))?;
+        }
 
         // add current_node to current_scope's children
         current_scope
@@ -2206,6 +2213,9 @@ pub fn handle_form_package(
             .push(Rc::clone(&current_node));
 
         if current_node.borrow().open_scope {
+            if skipped_depth > 0 || skips_scope(&current_node.borrow()) {
+                skipped_depth += 1;
+            }
             current_scope = Rc::clone(&current_node);
         }
     }
@@ -4961,6 +4971,66 @@ mod tests {
             unknown,
             ["            OpCode: Unknown(0x70) - skipped, as edk2 does"],
             "Unknown lines of {shown:?}"
+        );
+    }
+
+    /// The ops in the scope of an opcode above EFI_IFR_MATCH2_OP, nested ones too, are not
+    /// decoded, so a malformed one does not fail the form package; in a known opcode's scope
+    /// it still does.
+    #[test]
+    fn ops_in_an_unknown_opcode_scope_are_not_decoded() {
+        let in_scope = |op_code: u8| {
+            let short_checkbox = operation(CHECKBOX, false, &[0x00]); // 1 of its data bytes
+            let scope = [
+                operation(op_code, true, &[0x00; 16]),
+                operation(0x02, true, &[0x05, 0x00, 0x06, 0x00, 0x00]), // Subtitle
+                short_checkbox.clone(),
+                END.to_vec(), // End of Subtitle
+                short_checkbox,
+                END.to_vec(), // End of op_code
+            ];
+            form_set(&[form(
+                1,
+                &[
+                    scope.concat(),
+                    operation(op_code, false, &[]),
+                    checkbox_op(1, 0),
+                ],
+            )])
+        };
+
+        for op_code in [0x65, 0x70, 0xFF] {
+            let data = in_scope(op_code);
+            let root = handle_form_package(&mut Cursor::new(&data)).unwrap_or_else(|error| {
+                panic!("parse the scope of opcode {op_code:#x}: {error:#}")
+            });
+
+            let root = root.borrow();
+            let form = Rc::clone(&root.children[0].borrow().children[0]);
+            let scope = Rc::clone(&form.borrow().children[0]);
+            let subtitle = Rc::clone(&scope.borrow().children[0]);
+            let undecoded = [
+                ("in the Subtitle", Rc::clone(&subtitle.borrow().children[0])),
+                ("after the Subtitle", Rc::clone(&scope.borrow().children[1])),
+            ];
+            for (place, checkbox) in undecoded {
+                assert!(
+                    matches!(checkbox.borrow().parsed_data, ParsedOperation::Placeholder),
+                    "opcode {op_code:#x}: the CheckBox {place} is not decoded"
+                );
+            }
+            let after = Rc::clone(&form.borrow().children[2]);
+            assert!(
+                matches!(after.borrow().parsed_data, ParsedOperation::CheckBox(_)),
+                "opcode {op_code:#x}: the CheckBox after the scope is decoded"
+            );
+        }
+
+        let data = in_scope(GUID);
+        let error = handle_form_package(&mut Cursor::new(&data)).expect_err("GUID scope");
+        assert!(
+            format!("{error:#}").contains("failed to parse CheckBox's data"),
+            "GUID scope: {error:#}"
         );
     }
 
