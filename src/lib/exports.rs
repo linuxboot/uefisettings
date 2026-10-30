@@ -141,7 +141,7 @@ impl HiiBackend {
             if list.forms.is_empty() {
                 continue;
             }
-            write!(readable_representation, "Packagelist {}", list.guid)?;
+            writeln!(readable_representation, "Packagelist {}", list.guid)?;
             for form_package in list.forms {
                 readable_representation.push_str(&forms::display(
                     form_package,
@@ -833,6 +833,41 @@ mod tests {
             ("33333333-3333-3333-3333-333333333333", "B"),
         ];
         assert_eq!(got, want, "package lists and FormSet titles in {ifr:?}");
+    }
+
+    /// show_ifr ends the line of each package list's header before the forms of that list.
+    #[test]
+    fn test_show_ifr_ends_each_package_list_line_before_its_forms() {
+        let hiidb = [
+            form_set_list([0x33; 16], b'A'),
+            form_set_list([0x11; 16], b'C'),
+        ]
+        .concat();
+
+        let ifr = HiiBackend::show_ifr(&hiidb)
+            .expect("show the IFR")
+            .readable_representation;
+
+        let lines: Vec<&str> = ifr.lines().collect();
+        let headers: Vec<(&str, &str)> = lines
+            .windows(2)
+            .filter(|pair| pair[0].starts_with("Packagelist "))
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        let want = [
+            (
+                "Packagelist 33333333-3333-3333-3333-333333333333",
+                "OpCode: ROOT",
+            ),
+            (
+                "Packagelist 11111111-1111-1111-1111-111111111111",
+                "OpCode: ROOT",
+            ),
+        ];
+        assert_eq!(
+            headers, want,
+            "package list lines and the lines after them in {ifr:?}"
+        );
     }
 
     /// list_strings returns the strings packages in HiiDB order, duplicate
