@@ -46,7 +46,7 @@ pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
 pub(super) const FORM_MAP: u8 = 0x5D;
 
-pub(super) const VAR_STORE_EFI: u8 = 0x26;
+const VAR_STORE_EFI: u8 = 0x26;
 
 /// EFI variable Attributes: non-volatile, boot service and runtime access.
 pub(super) const NV_BS_RT: u32 = 0x07;

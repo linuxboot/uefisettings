@@ -1459,21 +1459,13 @@ mod efivar_reader_tests {
 
     #[test]
     fn list_questions_and_display_share_one_read() {
-        let var_store_efi = operation(
-            VAR_STORE_EFI,
-            false,
-            &[
-                &1u16.to_le_bytes()[..], // VarStoreId
-                &[0; 16],                // Guid
-                &7u32.to_le_bytes(),     // Attributes
-                &2u16.to_le_bytes(),     // Size
-                b"Setup\0",
-            ]
-            .concat(),
-        );
         let first = operation(CHECKBOX, false, &checkbox(0, 0x00));
-        let (root, _second) =
-            parse_question(&[var_store_efi, first], CHECKBOX, &checkbox(1, 0x00), &[]);
+        let (root, _second) = parse_question(
+            &[var_store_efi(1, "Setup", NV_BS_RT, 2), first],
+            CHECKBOX,
+            &checkbox(1, 0x00),
+            &[],
+        );
         let show = |reader: &mut EfivarReader| {
             display(Rc::clone(&root), 0, &strings(), reader).expect("display the form package")
         };
