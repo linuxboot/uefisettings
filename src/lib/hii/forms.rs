@@ -1058,7 +1058,7 @@ mod non_efi_varstore_tests {
         let efivars = Efivars::new();
         efivars.write(&efi_variable("Short", 2), &[1]);
         let want = format!(
-            "<VStoreError: failed to read efivar file '{}'>",
+            "<VStoreError: failed to read efivar file '{}': failed to fill whole buffer>",
             efivars
                 .path()
                 .join("Short-00000000-0000-0000-0000-000000000000")
@@ -1098,7 +1098,7 @@ mod non_efi_varstore_tests {
 
         assert_eq!(
             read_failure_reason(VariableStoreKind::Buffer, &error),
-            "<VStoreError: failed to read bytes>",
+            "<VStoreError: failed to read bytes: entity not found>",
             "a NotFound io::Error under a context"
         );
     }
@@ -1263,7 +1263,7 @@ fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> String
         return format!("<ValueUnavailable: {error}>");
     }
     let Some(missing) = error.downcast_ref::<EfivarNotFound>() else {
-        return format!("<VStoreError: {error}>");
+        return format!("<VStoreError: {error:#}>");
     };
     match kind {
         VariableStoreKind::Buffer => format!(
