@@ -100,6 +100,20 @@ fn set_one_of_is_stored() {
 }
 
 #[test]
+fn set_bit_field_numeric_is_refused() {
+    // The 12-bit BitNumeric field of DriverSample's variable; set picks it, as the
+    // "BIT numeric" on MyEfiBitVar is grayed out unless EfiBitGrayoutTest, which Linux
+    // cannot read, is nonzero.
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse(prefix, "BIT numeric", "20", &[]).error_message,
+            "setting EDKII bit-field values is not supported",
+            "{prefix:?}"
+        );
+    }
+}
+
+#[test]
 fn set_one_of_to_an_unknown_option_is_refused() {
     refuse(&["hii"], ONE_OF, "Bogus", &[]);
 }

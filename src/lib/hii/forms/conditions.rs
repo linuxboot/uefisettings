@@ -26,8 +26,7 @@ use anyhow::Result;
 use thiserror::Error;
 
 use super::find_corresponding_varstore;
-use super::read_question_bytes;
-use super::stored_value;
+use super::read_question_value;
 use super::value_question;
 use super::EfivarReader;
 use super::IFROpCode;
@@ -644,8 +643,8 @@ fn question_value(
         ValueQuestion::CheckBox(_) => ValueKind::Boolean,
         ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => ValueKind::Uint,
     };
-    let bytes = match read_question_bytes(question, varstore, reader) {
-        Ok(bytes) => bytes,
+    let value = match read_question_value(question, varstore, reader) {
+        Ok((_, value)) => value,
         Err(reason) => {
             return QuestionValue::Unreadable {
                 kind,
@@ -653,18 +652,16 @@ fn question_value(
             }
         }
     };
-    match (value_question, bytes) {
-        (ValueQuestion::CheckBox(_), [byte]) => QuestionValue::Boolean(*byte),
-        (ValueQuestion::CheckBox(_), _) => QuestionValue::Unreadable {
-            kind,
-            reason: format!(
-                "<ValueUnavailable: CHECKBOX value of {} bytes>",
-                bytes.len()
-            ),
+    match value_question {
+        // a byte or a bit
+        ValueQuestion::CheckBox(_) => match u8::try_from(value) {
+            Ok(byte) => QuestionValue::Boolean(byte),
+            Err(_) => QuestionValue::Unreadable {
+                kind,
+                reason: format!("<ValueUnavailable: CHECKBOX value {value} over a byte>"),
+            },
         },
-        (ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_), _) => {
-            QuestionValue::Uint(stored_value(bytes))
-        }
+        ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => QuestionValue::Uint(value),
     }
 }
 
@@ -1336,6 +1333,7 @@ mod tests {
     use super::super::Cursor;
     use super::super::FormSetWalk;
     use super::super::QuestionDescriptor;
+    use super::super::ValueLocation;
     use super::*;
 
     const EQ_ID_ID: u8 = 0x13;
@@ -2619,7 +2617,24 @@ mod tests {
             &HashSet::from([PROMPT]),
             &mut FormSetWalk::new(&strings(), &mut Efivars::new().reader(), &values(), include),
         )
-        .map(|question| question.header.question_id)
+        .map(|question| {
+            question_id_at(&root, question.location).expect("the QuestionId of the selected")
+        })
+    }
+
+    /// The QuestionId of the question under `node` that keeps its value at `location`, which
+    /// no other question of these tests shares.
+    fn question_id_at(node: &Rc<RefCell<IFROperation>>, location: ValueLocation) -> Option<u16> {
+        let op = node.borrow();
+        match value_question(&op) {
+            Some(question) if question.location() == location => {
+                Some(question.header().question_id)
+            }
+            _ => op
+                .children
+                .iter()
+                .find_map(|child| question_id_at(child, location)),
+        }
     }
 
     #[test]
@@ -3262,13 +3277,15 @@ mod tests {
             let root = parse_form_set(&[form(1, &[checkbox_op(1, 0), scope, checkbox_op(3, 2)])]);
 
             let got: Vec<u16> = list_questions(
-                root,
+                Rc::clone(&root),
                 &strings(),
                 IncludedStates::empty(),
                 &mut Efivars::new().reader(),
             )
             .into_iter()
-            .map(|(question, _)| question.header.question_id)
+            .map(|(question, _)| {
+                question_id_at(&root, question.location).expect("the QuestionId of the listed")
+            })
             .collect();
 
             assert_eq!(got, want, "{name}");
@@ -3554,18 +3571,40 @@ mod tests {
             assert_eq!(got, want, "{name}");
         }
 
-        let (_root, bit_field) =
-            parse_question_in_guid(BIT_VARSTORE_GUID, CHECKBOX, &checkbox(0, 0x00), &[]);
-        let bit_field = bit_field.borrow();
-        let value_question = value_question(&bit_field).expect("a CHECKBOX");
-        let VarStoreFixture { store, efivars } = var_store_of(&[0x01]);
-        assert_eq!(
-            question_value(&bit_field, value_question, &store, &mut efivars.reader()),
-            QuestionValue::Unreadable {
-                kind: ValueKind::Boolean,
-                reason: "<ValueUnavailable: EDKII bit-field value not decoded>".to_string(),
-            },
-            "bit-field CHECKBOX"
-        );
+        // only the bits of an EDKII bit varstore field
+        let bit_field_cases = [
+            (
+                "bit-field CHECKBOX clear",
+                CHECKBOX,
+                checkbox(1, 0x00),
+                0xFD,
+                QuestionValue::Boolean(0),
+            ),
+            (
+                "bit-field CHECKBOX set",
+                CHECKBOX,
+                checkbox(1, 0x00),
+                0x02,
+                QuestionValue::Boolean(1),
+            ),
+            (
+                "3-bit NUMERIC at bit 2",
+                NUMERIC,
+                uint32_range_question(2, 0x43),
+                0b1111_0111,
+                QuestionValue::Uint(0b101),
+            ),
+        ];
+        for (name, op_code, data, byte, want) in bit_field_cases {
+            let (_root, bit_field) = parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &[]);
+            let bit_field = bit_field.borrow();
+            let value_question = value_question(&bit_field).expect("a ONE_OF, NUMERIC or CHECKBOX");
+            let VarStoreFixture { store, efivars } = var_store_of(&[byte]);
+            assert_eq!(
+                question_value(&bit_field, value_question, &store, &mut efivars.reader()),
+                want,
+                "{name}"
+            );
+        }
     }
 }

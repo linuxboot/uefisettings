@@ -459,12 +459,14 @@ pub struct QuestionHeader {
 }
 
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little, import(encoding: RangeEncoding))]
+#[br(little, import(encoding: ValueEncoding))]
 pub struct OneOf {
     pub question_header: QuestionHeader,
     pub flags: u8,
     #[br(parse_with = range_parser, args(flags, encoding))]
     pub data: Range,
+    #[br(calc = encoding.numeric_location(question_header.var_store_info, flags, &data))]
+    location: ValueLocation,
 }
 
 impl Question for OneOf {
@@ -474,12 +476,14 @@ impl Question for OneOf {
 }
 
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little, import(encoding: RangeEncoding))]
+#[br(little, import(encoding: ValueEncoding))]
 pub struct Numeric {
     pub question_header: QuestionHeader,
     pub flags: u8,
     #[br(parse_with = range_parser, args(flags, encoding))]
     pub data: Range,
+    #[br(calc = encoding.numeric_location(question_header.var_store_info, flags, &data))]
+    location: ValueLocation,
 }
 
 impl Question for Numeric {
@@ -612,11 +616,22 @@ struct NumericFormat {
     signed_type_bits: Option<u32>,
 }
 
-/// Why the Flags of a NUMERIC or ONE_OF give no value format.
+/// Why the Flags and VarOffset of a NUMERIC or ONE_OF give no value format.
 #[derive(Debug, Error)]
 enum NumericFormatError {
     #[error("EDKII bit-field width {0}, not 1 to 32")]
     BitFieldWidth(u8),
+    #[error("EDKII bit field of width {width} at bit {offset} spans more than 4 bytes")]
+    BitFieldSpan { offset: u16, width: u8 },
+}
+
+/// Returns `width`, an EDKII bit varstore field's width, in bits if it is 1 to 32.
+fn bit_field_bits(width: u8) -> Result<u32, NumericFormatError> {
+    let bits = u32::from(width);
+    if !(1..=EDKII_BIT_FIELD_VALUE_BITS).contains(&bits) {
+        return Err(NumericFormatError::BitFieldWidth(width));
+    }
+    Ok(bits)
 }
 
 impl NumericFormat {
@@ -629,13 +644,29 @@ impl NumericFormat {
         }
     }
 
-    /// Returns the format of an EDKII bit varstore field's IFR default, from its Flags.
-    fn from_bit_field_flags(flags: u8) -> Result<Self, NumericFormatError> {
-        let width = flags & EDKII_IFR_NUMERIC_SIZE_BIT;
-        let bits = u32::from(width);
-        if !(1..=EDKII_BIT_FIELD_VALUE_BITS).contains(&bits) {
-            return Err(NumericFormatError::BitFieldWidth(width));
+    /// Returns the format of the value at `location` of a NUMERIC or ONE_OF with `flags` and
+    /// `range`. edk2-stable202608 IfrParse.c types an EDKII bit varstore field's value by its
+    /// StorageWidth, the bytes its bits span: UINT8, UINT16, or UINT32 for 3 or 4;
+    /// ProcessOptions.c signs an INT_DEC value from that type. So an 8-bit field holding 0xFF
+    /// shows -1 at bit 0, in UINT8, and 255 at bit 4, in UINT16.
+    fn from_location(location: ReadableLocation, flags: u8, range: &Range) -> Self {
+        match location.0 {
+            ValueLocation::Bytes { .. } => Self::from_ifr(range, flags),
+            ValueLocation::Bits { offset, width } => {
+                let storage_bits = u32::from(storage_width(offset, width)) * u8::BITS;
+                let signed = flags & EDKII_IFR_DISPLAY_BIT == EDKII_IFR_DISPLAY_INT_DEC_BIT;
+                Self {
+                    bits: u32::from(width),
+                    signed_type_bits: signed.then_some(storage_bits.next_power_of_two()),
+                }
+            }
         }
+    }
+
+    /// Returns the format of the IFR default of an EDKII bit varstore field of `width` bits,
+    /// from its Flags.
+    fn from_bit_field(width: u8, flags: u8) -> Result<Self, NumericFormatError> {
+        let bits = bit_field_bits(width)?;
         // edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault copies the EFI_IFR_DEFAULT,
         // Type UINT32 here, and DisplayEngineDxe/ProcessOptions.c PrintFormattedNumber signs by
         // that Type; IfrParse.c types the question by the bytes it spans and GetBitsQuestionValue
@@ -679,14 +710,13 @@ impl NumericFormat {
 
 /// Returns the format of the question's IFR default, from EDKII bit-field Flags if it has them.
 fn numeric_format(
-    question: &IFROperation,
+    location: ValueLocation,
     flags: u8,
     range: &Range,
 ) -> Result<NumericFormat, NumericFormatError> {
-    if refers_to_bit_field(question) {
-        NumericFormat::from_bit_field_flags(flags)
-    } else {
-        Ok(NumericFormat::from_ifr(range, flags))
+    match location {
+        ValueLocation::Bits { width, .. } => NumericFormat::from_bit_field(width, flags),
+        ValueLocation::Bytes { .. } => Ok(NumericFormat::from_ifr(range, flags)),
     }
 }
 
@@ -704,17 +734,18 @@ fn refers_to_bit_field(question: &IFROperation) -> bool {
         })
 }
 
-/// How a NUMERIC or ONE_OF stores its MinValue, MaxValue and Step.
+/// How a ONE_OF, NUMERIC or CHECKBOX stores its value, and a NUMERIC or ONE_OF its MinValue,
+/// MaxValue and Step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RangeEncoding {
-    /// In the size of EFI_IFR_NUMERIC_SIZE in its Flags.
+pub enum ValueEncoding {
+    /// In the size of EFI_IFR_NUMERIC_SIZE in its Flags, a CHECKBOX value in a byte.
     NumericSize,
     /// As UINT32, as edk2-stable202608 VfrSyntax.g stores them for an EDKII bit varstore field,
-    /// whose Flags hold its width in bits.
+    /// whose Flags hold its width in bits; the value in that width, a CHECKBOX value in 1 bit.
     EdkiiBitField,
 }
 
-impl RangeEncoding {
+impl ValueEncoding {
     fn from_question(question: &IFROperation) -> Self {
         if refers_to_bit_field(question) {
             Self::EdkiiBitField
@@ -722,16 +753,39 @@ impl RangeEncoding {
             Self::NumericSize
         }
     }
+
+    /// Where a ONE_OF or NUMERIC with `flags` and `range` keeps its value, VarOffset `offset`.
+    fn numeric_location(self, offset: u16, flags: u8, range: &Range) -> ValueLocation {
+        match self {
+            Self::NumericSize => ValueLocation::Bytes {
+                offset,
+                size: range.size(),
+            },
+            Self::EdkiiBitField => ValueLocation::Bits {
+                offset,
+                width: flags & EDKII_IFR_NUMERIC_SIZE_BIT,
+            },
+        }
+    }
+
+    /// Where a CHECKBOX keeps its value, VarOffset `offset`: in a byte, or in the 1 bit that
+    /// edk2-stable202608 IfrParse.c gives a bit-field CHECKBOX.
+    fn checkbox_location(self, offset: u16) -> ValueLocation {
+        match self {
+            Self::NumericSize => ValueLocation::Bytes { offset, size: 1 },
+            Self::EdkiiBitField => ValueLocation::Bits { offset, width: 1 },
+        }
+    }
 }
 
 fn range_parser<R: Read + Seek>(
     reader: &mut R,
     _endian: binrw::Endian,
-    (flags, encoding): (u8, RangeEncoding),
+    (flags, encoding): (u8, ValueEncoding),
 ) -> BinResult<Range> {
     match encoding {
-        RangeEncoding::EdkiiBitField => Ok(Range::Range32(reader.read_ne()?)),
-        RangeEncoding::NumericSize => match flags & EFI_IFR_NUMERIC_SIZE {
+        ValueEncoding::EdkiiBitField => Ok(Range::Range32(reader.read_ne()?)),
+        ValueEncoding::NumericSize => match flags & EFI_IFR_NUMERIC_SIZE {
             EFI_IFR_NUMERIC_SIZE_1 => Ok(Range::Range8(reader.read_ne()?)),
             EFI_IFR_NUMERIC_SIZE_2 => Ok(Range::Range16(reader.read_ne()?)),
             EFI_IFR_NUMERIC_SIZE_4 => Ok(Range::Range32(reader.read_ne()?)),
@@ -742,10 +796,12 @@ fn range_parser<R: Read + Seek>(
 }
 
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+#[br(little, import(encoding: ValueEncoding))]
 pub struct CheckBox {
     pub question_header: QuestionHeader,
     pub flags: u8,
+    #[br(calc = encoding.checkbox_location(question_header.var_store_info))]
+    location: ValueLocation,
 }
 
 impl Question for CheckBox {
@@ -768,6 +824,14 @@ impl ValueQuestion<'_> {
             ValueQuestion::OneOf(question) => question.question_header(),
             ValueQuestion::Numeric(question) => question.question_header(),
             ValueQuestion::CheckBox(question) => question.question_header(),
+        }
+    }
+
+    fn location(self) -> ValueLocation {
+        match self {
+            ValueQuestion::OneOf(question) => question.location,
+            ValueQuestion::Numeric(question) => question.location,
+            ValueQuestion::CheckBox(question) => question.location,
         }
     }
 }
@@ -1212,18 +1276,10 @@ mod non_efi_varstore_tests {
                 raw_value: TypeValue::NumSize8(1),
                 state: StateEvaluation::selectable(),
             }],
-            header: QuestionHeader {
-                prompt_string_id: 0,
-                help_string_id: 0,
-                question_id: 0,
-                var_store_id: 1,
-                var_store_info: 0,
-                question_flags: 0,
-            },
             varstore: Ok(Box::new(TestVariableStore {
                 kind: VariableStoreKind::Buffer,
             })),
-            refers_to_bit_field: false,
+            location: ValueLocation::Bytes { offset: 0, size: 1 },
             value_state: StateEvaluation::selectable(),
         };
 
@@ -1294,24 +1350,101 @@ fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> String
     }
 }
 
+/// Where a ONE_OF, NUMERIC or CHECKBOX keeps its value in the payload of its VarStore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueLocation {
+    /// `size` bytes from byte `offset`, little-endian
+    Bytes { offset: u16, size: u8 },
+    /// `width` bits from bit `offset`: an EDKII bit varstore field, its BitVarOffset and
+    /// BitStorageWidth in edk2-stable202608 SetupBrowserDxe/IfrParse.c
+    Bits { offset: u16, width: u8 },
+}
+
+impl ValueLocation {
+    /// The payload bytes that hold the value: for Bits, the StorageWidth bytes of IfrParse.c.
+    fn bytes(self) -> std::ops::Range<usize> {
+        match self {
+            Self::Bytes { offset, size } => {
+                usize::from(offset)..usize::from(offset) + usize::from(size)
+            }
+            Self::Bits { offset, width } => {
+                let start = usize::from(offset / 8);
+                start..start + usize::from(storage_width(offset, width))
+            }
+        }
+    }
+
+    /// Refuses a bit field that edk2-stable202608 Setup.c GetBitsQuestionValue cannot read: it
+    /// copies the StorageWidth bytes into a UINT32 and takes 1 to 32 bits from it.
+    fn check(self) -> Result<ReadableLocation, NumericFormatError> {
+        match self {
+            Self::Bytes { .. } => Ok(ReadableLocation(self)),
+            Self::Bits { offset, width } => {
+                bit_field_bits(width)?;
+                if u32::from(storage_width(offset, width)) * u8::BITS > EDKII_BIT_FIELD_VALUE_BITS {
+                    return Err(NumericFormatError::BitFieldSpan { offset, width });
+                }
+                Ok(ReadableLocation(self))
+            }
+        }
+    }
+}
+
+/// The StorageWidth of edk2-stable202608 IfrParse.c: the bytes that `width` bits from bit
+/// `offset` span.
+fn storage_width(offset: u16, width: u8) -> u16 {
+    (offset % 8 + u16::from(width)).div_ceil(8)
+}
+
+/// A ValueLocation that ValueLocation::check accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadableLocation(ValueLocation);
+
+impl ReadableLocation {
+    /// Returns the value that `bytes`, the bytes() of the location, hold: for Bits, as
+    /// GetBitsQuestionValue reads it.
+    fn read(self, bytes: &[u8]) -> u64 {
+        match self.0 {
+            ValueLocation::Bytes { .. } => stored_value(bytes),
+            ValueLocation::Bits { offset, width } => {
+                (stored_value(bytes) >> u32::from(offset % 8)) & ((1 << width) - 1)
+            }
+        }
+    }
+}
+
 /// The payload bytes that hold the value of `question`, if it is a ONE_OF, NUMERIC or CHECKBOX,
 /// where edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes places it: an EDKII bit
 /// varstore field, whose VarOffset and width count bits, spans the bytes of its bits.
 fn value_bytes(question: &IFROperation) -> Option<std::ops::Range<usize>> {
-    let value_question = value_question(question)?;
-    let (size, bits) = match value_question {
-        ValueQuestion::OneOf(OneOf { flags, data, .. })
-        | ValueQuestion::Numeric(Numeric { flags, data, .. }) => {
-            (usize::from(data.size()), flags & EDKII_IFR_NUMERIC_SIZE_BIT)
-        }
-        ValueQuestion::CheckBox(_) => (std::mem::size_of::<u8>(), 1),
+    Some(value_question(question)?.location().bytes())
+}
+
+/// Returns where the question keeps its value and the value, or why it cannot be read.
+fn read_question_value(
+    question: &IFROperation,
+    varstore: &Result<Box<dyn VariableStore>>,
+    reader: &mut EfivarReader,
+) -> std::result::Result<(ReadableLocation, u64), Cow<'static, str>> {
+    let Some(value_question) = value_question(question) else {
+        return Err(not_decoded(question));
     };
-    let offset = usize::from(value_question.header().var_store_info);
-    if refers_to_bit_field(question) {
-        Some(offset / 8..(offset + usize::from(bits)).div_ceil(8))
-    } else {
-        Some(offset..offset + size)
-    }
+    // before the read: a field that cannot be read gives its own reason, and dump-efivars keeps
+    // no bytes for it
+    let location = value_question
+        .location()
+        .check()
+        .map_err(|error| Cow::Owned(format!("<ValueUnavailable: {error}>")))?;
+    let bytes = read_question_bytes(question, varstore, reader)?;
+    Ok((location, location.read(bytes)))
+}
+
+/// Why the value of `question`, which is not a ONE_OF, NUMERIC or CHECKBOX, is unavailable.
+fn not_decoded(question: &IFROperation) -> Cow<'static, str> {
+    Cow::Owned(format!(
+        "<ValueUnavailable: {:?} value not decoded>",
+        question.op_code
+    ))
 }
 
 /// Returns the value_bytes of the question, or why its value cannot be read.
@@ -1321,19 +1454,9 @@ fn read_question_bytes<'a>(
     reader: &'a mut EfivarReader,
 ) -> std::result::Result<&'a [u8], Cow<'static, str>> {
     let Some(value) = value_bytes(question) else {
-        return Err(Cow::Owned(format!(
-            "<ValueUnavailable: {:?} value not decoded>",
-            question.op_code
-        )));
+        return Err(not_decoded(question));
     };
     let bytes = read_current_value_bytes(varstore, value.clone(), reader)?;
-    // edk2-stable202608 SetupBrowserDxe/IfrParse.c reads the VarOffset of such a question in bits
-    // TODO: decode bit fields by the width in their Flags, not their Range32 (UINT32 storage)
-    if refers_to_bit_field(question) {
-        return Err(Cow::Borrowed(
-            "<ValueUnavailable: EDKII bit-field value not decoded>",
-        ));
-    }
     let offset = value.start;
     bytes
         .get(EFIVARFS_HEADER_SIZE..)
@@ -1346,8 +1469,7 @@ fn read_question_bytes<'a>(
         })
 }
 
-/// The little-endian integer that `bytes`, the value_bytes of a question that is not a bit
-/// field, store.
+/// The little-endian integer that `bytes`, the value_bytes of a question, store.
 fn stored_value(bytes: &[u8]) -> u64 {
     bytes
         .iter()
@@ -1790,7 +1912,7 @@ mod efivar_reader_tests {
 
     #[test]
     fn questions_decode_only_their_value_bytes() {
-        for (case, (root, question), value) in value_questions() {
+        for (case, (root, _question), value) in value_questions() {
             let show = |outside: u8, inside: u8| {
                 let payload: Vec<u8> = (0..16)
                     .map(|offset| match value.contains(&offset) {
@@ -1816,14 +1938,11 @@ mod efivar_reader_tests {
             };
 
             assert_eq!(show(0x00, 0x01), show(0xFF, 0x01), "{case}: other bytes");
-            // read_question_bytes refuses bit fields
-            if !refers_to_bit_field(&question.borrow()) {
-                assert_ne!(
-                    show(0x00, 0x01).1,
-                    show(0x00, 0x00).1,
-                    "{case}: value bytes"
-                );
-            }
+            assert_ne!(
+                show(0x00, 0xFF).1,
+                show(0x00, 0x00).1,
+                "{case}: value bytes"
+            );
         }
     }
 
@@ -1873,6 +1992,35 @@ mod efivar_reader_tests {
             ]),
             "decoded bytes: only of variables read"
         );
+    }
+
+    /// A bit field that cannot be read reports why without reading its bytes, so that a short
+    /// store reports the field, not the read, and dump-efivars keeps no bytes for it.
+    #[test]
+    fn unreadable_bit_field_is_refused_before_its_bytes_are_read() {
+        // 33 bits from bit 0 span 5 bytes of the 4-byte store
+        let (_root, node) = parse_question_in_guid(
+            BIT_VARSTORE_GUID,
+            NUMERIC,
+            &uint32_range_question(0, 33),
+            &[],
+        );
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Bits", 4), &[0xFF; 4]);
+        let mut reader = efivars.reader();
+
+        assert_eq!(
+            read_question_value(
+                &node.borrow(),
+                &Ok(Box::new(efi_variable("Bits", 4))),
+                &mut reader
+            )
+            .map(|_| ())
+            .map_err(Cow::into_owned),
+            Err("<ValueUnavailable: EDKII bit-field width 33, not 1 to 32>".to_string()),
+            "33-bit field"
+        );
+        assert_eq!(reader.decoded, BTreeMap::new(), "decoded bytes");
     }
 }
 
@@ -2260,7 +2408,7 @@ pub fn handle_form_set(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<Rc<RefCe
         }
 
         // set current_node's parent
-        // before handle_opcode: RangeEncoding::from_question reads it
+        // before handle_opcode: ValueEncoding::from_question reads it
         current_node.borrow_mut().parent = Some(Rc::downgrade(&current_scope));
 
         if skipped_depth == 0 {
@@ -2304,14 +2452,14 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
         IFROpCode::OneOf => {
             let parsed: OneOf = data_cursor
-                .read_ne_args((RangeEncoding::from_question(&node),))
+                .read_ne_args((ValueEncoding::from_question(&node),))
                 .context("failed to parse OneOf's data")?;
             debug!("OneOf is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOf(parsed);
         }
         IFROpCode::CheckBox => {
             let parsed: CheckBox = data_cursor
-                .read_ne()
+                .read_ne_args((ValueEncoding::from_question(&node),))
                 .context("failed to parse CheckBox's data")?;
             debug!("CheckBox is {:?}", parsed);
             node.parsed_data = ParsedOperation::CheckBox(parsed);
@@ -2385,7 +2533,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         }
         IFROpCode::Numeric => {
             let parsed: Numeric = data_cursor
-                .read_ne_args((RangeEncoding::from_question(&node),))
+                .read_ne_args((ValueEncoding::from_question(&node),))
                 .context("failed to parse Numeric's data")?;
             debug!("Numeric is {:?}", parsed);
             node.parsed_data = ParsedOperation::Numeric(parsed);
@@ -2432,12 +2580,10 @@ pub struct QuestionDescriptor {
     numeric_range: Option<NumericRange>,
     opcode: IFROpCode,
     pub possible_options: Vec<AnswerOption>,
-    header: QuestionHeader,
     /// The VarStore of the question, or why set cannot write it
     varstore: Result<Box<dyn VariableStore>>,
-    /// Whether the question is an EDKII bit varstore field, whose VarOffset edk2-stable202608
-    /// SetupBrowserDxe/IfrParse.c reads in bits
-    refers_to_bit_field: bool,
+    /// Where the question keeps its value
+    location: ValueLocation,
     /// The state of the option that `value` names: selectable if none does
     pub(crate) value_state: StateEvaluation,
 }
@@ -3031,13 +3177,13 @@ fn handle_checkbox(
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
-    let available = match read_question_bytes(current_node, &varstore, walk.inputs.reader) {
+    let available = match read_question_value(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             false
         }
-        Ok(bytes) => {
-            answer.push_str(&stored_value(bytes).to_string());
+        Ok((_, value)) => {
+            answer.push_str(&value.to_string());
             true
         }
     };
@@ -3061,9 +3207,8 @@ fn handle_checkbox(
         )
         .to_string(),
         possible_options: Vec::new(),
-        header: parsed.question_header(),
         varstore,
-        refers_to_bit_field: refers_to_bit_field(current_node),
+        location: parsed.location,
         max_value: RangeType::NumSize8(1),
         numeric_range: None,
         opcode: current_node.op_code,
@@ -3082,17 +3227,17 @@ fn handle_oneof(
     let mut answer = String::new();
     // None, with the reason in `answer`, when the current value cannot be read: any u64,
     // all ones too, can be stored.
-    let chosen_value = match read_question_bytes(current_node, &varstore, walk.inputs.reader) {
+    let chosen_value = match read_question_value(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             None
         }
-        Ok(bytes) => Some(stored_value(bytes)),
+        Ok((_, value)) => Some(value),
     };
 
     if chosen_value.is_none() {
         let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
-        match numeric_format(current_node, parsed.flags, &parsed.data) {
+        match numeric_format(parsed.location, parsed.flags, &parsed.data) {
             Ok(format) => push_default(
                 &mut answer,
                 current_node,
@@ -3164,9 +3309,8 @@ fn handle_oneof(
         )
         .to_string(),
         possible_options,
-        header: parsed.question_header(),
         varstore,
-        refers_to_bit_field: refers_to_bit_field(current_node),
+        location: parsed.location,
         max_value: match &parsed.data {
             Range::Range8(r) => RangeType::NumSize8(r.max_value),
             Range::Range16(r) => RangeType::NumSize16(r.max_value),
@@ -3189,15 +3333,14 @@ fn handle_numeric(
 ) -> QuestionDescriptor {
     let mut answer = String::new();
 
-    let available = match read_question_bytes(current_node, &varstore, walk.inputs.reader) {
+    let available = match read_question_value(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
             answer.push_str(&reason);
             false
         }
-        // read_question_bytes refuses bit-field questions, so the Range gives the width
-        Ok(bytes) => {
-            let format = NumericFormat::from_ifr(&parsed.data, parsed.flags);
-            answer.push_str(&format.decode(stored_value(bytes)).to_string());
+        Ok((location, value)) => {
+            let format = NumericFormat::from_location(location, parsed.flags, &parsed.data);
+            answer.push_str(&format.decode(value).to_string());
             true
         }
     };
@@ -3209,7 +3352,7 @@ fn handle_numeric(
             default_ids,
             &mut walk.inputs,
             |v, _| {
-                numeric_format(current_node, parsed.flags, &parsed.data)
+                numeric_format(parsed.location, parsed.flags, &parsed.data)
                     .map(|format| format.decode(v).to_string())
             },
         );
@@ -3223,17 +3366,19 @@ fn handle_numeric(
         )
         .to_string(),
         possible_options: Vec::new(),
-        header: parsed.question_header(),
         varstore,
-        refers_to_bit_field: refers_to_bit_field(current_node),
+        location: parsed.location,
         max_value: match &parsed.data {
             Range::Range8(r) => RangeType::NumSize8(r.max_value),
             Range::Range16(r) => RangeType::NumSize16(r.max_value),
             Range::Range32(r) => RangeType::NumSize32(r.max_value),
             Range::Range64(r) => RangeType::NumSize64(r.max_value),
         },
-        // TODO: None for bit fields: from_ifr reads EFI_IFR_DISPLAY from EDKII bit-field Flags
-        numeric_range: Some(NumericRange::from_ifr(&parsed.data, parsed.flags)),
+        // set refuses bit fields, whose Flags from_ifr would misread
+        numeric_range: match parsed.location {
+            ValueLocation::Bytes { .. } => Some(NumericRange::from_ifr(&parsed.data, parsed.flags)),
+            ValueLocation::Bits { .. } => None,
+        },
         opcode: current_node.op_code,
         value_state: StateEvaluation::selectable(),
     };
@@ -3247,7 +3392,8 @@ mod question_value_tests {
     use super::ifr_fixtures::*;
     use super::*;
 
-    const BIT_FIELD_NOT_DECODED: &str = "<ValueUnavailable: EDKII bit-field value not decoded>";
+    /// EDKII_IFR_DISPLAY_UINT_DEC_BIT
+    const UINT_DEC: u8 = 0x40;
 
     #[test]
     fn readable_checkbox_shows_no_default() {
@@ -3645,20 +3791,6 @@ mod question_value_tests {
                 u32::MAX,
                 " <IFR default: -1>",
             ),
-            (
-                "zero width",
-                BIT_VARSTORE_GUID,
-                0x40,
-                1,
-                " <IFR default: unknown (EDKII bit-field width 0, not 1 to 32)>",
-            ),
-            (
-                "33-bit width",
-                BIT_VARSTORE_GUID,
-                0x61,
-                1,
-                " <IFR default: unknown (EDKII bit-field width 33, not 1 to 32)>",
-            ),
             // Flags 0x00: UINT8 INT_DEC
             ("other GUID", OTHER_GUID, 0x00, 0xC8, " <IFR default: -56>"),
         ];
@@ -3671,17 +3803,15 @@ mod question_value_tests {
         }
     }
 
-    /// show-ifr does not decode a readable EDKII bit varstore field either.
+    /// show-ifr shows the value in the bits of an EDKII bit varstore field.
     #[test]
-    fn show_ifr_answer_of_bit_field_is_not_decoded() {
-        for (guid, want) in [
-            (BIT_VARSTORE_GUID, BIT_FIELD_NOT_DECODED),
-            (OTHER_GUID, "1"),
-        ] {
+    fn show_ifr_answer_of_bit_field_is_its_value() {
+        for (guid, want) in [(BIT_VARSTORE_GUID, "1"), (OTHER_GUID, "2")] {
             let (_root, node) = parse_question_in_guid(guid, CHECKBOX, &checkbox(3, 0x00), &[]);
             let question = node.borrow();
 
-            let VarStoreFixture { store, efivars } = var_store_of(&[0x00, 0x00, 0x00, 0x01]);
+            // bit 3, and byte 3
+            let VarStoreFixture { store, efivars } = var_store_of(&[0xF8, 0x00, 0x00, 0x02]);
 
             let got = display_answer(&question, &store, &mut efivars.reader());
 
@@ -3751,15 +3881,16 @@ mod question_value_tests {
         }
     }
 
-    /// A readable EDKII bit varstore field's stored value is not decoded, and its
-    /// default is shown, as for any value that cannot be read.
+    /// A readable EDKII bit varstore field shows the value in its bits, without its default.
     #[test]
-    fn readable_bit_field_question_shows_its_default() {
-        let store = || var_store_of(&[0x00, 0xC8, 0x0C, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    fn readable_bit_field_question_shows_its_value() {
+        // bits 4 to 15: 0xC8D; bits 4 and 5: 1
+        let store = || var_store_of(&[0xD0, 0xC8, 0x0C, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
         let one_of_children = || {
             vec![
                 one_of_option(5, 0x02, &0u32.to_le_bytes()),
                 one_of_option(6, 0x02, &1u32.to_le_bytes()),
+                uint32_default(0x0000, 0),
             ]
         };
         let cases = [
@@ -3768,35 +3899,160 @@ mod question_value_tests {
                 NUMERIC,
                 uint32_range_question(4, 0x4C),
                 vec![uint32_default(0x0000, 200)],
-                " <IFR default: 200>",
+                "3213",
             ),
-            (
-                "CHECKBOX",
-                CHECKBOX,
-                checkbox(4, 0x01),
-                vec![],
-                " <IFR default: 1>",
-            ),
+            ("CHECKBOX", CHECKBOX, checkbox(4, 0x01), vec![], "1"),
             (
                 "2-bit UINT_DEC ONE_OF",
                 ONE_OF,
                 uint32_range_question(4, 0x42),
-                [one_of_children(), vec![uint32_default(0x0000, 1)]].concat(),
-                " <IFR default: Enabled>",
-            ),
-            (
-                "2-bit ONE_OF default cut to its width",
-                ONE_OF,
-                uint32_range_question(4, 0x42),
-                [one_of_children(), vec![uint32_default(0x0000, 0b101)]].concat(),
-                " <IFR default: Enabled>",
+                one_of_children(),
+                "Enabled",
             ),
         ];
-        for (name, op_code, data, children, suffix) in cases {
+        for (name, op_code, data, children, want) in cases {
             assert_eq!(
                 answer_in_guid(BIT_VARSTORE_GUID, op_code, &data, &children, store()),
-                format!("{BIT_FIELD_NOT_DECODED}{suffix}"),
+                want,
                 "{name}"
+            );
+        }
+    }
+
+    /// A bit-field ONE_OF default is cut to the width in its Flags before it is matched to an
+    /// option.
+    #[test]
+    fn bit_field_one_of_default_is_cut_to_its_width() {
+        let children = [
+            one_of_option(5, 0x02, &0u32.to_le_bytes()),
+            one_of_option(6, 0x02, &1u32.to_le_bytes()),
+            uint32_default(0x0000, 0b101),
+        ];
+        assert_eq!(
+            answer_in_guid(
+                BIT_VARSTORE_GUID,
+                ONE_OF,
+                &uint32_range_question(4, UINT_DEC | 2),
+                &children,
+                unavailable()
+            ),
+            format!("{UNAVAILABLE} <IFR default: Enabled>"),
+            "default 0b101 of a 2-bit ONE_OF"
+        );
+    }
+
+    /// A bit field's value is its width in bits from its bit VarOffset, as edk2-stable202608
+    /// Setup.c GetBitsQuestionValue reads it, whatever the other bits of its bytes hold; a
+    /// field over the 4 bytes that GetBitsQuestionValue copies into a UINT32 has none.
+    #[test]
+    fn bit_field_values_are_read_from_their_bits() {
+        let payload = [0x6C, 0xBB, 0x15, 0xAF, 0xD7, 0x86];
+        // at bits 8, 9 and 15, from Python's int.from_bytes(payload, "little")
+        let cases = [
+            (1, ["1", "1", "1"]),
+            (3, ["3", "5", "3"]),
+            (4, ["11", "13", "11"]),
+            (12, ["1467", "2781", "3627"]),
+            (17, ["71099", "101085", "89643"]),
+            (18, ["202171", "232157", "220715"]),
+            (19, ["464315", "494301", "482859"]),
+            (
+                32,
+                [
+                    "3618575803",
+                    "<ValueUnavailable: EDKII bit field of width 32 at bit 9 spans more than 4 \
+                     bytes>",
+                    "<ValueUnavailable: EDKII bit field of width 32 at bit 15 spans more than 4 \
+                     bytes>",
+                ],
+            ),
+        ];
+        for (width, wants) in cases {
+            for (offset, want) in [8, 9, 15].into_iter().zip(wants) {
+                let data = uint32_range_question(offset, UINT_DEC | width);
+                assert_eq!(
+                    answer_in_guid(
+                        BIT_VARSTORE_GUID,
+                        NUMERIC,
+                        &data,
+                        &[],
+                        var_store_of(&payload)
+                    ),
+                    want,
+                    "width {width} at bit {offset}"
+                );
+            }
+        }
+    }
+
+    /// An INT_DEC bit field is signed from the type that edk2-stable202608 IfrParse.c gives
+    /// it by its StorageWidth, as ProcessOptions.c shows it; its UINT32 IFR default is not.
+    #[test]
+    fn int_dec_bit_field_is_signed_by_its_storage_width() {
+        let cases = [
+            ("8-bit at bit 0, in UINT8", 0, 8, vec![0xFF], "-1"),
+            ("8-bit at bit 4, in UINT16", 4, 8, vec![0xF0, 0x0F], "255"),
+            ("16-bit at bit 0, in UINT16", 0, 16, vec![0xFF, 0xFF], "-1"),
+            ("4-bit at bit 0, in UINT8", 0, 4, vec![0x0F], "15"),
+            (
+                "24-bit at bit 0, in UINT32",
+                0,
+                24,
+                vec![0xFF; 3],
+                "16777215",
+            ),
+            ("32-bit at bit 0, in UINT32", 0, 32, vec![0xFF; 4], "-1"),
+        ];
+        let default = [uint32_default(0x0000, 0xFF)];
+        for (name, offset, width, payload, want) in cases {
+            // Flags: EDKII_IFR_DISPLAY_INT_DEC_BIT
+            let data = uint32_range_question(offset, width);
+            assert_eq!(
+                answer_in_guid(
+                    BIT_VARSTORE_GUID,
+                    NUMERIC,
+                    &data,
+                    &default,
+                    var_store_of(&payload)
+                ),
+                want,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            answer_in_guid(
+                BIT_VARSTORE_GUID,
+                NUMERIC,
+                &uint32_range_question(0, 8),
+                &default,
+                unavailable()
+            ),
+            format!("{UNAVAILABLE} <IFR default: 255>"),
+            "8-bit default"
+        );
+    }
+
+    /// A bit field of width 0 or over 32, which edk2 VfrCompile does not emit, has neither a
+    /// value nor a default, and gives its width as the reason before any store error.
+    #[test]
+    fn bit_field_width_outside_1_to_32_has_no_value() {
+        for (width, flags) in [(0, UINT_DEC), (33, UINT_DEC | 33)] {
+            let reason = format!("EDKII bit-field width {width}, not 1 to 32");
+            assert_eq!(
+                answer_in_guid(
+                    BIT_VARSTORE_GUID,
+                    NUMERIC,
+                    &uint32_range_question(0, flags),
+                    &[],
+                    var_store_of(&[0xFF; 8])
+                ),
+                format!("<ValueUnavailable: {reason}>"),
+                "width {width}"
+            );
+            assert_eq!(
+                numeric_in_guid_answer(BIT_VARSTORE_GUID, flags, 1),
+                format!("<ValueUnavailable: {reason}> <IFR default: unknown ({reason})>"),
+                "width {width} without a store"
             );
         }
     }
@@ -3810,15 +4066,15 @@ mod question_value_tests {
             (
                 "constant DEFAULT",
                 uint32_default(0x0000, 1),
-                format!("{UNAVAILABLE} <IFR default: unknown ({reason})>"),
+                format!("<ValueUnavailable: {reason}> <IFR default: unknown ({reason})>"),
             ),
             (
                 "non-constant DEFAULT_2",
                 ifr_default_2(0x0000, eq_id_val()),
                 format!(
-                    "{UNAVAILABLE} <IFR default: unknown (EFI_IFR_VALUE expression not \
-                     evaluated: EqIdVal of question 0x0001: <ValueUnavailable: no supported \
-                     varstore with matching id 0x0001 found>)>"
+                    "<ValueUnavailable: {reason}> <IFR default: unknown (EFI_IFR_VALUE \
+                     expression not evaluated: EqIdVal of question 0x0001: \
+                     <ValueUnavailable: {reason}>)>"
                 ),
             ),
         ];
@@ -3827,8 +4083,7 @@ mod question_value_tests {
                 answer_in_guid(
                     BIT_VARSTORE_GUID,
                     ONE_OF,
-                    // Flags: EDKII_IFR_DISPLAY_UINT_DEC_BIT, width 33
-                    &uint32_range_question(0, 0x61),
+                    &uint32_range_question(0, UINT_DEC | 33),
                     &[default],
                     unavailable()
                 ),
@@ -4150,9 +4405,9 @@ fn display_answer(
     varstore: &Result<Box<dyn VariableStore>>,
     reader: &mut EfivarReader,
 ) -> String {
-    match read_question_bytes(question, varstore, reader) {
+    match read_question_value(question, varstore, reader) {
         Err(reason) => reason.into_owned(),
-        Ok(bytes) => stored_value(bytes).to_string(),
+        Ok((_, value)) => value.to_string(),
     }
 }
 
@@ -4233,9 +4488,9 @@ fn value_write<'a>(
     new_value: &str,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
-    if question.refers_to_bit_field {
+    let ValueLocation::Bytes { offset, .. } = question.location else {
         return Err(ChangeValueError::UnsupportedBitField);
-    }
+    };
     let store = question.store()?;
     if question.opcode == IFROpCode::OneOf {
         let option = question
@@ -4287,11 +4542,7 @@ fn value_write<'a>(
             }
         },
     };
-    Ok(VarStoreWrite::new(
-        store,
-        question.header.var_store_info,
-        value,
-    )?)
+    Ok(VarStoreWrite::new(store, offset, value)?)
 }
 
 /// The write of `option`, one of the possible_options of the ONE_OF `question`.
@@ -4300,12 +4551,12 @@ fn option_write<'a>(
     option: &AnswerOption,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
-    if question.refers_to_bit_field {
+    let ValueLocation::Bytes { offset, .. } = question.location else {
         return Err(ChangeValueError::UnsupportedBitField);
-    }
+    };
     Ok(VarStoreWrite::new(
         question.store()?,
-        question.header.var_store_info,
+        offset,
         option.raw_value,
     )?)
 }
@@ -4454,6 +4705,18 @@ mod set_questions_tests {
         question_descriptor(&node, var_store)
     }
 
+    /// An EDKII bit varstore field `op_code` with `data` and `children` on `var_store`, as set
+    /// sees it.
+    fn bit_field_on_store(
+        op_code: u8,
+        data: &[u8],
+        children: &[Vec<u8>],
+        var_store: VarStoreFixture,
+    ) -> QuestionDescriptor {
+        let (_root, node) = parse_question_in_guid(BIT_VARSTORE_GUID, op_code, data, children);
+        question_descriptor(&node, var_store)
+    }
+
     /// set_questions of PROMPT to `new_value`, or to an option of the texts `texts`: the texts
     /// of the options written, or the error as the CLI prints it.
     fn set_options(
@@ -4580,6 +4843,21 @@ mod set_questions_tests {
         let boolean_option = one_of_on_store(one_of_option(6, 0x04, &[1]), boolean_store);
         let (short_store, past_writes) = recording_var_store(&[0]);
         let past_the_var_store = checkbox_at(1, short_store);
+        // 8-bit UINT_DEC fields at bit 0: writes take VarOffset in bytes
+        let (numeric_bits_store, numeric_bits_writes) = recording_var_store(&[0; 4]);
+        let bit_field_numeric = bit_field_on_store(
+            NUMERIC,
+            &uint32_range_question(0, 0x48),
+            &[],
+            numeric_bits_store,
+        );
+        let (one_of_bits_store, one_of_bits_writes) = recording_var_store(&[0; 4]);
+        let bit_field_one_of = bit_field_on_store(
+            ONE_OF,
+            &uint32_range_question(0, 0x48),
+            &[one_of_option(6, 0x02, &1u32.to_le_bytes())],
+            one_of_bits_store,
+        );
         let cases = [
             (
                 "B's option of Type BOOLEAN",
@@ -4592,6 +4870,18 @@ mod set_questions_tests {
                 &past_the_var_store,
                 "write at offset 1 with width 1 exceeds varstore size 1",
                 &past_writes,
+            ),
+            (
+                "B an EDKII bit-field NUMERIC",
+                &bit_field_numeric,
+                "setting EDKII bit-field values is not supported",
+                &numeric_bits_writes,
+            ),
+            (
+                "B's option of an EDKII bit-field ONE_OF",
+                &bit_field_one_of,
+                "setting EDKII bit-field values is not supported",
+                &one_of_bits_writes,
             ),
         ];
         for (case, b, error, b_writes) in cases {
@@ -5357,6 +5647,10 @@ mod write_validation_tests {
                 question_flags: 0,
             },
             flags: width_code | display,
+            location: ValueLocation::Bytes {
+                offset: 2,
+                size: range.size(),
+            },
             data: range,
         };
         let node = RefCell::new(IFROperation {
