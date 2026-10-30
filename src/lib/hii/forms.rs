@@ -2176,8 +2176,9 @@ pub fn handle_form_package(
                 None => debug!("IFR:End when parent_ref is none"),
             };
 
-            // if its our own dummy opcode we've reached the top again and this form package has been parsed
-            if current_scope.borrow().op_code == IFROpCode::Unknown(DUMMY_OPCODE) {
+            // back at the root: this form package has been parsed. The root is found by
+            // identity: an IFR op may have opcode 0xFF, the root's DUMMY_OPCODE, and a scope.
+            if Rc::ptr_eq(&current_scope, &root) {
                 debug!("Reached root element. Current scope: {:?}", current_scope);
                 // NOTE: I'm 99.99 % sure there is only one top level FormSet in a package.
                 // Just in case there isn't there could be a chance we're skipping any subsequent FormSets
@@ -3914,7 +3915,8 @@ pub fn display(
 
     match &current_node.parsed_data {
         ParsedOperation::Placeholder => {
-            if current_node.op_code == IFROpCode::Unknown(DUMMY_OPCODE) {
+            // every op that handle_form_package parses has a parent; the root has none
+            if current_node.parent.is_none() {
                 result.push_str(format!("{extra_spaces}OpCode: ROOT\n").as_str())
             }
         }
@@ -4624,7 +4626,7 @@ fn find_corresponding_varstore(
 
 #[cfg(test)]
 mod tests {
-    use super::ifr_fixtures::efi_variable;
+    use super::ifr_fixtures::*;
     use super::*;
     use crate::hii::efivarfs::read_efivarfs_bytes;
 
@@ -4817,7 +4819,7 @@ mod tests {
     fn other_efivar_open_failure_is_not_explained_as_not_exported() {
         // ENOTDIR: the directory is a regular file
         let not_a_dir = tempfile::NamedTempFile::new().expect("create a file");
-        let name = EfivarFileName::new("Setup", ifr_fixtures::NIL_GUID);
+        let name = EfivarFileName::new("Setup", NIL_GUID);
 
         let open_error = open_efivar(not_a_dir.path(), &name).expect_err("open below a file");
         let expected = format!("{open_error:#}");
@@ -4877,6 +4879,56 @@ mod tests {
 
         let want = "invalid IFR operation length 0 at 0x";
         assert!(err.contains(want), "{}", err);
+    }
+
+    /// An End that returns to an IFR op with opcode 0xFF, which is also the root's
+    /// DUMMY_OPCODE, does not end the form package: the ops after that op's scope are parsed.
+    #[test]
+    fn end_back_in_an_opcode_0xff_scope_does_not_end_the_form_package() {
+        let data = form_set(&[form(
+            1,
+            &[
+                operation(DUMMY_OPCODE, true, &[]),
+                form(2, &[]), // its End returns to the opcode 0xFF op
+                END.to_vec(), // End of the opcode 0xFF op
+                checkbox_op(1, 0),
+            ],
+        )]);
+        let mut cursor = Cursor::new(&data);
+
+        let root = handle_form_package(&mut cursor).expect("parse the form package");
+
+        let root = root.borrow();
+        assert_eq!(root.children.len(), 1, "FormSets");
+        let form_set = root.children[0].borrow();
+        assert_eq!(form_set.children.len(), 1, "Forms");
+        let form = form_set.children[0].borrow();
+        let op_codes: Vec<IFROpCode> = form.children.iter().map(|op| op.borrow().op_code).collect();
+        assert_eq!(
+            op_codes,
+            [IFROpCode::Unknown(DUMMY_OPCODE), IFROpCode::CheckBox],
+            "ops of the Form"
+        );
+        assert_eq!(
+            cursor.position(),
+            u64::try_from(data.len()).expect("length"),
+            "bytes read"
+        );
+    }
+
+    /// display shows the root as ROOT, and not an IFR op with opcode 0xFF, the root's
+    /// DUMMY_OPCODE.
+    #[test]
+    fn display_shows_only_the_root_as_root() {
+        let root = parse_form_set(&[form(1, &[operation(DUMMY_OPCODE, false, &[])])]);
+
+        let shown = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+
+        let roots: Vec<&str> = shown
+            .lines()
+            .filter(|line| line.trim() == "OpCode: ROOT")
+            .collect();
+        assert_eq!(roots, ["OpCode: ROOT"], "ROOT lines of {shown:?}");
     }
 
     /// An IFR operation of exactly the header size, like End, is parsed.
