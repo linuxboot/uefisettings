@@ -2506,10 +2506,12 @@ fn list_questions_in(
     node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormPackageWalk<'_, impl QuestionValues>,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
+    if skips_scope(&node.borrow()) {
+        return Vec::new();
+    }
     let mut res: Vec<_> = listed_question(node, walk).into_iter().collect();
 
     // Now look inside current node's children for more questions
-    // TODO: skip the scopes that skips_scope names, as questions_named does.
     for child in &node.borrow().children {
         res.extend(list_questions_in(child, walk));
     }
@@ -3912,6 +3914,13 @@ pub fn display(
     let extra_spaces = "    ".repeat(level);
 
     let current_node = node.borrow();
+    if let IFROpCode::Unknown(code) = current_node.op_code {
+        if skips_scope(&current_node) {
+            return Ok(format!(
+                "{extra_spaces}OpCode: Unknown({code:#04x}) - skipped, as edk2 does\n"
+            ));
+        }
+    }
 
     match &current_node.parsed_data {
         ParsedOperation::Placeholder => {
@@ -4929,6 +4938,30 @@ mod tests {
             .filter(|line| line.trim() == "OpCode: ROOT")
             .collect();
         assert_eq!(roots, ["OpCode: ROOT"], "ROOT lines of {shown:?}");
+    }
+
+    /// display shows an op whose scope edk2 skips on one line, and nothing in that scope.
+    #[test]
+    fn display_skips_an_unknown_opcode_scope() {
+        let skipped_scope = [operation(0x70, true, &[]), checkbox_op(2, 1), END.to_vec()].concat();
+        let root = parse_form_set(&[form(1, &[checkbox_op(1, 0), skipped_scope])]);
+
+        let shown = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+
+        let check_boxes = shown
+            .lines()
+            .filter(|line| line.trim().starts_with("OpCode: CheckBox "))
+            .count();
+        assert_eq!(check_boxes, 1, "CheckBox lines of {shown:?}");
+        let unknown: Vec<&str> = shown
+            .lines()
+            .filter(|line| line.trim().starts_with("OpCode: Unknown"))
+            .collect();
+        assert_eq!(
+            unknown,
+            ["            OpCode: Unknown(0x70) - skipped, as edk2 does"],
+            "Unknown lines of {shown:?}"
+        );
     }
 
     /// An IFR operation of exactly the header size, like End, is parsed.

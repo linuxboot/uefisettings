@@ -1332,6 +1332,7 @@ mod tests {
     use super::super::find_question_in;
     use super::super::handle_form_package;
     use super::super::ifr_fixtures::*;
+    use super::super::list_questions;
     use super::super::Cursor;
     use super::super::FormPackageWalk;
     use super::super::QuestionDescriptor;
@@ -3236,6 +3237,41 @@ mod tests {
                 &mut Efivars::new().reader(),
             );
             assert_eq!(value.is_some(), parsed, "{name}: found by its QuestionId");
+        }
+    }
+
+    /// list_questions leaves out the questions that find_question_in does not find: those in the
+    /// scope of an opcode above EFI_IFR_MATCH2_OP, 0xFF included.
+    #[test]
+    fn questions_in_an_unknown_opcode_scope_are_not_listed() {
+        let in_scope = |op_code: u8| {
+            [
+                operation(op_code, true, &[]),
+                checkbox_op(2, 1),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let cases = [
+            ("opcode 0x00", in_scope(0x00), vec![1, 2, 3]),
+            ("opcode 0x65", in_scope(0x65), vec![1, 3]),
+            ("opcode 0x70", in_scope(0x70), vec![1, 3]),
+            ("opcode 0xFF", in_scope(0xFF), vec![1, 3]),
+        ];
+        for (name, scope, want) in cases {
+            let root = parse_form_set(&[form(1, &[checkbox_op(1, 0), scope, checkbox_op(3, 2)])]);
+
+            let got: Vec<u16> = list_questions(
+                root,
+                &strings(),
+                IncludedStates::empty(),
+                &mut Efivars::new().reader(),
+            )
+            .into_iter()
+            .map(|(question, _)| question.header.question_id)
+            .collect();
+
+            assert_eq!(got, want, "{name}");
         }
     }
 
