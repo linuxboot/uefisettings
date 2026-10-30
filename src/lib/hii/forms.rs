@@ -3169,6 +3169,22 @@ fn describe_question(
     }
 }
 
+/// Returns `value`, a current value or IFR default of a CHECKBOX, as list-questions and get show
+/// it: FALSE or TRUE (UEFI 2.10 §33.3.8.3.9) as 0 or 1, any nonzero value as 1, as
+/// edk2-stable202608 ProcessOptions.c shows it on.
+fn checkbox_text(value: u64) -> String {
+    u8::from(value != 0).to_string()
+}
+
+/// Returns `value`, a current value or IFR default of a ONE_OF in `format`, as list-questions and
+/// get show it: `option`, the text of the option that holds it, else its number.
+fn one_of_text(value: u64, format: NumericFormat, option: Option<&str>) -> String {
+    match option {
+        Some(text) => text.to_string(),
+        None => format!("{} (no matching option)", format.decode(value)),
+    }
+}
+
 fn handle_checkbox(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &CheckBox,
@@ -3183,7 +3199,7 @@ fn handle_checkbox(
             false
         }
         Ok((_, value)) => {
-            answer.push_str(&value.to_string());
+            answer.push_str(&checkbox_text(value));
             true
         }
     };
@@ -3194,8 +3210,7 @@ fn handle_checkbox(
             current_node,
             default_ids,
             &mut walk.inputs,
-            // FALSE or TRUE (UEFI 2.10 §33.3.8.3.9)
-            |v, _| Ok::<_, Infallible>(u8::from(v != 0).to_string()),
+            |v, _| Ok::<_, Infallible>(checkbox_text(v)),
         );
     }
     let res = QuestionDescriptor {
@@ -3232,7 +3247,7 @@ fn handle_oneof(
             answer.push_str(&reason);
             None
         }
-        Ok((_, value)) => Some(value),
+        Ok(stored) => Some(stored),
     };
 
     if chosen_value.is_none() {
@@ -3244,13 +3259,8 @@ fn handle_oneof(
                 default_ids,
                 &mut walk.inputs,
                 |v, inputs| {
-                    option_text(current_node, format.cut(v), walk.string_packages, inputs).map(
-                        |option| {
-                            option.unwrap_or_else(|| {
-                                format!("{} (no matching option)", format.decode(v))
-                            })
-                        },
-                    )
+                    option_text(current_node, format.cut(v), walk.string_packages, inputs)
+                        .map(|option| one_of_text(v, format, option.as_deref()))
                 },
             ),
             Err(error) => push_default(
@@ -3279,26 +3289,23 @@ fn handle_oneof(
     }
     let chosen: Vec<&AnswerOption> = possible_options
         .iter()
-        .filter(
-            |opt| matches!((chosen_value, opt.raw_value.as_u64()), (Some(a), Some(b)) if a == b),
-        )
+        .filter(|opt| chosen_value.is_some_and(|(_, value)| opt.raw_value.as_u64() == Some(value)))
         .collect();
     // the first that may be shown, as edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption
     // finds it, else the first, which a SUPPRESS_IF hides
-    let value_state = match chosen
+    let option = chosen
         .iter()
         .find(|opt| opt.state.may_be_allowed(IncludedStates::empty()))
-        .or(chosen.first())
-    {
-        Some(opt) => {
-            answer.push_str(opt.value.trim());
-            opt.state.clone()
-        }
-        None => StateEvaluation::selectable(),
-    };
-    if answer.is_empty() {
-        answer.push_str("Unknown");
+        .or(chosen.first());
+    if let Some((location, value)) = chosen_value {
+        let format = NumericFormat::from_location(location, parsed.flags, &parsed.data);
+        answer.push_str(&one_of_text(
+            value,
+            format,
+            option.map(|opt| opt.value.trim()),
+        ));
     }
+    let value_state = option.map_or_else(StateEvaluation::selectable, |opt| opt.state.clone());
 
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
@@ -3550,6 +3557,80 @@ mod question_value_tests {
             format!("{UNAVAILABLE} <IFR default: 7 (no matching option)>"),
             "ONE_OF default without option"
         );
+    }
+
+    /// A CHECKBOX value shows as its IFR default does: a nonzero byte as 1, as
+    /// edk2-stable202608 ProcessOptions.c shows it on.
+    #[test]
+    fn checkbox_shows_a_nonzero_byte_as_1() {
+        for (byte, want) in [(0x00, "0"), (0x01, "1"), (0x02, "1"), (0xFF, "1")] {
+            assert_eq!(
+                answer(
+                    &[],
+                    CHECKBOX,
+                    &checkbox(0, 0x00),
+                    &[],
+                    var_store_of(&[byte])
+                ),
+                want,
+                "CHECKBOX byte {byte:#04x}"
+            );
+        }
+    }
+
+    /// A ONE_OF value shows as its IFR default does: a value that no option holds as its
+    /// number, signed as the Flags say, and a value whose option has empty text as that text.
+    #[test]
+    fn one_of_value_shows_as_its_default_does() {
+        // Flags: UINT8 INT_DEC; MinValue, MaxValue, Step
+        let data = [&question_header(0)[..], &[0x00, 0x00, 0xFF, 0x01]].concat();
+        let cases = [
+            (
+                "no matching option",
+                one_of_option(5, 0x00, &[0]),
+                "-1 (no matching option)",
+            ),
+            // string 9 is not in strings()
+            ("option without text", one_of_option(9, 0x00, &[0xFF]), ""),
+        ];
+        for (name, option, want) in cases {
+            let children = [option, ifr_default(0x0000, 0xFF)];
+            assert_eq!(
+                answer(&[], ONE_OF, &data, &children, var_store_of(&[0xFF])),
+                want,
+                "{name}: current value"
+            );
+            assert_eq!(
+                answer(&[], ONE_OF, &data, &children, unavailable()),
+                format!("{UNAVAILABLE} <IFR default: {want}>"),
+                "{name}: default"
+            );
+        }
+
+        // the current value of a bit field is signed by its StorageWidth, its default as UINT32
+        let data = uint32_range_question(0, 0x08); // 8-bit INT_DEC
+        let children = [
+            one_of_option(5, 0x02, &0u32.to_le_bytes()),
+            uint32_default(0x0000, 0xFF),
+        ];
+        for (name, var_store, want) in [
+            (
+                "current value",
+                var_store_of(&[0xFF]),
+                "-1 (no matching option)".to_string(),
+            ),
+            (
+                "default",
+                unavailable(),
+                format!("{UNAVAILABLE} <IFR default: 255 (no matching option)>"),
+            ),
+        ] {
+            assert_eq!(
+                answer_in_guid(BIT_VARSTORE_GUID, ONE_OF, &data, &children, var_store),
+                want,
+                "8-bit field: {name}"
+            );
+        }
     }
 
     /// A ONE_OF default is cut to the ONE_OF's width before it is matched to an
