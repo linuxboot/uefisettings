@@ -10,7 +10,6 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1064,7 +1063,7 @@ mod non_efi_varstore_tests {
         // these tests check reasons, which no value range changes
         read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut efivars.reader())
             .map(<[u8]>::to_vec)
-            .map_err(Cow::into_owned)
+            .map_err(|reason| reason.to_answer())
     }
 
     #[test]
@@ -1202,10 +1201,64 @@ mod non_efi_varstore_tests {
             .context("failed to read bytes");
 
         assert_eq!(
-            read_failure_reason(VariableStoreKind::Buffer, &error),
+            ValueUnavailable::from_read_error(VariableStoreKind::Buffer, &error).to_answer(),
             "<VStoreError: failed to read bytes: entity not found>",
             "a NotFound io::Error under a context"
         );
+    }
+
+    /// to_answer gives each reason the text that get shows for it.
+    #[test]
+    fn to_answer_gives_each_reason_the_text_get_shows() {
+        let name = EfivarFileName::new("Setup", NIL_GUID);
+        let cases = [
+            (
+                ValueUnavailable::NoVarStore("varstore not found because we reached root".into()),
+                "<ValueUnavailable: varstore not found because we reached root>",
+            ),
+            (
+                ValueUnavailable::BootServiceOnly(BootServiceOnlyVariable(name.clone())),
+                "<ValueUnavailable: EFI variable Setup-00000000-0000-0000-0000-000000000000 is \
+                 boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither \
+                 lists nor writes>",
+            ),
+            (
+                ValueUnavailable::NotRead(EfivarsNotRead),
+                "<ValueUnavailable: EFI variables not read>",
+            ),
+            (
+                ValueUnavailable::Missing(EfivarNotFound { name: name.clone() }),
+                "<ValueUnavailable: no EFI variable Setup-00000000-0000-0000-0000-000000000000>",
+            ),
+            (
+                ValueUnavailable::MissingBuffer(EfivarNotFound { name }),
+                "<ValueUnavailable: no EFI variable Setup-00000000-0000-0000-0000-000000000000; \
+                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+            ),
+            (
+                ValueUnavailable::ReadError("failed to read bytes: entity not found".into()),
+                "<VStoreError: failed to read bytes: entity not found>",
+            ),
+            (
+                ValueUnavailable::BitField(NumericFormatError::BitFieldWidth(33)),
+                "<ValueUnavailable: EDKII bit-field width 33, not 1 to 32>",
+            ),
+            (
+                ValueUnavailable::NotDecoded(IFROpCode::FormSet),
+                "<ValueUnavailable: FormSet value not decoded>",
+            ),
+            (
+                ValueUnavailable::Truncated { offset: 3, len: 8 },
+                "<ExtractEFIDataError: failed to fill whole buffer (offset: 3; buflen: 8)>",
+            ),
+            (
+                ValueUnavailable::CheckboxOverByte(256),
+                "<ValueUnavailable: CHECKBOX value 256 over a byte>",
+            ),
+        ];
+        for (reason, want) in cases {
+            assert_eq!(reason.to_answer(), want, "{reason:?}");
+        }
     }
 
     #[test]
@@ -1336,34 +1389,85 @@ fn read_current_value_bytes<'a>(
     varstore: &Result<Box<dyn VariableStore>>,
     value: std::ops::Range<usize>,
     reader: &'a mut EfivarReader,
-) -> std::result::Result<&'a [u8], Cow<'static, str>> {
+) -> std::result::Result<&'a [u8], ValueUnavailable> {
     let store = match varstore {
         Ok(store) => store,
-        Err(error) => return Err(Cow::Owned(format!("<ValueUnavailable: {}>", error))),
+        Err(error) => return Err(ValueUnavailable::NoVarStore(error.to_string())),
     };
-    if let Err(refusal) = store.check_runtime_access() {
-        return Err(Cow::Owned(format!("<ValueUnavailable: {refusal}>")));
-    }
+    store
+        .check_runtime_access()
+        .map_err(ValueUnavailable::BootServiceOnly)?;
 
     reader
         .read(EfivarRange::of(store.as_ref()), value)
-        .map_err(|error| Cow::Owned(read_failure_reason(store.kind(), error)))
+        .map_err(|error| ValueUnavailable::from_read_error(store.kind(), error))
 }
 
-/// Why a question on a VarStore of `kind` has no value, its efivar file having failed with
-/// `error`.
-fn read_failure_reason(kind: VariableStoreKind, error: &anyhow::Error) -> String {
-    if error.downcast_ref::<EfivarsNotRead>().is_some() {
-        return format!("<ValueUnavailable: {error}>");
+/// Why a question has no value. Display gives the reason, to_answer the text shown for the
+/// value.
+#[derive(Debug, Error)]
+enum ValueUnavailable {
+    /// find_corresponding_varstore's error, its outermost context only
+    #[error("{0}")]
+    NoVarStore(String),
+    #[error("{0}")]
+    BootServiceOnly(BootServiceOnlyVariable),
+    #[error("{0}")]
+    NotRead(EfivarsNotRead),
+    #[error("{0}")]
+    Missing(EfivarNotFound),
+    #[error("{0}; HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL")]
+    MissingBuffer(EfivarNotFound),
+    /// The cause chain of a read error that the EfivarReader keeps, as `{:#}` shows it
+    #[error("{0}")]
+    ReadError(String),
+    #[error("{0}")]
+    BitField(NumericFormatError),
+    #[error("{0:?} value not decoded")]
+    NotDecoded(IFROpCode),
+    #[error("failed to fill whole buffer (offset: {offset}; buflen: {len})")]
+    Truncated {
+        offset: usize,
+        /// the bytes read_efivar returned, attributes included
+        len: usize,
+    },
+    #[error("CHECKBOX value {0} over a byte")]
+    CheckboxOverByte(u64),
+}
+
+impl ValueUnavailable {
+    /// Why a question on a VarStore of `kind` has no value, its efivar file having failed with
+    /// `error`.
+    fn from_read_error(kind: VariableStoreKind, error: &anyhow::Error) -> Self {
+        if let Some(&not_read) = error.downcast_ref::<EfivarsNotRead>() {
+            return Self::NotRead(not_read);
+        }
+        let Some(missing) = error.downcast_ref::<EfivarNotFound>() else {
+            return Self::ReadError(format!("{error:#}"));
+        };
+        match kind {
+            VariableStoreKind::Buffer => Self::MissingBuffer(missing.clone()),
+            VariableStoreKind::EfiVariable => Self::Missing(missing.clone()),
+        }
     }
-    let Some(missing) = error.downcast_ref::<EfivarNotFound>() else {
-        return format!("<VStoreError: {error:#}>");
-    };
-    match kind {
-        VariableStoreKind::Buffer => format!(
-            "<ValueUnavailable: {missing}; HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
-        ),
-        VariableStoreKind::EfiVariable => format!("<ValueUnavailable: {missing}>"),
+
+    /// The text that get, list-questions and show-ifr show for the value: the reason, tagged
+    /// VStoreError for a read error, ExtractEFIDataError for a short variable, else
+    /// ValueUnavailable.
+    fn to_answer(&self) -> String {
+        let tag = match self {
+            Self::ReadError(_) => "VStoreError",
+            Self::Truncated { .. } => "ExtractEFIDataError",
+            Self::NoVarStore(_)
+            | Self::BootServiceOnly(_)
+            | Self::NotRead(_)
+            | Self::Missing(_)
+            | Self::MissingBuffer(_)
+            | Self::BitField(_)
+            | Self::NotDecoded(_)
+            | Self::CheckboxOverByte(_) => "ValueUnavailable",
+        };
+        format!("<{tag}: {self}>")
     }
 }
 
@@ -1442,26 +1546,18 @@ fn read_question_value(
     question: &IFROperation,
     varstore: &Result<Box<dyn VariableStore>>,
     reader: &mut EfivarReader,
-) -> std::result::Result<(ReadableLocation, u64), Cow<'static, str>> {
+) -> std::result::Result<(ReadableLocation, u64), ValueUnavailable> {
     let Some(value_question) = value_question(question) else {
-        return Err(not_decoded(question));
+        return Err(ValueUnavailable::NotDecoded(question.op_code));
     };
     // before the read: a field that cannot be read gives its own reason, and dump-efivars keeps
     // no bytes for it
     let location = value_question
         .location()
         .check()
-        .map_err(|error| Cow::Owned(format!("<ValueUnavailable: {error}>")))?;
+        .map_err(ValueUnavailable::BitField)?;
     let bytes = read_question_bytes(question, varstore, reader)?;
     Ok((location, location.read(bytes)))
-}
-
-/// Why the value of `question`, which is not a ONE_OF, NUMERIC or CHECKBOX, is unavailable.
-fn not_decoded(question: &IFROperation) -> Cow<'static, str> {
-    Cow::Owned(format!(
-        "<ValueUnavailable: {:?} value not decoded>",
-        question.op_code
-    ))
 }
 
 /// Returns the value_bytes of the question, or why its value cannot be read.
@@ -1469,20 +1565,18 @@ fn read_question_bytes<'a>(
     question: &IFROperation,
     varstore: &Result<Box<dyn VariableStore>>,
     reader: &'a mut EfivarReader,
-) -> std::result::Result<&'a [u8], Cow<'static, str>> {
+) -> std::result::Result<&'a [u8], ValueUnavailable> {
     let Some(value) = value_bytes(question) else {
-        return Err(not_decoded(question));
+        return Err(ValueUnavailable::NotDecoded(question.op_code));
     };
     let bytes = read_current_value_bytes(varstore, value.clone(), reader)?;
     let offset = value.start;
     bytes
         .get(EFIVARFS_HEADER_SIZE..)
         .and_then(|payload| payload.get(value))
-        .ok_or_else(|| {
-            Cow::Owned(format!(
-                "<ExtractEFIDataError: failed to fill whole buffer (offset: {offset}; buflen: {})>",
-                bytes.len()
-            ))
+        .ok_or(ValueUnavailable::Truncated {
+            offset,
+            len: bytes.len(),
         })
 }
 
@@ -1518,7 +1612,7 @@ mod efivar_reader_tests {
     ) -> std::result::Result<Vec<u8>, String> {
         read_question_bytes(question, &Ok(Box::new(store)), reader)
             .map(<[u8]>::to_vec)
-            .map_err(Cow::into_owned)
+            .map_err(|reason| reason.to_answer())
     }
 
     #[test]
@@ -2033,7 +2127,7 @@ mod efivar_reader_tests {
                 &mut reader
             )
             .map(|_| ())
-            .map_err(Cow::into_owned),
+            .map_err(|reason| reason.to_answer()),
             Err("<ValueUnavailable: EDKII bit-field width 33, not 1 to 32>".to_string()),
             "33-bit field"
         );
@@ -3212,7 +3306,7 @@ fn handle_checkbox(
     let mut answer = String::new();
     let available = match read_question_value(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
-            answer.push_str(&reason);
+            answer.push_str(&reason.to_answer());
             false
         }
         Ok((_, value)) => {
@@ -3261,7 +3355,7 @@ fn handle_oneof(
     // all ones too, can be stored.
     let chosen_value = match read_question_value(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
-            answer.push_str(&reason);
+            answer.push_str(&reason.to_answer());
             None
         }
         Ok(stored) => Some(stored),
@@ -3359,7 +3453,7 @@ fn handle_numeric(
 
     let available = match read_question_value(current_node, &varstore, walk.inputs.reader) {
         Err(reason) => {
-            answer.push_str(&reason);
+            answer.push_str(&reason.to_answer());
             false
         }
         Ok((location, value)) => {
@@ -4504,7 +4598,7 @@ fn display_answer(
     reader: &mut EfivarReader,
 ) -> String {
     match read_question_value(question, varstore, reader) {
-        Err(reason) => reason.into_owned(),
+        Err(reason) => reason.to_answer(),
         Ok((_, value)) => value.to_string(),
     }
 }

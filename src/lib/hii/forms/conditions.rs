@@ -33,6 +33,7 @@ use super::IFROpCode;
 use super::IFROperation;
 use super::ParsedOperation;
 use super::ValueQuestion;
+use super::ValueUnavailable;
 use super::VariableStore;
 
 /// The opcode of IFROpCode::Match2, the highest that edk2-stable202608
@@ -622,7 +623,7 @@ impl QuestionValues for VarStoreValues {
         let Some(value_question) = value_question(&op) else {
             return Some(QuestionValue::Unreadable {
                 kind: ValueKind::Other,
-                reason: format!("<ValueUnavailable: {:?} value not decoded>", op.op_code),
+                reason: ValueUnavailable::NotDecoded(op.op_code).to_answer(),
             });
         };
         let varstore =
@@ -648,7 +649,7 @@ fn question_value(
         Err(reason) => {
             return QuestionValue::Unreadable {
                 kind,
-                reason: reason.into_owned(),
+                reason: reason.to_answer(),
             }
         }
     };
@@ -658,7 +659,7 @@ fn question_value(
             Ok(byte) => QuestionValue::Boolean(byte),
             Err(_) => QuestionValue::Unreadable {
                 kind,
-                reason: format!("<ValueUnavailable: CHECKBOX value {value} over a byte>"),
+                reason: ValueUnavailable::CheckboxOverByte(value).to_answer(),
             },
         },
         ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => QuestionValue::Uint(value),
