@@ -2948,7 +2948,7 @@ where
         if value_question(&op).is_some()
             && phrases
                 .iter()
-                .any(|phrase| phrase.as_ref().eq_ignore_ascii_case(prompt))
+                .any(|phrase| phrase.as_ref().trim().eq_ignore_ascii_case(prompt))
         {
             found.push(Rc::clone(node));
         }
@@ -4692,6 +4692,57 @@ mod tests {
     use super::ifr_fixtures::*;
     use super::*;
     use crate::hii::efivarfs::read_efivarfs_bytes;
+
+    /// find_question_in finds a question by the name that list_questions prints, whose leading
+    /// and trailing whitespace the prompt string keeps, and by that name with other surrounding
+    /// whitespace or ASCII case.
+    #[test]
+    fn questions_are_found_by_their_listed_name() {
+        let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
+        let values = VarStoreValues::new(&root);
+        let prompted = |prompt: &str| vec![HashMap::from([(3, prompt.to_string())])];
+        let find = |prompt: &str, phrase: &str| {
+            find_question_in(
+                &root,
+                &HashSet::from([phrase]),
+                &mut FormSetWalk::new(
+                    &prompted(prompt),
+                    &mut Efivars::new().reader(),
+                    &values,
+                    IncludedStates::empty(),
+                ),
+            )
+            .map(|_| ())
+        };
+        let listed = list_questions(
+            Rc::clone(&root),
+            &prompted("  Prompt "),
+            IncludedStates::empty(),
+            &mut Efivars::new().reader(),
+        );
+        let name = &listed[0].0.question;
+        assert_eq!(name, "  Prompt ", "listed name");
+
+        let cases = [
+            ("  Prompt ", name.as_str()),
+            ("  Prompt ", "Prompt"),
+            ("  Prompt ", " PROMPT"),
+            (" ", ""),
+            (" ", " "),
+        ];
+        for (prompt, phrase) in cases {
+            assert_eq!(
+                find(prompt, phrase),
+                Selection::Picked((), StateEvaluation::selectable()),
+                "prompt {prompt:?}, phrase {phrase:?}"
+            );
+        }
+        assert_eq!(
+            find("  Prompt ", "Prompt 2"),
+            Selection::NotFound,
+            "another name"
+        );
+    }
 
     fn variable_bytes(payload_size: usize) -> Vec<u8> {
         let mut bytes = 7u32.to_le_bytes().to_vec();
