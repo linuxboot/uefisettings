@@ -39,6 +39,7 @@ use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
 use crate::hii::efivarfs::efivar_attributes;
 use crate::hii::efivarfs::open_efivar;
+use crate::hii::efivarfs::read_efivar_file;
 use crate::hii::efivarfs::EfivarFileName;
 use crate::hii::efivarfs::EfivarNotFound;
 use crate::hii::efivarfs::EfivarRange;
@@ -915,11 +916,11 @@ trait VariableStore {
         let file_name = self.efivar_file_name();
         let path = efivars.join(&file_name);
 
-        let mut file_ro = open_efivar(efivars, &file_name).map_err(VariableNotExported::explain)?;
+        let file_ro = open_efivar(efivars, &file_name).map_err(VariableNotExported::explain)?;
 
-        let mut file_contents = Vec::new();
-        file_ro
-            .read_to_end(&mut file_contents)
+        let mut file_contents = file_ro
+            .metadata()
+            .and_then(|metadata| read_efivar_file(&file_ro, metadata.len()))
             .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
         let attributes = efivar_attributes(&file_contents).context(MISSING_ATTRIBUTES_HEADER)?;

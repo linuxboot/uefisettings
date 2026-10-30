@@ -55,6 +55,11 @@ struct HiiDBEFIVar32 {
     address: u32,
 }
 
+impl HiiDBEFIVar32 {
+    /// The size of this layout of the HiiDB efivar.
+    const SIZE: usize = 12;
+}
+
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
 struct HiiDBEFIVar64 {
@@ -63,10 +68,15 @@ struct HiiDBEFIVar64 {
     address: u64,
 }
 
+impl HiiDBEFIVar64 {
+    /// The size of this layout of the HiiDB efivar, the longer one.
+    const SIZE: usize = 16;
+}
+
 impl HiiDBEFIVar {
     fn parse(contents: &[u8]) -> Result<Self> {
         match contents.len() {
-            12 => {
+            HiiDBEFIVar32::SIZE => {
                 let mut cursor = Cursor::new(contents);
                 let var: HiiDBEFIVar32 = cursor.read_ne()?;
 
@@ -76,7 +86,7 @@ impl HiiDBEFIVar {
                     address: var.address.into(),
                 })
             }
-            16 => {
+            HiiDBEFIVar64::SIZE => {
                 let mut cursor = Cursor::new(contents);
                 let var: HiiDBEFIVar64 = cursor.read_ne()?;
 
@@ -96,18 +106,32 @@ pub fn extract_db() -> Result<Vec<u8>> {
     // So this is directly based on what hiitool does.
 
     // try to read data from varstore
-    let mut efivar_file =
+    let efivar_file =
         File::open(OCP_HIIDB_PATH).context(format!("Failed to open {OCP_HIIDB_PATH}"))?;
 
-    let mut efivar_contents = Vec::new();
-    efivar_file
-        .read_to_end(&mut efivar_contents)
+    let efivar_contents = read_hiidb_efivar(efivar_file)
         .context(format!("Failed to read efivar file, {}", OCP_HIIDB_PATH))?;
 
     let db_info = HiiDBEFIVar::parse(&efivar_contents)?;
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
     read_physical_memory(db_info.address, db_info.length.try_into()?)
+}
+
+/// The bytes of the HiiDB efivar `file`; one longer than HiiDBEFIVar64::SIZE, which
+/// HiiDBEFIVar::parse would refuse, is refused without being read whole.
+fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
+    // one byte past the maximum, so that a longer file shows
+    let mut file = file.take(u64::try_from(HiiDBEFIVar64::SIZE)? + 1);
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    if file.limit() == 0 {
+        bail!(
+            "HiiDB efivar is longer than its maximum of {} bytes",
+            HiiDBEFIVar64::SIZE
+        );
+    }
+    Ok(contents)
 }
 
 /// Returns `length` bytes of physical memory at `address`.
@@ -294,6 +318,31 @@ unsafe fn copy_from_mapping(src: *const u8, dst: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A HiiDB efivar of HiiDBEFIVar64::SIZE bytes reads whole; one byte longer, it is
+    /// refused.
+    #[test]
+    fn hiidb_efivar_longer_than_its_maximum_is_refused() {
+        let size = u64::try_from(HiiDBEFIVar64::SIZE).expect("a u64 size");
+        for (case, length, fits) in [
+            ("the 64-bit layout's size", size, true),
+            ("one byte longer", size + 1, false),
+        ] {
+            let read = read_hiidb_efivar(std::io::repeat(0).take(length));
+
+            match (read, fits) {
+                (Ok(contents), true) => {
+                    assert_eq!(contents, [0; HiiDBEFIVar64::SIZE], "{case}: contents")
+                }
+                (Err(error), false) => assert_eq!(
+                    error.to_string(),
+                    "HiiDB efivar is longer than its maximum of 16 bytes",
+                    "{case}"
+                ),
+                (read, _) => panic!("{case}: read {read:?}"),
+            }
+        }
+    }
 
     #[test]
     fn parses_32_bit_hiidb_address() {
