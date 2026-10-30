@@ -22,7 +22,7 @@ use super::conditions::VarStoreValues;
 use super::*;
 use crate::hii::efivarfs::EfivarSource;
 
-pub(super) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
+pub(crate) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
 
 pub(super) const ONE_OF: u8 = 0x05;
 pub(crate) const CHECKBOX: u8 = 0x06;
@@ -407,7 +407,7 @@ fn form_set_data() -> Vec<u8> {
     .concat()
 }
 
-/// The root of a parsed form package, which owns the parents, and its question.
+/// The root of a parsed FormSet, which owns the parents, and its question.
 pub(super) type RootAndQuestion = (Rc<RefCell<IFROperation>>, Rc<RefCell<IFROperation>>);
 
 /// Parses a FormSet holding `declarations` and then one question, and
@@ -418,10 +418,10 @@ pub(super) fn parse_question(
     data: &[u8],
     children: &[Vec<u8>],
 ) -> RootAndQuestion {
-    try_parse_question(declarations, op_code, data, children).expect("parse the form package")
+    try_parse_question(declarations, op_code, data, children).expect("parse the FormSet")
 }
 
-/// `parse_question`, returning the error of an unparsable form package.
+/// `parse_question`, returning the error of an unparsable FormSet.
 pub(super) fn try_parse_question(
     declarations: &[Vec<u8>],
     op_code: u8,
@@ -435,7 +435,7 @@ pub(super) fn try_parse_question(
         END.to_vec(), // End of the question
     ]);
 
-    let root = handle_form_package(&mut Cursor::new(&data))?;
+    let root = handle_form_set(&mut Cursor::new(&data))?;
 
     let form_set = Rc::clone(&root.borrow().children[0]);
     let question = Rc::clone(&form_set.borrow().children[declarations.len()]);
@@ -526,7 +526,7 @@ pub(crate) fn form(form_id: u16, body: &[Vec<u8>]) -> Vec<u8> {
 /// Parses a FormSet holding `body`, and returns the root.
 pub(crate) fn parse_form_set(body: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
     let data = form_set(body);
-    handle_form_package(&mut Cursor::new(&data)).expect("parse the form package")
+    handle_form_set(&mut Cursor::new(&data)).expect("parse the FormSet")
 }
 
 /// Returns the first op under `node`, in IFR order, with `data`.
@@ -593,7 +593,7 @@ pub(super) fn question_descriptor_with(
     let current = node.borrow();
     let strings = strings();
     let mut reader = efivars.reader();
-    let walk = &mut FormPackageWalk::new(&strings, &mut reader, values, IncludedStates::empty());
+    let walk = &mut FormSetWalk::new(&strings, &mut reader, values, IncludedStates::empty());
     match &current.parsed_data {
         ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", &current, walk),
         ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", &current, walk),
@@ -645,10 +645,10 @@ pub(super) fn parse_question_in_guid(
     data: &[u8],
     children: &[Vec<u8>],
 ) -> RootAndQuestion {
-    try_parse_question_in_guid(guid, op_code, data, children).expect("parse the form package")
+    try_parse_question_in_guid(guid, op_code, data, children).expect("parse the FormSet")
 }
 
-/// `parse_question_in_guid`, returning the error of an unparsable form package.
+/// `parse_question_in_guid`, returning the error of an unparsable FormSet.
 pub(super) fn try_parse_question_in_guid(
     guid: [u8; 16],
     op_code: u8,
@@ -663,7 +663,7 @@ pub(super) fn try_parse_question_in_guid(
         END.to_vec(), // End of the GUID
     ]);
 
-    let root = handle_form_package(&mut Cursor::new(&data))?;
+    let root = handle_form_set(&mut Cursor::new(&data))?;
 
     let form_set = Rc::clone(&root.borrow().children[0]);
     let guid = Rc::clone(&form_set.borrow().children[0]);

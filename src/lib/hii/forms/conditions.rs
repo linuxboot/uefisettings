@@ -393,7 +393,7 @@ impl<T> Selector<T> {
     }
 }
 
-/// What get or set does in a form package.
+/// What get or set does in a FormSet.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Choice<T> {
     Chosen(T, StateEvaluation),
@@ -500,10 +500,10 @@ pub(crate) fn option_state(
     evaluation
 }
 
-/// The questions of a form package by QuestionId, for conditions to find them as
+/// The questions of a FormSet by QuestionId, for conditions to find them as
 /// edk2-stable202608 SetupBrowserDxe/Expression.c IdToQuestion does: in the form of the
-/// referrer first, then in the FormSet, in form order. handle_form_package parses one FormSet
-/// per package.
+/// referrer first, then in the FormSet, in form order. parse_form_sets makes each FormSet of a
+/// form package a root of its own.
 pub(crate) struct QuestionIndex(HashMap<u16, Vec<IndexedQuestion>>);
 
 struct IndexedQuestion {
@@ -567,7 +567,7 @@ impl QuestionIndex {
 
 /// Whether edk2 skips `op` with its scope, and so every question in it: edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c ParseOpCodes skips an opcode above EFI_IFR_MATCH2_OP
-/// (IsUnKnownOpCode). The root that handle_form_package adds has no parent and is no IFR op.
+/// (IsUnKnownOpCode). The root that handle_form_set adds has no parent and is no IFR op.
 pub(super) fn skips_scope(op: &IFROperation) -> bool {
     op.parent.is_some()
         && matches!(op.op_code, IFROpCode::Unknown(code) if code > EFI_IFR_MATCH2_OP)
@@ -603,7 +603,7 @@ pub(crate) struct VarStoreValues {
 }
 
 impl VarStoreValues {
-    /// Finds the questions in the form package of `root`.
+    /// Finds the questions in the FormSet of `root`.
     pub(crate) fn new(root: &Rc<RefCell<IFROperation>>) -> Self {
         VarStoreValues {
             index: QuestionIndex::new(root),
@@ -1330,11 +1330,11 @@ mod tests {
     use std::collections::HashSet;
 
     use super::super::find_question_in;
-    use super::super::handle_form_package;
+    use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
     use super::super::Cursor;
-    use super::super::FormPackageWalk;
+    use super::super::FormSetWalk;
     use super::super::QuestionDescriptor;
     use super::*;
 
@@ -1473,7 +1473,7 @@ mod tests {
     fn truth_of(condition: Vec<u8>, values: &impl QuestionValues) -> Truth {
         let body = operation(CHECKBOX, false, &checkbox(0, 0x00));
         let data = conditional(SUPPRESS_IF, condition, &[body]);
-        let root = handle_form_package(&mut Cursor::new(&[data, END.to_vec()].concat()))
+        let root = handle_form_set(&mut Cursor::new(&[data, END.to_vec()].concat()))
             .expect("parse the SUPPRESS_IF");
         let scope = Rc::clone(&root.borrow().children[0]);
         let scope = scope.borrow();
@@ -2617,7 +2617,7 @@ mod tests {
         find_question_in(
             &root,
             &HashSet::from([PROMPT]),
-            &mut FormPackageWalk::new(&strings(), &mut Efivars::new().reader(), &values(), include),
+            &mut FormSetWalk::new(&strings(), &mut Efivars::new().reader(), &values(), include),
         )
         .map(|question| question.header.question_id)
     }

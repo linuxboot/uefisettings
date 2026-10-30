@@ -65,7 +65,7 @@ pub(super) fn strings_package_header(length: u32) -> Vec<u8> {
 
 /// An EFI_HII_PACKAGE_HEADER of Type `package_type` with the 24-bit Length
 /// `length`.
-fn package_header(package_type: u8, length: u32) -> Vec<u8> {
+pub(super) fn package_header(package_type: u8, length: u32) -> Vec<u8> {
     [&length.to_le_bytes()[..3], &[package_type]].concat()
 }
 

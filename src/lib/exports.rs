@@ -142,9 +142,9 @@ impl HiiBackend {
                 continue;
             }
             writeln!(readable_representation, "Packagelist {}", list.guid)?;
-            for form_package in list.forms {
+            for root in list.forms {
                 readable_representation.push_str(&forms::display(
-                    form_package,
+                    root,
                     0,
                     &list.strings,
                     &mut reader,
@@ -196,11 +196,11 @@ impl HiiBackend {
         for list in parsed_db {
             list.check_form_strings()?;
 
-            for form_package in list.forms {
+            for root in list.forms {
                 //  TODO: show form name, package list guid in the final response as well
 
                 for (question_descriptor, state) in
-                    list_questions(form_package, &list.strings, include, &mut reader)
+                    list_questions(root, &list.strings, include, &mut reader)
                 {
                     let question = Question {
                         options: question_descriptor.listed_options(include),
@@ -284,17 +284,17 @@ impl HiiBackend {
             } => (question_variations, answer_variations, false),
         };
 
-        // Every form package selects its question and option before the first write, so that a
+        // Every FormSet selects its question and option before the first write, so that a
         // selection error leaves every variable unchanged.
         let mut selected = Vec::new();
         let mut excluded = IncludedStates::empty();
         // one cache for the selection, which ends before the first write
         let mut reader = EfivarReader::new(EfivarSource::System)?;
         for list in parsed_db {
-            for form_package in list.forms {
+            for root in list.forms {
                 // try to find the question
                 let selection = forms::find_question(
-                    form_package,
+                    root,
                     &list.strings,
                     &question_variations,
                     include,
@@ -304,7 +304,7 @@ impl HiiBackend {
                     Choice::Chosen(question_descriptor, state) => {
                         selected.push((list.guid.to_string(), question_descriptor, state));
                     }
-                    // question not found in this form package
+                    // question not found in this FormSet
                     // or only in states that `include` does not allow
                     Choice::Skipped(states) => excluded |= states,
                 }
@@ -369,7 +369,7 @@ impl HiiBackend {
         options: &GetOptions,
     ) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
-        // TODO: take a form@packagelist selector to pick one of the form packages that select
+        // TODO: take a form@packagelist selector to pick one of the FormSets that select
         // the question
         let include = options.include;
 
@@ -394,9 +394,9 @@ impl HiiBackend {
         for list in parsed_db {
             list.check_form_strings()?;
 
-            for form_package in list.forms {
+            for root in list.forms {
                 let selection = forms::find_question(
-                    form_package,
+                    root,
                     &list.strings,
                     &question_variations,
                     include,

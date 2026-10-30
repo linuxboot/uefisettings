@@ -32,6 +32,7 @@ use binrw::BinRead;
 use binrw::BinReaderExt;
 use binrw::BinResult;
 use log::debug;
+use log::warn;
 use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
@@ -1620,7 +1621,7 @@ mod efivar_reader_tests {
             &[],
         );
         let show = |reader: &mut EfivarReader| {
-            display(Rc::clone(&root), 0, &strings(), reader).expect("display the form package")
+            display(Rc::clone(&root), 0, &strings(), reader).expect("display the FormSet")
         };
         let efivars = Efivars::new();
         efivars.write(&efi_variable("Setup", 2), &[1, 0]);
@@ -1677,8 +1678,7 @@ mod efivar_reader_tests {
                     operation(op_code, false, data),
                     END.to_vec(), // End of the GUID
                 ]);
-                let root =
-                    handle_form_package(&mut Cursor::new(&bytes)).expect("parse the form package");
+                let root = handle_form_set(&mut Cursor::new(&bytes)).expect("parse the FormSet");
                 let guid = Rc::clone(&root.borrow().children[0].borrow().children[1]);
                 let question = Rc::clone(&guid.borrow().children[0]);
                 (root, question)
@@ -2130,11 +2130,59 @@ fn type_value_parser<R: Read + Seek>(
     }
 }
 
-pub fn handle_form_package(
+/// Parses a form package into one root per FormSet: the first as handle_form_set parses it,
+/// then each FORM_SET op after it that edk2-stable202608 SetupBrowserDxe/Setup.c
+/// GetIfrBinaryData reaches when it looks for a FormSet by GUID, walking the package op by op.
+/// That walk ends at an op whose Length runs past the package; here it also ends at one below the
+/// header size, which that walk loops on (Length 0) or steps into (Length 1), and at a later
+/// FormSet whose bytes do not parse.
+/// None of them fails the package: edk2 reads past the first FormSet only for such a walk.
+pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
-) -> Result<Rc<RefCell<IFROperation>>> {
+    package_list_guid: Guid,
+) -> Result<Vec<Rc<RefCell<IFROperation>>>> {
+    let mut roots = vec![handle_form_set(package_cursor)?];
+    let package_length = u64::try_from(package_cursor.get_ref().len())
+        .context("failed to convert form package length into u64")?;
+    while package_cursor.position() < package_length {
+        let offset = package_cursor.position();
+        let op: IFROperation = match package_cursor.read_ne() {
+            Ok(op) => op,
+            Err(error)
+                if error.is_eof()
+                    || matches!(error.root_cause(), binrw::Error::AssertFail { .. }) =>
+            {
+                debug!("ending the FormSet walk at offset {offset}: {error}");
+                break;
+            }
+            Err(error) => return Err(error).context("failed to parse IFR operation"),
+        };
+        if op.op_code != IFROpCode::FormSet {
+            debug!(
+                "skipping {:?} outside a FormSet at offset {offset}",
+                op.op_code
+            );
+            continue;
+        }
+        package_cursor.set_position(offset);
+        match handle_form_set(package_cursor) {
+            Ok(root) => roots.push(root),
+            Err(error) if error.chain().any(|cause| cause.is::<binrw::Error>()) => {
+                warn!(
+                    "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
+                     a form package and the ops after it: {error:#}"
+                );
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(roots)
+}
+
+pub fn handle_form_set(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<Rc<RefCell<IFROperation>>> {
     // this is the root element so all the values like op_code, length, etc are dummy
-    debug!("new forms package");
+    debug!("new FormSet");
     let root = Rc::new(RefCell::new(IFROperation {
         op_code: IFROpCode::Unknown(DUMMY_OPCODE),
         length: 0,
@@ -2181,15 +2229,11 @@ pub fn handle_form_package(
                 None => debug!("IFR:End when parent_ref is none"),
             };
 
-            // back at the root: this form package has been parsed. The root is found by
+            // back at the root: this FormSet has been parsed. The root is found by
             // identity: an IFR op may have opcode 0xFF, the root's DUMMY_OPCODE, and a scope.
             if Rc::ptr_eq(&current_scope, &root) {
                 debug!("Reached root element. Current scope: {:?}", current_scope);
-                // NOTE: I'm 99.99 % sure there is only one top level FormSet in a package.
-                // Just in case there isn't there could be a chance we're skipping any subsequent FormSets
-                // by breaking here.
-                // If anyone finds an exception in the future (next to zero chance I know) you will have to
-                // remove the break here and find another way of checking bounds to prevent a "trying to read out of bounds" error
+                // parse_form_sets reads the FormSets after this one
                 break;
             }
             continue;
@@ -2470,9 +2514,9 @@ impl QuestionDescriptor {
     }
 }
 
-// list_questions returns a list of QuestionDescriptors in a form package
+// list_questions returns a list of QuestionDescriptors in a FormSet
 // with their states, of the questions in a state that `include` may allow
-// node should be the form_package node
+// node should be the root of a FormSet
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &[HashMap<i32, String>],
@@ -2482,20 +2526,20 @@ pub fn list_questions(
     let values = VarStoreValues::new(&node);
     list_questions_in(
         &node,
-        &mut FormPackageWalk::new(string_packages, reader, &values, include),
+        &mut FormSetWalk::new(string_packages, reader, &values, include),
     )
 }
 
-/// What walking the ops of a form package takes besides them.
-struct FormPackageWalk<'a, V> {
-    /// The string packages of the form package's package list
+/// What walking the ops of a FormSet takes besides them.
+struct FormSetWalk<'a, V> {
+    /// The string packages of the FormSet's package list
     string_packages: &'a [HashMap<i32, String>],
     default_ids: FormSetDefaultIds,
     inputs: ExpressionInputs<'a, V>,
     include: IncludedStates,
 }
 
-impl<'a, V> FormPackageWalk<'a, V> {
+impl<'a, V> FormSetWalk<'a, V> {
     fn new(
         string_packages: &'a [HashMap<i32, String>],
         reader: &'a mut EfivarReader,
@@ -2514,7 +2558,7 @@ impl<'a, V> FormPackageWalk<'a, V> {
 /// Lists questions as list_questions does, with `walk`.
 fn list_questions_in(
     node: &Rc<RefCell<IFROperation>>,
-    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
     if skips_scope(&node.borrow()) {
         return Vec::new();
@@ -2533,7 +2577,7 @@ fn list_questions_in(
 /// `walk.include` may allow.
 fn listed_question(
     question: &Rc<RefCell<IFROperation>>,
-    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Option<(QuestionDescriptor, StateEvaluation)> {
     let op = question.borrow();
     let value_question = value_question(&op)?;
@@ -2563,7 +2607,7 @@ where
     find_question_in(
         &node,
         possible_question_phrases,
-        &mut FormPackageWalk::new(string_packages, reader, &values, include),
+        &mut FormSetWalk::new(string_packages, reader, &values, include),
     )
 }
 
@@ -2571,7 +2615,7 @@ where
 fn find_question_in<T>(
     node: &Rc<RefCell<IFROperation>>,
     possible_question_phrases: &HashSet<T>,
-    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Selection<QuestionDescriptor>
 where
     T: AsRef<str>,
@@ -2592,7 +2636,7 @@ where
         .map(|(question, op, value_question)| describe_question(question, op, value_question, walk))
 }
 
-/// set's choice of the selection of a form package: that of Selection::for_set, unless the
+/// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
 /// match that set would write, or the likely match, has no VarStore, or its efivar is missing,
 /// unreadable, boot-service-only or volatile, which --include cannot make writable: then
 /// ChangeValueError::NoVarStore, VariableNotExported or the read's error, as `reader` found
@@ -2639,7 +2683,7 @@ mod choice_for_set_tests {
     const MISSING_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI variable \
         Missing-00000000-0000-0000-0000-000000000000>";
 
-    /// set's choice for PROMPT in the form package `root`, where only the efivar Present, of
+    /// set's choice for PROMPT in the FormSet `root`, where only the efivar Present, of
     /// 1 byte, exists.
     fn choice_in(root: &Rc<RefCell<IFROperation>>) -> Result<Choice<QuestionDescriptor>> {
         choice_attributed(root, NV_BS_RT)
@@ -2655,7 +2699,7 @@ mod choice_for_set_tests {
         choice_with(root, &efivars)
     }
 
-    /// set's choice for PROMPT in the form package `root`, with the efivar files `efivars`.
+    /// set's choice for PROMPT in the FormSet `root`, with the efivar files `efivars`.
     fn choice_with(
         root: &Rc<RefCell<IFROperation>>,
         efivars: &Efivars,
@@ -2665,7 +2709,7 @@ mod choice_for_set_tests {
         let selection = find_question_in(
             root,
             &HashSet::from([PROMPT]),
-            &mut FormPackageWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
+            &mut FormSetWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
         );
         choice_for_set(selection, PROMPT, &reader)
     }
@@ -2695,7 +2739,7 @@ mod choice_for_set_tests {
         choice_in(&picked_one_of(var_stores, input))
     }
 
-    /// The form package of picked_choice.
+    /// The FormSet of picked_choice.
     fn picked_one_of(var_stores: &[Vec<u8>], input: u16) -> Rc<RefCell<IFROperation>> {
         let (root, _question) = parse_question(
             &[var_stores, &[checkbox_on(2, 5, input)]].concat(),
@@ -2929,7 +2973,7 @@ fn describe_question(
     question: &Rc<RefCell<IFROperation>>,
     op: &std::cell::Ref<IFROperation>,
     value_question: ValueQuestion<'_>,
-    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let header = value_question.header();
     let prompt = find_corresponding_string(header.prompt_string_id, walk.string_packages);
@@ -2946,7 +2990,7 @@ fn handle_checkbox(
     parsed: &CheckBox,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
-    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
     let available = match read_question_bytes(current_node, &varstore, walk.inputs.reader) {
@@ -2995,7 +3039,7 @@ fn handle_oneof(
     parsed: &OneOf,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
-    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
     // None, with the reason in `answer`, when the current value cannot be read: any u64,
@@ -3103,7 +3147,7 @@ fn handle_numeric(
     parsed: &Numeric,
     question: &str,
     current_node: &std::cell::Ref<IFROperation>,
-    walk: &mut FormPackageWalk<'_, impl QuestionValues>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let mut answer = String::new();
 
@@ -3910,7 +3954,7 @@ mod question_value_tests {
     }
 }
 
-// display returns a String which is our tree like representation of a Forms package
+// display returns a String which is our tree like representation of a FormSet
 // TODO: show the default of an unreadable OneOf, Numeric or CheckBox, as list_questions does.
 // TODO: show the state that the conditions give each question and option, as list-questions
 // does.
@@ -3934,7 +3978,7 @@ pub fn display(
 
     match &current_node.parsed_data {
         ParsedOperation::Placeholder => {
-            // every op that handle_form_package parses has a parent; the root has none
+            // every op that handle_form_set parses has a parent; the root has none
             if current_node.parent.is_none() {
                 result.push_str(format!("{extra_spaces}OpCode: ROOT\n").as_str())
             }
@@ -4873,7 +4917,7 @@ mod tests {
             let data = vec![0x0E, length]; // FormSet
             let mut cursor = Cursor::new(&data);
 
-            let err = format!("{:#}", handle_form_package(&mut cursor).unwrap_err());
+            let err = format!("{:#}", handle_form_set(&mut cursor).unwrap_err());
 
             let want = format!("invalid IFR operation length {} at 0x", length);
             assert!(err.contains(&want), "length {}: {}", length, err);
@@ -4894,16 +4938,16 @@ mod tests {
         .concat();
         let mut cursor = Cursor::new(&data);
 
-        let err = format!("{:#}", handle_form_package(&mut cursor).unwrap_err());
+        let err = format!("{:#}", handle_form_set(&mut cursor).unwrap_err());
 
         let want = "invalid IFR operation length 0 at 0x";
         assert!(err.contains(want), "{}", err);
     }
 
     /// An End that returns to an IFR op with opcode 0xFF, which is also the root's
-    /// DUMMY_OPCODE, does not end the form package: the ops after that op's scope are parsed.
+    /// DUMMY_OPCODE, does not end the FormSet: the ops after that op's scope are parsed.
     #[test]
-    fn end_back_in_an_opcode_0xff_scope_does_not_end_the_form_package() {
+    fn end_back_in_an_opcode_0xff_scope_does_not_end_the_form_set() {
         let data = form_set(&[form(
             1,
             &[
@@ -4915,7 +4959,7 @@ mod tests {
         )]);
         let mut cursor = Cursor::new(&data);
 
-        let root = handle_form_package(&mut cursor).expect("parse the form package");
+        let root = handle_form_set(&mut cursor).expect("parse the FormSet");
 
         let root = root.borrow();
         assert_eq!(root.children.len(), 1, "FormSets");
@@ -4975,7 +5019,7 @@ mod tests {
     }
 
     /// The ops in the scope of an opcode above EFI_IFR_MATCH2_OP, nested ones too, are not
-    /// decoded, so a malformed one does not fail the form package; in a known opcode's scope
+    /// decoded, so a malformed one does not fail the FormSet; in a known opcode's scope
     /// it still does.
     #[test]
     fn ops_in_an_unknown_opcode_scope_are_not_decoded() {
@@ -5001,7 +5045,7 @@ mod tests {
 
         for op_code in [0x65, 0x70, 0xFF] {
             let data = in_scope(op_code);
-            let root = handle_form_package(&mut Cursor::new(&data)).unwrap_or_else(|error| {
+            let root = handle_form_set(&mut Cursor::new(&data)).unwrap_or_else(|error| {
                 panic!("parse the scope of opcode {op_code:#x}: {error:#}")
             });
 
@@ -5027,7 +5071,7 @@ mod tests {
         }
 
         let data = in_scope(GUID);
-        let error = handle_form_package(&mut Cursor::new(&data)).expect_err("GUID scope");
+        let error = handle_form_set(&mut Cursor::new(&data)).expect_err("GUID scope");
         assert!(
             format!("{error:#}").contains("failed to parse CheckBox's data"),
             "GUID scope: {error:#}"
@@ -5054,7 +5098,7 @@ mod tests {
         .concat();
         let mut cursor = Cursor::new(&data);
 
-        let root = handle_form_package(&mut cursor).unwrap();
+        let root = handle_form_set(&mut cursor).unwrap();
 
         let root = root.borrow();
         assert_eq!(root.children.len(), 1);
@@ -5196,7 +5240,7 @@ mod write_validation_tests {
             parsed,
             "Numeric test",
             &current,
-            &mut FormPackageWalk::new(
+            &mut FormSetWalk::new(
                 &[],
                 &mut efivars.reader(),
                 &MapValues(HashMap::new()),

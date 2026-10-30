@@ -89,13 +89,8 @@ fn decoded_bytes(
     let mut reader = EfivarReader::new(EfivarSource::Disabled)?;
     for list in package_lists {
         list.check_form_strings()?;
-        for form_package in list.forms {
-            list_questions(
-                form_package,
-                &list.strings,
-                IncludedStates::all(),
-                &mut reader,
-            );
+        for root in list.forms {
+            list_questions(root, &list.strings, IncludedStates::all(), &mut reader);
         }
     }
     Ok(reader.decoded)
@@ -274,7 +269,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::hii::forms::handle_form_package;
+    use crate::hii::forms::handle_form_set;
     use crate::hii::forms::ifr_fixtures::checkbox;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
     use crate::hii::forms::ifr_fixtures::conditional;
@@ -332,21 +327,21 @@ mod tests {
             .collect()
     }
 
-    /// The package list of `form_package`, with no strings.
-    fn package_list(form_package: &Rc<RefCell<IFROperation>>) -> ParsedPackageList {
+    /// The package list of `root`, with no strings.
+    fn package_list(root: &Rc<RefCell<IFROperation>>) -> ParsedPackageList {
         ParsedPackageList {
             guid: NIL_GUID,
             strings: vec![HashMap::new()],
-            forms: vec![Rc::clone(form_package)],
+            forms: vec![Rc::clone(root)],
         }
     }
 
-    /// The answers and states that list_questions gives for the questions of `form_package`,
+    /// The answers and states that list_questions gives for the questions of `root`,
     /// reading the efivar files in `efivars`.
-    fn answers(form_package: &Rc<RefCell<IFROperation>>, efivars: &Path) -> Vec<String> {
+    fn answers(root: &Rc<RefCell<IFROperation>>, efivars: &Path) -> Vec<String> {
         let source = EfivarSource::Directory(efivars.to_path_buf());
         list_questions(
-            Rc::clone(form_package),
+            Rc::clone(root),
             &[HashMap::new()],
             IncludedStates::all(),
             &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),
@@ -679,13 +674,11 @@ mod tests {
             operation(CHECKBOX, false, &checkbox(1, 0x00)),
             operation(CHECKBOX, false, &checkbox(3, 0x00)),
         ]);
-        let form_package =
-            handle_form_package(&mut Cursor::new(&bytes)).expect("parse the form package");
+        let root = handle_form_set(&mut Cursor::new(&bytes)).expect("parse the FormSet");
         let live = efivars(&[(&efivar("Setup"), &[7, 0, 0, 0, 0xAA, 1, 0xBB, 0])]);
         let (_parent, dir) = dump_dir();
 
-        let decoded =
-            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
         copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
             .expect("dump efivars");
 
@@ -694,14 +687,10 @@ mod tests {
             [7, 0, 0, 0, 0, 1, 0, 0],
             "dumped Setup"
         );
+        assert_eq!(answers(&root, &dir), ["1", "0"], "answers from the dump");
         assert_eq!(
-            answers(&form_package, &dir),
-            ["1", "0"],
-            "answers from the dump"
-        );
-        assert_eq!(
-            answers(&form_package, &dir),
-            answers(&form_package, live.path()),
+            answers(&root, &dir),
+            answers(&root, live.path()),
             "answers from the source"
         );
     }
@@ -713,16 +702,14 @@ mod tests {
             operation(CHECKBOX, false, &checkbox(1, 0x00)),
             operation(CHECKBOX, false, &checkbox(6, 0x00)),
         ]);
-        let form_package =
-            handle_form_package(&mut Cursor::new(&bytes)).expect("parse the form package");
+        let root = handle_form_set(&mut Cursor::new(&bytes)).expect("parse the FormSet");
         let live = efivars(&[(
             &efivar("Setup"),
             &[7, 0, 0, 0, 0xAA, 1, 0xBB, 0, 0xCC, 0, 1, 0xDD],
         )]);
         let (_parent, dir) = dump_dir();
 
-        let decoded =
-            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
         copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
             .expect("dump efivars");
 
@@ -732,7 +719,7 @@ mod tests {
             "dumped Setup: not the byte at 6, past the VarStore's 4"
         );
         assert_eq!(
-            answers(&form_package, &dir),
+            answers(&root, &dir),
             [
                 "1",
                 "<ExtractEFIDataError: failed to fill whole buffer (offset: 6; buflen: 8)> \
@@ -741,15 +728,15 @@ mod tests {
             "answers from the dump"
         );
         assert_eq!(
-            answers(&form_package, &dir),
-            answers(&form_package, live.path()),
+            answers(&root, &dir),
+            answers(&root, live.path()),
             "answers from the source"
         );
     }
 
     #[test]
     fn redacted_dump_keeps_no_byte_of_a_file_shorter_than_its_var_store() {
-        let form_package = parse_form_set(&[
+        let root = parse_form_set(&[
             var_store_efi(1, "Setup", NV_BS_RT, 2),
             var_store_efi(2, "Short", NV_BS_RT, 4),
             form(1, &[checkbox_on(1, 3, 1), checkbox_on(2, 3, 2)]),
@@ -761,14 +748,13 @@ mod tests {
         ]);
         let (_parent, dir) = dump_dir();
         let answers_in = |efivars: &Path| -> Vec<String> {
-            answers(&form_package, efivars)
+            answers(&root, efivars)
                 .into_iter()
                 .map(|answer| answer.replace(&efivars.display().to_string(), "DIR"))
                 .collect()
         };
 
-        let decoded =
-            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
         copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
             .expect("dump efivars");
 
@@ -791,7 +777,7 @@ mod tests {
 
     #[test]
     fn redacted_dump_keeps_the_bytes_of_suppressed_questions() {
-        let form_package = parse_form_set(&[
+        let root = parse_form_set(&[
             var_store_efi(1, "Setup", NV_BS_RT, 2),
             var_store_efi(2, "Hidden", NV_BS_RT, 2),
             form(
@@ -808,8 +794,7 @@ mod tests {
         ]);
         let (_parent, dir) = dump_dir();
 
-        let decoded =
-            decoded_bytes(vec![package_list(&form_package)]).expect("find the decoded bytes");
+        let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
         let dump = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
             .expect("dump efivars");
 
@@ -824,13 +809,13 @@ mod tests {
             "dumped Hidden: the suppressed question's byte only"
         );
         assert_eq!(
-            answers(&form_package, &dir),
+            answers(&root, &dir),
             ["1", "1 <suppressed>"],
             "answers from the dump"
         );
         assert_eq!(
-            answers(&form_package, &dir),
-            answers(&form_package, live.path()),
+            answers(&root, &dir),
+            answers(&root, live.path()),
             "answers from the source"
         );
     }

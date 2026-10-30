@@ -314,8 +314,8 @@ impl fmt::Debug for Guid {
 type StringMap = HashMap<i32, String>;
 type IFRNodeLink = Rc<RefCell<IFROperation>>;
 
-/// String map (string id -> string) per strings package and IFR root per form
-/// package of one package list.
+/// String map (string id -> string) per strings package and IFR root per FormSet
+/// of one package list.
 pub struct ParsedPackageList {
     pub guid: Guid,
     pub strings: Vec<StringMap>,
@@ -371,9 +371,9 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
             }
             PackageType::Form => {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
-                let root_node = forms::handle_form_package(&mut package_cursor)
+                let form_sets = forms::parse_form_sets(&mut package_cursor, package_list.guid)
                     .context("failed to parse a form package")?;
-                roots.push(root_node);
+                roots.extend(form_sets);
             }
             _ => continue,
         }
@@ -397,6 +397,8 @@ mod tests {
 
     use super::hiidb_fixtures::*;
     use super::*;
+    use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::END;
 
     /// OPAQUE_PACKAGE is a package with Length 6, that is, 2 bytes of data:
     /// 0xAA 0xBB. Its Type 0xE0 is in the range that UEFI Spec v2.10 §33.3.1.1
@@ -455,6 +457,86 @@ mod tests {
             .iter()
             .find(|list| list.guid.to_string() == guid)
             .unwrap_or_else(|| panic!("find package list {guid}"))
+    }
+
+    /// read_db keeps each FormSet of a form package as a root of its own. The walk for FormSets
+    /// after the first skips other ops and ends, without failing the package, at an op that does
+    /// not fit it or at a later FormSet whose bytes do not parse; a malformed first FormSet still
+    /// fails it.
+    #[test]
+    fn test_read_db_ends_the_form_set_walk_at_an_op_that_does_not_fit() {
+        let form_set = |guid: u8, body: &[u8]| {
+            [
+                &[0x0E, 0x80 | 39][..], // FormSet: Length, Scope
+                &[guid; 16],
+                &[0x01, 0x00, 0x02, 0x00, 0x01], // FormSetTitle, Help, Flags: one ClassGuid
+                &[0x22; 16],                     // ClassGuid
+                body,
+                &END,
+            ]
+            .concat()
+        };
+        let read = |ifr: Vec<u8>| {
+            let length =
+                PACKAGE_HEADER_SIZE + u32::try_from(ifr.len()).expect("form package length");
+            let form_package = [package_header(0x02, length), ifr].concat();
+            let hiidb =
+                package_list_with_guid([0x22; 16], &[form_package, END_PACKAGE.to_vec()].concat());
+            read_db(&hiidb).map(|lists| {
+                lists[0]
+                    .forms
+                    .iter()
+                    .map(
+                        |root| match &root.borrow().children[0].borrow().parsed_data {
+                            forms::ParsedOperation::FormSet(parsed) => parsed.guid.data4[7],
+                            other => panic!("root holds {other:?}, not a FormSet"),
+                        },
+                    )
+                    .collect::<Vec<u8>>()
+            })
+        };
+        let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
+        let subtitle = [0x02, 0x07, 0x05, 0x00, 0x06, 0x00, 0x00];
+        let cases: [(&str, Vec<u8>, &[u8]); 8] = [
+            ("0xFF padding", vec![0xFF; 8], &[0xA0]),
+            ("zero bytes", vec![0x00; 4], &[0xA0]),
+            ("Length 1", vec![0x29, 0x01], &[0xA0]),
+            (
+                "zero bytes, then a FormSet",
+                [&[0x00, 0x00][..], &form_set(0xB0, &[])].concat(),
+                &[0xA0],
+            ),
+            ("a FormSet", form_set(0xB0, &[]), &[0xA0, 0xB0]),
+            (
+                "a Subtitle, then a FormSet",
+                [&subtitle[..], &form_set(0xB0, &[])].concat(),
+                &[0xA0, 0xB0],
+            ),
+            (
+                "a FormSet with a malformed CheckBox",
+                form_set(0xB0, &short_checkbox),
+                &[0xA0],
+            ),
+            (
+                "a FormSet with a malformed CheckBox, then a FormSet",
+                [form_set(0xB0, &short_checkbox), form_set(0xC0, &[])].concat(),
+                &[0xA0],
+            ),
+        ];
+        for (name, trailing, want) in cases {
+            let got = read([form_set(0xA0, &[]), trailing].concat())
+                .unwrap_or_else(|error| panic!("read_db after {name}: {error:#}"));
+            assert_eq!(
+                got, want,
+                "FormSets, by the last byte of their GUID, after {name}"
+            );
+        }
+
+        let error = read(form_set(0xA0, &short_checkbox)).expect_err("a malformed first FormSet");
+        assert!(
+            format!("{error:#}").contains("failed to parse CheckBox's data"),
+            "a malformed first FormSet: {error:#}"
+        );
     }
 
     /// A PackageLength below the header size is rejected as an invalid

@@ -497,7 +497,7 @@ mod tests {
     use super::super::conditions::QuestionValue;
     use super::super::conditions::ValueKind;
     use super::super::find_question;
-    use super::super::handle_form_package;
+    use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
     use super::super::IncludedStates;
@@ -755,7 +755,7 @@ mod tests {
             END.to_vec(),
         ]
         .concat();
-        let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
+        let root = handle_form_set(&mut Cursor::new(&data)).expect("parse the Numeric");
         let unavailable = "<ValueUnavailable: varstore not found because we reached root>";
 
         let listed = list_questions(
@@ -797,7 +797,7 @@ mod tests {
             form_set(&[numeric(5)]),
             numeric(6),
         ]);
-        let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
+        let root = handle_form_set(&mut Cursor::new(&data)).expect("parse the FormSet");
         let unavailable = "<ValueUnavailable: no supported varstore with matching id 0x0001 found>";
 
         let listed = list_questions(
@@ -840,7 +840,7 @@ mod tests {
             ifr_false(),
             &[form_set(&[default_store(0x0001), numeric(4)]), numeric(5)],
         );
-        let root = handle_form_package(&mut Cursor::new(&data)).expect("parse the form package");
+        let root = handle_form_set(&mut Cursor::new(&data)).expect("parse the SUPPRESS_IF");
 
         let listed = list_questions(
             root,
