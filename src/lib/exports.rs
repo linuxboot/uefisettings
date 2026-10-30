@@ -12,7 +12,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
@@ -37,7 +36,6 @@ use crate::hii::extract;
 use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
-use crate::hii::forms::QuestionDescriptor;
 use crate::hii::package;
 pub use crate::hii::EfivarDump;
 use crate::hii::EfivarReader;
@@ -254,7 +252,8 @@ impl SettingsBackend for HiiBackend {
 }
 
 impl HiiBackend {
-    /// set with `options`
+    /// set with `options`: fails with SelectionError::NotFound when no question has the text, and
+    /// unless every selected match is written, also after writing the others.
     pub fn set_using(
         question: &str,
         new_value: &str,
@@ -285,11 +284,6 @@ impl HiiBackend {
             } => (question_variations, answer_variations, false),
         };
 
-        // TODO: set returns {"responses":[]} and exits 0 when no question matches or no matching
-        // question has a varstore, and aborts on the first write error even if another match is
-        // writable; report what was written and what failed, and fail unless every match was
-        // written.
-
         // Every form package selects its question and option before the first write, so that a
         // selection error leaves every variable unchanged.
         let mut selected = Vec::new();
@@ -308,9 +302,6 @@ impl HiiBackend {
                 );
                 match forms::choice_for_set(selection, question, &reader)? {
                     Choice::Chosen(question_descriptor, state) => {
-                        if !(question_descriptor.possible_options.is_empty()) {
-                            chosen_option(&question_descriptor, &new_value_variations, include)?;
-                        }
                         selected.push((list.guid.to_string(), question_descriptor, state));
                     }
                     // question not found in this form package
@@ -328,45 +319,40 @@ impl HiiBackend {
         }
         drop(reader);
 
-        for (guid, question_descriptor, state) in selected {
-            // if the question_descriptor provides options then set the closest one from new_value_variations
-            // (example whatever matches from [Enabled, Enable])
-            // else try setting the new_value because it might be some arbitrary value like a number
-            // (will return error if doesn't match constraints)
-            let (modified, option_annotation) =
-                if !(question_descriptor.possible_options.is_empty()) {
-                    let option =
-                        chosen_option(&question_descriptor, &new_value_variations, include)?;
-                    (
-                        forms::change_option(&question_descriptor, option)?,
-                        option.state.option_annotation(),
-                    )
-                } else {
-                    (
-                        forms::change_value(&question_descriptor, new_value)?,
-                        String::new(),
-                    )
-                };
+        let option_annotations: Vec<String> = forms::set_questions(
+            question,
+            &selected
+                .iter()
+                .map(|(guid, question_descriptor, _)| (guid.as_str(), question_descriptor))
+                .collect::<Vec<_>>(),
+            new_value,
+            &new_value_variations,
+            include,
+        )?
+        .into_iter()
+        .map(|chosen| chosen.map_or_else(String::new, |option| option.state.option_annotation()))
+        .collect();
 
-            if modified {
-                let set_resp = SetResponse {
-                    // TODO: GUIDs repeat, also in errors; identify lists by HiiDB index
-                    selector: guid,
-                    backend: Backend::Hii,
-                    is_translated,
-                    question: Question {
-                        options: question_descriptor.listed_options(include),
-                        name: question_descriptor.question,
-                        answer: new_value.to_owned() + &option_annotation + &state.annotation(),
-                        help: question_descriptor.help,
-                        ..Default::default()
-                    },
-                    modified: true,
+        for ((guid, question_descriptor, state), option_annotation) in
+            selected.into_iter().zip(option_annotations)
+        {
+            let set_resp = SetResponse {
+                // TODO: GUIDs repeat, also in errors; identify lists by HiiDB index
+                selector: guid,
+                backend: Backend::Hii,
+                is_translated,
+                question: Question {
+                    options: question_descriptor.listed_options(include),
+                    name: question_descriptor.question,
+                    answer: new_value.to_owned() + &option_annotation + &state.annotation(),
+                    help: question_descriptor.help,
                     ..Default::default()
-                };
+                },
+                modified: true,
+                ..Default::default()
+            };
 
-                resp.push(set_resp);
-            }
+            resp.push(set_resp);
         }
 
         Ok(SetResponseList {
@@ -462,18 +448,6 @@ impl HiiBackend {
             ..Default::default()
         })
     }
-}
-
-/// The option of `question` that set writes for one of `texts`.
-fn chosen_option<'a>(
-    question: &'a QuestionDescriptor,
-    texts: &HashSet<String>,
-    include: IncludedStates,
-) -> Result<&'a forms::AnswerOption> {
-    // if not a single option matched then error out
-    question
-        .select_option(texts, include)?
-        .ok_or_else(|| forms::ChangeValueError::InvalidOption.into())
 }
 
 pub struct IloBackend {}
@@ -658,6 +632,8 @@ impl SettingsBackend for IloBackend {
             }
         }
 
+        // TODO: fail when no attribute matches, and try every match before failing, as
+        // HiiBackend::set_using does
         Ok(SetResponseList {
             responses: resp,
             ..Default::default()

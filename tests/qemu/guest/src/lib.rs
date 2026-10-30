@@ -63,6 +63,9 @@ pub const BACKEND_UNKNOWN: i32 = 0;
 /// `Backend::Hii` in `thrift/uefisettings_backend.thrift`.
 pub const BACKEND_HII: i32 = 1;
 
+/// What comes before `get` or `set`: `["hii"]` for the HII commands, `[]` for the generic ones.
+pub const PREFIXES: [&[&str]; 2] = [&["hii"], &[]];
+
 /// The variable that holds the answers of the main form of EDK2's DriverSample, which the
 /// HII scenarios load: `MyIfrNVData`, with the formset GUID as its vendor.
 pub const DRIVER_SAMPLE_VARIABLE: &str =
@@ -230,6 +233,8 @@ pub struct Responses {
 /// One response of `get --json` or `set --json` (`GetResponse` or `SetResponse`).
 #[derive(Debug, Deserialize)]
 pub struct Response {
+    /// The package list that answered, for the HII backend.
+    pub selector: String,
     /// The backend that answered.
     pub backend: i32,
     /// The question, with its answer after the command.

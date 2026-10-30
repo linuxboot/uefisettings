@@ -113,19 +113,15 @@ const EDKII_BIT_FIELD_VALUE_BITS: u32 = 32;
 /// `length - IFR_OPERATION_HEADER_SIZE` bytes of data.
 const IFR_OPERATION_HEADER_SIZE: u8 = 2;
 
+/// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
+/// shorter than the `payload_size` bytes of its VarStore, which VarStoreWrite::new fits the
+/// write in.
 fn update_efivarfs_bytes(
     bytes: &mut [u8],
     payload_size: u16,
     offset: u16,
-    data: TypeValue,
+    encoded: &[u8],
 ) -> Result<()> {
-    let encoded = match data {
-        TypeValue::NumSize8(value) => value.to_le_bytes().to_vec(),
-        TypeValue::NumSize16(value) => value.to_le_bytes().to_vec(),
-        TypeValue::NumSize32(value) => value.to_le_bytes().to_vec(),
-        TypeValue::NumSize64(value) => value.to_le_bytes().to_vec(),
-        _ => return Err(anyhow!("unsupported value type for efivarfs write")),
-    };
     let payload = bytes
         .get_mut(EFIVARFS_HEADER_SIZE..)
         .context(MISSING_ATTRIBUTES_HEADER)?;
@@ -138,16 +134,10 @@ fn update_efivarfs_bytes(
     }
 
     let start = usize::from(offset);
-    let end = start + encoded.len();
-    if end > usize::from(payload_size) {
-        return Err(anyhow!(
-            "write at offset {} with width {} exceeds varstore size {}",
-            offset,
-            encoded.len(),
-            payload_size
-        ));
-    }
-    payload[start..end].copy_from_slice(&encoded);
+    payload
+        .get_mut(start..start + encoded.len())
+        .context("write past the efivarfs payload")?
+        .copy_from_slice(encoded);
     Ok(())
 }
 
@@ -815,12 +805,12 @@ trait VariableStore {
         Ok(())
     }
 
-    fn write_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+    fn write_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
         self.check_runtime_access()?;
-        self.write_efivarfs_at_offset(offset, data)
+        self.write_efivarfs_at_offset(offset, encoded)
     }
 
-    fn write_efivarfs_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
+    fn write_efivarfs_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
         // Steps:
         // * Read bytes
         // * Seek to 4 + offset
@@ -850,7 +840,7 @@ trait VariableStore {
         let attributes = efivar_attributes(&file_contents).context(MISSING_ATTRIBUTES_HEADER)?;
         check_non_volatile(&file_name, attributes)?;
 
-        update_efivarfs_bytes(&mut file_contents, self.size(), offset, data)?;
+        update_efivarfs_bytes(&mut file_contents, self.size(), offset, encoded)?;
 
         let _efifs = EfivarsMountGuard::new().context("Failed to create efivars fs mount guard")?;
 
@@ -957,7 +947,7 @@ mod non_efi_varstore_tests {
             self.kind == VariableStoreKind::EfiVariable
         }
 
-        fn write_efivarfs_at_offset(&self, _offset: u16, _data: TypeValue) -> Result<()> {
+        fn write_efivarfs_at_offset(&self, _offset: u16, _encoded: &[u8]) -> Result<()> {
             Ok(())
         }
     }
@@ -1007,7 +997,7 @@ mod non_efi_varstore_tests {
         for attributes in [0x2, 0x3] {
             assert_eq!(
                 efi_varstore(attributes)
-                    .write_at_offset(0, TypeValue::NumSize8(1))
+                    .write_at_offset(0, &[1])
                     .unwrap_err()
                     .to_string(),
                 "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is \
@@ -1209,14 +1199,14 @@ mod non_efi_varstore_tests {
                 var_store_info: 0,
                 question_flags: 0,
             },
-            varstore: Some(Box::new(TestVariableStore {
+            varstore: Ok(Box::new(TestVariableStore {
                 kind: VariableStoreKind::Buffer,
             })),
             refers_to_bit_field: false,
             value_state: StateEvaluation::selectable(),
         };
 
-        assert!(change_value(&question, "Enabled").unwrap());
+        change_value(&question, "Enabled").expect("set the buffer VarStore");
     }
 }
 
@@ -1231,13 +1221,9 @@ impl EfivarRange {
 }
 
 impl EfivarReader {
-    /// Why the efivar of `store` is missing, if a read of it found it so.
-    fn missing(&self, store: &dyn VariableStore) -> Option<&EfivarNotFound> {
-        self.outcomes
-            .get(&EfivarRange::of(store))?
-            .as_ref()
-            .err()?
-            .downcast_ref()
+    /// Why a read of the efivar of `store` failed, if one did.
+    fn read_error(&self, store: &dyn VariableStore) -> Option<&anyhow::Error> {
+        self.outcomes.get(&EfivarRange::of(store))?.as_ref().err()
     }
 
     /// The attribute word of the efivar of `store`, if a read of it succeeded; None skips set's
@@ -2372,7 +2358,8 @@ pub struct QuestionDescriptor {
     opcode: IFROpCode,
     pub possible_options: Vec<AnswerOption>,
     header: QuestionHeader,
-    varstore: Option<Box<dyn VariableStore>>,
+    /// The VarStore of the question, or why set cannot write it
+    varstore: Result<Box<dyn VariableStore>>,
     /// Whether the question is an EDKII bit varstore field, whose VarOffset edk2-stable202608
     /// SetupBrowserDxe/IfrParse.c reads in bits
     refers_to_bit_field: bool,
@@ -2398,6 +2385,27 @@ pub struct AnswerOption {
 }
 
 impl QuestionDescriptor {
+    /// The VarStore of the question, or why set cannot write it.
+    fn store(&self) -> std::result::Result<&dyn VariableStore, ChangeValueError> {
+        self.varstore
+            .as_deref()
+            .map_err(|reason| ChangeValueError::NoVarStore {
+                question: self.question.clone(),
+                reason: format!("{reason:#}"),
+            })
+    }
+
+    /// The option that set writes for one of `texts`.
+    pub(crate) fn chosen_option(
+        &self,
+        texts: &HashSet<String>,
+        include: IncludedStates,
+    ) -> Result<&AnswerOption> {
+        // if not a single option matched then error out
+        self.select_option(texts, include)?
+            .ok_or_else(|| ChangeValueError::InvalidOption.into())
+    }
+
     /// The texts of the options that `include` certainly allows: those that get lists and set
     /// takes.
     pub(crate) fn listed_options(&self, include: IncludedStates) -> Vec<String> {
@@ -2572,30 +2580,33 @@ where
 }
 
 /// set's choice of the selection of a form package: that of Selection::for_set, unless the
-/// efivar of the match that set would write, or of the likely match, is missing,
-/// boot-service-only or volatile, which --include cannot make writable: then
-/// VariableNotExported, as `reader` found it, BootServiceOnlyVariable or VolatileVariable.
+/// match that set would write, or the likely match, has no VarStore, or its efivar is missing,
+/// unreadable, boot-service-only or volatile, which --include cannot make writable: then
+/// ChangeValueError::NoVarStore, VariableNotExported or the read's error, as `reader` found
+/// it, BootServiceOnlyVariable or VolatileVariable.
 pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
     reader: &EfivarReader,
 ) -> Result<Choice<QuestionDescriptor>> {
-    let store = match &selection {
+    let descriptor = match &selection {
         Selection::Picked(descriptor, _)
         | Selection::Undetermined {
             likely: (descriptor, _),
             ..
-        } => descriptor.varstore.as_deref(),
-        Selection::Excluded(_) | Selection::NotFound => None,
+        } => descriptor,
+        Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
     };
-    if let Some(store) = store {
-        store.check_runtime_access()?;
-        if let Some(missing) = reader.missing(store) {
-            return Err(VariableNotExported(missing.clone()).into());
-        }
-        if let Some(attributes) = reader.attributes(store) {
-            check_non_volatile(&store.efivar_file_name(), attributes)?;
-        }
+    let store = descriptor.store()?;
+    store.check_runtime_access()?;
+    if let Some(error) = reader.read_error(store) {
+        return Err(match error.downcast_ref::<EfivarNotFound>() {
+            Some(missing) => VariableNotExported(missing.clone()).into(),
+            None => anyhow!("{error:#}"),
+        });
+    }
+    if let Some(attributes) = reader.attributes(store) {
+        check_non_volatile(&store.efivar_file_name(), attributes)?;
     }
     Ok(selection.for_set(question)?)
 }
@@ -2628,6 +2639,14 @@ mod choice_for_set_tests {
     ) -> Result<Choice<QuestionDescriptor>> {
         let efivars = Efivars::new();
         efivars.write_attributed(&efi_variable("Present", 1), attributes, &[0]);
+        choice_with(root, &efivars)
+    }
+
+    /// set's choice for PROMPT in the form package `root`, with the efivar files `efivars`.
+    fn choice_with(
+        root: &Rc<RefCell<IFROperation>>,
+        efivars: &Efivars,
+    ) -> Result<Choice<QuestionDescriptor>> {
         let mut reader = efivars.reader();
         let values = VarStoreValues::new(root);
         let selection = find_question_in(
@@ -2764,6 +2783,46 @@ mod choice_for_set_tests {
             selected(IncludedStates::SUPPRESSED),
             Ok(Some("Enabled")),
             "Enabled with --include suppressed"
+        );
+    }
+
+    #[test]
+    fn match_without_a_varstore_is_refused() {
+        let choice = choice_in(&parse_form_set(&[form(1, &[checkbox_on(1, 3, 0)])]));
+        assert_eq!(
+            choice.map_err(|error| error.to_string()).err().as_deref(),
+            Some(
+                "cannot set question \"Prompt\": question is callback-driven or temporary and \
+                 has no varstore"
+            ),
+            "question 1 on VarStoreId 0"
+        );
+    }
+
+    #[test]
+    fn match_on_an_unreadable_efivar_is_refused_with_the_read_error() {
+        // VARSTORE_EFI's Size is 2
+        let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS_RT, 2)], 1);
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Present", 1), &[0]);
+
+        let error = choice_with(&root, &efivars).expect_err("set refuses the ONE_OF");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "failed to read efivar file '{}': failed to fill whole buffer",
+                efivars
+                    .path()
+                    .join("Present-00000000-0000-0000-0000-000000000000")
+                    .display()
+            ),
+            "efivar file of 1 payload byte"
+        );
+        efivars.write(&efi_variable("Present", 2), &[0, 0]);
+        let choice = choice_with(&root, &efivars);
+        assert!(
+            matches!(choice, Ok(Choice::Chosen(..))),
+            "efivar file of 2 payload bytes: {choice:?}"
         );
     }
 
@@ -2908,7 +2967,7 @@ fn handle_checkbox(
         .to_string(),
         possible_options: Vec::new(),
         header: parsed.question_header(),
-        varstore: varstore.ok(),
+        varstore,
         refers_to_bit_field: refers_to_bit_field(current_node),
         max_value: RangeType::NumSize8(1),
         numeric_range: None,
@@ -3011,7 +3070,7 @@ fn handle_oneof(
         .to_string(),
         possible_options,
         header: parsed.question_header(),
-        varstore: varstore.ok(),
+        varstore,
         refers_to_bit_field: refers_to_bit_field(current_node),
         max_value: match &parsed.data {
             Range::Range8(r) => RangeType::NumSize8(r.max_value),
@@ -3070,7 +3129,7 @@ fn handle_numeric(
         .to_string(),
         possible_options: Vec::new(),
         header: parsed.question_header(),
-        varstore: varstore.ok(),
+        varstore,
         refers_to_bit_field: refers_to_bit_field(current_node),
         max_value: match &parsed.data {
             Range::Range8(r) => RangeType::NumSize8(r.max_value),
@@ -4006,6 +4065,8 @@ pub enum ChangeValueError {
     InvalidNumericRange,
     #[error("setting EDKII bit-field values is not supported")]
     UnsupportedBitField,
+    #[error("cannot set question {question:?}: {reason}")]
+    NoVarStore { question: String, reason: String },
     #[error(transparent)]
     Selection(#[from] SelectionError),
 
@@ -4013,104 +4074,476 @@ pub enum ChangeValueError {
     Other(#[from] anyhow::Error),
 }
 
-pub fn change_value(
-    question: &QuestionDescriptor,
+/// set's write of a value at VarOffset `offset` of `store`: `encoded`, its little-endian bytes,
+/// which fit in the Size of `store`.
+struct VarStoreWrite<'a> {
+    store: &'a dyn VariableStore,
+    offset: u16,
+    encoded: Vec<u8>,
+}
+
+impl<'a> VarStoreWrite<'a> {
+    /// The write of `value` at VarOffset `offset` of `store`: fails unless `value` is a number
+    /// that fits in the Size of `store` there.
+    fn new(store: &'a dyn VariableStore, offset: u16, value: TypeValue) -> Result<Self> {
+        let encoded = match value {
+            TypeValue::NumSize8(value) => value.to_le_bytes().to_vec(),
+            TypeValue::NumSize16(value) => value.to_le_bytes().to_vec(),
+            TypeValue::NumSize32(value) => value.to_le_bytes().to_vec(),
+            TypeValue::NumSize64(value) => value.to_le_bytes().to_vec(),
+            TypeValue::Boolean(_)
+            | TypeValue::Time(_)
+            | TypeValue::Date(_)
+            | TypeValue::StringID(_)
+            | TypeValue::Other
+            | TypeValue::Undefined
+            | TypeValue::Action(_)
+            | TypeValue::Ref(_)
+            | TypeValue::Unknown(_) => {
+                return Err(anyhow!("unsupported value type for efivarfs write"))
+            }
+        };
+        if usize::from(offset) + encoded.len() > usize::from(store.size()) {
+            return Err(anyhow!(
+                "write at offset {} with width {} exceeds varstore size {}",
+                offset,
+                encoded.len(),
+                store.size()
+            ));
+        }
+        Ok(Self {
+            store,
+            offset,
+            encoded,
+        })
+    }
+
+    fn write(&self) -> Result<()> {
+        self.store.write_at_offset(self.offset, &self.encoded)
+    }
+}
+
+/// The write that sets `question` to `new_value`; for a ONE_OF, to the option of that text
+/// that select_option picks without --include.
+fn value_write<'a>(
+    question: &'a QuestionDescriptor,
     new_value: &str,
-) -> Result<bool, ChangeValueError> {
+) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
     if question.refers_to_bit_field {
         return Err(ChangeValueError::UnsupportedBitField);
     }
-    let mut changed = false;
-    if let Some(varstore) = &question.varstore {
-        if question.opcode == IFROpCode::OneOf {
-            let option = question
-                .select_option(
-                    &HashSet::from([new_value.to_owned()]),
-                    IncludedStates::empty(),
-                )?
-                .ok_or(ChangeValueError::InvalidOption)?;
-            return change_option(question, option);
-        } else if let Some(range) = &question.numeric_range {
-            let data = range.parse_value(new_value)?;
-            varstore.write_at_offset(question.header.var_store_info, data)?;
-            changed = true;
-        } else {
-            match question.max_value {
-                RangeType::NumSize8(m) => {
-                    let data_to_write = new_value
-                        .parse::<u8>()
-                        .context("value should fit in a u8")?;
-                    if data_to_write > m {
-                        return Err(ChangeValueError::ExceededMaxValue);
-                    }
-                    varstore.write_at_offset(
-                        question.header.var_store_info,
-                        TypeValue::NumSize8(data_to_write),
-                    )?;
-                    changed = true;
+    let store = question.store()?;
+    if question.opcode == IFROpCode::OneOf {
+        let option = question
+            .select_option(
+                &HashSet::from([new_value.to_owned()]),
+                IncludedStates::empty(),
+            )?
+            .ok_or(ChangeValueError::InvalidOption)?;
+        return option_write(question, option);
+    }
+    let value = match &question.numeric_range {
+        Some(range) => range.parse_value(new_value)?,
+        None => match question.max_value {
+            RangeType::NumSize8(m) => {
+                let data_to_write = new_value
+                    .parse::<u8>()
+                    .context("value should fit in a u8")?;
+                if data_to_write > m {
+                    return Err(ChangeValueError::ExceededMaxValue);
                 }
-                RangeType::NumSize16(m) => {
-                    let data_to_write = new_value
-                        .parse::<u16>()
-                        .context("value should fit in a u16")?;
-                    if data_to_write > m {
-                        return Err(ChangeValueError::ExceededMaxValue);
-                    }
-                    varstore.write_at_offset(
-                        question.header.var_store_info,
-                        TypeValue::NumSize16(data_to_write),
-                    )?;
-                    changed = true;
-                }
-                RangeType::NumSize32(m) => {
-                    let data_to_write = new_value
-                        .parse::<u32>()
-                        .context("value should fit in a u32")?;
-                    if data_to_write > m {
-                        return Err(ChangeValueError::ExceededMaxValue);
-                    }
-                    varstore.write_at_offset(
-                        question.header.var_store_info,
-                        TypeValue::NumSize32(data_to_write),
-                    )?;
-                    changed = true;
-                }
-                RangeType::NumSize64(m) => {
-                    let data_to_write = new_value
-                        .parse::<u64>()
-                        .context("value should fit in a u64")?;
-                    if data_to_write > m {
-                        return Err(ChangeValueError::ExceededMaxValue);
-                    }
-                    varstore.write_at_offset(
-                        question.header.var_store_info,
-                        TypeValue::NumSize64(data_to_write),
-                    )?;
-                    changed = true;
-                }
+                TypeValue::NumSize8(data_to_write)
             }
+            RangeType::NumSize16(m) => {
+                let data_to_write = new_value
+                    .parse::<u16>()
+                    .context("value should fit in a u16")?;
+                if data_to_write > m {
+                    return Err(ChangeValueError::ExceededMaxValue);
+                }
+                TypeValue::NumSize16(data_to_write)
+            }
+            RangeType::NumSize32(m) => {
+                let data_to_write = new_value
+                    .parse::<u32>()
+                    .context("value should fit in a u32")?;
+                if data_to_write > m {
+                    return Err(ChangeValueError::ExceededMaxValue);
+                }
+                TypeValue::NumSize32(data_to_write)
+            }
+            RangeType::NumSize64(m) => {
+                let data_to_write = new_value
+                    .parse::<u64>()
+                    .context("value should fit in a u64")?;
+                if data_to_write > m {
+                    return Err(ChangeValueError::ExceededMaxValue);
+                }
+                TypeValue::NumSize64(data_to_write)
+            }
+        },
+    };
+    Ok(VarStoreWrite::new(
+        store,
+        question.header.var_store_info,
+        value,
+    )?)
+}
+
+/// The write of `option`, one of the possible_options of the ONE_OF `question`.
+fn option_write<'a>(
+    question: &'a QuestionDescriptor,
+    option: &AnswerOption,
+) -> Result<VarStoreWrite<'a>, ChangeValueError> {
+    // writes take VarOffset in bytes
+    if question.refers_to_bit_field {
+        return Err(ChangeValueError::UnsupportedBitField);
+    }
+    Ok(VarStoreWrite::new(
+        question.store()?,
+        question.header.var_store_info,
+        option.raw_value,
+    )?)
+}
+
+/// Sets each of the `selected` questions, by the selector of its package list, to `new_value`
+/// or to its option of one of `texts` that chosen_option picks with `include`, and returns one
+/// option per selected question, in its order; None for a value; fails with
+/// SelectionError::NotFound when nothing is selected.
+/// It builds every VarStoreWrite before the first write, so that a value that one question
+/// refuses leaves every variable unchanged; then it writes each, also after a failed one, and
+/// fails unless every write succeeds: with the error of a single write unchanged, else with
+/// NotSetEverywhere.
+pub(crate) fn set_questions<'a>(
+    question: &str,
+    selected: &[(&str, &'a QuestionDescriptor)],
+    new_value: &str,
+    texts: &HashSet<String>,
+    include: IncludedStates,
+) -> Result<Vec<Option<&'a AnswerOption>>> {
+    if selected.is_empty() {
+        return Err(SelectionError::NotFound {
+            question: question.to_owned(),
+        }
+        .into());
+    }
+    let writes = selected
+        .iter()
+        .map(|&(selector, descriptor)| {
+            // if the descriptor provides options then set the closest one from texts
+            // (example whatever matches from [Enabled, Enable])
+            // else try setting the new_value because it might be some arbitrary value like a number
+            // (will return error if doesn't match constraints)
+            if descriptor.possible_options.is_empty() {
+                return Ok((selector, value_write(descriptor, new_value)?, None));
+            }
+            let option = descriptor.chosen_option(texts, include)?;
+            Ok((selector, option_write(descriptor, option)?, Some(option)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if let [(_, write, option)] = writes.as_slice() {
+        write.write()?;
+        return Ok(vec![*option]);
+    }
+    let mut written = Vec::new();
+    let mut failed = Vec::new();
+    for (selector, write, _) in &writes {
+        match write.write() {
+            Ok(()) => written.push(selector.to_string()),
+            Err(error) => failed.push((*selector, error)),
+        }
+    }
+    if !failed.is_empty() {
+        return Err(NotSetEverywhere::new(question, failed, written).into());
+    }
+    Ok(writes.into_iter().map(|(_, _, option)| option).collect())
+}
+
+/// set's error when a write fails while set writes several questions: each Failure, and the
+/// selectors written.
+#[derive(Error, Debug)]
+#[error(
+    "question {question:?} was not set everywhere: {}",
+    outcome(.failures, .written)
+)]
+struct NotSetEverywhere {
+    question: String,
+    failures: Vec<Failure>,
+    written: Vec<String>,
+}
+
+/// A distinct error of NotSetEverywhere, with the selectors whose writes failed with it.
+#[derive(Debug)]
+struct Failure {
+    error: String,
+    selectors: Vec<String>,
+}
+
+/// The text of NotSetEverywhere after the question: `failures`, then the selectors `written`.
+fn outcome(failures: &[Failure], written: &[String]) -> String {
+    let failures: Vec<String> = failures
+        .iter()
+        .map(|Failure { error, selectors }| format!("{error} (in {})", selectors.join(", ")))
+        .collect();
+    let written = match written {
+        [] => "none".to_owned(),
+        _ => written.join(", "),
+    };
+    format!("{}; written in: {written}", failures.join("; "))
+}
+
+impl NotSetEverywhere {
+    /// The error of `question`, whose writes `failed` by selector, and were `written` by the
+    /// others: each error is named once.
+    fn new(question: &str, failed: Vec<(&str, anyhow::Error)>, written: Vec<String>) -> Self {
+        let mut failures: Vec<Failure> = Vec::new();
+        for (selector, error) in failed {
+            let error = format!("{error:#}");
+            match failures.iter_mut().find(|failure| failure.error == error) {
+                Some(failure) => failure.selectors.push(selector.to_owned()),
+                None => failures.push(Failure {
+                    error,
+                    selectors: vec![selector.to_owned()],
+                }),
+            }
+        }
+        Self {
+            question: question.to_owned(),
+            failures,
+            written,
+        }
+    }
+}
+
+#[cfg(test)]
+mod set_questions_tests {
+    use super::ifr_fixtures::*;
+    use super::*;
+
+    const WRITE_ERROR: WriteError = WriteError {
+        cause: "write failed",
+        context: None,
+    };
+
+    /// A CHECKBOX at VarOffset `offset` of `var_store`, as set sees it.
+    fn checkbox_at(offset: u16, var_store: VarStoreFixture) -> QuestionDescriptor {
+        let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(offset, 0x00), &[]);
+        question_descriptor(&node, var_store)
+    }
+
+    /// A CHECKBOX on `var_store`, as set sees it.
+    fn checkbox_on_store(var_store: VarStoreFixture) -> QuestionDescriptor {
+        checkbox_at(0, var_store)
+    }
+
+    /// A UINT8 NUMERIC shown unsigned (EFI_IFR_DISPLAY_UINT_DEC) from 0 to `maximum` on
+    /// `var_store`, as set sees it.
+    fn numeric_on_store(maximum: u8, var_store: VarStoreFixture) -> QuestionDescriptor {
+        let (_root, node) = parse_question(&[], NUMERIC, &uint8_numeric(0x10, 0, maximum), &[]);
+        question_descriptor(&node, var_store)
+    }
+
+    /// A UINT8 ONE_OF with the one option `option` on `var_store`, as set sees it.
+    fn one_of_on_store(option: Vec<u8>, var_store: VarStoreFixture) -> QuestionDescriptor {
+        let (_root, node) = parse_question(&[], ONE_OF, &one_of_data(), &[option]);
+        question_descriptor(&node, var_store)
+    }
+
+    /// set_questions of PROMPT to `new_value`, or to an option of the texts `texts`: the texts
+    /// of the options written, or the error as the CLI prints it.
+    fn set_options(
+        selected: &[(&str, &QuestionDescriptor)],
+        new_value: &str,
+        texts: &[&str],
+    ) -> std::result::Result<Vec<Option<String>>, String> {
+        set_questions(
+            PROMPT,
+            selected,
+            new_value,
+            &texts.iter().map(|text| text.to_string()).collect(),
+            IncludedStates::empty(),
+        )
+        .map(|options| {
+            options
+                .into_iter()
+                .map(|option| option.map(|option| option.value.clone()))
+                .collect()
+        })
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    /// set_questions of PROMPT to `new_value`, its error as the CLI prints it.
+    fn set(
+        selected: &[(&str, &QuestionDescriptor)],
+        new_value: &str,
+    ) -> std::result::Result<(), String> {
+        set_options(selected, new_value, &[]).map(drop)
+    }
+
+    #[test]
+    fn every_match_is_written() {
+        let (first, first_writes) = recording_var_store(&[0]);
+        let (second, second_writes) = recording_var_store(&[0]);
+        let (a, b) = (checkbox_on_store(first), checkbox_on_store(second));
+
+        assert_eq!(set(&[("A", &a), ("B", &b)], "1"), Ok(()), "set");
+        assert_eq!(*first_writes.borrow(), [(0, vec![1])], "writes of A");
+        assert_eq!(*second_writes.borrow(), [(0, vec![1])], "writes of B");
+    }
+
+    #[test]
+    fn no_match_is_not_found() {
+        assert_eq!(
+            set(&[], "1"),
+            Err("no question \"Prompt\" in the HiiDB".to_string()),
+            "no selected question"
+        );
+    }
+
+    #[test]
+    fn the_options_written_follow_the_matches() {
+        let (first, first_writes) = recording_var_store(&[0]);
+        let (second, second_writes) = recording_var_store(&[0]);
+        let a = one_of_on_store(flagged_option(6, 0x00, 1), first);
+        let b = one_of_on_store(flagged_option(5, 0x00, 2), second);
+
+        assert_eq!(
+            set_options(&[("A", &a), ("B", &b)], "", &["Enabled", "Disabled"]),
+            Ok(vec![
+                Some("Enabled".to_string()),
+                Some("Disabled".to_string())
+            ]),
+            "A's option Enabled, then B's option Disabled"
+        );
+        assert_eq!(*first_writes.borrow(), [(0, vec![1])], "writes of A");
+        assert_eq!(*second_writes.borrow(), [(0, vec![2])], "writes of B");
+    }
+
+    #[test]
+    fn a_failed_write_fails_set_after_the_other_writes() {
+        let (second, second_writes) = recording_var_store(&[0]);
+        let a = checkbox_on_store(failing_var_store(WRITE_ERROR));
+        let b = checkbox_on_store(second);
+
+        assert_eq!(
+            set(&[("A", &a), ("B", &b)], "1"),
+            Err(
+                "question \"Prompt\" was not set everywhere: write failed (in A); written in: B"
+                    .to_string()
+            ),
+            "set"
+        );
+        assert_eq!(
+            *second_writes.borrow(),
+            [(0, vec![1])],
+            "writes of B after A failed"
+        );
+    }
+
+    #[test]
+    fn the_failed_write_of_a_single_match_is_its_error() {
+        let a = checkbox_on_store(failing_var_store(WRITE_ERROR));
+
+        assert_eq!(
+            set(&[("A", &a)], "1"),
+            Err(WRITE_ERROR.cause.to_string()),
+            "one match"
+        );
+    }
+
+    #[test]
+    fn a_value_that_one_match_refuses_writes_no_match() {
+        let (first, first_writes) = recording_var_store(&[0]);
+        let (second, second_writes) = recording_var_store(&[0]);
+        let a = numeric_on_store(200, first);
+        let b = numeric_on_store(100, second);
+
+        assert_eq!(
+            set(&[("A", &a), ("B", &b)], "150"),
+            Err("provided value exceeded max possible value".to_string()),
+            "150, above the maximum of B"
+        );
+        assert_eq!(*first_writes.borrow(), [], "writes of A");
+        assert_eq!(*second_writes.borrow(), [], "writes of B");
+    }
+
+    #[test]
+    fn a_write_that_the_ifr_of_one_match_refuses_writes_no_match() {
+        let (first, first_writes) = recording_var_store(&[0]);
+        let a = checkbox_on_store(first);
+        let (boolean_store, boolean_writes) = recording_var_store(&[0]);
+        let boolean_option = one_of_on_store(one_of_option(6, 0x04, &[1]), boolean_store);
+        let (short_store, past_writes) = recording_var_store(&[0]);
+        let past_the_var_store = checkbox_at(1, short_store);
+        let cases = [
+            (
+                "B's option of Type BOOLEAN",
+                &boolean_option,
+                "unsupported value type for efivarfs write",
+                &boolean_writes,
+            ),
+            (
+                "B at VarOffset 1 of its 1-byte VarStore",
+                &past_the_var_store,
+                "write at offset 1 with width 1 exceeds varstore size 1",
+                &past_writes,
+            ),
+        ];
+        for (case, b, error, b_writes) in cases {
+            assert_eq!(
+                set_options(&[("A", &a), ("B", b)], "1", &["Enabled"]),
+                Err(error.to_string()),
+                "{case}"
+            );
+            assert_eq!(*first_writes.borrow(), [], "writes of A, {case}");
+            assert_eq!(*b_writes.borrow(), [], "writes of B, {case}");
         }
     }
 
-    Ok(changed)
-}
-
-/// Writes `option`, one of the possible_options of the ONE_OF `question`; Ok(false) without a
-/// VarStore.
-pub fn change_option(
-    question: &QuestionDescriptor,
-    option: &AnswerOption,
-) -> Result<bool, ChangeValueError> {
-    // writes take VarOffset in bytes
-    if question.refers_to_bit_field {
-        return Err(ChangeValueError::UnsupportedBitField);
+    #[test]
+    fn each_failure_is_named_once() {
+        const FIRST: WriteError = WriteError {
+            cause: "first failure",
+            context: None,
+        };
+        const SECOND: WriteError = WriteError {
+            cause: "second failure",
+            context: None,
+        };
+        const CHAINED: WriteError = WriteError {
+            cause: "permission denied",
+            context: Some("failed to write"),
+        };
+        let cases = [
+            (
+                "one error",
+                [WRITE_ERROR, WRITE_ERROR, WRITE_ERROR],
+                "write failed (in A, B, C)",
+            ),
+            (
+                "two errors",
+                [FIRST, SECOND, FIRST],
+                "first failure (in A, C); second failure (in B)",
+            ),
+            (
+                "an error in a context",
+                [CHAINED, WRITE_ERROR, CHAINED],
+                "failed to write: permission denied (in A, C); write failed (in B)",
+            ),
+        ];
+        for (case, errors, failures) in cases {
+            let [a, b, c] = errors.map(|error| checkbox_on_store(failing_var_store(error)));
+            assert_eq!(
+                set(&[("A", &a), ("B", &b), ("C", &c)], "1"),
+                Err(format!(
+                    "question \"Prompt\" was not set everywhere: {failures}; written in: none"
+                )),
+                "{case}"
+            );
+        }
     }
-    let Some(varstore) = &question.varstore else {
-        return Ok(false);
-    };
-    varstore.write_at_offset(question.header.var_store_info, option.raw_value)?;
-    Ok(true)
 }
 
 fn find_corresponding_string(string_id: u16, string_packages: &[HashMap<i32, String>]) -> &str {
@@ -4191,6 +4624,7 @@ fn find_corresponding_varstore(
 
 #[cfg(test)]
 mod tests {
+    use super::ifr_fixtures::efi_variable;
     use super::*;
     use crate::hii::efivarfs::read_efivarfs_bytes;
 
@@ -4202,6 +4636,7 @@ mod tests {
 
     #[test]
     fn writes_each_integer_width_at_end_of_varstore() {
+        let store = efi_variable("Test", 42);
         for (data, encoded) in [
             (TypeValue::NumSize8(95), 95u8.to_le_bytes().to_vec()),
             (TypeValue::NumSize16(259), 259u16.to_le_bytes().to_vec()),
@@ -4218,35 +4653,70 @@ mod tests {
             let mut expected = bytes.clone();
             let offset = 42 - encoded.len();
             expected[EFIVARFS_HEADER_SIZE + offset..].copy_from_slice(&encoded);
-            update_efivarfs_bytes(&mut bytes, 42, offset as u16, data).unwrap();
-            assert_eq!(bytes, expected);
+            let write = VarStoreWrite::new(
+                &store,
+                u16::try_from(offset).expect("offset fits u16"),
+                data,
+            )
+            .unwrap_or_else(|error| panic!("write {data:?} at offset {offset}: {error}"));
+            assert_eq!(write.encoded, encoded, "{data:?}");
+            update_efivarfs_bytes(&mut bytes, 42, write.offset, &write.encoded)
+                .unwrap_or_else(|error| panic!("update {data:?} at offset {offset}: {error}"));
+            assert_eq!(bytes, expected, "{data:?}");
         }
     }
 
     #[test]
     fn trailing_thermal_fields_do_not_overlap() {
         let mut bytes = variable_bytes(42);
-        update_efivarfs_bytes(&mut bytes, 42, 38, TypeValue::NumSize16(95)).unwrap();
-        update_efivarfs_bytes(&mut bytes, 42, 40, TypeValue::NumSize16(90)).unwrap();
+        update_efivarfs_bytes(&mut bytes, 42, 38, &95u16.to_le_bytes()).expect("update 38");
+        update_efivarfs_bytes(&mut bytes, 42, 40, &90u16.to_le_bytes()).expect("update 40");
         assert_eq!(stored_value(&bytes[EFIVARFS_HEADER_SIZE + 38..][..2]), 95);
         assert_eq!(stored_value(&bytes[EFIVARFS_HEADER_SIZE + 40..][..2]), 90);
         assert_eq!(&bytes[..4], &7u32.to_le_bytes());
     }
 
     #[test]
-    fn rejects_writes_past_declared_size_without_changing_bytes() {
-        for (size, offset, data) in [
-            (42, 42, TypeValue::NumSize8(1)),
-            (42, 41, TypeValue::NumSize16(1)),
-            (42, 39, TypeValue::NumSize32(1)),
-            (42, 35, TypeValue::NumSize64(1)),
-            (0, 0, TypeValue::NumSize8(1)),
-            (42, u16::MAX, TypeValue::NumSize64(1)),
+    fn rejects_writes_past_declared_size() {
+        for (size, offset, data, width) in [
+            (42, 42, TypeValue::NumSize8(1), 1),
+            (42, 41, TypeValue::NumSize16(1), 2),
+            (42, 39, TypeValue::NumSize32(1), 4),
+            (42, 35, TypeValue::NumSize64(1), 8),
+            (0, 0, TypeValue::NumSize8(1), 1),
+            (42, u16::MAX, TypeValue::NumSize64(1), 8),
         ] {
-            let mut bytes = variable_bytes(64);
+            let store = efi_variable("Test", size);
+            assert_eq!(
+                VarStoreWrite::new(&store, offset, data)
+                    .map(drop)
+                    .map_err(|error| error.to_string()),
+                Err(format!(
+                    "write at offset {offset} with width {width} exceeds varstore size {size}"
+                )),
+                "{data:?} at offset {offset} of {size} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_writes_past_the_payload_without_changing_bytes() {
+        for (offset, encoded) in [(42, &[1][..]), (41, &[1, 2]), (u16::MAX, &[1])] {
+            let mut bytes = variable_bytes(42);
             let original = bytes.clone();
-            assert!(update_efivarfs_bytes(&mut bytes, size, offset, data).is_err());
-            assert_eq!(bytes, original);
+            assert_eq!(
+                update_efivarfs_bytes(&mut bytes, 42, offset, encoded)
+                    .map_err(|error| error.to_string()),
+                Err("write past the efivarfs payload".to_string()),
+                "{} bytes at offset {offset}",
+                encoded.len()
+            );
+            assert_eq!(
+                bytes,
+                original,
+                "{} bytes at offset {offset}",
+                encoded.len()
+            );
         }
     }
 
@@ -4255,9 +4725,7 @@ mod tests {
         for offset in [0, 40] {
             let mut bytes = variable_bytes(39);
             let original = bytes.clone();
-            assert!(
-                update_efivarfs_bytes(&mut bytes, 42, offset, TypeValue::NumSize16(1)).is_err()
-            );
+            assert!(update_efivarfs_bytes(&mut bytes, 42, offset, &1u16.to_le_bytes()).is_err());
             assert_eq!(bytes, original);
         }
     }
@@ -4267,7 +4735,7 @@ mod tests {
         for length in 0..EFIVARFS_HEADER_SIZE {
             let mut bytes = vec![0xa5; length];
             let original = bytes.clone();
-            assert!(update_efivarfs_bytes(&mut bytes, 1, 0, TypeValue::NumSize8(1)).is_err());
+            assert!(update_efivarfs_bytes(&mut bytes, 1, 0, &[1]).is_err());
             assert_eq!(bytes, original);
         }
     }
@@ -4276,7 +4744,7 @@ mod tests {
     fn preserves_bytes_beyond_declared_varstore() {
         let mut bytes = variable_bytes(50);
         let original = bytes.clone();
-        update_efivarfs_bytes(&mut bytes, 42, 40, TypeValue::NumSize16(95)).unwrap();
+        update_efivarfs_bytes(&mut bytes, 42, 40, &95u16.to_le_bytes()).expect("update 40");
         assert_eq!(&bytes[46..], &original[46..]);
         assert_eq!(&bytes[..44], &original[..44]);
         assert_eq!(bytes.len(), original.len());
@@ -4286,7 +4754,8 @@ mod tests {
     fn writes_small_and_maximum_sized_varstores() {
         for size in [1, 2, u16::MAX] {
             let mut bytes = variable_bytes(usize::from(size));
-            update_efivarfs_bytes(&mut bytes, size, size - 1, TypeValue::NumSize8(95)).unwrap();
+            update_efivarfs_bytes(&mut bytes, size, size - 1, &[95])
+                .unwrap_or_else(|error| panic!("update the last of {size} bytes: {error}"));
             assert_eq!(bytes.len(), EFIVARFS_HEADER_SIZE + usize::from(size));
             assert_eq!(bytes.last(), Some(&95));
         }
@@ -4294,10 +4763,13 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_value_instead_of_silent_noop() {
-        let mut bytes = variable_bytes(42);
-        let original = bytes.clone();
-        assert!(update_efivarfs_bytes(&mut bytes, 42, 0, TypeValue::Boolean(true)).is_err());
-        assert_eq!(bytes, original);
+        assert_eq!(
+            VarStoreWrite::new(&efi_variable("Test", 42), 0, TypeValue::Boolean(true))
+                .map(drop)
+                .map_err(|error| error.to_string()),
+            Err("unsupported value type for efivarfs write".to_string()),
+            "BOOLEAN"
+        );
     }
 
     #[test]
@@ -4467,8 +4939,8 @@ mod write_validation_tests {
             false
         }
 
-        fn write_efivarfs_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
-            self.writes.borrow_mut().push((offset, data));
+        fn write_efivarfs_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
+            self.writes.borrow_mut().push((offset, encoded.to_vec()));
             Ok(())
         }
     }
@@ -4579,14 +5051,9 @@ mod write_validation_tests {
         (question, writes)
     }
 
-    fn encoded_value(bits: u32, value: i128) -> TypeValue {
-        match bits {
-            8 => TypeValue::NumSize8(value as u8),
-            16 => TypeValue::NumSize16(value as u16),
-            32 => TypeValue::NumSize32(value as u32),
-            64 => TypeValue::NumSize64(value as u64),
-            _ => panic!("invalid test width"),
-        }
+    fn encoded_value(bits: u32, value: i128) -> Vec<u8> {
+        let width = usize::try_from(bits / 8).expect("a byte width fits usize");
+        value.to_le_bytes()[..width].to_vec()
     }
 
     #[test]
@@ -4619,7 +5086,12 @@ mod write_validation_tests {
                 for display in [0x10, 0x20] {
                     let (question, writes) = numeric_question(bits, 10, 20, step, display, 10);
                     for value in [10, 11, 20] {
-                        assert!(change_value(&question, &value.to_string()).unwrap());
+                        change_value(&question, &value.to_string()).unwrap_or_else(|error| {
+                            panic!(
+                                "set {value} at {bits} bits, step {step}, display {display:#x}: \
+                                 {error}"
+                            )
+                        });
                     }
                     assert_eq!(
                         *writes.borrow(),
@@ -4650,7 +5122,8 @@ mod write_validation_tests {
             ));
             assert!(writes.borrow().is_empty());
             for value in [-10, 0, 10] {
-                assert!(change_value(&question, &value.to_string()).unwrap());
+                change_value(&question, &value.to_string())
+                    .unwrap_or_else(|error| panic!("set {value} at {bits} bits: {error}"));
             }
             assert_eq!(
                 *writes.borrow(),
@@ -4670,8 +5143,10 @@ mod write_validation_tests {
             let maximum = (1i128 << (bits - 1)) - 1;
             let (question, writes) =
                 numeric_question(bits, minimum as u64, maximum as u64, 1, 0, 0);
-            assert!(change_value(&question, &minimum.to_string()).unwrap());
-            assert!(change_value(&question, &maximum.to_string()).unwrap());
+            change_value(&question, &minimum.to_string())
+                .unwrap_or_else(|error| panic!("set {minimum} at {bits} bits: {error}"));
+            change_value(&question, &maximum.to_string())
+                .unwrap_or_else(|error| panic!("set {maximum} at {bits} bits: {error}"));
             assert!(change_value(&question, &(minimum - 1).to_string()).is_err());
             assert!(change_value(&question, &(maximum + 1).to_string()).is_err());
             assert_eq!(writes.borrow().len(), 2);
@@ -4682,8 +5157,8 @@ mod write_validation_tests {
     fn supports_unsigned_64_bit_values_above_signed_maximum() {
         let (question, writes) = numeric_question(64, u64::MAX - 2, u64::MAX, 1, 0x10, u64::MAX);
         assert_eq!(question.value, u64::MAX.to_string());
-        assert!(change_value(&question, &u64::MAX.to_string()).unwrap());
-        assert_eq!(*writes.borrow(), vec![(2, TypeValue::NumSize64(u64::MAX))]);
+        change_value(&question, &u64::MAX.to_string()).expect("set u64::MAX");
+        assert_eq!(*writes.borrow(), vec![(2, u64::MAX.to_le_bytes().to_vec())]);
         assert!(change_value(&question, "18446744073709551616").is_err());
         assert_eq!(writes.borrow().len(), 1);
     }
@@ -4714,7 +5189,7 @@ mod write_validation_tests {
                 uint32_range_question(12, 0x52),
                 vec![],
                 "5",
-                (12, TypeValue::NumSize32(5)),
+                (12, 5u32.to_le_bytes().to_vec()),
             ),
             (
                 "CHECKBOX",
@@ -4722,7 +5197,7 @@ mod write_validation_tests {
                 checkbox(3, 0x00),
                 vec![],
                 "1",
-                (3, TypeValue::NumSize8(1)),
+                (3, vec![1]),
             ),
             (
                 "2-bit ONE_OF",
@@ -4730,7 +5205,7 @@ mod write_validation_tests {
                 uint32_range_question(8, 0x42),
                 one_of_children,
                 "Enabled",
-                (8, TypeValue::NumSize32(1)),
+                (8, 1u32.to_le_bytes().to_vec()),
             ),
         ];
         for (name, op_code, data, children, value, write) in cases {
@@ -4785,7 +5260,7 @@ mod write_validation_tests {
             let (store, writes) = recording_store();
             let changed = set(other_guid, store);
             assert!(
-                matches!(changed, Ok(true)),
+                matches!(changed, Ok(())),
                 "{name}, GUID {other_guid:02X?}: {changed:?}"
             );
             assert_eq!(*writes.borrow(), [write], "{name}, GUID {other_guid:02X?}");

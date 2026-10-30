@@ -13,19 +13,22 @@
 //! A guest whose firmware publishes, after its own package lists, those of publish-hiidb's
 //! `global_variable_forms`: questions on EFI global variables of the firmware, under
 //! VarStores that declare every variable non-volatile. `set` refuses those on a volatile
-//! variable, naming it, before it writes anything, and writes the one on Timeout; `get` reads
-//! those on ConOutDev, LangCodes and Timeout. Each check of `set` compares every efivar file
-//! before and after.
+//! variable, naming it, and those whose variable it cannot read, with the read's error, before
+//! it writes anything, and writes the one on Timeout; `get` reads those on ConOutDev, LangCodes
+//! and Timeout. Each check of `set` compares every efivar file before and after.
 
 use std::collections::BTreeMap;
 use std::fs;
 
+use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::single_response;
+use uefisettings_qemu_guest::Responses;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::EFIVARFS_HEADER_SIZE;
 use uefisettings_qemu_guest::EFIVARS;
+use uefisettings_qemu_guest::PREFIXES;
 
 /// EFI_GLOBAL_VARIABLE, the vendor GUID of the variables, as efivarfs names their files.
 const EFI_GLOBAL_VARIABLE: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
@@ -53,9 +56,16 @@ const NON_VOLATILE: &str = "Non-volatile EFI variable";
 /// A question in two package lists: on Timeout in the first, as [`NON_VOLATILE`], and on
 /// ConOutDev in the second, as [`VOLATILE`].
 const VOLATILE_COPY: &str = "Volatile copy among several";
-
-/// The flags of the `hii` and generic commands before `set`.
-const PREFIXES: [&[&str]; 2] = [&["hii"], &[]];
+/// A question in two package lists, on Timeout in both: under a VARSTORE_EFI of 2 bytes in
+/// the first, and of 64, more than Timeout holds, in the second.
+const UNREADABLE_COPY: &str = "Unreadable copy among several";
+/// A question in two package lists, on Timeout under a VARSTORE_EFI of 2 bytes in both: up
+/// to 200 in [`MAXIMUM_200`], then up to 100 in [`MAXIMUM_100`].
+const DIFFERENT_MAXIMA: &str = "Copies with different maxima";
+/// The package list of the copy of [`DIFFERENT_MAXIMA`] up to 200, as `set` names it.
+const MAXIMUM_200: &str = "8C78A505-BAA0-4C4A-869F-000000000006";
+/// The package list of the copy of [`DIFFERENT_MAXIMA`] up to 100, as `set` names it.
+const MAXIMUM_100: &str = "8C78A505-BAA0-4C4A-869F-000000000007";
 
 /// The bytes of every efivar file, or why it cannot be read.
 type Efivars = BTreeMap<String, Result<Vec<u8>, String>>;
@@ -114,6 +124,15 @@ fn volatile(name: &str) -> String {
     format!(
         "EFI variable {} is volatile (no EFI_VARIABLE_NON_VOLATILE) and cannot be written \
          through efivarfs",
+        file_name(name)
+    )
+}
+
+/// The error with which `set` refuses the EFI global variable `name` when it holds fewer bytes
+/// than the VarStore of a question on it.
+fn read_error(name: &str) -> String {
+    format!(
+        "failed to read efivar file '{EFIVARS}/{}': failed to fill whole buffer",
         file_name(name)
     )
 }
@@ -177,11 +196,11 @@ fn set_of_a_volatile_variable_is_refused() {
 
 #[test]
 fn set_of_a_volatile_variable_under_a_larger_var_store_is_refused() {
-    // its read before the first write fails, so only the write refuses it
+    // its read before the first write fails, which refuses it
     refuse(
         VOLATILE_UNDER_A_LARGER_VAR_STORE,
         "PlatformLangCodes",
-        &volatile("PlatformLangCodes"),
+        &read_error("PlatformLangCodes"),
     );
 }
 
@@ -215,4 +234,50 @@ fn set_of_a_non_volatile_variable_is_written() {
 #[test]
 fn a_volatile_copy_among_several_is_refused_before_any_write() {
     refuse(VOLATILE_COPY, "Timeout", &volatile("ConOutDev"));
+}
+
+#[test]
+fn an_unreadable_copy_among_several_is_refused_before_any_write() {
+    refuse(UNREADABLE_COPY, "Timeout", &read_error("Timeout"));
+}
+
+#[test]
+fn a_value_that_one_copy_refuses_writes_no_copy() {
+    let before = efivars();
+    let refused = json_error(&["hii", "set", DIFFERENT_MAXIMA, "150", "--json"]);
+    assert_eq!(
+        (refused.error_message.as_str(), changed(&before, &efivars())),
+        ("provided value exceeded max possible value", vec![]),
+        "set 150"
+    );
+
+    let (attributes, data) = global_variable("Timeout");
+    let value = other_than(data[0]);
+    let before = efivars();
+    let Responses { responses } = json(&["hii", "set", DIFFERENT_MAXIMA, &value, "--json"]);
+    assert_eq!(
+        responses
+            .iter()
+            .map(|response| {
+                let answer = response.question.answer.as_str();
+                (response.selector.as_str(), answer, response.modified)
+            })
+            .collect::<Vec<_>>(),
+        [
+            (MAXIMUM_200, value.as_str(), true),
+            (MAXIMUM_100, value.as_str(), true)
+        ],
+        "set {value}"
+    );
+    assert_eq!(
+        changed(&before, &efivars()),
+        [file_name("Timeout")],
+        "efivar files changed by set {value}"
+    );
+    let written = value.parse::<u8>().expect("a byte");
+    assert_eq!(
+        global_variable("Timeout"),
+        (attributes, vec![written, data[1]]),
+        "Timeout after set {value}"
+    );
 }

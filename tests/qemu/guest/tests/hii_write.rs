@@ -38,6 +38,7 @@ use uefisettings_qemu_guest::variable_data;
 use uefisettings_qemu_guest::ErrorObject;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
+use uefisettings_qemu_guest::PREFIXES;
 
 #[track_caller]
 fn driver_sample_data() -> Vec<u8> {
@@ -77,17 +78,17 @@ fn set(
 /// What `set` takes and answers for a question that no condition hides.
 const SELECTABLE: (&[&str], &str) = (&[], "");
 
-/// Checks that `hii set` refuses `answer` for `question` without changing the variable.
-/// `flags` go to `hii set`.
-/// Returns the error that `hii set` printed.
+/// Checks that `set` after `prefix` refuses `answer` for `question` without changing the variable.
+/// `flags` go to `set`.
+/// Returns the error that `set` printed.
 #[track_caller]
-fn refuse(question: &str, answer: &str, flags: &[&str]) -> ErrorObject {
+fn refuse(prefix: &[&str], question: &str, answer: &str, flags: &[&str]) -> ErrorObject {
     let before = driver_sample_data();
-    let error = json_error(&[&["hii", "set", question, answer, "--json"][..], flags].concat());
+    let error = json_error(&[prefix, &["set", question, answer, "--json"], flags].concat());
     assert_eq!(
         changed_bytes(&before, &driver_sample_data()),
         [],
-        "{question} = {answer} {flags:?}"
+        "{prefix:?} {question} = {answer} {flags:?}"
     );
     error
 }
@@ -100,7 +101,7 @@ fn set_one_of_is_stored() {
 
 #[test]
 fn set_one_of_to_an_unknown_option_is_refused() {
-    refuse(ONE_OF, "Bogus", &[]);
+    refuse(&["hii"], ONE_OF, "Bogus", &[]);
 }
 
 #[test]
@@ -111,7 +112,7 @@ fn generic_set_check_box_is_stored() {
 
 #[test]
 fn set_check_box_to_2_is_refused() {
-    refuse(CHECK_BOX, "2", &[]);
+    refuse(&["hii"], CHECK_BOX, "2", &[]);
 }
 
 #[test]
@@ -125,7 +126,7 @@ fn set_boot_service_only_question_is_refused_naming_its_variable() {
         .and_then(OsStr::to_str)
         .expect("file name of the variable");
 
-    let error = refuse(QUESTION, "1", &[]);
+    let error = refuse(&["hii"], QUESTION, "1", &[]);
 
     assert_eq!(
         error.error_message,
@@ -146,7 +147,7 @@ fn set_numeric_to_its_maximum_is_stored() {
 
 #[test]
 fn set_numeric_above_its_maximum_is_refused() {
-    refuse(NUMERIC, "244", &[]);
+    refuse(&["hii"], NUMERIC, "244", &[]);
 }
 
 #[test]
@@ -173,7 +174,7 @@ fn set_of_a_suppressed_question_is_refused_unless_suppressed_is_included() {
     );
     for flags in [&[][..], &INCLUDE_GRAYED_OUT] {
         assert_eq!(
-            refuse(SERIAL_PORT, "2E8", flags).error_message,
+            refuse(&["hii"], SERIAL_PORT, "2E8", flags).error_message,
             excluded,
             "{flags:?}"
         );
@@ -187,7 +188,7 @@ fn set_of_a_question_that_may_be_grayed_out_is_refused_unless_grayed_out_is_incl
          grayed-out questions to select it regardless"
     );
     assert_eq!(
-        refuse(MATCH2, "5", &[]).error_message,
+        refuse(&["hii"], MATCH2, "5", &[]).error_message,
         undetermined,
         "{MATCH2} without flags"
     );
@@ -199,4 +200,40 @@ fn set_of_a_question_that_may_be_grayed_out_is_refused_unless_grayed_out_is_incl
         [(MATCH2_OFFSET, 5)],
         "{MATCH2} {INCLUDE_GRAYED_OUT:?}"
     );
+}
+
+#[test]
+fn set_of_an_unknown_question_is_refused() {
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse(prefix, "No Such Question", "1", &[]).error_message,
+            "no question \"No Such Question\" in the HiiDB",
+            "{prefix:?}"
+        );
+    }
+}
+
+#[test]
+fn set_of_a_question_without_a_varstore_is_refused() {
+    let cases = [
+        (
+            "NameValueVar0",
+            "1",
+            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
+        ),
+        (
+            "Disk Memory Type:",
+            "Reserved",
+            "question is callback-driven or temporary and has no varstore",
+        ),
+    ];
+    for (question, answer, reason) in cases {
+        for prefix in PREFIXES {
+            assert_eq!(
+                refuse(prefix, question, answer, &[]).error_message,
+                format!("cannot set question {question:?}: {reason}"),
+                "{prefix:?} {question}"
+            );
+        }
+    }
 }

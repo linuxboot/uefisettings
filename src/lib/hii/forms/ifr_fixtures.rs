@@ -78,17 +78,26 @@ pub(crate) const NIL_GUID: Guid = Guid {
     data4: [0; 8],
 };
 
-/// The VarOffsets and values written to a VarStore.
-pub(super) type RecordedWrites = Rc<RefCell<Vec<(u16, TypeValue)>>>;
+/// The VarOffsets and little-endian values written to a VarStore.
+pub(super) type RecordedWrites = Rc<RefCell<Vec<(u16, Vec<u8>)>>>;
 
 /// A VarStore declared without IFR bytes.
-/// Writes go to `writes`, not to efivarfs.
+/// Writes go to `writes`, or fail with `write_error`, never to efivarfs.
 pub(super) struct DeclaredVarStore {
     pub(super) name: &'static str,
     pub(super) size: u16,
     pub(super) kind: VariableStoreKind,
     pub(super) runtime_accessible: bool,
     pub(super) writes: RecordedWrites,
+    pub(super) write_error: Option<WriteError>,
+}
+
+/// Why the writes to a DeclaredVarStore fail: `cause`, in `context` if any, as
+/// anyhow::Context adds it.
+#[derive(Clone, Copy)]
+pub(super) struct WriteError {
+    pub(super) cause: &'static str,
+    pub(super) context: Option<&'static str>,
 }
 
 impl VariableStore for DeclaredVarStore {
@@ -112,9 +121,21 @@ impl VariableStore for DeclaredVarStore {
         self.runtime_accessible
     }
 
-    fn write_efivarfs_at_offset(&self, offset: u16, data: TypeValue) -> Result<()> {
-        self.writes.borrow_mut().push((offset, data));
-        Ok(())
+    fn write_efivarfs_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
+        match self.write_error {
+            None => {
+                self.writes.borrow_mut().push((offset, encoded.to_vec()));
+                Ok(())
+            }
+            Some(WriteError {
+                cause,
+                context: None,
+            }) => Err(anyhow!(cause)),
+            Some(WriteError {
+                cause,
+                context: Some(context),
+            }) => Err(anyhow!(cause).context(context)),
+        }
     }
 }
 
@@ -186,6 +207,7 @@ pub(super) fn efi_variable(name: &'static str, size: usize) -> DeclaredVarStore 
         kind: VariableStoreKind::EfiVariable,
         runtime_accessible: true,
         writes: RecordedWrites::default(),
+        write_error: None,
     }
 }
 
@@ -214,6 +236,38 @@ pub(super) fn recording_var_store(payload: &[u8]) -> (VarStoreFixture, RecordedW
         efivars,
     };
     (fixture, writes)
+}
+
+/// A VarStore whose efivar file holds 0 and whose writes fail with `write_error`.
+pub(super) fn failing_var_store(write_error: WriteError) -> VarStoreFixture {
+    let store = DeclaredVarStore {
+        write_error: Some(write_error),
+        ..efi_variable("Failing", 1)
+    };
+    let efivars = Efivars::new();
+    efivars.write(&store, &[0]);
+    VarStoreFixture {
+        store: Ok(Box::new(store)),
+        efivars,
+    }
+}
+
+/// Writes `new_value` to `question` as set does: value_write, then its write.
+pub(super) fn change_value(
+    question: &QuestionDescriptor,
+    new_value: &str,
+) -> Result<(), ChangeValueError> {
+    value_write(question, new_value)?.write()?;
+    Ok(())
+}
+
+/// Writes `option`, one of the possible_options of the ONE_OF `question`, as set does.
+pub(super) fn change_option(
+    question: &QuestionDescriptor,
+    option: &AnswerOption,
+) -> Result<(), ChangeValueError> {
+    option_write(question, option)?.write()?;
+    Ok(())
 }
 
 pub(super) fn unavailable() -> VarStoreFixture {

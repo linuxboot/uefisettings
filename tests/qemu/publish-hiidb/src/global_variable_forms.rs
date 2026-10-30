@@ -94,6 +94,38 @@ const PACKAGE_LISTS: &[PackageList] = &[
             maximum: 255,
         }],
     },
+    PackageList {
+        guid: guid!("8c78a505-baa0-4c4a-869f-000000000004"),
+        questions: &[Question {
+            prompt: "Unreadable copy among several",
+            var_store: VarStore::efi("Timeout", 2),
+            maximum: 255,
+        }],
+    },
+    PackageList {
+        guid: guid!("8c78a505-baa0-4c4a-869f-000000000005"),
+        questions: &[Question {
+            prompt: "Unreadable copy among several",
+            var_store: VarStore::efi("Timeout", 64),
+            maximum: 255,
+        }],
+    },
+    PackageList {
+        guid: guid!("8c78a505-baa0-4c4a-869f-000000000006"),
+        questions: &[Question {
+            prompt: "Copies with different maxima",
+            var_store: VarStore::efi("Timeout", 2),
+            maximum: 200,
+        }],
+    },
+    PackageList {
+        guid: guid!("8c78a505-baa0-4c4a-869f-000000000007"),
+        questions: &[Question {
+            prompt: "Copies with different maxima",
+            var_store: VarStore::efi("Timeout", 2),
+            maximum: 100,
+        }],
+    },
 ];
 
 /// A package list whose form set, of the same GUID, has one form with `questions`, each on

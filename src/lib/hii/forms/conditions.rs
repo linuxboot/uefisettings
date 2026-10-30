@@ -165,6 +165,9 @@ pub enum SelectionError {
         states: IncludedStates,
         reasons: Vec<String>,
     },
+    /// set's error when no question has the text; get answers no question instead
+    #[error("no question {question:?} in the HiiDB")]
+    NotFound { question: String },
 }
 
 /// The states that the conditions around a question or option can give it.
@@ -1326,15 +1329,12 @@ mod tests {
     use std::collections::HashMap;
     use std::collections::HashSet;
 
-    use super::super::change_option;
-    use super::super::change_value;
     use super::super::find_question_in;
     use super::super::handle_form_package;
     use super::super::ifr_fixtures::*;
     use super::super::Cursor;
     use super::super::FormPackageWalk;
     use super::super::QuestionDescriptor;
-    use super::super::TypeValue;
     use super::*;
 
     const EQ_ID_ID: u8 = 0x13;
@@ -2745,6 +2745,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn not_found_names_the_question() {
+        let error = SelectionError::NotFound {
+            question: "Q".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "no question \"Q\" in the HiiDB",
+            "{error:?}"
+        );
+    }
+
     /// The options of the UINT8 ONE_OF of `one_of_data()` holding `children` that get lists,
     /// with their states.
     fn options(children: &[Vec<u8>]) -> Vec<(String, StateEvaluation)> {
@@ -2887,7 +2899,7 @@ mod tests {
         question: &QuestionDescriptor,
         text: &str,
         include: IncludedStates,
-    ) -> std::result::Result<bool, String> {
+    ) -> std::result::Result<(), String> {
         let option = question
             .select_option(&HashSet::from([text.to_string()]), include)
             .map_err(|error| error.to_string())?
@@ -2915,14 +2927,10 @@ mod tests {
         );
         assert_eq!(shown_answer(&question), "Enabled", "answer");
         assert!(
-            matches!(change_value(&question, "Disabled"), Ok(true)),
+            matches!(change_value(&question, "Disabled"), Ok(())),
             "set Disabled"
         );
-        assert_eq!(
-            *writes.borrow(),
-            [(0, TypeValue::NumSize8(0))],
-            "writes of Disabled"
-        );
+        assert_eq!(*writes.borrow(), [(0, vec![0])], "writes of Disabled");
     }
 
     #[test]
@@ -2962,12 +2970,12 @@ mod tests {
         );
         assert_eq!(
             set_option(&question, "Enabled", suppressed),
-            Ok(true),
+            Ok(()),
             "set Enabled, suppressed included"
         );
         assert_eq!(
             *writes.borrow(),
-            [(0, TypeValue::NumSize8(1))],
+            [(0, vec![1])],
             "writes, suppressed included"
         );
     }
@@ -3000,7 +3008,7 @@ mod tests {
                 QuestionValue::Uint(2),
                 vec!["Disabled", "Enabled"],
                 "Enabled",
-                Ok(true),
+                Ok(()),
             ),
             (
                 "question 4 unreadable",
@@ -3022,7 +3030,7 @@ mod tests {
             );
             assert_eq!(shown_answer(&question), answer, "{name}");
             let written = if set.is_ok() {
-                vec![(0, TypeValue::NumSize8(1))]
+                vec![(0, vec![1])]
             } else {
                 vec![]
             };
@@ -3041,7 +3049,7 @@ mod tests {
             );
             assert_eq!(
                 set_option(&question, "Enabled", suppressed),
-                Ok(true),
+                Ok(()),
                 "{name}, suppressed included"
             );
         }
@@ -3082,14 +3090,10 @@ mod tests {
         assert_eq!(shown_answer(&question), "Disabled", "answer");
         assert_eq!(
             set_option(&question, "Enabled", IncludedStates::empty()),
-            Ok(true),
+            Ok(()),
             "set Enabled"
         );
-        assert_eq!(
-            *writes.borrow(),
-            [(0, TypeValue::NumSize8(1))],
-            "writes of Enabled"
-        );
+        assert_eq!(*writes.borrow(), [(0, vec![1])], "writes of Enabled");
     }
 
     /// As edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption, get names the first option
