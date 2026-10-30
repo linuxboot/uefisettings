@@ -142,7 +142,7 @@ fn update_efivarfs_bytes(
     Ok(())
 }
 
-// UEFI Spec v2.9 Page 1844
+// UEFI 2.10 §33.3.8.3, Table 33.11 IFR Opcodes
 #[derive(BinRead, Debug, PartialEq, Copy, Clone)]
 // binrw tries the variants in order; by default it collects every miss's
 // error in a Vec that grows up to 100 entries and is dropped per opcode
@@ -427,7 +427,7 @@ pub enum ParsedOperation {
 }
 
 // Documentation for subsequent structs at:
-// UEFI Spec v2.9 Pages 1840 - 1916
+// UEFI 2.10 §33.3.8
 
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
@@ -445,7 +445,7 @@ pub trait Question {
 
 #[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
-// In the UEFI spec question header's first field is statement header
+// In UEFI 2.10 §33.3.8.2.2 question header's first field is statement header
 // however instead of having a separate nested struct I've combined it together
 pub struct QuestionHeader {
     // start of statement header

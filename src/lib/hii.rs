@@ -19,7 +19,7 @@ mod strings;
 // UEFI HII Library
 
 // Implements (partial) decoding of the Form and Strings packages.
-// See the "Human Interface Infrastructure" section of the UEFI spec:
+// See UEFI 2.10 §33 "Human Interface Infrastructure Overview":
 // https://uefi.org/specifications
 
 pub(crate) use efivar_dump::dump_efivars;

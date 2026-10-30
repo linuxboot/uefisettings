@@ -20,7 +20,7 @@ use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
 
-// UEFI Spec v2.9 Page 1807
+// UEFI 2.10 §33.3.6.1
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
 struct StringPackageHeader {
@@ -35,7 +35,7 @@ struct StringPackageHeader {
     language: binrw::NullString,
 }
 
-// UEFI Spec v2.9 Page 1809
+// UEFI 2.10 §33.3.6.2
 #[derive(BinRead, Debug, PartialEq)]
 // no Vec of per-variant errors per block; see forms::IFROpCode
 #[br(little, return_unexpected_error)]

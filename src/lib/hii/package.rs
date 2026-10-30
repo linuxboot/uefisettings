@@ -119,7 +119,7 @@ struct Package {
     data: Vec<u8>,
 }
 
-// UEFI Spec v2.9 Page 1790
+// UEFI 2.10 §33.3.1.1
 #[derive(BinRead, Debug, PartialEq)]
 // no Vec of per-variant errors per package; see forms::IFROpCode
 #[br(little, return_unexpected_error)]
