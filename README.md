@@ -61,7 +61,7 @@ SUBCOMMANDS:
 
 ```plain
 SUBCOMMANDS:
-    dump-efivars    Copy the EFI variables that the HiiDB's questions read into a new
+    dump-efivars    Copy the HiiDB and the EFI variables that its questions read into a new
                         directory, for --efivars on another machine
     extract-db      Dump HiiDB into a file
     get             Get the current value of a question
@@ -86,17 +86,24 @@ SUBCOMMANDS:
 ## Inspecting a machine's settings elsewhere
 
 `hii dump-efivars` copies the EFI variables that the HiiDB's questions read, so that `hii get`,
-`hii list-questions` and `hii show-ifr` can answer from them on another machine:
+`hii list-questions` and `hii show-ifr` can answer from them on another machine. The dump also
+holds the HiiDB, as `hiidb.bin`, and records its format and redaction in
+`uefisettings-dump.json`:
 
 ```sh
 # on the machine to inspect
-uefisettings hii extract-db hiidb.bin
+sudo uefisettings hii extract-db hiidb.bin
 uefisettings hii dump-efivars -f hiidb.bin efivars
 # on any machine
 uefisettings hii list-questions -f hiidb.bin --efivars efivars
 ```
 
-The dump keeps only the bytes that questions decode unless `--unredacted` is given; even those
+`extract-db` reads the HiiDB from /dev/mem, which needs CAP_SYS_RAWIO. `dump-efivars -f` reads
+only efivarfs, whose files every user can read, so run it unprivileged: as root, it would leave a
+directory that only root can read.
+
+The dump keeps the HiiDB whole, whose strings can name the machine (a MAC address, for one), and
+of each EFI variable only the bytes that questions decode unless `--unredacted` is given; even those
 can be secrets, so share it only with people you trust. A redacted dump zeroes every other byte,
 so read it with the HiiDB it was dumped from (-f): another HiiDB, or a later uefisettings that
 decodes more, reads those zeros as values.

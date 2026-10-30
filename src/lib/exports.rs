@@ -226,13 +226,13 @@ impl HiiBackend {
     }
 
     /// Copies the efivar files that the questions of the HiiDB `db_bytes` read into the new
-    /// directory `dir`, in efivarfs format, as `options` say
+    /// directory `dir`, in efivarfs format, as `options` say, with the HiiDB and a manifest
     pub fn dump_efivars(
         db_bytes: &[u8],
         dir: &Path,
         options: &DumpEfivarsOptions,
     ) -> Result<EfivarDump> {
-        crate::hii::dump_efivars(package::read_db(db_bytes)?, dir, options.redaction)
+        crate::hii::dump_efivars(db_bytes, dir, options.redaction)
     }
 }
 

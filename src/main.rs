@@ -144,7 +144,7 @@ enum HiiSubcommands {
         #[clap(parse(from_os_str))]
         filename: PathBuf,
     },
-    /// Copy the EFI variables that the HiiDB's questions read into a new directory, for --efivars on another machine
+    /// Copy the HiiDB and the EFI variables that its questions read into a new directory, for --efivars on another machine
     DumpEfivars {
         /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
         #[clap(parse(from_os_str), short, long)]
@@ -557,12 +557,13 @@ fn extract_db_report(path: &Path) -> serde_json::Value {
 fn dump_report(dir: &Path, redaction: EfivarRedaction, dump: EfivarDump) -> serde_json::Value {
     serde_json::json!({
         "info": format!(
-            "copied {} of the {} EFI variables that questions read to {}",
+            "copied {} of the {} EFI variables that questions read, and the HiiDB, to {}",
             dump.copied.len(),
             dump.copied.len() + dump.missing.len(),
             dir.display()
         ),
         "directory": dir.display().to_string(),
+        // as the dump's manifest records it
         "redaction": redaction,
         "copied": dump.copied,
         "missing": dump.missing,
@@ -573,18 +574,20 @@ fn dump_report(dir: &Path, redaction: EfivarRedaction, dump: EfivarDump) -> serd
 fn dump_warning(dir: &Path, redaction: EfivarRedaction) -> String {
     match redaction {
         EfivarRedaction::DecodedBytes => format!(
-            "warning: {} is redacted to the bytes that questions decode, whose values can still \
-             be secrets; share it only with people you trust",
+            "warning: {} holds the HiiDB, whose strings can name the machine, and EFI variables \
+             redacted to the bytes that questions decode, whose values can still be secrets; \
+             share it only with people you trust",
             dir.display()
         ),
         EfivarRedaction::Unredacted => format!(
-            "warning: {} holds whole EFI variables, not redacted, which can hold secrets such as \
-             password hashes; share it only with people you trust",
+            "warning: {} holds the HiiDB, whose strings can name the machine, and whole EFI \
+             variables, not redacted, which can hold secrets such as password hashes; share it \
+             only with people you trust",
             dir.display()
         ),
         _ => format!(
-            "warning: {} holds EFI variables, which can hold secrets such as password hashes; \
-             share it only with people you trust",
+            "warning: {} holds the HiiDB, whose strings can name the machine, and EFI variables, \
+             which can hold secrets such as password hashes; share it only with people you trust",
             dir.display()
         ),
     }
@@ -882,7 +885,8 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&report).expect("parse the report"),
                 serde_json::json!({
-                    "info": "copied 1 of the 2 EFI variables that questions read to out",
+                    "info": "copied 1 of the 2 EFI variables that questions read, and the HiiDB, \
+                             to out",
                     "directory": "out",
                     "redaction": json,
                     "copied": ["Setup-guid"],
@@ -899,14 +903,16 @@ mod tests {
             (
                 "redacted",
                 EfivarRedaction::DecodedBytes,
-                "warning: out is redacted to the bytes that questions decode, whose values can \
-                 still be secrets; share it only with people you trust",
+                "warning: out holds the HiiDB, whose strings can name the machine, and EFI \
+                 variables redacted to the bytes that questions decode, whose values can still \
+                 be secrets; share it only with people you trust",
             ),
             (
                 "unredacted",
                 EfivarRedaction::Unredacted,
-                "warning: out holds whole EFI variables, not redacted, which can hold secrets \
-                 such as password hashes; share it only with people you trust",
+                "warning: out holds the HiiDB, whose strings can name the machine, and whole \
+                 EFI variables, not redacted, which can hold secrets such as password hashes; \
+                 share it only with people you trust",
             ),
         ];
 

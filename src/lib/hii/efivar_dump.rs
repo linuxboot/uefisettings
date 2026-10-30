@@ -37,12 +37,22 @@ use crate::hii::efivarfs::EFIVARFS_HEADER_SIZE;
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::IncludedStates;
+use crate::hii::package::read_db;
 use crate::hii::package::ParsedPackageList;
 
 /// The largest efivar file that read_efivar_file reads, far above EDK2's largest EFI variables:
 /// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
 /// (OvmfPkgX64.dsc), as of edk2-stable202508.
 const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
+/// The file of an efivars dump that holds the HiiDB that its efivars were dumped with.
+const DUMP_HIIDB: &str = "hiidb.bin";
+/// The file of an efivars dump that describes it: a DumpManifest as JSON.
+const DUMP_MANIFEST: &str = "uefisettings-dump.json";
+/// The DumpManifest::format that this uefisettings writes. Any change that a reader of it would
+/// misread bumps it; readers ignore unknown fields and never act on uefisettings.
+const DUMP_FORMAT: u32 = 1;
+/// What errors call a file of an efivars dump.
+const DUMP_FILE_NOUN: &str = "efivars dump file";
 
 /// Which bytes of an efivar file a dump keeps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
@@ -66,15 +76,27 @@ pub struct EfivarDump {
     pub missing: Vec<String>,
 }
 
-/// Copies the efivar files that the questions of `package_lists` read from this machine's
-/// efivarfs into the new directory `dir`, as `redaction` says.
+/// What an efivars dump records about itself in DUMP_MANIFEST.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DumpManifest {
+    /// The DUMP_FORMAT of the uefisettings that wrote the dump
+    format: u32,
+    /// The version of the uefisettings that wrote the dump
+    uefisettings: String,
+    /// Which bytes of each efivar file the dump keeps
+    redaction: EfivarRedaction,
+}
+
+/// Copies the efivar files that the questions of the HiiDB `db_bytes` read from this machine's
+/// efivarfs into the new directory `dir`, as `redaction` says, with the HiiDB and a manifest.
 pub(crate) fn dump_efivars(
-    package_lists: Vec<ParsedPackageList>,
+    db_bytes: &[u8],
     dir: &Path,
     redaction: EfivarRedaction,
 ) -> Result<EfivarDump> {
-    copy_efivars(
-        &decoded_bytes(package_lists)?,
+    write_dump(
+        db_bytes,
+        &decoded_bytes(read_db(db_bytes)?)?,
         Path::new(EFIVARS_MOUNT_POINT),
         dir,
         redaction,
@@ -97,8 +119,10 @@ fn decoded_bytes(
 }
 
 /// Copies the efivar files that `decoded` names from `efivars` into the new directory `dir`,
-/// keeping, as `redaction` says, only their `decoded` payload bytes.
-fn copy_efivars(
+/// keeping, as `redaction` says, only their `decoded` payload bytes, and saves `hiidb`, which
+/// `decoded` comes from, as DUMP_HIIDB and then the DUMP_MANIFEST.
+fn write_dump(
+    hiidb: &[u8],
     decoded: &BTreeMap<EfivarFileName, Vec<DecodedValue>>,
     efivars: &Path,
     dir: &Path,
@@ -131,6 +155,13 @@ fn copy_efivars(
         partial.write(name, &bytes)?;
         dump.copied.push(name.to_string());
     }
+    partial.write(DUMP_HIIDB, hiidb)?;
+    let manifest = DumpManifest {
+        format: DUMP_FORMAT,
+        uefisettings: env!("CARGO_PKG_VERSION").to_string(),
+        redaction,
+    };
+    partial.write(DUMP_MANIFEST, &serde_json::to_vec_pretty(&manifest)?)?;
     partial.commit();
     Ok(dump)
 }
@@ -216,22 +247,20 @@ impl<'a> PartialDump<'a> {
         })
     }
 
-    /// Writes `bytes` to the new efivar file `name`, for its owner only.
-    fn write(&mut self, name: &EfivarFileName, bytes: &[u8]) -> Result<()> {
+    /// Writes `bytes` to the new file `name`, for its owner only.
+    fn write(&mut self, name: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         let path = self.dir.join(name);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)
-            .with_context(|| format!("failed to create efivar file '{}'", path.display()))?;
+            .with_context(|| format!("failed to create {DUMP_FILE_NOUN} '{}'", path.display()))?;
+        let written = file
+            .write_all(bytes)
+            .with_context(|| format!("failed to write {DUMP_FILE_NOUN} '{}'", path.display()));
         self.files.push(path);
-        file.write_all(bytes).with_context(|| {
-            format!(
-                "failed to write efivar file '{}'",
-                self.dir.join(name).display()
-            )
-        })
+        written
     }
 
     /// Keeps the dump.
@@ -289,6 +318,8 @@ mod tests {
     const SETUP: [u8; 14] = [7, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     /// SETUP's size, as its metadata gives it.
     const SETUP_SIZE: u64 = SETUP.len() as u64;
+    /// The HiiDB that write_dump saves; it does not parse it.
+    const HIIDB: &[u8] = b"a HiiDB";
 
     /// The efivar file name of the variable `name` of the nil GUID.
     fn efivar(name: &str) -> EfivarFileName {
@@ -532,8 +563,14 @@ mod tests {
             vec![decoded(1..3), decoded(6..7), decoded(9..10)],
         )]);
 
-        let dump = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
-            .expect("dump efivars");
+        let dump = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
 
         assert_eq!(
             dump,
@@ -556,8 +593,14 @@ mod tests {
         let (_parent, dir) = dump_dir();
         let decoded = first_bytes(&[&efivar("Setup")]);
 
-        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
-            .expect("dump efivars");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::Unredacted,
+        )
+        .expect("dump efivars");
 
         assert_eq!(
             fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
@@ -573,11 +616,19 @@ mod tests {
         let decoded = first_bytes(&[&efivar("Setup")]);
         let mode = |path: &Path| fs::metadata(path).expect("stat").permissions().mode() & 0o777;
 
-        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
-            .expect("dump efivars");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::Unredacted,
+        )
+        .expect("dump efivars");
 
         assert_eq!(mode(&dir), 0o700, "directory mode");
-        assert_eq!(mode(&dir.join(efivar("Setup"))), 0o600, "file mode");
+        for name in [&efivar("Setup").to_string(), DUMP_HIIDB, DUMP_MANIFEST] {
+            assert_eq!(mode(&dir.join(name)), 0o600, "{name}: file mode");
+        }
     }
 
     #[test]
@@ -586,7 +637,8 @@ mod tests {
         let existing = efivars(&[(&efivar("Kept"), b"kept")]);
         let decoded = first_bytes(&[&efivar("Setup")]);
 
-        let error = copy_efivars(
+        let error = write_dump(
+            HIIDB,
             &decoded,
             live.path(),
             existing.path(),
@@ -615,8 +667,14 @@ mod tests {
         let (_parent, dir) = dump_dir();
         let decoded = first_bytes(&[&efivar("Missing"), &efivar("Setup")]);
 
-        let dump = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
-            .expect("dump efivars");
+        let dump = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::Unredacted,
+        )
+        .expect("dump efivars");
 
         assert_eq!(
             dump,
@@ -639,8 +697,14 @@ mod tests {
         let (_parent, dir) = dump_dir();
         let decoded = first_bytes(&[&efivar("A"), &efivar("B")]);
 
-        let error = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
-            .expect_err("dump a directory as a variable");
+        let error = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::Unredacted,
+        )
+        .expect_err("dump a directory as a variable");
 
         assert_eq!(
             error.to_string(),
@@ -660,11 +724,93 @@ mod tests {
         let (parent, dir) = dump_dir();
         let decoded = first_bytes(&[&crafted]);
 
-        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::Unredacted)
-            .expect("dump efivars");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::Unredacted,
+        )
+        .expect("dump efivars");
 
-        assert_eq!(file_names(&dir), [crafted.to_string()], "dump directory");
+        assert_eq!(
+            file_names(&dir),
+            [
+                crafted.to_string(),
+                DUMP_HIIDB.to_string(),
+                DUMP_MANIFEST.to_string()
+            ],
+            "dump directory"
+        );
         assert_eq!(file_names(parent.path()), ["dump"], "its parent");
+    }
+
+    #[test]
+    fn dump_saves_the_hiidb_and_a_manifest() {
+        for (case, redaction, json) in [
+            ("redacted", EfivarRedaction::DecodedBytes, "decoded-bytes"),
+            ("unredacted", EfivarRedaction::Unredacted, "unredacted"),
+        ] {
+            let live = efivars(&[(&efivar("Setup"), &SETUP)]);
+            let (_parent, dir) = dump_dir();
+
+            write_dump(
+                HIIDB,
+                &first_bytes(&[&efivar("Setup")]),
+                live.path(),
+                &dir,
+                redaction,
+            )
+            .unwrap_or_else(|error| panic!("dump efivars {case}: {error:#}"));
+
+            assert_eq!(
+                fs::read(dir.join(DUMP_HIIDB)).expect("read the saved HiiDB"),
+                HIIDB,
+                "{case}: HiiDB"
+            );
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(dir.join(DUMP_MANIFEST)).expect("read the manifest"),
+            )
+            .expect("parse the manifest");
+            assert_eq!(
+                manifest,
+                serde_json::json!({
+                    "format": 1,
+                    "uefisettings": env!("CARGO_PKG_VERSION"),
+                    "redaction": json,
+                }),
+                "{case}: manifest"
+            );
+        }
+    }
+
+    /// efivarfs names each file `<name>-<GUID>` (Linux v7.2 fs/efivarfs/vars.c
+    /// efivar_get_utf8name()), as EfivarFileName does, so no efivar file has the name of a file
+    /// that a dump adds.
+    #[test]
+    fn dump_files_are_no_efivar_file_names() {
+        let ends_with_guid = |name: &str| {
+            let groups: Vec<&str> = name.rsplitn(6, '-').collect();
+            groups.len() == 6
+                && groups
+                    .iter()
+                    .take(5)
+                    .rev()
+                    .map(|group| group.len())
+                    .eq([8, 4, 4, 4, 12])
+                && groups
+                    .iter()
+                    .take(5)
+                    .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
+        };
+
+        assert!(
+            ends_with_guid(&efivar("Setup").to_string()),
+            "an efivar file name ends with -<GUID>"
+        );
+        for name in [DUMP_HIIDB, DUMP_MANIFEST] {
+            assert!(!ends_with_guid(name), "{name}");
+        }
     }
 
     #[test]
@@ -679,8 +825,14 @@ mod tests {
         let (_parent, dir) = dump_dir();
 
         let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
-        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
-            .expect("dump efivars");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
 
         assert_eq!(
             fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
@@ -710,8 +862,14 @@ mod tests {
         let (_parent, dir) = dump_dir();
 
         let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
-        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
-            .expect("dump efivars");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
 
         assert_eq!(
             fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
@@ -755,8 +913,14 @@ mod tests {
         };
 
         let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
-        copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
-            .expect("dump efivars");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
 
         assert_eq!(
             fs::read(dir.join(efivar("Short"))).expect("read the dumped file"),
@@ -795,8 +959,14 @@ mod tests {
         let (_parent, dir) = dump_dir();
 
         let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
-        let dump = copy_efivars(&decoded, live.path(), &dir, EfivarRedaction::DecodedBytes)
-            .expect("dump efivars");
+        let dump = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
 
         assert_eq!(
             dump.copied,

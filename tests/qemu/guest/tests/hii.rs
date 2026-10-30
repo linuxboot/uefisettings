@@ -511,6 +511,9 @@ fn dumped_efivars_answer_as_efivarfs() {
             fs::metadata(path).unwrap_or_else(|error| panic!("cannot stat {path}: {error}"));
         metadata.permissions().mode() & 0o777
     };
+    let extracted = uefisettings(&["hii", "extract-db", "/tmp/hiidb.bin"]);
+    assert_eq!(extracted.code, Some(0), "extract-db: {extracted:#?}");
+    let hiidb = fs::read("/tmp/hiidb.bin").expect("cannot read /tmp/hiidb.bin");
     for (dir, unredacted) in [("/tmp/efivars", false), ("/tmp/efivars-whole", true)] {
         let flags: &[&str] = if unredacted { &["--unredacted"] } else { &[] };
         let dump: Dump = json(&[&["hii", "dump-efivars"], flags, &[dir]].concat());
@@ -522,11 +525,27 @@ fn dumped_efivars_answer_as_efivarfs() {
         } else {
             "decoded-bytes"
         };
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(format!("{dir}/uefisettings-dump.json"))
+                .unwrap_or_else(|error| panic!("cannot read the manifest in {dir}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("cannot parse the manifest in {dir}: {error}"));
 
         assert_eq!(
             (dump.directory.as_str(), dump.redaction.as_str()),
             (dir, redaction),
             "{dump:#?}"
+        );
+        assert_eq!(
+            (&manifest["format"], &manifest["redaction"]),
+            (&serde_json::json!(1), &serde_json::json!(redaction)),
+            "{dir}: manifest {manifest}"
+        );
+        let saved = fs::read(format!("{dir}/hiidb.bin"))
+            .unwrap_or_else(|error| panic!("cannot read the HiiDB in {dir}: {error}"));
+        assert!(
+            saved == hiidb,
+            "{dir}: the saved HiiDB is not the extracted one"
         );
         assert!(dump.copied.iter().any(|name| name == variable), "{dump:#?}");
         assert_eq!((mode(dir), mode(&path)), (0o700, 0o600), "{dir}: modes");
