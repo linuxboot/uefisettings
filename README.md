@@ -116,6 +116,30 @@ they would create absent variables and overwrite writable ones, such as BootOrde
 
 ---
 
+## AMI Setup access level
+
+AMI firmware's Setup grays out or hides some questions by the access level of its session, which
+it keeps in the VarStore `SystemAccess` (E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator,
+1 User). Where Linux cannot read that variable, those questions are undetermined, and `set`
+refuses them unless `--include` selects their states, such as `grayed-out`.
+`--access-level administrator|user`, on `get`, `set`, `hii get`, `hii set` and
+`hii list-questions`, evaluates those conditions at the stated level instead, and fails on a
+HiiDB that declares no `SystemAccess`:
+
+```sh
+uefisettings hii list-questions --access-level administrator
+```
+
+`--access-level` changes no variable: the questions on `SystemAccess` itself still answer with its
+stored value, or why it cannot be read.
+
+uefisettings never takes, checks or circumvents a firmware password, because efivarfs writes carry
+none. With an Administrator password installed, `administrator` lets root select from the OS the
+questions that the firmware's Setup reserves for Administrator sessions, as `--include grayed-out`
+already does more broadly.
+
+---
+
 ## Changing UEFI settings with automation
 
 To change BIOS settings from Linux terminal there are usually next ways available:

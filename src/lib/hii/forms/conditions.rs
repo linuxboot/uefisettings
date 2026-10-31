@@ -29,6 +29,7 @@ use super::ami_access_level::AMI_ACCESS_LEVEL;
 use super::find_corresponding_varstore;
 use super::read_question_value;
 use super::value_question;
+use super::AccessLevel;
 use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
@@ -602,13 +603,17 @@ fn question_id(op: &IFROperation) -> Option<u16> {
 /// does.
 pub(crate) struct VarStoreValues {
     index: QuestionIndex,
+    /// What conditions read from AMI_ACCESS_LEVEL instead of its value, if stated
+    access_level: Option<AccessLevel>,
 }
 
 impl VarStoreValues {
-    /// Finds the questions in the FormSet of `root`.
-    pub(crate) fn new(root: &Rc<RefCell<IFROperation>>) -> Self {
+    /// Finds the questions in the FormSet of `root`, reading `access_level`, if stated, for
+    /// AMI_ACCESS_LEVEL instead of its value.
+    pub(crate) fn new(root: &Rc<RefCell<IFROperation>>, access_level: Option<AccessLevel>) -> Self {
         VarStoreValues {
             index: QuestionIndex::new(root),
+            access_level,
         }
     }
 }
@@ -630,16 +635,24 @@ impl QuestionValues for VarStoreValues {
         };
         let varstore =
             find_corresponding_varstore(Rc::clone(question), value_question.header().var_store_id);
-        Some(question_value(&op, value_question, &varstore, reader))
+        Some(question_value(
+            &op,
+            value_question,
+            &varstore,
+            self.access_level,
+            reader,
+        ))
     }
 }
 
 /// Returns the value of `question`, which is `value_question`, in `varstore`, typed as
-/// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes types it.
+/// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes types it: on AMI_ACCESS_LEVEL,
+/// `access_level` instead, if stated.
 fn question_value(
     question: &IFROperation,
     value_question: ValueQuestion,
     varstore: &Result<Box<dyn VariableStore>>,
+    access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
 ) -> QuestionValue {
     let kind = match value_question {
@@ -650,9 +663,15 @@ fn question_value(
     let on_access_level = value_question.location()
         == (ValueLocation::Bytes { offset: 0, size: 1 })
         && matches!(varstore, Ok(store) if AMI_ACCESS_LEVEL.identifies(store.as_ref()));
-    let reason = match read_question_value(question, varstore, reader)
-        .and_then(|(_, value)| typed_value(value_question, value))
-    {
+    let value = match (on_access_level, access_level) {
+        // AMI IFR also compares the level with 85, of unknown meaning, in a SUPPRESS_IF NOT
+        // around a REF, which either stated level suppresses
+        (true, Some(level)) => Ok(u64::from(u8::from(level))),
+        (true, None) | (false, Some(_) | None) => {
+            read_question_value(question, varstore, reader).map(|(_, value)| value)
+        }
+    };
+    let reason = match value.and_then(|value| typed_value(value_question, value)) {
         Ok(value) => return value,
         Err(reason) => reason,
     };
@@ -3261,7 +3280,7 @@ mod tests {
             let root = parse_form_set(&[form(1, &[body, referrer.clone()])]);
             let referrer = find_op(&root, &referrer[2..])
                 .unwrap_or_else(|| panic!("{name}: find the referrer"));
-            let value = VarStoreValues::new(&root).value(
+            let value = VarStoreValues::new(&root, None).value(
                 &referrer.borrow(),
                 1,
                 &mut Efivars::new().reader(),
@@ -3295,6 +3314,7 @@ mod tests {
                 Rc::clone(&root),
                 &strings(),
                 IncludedStates::empty(),
+                None,
                 &mut Efivars::new().reader(),
             )
             .into_iter()
@@ -3404,7 +3424,7 @@ mod tests {
         let referrer = checkbox_op(1, 1);
         let root = parse_form_set(&[form(1, &[checkbox_op(0, 0), referrer.clone()])]);
         let referrer = find_op(&root, &referrer[2..]).expect("find the referrer");
-        let values = VarStoreValues::new(&root);
+        let values = VarStoreValues::new(&root, None);
         let mut reader = Efivars::new().reader();
         assert_eq!(
             values.value(&referrer.borrow(), 0, &mut reader),
@@ -3449,7 +3469,7 @@ mod tests {
                     &scope.borrow(),
                     &mut ExpressionInputs {
                         reader: &mut Efivars::new().reader(),
-                        values: &VarStoreValues::new(&root),
+                        values: &VarStoreValues::new(&root, None),
                     },
                 ),
                 Truth::Known(false),
@@ -3464,7 +3484,7 @@ mod tests {
         let root = two_forms();
         let referrer = find_op(&root, &eq_id_val_of(7, 1)[2..]).expect("find the referrer");
         let referrer = referrer.borrow();
-        let values = VarStoreValues::new(&root);
+        let values = VarStoreValues::new(&root, None);
 
         assert_eq!(
             values.value(&referrer, 9, &mut Efivars::new().reader()),
@@ -3503,7 +3523,7 @@ mod tests {
         let efivars = Efivars::new();
         efivars.write(store.as_ref(), &[1, 0]);
         let mut reader = efivars.reader();
-        let values = VarStoreValues::new(&root);
+        let values = VarStoreValues::new(&root, None);
         let referrer = question.borrow();
 
         assert_eq!(
@@ -3537,14 +3557,16 @@ mod tests {
                 "<ValueUnavailable: no EFI variable \
                  SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore requires \
                  EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level \
-                 there (0 Administrator, 1 User)>",
+                 there (0 Administrator, 1 User); \
+                 --access-level administrator|user states one>",
             ),
             (
                 "EFI variable SystemAccess",
                 var_store_efi_of(1, SYSTEM_ACCESS_GUID, "SystemAccess", NV_BS_RT, 1),
                 "<ValueUnavailable: no EFI variable \
                  SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; the AMI setup browser keeps \
-                 its access level there (0 Administrator, 1 User)>",
+                 its access level there (0 Administrator, 1 User); \
+                 --access-level administrator|user states one>",
             ),
             (
                 "boot-service-only EFI variable SystemAccess",
@@ -3552,7 +3574,8 @@ mod tests {
                 "<ValueUnavailable: EFI variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac \
                  is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither \
                  lists nor writes; the AMI setup browser keeps its access level there \
-                 (0 Administrator, 1 User)>",
+                 (0 Administrator, 1 User); \
+                 --access-level administrator|user states one>",
             ),
             (
                 "buffer SystemAccess of NIL_GUID",
@@ -3578,7 +3601,7 @@ mod tests {
             let root = parse_form_set(&[declaration, form(1, &[checkbox_op(1, 0)])]);
             let question = find_op(&root, &checkbox_op(1, 0)[2..]).expect("find question 1");
             assert_eq!(
-                VarStoreValues::new(&root).value(
+                VarStoreValues::new(&root, None).value(
                     &question.borrow(),
                     1,
                     &mut Efivars::new().reader()
@@ -3622,7 +3645,7 @@ mod tests {
         for (name, op, id, kind) in others {
             let question = find_op(&root, &op[2..]).expect("find the question");
             assert_eq!(
-                VarStoreValues::new(&root).value(
+                VarStoreValues::new(&root, None).value(
                     &question.borrow(),
                     id,
                     &mut Efivars::new().reader()
@@ -3643,13 +3666,14 @@ mod tests {
             form(1, &[checkbox_op(1, 0)]),
         ]);
         let question = find_op(&root, &checkbox_op(1, 0)[2..]).expect("find question 1");
-        let values = VarStoreValues::new(&root);
+        let values = VarStoreValues::new(&root, None);
         assert_eq!(
             values.value(&question.borrow(), 1, &mut disabled_reader()),
             Some(QuestionValue::Unreadable {
                 kind: ValueKind::Boolean,
                 reason: "<ValueUnavailable: EFI variables not read; the AMI setup browser keeps \
-                         its access level there (0 Administrator, 1 User)>"
+                         its access level there (0 Administrator, 1 User); \
+                         --access-level administrator|user states one>"
                     .to_string(),
             }),
             "buffer SystemAccess without reading efivars"
@@ -3664,6 +3688,287 @@ mod tests {
         );
     }
 
+    /// The state of question 1 in the scope `scope` of `condition`, which reads question 2,
+    /// `access_level_question`, on AMI firmware's buffer VarStore SystemAccess, whose efivar
+    /// holds `stored` if any, with conditions reading `stated`, if stated, instead of its value.
+    fn access_level_state(
+        access_level_question: &[u8],
+        (scope, condition): (u8, Vec<u8>),
+        stored: Option<u8>,
+        stated: Option<AccessLevel>,
+    ) -> StateEvaluation {
+        let question = checkbox_on(1, 3, 1);
+        let root = parse_form_set(&[
+            var_store_efi(1, "Present", NV_BS_RT, 1),
+            var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+            form(
+                1,
+                &[
+                    access_level_question.to_vec(),
+                    conditional(scope, condition, std::slice::from_ref(&question)),
+                ],
+            ),
+        ]);
+        let question = find_op(&root, &question[2..]).expect("find question 1");
+        let efivars = Efivars::new();
+        if let Some(stored) = stored {
+            let store = find_corresponding_varstore(Rc::clone(&question), 2);
+            efivars.write(store.as_ref().expect("find VarStore 2").as_ref(), &[stored]);
+        }
+        let question = question.borrow();
+        question_state(
+            &question,
+            &mut ExpressionInputs {
+                reader: &mut efivars.reader(),
+                values: &VarStoreValues::new(&root, stated),
+            },
+        )
+    }
+
+    /// A stated access level replaces the level byte of SystemAccess in every condition,
+    /// whether or not its efivar can be read; without one, and for a question on another byte
+    /// or of another width, conditions read the efivar.
+    #[test]
+    fn stated_access_level_replaces_the_stored_one() {
+        const UNREAD: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI variable \
+            SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore requires \
+            EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level there \
+            (0 Administrator, 1 User); --access-level administrator|user states one>";
+        let user_only = || (GRAY_OUT_IF, eq_id_val_of(2, 1));
+        // the one comparison with 85 in the HiiDBs of AMI firmware read so far
+        let not_85 = || {
+            (
+                SUPPRESS_IF,
+                [eq_id_val_of(2, 85), operation(NOT, false, &[])].concat(),
+            )
+        };
+        let undetermined = StateEvaluation {
+            known: QuestionState::Selectable,
+            unknown: vec![(QuestionState::GrayedOut, UNREAD.to_string())],
+        };
+        let cases = [
+            (
+                "Administrator, no efivar",
+                user_only(),
+                None,
+                Some(AccessLevel::Administrator),
+                known(QuestionState::Selectable),
+            ),
+            (
+                "User, no efivar",
+                user_only(),
+                None,
+                Some(AccessLevel::User),
+                known(QuestionState::GrayedOut),
+            ),
+            ("no level, no efivar", user_only(), None, None, undetermined),
+            (
+                "Administrator over a stored 1",
+                user_only(),
+                Some(1),
+                Some(AccessLevel::Administrator),
+                known(QuestionState::Selectable),
+            ),
+            (
+                "User over a stored 0",
+                user_only(),
+                Some(0),
+                Some(AccessLevel::User),
+                known(QuestionState::GrayedOut),
+            ),
+            (
+                "no level, stored 1",
+                user_only(),
+                Some(1),
+                None,
+                known(QuestionState::GrayedOut),
+            ),
+            (
+                "no level, stored 0",
+                user_only(),
+                Some(0),
+                None,
+                known(QuestionState::Selectable),
+            ),
+            (
+                "Administrator, NOT 85",
+                not_85(),
+                None,
+                Some(AccessLevel::Administrator),
+                known(QuestionState::Suppressed),
+            ),
+            (
+                "User, NOT 85",
+                not_85(),
+                None,
+                Some(AccessLevel::User),
+                known(QuestionState::Suppressed),
+            ),
+        ];
+        let access_level_questions = [
+            ("CHECKBOX", checkbox_on(2, 5, 2)),
+            ("UINT8 NUMERIC", uint8_numeric_on(2, 5, 2)),
+        ];
+        for (kind, access_level_question) in &access_level_questions {
+            for (name, scope, stored, stated, want) in cases.clone() {
+                assert_eq!(
+                    access_level_state(access_level_question, scope, stored, stated),
+                    want,
+                    "{kind}: {name}"
+                );
+            }
+        }
+
+        let checkbox_at_1 = operation(
+            CHECKBOX,
+            false,
+            &[question_header_on(2, 5, 2, 1), vec![0x00]].concat(),
+        );
+        let uint16_at_0 = operation(
+            NUMERIC,
+            false,
+            &[
+                question_header_on(3, 5, 2, 0),
+                vec![0x01, 0, 0, 0xFF, 0xFF, 1, 0],
+            ]
+            .concat(),
+        );
+        let root = parse_form_set(&[
+            var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+            form(1, &[checkbox_at_1.clone(), uint16_at_0.clone()]),
+        ]);
+        let others = [
+            (
+                "CHECKBOX at VarOffset 1",
+                &checkbox_at_1,
+                2,
+                ValueKind::Boolean,
+                "<ExtractEFIDataError: failed to fill whole buffer (offset: 1; buflen: 5)>",
+            ),
+            (
+                "UINT16 NUMERIC at VarOffset 0",
+                &uint16_at_0,
+                3,
+                ValueKind::Uint,
+                "<ExtractEFIDataError: failed to fill whole buffer (offset: 0; buflen: 5)>",
+            ),
+        ];
+        for (name, op, id, kind, reason) in others {
+            let question = find_op(&root, &op[2..]).expect("find the question");
+            let store = find_corresponding_varstore(Rc::clone(&question), 2);
+            let efivars = Efivars::new();
+            efivars.write(store.as_ref().expect("find VarStore 2").as_ref(), &[1]);
+            assert_eq!(
+                VarStoreValues::new(&root, Some(AccessLevel::User)).value(
+                    &question.borrow(),
+                    id,
+                    &mut efivars.reader()
+                ),
+                Some(QuestionValue::Unreadable {
+                    kind,
+                    reason: reason.to_string(),
+                }),
+                "{name}, User"
+            );
+        }
+    }
+
+    /// A stated level replaces only the level byte: question 2 at VarOffset 1 of a 2-byte
+    /// SystemAccess is read as stored.
+    #[test]
+    fn stated_access_level_replaces_only_the_level_byte() {
+        let at_offset_1 = operation(
+            NUMERIC,
+            false,
+            &[question_header_on(2, 5, 2, 1), vec![0x00, 0, 255, 1]].concat(),
+        );
+        let question = checkbox_on(1, 3, 1);
+        let root = parse_form_set(&[
+            var_store_efi(1, "Present", NV_BS_RT, 1),
+            var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 2),
+            form(
+                1,
+                &[
+                    at_offset_1,
+                    conditional(
+                        SUPPRESS_IF,
+                        eq_id_val_of(2, 7),
+                        std::slice::from_ref(&question),
+                    ),
+                ],
+            ),
+        ]);
+        let question = find_op(&root, &question[2..]).expect("find question 1");
+        let store = find_corresponding_varstore(Rc::clone(&question), 2);
+        let efivars = Efivars::new();
+        efivars.write(store.as_ref().expect("find VarStore 2").as_ref(), &[1, 7]);
+        let question = question.borrow();
+        for level in [
+            None,
+            Some(AccessLevel::Administrator),
+            Some(AccessLevel::User),
+        ] {
+            assert_eq!(
+                question_state(
+                    &question,
+                    &mut ExpressionInputs {
+                        reader: &mut efivars.reader(),
+                        values: &VarStoreValues::new(&root, level),
+                    },
+                ),
+                known(QuestionState::Suppressed),
+                "{level:?}"
+            );
+        }
+    }
+
+    /// A stated access level leaves a condition on another VarStore's question as its efivar
+    /// holds it.
+    #[test]
+    fn stated_access_level_reads_other_var_stores() {
+        let question = checkbox_on(1, 3, 1);
+        let root = parse_form_set(&[
+            var_store_efi(1, "Present", NV_BS_RT, 1),
+            var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+            var_store_efi(3, "Other", NV_BS_RT, 1),
+            form(
+                1,
+                &[
+                    checkbox_on(2, 5, 2),
+                    checkbox_on(3, 6, 3),
+                    conditional(
+                        GRAY_OUT_IF,
+                        eq_id_val_of(3, 1),
+                        std::slice::from_ref(&question),
+                    ),
+                ],
+            ),
+        ]);
+        let question = find_op(&root, &question[2..]).expect("find question 1");
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Other", 1), &[0]);
+        for level in [
+            None,
+            Some(AccessLevel::Administrator),
+            Some(AccessLevel::User),
+        ] {
+            assert_eq!(
+                question_state(
+                    &question.borrow(),
+                    &mut ExpressionInputs {
+                        reader: &mut efivars.reader(),
+                        values: &VarStoreValues::new(&root, level),
+                    },
+                ),
+                StateEvaluation {
+                    known: QuestionState::Selectable,
+                    unknown: Vec::new(),
+                },
+                "{level:?}"
+            );
+        }
+    }
+
     /// The value of a parsed question in `var_store`.
     fn value_in(
         op_code: u8,
@@ -3673,7 +3978,13 @@ mod tests {
         let (_root, question) = parse_question(&[], op_code, data, &[]);
         let question = question.borrow();
         let value_question = value_question(&question).expect("a ONE_OF, NUMERIC or CHECKBOX");
-        question_value(&question, value_question, &store, &mut efivars.reader())
+        question_value(
+            &question,
+            value_question,
+            &store,
+            None,
+            &mut efivars.reader(),
+        )
     }
 
     #[test]
@@ -3756,7 +4067,13 @@ mod tests {
             let value_question = value_question(&bit_field).expect("a ONE_OF, NUMERIC or CHECKBOX");
             let VarStoreFixture { store, efivars } = var_store_of(&[byte]);
             assert_eq!(
-                question_value(&bit_field, value_question, &store, &mut efivars.reader()),
+                question_value(
+                    &bit_field,
+                    value_question,
+                    &store,
+                    None,
+                    &mut efivars.reader()
+                ),
                 want,
                 "{name}"
             );

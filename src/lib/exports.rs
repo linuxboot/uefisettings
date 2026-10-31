@@ -12,9 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::Result;
 use log::debug;
@@ -53,6 +55,7 @@ use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
 use crate::translation::IloTranslation;
 
+pub use crate::hii::forms::AccessLevel;
 pub use crate::hii::forms::IncludedStates;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
@@ -75,6 +78,8 @@ pub struct GetOptions {
     pub include: IncludedStates,
     /// Where to read question values
     pub efivars: EfivarSource,
+    /// The AMI Setup access level that conditions read instead of the stored one, if stated
+    pub access_level: Option<AccessLevel>,
 }
 
 /// The options of HiiBackend::set_using.
@@ -83,6 +88,8 @@ pub struct GetOptions {
 pub struct SetOptions {
     /// The states of the questions and options to select too
     pub include: IncludedStates,
+    /// The AMI Setup access level that conditions read instead of the stored one, if stated
+    pub access_level: Option<AccessLevel>,
 }
 
 /// The options of HiiBackend::list_questions_using.
@@ -93,6 +100,8 @@ pub struct ListQuestionsOptions {
     pub include: IncludedStates,
     /// Where to read question values
     pub efivars: EfivarSource,
+    /// The AMI Setup access level that conditions read instead of the stored one, if stated
+    pub access_level: Option<AccessLevel>,
 }
 
 /// The options of HiiBackend::show_ifr_using.
@@ -215,15 +224,23 @@ impl HiiBackend {
         let mut res = Vec::new();
         let mut reader = EfivarReader::new(options.efivars.clone())?;
         let parsed_db = package::read_db(db_bytes)?;
+        forms::check_access_level(
+            parsed_db.iter().flat_map(|list| &list.forms),
+            options.access_level,
+        )?;
         for list in parsed_db {
             list.check_form_strings()?;
 
             for root in list.forms {
                 //  TODO: show form name, package list guid in the final response as well
 
-                for (question_descriptor, state) in
-                    list_questions(root, &list.strings, include, &mut reader)
-                {
+                for (question_descriptor, state) in list_questions(
+                    root,
+                    &list.strings,
+                    include,
+                    options.access_level,
+                    &mut reader,
+                ) {
                     let question = Question {
                         options: question_descriptor.listed_options(include),
                         name: question_descriptor.question,
@@ -289,10 +306,6 @@ impl HiiBackend {
 
         let db_bytes = extract::extract_db()?;
         let parsed_db = package::read_db(&db_bytes)?;
-        // all lists before the first write, so that no error follows a write
-        parsed_db
-            .iter()
-            .try_for_each(package::ParsedPackageList::check_form_strings)?;
 
         let hii_translation = get_qa_variations_hii(question, new_value);
         let (question_variations, new_value_variations, is_translated) = match hii_translation {
@@ -306,40 +319,13 @@ impl HiiBackend {
             } => (question_variations, answer_variations, false),
         };
 
-        // Every FormSet selects its question and option before the first write, so that a
-        // selection error leaves every variable unchanged.
-        let mut selected = Vec::new();
-        let mut excluded = IncludedStates::empty();
-        // one cache for the selection, which ends before the first write
-        let mut reader = EfivarReader::new(EfivarSource::System)?;
-        for list in parsed_db {
-            for root in list.forms {
-                // try to find the question
-                let selection = forms::find_question(
-                    root,
-                    &list.strings,
-                    &question_variations,
-                    include,
-                    &mut reader,
-                );
-                match forms::choice_for_set(selection, question, &reader)? {
-                    Choice::Chosen(question_descriptor, state) => {
-                        selected.push((list.guid.to_string(), question_descriptor, state));
-                    }
-                    // question not found in this FormSet
-                    // or only in states that `include` does not allow
-                    Choice::Skipped(states) => excluded |= states,
-                }
-            }
-        }
-        if selected.is_empty() && !excluded.is_empty() {
-            return Err(SelectionError::Excluded {
-                question: question.to_owned(),
-                states: excluded,
-            }
-            .into());
-        }
-        drop(reader);
+        let selected = select_for_set(
+            &parsed_db,
+            question,
+            &question_variations,
+            options,
+            EfivarSource::System,
+        )?;
 
         let option_annotations: Vec<String> = forms::set_questions(
             question,
@@ -411,6 +397,10 @@ impl HiiBackend {
 
         let mut reader = EfivarReader::new(options.efivars.clone())?;
         let parsed_db = package::read_db(db_bytes)?;
+        forms::check_access_level(
+            parsed_db.iter().flat_map(|list| &list.forms),
+            options.access_level,
+        )?;
 
         let mut excluded = IncludedStates::empty();
         for list in parsed_db {
@@ -422,6 +412,7 @@ impl HiiBackend {
                     &list.strings,
                     &question_variations,
                     include,
+                    options.access_level,
                     &mut reader,
                 );
                 let (question_descriptor, state) = match selection.for_get() {
@@ -470,6 +461,63 @@ impl HiiBackend {
             ..Default::default()
         })
     }
+}
+
+/// set's phase before its first write, so that no error follows a write: checks every package
+/// list of `parsed_db` and the stated access level, then selects, in each FormSet, the question
+/// of `question_variations` that set writes, reading `efivars` once; returns them with the GUID
+/// of their package list, or SelectionError::Excluded for `question` if each FormSet skips it
+/// for its states.
+fn select_for_set(
+    parsed_db: &[package::ParsedPackageList],
+    question: &str,
+    question_variations: &HashSet<String>,
+    options: &SetOptions,
+    efivars: EfivarSource,
+) -> Result<Vec<(String, forms::QuestionDescriptor, forms::StateEvaluation)>> {
+    forms::check_access_level(
+        parsed_db.iter().flat_map(|list| &list.forms),
+        options.access_level,
+    )?;
+    parsed_db
+        .iter()
+        .try_for_each(package::ParsedPackageList::check_form_strings)?;
+
+    // Every FormSet selects its question and option before the first write, so that a
+    // selection error leaves every variable unchanged.
+    let mut selected = Vec::new();
+    let mut excluded = IncludedStates::empty();
+    // one cache for the selection, which ends before the first write
+    let mut reader = EfivarReader::new(efivars)?;
+    for list in parsed_db {
+        for root in &list.forms {
+            // try to find the question
+            let selection = forms::find_question(
+                Rc::clone(root),
+                &list.strings,
+                question_variations,
+                options.include,
+                options.access_level,
+                &mut reader,
+            );
+            match forms::choice_for_set(selection, question, &reader)? {
+                Choice::Chosen(question_descriptor, state) => {
+                    selected.push((list.guid.to_string(), question_descriptor, state));
+                }
+                // question not found in this FormSet
+                // or only in states that `include` does not allow
+                Choice::Skipped(states) => excluded |= states,
+            }
+        }
+    }
+    if selected.is_empty() && !excluded.is_empty() {
+        return Err(SelectionError::Excluded {
+            question: question.to_owned(),
+            states: excluded,
+        }
+        .into());
+    }
+    Ok(selected)
 }
 
 pub struct IloBackend {}
@@ -799,9 +847,14 @@ fn compare_redfish_attributes(
 #[cfg(test)]
 mod tests {
     use crate::hii::forms::ifr_fixtures::checkbox_on;
+    use crate::hii::forms::ifr_fixtures::conditional;
+    use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::form;
+    use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
+    use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+    use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::en_strings_package;
     use crate::hii::package::hiidb_fixtures::form_package;
@@ -987,6 +1040,181 @@ mod tests {
                 "{case}: show-ifr {ifr:?}"
             );
         }
+    }
+
+    /// A HiiDB of two package lists: one whose FormSet declares no VarStore, then one whose
+    /// question Q, on the EFI variable Setup, is grayed out when question 2, on `var_store`, is 1.
+    fn access_level_hiidb(var_store: Vec<u8>) -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                var_store,
+                form(
+                    1,
+                    &[
+                        checkbox_on(2, 2, 2),
+                        conditional(GRAY_OUT_IF, eq_id_val_of(2, 1), &[checkbox_on(1, 1, 1)]),
+                    ],
+                ),
+            ]),
+            en_strings_package(b'Q'),
+            END_PACKAGE.to_vec(),
+        ];
+        [
+            form_set_list([0x33; 16], b'A'),
+            package_list_with_guid([0x55; 16], &packages.concat()),
+        ]
+        .concat()
+    }
+
+    /// set selects at a stated access level, before any write, and refuses one for a HiiDB that
+    /// declares no SystemAccess.
+    #[test]
+    fn set_selects_at_the_stated_access_level() {
+        let ami = access_level_hiidb(var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1));
+        let other = access_level_hiidb(var_store(2, [0; 16], "SystemAccess", 1));
+        let efivars = tempfile::tempdir().expect("create efivars directory");
+        fs::write(
+            efivars
+                .path()
+                .join("Setup-00000000-0000-0000-0000-000000000000"),
+            [7, 0, 0, 0, 1],
+        )
+        .expect("write efivar file");
+        let select = |hiidb: &[u8], access_level| {
+            let options = SetOptions {
+                access_level,
+                ..SetOptions::default()
+            };
+            select_for_set(
+                &package::read_db(hiidb).expect("parse the HiiDB"),
+                "Q",
+                &HashSet::from(["Q".to_string()]),
+                &options,
+                EfivarSource::Directory(efivars.path().to_path_buf()),
+            )
+            .map(|selected| {
+                selected
+                    .into_iter()
+                    .map(|(_, question, _)| question.question)
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            select(&ami, Some(AccessLevel::Administrator)).expect("select as Administrator"),
+            ["Q"],
+            "Administrator"
+        );
+        let user = select(&ami, Some(AccessLevel::User)).expect_err("select as User");
+        assert_eq!(
+            user.downcast_ref::<SelectionError>(),
+            Some(&SelectionError::Excluded {
+                question: "Q".to_string(),
+                states: IncludedStates::GRAYED_OUT,
+            }),
+            "User: {user:#}"
+        );
+        let no_level = select(&ami, None).expect_err("select without a level");
+        assert!(
+            matches!(
+                no_level.downcast_ref::<SelectionError>(),
+                Some(SelectionError::Undetermined { states, .. })
+                    if *states == IncludedStates::GRAYED_OUT
+            ),
+            "no level: {no_level:#}"
+        );
+        for level in [AccessLevel::Administrator, AccessLevel::User] {
+            assert_eq!(
+                select(&other, Some(level)).map_err(|error| error.to_string()),
+                Err(
+                    "--access-level applies to AMI firmware whose HiiDB declares the \
+                     SystemAccess VarStore; this HiiDB declares none"
+                        .to_string()
+                ),
+                "{level:?}, SystemAccess of NIL_GUID"
+            );
+        }
+    }
+
+    /// get and list-questions evaluate the conditions on AMI firmware's SystemAccess at a
+    /// stated access level, and refuse one for a HiiDB that declares no SystemAccess.
+    #[test]
+    fn options_state_the_access_level() {
+        let ami = access_level_hiidb(var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1));
+        let other = access_level_hiidb(var_store(2, [0; 16], "SystemAccess", 1));
+        let get = |hiidb: &[u8], access_level| {
+            let options = GetOptions {
+                efivars: EfivarSource::Disabled,
+                access_level,
+                ..GetOptions::default()
+            };
+            HiiBackend::get_using(hiidb, "Q", None, &options).map(|got| {
+                got.responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let list = |hiidb: &[u8], access_level| {
+            let options = ListQuestionsOptions {
+                efivars: EfivarSource::Disabled,
+                access_level,
+                ..ListQuestionsOptions::default()
+            };
+            HiiBackend::list_questions_using(hiidb, &options).map(|listed| {
+                listed
+                    .into_iter()
+                    .filter(|question| question.name == "Q")
+                    .map(|question| question.answer)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let not_read = "<ValueUnavailable: EFI variables not read> <IFR default: 0>";
+
+        let administrator = Some(AccessLevel::Administrator);
+        assert_eq!(
+            get(&ami, administrator).expect("get as Administrator"),
+            [not_read],
+            "get as Administrator"
+        );
+        assert_eq!(
+            list(&ami, administrator).expect("list as Administrator"),
+            [not_read],
+            "list-questions as Administrator"
+        );
+        let user = Some(AccessLevel::User);
+        let error = get(&ami, user).expect_err("get as User");
+        assert_eq!(
+            error.downcast_ref::<SelectionError>(),
+            Some(&SelectionError::Excluded {
+                question: "Q".to_string(),
+                states: IncludedStates::GRAYED_OUT,
+            }),
+            "get as User: {error:#}"
+        );
+        assert_eq!(
+            list(&ami, user).expect("list as User"),
+            Vec::<String>::new(),
+            "list-questions as User"
+        );
+
+        let refusal = "--access-level applies to AMI firmware whose HiiDB declares the \
+                       SystemAccess VarStore; this HiiDB declares none";
+        for level in [administrator, user] {
+            assert_eq!(
+                get(&other, level).map_err(|error| error.to_string()),
+                Err(refusal.to_string()),
+                "get, {level:?}, SystemAccess of NIL_GUID"
+            );
+            assert_eq!(
+                list(&other, level).map_err(|error| error.to_string()),
+                Err(refusal.to_string()),
+                "list-questions, {level:?}, SystemAccess of NIL_GUID"
+            );
+        }
+        assert!(get(&other, None).is_ok(), "get, no level");
+        assert!(list(&other, None).is_ok(), "list-questions, no level");
     }
 
     /// read_hiidb reads `filename` if given, else the HiiDB that an efivars dump saved; a

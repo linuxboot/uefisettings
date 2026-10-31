@@ -27,6 +27,7 @@ use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
 use uefisettings::exports::identify_machine;
+use uefisettings::exports::AccessLevel;
 use uefisettings::exports::DumpEfivarsOptions;
 use uefisettings::exports::EfivarDump;
 use uefisettings::exports::EfivarRedaction;
@@ -211,6 +212,12 @@ struct SelectionArgs {
     /// counts as suppressed.
     #[clap(long, value_enum, value_delimiter = ',')]
     include: Vec<IncludeState>,
+    /// Evaluate the conditions that read the AMI Setup access level (VarStore SystemAccess
+    /// E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User) at this level instead of
+    /// the stored value. This states a Setup privilege; it is no password and authenticates
+    /// nothing (efivarfs writes carry no password).
+    #[clap(long, value_enum, value_name = "LEVEL")]
+    access_level: Option<AccessLevelArg>,
 }
 
 impl SelectionArgs {
@@ -222,14 +229,26 @@ impl SelectionArgs {
             .collect()
     }
 
-    /// Fails if any state is included: Ilo attributes have no IFR conditions.
+    /// Fails if any state is included or an access level stated: Ilo attributes have no IFR
+    /// conditions.
     fn refuse_on_ilo(&self) -> Result<()> {
-        match self.include.as_slice() {
-            [] => Ok(()),
-            [..] => Err(anyhow!(
+        match (self.include.as_slice(), self.access_level) {
+            ([], None) => Ok(()),
+            ([_, ..], None) => Err(anyhow!(
                 "--include applies to the HII backend, not to the Ilo backend of this machine"
             )),
+            ([], Some(_)) => Err(anyhow!(
+                "--access-level applies to the HII backend, not to the Ilo backend of this machine"
+            )),
+            ([_, ..], Some(_)) => Err(anyhow!(
+                "--include and --access-level apply to the HII backend, not to the Ilo backend of \
+                 this machine"
+            )),
         }
+    }
+
+    fn access_level(&self) -> Option<AccessLevel> {
+        self.access_level.map(AccessLevel::from)
     }
 }
 
@@ -237,6 +256,7 @@ impl From<&SelectionArgs> for GetOptions {
     fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
+        options.access_level = args.access_level();
         options
     }
 }
@@ -245,6 +265,7 @@ impl From<&SelectionArgs> for SetOptions {
     fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
+        options.access_level = args.access_level();
         options
     }
 }
@@ -253,6 +274,7 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
     fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
+        options.access_level = args.access_level();
         options
     }
 }
@@ -270,6 +292,21 @@ impl From<IncludeState> for IncludedStates {
             IncludeState::GrayedOut => IncludedStates::GRAYED_OUT,
             IncludeState::Suppressed => IncludedStates::SUPPRESSED,
             IncludeState::Disabled => IncludedStates::DISABLED,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum AccessLevelArg {
+    Administrator,
+    User,
+}
+
+impl From<AccessLevelArg> for AccessLevel {
+    fn from(level: AccessLevelArg) -> Self {
+        match level {
+            AccessLevelArg::Administrator => AccessLevel::Administrator,
+            AccessLevelArg::User => AccessLevel::User,
         }
     }
 }
@@ -680,6 +717,100 @@ mod tests {
                 args.is_empty(),
                 "{name}: refuse_on_ilo"
             );
+        }
+    }
+
+    #[test]
+    fn access_level_maps_to_its_flag() {
+        let cases = [
+            ("no flag", vec![], None),
+            (
+                "administrator",
+                vec!["--access-level", "administrator"],
+                Some(AccessLevel::Administrator),
+            ),
+            (
+                "user",
+                vec!["--access-level", "user"],
+                Some(AccessLevel::User),
+            ),
+        ];
+        for (name, args, level) in cases {
+            let selection = selection_of(&args);
+            assert_eq!(
+                GetOptions::from(&selection).access_level,
+                level,
+                "{name}: get"
+            );
+            assert_eq!(
+                SetOptions::from(&selection).access_level,
+                level,
+                "{name}: set"
+            );
+            assert_eq!(
+                ListQuestionsOptions::from(&selection).access_level,
+                level,
+                "{name}: list-questions"
+            );
+            assert_eq!(
+                selection.refuse_on_ilo().map_err(|error| error.to_string()),
+                match level {
+                    None => Ok(()),
+                    Some(_) => Err("--access-level applies to the HII backend, not to the Ilo \
+                                    backend of this machine"
+                        .to_string()),
+                },
+                "{name}: refuse_on_ilo"
+            );
+        }
+
+        let both = selection_of(&["--include", "grayed-out", "--access-level", "user"]);
+        assert_eq!(
+            both.refuse_on_ilo().map_err(|error| error.to_string()),
+            Err(
+                "--include and --access-level apply to the HII backend, not to the Ilo backend \
+                 of this machine"
+                    .to_string()
+            ),
+            "--include and --access-level: refuse_on_ilo"
+        );
+
+        let error = UefiSettingsToolArgs::try_parse_from([
+            "uefisettings",
+            "set",
+            "Q",
+            "V",
+            "--access-level",
+            "0",
+        ])
+        .expect_err("parse --access-level 0");
+        assert_eq!(error.kind(), clap::ErrorKind::InvalidValue, "0");
+    }
+
+    /// --access-level comes with --include: on hii get, set and list-questions and on get and
+    /// set, not on show-ifr, which evaluates no conditions, nor on ilo.
+    #[test]
+    fn access_level_is_taken_where_include_is() {
+        let commands: [(&[&str], bool); 7] = [
+            (&["hii", "get", "Q"], true),
+            (&["hii", "set", "Q", "V"], true),
+            (&["hii", "list-questions"], true),
+            (&["get", "Q"], true),
+            (&["set", "Q", "V"], true),
+            (&["hii", "show-ifr"], false),
+            (&["ilo", "get", "Q"], false),
+        ];
+        for (command, takes) in commands {
+            let argv = [&["uefisettings"][..], command, &["--access-level", "user"]].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            match takes {
+                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
+                false => assert_eq!(
+                    parsed.err(),
+                    Some(clap::ErrorKind::UnknownArgument),
+                    "{command:?}"
+                ),
+            }
         }
     }
 

@@ -194,7 +194,13 @@ fn decoded_bytes(
     for list in package_lists {
         list.check_form_strings()?;
         for root in list.forms {
-            list_questions(root, &list.strings, IncludedStates::all(), &mut reader);
+            list_questions(
+                root,
+                &list.strings,
+                IncludedStates::all(),
+                None,
+                &mut reader,
+            );
         }
     }
     Ok(reader.decoded)
@@ -412,6 +418,7 @@ mod tests {
             Rc::clone(root),
             &[HashMap::new()],
             IncludedStates::all(),
+            None,
             &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),
         )
         .into_iter()

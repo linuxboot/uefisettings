@@ -29,7 +29,7 @@ pub(crate) const CHECKBOX: u8 = 0x06;
 pub(super) const NUMERIC: u8 = 0x07;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
-pub(super) const GRAY_OUT_IF: u8 = 0x19;
+pub(crate) const GRAY_OUT_IF: u8 = 0x19;
 pub(super) const DISABLE_IF: u8 = 0x1E;
 
 pub(super) const FORM: u8 = 0x01;
@@ -52,7 +52,7 @@ const VAR_STORE_EFI: u8 = 0x26;
 
 /// The Guid E770BB69-BCB4-4D04-9E97-23FF9456FEAC of AMI firmware's VarStore SystemAccess, as
 /// stored.
-pub(super) const SYSTEM_ACCESS_GUID: [u8; 16] = [
+pub(crate) const SYSTEM_ACCESS_GUID: [u8; 16] = [
     0x69, 0xBB, 0x70, 0xE7, 0xB4, 0xBC, 0x04, 0x4D, 0x9E, 0x97, 0x23, 0xFF, 0x94, 0x56, 0xFE, 0xAC,
 ];
 
@@ -374,7 +374,7 @@ pub(super) fn eq_id_val() -> Vec<u8> {
 }
 
 /// EFI_IFR_EQ_ID_VAL: question `question_id` equals `value`.
-pub(super) fn eq_id_val_of(question_id: u16, value: u16) -> Vec<u8> {
+pub(crate) fn eq_id_val_of(question_id: u16, value: u16) -> Vec<u8> {
     let data = [question_id.to_le_bytes(), value.to_le_bytes()].concat();
     operation(EQ_ID_VAL, false, &data)
 }
@@ -518,8 +518,19 @@ pub(crate) fn checkbox_on(question_id: u16, prompt: u16, var_store_id: u16) -> V
     operation(CHECKBOX, false, &data)
 }
 
+/// A UINT8 NUMERIC of QuestionId `question_id`, prompted string `prompt`, from 0 to 255 at
+/// VarOffset 0 of VarStore `var_store_id`.
+pub(super) fn uint8_numeric_on(question_id: u16, prompt: u16, var_store_id: u16) -> Vec<u8> {
+    let data = [
+        question_header_on(question_id, prompt, var_store_id, 0),
+        vec![0x00, 0, 255, 1], // Flags, MinValue, MaxValue, Step
+    ]
+    .concat();
+    operation(NUMERIC, false, &data)
+}
+
 /// A VARSTORE of `id` named `name`, of the Guid stored as `guid`, of `size` bytes.
-pub(super) fn var_store(id: u16, guid: [u8; 16], name: &str, size: u16) -> Vec<u8> {
+pub(crate) fn var_store(id: u16, guid: [u8; 16], name: &str, size: u16) -> Vec<u8> {
     let data = [
         &guid[..],
         &id.to_le_bytes(),
@@ -611,7 +622,7 @@ pub(super) fn question_descriptor(
     node: &Rc<RefCell<IFROperation>>,
     var_store: VarStoreFixture,
 ) -> QuestionDescriptor {
-    question_descriptor_with(node, var_store, &VarStoreValues::new(&root_of(node)))
+    question_descriptor_with(node, var_store, &VarStoreValues::new(&root_of(node), None))
 }
 
 /// Returns the root of the tree of `node`.

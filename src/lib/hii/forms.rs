@@ -54,7 +54,6 @@ use conditions::select;
 use conditions::skips_scope;
 use conditions::ExpressionInputs;
 use conditions::QuestionValues;
-use conditions::StateEvaluation;
 use conditions::VarStoreValues;
 use defaults::option_text;
 use defaults::push_default;
@@ -62,12 +61,15 @@ use defaults::question_scope;
 use defaults::DefaultId;
 use defaults::FormSetDefaultIds;
 
+pub use ami_access_level::AccessLevel;
 pub use conditions::IncludedStates;
 pub use conditions::QuestionState;
 pub use conditions::SelectionError;
 
+pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Selection;
+pub(crate) use conditions::StateEvaluation;
 
 mod ami_access_level;
 mod conditions;
@@ -1274,14 +1276,16 @@ mod non_efi_varstore_tests {
                     EfivarsNotRead,
                 ))),
                 "<ValueUnavailable: EFI variables not read; the AMI setup browser keeps its \
-                 access level there (0 Administrator, 1 User)>",
+                 access level there (0 Administrator, 1 User); \
+                 --access-level administrator|user states one>",
             ),
             (
                 ValueUnavailable::AmiAccessLevel(Box::new(ValueUnavailable::ReadError(
                     "failed to read bytes: entity not found".into(),
                 ))),
                 "<VStoreError: failed to read bytes: entity not found; the AMI setup browser \
-                 keeps its access level there (0 Administrator, 1 User)>",
+                 keeps its access level there (0 Administrator, 1 User); \
+                 --access-level administrator|user states one>",
             ),
         ];
         for (reason, want) in cases {
@@ -1461,8 +1465,12 @@ enum ValueUnavailable {
     },
     #[error("CHECKBOX value {0} over a byte")]
     CheckboxOverByte(u64),
-    /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason
-    #[error("{0}; the AMI setup browser keeps its access level there (0 Administrator, 1 User)")]
+    /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
+    /// level replaces it only in conditions
+    #[error(
+        "{0}; the AMI setup browser keeps its access level there (0 Administrator, 1 User); \
+         --access-level administrator|user states one"
+    )]
     AmiAccessLevel(Box<ValueUnavailable>),
 }
 
@@ -1841,6 +1849,7 @@ mod efivar_reader_tests {
             root,
             &strings(),
             IncludedStates::empty(),
+            None,
             &mut disabled_reader(),
         )
         .into_iter()
@@ -1869,7 +1878,7 @@ mod efivar_reader_tests {
                 ],
             ),
         ]);
-        list_questions(root, &strings(), IncludedStates::all(), reader)
+        list_questions(root, &strings(), IncludedStates::all(), None, reader)
             .into_iter()
             .map(|(_, state)| state.annotation())
             .collect()
@@ -1921,6 +1930,7 @@ mod efivar_reader_tests {
             Rc::clone(&root),
             &strings(),
             IncludedStates::empty(),
+            None,
             &mut reader,
         )
         .into_iter()
@@ -2075,6 +2085,7 @@ mod efivar_reader_tests {
                     Rc::clone(&root),
                     &strings(),
                     IncludedStates::empty(),
+                    None,
                     &mut reader,
                 )
                 .into_iter()
@@ -2848,13 +2859,15 @@ impl QuestionDescriptor {
 // list_questions returns a list of QuestionDescriptors in a FormSet
 // with their states, of the questions in a state that `include` may allow
 // node should be the root of a FormSet
+// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &[HashMap<i32, String>],
     include: IncludedStates,
+    access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
-    let values = VarStoreValues::new(&node);
+    let values = VarStoreValues::new(&node, access_level);
     list_questions_in(
         &node,
         &mut FormSetWalk::new(string_packages, reader, &values, include),
@@ -2923,18 +2936,20 @@ fn listed_question(
 /// find_question accepts the root node, string_packages and possible_question_phrases.
 /// possible_question_phrases is a vector of strings which represent variations of the
 /// same question. So if a single phrase matches then we assume that we have the answer.
-/// Of the matching questions, it selects one as select does.
+/// Of the matching questions, it selects one as select does, with conditions reading
+/// `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value.
 pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     string_packages: &[HashMap<i32, String>],
     possible_question_phrases: &HashSet<T>,
     include: IncludedStates,
+    access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
 ) -> Selection<QuestionDescriptor>
 where
     T: AsRef<str>,
 {
-    let values = VarStoreValues::new(&node);
+    let values = VarStoreValues::new(&node, access_level);
     find_question_in(
         &node,
         possible_question_phrases,
@@ -3018,7 +3033,8 @@ mod choice_for_set_tests {
     const SYSTEM_ACCESS_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI \
         variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore requires \
         EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level there \
-        (0 Administrator, 1 User)>";
+        (0 Administrator, 1 User); \
+        --access-level administrator|user states one>";
 
     /// set's choice for PROMPT in the FormSet `root`, where only the efivar Present, of
     /// 1 byte, exists.
@@ -3041,8 +3057,18 @@ mod choice_for_set_tests {
         root: &Rc<RefCell<IFROperation>>,
         efivars: &Efivars,
     ) -> Result<Choice<QuestionDescriptor>> {
+        choice_reading(root, efivars, None)
+    }
+
+    /// choice_with, with conditions reading `access_level`, if stated, for SystemAccess instead of
+    /// its value.
+    fn choice_reading(
+        root: &Rc<RefCell<IFROperation>>,
+        efivars: &Efivars,
+        access_level: Option<AccessLevel>,
+    ) -> Result<Choice<QuestionDescriptor>> {
         let mut reader = efivars.reader();
-        let values = VarStoreValues::new(root);
+        let values = VarStoreValues::new(root, access_level);
         let selection = find_question_in(
             root,
             &HashSet::from([PROMPT]),
@@ -3121,11 +3147,10 @@ mod choice_for_set_tests {
         );
     }
 
-    /// set's refusal of a question that AMI firmware grays out for a User session names where
-    /// the access level is kept.
-    #[test]
-    fn undetermined_match_on_the_ami_access_level_names_it() {
-        let error = choice_in(&parse_form_set(&[
+    /// The FormSet of PROMPT, question 1 on VarStore 1, which AMI firmware grays out for a
+    /// User session: SystemAccess, question 2, being 1.
+    fn grayed_out_for_users() -> Rc<RefCell<IFROperation>> {
+        parse_form_set(&[
             var_store_efi(1, "Present", NV_BS_RT, 1),
             var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
             form(
@@ -3135,8 +3160,14 @@ mod choice_for_set_tests {
                     conditional(GRAY_OUT_IF, eq_id_val_of(2, 1), &[checkbox_on(1, 3, 1)]),
                 ],
             ),
-        ]))
-        .expect_err("set refuses question 1");
+        ])
+    }
+
+    /// set's refusal of a question that AMI firmware grays out for a User session names where
+    /// the access level is kept.
+    #[test]
+    fn undetermined_match_on_the_ami_access_level_names_it() {
+        let error = choice_in(&grayed_out_for_users()).expect_err("set refuses question 1");
         assert_eq!(
             error.downcast_ref::<SelectionError>(),
             Some(&SelectionError::Undetermined {
@@ -3145,6 +3176,26 @@ mod choice_for_set_tests {
                 reasons: vec![SYSTEM_ACCESS_INPUT.to_string()],
             }),
             "question 1 under a GRAY_OUT_IF on the access level: {error:#}"
+        );
+    }
+
+    /// set chooses a question that AMI firmware grays out for a User session at a stated
+    /// Administrator level, and skips it as grayed out at a stated User level.
+    #[test]
+    fn stated_access_level_decides_the_choice() {
+        let root = grayed_out_for_users();
+        let efivars = Efivars::new();
+        efivars.write(&efi_variable("Present", 1), &[0]);
+
+        let administrator = choice_reading(&root, &efivars, Some(AccessLevel::Administrator));
+        assert!(
+            matches!(administrator, Ok(Choice::Chosen(..))),
+            "Administrator: {administrator:?}"
+        );
+        let user = choice_reading(&root, &efivars, Some(AccessLevel::User));
+        assert!(
+            matches!(user, Ok(Choice::Skipped(states)) if states == IncludedStates::GRAYED_OUT),
+            "User: {user:?}"
         );
     }
 
@@ -5288,7 +5339,7 @@ mod tests {
     #[test]
     fn questions_are_found_by_their_listed_name() {
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
-        let values = VarStoreValues::new(&root);
+        let values = VarStoreValues::new(&root, None);
         let prompted = |prompt: &str| vec![HashMap::from([(3, prompt.to_string())])];
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
@@ -5307,6 +5358,7 @@ mod tests {
             Rc::clone(&root),
             &prompted("  Prompt "),
             IncludedStates::empty(),
+            None,
             &mut Efivars::new().reader(),
         );
         let name = &listed[0].0.question;

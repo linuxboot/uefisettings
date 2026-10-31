@@ -252,3 +252,25 @@ fn set_of_a_question_without_a_varstore_is_refused() {
         }
     }
 }
+
+/// set, through hii set and set, refuses --access-level on a HiiDB that declares no SystemAccess
+/// VarStore, and writes nothing.
+#[test]
+fn set_with_an_access_level_is_refused_without_system_access() {
+    for prefix in PREFIXES {
+        for level in ["administrator", "user"] {
+            assert_eq!(
+                refuse(
+                    prefix,
+                    ONE_OF,
+                    "My one-of text #3",
+                    &["--access-level", level]
+                )
+                .error_message,
+                "--access-level applies to AMI firmware whose HiiDB declares the SystemAccess \
+                 VarStore; this HiiDB declares none",
+                "{prefix:?} {level}"
+            );
+        }
+    }
+}

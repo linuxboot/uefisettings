@@ -726,6 +726,7 @@ mod tests {
             Rc::clone(&root),
             &strings(),
             IncludedStates::empty(),
+            None,
             &mut efivars.reader(),
         );
         let Selection::Picked(found, _) = find_question(
@@ -733,6 +734,7 @@ mod tests {
             &strings(),
             &HashSet::from([PROMPT]),
             IncludedStates::empty(),
+            None,
             &mut efivars.reader(),
         ) else {
             panic!("find the question by its prompt");
@@ -762,6 +764,7 @@ mod tests {
             root,
             &strings(),
             IncludedStates::empty(),
+            None,
             &mut Efivars::new().reader(),
         );
 
@@ -804,6 +807,7 @@ mod tests {
             root,
             &strings(),
             IncludedStates::empty(),
+            None,
             &mut Efivars::new().reader(),
         );
 
@@ -846,6 +850,7 @@ mod tests {
             root,
             &strings(),
             IncludedStates::empty(),
+            None,
             &mut Efivars::new().reader(),
         );
 
