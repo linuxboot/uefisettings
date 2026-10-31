@@ -283,7 +283,7 @@ fn get_packages(package_list: &PackageList) -> Result<Vec<Package>> {
     Ok(packages)
 }
 
-#[derive(PartialEq, Eq, Copy, Clone, BinRead)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone, BinRead)]
 #[br(little)]
 pub struct Guid {
     pub data1: u32,

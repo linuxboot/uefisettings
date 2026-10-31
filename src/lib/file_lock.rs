@@ -13,6 +13,7 @@
 use std::fs::OpenOptions;
 use std::os::unix::prelude::IntoRawFd;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -22,18 +23,15 @@ use nix::fcntl::flock;
 use nix::fcntl::FlockArg;
 
 pub struct FileLock {
-    path: String,
+    path: PathBuf,
     file_descriptor: i32,
 }
 
 impl FileLock {
-    pub fn new<T>(file_path: T) -> Self
-    where
-        T: AsRef<Path> + ToString,
-    {
+    pub fn new(file_path: impl AsRef<Path>) -> Self {
         Self {
             file_descriptor: -1,
-            path: file_path.to_string(),
+            path: file_path.as_ref().to_path_buf(),
         }
     }
 
@@ -44,14 +42,15 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .open(&self.path)
-            .context(format!("failed to open or create {}", &self.path))?;
+            .context(format!("failed to open or create {}", self.path.display()))?;
 
         self.file_descriptor = file.into_raw_fd();
 
         match flock(self.file_descriptor, FlockArg::LockExclusiveNonblock) {
             Err(_) => Err(anyhow!(format!(
                 "failed to get lock on fd {} path {}",
-                &self.file_descriptor, &self.path
+                &self.file_descriptor,
+                self.path.display()
             ))),
             Ok(_) => Ok(()),
         }

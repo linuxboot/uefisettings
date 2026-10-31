@@ -16,6 +16,7 @@ pub mod extract;
 pub mod forms;
 pub mod package;
 mod strings;
+mod variables;
 // UEFI HII Library
 
 // Implements (partial) decoding of the Form and Strings packages.
@@ -26,5 +27,6 @@ pub(crate) use efivar_dump::dump_efivars;
 pub use efivar_dump::EfivarDump;
 pub use efivar_dump::EfivarRedaction;
 pub(crate) use efivar_dump::SavedDump;
-pub(crate) use efivarfs::EfivarReader;
-pub use efivarfs::EfivarSource;
+pub(crate) use efivarfs::EfivarFiles;
+pub(crate) use variables::EfivarReader;
+pub use variables::EfivarSource;

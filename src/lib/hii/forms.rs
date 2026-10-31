@@ -15,11 +15,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt;
-use std::fs::File;
 use std::io::Read;
 use std::io::Seek;
-use std::io::Write;
-use std::path::Path;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -34,20 +31,17 @@ use log::debug;
 use log::warn;
 use thiserror::Error;
 
-use crate::chattr::EfivarsImmutabilityGuard;
-use crate::file_lock::FileLock;
-use crate::hii::efivarfs::efivar_attributes;
-use crate::hii::efivarfs::open_efivar;
-use crate::hii::efivarfs::read_efivar_file;
-use crate::hii::efivarfs::EfivarFileName;
-use crate::hii::efivarfs::EfivarNotFound;
-use crate::hii::efivarfs::EfivarRange;
-use crate::hii::efivarfs::EfivarReader;
-use crate::hii::efivarfs::EfivarsMountGuard;
-use crate::hii::efivarfs::EfivarsNotRead;
-use crate::hii::efivarfs::EFIVARFS_HEADER_SIZE;
-use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::package::Guid;
+use crate::hii::variables::check_non_volatile;
+use crate::hii::variables::efivar_attributes;
+use crate::hii::variables::EfivarRange;
+use crate::hii::variables::EfivarReader;
+use crate::hii::variables::EfivarsNotRead;
+use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::VariableKey;
+use crate::hii::variables::VariableNotFound;
+use crate::hii::variables::VariableReach;
+use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use conditions::option_state;
 use conditions::question_state;
 use conditions::select;
@@ -78,9 +72,7 @@ mod defaults;
 pub(crate) mod ifr_fixtures;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
-const EFI_VARIABLE_NON_VOLATILE: u32 = 0x00000001;
 const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
-const MISSING_ATTRIBUTES_HEADER: &str = "efivarfs file is missing its attributes header";
 // UEFI 2.10 §33.3.8.3.47
 const EFI_IFR_NUMERIC_SIZE: u8 = 0x03;
 const EFI_IFR_NUMERIC_SIZE_1: u8 = 0x00;
@@ -116,34 +108,6 @@ const EDKII_BIT_FIELD_VALUE_BITS: u32 = 32;
 /// Example: Length includes the header, so an operation carries
 /// `length - IFR_OPERATION_HEADER_SIZE` bytes of data.
 const IFR_OPERATION_HEADER_SIZE: u8 = 2;
-
-/// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
-/// shorter than the `payload_size` bytes of its VarStore, which VarStoreWrite::new fits the
-/// write in.
-fn update_efivarfs_bytes(
-    bytes: &mut [u8],
-    payload_size: u16,
-    offset: u16,
-    encoded: &[u8],
-) -> Result<()> {
-    let payload = bytes
-        .get_mut(EFIVARFS_HEADER_SIZE..)
-        .context(MISSING_ATTRIBUTES_HEADER)?;
-    if payload.len() < usize::from(payload_size) {
-        return Err(anyhow!(
-            "efivarfs payload is shorter than the declared varstore: {} < {} bytes",
-            payload.len(),
-            payload_size
-        ));
-    }
-
-    let start = usize::from(offset);
-    payload
-        .get_mut(start..start + encoded.len())
-        .context("write past the efivarfs payload")?
-        .copy_from_slice(encoded);
-    Ok(())
-}
 
 // UEFI 2.10 §33.3.8.3, Table 33.11 IFR Opcodes
 #[derive(BinRead, Debug, PartialEq, Copy, Clone)]
@@ -880,71 +844,30 @@ trait VariableStore {
     fn kind(&self) -> VariableStoreKind;
     fn is_runtime_accessible(&self) -> bool;
 
-    fn efivar_file_name(&self) -> EfivarFileName {
-        EfivarFileName::new(&self.name(), self.guid())
-    }
-
-    /// Refuses an EFI variable without EFI_VARIABLE_RUNTIME_ACCESS, which efivarfs neither
-    /// lists nor writes (UEFI 2.10 §8.2.2, §8.2.3).
-    fn check_runtime_access(&self) -> std::result::Result<(), BootServiceOnlyVariable> {
-        if self.kind() == VariableStoreKind::EfiVariable && !self.is_runtime_accessible() {
-            return Err(BootServiceOnlyVariable(self.efivar_file_name()));
+    /// The variable that holds the values of this VarStore.
+    fn variable_key(&self) -> VariableKey {
+        VariableKey {
+            name: self.name(),
+            guid: self.guid(),
         }
-        Ok(())
     }
 
-    fn write_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
-        self.check_runtime_access()?;
-        self.write_efivarfs_at_offset(offset, encoded)
-    }
-
-    fn write_efivarfs_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
-        // Steps:
-        // * Read bytes
-        // * Seek to 4 + offset
-        // * If checks pass, write your answer
-
-        // We have three layers of checks so as to not accidentally corrupt EFI vars.
-
-        // The /run/lock/efibootmgr-remount lock will release automatically on drop.
-        // If something errors out, doesn't matter since we are using the flock syscall to lock it.
-        // Linux will then release it automatically after the program ends.
-
-        const LOCK_FILE_PATH: &str = "/run/lock/efibootmgr-remount";
-        let mut lock = FileLock::new(LOCK_FILE_PATH);
-        lock.lock()?;
-
-        let efivars = Path::new(EFIVARS_MOUNT_POINT);
-        let file_name = self.efivar_file_name();
-        let path = efivars.join(&file_name);
-
-        let file_ro = open_efivar(efivars, &file_name).map_err(VariableNotExported::explain)?;
-
-        let mut file_contents = file_ro
-            .metadata()
-            .and_then(|metadata| read_efivar_file(&file_ro, metadata.len()))
-            .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
-
-        let attributes = efivar_attributes(&file_contents).context(MISSING_ATTRIBUTES_HEADER)?;
-        check_non_volatile(&file_name, attributes)?;
-
-        update_efivarfs_bytes(&mut file_contents, self.size(), offset, encoded)?;
-
-        let _efifs = EfivarsMountGuard::new().context("Failed to create efivars fs mount guard")?;
-
-        // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
-        // validate temporarily writable.
-        let _immutability_attribute_guard = EfivarsImmutabilityGuard::new(&path)
-            .context("failed to create immutability attribute guard")?;
-
-        // All checks passed, now we can try to write.
-        debug!("Writing value to {}", path.display());
-        File::create(&path)
-            .context("Failed to open efivarfs file for writing")?
-            .write_all(&file_contents)
-            .context("Failed to write to efivarfs file")?;
-
-        Ok(())
+    /// Refuses, for variables of `reach` Runtime, an EFI variable without
+    /// EFI_VARIABLE_RUNTIME_ACCESS, which efivarfs neither lists nor writes (UEFI 2.10 §8.2.2,
+    /// §8.2.3).
+    fn check_runtime_access(
+        &self,
+        reach: VariableReach,
+    ) -> std::result::Result<(), BootServiceOnlyVariable> {
+        match reach {
+            VariableReach::Runtime
+                if self.kind() == VariableStoreKind::EfiVariable
+                    && !self.is_runtime_accessible() =>
+            {
+                Err(BootServiceOnlyVariable(self.variable_key()))
+            }
+            VariableReach::Runtime | VariableReach::BootServices => Ok(()),
+        }
     }
 }
 
@@ -956,13 +879,13 @@ trait VariableStore {
      cannot be set from Linux; change them in the firmware setup, or ask the board vendor for \
      firmware that exposes it; see https://github.com/linuxboot/uefisettings/issues/2"
 )]
-struct VariableNotExported(EfivarNotFound);
+struct VariableNotExported(VariableNotFound);
 
 impl VariableNotExported {
-    /// Turns open_efivar's EfivarNotFound into VariableNotExported; other errors pass through
-    /// unchanged.
+    /// Turns FirmwareVariables's VariableNotFound into VariableNotExported; other errors pass
+    /// through unchanged.
     fn explain(error: anyhow::Error) -> anyhow::Error {
-        match error.downcast::<EfivarNotFound>() {
+        match error.downcast::<VariableNotFound>() {
             Ok(not_found) => Self(not_found).into(),
             Err(error) => error,
         }
@@ -976,30 +899,7 @@ impl VariableNotExported {
     "EFI variable {0} is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs \
      neither lists nor writes"
 )]
-struct BootServiceOnlyVariable(EfivarFileName);
-
-/// Refuses an EFI variable without EFI_VARIABLE_NON_VOLATILE, which efivarfs cannot write
-/// (UEFI 2.10 §8.2.3).
-/// Takes the efivar file's attribute word, which Linux passes to SetVariable(), not
-/// VARSTORE_EFI's Attributes; check_runtime_access cannot, as a boot-service-only variable has
-/// no file.
-fn check_non_volatile(
-    name: &EfivarFileName,
-    attributes: u32,
-) -> std::result::Result<(), VolatileVariable> {
-    if attributes & EFI_VARIABLE_NON_VOLATILE == 0 {
-        return Err(VolatileVariable(name.clone()));
-    }
-    Ok(())
-}
-
-/// An EFI variable without EFI_VARIABLE_NON_VOLATILE, which set refuses.
-#[derive(Error, Debug)]
-#[error(
-    "EFI variable {0} is volatile (no EFI_VARIABLE_NON_VOLATILE) and cannot be written through \
-     efivarfs"
-)]
-struct VolatileVariable(EfivarFileName);
+struct BootServiceOnlyVariable(VariableKey);
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum VariableStoreKind {
@@ -1022,9 +922,13 @@ impl VarStoreVariable {
 
 #[cfg(test)]
 mod non_efi_varstore_tests {
+    use std::path::Path;
+
     use super::ifr_fixtures::*;
     use super::*;
-    use crate::hii::efivarfs::tests::EFI_GLOBAL_VARIABLE;
+    use crate::hii::efivarfs::EfivarFileName;
+    use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
+    use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
 
     struct TestVariableStore {
         kind: VariableStoreKind,
@@ -1049,10 +953,6 @@ mod non_efi_varstore_tests {
 
         fn is_runtime_accessible(&self) -> bool {
             self.kind == VariableStoreKind::EfiVariable
-        }
-
-        fn write_efivarfs_at_offset(&self, _offset: u16, _encoded: &[u8]) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -1096,11 +996,42 @@ mod non_efi_varstore_tests {
         }
     }
 
+    /// Without efivars, get shows a boot-service-only VarStore by the refusal it shows with them.
+    #[test]
+    fn boot_service_only_varstore_without_efivars_is_refused_as_with_them() {
+        let with_efivars = read(efi_varstore(0x3), &Efivars::new());
+
+        let without = read_current_value_bytes(
+            &Ok(Box::new(efi_varstore(0x3))),
+            0..1,
+            &mut disabled_reader(),
+        )
+        .map(<[u8]>::to_vec)
+        .map_err(|reason| reason.to_answer());
+
+        assert!(
+            matches!(&with_efivars, Err(answer) if answer.contains("is boot-service-only")),
+            "with efivars: {with_efivars:?}"
+        );
+        assert_eq!(without, with_efivars, "without efivars");
+    }
+
+    /// Writes 1 at offset 0 of `store`, as set does, in `variables`.
+    fn write_one(store: &VarStoreEfi, variables: &MemoryVariables) -> Result<()> {
+        VarStoreWrite::new(store, 0, TypeValue::NumSize8(1))?.write(variables)
+    }
+
+    /// MemoryVariables holding TestVarStore: NV_BS_RT, then 0.
+    fn test_var_store_variables() -> MemoryVariables {
+        let variables = MemoryVariables::default();
+        variables.insert(variable_key("TestVarStore"), NV_BS_RT, &[0]);
+        variables
+    }
+
     /// get shows a boot-service-only variable by the text of set's refusal of it.
     #[test]
     fn boot_service_only_text_is_shared_by_get_and_set() {
-        let refusal = efi_varstore(0x3)
-            .write_at_offset(0, &[1])
+        let refusal = write_one(&efi_varstore(0x3), &test_var_store_variables())
             .expect_err("write a boot-service-only variable")
             .to_string();
 
@@ -1111,12 +1042,14 @@ mod non_efi_varstore_tests {
         );
     }
 
+    /// set refuses a boot-service-only VarStore before it writes, though the variable is there.
     #[test]
     fn boot_service_only_varstore_write_is_rejected() {
         for attributes in [0x2, 0x3] {
+            let variables = test_var_store_variables();
+
             assert_eq!(
-                efi_varstore(attributes)
-                    .write_at_offset(0, &[1])
+                write_one(&efi_varstore(attributes), &variables)
                     .unwrap_err()
                     .to_string(),
                 "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is \
@@ -1124,28 +1057,74 @@ mod non_efi_varstore_tests {
                  lists nor writes",
                 "attributes {attributes:#x}"
             );
+            assert_eq!(
+                variables.writes_to(&variable_key("TestVarStore")),
+                [],
+                "writes, attributes {attributes:#x}"
+            );
         }
     }
 
+    /// Variables that reach BootServices read and write an NV|BS VARSTORE_EFI; for variables
+    /// that reach Runtime, check_runtime_access refuses it, with no read and no write.
     #[test]
-    fn volatile_efivar_is_refused() {
-        let name = EfivarFileName::new("TestVarStore", NIL_GUID);
+    fn boot_service_only_varstore_is_refused_only_for_runtime_variables() {
+        let refusal = "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is \
+                       boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs \
+                       neither lists nor writes";
         let cases = [
             (
-                BS_RT,
-                Err(
-                    "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is volatile \
-                     (no EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs"
-                        .to_string(),
-                ),
+                VariableReach::BootServices,
+                Ok(efivar_file_bytes(NV_BS, &[0])),
+                Ok(()),
+                vec![(variable_key("TestVarStore"), 1)],
+                vec![(0, vec![1])],
             ),
-            (NV_BS_RT, Ok(())),
+            (
+                VariableReach::Runtime,
+                Err(format!("<ValueUnavailable: {refusal}>")),
+                Err(refusal.to_string()),
+                vec![],
+                vec![],
+            ),
         ];
-        for (attributes, want) in cases {
+
+        for (reach, read_outcome, write_outcome, reads, writes) in cases {
+            let variables = Rc::new(MemoryVariables::with_reach(reach));
+            variables.insert(variable_key("TestVarStore"), NV_BS, &[0]);
+            let mut reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
+
+            let read =
+                read_current_value_bytes(&Ok(Box::new(efi_varstore(NV_BS))), 0..1, &mut reader)
+                    .map(<[u8]>::to_vec)
+                    .map_err(|reason| reason.to_answer());
+            let written =
+                write_one(&efi_varstore(NV_BS), &variables).map_err(|error| error.to_string());
+
+            assert_eq!(read, read_outcome, "{reach:?}: read");
+            assert_eq!(written, write_outcome, "{reach:?}: write");
+            assert_eq!(variables.reads(), reads, "{reach:?}: reads");
             assert_eq!(
-                check_non_volatile(&name, attributes).map_err(|error| error.to_string()),
-                want,
-                "attributes {attributes:#x}"
+                variables.writes_to(&variable_key("TestVarStore")),
+                writes,
+                "{reach:?}: writes"
+            );
+        }
+    }
+
+    /// set writes a runtime VarStore in its variable.
+    #[test]
+    fn runtime_varstore_is_written() {
+        for attributes in [0x6, 0x7] {
+            let variables = test_var_store_variables();
+
+            write_one(&efi_varstore(attributes), &variables)
+                .unwrap_or_else(|error| panic!("write attributes {attributes:#x}: {error:#}"));
+
+            assert_eq!(
+                variables.writes_to(&variable_key("TestVarStore")),
+                [(0, vec![1])],
+                "writes, attributes {attributes:#x}"
             );
         }
     }
@@ -1226,7 +1205,7 @@ mod non_efi_varstore_tests {
     /// to_answer gives each reason the text that get shows for it.
     #[test]
     fn to_answer_gives_each_reason_the_text_get_shows() {
-        let name = EfivarFileName::new("Setup", NIL_GUID);
+        let name = variable_key("Setup");
         let cases = [
             (
                 ValueUnavailable::NoVarStore("varstore not found because we reached root".into()),
@@ -1243,11 +1222,11 @@ mod non_efi_varstore_tests {
                 "<ValueUnavailable: EFI variables not read>",
             ),
             (
-                ValueUnavailable::Missing(EfivarNotFound { name: name.clone() }),
+                ValueUnavailable::Missing(VariableNotFound(name.clone())),
                 "<ValueUnavailable: no EFI variable Setup-00000000-0000-0000-0000-000000000000>",
             ),
             (
-                ValueUnavailable::MissingBuffer(EfivarNotFound { name }),
+                ValueUnavailable::MissingBuffer(VariableNotFound(name)),
                 "<ValueUnavailable: no EFI variable Setup-00000000-0000-0000-0000-000000000000; \
                  HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
             ),
@@ -1335,8 +1314,8 @@ mod non_efi_varstore_tests {
                 name: name.into(),
             };
             for file_name in [
-                var_store.efivar_file_name(),
-                var_store_efi.efivar_file_name(),
+                EfivarFileName::from(&var_store.variable_key()),
+                EfivarFileName::from(&var_store_efi.variable_key()),
             ] {
                 let path = Path::new(EFIVARS_MOUNT_POINT).join(file_name);
                 assert_eq!(
@@ -1388,7 +1367,15 @@ mod non_efi_varstore_tests {
             value_state: StateEvaluation::selectable(),
         };
 
-        change_value(&question, "Enabled").expect("set the buffer VarStore");
+        let variables = test_var_store_variables();
+
+        change_value(&question, "Enabled", &variables).expect("set the buffer VarStore");
+
+        assert_eq!(
+            variables.writes_to(&variable_key("TestVarStore")),
+            [(0, vec![1])],
+            "writes"
+        );
     }
 }
 
@@ -1396,7 +1383,7 @@ impl EfivarRange {
     /// The efivar bytes that hold the value of `store`.
     fn of(store: &dyn VariableStore) -> Self {
         Self {
-            name: store.efivar_file_name(),
+            key: store.variable_key(),
             size: store.size(),
         }
     }
@@ -1427,7 +1414,7 @@ fn read_current_value_bytes<'a>(
         Err(error) => return Err(ValueUnavailable::NoVarStore(error.to_string())),
     };
     store
-        .check_runtime_access()
+        .check_runtime_access(reader.reach())
         .map_err(ValueUnavailable::BootServiceOnly)?;
 
     reader
@@ -1447,9 +1434,9 @@ enum ValueUnavailable {
     #[error("{0}")]
     NotRead(EfivarsNotRead),
     #[error("{0}")]
-    Missing(EfivarNotFound),
+    Missing(VariableNotFound),
     #[error("{0}; HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL")]
-    MissingBuffer(EfivarNotFound),
+    MissingBuffer(VariableNotFound),
     /// The cause chain of a read error that the EfivarReader keeps, as `{:#}` shows it
     #[error("{0}")]
     ReadError(String),
@@ -1481,7 +1468,7 @@ impl ValueUnavailable {
         if let Some(&not_read) = error.downcast_ref::<EfivarsNotRead>() {
             return Self::NotRead(not_read);
         }
-        let Some(missing) = error.downcast_ref::<EfivarNotFound>() else {
+        let Some(missing) = error.downcast_ref::<VariableNotFound>() else {
             return Self::ReadError(format!("{error:#}"));
         };
         match kind {
@@ -1638,7 +1625,7 @@ mod efivar_reader_tests {
 
     use super::ifr_fixtures::*;
     use super::*;
-    use crate::hii::efivarfs::DecodedValue;
+    use crate::hii::variables::DecodedValue;
 
     const MISSING_BUFFER: &str = "<ValueUnavailable: no EFI variable \
         Missing-00000000-0000-0000-0000-000000000000; \
@@ -2134,14 +2121,14 @@ mod efivar_reader_tests {
             reader.decoded,
             BTreeMap::from([
                 (
-                    efi_variable("Bits", 4).efivar_file_name(),
+                    efi_variable("Bits", 4).variable_key(),
                     vec![DecodedValue {
                         size: 4,
                         value: 1..2
                     }]
                 ),
                 (
-                    efi_variable("Setup", 4).efivar_file_name(),
+                    efi_variable("Setup", 4).variable_key(),
                     vec![DecodedValue {
                         size: 4,
                         value: 3..4
@@ -3001,15 +2988,15 @@ pub(crate) fn choice_for_set(
         Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
     };
     let store = descriptor.store()?;
-    store.check_runtime_access()?;
+    store.check_runtime_access(reader.reach())?;
     if let Some(error) = reader.read_error(store) {
-        return Err(match error.downcast_ref::<EfivarNotFound>() {
+        return Err(match error.downcast_ref::<VariableNotFound>() {
             Some(missing) => VariableNotExported(missing.clone()).into(),
             None => anyhow!("{error:#}"),
         });
     }
     if let Some(attributes) = reader.attributes(store) {
-        check_non_volatile(&store.efivar_file_name(), attributes)?;
+        check_non_volatile(&store.variable_key(), attributes)?;
     }
     Ok(selection.for_set(question)?)
 }
@@ -3019,11 +3006,11 @@ mod choice_for_set_tests {
     use super::ifr_fixtures::*;
     use super::*;
 
-    /// The text of write_at_offset's refusal of the boot-service-only efivar Present.
+    /// The text of check_runtime_access's refusal of the boot-service-only efivar Present.
     const PRESENT_BOOT_SERVICE_ONLY: &str = "EFI variable \
         Present-00000000-0000-0000-0000-000000000000 is boot-service-only \
         (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists nor writes";
-    /// The EfivarNotFound of the efivar Missing.
+    /// The VariableNotFound of the efivar Missing.
     const MISSING_NOT_FOUND: &str = "no EFI variable Missing-00000000-0000-0000-0000-000000000000";
     /// Why the EQ_ID_VAL on question 2, on the efivar Missing, is not evaluated.
     const MISSING_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI variable \
@@ -3067,7 +3054,15 @@ mod choice_for_set_tests {
         efivars: &Efivars,
         access_level: Option<AccessLevel>,
     ) -> Result<Choice<QuestionDescriptor>> {
-        let mut reader = efivars.reader();
+        choice_by(root, efivars.reader(), access_level)
+    }
+
+    /// choice_reading, with `reader` instead of a reader of efivar files.
+    fn choice_by(
+        root: &Rc<RefCell<IFROperation>>,
+        mut reader: EfivarReader,
+        access_level: Option<AccessLevel>,
+    ) -> Result<Choice<QuestionDescriptor>> {
         let values = VarStoreValues::new(root, access_level);
         let selection = find_question_in(
             root,
@@ -3317,6 +3312,33 @@ mod choice_for_set_tests {
             matches!(non_volatile, Ok(Choice::Chosen(..))),
             "efivar file with attributes NV_BS_RT: {non_volatile:?}"
         );
+    }
+
+    /// set chooses a question on an NV|BS VARSTORE_EFI from variables that reach BootServices,
+    /// and refuses it, reading none, from variables that reach Runtime.
+    #[test]
+    fn match_on_a_boot_service_only_store_is_refused_only_for_runtime_variables() {
+        let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS, 1)], 1);
+        let choose = |reach| {
+            let variables = Rc::new(MemoryVariables::with_reach(reach));
+            variables.insert(variable_key("Present"), NV_BS, &[0]);
+            let reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
+            (choice_by(&root, reader, None), variables.reads())
+        };
+
+        let (choice, reads) = choose(VariableReach::BootServices);
+        assert!(
+            matches!(choice, Ok(Choice::Chosen(..))),
+            "BootServices: {choice:?}"
+        );
+        assert_eq!(reads, [(variable_key("Present"), 1)], "BootServices: reads");
+        let (choice, reads) = choose(VariableReach::Runtime);
+        assert_eq!(
+            choice.map_err(|error| error.to_string()).err().as_deref(),
+            Some(PRESENT_BOOT_SERVICE_ONLY),
+            "Runtime"
+        );
+        assert_eq!(reads, [], "Runtime: reads");
     }
 
     #[test]
@@ -4788,8 +4810,17 @@ impl<'a> VarStoreWrite<'a> {
         })
     }
 
-    fn write(&self) -> Result<()> {
-        self.store.write_at_offset(self.offset, &self.encoded)
+    /// Writes the value through `variables`, unless check_runtime_access refuses its VarStore.
+    fn write(&self, variables: &dyn FirmwareVariables) -> Result<()> {
+        self.store.check_runtime_access(variables.reach())?;
+        variables
+            .write_at(
+                &self.store.variable_key(),
+                self.store.size(),
+                self.offset,
+                &self.encoded,
+            )
+            .map_err(VariableNotExported::explain)
     }
 }
 
@@ -4874,8 +4905,8 @@ fn option_write<'a>(
 }
 
 /// Sets each of the `selected` questions, by the selector of its package list, to `new_value`
-/// or to its option of one of `texts` that chosen_option picks with `include`, and returns one
-/// option per selected question, in its order; None for a value; fails with
+/// or to its option of one of `texts` that chosen_option picks with `include`, in `variables`,
+/// and returns one option per selected question, in its order; None for a value; fails with
 /// SelectionError::NotFound when nothing is selected.
 /// It builds every VarStoreWrite before the first write, so that a value that one question
 /// refuses leaves every variable unchanged; then it writes each, also after a failed one, and
@@ -4887,6 +4918,7 @@ pub(crate) fn set_questions<'a>(
     new_value: &str,
     texts: &BTreeSet<String>,
     include: IncludedStates,
+    variables: &dyn FirmwareVariables,
 ) -> Result<Vec<Option<&'a AnswerOption>>> {
     if selected.is_empty() {
         return Err(SelectionError::NotFound {
@@ -4910,13 +4942,13 @@ pub(crate) fn set_questions<'a>(
         .collect::<Result<Vec<_>>>()?;
 
     if let [(_, write, option)] = writes.as_slice() {
-        write.write()?;
+        write.write(variables)?;
         return Ok(vec![*option]);
     }
     let mut written = Vec::new();
     let mut failed = Vec::new();
     for (selector, write, _) in &writes {
-        match write.write() {
+        match write.write(variables) {
             Ok(()) => written.push(selector.to_string()),
             Err(error) => failed.push((*selector, error)),
         }
@@ -5029,9 +5061,10 @@ mod set_questions_tests {
         question_descriptor(&node, var_store)
     }
 
-    /// set_questions of PROMPT to `new_value`, or to an option of the texts `texts`: the texts
-    /// of the options written, or the error as the CLI prints it.
+    /// set_questions of PROMPT to `new_value`, or to an option of the texts `texts`, in
+    /// `variables`: the texts of the options written, or the error as the CLI prints it.
     fn set_options(
+        variables: &MemoryVariables,
         selected: &[(&str, &QuestionDescriptor)],
         new_value: &str,
         texts: &[&str],
@@ -5042,6 +5075,7 @@ mod set_questions_tests {
             new_value,
             &texts.iter().map(|text| text.to_string()).collect(),
             IncludedStates::empty(),
+            variables,
         )
         .map(|options| {
             options
@@ -5052,29 +5086,35 @@ mod set_questions_tests {
         .map_err(|error| format!("{error:#}"))
     }
 
-    /// set_questions of PROMPT to `new_value`, its error as the CLI prints it.
+    /// set_questions of PROMPT to `new_value` in `variables`, its error as the CLI prints it.
     fn set(
+        variables: &MemoryVariables,
         selected: &[(&str, &QuestionDescriptor)],
         new_value: &str,
     ) -> std::result::Result<(), String> {
-        set_options(selected, new_value, &[]).map(drop)
+        set_options(variables, selected, new_value, &[]).map(drop)
+    }
+
+    /// The writes to the variable `name`.
+    fn writes(variables: &MemoryVariables, name: &str) -> Vec<(u16, Vec<u8>)> {
+        variables.writes_to(&variable_key(name))
     }
 
     #[test]
     fn every_match_is_written() {
-        let (first, first_writes) = recording_var_store(&[0]);
-        let (second, second_writes) = recording_var_store(&[0]);
-        let (a, b) = (checkbox_on_store(first), checkbox_on_store(second));
+        let variables = MemoryVariables::default();
+        let a = checkbox_on_store(writable_var_store("A", &[0], &variables));
+        let b = checkbox_on_store(writable_var_store("B", &[0], &variables));
 
-        assert_eq!(set(&[("A", &a), ("B", &b)], "1"), Ok(()), "set");
-        assert_eq!(*first_writes.borrow(), [(0, vec![1])], "writes of A");
-        assert_eq!(*second_writes.borrow(), [(0, vec![1])], "writes of B");
+        assert_eq!(set(&variables, &[("A", &a), ("B", &b)], "1"), Ok(()), "set");
+        assert_eq!(writes(&variables, "A"), [(0, vec![1])], "writes of A");
+        assert_eq!(writes(&variables, "B"), [(0, vec![1])], "writes of B");
     }
 
     #[test]
     fn no_match_is_not_found() {
         assert_eq!(
-            set(&[], "1"),
+            set(&MemoryVariables::default(), &[], "1"),
             Err("no question \"Prompt\" in the HiiDB".to_string()),
             "no selected question"
         );
@@ -5082,31 +5122,41 @@ mod set_questions_tests {
 
     #[test]
     fn the_options_written_follow_the_matches() {
-        let (first, first_writes) = recording_var_store(&[0]);
-        let (second, second_writes) = recording_var_store(&[0]);
-        let a = one_of_on_store(flagged_option(6, 0x00, 1), first);
-        let b = one_of_on_store(flagged_option(5, 0x00, 2), second);
+        let variables = MemoryVariables::default();
+        let a = one_of_on_store(
+            flagged_option(6, 0x00, 1),
+            writable_var_store("A", &[0], &variables),
+        );
+        let b = one_of_on_store(
+            flagged_option(5, 0x00, 2),
+            writable_var_store("B", &[0], &variables),
+        );
 
         assert_eq!(
-            set_options(&[("A", &a), ("B", &b)], "", &["Enabled", "Disabled"]),
+            set_options(
+                &variables,
+                &[("A", &a), ("B", &b)],
+                "",
+                &["Enabled", "Disabled"]
+            ),
             Ok(vec![
                 Some("Enabled".to_string()),
                 Some("Disabled".to_string())
             ]),
             "A's option Enabled, then B's option Disabled"
         );
-        assert_eq!(*first_writes.borrow(), [(0, vec![1])], "writes of A");
-        assert_eq!(*second_writes.borrow(), [(0, vec![2])], "writes of B");
+        assert_eq!(writes(&variables, "A"), [(0, vec![1])], "writes of A");
+        assert_eq!(writes(&variables, "B"), [(0, vec![2])], "writes of B");
     }
 
     #[test]
     fn a_failed_write_fails_set_after_the_other_writes() {
-        let (second, second_writes) = recording_var_store(&[0]);
-        let a = checkbox_on_store(failing_var_store(WRITE_ERROR));
-        let b = checkbox_on_store(second);
+        let mut variables = MemoryVariables::default();
+        let a = checkbox_on_store(failing_var_store("A", WRITE_ERROR, &mut variables));
+        let b = checkbox_on_store(writable_var_store("B", &[0], &variables));
 
         assert_eq!(
-            set(&[("A", &a), ("B", &b)], "1"),
+            set(&variables, &[("A", &a), ("B", &b)], "1"),
             Err(
                 "question \"Prompt\" was not set everywhere: write failed (in A); written in: B"
                     .to_string()
@@ -5114,7 +5164,7 @@ mod set_questions_tests {
             "set"
         );
         assert_eq!(
-            *second_writes.borrow(),
+            writes(&variables, "B"),
             [(0, vec![1])],
             "writes of B after A failed"
         );
@@ -5122,10 +5172,11 @@ mod set_questions_tests {
 
     #[test]
     fn the_failed_write_of_a_single_match_is_its_error() {
-        let a = checkbox_on_store(failing_var_store(WRITE_ERROR));
+        let mut variables = MemoryVariables::default();
+        let a = checkbox_on_store(failing_var_store("A", WRITE_ERROR, &mut variables));
 
         assert_eq!(
-            set(&[("A", &a)], "1"),
+            set(&variables, &[("A", &a)], "1"),
             Err(WRITE_ERROR.cause.to_string()),
             "one match"
         );
@@ -5133,77 +5184,75 @@ mod set_questions_tests {
 
     #[test]
     fn a_value_that_one_match_refuses_writes_no_match() {
-        let (first, first_writes) = recording_var_store(&[0]);
-        let (second, second_writes) = recording_var_store(&[0]);
-        let a = numeric_on_store(200, first);
-        let b = numeric_on_store(100, second);
+        let variables = MemoryVariables::default();
+        let a = numeric_on_store(200, writable_var_store("A", &[0], &variables));
+        let b = numeric_on_store(100, writable_var_store("B", &[0], &variables));
 
         assert_eq!(
-            set(&[("A", &a), ("B", &b)], "150"),
+            set(&variables, &[("A", &a), ("B", &b)], "150"),
             Err("provided value exceeded max possible value".to_string()),
             "150, above the maximum of B"
         );
-        assert_eq!(*first_writes.borrow(), [], "writes of A");
-        assert_eq!(*second_writes.borrow(), [], "writes of B");
+        assert_eq!(writes(&variables, "A"), [], "writes of A");
+        assert_eq!(writes(&variables, "B"), [], "writes of B");
     }
 
     #[test]
     fn a_write_that_the_ifr_of_one_match_refuses_writes_no_match() {
-        let (first, first_writes) = recording_var_store(&[0]);
-        let a = checkbox_on_store(first);
-        let (boolean_store, boolean_writes) = recording_var_store(&[0]);
-        let boolean_option = one_of_on_store(one_of_option(6, 0x04, &[1]), boolean_store);
-        let (short_store, past_writes) = recording_var_store(&[0]);
-        let past_the_var_store = checkbox_at(1, short_store);
+        let variables = MemoryVariables::default();
+        let a = checkbox_on_store(writable_var_store("A", &[0], &variables));
+        let boolean_option = one_of_on_store(
+            one_of_option(6, 0x04, &[1]),
+            writable_var_store("Boolean", &[0], &variables),
+        );
+        let past_the_var_store = checkbox_at(1, writable_var_store("Short", &[0], &variables));
         // 8-bit UINT_DEC fields at bit 0: writes take VarOffset in bytes
-        let (numeric_bits_store, numeric_bits_writes) = recording_var_store(&[0; 4]);
         let bit_field_numeric = bit_field_on_store(
             NUMERIC,
             &uint32_range_question(0, 0x48),
             &[],
-            numeric_bits_store,
+            writable_var_store("NumericBits", &[0; 4], &variables),
         );
-        let (one_of_bits_store, one_of_bits_writes) = recording_var_store(&[0; 4]);
         let bit_field_one_of = bit_field_on_store(
             ONE_OF,
             &uint32_range_question(0, 0x48),
             &[one_of_option(6, 0x02, &1u32.to_le_bytes())],
-            one_of_bits_store,
+            writable_var_store("OneOfBits", &[0; 4], &variables),
         );
         let cases = [
             (
                 "B's option of Type BOOLEAN",
                 &boolean_option,
                 "unsupported value type for efivarfs write",
-                &boolean_writes,
+                "Boolean",
             ),
             (
                 "B at VarOffset 1 of its 1-byte VarStore",
                 &past_the_var_store,
                 "write at offset 1 with width 1 exceeds varstore size 1",
-                &past_writes,
+                "Short",
             ),
             (
                 "B an EDKII bit-field NUMERIC",
                 &bit_field_numeric,
                 "setting EDKII bit-field values is not supported",
-                &numeric_bits_writes,
+                "NumericBits",
             ),
             (
                 "B's option of an EDKII bit-field ONE_OF",
                 &bit_field_one_of,
                 "setting EDKII bit-field values is not supported",
-                &one_of_bits_writes,
+                "OneOfBits",
             ),
         ];
-        for (case, b, error, b_writes) in cases {
+        for (case, b, error, b_variable) in cases {
             assert_eq!(
-                set_options(&[("A", &a), ("B", b)], "1", &["Enabled"]),
+                set_options(&variables, &[("A", &a), ("B", b)], "1", &["Enabled"]),
                 Err(error.to_string()),
                 "{case}"
             );
-            assert_eq!(*first_writes.borrow(), [], "writes of A, {case}");
-            assert_eq!(*b_writes.borrow(), [], "writes of B, {case}");
+            assert_eq!(writes(&variables, "A"), [], "writes of A, {case}");
+            assert_eq!(writes(&variables, b_variable), [], "writes of B, {case}");
         }
     }
 
@@ -5238,10 +5287,14 @@ mod set_questions_tests {
                 "failed to write: permission denied (in A, C); write failed (in B)",
             ),
         ];
-        for (case, errors, failures) in cases {
-            let [a, b, c] = errors.map(|error| checkbox_on_store(failing_var_store(error)));
+        for (case, [a_error, b_error, c_error], failures) in cases {
+            let mut variables = MemoryVariables::default();
+            let [a, b, c] =
+                [("A", a_error), ("B", b_error), ("C", c_error)].map(|(name, error)| {
+                    checkbox_on_store(failing_var_store(name, error, &mut variables))
+                });
             assert_eq!(
-                set(&[("A", &a), ("B", &b), ("C", &c)], "1"),
+                set(&variables, &[("A", &a), ("B", &b), ("C", &c)], "1"),
                 Err(format!(
                     "question \"Prompt\" was not set everywhere: {failures}; written in: none"
                 )),
@@ -5331,7 +5384,9 @@ fn find_corresponding_varstore(
 mod tests {
     use super::ifr_fixtures::*;
     use super::*;
+    use crate::hii::efivarfs::open_efivar;
     use crate::hii::efivarfs::read_efivarfs_bytes;
+    use crate::hii::efivarfs::EfivarFileName;
 
     /// find_question_in finds a question by the name that list_questions prints, whose leading
     /// and trailing whitespace the prompt string keeps, and by that name with other surrounding
@@ -5442,12 +5497,8 @@ mod tests {
         }
     }
 
-    fn variable_bytes(payload_size: usize) -> Vec<u8> {
-        let mut bytes = 7u32.to_le_bytes().to_vec();
-        bytes.extend(vec![0xa5; payload_size]);
-        bytes
-    }
-
+    /// set writes each integer width at the end of its VarStore, through FirmwareVariables, which
+    /// keep the attributes word and the other bytes.
     #[test]
     fn writes_each_integer_width_at_end_of_varstore() {
         let store = efi_variable("Test", 42);
@@ -5463,8 +5514,11 @@ mod tests {
                 u64::MAX.to_le_bytes().to_vec(),
             ),
         ] {
-            let mut bytes = variable_bytes(42);
-            let mut expected = bytes.clone();
+            let variables = MemoryVariables::default();
+            variables.insert(store.variable_key(), NV_BS_RT, &[0xa5; 42]);
+            let mut expected = variables
+                .bytes(&store.variable_key())
+                .expect("the bytes of Test");
             let offset = 42 - encoded.len();
             expected[EFIVARFS_HEADER_SIZE + offset..].copy_from_slice(&encoded);
             let write = VarStoreWrite::new(
@@ -5474,20 +5528,54 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("write {data:?} at offset {offset}: {error}"));
             assert_eq!(write.encoded, encoded, "{data:?}");
-            update_efivarfs_bytes(&mut bytes, 42, write.offset, &write.encoded)
-                .unwrap_or_else(|error| panic!("update {data:?} at offset {offset}: {error}"));
-            assert_eq!(bytes, expected, "{data:?}");
+
+            write
+                .write(&variables)
+                .unwrap_or_else(|error| panic!("write {data:?} at offset {offset}: {error:#}"));
+
+            assert_eq!(
+                variables.bytes(&store.variable_key()),
+                Some(expected),
+                "{data:?}"
+            );
         }
     }
 
+    /// set refuses a VarStore whose variable is shorter than its Size, also where the value
+    /// fits, and writes nothing.
     #[test]
-    fn trailing_thermal_fields_do_not_overlap() {
-        let mut bytes = variable_bytes(42);
-        update_efivarfs_bytes(&mut bytes, 42, 38, &95u16.to_le_bytes()).expect("update 38");
-        update_efivarfs_bytes(&mut bytes, 42, 40, &90u16.to_le_bytes()).expect("update 40");
-        assert_eq!(stored_value(&bytes[EFIVARFS_HEADER_SIZE + 38..][..2]), 95);
-        assert_eq!(stored_value(&bytes[EFIVARFS_HEADER_SIZE + 40..][..2]), 90);
-        assert_eq!(&bytes[..4], &7u32.to_le_bytes());
+    fn write_of_a_variable_shorter_than_its_var_store_is_refused() {
+        let store = efi_variable("Short", 4);
+        let variables = MemoryVariables::default();
+        variables.insert(store.variable_key(), NV_BS_RT, &[0; 2]);
+        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1)).expect("write 1");
+
+        let error = write
+            .write(&variables)
+            .expect_err("write a variable shorter than its VarStore");
+
+        assert_eq!(
+            error.to_string(),
+            "efivarfs payload is shorter than the declared varstore: 2 < 4 bytes",
+            "refusal"
+        );
+        assert_eq!(variables.writes_to(&store.variable_key()), [], "writes");
+    }
+
+    /// set of a VarStore whose variable is missing explains why it cannot write it.
+    #[test]
+    fn write_of_a_missing_variable_is_explained_as_not_exported() {
+        let store = efi_variable("Setup", 1);
+        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1)).expect("write 1");
+
+        let error = write
+            .write(&MemoryVariables::default())
+            .expect_err("write a missing variable");
+
+        assert!(
+            error.downcast_ref::<VariableNotExported>().is_some(),
+            "{error:#} is not VariableNotExported"
+        );
     }
 
     #[test]
@@ -5510,68 +5598,6 @@ mod tests {
                 )),
                 "{data:?} at offset {offset} of {size} bytes"
             );
-        }
-    }
-
-    #[test]
-    fn rejects_writes_past_the_payload_without_changing_bytes() {
-        for (offset, encoded) in [(42, &[1][..]), (41, &[1, 2]), (u16::MAX, &[1])] {
-            let mut bytes = variable_bytes(42);
-            let original = bytes.clone();
-            assert_eq!(
-                update_efivarfs_bytes(&mut bytes, 42, offset, encoded)
-                    .map_err(|error| error.to_string()),
-                Err("write past the efivarfs payload".to_string()),
-                "{} bytes at offset {offset}",
-                encoded.len()
-            );
-            assert_eq!(
-                bytes,
-                original,
-                "{} bytes at offset {offset}",
-                encoded.len()
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_short_payload_even_when_requested_field_fits() {
-        for offset in [0, 40] {
-            let mut bytes = variable_bytes(39);
-            let original = bytes.clone();
-            assert!(update_efivarfs_bytes(&mut bytes, 42, offset, &1u16.to_le_bytes()).is_err());
-            assert_eq!(bytes, original);
-        }
-    }
-
-    #[test]
-    fn rejects_incomplete_attributes_header() {
-        for length in 0..EFIVARFS_HEADER_SIZE {
-            let mut bytes = vec![0xa5; length];
-            let original = bytes.clone();
-            assert!(update_efivarfs_bytes(&mut bytes, 1, 0, &[1]).is_err());
-            assert_eq!(bytes, original);
-        }
-    }
-
-    #[test]
-    fn preserves_bytes_beyond_declared_varstore() {
-        let mut bytes = variable_bytes(50);
-        let original = bytes.clone();
-        update_efivarfs_bytes(&mut bytes, 42, 40, &95u16.to_le_bytes()).expect("update 40");
-        assert_eq!(&bytes[46..], &original[46..]);
-        assert_eq!(&bytes[..44], &original[..44]);
-        assert_eq!(bytes.len(), original.len());
-    }
-
-    #[test]
-    fn writes_small_and_maximum_sized_varstores() {
-        for size in [1, 2, u16::MAX] {
-            let mut bytes = variable_bytes(usize::from(size));
-            update_efivarfs_bytes(&mut bytes, size, size - 1, &[95])
-                .unwrap_or_else(|error| panic!("update the last of {size} bytes: {error}"));
-            assert_eq!(bytes.len(), EFIVARFS_HEADER_SIZE + usize::from(size));
-            assert_eq!(bytes.last(), Some(&95));
         }
     }
 
@@ -5601,17 +5627,17 @@ mod tests {
 
     #[test]
     fn missing_efivar_is_explained_as_not_exported() {
-        let name = EfivarFileName::new(
-            "Setup",
-            Guid {
+        let key = VariableKey {
+            name: "Setup".to_string(),
+            guid: Guid {
                 data1: 0xec87d643,
                 data2: 0xeba4,
                 data3: 0x4bb5,
                 data4: [0xa1, 0xe5, 0x3f, 0x3e, 0x36, 0xb2, 0x0d, 0xa9],
             },
-        );
+        };
 
-        let error = VariableNotExported::explain(EfivarNotFound { name }.into());
+        let error = VariableNotExported::explain(VariableNotFound(key).into());
 
         assert!(
             error.downcast_ref::<VariableNotExported>().is_some(),
@@ -5862,49 +5888,24 @@ mod write_validation_tests {
     use super::ifr_fixtures::*;
     use super::*;
 
-    struct RecordingVarStore {
-        writes: RecordedWrites,
-    }
-
-    impl VariableStore for RecordingVarStore {
-        fn name(&self) -> String {
-            "NumericTest".to_string()
-        }
-
-        fn guid(&self) -> Guid {
-            NIL_GUID
-        }
-
-        fn size(&self) -> u16 {
-            42
-        }
-
-        fn kind(&self) -> VariableStoreKind {
-            VariableStoreKind::Buffer
-        }
-
-        fn is_runtime_accessible(&self) -> bool {
-            false
-        }
-
-        fn write_efivarfs_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
-            self.writes.borrow_mut().push((offset, encoded.to_vec()));
-            Ok(())
-        }
-    }
-
-    fn recording_store() -> (VarStoreFixture, RecordedWrites) {
-        let writes = RecordedWrites::default();
-        let store = RecordingVarStore {
-            writes: Rc::clone(&writes),
-        };
+    /// The buffer VarStore NumericTest of 42 bytes, whose efivar file holds `payload`, and
+    /// variables that hold it too, for set to write there.
+    fn numeric_test_store(payload: &[u8]) -> (VarStoreFixture, MemoryVariables) {
+        let store = buffer("NumericTest", 42);
+        let variables = MemoryVariables::default();
+        variables.insert(store.variable_key(), NV_BS_RT, payload);
         let efivars = Efivars::new();
-        efivars.write(&store, &[0; 42]);
+        efivars.write(&store, payload);
         let fixture = VarStoreFixture {
             store: Ok(Box::new(store)),
             efivars,
         };
-        (fixture, writes)
+        (fixture, variables)
+    }
+
+    /// The writes to NumericTest.
+    fn writes(variables: &MemoryVariables) -> Vec<(u16, Vec<u8>)> {
+        variables.writes_to(&variable_key("NumericTest"))
     }
 
     fn numeric_question(
@@ -5914,7 +5915,7 @@ mod write_validation_tests {
         step: u64,
         display: u8,
         initial: u64,
-    ) -> (QuestionDescriptor, RecordedWrites) {
+    ) -> (QuestionDescriptor, MemoryVariables) {
         let (width_code, range) = match bits {
             8 => (
                 0,
@@ -5978,18 +5979,13 @@ mod write_validation_tests {
         let mut payload = vec![0; 42];
         let width = (bits / 8) as usize;
         payload[2..2 + width].copy_from_slice(&initial.to_le_bytes()[..width]);
-        let writes = Rc::new(RefCell::new(Vec::new()));
-        let store = RecordingVarStore {
-            writes: Rc::clone(&writes),
-        };
-        let efivars = Efivars::new();
-        efivars.write(&store, &payload);
+        let (VarStoreFixture { store, efivars }, variables) = numeric_test_store(&payload);
         let current = node.borrow();
         let ParsedOperation::Numeric(parsed) = &current.parsed_data else {
             panic!("not a NUMERIC: {:?}", current.parsed_data);
         };
         let question = handle_numeric(
-            Ok(Box::new(store)),
+            store,
             parsed,
             "Numeric test",
             &current,
@@ -6000,7 +5996,7 @@ mod write_validation_tests {
                 IncludedStates::empty(),
             ),
         );
-        (question, writes)
+        (question, variables)
     }
 
     fn encoded_value(bits: u32, value: i128) -> Vec<u8> {
@@ -6011,13 +6007,13 @@ mod write_validation_tests {
     #[test]
     fn rejects_unsigned_out_of_range_values_before_writing() {
         for bits in [8, 16, 32, 64] {
-            let (question, writes) = numeric_question(bits, 10, 20, 2, 0x10, 10);
+            let (question, variables) = numeric_question(bits, 10, 20, 2, 0x10, 10);
             assert!(matches!(
-                change_value(&question, "9"),
+                change_value(&question, "9", &variables),
                 Err(ChangeValueError::BelowMinValue)
             ));
             assert!(matches!(
-                change_value(&question, "21"),
+                change_value(&question, "21", &variables),
                 Err(ChangeValueError::ExceededMaxValue)
             ));
             for value in [
@@ -6025,9 +6021,9 @@ mod write_validation_tests {
                 "not-a-number",
                 "340282366920938463463374607431768211455",
             ] {
-                assert!(change_value(&question, value).is_err());
+                assert!(change_value(&question, value, &variables).is_err());
             }
-            assert!(writes.borrow().is_empty());
+            assert!(writes(&variables).is_empty());
         }
     }
 
@@ -6036,17 +6032,18 @@ mod write_validation_tests {
         for bits in [8, 16, 32, 64] {
             for step in [0, 2] {
                 for display in [0x10, 0x20] {
-                    let (question, writes) = numeric_question(bits, 10, 20, step, display, 10);
+                    let (question, variables) = numeric_question(bits, 10, 20, step, display, 10);
                     for value in [10, 11, 20] {
-                        change_value(&question, &value.to_string()).unwrap_or_else(|error| {
+                        let changed = change_value(&question, &value.to_string(), &variables);
+                        if let Err(error) = changed {
                             panic!(
                                 "set {value} at {bits} bits, step {step}, display {display:#x}: \
                                  {error}"
-                            )
-                        });
+                            );
+                        }
                     }
                     assert_eq!(
-                        *writes.borrow(),
+                        writes(&variables),
                         vec![
                             (2, encoded_value(bits, 10)),
                             (2, encoded_value(bits, 11)),
@@ -6061,24 +6058,24 @@ mod write_validation_tests {
     #[test]
     fn validates_signed_bounds_and_encodes_negative_values() {
         for bits in [8, 16, 32, 64] {
-            let (question, writes) =
+            let (question, variables) =
                 numeric_question(bits, (-10i64) as u64, 10, 1, 0, (-3i64) as u64);
             assert_eq!(question.value, "-3");
             assert!(matches!(
-                change_value(&question, "-11"),
+                change_value(&question, "-11", &variables),
                 Err(ChangeValueError::BelowMinValue)
             ));
             assert!(matches!(
-                change_value(&question, "11"),
+                change_value(&question, "11", &variables),
                 Err(ChangeValueError::ExceededMaxValue)
             ));
-            assert!(writes.borrow().is_empty());
+            assert!(writes(&variables).is_empty());
             for value in [-10, 0, 10] {
-                change_value(&question, &value.to_string())
+                change_value(&question, &value.to_string(), &variables)
                     .unwrap_or_else(|error| panic!("set {value} at {bits} bits: {error}"));
             }
             assert_eq!(
-                *writes.borrow(),
+                writes(&variables),
                 vec![
                     (2, encoded_value(bits, -10)),
                     (2, encoded_value(bits, 0)),
@@ -6093,37 +6090,40 @@ mod write_validation_tests {
         for bits in [8, 16, 32, 64] {
             let minimum = -(1i128 << (bits - 1));
             let maximum = (1i128 << (bits - 1)) - 1;
-            let (question, writes) =
+            let (question, variables) =
                 numeric_question(bits, minimum as u64, maximum as u64, 1, 0, 0);
-            change_value(&question, &minimum.to_string())
+            change_value(&question, &minimum.to_string(), &variables)
                 .unwrap_or_else(|error| panic!("set {minimum} at {bits} bits: {error}"));
-            change_value(&question, &maximum.to_string())
+            change_value(&question, &maximum.to_string(), &variables)
                 .unwrap_or_else(|error| panic!("set {maximum} at {bits} bits: {error}"));
-            assert!(change_value(&question, &(minimum - 1).to_string()).is_err());
-            assert!(change_value(&question, &(maximum + 1).to_string()).is_err());
-            assert_eq!(writes.borrow().len(), 2);
+            assert!(change_value(&question, &(minimum - 1).to_string(), &variables).is_err());
+            assert!(change_value(&question, &(maximum + 1).to_string(), &variables).is_err());
+            assert_eq!(writes(&variables).len(), 2);
         }
     }
 
     #[test]
     fn supports_unsigned_64_bit_values_above_signed_maximum() {
-        let (question, writes) = numeric_question(64, u64::MAX - 2, u64::MAX, 1, 0x10, u64::MAX);
+        let (question, variables) = numeric_question(64, u64::MAX - 2, u64::MAX, 1, 0x10, u64::MAX);
         assert_eq!(question.value, u64::MAX.to_string());
-        change_value(&question, &u64::MAX.to_string()).expect("set u64::MAX");
-        assert_eq!(*writes.borrow(), vec![(2, u64::MAX.to_le_bytes().to_vec())]);
-        assert!(change_value(&question, "18446744073709551616").is_err());
-        assert_eq!(writes.borrow().len(), 1);
+        change_value(&question, &u64::MAX.to_string(), &variables).expect("set u64::MAX");
+        assert_eq!(
+            writes(&variables),
+            vec![(2, u64::MAX.to_le_bytes().to_vec())]
+        );
+        assert!(change_value(&question, "18446744073709551616", &variables).is_err());
+        assert_eq!(writes(&variables).len(), 1);
     }
 
     #[test]
     fn rejects_invalid_numeric_ranges_without_writing() {
         for bits in [8, 16, 32, 64] {
-            let (question, writes) = numeric_question(bits, 20, 10, 1, 0x10, 0);
+            let (question, variables) = numeric_question(bits, 20, 10, 1, 0x10, 0);
             assert!(matches!(
-                change_value(&question, "15"),
+                change_value(&question, "15", &variables),
                 Err(ChangeValueError::InvalidNumericRange)
             ));
-            assert!(writes.borrow().is_empty());
+            assert!(writes(&variables).is_empty());
         }
     }
 
@@ -6161,23 +6161,23 @@ mod write_validation_tests {
             ),
         ];
         for (name, op_code, data, children, value, write) in cases {
-            let set = |guid, var_store| {
+            let set = |guid, var_store, variables: &MemoryVariables| {
                 let (_root, node) = parse_question_in_guid(guid, op_code, &data, &children);
-                change_value(&question_descriptor(&node, var_store), value)
+                change_value(&question_descriptor(&node, var_store), value, variables)
             };
 
-            let (store, writes) = recording_store();
-            let changed = set(BIT_VARSTORE_GUID, store);
+            let (store, variables) = numeric_test_store(&[0; 42]);
+            let changed = set(BIT_VARSTORE_GUID, store, &variables);
             assert!(
                 matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
                 "{name}, GUID {BIT_VARSTORE_GUID:02X?}: {changed:?}"
             );
             assert!(
-                writes.borrow().is_empty(),
+                writes(&variables).is_empty(),
                 "{name}, GUID {BIT_VARSTORE_GUID:02X?}"
             );
 
-            let changed = set(BIT_VARSTORE_GUID, unavailable());
+            let changed = set(BIT_VARSTORE_GUID, unavailable(), &variables);
             assert!(
                 matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
                 "{name}, GUID {BIT_VARSTORE_GUID:02X?} without VarStore: {changed:?}"
@@ -6186,21 +6186,21 @@ mod write_validation_tests {
             // set writes a ONE_OF's option as change_option does, not as change_value does
             let (_root, node) =
                 parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &children);
-            let (store, writes) = recording_store();
+            let (store, variables) = numeric_test_store(&[0; 42]);
             let question = question_descriptor(&node, store);
             for option in &question.possible_options {
-                let changed = change_option(&question, option);
+                let changed = change_option(&question, option, &variables);
                 assert!(
                     matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
                     "{name}: change_option {:?}: {changed:?}",
                     option.value
                 );
             }
-            assert!(writes.borrow().is_empty(), "{name}: change_option");
+            assert!(writes(&variables).is_empty(), "{name}: change_option");
 
             let question = question_descriptor(&node, unavailable());
             for option in &question.possible_options {
-                let changed = change_option(&question, option);
+                let changed = change_option(&question, option, &variables);
                 assert!(
                     matches!(changed, Err(ChangeValueError::UnsupportedBitField)),
                     "{name}: change_option {:?} without VarStore: {changed:?}",
@@ -6209,13 +6209,17 @@ mod write_validation_tests {
             }
 
             let other_guid = OTHER_GUID;
-            let (store, writes) = recording_store();
-            let changed = set(other_guid, store);
+            let (store, variables) = numeric_test_store(&[0; 42]);
+            let changed = set(other_guid, store, &variables);
             assert!(
                 matches!(changed, Ok(())),
                 "{name}, GUID {other_guid:02X?}: {changed:?}"
             );
-            assert_eq!(*writes.borrow(), [write], "{name}, GUID {other_guid:02X?}");
+            assert_eq!(
+                writes(&variables),
+                [write],
+                "{name}, GUID {other_guid:02X?}"
+            );
         }
     }
 

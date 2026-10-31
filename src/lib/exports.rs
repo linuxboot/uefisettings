@@ -39,6 +39,7 @@ use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::package;
 pub use crate::hii::EfivarDump;
+use crate::hii::EfivarFiles;
 use crate::hii::EfivarReader;
 pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
@@ -335,6 +336,7 @@ impl HiiBackend {
             new_value,
             &new_value_variations,
             include,
+            &EfivarFiles::system(),
         )?
         .into_iter()
         .map(|chosen| chosen.map_or_else(String::new, |option| option.state.option_annotation()))

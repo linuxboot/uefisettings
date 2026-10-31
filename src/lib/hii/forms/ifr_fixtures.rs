@@ -13,6 +13,7 @@
 //! IFR byte builders and question answers shared by the tests of forms.rs and its modules.
 
 use std::fs;
+use std::path::Path;
 
 use tempfile::TempDir;
 
@@ -20,7 +21,15 @@ use super::conditions::QuestionValue;
 use super::conditions::QuestionValues;
 use super::conditions::VarStoreValues;
 use super::*;
-use crate::hii::efivarfs::EfivarSource;
+use crate::hii::efivarfs::EfivarFileName;
+pub(super) use crate::hii::variables::tests::variable_key;
+pub(super) use crate::hii::variables::tests::MemoryVariables;
+pub(super) use crate::hii::variables::tests::WriteError;
+pub(super) use crate::hii::variables::tests::BS_RT;
+pub(crate) use crate::hii::variables::tests::NIL_GUID;
+pub(super) use crate::hii::variables::tests::NV_BS;
+pub(crate) use crate::hii::variables::tests::NV_BS_RT;
+use crate::hii::variables::EfivarSource;
 
 pub(crate) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
 
@@ -56,13 +65,6 @@ pub(crate) const SYSTEM_ACCESS_GUID: [u8; 16] = [
     0x69, 0xBB, 0x70, 0xE7, 0xB4, 0xBC, 0x04, 0x4D, 0x9E, 0x97, 0x23, 0xFF, 0x94, 0x56, 0xFE, 0xAC,
 ];
 
-/// EFI variable Attributes: non-volatile, boot service and runtime access.
-pub(crate) const NV_BS_RT: u32 = 0x07;
-/// EFI variable Attributes: non-volatile and boot service access only.
-pub(super) const NV_BS: u32 = 0x03;
-/// EFI variable Attributes: boot service and runtime access, volatile.
-pub(super) const BS_RT: u32 = 0x06;
-
 pub(super) const GUID: u8 = 0x5F;
 
 /// EDKII_IFR_BIT_VARSTORE_GUID 82DDD68B-9163-4187-9B27-20A8FD60A71D as stored.
@@ -80,33 +82,12 @@ pub(super) const PADDED_ENABLED: u16 = 8;
 /// The reason `unavailable()` gives.
 pub(super) const UNAVAILABLE: &str = "<ValueUnavailable: no VarStore 1>";
 
-pub(crate) const NIL_GUID: Guid = Guid {
-    data1: 0,
-    data2: 0,
-    data3: 0,
-    data4: [0; 8],
-};
-
-/// The VarOffsets and little-endian values written to a VarStore.
-pub(super) type RecordedWrites = Rc<RefCell<Vec<(u16, Vec<u8>)>>>;
-
 /// A VarStore declared without IFR bytes.
-/// Writes go to `writes`, or fail with `write_error`, never to efivarfs.
 pub(super) struct DeclaredVarStore {
     pub(super) name: &'static str,
     pub(super) size: u16,
     pub(super) kind: VariableStoreKind,
     pub(super) runtime_accessible: bool,
-    pub(super) writes: RecordedWrites,
-    pub(super) write_error: Option<WriteError>,
-}
-
-/// Why the writes to a DeclaredVarStore fail: `cause`, in `context` if any, as
-/// anyhow::Context adds it.
-#[derive(Clone, Copy)]
-pub(super) struct WriteError {
-    pub(super) cause: &'static str,
-    pub(super) context: Option<&'static str>,
 }
 
 impl VariableStore for DeclaredVarStore {
@@ -128,23 +109,6 @@ impl VariableStore for DeclaredVarStore {
 
     fn is_runtime_accessible(&self) -> bool {
         self.runtime_accessible
-    }
-
-    fn write_efivarfs_at_offset(&self, offset: u16, encoded: &[u8]) -> Result<()> {
-        match self.write_error {
-            None => {
-                self.writes.borrow_mut().push((offset, encoded.to_vec()));
-                Ok(())
-            }
-            Some(WriteError {
-                cause,
-                context: None,
-            }) => Err(anyhow!(cause)),
-            Some(WriteError {
-                cause,
-                context: Some(context),
-            }) => Err(anyhow!(cause).context(context)),
-        }
     }
 }
 
@@ -169,7 +133,9 @@ impl Efivars {
         payload: &[u8],
     ) {
         fs::write(
-            self.0.path().join(store.efivar_file_name()),
+            self.0
+                .path()
+                .join(EfivarFileName::from(&store.variable_key())),
             efivar_file_bytes(attributes, payload),
         )
         .expect("write efivar file");
@@ -215,8 +181,6 @@ pub(super) fn efi_variable(name: &'static str, size: usize) -> DeclaredVarStore 
         size: u16::try_from(size).expect("test size fits a VarStore Size"),
         kind: VariableStoreKind::EfiVariable,
         runtime_accessible: true,
-        writes: RecordedWrites::default(),
-        write_error: None,
     }
 }
 
@@ -231,51 +195,55 @@ pub(super) fn buffer(name: &'static str, size: usize) -> DeclaredVarStore {
 
 /// An EFI variable VarStore whose efivar file holds `payload`.
 pub(super) fn var_store_of(payload: &[u8]) -> VarStoreFixture {
-    recording_var_store(payload).0
+    writable_var_store("VarStore", payload, &MemoryVariables::default())
 }
 
-/// var_store_of `payload`, and the writes to its VarStore.
-pub(super) fn recording_var_store(payload: &[u8]) -> (VarStoreFixture, RecordedWrites) {
-    let store = efi_variable("VarStore", payload.len());
-    let writes = Rc::clone(&store.writes);
+/// var_store_of `payload` on the EFI variable `name`, which `variables` holds too, for set to
+/// write there.
+pub(super) fn writable_var_store(
+    name: &'static str,
+    payload: &[u8],
+    variables: &MemoryVariables,
+) -> VarStoreFixture {
+    let store = efi_variable(name, payload.len());
+    variables.insert(store.variable_key(), NV_BS_RT, payload);
     let efivars = Efivars::new();
     efivars.write(&store, payload);
-    let fixture = VarStoreFixture {
-        store: Ok(Box::new(store)),
-        efivars,
-    };
-    (fixture, writes)
-}
-
-/// A VarStore whose efivar file holds 0 and whose writes fail with `write_error`.
-pub(super) fn failing_var_store(write_error: WriteError) -> VarStoreFixture {
-    let store = DeclaredVarStore {
-        write_error: Some(write_error),
-        ..efi_variable("Failing", 1)
-    };
-    let efivars = Efivars::new();
-    efivars.write(&store, &[0]);
     VarStoreFixture {
         store: Ok(Box::new(store)),
         efivars,
     }
 }
 
-/// Writes `new_value` to `question` as set does: value_write, then its write.
+/// A VarStore on the EFI variable `name`, whose efivar file holds 0, and whose writes to
+/// `variables` fail with `write_error`.
+pub(super) fn failing_var_store(
+    name: &'static str,
+    write_error: WriteError,
+    variables: &mut MemoryVariables,
+) -> VarStoreFixture {
+    variables.fail_writes(variable_key(name), write_error);
+    writable_var_store(name, &[0], variables)
+}
+
+/// Writes `new_value` to `question` in `variables` as set does: value_write, then its write.
 pub(super) fn change_value(
     question: &QuestionDescriptor,
     new_value: &str,
+    variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    value_write(question, new_value)?.write()?;
+    value_write(question, new_value)?.write(variables)?;
     Ok(())
 }
 
-/// Writes `option`, one of the possible_options of the ONE_OF `question`, as set does.
+/// Writes `option`, one of the possible_options of the ONE_OF `question`, in `variables` as set
+/// does.
 pub(super) fn change_option(
     question: &QuestionDescriptor,
     option: &AnswerOption,
+    variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    option_write(question, option)?.write()?;
+    option_write(question, option)?.write(variables)?;
     Ok(())
 }
 

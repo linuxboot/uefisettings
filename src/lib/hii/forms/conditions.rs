@@ -2927,15 +2927,25 @@ mod tests {
     }
 
     /// The UINT8 ONE_OF of `one_of_data()` holding `children` and storing `stored`, as get,
-    /// list-questions and set see it with `values`, and the writes to its VarStore.
+    /// list-questions and set see it with `values`, and variables that hold its VarStore, for set
+    /// to write there.
     fn stored_one_of(
         children: &[Vec<u8>],
         stored: u8,
         values: &impl QuestionValues,
-    ) -> (QuestionDescriptor, RecordedWrites) {
+    ) -> (QuestionDescriptor, MemoryVariables) {
         let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), children);
-        let (store, writes) = recording_var_store(&[stored]);
-        (question_descriptor_with(&question, store, values), writes)
+        let variables = MemoryVariables::default();
+        let store = writable_var_store("VarStore", &[stored], &variables);
+        (
+            question_descriptor_with(&question, store, values),
+            variables,
+        )
+    }
+
+    /// The writes to the VarStore of stored_one_of.
+    fn writes(variables: &MemoryVariables) -> Vec<(u16, Vec<u8>)> {
+        variables.writes_to(&variable_key("VarStore"))
     }
 
     /// The answer that get shows for `question`, but for the state of the question.
@@ -2943,17 +2953,18 @@ mod tests {
         question.value.clone() + &question.value_state.option_annotation()
     }
 
-    /// Sets `question` to the option `text` as set does with `include`.
+    /// Sets `question` to the option `text` in `variables` as set does with `include`.
     fn set_option(
         question: &QuestionDescriptor,
         text: &str,
         include: IncludedStates,
+        variables: &MemoryVariables,
     ) -> std::result::Result<(), String> {
         let option = question
             .select_option(&BTreeSet::from([text.to_string()]), include)
             .map_err(|error| error.to_string())?
             .ok_or("no such option")?;
-        change_option(question, option).map_err(|error| error.to_string())
+        change_option(question, option, variables).map_err(|error| error.to_string())
     }
 
     /// A false SUPPRESS_IF shows the options in it, so get lists them and names the stored one,
@@ -2963,7 +2974,7 @@ mod tests {
     #[test]
     fn options_in_a_false_suppress_if_are_listed_shown_and_set() {
         let options = [flagged_option(5, 0x00, 0), flagged_option(6, 0x00, 1)];
-        let (question, writes) = stored_one_of(
+        let (question, variables) = stored_one_of(
             &[conditional(SUPPRESS_IF, ifr_false(), &options)],
             1,
             &values(),
@@ -2976,10 +2987,10 @@ mod tests {
         );
         assert_eq!(shown_answer(&question), "Enabled", "answer");
         assert!(
-            matches!(change_value(&question, "Disabled"), Ok(())),
+            matches!(change_value(&question, "Disabled", &variables), Ok(())),
             "set Disabled"
         );
-        assert_eq!(*writes.borrow(), [(0, vec![0])], "writes of Disabled");
+        assert_eq!(writes(&variables), [(0, vec![0])], "writes of Disabled");
     }
 
     #[test]
@@ -2988,7 +2999,7 @@ mod tests {
             flagged_option(5, 0x00, 0),
             conditional(SUPPRESS_IF, ifr_true(), &[flagged_option(6, 0x00, 1)]),
         ];
-        let (question, writes) = stored_one_of(&children, 1, &values());
+        let (question, variables) = stored_one_of(&children, 1, &values());
 
         assert_eq!(
             question.listed_options(IncludedStates::empty()),
@@ -3001,7 +3012,7 @@ mod tests {
             "answer"
         );
         assert_eq!(
-            change_value(&question, "Enabled").map_err(|error| error.to_string()),
+            change_value(&question, "Enabled", &variables).map_err(|error| error.to_string()),
             Err(
                 "option \"Enabled\" of question \"\" is suppressed; also include suppressed \
                  questions to select it"
@@ -3009,7 +3020,7 @@ mod tests {
             ),
             "change_value to Enabled"
         );
-        assert_eq!(*writes.borrow(), [], "writes of change_value");
+        assert_eq!(writes(&variables), [], "writes of change_value");
 
         let suppressed = IncludedStates::SUPPRESSED;
         assert_eq!(
@@ -3018,12 +3029,12 @@ mod tests {
             "listed, suppressed included"
         );
         assert_eq!(
-            set_option(&question, "Enabled", suppressed),
+            set_option(&question, "Enabled", suppressed, &variables),
             Ok(()),
             "set Enabled, suppressed included"
         );
         assert_eq!(
-            *writes.borrow(),
+            writes(&variables),
             [(0, vec![1])],
             "writes, suppressed included"
         );
@@ -3070,7 +3081,7 @@ mod tests {
         ];
         for (name, question_4, listed, answer, set) in cases {
             let values = MapValues(BTreeMap::from([(4, question_4)]));
-            let (question, writes) = stored_one_of(&children, 1, &values);
+            let (question, variables) = stored_one_of(&children, 1, &values);
 
             assert_eq!(
                 question.listed_options(IncludedStates::empty()),
@@ -3084,11 +3095,11 @@ mod tests {
                 vec![]
             };
             assert_eq!(
-                set_option(&question, "Enabled", IncludedStates::empty()),
+                set_option(&question, "Enabled", IncludedStates::empty(), &variables),
                 set,
                 "{name}"
             );
-            assert_eq!(*writes.borrow(), written, "{name}");
+            assert_eq!(writes(&variables), written, "{name}");
 
             let suppressed = IncludedStates::SUPPRESSED;
             assert_eq!(
@@ -3097,7 +3108,7 @@ mod tests {
                 "{name}, suppressed included"
             );
             assert_eq!(
-                set_option(&question, "Enabled", suppressed),
+                set_option(&question, "Enabled", suppressed, &variables),
                 Ok(()),
                 "{name}, suppressed included"
             );
@@ -3117,7 +3128,8 @@ mod tests {
                 conditional(DISABLE_IF, ifr_true(), &[flagged_option(6, 0x00, 1)]),
             ],
         );
-        let (store, writes) = recording_var_store(&[0]);
+        let variables = MemoryVariables::default();
+        let store = writable_var_store("VarStore", &[0], &variables);
         let question = question_descriptor_with(&node, store, &values());
 
         assert_eq!(
@@ -3138,11 +3150,11 @@ mod tests {
         );
         assert_eq!(shown_answer(&question), "Disabled", "answer");
         assert_eq!(
-            set_option(&question, "Enabled", IncludedStates::empty()),
+            set_option(&question, "Enabled", IncludedStates::empty(), &variables),
             Ok(()),
             "set Enabled"
         );
-        assert_eq!(*writes.borrow(), [(0, vec![1])], "writes of Enabled");
+        assert_eq!(writes(&variables), [(0, vec![1])], "writes of Enabled");
     }
 
     /// As edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption, get names the first option

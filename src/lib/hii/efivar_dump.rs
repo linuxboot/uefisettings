@@ -31,18 +31,18 @@ use serde::Serialize;
 use crate::hii::efivarfs::open_efivar;
 use crate::hii::efivarfs::open_regular_file;
 use crate::hii::efivarfs::read_efivar_file;
-use crate::hii::efivarfs::DecodedValue;
 use crate::hii::efivarfs::EfivarFileName;
 use crate::hii::efivarfs::EfivarNotFound;
-use crate::hii::efivarfs::EfivarReader;
-use crate::hii::efivarfs::EfivarSource;
-use crate::hii::efivarfs::EFIVARFS_HEADER_SIZE;
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::IncludedStates;
 use crate::hii::package::read_db;
 use crate::hii::package::read_db_bytes;
 use crate::hii::package::ParsedPackageList;
+use crate::hii::variables::DecodedValue;
+use crate::hii::variables::EfivarReader;
+use crate::hii::variables::EfivarSource;
+use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 /// The file of an efivars dump that holds the HiiDB that its efivars were dumped with.
 const DUMP_HIIDB: &str = "hiidb.bin";
@@ -203,7 +203,15 @@ fn decoded_bytes(
             );
         }
     }
-    Ok(reader.decoded)
+    // by efivar file, which names that differ only in '/' and '!' share
+    let mut files: BTreeMap<EfivarFileName, Vec<DecodedValue>> = BTreeMap::new();
+    for (key, values) in reader.decoded {
+        files
+            .entry(EfivarFileName::from(&key))
+            .or_default()
+            .extend(values);
+    }
+    Ok(files)
 }
 
 /// Copies the efivar files that `decoded` names from `efivars` into the new directory `dir`,
@@ -1121,6 +1129,43 @@ mod tests {
             answers_in(&dir),
             answers_in(live.path()),
             "answers from the dump and from the source"
+        );
+    }
+
+    /// A dump keeps the bytes that the questions of VarStores named with '/' and with '!'
+    /// decode from the one efivar file of both names.
+    #[test]
+    fn redacted_dump_keeps_the_bytes_of_names_that_share_an_efivar_file() {
+        let root = parse_form_set(&[
+            var_store_efi(1, "A/B", NV_BS_RT, 2),
+            var_store_efi(2, "A!B", NV_BS_RT, 2),
+            checkbox_on(1, 3, 1),
+            // Prompt 3, Help 4, QuestionId 2, VarStoreId 2, VarOffset 1
+            operation(CHECKBOX, false, &[3, 0, 4, 0, 2, 0, 2, 0, 1, 0, 0, 0]),
+        ]);
+        let live = efivars(&[(&efivar("A!B"), &[7, 0, 0, 0, 1, 1, 0xAA])]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
+
+        assert_eq!(
+            fs::read(dir.join(efivar("A!B"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 1, 1, 0],
+            "dumped A!B: the bytes of the questions of both names"
+        );
+        assert_eq!(answers(&root, &dir), ["1", "1"], "answers from the dump");
+        assert_eq!(
+            answers(&root, &dir),
+            answers(&root, live.path()),
+            "answers from the source"
         );
     }
 
