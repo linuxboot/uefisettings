@@ -47,7 +47,14 @@ pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
 pub(super) const FORM_MAP: u8 = 0x5D;
 
+const VAR_STORE: u8 = 0x24;
 const VAR_STORE_EFI: u8 = 0x26;
+
+/// The Guid E770BB69-BCB4-4D04-9E97-23FF9456FEAC of AMI firmware's VarStore SystemAccess, as
+/// stored.
+pub(super) const SYSTEM_ACCESS_GUID: [u8; 16] = [
+    0x69, 0xBB, 0x70, 0xE7, 0xB4, 0xBC, 0x04, 0x4D, 0x9E, 0x97, 0x23, 0xFF, 0x94, 0x56, 0xFE, 0xAC,
+];
 
 /// EFI variable Attributes: non-volatile, boot service and runtime access.
 pub(crate) const NV_BS_RT: u32 = 0x07;
@@ -477,7 +484,12 @@ pub(super) fn question_header_of(question_id: u16, offset: u16) -> Vec<u8> {
 
 /// Prompt `prompt`, Help 4, QuestionId `question_id`, VarStoreId `var_store_id`, VarOffset
 /// `offset`.
-fn question_header_on(question_id: u16, prompt: u16, var_store_id: u16, offset: u16) -> Vec<u8> {
+pub(super) fn question_header_on(
+    question_id: u16,
+    prompt: u16,
+    var_store_id: u16,
+    offset: u16,
+) -> Vec<u8> {
     [
         &prompt.to_le_bytes()[..],
         &[0x04, 0x00],
@@ -506,11 +518,35 @@ pub(crate) fn checkbox_on(question_id: u16, prompt: u16, var_store_id: u16) -> V
     operation(CHECKBOX, false, &data)
 }
 
+/// A VARSTORE of `id` named `name`, of the Guid stored as `guid`, of `size` bytes.
+pub(super) fn var_store(id: u16, guid: [u8; 16], name: &str, size: u16) -> Vec<u8> {
+    let data = [
+        &guid[..],
+        &id.to_le_bytes(),
+        &size.to_le_bytes(),
+        name.as_bytes(),
+        &[0x00],
+    ]
+    .concat();
+    operation(VAR_STORE, false, &data)
+}
+
 /// A VARSTORE_EFI of `id` named `name`, of NIL_GUID, with `attributes`, of `size` bytes.
 pub(crate) fn var_store_efi(id: u16, name: &str, attributes: u32, size: u16) -> Vec<u8> {
+    var_store_efi_of(id, [0; 16], name, attributes, size)
+}
+
+/// var_store_efi of the Guid stored as `guid`.
+pub(super) fn var_store_efi_of(
+    id: u16,
+    guid: [u8; 16],
+    name: &str,
+    attributes: u32,
+    size: u16,
+) -> Vec<u8> {
     let data = [
         &id.to_le_bytes()[..],
-        &[0; 16], // Guid
+        &guid,
         &attributes.to_le_bytes(),
         &size.to_le_bytes(),
         name.as_bytes(),

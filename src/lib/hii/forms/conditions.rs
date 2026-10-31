@@ -25,6 +25,7 @@ use std::rc::Weak;
 use anyhow::Result;
 use thiserror::Error;
 
+use super::ami_access_level::AMI_ACCESS_LEVEL;
 use super::find_corresponding_varstore;
 use super::read_question_value;
 use super::value_question;
@@ -32,6 +33,7 @@ use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
 use super::ParsedOperation;
+use super::ValueLocation;
 use super::ValueQuestion;
 use super::ValueUnavailable;
 use super::VariableStore;
@@ -644,25 +646,37 @@ fn question_value(
         ValueQuestion::CheckBox(_) => ValueKind::Boolean,
         ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => ValueKind::Uint,
     };
-    let value = match read_question_value(question, varstore, reader) {
-        Ok((_, value)) => value,
-        Err(reason) => {
-            return QuestionValue::Unreadable {
-                kind,
-                reason: reason.to_answer(),
-            }
-        }
+    // the level is the one byte of SystemAccess that AMI IFR reads
+    let on_access_level = value_question.location()
+        == (ValueLocation::Bytes { offset: 0, size: 1 })
+        && matches!(varstore, Ok(store) if AMI_ACCESS_LEVEL.identifies(store.as_ref()));
+    let reason = match read_question_value(question, varstore, reader)
+        .and_then(|(_, value)| typed_value(value_question, value))
+    {
+        Ok(value) => return value,
+        Err(reason) => reason,
     };
+    let reason = match on_access_level {
+        true => ValueUnavailable::AmiAccessLevel(Box::new(reason)),
+        false => reason,
+    };
+    QuestionValue::Unreadable {
+        kind,
+        reason: reason.to_answer(),
+    }
+}
+
+/// `value`, read for `value_question`, as a QuestionValue.
+fn typed_value(
+    value_question: ValueQuestion,
+    value: u64,
+) -> std::result::Result<QuestionValue, ValueUnavailable> {
     match value_question {
         // a byte or a bit
-        ValueQuestion::CheckBox(_) => match u8::try_from(value) {
-            Ok(byte) => QuestionValue::Boolean(byte),
-            Err(_) => QuestionValue::Unreadable {
-                kind,
-                reason: ValueUnavailable::CheckboxOverByte(value).to_answer(),
-            },
-        },
-        ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => QuestionValue::Uint(value),
+        ValueQuestion::CheckBox(_) => u8::try_from(value)
+            .map(QuestionValue::Boolean)
+            .map_err(|_| ValueUnavailable::CheckboxOverByte(value)),
+        ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => Ok(QuestionValue::Uint(value)),
     }
 }
 
@@ -3507,6 +3521,146 @@ mod tests {
             values.value(&referrer, 2, &mut efivars.reader()),
             Some(QuestionValue::Boolean(1)),
             "question 2 through a fresh EfivarReader"
+        );
+    }
+
+    /// The reason that a question on the level byte of AMI firmware's VarStore SystemAccess,
+    /// buffer or EFI variable, has no value says what the setup browser keeps there; a question
+    /// on another byte of it or of another width, or on a VarStore of another name or Guid,
+    /// keeps its reason, and a readable SystemAccess its value.
+    #[test]
+    fn unreadable_ami_access_level_is_named() {
+        let cases = [
+            (
+                "buffer SystemAccess",
+                var_store(1, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+                "<ValueUnavailable: no EFI variable \
+                 SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore requires \
+                 EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level \
+                 there (0 Administrator, 1 User)>",
+            ),
+            (
+                "EFI variable SystemAccess",
+                var_store_efi_of(1, SYSTEM_ACCESS_GUID, "SystemAccess", NV_BS_RT, 1),
+                "<ValueUnavailable: no EFI variable \
+                 SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; the AMI setup browser keeps \
+                 its access level there (0 Administrator, 1 User)>",
+            ),
+            (
+                "boot-service-only EFI variable SystemAccess",
+                var_store_efi_of(1, SYSTEM_ACCESS_GUID, "SystemAccess", NV_BS, 1),
+                "<ValueUnavailable: EFI variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac \
+                 is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither \
+                 lists nor writes; the AMI setup browser keeps its access level there \
+                 (0 Administrator, 1 User)>",
+            ),
+            (
+                "buffer SystemAccess of NIL_GUID",
+                var_store(1, [0; 16], "SystemAccess", 1),
+                "<ValueUnavailable: no EFI variable \
+                 SystemAccess-00000000-0000-0000-0000-000000000000; HII buffer varstore requires \
+                 EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+            ),
+            (
+                "buffer Setup of the SystemAccess Guid",
+                var_store(1, SYSTEM_ACCESS_GUID, "Setup", 1),
+                "<ValueUnavailable: no EFI variable Setup-e770bb69-bcb4-4d04-9e97-23ff9456feac; \
+                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+            ),
+            (
+                "buffer Setup of NIL_GUID",
+                var_store(1, [0; 16], "Setup", 1),
+                "<ValueUnavailable: no EFI variable Setup-00000000-0000-0000-0000-000000000000; \
+                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+            ),
+        ];
+        for (name, declaration, want) in cases {
+            let root = parse_form_set(&[declaration, form(1, &[checkbox_op(1, 0)])]);
+            let question = find_op(&root, &checkbox_op(1, 0)[2..]).expect("find question 1");
+            assert_eq!(
+                VarStoreValues::new(&root).value(
+                    &question.borrow(),
+                    1,
+                    &mut Efivars::new().reader()
+                ),
+                Some(QuestionValue::Unreadable {
+                    kind: ValueKind::Boolean,
+                    reason: want.to_string(),
+                }),
+                "{name}"
+            );
+        }
+
+        let checkbox_at_1 = checkbox_op(1, 1);
+        let uint16_at_0 = operation(
+            NUMERIC,
+            false,
+            &[
+                question_header_on(2, 5, 1, 0),
+                vec![0x01, 0, 0, 0xFF, 0xFF, 1, 0],
+            ]
+            .concat(),
+        );
+        let root = parse_form_set(&[
+            var_store(1, SYSTEM_ACCESS_GUID, "SystemAccess", 2),
+            form(1, &[checkbox_at_1.clone(), uint16_at_0.clone()]),
+        ]);
+        let others = [
+            (
+                "VarOffset 1 of a 2-byte buffer SystemAccess",
+                &checkbox_at_1,
+                1,
+                ValueKind::Boolean,
+            ),
+            (
+                "UINT16 NUMERIC at VarOffset 0 of a 2-byte buffer SystemAccess",
+                &uint16_at_0,
+                2,
+                ValueKind::Uint,
+            ),
+        ];
+        for (name, op, id, kind) in others {
+            let question = find_op(&root, &op[2..]).expect("find the question");
+            assert_eq!(
+                VarStoreValues::new(&root).value(
+                    &question.borrow(),
+                    id,
+                    &mut Efivars::new().reader()
+                ),
+                Some(QuestionValue::Unreadable {
+                    kind,
+                    reason: "<ValueUnavailable: no EFI variable \
+                             SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer \
+                             varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
+                        .to_string(),
+                }),
+                "{name}"
+            );
+        }
+
+        let root = parse_form_set(&[
+            var_store(1, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+            form(1, &[checkbox_op(1, 0)]),
+        ]);
+        let question = find_op(&root, &checkbox_op(1, 0)[2..]).expect("find question 1");
+        let values = VarStoreValues::new(&root);
+        assert_eq!(
+            values.value(&question.borrow(), 1, &mut disabled_reader()),
+            Some(QuestionValue::Unreadable {
+                kind: ValueKind::Boolean,
+                reason: "<ValueUnavailable: EFI variables not read; the AMI setup browser keeps \
+                         its access level there (0 Administrator, 1 User)>"
+                    .to_string(),
+            }),
+            "buffer SystemAccess without reading efivars"
+        );
+        let store = find_corresponding_varstore(Rc::clone(&question), 1);
+        let efivars = Efivars::new();
+        efivars.write(store.as_ref().expect("find VarStore 1").as_ref(), &[1]);
+        assert_eq!(
+            values.value(&question.borrow(), 1, &mut efivars.reader()),
+            Some(QuestionValue::Boolean(1)),
+            "readable buffer SystemAccess"
         );
     }
 

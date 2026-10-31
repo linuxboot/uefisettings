@@ -69,6 +69,7 @@ pub use conditions::SelectionError;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Selection;
 
+mod ami_access_level;
 mod conditions;
 mod defaults;
 #[cfg(test)]
@@ -1004,6 +1005,19 @@ enum VariableStoreKind {
     EfiVariable,
 }
 
+/// The Name and Guid of a VarStore, which name its variable whatever its kind.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct VarStoreVariable {
+    name: &'static str,
+    guid: Guid,
+}
+
+impl VarStoreVariable {
+    fn identifies(self, store: &dyn VariableStore) -> bool {
+        store.guid() == self.guid && store.name() == self.name
+    }
+}
+
 #[cfg(test)]
 mod non_efi_varstore_tests {
     use super::ifr_fixtures::*;
@@ -1255,6 +1269,20 @@ mod non_efi_varstore_tests {
                 ValueUnavailable::CheckboxOverByte(256),
                 "<ValueUnavailable: CHECKBOX value 256 over a byte>",
             ),
+            (
+                ValueUnavailable::AmiAccessLevel(Box::new(ValueUnavailable::NotRead(
+                    EfivarsNotRead,
+                ))),
+                "<ValueUnavailable: EFI variables not read; the AMI setup browser keeps its \
+                 access level there (0 Administrator, 1 User)>",
+            ),
+            (
+                ValueUnavailable::AmiAccessLevel(Box::new(ValueUnavailable::ReadError(
+                    "failed to read bytes: entity not found".into(),
+                ))),
+                "<VStoreError: failed to read bytes: entity not found; the AMI setup browser \
+                 keeps its access level there (0 Administrator, 1 User)>",
+            ),
         ];
         for (reason, want) in cases {
             assert_eq!(reason.to_answer(), want, "{reason:?}");
@@ -1433,6 +1461,9 @@ enum ValueUnavailable {
     },
     #[error("CHECKBOX value {0} over a byte")]
     CheckboxOverByte(u64),
+    /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason
+    #[error("{0}; the AMI setup browser keeps its access level there (0 Administrator, 1 User)")]
+    AmiAccessLevel(Box<ValueUnavailable>),
 }
 
 impl ValueUnavailable {
@@ -1455,9 +1486,15 @@ impl ValueUnavailable {
     /// VStoreError for a read error, ExtractEFIDataError for a short variable, else
     /// ValueUnavailable.
     fn to_answer(&self) -> String {
-        let tag = match self {
+        format!("<{}: {self}>", self.tag())
+    }
+
+    /// to_answer's tag: AmiAccessLevel keeps the tag of its reason.
+    fn tag(&self) -> &'static str {
+        match self {
             Self::ReadError(_) => "VStoreError",
             Self::Truncated { .. } => "ExtractEFIDataError",
+            Self::AmiAccessLevel(reason) => reason.tag(),
             Self::NoVarStore(_)
             | Self::BootServiceOnly(_)
             | Self::NotRead(_)
@@ -1466,8 +1503,7 @@ impl ValueUnavailable {
             | Self::BitField(_)
             | Self::NotDecoded(_)
             | Self::CheckboxOverByte(_) => "ValueUnavailable",
-        };
-        format!("<{tag}: {self}>")
+        }
     }
 }
 
@@ -2977,6 +3013,12 @@ mod choice_for_set_tests {
     /// Why the EQ_ID_VAL on question 2, on the efivar Missing, is not evaluated.
     const MISSING_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI variable \
         Missing-00000000-0000-0000-0000-000000000000>";
+    /// Why the EQ_ID_VAL on question 2, on AMI firmware's buffer VarStore SystemAccess without
+    /// an efivar, is not evaluated.
+    const SYSTEM_ACCESS_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI \
+        variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore requires \
+        EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level there \
+        (0 Administrator, 1 User)>";
 
     /// set's choice for PROMPT in the FormSet `root`, where only the efivar Present, of
     /// 1 byte, exists.
@@ -3076,6 +3118,33 @@ mod choice_for_set_tests {
                 reasons: vec![MISSING_INPUT.to_string()],
             }),
             "question 1 on the present VarStore"
+        );
+    }
+
+    /// set's refusal of a question that AMI firmware grays out for a User session names where
+    /// the access level is kept.
+    #[test]
+    fn undetermined_match_on_the_ami_access_level_names_it() {
+        let error = choice_in(&parse_form_set(&[
+            var_store_efi(1, "Present", NV_BS_RT, 1),
+            var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+            form(
+                1,
+                &[
+                    checkbox_on(2, 5, 2),
+                    conditional(GRAY_OUT_IF, eq_id_val_of(2, 1), &[checkbox_on(1, 3, 1)]),
+                ],
+            ),
+        ]))
+        .expect_err("set refuses question 1");
+        assert_eq!(
+            error.downcast_ref::<SelectionError>(),
+            Some(&SelectionError::Undetermined {
+                question: PROMPT.to_string(),
+                states: IncludedStates::GRAYED_OUT,
+                reasons: vec![SYSTEM_ACCESS_INPUT.to_string()],
+            }),
+            "question 1 under a GRAY_OUT_IF on the access level: {error:#}"
         );
     }
 
