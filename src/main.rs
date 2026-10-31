@@ -74,7 +74,7 @@ enum Commands {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
         #[clap(flatten)]
-        include: IncludeArgs,
+        selection: SelectionArgs,
     },
     /// Auto-identify backend and set/change the value of a question
     Set {
@@ -85,7 +85,7 @@ enum Commands {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
         #[clap(flatten)]
-        include: IncludeArgs,
+        selection: SelectionArgs,
     },
     /// Show the translation/spellings database for questions and answers
     ShowTranslations {
@@ -112,7 +112,7 @@ enum HiiSubcommands {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
         #[clap(flatten)]
-        include: IncludeArgs,
+        selection: SelectionArgs,
         #[clap(flatten)]
         efivars: EfivarArgs,
     },
@@ -125,7 +125,7 @@ enum HiiSubcommands {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
         #[clap(flatten)]
-        include: IncludeArgs,
+        selection: SelectionArgs,
     },
     /// Show a human readable representation of the Hii Forms
     ShowIFR {
@@ -168,7 +168,7 @@ enum HiiSubcommands {
         #[clap(short = 'j', long = "json", action, value_parser)]
         json: bool,
         #[clap(flatten)]
-        include: IncludeArgs,
+        selection: SelectionArgs,
         #[clap(flatten)]
         efivars: EfivarArgs,
     },
@@ -202,8 +202,9 @@ impl EfivarArgs {
     }
 }
 
+/// Which questions and options get, set and list-questions select.
 #[derive(Debug, Args)]
-struct IncludeArgs {
+struct SelectionArgs {
     /// Also select questions that conditions gray out, suppress or disable. The edk2 setup
     /// browser (edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList) ranks
     /// DisableIf > SuppressIf > GrayOutIf, so a question that is both grayed out and suppressed
@@ -212,7 +213,7 @@ struct IncludeArgs {
     include: Vec<IncludeState>,
 }
 
-impl IncludeArgs {
+impl SelectionArgs {
     fn states(&self) -> IncludedStates {
         self.include
             .iter()
@@ -232,24 +233,24 @@ impl IncludeArgs {
     }
 }
 
-impl From<&IncludeArgs> for GetOptions {
-    fn from(args: &IncludeArgs) -> Self {
+impl From<&SelectionArgs> for GetOptions {
+    fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
         options
     }
 }
 
-impl From<&IncludeArgs> for SetOptions {
-    fn from(args: &IncludeArgs) -> Self {
+impl From<&SelectionArgs> for SetOptions {
+    fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
         options
     }
 }
 
-impl From<&IncludeArgs> for ListQuestionsOptions {
-    fn from(args: &IncludeArgs) -> Self {
+impl From<&SelectionArgs> for ListQuestionsOptions {
+    fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
         options
@@ -339,10 +340,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 question,
                 filename,
                 json,
-                include,
+                selection,
                 efivars,
             } => {
-                let mut options = GetOptions::from(include);
+                let mut options = GetOptions::from(selection);
                 options.efivars = efivars.source()?;
                 // before the HiiDB is read
                 options.efivars.validate()?;
@@ -358,9 +359,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 question,
                 value,
                 json,
-                include,
+                selection,
             } => {
-                let res = HiiBackend::set_using(question, value, None, &SetOptions::from(include))?;
+                let res =
+                    HiiBackend::set_using(question, value, None, &SetOptions::from(selection))?;
                 print_with_style(res, *json)?;
             }
             HiiSubcommands::ShowIFR { filename, efivars } => {
@@ -409,10 +411,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             HiiSubcommands::ListQuestions {
                 filename,
                 json,
-                include,
+                selection,
                 efivars,
             } => {
-                let mut options = ListQuestionsOptions::from(include);
+                let mut options = ListQuestionsOptions::from(selection);
                 options.efivars = efivars.source()?;
                 // before the HiiDB is read
                 options.efivars.validate()?;
@@ -452,14 +454,14 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
         Commands::Get {
             question,
             json,
-            include,
+            selection,
         } => {
             let machine = identify_machine();
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
             if prioritize_backend(&machine, *json)? == Backend::Ilo {
-                include.refuse_on_ilo()?;
+                selection.refuse_on_ilo()?;
                 let res = IloBackend::get(question, None)?;
                 print_with_style(res, *json)?;
             } else {
@@ -467,7 +469,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     &get_db_dump_bytes(None)?,
                     question,
                     None,
-                    &GetOptions::from(include),
+                    &GetOptions::from(selection),
                 )?;
                 print_with_style(res, *json)?;
             }
@@ -476,18 +478,19 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             question,
             value,
             json,
-            include,
+            selection,
         } => {
             let machine = identify_machine();
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
             if prioritize_backend(&machine, *json)? == Backend::Ilo {
-                include.refuse_on_ilo()?;
+                selection.refuse_on_ilo()?;
                 let res = IloBackend::set(question, value, None)?;
                 print_with_style(res, *json)?;
             } else {
-                let res = HiiBackend::set_using(question, value, None, &SetOptions::from(include))?;
+                let res =
+                    HiiBackend::set_using(question, value, None, &SetOptions::from(selection))?;
                 print_with_style(res, *json)?;
             }
         }
@@ -621,15 +624,15 @@ mod tests {
         }
     }
 
-    /// The --include of `uefisettings set Q V` with `args` after it.
-    fn include_of(args: &[&str]) -> IncludeArgs {
+    /// The selection flags of `uefisettings set Q V` with `args` after it.
+    fn selection_of(args: &[&str]) -> SelectionArgs {
         let command = [&["uefisettings", "set", "Q", "V"][..], args].concat();
         let parsed = UefiSettingsToolArgs::try_parse_from(&command)
             .unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
-        let Commands::Set { include, .. } = parsed.command else {
+        let Commands::Set { selection, .. } = parsed.command else {
             panic!("{command:?} is no set: {parsed:?}");
         };
-        include
+        selection
     }
 
     #[test]
@@ -663,17 +666,17 @@ mod tests {
             ),
         ];
         for (name, args, states) in cases {
-            let include = include_of(&args);
-            assert_eq!(include.states(), states, "{name}");
-            assert_eq!(GetOptions::from(&include).include, states, "{name}: get");
-            assert_eq!(SetOptions::from(&include).include, states, "{name}: set");
+            let selection = selection_of(&args);
+            assert_eq!(selection.states(), states, "{name}");
+            assert_eq!(GetOptions::from(&selection).include, states, "{name}: get");
+            assert_eq!(SetOptions::from(&selection).include, states, "{name}: set");
             assert_eq!(
-                ListQuestionsOptions::from(&include).include,
+                ListQuestionsOptions::from(&selection).include,
                 states,
                 "{name}: list-questions"
             );
             assert_eq!(
-                include.refuse_on_ilo().is_ok(),
+                selection.refuse_on_ilo().is_ok(),
                 args.is_empty(),
                 "{name}: refuse_on_ilo"
             );
