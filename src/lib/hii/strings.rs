@@ -10,7 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -77,7 +77,7 @@ enum StringBlockType {
 
 pub fn handle_string_package(
     package_cursor: &mut Cursor<&Vec<u8>>,
-) -> Result<HashMap<i32, String>> {
+) -> Result<BTreeMap<i32, String>> {
     let string_header: StringPackageHeader = package_cursor
         .read_ne()
         .context("failed to parse string package header")?;
@@ -91,7 +91,7 @@ pub fn handle_string_package(
 
     let mut string_id_current: i32 = 1;
 
-    let mut string_map: HashMap<i32, String> = HashMap::new();
+    let mut string_map: BTreeMap<i32, String> = BTreeMap::new();
 
     loop {
         // for every block the first 8 bits are the block type

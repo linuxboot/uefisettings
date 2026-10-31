@@ -10,7 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -213,11 +213,11 @@ impl IloDev for Ilo4Dev {
         let client = RestClient::new(&find_lib_location()?);
 
         let update_struct =
-            HashMap::from([(attribute.to_string(), Value::String(new_value.to_string()))]);
+            BTreeMap::from([(attribute.to_string(), Value::String(new_value.to_string()))]);
 
         let serialized = serde_json::to_string(&update_struct)
-            .context("failed while serializing Hashmap to json")?;
-        debug!("Serialized Hashmap to patch ilo4 is {} ", serialized);
+            .context("failed while serializing BTreeMap to json")?;
+        debug!("Serialized BTreeMap to patch ilo4 is {} ", serialized);
 
         // NOTE: trailing slashes are necessary in ilo4 because otherwise it returns HTTP 308 Moved Permanently
         let (status, body) = client.patch("/redfish/v1/systems/1/bios/settings/", &serialized)?;
@@ -318,7 +318,7 @@ mod redfish {
         let client = RestClient::new(&find_lib_location()?);
 
         let update_struct = RedfishUpdateAttribute {
-            attributes: HashMap::from([(
+            attributes: BTreeMap::from([(
                 attribute.to_string(),
                 Value::String(new_value.to_string()),
             )]),
@@ -386,7 +386,7 @@ enum HTTPStatusCode {
 // HPE's Gen10 and Gen10+ have different OEM specific hidden routes but the way to change/view bios settings is the same
 
 // RedfishAttribute is used in both ilo4 and ilo5
-pub type RedfishAttributes = HashMap<String, Value>;
+pub type RedfishAttributes = BTreeMap<String, Value>;
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]

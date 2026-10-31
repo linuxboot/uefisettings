@@ -11,7 +11,6 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::fs::File;
@@ -276,7 +275,7 @@ pub(super) struct EfivarsNotADirectory(PathBuf);
 pub(super) struct EfivarsNotRead;
 
 /// The arguments of read_efivar after its directory, which an EfivarReader fixes.
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct EfivarRange {
     pub(super) name: EfivarFileName,
     pub(super) size: u16,
@@ -303,7 +302,7 @@ impl DecodedValue {
 /// (fs/efivarfs/file.c, kernel/user.c).
 pub(crate) struct EfivarReader {
     source: EfivarSource,
-    pub(super) outcomes: HashMap<EfivarRange, Result<Vec<u8>>>,
+    pub(super) outcomes: BTreeMap<EfivarRange, Result<Vec<u8>>>,
     /// The payload bytes that the callers of read decode, by efivar file
     pub(super) decoded: BTreeMap<EfivarFileName, Vec<DecodedValue>>,
 }
@@ -314,7 +313,7 @@ impl EfivarReader {
         source.validate()?;
         Ok(Self {
             source,
-            outcomes: HashMap::new(),
+            outcomes: BTreeMap::new(),
             decoded: BTreeMap::new(),
         })
     }

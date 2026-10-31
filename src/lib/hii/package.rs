@@ -11,7 +11,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -319,7 +319,7 @@ impl fmt::Debug for Guid {
     }
 }
 
-type StringMap = HashMap<i32, String>;
+type StringMap = BTreeMap<i32, String>;
 type IFRNodeLink = Rc<RefCell<IFROperation>>;
 
 /// String map (string id -> string) per strings package and IFR root per FormSet
@@ -863,12 +863,12 @@ mod tests {
         let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![HashMap::from([(1, "A".to_string())])],
+                vec![BTreeMap::from([(1, "A".to_string())])],
             ),
             ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![HashMap::from([(1, "B".to_string())])],
+                vec![BTreeMap::from([(1, "B".to_string())])],
             ),
         ];
         assert_eq!(strings_of_lists(lists), want, "strings of the lists");
@@ -1057,12 +1057,12 @@ mod tests {
         let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![HashMap::from([(1, "A".to_string())])],
+                vec![BTreeMap::from([(1, "A".to_string())])],
             ),
             ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![HashMap::from([(1, "B".to_string())])],
+                vec![BTreeMap::from([(1, "B".to_string())])],
             ),
         ];
         assert_eq!(strings_of_lists(lists), want, "strings of the lists");
@@ -1083,15 +1083,15 @@ mod tests {
         let want = vec![
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![HashMap::from([(1, "A".to_string())])],
+                vec![BTreeMap::from([(1, "A".to_string())])],
             ),
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![HashMap::from([(1, "C".to_string())])],
+                vec![BTreeMap::from([(1, "C".to_string())])],
             ),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![HashMap::from([(1, "B".to_string())])],
+                vec![BTreeMap::from([(1, "B".to_string())])],
             ),
         ];
         assert_eq!(
@@ -1126,8 +1126,8 @@ mod tests {
             .map(|list| (list.forms.len(), list.strings))
             .collect();
         let want = vec![
-            (1, vec![HashMap::from([(1, "A".to_string())])]),
-            (0, vec![HashMap::from([(1, "B".to_string())])]),
+            (1, vec![BTreeMap::from([(1, "A".to_string())])]),
+            (0, vec![BTreeMap::from([(1, "B".to_string())])]),
         ];
         assert_eq!(got, want, "forms stay with the strings of their list");
     }

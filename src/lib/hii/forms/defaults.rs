@@ -11,7 +11,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -457,7 +457,7 @@ pub(super) fn push_default<V: QuestionValues, E: fmt::Display>(
 pub(super) fn option_text(
     question: &IFROperation,
     value: u64,
-    string_packages: &[HashMap<i32, String>],
+    string_packages: &[BTreeMap<i32, String>],
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> Result<Option<String>, DefaultError> {
     question_scope(question)
@@ -488,8 +488,8 @@ pub(super) fn option_text(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::collections::HashSet;
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::rc::Rc;
 
     use binrw::io::Cursor;
@@ -732,7 +732,7 @@ mod tests {
         let Selection::Picked(found, _) = find_question(
             root,
             &strings(),
-            &HashSet::from([PROMPT]),
+            &BTreeSet::from([PROMPT]),
             IncludedStates::empty(),
             None,
             &mut efivars.reader(),
@@ -1024,7 +1024,7 @@ mod tests {
         ];
         for (name, value, default) in cases {
             let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), &children);
-            let values = MapValues(HashMap::from([(2, value)]));
+            let values = MapValues(BTreeMap::from([(2, value)]));
 
             assert_eq!(
                 question_descriptor_with(&question, unavailable(), &values).value,
@@ -1043,7 +1043,7 @@ mod tests {
             ifr_default_2(0x0000, question_ref1),
         ];
         let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), &children);
-        let values = MapValues(HashMap::from([(2, QuestionValue::Uint(1))]));
+        let values = MapValues(BTreeMap::from([(2, QuestionValue::Uint(1))]));
 
         assert_eq!(
             question_descriptor_with(&question, unavailable(), &values).value,

@@ -1,0 +1,8 @@
+# HashMap and HashSet hash with RandomState, whose keys std on UEFI takes from
+# EFI_RNG_PROTOCOL, else from rdrand on x86 only, else it panics (Rust 1.93.1
+# library/std/src/sys/random/uefi.rs fill_bytes): an aarch64 UEFI Shell without
+# an RNG would panic at the first HashMap. BTreeMap and BTreeSet need no keys.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "RandomState can panic on UEFI", replacement = "std::collections::BTreeMap" },
+    { path = "std::collections::HashSet", reason = "RandomState can panic on UEFI", replacement = "std::collections::BTreeSet" },
+]

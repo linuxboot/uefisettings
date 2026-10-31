@@ -11,8 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt;
 use std::fs::File;
@@ -2777,7 +2777,7 @@ impl QuestionDescriptor {
     /// The option that set writes for one of `texts`.
     pub(crate) fn chosen_option(
         &self,
-        texts: &HashSet<String>,
+        texts: &BTreeSet<String>,
         include: IncludedStates,
     ) -> Result<&AnswerOption> {
         // if not a single option matched then error out
@@ -2802,7 +2802,7 @@ impl QuestionDescriptor {
     /// such whitespace.
     pub(crate) fn select_option(
         &self,
-        texts: &HashSet<String>,
+        texts: &BTreeSet<String>,
         include: IncludedStates,
     ) -> std::result::Result<Option<&AnswerOption>, SelectionError> {
         let stored: Vec<&AnswerOption> = self
@@ -2862,7 +2862,7 @@ impl QuestionDescriptor {
 // conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &[HashMap<i32, String>],
+    string_packages: &[BTreeMap<i32, String>],
     include: IncludedStates,
     access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
@@ -2877,7 +2877,7 @@ pub fn list_questions(
 /// What walking the ops of a FormSet takes besides them.
 struct FormSetWalk<'a, V> {
     /// The string packages of the FormSet's package list
-    string_packages: &'a [HashMap<i32, String>],
+    string_packages: &'a [BTreeMap<i32, String>],
     default_ids: FormSetDefaultIds,
     inputs: ExpressionInputs<'a, V>,
     include: IncludedStates,
@@ -2885,7 +2885,7 @@ struct FormSetWalk<'a, V> {
 
 impl<'a, V> FormSetWalk<'a, V> {
     fn new(
-        string_packages: &'a [HashMap<i32, String>],
+        string_packages: &'a [BTreeMap<i32, String>],
         reader: &'a mut EfivarReader,
         values: &'a V,
         include: IncludedStates,
@@ -2940,8 +2940,8 @@ fn listed_question(
 /// `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value.
 pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &[HashMap<i32, String>],
-    possible_question_phrases: &HashSet<T>,
+    string_packages: &[BTreeMap<i32, String>],
+    possible_question_phrases: &BTreeSet<T>,
     include: IncludedStates,
     access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
@@ -2960,7 +2960,7 @@ where
 /// Finds a question as find_question does, with `walk`.
 fn find_question_in<T>(
     node: &Rc<RefCell<IFROperation>>,
-    possible_question_phrases: &HashSet<T>,
+    possible_question_phrases: &BTreeSet<T>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Selection<QuestionDescriptor>
 where
@@ -3071,7 +3071,7 @@ mod choice_for_set_tests {
         let values = VarStoreValues::new(root, access_level);
         let selection = find_question_in(
             root,
-            &HashSet::from([PROMPT]),
+            &BTreeSet::from([PROMPT]),
             &mut FormSetWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
         );
         choice_for_set(selection, PROMPT, &reader)
@@ -3234,7 +3234,7 @@ mod choice_for_set_tests {
         let Ok(Choice::Chosen(descriptor, _)) = choice else {
             panic!("the ONE_OF on the present VarStore: {choice:?}");
         };
-        let enabled = HashSet::from(["Enabled".to_string()]);
+        let enabled = BTreeSet::from(["Enabled".to_string()]);
         let selected = |include| {
             descriptor
                 .select_option(&enabled, include)
@@ -3342,16 +3342,16 @@ mod choice_for_set_tests {
 /// prompt is one of `phrases`, ignoring ASCII case and surrounding whitespace.
 fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
-    string_packages: &[HashMap<i32, String>],
-    phrases: &HashSet<T>,
+    string_packages: &[BTreeMap<i32, String>],
+    phrases: &BTreeSet<T>,
 ) -> Vec<Rc<RefCell<IFROperation>>>
 where
     T: AsRef<str>,
 {
     fn walk<T: AsRef<str>>(
         node: &Rc<RefCell<IFROperation>>,
-        string_packages: &[HashMap<i32, String>],
-        phrases: &HashSet<T>,
+        string_packages: &[BTreeMap<i32, String>],
+        phrases: &BTreeSet<T>,
         found: &mut Vec<Rc<RefCell<IFROperation>>>,
     ) {
         let op = node.borrow();
@@ -3377,7 +3377,7 @@ where
 }
 
 /// Returns the prompt of a ONE_OF, NUMERIC or CHECKBOX, empty for other ops.
-fn prompt<'a>(op: &IFROperation, string_packages: &'a [HashMap<i32, String>]) -> &'a str {
+fn prompt<'a>(op: &IFROperation, string_packages: &'a [BTreeMap<i32, String>]) -> &'a str {
     value_question(op).map_or("", |question| {
         find_corresponding_string(question.header().prompt_string_id, string_packages)
     })
@@ -4566,7 +4566,7 @@ mod question_value_tests {
 pub fn display(
     node: Rc<RefCell<IFROperation>>,
     level: usize,
-    string_packages: &[HashMap<i32, String>],
+    string_packages: &[BTreeMap<i32, String>],
     reader: &mut EfivarReader,
 ) -> Result<String> {
     let mut result = String::new();
@@ -4807,7 +4807,7 @@ fn value_write<'a>(
     if question.opcode == IFROpCode::OneOf {
         let option = question
             .select_option(
-                &HashSet::from([new_value.to_owned()]),
+                &BTreeSet::from([new_value.to_owned()]),
                 IncludedStates::empty(),
             )?
             .ok_or(ChangeValueError::InvalidOption)?;
@@ -4885,7 +4885,7 @@ pub(crate) fn set_questions<'a>(
     question: &str,
     selected: &[(&str, &'a QuestionDescriptor)],
     new_value: &str,
-    texts: &HashSet<String>,
+    texts: &BTreeSet<String>,
     include: IncludedStates,
 ) -> Result<Vec<Option<&'a AnswerOption>>> {
     if selected.is_empty() {
@@ -5251,7 +5251,7 @@ mod set_questions_tests {
     }
 }
 
-fn find_corresponding_string(string_id: u16, string_packages: &[HashMap<i32, String>]) -> &str {
+fn find_corresponding_string(string_id: u16, string_packages: &[BTreeMap<i32, String>]) -> &str {
     // TODO: accept language pack parameter later
     // it defaults to the first language pack it can find and the first one is en-US
 
@@ -5340,11 +5340,11 @@ mod tests {
     fn questions_are_found_by_their_listed_name() {
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
         let values = VarStoreValues::new(&root, None);
-        let prompted = |prompt: &str| vec![HashMap::from([(3, prompt.to_string())])];
+        let prompted = |prompt: &str| vec![BTreeMap::from([(3, prompt.to_string())])];
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
                 &root,
-                &HashSet::from([phrase]),
+                &BTreeSet::from([phrase]),
                 &mut FormSetWalk::new(
                     &prompted(prompt),
                     &mut Efivars::new().reader(),
@@ -5405,7 +5405,7 @@ mod tests {
         );
         let select = |question: &QuestionDescriptor, text: &str| {
             question
-                .select_option(&HashSet::from([text.to_string()]), IncludedStates::empty())
+                .select_option(&BTreeSet::from([text.to_string()]), IncludedStates::empty())
                 .unwrap_or_else(|error| panic!("select {text:?}: {error}"))
                 .map(|option| option.value.clone())
         };
@@ -5996,7 +5996,7 @@ mod write_validation_tests {
             &mut FormSetWalk::new(
                 &[],
                 &mut efivars.reader(),
-                &MapValues(HashMap::new()),
+                &MapValues(BTreeMap::new()),
                 IncludedStates::empty(),
             ),
         );

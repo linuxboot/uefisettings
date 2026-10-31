@@ -15,9 +15,8 @@
 //! questions and options that they leave to get, set and list-questions.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -209,7 +208,7 @@ impl StateEvaluation {
     /// Why the conditions that decide between the possible states are not evaluated, each
     /// reason once.
     pub(crate) fn reasons(&self) -> impl Iterator<Item = &str> {
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         self.deciding()
             .map(|(_, reason)| reason.as_str())
             .filter(move |reason| seen.insert(*reason))
@@ -507,7 +506,7 @@ pub(crate) fn option_state(
 /// edk2-stable202608 SetupBrowserDxe/Expression.c IdToQuestion does: in the form of the
 /// referrer first, then in the FormSet, in form order. parse_form_sets makes each FormSet of a
 /// form package a root of its own.
-pub(crate) struct QuestionIndex(HashMap<u16, Vec<IndexedQuestion>>);
+pub(crate) struct QuestionIndex(BTreeMap<u16, Vec<IndexedQuestion>>);
 
 struct IndexedQuestion {
     /// The FORM or FORM_MAP that holds the question
@@ -523,7 +522,7 @@ impl QuestionIndex {
         fn walk(
             node: &Rc<RefCell<IFROperation>>,
             form: Option<&Rc<RefCell<IFROperation>>>,
-            index: &mut HashMap<u16, Vec<IndexedQuestion>>,
+            index: &mut BTreeMap<u16, Vec<IndexedQuestion>>,
         ) {
             let op = node.borrow();
             if skips_scope(&op) {
@@ -545,7 +544,7 @@ impl QuestionIndex {
                 walk(child, form, index);
             }
         }
-        let mut index = HashMap::new();
+        let mut index = BTreeMap::new();
         walk(root, None, &mut index);
         QuestionIndex(index)
     }
@@ -1357,8 +1356,8 @@ impl Arithmetic {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::collections::HashSet;
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
     use super::super::find_question_in;
     use super::super::handle_form_set;
@@ -1412,7 +1411,7 @@ mod tests {
     /// Question 1 is the UINT 1, 2 the UINT 0x10001, 3 the BOOLEAN 2, 4 an unreadable UINT,
     /// 5 an unreadable BOOLEAN, 6 and 7 of another type; no question has id 9.
     fn values() -> MapValues {
-        MapValues(HashMap::from([
+        MapValues(BTreeMap::from([
             (1, QuestionValue::Uint(1)),
             (2, QuestionValue::Uint(0x10001)),
             (3, QuestionValue::Boolean(2)),
@@ -1538,7 +1537,7 @@ mod tests {
             ("0x495 is 4", 4, 7, true),
         ];
         for (name, question_495, question_9a, want) in cases {
-            let values = MapValues(HashMap::from([
+            let values = MapValues(BTreeMap::from([
                 (0x495, QuestionValue::Uint(question_495)),
                 (0x9A, QuestionValue::Uint(question_9a)),
             ]));
@@ -1606,7 +1605,7 @@ mod tests {
             for q1 in [4, 5, 6] {
                 for q2 in [1, 9] {
                     for q3 in [7, 8] {
-                        let values = MapValues(HashMap::from([
+                        let values = MapValues(BTreeMap::from([
                             (1, QuestionValue::Uint(q1)),
                             (2, QuestionValue::Uint(q2)),
                             (3, QuestionValue::Uint(q3)),
@@ -2648,7 +2647,7 @@ mod tests {
         let root = parse_form_set(forms);
         find_question_in(
             &root,
-            &HashSet::from([PROMPT]),
+            &BTreeSet::from([PROMPT]),
             &mut FormSetWalk::new(&strings(), &mut Efivars::new().reader(), &values(), include),
         )
         .map(|question| {
@@ -2863,7 +2862,7 @@ mod tests {
         let (_root, question) = parse_question(&[], ONE_OF, &one_of_data(), children);
         let descriptor: QuestionDescriptor =
             question_descriptor_with(&question, unavailable(), &values());
-        let option = descriptor.select_option(&HashSet::from(["Enabled".to_string()]), include)?;
+        let option = descriptor.select_option(&BTreeSet::from(["Enabled".to_string()]), include)?;
         Ok(option.and_then(|option| option.raw_value.as_u64()))
     }
 
@@ -2951,7 +2950,7 @@ mod tests {
         include: IncludedStates,
     ) -> std::result::Result<(), String> {
         let option = question
-            .select_option(&HashSet::from([text.to_string()]), include)
+            .select_option(&BTreeSet::from([text.to_string()]), include)
             .map_err(|error| error.to_string())?
             .ok_or("no such option")?;
         change_option(question, option).map_err(|error| error.to_string())
@@ -3070,7 +3069,7 @@ mod tests {
             ),
         ];
         for (name, question_4, listed, answer, set) in cases {
-            let values = MapValues(HashMap::from([(4, question_4)]));
+            let values = MapValues(BTreeMap::from([(4, question_4)]));
             let (question, writes) = stored_one_of(&children, 1, &values);
 
             assert_eq!(

@@ -286,8 +286,8 @@ pub(super) fn unavailable() -> VarStoreFixture {
     }
 }
 
-pub(super) fn strings() -> Vec<HashMap<i32, String>> {
-    vec![HashMap::from([
+pub(super) fn strings() -> Vec<BTreeMap<i32, String>> {
+    vec![BTreeMap::from([
         (3, PROMPT.to_string()),
         (5, "Disabled".to_string()),
         (6, "Enabled".to_string()),
@@ -388,7 +388,7 @@ pub(super) fn scoped_expression(ops: &[Vec<u8>], scope_at: usize) -> Vec<u8> {
 }
 
 /// Answers from a map, whatever the referrer.
-pub(super) struct MapValues(pub(super) HashMap<u16, QuestionValue>);
+pub(super) struct MapValues(pub(super) BTreeMap<u16, QuestionValue>);
 
 impl QuestionValues for MapValues {
     fn value(

@@ -10,7 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ffi::CString;
 
 use anyhow::anyhow;
@@ -88,8 +88,8 @@ impl RestClient {
     }
 
     // default_headers for creating a new REST request
-    fn default_headers(&self) -> HashMap<String, String> {
-        HashMap::from([
+    fn default_headers(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
             ("Host".to_string(), "".to_string()),
             ("Accept-Encoding".to_string(), "identity".to_string()),
             (
@@ -105,7 +105,7 @@ impl RestClient {
         &self,
         method: &str,
         endpoint: &str,
-        headers: HashMap<String, String>,
+        headers: BTreeMap<String, String>,
         body: &str,
     ) -> Result<Vec<u8>> {
         // HPE's ilorest CLI tool initializes a new lib instance for every request and since we have
@@ -163,7 +163,7 @@ impl RestClient {
         method: &str,
         endpoint: &str,
         body: &str,
-        mut headers: HashMap<String, String>,
+        mut headers: BTreeMap<String, String>,
     ) -> Result<Vec<u8>> {
         let mut request_contents = format!("{} {} HTTP/1.1\r\n", method, endpoint);
         headers.insert("Content-Length".to_string(), body.len().to_string());
@@ -177,5 +177,34 @@ impl RestClient {
 
         let request = CString::new(request_contents)?.as_bytes_with_nul().to_vec();
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request lists its headers in the order of their names.
+    #[test]
+    fn request_lists_the_headers_in_name_order() {
+        let client = RestClient::new("ilorest_chif.so");
+
+        let request = client
+            .generate_request_bytes("PATCH", "/x", "{}", client.default_headers())
+            .expect("generate the request");
+
+        assert_eq!(
+            String::from_utf8(request).expect("decode the request"),
+            "PATCH /x HTTP/1.1\r\n\
+             Accept: */*\r\n\
+             Accept-Encoding: identity\r\n\
+             Connection: Keep-Alive\r\n\
+             Content-Length: 2\r\n\
+             Content-Type: application/json; charset=utf-8\r\n\
+             Host: \r\n\
+             \r\n\
+             {}\0",
+            "PATCH /x"
+        );
     }
 }

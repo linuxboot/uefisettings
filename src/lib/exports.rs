@@ -12,7 +12,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
@@ -471,7 +470,7 @@ impl HiiBackend {
 fn select_for_set(
     parsed_db: &[package::ParsedPackageList],
     question: &str,
-    question_variations: &HashSet<String>,
+    question_variations: &BTreeSet<String>,
     options: &SetOptions,
     efivars: EfivarSource,
 ) -> Result<Vec<(String, forms::QuestionDescriptor, forms::StateEvaluation)>> {
@@ -1089,7 +1088,7 @@ mod tests {
             select_for_set(
                 &package::read_db(hiidb).expect("parse the HiiDB"),
                 "Q",
-                &HashSet::from(["Q".to_string()]),
+                &BTreeSet::from(["Q".to_string()]),
                 &options,
                 EfivarSource::Directory(efivars.path().to_path_buf()),
             )

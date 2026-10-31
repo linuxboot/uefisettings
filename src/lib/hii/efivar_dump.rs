@@ -336,7 +336,7 @@ impl Drop for PartialDump<'_> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
     use std::rc::Rc;
@@ -405,7 +405,7 @@ mod tests {
     fn package_list(root: &Rc<RefCell<IFROperation>>) -> ParsedPackageList {
         ParsedPackageList {
             guid: NIL_GUID,
-            strings: vec![HashMap::new()],
+            strings: vec![BTreeMap::new()],
             forms: vec![Rc::clone(root)],
         }
     }
@@ -416,7 +416,7 @@ mod tests {
         let source = EfivarSource::Directory(efivars.to_path_buf());
         list_questions(
             Rc::clone(root),
-            &[HashMap::new()],
+            &[BTreeMap::new()],
             IncludedStates::all(),
             None,
             &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),

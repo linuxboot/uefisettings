@@ -10,7 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use log::debug;
 use log::info;
@@ -20,12 +20,12 @@ use uefisettings_spellings_db_thrift::consts::translation_db;
 
 pub enum HiiTranslation {
     Translated {
-        question_variations: HashSet<String>,
-        answer_variations: HashSet<String>,
+        question_variations: BTreeSet<String>,
+        answer_variations: BTreeSet<String>,
     },
     NotTranslated {
-        question_variations: HashSet<String>,
-        answer_variations: HashSet<String>,
+        question_variations: BTreeSet<String>,
+        answer_variations: BTreeSet<String>,
     },
 }
 
@@ -34,8 +34,8 @@ pub enum HiiTranslation {
 /// Ex: the canonical question "Hyper Threading" -> ["Hyper-Threading", "Enable LP", "Hyper-Threading \[ALL\]"]
 /// and for it the canonical answer "Enabled" -> ["Enabled", "Enable"].
 pub fn get_qa_variations_hii(question: &str, answer: &str) -> HiiTranslation {
-    let mut question_variations = HashSet::from([question.to_owned()]);
-    let mut answer_variations = HashSet::from([answer.to_owned()]);
+    let mut question_variations = BTreeSet::from([question.to_owned()]);
+    let mut answer_variations = BTreeSet::from([answer.to_owned()]);
 
     // if spellings_db has question variations, then use those instead
     if let Some(question_mapping) = translation_db.get(question) {
