@@ -18,6 +18,8 @@ use log::info;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
+pub(crate) mod ilo;
+
 pub enum HiiTranslation {
     Translated {
         question_variations: BTreeSet<String>,
@@ -72,49 +74,6 @@ pub fn get_qa_variations_hii(question: &str, answer: &str) -> HiiTranslation {
     HiiTranslation::NotTranslated {
         question_variations,
         answer_variations,
-    }
-}
-
-pub enum IloTranslation {
-    Translated {
-        translated_question: String,
-        translated_answer: String,
-    },
-    NotTranslated {
-        question: String,
-        answer: String,
-    },
-}
-
-/// get_qa_variations_ilo translates canonical questions and answers into ilo variants
-/// If any part isn't in the translation database, it doesn't fail it just returns the original values.
-/// Ex: the canonical question "TPM State" -> "TpmState" and for it the canonical answer "Enabled" -> "PresentEnabled".
-pub fn get_qa_variations_ilo(question: &str, answer: &str) -> IloTranslation {
-    if let Some(question_mapping) = translation_db.get(question) {
-        if let Some(ilo_question_mapping) = &question_mapping.ilo_question {
-            // use translated question name instead of canonical name
-            let translated_question = ilo_question_mapping.question.to_owned();
-            let mut translated_answer = answer.to_owned();
-
-            // use translated answer to send to ilo instead of canonical answer
-            if let Some(answer_replacements) = &(ilo_question_mapping.answer_replacements) {
-                for (key, value) in answer_replacements {
-                    if key.eq_ignore_ascii_case(answer) {
-                        translated_answer = value.to_owned();
-                        break;
-                    }
-                }
-            }
-
-            return IloTranslation::Translated {
-                translated_question,
-                translated_answer,
-            };
-        }
-    }
-    IloTranslation::NotTranslated {
-        question: question.to_owned(),
-        answer: answer.to_owned(),
     }
 }
 

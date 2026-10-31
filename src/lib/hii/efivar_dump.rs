@@ -282,6 +282,14 @@ fn keep_decoded(bytes: &[u8], values: &[DecodedValue]) -> Vec<u8> {
     kept
 }
 
+impl DecodedValue {
+    /// Whether this value decodes from an efivar file of `len` bytes: read_efivar reads the
+    /// attributes field and `size` payload bytes, so it fails on a shorter file.
+    fn decodes_from(&self, len: usize) -> bool {
+        len >= EFIVARFS_HEADER_SIZE + usize::from(self.size)
+    }
+}
+
 /// A dump directory being written: dropped before commit, it removes its files and itself.
 struct PartialDump<'a> {
     dir: &'a Path,

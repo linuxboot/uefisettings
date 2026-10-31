@@ -240,14 +240,6 @@ pub(super) struct DecodedValue {
     pub(super) value: Range<usize>,
 }
 
-impl DecodedValue {
-    /// Whether this value decodes from an efivar file of `len` bytes: read_efivar reads the
-    /// attributes field and `size` payload bytes, so it fails on a shorter file.
-    pub(super) fn decodes_from(&self, len: usize) -> bool {
-        len >= EFIVARFS_HEADER_SIZE + usize::from(self.size)
-    }
-}
-
 /// Reads each EfivarRange of one command once, keeping the outcomes:
 /// Linux v7.2 efivarfs sleeps once a non-root user has read 100 times within a second
 /// (fs/efivarfs/file.c, kernel/user.c). VarStore names that differ only in '/' and '!' are two
