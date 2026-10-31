@@ -48,37 +48,41 @@ fi
 ## Available commands
 
 ```plain
-SUBCOMMANDS:
-    get         Auto-identify backend and get the current value of a question
-    help        Print this message or the help of the given subcommand(s)
-    hii         Commands which work on machines exposing the UEFI HiiDB
-    identify    Auto-identify backend and display hardware/bios-information
-    ilo         Commands which work on machines having HPE's Ilo BMC
-    set         Auto-identify backend and set/change the value of a question
+Commands:
+  get                Auto-identify backend and get the current value of a question
+  help               Print this message or the help of the given subcommand(s)
+  hii                Commands which work on machines exposing the UEFI HiiDB
+  identify           Auto-identify backend and display hardware/bios-information
+  ilo                Commands which work on machines having HPE's Ilo BMC
+  set                Auto-identify backend and set/change the value of a question
+  show-translations  Show the translation/spellings database for questions and answers
 ```
 
 `hii`:
 
 ```plain
-SUBCOMMANDS:
-    dump-efivars    Copy the HiiDB and the EFI variables that its questions read into a new
-                        directory, for --efivars on another machine
-    extract-db      Dump HiiDB into a file
-    get             Get the current value of a question
-    help            Print this message or the help of the given subcommand(s)
-    list-strings    List all strings-id, string pairs in HiiDB
-    set             Set/change the value of a question
-    show-ifr        Show a human readable representation of the Hii Forms
+Commands:
+  dump-efivars    Copy the HiiDB and the EFI variables that its questions read into a new directory,
+                  for --efivars on another machine
+  extract-db      Dump HiiDB into a file
+  get             Get the current value of a question
+  help            Print this message or the help of the given subcommand(s)
+  list-questions  List questions HiiDB. Note that these are not all possible questions, because we
+                  don't parse certain non-useful question types
+  list-strings    List all strings-id, string pairs in HiiDB
+  set             Set/change the value of a question
+  show-ifr        Show a human readable representation of the Hii Forms
 ```
 
 `ilo`:
 
 ```plain
-SUBCOMMANDS:
-    get                Get the current value of a question
-    help               Print this message or the help of the given subcommand(s)
-    set                Set/change the value of a question
-    show-attributes    List bios attributes and their current values
+Commands:
+  get                      Get the current value of a question
+  help                     Print this message or the help of the given subcommand(s)
+  set                      Set/change the value of a question
+  show-attributes          List bios attributes and their current values
+  show-pending-attributes  List all pending changes that will take effect after reboot
 ```
 
 ---

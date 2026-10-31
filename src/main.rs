@@ -44,14 +44,17 @@ use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
+// Every command lists its options and subcommands alphabetically, as under clap 3:
+// next_display_order = None leaves them unordered, and clap sorts those by name.
 #[derive(Debug, Parser)]
-#[clap(
+#[command(
     name = "uefisettings",
     about = "UEFI Settings Manipulation Tool",
-    long_about = None
+    long_about = None,
+    next_display_order = None
 )]
 struct UefiSettingsToolArgs {
-    #[clap(subcommand)]
+    #[command(subcommand)]
     command: Commands,
 }
 
@@ -64,130 +67,135 @@ enum Commands {
     // TODO: Auto(AutoCommand) after building a backend identifier function
     // TODO: Get/Set without having to specify Auto
     /// Auto-identify backend and display hardware/bios-information
+    #[command(next_display_order = None)]
     Identify {
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
+        #[command(flatten)]
+        output: JsonArgs,
     },
     /// Auto-identify backend and get the current value of a question
+    #[command(next_display_order = None)]
     Get {
-        #[clap(value_parser)]
         question: String,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
-        #[clap(flatten)]
+        #[command(flatten)]
+        output: JsonArgs,
+        #[command(flatten)]
         selection: SelectionArgs,
     },
     /// Auto-identify backend and set/change the value of a question
+    #[command(next_display_order = None)]
     Set {
-        #[clap(value_parser)]
         question: String,
-        #[clap(value_parser)]
         value: String,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
-        #[clap(flatten)]
+        #[command(flatten)]
+        output: JsonArgs,
+        #[command(flatten)]
         selection: SelectionArgs,
     },
     /// Show the translation/spellings database for questions and answers
+    #[command(next_display_order = None)]
     ShowTranslations {
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
 #[derive(Debug, Parser)]
+#[command(next_display_order = None)]
 struct HiiCommand {
-    #[clap(subcommand)]
+    #[command(subcommand)]
     command: HiiSubcommands,
 }
 
 #[derive(Debug, Subcommand)]
 enum HiiSubcommands {
     /// Get the current value of a question
+    #[command(next_display_order = None)]
     Get {
-        #[clap(value_parser)]
         question: String,
         /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[clap(parse(from_os_str), short, long)]
+        #[arg(short, long)]
         filename: Option<PathBuf>,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
-        #[clap(flatten)]
+        #[command(flatten)]
+        output: JsonArgs,
+        #[command(flatten)]
         selection: SelectionArgs,
-        #[clap(flatten)]
+        #[command(flatten)]
         efivars: EfivarArgs,
     },
     /// Set/change the value of a question
+    #[command(next_display_order = None)]
     Set {
-        #[clap(value_parser)]
         question: String,
-        #[clap(value_parser)]
         value: String,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
-        #[clap(flatten)]
+        #[command(flatten)]
+        output: JsonArgs,
+        #[command(flatten)]
         selection: SelectionArgs,
     },
     /// Show a human readable representation of the Hii Forms
+    #[command(next_display_order = None)]
     ShowIFR {
         /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[clap(parse(from_os_str), short, long)]
+        #[arg(short, long)]
         filename: Option<PathBuf>,
-        #[clap(flatten)]
+        #[command(flatten)]
         efivars: EfivarArgs,
     },
     /// Dump HiiDB into a file
-    ExtractDB {
-        #[clap(parse(from_os_str))]
-        filename: PathBuf,
-    },
+    #[command(next_display_order = None)]
+    ExtractDB { filename: PathBuf },
     /// Copy the HiiDB and the EFI variables that its questions read into a new directory, for --efivars on another machine
+    #[command(next_display_order = None)]
     DumpEfivars {
         /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[clap(parse(from_os_str), short, long)]
+        #[arg(short, long)]
         filename: Option<PathBuf>,
         /// Copy whole EFI variables, not only the bytes that questions decode; the others can hold secrets such as password hashes
-        #[clap(long)]
+        #[arg(long)]
         unredacted: bool,
         /// The directory to create
-        #[clap(parse(from_os_str), value_name = "DIR")]
+        #[arg(value_name = "DIR")]
         directory: PathBuf,
     },
     /// List all strings-id, string pairs in HiiDB
+    #[command(next_display_order = None)]
     ListStrings {
         /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[clap(parse(from_os_str), short, long)]
+        #[arg(short, long)]
         filename: Option<PathBuf>,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
+        #[command(flatten)]
+        output: JsonArgs,
     },
     /// List questions HiiDB. Note that these are not all possible questions, because we don't parse certain non-useful question types.
+    #[command(next_display_order = None)]
     ListQuestions {
         /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[clap(parse(from_os_str), short, long)]
+        #[arg(short, long)]
         filename: Option<PathBuf>,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
-        #[clap(flatten)]
+        #[command(flatten)]
+        output: JsonArgs,
+        #[command(flatten)]
         selection: SelectionArgs,
-        #[clap(flatten)]
+        #[command(flatten)]
         efivars: EfivarArgs,
     },
+}
+
+/// -j/--json, which overrides itself: it may repeat, as under clap 3.
+#[derive(Debug, Args)]
+struct JsonArgs {
+    #[arg(short = 'j', long = "json", overrides_with = "json")]
+    json: bool,
 }
 
 /// Where get, show-ifr and list-questions read question values.
 #[derive(Debug, Args)]
 struct EfivarArgs {
     /// Read question values from the efivar files in this directory (efivarfs format) instead of this machine's efivarfs; without --filename, also the HiiDB if dump-efivars wrote the directory
-    #[clap(
-        long,
-        value_name = "DIR",
-        parse(from_os_str),
-        conflicts_with = "no-efivars"
-    )]
+    #[arg(long, value_name = "DIR", conflicts_with = "no_efivars")]
     efivars: Option<PathBuf>,
     /// Read no question values from EFI variables: each shows as unavailable (get and list-questions add its IFR default) and conditions on values stay undetermined (the HiiDB still comes from --filename or this machine)
-    #[clap(long)]
+    #[arg(long)]
     no_efivars: bool,
 }
 
@@ -210,13 +218,13 @@ struct SelectionArgs {
     /// browser (edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList) ranks
     /// DisableIf > SuppressIf > GrayOutIf, so a question that is both grayed out and suppressed
     /// counts as suppressed.
-    #[clap(long, value_enum, value_delimiter = ',')]
+    #[arg(long, value_enum, value_delimiter = ',')]
     include: Vec<IncludeState>,
     /// Evaluate the conditions that read the AMI Setup access level (VarStore SystemAccess
     /// E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User) at this level instead of
     /// the stored value. This states a Setup privilege; it is no password and authenticates
     /// nothing (efivarfs writes carry no password).
-    #[clap(long, value_enum, value_name = "LEVEL")]
+    #[arg(long, value_enum, value_name = "LEVEL")]
     access_level: Option<AccessLevelArg>,
 }
 
@@ -312,38 +320,40 @@ impl From<AccessLevelArg> for AccessLevel {
 }
 
 #[derive(Debug, Parser)]
+#[command(next_display_order = None)]
 struct IloCommand {
-    #[clap(subcommand)]
+    #[command(subcommand)]
     command: IloSubcommands,
 }
 
 #[derive(Debug, Subcommand)]
 enum IloSubcommands {
     /// Get the current value of a question
+    #[command(next_display_order = None)]
     Get {
-        #[clap(value_parser)]
         question: String,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
+        #[command(flatten)]
+        output: JsonArgs,
     },
     /// Set/change the value of a question
+    #[command(next_display_order = None)]
     Set {
-        #[clap(value_parser)]
         question: String,
-        #[clap(value_parser)]
         value: String,
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
+        #[command(flatten)]
+        output: JsonArgs,
     },
     /// List bios attributes and their current values
+    #[command(next_display_order = None)]
     ShowAttributes {
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
+        #[command(flatten)]
+        output: JsonArgs,
     },
     /// List all pending changes that will take effect after reboot
+    #[command(next_display_order = None)]
     ShowPendingAttributes {
-        #[clap(short = 'j', long = "json", action, value_parser)]
-        json: bool,
+        #[command(flatten)]
+        output: JsonArgs,
     },
 }
 
@@ -376,7 +386,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             HiiSubcommands::Get {
                 question,
                 filename,
-                json,
+                output,
                 selection,
                 efivars,
             } => {
@@ -390,17 +400,17 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     None,
                     &options,
                 )?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
             HiiSubcommands::Set {
                 question,
                 value,
-                json,
+                output,
                 selection,
             } => {
                 let res =
                     HiiBackend::set_using(question, value, None, &SetOptions::from(selection))?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
             HiiSubcommands::ShowIFR { filename, efivars } => {
                 let mut options = ShowIfrOptions::default();
@@ -441,13 +451,13 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     dump_report(directory, options.redaction, dump)
                 ))?;
             }
-            HiiSubcommands::ListStrings { filename, json } => {
+            HiiSubcommands::ListStrings { filename, output } => {
                 let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
             HiiSubcommands::ListQuestions {
                 filename,
-                json,
+                output,
                 selection,
                 efivars,
             } => {
@@ -459,48 +469,48 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     &HiiBackend::read_hiidb(filename.as_deref(), &options.efivars)?,
                     &options,
                 )?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
         },
         Commands::Ilo(ilo_command) => match &ilo_command.command {
-            IloSubcommands::Get { question, json } => {
+            IloSubcommands::Get { question, output } => {
                 let res = IloBackend::get(question, None)?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
             IloSubcommands::Set {
                 question,
                 value,
-                json,
+                output,
             } => {
                 let res = IloBackend::set(question, value, None)?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
-            IloSubcommands::ShowAttributes { json } => {
+            IloSubcommands::ShowAttributes { output } => {
                 let res = IloBackend::show_attributes()?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
-            IloSubcommands::ShowPendingAttributes { json } => {
+            IloSubcommands::ShowPendingAttributes { output } => {
                 let res = IloBackend::show_pending_attributes()?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
         },
-        Commands::Identify { json } => {
+        Commands::Identify { output } => {
             let machine = identify_machine();
-            print_with_style(machine, *json)?;
+            print_with_style(machine, output.json)?;
         }
         Commands::Get {
             question,
-            json,
+            output,
             selection,
         } => {
             let machine = identify_machine();
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
-            if prioritize_backend(&machine, *json)? == Backend::Ilo {
+            if prioritize_backend(&machine, output.json)? == Backend::Ilo {
                 selection.refuse_on_ilo()?;
                 let res = IloBackend::get(question, None)?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             } else {
                 let res = HiiBackend::get_using(
                     &get_db_dump_bytes(None)?,
@@ -508,31 +518,31 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     None,
                     &GetOptions::from(selection),
                 )?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
         }
         Commands::Set {
             question,
             value,
-            json,
+            output,
             selection,
         } => {
             let machine = identify_machine();
             if machine.backend.contains(&Backend::Unknown) {
                 return Err(anyhow!("unknown backend"));
             }
-            if prioritize_backend(&machine, *json)? == Backend::Ilo {
+            if prioritize_backend(&machine, output.json)? == Backend::Ilo {
                 selection.refuse_on_ilo()?;
                 let res = IloBackend::set(question, value, None)?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             } else {
                 let res =
                     HiiBackend::set_using(question, value, None, &SetOptions::from(selection))?;
-                print_with_style(res, *json)?;
+                print_with_style(res, output.json)?;
             }
         }
-        Commands::ShowTranslations { json } => {
-            print_with_style(&*translation_db, *json)?;
+        Commands::ShowTranslations { output } => {
+            print_with_style(&*translation_db, output.json)?;
         }
     }
     Ok(())
@@ -644,6 +654,8 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     const READING_COMMANDS: [&[&str]; 3] =
@@ -784,7 +796,7 @@ mod tests {
             "0",
         ])
         .expect_err("parse --access-level 0");
-        assert_eq!(error.kind(), clap::ErrorKind::InvalidValue, "0");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "0");
     }
 
     /// --access-level comes with --include: on hii get, set and list-questions and on get and
@@ -807,15 +819,74 @@ mod tests {
                 true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
                 false => assert_eq!(
                     parsed.err(),
-                    Some(clap::ErrorKind::UnknownArgument),
+                    Some(clap::error::ErrorKind::UnknownArgument),
                     "{command:?}"
                 ),
             }
         }
     }
 
+    /// -j and --json may repeat, as clap 3.2 let them (ArgAction::SetTrue); --no-efivars may
+    /// not, as before.
+    #[test]
+    fn json_flag_may_repeat() {
+        let commands: [&[&str]; 4] = [
+            &["hii", "list-questions", "--json", "--json"],
+            &["hii", "get", "Q", "-j", "--json"],
+            &["show-translations", "-j", "-j"],
+            &["ilo", "show-attributes", "--json", "-j"],
+        ];
+        for command in commands {
+            let argv = [&["uefisettings"][..], command].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            assert!(parsed.is_ok(), "{command:?}: {parsed:?}");
+        }
+
+        let error = hii(&["list-questions", "--no-efivars", "--no-efivars"])
+            .expect_err("parse --no-efivars twice");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--no-efivars twice"
+        );
+    }
+
+    /// Every command lists its subcommands and options by name, as under clap 3: clap sorts those
+    /// of one display order by name, and next_display_order = None leaves each at the default.
+    /// clap's help subcommand renders none of its own subcommands, which mirror the commands.
+    #[test]
+    fn help_lists_every_command_s_entries_by_name() {
+        let unordered = clap::Arg::new("unordered").get_display_order();
+        let mut root = UefiSettingsToolArgs::command();
+        root.build();
+        let mut commands = vec![&root];
+        while let Some(command) = commands.pop() {
+            for subcommand in command.get_subcommands() {
+                assert_eq!(
+                    subcommand.get_display_order(),
+                    unordered,
+                    "subcommand {} of {}",
+                    subcommand.get_name(),
+                    command.get_name()
+                );
+                if subcommand.get_name() != "help" {
+                    commands.push(subcommand);
+                }
+            }
+            for arg in command.get_arguments().filter(|arg| !arg.is_positional()) {
+                assert_eq!(
+                    arg.get_display_order(),
+                    unordered,
+                    "option {} of {}",
+                    arg.get_id(),
+                    command.get_name()
+                );
+            }
+        }
+    }
+
     /// The hii subcommand that `args`, after `uefisettings hii`, parse to.
-    fn hii(args: &[&str]) -> clap::Result<HiiSubcommands> {
+    fn hii(args: &[&str]) -> clap::error::Result<HiiSubcommands> {
         let argv = [&["uefisettings", "hii"][..], args].concat();
         UefiSettingsToolArgs::try_parse_from(argv).map(|parsed| match parsed.command {
             Commands::Hii(hii) => hii.command,
@@ -873,7 +944,7 @@ mod tests {
 
             assert_eq!(
                 error.kind(),
-                clap::ErrorKind::ArgumentConflict,
+                clap::error::ErrorKind::ArgumentConflict,
                 "{command:?}"
             );
         }
@@ -912,7 +983,11 @@ mod tests {
             let error = hii(&[&["set", "Question", "Value"][..], flags].concat())
                 .expect_err("parse an efivar flag of set");
 
-            assert_eq!(error.kind(), clap::ErrorKind::UnknownArgument, "{flags:?}");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flags:?}"
+            );
         }
     }
 
@@ -958,7 +1033,7 @@ mod tests {
         let error = hii(&["dump-efivars"]).expect_err("parse dump-efivars without DIR");
         assert_eq!(
             error.kind(),
-            clap::ErrorKind::MissingRequiredArgument,
+            clap::error::ErrorKind::MissingRequiredArgument,
             "no DIR"
         );
     }
