@@ -38,7 +38,9 @@ use super::SettingsBackend;
 use crate::hii::extract;
 use crate::hii::package;
 use crate::hii::EfivarDump;
+use crate::hii::EfivarFiles;
 use crate::hii::EfivarSource;
+use crate::hii::FirmwareVariables;
 use crate::hii::SavedDump;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
@@ -48,6 +50,19 @@ use crate::ilorest::requests::RedfishAttributes;
 use crate::translation::ilo::get_qa_variations_ilo;
 use crate::translation::ilo::IloTranslation;
 use crate::translation::translate_response;
+
+/// What set and get read and write when no file names them: this machine's HiiDB and efivarfs.
+impl HiiBackend {
+    /// This machine's HiiDB.
+    pub(super) fn system_hiidb() -> Result<Vec<u8>> {
+        extract::extract_db()
+    }
+
+    /// This machine's efivarfs.
+    pub(super) fn system_variables() -> impl FirmwareVariables {
+        EfivarFiles::system()
+    }
+}
 
 impl HiiBackend {
     /// extract_db extracts HiiDB from efivarfs and returns it in bytes (in HiiDatabase's db field which is `Vec<u8>`)

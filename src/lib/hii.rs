@@ -10,8 +10,11 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#[cfg(target_os = "linux")]
 mod efivar_dump;
+#[cfg(target_os = "linux")]
 mod efivarfs;
+#[cfg(target_os = "linux")]
 pub mod extract;
 pub mod forms;
 pub mod package;
@@ -23,10 +26,16 @@ mod variables;
 // See UEFI 2.10 §33 "Human Interface Infrastructure Overview":
 // https://uefi.org/specifications
 
+#[cfg(target_os = "linux")]
 pub(crate) use efivar_dump::dump_efivars;
+#[cfg(target_os = "linux")]
 pub use efivar_dump::EfivarDump;
+#[cfg(target_os = "linux")]
 pub use efivar_dump::EfivarRedaction;
+#[cfg(target_os = "linux")]
 pub(crate) use efivar_dump::SavedDump;
+#[cfg(target_os = "linux")]
 pub(crate) use efivarfs::EfivarFiles;
 pub(crate) use variables::EfivarReader;
 pub use variables::EfivarSource;
+pub(crate) use variables::FirmwareVariables;

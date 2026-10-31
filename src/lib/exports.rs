@@ -25,14 +25,14 @@ use uefisettings_backend_thrift::Question;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
-use crate::hii::extract;
 use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::package;
+#[cfg(target_os = "linux")]
 pub use crate::hii::EfivarDump;
-use crate::hii::EfivarFiles;
 use crate::hii::EfivarReader;
+#[cfg(target_os = "linux")]
 pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
 use crate::translation::get_qa_variations_hii;
@@ -44,9 +44,12 @@ pub use crate::hii::forms::IncludedStates;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
 
+#[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(target_os = "linux")]
 pub use linux::identify_machine;
+#[cfg(target_os = "linux")]
 pub use linux::IloBackend;
 
 /// SettingsBackend is a trait which should be satisfied by all backends (like ilo, hii)
@@ -102,6 +105,7 @@ pub struct ShowIfrOptions {
 }
 
 /// The options of HiiBackend::dump_efivars.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct DumpEfivarsOptions {
@@ -231,7 +235,7 @@ impl SettingsBackend for HiiBackend {
 
     fn get(question: &str, selector: Option<&str>) -> Result<GetResponseList> {
         Self::get_using(
-            &extract::extract_db()?,
+            &Self::system_hiidb()?,
             question,
             selector,
             &GetOptions::default(),
@@ -253,7 +257,7 @@ impl HiiBackend {
 
         let mut resp = Vec::new();
 
-        let db_bytes = extract::extract_db()?;
+        let db_bytes = Self::system_hiidb()?;
         let parsed_db = package::read_db(&db_bytes)?;
 
         let hii_translation = get_qa_variations_hii(question, new_value);
@@ -285,7 +289,7 @@ impl HiiBackend {
             new_value,
             &new_value_variations,
             include,
-            &EfivarFiles::system(),
+            &Self::system_variables(),
         )?
         .into_iter()
         .map(|chosen| chosen.map_or_else(String::new, |option| option.state.option_annotation()))

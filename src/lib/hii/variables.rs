@@ -16,7 +16,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
-use std::path::PathBuf;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -164,7 +163,8 @@ pub enum EfivarSource {
     #[default]
     System,
     /// A directory of efivar files in efivarfs format, such as a copy of another machine's.
-    Directory(PathBuf),
+    #[cfg(target_os = "linux")]
+    Directory(std::path::PathBuf),
     /// No efivar files: each value shows as unavailable (get and list-questions add its IFR
     /// default) and conditions on values stay undetermined.
     Disabled,
@@ -176,6 +176,7 @@ impl EfivarSource {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::System | Self::Disabled => Ok(()),
+            #[cfg(target_os = "linux")]
             Self::Directory(dir) => match std::fs::metadata(dir) {
                 Ok(metadata) if metadata.is_dir() => Ok(()),
                 Ok(_) => Err(EfivarsNotADirectory(dir.clone()).into()),
@@ -192,9 +193,10 @@ impl EfivarSource {
 }
 
 /// Why EfivarSource::validate refuses a Directory.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("efivars directory {} is not a directory", .0.display())]
-pub(super) struct EfivarsNotADirectory(PathBuf);
+pub(super) struct EfivarsNotADirectory(std::path::PathBuf);
 
 /// The outcome of every efivar range under EfivarSource::Disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

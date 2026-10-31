@@ -12,7 +12,6 @@ name = "uefisettings"
 path = "src/lib/lib.rs"
 
 [dependencies]
-libc = "0.2"
 uefisettings_backend_thrift = { path = "thrift/rust/uefisettings_backend_thrift", version = "0.1.6" }
 uefisettings_spellings_db_thrift = { path = "thrift/rust/uefisettings_spellings_db_thrift", version = "0.1.6" }
 anyhow = "1.0"
@@ -21,17 +20,22 @@ clap = { package = "clap", version = "3.2.25", features = ["derive", "env", "reg
 log = { version = "0.4", features = ["kv_unstable", "kv_unstable_std"] }
 serde = { version = "1.0", features = ["derive", "rc"]}
 serde_json = { version = "1.0", features = ["float_roundtrip", "unbounded_depth"] }
+# binrw's default verbose-backtrace feature puts ANSI bold codes and a banner into its
+# errors, which main prints as JSON (https://github.com/linuxboot/uefisettings/issues/16).
+binrw = { version = "0.13", default-features = false, features = ["std"] }
+thiserror = "1.0"
+bitflags = "2.4.1"
+
+# Only the Linux build uses these: efivarfs, the HiiDB in sysfs, iLO through
+# ilorest_chif.so, and the CLI's logging.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 nix = { version = "0.27", features = ["fs", "ioctl", "mount"] }
 tempfile = "3.5"
 libloading = "0.8"
 httparse = "1.8"
-# binrw's default verbose-backtrace feature puts ANSI bold codes and a banner into its
-# errors, which main prints as JSON (https://github.com/linuxboot/uefisettings/issues/16).
-binrw = { version = "0.13", default-features = false, features = ["std"] }
 rand = { version = "0.8", features = ["small_rng"] }
 proc-mounts = "0.3"
-thiserror = "1.0"
-bitflags = "2.4.1"
 env_logger = "0.10"
 
 [dev-dependencies]

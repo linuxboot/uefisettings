@@ -18,6 +18,7 @@ use log::info;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
+#[cfg(target_os = "linux")]
 pub(crate) mod ilo;
 
 pub enum HiiTranslation {
