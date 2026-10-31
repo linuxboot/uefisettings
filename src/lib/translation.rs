@@ -123,11 +123,9 @@ pub fn get_qa_variations_ilo(question: &str, answer: &str) -> IloTranslation {
 /// i.e. basically reverse replacement from real answer to canonical answer
 /// if something wasn't found in the db then return the real/original answer
 pub fn translate_response(question: &str, answer: &str, backend: Backend) -> String {
-    let question_mapping = translation_db.get(question);
-    if question_mapping.is_none() {
+    let Some(question_mapping) = translation_db.get(question) else {
         return answer.to_owned();
-    }
-    let question_mapping = question_mapping.unwrap();
+    };
 
     match backend {
         Backend::Hii => {
@@ -159,4 +157,34 @@ pub fn translate_response(question: &str, answer: &str, backend: Backend) -> Str
         _ => {}
     }
     answer.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use uefisettings_spellings_db_thrift::consts::CQ_HYPER_THREADING;
+    use uefisettings_spellings_db_thrift::consts::CQ_TPM_STATE;
+
+    use super::*;
+
+    /// translate_response gives the canonical answer for a spelling that the DB lists for the
+    /// question and backend, and the answer unchanged for any other question, answer or backend.
+    #[test]
+    fn translate_response_reverses_only_the_spellings_in_the_db() {
+        let cases = [
+            (CQ_TPM_STATE, "Enable", Backend::Hii, "Enabled"),
+            (CQ_TPM_STATE, "PresentEnabled", Backend::Ilo, "Enabled"),
+            (CQ_TPM_STATE, "Enable", Backend::Ilo, "Enable"),
+            (CQ_TPM_STATE, "Unknown", Backend::Hii, "Unknown"),
+            (CQ_HYPER_THREADING, "Disable", Backend::Ilo, "Disable"),
+            ("Not in the DB", "Enable", Backend::Hii, "Enable"),
+        ];
+
+        for (question, answer, backend, expected) in cases {
+            assert_eq!(
+                translate_response(question, answer, backend),
+                expected,
+                "{question:?} {answer:?} {backend:?}"
+            );
+        }
+    }
 }
