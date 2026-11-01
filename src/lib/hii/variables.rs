@@ -11,9 +11,10 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The firmware variables that questions read and set, whatever holds them: efivarfs on Linux
-//! (efivarfs.rs).
+//! (efivarfs.rs), GetVariable() and SetVariable() in the UEFI Shell (variable_services.rs).
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 
@@ -34,7 +35,6 @@ const EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: u32 = 0x00000080;
 /// and EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.10 §8.2.1)
 const EFI_VARIABLE_AUTHENTICATED_ACCESS: u32 =
     0x00000010 | 0x00000020 | EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS;
-const MISSING_ATTRIBUTES_HEADER: &str = "efivarfs file is missing its attributes header";
 
 /// A firmware variable: its name and vendor GUID (UEFI 2.10 §8.2.1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,9 +61,67 @@ impl fmt::Display for VariableKey {
 /// EFI_VARIABLE_RUNTIME_ACCESS; before it, as in the UEFI Shell, all (UEFI 2.10 §8.2.1-§8.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VariableReach {
+    #[cfg_attr(
+        target_os = "uefi",
+        allow(dead_code, reason = "no UEFI Shell variables reach Runtime")
+    )]
     Runtime,
-    #[allow(dead_code, reason = "no Linux variables reach BootServices")]
+    #[cfg_attr(
+        target_os = "linux",
+        allow(dead_code, reason = "no Linux variables reach BootServices")
+    )]
     BootServices,
+}
+
+/// The texts of errors about variables of each reach: Runtime as through Linux's efivarfs,
+/// BootServices as through GetVariable() and SetVariable() in the UEFI Shell.
+impl VariableReach {
+    /// What errors call the data bytes of a variable, which follow its attributes word.
+    fn data(self) -> &'static str {
+        match self {
+            Self::Runtime => "efivarfs payload",
+            Self::BootServices => "GetVariable() data",
+        }
+    }
+
+    /// The error for variable bytes without their whole attributes word.
+    fn missing_attributes(self) -> &'static str {
+        match self {
+            Self::Runtime => "efivarfs file is missing its attributes header",
+            Self::BootServices => "variable bytes are missing their attributes word",
+        }
+    }
+
+    /// What errors call a write of a question's value.
+    pub(super) fn write(self) -> &'static str {
+        match self {
+            Self::Runtime => "efivarfs write",
+            Self::BootServices => "SetVariable() write",
+        }
+    }
+
+    /// Why set refuses a volatile variable, after its name.
+    fn volatile_refusal(self) -> &'static str {
+        match self {
+            Self::Runtime => " and cannot be written through efivarfs",
+            Self::BootServices => ", so a write would not outlast a power cycle",
+        }
+    }
+
+    /// Why set cannot write a variable that does not exist, after its VariableNotFound.
+    pub(super) fn not_found_refusal(self) -> &'static str {
+        match self {
+            Self::Runtime => {
+                "the firmware has not created it or does not expose it to the OS, so its \
+                 questions cannot be set from Linux; change them in the firmware setup, or ask \
+                 the board vendor for firmware that exposes it; see \
+                 https://github.com/linuxboot/uefisettings/issues/2"
+            }
+            Self::BootServices => {
+                "the firmware has not created it, and set never creates variables"
+            }
+        }
+    }
 }
 
 /// The firmware variables that questions read and set: efivarfs on Linux, GetVariable/SetVariable
@@ -80,6 +138,34 @@ pub(crate) trait FirmwareVariables {
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()>;
 }
 
+impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
+    fn reach(&self) -> VariableReach {
+        (**self).reach()
+    }
+
+    fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
+        (**self).read(key, size)
+    }
+
+    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
+        (**self).write_at(key, size, offset, encoded)
+    }
+}
+
+impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
+    fn reach(&self) -> VariableReach {
+        (**self).reach()
+    }
+
+    fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
+        (**self).read(key, size)
+    }
+
+    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
+        (**self).write_at(key, size, offset, encoded)
+    }
+}
+
 /// The attribute word of efivar file bytes, which Linux v7.2 fs/efivarfs/file.c
 /// efivarfs_file_read() copies as a native u32 before the payload; None for fewer bytes.
 pub(super) fn efivar_attributes(bytes: &[u8]) -> Option<u32> {
@@ -89,26 +175,54 @@ pub(super) fn efivar_attributes(bytes: &[u8]) -> Option<u32> {
         .map(u32::from_ne_bytes)
 }
 
+/// What FirmwareVariables::read gives for the variable `key` whose GetVariable() returned
+/// `attributes` and `data`: the attributes word and the first `size` data bytes, as an efivarfs
+/// file starts.
+#[cfg_attr(
+    not(target_os = "uefi"),
+    allow(
+        dead_code,
+        reason = "efivarfs reads its files; the UEFI build and the tests' MemoryVariables call it"
+    )
+)]
+pub(super) fn attributes_and_data(
+    key: &VariableKey,
+    attributes: u32,
+    data: &[u8],
+    size: u16,
+) -> Result<Vec<u8>> {
+    let data = data.get(..usize::from(size)).with_context(|| {
+        format!(
+            "EFI variable {key} holds {} data bytes, fewer than the {size} of its VarStore",
+            data.len()
+        )
+    })?;
+    Ok([&attributes.to_ne_bytes()[..], data].concat())
+}
+
 /// The read-modify-write of FirmwareVariables::write_at on `bytes`, the attributes word and all
-/// the data of variable `key`: refuses a volatile or authenticated variable, then writes
-/// `encoded` at data offset `offset` as update_efivarfs_bytes does.
+/// the data of variable `key`, which variables of `reach` hold: refuses a volatile or
+/// authenticated variable, then writes `encoded` at data offset `offset` as update_efivarfs_bytes
+/// does.
 pub(super) fn modify_variable_bytes(
     key: &VariableKey,
+    reach: VariableReach,
     bytes: &mut [u8],
     size: u16,
     offset: u16,
     encoded: &[u8],
 ) -> Result<()> {
-    let attributes = efivar_attributes(bytes).context(MISSING_ATTRIBUTES_HEADER)?;
-    check_non_volatile(key, attributes)?;
+    let attributes = efivar_attributes(bytes).context(reach.missing_attributes())?;
+    check_non_volatile(key, reach, attributes)?;
     check_unauthenticated(key, attributes)?;
-    update_efivarfs_bytes(bytes, size, offset, encoded)
+    update_efivarfs_bytes(reach, bytes, size, offset, encoded)
 }
 
 /// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
 /// shorter than the `payload_size` bytes of its VarStore, which VarStoreWrite::new fits the
-/// write in.
+/// write in. Errors word it as variables of `reach` hold it.
 fn update_efivarfs_bytes(
+    reach: VariableReach,
     bytes: &mut [u8],
     payload_size: u16,
     offset: u16,
@@ -116,10 +230,11 @@ fn update_efivarfs_bytes(
 ) -> Result<()> {
     let payload = bytes
         .get_mut(EFIVARFS_HEADER_SIZE..)
-        .context(MISSING_ATTRIBUTES_HEADER)?;
+        .context(reach.missing_attributes())?;
     if payload.len() < usize::from(payload_size) {
         return Err(anyhow!(
-            "efivarfs payload is shorter than the declared varstore: {} < {} bytes",
+            "{} is shorter than the declared varstore: {} < {} bytes",
+            reach.data(),
             payload.len(),
             payload_size
         ));
@@ -128,22 +243,27 @@ fn update_efivarfs_bytes(
     let start = usize::from(offset);
     payload
         .get_mut(start..start + encoded.len())
-        .context("write past the efivarfs payload")?
+        .with_context(|| format!("write past the {}", reach.data()))?
         .copy_from_slice(encoded);
     Ok(())
 }
 
 /// Refuses an EFI variable without EFI_VARIABLE_NON_VOLATILE, which efivarfs cannot write
-/// (UEFI 2.10 §8.2.3).
-/// Takes the efivar file's attribute word, which Linux passes to SetVariable(), not
+/// (UEFI 2.10 §8.2.3) and a power cycle would erase; errors word it as variables of `reach` hold
+/// it.
+/// Takes the variable's own attribute word, which its write passes to SetVariable(), not
 /// VARSTORE_EFI's Attributes; check_runtime_access cannot, as a boot-service-only variable has
 /// no file.
 pub(super) fn check_non_volatile(
     key: &VariableKey,
+    reach: VariableReach,
     attributes: u32,
 ) -> std::result::Result<(), VolatileVariable> {
     if attributes & EFI_VARIABLE_NON_VOLATILE == 0 {
-        return Err(VolatileVariable(key.clone()));
+        return Err(VolatileVariable {
+            key: key.clone(),
+            reach,
+        });
     }
     Ok(())
 }
@@ -151,10 +271,13 @@ pub(super) fn check_non_volatile(
 /// An EFI variable without EFI_VARIABLE_NON_VOLATILE, which set refuses.
 #[derive(Error, Debug)]
 #[error(
-    "EFI variable {0} is volatile (no EFI_VARIABLE_NON_VOLATILE) and cannot be written through \
-     efivarfs"
+    "EFI variable {key} is volatile (no EFI_VARIABLE_NON_VOLATILE){}",
+    .reach.volatile_refusal()
 )]
-pub(super) struct VolatileVariable(VariableKey);
+pub(super) struct VolatileVariable {
+    key: VariableKey,
+    reach: VariableReach,
+}
 
 /// Refuses an EFI variable with authenticated access, which its `attributes` word names: every
 /// write of it needs a signed descriptor (UEFI 2.10 §8.2.3).
@@ -213,20 +336,22 @@ pub(super) struct EnhancedAuthenticatedVariable {
 /// A variable that FirmwareVariables does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("no EFI variable {0}")]
-pub(crate) struct VariableNotFound(pub(crate) VariableKey);
+pub(super) struct VariableNotFound(pub(super) VariableKey);
 
-/// Where question values are read: the efivar files of this machine or of a directory, or none.
-// Each backend makes the variables of a source in EfivarSource::into_variables: efivarfs.rs.
+/// Where question values are read: the variables of this machine, a directory of efivar files,
+/// or none.
+// Each backend makes the variables of a source in EfivarSource::into_variables: efivarfs.rs,
+// variable_services.rs.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum EfivarSource {
-    /// This machine's efivarfs.
+    /// This machine's variables: its efivarfs on Linux, GetVariable() in the UEFI Shell.
     #[default]
     System,
     /// A directory of efivar files in efivarfs format, such as a copy of another machine's.
     #[cfg(target_os = "linux")]
     Directory(std::path::PathBuf),
-    /// No efivar files: each value shows as unavailable (get and list-questions add its IFR
+    /// No variables: each value shows as unavailable (get and list-questions add its IFR
     /// default) and conditions on values stay undetermined.
     Disabled,
 }
@@ -316,12 +441,20 @@ pub(crate) struct EfivarReader {
 
 impl EfivarReader {
     /// Reads the variables of `source`, which EfivarSource::validate accepts.
+    #[cfg_attr(
+        target_os = "uefi",
+        allow(
+            dead_code,
+            reason = "the exports withhold password VarStores from a source's variables; only \
+                      the Linux build's dump-efivars and the tests read a source as it is"
+        )
+    )]
     pub(crate) fn new(source: EfivarSource) -> Result<Self> {
         Ok(Self::with_variables(source.into_variables()?))
     }
 
     /// Reads `variables`.
-    pub(super) fn with_variables(variables: Box<dyn FirmwareVariables>) -> Self {
+    pub(crate) fn with_variables(variables: Box<dyn FirmwareVariables>) -> Self {
         Self {
             variables,
             outcomes: BTreeMap::new(),
@@ -330,7 +463,7 @@ impl EfivarReader {
     }
 
     /// Which variables this reader reaches.
-    pub(super) fn reach(&self) -> VariableReach {
+    pub(crate) fn reach(&self) -> VariableReach {
         self.variables.reach()
     }
 
@@ -358,6 +491,52 @@ impl EfivarReader {
             .as_deref()
     }
 }
+
+/// `variables` without the `withheld` ones, the VarStores that PASSWORD questions name: each read
+/// or write of one fails with WithheldVariable, before `variables` see it.
+pub(crate) struct WithholdingVariables<V> {
+    variables: V,
+    withheld: BTreeSet<VariableKey>,
+}
+
+impl<V> WithholdingVariables<V> {
+    pub(super) fn new(variables: V, withheld: BTreeSet<VariableKey>) -> Self {
+        Self {
+            variables,
+            withheld,
+        }
+    }
+
+    /// Refuses the variable `key` if it is withheld.
+    fn check(&self, key: &VariableKey) -> std::result::Result<(), WithheldVariable> {
+        match self.withheld.contains(key) {
+            true => Err(WithheldVariable(key.clone())),
+            false => Ok(()),
+        }
+    }
+}
+
+impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
+    fn reach(&self) -> VariableReach {
+        self.variables.reach()
+    }
+
+    fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
+        self.check(key)?;
+        self.variables.read(key, size)
+    }
+
+    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
+        self.check(key)?;
+        self.variables.write_at(key, size, offset, encoded)
+    }
+}
+
+/// The outcome of every read and write of a variable that WithholdingVariables withhold: a
+/// password VarStore.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("EFI variable {0} holds a password, which the UEFI Shell build never reads or writes")]
+pub(super) struct WithheldVariable(pub(super) VariableKey);
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -441,6 +620,16 @@ pub(crate) mod tests {
             self.variables.borrow().get(key).cloned()
         }
 
+        /// The sizes of the reads of `key`, in order.
+        pub(crate) fn reads_of(&self, key: &VariableKey) -> Vec<u16> {
+            self.reads
+                .borrow()
+                .iter()
+                .filter(|(read, _)| read == key)
+                .map(|(_, size)| *size)
+                .collect()
+        }
+
         /// The variables and sizes of every read, in order.
         pub(crate) fn reads(&self) -> Vec<(VariableKey, u16)> {
             self.reads.borrow().clone()
@@ -468,10 +657,9 @@ pub(crate) mod tests {
             let bytes = variables
                 .get(key)
                 .ok_or_else(|| VariableNotFound(key.clone()))?;
-            bytes
-                .get(..EFIVARFS_HEADER_SIZE + usize::from(size))
-                .map(<[u8]>::to_vec)
-                .with_context(|| format!("variable {key} is shorter than {size} bytes"))
+            let attributes = efivar_attributes(bytes).context("attributes word")?;
+            let data = bytes.get(EFIVARFS_HEADER_SIZE..).unwrap_or_default();
+            attributes_and_data(key, attributes, data, size)
         }
 
         fn write_at(
@@ -497,7 +685,7 @@ pub(crate) mod tests {
                 .get_mut(key)
                 .ok_or_else(|| VariableNotFound(key.clone()))?;
             let mut modified = bytes.clone();
-            modify_variable_bytes(key, &mut modified, size, offset, encoded)?;
+            modify_variable_bytes(key, self.reach, &mut modified, size, offset, encoded)?;
             *bytes = modified;
             self.writes
                 .borrow_mut()
@@ -533,6 +721,85 @@ pub(crate) mod tests {
             name: name.to_string(),
             guid: NIL_GUID,
         }
+    }
+
+    /// The errors of a write word it as variables of their reach hold it: Runtime as efivarfs,
+    /// BootServices as GetVariable() and SetVariable(), never efivarfs.
+    #[test]
+    fn write_errors_follow_their_reach() {
+        let volatile = |reach| {
+            check_non_volatile(&variable_key("Volatile"), reach, BS_RT)
+                .map_err(|error| error.to_string())
+        };
+        let short = |reach| {
+            update_efivarfs_bytes(reach, &mut variable_bytes(2), 4, 0, &[1])
+                .map_err(|error| error.to_string())
+        };
+        let past = |reach| {
+            update_efivarfs_bytes(reach, &mut variable_bytes(4), 4, 4, &[1])
+                .map_err(|error| format!("{error:#}"))
+        };
+        let headless = |reach| {
+            update_efivarfs_bytes(reach, &mut [7, 0], 0, 0, &[])
+                .map_err(|error| format!("{error:#}"))
+        };
+        let cases = [
+            (
+                VariableReach::Runtime,
+                "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
+                 EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs",
+                "efivarfs payload is shorter than the declared varstore: 2 < 4 bytes",
+                "write past the efivarfs payload",
+                "efivarfs file is missing its attributes header",
+                "efivarfs write",
+            ),
+            (
+                VariableReach::BootServices,
+                "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
+                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
+                "GetVariable() data is shorter than the declared varstore: 2 < 4 bytes",
+                "write past the GetVariable() data",
+                "variable bytes are missing their attributes word",
+                "SetVariable() write",
+            ),
+        ];
+        for (reach, want_volatile, want_short, want_past, want_headless, want_write) in cases {
+            assert_eq!(
+                volatile(reach),
+                Err(want_volatile.to_string()),
+                "{reach:?}: volatile"
+            );
+            assert_eq!(
+                short(reach),
+                Err(want_short.to_string()),
+                "{reach:?}: short"
+            );
+            assert_eq!(past(reach), Err(want_past.to_string()), "{reach:?}: past");
+            assert_eq!(
+                headless(reach),
+                Err(want_headless.to_string()),
+                "{reach:?}: headless"
+            );
+            assert_eq!(reach.write(), want_write, "{reach:?}: write");
+        }
+    }
+
+    /// set's refusal of a variable that does not exist follows its reach: Runtime as on Linux,
+    /// BootServices, which reach every variable that the firmware has created.
+    #[test]
+    fn not_found_refusal_follows_its_reach() {
+        assert_eq!(
+            VariableReach::Runtime.not_found_refusal(),
+            "the firmware has not created it or does not expose it to the OS, so its questions \
+             cannot be set from Linux; change them in the firmware setup, or ask the board vendor \
+             for firmware that exposes it; see https://github.com/linuxboot/uefisettings/issues/2",
+            "Runtime"
+        );
+        assert_eq!(
+            VariableReach::BootServices.not_found_refusal(),
+            "the firmware has not created it, and set never creates variables",
+            "BootServices"
+        );
     }
 
     #[test]
@@ -601,6 +868,56 @@ pub(crate) mod tests {
                 (variable_key("Setup"), 1)
             ],
             "reads: each range once, in order"
+        );
+    }
+
+    /// WithholdingVariables refuse to read or write a withheld variable before their variables
+    /// see it, and pass the others through.
+    #[test]
+    fn withheld_variable_is_neither_read_nor_written() {
+        let variables = MemoryVariables::with_reach(VariableReach::BootServices);
+        variables.insert(variable_key("Setup"), NV_BS_RT, &[1]);
+        variables.insert(variable_key("AMITSESetup"), NV_BS_RT, &[0xAA]);
+        let withholding =
+            WithholdingVariables::new(&variables, BTreeSet::from([variable_key("AMITSESetup")]));
+        let withheld = |error: anyhow::Error| error.downcast_ref::<WithheldVariable>().cloned();
+
+        assert_eq!(
+            withholding
+                .read(&variable_key("AMITSESetup"), 1)
+                .map_err(withheld),
+            Err(Some(WithheldVariable(variable_key("AMITSESetup")))),
+            "read AMITSESetup"
+        );
+        assert_eq!(
+            withholding
+                .write_at(&variable_key("AMITSESetup"), 1, 0, &[0])
+                .map_err(withheld),
+            Err(Some(WithheldVariable(variable_key("AMITSESetup")))),
+            "write AMITSESetup"
+        );
+        assert_eq!(
+            withholding.read(&variable_key("Setup"), 1).ok(),
+            Some([&NV_BS_RT.to_ne_bytes()[..], &[1]].concat()),
+            "read Setup"
+        );
+        withholding
+            .write_at(&variable_key("Setup"), 1, 0, &[2])
+            .expect("write Setup");
+        assert_eq!(
+            variables.reads(),
+            [(variable_key("Setup"), 1)],
+            "reads: Setup only"
+        );
+        assert_eq!(
+            variables.writes_to(&variable_key("AMITSESetup")),
+            [],
+            "writes to AMITSESetup"
+        );
+        assert_eq!(
+            variables.writes_to(&variable_key("Setup")),
+            [(0, vec![2])],
+            "writes to Setup"
         );
     }
 
@@ -699,8 +1016,22 @@ pub(crate) mod tests {
     #[test]
     fn trailing_thermal_fields_do_not_overlap() {
         let mut bytes = variable_bytes(42);
-        update_efivarfs_bytes(&mut bytes, 42, 38, &95u16.to_le_bytes()).expect("update 38");
-        update_efivarfs_bytes(&mut bytes, 42, 40, &90u16.to_le_bytes()).expect("update 40");
+        update_efivarfs_bytes(
+            VariableReach::Runtime,
+            &mut bytes,
+            42,
+            38,
+            &95u16.to_le_bytes(),
+        )
+        .expect("update 38");
+        update_efivarfs_bytes(
+            VariableReach::Runtime,
+            &mut bytes,
+            42,
+            40,
+            &90u16.to_le_bytes(),
+        )
+        .expect("update 40");
         assert_eq!(
             &bytes[EFIVARFS_HEADER_SIZE + 38..][..2],
             &95u16.to_le_bytes()
@@ -718,7 +1049,7 @@ pub(crate) mod tests {
             let mut bytes = variable_bytes(42);
             let original = bytes.clone();
             assert_eq!(
-                update_efivarfs_bytes(&mut bytes, 42, offset, encoded)
+                update_efivarfs_bytes(VariableReach::Runtime, &mut bytes, 42, offset, encoded)
                     .map_err(|error| error.to_string()),
                 Err("write past the efivarfs payload".to_string()),
                 "{} bytes at offset {offset}",
@@ -738,7 +1069,14 @@ pub(crate) mod tests {
         for offset in [0, 40] {
             let mut bytes = variable_bytes(39);
             let original = bytes.clone();
-            assert!(update_efivarfs_bytes(&mut bytes, 42, offset, &1u16.to_le_bytes()).is_err());
+            assert!(update_efivarfs_bytes(
+                VariableReach::Runtime,
+                &mut bytes,
+                42,
+                offset,
+                &1u16.to_le_bytes()
+            )
+            .is_err());
             assert_eq!(bytes, original);
         }
     }
@@ -748,7 +1086,7 @@ pub(crate) mod tests {
         for length in 0..EFIVARFS_HEADER_SIZE {
             let mut bytes = vec![0xa5; length];
             let original = bytes.clone();
-            assert!(update_efivarfs_bytes(&mut bytes, 1, 0, &[1]).is_err());
+            assert!(update_efivarfs_bytes(VariableReach::Runtime, &mut bytes, 1, 0, &[1]).is_err());
             assert_eq!(bytes, original);
         }
     }
@@ -757,7 +1095,14 @@ pub(crate) mod tests {
     fn preserves_bytes_beyond_declared_varstore() {
         let mut bytes = variable_bytes(50);
         let original = bytes.clone();
-        update_efivarfs_bytes(&mut bytes, 42, 40, &95u16.to_le_bytes()).expect("update 40");
+        update_efivarfs_bytes(
+            VariableReach::Runtime,
+            &mut bytes,
+            42,
+            40,
+            &95u16.to_le_bytes(),
+        )
+        .expect("update 40");
         assert_eq!(&bytes[46..], &original[46..]);
         assert_eq!(&bytes[..44], &original[..44]);
         assert_eq!(bytes.len(), original.len());
@@ -767,7 +1112,7 @@ pub(crate) mod tests {
     fn writes_small_and_maximum_sized_varstores() {
         for size in [1, 2, u16::MAX] {
             let mut bytes = variable_bytes(usize::from(size));
-            update_efivarfs_bytes(&mut bytes, size, size - 1, &[95])
+            update_efivarfs_bytes(VariableReach::Runtime, &mut bytes, size, size - 1, &[95])
                 .unwrap_or_else(|error| panic!("update the last of {size} bytes: {error}"));
             assert_eq!(bytes.len(), EFIVARFS_HEADER_SIZE + usize::from(size));
             assert_eq!(bytes.last(), Some(&95));
@@ -790,9 +1135,38 @@ pub(crate) mod tests {
         ];
         for (attributes, want) in cases {
             assert_eq!(
-                check_non_volatile(&key, attributes).map_err(|error| error.to_string()),
+                check_non_volatile(&key, VariableReach::Runtime, attributes)
+                    .map_err(|error| error.to_string()),
                 want,
                 "attributes {attributes:#x}"
+            );
+        }
+    }
+
+    /// A variable read gives the attributes word and the first `size` data bytes, and fails for
+    /// fewer data bytes.
+    #[test]
+    fn attributes_and_data_start_as_an_efivarfs_file() {
+        let key = variable_key("Setup");
+        let cases = [
+            (2, Ok([&NV_BS_RT.to_ne_bytes()[..], &[1, 2]].concat())),
+            (3, Ok([&NV_BS_RT.to_ne_bytes()[..], &[1, 2, 3]].concat())),
+            (0, Ok(NV_BS_RT.to_ne_bytes().to_vec())),
+            (
+                4,
+                Err(
+                    "EFI variable Setup-00000000-0000-0000-0000-000000000000 holds 3 data bytes, \
+                     fewer than the 4 of its VarStore"
+                        .to_string(),
+                ),
+            ),
+        ];
+        for (size, want) in cases {
+            assert_eq!(
+                attributes_and_data(&key, NV_BS_RT, &[1, 2, 3], size)
+                    .map_err(|error| error.to_string()),
+                want,
+                "{size} bytes"
             );
         }
     }
@@ -815,46 +1189,62 @@ pub(crate) mod tests {
         );
     }
 
-    /// modify_variable_bytes refuses a volatile variable and keeps its bytes.
+    /// modify_variable_bytes refuses a volatile variable, in the words of its reach, and keeps its
+    /// bytes.
     #[test]
     fn modify_variable_bytes_refuses_a_volatile_variable() {
         let key = variable_key("Volatile");
-        let mut bytes = [&BS_RT.to_ne_bytes()[..], &[1]].concat();
-        let before = bytes.clone();
+        let cases = [
+            (
+                VariableReach::Runtime,
+                "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
+                 EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs",
+            ),
+            (
+                VariableReach::BootServices,
+                "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
+                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
+            ),
+        ];
+        for (reach, want) in cases {
+            let mut bytes = [&BS_RT.to_ne_bytes()[..], &[1]].concat();
+            let before = bytes.clone();
 
-        let error = modify_variable_bytes(&key, &mut bytes, 1, 0, &[0x2A])
-            .expect_err("modify a volatile variable");
+            let error = modify_variable_bytes(&key, reach, &mut bytes, 1, 0, &[0x2A])
+                .expect_err("modify a volatile variable");
 
-        assert_eq!(
-            error.to_string(),
-            "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
-             EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs",
-            "refusal"
-        );
-        assert_eq!(bytes, before, "bytes");
+            assert_eq!(error.to_string(), want, "{reach:?}: refusal");
+            assert_eq!(bytes, before, "{reach:?}: bytes");
+        }
     }
 
     /// modify_variable_bytes refuses a variable with authenticated access, whose writes need a
-    /// signed descriptor (UEFI 2.10 §8.2.3), and keeps its bytes.
+    /// signed descriptor (UEFI 2.10 §8.2.3), whatever its reach, and keeps its bytes.
     #[test]
     fn modify_variable_bytes_refuses_an_authenticated_variable() {
         let key = variable_key("Signed");
-        for attributes in [NV_BS_RT | 0x10, NV_BS_RT | 0x20, NV_BS_RT | 0x80] {
-            let mut bytes = [&attributes.to_ne_bytes()[..], &[1]].concat();
-            let before = bytes.clone();
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            for attributes in [NV_BS_RT | 0x10, NV_BS_RT | 0x20, NV_BS_RT | 0x80] {
+                let mut bytes = [&attributes.to_ne_bytes()[..], &[1]].concat();
+                let before = bytes.clone();
 
-            let error = modify_variable_bytes(&key, &mut bytes, 1, 0, &[0x2A])
-                .expect_err("modify an authenticated variable");
+                let error = modify_variable_bytes(&key, reach, &mut bytes, 1, 0, &[0x2A])
+                    .expect_err("modify an authenticated variable");
 
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "EFI variable Signed-00000000-0000-0000-0000-000000000000 has authenticated \
-                     access (attributes {attributes:#x}), which uefisettings does not write"
-                ),
-                "attributes {attributes:#x}: refusal"
-            );
-            assert_eq!(bytes, before, "attributes {attributes:#x}: bytes");
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "EFI variable Signed-00000000-0000-0000-0000-000000000000 has \
+                         authenticated access (attributes {attributes:#x}), which uefisettings \
+                         does not write"
+                    ),
+                    "{reach:?}, attributes {attributes:#x}: refusal"
+                );
+                assert_eq!(
+                    bytes, before,
+                    "{reach:?}, attributes {attributes:#x}: bytes"
+                );
+            }
         }
     }
 
@@ -866,7 +1256,7 @@ pub(crate) mod tests {
         let mut bytes = [&NV_BS_RT.to_ne_bytes()[..], &[1, 2]].concat();
         let before = bytes.clone();
 
-        let error = modify_variable_bytes(&key, &mut bytes, 4, 0, &[0x2A])
+        let error = modify_variable_bytes(&key, VariableReach::Runtime, &mut bytes, 4, 0, &[0x2A])
             .expect_err("modify a variable shorter than its VarStore");
 
         assert_eq!(
@@ -885,7 +1275,7 @@ pub(crate) mod tests {
         let mut bytes = vec![7, 0];
         let before = bytes.clone();
 
-        let error = modify_variable_bytes(&key, &mut bytes, 0, 0, &[])
+        let error = modify_variable_bytes(&key, VariableReach::Runtime, &mut bytes, 0, 0, &[])
             .expect_err("modify a variable without its attributes word");
 
         assert_eq!(

@@ -44,6 +44,8 @@ use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::WithheldVariable;
+use crate::hii::variables::WithholdingVariables;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use conditions::option_state;
 use conditions::question_state;
@@ -62,17 +64,20 @@ pub use ami_access_level::AccessLevel;
 pub use conditions::IncludedStates;
 pub use conditions::QuestionState;
 pub use conditions::SelectionError;
+pub use setup_password::SetupPasswordPolicy;
 
 pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Selection;
 pub(crate) use conditions::StateEvaluation;
+pub(crate) use setup_password::PasswordQuestions;
 
 mod ami_access_level;
 mod conditions;
 mod defaults;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
+mod setup_password;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
@@ -874,22 +879,22 @@ trait VariableStore {
     }
 }
 
-/// set's error for a missing efivar file: firmware that keeps the variable from the OS, e.g.
-/// boot-service-only, leaves no file to rewrite.
+/// set's error for a missing variable: for variables that reach Runtime, firmware that keeps the
+/// variable from the OS, e.g. boot-service-only, leaves no file to rewrite; variables that reach
+/// BootServices reach every variable that the firmware has created.
 #[derive(Error, Debug)]
-#[error(
-    "{0}: the firmware has not created it or does not expose it to the OS, so its questions \
-     cannot be set from Linux; change them in the firmware setup, or ask the board vendor for \
-     firmware that exposes it; see https://github.com/linuxboot/uefisettings/issues/2"
-)]
-struct VariableNotExported(VariableNotFound);
+#[error("{missing}: {}", .reach.not_found_refusal())]
+struct VariableNotExported {
+    missing: VariableNotFound,
+    reach: VariableReach,
+}
 
 impl VariableNotExported {
-    /// Turns FirmwareVariables's VariableNotFound into VariableNotExported; other errors pass
-    /// through unchanged.
-    fn explain(error: anyhow::Error) -> anyhow::Error {
+    /// Turns the VariableNotFound of FirmwareVariables of `reach` into VariableNotExported;
+    /// other errors pass through unchanged.
+    fn explain(error: anyhow::Error, reach: VariableReach) -> anyhow::Error {
         match error.downcast::<VariableNotFound>() {
-            Ok(not_found) => Self(not_found).into(),
+            Ok(missing) => Self { missing, reach }.into(),
             Err(error) => error,
         }
     }
@@ -932,6 +937,7 @@ mod non_efi_varstore_tests {
     use crate::hii::efivarfs::EfivarFileName;
     use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
+    use crate::hii::variables::VolatileVariable;
 
     struct TestVariableStore {
         kind: VariableStoreKind,
@@ -1021,7 +1027,7 @@ mod non_efi_varstore_tests {
 
     /// Writes 1 at offset 0 of `store`, as set does, in `variables`.
     fn write_one(store: &VarStoreEfi, variables: &MemoryVariables) -> Result<()> {
-        VarStoreWrite::new(store, 0, TypeValue::NumSize8(1))?.write(variables)
+        VarStoreWrite::new(store, 0, TypeValue::NumSize8(1), variables.reach())?.write(variables)
     }
 
     /// MemoryVariables holding TestVarStore: NV_BS_RT, then 0.
@@ -1115,6 +1121,64 @@ mod non_efi_varstore_tests {
         }
     }
 
+    /// Variables that reach BootServices keep set's check of the attributes that the variable
+    /// itself has: a volatile one stays unwritten.
+    #[test]
+    fn boot_services_refuse_a_volatile_variable() {
+        let variables = MemoryVariables::with_reach(VariableReach::BootServices);
+        variables.insert(variable_key("TestVarStore"), BS_RT, &[0]);
+
+        let error =
+            write_one(&efi_varstore(NV_BS_RT), &variables).expect_err("write a volatile variable");
+
+        assert!(
+            error.downcast_ref::<VolatileVariable>().is_some(),
+            "{error:#} is not VolatileVariable"
+        );
+        assert_eq!(
+            variables.writes_to(&variable_key("TestVarStore")),
+            [],
+            "writes"
+        );
+    }
+
+    /// get decodes no value from a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, whose
+    /// data starts with metadata (UEFI 2.10 §8.2.1). The other authenticated accesses put their
+    /// descriptors only into writes, so those variables decode as others do.
+    #[test]
+    fn enhanced_authenticated_variable_is_not_decoded() {
+        let store = || efi_variable("Signed", 1);
+        let efivars = Efivars::new();
+        efivars.write_attributed(&store(), NV_BS_RT | 0x80, &[1]);
+
+        assert_eq!(
+            read(store(), &efivars),
+            Err(
+                "<ValueUnavailable: EFI variable Signed-00000000-0000-0000-0000-000000000000 \
+                 has enhanced authenticated access (attributes 0x87): its data starts with \
+                 metadata, which uefisettings does not decode>"
+                    .to_string()
+            ),
+            "attributes 0x87"
+        );
+        for attributes in [
+            NV_BS_RT,
+            NV_BS_RT | 0x08,
+            NV_BS_RT | 0x10,
+            NV_BS_RT | 0x20,
+            NV_BS_RT | 0x40,
+        ] {
+            let efivars = Efivars::new();
+            efivars.write_attributed(&store(), attributes, &[1]);
+
+            assert_eq!(
+                read(store(), &efivars),
+                Ok(efivar_file_bytes(attributes, &[1])),
+                "attributes {attributes:#x}"
+            );
+        }
+    }
+
     /// set writes a runtime VarStore in its variable.
     #[test]
     fn runtime_varstore_is_written() {
@@ -1152,43 +1216,6 @@ mod non_efi_varstore_tests {
 
             assert_eq!(varstore.kind(), VariableStoreKind::EfiVariable);
             assert!(varstore.is_runtime_accessible());
-        }
-    }
-
-    /// get decodes no value from a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, whose
-    /// data starts with metadata (UEFI 2.10 §8.2.1). The other authenticated accesses put their
-    /// descriptors only into writes, so those variables decode as others do.
-    #[test]
-    fn enhanced_authenticated_variable_is_not_decoded() {
-        let store = || efi_variable("Signed", 1);
-        let efivars = Efivars::new();
-        efivars.write_attributed(&store(), NV_BS_RT | 0x80, &[1]);
-
-        assert_eq!(
-            read(store(), &efivars),
-            Err(
-                "<ValueUnavailable: EFI variable Signed-00000000-0000-0000-0000-000000000000 \
-                 has enhanced authenticated access (attributes 0x87): its data starts with \
-                 metadata, which uefisettings does not decode>"
-                    .to_string()
-            ),
-            "attributes 0x87"
-        );
-        for attributes in [
-            NV_BS_RT,
-            NV_BS_RT | 0x08,
-            NV_BS_RT | 0x10,
-            NV_BS_RT | 0x20,
-            NV_BS_RT | 0x40,
-        ] {
-            let efivars = Efivars::new();
-            efivars.write_attributed(&store(), attributes, &[1]);
-
-            assert_eq!(
-                read(store(), &efivars),
-                Ok(efivar_file_bytes(attributes, &[1])),
-                "attributes {attributes:#x}"
-            );
         }
     }
 
@@ -1478,6 +1505,9 @@ enum ValueUnavailable {
     BootServiceOnly(BootServiceOnlyVariable),
     #[error("{0}")]
     EnhancedAuthenticated(EnhancedAuthenticatedVariable),
+    /// The read of a VarStore that a PASSWORD question names, which the reader withholds
+    #[error("VarStore holds a password")]
+    PasswordVarStore,
     #[error("{0}")]
     NotRead(EfivarsNotRead),
     #[error("{0}")]
@@ -1515,6 +1545,9 @@ impl ValueUnavailable {
         if let Some(&not_read) = error.downcast_ref::<EfivarsNotRead>() {
             return Self::NotRead(not_read);
         }
+        if error.downcast_ref::<WithheldVariable>().is_some() {
+            return Self::PasswordVarStore;
+        }
         let Some(missing) = error.downcast_ref::<VariableNotFound>() else {
             return Self::ReadError(format!("{error:#}"));
         };
@@ -1540,6 +1573,7 @@ impl ValueUnavailable {
             Self::NoVarStore(_)
             | Self::BootServiceOnly(_)
             | Self::EnhancedAuthenticated(_)
+            | Self::PasswordVarStore
             | Self::NotRead(_)
             | Self::Missing(_)
             | Self::MissingBuffer(_)
@@ -3019,9 +3053,10 @@ where
 
 /// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
 /// match that set would write, or the likely match, has no VarStore, or its efivar is missing,
-/// unreadable, boot-service-only, volatile or authenticated, which --include cannot make
-/// writable: then ChangeValueError::NoVarStore, VariableNotExported or the read's error, as
-/// `reader` found it, BootServiceOnlyVariable, VolatileVariable or AuthenticatedVariable.
+/// unreadable, e.g. withheld, boot-service-only, volatile or authenticated, which --include
+/// cannot make writable: then ChangeValueError::NoVarStore, VariableNotExported or the read's
+/// error, as `reader` found it, BootServiceOnlyVariable, VolatileVariable or
+/// AuthenticatedVariable.
 pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
@@ -3036,16 +3071,21 @@ pub(crate) fn choice_for_set(
         Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
     };
     let store = descriptor.store()?;
-    store.check_runtime_access(reader.reach())?;
+    let reach = reader.reach();
+    store.check_runtime_access(reach)?;
     if let Some(error) = reader.read_error(store) {
         return Err(match error.downcast_ref::<VariableNotFound>() {
-            Some(missing) => VariableNotExported(missing.clone()).into(),
+            Some(missing) => VariableNotExported {
+                missing: missing.clone(),
+                reach,
+            }
+            .into(),
             None => anyhow!("{error:#}"),
         });
     }
     if let Some(attributes) = reader.attributes(store) {
         let key = store.variable_key();
-        check_non_volatile(&key, attributes)?;
+        check_non_volatile(&key, reach, attributes)?;
         check_unauthenticated(&key, attributes)?;
     }
     Ok(selection.for_set(question)?)
@@ -3171,7 +3211,7 @@ mod choice_for_set_tests {
         assert_eq!(
             error
                 .downcast_ref::<VariableNotExported>()
-                .map(|error| error.0.to_string())
+                .map(|error| error.missing.to_string())
                 .as_deref(),
             Some(MISSING_NOT_FOUND),
             "question 1 on the missing VarStore: {error:#}"
@@ -3251,7 +3291,7 @@ mod choice_for_set_tests {
         assert_eq!(
             error
                 .downcast_ref::<VariableNotExported>()
-                .map(|error| error.0.to_string())
+                .map(|error| error.missing.to_string())
                 .as_deref(),
             Some(MISSING_NOT_FOUND),
             "the ONE_OF on the missing VarStore: {error:#}"
@@ -3389,6 +3429,31 @@ mod choice_for_set_tests {
             "Runtime"
         );
         assert_eq!(reads, [], "Runtime: reads");
+    }
+
+    /// set's refusal of a match whose variable is missing follows the reach of the variables
+    /// that it reads.
+    #[test]
+    fn match_on_a_missing_variable_is_explained_by_its_reach() {
+        let root = picked_one_of(&[var_store_efi(1, "Missing", NV_BS_RT, 1)], 1);
+        let cases = [
+            (VariableReach::Runtime, "does not expose it to the OS"),
+            (
+                VariableReach::BootServices,
+                ": the firmware has not created it, and set never creates variables",
+            ),
+        ];
+
+        for (reach, refusal) in cases {
+            let reader = EfivarReader::with_variables(Box::new(MemoryVariables::with_reach(reach)));
+            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+
+            let text = error.to_string();
+            assert!(
+                text.starts_with(MISSING_NOT_FOUND) && text.contains(refusal),
+                "{reach:?}: {text}"
+            );
+        }
     }
 
     /// set refuses a match on a variable with any authenticated access before any write: every
@@ -4844,9 +4909,14 @@ struct VarStoreWrite<'a> {
 }
 
 impl<'a> VarStoreWrite<'a> {
-    /// The write of `value` at VarOffset `offset` of `store`: fails unless `value` is a number
-    /// that fits in the Size of `store` there.
-    fn new(store: &'a dyn VariableStore, offset: u16, value: TypeValue) -> Result<Self> {
+    /// The write of `value` at VarOffset `offset` of `store`, through variables of `reach`: fails
+    /// unless `value` is a number that fits in the Size of `store` there.
+    fn new(
+        store: &'a dyn VariableStore,
+        offset: u16,
+        value: TypeValue,
+        reach: VariableReach,
+    ) -> Result<Self> {
         let encoded = match value {
             TypeValue::NumSize8(value) => value.to_le_bytes().to_vec(),
             TypeValue::NumSize16(value) => value.to_le_bytes().to_vec(),
@@ -4861,7 +4931,7 @@ impl<'a> VarStoreWrite<'a> {
             | TypeValue::Action(_)
             | TypeValue::Ref(_)
             | TypeValue::Unknown(_) => {
-                return Err(anyhow!("unsupported value type for efivarfs write"))
+                return Err(anyhow!("unsupported value type for {}", reach.write()))
             }
         };
         if usize::from(offset) + encoded.len() > usize::from(store.size()) {
@@ -4889,15 +4959,16 @@ impl<'a> VarStoreWrite<'a> {
                 self.offset,
                 &self.encoded,
             )
-            .map_err(VariableNotExported::explain)
+            .map_err(|error| VariableNotExported::explain(error, variables.reach()))
     }
 }
 
-/// The write that sets `question` to `new_value`; for a ONE_OF, to the option of that text
-/// that select_option picks without --include.
+/// The write that sets `question` to `new_value` through variables of `reach`; for a ONE_OF, to
+/// the option of that text that select_option picks without --include.
 fn value_write<'a>(
     question: &'a QuestionDescriptor,
     new_value: &str,
+    reach: VariableReach,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
     let ValueLocation::Bytes { offset, .. } = question.location else {
@@ -4911,7 +4982,7 @@ fn value_write<'a>(
                 IncludedStates::empty(),
             )?
             .ok_or(ChangeValueError::InvalidOption)?;
-        return option_write(question, option);
+        return option_write(question, option, reach);
     }
     let value = match &question.numeric_range {
         Some(range) => range.parse_value(new_value)?,
@@ -4954,13 +5025,15 @@ fn value_write<'a>(
             }
         },
     };
-    Ok(VarStoreWrite::new(store, offset, value)?)
+    Ok(VarStoreWrite::new(store, offset, value, reach)?)
 }
 
-/// The write of `option`, one of the possible_options of the ONE_OF `question`.
+/// The write of `option`, one of the possible_options of the ONE_OF `question`, through
+/// variables of `reach`.
 fn option_write<'a>(
     question: &'a QuestionDescriptor,
     option: &AnswerOption,
+    reach: VariableReach,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
     let ValueLocation::Bytes { offset, .. } = question.location else {
@@ -4970,6 +5043,7 @@ fn option_write<'a>(
         question.store()?,
         offset,
         option.raw_value,
+        reach,
     )?)
 }
 
@@ -4987,7 +5061,7 @@ pub(crate) fn set_questions<'a>(
     new_value: &str,
     texts: &BTreeSet<String>,
     include: IncludedStates,
-    variables: &dyn FirmwareVariables,
+    variables: &WithholdingVariables<impl FirmwareVariables>,
 ) -> Result<Vec<Option<&'a AnswerOption>>> {
     if selected.is_empty() {
         return Err(SelectionError::NotFound {
@@ -5002,11 +5076,16 @@ pub(crate) fn set_questions<'a>(
             // (example whatever matches from [Enabled, Enable])
             // else try setting the new_value because it might be some arbitrary value like a number
             // (will return error if doesn't match constraints)
+            let reach = variables.reach();
             if descriptor.possible_options.is_empty() {
-                return Ok((selector, value_write(descriptor, new_value)?, None));
+                return Ok((selector, value_write(descriptor, new_value, reach)?, None));
             }
             let option = descriptor.chosen_option(texts, include)?;
-            Ok((selector, option_write(descriptor, option)?, Some(option)))
+            Ok((
+                selector,
+                option_write(descriptor, option, reach)?,
+                Some(option),
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -5144,7 +5223,7 @@ mod set_questions_tests {
             new_value,
             &texts.iter().map(|text| text.to_string()).collect(),
             IncludedStates::empty(),
-            variables,
+            &WithholdingVariables::new(variables, BTreeSet::new()),
         )
         .map(|options| {
             options
@@ -5594,6 +5673,7 @@ mod tests {
                 &store,
                 u16::try_from(offset).expect("offset fits u16"),
                 data,
+                variables.reach(),
             )
             .unwrap_or_else(|error| panic!("write {data:?} at offset {offset}: {error}"));
             assert_eq!(write.encoded, encoded, "{data:?}");
@@ -5617,7 +5697,8 @@ mod tests {
         let store = efi_variable("Short", 4);
         let variables = MemoryVariables::default();
         variables.insert(store.variable_key(), NV_BS_RT, &[0; 2]);
-        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1)).expect("write 1");
+        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), variables.reach())
+            .expect("write 1");
 
         let error = write
             .write(&variables)
@@ -5635,7 +5716,8 @@ mod tests {
     #[test]
     fn write_of_a_missing_variable_is_explained_as_not_exported() {
         let store = efi_variable("Setup", 1);
-        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1)).expect("write 1");
+        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), VariableReach::Runtime)
+            .expect("write 1");
 
         let error = write
             .write(&MemoryVariables::default())
@@ -5659,7 +5741,7 @@ mod tests {
         ] {
             let store = efi_variable("Test", size);
             assert_eq!(
-                VarStoreWrite::new(&store, offset, data)
+                VarStoreWrite::new(&store, offset, data, VariableReach::Runtime)
                     .map(drop)
                     .map_err(|error| error.to_string()),
                 Err(format!(
@@ -5673,12 +5755,78 @@ mod tests {
     #[test]
     fn rejects_unsupported_value_instead_of_silent_noop() {
         assert_eq!(
-            VarStoreWrite::new(&efi_variable("Test", 42), 0, TypeValue::Boolean(true))
-                .map(drop)
-                .map_err(|error| error.to_string()),
+            VarStoreWrite::new(
+                &efi_variable("Test", 42),
+                0,
+                TypeValue::Boolean(true),
+                VariableReach::Runtime
+            )
+            .map(drop)
+            .map_err(|error| error.to_string()),
             Err("unsupported value type for efivarfs write".to_string()),
             "BOOLEAN"
         );
+    }
+
+    /// set's error for a missing variable follows the reach of its variables: Runtime as on
+    /// Linux, BootServices, which would find any variable the firmware has created.
+    #[test]
+    fn variable_not_exported_follows_its_reach() {
+        let cases = [
+            (
+                VariableReach::Runtime,
+                "no EFI variable Setup-00000000-0000-0000-0000-000000000000: the firmware has not \
+                 created it or does not expose it to the OS, so its questions cannot be set from \
+                 Linux; change them in the firmware setup, or ask the board vendor for firmware \
+                 that exposes it; see https://github.com/linuxboot/uefisettings/issues/2",
+            ),
+            (
+                VariableReach::BootServices,
+                "no EFI variable Setup-00000000-0000-0000-0000-000000000000: the firmware has \
+                 not created it, and set never creates variables",
+            ),
+        ];
+        for (reach, want) in cases {
+            let variables = MemoryVariables::with_reach(reach);
+            let store = efi_variable("Setup", 1);
+            let write =
+                VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), reach).expect("write 1");
+
+            let error = write
+                .write(&variables)
+                .expect_err("write a missing variable");
+
+            assert_eq!(error.to_string(), want, "{reach:?}");
+        }
+    }
+
+    /// A write of an unsupported value names the write of its variables: efivarfs for Runtime,
+    /// SetVariable() for BootServices.
+    #[test]
+    fn unsupported_value_names_the_write_of_its_reach() {
+        for (reach, want) in [
+            (
+                VariableReach::Runtime,
+                "unsupported value type for efivarfs write",
+            ),
+            (
+                VariableReach::BootServices,
+                "unsupported value type for SetVariable() write",
+            ),
+        ] {
+            assert_eq!(
+                VarStoreWrite::new(
+                    &efi_variable("Test", 42),
+                    0,
+                    TypeValue::Boolean(true),
+                    reach
+                )
+                .map(drop)
+                .map_err(|error| error.to_string()),
+                Err(want.to_string()),
+                "{reach:?}"
+            );
+        }
     }
 
     #[test]
@@ -5706,7 +5854,8 @@ mod tests {
             },
         };
 
-        let error = VariableNotExported::explain(VariableNotFound(key).into());
+        let error =
+            VariableNotExported::explain(VariableNotFound(key).into(), VariableReach::Runtime);
 
         assert!(
             error.downcast_ref::<VariableNotExported>().is_some(),
@@ -5731,7 +5880,7 @@ mod tests {
         let open_error = open_efivar(not_a_dir.path(), &name).expect_err("open below a file");
         let expected = format!("{open_error:#}");
 
-        let error = VariableNotExported::explain(open_error);
+        let error = VariableNotExported::explain(open_error, VariableReach::Runtime);
 
         assert!(
             error.downcast_ref::<VariableNotExported>().is_none(),

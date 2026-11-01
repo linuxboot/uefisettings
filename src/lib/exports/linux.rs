@@ -36,7 +36,7 @@ use super::DumpEfivarsOptions;
 use super::HiiBackend;
 use super::SettingsBackend;
 use crate::hii::extract;
-use crate::hii::package;
+use crate::hii::package::db_file;
 use crate::hii::EfivarDump;
 use crate::hii::EfivarFiles;
 use crate::hii::EfivarSource;
@@ -84,9 +84,9 @@ impl HiiBackend {
             EfivarSource::System | EfivarSource::Disabled => None,
         };
         match (filename, dump) {
-            (Some(filename), None) => package::read_db_file(filename),
+            (Some(filename), None) => db_file::read_db_file(filename),
             (Some(filename), Some(dump)) => {
-                let hiidb = package::read_db_file(filename)?;
+                let hiidb = db_file::read_db_file(filename)?;
                 dump.check_hiidb(&hiidb, filename)?;
                 Ok(hiidb)
             }

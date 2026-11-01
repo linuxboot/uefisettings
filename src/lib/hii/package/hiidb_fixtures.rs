@@ -84,6 +84,18 @@ pub(crate) fn en_strings_package(letter: u8) -> Vec<u8> {
     en_strings_package_with_blocks(&strings)
 }
 
+/// An "en" strings package holding `strings`, string ID 1 first.
+pub(crate) fn en_strings_package_of(strings: &[&str]) -> Vec<u8> {
+    let mut blocks = Vec::new();
+    for string in strings {
+        blocks.push(0x14); // EFI_HII_SIBT_STRING_UCS2
+        blocks.extend(string.encode_utf16().flat_map(u16::to_le_bytes));
+        blocks.extend([0x00, 0x00]);
+    }
+    blocks.push(0x00); // EFI_HII_SIBT_END
+    en_strings_package_with_blocks(&blocks)
+}
+
 /// An "en" strings package whose string blocks are `blocks`, valid or not.
 pub(super) fn en_strings_package_with_blocks(blocks: &[u8]) -> Vec<u8> {
     let language = [

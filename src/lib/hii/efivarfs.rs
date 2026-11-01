@@ -219,7 +219,7 @@ fn efivar_file_too_large() -> io::Error {
 
 impl EfivarSource {
     /// The firmware variables that questions read from this source, which validate accepts.
-    pub(super) fn into_variables(self) -> Result<Box<dyn FirmwareVariables>> {
+    pub(crate) fn into_variables(self) -> Result<Box<dyn FirmwareVariables>> {
         self.validate()?;
         Ok(match self {
             Self::System => Box::new(EfivarFiles::system()),
@@ -298,7 +298,7 @@ impl FirmwareVariables for EfivarFiles {
             .and_then(|metadata| read_efivar_file(&file_ro, metadata.len()))
             .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
-        modify_variable_bytes(key, &mut file_contents, size, offset, encoded)?;
+        modify_variable_bytes(key, Self::REACH, &mut file_contents, size, offset, encoded)?;
 
         let _efifs =
             EfivarsMountGuard::new(&self.dir).context("Failed to create efivars fs mount guard")?;

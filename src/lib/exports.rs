@@ -28,6 +28,7 @@ use uefisettings_backend_thrift::SetResponseList;
 use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
+use crate::hii::forms::PasswordQuestions;
 use crate::hii::package;
 #[cfg(target_os = "linux")]
 pub use crate::hii::EfivarDump;
@@ -35,6 +36,7 @@ use crate::hii::EfivarReader;
 #[cfg(target_os = "linux")]
 pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
+use crate::hii::FirmwareVariables;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
@@ -43,9 +45,12 @@ pub use crate::hii::forms::AccessLevel;
 pub use crate::hii::forms::IncludedStates;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
+pub use crate::hii::forms::SetupPasswordPolicy;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "uefi")]
+mod uefi;
 
 #[cfg(target_os = "linux")]
 pub use linux::identify_machine;
@@ -82,6 +87,8 @@ pub struct SetOptions {
     pub include: IncludedStates,
     /// The AMI Setup access level that conditions read instead of the stored one, if stated
     pub access_level: Option<AccessLevel>,
+    /// In the UEFI Shell, whether set writes in a HiiDB that declares a setup password question
+    pub setup_password: SetupPasswordPolicy,
 }
 
 /// The options of HiiBackend::list_questions_using.
@@ -121,13 +128,20 @@ impl HiiBackend {
 
     /// show_ifr with `options`
     pub fn show_ifr_using(db_bytes: &[u8], options: &ShowIfrOptions) -> Result<HiiShowIfrResponse> {
+        Self::show_ifr_in(db_bytes, options.efivars.clone().into_variables()?)
+    }
+
+    /// show_ifr, reading question values from `variables`
+    fn show_ifr_in(
+        db_bytes: &[u8],
+        variables: Box<dyn FirmwareVariables>,
+    ) -> Result<HiiShowIfrResponse> {
         // We depend on the caller to provide us with the hiidb instead of calling extract here
         // because they might want to provide a file instead.
 
         let mut readable_representation = String::new();
 
-        let mut reader = EfivarReader::new(options.efivars.clone())?;
-        let parsed_db = package::read_db(db_bytes)?;
+        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables)?;
 
         for list in parsed_db {
             list.check_form_strings()?;
@@ -183,10 +197,18 @@ impl HiiBackend {
         db_bytes: &[u8],
         options: &ListQuestionsOptions,
     ) -> Result<Vec<Question>> {
+        Self::list_questions_in(db_bytes, options, options.efivars.clone().into_variables()?)
+    }
+
+    /// list_questions with `options`, reading question values from `variables`
+    fn list_questions_in(
+        db_bytes: &[u8],
+        options: &ListQuestionsOptions,
+        variables: Box<dyn FirmwareVariables>,
+    ) -> Result<Vec<Question>> {
         let include = options.include;
         let mut res = Vec::new();
-        let mut reader = EfivarReader::new(options.efivars.clone())?;
-        let parsed_db = package::read_db(db_bytes)?;
+        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables)?;
         forms::check_access_level(
             parsed_db.iter().flat_map(|list| &list.forms),
             options.access_level,
@@ -244,21 +266,48 @@ impl SettingsBackend for HiiBackend {
 }
 
 impl HiiBackend {
-    /// set with `options`: fails with SelectionError::NotFound when no question has the text, and
-    /// unless every selected match is written, also after writing the others.
+    /// set with `options`, in this machine's HiiDB and variables, as set_in does.
     pub fn set_using(
+        question: &str,
+        new_value: &str,
+        selector: Option<&str>,
+        options: &SetOptions,
+    ) -> Result<SetResponseList> {
+        Self::set_in(
+            &Self::system_hiidb()?,
+            question,
+            new_value,
+            selector,
+            options,
+            EfivarSource::System.into_variables()?,
+            &Self::system_variables(),
+        )
+    }
+
+    /// set in the HiiDB `db_bytes` with `options`, selecting by the values of `reads`, which it
+    /// reads before the first write, and writing through `writes`, neither of them withheld
+    /// variables (PasswordQuestions::withholding): fails with SelectionError::NotFound when no
+    /// question has the text, and unless every selected match is written, also after writing the
+    /// others.
+    fn set_in(
+        db_bytes: &[u8],
         question: &str,
         new_value: &str,
         _selector: Option<&str>,
         options: &SetOptions,
+        reads: Box<dyn FirmwareVariables>,
+        writes: &dyn FirmwareVariables,
     ) -> Result<SetResponseList> {
         // TODO: use selector to only change values which match question + selector
         let include = options.include;
 
         let mut resp = Vec::new();
 
-        let db_bytes = Self::system_hiidb()?;
-        let parsed_db = package::read_db(&db_bytes)?;
+        let parsed_db = package::read_db(db_bytes)?;
+        let passwords = PasswordQuestions::of(parsed_db.iter().flat_map(|list| &list.forms));
+        let reader = EfivarReader::with_variables(Box::new(passwords.withholding(reads)?));
+        let writes = passwords.withholding(writes)?;
+        passwords.check_set(writes.reach(), options.setup_password)?;
 
         let hii_translation = get_qa_variations_hii(question, new_value);
         let (question_variations, new_value_variations, is_translated) = match hii_translation {
@@ -272,13 +321,7 @@ impl HiiBackend {
             } => (question_variations, answer_variations, false),
         };
 
-        let selected = select_for_set(
-            &parsed_db,
-            question,
-            &question_variations,
-            options,
-            EfivarSource::System,
-        )?;
+        let selected = select_for_set(&parsed_db, question, &question_variations, options, reader)?;
 
         let option_annotations: Vec<String> = forms::set_questions(
             question,
@@ -289,7 +332,7 @@ impl HiiBackend {
             new_value,
             &new_value_variations,
             include,
-            &Self::system_variables(),
+            &writes,
         )?
         .into_iter()
         .map(|chosen| chosen.map_or_else(String::new, |option| option.state.option_annotation()))
@@ -327,8 +370,25 @@ impl HiiBackend {
     pub fn get_using(
         db_bytes: &[u8],
         question: &str,
+        selector: Option<&str>,
+        options: &GetOptions,
+    ) -> Result<GetResponseList> {
+        Self::get_in(
+            db_bytes,
+            question,
+            selector,
+            options,
+            options.efivars.clone().into_variables()?,
+        )
+    }
+
+    /// get with `options`, reading question values from `variables`
+    fn get_in(
+        db_bytes: &[u8],
+        question: &str,
         _selector: Option<&str>,
         options: &GetOptions,
+        variables: Box<dyn FirmwareVariables>,
     ) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
         // TODO: take a form@packagelist selector to pick one of the FormSets that select
@@ -349,8 +409,7 @@ impl HiiBackend {
             } => (question_variations, false),
         };
 
-        let mut reader = EfivarReader::new(options.efivars.clone())?;
-        let parsed_db = package::read_db(db_bytes)?;
+        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables)?;
         forms::check_access_level(
             parsed_db.iter().flat_map(|list| &list.forms),
             options.access_level,
@@ -417,17 +476,29 @@ impl HiiBackend {
     }
 }
 
+/// The package lists of the HiiDB `db_bytes`, and a reader of `variables` without the variables
+/// that its password questions name, as their reach withholds (PasswordQuestions::withholding).
+fn read_db_withholding(
+    db_bytes: &[u8],
+    variables: Box<dyn FirmwareVariables>,
+) -> Result<(Vec<package::ParsedPackageList>, EfivarReader)> {
+    let parsed_db = package::read_db(db_bytes)?;
+    let passwords = PasswordQuestions::of(parsed_db.iter().flat_map(|list| &list.forms));
+    let reader = EfivarReader::with_variables(Box::new(passwords.withholding(variables)?));
+    Ok((parsed_db, reader))
+}
+
 /// set's phase before its first write, so that no error follows a write: checks every package
 /// list of `parsed_db` and the stated access level, then selects, in each FormSet, the question
-/// of `question_variations` that set writes, reading `efivars` once; returns them with the GUID
-/// of their package list, or SelectionError::Excluded for `question` if each FormSet skips it
-/// for its states.
+/// of `question_variations` that set writes, reading each range once with `reader`; returns them
+/// with the GUID of their package list, or SelectionError::Excluded for `question` if each
+/// FormSet skips it for its states.
 fn select_for_set(
     parsed_db: &[package::ParsedPackageList],
     question: &str,
     question_variations: &BTreeSet<String>,
     options: &SetOptions,
-    efivars: EfivarSource,
+    mut reader: EfivarReader,
 ) -> Result<Vec<(String, forms::QuestionDescriptor, forms::StateEvaluation)>> {
     forms::check_access_level(
         parsed_db.iter().flat_map(|list| &list.forms),
@@ -441,8 +512,6 @@ fn select_for_set(
     // selection error leaves every variable unchanged.
     let mut selected = Vec::new();
     let mut excluded = IncludedStates::empty();
-    // one cache for the selection, which ends before the first write
-    let mut reader = EfivarReader::new(efivars)?;
     for list in parsed_db {
         for root in &list.forms {
             // try to find the question
@@ -478,23 +547,32 @@ fn select_for_set(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::rc::Rc;
 
+    use crate::hii::forms::ifr_fixtures::checkbox_at;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
     use crate::hii::forms::ifr_fixtures::conditional;
     use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::form;
+    use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
+    use crate::hii::forms::ifr_fixtures::MemoryVariables;
+    use crate::hii::forms::ifr_fixtures::VariableKey;
+    use crate::hii::forms::ifr_fixtures::VariableReach;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
+    use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::en_strings_package;
+    use crate::hii::package::hiidb_fixtures::en_strings_package_of;
     use crate::hii::package::hiidb_fixtures::form_package;
     use crate::hii::package::hiidb_fixtures::form_set_package;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::END_ONLY_FORM_PACKAGE;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::Guid;
 
     use super::*;
 
@@ -675,6 +753,329 @@ mod tests {
         }
     }
 
+    /// The variable of the EFI variable VarStore Setup of password_hiidb.
+    fn setup() -> VariableKey {
+        VariableKey {
+            name: "Setup".to_string(),
+            guid: NIL_GUID,
+        }
+    }
+
+    /// The variable of the buffer VarStore AMITSESetup of password_hiidb.
+    fn amitse_setup() -> VariableKey {
+        VariableKey {
+            name: "AMITSESetup".to_string(),
+            guid: Guid {
+                data1: 0x44444444,
+                data2: 0x4444,
+                data3: 0x4444,
+                data4: [0x44; 8],
+            },
+        }
+    }
+
+    /// A HiiDB whose FormSet has the CHECKBOX Q at byte 0 of the EFI variable Setup and, on the
+    /// buffer VarStore AMITSESetup of AMI's layout, a PASSWORD at byte 0 and the CHECKBOX P at
+    /// byte 80.
+    fn password_hiidb() -> Vec<u8> {
+        password_hiidb_with(password_on(3, 3, 2, 0))
+    }
+
+    /// password_hiidb with the PASSWORD op `password`.
+    fn password_hiidb_with(password: Vec<u8>) -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(
+                    1,
+                    &[checkbox_on(1, 1, 1), password, checkbox_at(2, 2, 2, 80)],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// The variables of password_hiidb, which reach `reach`: Setup holds 0, AMITSESetup 80 bytes
+    /// of 0xAA, a password, and then 1.
+    fn password_variables(reach: VariableReach) -> Rc<MemoryVariables> {
+        let variables = MemoryVariables::with_reach(reach);
+        variables.insert(setup(), NV_BS_RT, &[0]);
+        variables.insert(
+            amitse_setup(),
+            NV_BS_RT,
+            &[[0xAA; 80].as_slice(), &[1]].concat(),
+        );
+        Rc::new(variables)
+    }
+
+    /// `variables`, shared with the caller.
+    fn shared(variables: &Rc<MemoryVariables>) -> Box<dyn FirmwareVariables> {
+        Box::new(Rc::clone(variables))
+    }
+
+    /// Through variables that reach BootServices, get, list-questions and show-ifr read no data
+    /// of a VarStore that a password question names, whose questions show why; through those
+    /// that reach Runtime they read it, as before.
+    #[test]
+    fn password_var_stores_are_read_only_through_runtime_variables() {
+        let cases = [
+            (VariableReach::Runtime, "1", "1", vec![81]),
+            (
+                VariableReach::BootServices,
+                "<ValueUnavailable: VarStore holds a password> <IFR default: 0>",
+                "<ValueUnavailable: VarStore holds a password>",
+                vec![],
+            ),
+        ];
+
+        for (reach, want, want_shown, want_reads) in cases {
+            let variables = password_variables(reach);
+            let got = HiiBackend::get_in(
+                &password_hiidb(),
+                "P",
+                None,
+                &GetOptions::default(),
+                shared(&variables),
+            )
+            .expect("get");
+            let listed = HiiBackend::list_questions_in(
+                &password_hiidb(),
+                &ListQuestionsOptions::default(),
+                shared(&variables),
+            )
+            .expect("list questions");
+            let ifr = HiiBackend::show_ifr_in(&password_hiidb(), shared(&variables))
+                .expect("show the IFR")
+                .readable_representation;
+
+            let answers: Vec<&str> = got
+                .responses
+                .iter()
+                .map(|response| response.question.answer.as_str())
+                .collect();
+            assert_eq!(answers, [want], "{reach:?}: get");
+            let answers: Vec<&str> = listed
+                .iter()
+                .filter(|question| question.name == "P")
+                .map(|question| question.answer.as_str())
+                .collect();
+            assert_eq!(answers, [want], "{reach:?}: list-questions");
+            assert!(
+                ifr.contains(&format!("-Answer: {want_shown}\n")),
+                "{reach:?}: show-ifr {ifr:?}"
+            );
+            assert_eq!(
+                variables.reads_of(&amitse_setup()),
+                want_reads.repeat(3),
+                "{reach:?}: reads of AMITSESetup"
+            );
+        }
+    }
+
+    /// set through variables that reach BootServices, in a HiiDB that declares a password
+    /// question, refuses unless the caller bypasses, and never reads or writes a VarStore that a
+    /// password question names; set through those that reach Runtime writes either, as before.
+    #[test]
+    fn set_follows_the_setup_password_policy() {
+        let refusal = "this HiiDB declares a setup password question; the UEFI Shell runs no \
+                       setup browser, so no password is asked or checked; pass \
+                       --bypass-setup-password to write anyway";
+        let withheld = "EFI variable AMITSESetup-44444444-4444-4444-4444-444444444444 holds a \
+                        password, which the UEFI Shell build never reads or writes";
+        let cases = [
+            (
+                VariableReach::Runtime,
+                "Q",
+                SetupPasswordPolicy::Refuse,
+                Ok(()),
+                vec![(0, vec![1])],
+                vec![],
+            ),
+            (
+                VariableReach::Runtime,
+                "P",
+                SetupPasswordPolicy::Refuse,
+                Ok(()),
+                vec![],
+                vec![(80, vec![0])],
+            ),
+            (
+                VariableReach::BootServices,
+                "Q",
+                SetupPasswordPolicy::Refuse,
+                Err(refusal),
+                vec![],
+                vec![],
+            ),
+            (
+                VariableReach::BootServices,
+                "Q",
+                SetupPasswordPolicy::Bypass,
+                Ok(()),
+                vec![(0, vec![1])],
+                vec![],
+            ),
+            (
+                VariableReach::BootServices,
+                "P",
+                SetupPasswordPolicy::Refuse,
+                Err(refusal),
+                vec![],
+                vec![],
+            ),
+            (
+                VariableReach::BootServices,
+                "P",
+                SetupPasswordPolicy::Bypass,
+                Err(withheld),
+                vec![],
+                vec![],
+            ),
+        ];
+
+        for (reach, question, policy, want, want_setup, want_amitse_setup) in cases {
+            let variables = password_variables(reach);
+            let options = SetOptions {
+                setup_password: policy,
+                ..SetOptions::default()
+            };
+            let value = match question {
+                "Q" => "1",
+                _ => "0",
+            };
+
+            let got = HiiBackend::set_in(
+                &password_hiidb(),
+                question,
+                value,
+                None,
+                &options,
+                shared(&variables),
+                &*variables,
+            );
+
+            let case = format!("{reach:?}, set {question} {value}, {policy:?}");
+            assert_eq!(
+                got.map(drop).map_err(|error| error.to_string()),
+                want.map_err(str::to_string),
+                "{case}"
+            );
+            assert_eq!(variables.writes_to(&setup()), want_setup, "{case}: Setup");
+            assert_eq!(
+                variables.writes_to(&amitse_setup()),
+                want_amitse_setup,
+                "{case}: AMITSESetup"
+            );
+            if reach == VariableReach::BootServices {
+                assert_eq!(
+                    variables.reads_of(&amitse_setup()),
+                    Vec::<u16>::new(),
+                    "{case}: reads of AMITSESetup"
+                );
+            }
+        }
+    }
+
+    /// Through variables that reach BootServices, a HiiDB with a PASSWORD op whose VarStore is
+    /// unknown has get, list-questions, show-ifr and set read and write no variable, even with
+    /// --bypass-setup-password; through those that reach Runtime they work, as before.
+    #[test]
+    fn unresolved_password_closes_every_variable_to_boot_services() {
+        let hiidb = password_hiidb_with(password_on(3, 3, 9, 0));
+        let closed = "PASSWORD question 0x0003 in FormSet 11111111-1111-1111-1111-111111111111: \
+                      no supported varstore with matching id 0x0009 found; as the variable of \
+                      that password is unknown, the UEFI Shell build reads and writes no variable \
+                      of this HiiDB";
+        let set = |variables: &Rc<MemoryVariables>, setup_password| {
+            let options = SetOptions {
+                setup_password,
+                ..SetOptions::default()
+            };
+            HiiBackend::set_in(
+                &hiidb,
+                "Q",
+                "1",
+                None,
+                &options,
+                shared(variables),
+                &**variables,
+            )
+            .map(drop)
+            .map_err(|error| error.to_string())
+        };
+
+        let variables = password_variables(VariableReach::BootServices);
+        let got = HiiBackend::get_in(
+            &hiidb,
+            "Q",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+        );
+        let listed = HiiBackend::list_questions_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            shared(&variables),
+        );
+        let shown = HiiBackend::show_ifr_in(&hiidb, shared(&variables));
+        assert_eq!(
+            got.map(drop).map_err(|error| error.to_string()),
+            Err(closed.to_string()),
+            "BootServices: get"
+        );
+        assert_eq!(
+            listed.map(drop).map_err(|error| error.to_string()),
+            Err(closed.to_string()),
+            "BootServices: list-questions"
+        );
+        assert_eq!(
+            shown.map(drop).map_err(|error| error.to_string()),
+            Err(closed.to_string()),
+            "BootServices: show-ifr"
+        );
+        assert_eq!(
+            set(&variables, SetupPasswordPolicy::Refuse),
+            Err(closed.to_string()),
+            "BootServices: set"
+        );
+        assert_eq!(
+            set(&variables, SetupPasswordPolicy::Bypass),
+            Err(closed.to_string()),
+            "BootServices: set --bypass-setup-password"
+        );
+        assert_eq!(variables.reads(), [], "BootServices: reads");
+        assert_eq!(variables.writes_to(&setup()), [], "BootServices: writes");
+
+        let variables = password_variables(VariableReach::Runtime);
+        let got = HiiBackend::get_in(
+            &hiidb,
+            "Q",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+        )
+        .expect("get through Runtime");
+        let answers: Vec<&str> = got
+            .responses
+            .iter()
+            .map(|response| response.question.answer.as_str())
+            .collect();
+        assert_eq!(answers, ["0"], "Runtime: get");
+        assert_eq!(
+            set(&variables, SetupPasswordPolicy::Refuse),
+            Ok(()),
+            "Runtime: set"
+        );
+        assert_eq!(
+            variables.writes_to(&setup()),
+            [(0, vec![1])],
+            "Runtime: writes"
+        );
+    }
+
     /// A HiiDB of two package lists: one whose FormSet declares no VarStore, then one whose
     /// question Q, on the EFI variable Setup, is grayed out when question 2, on `var_store`, is 1.
     fn access_level_hiidb(var_store: Vec<u8>) -> Vec<u8> {
@@ -724,7 +1125,8 @@ mod tests {
                 "Q",
                 &BTreeSet::from(["Q".to_string()]),
                 &options,
-                EfivarSource::Directory(efivars.path().to_path_buf()),
+                EfivarReader::new(EfivarSource::Directory(efivars.path().to_path_buf()))
+                    .expect("create a reader of the efivars directory"),
             )
             .map(|selected| {
                 selected

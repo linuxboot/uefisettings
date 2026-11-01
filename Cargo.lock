@@ -1004,6 +1004,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "uefi",
  "uefisettings_backend_thrift",
  "uefisettings_spellings_db_thrift",
 ]

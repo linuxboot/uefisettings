@@ -23,19 +23,22 @@ use super::conditions::VarStoreValues;
 use super::*;
 use crate::hii::efivarfs::EfivarFileName;
 pub(super) use crate::hii::variables::tests::variable_key;
-pub(super) use crate::hii::variables::tests::MemoryVariables;
+pub(crate) use crate::hii::variables::tests::MemoryVariables;
 pub(super) use crate::hii::variables::tests::WriteError;
 pub(super) use crate::hii::variables::tests::BS_RT;
 pub(crate) use crate::hii::variables::tests::NIL_GUID;
 pub(super) use crate::hii::variables::tests::NV_BS;
 pub(crate) use crate::hii::variables::tests::NV_BS_RT;
 use crate::hii::variables::EfivarSource;
+pub(crate) use crate::hii::variables::VariableKey;
+pub(crate) use crate::hii::variables::VariableReach;
 
 pub(crate) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
 
 pub(super) const ONE_OF: u8 = 0x05;
 pub(crate) const CHECKBOX: u8 = 0x06;
 pub(super) const NUMERIC: u8 = 0x07;
+pub(super) const PASSWORD: u8 = 0x08;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
 pub(crate) const GRAY_OUT_IF: u8 = 0x19;
@@ -232,7 +235,7 @@ pub(super) fn change_value(
     new_value: &str,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    value_write(question, new_value)?.write(variables)?;
+    value_write(question, new_value, variables.reach())?.write(variables)?;
     Ok(())
 }
 
@@ -243,7 +246,7 @@ pub(super) fn change_option(
     option: &AnswerOption,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    option_write(question, option)?.write(variables)?;
+    option_write(question, option, variables.reach())?.write(variables)?;
     Ok(())
 }
 
@@ -478,12 +481,39 @@ pub(super) fn checkbox_op(question_id: u16, offset: u16) -> Vec<u8> {
 /// A CHECKBOX op of QuestionId `question_id`, prompted string `prompt`, at VarOffset 0 of
 /// VarStore `var_store_id`.
 pub(crate) fn checkbox_on(question_id: u16, prompt: u16, var_store_id: u16) -> Vec<u8> {
+    checkbox_at(question_id, prompt, var_store_id, 0)
+}
+
+/// checkbox_on at VarOffset `offset`.
+pub(crate) fn checkbox_at(
+    question_id: u16,
+    prompt: u16,
+    var_store_id: u16,
+    offset: u16,
+) -> Vec<u8> {
     let data = [
-        question_header_on(question_id, prompt, var_store_id, 0),
+        question_header_on(question_id, prompt, var_store_id, offset),
         vec![0x00],
     ]
     .concat();
     operation(CHECKBOX, false, &data)
+}
+
+/// A PASSWORD op of QuestionId `question_id`, prompted string `prompt`, of up to 20 characters
+/// at VarOffset `offset` of VarStore `var_store_id`, as AMI firmware declares its setup
+/// passwords; VarStore 0 is none.
+pub(crate) fn password_on(
+    question_id: u16,
+    prompt: u16,
+    var_store_id: u16,
+    offset: u16,
+) -> Vec<u8> {
+    let data = [
+        question_header_on(question_id, prompt, var_store_id, offset),
+        [&1u16.to_le_bytes()[..], &20u16.to_le_bytes()].concat(), // MinSize, MaxSize
+    ]
+    .concat();
+    operation(PASSWORD, false, &data)
 }
 
 /// A UINT8 NUMERIC of QuestionId `question_id`, prompted string `prompt`, from 0 to 255 at

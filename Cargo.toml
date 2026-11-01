@@ -38,6 +38,11 @@ rand = { version = "0.8", features = ["small_rng"] }
 proc-mounts = "0.3"
 env_logger = "0.10"
 
+# The UEFI Shell build reaches the firmware through boot services: the HII database protocol,
+# GetVariable() and SetVariable().
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.41", features = ["alloc"] }
+
 [dev-dependencies]
 # inotify: a test sees which files open_efivar opens
 nix = { version = "0.27", features = ["inotify"] }

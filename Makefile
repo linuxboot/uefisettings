@@ -109,8 +109,11 @@ fmt: toolchain
 clippy-x86_64 clippy-aarch64 clippy-i686: clippy-%: toolchain
 	cargo clippy --locked --workspace --all-targets --all-features --target $*-unknown-linux-gnu -- -D warnings
 
-# publish-hiidb, the one crate built for UEFI.
+# The library for the UEFI Shell on its 3 targets, and publish-hiidb, the UEFI driver of the
+# QEMU tests.
 clippy-uefi: toolchain
+	cargo clippy --locked --lib --target x86_64-unknown-uefi --target i686-unknown-uefi \
+		--target aarch64-unknown-uefi -- -D warnings
 	cargo clippy --locked --release --target x86_64-unknown-uefi --manifest-path tests/qemu/publish-hiidb/Cargo.toml -- -D warnings
 
 test: toolchain

@@ -13,13 +13,9 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
 use std::io::Seek;
-use std::path::Path;
 use std::rc::Rc;
 
-use anyhow::anyhow;
 use anyhow::ensure;
 use anyhow::Context;
 use anyhow::Result;
@@ -28,14 +24,10 @@ use binrw::io::SeekFrom;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
-use log::info;
 
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
 use crate::hii::strings;
-
-/// The largest HiiDB file that read_db_bytes reads.
-const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
 /// PACKAGE_LIST_HEADER_SIZE is the size of EFI_HII_PACKAGE_LIST_HEADER:
 /// PackageListGuid (16 bytes) + PackageLength (4 bytes).
@@ -342,44 +334,6 @@ impl ParsedPackageList {
     }
 }
 
-/// The HiiDB in the file at `path`.
-pub(crate) fn read_db_file(path: &Path) -> Result<Vec<u8>> {
-    info!("Using database dump from file: {}", path.display());
-
-    let mut file = File::open(path).context(format!("opening dbdump from{}", path.display()))?;
-    read_db_bytes(&mut file)
-}
-
-/// The HiiDB in `file`.
-pub(crate) fn read_db_bytes(file: &mut File) -> Result<Vec<u8>> {
-    // Most Hii DBs are a few hundred kilobytes in size and the largest we've seen so far is close to 3 MB.
-    // Since we're reading the entire DB into a Vec<u8> we need to have a check here.
-    if file
-        .metadata()
-        .context("failed to read metadata for open file")?
-        .len()
-        > MAX_ALLOWED_FILESIZE
-    {
-        return Err(db_file_too_big());
-    }
-
-    let mut file_contents = Vec::new();
-    // one byte past the maximum, so that a file that grew past it since the check above shows
-    let mut file = Read::take(&mut *file, MAX_ALLOWED_FILESIZE + 1);
-    file.read_to_end(&mut file_contents)
-        .context("Couldn't convert file bytes to Vec<u8>")?;
-    if file.limit() == 0 {
-        return Err(db_file_too_big());
-    }
-
-    Ok(file_contents)
-}
-
-/// read_db_bytes's error for a file of more than MAX_ALLOWED_FILESIZE bytes.
-fn db_file_too_big() -> anyhow::Error {
-    anyhow!("File size is too big for the file to be a HII database.")
-}
-
 /// read_db input (source) is a vector of u8 bytes
 /// In hiidb, we have package lists which have multiple packages of different types including string, form and end type packages.
 /// For every package list, we will parse different packages. If package type is
@@ -432,6 +386,8 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     })
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) mod db_file;
 #[cfg(test)]
 pub(crate) mod hiidb_fixtures;
 
@@ -445,36 +401,6 @@ mod tests {
     use super::*;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
-
-    /// A file of more than MAX_ALLOWED_FILESIZE bytes whose metadata says less, as a FIFO's does,
-    /// is read one byte past the maximum and refused.
-    #[test]
-    fn read_db_bytes_reads_no_more_than_its_maximum() {
-        let dir = tempfile::tempdir().expect("create a directory");
-        let max = usize::try_from(MAX_ALLOWED_FILESIZE).expect("a usize maximum");
-        for (case, length, fits) in [
-            ("a FIFO of the maximum size", max, true),
-            ("a FIFO one byte longer than the maximum", max + 1, false),
-        ] {
-            let fifo = dir.path().join(length.to_string());
-            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("create a FIFO");
-
-            let read = std::thread::scope(|scope| {
-                scope.spawn(|| fs::write(&fifo, vec![0x5A; length]).expect("write the FIFO"));
-                read_db_bytes(&mut File::open(&fifo).expect("open the FIFO"))
-            });
-
-            match (read, fits) {
-                (Ok(bytes), true) => assert_eq!(bytes.len(), length, "{case}: length"),
-                (Err(error), false) => assert_eq!(
-                    error.to_string(),
-                    "File size is too big for the file to be a HII database.",
-                    "{case}"
-                ),
-                (read, _) => panic!("{case}: read {:?} bytes", read.map(|bytes| bytes.len())),
-            }
-        }
-    }
 
     /// OPAQUE_PACKAGE is a package with Length 6, that is, 2 bytes of data:
     /// 0xAA 0xBB. Its Type 0xE0 is in the range that UEFI Spec v2.10 §33.3.1.1
