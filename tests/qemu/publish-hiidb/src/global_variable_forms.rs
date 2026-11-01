@@ -24,11 +24,21 @@ use uefi::guid;
 use uefi::runtime::VariableVendor;
 use uefi::Guid;
 
+use crate::hii_package::end;
+use crate::hii_package::op;
+use crate::hii_package::package;
+use crate::hii_package::package_list;
+use crate::hii_package::strings_package;
+use crate::hii_package::EFI_HII_PACKAGE_FORMS;
+use crate::hii_package::EFI_IFR_FORM_OP;
+use crate::hii_package::EFI_IFR_FORM_SET_OP;
+use crate::hii_package::EFI_IFR_NUMERIC_OP;
+use crate::hii_package::EFI_IFR_VARSTORE_EFI_OP;
+use crate::hii_package::EFI_IFR_VARSTORE_OP;
+
 /// The Attributes of every VARSTORE_EFI: non-volatile, boot service and runtime access.
 const NV_BS_RT: u32 = 0x07;
 
-/// The string ID of the name of the strings package's language.
-const LANGUAGE_NAME: u16 = 1;
 /// The string ID of the form set's title.
 const TITLE: u16 = 2;
 /// The string ID of the help of the form set and of each question; the prompts follow it.
@@ -36,19 +46,6 @@ const HELP: u16 = 3;
 
 /// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.10 §33.3.8.3.47).
 const UINT8_DECIMAL: u8 = 0x10;
-
-// The package types, string block types and IFR opcodes that the package lists use.
-const EFI_HII_PACKAGE_FORMS: u8 = 0x02;
-const EFI_HII_PACKAGE_STRINGS: u8 = 0x04;
-const EFI_HII_PACKAGE_END: u8 = 0xDF;
-const EFI_HII_SIBT_END: u8 = 0x00;
-const EFI_HII_SIBT_STRING_UCS2: u8 = 0x14;
-const EFI_IFR_FORM_OP: u8 = 0x01;
-const EFI_IFR_NUMERIC_OP: u8 = 0x07;
-const EFI_IFR_FORM_SET_OP: u8 = 0x0E;
-const EFI_IFR_VARSTORE_OP: u8 = 0x24;
-const EFI_IFR_VARSTORE_EFI_OP: u8 = 0x26;
-const EFI_IFR_END_OP: u8 = 0x29;
 
 /// The package lists, in the order of the database: a question in several lists has one
 /// copy in each.
@@ -212,27 +209,14 @@ pub(crate) fn package_lists() -> Vec<u8> {
 }
 
 impl PackageList {
-    /// EFI_HII_PACKAGE_LIST_HEADER (UEFI 2.10 §33.3.1.2), then the strings, form and End
-    /// packages.
+    /// The package list of the strings and form packages.
     fn bytes(&self) -> Vec<u8> {
-        let packages = [
-            self.strings_package(),
-            self.form_package(),
-            package(EFI_HII_PACKAGE_END, &[]),
-        ]
-        .concat();
-        let length = u32::try_from(16 + 4 + packages.len()).expect("a package list fits 4 GiB");
-        [&self.guid.to_bytes()[..], &length.to_le_bytes(), &packages].concat()
+        package_list(self.guid, &[self.strings_package(), self.form_package()])
     }
 
-    /// An en-US strings package: the language name, the title, the help, then each prompt,
-    /// from string ID 1.
+    /// The strings package: the language name, the title, the help, then each prompt, from
+    /// string ID 1.
     fn strings_package(&self) -> Vec<u8> {
-        const LANGUAGE: &[u8] = b"en-US\0";
-        // EFI_HII_STRING_PACKAGE_HDR: the package header, HdrSize, StringInfoOffset,
-        // LanguageWindow, LanguageName and Language
-        let header_size =
-            u32::try_from(4 + 4 + 4 + 32 + 2 + LANGUAGE.len()).expect("the header fits 4 GiB");
         let strings = [
             "English",
             "uefisettings QEMU test forms",
@@ -240,27 +224,7 @@ impl PackageList {
         ]
         .into_iter()
         .chain(self.questions.iter().map(|question| question.prompt));
-        // EFI_HII_SIBT_STRING_UCS2 blocks, then EFI_HII_SIBT_END
-        let blocks: Vec<u8> = strings
-            .flat_map(|string| {
-                [EFI_HII_SIBT_STRING_UCS2]
-                    .into_iter()
-                    .chain(string.encode_utf16().chain([0]).flat_map(u16::to_le_bytes))
-            })
-            .chain([EFI_HII_SIBT_END])
-            .collect();
-        package(
-            EFI_HII_PACKAGE_STRINGS,
-            &[
-                &header_size.to_le_bytes()[..],
-                &header_size.to_le_bytes(),
-                &[0; 32],
-                &LANGUAGE_NAME.to_le_bytes(),
-                LANGUAGE,
-                &blocks,
-            ]
-            .concat(),
-        )
+        strings_package(strings)
     }
 
     /// A form package: a form set of the package list's GUID that declares one VarStore per
@@ -315,28 +279,4 @@ impl Question {
         .concat();
         [op(EFI_IFR_NUMERIC_OP, true, &data), end()].concat()
     }
-}
-
-/// An IFR op: EFI_IFR_OP_HEADER (UEFI 2.10 §33.3.8.2.1), then `data`.
-fn op(op_code: u8, scope: bool, data: &[u8]) -> Vec<u8> {
-    let length = u8::try_from(2 + data.len())
-        .ok()
-        .filter(|length| length & 0x80 == 0)
-        .expect("an IFR op fits its 7-bit Length");
-    let scope = if scope { 0x80 } else { 0 };
-    [&[op_code, scope | length][..], data].concat()
-}
-
-/// EFI_IFR_END, which closes a scope.
-fn end() -> Vec<u8> {
-    op(EFI_IFR_END_OP, false, &[])
-}
-
-/// An HII package of `kind`: EFI_HII_PACKAGE_HEADER (UEFI 2.10 §33.3.1.1), then `data`.
-fn package(kind: u8, data: &[u8]) -> Vec<u8> {
-    let length = u32::try_from(4 + data.len())
-        .ok()
-        .filter(|length| length >> 24 == 0)
-        .expect("a package fits its 24-bit Length");
-    [&length.to_le_bytes()[..3], &[kind], data].concat()
 }

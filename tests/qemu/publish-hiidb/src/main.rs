@@ -32,6 +32,7 @@
 extern crate alloc;
 
 mod global_variable_forms;
+mod hii_package;
 
 use core::ptr;
 
