@@ -122,40 +122,21 @@ they would create absent variables and overwrite writable ones, such as BootOrde
 
 ## In the UEFI Shell
 
-`uefisettings.efi` runs in the UEFI Shell, before an OS boots. It reads the HII database and the
-variables of the firmware it runs on through boot services, so it also reaches the
-boot-service-only variables that Linux cannot. Build it for x86_64, i686 or aarch64:
+`uefisettings.efi` runs `get`, `set`, `show-translations` and the `hii` commands but
+`extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots; it also reaches
+boot-service-only variables, and has no `-f` or `--efivars`.
 
 ```sh
-rustup target add x86_64-unknown-uefi
+rustup target add x86_64-unknown-uefi  # or i686-unknown-uefi, aarch64-unknown-uefi
 cargo build --release --target x86_64-unknown-uefi
-# target/x86_64-unknown-uefi/release/uefisettings.efi
 ```
 
 ```plain
 FS0:\> uefisettings.efi hii get --json "Activate this check box"
 ```
 
-It has `get`, `set`, `show-translations` and the `hii` commands `get`, `set`, `list-questions`,
-`show-ifr` and `list-strings`, with the flags of the Linux build but `-f` and `--efivars`. A
-failing command returns EFI_ABORTED, which `%lasterror%` shows as 0x15 (0x80000015 on i686).
-
-Questions never read a VarStore that a password question names: they show
-`<ValueUnavailable: VarStore holds a password>`, and `set` refuses them. The UEFI Shell runs no
-setup browser, so nothing there asks for or checks a setup password: in a HiiDB that declares a
-password question, `set` writes nothing unless `--bypass-setup-password` is given.
-
-`hii variable-info NAME GUID`, of this build only, prints the attributes bitmask and the data
-size of an EFI variable, but never its data, such as of AMI firmware's `AMITSESetup`. It prints
-them as a JSON object of its own, outside the thrift IDL of the other commands, with no `-j`:
-
-```plain
-FS0:\> uefisettings.efi hii variable-info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
-```
-
-With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
-the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
-machine's db trusts.
+Exit statuses, setup passwords, `hii variable-info` and Secure Boot: see the
+[appendix](#appendix).
 
 ---
 
@@ -271,5 +252,29 @@ uefisettings never takes, checks or circumvents a firmware password, because UEF
 carry none. With an Administrator password installed, `administrator` lets root select from the OS
 the questions that the firmware's Setup reserves for Administrator sessions, as
 `--include grayed-out` already does more broadly.
+
+</details>
+
+<details>
+<summary>UEFI Shell details</summary>
+
+A failing command returns EFI_ABORTED, which `%lasterror%` shows as 0x15 (0x80000015 on i686).
+
+Questions never read a VarStore that a password question names: they show
+`<ValueUnavailable: VarStore holds a password>`, and `set` refuses them. The UEFI Shell runs no
+setup browser, so nothing there asks for or checks a setup password: in a HiiDB that declares a
+password question, `set` writes nothing unless `--bypass-setup-password` is given.
+
+`hii variable-info NAME GUID`, of this build only, prints the attributes bitmask and the data
+size of an EFI variable, but never its data, such as of AMI firmware's `AMITSESetup`. It prints
+them as a JSON object of its own, outside the thrift IDL of the other commands, with no `-j`:
+
+```plain
+FS0:\> uefisettings.efi hii variable-info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
+```
+
+With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
+the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
+machine's db trusts.
 
 </details>
