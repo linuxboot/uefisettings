@@ -87,39 +87,6 @@ Commands:
 
 ---
 
-## Inspecting a machine's settings elsewhere
-
-`hii dump-efivars` copies the EFI variables that the HiiDB's questions read, so that `hii get`,
-`hii list-questions` and `hii show-ifr` can answer from them on another machine. The dump also
-holds the HiiDB, as `hiidb.bin`, and records its format and redaction in
-`uefisettings-dump.json`:
-
-```sh
-# on the machine to inspect
-sudo uefisettings hii extract-db hiidb.bin
-uefisettings hii dump-efivars -f hiidb.bin efivars
-# on any machine
-uefisettings hii list-questions --efivars efivars
-```
-
-`extract-db` reads the HiiDB from /dev/mem, which needs CAP_SYS_RAWIO. `dump-efivars -f` reads
-only efivarfs, whose files every user can read, so run it unprivileged: as root, it would leave a
-directory that only root can read.
-
-Without `-f`, `--efivars` reads the HiiDB that the dump saved. A directory without
-`uefisettings-dump.json` holds plain efivar files, read with the HiiDB of `-f` or this machine.
-
-The dump keeps the HiiDB whole, whose strings can name the machine (a MAC address, for one), and
-of each EFI variable only the bytes that questions decode unless `--unredacted` is given; even those
-can be secrets, so share it only with people you trust. A redacted dump zeroes every other byte,
-so `--efivars` refuses it with another HiiDB (`-f`), whose questions would read those zeros as
-values; a later uefisettings that decodes more reads them as values too.
-
-Never copy a dump into /sys/firmware/efi/efivars: its files are in efivarfs's write format, so
-they would create absent variables and overwrite writable ones, such as BootOrder and Timeout.
-
----
-
 ## In the UEFI Shell
 
 `uefisettings.efi` runs `get`, `set`, `show-translations` and the `hii` commands but
@@ -229,6 +196,40 @@ GitHub Actions runs the checks on every pull request and every push to main, as 
 End-to-end tests boot QEMU guests and run `uefisettings` against emulated firmware; [`tests/qemu/README.md`](tests/qemu/README.md) explains how to run them.
 
 ## Appendix
+
+<details>
+<summary>Inspecting a machine's settings elsewhere</summary>
+
+`hii dump-efivars` copies the EFI variables that the HiiDB's questions read, so that `hii get`,
+`hii list-questions` and `hii show-ifr` can answer from them on another machine. The dump also
+holds the HiiDB, as `hiidb.bin`, and records its format and redaction in
+`uefisettings-dump.json`:
+
+```sh
+# on the machine to inspect
+sudo uefisettings hii extract-db hiidb.bin
+uefisettings hii dump-efivars -f hiidb.bin efivars
+# on any machine
+uefisettings hii list-questions --efivars efivars
+```
+
+`extract-db` reads the HiiDB from /dev/mem, which needs CAP_SYS_RAWIO. `dump-efivars -f` reads
+only efivarfs, whose files every user can read, so run it unprivileged: as root, it would leave a
+directory that only root can read.
+
+Without `-f`, `--efivars` reads the HiiDB that the dump saved. A directory without
+`uefisettings-dump.json` holds plain efivar files, read with the HiiDB of `-f` or this machine.
+
+The dump keeps the HiiDB whole, whose strings can name the machine (a MAC address, for one), and
+of each EFI variable only the bytes that questions decode unless `--unredacted` is given; even those
+can be secrets, so share it only with people you trust. A redacted dump zeroes every other byte,
+so `--efivars` refuses it with another HiiDB (`-f`), whose questions would read those zeros as
+values; a later uefisettings that decodes more reads them as values too.
+
+Never copy a dump into /sys/firmware/efi/efivars: its files are in efivarfs's write format, so
+they would create absent variables and overwrite writable ones, such as BootOrder and Timeout.
+
+</details>
 
 <details>
 <summary>AMI Setup access level</summary>
