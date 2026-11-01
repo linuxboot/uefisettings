@@ -13,7 +13,8 @@
 
 # Runs the QEMU tests: boots each scenario of tests/qemu/scenarios.tsv, or only the named
 # ones, under EDK2's firmware and fails unless the guest tests and health checks of every
-# boot pass. tests/qemu/README.md describes the requirements and the logs.
+# Linux boot pass, and check-shell-log.sh passes the console of every UEFI Shell boot.
+# tests/qemu/README.md describes the requirements and the logs.
 #
 # Usage: tests/qemu/run.sh ARCH [SCENARIO...]
 #
@@ -63,6 +64,8 @@ i686)
     kernel_params=(pti=on)
     ;;
 aarch64)
+    # With these devices, none of them virtio-rng, the firmware has no EFI_RNG_PROTOCOL, so
+    # std's RandomState panics in uefisettings.efi: what lets the UEFI Shell scenarios catch it.
     qemu=(qemu-system-aarch64 -machine virt -accel tcg -cpu cortex-a57)
     firmware=usr/share/AAVMF/AAVMF_CODE.fd
     firmware_vars=usr/share/AAVMF/AAVMF_VARS.fd
@@ -106,14 +109,20 @@ for name in "$@"; do
         exit 2
     fi
 done
-# The test binaries that the boots of the scenarios name, the last column.
+# The test binaries that the Linux boots of the scenarios name, the last column.
 mapfile -t named < <(awk -F '\t' '$1 !~ /^(#|$)/ {
     n = split($NF, boots, ",")
-    for (i = 1; i <= n; i++) { sub("/.*", "", boots[i]); print boots[i] }
+    for (i = 1; i <= n; i++) if (boots[i] !~ /^shell:/) { sub("/.*", "", boots[i]); print boots[i] }
 }' "$here/scenarios.tsv")
 
+# One run of an architecture at a time, such as make -j's of its Linux and UEFI Shell
+# scenarios: they unpack the guest's packages into one directory and build DriverSample.efi.
+mkdir -p "$out/$arch"
+exec {lock}>"$out/$arch/lock"
+flock "$lock"
 echo "run.sh: start $(date -u +%FT%TZ), logs in $run"
-mkdir -p "$run/initramfs/bin" "$run/initramfs/lib/modules" "$run/initramfs/tests" "$run/esp"
+mkdir -p "$run/initramfs/bin" "$run/initramfs/lib/modules" "$run/initramfs/tests" "$run/esp" \
+    "$run/shell-esp"
 grep --max-count=1 '^model name' /proc/cpuinfo
 "${qemu[0]}" --version
 
@@ -145,17 +154,42 @@ cargo build --release --locked --target "$target" --bin uefisettings \
 cargo build --release --locked --target "$arch-unknown-uefi" \
     --manifest-path "$here/publish-hiidb/Cargo.toml" --message-format=json-render-diagnostics |
     executables >>"$run/executables"
+# std's RandomState, which HashMap uses, takes its keys from hashmap_random_keys, which panics
+# on firmware without EFI_RNG_PROTOCOL unless the CPU has x86's RDRAND (Rust 1.93 std
+# sys/random/uefi.rs). So the link map of uefisettings.efi must not name it. Each run asks for
+# a map of its own, beside its logs, so cargo relinks uefisettings.efi and the map is that of the
+# .efi that the run boots.
+map=$run/uefisettings.efi.map
+cargo rustc --release --locked --target "$arch-unknown-uefi" --bin uefisettings \
+    --manifest-path "$repo/Cargo.toml" --message-format=json-render-diagnostics \
+    -- -C "link-arg=/MAP:$map" |
+    executables | sed 's|^|shell/|' >>"$run/executables"
+found=0
+grep --quiet hashmap_random_keys "$map" || found=$?
+case $found in
+0)
+    echo "uefisettings.efi links std's hashmap_random_keys: see $map" >&2
+    exit 1
+    ;;
+1) ;;
+*)
+    echo "no link map $map of uefisettings.efi" >&2
+    exit 1
+    ;;
+esac
 cargo test --release --locked --target "$target" --features test-vm --test '*' --no-run \
     --manifest-path "$here/guest/Cargo.toml" --message-format=json-render-diagnostics |
     executables | sed 's|^|tests/|' >>"$run/executables"
 # The initramfs gets uefisettings, the test binaries, busybox and init. The ESP gets the
-# HII fixture: publish-hiidb and EDK2's DriverSample.
+# HII fixture: publish-hiidb and EDK2's DriverSample; the UEFI Shell boots get
+# uefisettings.efi on it too.
 unnamed=()
 # read fails on a last line without a newline, which still counts.
 while read -r name path || [[ -n $name ]]; do
     case $name in
     uefisettings) cp "$path" "$run/initramfs/bin/" ;;
     publish-hiidb) cp "$path" "$run/esp/" ;;
+    shell/uefisettings) cp "$path" "$run/shell-esp/" ;;
     tests/*)
         cp "$path" "$run/initramfs/$name"
         [[ " ${named[*]} " == *" ${name#tests/} "* ]] || unnamed+=("${name#tests/}")
@@ -191,6 +225,15 @@ for module in "${modules[@]}"; do
 done
 cp "$guest/usr/bin/busybox" "$run/initramfs/bin/busybox"
 
+# Prints the guest tests' log of the Linux boot whose logs start with $1, and fails unless they
+# and the health checks passed: init prints their exit codes last. A filter that matches no
+# test passes too, so the tests must also report a passed test.
+linux_passed() {
+    sed -n '/^uefisettings-qemu-test: start/,$p' "$1.test.log"
+    tr -d '\r' <"$1.console.log" | grep --quiet --line-regexp 'uefisettings-qemu-test: exit 0 0' &&
+        grep --quiet '^test result: ok\. [1-9]' "$1.test.log"
+}
+
 failed=()
 # read fails on a last line without a newline, which still counts.
 while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
@@ -218,27 +261,56 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
     IFS=, read -r -a specs <<<"$boots"
     for spec in "${specs[@]}"; do
         boot=$((boot + 1))
-        test=${spec%%/*}
-        filter=${spec#"$test"}
-        filter=${filter#/}
         log=$dir/boot$boot
         echo "run.sh: $name boot $boot: $spec"
+        case $spec in
+        shell:*)
+            # Without a kernel, the firmware boots its UEFI Shell, which runs startup.nsh:
+            # the boot's script, on a copy of the ESP that also holds uefisettings.efi, and
+            # the kernel and initrd, which the line @LINUX@ of the script starts from the
+            # shell, into the guest test boot_smoke.
+            script=$here/shell/${spec#shell:}
+            esp=$log.esp
+            cp -r "$run/esp" "$esp"
+            cp "$run/shell-esp/uefisettings.efi" "$esp/"
+            cp "$vmlinuz" "$esp/vmlinuz.efi"
+            cp "$dir/initrd.img" "$esp/initrd.img"
+            linux="vmlinuz.efi initrd=\\initrd.img console=$console panic=-1"
+            linux+="${kernel_params[*]:+ ${kernel_params[*]}} uefisettings.tty=$tty"
+            linux+=" uefisettings.test=boot_smoke"
+            # ENVIRON, as awk -v would take the backslash of \initrd.img as an escape
+            LINUX=$linux awk '$0 == "@LINUX@" { $0 = ENVIRON["LINUX"] } { print $0 "\r" }' \
+                "$script.nsh" >"$esp/startup.nsh"
+            guest_args=(
+                -drive "if=virtio,format=raw,readonly=on,file=fat:$esp"
+                -chardev "file,id=tty,path=$log.test.log" "${tty_device[@]}"
+            )
+            ;;
+        *)
+            test=${spec%%/*}
+            filter=${spec#"$test"}
+            filter=${filter#/}
+            guest_args=(
+                -drive "if=virtio,format=raw,readonly=on,file=fat:$run/esp"
+                -kernel "$vmlinuz" -initrd "$dir/initrd.img"
+                -append "console=$console quiet panic=-1${kernel_params[*]:+ ${kernel_params[*]}} uefisettings.tty=$tty uefisettings.test=$test${filter:+ uefisettings.filter=$filter}"
+                -chardev "file,id=tty,path=$log.test.log" "${tty_device[@]}"
+            )
+            ;;
+        esac
         # Without --foreground, timeout would move QEMU into a process group of its own,
         # which a timeout around make does not reach.
         # The QEMU log, empty if QEMU does not start, tells how the guest ended (QEMU 10.2):
         # a poweroff makes a shutdown request (reason=6); a reset, after which -no-reboot
         # just ends QEMU, and a kill by the timeout make none. A CPU's last KVM exit is 8
         # (KVM_EXIT_SHUTDOWN) after its triple fault and 2 (I/O) after a reset through a port.
+        # The console is the first serial port, before any of guest_args.
         : >"$log.qemu.log"
         timeout --foreground -k 10 120 "${qemu[@]}" -nodefaults -no-user-config -no-reboot \
             -display none -sandbox on -m 1024 -smp 2 \
             -drive "if=pflash,format=raw,unit=0,readonly=on,file=$guest/$firmware" \
             -drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \
-            -drive "if=virtio,format=raw,readonly=on,file=fat:$run/esp" \
-            -kernel "$vmlinuz" -initrd "$dir/initrd.img" \
-            -append "console=$console quiet panic=-1${kernel_params[*]:+ ${kernel_params[*]}} uefisettings.tty=$tty uefisettings.test=$test${filter:+ uefisettings.filter=$filter}" \
-            -serial "file:$log.console.log" \
-            -chardev "file,id=tty,path=$log.test.log" "${tty_device[@]}" \
+            -serial "file:$log.console.log" "${guest_args[@]}" \
             -d guest_errors,trace:qemu_system_shutdown_request,trace:kvm_run_exit \
             -D "$log.qemu.log" </dev/null || echo "run.sh: QEMU exited with $?"
         # A line per KVM exit, some MB a boot, of which only each CPU's last tells the end;
@@ -248,11 +320,17 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
             END { for (cpu = 0; cpu <= max; cpu++) if (cpu in last) print last[cpu] }' \
             "$log.qemu.log" >"$log.qemu.log.new"
         mv "$log.qemu.log.new" "$log.qemu.log"
-        sed -n '/^uefisettings-qemu-test: start/,$p' "$log.test.log"
-        # init prints the exit codes of the tests and the health checks last. A filter
-        # that matches no test passes too, so the tests must also report a passed test.
-        if ! tr -d '\r' <"$log.console.log" | grep --quiet --line-regexp 'uefisettings-qemu-test: exit 0 0' ||
-            ! grep --quiet '^test result: ok\. [1-9]' "$log.test.log"; then
+        passed=yes
+        case $spec in
+        shell:*)
+            "$here/check-shell-log.sh" "$arch" "$script.tsv" "$log.console.log" || passed=no
+            if grep --quiet --line-regexp @LINUX@ "$script.nsh"; then
+                linux_passed "$log" || passed=no
+            fi
+            ;;
+        *) linux_passed "$log" || passed=no ;;
+        esac
+        if [[ $passed == no ]]; then
             failed+=("$name boot $boot")
             sed "s/^/run.sh: $name boot $boot: QEMU: /" "$log.qemu.log"
         fi

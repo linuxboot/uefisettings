@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms]`:
+//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -25,6 +25,8 @@
 //! variable, for the tests to check what `uefisettings` extracts.
 //! `rt-data-global-variable-forms` is `rt-data`, with the package lists of
 //! [`global_variable_forms`] after those that the firmware exports.
+//! `password-forms` publishes nothing: it registers the package list of [`password_forms`]
+//! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
 
 #![cfg_attr(target_os = "uefi", no_std, no_main)]
 #![deny(unsafe_code)]
@@ -33,6 +35,7 @@ extern crate alloc;
 
 mod global_variable_forms;
 mod hii_package;
+mod password_forms;
 
 use core::ptr;
 
@@ -47,12 +50,15 @@ use uefi::println;
 use uefi::proto::hii::database::HiiDatabase;
 use uefi::proto::loaded_image::LoadOptionsError;
 use uefi::proto::loaded_image::LoadedImage;
+use uefi::proto::unsafe_protocol;
 use uefi::runtime;
 use uefi::runtime::VariableAttributes;
 use uefi::runtime::VariableVendor;
 use uefi::CStr16;
 use uefi::Guid;
 use uefi::Status;
+use uefi::StatusExt;
+use uefi_raw::protocol::hii::database::HiiDatabaseProtocol;
 
 /// Name of the variable that `uefisettings` looks for.
 const HIIDB_NAME: &CStr16 = cstr16!("HiiDB");
@@ -84,17 +90,24 @@ fn main() {
 
 #[entry]
 fn efi_main() -> Status {
-    let Some((memory_type, database)) = load_option() else {
-        println!(
-            "usage: publish-hiidb [rt-data|reserved|loader-data|rt-data-global-variable-forms]"
-        );
-        return Status::INVALID_PARAMETER;
-    };
-    match publish(memory_type, database) {
-        Ok((address, length)) => {
-            println!("publish-hiidb: {length} bytes at {address:#x}, type {memory_type:?}");
-            Status::SUCCESS
+    let result = match load_option() {
+        Some(Task::Publish(memory_type, database)) => {
+            publish(memory_type, database).map(|(address, length)| {
+                println!("publish-hiidb: {length} bytes at {address:#x}, type {memory_type:?}");
+            })
         }
+        Some(Task::RegisterPasswordForms) => register_password_forms()
+            .map(|()| println!("publish-hiidb: registered the password forms")),
+        None => {
+            println!(
+                "usage: publish-hiidb \
+                 [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms]"
+            );
+            return Status::INVALID_PARAMETER;
+        }
+    };
+    match result {
+        Ok(()) => Status::SUCCESS,
         Err((step, status)) => {
             println!("publish-hiidb: ERROR: {step}: {status:?}");
             status
@@ -102,25 +115,73 @@ fn efi_main() -> Status {
     }
 }
 
-/// The memory type and database that the optional data of the load option, a NUL-terminated
-/// UCS-2 string, names: `rt-data` if there is none, or `None` if it is invalid.
-fn load_option() -> Option<(MemoryType, Database)> {
+/// What the load option asks for.
+#[derive(Clone, Copy, Debug)]
+enum Task {
+    /// Publish the database in pages of the memory type.
+    Publish(MemoryType, Database),
+    /// Register the package list of [`password_forms`] in the HII database.
+    RegisterPasswordForms,
+}
+
+/// The task that the optional data of the load option, a NUL-terminated UCS-2 string,
+/// names: `rt-data` if there is none, or `None` if it is invalid.
+fn load_option() -> Option<Task> {
     let image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle()).ok()?;
     let rt_data = MemoryType::RUNTIME_SERVICES_DATA;
     match image.load_options_as_cstr16() {
-        Err(LoadOptionsError::NotSet) => Some((rt_data, Database::Exported)),
-        Ok(option) if option == cstr16!("rt-data") => Some((rt_data, Database::Exported)),
+        Err(LoadOptionsError::NotSet) => Some(Task::Publish(rt_data, Database::Exported)),
+        Ok(option) if option == cstr16!("rt-data") => {
+            Some(Task::Publish(rt_data, Database::Exported))
+        }
         Ok(option) if option == cstr16!("reserved") => {
-            Some((MemoryType::RESERVED, Database::Exported))
+            Some(Task::Publish(MemoryType::RESERVED, Database::Exported))
         }
         Ok(option) if option == cstr16!("loader-data") => {
-            Some((MemoryType::LOADER_DATA, Database::Exported))
+            Some(Task::Publish(MemoryType::LOADER_DATA, Database::Exported))
         }
         Ok(option) if option == cstr16!("rt-data-global-variable-forms") => {
-            Some((rt_data, Database::WithGlobalVariableForms))
+            Some(Task::Publish(rt_data, Database::WithGlobalVariableForms))
         }
+        Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
         _ => None,
     }
+}
+
+/// EFI_HII_DATABASE_PROTOCOL with its functions, of which the uefi crate's HiiDatabase wraps
+/// only ExportPackageLists().
+#[repr(transparent)]
+#[unsafe_protocol(HiiDatabaseProtocol::GUID)]
+struct RawHiiDatabase(HiiDatabaseProtocol);
+
+/// Registers the package list of [`password_forms`] in the HII database, for no driver, until
+/// the reset: the UEFI Shell exports the database later.
+fn register_password_forms() -> Result<(), Failure> {
+    let database = boot::get_handle_for_protocol::<RawHiiDatabase>()
+        .and_then(boot::open_protocol_exclusive::<RawHiiDatabase>)
+        .map_err(|error| ("opening the HII database", error.status()))?;
+    let list = password_forms::package_list_bytes();
+    let mut handle = ptr::null_mut();
+    #[expect(
+        unsafe_code,
+        reason = "the uefi crate does not wrap NewPackageList(), a function of the protocol"
+    )]
+    // SAFETY: `database` is the protocol that the firmware installed, which stays open while
+    // the call runs; `list` is a whole package list whose header gives its length, whose
+    // packages the database adds (UEFI 2.10 §34.8.2) as copies (edk2-stable202508
+    // HiiDatabaseDxe/Database.c HiiNewPackageList); DriverHandle is optional, and `handle` is a
+    // valid place for the new HII handle.
+    let status = unsafe {
+        (database.0.new_package_list)(
+            &database.0,
+            list.as_ptr().cast(),
+            ptr::null_mut(),
+            &mut handle,
+        )
+    };
+    status
+        .to_result()
+        .map_err(|error| ("registering the password forms", error.status()))
 }
 
 /// The HII database that publish-hiidb copies.

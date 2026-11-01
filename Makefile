@@ -66,7 +66,11 @@ comma := ,
 # CI runs lint test test-i686 and test-e2e-qemu: a new check joins LINTS or
 # QEMU_TESTS or CI runs it too.
 LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi doc
-QEMU_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
+QEMU_LINUX_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
+QEMU_SHELL_TESTS := test-e2e-qemu-shell-x86_64 test-e2e-qemu-shell-i686 test-e2e-qemu-shell-aarch64
+QEMU_TESTS := $(QEMU_LINUX_TESTS) $(QEMU_SHELL_TESTS)
+# The scenarios of tests/qemu/scenarios.tsv: those named shell-* boot the UEFI Shell.
+SCENARIOS := $(shell awk -F '\t' '$$1 ~ /^[a-z]/ { print $$1 }' tests/qemu/scenarios.tsv)
 CHECKS := $(LINTS) test test-i686 test-e2e-qemu
 
 .PHONY: check lint help setup toolchain $(CHECKS) $(QEMU_TESTS)
@@ -135,6 +139,10 @@ doc: toolchain
 test-e2e-qemu: $(QEMU_TESTS)
 
 # Boots the scenarios of tests/qemu/scenarios.tsv on one architecture, with logs in
-# target/qemu-test/<architecture>/<UTC time>/; see tests/qemu/README.md.
-$(QEMU_TESTS): test-e2e-qemu-%: toolchain
-	tests/qemu/run.sh $*
+# target/qemu-test/<architecture>/<UTC time>/: those of Linux, or those of the UEFI Shell;
+# see tests/qemu/README.md.
+$(QEMU_LINUX_TESTS): test-e2e-qemu-%: toolchain
+	tests/qemu/run.sh $* $(filter-out shell-%,$(SCENARIOS))
+
+$(QEMU_SHELL_TESTS): test-e2e-qemu-shell-%: toolchain
+	tests/qemu/run.sh $* $(filter shell-%,$(SCENARIOS))

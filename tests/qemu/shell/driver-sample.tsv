@@ -1,0 +1,77 @@
+# The checks of shell/driver-sample.nsh: in the scenario shell-driver-sample, DriverSample
+# creates its variables MyIfrNVData and MyEfiVar boot-service-only (NV+BS), which Linux
+# cannot reach, and declares no PASSWORD question, so set writes without
+# --bypass-setup-password. See check-shell-log.sh.
+get-check-box	status	0x0
+get-check-box	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "1"
+get-numeric	status	0x0
+get-numeric	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "18"
+dmpstore-before	status	any
+dmpstore-before	line	^Variable NV\+BS 'A04A27F4-DF00-4D42-B552-39511302113D:MyIfrNVData' DataSize = 0xDC$
+# How old are you? (Step) is the byte at 0x55
+dmpstore-before	line	^  00000050: 00 00 15 00 00 12 00 00-
+set-numeric	status	0x0
+set-numeric	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "42" and .[0].modified == true
+dmpstore-after	status	any
+dmpstore-after	line	^Variable NV\+BS 'A04A27F4-DF00-4D42-B552-39511302113D:MyIfrNVData' DataSize = 0xDC$
+dmpstore-after	line	^  00000050: 00 00 15 00 00 2A 00 00-
+get-numeric-after	status	0x0
+get-numeric-after	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "42"
+get-efi-var	status	0x0
+get-efi-var	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "18"
+set-efi-var	status	0x0
+set-efi-var	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "20" and .[0].modified == true
+get-efi-var-after	status	0x0
+get-efi-var-after	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "20"
+dmpstore-efi-var	status	any
+dmpstore-efi-var	line	^Variable NV\+BS 'A04A27F4-DF00-4D42-B552-39511302113D:MyEfiVar' DataSize = 
+get-unknown	status	0x0
+get-unknown	json	. == {"responses": []}
+set-unknown	status	aborted
+set-unknown	json	. == {"error_message": "no question \"No such question anywhere\" in the HiiDB"}
+set-out-of-range	status	aborted
+set-out-of-range	json	. == {"error_message": "provided value exceeded max possible value"}
+usage-error	status	aborted
+usage-error	line	^error: unrecognized subcommand 'bogus-subcommand'$
+missing-value	status	aborted
+missing-value	line	^error: the following required arguments were not provided:$
+# extract-db needs Linux
+extract-db	status	aborted
+extract-db	line	^error: unrecognized subcommand 'extract-db'$
+# no failed set wrote
+dmpstore-negatives	status	any
+dmpstore-negatives	same	dmpstore-after
+# >v captures what the console shows
+capture	status	0x0
+capture	none	.
+variables	status	0x0
+variables	variable	captured get-check-box
+top-get	status	0x0
+top-get	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "1"
+top-set	status	0x0
+top-set	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "0" and .[0].modified == true
+list-questions	status	0x0
+list-questions	json	type == "array" and any(.[]; .name == "How old are you? (Step)" and .answer == "42")
+show-ifr	status	0x0
+show-ifr	line	How old are you\? \(Step\)
+list-strings	status	0x0
+list-strings	json	type == "array" and any(.[]; .string_package | type == "object")
+show-translations	status	0x0
+show-translations	json	type == "object"
+no-efivars	status	0x0
+no-efivars	json	.responses[0].question.answer | startswith("<ValueUnavailable: EFI variables not read>")
+# the help names no command or flag of the Linux build only
+help	status	0x0
+help	line	^Usage: uefisettings.efi <COMMAND>$
+help	none	^  (identify|ilo) 
+# get and set use the HII database here, with no backend to identify
+help	line	^  get +Get the current value of a question$
+help	none	Auto-identify
+hii-help	status	0x0
+hii-help	line	^  list-questions 
+hii-help	none	^  (dump-efivars|extract-db) 
+hii-get-help	status	0x0
+hii-get-help	line	--no-efivars
+hii-get-help	none	--efivars|--filename
+hii-set-help	status	0x0
+hii-set-help	line	--bypass-setup-password

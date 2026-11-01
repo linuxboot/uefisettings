@@ -1,0 +1,3 @@
+# The checks of shell/list-questions.nsh. See check-shell-log.sh.
+list-questions	status	0x0
+list-questions	parity	boot1.test.log

@@ -1,0 +1,8 @@
+# The checks of shell/driver-sample-reboot.nsh, the second boot of shell-driver-sample: the
+# values that the first boot set outlast the reset. See check-shell-log.sh.
+get-numeric	status	0x0
+get-numeric	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "42"
+get-check-box	status	0x0
+get-check-box	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "0"
+get-efi-var	status	0x0
+get-efi-var	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "20"

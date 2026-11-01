@@ -48,5 +48,9 @@ name = "hii_persistence"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_shell_parity"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_write"
 required-features = ["test-vm"]

@@ -1,0 +1,5 @@
+# The checks of shell/then-linux.nsh, the third boot of shell-driver-sample; run.sh checks
+# the Linux boot that follows them. See check-shell-log.sh.
+get	status	0x0
+set	status	0x0
+usage-error	status	aborted

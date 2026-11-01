@@ -3,12 +3,14 @@
 These tests boot x86_64, i686 and aarch64 QEMU guests under EDK2's firmware (OVMF, or
 AAVMF on aarch64) and run `uefisettings` inside them, so they
 exercise the CLI against real UEFI firmware, efivarfs and `/dev/mem` without touching the
-machine that runs them.
+machine that runs them. The UEFI Shell scenarios run `uefisettings.efi` in the firmware's
+UEFI Shell instead.
 
 ## Running
 
-`make test-e2e-qemu` runs every scenario on every architecture, and
-`make test-e2e-qemu-<arch>` on one of `x86_64`, `i686` and `aarch64`, on the Rust
+`make test-e2e-qemu` runs every scenario on every architecture,
+`make test-e2e-qemu-<arch>` the Linux scenarios on one of `x86_64`, `i686` and `aarch64`,
+and `make test-e2e-qemu-shell-<arch>` the UEFI Shell scenarios, on the Rust
 toolchain and targets that `make setup` installs (see the Checks section of the
 repository's README):
 
@@ -41,8 +43,8 @@ tests/qemu/run.sh x86_64 boot-smoke   # the named scenarios
 ```
 
 Elsewhere, these tools must be on `PATH`: `qemu-system-x86_64`, `qemu-system-i386`,
-`qemu-system-aarch64`, `virt-fw-vars`, `jq` and `cpio` for `run.sh`; `curl`, `rpm2cpio`,
-`cpio`, `ar`, `tar`, `xz` and `zstd` for `fetch-packages.sh`; and,
+`qemu-system-aarch64`, `virt-fw-vars`, `jq`, `cpio` and `flock` for `run.sh`; `curl`,
+`rpm2cpio`, `cpio`, `ar`, `tar`, `xz` and `zstd` for `fetch-packages.sh`; and,
 unless DriverSample.efi is already built, `gcc`, `g++`, `make`, `git`, `nasm`, `python3`
 and the libuuid headers for [`build-driver-sample.sh`](build-driver-sample.sh).
 The aarch64 builds also need `aarch64-linux-gnu-gcc` with the `libdl.a` of an aarch64
@@ -66,6 +68,15 @@ command line lacks `uefisettings.test=`. They build only with the `test-vm` feat
 `run.sh` enables, so each file needs a `[[test]]` entry with
 `required-features = ["test-vm"]` in [`guest/Cargo.toml`](guest/Cargo.toml).
 
+A UEFI Shell boot names a script of [`shell/`](shell/) instead of a test binary: `run.sh`
+boots no kernel, so the firmware starts its UEFI Shell, which runs the script as
+`startup.nsh` from a copy of the ESP that also holds `uefisettings.efi`. Then
+[`check-shell-log.sh`](check-shell-log.sh) checks each step of the script in
+`bootN.console.log` against the `.tsv` file of the script: its output, which `%lasterror%`
+the shell set, and the JSON of `uefisettings.efi`. The line `@LINUX@` of a script starts
+Linux from the shell, after `uefisettings.efi` has run, into the guest test `boot_smoke`,
+which must pass too.
+
 ## HII fixture
 
 EDK2's firmware does not publish its HII database for the OS, so the HII scenarios have it
@@ -81,9 +92,21 @@ run two drivers from the ESP before the kernel, through `Driver####` load option
 [`vars/my-ifr-nv-data.json`](vars/my-ifr-nv-data.json) creates DriverSample's variable
 first, with runtime access, so that efivarfs shows it, and with DriverSample's defaults at
 that commit.
+[`vars/my-ifr-nv-data-auth27.json`](vars/my-ifr-nv-data-auth27.json) and
+[`vars/my-ifr-nv-data-authA7.json`](vars/my-ifr-nv-data-authA7.json) create it with the
+same data and authenticated access, the attributes 0x27 and 0xA7, for the UEFI Shell
+scenarios `shell-auth27` and `shell-authA7`: `uefisettings.efi` decodes the first but not
+the second, and writes neither.
 
 `publish-hiidb.efi rt-data-global-variable-forms` publishes, after the firmware's own
 package lists, those of
 [`publish-hiidb/src/global_variable_forms.rs`](publish-hiidb/src/global_variable_forms.rs):
 forms whose questions sit on EFI global variables of the firmware, some of them volatile,
 under VarStores that declare every one non-volatile.
+
+`publish-hiidb.efi password-forms` publishes nothing: it registers the forms of
+[`publish-hiidb/src/password_forms.rs`](publish-hiidb/src/password_forms.rs) in the HII
+database, which `uefisettings.efi` exports in the UEFI Shell: PASSWORD questions in the
+layout of AMI firmware's `AMITSESetup`, which
+[`vars/amitse-setup.json`](vars/amitse-setup.json) creates, and a question on a volatile
+variable.
