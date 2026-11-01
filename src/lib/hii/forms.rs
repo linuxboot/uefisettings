@@ -32,11 +32,14 @@ use log::warn;
 use thiserror::Error;
 
 use crate::hii::package::Guid;
+use crate::hii::variables::check_decodable;
 use crate::hii::variables::check_non_volatile;
+use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarRange;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EfivarsNotRead;
+use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
@@ -1152,6 +1155,43 @@ mod non_efi_varstore_tests {
         }
     }
 
+    /// get decodes no value from a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, whose
+    /// data starts with metadata (UEFI 2.10 §8.2.1). The other authenticated accesses put their
+    /// descriptors only into writes, so those variables decode as others do.
+    #[test]
+    fn enhanced_authenticated_variable_is_not_decoded() {
+        let store = || efi_variable("Signed", 1);
+        let efivars = Efivars::new();
+        efivars.write_attributed(&store(), NV_BS_RT | 0x80, &[1]);
+
+        assert_eq!(
+            read(store(), &efivars),
+            Err(
+                "<ValueUnavailable: EFI variable Signed-00000000-0000-0000-0000-000000000000 \
+                 has enhanced authenticated access (attributes 0x87): its data starts with \
+                 metadata, which uefisettings does not decode>"
+                    .to_string()
+            ),
+            "attributes 0x87"
+        );
+        for attributes in [
+            NV_BS_RT,
+            NV_BS_RT | 0x08,
+            NV_BS_RT | 0x10,
+            NV_BS_RT | 0x20,
+            NV_BS_RT | 0x40,
+        ] {
+            let efivars = Efivars::new();
+            efivars.write_attributed(&store(), attributes, &[1]);
+
+            assert_eq!(
+                read(store(), &efivars),
+                Ok(efivar_file_bytes(attributes, &[1])),
+                "attributes {attributes:#x}"
+            );
+        }
+    }
+
     #[test]
     fn short_efivar_file_is_a_read_error() {
         let efivars = Efivars::new();
@@ -1417,9 +1457,14 @@ fn read_current_value_bytes<'a>(
         .check_runtime_access(reader.reach())
         .map_err(ValueUnavailable::BootServiceOnly)?;
 
-    reader
+    let bytes = reader
         .read(EfivarRange::of(store.as_ref()), value)
-        .map_err(|error| ValueUnavailable::from_read_error(store.kind(), error))
+        .map_err(|error| ValueUnavailable::from_read_error(store.kind(), error))?;
+    if let Some(attributes) = efivar_attributes(bytes) {
+        check_decodable(&store.variable_key(), attributes)
+            .map_err(ValueUnavailable::EnhancedAuthenticated)?;
+    }
+    Ok(bytes)
 }
 
 /// Why a question has no value. Display gives the reason, to_answer the text shown for the
@@ -1431,6 +1476,8 @@ enum ValueUnavailable {
     NoVarStore(String),
     #[error("{0}")]
     BootServiceOnly(BootServiceOnlyVariable),
+    #[error("{0}")]
+    EnhancedAuthenticated(EnhancedAuthenticatedVariable),
     #[error("{0}")]
     NotRead(EfivarsNotRead),
     #[error("{0}")]
@@ -1492,6 +1539,7 @@ impl ValueUnavailable {
             Self::AmiAccessLevel(reason) => reason.tag(),
             Self::NoVarStore(_)
             | Self::BootServiceOnly(_)
+            | Self::EnhancedAuthenticated(_)
             | Self::NotRead(_)
             | Self::Missing(_)
             | Self::MissingBuffer(_)
@@ -2971,9 +3019,9 @@ where
 
 /// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
 /// match that set would write, or the likely match, has no VarStore, or its efivar is missing,
-/// unreadable, boot-service-only or volatile, which --include cannot make writable: then
-/// ChangeValueError::NoVarStore, VariableNotExported or the read's error, as `reader` found
-/// it, BootServiceOnlyVariable or VolatileVariable.
+/// unreadable, boot-service-only, volatile or authenticated, which --include cannot make
+/// writable: then ChangeValueError::NoVarStore, VariableNotExported or the read's error, as
+/// `reader` found it, BootServiceOnlyVariable, VolatileVariable or AuthenticatedVariable.
 pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
@@ -2996,7 +3044,9 @@ pub(crate) fn choice_for_set(
         });
     }
     if let Some(attributes) = reader.attributes(store) {
-        check_non_volatile(&store.variable_key(), attributes)?;
+        let key = store.variable_key();
+        check_non_volatile(&key, attributes)?;
+        check_unauthenticated(&key, attributes)?;
     }
     Ok(selection.for_set(question)?)
 }
@@ -3339,6 +3389,25 @@ mod choice_for_set_tests {
             "Runtime"
         );
         assert_eq!(reads, [], "Runtime: reads");
+    }
+
+    /// set refuses a match on a variable with any authenticated access before any write: every
+    /// write of it needs a signed descriptor (UEFI 2.10 §8.2.3).
+    #[test]
+    fn match_on_an_authenticated_efivar_is_refused() {
+        let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS_RT, 1)], 1);
+        for attributes in [NV_BS_RT | 0x10, NV_BS_RT | 0x20, NV_BS_RT | 0x80] {
+            let signed = choice_attributed(&root, attributes);
+
+            assert_eq!(
+                signed.map_err(|error| error.to_string()).err(),
+                Some(format!(
+                    "EFI variable Present-00000000-0000-0000-0000-000000000000 has authenticated \
+                     access (attributes {attributes:#x}), which uefisettings does not write"
+                )),
+                "efivar file with attributes {attributes:#x}"
+            );
+        }
     }
 
     #[test]

@@ -28,6 +28,12 @@ use crate::hii::package::Guid;
 /// efivarfs does.
 pub(super) const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
 const EFI_VARIABLE_NON_VOLATILE: u32 = 0x00000001;
+/// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.10 §8.2.1)
+const EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: u32 = 0x00000080;
+/// EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS, EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+/// and EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.10 §8.2.1)
+const EFI_VARIABLE_AUTHENTICATED_ACCESS: u32 =
+    0x00000010 | 0x00000020 | EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS;
 const MISSING_ATTRIBUTES_HEADER: &str = "efivarfs file is missing its attributes header";
 
 /// A firmware variable: its name and vendor GUID (UEFI 2.10 §8.2.1).
@@ -84,8 +90,8 @@ pub(super) fn efivar_attributes(bytes: &[u8]) -> Option<u32> {
 }
 
 /// The read-modify-write of FirmwareVariables::write_at on `bytes`, the attributes word and all
-/// the data of variable `key`: refuses a volatile variable, then writes `encoded` at data offset
-/// `offset` as update_efivarfs_bytes does.
+/// the data of variable `key`: refuses a volatile or authenticated variable, then writes
+/// `encoded` at data offset `offset` as update_efivarfs_bytes does.
 pub(super) fn modify_variable_bytes(
     key: &VariableKey,
     bytes: &mut [u8],
@@ -95,6 +101,7 @@ pub(super) fn modify_variable_bytes(
 ) -> Result<()> {
     let attributes = efivar_attributes(bytes).context(MISSING_ATTRIBUTES_HEADER)?;
     check_non_volatile(key, attributes)?;
+    check_unauthenticated(key, attributes)?;
     update_efivarfs_bytes(bytes, size, offset, encoded)
 }
 
@@ -148,6 +155,60 @@ pub(super) fn check_non_volatile(
      efivarfs"
 )]
 pub(super) struct VolatileVariable(VariableKey);
+
+/// Refuses an EFI variable with authenticated access, which its `attributes` word names: every
+/// write of it needs a signed descriptor (UEFI 2.10 §8.2.3).
+pub(super) fn check_unauthenticated(
+    key: &VariableKey,
+    attributes: u32,
+) -> std::result::Result<(), AuthenticatedVariable> {
+    if attributes & EFI_VARIABLE_AUTHENTICATED_ACCESS != 0 {
+        return Err(AuthenticatedVariable {
+            key: key.clone(),
+            attributes,
+        });
+    }
+    Ok(())
+}
+
+/// An EFI variable with authenticated access, which set refuses.
+#[derive(Error, Debug)]
+#[error(
+    "EFI variable {key} has authenticated access (attributes {attributes:#x}), which \
+     uefisettings does not write"
+)]
+pub(super) struct AuthenticatedVariable {
+    key: VariableKey,
+    attributes: u32,
+}
+
+/// Refuses to decode an EFI variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, which its
+/// `attributes` word names: its data starts with metadata (UEFI 2.10 §8.2.1), where questions
+/// would decode their values.
+pub(super) fn check_decodable(
+    key: &VariableKey,
+    attributes: u32,
+) -> std::result::Result<(), EnhancedAuthenticatedVariable> {
+    if attributes & EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS != 0 {
+        return Err(EnhancedAuthenticatedVariable {
+            key: key.clone(),
+            attributes,
+        });
+    }
+    Ok(())
+}
+
+/// An EFI variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, which questions do not
+/// decode.
+#[derive(Error, Debug)]
+#[error(
+    "EFI variable {key} has enhanced authenticated access (attributes {attributes:#x}): its data \
+     starts with metadata, which uefisettings does not decode"
+)]
+pub(super) struct EnhancedAuthenticatedVariable {
+    key: VariableKey,
+    attributes: u32,
+}
 
 /// A variable that FirmwareVariables does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -771,6 +832,30 @@ pub(crate) mod tests {
             "refusal"
         );
         assert_eq!(bytes, before, "bytes");
+    }
+
+    /// modify_variable_bytes refuses a variable with authenticated access, whose writes need a
+    /// signed descriptor (UEFI 2.10 §8.2.3), and keeps its bytes.
+    #[test]
+    fn modify_variable_bytes_refuses_an_authenticated_variable() {
+        let key = variable_key("Signed");
+        for attributes in [NV_BS_RT | 0x10, NV_BS_RT | 0x20, NV_BS_RT | 0x80] {
+            let mut bytes = [&attributes.to_ne_bytes()[..], &[1]].concat();
+            let before = bytes.clone();
+
+            let error = modify_variable_bytes(&key, &mut bytes, 1, 0, &[0x2A])
+                .expect_err("modify an authenticated variable");
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "EFI variable Signed-00000000-0000-0000-0000-000000000000 has authenticated \
+                     access (attributes {attributes:#x}), which uefisettings does not write"
+                ),
+                "attributes {attributes:#x}: refusal"
+            );
+            assert_eq!(bytes, before, "attributes {attributes:#x}: bytes");
+        }
     }
 
     /// modify_variable_bytes refuses a variable whose data is shorter than its VarStore, also
