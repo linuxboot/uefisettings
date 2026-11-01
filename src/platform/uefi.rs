@@ -20,9 +20,11 @@ use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::exports::VariableInfo;
 
 use crate::hii_get;
 use crate::hii_set;
+use crate::print_line;
 use crate::SelectionArgs;
 
 /// The about of top-level get, which reads this firmware's HII database, as hii get does.
@@ -43,14 +45,38 @@ impl PlatformCommands {
     }
 }
 
-/// None: extract-db and dump-efivars write files, which this build does not.
+/// variable-info; extract-db and dump-efivars write files, which this build does not.
 #[derive(Debug, Subcommand)]
-pub(super) enum HiiPlatformCommands {}
+pub(super) enum HiiPlatformCommands {
+    /// Show the attributes and the size of an EFI variable, never its data
+    #[command(next_display_order = None)]
+    VariableInfo {
+        name: String,
+        /// The vendor GUID of the variable, such as 8C78A505-BAA0-4C4A-869F-000000000101
+        guid: String,
+    },
+}
 
 impl HiiPlatformCommands {
     pub(super) fn run(&self) -> Result<()> {
-        match *self {}
+        match self {
+            Self::VariableInfo { name, guid } => {
+                let info = HiiBackend::variable_info(name, guid)?;
+                print_line(format_args!("{}", variable_info_report(&info)))?;
+            }
+        }
+        Ok(())
     }
+}
+
+/// What variable-info prints on stdout about `info`: its own JSON object, outside the thrift
+/// IDL that the other commands print, and JSON always, as variable-info takes no -j.
+fn variable_info_report(info: &VariableInfo) -> serde_json::Value {
+    serde_json::json!({
+        "variable": info.variable,
+        "attributes": info.attributes,
+        "size": info.size,
+    })
 }
 
 /// None: a hii command reads the HiiDB of the firmware that it runs on.

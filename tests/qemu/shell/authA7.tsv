@@ -17,3 +17,6 @@ set-bypass	json	. == {"error_message": "EFI variable MyIfrNVData-a04a27f4-df00-4
 # and the variable stays as it was
 dmpstore-after	status	any
 dmpstore-after	same	dmpstore-before
+# the firmware holds the attributes that the scenario seeds
+variable-info	status	0x0
+variable-info	json	. == {"variable": "MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d", "attributes": 167, "size": 220}

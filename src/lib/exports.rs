@@ -52,6 +52,8 @@ mod linux;
 #[cfg(target_os = "uefi")]
 mod uefi;
 
+#[cfg(target_os = "uefi")]
+pub use crate::hii::VariableInfo;
 #[cfg(target_os = "linux")]
 pub use linux::identify_machine;
 #[cfg(target_os = "linux")]

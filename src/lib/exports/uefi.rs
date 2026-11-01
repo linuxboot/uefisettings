@@ -23,6 +23,7 @@ use anyhow::Result;
 use super::HiiBackend;
 use crate::hii::export_package_lists;
 use crate::hii::FirmwareVariables;
+use crate::hii::VariableInfo;
 use crate::hii::VariableServices;
 
 /// What set and get read and write when no file names them: this firmware's HII database and
@@ -43,5 +44,11 @@ impl HiiBackend {
     /// The HiiDB of this firmware: every package list that EFI_HII_DATABASE_PROTOCOL exports.
     pub fn export_hiidb() -> Result<Vec<u8>> {
         export_package_lists()
+    }
+
+    /// The VariableInfo of the EFI variable `name` of the vendor GUID `vendor`, such as
+    /// "8C78A505-BAA0-4C4A-869F-000000000101", whose data it never reads.
+    pub fn variable_info(name: &str, vendor: &str) -> Result<VariableInfo> {
+        crate::hii::variable_info(name, vendor)
     }
 }

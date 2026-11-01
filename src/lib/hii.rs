@@ -43,6 +43,10 @@ pub(crate) use efivar_dump::SavedDump;
 #[cfg(target_os = "linux")]
 pub(crate) use efivarfs::EfivarFiles;
 #[cfg(target_os = "uefi")]
+pub(crate) use variable_services::variable_info;
+#[cfg(target_os = "uefi")]
+pub use variable_services::VariableInfo;
+#[cfg(target_os = "uefi")]
 pub(crate) use variable_services::VariableServices;
 pub(crate) use variables::EfivarReader;
 pub use variables::EfivarSource;

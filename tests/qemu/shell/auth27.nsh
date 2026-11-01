@@ -16,5 +16,7 @@ uefisettings.efi hii set --json --bypass-setup-password "How old are you? (Step)
 echo uefisettings-shell: step set-bypass %lasterror%
 dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
 echo uefisettings-shell: step dmpstore-after %lasterror%
+uefisettings.efi hii variable-info MyIfrNVData A04A27F4-DF00-4D42-B552-39511302113D
+echo uefisettings-shell: step variable-info %lasterror%
 echo uefisettings-shell: done
 reset -s

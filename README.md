@@ -169,6 +169,14 @@ Questions never read a VarStore that a password question names: they show
 setup browser, so nothing there asks for or checks a setup password: in a HiiDB that declares a
 password question, `set` writes nothing unless `--bypass-setup-password` is given.
 
+`hii variable-info NAME GUID`, of this build only, prints the attributes bitmask and the data
+size of an EFI variable, but never its data, such as of AMI firmware's `AMITSESetup`. It prints
+them as a JSON object of its own, outside the thrift IDL of the other commands, with no `-j`:
+
+```plain
+FS0:\> uefisettings.efi hii variable-info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
+```
+
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
 machine's db trusts.

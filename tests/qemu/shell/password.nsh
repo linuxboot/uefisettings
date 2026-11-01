@@ -37,5 +37,11 @@ set
 echo uefisettings-shell: step variables %lasterror%
 dmpstore AMITSESetup -guid 8C78A505-BAA0-4C4A-869F-000000000101
 echo uefisettings-shell: step dmpstore-amitse-after %lasterror%
+uefisettings.efi hii variable-info AMITSESetup 8C78A505-BAA0-4C4A-869F-000000000101
+echo uefisettings-shell: step variable-info %lasterror%
+uefisettings.efi hii variable-info NoSuchVariable 8C78A505-BAA0-4C4A-869F-000000000101
+echo uefisettings-shell: step variable-info-missing %lasterror%
+uefisettings.efi hii variable-info AMITSESetup 8C78A505-BAA0-4C4A-869F
+echo uefisettings-shell: step variable-info-bad-guid %lasterror%
 echo uefisettings-shell: done
 reset -s

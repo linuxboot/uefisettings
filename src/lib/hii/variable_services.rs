@@ -13,6 +13,8 @@
 //! The firmware variables of the UEFI Shell build: GetVariable() and SetVariable() through the
 //! uefi crate, which the image's entry point initializes, while boot services run.
 
+use core::ptr;
+
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
@@ -32,6 +34,10 @@ use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
+
+/// Attributes that no variable has, as GetVariable() never returns EFI_VARIABLE_APPEND_WRITE
+/// (UEFI 2.10 §8.2.1): variable_info's sign that the firmware left them unset.
+const UNSET_ATTRIBUTES: u32 = u32::MAX;
 
 impl EfivarSource {
     /// The firmware variables that questions read from this source, which validate accepts.
@@ -79,6 +85,66 @@ impl FirmwareVariables for VariableServices {
     }
 }
 
+/// What variable_info tells of an EFI variable: never its data.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VariableInfo {
+    /// The variable, named as its efivar file
+    pub variable: String,
+    /// Its attributes bitmask (UEFI 2.10 §8.2.1)
+    pub attributes: u32,
+    /// The size of its data, in bytes
+    pub size: usize,
+}
+
+/// The VariableInfo of the EFI variable `name` of the vendor GUID `vendor`, from GetVariable()
+/// with a DataSize of 0, which reads no byte of its data: as every variable holds one at least
+/// (UEFI 2.10 §8.2.3), the firmware returns EFI_BUFFER_TOO_SMALL with the attributes and the
+/// size (§8.2.1), and uefi::runtime::get_variable drops the attributes then.
+pub(crate) fn variable_info(name: &str, vendor: &str) -> Result<VariableInfo> {
+    let guid: uefi::Guid = vendor
+        .parse()
+        .with_context(|| format!("vendor {vendor} is not a GUID"))?;
+    let key = VariableKey {
+        name: name.to_owned(),
+        guid: guid.into(),
+    };
+    let (variable_name, variable_vendor) = uefi_key(&key)?;
+    let system_table = uefi::table::system_table_raw().context("no system table")?;
+    // SAFETY: the system table of the firmware, which the entry point set and boot services
+    // keep
+    let runtime_services = unsafe { system_table.as_ref() }.runtime_services;
+    // SAFETY: the firmware's runtime services, which the system table points at
+    let runtime_services = unsafe { runtime_services.as_ref() }.context("no runtime services")?;
+    let mut attributes = VariableAttributes::from_bits_retain(UNSET_ATTRIBUTES);
+    let mut size = 0;
+    // SAFETY: GetVariable() with a NUL-terminated name, a GUID and places for the attributes
+    // and the size; Data may be NULL as DataSize is 0 (§8.2.1)
+    let status = unsafe {
+        (runtime_services.get_variable)(
+            variable_name.as_ptr().cast(),
+            &variable_vendor.0,
+            &mut attributes,
+            &mut size,
+            ptr::null_mut(),
+        )
+    };
+    match status {
+        Status::BUFFER_TOO_SMALL | Status::SUCCESS if attributes.bits() == UNSET_ATTRIBUTES => {
+            Err(anyhow!(
+                "GetVariable() of EFI variable {key} returned {status:?} without its attributes"
+            ))
+        }
+        Status::BUFFER_TOO_SMALL | Status::SUCCESS => Ok(VariableInfo {
+            variable: key.to_string(),
+            attributes: attributes.bits(),
+            size,
+        }),
+        Status::NOT_FOUND => Err(VariableNotFound(key).into()),
+        status => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),
+    }
+}
+
 /// GetVariable() of `key`: its data and attributes, or VariableNotFound.
 fn get_variable(key: &VariableKey) -> Result<(Box<[u8]>, VariableAttributes)> {
     let (name, vendor) = uefi_key(key)?;
@@ -103,5 +169,17 @@ impl From<Guid> for uefi::Guid {
         let [g, h] = guid.data3.to_le_bytes();
         let [i, j, k, l, m, n, o, p] = guid.data4;
         Self::from_bytes([a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p])
+    }
+}
+
+impl From<uefi::Guid> for Guid {
+    fn from(guid: uefi::Guid) -> Self {
+        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = guid.to_bytes();
+        Self {
+            data1: u32::from_le_bytes([a, b, c, d]),
+            data2: u16::from_le_bytes([e, f]),
+            data3: u16::from_le_bytes([g, h]),
+            data4: [i, j, k, l, m, n, o, p],
+        }
     }
 }
