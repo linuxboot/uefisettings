@@ -11,8 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The part of the CLI that only the Linux build has: the commands ilo, identify, hii
-//! extract-db and hii dump-efivars, the flag --efivars, and the machine's backend for get and
-//! set.
+//! extract-db and hii dump-efivars, the flags -f/--filename and --efivars, and the machine's
+//! backend for get and set.
 
 use std::fs::File;
 use std::io::Write;
@@ -32,16 +32,27 @@ use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IloBackend;
-use uefisettings::exports::SetOptions;
 use uefisettings::exports::SettingsBackend;
+use uefisettings::exports::SetupPasswordPolicy;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 
-use crate::get_db_dump_bytes;
+use crate::hii_get;
+use crate::hii_set;
 use crate::print_line;
 use crate::print_with_style;
 use crate::JsonArgs;
 use crate::SelectionArgs;
+
+/// The about of top-level get, which reads this machine's backend.
+pub(super) const GET_ABOUT: &str = "Auto-identify backend and get the current value of a question";
+/// The about of top-level set, which writes this machine's backend.
+pub(super) const SET_ABOUT: &str = "Auto-identify backend and set/change the value of a question";
+
+/// Logs as RUST_LOG says.
+pub(super) fn init_logging() {
+    env_logger::init();
+}
 
 #[derive(Debug, Subcommand)]
 pub(super) enum PlatformCommands {
@@ -135,9 +146,8 @@ pub(super) enum HiiPlatformCommands {
     /// Copy the HiiDB and the EFI variables that its questions read into a new directory, for --efivars on another machine
     #[command(next_display_order = None)]
     DumpEfivars {
-        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[arg(short, long)]
-        filename: Option<PathBuf>,
+        #[command(flatten)]
+        hiidb: HiiDbArgs,
         /// Copy whole EFI variables, not only the bytes that questions decode; the others can hold secrets such as password hashes
         #[arg(long)]
         unredacted: bool,
@@ -158,7 +168,7 @@ impl HiiPlatformCommands {
                 print_line(format_args!("{}", extract_db_report(filename)))?;
             }
             Self::DumpEfivars {
-                filename,
+                hiidb,
                 unredacted,
                 directory,
             } => {
@@ -168,7 +178,7 @@ impl HiiPlatformCommands {
                     false => EfivarRedaction::DecodedBytes,
                 };
                 let dump = HiiBackend::dump_efivars(
-                    &get_db_dump_bytes(filename.as_deref())?,
+                    &hiidb.read(&EfivarSource::System)?,
                     directory,
                     &options,
                 )?;
@@ -180,6 +190,24 @@ impl HiiPlatformCommands {
             }
         }
         Ok(())
+    }
+}
+
+/// Where a hii command reads the HiiDB.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiDbArgs {
+    /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
+    #[arg(short, long)]
+    pub(super) filename: Option<PathBuf>,
+}
+
+impl HiiDbArgs {
+    /// The HiiDB: the file, else the one in `efivars` if dump-efivars wrote it, else this
+    /// machine's.
+    pub(super) fn read(&self, efivars: &EfivarSource) -> Result<Vec<u8>> {
+        HiiBackend::read_hiidb(self.filename.as_deref(), efivars)
     }
 }
 
@@ -203,6 +231,19 @@ impl EfivarArgs {
             (Some(dir), false) => Ok(EfivarSource::Directory(dir.clone())),
             (Some(_), true) => Err(anyhow!("--efivars and --no-efivars conflict")),
         }
+    }
+}
+
+/// None: efivarfs writes from Linux, where set takes no setup password policy.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct SetupPasswordArgs {}
+
+impl SetupPasswordArgs {
+    /// The default, which set through efivarfs does not consult.
+    pub(super) fn policy(&self) -> SetupPasswordPolicy {
+        SetupPasswordPolicy::default()
     }
 }
 
@@ -237,13 +278,12 @@ pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) ->
         let res = IloBackend::get(question, None)?;
         print_with_style(res, json)?;
     } else {
-        let res = HiiBackend::get_using(
-            &get_db_dump_bytes(None)?,
+        hii_get(
+            &HiiBackend::read_hiidb(None, &EfivarSource::System)?,
             question,
-            None,
             &GetOptions::from(selection),
+            json,
         )?;
-        print_with_style(res, json)?;
     }
     Ok(())
 }
@@ -254,6 +294,7 @@ pub(super) fn auto_set(
     value: &str,
     json: bool,
     selection: &SelectionArgs,
+    setup_password: &SetupPasswordArgs,
 ) -> Result<()> {
     let machine = identify_machine();
     if machine.backend.contains(&Backend::Unknown) {
@@ -264,8 +305,7 @@ pub(super) fn auto_set(
         let res = IloBackend::set(question, value, None)?;
         print_with_style(res, json)?;
     } else {
-        let res = HiiBackend::set_using(question, value, None, &SetOptions::from(selection))?;
-        print_with_style(res, json)?;
+        hii_set(question, value, selection, setup_password, json)?;
     }
     Ok(())
 }
@@ -335,6 +375,171 @@ fn dump_warning(dir: &Path, redaction: EfivarRedaction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::hii;
+    use crate::tests::selection_of;
+    use crate::tests::READING_COMMANDS;
+    use crate::HiiSubcommands;
+    use crate::UefiSettingsToolArgs;
+
+    /// refuse_on_ilo names the flags that apply to the HII backend only, of which Ilo attributes
+    /// take none, and passes no flag.
+    #[test]
+    fn refuse_on_ilo_names_the_flags_of_the_hii_backend() {
+        let cases = [
+            ("no flag", vec![], Ok(())),
+            (
+                "--include",
+                vec!["--include", "grayed-out"],
+                Err("--include applies to the HII backend, not to the Ilo backend of this machine"),
+            ),
+            (
+                "--access-level",
+                vec!["--access-level", "user"],
+                Err(
+                    "--access-level applies to the HII backend, not to the Ilo backend of this \
+                     machine",
+                ),
+            ),
+            (
+                "--include and --access-level",
+                vec!["--include", "grayed-out", "--access-level", "user"],
+                Err(
+                    "--include and --access-level apply to the HII backend, not to the Ilo \
+                     backend of this machine",
+                ),
+            ),
+        ];
+        for (case, args, want) in cases {
+            assert_eq!(
+                selection_of(&args)
+                    .refuse_on_ilo()
+                    .map_err(|error| error.to_string()),
+                want.map_err(str::to_string),
+                "{case}"
+            );
+        }
+    }
+
+    /// The efivar flags of a get, show-ifr or list-questions.
+    fn efivar_args(command: &HiiSubcommands) -> &EfivarArgs {
+        match command {
+            HiiSubcommands::Get { efivars, .. }
+            | HiiSubcommands::ShowIFR { efivars, .. }
+            | HiiSubcommands::ListQuestions { efivars, .. } => efivars,
+            other => panic!("no efivar flags: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn efivar_flags_name_their_source() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let dir_arg = dir.path().to_str().expect("UTF-8 temporary path");
+        let missing = dir.path().join("missing");
+        let missing_arg = missing.to_str().expect("UTF-8 temporary path");
+        let cases = [
+            ("no flag", vec![], EfivarSource::System),
+            ("--no-efivars", vec!["--no-efivars"], EfivarSource::Disabled),
+            (
+                "--efivars",
+                vec!["--efivars", dir_arg],
+                EfivarSource::Directory(dir.path().to_path_buf()),
+            ),
+            // EfivarSource::validate checks the directory
+            (
+                "--efivars of a missing directory",
+                vec!["--efivars", missing_arg],
+                EfivarSource::Directory(missing.clone()),
+            ),
+        ];
+
+        for command in READING_COMMANDS {
+            for (case, flags, want) in &cases {
+                let parsed = hii(&[command, &flags[..]].concat()).expect("parse the flags");
+                let source = efivar_args(&parsed).source().expect("name the source");
+
+                assert_eq!(&source, want, "{command:?} {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn efivar_flags_conflict() {
+        for command in READING_COMMANDS {
+            let error = hii(&[command, &["--efivars", "dir", "--no-efivars"]].concat())
+                .expect_err("parse both flags");
+
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hii_get_takes_a_hiidb_file() {
+        let parsed = hii(&["get", "Question", "-f", "hiidb.bin"]).expect("parse get -f");
+
+        let HiiSubcommands::Get { hiidb, .. } = parsed else {
+            panic!("not get: {parsed:?}");
+        };
+        assert_eq!(hiidb.filename, Some(PathBuf::from("hiidb.bin")), "get -f");
+    }
+
+    #[test]
+    fn dump_efivars_takes_a_directory() {
+        let cases = [
+            ("DIR", vec!["dump-efivars", "out"], None, false),
+            (
+                "-f and --unredacted",
+                vec!["dump-efivars", "-f", "hiidb.bin", "--unredacted", "out"],
+                Some(PathBuf::from("hiidb.bin")),
+                true,
+            ),
+        ];
+
+        for (case, args, want_filename, want_unredacted) in cases {
+            let parsed = hii(&args).expect("parse dump-efivars");
+            let HiiSubcommands::Platform(HiiPlatformCommands::DumpEfivars {
+                hiidb,
+                unredacted,
+                directory,
+            }) = parsed
+            else {
+                panic!("{case}: not dump-efivars: {parsed:?}");
+            };
+
+            assert_eq!(
+                (hiidb.filename, unredacted, directory),
+                (want_filename, want_unredacted, PathBuf::from("out")),
+                "{case}"
+            );
+        }
+        let error = hii(&["dump-efivars"]).expect_err("parse dump-efivars without DIR");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "no DIR"
+        );
+    }
+
+    /// The Linux build takes no --bypass-setup-password: set through efivarfs has no setup
+    /// password policy.
+    #[test]
+    fn set_takes_no_setup_password_flag() {
+        let commands: [&[&str]; 2] = [&["hii", "set", "Q", "V"], &["set", "Q", "V"]];
+        for command in commands {
+            let argv = [&["uefisettings"][..], command, &["--bypass-setup-password"]].concat();
+            let error = UefiSettingsToolArgs::try_parse_from(argv)
+                .expect_err("parse --bypass-setup-password");
+
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{command:?}"
+            );
+        }
+    }
 
     #[test]
     fn extract_db_report_is_json_of_the_path() {

@@ -1,6 +1,6 @@
 [package]
 name = "uefisettings"
-description = "The tool to read/get/extract and write/change/modify BIOS/UEFI settings from Linux terminal."
+description = "The tool to read/get/extract and write/change/modify BIOS/UEFI settings from a Linux terminal or the UEFI Shell."
 version = "0.1.6"
 edition = "2021"
 license = "BSD-3-Clause"

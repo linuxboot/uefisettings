@@ -13,9 +13,7 @@
 use std::fmt::Debug;
 use std::io;
 use std::io::Write;
-use std::path::Path;
-use std::path::PathBuf;
-use std::process;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Args;
@@ -35,11 +33,14 @@ use uefisettings::exports::ShowIfrOptions;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
 use platform::EfivarArgs;
+use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
 use platform::PlatformCommands;
+use platform::SetupPasswordArgs;
 
-/// The commands and flags that only this build has.
-#[path = "platform/linux.rs"]
+/// The commands and flags that only this build has, and where it reads the HiiDB.
+#[cfg_attr(target_os = "linux", path = "platform/linux.rs")]
+#[cfg_attr(target_os = "uefi", path = "platform/uefi.rs")]
 mod platform;
 
 // Every command lists its options and subcommands alphabetically, as under clap 3:
@@ -62,8 +63,8 @@ enum Commands {
     Hii(HiiCommand),
     // TODO: Auto(AutoCommand) after building a backend identifier function
     // TODO: Get/Set without having to specify Auto
-    /// Auto-identify backend and get the current value of a question
-    #[command(next_display_order = None)]
+    // The platform words get and set: only the Linux build identifies a backend.
+    #[command(about = platform::GET_ABOUT, next_display_order = None)]
     Get {
         question: String,
         #[command(flatten)]
@@ -71,8 +72,7 @@ enum Commands {
         #[command(flatten)]
         selection: SelectionArgs,
     },
-    /// Auto-identify backend and set/change the value of a question
-    #[command(next_display_order = None)]
+    #[command(about = platform::SET_ABOUT, next_display_order = None)]
     Set {
         question: String,
         value: String,
@@ -80,6 +80,8 @@ enum Commands {
         output: JsonArgs,
         #[command(flatten)]
         selection: SelectionArgs,
+        #[command(flatten)]
+        setup_password: SetupPasswordArgs,
     },
     /// Show the translation/spellings database for questions and answers
     #[command(next_display_order = None)]
@@ -104,9 +106,8 @@ enum HiiSubcommands {
     #[command(next_display_order = None)]
     Get {
         question: String,
-        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[arg(short, long)]
-        filename: Option<PathBuf>,
+        #[command(flatten)]
+        hiidb: HiiDbArgs,
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
@@ -123,31 +124,30 @@ enum HiiSubcommands {
         output: JsonArgs,
         #[command(flatten)]
         selection: SelectionArgs,
+        #[command(flatten)]
+        setup_password: SetupPasswordArgs,
     },
     /// Show a human readable representation of the Hii Forms
     #[command(next_display_order = None)]
     ShowIFR {
-        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[arg(short, long)]
-        filename: Option<PathBuf>,
+        #[command(flatten)]
+        hiidb: HiiDbArgs,
         #[command(flatten)]
         efivars: EfivarArgs,
     },
     /// List all strings-id, string pairs in HiiDB
     #[command(next_display_order = None)]
     ListStrings {
-        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[arg(short, long)]
-        filename: Option<PathBuf>,
+        #[command(flatten)]
+        hiidb: HiiDbArgs,
         #[command(flatten)]
         output: JsonArgs,
     },
     /// List questions HiiDB. Note that these are not all possible questions, because we don't parse certain non-useful question types.
     #[command(next_display_order = None)]
     ListQuestions {
-        /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
-        #[arg(short, long)]
-        filename: Option<PathBuf>,
+        #[command(flatten)]
+        hiidb: HiiDbArgs,
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
@@ -178,7 +178,7 @@ struct SelectionArgs {
     /// Evaluate the conditions that read the AMI Setup access level (VarStore SystemAccess
     /// E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User) at this level instead of
     /// the stored value. This states a Setup privilege; it is no password and authenticates
-    /// nothing (efivarfs writes carry no password).
+    /// nothing (UEFI variable writes carry no password).
     #[arg(long, value_enum, value_name = "LEVEL")]
     access_level: Option<AccessLevelArg>,
 }
@@ -224,6 +224,39 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
     }
 }
 
+/// The SetOptions of `selection` and `setup_password`.
+fn set_options(selection: &SelectionArgs, setup_password: &SetupPasswordArgs) -> SetOptions {
+    let mut options = SetOptions::from(selection);
+    options.setup_password = setup_password.policy();
+    options
+}
+
+/// get of `question` in the HiiDB `db_bytes` with `options`, printed as JSON if `json`.
+fn hii_get(db_bytes: &[u8], question: &str, options: &GetOptions, json: bool) -> Result<()> {
+    let res = HiiBackend::get_using(db_bytes, question, None, options)?;
+    print_with_style(res, json)?;
+    Ok(())
+}
+
+/// set of `question` to `value` with `selection` and `setup_password`, in this machine's HiiDB
+/// and variables, printed as JSON if `json`.
+fn hii_set(
+    question: &str,
+    value: &str,
+    selection: &SelectionArgs,
+    setup_password: &SetupPasswordArgs,
+    json: bool,
+) -> Result<()> {
+    let res = HiiBackend::set_using(
+        question,
+        value,
+        None,
+        &set_options(selection, setup_password),
+    )?;
+    print_with_style(res, json)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum IncludeState {
     GrayedOut,
@@ -256,13 +289,26 @@ impl From<AccessLevelArg> for AccessLevel {
     }
 }
 
-fn main() -> Result<()> {
-    env_logger::init();
-    let args = UefiSettingsToolArgs::parse();
+// Every exit returns from main, whose ExitCode::FAILURE the UEFI Shell build's entry point turns
+// into EFI_ABORTED: std::process::exit, also through clap's Error::exit, would exit that image
+// with its code as the status, a warning such as 1 or 2.
+fn main() -> ExitCode {
+    platform::init_logging();
+    let args = match UefiSettingsToolArgs::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            // As clap's Error::exit, which ignores every print error: the exit code stays
+            // clap's, as nothing is left to report a failed print to.
+            if let Err(print_error) = error.print() {
+                log::debug!("failed to print the parse error: {print_error}");
+            }
+            return parse_error_exit_code(&error);
+        }
+    };
 
     if let Err(why) = handle_cmds(args) {
         if is_broken_pipe(&why) {
-            return Ok(());
+            return ExitCode::SUCCESS;
         }
 
         let _ = print_with_style(
@@ -272,11 +318,16 @@ fn main() -> Result<()> {
             },
             true,
         );
-        process::exit(1);
+        return ExitCode::FAILURE;
     }
 
     info!("Exiting UEFI Settings Manipulation Tool");
-    Ok(())
+    ExitCode::SUCCESS
+}
+
+/// The exit code of clap's Error::exit for `error`: 0 for help, else 2.
+fn parse_error_exit_code(error: &clap::Error) -> ExitCode {
+    u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
 fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
@@ -284,7 +335,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
         Commands::Hii(hii_command) => match &hii_command.command {
             HiiSubcommands::Get {
                 question,
-                filename,
+                hiidb,
                 output,
                 selection,
                 efivars,
@@ -293,41 +344,34 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 options.efivars = efivars.source()?;
                 // before the HiiDB is read
                 options.efivars.validate()?;
-                let res = HiiBackend::get_using(
-                    &HiiBackend::read_hiidb(filename.as_deref(), &options.efivars)?,
+                hii_get(
+                    &hiidb.read(&options.efivars)?,
                     question,
-                    None,
                     &options,
+                    output.json,
                 )?;
-                print_with_style(res, output.json)?;
             }
             HiiSubcommands::Set {
                 question,
                 value,
                 output,
                 selection,
-            } => {
-                let res =
-                    HiiBackend::set_using(question, value, None, &SetOptions::from(selection))?;
-                print_with_style(res, output.json)?;
-            }
-            HiiSubcommands::ShowIFR { filename, efivars } => {
+                setup_password,
+            } => hii_set(question, value, selection, setup_password, output.json)?,
+            HiiSubcommands::ShowIFR { hiidb, efivars } => {
                 let mut options = ShowIfrOptions::default();
                 options.efivars = efivars.source()?;
                 // before the HiiDB is read
                 options.efivars.validate()?;
-                let res = HiiBackend::show_ifr_using(
-                    &HiiBackend::read_hiidb(filename.as_deref(), &options.efivars)?,
-                    &options,
-                )?;
+                let res = HiiBackend::show_ifr_using(&hiidb.read(&options.efivars)?, &options)?;
                 print_line(format_args!("{}", res.readable_representation))?;
             }
-            HiiSubcommands::ListStrings { filename, output } => {
-                let res = HiiBackend::list_strings(&get_db_dump_bytes(filename.as_deref())?)?;
+            HiiSubcommands::ListStrings { hiidb, output } => {
+                let res = HiiBackend::list_strings(&hiidb.read(&EfivarSource::System)?)?;
                 print_with_style(res, output.json)?;
             }
             HiiSubcommands::ListQuestions {
-                filename,
+                hiidb,
                 output,
                 selection,
                 efivars,
@@ -336,10 +380,8 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 options.efivars = efivars.source()?;
                 // before the HiiDB is read
                 options.efivars.validate()?;
-                let res = HiiBackend::list_questions_using(
-                    &HiiBackend::read_hiidb(filename.as_deref(), &options.efivars)?,
-                    &options,
-                )?;
+                let res =
+                    HiiBackend::list_questions_using(&hiidb.read(&options.efivars)?, &options)?;
                 print_with_style(res, output.json)?;
             }
             HiiSubcommands::Platform(command) => command.run()?,
@@ -354,17 +396,14 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             value,
             output,
             selection,
-        } => platform::auto_set(question, value, output.json, selection)?,
+            setup_password,
+        } => platform::auto_set(question, value, output.json, selection, setup_password)?,
         Commands::ShowTranslations { output } => {
             print_with_style(&*translation_db, output.json)?;
         }
         Commands::Platform(command) => command.run()?,
     }
     Ok(())
-}
-
-fn get_db_dump_bytes(filename: Option<&Path>) -> Result<Vec<u8>> {
-    HiiBackend::read_hiidb(filename, &EfivarSource::System)
 }
 
 fn print_line(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
@@ -411,7 +450,7 @@ mod tests {
 
     use super::*;
 
-    const READING_COMMANDS: [&[&str]; 3] =
+    pub(super) const READING_COMMANDS: [&[&str]; 3] =
         [&["get", "Question"], &["show-ifr"], &["list-questions"]];
 
     struct BrokenPipeWriter;
@@ -427,7 +466,7 @@ mod tests {
     }
 
     /// The selection flags of `uefisettings set Q V` with `args` after it.
-    fn selection_of(args: &[&str]) -> SelectionArgs {
+    pub(super) fn selection_of(args: &[&str]) -> SelectionArgs {
         let command = [&["uefisettings", "set", "Q", "V"][..], args].concat();
         let parsed = UefiSettingsToolArgs::try_parse_from(&command)
             .unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
@@ -477,11 +516,6 @@ mod tests {
                 states,
                 "{name}: list-questions"
             );
-            assert_eq!(
-                selection.refuse_on_ilo().is_ok(),
-                args.is_empty(),
-                "{name}: refuse_on_ilo"
-            );
         }
     }
 
@@ -517,28 +551,7 @@ mod tests {
                 level,
                 "{name}: list-questions"
             );
-            assert_eq!(
-                selection.refuse_on_ilo().map_err(|error| error.to_string()),
-                match level {
-                    None => Ok(()),
-                    Some(_) => Err("--access-level applies to the HII backend, not to the Ilo \
-                                    backend of this machine"
-                        .to_string()),
-                },
-                "{name}: refuse_on_ilo"
-            );
         }
-
-        let both = selection_of(&["--include", "grayed-out", "--access-level", "user"]);
-        assert_eq!(
-            both.refuse_on_ilo().map_err(|error| error.to_string()),
-            Err(
-                "--include and --access-level apply to the HII backend, not to the Ilo backend \
-                 of this machine"
-                    .to_string()
-            ),
-            "--include and --access-level: refuse_on_ilo"
-        );
 
         let error = UefiSettingsToolArgs::try_parse_from([
             "uefisettings",
@@ -639,68 +652,12 @@ mod tests {
     }
 
     /// The hii subcommand that `args`, after `uefisettings hii`, parse to.
-    fn hii(args: &[&str]) -> clap::error::Result<HiiSubcommands> {
+    pub(super) fn hii(args: &[&str]) -> clap::error::Result<HiiSubcommands> {
         let argv = [&["uefisettings", "hii"][..], args].concat();
         UefiSettingsToolArgs::try_parse_from(argv).map(|parsed| match parsed.command {
             Commands::Hii(hii) => hii.command,
             other => panic!("not a hii command: {other:?}"),
         })
-    }
-
-    /// The efivar flags of a get, show-ifr or list-questions.
-    fn efivar_args(command: &HiiSubcommands) -> &EfivarArgs {
-        match command {
-            HiiSubcommands::Get { efivars, .. }
-            | HiiSubcommands::ShowIFR { efivars, .. }
-            | HiiSubcommands::ListQuestions { efivars, .. } => efivars,
-            other => panic!("no efivar flags: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn efivar_flags_name_their_source() {
-        let dir = tempfile::tempdir().expect("create directory");
-        let dir_arg = dir.path().to_str().expect("UTF-8 temporary path");
-        let missing = dir.path().join("missing");
-        let missing_arg = missing.to_str().expect("UTF-8 temporary path");
-        let cases = [
-            ("no flag", vec![], EfivarSource::System),
-            ("--no-efivars", vec!["--no-efivars"], EfivarSource::Disabled),
-            (
-                "--efivars",
-                vec!["--efivars", dir_arg],
-                EfivarSource::Directory(dir.path().to_path_buf()),
-            ),
-            // EfivarSource::validate checks the directory
-            (
-                "--efivars of a missing directory",
-                vec!["--efivars", missing_arg],
-                EfivarSource::Directory(missing.clone()),
-            ),
-        ];
-
-        for command in READING_COMMANDS {
-            for (case, flags, want) in &cases {
-                let parsed = hii(&[command, &flags[..]].concat()).expect("parse the flags");
-                let source = efivar_args(&parsed).source().expect("name the source");
-
-                assert_eq!(&source, want, "{command:?} {case}");
-            }
-        }
-    }
-
-    #[test]
-    fn efivar_flags_conflict() {
-        for command in READING_COMMANDS {
-            let error = hii(&[command, &["--efivars", "dir", "--no-efivars"]].concat())
-                .expect_err("parse both flags");
-
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::ArgumentConflict,
-                "{command:?}"
-            );
-        }
     }
 
     #[test]
@@ -744,51 +701,21 @@ mod tests {
         }
     }
 
+    /// A parse error exits as clap's Error::exit exits: 2 for a usage error, 0 for --help.
     #[test]
-    fn hii_get_takes_a_hiidb_file() {
-        let parsed = hii(&["get", "Question", "-f", "hiidb.bin"]).expect("parse get -f");
-
-        let HiiSubcommands::Get { filename, .. } = parsed else {
-            panic!("not get: {parsed:?}");
-        };
-        assert_eq!(filename, Some(PathBuf::from("hiidb.bin")), "get -f");
-    }
-
-    #[test]
-    fn dump_efivars_takes_a_directory() {
-        let cases = [
-            ("DIR", vec!["dump-efivars", "out"], None, false),
-            (
-                "-f and --unredacted",
-                vec!["dump-efivars", "-f", "hiidb.bin", "--unredacted", "out"],
-                Some(PathBuf::from("hiidb.bin")),
-                true,
-            ),
+    fn parse_errors_exit_as_clap_exits() {
+        let cases: [(&[&str], ExitCode); 4] = [
+            (&["hii", "set", "Q"], ExitCode::from(2)),
+            (&["nonsense"], ExitCode::from(2)),
+            (&["--help"], ExitCode::SUCCESS),
+            (&["hii", "get", "--help"], ExitCode::SUCCESS),
         ];
+        for (args, want) in cases {
+            let argv = [&["uefisettings"][..], args].concat();
+            let error = UefiSettingsToolArgs::try_parse_from(argv).expect_err("parse error");
 
-        for (case, args, want_filename, want_unredacted) in cases {
-            let parsed = hii(&args).expect("parse dump-efivars");
-            let HiiSubcommands::Platform(HiiPlatformCommands::DumpEfivars {
-                filename,
-                unredacted,
-                directory,
-            }) = parsed
-            else {
-                panic!("{case}: not dump-efivars: {parsed:?}");
-            };
-
-            assert_eq!(
-                (filename, unredacted, directory),
-                (want_filename, want_unredacted, PathBuf::from("out")),
-                "{case}"
-            );
+            assert_eq!(parse_error_exit_code(&error), want, "{args:?}");
         }
-        let error = hii(&["dump-efivars"]).expect_err("parse dump-efivars without DIR");
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument,
-            "no DIR"
-        );
     }
 
     #[test]

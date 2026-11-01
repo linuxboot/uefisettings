@@ -15,7 +15,8 @@
 //!
 //! Every export that reaches this firmware, export_hiidb here and get, set, list-questions and
 //! show-ifr of EfivarSource::System, calls the uefi crate, which panics unless the image has
-//! initialized it: uefi::table::set_system_table, then uefi::boot::set_image_handle.
+//! initialized it: uefi::table::set_system_table, then uefi::boot::set_image_handle, as
+//! uefisettings.efi's entry point uefi_std_entry does.
 
 use anyhow::Result;
 

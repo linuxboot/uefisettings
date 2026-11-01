@@ -109,10 +109,10 @@ fmt: toolchain
 clippy-x86_64 clippy-aarch64 clippy-i686: clippy-%: toolchain
 	cargo clippy --locked --workspace --all-targets --all-features --target $*-unknown-linux-gnu -- -D warnings
 
-# The library for the UEFI Shell on its 3 targets, and publish-hiidb, the UEFI driver of the
-# QEMU tests.
+# The library and uefisettings.efi for the UEFI Shell on its 3 targets, and publish-hiidb, the
+# UEFI driver of the QEMU tests.
 clippy-uefi: toolchain
-	cargo clippy --locked --lib --target x86_64-unknown-uefi --target i686-unknown-uefi \
+	cargo clippy --locked --lib --bins --target x86_64-unknown-uefi --target i686-unknown-uefi \
 		--target aarch64-unknown-uefi -- -D warnings
 	cargo clippy --locked --release --target x86_64-unknown-uefi --manifest-path tests/qemu/publish-hiidb/Cargo.toml -- -D warnings
 
@@ -124,8 +124,13 @@ test: toolchain
 test-i686: toolchain
 	scripts/assert-tests-ran.sh cargo test --locked --target i686-unknown-linux-gnu
 
+# Also the UEFI Shell build's library and binary. Both are named uefisettings, so cargo warns
+# that their pages collide (https://github.com/rust-lang/cargo/issues/6313); rustdoc still
+# checks both.
 doc: toolchain
 	RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
+	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --document-private-items --locked --lib --bins \
+		--target x86_64-unknown-uefi
 
 test-e2e-qemu: $(QEMU_TESTS)
 

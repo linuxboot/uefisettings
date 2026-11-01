@@ -15,6 +15,7 @@ compile_error!("uefisettings builds for Linux and for the UEFI Shell only");
 
 #[cfg(target_os = "linux")]
 mod chattr;
+mod exit_status;
 pub mod exports;
 #[cfg(target_os = "linux")]
 mod file_lock;
@@ -22,3 +23,5 @@ mod hii;
 #[cfg(target_os = "linux")]
 mod ilorest;
 mod translation;
+#[cfg(target_os = "uefi")]
+mod uefi_entry;

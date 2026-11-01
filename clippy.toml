@@ -6,3 +6,14 @@ disallowed-types = [
     { path = "std::collections::HashMap", reason = "RandomState can panic on UEFI", replacement = "std::collections::BTreeMap" },
     { path = "std::collections::HashSet", reason = "RandomState can panic on UEFI", replacement = "std::collections::BTreeSet" },
 ]
+
+# The UEFI Shell build's main must return. Its entry point turns ExitCode::FAILURE into
+# EFI_ABORTED, where std::process::exit would exit the image with its code as the status, a
+# warning such as 1. uefi::boot::exit would also skip std's cleanup, which closes the
+# ExitBootServices event whose notify function lives in the image (Rust 1.93.1
+# library/std/src/sys/pal/uefi/mod.rs init, cleanup). The Linux build has no uefi crate, hence
+# allow-invalid.
+disallowed-methods = [
+    { path = "std::process::exit", reason = "main returns its ExitCode, which the UEFI Shell build's entry point turns into EFI_ABORTED" },
+    { path = "uefi::boot::exit", reason = "exits the image before std closes its ExitBootServices event, whose notify function then runs in freed memory", allow-invalid = true },
+]
