@@ -189,7 +189,10 @@ fn driver_sample_variable_holds_the_defaults() {
 fn extract_db_copies_the_published_database() {
     let published = published_database();
     let path = "/tmp/hiidb.bin";
-    let report: serde_json::Value = json(&["hii", "extract-db", path]);
+    let output = uefisettings(&["hii", "extract-db", path]);
+    // The HII source is logged at debug level, which RUST_LOG leaves off.
+    assert_eq!(output.stderr, "", "extract-db stderr");
+    let report: serde_json::Value = output.json(0);
     assert_eq!(
         report,
         serde_json::json!({ "info": format!("HiiDB written to {path}") }),

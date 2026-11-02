@@ -114,8 +114,8 @@ fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
     // Prefer the spec-standard route (the HII database configuration table
     // found through the EFI System Table), then the vendor ACPI table that
     // carries the database content directly (read from sysfs, no /dev/mem), and
-    // fall back to the OCP variable + /dev/mem. Each fallback reason is printed
-    // to stderr so a failure here is not masked by the OCP error below.
+    // fall back to the OCP variable + /dev/mem. Each fallback reason is logged
+    // at debug level so a failure here is not masked by the OCP error below.
     match extract_db_efi_config_table(&paths.efi_config_table, &paths.dev_mem) {
         Ok(bytes) => {
             debug!(
@@ -124,8 +124,8 @@ fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
             );
             return Ok(bytes);
         }
-        Err(e) => eprintln!(
-            "[uefisettings] could not use the EFI configuration table ({}): {e:#}; \
+        Err(e) => debug!(
+            "could not use the EFI configuration table ({}): {e:#}; \
              falling back to the HII ACPI table",
             paths.efi_config_table.display()
         ),
@@ -133,8 +133,8 @@ fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
 
     match extract_db_acpi(paths.acpi_hiid.as_path()) {
         Ok(bytes) => return Ok(bytes),
-        Err(e) => eprintln!(
-            "[uefisettings] could not use the HII ACPI table ({}): {e:#}; \
+        Err(e) => debug!(
+            "could not use the HII ACPI table ({}): {e:#}; \
              falling back to the OCP HiiDB variable + /dev/mem",
             paths.acpi_hiid.display()
         ),
