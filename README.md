@@ -173,7 +173,7 @@ mv lib.rs thrift/rust/uefisettings_spellings_db_thrift/uefisettings_spellings_db
 
 ## Checks
 
-The `Makefile` in the root of the repository runs the checks that a change should pass: the lints (`make lint`: rustfmt, clippy for x86_64, aarch64, i686 and UEFI, and the docs), the tests (`make test`, and `make test-i686` on 32-bit glibc) and the QEMU tests (`make test-e2e-qemu`).
+The `Makefile` in the root of the repository runs the checks that a change should pass: the lints (`make lint`: rustfmt, clippy for x86_64, aarch64, i686, UEFI and macOS, and the docs), the tests (`make test`, and `make test-i686` on 32-bit glibc) and the QEMU tests (`make test-e2e-qemu`).
 
 The checks need GNU make and bash, and rustup unless `make RUST_TOOLCHAIN=` runs them on the cargo of `PATH`.
 
