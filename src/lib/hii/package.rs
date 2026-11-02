@@ -63,7 +63,9 @@ const PADDING_BYTES: [u8; 2] = [0x00, 0xFF];
 ///
 /// Example: a package that starts 6 bytes before the end of its package
 /// list is read with `AvailableBytes(6)`, so its Length may be at most 6.
-struct AvailableBytes(u64);
+/// PackageList's BinRead takes it, so it is as visible as PackageList; its field
+/// stays private.
+pub(crate) struct AvailableBytes(u64);
 
 /// PackageList is an EFI_HII_PACKAGE_LIST_HEADER followed by its packages.
 /// Its import `available` counts the bytes from its start to the end of the
@@ -74,7 +76,7 @@ struct AvailableBytes(u64);
 /// `db_cursor.read_ne_args::<PackageList>(AvailableBytes(db_size - used_bytes))`.
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little, import_raw(available: AvailableBytes))]
-struct PackageList {
+pub(crate) struct PackageList {
     guid: Guid,
     // binrw computes `count` below without a bounds check (debug builds
     // panic on underflow, release builds wrap) and reserves that many bytes
@@ -154,7 +156,7 @@ enum PackageType {
 ///
 /// Example: a HiiDB of two package lists followed by 64 zero bytes yields
 /// the two lists, while one with 32 zero bytes between the lists fails.
-fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
+pub(crate) fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
     let mut db_cursor = Cursor::new(&source);
 
     let mut package_lists: Vec<PackageList> = Vec::new();

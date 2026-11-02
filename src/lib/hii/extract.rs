@@ -25,7 +25,9 @@ use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
+use thiserror::Error;
 
+use crate::hii::package;
 use crate::hii::package::db_file::read_db_bytes;
 
 // TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
@@ -46,6 +48,9 @@ pub const HIIDB_ACPI_PATH: &str = "/sys/firmware/acpi/tables/HIID";
 // Size of the standard ACPI table header (EFI_ACPI_DESCRIPTION_HEADER) that
 // prefixes the HII database bytes in the HIID table.
 const ACPI_HEADER_LEN: usize = 36;
+
+/// Signature of the HIID table, the first field of its header.
+const HIID_SIGNATURE: [u8; 4] = *b"HIID";
 
 // Linux prints the physical address of the EFI System Table's ConfigurationTable
 // array here (an EFI_CONFIGURATION_TABLE[]). Not every kernel creates it (e.g.
@@ -521,30 +526,90 @@ unsafe fn copy_from_mapping(src: *const u8, dst: &mut [u8]) {
 /// Reads the HII database from the vendor ACPI table at `path` (HIIDB_ACPI_PATH) whose
 /// body IS the database content. The sysfs file is a 36-byte ACPI header
 /// (EFI_ACPI_DESCRIPTION_HEADER) followed by the database bytes, so we drop the
-/// header and return the rest. No /dev/mem — works even where /dev/mem is
-/// unavailable/blocked, and (unlike a UEFI variable) has no efivarfs
-/// single-read size limit; read_db_bytes caps it at MAX_ALLOWED_FILESIZE.
+/// header and return the rest, once validate_hiid_table accepts the table. No
+/// /dev/mem — works where lockdown or STRICT_DEVMEM refuses /dev/mem; read_db_bytes caps it
+/// at MAX_ALLOWED_FILESIZE.
 fn extract_db_acpi(path: &Path) -> Result<Vec<u8>> {
     let mut acpi_file =
         File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
 
-    let mut contents = read_db_bytes(&mut acpi_file)
+    let contents = read_db_bytes(&mut acpi_file)
         .with_context(|| format!("Failed to read ACPI table file, {}", path.display()))?;
 
-    if contents.len() <= ACPI_HEADER_LEN {
-        return Err(anyhow::anyhow!(
-            "{} is too short ({} bytes) to contain a HII database",
-            path.display(),
-            contents.len()
-        ));
+    validate_hiid_table(&contents)
+        .map(<[u8]>::to_vec)
+        .with_context(|| format!("{} holds no HII database", path.display()))
+}
+
+/// Why the bytes of a HIID table hold no HII database: the table is not one
+/// that publishes it, so the next source is tried.
+#[derive(Debug, Error)]
+enum HiidInvalid {
+    #[error("the table has {0} bytes, no more than its {ACPI_HEADER_LEN}-byte header")]
+    TooShort(usize),
+    #[error(
+        "the table's signature is {:?}, not {:?}",
+        String::from_utf8_lossy(.0),
+        String::from_utf8_lossy(&HIID_SIGNATURE)
+    )]
+    Signature([u8; 4]),
+    #[error("the table's header gives a length of {header} bytes, but it has {actual}")]
+    Length { header: u32, actual: usize },
+    #[error("the table fails its checksum: its bytes sum to {0:#04x}, not 0")]
+    Checksum(u8),
+    #[error("the table's body is not a series of HII package lists")]
+    Database(#[source] anyhow::Error),
+}
+
+/// The HII database in the HIID table `bytes`: its body, after the header, once the
+/// table checks and the body splits into HII package lists.
+///
+/// The packages inside are left to the parser, so that a database it cannot parse
+/// fails with the parse error instead of a fallback to the next source, and
+/// `hii extract-db` still copies it for a bug report.
+///
+/// For HIIDB_ACPI_PATH, sysfs guarantees Signature and Length: the file is named
+/// after the signature and holds Length bytes (Linux v6.11 drivers/acpi/sysfs.c
+/// acpi_table_attr_init, acpi_table_show). extract_db_acpi reads any path, so
+/// they are checked too.
+fn validate_hiid_table(bytes: &[u8]) -> Result<&[u8], HiidInvalid> {
+    let (header, body) = bytes
+        .split_first_chunk::<ACPI_HEADER_LEN>()
+        .filter(|(_, body)| !body.is_empty())
+        .ok_or(HiidInvalid::TooShort(bytes.len()))?;
+
+    let [s0, s1, s2, s3, l0, l1, l2, l3, ..] = *header;
+    let signature = [s0, s1, s2, s3];
+    if signature != HIID_SIGNATURE {
+        return Err(HiidInvalid::Signature(signature));
     }
-    Ok(contents.split_off(ACPI_HEADER_LEN))
+    let length = u32::from_le_bytes([l0, l1, l2, l3]);
+    if u32::try_from(bytes.len()).ok() != Some(length) {
+        return Err(HiidInvalid::Length {
+            header: length,
+            actual: bytes.len(),
+        });
+    }
+    // The checksum makes all bytes of the table sum to 0 (Linux v6.11
+    // include/acpi/actbl.h struct acpi_table_header).
+    let sum = bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+    if sum != 0 {
+        return Err(HiidInvalid::Checksum(sum));
+    }
+
+    package::get_package_lists(body).map_err(HiidInvalid::Database)?;
+    Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
+    use crate::hii::package::hiidb_fixtures::en_strings_list;
+    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+
+    /// Offset of Checksum in an ACPI table header, after Signature, Length and Revision.
+    const ACPI_CHECKSUM_OFFSET: usize = 9;
 
     /// hii_db_published fails, rather than answers false, when it cannot check a file.
     #[test]
@@ -593,42 +658,118 @@ mod tests {
         }
     }
 
-    /// The HIID table is the HiiDB after its ACPI header, and no longer than MAX_ALLOWED_FILESIZE.
+    /// An ACPI table of `signature` and Length `length`, then `body`, whose checksum holds.
+    fn acpi_table(signature: [u8; 4], length: u32, body: &[u8]) -> Vec<u8> {
+        let mut table = [&signature[..], &length.to_le_bytes()].concat();
+        table.resize(ACPI_HEADER_LEN, 0);
+        table.extend_from_slice(body);
+        let sum = table.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+        table[ACPI_CHECKSUM_OFFSET] = sum.wrapping_neg();
+        table
+    }
+
+    /// A HIID table of `body`, whose header and checksum hold.
+    fn hiid_table(body: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(ACPI_HEADER_LEN + body.len()).expect("a u32 table length");
+        acpi_table(HIID_SIGNATURE, length, body)
+    }
+
+    /// The body of a HIID table is the HiiDB only if the table is no longer than
+    /// MAX_ALLOWED_FILESIZE, its header and checksum hold, and the body parses. A table of other
+    /// content fails with HiidInvalid, so that the next source is tried.
     #[test]
-    fn extract_db_acpi_strips_the_header_and_caps_the_size() {
-        let dir = tempfile::tempdir().expect("create a directory");
-        let path = dir.path().join("HIID");
+    fn extract_db_acpi_returns_only_a_checked_database() {
+        /// What extract_db_acpi returns for a case.
+        enum Want {
+            Database(Vec<u8>),
+            /// HiidInvalid, as Display gives it
+            Invalid(String),
+            /// read_db_bytes' error
+            Unread(&'static str),
+        }
+
+        let database = en_strings_list([0x11; 16], b'A');
+        // a form package of an IFR End op without its length byte
+        let unparsable = package_list_with_guid([0x33; 16], &[0x05, 0x00, 0x00, 0x02, 0x29]);
+        assert!(
+            package::read_db(&unparsable).is_err(),
+            "read_db parsed the unparsable package list"
+        );
+        let mut bad_checksum = hiid_table(&database);
+        bad_checksum[ACPI_CHECKSUM_OFFSET] = bad_checksum[ACPI_CHECKSUM_OFFSET].wrapping_add(1);
+        let length = u32::try_from(ACPI_HEADER_LEN + database.len()).expect("a u32 table length");
         let over_cap = usize::try_from(MAX_ALLOWED_FILESIZE + 1).expect("a usize size");
-        for (case, size, want) in [
+        for (case, table, want) in [
             (
-                "a header and a HiiDB",
-                ACPI_HEADER_LEN + 3,
-                Ok(&[1, 1, 1][..]),
+                "a database",
+                hiid_table(&database),
+                Want::Database(database.clone()),
+            ),
+            (
+                "a bad checksum",
+                bad_checksum,
+                Want::Invalid("the table fails its checksum: its bytes sum to 0x01, not 0".into()),
+            ),
+            (
+                "a body that is no database",
+                hiid_table(&[0x5a; 64]),
+                Want::Invalid("the table's body is not a series of HII package lists".into()),
+            ),
+            (
+                "package lists that the parser refuses",
+                hiid_table(&unparsable),
+                Want::Database(unparsable.clone()),
             ),
             (
                 "a header only",
-                ACPI_HEADER_LEN,
-                Err("is too short (36 bytes)"),
+                hiid_table(&[]),
+                Want::Invalid("the table has 36 bytes, no more than its 36-byte header".into()),
             ),
-            ("shorter than a header", 4, Err("is too short (4 bytes)")),
+            (
+                "shorter than a header",
+                vec![0x5a; 4],
+                Want::Invalid("the table has 4 bytes, no more than its 36-byte header".into()),
+            ),
+            (
+                "another signature",
+                acpi_table(*b"XSDT", length, &database),
+                Want::Invalid(r#"the table's signature is "XSDT", not "HIID""#.into()),
+            ),
+            (
+                "a Length past the end",
+                acpi_table(HIID_SIGNATURE, length + 1, &database),
+                Want::Invalid(format!(
+                    "the table's header gives a length of {} bytes, but it has {length}",
+                    length + 1
+                )),
+            ),
+            (
+                "a Length short of the end",
+                acpi_table(HIID_SIGNATURE, length - 1, &database),
+                Want::Invalid(format!(
+                    "the table's header gives a length of {} bytes, but it has {length}",
+                    length - 1
+                )),
+            ),
             (
                 "longer than MAX_ALLOWED_FILESIZE",
-                over_cap,
-                Err("File size is too big for the file to be a HII database."),
+                vec![0; over_cap],
+                Want::Unread("File size is too big for the file to be a HII database."),
             ),
         ] {
-            let file = File::create(&path).expect("create the table");
-            file.set_len(u64::try_from(size).expect("a u64 size"))
-                .expect("size the table");
-            if size == ACPI_HEADER_LEN + 3 {
-                file.write_all_at(&[1, 1, 1], u64::try_from(ACPI_HEADER_LEN).expect("a u64"))
-                    .expect("write the HiiDB");
-            }
+            let dir = tempfile::tempdir().expect("create a directory");
+            let path = dir.path().join("HIID");
+            std::fs::write(&path, &table).expect("write the table");
 
             match (extract_db_acpi(&path), want) {
-                (Ok(db), Ok(want)) => assert_eq!(db, want, "{case}"),
-                (Err(error), Err(message)) => {
-                    assert!(format!("{error:#}").contains(message), "{case}: {error:#}")
+                (Ok(db), Want::Database(want)) => assert_eq!(db, want, "{case}"),
+                (Err(error), Want::Invalid(message)) => {
+                    let invalid = error.downcast_ref::<HiidInvalid>().map(ToString::to_string);
+                    assert_eq!(invalid, Some(message), "{case}: {error:#}");
+                }
+                (Err(error), Want::Unread(message)) => {
+                    assert!(!error.is::<HiidInvalid>(), "{case}: {error:#}");
+                    assert!(format!("{error:#}").contains(message), "{case}: {error:#}");
                 }
                 (got, _) => panic!("{case}: got {got:?}"),
             }
