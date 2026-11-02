@@ -104,6 +104,22 @@ impl Default for HiiSourcePaths {
     }
 }
 
+/// Whether a source file of extract_db exists: the HIID ACPI table or the OCP
+/// variable.
+pub fn hii_db_published() -> std::io::Result<bool> {
+    hii_db_published_at(&HiiSourcePaths::default())
+}
+
+/// hii_db_published, probing the acpi and efivar sources at `paths`, in extract_db's order.
+fn hii_db_published_at(paths: &HiiSourcePaths) -> std::io::Result<bool> {
+    for path in [&paths.acpi_hiid, &paths.ocp_hiidb] {
+        if path.try_exists()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn extract_db() -> Result<Vec<u8>> {
     extract_db_at(&HiiSourcePaths::default())
 }
@@ -529,6 +545,53 @@ fn extract_db_acpi(path: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
+
+    /// hii_db_published fails, rather than answers false, when it cannot check a file.
+    #[test]
+    fn hii_db_published_fails_when_a_file_cannot_be_checked() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").expect("create the file");
+        // stat() of a path through a regular file fails with ENOTDIR, not ENOENT
+        let paths = HiiSourcePaths {
+            efi_config_table: file.join("config_table"),
+            ocp_hiidb: file.join("HiiDB"),
+            acpi_hiid: file.join("HIID"),
+            dev_mem: file.join("mem"),
+        };
+
+        let error = hii_db_published_at(&paths).expect_err("checked a path through a file");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory, "{error}");
+    }
+
+    /// hii_db_published holds once either file exists, the OCP HiiDB efivar or the HIID table.
+    #[test]
+    fn hii_db_published_once_either_file_exists() {
+        for (case, ocp_file, acpi_file, want) in [
+            ("neither file", false, false, false),
+            ("the HiiDB efivar only", true, false, true),
+            ("the HIID table only", false, true, true),
+            ("both files", true, true, true),
+        ] {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let paths = HiiSourcePaths {
+                efi_config_table: dir.path().join("config_table"),
+                ocp_hiidb: dir.path().join("HiiDB"),
+                acpi_hiid: dir.path().join("HIID"),
+                dev_mem: dir.path().join("mem"),
+            };
+            for (exists, path) in [(ocp_file, &paths.ocp_hiidb), (acpi_file, &paths.acpi_hiid)] {
+                if exists {
+                    std::fs::write(path, b"").expect("create the file");
+                }
+            }
+
+            let got = hii_db_published_at(&paths).unwrap_or_else(|error| panic!("{case}: {error}"));
+
+            assert_eq!(got, want, "{case}");
+        }
+    }
 
     /// The HIID table is the HiiDB after its ACPI header, and no longer than MAX_ALLOWED_FILESIZE.
     #[test]

@@ -104,6 +104,11 @@ package lists, those of
 forms whose questions sit on EFI global variables of the firmware, some of them volatile,
 under VarStores that declare every one non-volatile.
 
+`publish-hiidb.efi acpi-table` sets no `HiiDB` variable: it installs the database as the body
+of a `HIID` ACPI table through `EFI_ACPI_TABLE_PROTOCOL`, which `uefisettings` reads from
+`/sys/firmware/acpi/tables/HIID`. QEMU's `-acpitable` cannot add it: only the x86 machines
+take that option.
+
 `publish-hiidb.efi password-forms` publishes nothing: it registers the forms of
 [`publish-hiidb/src/password_forms.rs`](publish-hiidb/src/password_forms.rs) in the HII
 database, which `uefisettings.efi` exports in the UEFI Shell: PASSWORD questions in the

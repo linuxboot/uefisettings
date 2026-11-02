@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms]`:
+//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms|acpi-table]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -27,6 +27,8 @@
 //! [`global_variable_forms`] after those that the firmware exports.
 //! `password-forms` publishes nothing: it registers the package list of [`password_forms`]
 //! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
+//! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `HIID` ACPI table,
+//! where `src/lib/hii/extract.rs` also looks, and puts its CRC-32 in `HiiDBCrc32`.
 
 #![cfg_attr(target_os = "uefi", no_std, no_main)]
 #![deny(unsafe_code)]
@@ -37,6 +39,7 @@ mod global_variable_forms;
 mod hii_package;
 mod password_forms;
 
+use alloc::vec::Vec;
 use core::ptr;
 
 use uefi::boot;
@@ -47,6 +50,7 @@ use uefi::cstr16;
 use uefi::entry;
 use uefi::guid;
 use uefi::println;
+use uefi::proto::acpi::AcpiTable;
 use uefi::proto::hii::database::HiiDatabase;
 use uefi::proto::loaded_image::LoadOptionsError;
 use uefi::proto::loaded_image::LoadedImage;
@@ -78,6 +82,14 @@ const HIIDB_CRC32_VENDOR: Guid = guid!("de145b29-c3cd-455f-91de-a76237b67c52");
 /// faults for wide loads (<https://github.com/linuxboot/uefisettings/pull/12>).
 const COPY_OFFSET: usize = 1;
 
+/// Signature of the ACPI table that `acpi-table` installs.
+const HIID_SIGNATURE: [u8; 4] = *b"HIID";
+/// Size of the header of an ACPI table, EFI_ACPI_DESCRIPTION_HEADER (edk2
+/// MdePkg/Include/IndustryStandard/Acpi10.h), which the database follows.
+const ACPI_HEADER_SIZE: usize = 36;
+/// Revision of the `HIID` table, which uefisettings does not read.
+const HIID_REVISION: u8 = 1;
+
 /// A failed step and the firmware's status.
 type Failure = (&'static str, Status);
 
@@ -98,10 +110,13 @@ fn efi_main() -> Status {
         }
         Some(Task::RegisterPasswordForms) => register_password_forms()
             .map(|()| println!("publish-hiidb: registered the password forms")),
+        Some(Task::PublishAcpiTable) => publish_acpi_table()
+            .map(|length| println!("publish-hiidb: {length} bytes in the HIID ACPI table")),
         None => {
             println!(
                 "usage: publish-hiidb \
-                 [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms]"
+                 [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms\
+                 |acpi-table]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -122,6 +137,8 @@ enum Task {
     Publish(MemoryType, Database),
     /// Register the package list of [`password_forms`] in the HII database.
     RegisterPasswordForms,
+    /// Publish the database in a `HIID` ACPI table.
+    PublishAcpiTable,
 }
 
 /// The task that the optional data of the load option, a NUL-terminated UCS-2 string,
@@ -144,6 +161,7 @@ fn load_option() -> Option<Task> {
             Some(Task::Publish(rt_data, Database::WithGlobalVariableForms))
         }
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
+        Ok(option) if option == cstr16!("acpi-table") => Some(Task::PublishAcpiTable),
         _ => None,
     }
 }
@@ -193,14 +211,9 @@ enum Database {
     WithGlobalVariableForms,
 }
 
-/// Copies `database` into pages of `memory_type` at `COPY_OFFSET` and points `HiiDB` at
-/// the copy. Returns the address and length of the copy.
-///
-/// It first puts the CRC-32 of the database in `HiiDBCrc32`, so that `HiiDB`
-/// never exists without it.
-///
-/// The pages are never freed: the OS reads them after boot.
-fn publish(memory_type: MemoryType, database: Database) -> Result<(u64, u32), Failure> {
+/// Returns `database` after putting its CRC-32 in `HiiDBCrc32`, so that no source
+/// publishes it without its CRC-32.
+fn export_with_crc32(database: Database) -> Result<Vec<u8>, Failure> {
     let mut export = boot::get_handle_for_protocol::<HiiDatabase>()
         .and_then(boot::open_protocol_exclusive::<HiiDatabase>)
         .and_then(|database| database.export_all_raw())
@@ -212,8 +225,6 @@ fn publish(memory_type: MemoryType, database: Database) -> Result<(u64, u32), Fa
             export.extend(global_variable_forms::package_lists());
         }
     }
-    let length = u32::try_from(export.len())
-        .map_err(|_| ("the HII database exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
 
     let crc32 = boot::calculate_crc32(&export)
         .map_err(|error| ("computing the CRC-32 of the HII database", error.status()))?;
@@ -224,6 +235,17 @@ fn publish(memory_type: MemoryType, database: Database) -> Result<(u64, u32), Fa
         &crc32.to_le_bytes(),
     )
     .map_err(|error| ("setting the HiiDBCrc32 variable", error.status()))?;
+    Ok(export)
+}
+
+/// Copies `database` into pages of `memory_type` at `COPY_OFFSET` and points `HiiDB` at
+/// the copy. Returns the address and length of the copy.
+///
+/// The pages are never freed: the OS reads them after boot.
+fn publish(memory_type: MemoryType, database: Database) -> Result<(u64, u32), Failure> {
+    let export = export_with_crc32(database)?;
+    let length = u32::try_from(export.len())
+        .map_err(|_| ("the HII database exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
 
     let pages = (COPY_OFFSET + export.len()).div_ceil(PAGE_SIZE);
     let base = boot::allocate_pages(AllocateType::AnyPages, memory_type, pages)
@@ -255,4 +277,42 @@ fn publish(memory_type: MemoryType, database: Database) -> Result<(u64, u32), Fa
     )
     .map_err(|error| ("setting the HiiDB variable", error.status()))?;
     Ok((address, length))
+}
+
+/// Installs the database that the firmware exports as the body of a `HIID` ACPI table, after
+/// its header. Returns the length of the database.
+fn publish_acpi_table() -> Result<usize, Failure> {
+    let export = export_with_crc32(Database::Exported)?;
+    let table_length = ACPI_HEADER_SIZE
+        .checked_add(export.len())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or(("the HIID table exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
+
+    // Signature, Length and Revision. The rest of the header is zeros: Checksum, which
+    // InstallAcpiTable() corrects in its copy (UEFI 2.11 §20.2), then the OEM and creator fields,
+    // which uefisettings does not read.
+    let mut table = [
+        &HIID_SIGNATURE[..],
+        &table_length.to_le_bytes(),
+        &[HIID_REVISION],
+    ]
+    .concat();
+    table.resize(ACPI_HEADER_SIZE, 0);
+    table.extend_from_slice(&export);
+
+    let acpi = boot::get_handle_for_protocol::<AcpiTable>()
+        .and_then(boot::open_protocol_exclusive::<AcpiTable>)
+        .map_err(|error| ("opening the ACPI table protocol", error.status()))?;
+    #[expect(
+        unsafe_code,
+        reason = "the uefi crate's InstallAcpiTable() wrapper is unsafe"
+    )]
+    // SAFETY: `table` is a whole table whose Length is its size. InstallAcpiTable() links a copy
+    // of it (UEFI 2.11 §20.2): edk2-stable202608 AcpiTableProtocol.c InstallAcpiTable() copies it
+    // with AllocateCopyPool() and passes the copy to AddTableToList() with Checksum TRUE. So it
+    // needs `table` only during the call, not in memory of a type that the OS keeps, which the
+    // wrapper's documentation asks for.
+    unsafe { acpi.install_acpi_table(table.as_ptr().cast(), table.len()) }
+        .map_err(|error| ("installing the HIID ACPI table", error.status()))?;
+    Ok(export.len())
 }

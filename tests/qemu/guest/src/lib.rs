@@ -290,13 +290,20 @@ pub struct PublishedDatabase {
 pub fn published_database() -> PublishedDatabase {
     let hiidb = variable_data(HIIDB_VARIABLE).expect("the HiiDB variable does not exist");
     let (length, address) = hiidb.split_at(size_of::<u32>());
-    let crc32 =
-        variable_data(HIIDB_CRC32_VARIABLE).expect("the HiiDBCrc32 variable does not exist");
     PublishedDatabase {
         length: u32::from_le_bytes(length.try_into().expect("HiiDB holds no length")),
         address: u64::from_le_bytes(address.try_into().expect("HiiDB holds no 64-bit address")),
-        crc32: u32::from_le_bytes(crc32.try_into().expect("HiiDBCrc32 holds no CRC-32")),
+        crc32: published_crc32(),
     }
+}
+
+/// The CRC-32 of the HII database that publish-hiidb published, from
+/// [`HIIDB_CRC32_VARIABLE`]. Panics if the variable does not exist or has the wrong size.
+#[track_caller]
+pub fn published_crc32() -> u32 {
+    let crc32 =
+        variable_data(HIIDB_CRC32_VARIABLE).expect("the HiiDBCrc32 variable does not exist");
+    u32::from_le_bytes(crc32.try_into().expect("HiiDBCrc32 holds no CRC-32"))
 }
 
 /// Reads the byte at physical `address` with read() of `/dev/mem`, which `uefisettings` tries

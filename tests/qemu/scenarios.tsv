@@ -16,6 +16,7 @@ hii-reserved	/DriverSample.efi;/publish-hiidb.efi reserved	my-ifr-nv-data.json	h
 hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard
 hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access
 hii-global-variables	/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables
+hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi
 shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-reboot,shell:then-linux
 shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions
 shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password

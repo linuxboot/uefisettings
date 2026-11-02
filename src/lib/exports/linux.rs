@@ -20,6 +20,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use log::debug;
+use log::warn;
 use serde_json::Value;
 
 use uefisettings_backend_thrift::Backend;
@@ -363,11 +364,20 @@ impl SettingsBackend for IloBackend {
 pub fn identify_machine() -> MachineInfo {
     let mut backend = BTreeSet::new();
 
-    if Path::new(extract::OCP_HIIDB_PATH).exists() {
-        backend.insert(Backend::Hii);
+    match extract::hii_db_published() {
+        Ok(true) => {
+            debug!("Backend Identified: Hii");
+            backend.insert(Backend::Hii);
+        }
+        Ok(false) => {}
+        // reading the database then reports the error
+        Err(error) => {
+            warn!("Cannot tell whether the firmware publishes its HII database: {error}");
+            backend.insert(Backend::Hii);
+        }
     }
     if chif::check_ilo_connectivity().is_ok() {
-        debug!("Backend Identified: Hii");
+        debug!("Backend Identified: Ilo");
         backend.insert(Backend::Ilo);
     }
 
