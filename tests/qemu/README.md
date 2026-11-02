@@ -115,3 +115,8 @@ database, which `uefisettings.efi` exports in the UEFI Shell: PASSWORD questions
 layout of AMI firmware's `AMITSESetup`, which
 [`vars/amitse-setup.json`](vars/amitse-setup.json) creates, and a question on a volatile
 variable.
+
+`publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
+database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
+database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
+set to FALSE. No scenario boots it.

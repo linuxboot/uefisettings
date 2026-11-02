@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms|acpi-table]`:
+//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|install-config-tables]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -29,6 +29,11 @@
 //! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
 //! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `HIID` ACPI table,
 //! where `src/lib/hii/extract.rs` also looks, and puts its CRC-32 in `HiiDBCrc32`.
+//! `install-config-tables` sets no `HiiDB`: it installs a runtime-data copy of the database,
+//! with edk2's zeroed slack, as the configuration table of the HII database protocol's GUID, as
+//! edk2's HiiDatabaseDxe does when PcdHiiOsRuntimeSupport is TRUE (UEFI 2.11 §33.2.11.1), and
+//! puts its length and address in the volatile `HiiDBConfigTable` variable, in `HiiDB`'s
+//! layout, for the tests.
 
 #![cfg_attr(target_os = "uefi", no_std, no_main)]
 #![deny(unsafe_code)]
@@ -76,6 +81,11 @@ const HIIDB_ATTRIBUTES: VariableAttributes =
 const HIIDB_CRC32_NAME: &CStr16 = cstr16!("HiiDBCrc32");
 /// Vendor GUID of that variable, which the tests own.
 const HIIDB_CRC32_VENDOR: Guid = guid!("de145b29-c3cd-455f-91de-a76237b67c52");
+/// Name of the variable that holds the length and address of the configuration table copy, in
+/// `HiiDB`'s layout, for the tests only, with the vendor and attributes of `HiiDBCrc32`.
+const HIIDB_CONFIG_TABLE_NAME: &CStr16 = cstr16!("HiiDBConfigTable");
+/// The configuration table GUID of the database copy (UEFI 2.11 §33.2.11.1).
+static HII_DATABASE_GUID: Guid = HiiDatabaseProtocol::GUID;
 
 /// Where the copy starts in its pages: an unaligned start makes `uefisettings`
 /// read the first page from an unaligned address, which arm64 Device memory
@@ -112,11 +122,12 @@ fn efi_main() -> Status {
             .map(|()| println!("publish-hiidb: registered the password forms")),
         Some(Task::PublishAcpiTable) => publish_acpi_table()
             .map(|length| println!("publish-hiidb: {length} bytes in the HIID ACPI table")),
+        Some(Task::InstallConfigTables) => install_config_tables(),
         None => {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms\
-                 |acpi-table]"
+                 |acpi-table|install-config-tables]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -139,6 +150,8 @@ enum Task {
     RegisterPasswordForms,
     /// Publish the database in a `HIID` ACPI table.
     PublishAcpiTable,
+    /// Install a copy of the database as the HII database protocol's configuration table.
+    InstallConfigTables,
 }
 
 /// The task that the optional data of the load option, a NUL-terminated UCS-2 string,
@@ -162,6 +175,7 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
         Ok(option) if option == cstr16!("acpi-table") => Some(Task::PublishAcpiTable),
+        Ok(option) if option == cstr16!("install-config-tables") => Some(Task::InstallConfigTables),
         _ => None,
     }
 }
@@ -315,4 +329,56 @@ fn publish_acpi_table() -> Result<usize, Failure> {
     unsafe { acpi.install_acpi_table(table.as_ptr().cast(), table.len()) }
         .map_err(|error| ("installing the HIID ACPI table", error.status()))?;
     Ok(export.len())
+}
+
+/// Installs a runtime-data pool copy of the exported database as the configuration table of
+/// [`HII_DATABASE_GUID`], as edk2's HiiGetDatabaseInfo() does
+/// (MdeModulePkg/Universal/HiiDatabaseDxe/Database.c): in a zeroed pool a quarter larger than
+/// the database, so that the OS finds its end at a zero header. Puts its CRC-32 in
+/// `HiiDBCrc32` and its length and address in `HiiDBConfigTable`, and logs the latter two.
+fn install_config_tables() -> Result<(), Failure> {
+    let export = export_with_crc32(Database::Exported)?;
+    let length = u32::try_from(export.len())
+        .map_err(|_| ("the HII database exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
+
+    let size = export.len().checked_add(export.len() / 4).ok_or((
+        "the HII database's pool size overflows",
+        Status::BAD_BUFFER_SIZE,
+    ))?;
+    let copy = boot::allocate_pool(MemoryType::RUNTIME_SERVICES_DATA, size)
+        .map_err(|error| ("allocating the runtime pool", error.status()))?;
+    #[expect(
+        unsafe_code,
+        reason = "the pool from allocate_pool() is only reachable through a raw pointer"
+    )]
+    // SAFETY: allocate_pool returned `size` bytes, at least `export.len()`, that nothing else
+    // references, at an identity-mapped address, and `export` does not overlap them.
+    unsafe {
+        ptr::write_bytes(copy.as_ptr(), 0, size);
+        ptr::copy_nonoverlapping(export.as_ptr(), copy.as_ptr(), export.len());
+    }
+    #[expect(
+        unsafe_code,
+        reason = "InstallConfigurationTable() takes a raw pointer that must stay valid"
+    )]
+    // SAFETY: the table is a runtime-data pool allocation, as the function requires, that is
+    // never freed or written again.
+    unsafe { boot::install_configuration_table(&HII_DATABASE_GUID, copy.as_ptr().cast()) }
+        .map_err(|error| ("installing the configuration table", error.status()))?;
+    // `usize` has at most 64 bits on the UEFI targets.
+    let address = copy.as_ptr().addr() as u64;
+
+    let mut data = [0; size_of::<u32>() + size_of::<u64>()];
+    data[..4].copy_from_slice(&length.to_le_bytes());
+    data[4..].copy_from_slice(&address.to_le_bytes());
+    runtime::set_variable(
+        HIIDB_CONFIG_TABLE_NAME,
+        &VariableVendor(HIIDB_CRC32_VENDOR),
+        HIIDB_ATTRIBUTES,
+        &data,
+    )
+    .map_err(|error| ("setting the HiiDBConfigTable variable", error.status()))?;
+
+    println!("publish-hiidb: config table {HII_DATABASE_GUID} at {address:#x}, {length} bytes");
+    Ok(())
 }
