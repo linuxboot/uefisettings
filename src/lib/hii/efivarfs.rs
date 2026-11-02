@@ -24,7 +24,6 @@ use log::warn;
 use nix::mount::mount;
 use nix::mount::MsFlags;
 use proc_mounts::MountIter;
-use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
@@ -32,7 +31,9 @@ use crate::hii::efivarfs_format::as_variable_not_found;
 use crate::hii::efivarfs_format::open_efivar;
 use crate::hii::efivarfs_format::read_efivar;
 use crate::hii::efivarfs_format::read_efivar_file;
+use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::efivarfs_format::EfivarFileName;
+use crate::hii::efivarfs_format::EFIVARFS_REACH;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
@@ -50,44 +51,32 @@ impl EfivarSource {
         self.validate()?;
         Ok(match self {
             Self::System => Box::new(EfivarFiles::system()),
-            Self::Directory(dir) => Box::new(EfivarFiles::from_copy(dir)),
-            Self::Disabled => Box::new(UnreadVariables(EfivarFiles::REACH)),
+            Self::Directory(dir) => Box::new(EfivarCopy::new(dir)),
+            Self::Disabled => Box::new(UnreadVariables(EFIVARFS_REACH)),
         })
     }
 }
 
-/// The efivar files in `dir` as FirmwareVariables: this machine's efivarfs, or a copy of one,
-/// which takes no writes.
+/// The efivar files in `dir` as FirmwareVariables: this machine's efivarfs.
 pub(crate) struct EfivarFiles {
     dir: PathBuf,
-    /// The file that write_at locks while it remounts `dir` read-write; None for a copy.
-    remount_lock: Option<PathBuf>,
+    /// The file that write_at locks while it remounts `dir` read-write.
+    remount_lock: PathBuf,
 }
 
 impl EfivarFiles {
-    /// What efivarfs reaches.
-    const REACH: VariableReach = VariableReach::Runtime;
-
     /// This machine's efivarfs.
     pub(crate) fn system() -> Self {
         Self {
             dir: PathBuf::from(EFIVARS_MOUNT_POINT),
-            remount_lock: Some(PathBuf::from(REMOUNT_LOCK_FILE)),
-        }
-    }
-
-    /// The copy of efivarfs in `dir`.
-    fn from_copy(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            remount_lock: None,
+            remount_lock: PathBuf::from(REMOUNT_LOCK_FILE),
         }
     }
 }
 
 impl FirmwareVariables for EfivarFiles {
     fn reach(&self) -> VariableReach {
-        Self::REACH
+        EFIVARFS_REACH
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -96,10 +85,6 @@ impl FirmwareVariables for EfivarFiles {
     }
 
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
-        let Some(remount_lock) = &self.remount_lock else {
-            return Err(CopyOfEfivars.into());
-        };
-
         // Steps:
         // * Read bytes
         // * Seek to 4 + offset
@@ -111,7 +96,7 @@ impl FirmwareVariables for EfivarFiles {
         // If something errors out, doesn't matter since we are using the flock syscall to lock it.
         // Linux will then release it automatically after the program ends.
 
-        let mut lock = FileLock::new(remount_lock);
+        let mut lock = FileLock::new(&self.remount_lock);
         lock.lock()?;
 
         let file_name = EfivarFileName::from(key);
@@ -125,7 +110,14 @@ impl FirmwareVariables for EfivarFiles {
             .and_then(|metadata| read_efivar_file(&file_ro, metadata.len()))
             .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
-        modify_variable_bytes(key, Self::REACH, &mut file_contents, size, offset, encoded)?;
+        modify_variable_bytes(
+            key,
+            EFIVARFS_REACH,
+            &mut file_contents,
+            size,
+            offset,
+            encoded,
+        )?;
 
         let _efifs =
             EfivarsMountGuard::new(&self.dir).context("Failed to create efivars fs mount guard")?;
@@ -145,11 +137,6 @@ impl FirmwareVariables for EfivarFiles {
         Ok(())
     }
 }
-
-/// Why EfivarFiles of a copy of efivarfs refuse a write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("a copy of efivars takes no writes")]
-pub(super) struct CopyOfEfivars;
 
 /// Keeps the efivarfs at `mount_point` read-write while it lives, remounting it read-only again
 /// if it was.
@@ -287,7 +274,7 @@ mod tests {
         let lock = tempfile::tempdir().expect("create lock directory");
         let files = EfivarFiles {
             dir: dir.path().to_path_buf(),
-            remount_lock: Some(lock.path().join("remount")),
+            remount_lock: lock.path().join("remount"),
         };
         (dir, lock, files)
     }
@@ -365,39 +352,6 @@ mod tests {
             fs::read(&path).expect("read the efivar file"),
             bytes,
             "bytes"
-        );
-    }
-
-    /// The variables of an EfivarSource::Directory read its efivar files and take no writes.
-    #[test]
-    fn copy_of_efivars_takes_no_writes() {
-        let dir = tempfile::tempdir().expect("create efivars directory");
-        let key = variable_key("Setup");
-        let path = dir.path().join(EfivarFileName::from(&key));
-        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[0; 4]].concat();
-        fs::write(&path, &bytes).expect("write the efivar file");
-        let variables = EfivarSource::Directory(dir.path().to_path_buf())
-            .into_variables()
-            .expect("make the variables of the directory");
-
-        let error = variables
-            .write_at(&key, 4, 0, &[1])
-            .expect_err("write a copy of efivars");
-
-        assert_eq!(
-            error.to_string(),
-            "a copy of efivars takes no writes",
-            "refusal"
-        );
-        assert_eq!(
-            fs::read(&path).expect("read the efivar file"),
-            bytes,
-            "bytes"
-        );
-        assert_eq!(
-            variables.read(&key, 4).expect("read the copy"),
-            bytes,
-            "read"
         );
     }
 

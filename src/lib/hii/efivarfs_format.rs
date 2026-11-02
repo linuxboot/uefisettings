@@ -13,6 +13,7 @@
 //! Files in efivarfs format, as efivarfs and copies of it hold: their names, and how to open
 //! and read them.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
@@ -23,6 +24,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -32,8 +34,10 @@ use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use thiserror::Error;
 
+use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
+use crate::hii::variables::VariableReach;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 /// The directory of this process's file descriptors, through which reopen opens a located file.
@@ -42,6 +46,8 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 /// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
 /// (OvmfPkgX64.dsc), as of edk2-stable202508.
 const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
+/// What efivarfs, and so a copy of it, reaches.
+pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
 
 /// The name of the efivar file of a variable, as VariableKey displays it: always exactly one path
 /// component.
@@ -212,6 +218,69 @@ pub(super) fn as_variable_not_found(key: &VariableKey, error: anyhow::Error) -> 
     }
 }
 
+/// A copy of efivarfs in `dir`, such as dump-efivars writes, as FirmwareVariables: it reads the
+/// efivar file of each variable by its exact name and takes no writes.
+pub(super) struct EfivarCopy {
+    dir: PathBuf,
+}
+
+impl EfivarCopy {
+    pub(super) fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+}
+
+impl FirmwareVariables for EfivarCopy {
+    fn reach(&self) -> VariableReach {
+        EFIVARFS_REACH
+    }
+
+    fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
+        let name = EfivarFileName::from(key);
+        check_exact_name(&self.dir, &name)
+            .and_then(|()| read_efivar(&self.dir, &name, size))
+            .map_err(|error| as_variable_not_found(key, error))
+    }
+
+    fn write_at(
+        &self,
+        _key: &VariableKey,
+        _size: u16,
+        _offset: u16,
+        _encoded: &[u8],
+    ) -> Result<()> {
+        Err(CopyOfEfivars.into())
+    }
+}
+
+/// Fails with EfivarNotFound unless `dir` lists an entry named exactly `name`: a case-insensitive
+/// file system, such as APFS unless formatted case-sensitive, opens a name that differs only in
+/// case, which is another variable's file. Copied onto such a file system, two files whose names
+/// differ only in case become one, which no check can detect.
+fn check_exact_name(dir: &Path, name: &EfivarFileName) -> Result<()> {
+    let listed = lists_entry(dir, AsRef::<Path>::as_ref(name).as_os_str())
+        .with_context(|| format!("failed to list efivars directory '{}'", dir.display()))?;
+    if !listed {
+        return Err(EfivarNotFound { name: name.clone() }.into());
+    }
+    Ok(())
+}
+
+/// Whether `dir` lists an entry of exactly the name `name`.
+fn lists_entry(dir: &Path, name: &OsStr) -> io::Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        if entry?.file_name() == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Why an EfivarCopy refuses a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("a copy of efivars takes no writes")]
+struct CopyOfEfivars;
+
 #[cfg(test)]
 pub mod tests {
     use std::collections::VecDeque;
@@ -227,7 +296,11 @@ pub mod tests {
     use super::*;
     use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
     use crate::hii::package::Guid;
+    use crate::hii::variables::tests::variable_key;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
+    use crate::hii::variables::tests::NV_BS_RT;
+    use crate::hii::variables::EfivarSource;
+    use crate::hii::variables::FirmwareVariables;
 
     impl EfivarFileName {
         /// The efivar file of the variable `name` of `guid`.
@@ -662,5 +735,123 @@ pub mod tests {
                 "{case}: cause"
             );
         }
+    }
+
+    /// A copy of efivars reads the efivar file of each variable by its exact name: a
+    /// case-insensitive file system, such as APFS unless formatted case-sensitive, opens a name
+    /// that differs only in case, which is another variable's file.
+    #[test]
+    fn exact_name_refuses_a_case_variant() {
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        let setup = variable_key("Setup");
+        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[1]].concat();
+        fs::write(dir.path().join(EfivarFileName::from(&setup)), &bytes)
+            .expect("write the efivar file");
+        let variables = EfivarSource::Directory(dir.path().to_path_buf())
+            .into_variables()
+            .expect("make the variables of the directory");
+
+        assert_eq!(
+            variables.read(&setup, 1).expect("read Setup"),
+            bytes,
+            "Setup"
+        );
+        let variant = variable_key("SETUP");
+        let error = variables.read(&variant, 1).expect_err("read SETUP");
+        assert_eq!(
+            error.downcast_ref::<VariableNotFound>(),
+            Some(&VariableNotFound(variant)),
+            "SETUP: {error:#}"
+        );
+    }
+
+    /// check_exact_name compares the bytes of each name it lists, on any file system.
+    #[test]
+    fn exact_name_check_is_case_sensitive() {
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
+        fs::write(dir.path().join(&name), b"").expect("write the efivar file");
+
+        check_exact_name(dir.path(), &name).expect("check the exact name");
+        let variant = EfivarFileName::new("SETUP", EFI_GLOBAL_VARIABLE);
+        let error = check_exact_name(dir.path(), &variant).expect_err("check a case variant");
+        assert_eq!(
+            error.downcast_ref::<EfivarNotFound>(),
+            Some(&EfivarNotFound { name: variant }),
+            "case variant: {error:#}"
+        );
+    }
+
+    /// A copy of efivars reads an efivar file only through a listing of its directory: one that
+    /// it cannot list fails the read, though the file would open.
+    #[test]
+    fn copy_reads_only_listed_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        let setup = variable_key("Setup");
+        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[1]].concat();
+        fs::write(dir.path().join(EfivarFileName::from(&setup)), &bytes)
+            .expect("write the efivar file");
+        let copy = EfivarCopy::new(dir.path().to_path_buf());
+        // search and write but no read, which root has anyway: the tests run as a user
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300))
+            .expect("make the directory unlistable");
+
+        let unlisted = copy.read(&setup, 1);
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+            .expect("make the directory listable");
+        let error = unlisted.expect_err("read through an unlistable directory");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "failed to list efivars directory '{}'",
+                dir.path().display()
+            ),
+            "unlistable: {error:#}"
+        );
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied),
+            "unlistable: cause"
+        );
+        assert_eq!(copy.read(&setup, 1).expect("read Setup"), bytes, "listable");
+    }
+
+    /// The variables of an EfivarSource::Directory read its efivar files and take no writes.
+    #[test]
+    fn copy_of_efivars_takes_no_writes() {
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        let key = variable_key("Setup");
+        let path = dir.path().join(EfivarFileName::from(&key));
+        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[0; 4]].concat();
+        fs::write(&path, &bytes).expect("write the efivar file");
+        let variables = EfivarSource::Directory(dir.path().to_path_buf())
+            .into_variables()
+            .expect("make the variables of the directory");
+
+        let error = variables
+            .write_at(&key, 4, 0, &[1])
+            .expect_err("write a copy of efivars");
+
+        assert_eq!(
+            error.to_string(),
+            "a copy of efivars takes no writes",
+            "refusal"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read the efivar file"),
+            bytes,
+            "bytes"
+        );
+        assert_eq!(
+            variables.read(&key, 4).expect("read the copy"),
+            bytes,
+            "read"
+        );
     }
 }
