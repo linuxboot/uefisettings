@@ -81,6 +81,10 @@ fn variable_info_report(info: &VariableInfo) -> serde_json::Value {
     })
 }
 
+/// Where list-strings, which takes no --no-efivars, reads the HiiDB: as the other hii commands
+/// do.
+pub(super) type ListStringsHiiDbArgs = HiiDbArgs;
+
 /// None: a hii command reads the HiiDB of the firmware that it runs on.
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag

@@ -12,11 +12,11 @@
 
 #[cfg(target_os = "uefi")]
 mod database_protocol;
-#[cfg(target_os = "linux")]
+#[cfg(efivar_dumps)]
 mod efivar_dump;
 #[cfg(target_os = "linux")]
 mod efivarfs;
-#[cfg(target_os = "linux")]
+#[cfg(efivar_dumps)]
 mod efivarfs_format;
 #[cfg(target_os = "linux")]
 pub mod extract;
@@ -44,7 +44,7 @@ pub(crate) use efivar_dump::dump_efivars;
 pub use efivar_dump::EfivarDump;
 #[cfg(target_os = "linux")]
 pub use efivar_dump::EfivarRedaction;
-#[cfg(target_os = "linux")]
+#[cfg(efivar_dumps)]
 pub(crate) use efivar_dump::SavedDump;
 #[cfg(target_os = "linux")]
 pub(crate) use efivarfs::EfivarFiles;

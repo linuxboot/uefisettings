@@ -24,6 +24,8 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
+#[cfg(all(efivar_dumps, not(system_variables)))]
+use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::package::Guid;
 
 /// The size of the attributes word that FirmwareVariables::read gives before the data, as
@@ -355,7 +357,7 @@ pub enum EfivarSource {
     #[default]
     System,
     /// A directory of efivar files in efivarfs format, such as a copy of another machine's.
-    #[cfg(target_os = "linux")]
+    #[cfg(efivar_dumps)]
     Directory(std::path::PathBuf),
     /// No variables: each value shows as unavailable (get and list-questions add its IFR
     /// default) and conditions on values stay undetermined.
@@ -371,7 +373,7 @@ impl EfivarSource {
             #[cfg(system_variables)]
             Self::System => Ok(()),
             Self::Disabled => Ok(()),
-            #[cfg(target_os = "linux")]
+            #[cfg(efivar_dumps)]
             Self::Directory(dir) => match std::fs::metadata(dir) {
                 Ok(metadata) if metadata.is_dir() => Ok(()),
                 Ok(_) => Err(EfivarsNotADirectory(dir.clone()).into()),
@@ -396,13 +398,15 @@ impl EfivarSource {
     pub(crate) fn into_variables(self) -> Result<Box<dyn FirmwareVariables>> {
         self.validate()?;
         Ok(match self {
+            #[cfg(efivar_dumps)]
+            Self::Directory(dir) => Box::new(EfivarCopy::new(dir)),
             Self::Disabled => Box::new(UnreadVariables(VariableReach::Runtime)),
         })
     }
 }
 
 /// Why EfivarSource::validate refuses a Directory.
-#[cfg(target_os = "linux")]
+#[cfg(efivar_dumps)]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("efivars directory {} is not a directory", .0.display())]
 pub(super) struct EfivarsNotADirectory(std::path::PathBuf);

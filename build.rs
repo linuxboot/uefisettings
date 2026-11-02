@@ -25,7 +25,7 @@ struct Capability {
     target_oses: &'static [&'static str],
 }
 
-const CAPABILITIES: [Capability; 3] = [
+const CAPABILITIES: [Capability; 4] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
@@ -40,6 +40,12 @@ const CAPABILITIES: [Capability; 3] = [
     // db_file: HiiDB files, which -f names
     Capability {
         cfg: "hiidb_files",
+        target_oses: &["linux", "macos"],
+    },
+    // efivarfs_format, efivar_dump and EfivarSource::Directory: directories of efivar files, such
+    // as dump-efivars writes, which --efivars names
+    Capability {
+        cfg: "efivar_dumps",
         target_oses: &["linux", "macos"],
     },
 ];

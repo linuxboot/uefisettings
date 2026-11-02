@@ -195,6 +195,9 @@ impl HiiPlatformCommands {
     }
 }
 
+/// Where list-strings, which takes no --efivars, reads the HiiDB: as the other hii commands do.
+pub(super) type ListStringsHiiDbArgs = HiiDbArgs;
+
 /// Where a hii command reads the HiiDB.
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag

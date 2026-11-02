@@ -20,8 +20,12 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
+#[cfg(any(target_os = "macos", test))]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,7 +34,9 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
+#[cfg(target_os = "linux")]
 use nix::fcntl::OFlag;
+#[cfg(target_os = "linux")]
 use nix::sys::stat::Mode;
 use thiserror::Error;
 
@@ -41,10 +47,12 @@ use crate::hii::variables::VariableReach;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 /// The directory of this process's file descriptors, through which reopen opens a located file.
+#[cfg(target_os = "linux")]
 const PROC_SELF_FD: &str = "/proc/self/fd";
 /// The largest efivar file that read_efivar_file reads, far above EDK2's largest EFI variables:
 /// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
 /// (OvmfPkgX64.dsc), as of edk2-stable202508.
+#[cfg(target_os = "linux")]
 const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// What efivarfs, and so a copy of it, reaches.
 pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
@@ -91,6 +99,7 @@ pub(super) fn open_efivar(dir: &Path, name: &EfivarFileName) -> Result<File> {
 /// send a read elsewhere or block it. The check is on the file that is then read: an O_PATH
 /// descriptor opens no file (open(2)), so a device node runs no driver open, and reopening it
 /// through /proc/self/fd opens the very file checked, whatever the path names by then.
+#[cfg(target_os = "linux")]
 pub(super) fn open_regular_file(path: &Path, noun: &str) -> Result<Option<File>> {
     let location = match locate(path) {
         Ok(location) => location,
@@ -107,6 +116,7 @@ pub(super) fn open_regular_file(path: &Path, noun: &str) -> Result<Option<File>>
 }
 
 /// An O_PATH descriptor of `path`, of the link itself if it is a symlink.
+#[cfg(target_os = "linux")]
 fn locate(path: &Path) -> io::Result<File> {
     // not OpenOptions::custom_flags, which clears O_ACCMODE: musl defines it to include O_PATH
     let fd = nix::fcntl::open(
@@ -119,6 +129,7 @@ fn locate(path: &Path) -> io::Result<File> {
 }
 
 /// Opens the file of the O_PATH descriptor `location` for reading, whatever its path names now.
+#[cfg(target_os = "linux")]
 fn reopen(location: &File) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -126,6 +137,52 @@ fn reopen(location: &File) -> io::Result<File> {
         // (Linux v7.2 fs/locks.c); efivarfs_file_read() ignores O_NONBLOCK
         .custom_flags(libc::O_NONBLOCK)
         .open(Path::new(PROC_SELF_FD).join(location.as_raw_fd().to_string()))
+}
+
+/// Opens the regular file at `path`, which errors call `noun`, for reading; None if it does not
+/// exist. A symlink or other non-regular file is an error, so a directory of efivar files cannot
+/// send a read elsewhere or block it. xnu has no O_PATH (xnu-12377.121.6 bsd/sys/fcntl.h), so
+/// the check is on lstat, before the open: a node there that is not a regular file runs no
+/// driver open. One swapped in after the lstat does run its driver open, before the check that
+/// the opened file is the one checked, by device and inode, refuses it; O_NOFOLLOW refuses a
+/// symlink swapped in, and O_NONBLOCK keeps a FIFO swapped in from blocking the open.
+#[cfg(target_os = "macos")]
+pub(super) fn open_regular_file(path: &Path, noun: &str) -> Result<Option<File>> {
+    let checked = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        result => result.with_context(|| format!("failed to stat {noun} '{}'", path.display()))?,
+    };
+    check_regular_file(path, &checked, noun)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| open_error(path, noun, error))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to stat {noun} '{}'", path.display()))?;
+    check_same_file(path, noun, &checked, &opened)?;
+    Ok(Some(file))
+}
+
+/// Fails unless `opened`, of the `noun` opened at `path`, is a regular file with the device and
+/// inode of `checked`: another file swapped in after the check is refused, and so is a
+/// non-regular file that reuses the inode of one removed since.
+#[cfg(any(target_os = "macos", test))]
+fn check_same_file(
+    path: &Path,
+    noun: &str,
+    checked: &fs::Metadata,
+    opened: &fs::Metadata,
+) -> Result<()> {
+    check_regular_file(path, opened, noun)?;
+    if (opened.dev(), opened.ino()) != (checked.dev(), checked.ino()) {
+        return Err(anyhow!(
+            "{noun} '{}' changed while it was opened",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Fails unless `metadata`, of the `noun` at `path`, is a regular file's.
@@ -142,6 +199,7 @@ fn open_error(path: &Path, noun: &str, error: io::Error) -> anyhow::Error {
 }
 
 /// open_regular_file's error for `error` from reopening the `noun` at `path`.
+#[cfg(target_os = "linux")]
 fn reopen_error(path: &Path, noun: &str, error: io::Error) -> anyhow::Error {
     let hint = match error.kind() {
         // the descriptor is open, so NotFound means /proc/self/fd is missing
@@ -173,6 +231,7 @@ pub(super) fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Resul
 /// since: each efivarfs read() reads the whole variable from the firmware (Linux v7.2
 /// fs/efivarfs/file.c efivarfs_file_read()). A file of more than MAX_EFIVAR_FILE_SIZE bytes, by
 /// its metadata or as read, is an error.
+#[cfg(target_os = "linux")]
 pub(super) fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8>> {
     if size > MAX_EFIVAR_FILE_SIZE {
         return Err(efivar_file_too_large());
@@ -202,6 +261,7 @@ pub(super) fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8
 }
 
 /// read_efivar_file's error for a file of more than MAX_EFIVAR_FILE_SIZE bytes.
+#[cfg(target_os = "linux")]
 fn efivar_file_too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::FileTooLarge,
@@ -316,6 +376,12 @@ pub mod tests {
     pub(crate) const SETUP: [u8; 14] = [7, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     /// SETUP's size, as its metadata gives it.
     const SETUP_SIZE: u64 = SETUP.len() as u64;
+    /// What open_regular_file does first to a path, which its error there names: Linux's opener
+    /// opens an O_PATH descriptor, macOS's stats the path.
+    #[cfg(target_os = "linux")]
+    pub(crate) const FIRST_STEP: &str = "open";
+    #[cfg(target_os = "macos")]
+    pub(crate) const FIRST_STEP: &str = "stat";
 
     #[test]
     fn efivar_file_name_is_one_path_component() {
@@ -554,7 +620,7 @@ pub mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "failed to open efivar file '{}'",
+                "failed to {FIRST_STEP} efivar file '{}'",
                 not_a_dir.path().join(&name).display()
             ),
             "message of opening in a file"
@@ -733,6 +799,40 @@ pub mod tests {
                     .map(io::Error::kind),
                 Some(kind),
                 "{case}: cause"
+            );
+        }
+    }
+
+    /// check_same_file takes the metadata of the file checked, and refuses that of another file
+    /// and that of a non-regular file.
+    #[test]
+    fn check_same_file_refuses_another_file() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let path = dir
+            .path()
+            .join(EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE));
+        let other = dir.path().join("other");
+        fs::write(&path, b"checked").expect("write the efivar file");
+        fs::write(&other, b"other").expect("write another file");
+        let metadata = |path: &Path| fs::symlink_metadata(path).expect("stat a file");
+        let checked = metadata(&path);
+
+        check_same_file(&path, "efivar file", &checked, &metadata(&path))
+            .expect("check the same file");
+        for (case, opened, refusal) in [
+            (
+                "another file",
+                metadata(&other),
+                "changed while it was opened",
+            ),
+            ("a directory", metadata(dir.path()), "is not a regular file"),
+        ] {
+            let error = check_same_file(&path, "efivar file", &checked, &opened).expect_err(case);
+
+            assert_eq!(
+                error.to_string(),
+                format!("efivar file '{}' {refusal}", path.display()),
+                "{case}"
             );
         }
     }

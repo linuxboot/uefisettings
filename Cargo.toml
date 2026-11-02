@@ -38,6 +38,10 @@ rand = { version = "0.8", features = ["small_rng"] }
 proc-mounts = "0.3"
 env_logger = "0.10"
 
+# The macOS build opens the efivar files of a dump without following symlinks.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # The UEFI Shell build reaches the firmware through boot services: the HII database protocol,
 # GetVariable() and SetVariable().
 [target.'cfg(target_os = "uefi")'.dependencies]

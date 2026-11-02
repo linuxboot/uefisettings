@@ -36,6 +36,7 @@ use uefisettings_spellings_db_thrift::consts::translation_db;
 use platform::EfivarArgs;
 use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
+use platform::ListStringsHiiDbArgs;
 use platform::PlatformCommands;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::SetupPasswordArgs;
@@ -62,7 +63,7 @@ struct UefiSettingsToolArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    // The platform word hii: the macOS build reads HiiDB files only.
+    // The platform word hii: the macOS build reads HiiDB files and efivars dumps only.
     #[command(about = platform::HII_ABOUT)]
     Hii(HiiCommand),
     // TODO: Auto(AutoCommand) after building a backend identifier function
@@ -146,7 +147,7 @@ enum HiiSubcommands {
     #[command(next_display_order = None)]
     ListStrings {
         #[command(flatten)]
-        hiidb: HiiDbArgs,
+        hiidb: ListStringsHiiDbArgs,
         #[command(flatten)]
         output: JsonArgs,
     },
@@ -662,6 +663,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The flags, such as --efivars, that `text` names.
+    pub(super) fn flags_named_in(text: &str) -> Vec<String> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .filter(|word| word.len() > 2 && word.starts_with("--"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The flags that `command` takes, as --<long>.
+    pub(super) fn flags_of(command: &clap::Command) -> Vec<String> {
+        command
+            .get_arguments()
+            .filter_map(clap::Arg::get_long)
+            .map(|long| format!("--{long}"))
+            .collect()
+    }
+
+    /// The help of each option names only flags that its command takes, so that it never sends a
+    /// user to a flag that the command refuses.
+    #[test]
+    fn help_names_only_flags_of_its_command() {
+        let mut root = UefiSettingsToolArgs::command();
+        root.build();
+        let mut commands = vec![&root];
+        let mut checked = 0;
+        while let Some(command) = commands.pop() {
+            commands.extend(command.get_subcommands());
+            let taken = flags_of(command);
+            let named = command.get_arguments().flat_map(|arg| {
+                [arg.get_help(), arg.get_long_help()]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|help| flags_named_in(&help.to_string()))
+                    .map(move |flag| (arg.get_id(), flag))
+            });
+            for (arg, flag) in named {
+                assert!(
+                    taken.contains(&flag),
+                    "the help of {arg} of {} names {flag}",
+                    command.get_name()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no help names a flag");
     }
 
     /// The hii subcommand that `args`, after `uefisettings hii`, parse to.
