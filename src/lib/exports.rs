@@ -49,6 +49,8 @@ pub use crate::hii::forms::SetupPasswordPolicy;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "uefi")]
 mod uefi;
 
@@ -252,6 +254,7 @@ impl HiiBackend {
     }
 }
 
+#[cfg(all(system_hiidb, system_variables))]
 impl SettingsBackend for HiiBackend {
     fn set(question: &str, new_value: &str, selector: Option<&str>) -> Result<SetResponseList> {
         Self::set_using(question, new_value, selector, &SetOptions::default())
@@ -269,6 +272,7 @@ impl SettingsBackend for HiiBackend {
 
 impl HiiBackend {
     /// set with `options`, in this machine's HiiDB and variables, as set_in does.
+    #[cfg(all(system_hiidb, system_variables))]
     pub fn set_using(
         question: &str,
         new_value: &str,
@@ -291,6 +295,13 @@ impl HiiBackend {
     /// variables (PasswordQuestions::withholding): fails with SelectionError::NotFound when no
     /// question has the text, and unless every selected match is written, also after writing the
     /// others.
+    #[cfg_attr(
+        not(system_variables),
+        allow(
+            dead_code,
+            reason = "set writes only the variables of the machine, which this build does not reach"
+        )
+    )]
     fn set_in(
         db_bytes: &[u8],
         question: &str,

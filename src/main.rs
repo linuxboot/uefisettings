@@ -28,6 +28,7 @@ use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IncludedStates;
 use uefisettings::exports::ListQuestionsOptions;
+#[cfg(all(system_hiidb, system_variables))]
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::ShowIfrOptions;
 use uefisettings_spellings_db_thrift::consts::translation_db;
@@ -36,10 +37,12 @@ use platform::EfivarArgs;
 use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
 use platform::PlatformCommands;
+#[cfg(all(system_hiidb, system_variables))]
 use platform::SetupPasswordArgs;
 
 /// The commands and flags that only this build has, and where it reads the HiiDB.
 #[cfg_attr(target_os = "linux", path = "platform/linux.rs")]
+#[cfg_attr(target_os = "macos", path = "platform/macos.rs")]
 #[cfg_attr(target_os = "uefi", path = "platform/uefi.rs")]
 mod platform;
 
@@ -59,11 +62,13 @@ struct UefiSettingsToolArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Commands which work on machines exposing the UEFI HiiDB
+    // The platform word hii: the macOS build reads HiiDB files only.
+    #[command(about = platform::HII_ABOUT)]
     Hii(HiiCommand),
     // TODO: Auto(AutoCommand) after building a backend identifier function
     // TODO: Get/Set without having to specify Auto
     // The platform words get and set: only the Linux build identifies a backend.
+    #[cfg(all(system_hiidb, system_variables))]
     #[command(about = platform::GET_ABOUT, next_display_order = None)]
     Get {
         question: String,
@@ -72,6 +77,7 @@ enum Commands {
         #[command(flatten)]
         selection: SelectionArgs,
     },
+    #[cfg(all(system_hiidb, system_variables))]
     #[command(about = platform::SET_ABOUT, next_display_order = None)]
     Set {
         question: String,
@@ -116,6 +122,7 @@ enum HiiSubcommands {
         efivars: EfivarArgs,
     },
     /// Set/change the value of a question
+    #[cfg(all(system_hiidb, system_variables))]
     #[command(next_display_order = None)]
     Set {
         question: String,
@@ -206,6 +213,7 @@ impl From<&SelectionArgs> for GetOptions {
     }
 }
 
+#[cfg(all(system_hiidb, system_variables))]
 impl From<&SelectionArgs> for SetOptions {
     fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
@@ -225,6 +233,7 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
 }
 
 /// The SetOptions of `selection` and `setup_password`.
+#[cfg(all(system_hiidb, system_variables))]
 fn set_options(selection: &SelectionArgs, setup_password: &SetupPasswordArgs) -> SetOptions {
     let mut options = SetOptions::from(selection);
     options.setup_password = setup_password.policy();
@@ -240,6 +249,7 @@ fn hii_get(db_bytes: &[u8], question: &str, options: &GetOptions, json: bool) ->
 
 /// set of `question` to `value` with `selection` and `setup_password`, in this machine's HiiDB
 /// and variables, printed as JSON if `json`.
+#[cfg(all(system_hiidb, system_variables))]
 fn hii_set(
     question: &str,
     value: &str,
@@ -351,6 +361,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                     output.json,
                 )?;
             }
+            #[cfg(all(system_hiidb, system_variables))]
             HiiSubcommands::Set {
                 question,
                 value,
@@ -367,7 +378,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 print_line(format_args!("{}", res.readable_representation))?;
             }
             HiiSubcommands::ListStrings { hiidb, output } => {
-                let res = HiiBackend::list_strings(&hiidb.read(&EfivarSource::System)?)?;
+                let res = HiiBackend::list_strings(&hiidb.read(&EfivarSource::Disabled)?)?;
                 print_with_style(res, output.json)?;
             }
             HiiSubcommands::ListQuestions {
@@ -386,11 +397,13 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             }
             HiiSubcommands::Platform(command) => command.run()?,
         },
+        #[cfg(all(system_hiidb, system_variables))]
         Commands::Get {
             question,
             output,
             selection,
         } => platform::auto_get(question, output.json, selection)?,
+        #[cfg(all(system_hiidb, system_variables))]
         Commands::Set {
             question,
             value,

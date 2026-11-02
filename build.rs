@@ -12,14 +12,49 @@
 
 //! The UEFI Shell build's binary enters through uefi_std_entry (src/lib/uefi_entry.rs), which
 //! initializes the uefi crate before std's efi_main runs.
+//!
+//! Each of CAPABILITIES is a cfg for what some builds lack, for shared modules to test instead of
+//! OS names.
 
 use std::env;
 use std::env::VarError;
 
+/// A cfg that builds for `target_oses` set, as they have what it names.
+struct Capability {
+    cfg: &'static str,
+    target_oses: &'static [&'static str],
+}
+
+const CAPABILITIES: [Capability; 3] = [
+    // HiiBackend::system_hiidb: this machine's HiiDB
+    Capability {
+        cfg: "system_hiidb",
+        target_oses: &["linux", "uefi"],
+    },
+    // HiiBackend::system_variables and EfivarSource::System: this machine's EFI variables, the
+    // only ones that set writes
+    Capability {
+        cfg: "system_variables",
+        target_oses: &["linux", "uefi"],
+    },
+    // db_file: HiiDB files, which -f names
+    Capability {
+        cfg: "hiidb_files",
+        target_oses: &["linux", "macos"],
+    },
+];
+
 fn main() -> Result<(), VarError> {
     println!("cargo:rerun-if-changed=build.rs");
-    if env::var("CARGO_CFG_TARGET_OS")? == "uefi" {
+    let target_os = env::var("CARGO_CFG_TARGET_OS")?;
+    if target_os == "uefi" {
         println!("cargo:rustc-link-arg-bins=/entry:uefi_std_entry");
+    }
+    for capability in CAPABILITIES {
+        println!("cargo:rustc-check-cfg=cfg({})", capability.cfg);
+        if capability.target_oses.contains(&target_os.as_str()) {
+            println!("cargo:rustc-cfg={}", capability.cfg);
+        }
     }
     Ok(())
 }

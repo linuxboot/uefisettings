@@ -11,8 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The part of the CLI that only the Linux build has: the commands ilo, identify, hii
-//! extract-db and hii dump-efivars, the flags -f/--filename and --efivars, and the machine's
-//! backend for get and set.
+//! extract-db and hii dump-efivars, the flag --efivars, an optional -f/--filename, and the
+//! machine's backend for get and set.
 
 use std::fs::File;
 use std::io::Write;
@@ -44,6 +44,8 @@ use crate::print_with_style;
 use crate::JsonArgs;
 use crate::SelectionArgs;
 
+/// The about of hii, whose commands read this machine's HiiDB or a file.
+pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
 /// The about of top-level get, which reads this machine's backend.
 pub(super) const GET_ABOUT: &str = "Auto-identify backend and get the current value of a question";
 /// The about of top-level set, which writes this machine's backend.

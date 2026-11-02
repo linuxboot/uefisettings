@@ -386,7 +386,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(hiidb_files)]
 pub(crate) mod db_file;
 #[cfg(test)]
 pub(crate) mod hiidb_fixtures;

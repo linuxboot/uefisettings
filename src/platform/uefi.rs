@@ -27,6 +27,8 @@ use crate::hii_set;
 use crate::print_line;
 use crate::SelectionArgs;
 
+/// The about of hii, whose commands read this firmware's HII database.
+pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
 /// The about of top-level get, which reads this firmware's HII database, as hii get does.
 pub(super) const GET_ABOUT: &str = "Get the current value of a question";
 /// The about of top-level set, which writes this firmware's HII database, as hii set does.

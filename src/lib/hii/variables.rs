@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 
+#[cfg(system_variables)]
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
@@ -67,8 +68,8 @@ pub(crate) enum VariableReach {
     )]
     Runtime,
     #[cfg_attr(
-        target_os = "linux",
-        allow(dead_code, reason = "no Linux variables reach BootServices")
+        not(target_os = "uefi"),
+        allow(dead_code, reason = "only UEFI Shell variables reach BootServices")
     )]
     BootServices,
 }
@@ -77,6 +78,7 @@ pub(crate) enum VariableReach {
 /// BootServices as through GetVariable() and SetVariable() in the UEFI Shell.
 impl VariableReach {
     /// What errors call the data bytes of a variable, which follow its attributes word.
+    #[cfg(system_variables)]
     fn data(self) -> &'static str {
         match self {
             Self::Runtime => "efivarfs payload",
@@ -85,6 +87,7 @@ impl VariableReach {
     }
 
     /// The error for variable bytes without their whole attributes word.
+    #[cfg(system_variables)]
     fn missing_attributes(self) -> &'static str {
         match self {
             Self::Runtime => "efivarfs file is missing its attributes header",
@@ -204,6 +207,7 @@ pub(super) fn attributes_and_data(
 /// the data of variable `key`, which variables of `reach` hold: refuses a volatile or
 /// authenticated variable, then writes `encoded` at data offset `offset` as update_efivarfs_bytes
 /// does.
+#[cfg(system_variables)]
 pub(super) fn modify_variable_bytes(
     key: &VariableKey,
     reach: VariableReach,
@@ -221,6 +225,7 @@ pub(super) fn modify_variable_bytes(
 /// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
 /// shorter than the `payload_size` bytes of its VarStore, which VarStoreWrite::new fits the
 /// write in. Errors word it as variables of `reach` hold it.
+#[cfg(system_variables)]
 fn update_efivarfs_bytes(
     reach: VariableReach,
     bytes: &mut [u8],
@@ -341,11 +346,12 @@ pub(super) struct VariableNotFound(pub(super) VariableKey);
 /// Where question values are read: the variables of this machine, a directory of efivar files,
 /// or none.
 // Each backend makes the variables of a source in EfivarSource::into_variables: efivarfs.rs,
-// variable_services.rs.
+// variable_services.rs; a build without variables of its own makes them below.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum EfivarSource {
     /// This machine's variables: its efivarfs on Linux, GetVariable() in the UEFI Shell.
+    #[cfg(system_variables)]
     #[default]
     System,
     /// A directory of efivar files in efivarfs format, such as a copy of another machine's.
@@ -353,6 +359,7 @@ pub enum EfivarSource {
     Directory(std::path::PathBuf),
     /// No variables: each value shows as unavailable (get and list-questions add its IFR
     /// default) and conditions on values stay undetermined.
+    #[cfg_attr(not(system_variables), default)]
     Disabled,
 }
 
@@ -361,7 +368,9 @@ impl EfivarSource {
     /// as missing, or fail to open.
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::System | Self::Disabled => Ok(()),
+            #[cfg(system_variables)]
+            Self::System => Ok(()),
+            Self::Disabled => Ok(()),
             #[cfg(target_os = "linux")]
             Self::Directory(dir) => match std::fs::metadata(dir) {
                 Ok(metadata) if metadata.is_dir() => Ok(()),
@@ -378,6 +387,20 @@ impl EfivarSource {
     }
 }
 
+/// The variables of a build without variables of its own.
+#[cfg(not(system_variables))]
+impl EfivarSource {
+    /// The firmware variables that questions read from this source, which validate accepts. Those
+    /// of Disabled reach Runtime, as Linux's efivarfs does, so that questions show as under
+    /// --no-efivars on Linux.
+    pub(crate) fn into_variables(self) -> Result<Box<dyn FirmwareVariables>> {
+        self.validate()?;
+        Ok(match self {
+            Self::Disabled => Box::new(UnreadVariables(VariableReach::Runtime)),
+        })
+    }
+}
+
 /// Why EfivarSource::validate refuses a Directory.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -390,7 +413,8 @@ pub(super) struct EfivarsNotADirectory(std::path::PathBuf);
 pub(super) struct EfivarsNotRead;
 
 /// The variables of EfivarSource::Disabled: every read and write fails with EfivarsNotRead. They
-/// reach what the build's own variables reach, so that each refusal of a VarStore stays.
+/// reach what the build's own variables reach, or Runtime, as Linux's efivarfs, on a build
+/// without any, so that each refusal of a VarStore stays.
 pub(super) struct UnreadVariables(pub(super) VariableReach);
 
 impl FirmwareVariables for UnreadVariables {
@@ -442,7 +466,7 @@ pub(crate) struct EfivarReader {
 impl EfivarReader {
     /// Reads the variables of `source`, which EfivarSource::validate accepts.
     #[cfg_attr(
-        target_os = "uefi",
+        not(target_os = "linux"),
         allow(
             dead_code,
             reason = "the exports withhold password VarStores from a source's variables; only \
