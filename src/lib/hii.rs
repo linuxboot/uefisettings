@@ -17,6 +17,8 @@ mod efivar_dump;
 #[cfg(target_os = "linux")]
 mod efivarfs;
 #[cfg(target_os = "linux")]
+mod efivarfs_format;
+#[cfg(target_os = "linux")]
 pub mod extract;
 pub mod forms;
 #[cfg(target_os = "linux")]

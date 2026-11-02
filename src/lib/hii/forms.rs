@@ -934,8 +934,8 @@ mod non_efi_varstore_tests {
 
     use super::ifr_fixtures::*;
     use super::*;
-    use crate::hii::efivarfs::EfivarFileName;
     use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
+    use crate::hii::efivarfs_format::EfivarFileName;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
     use crate::hii::variables::VolatileVariable;
 
@@ -5532,9 +5532,9 @@ fn find_corresponding_varstore(
 mod tests {
     use super::ifr_fixtures::*;
     use super::*;
-    use crate::hii::efivarfs::open_efivar;
-    use crate::hii::efivarfs::read_efivarfs_bytes;
-    use crate::hii::efivarfs::EfivarFileName;
+    use crate::hii::efivarfs_format::open_efivar;
+    use crate::hii::efivarfs_format::read_efivarfs_bytes;
+    use crate::hii::efivarfs_format::EfivarFileName;
 
     /// find_question_in finds a question by the name that list_questions prints, whose leading
     /// and trailing whitespace the prompt string keeps, and by that name with other surrounding

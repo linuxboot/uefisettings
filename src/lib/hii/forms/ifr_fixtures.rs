@@ -21,7 +21,7 @@ use super::conditions::QuestionValue;
 use super::conditions::QuestionValues;
 use super::conditions::VarStoreValues;
 use super::*;
-use crate::hii::efivarfs::EfivarFileName;
+use crate::hii::efivarfs_format::EfivarFileName;
 pub(super) use crate::hii::variables::tests::variable_key;
 pub(crate) use crate::hii::variables::tests::MemoryVariables;
 pub(super) use crate::hii::variables::tests::WriteError;
