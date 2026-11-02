@@ -420,7 +420,7 @@ fn read_mapped(file: &File, offset: u64, dst: &mut [u8]) -> Result<()> {
     let mut done = 0;
     while done < length {
         // Cannot overflow: offset + length was checked above.
-        done += copy_mapped_page(file, offset + done as u64, &mut dst[done..])?;
+        done += copy_mapped_page(file, offset + u64::try_from(done)?, &mut dst[done..])?;
     }
 
     Ok(())
@@ -431,9 +431,9 @@ fn read_mapped(file: &File, offset: u64, dst: &mut [u8]) -> Result<()> {
 /// range. Loads go through copy_from_mapping: the page may be Device memory.
 fn copy_mapped_page(file: &File, offset: u64, dst: &mut [u8]) -> Result<usize> {
     let page_size = page_size()?;
-    let offset_in_page = usize::try_from(offset % page_size as u64)?;
+    let page_base = offset - offset % u64::try_from(page_size)?;
+    let offset_in_page = usize::try_from(offset - page_base)?;
     let len = (page_size - offset_in_page).min(dst.len());
-    let page_base = offset - offset_in_page as u64;
     // mmap64(), as off_t is signed and has 32 bits on most 32-bit glibc targets.
     let map_base = libc::off64_t::try_from(page_base)
         .with_context(|| format!("Mapping offset 0x{page_base:x} does not fit off64_t"))?;
