@@ -1,0 +1,10 @@
+Packagelist 55555555-5555-5555-5555-555555555555
+OpCode: ROOT
+    OpCode: FormSet - Offline - GUID 11111111-1111-1111-1111-111111111111 - ClassGUID 22222222-2222-2222-2222-222222222222
+        OpCode: VarStoreEfi
+        OpCode: Form
+            OpCode: CheckBox - Q: - Fast Boot - Help: - Help
+            -Answer: 1
+            OpCode: CheckBox - Q: - Wake on LAN - Help: - Help
+            -Answer: 0
+

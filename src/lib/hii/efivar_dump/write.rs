@@ -243,6 +243,7 @@ impl Drop for PartialDump<'_> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::ffi::OsStr;
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
     use std::rc::Rc;
@@ -256,6 +257,7 @@ mod tests {
     use crate::hii::efivarfs_format::tests::SETUP;
     use crate::hii::forms::handle_form_set;
     use crate::hii::forms::ifr_fixtures::checkbox;
+    use crate::hii::forms::ifr_fixtures::checkbox_at;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
     use crate::hii::forms::ifr_fixtures::conditional;
     use crate::hii::forms::ifr_fixtures::form;
@@ -269,6 +271,34 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::IFROperation;
+    use crate::hii::package::hiidb_fixtures::en_strings_package_of;
+    use crate::hii::package::hiidb_fixtures::form_package;
+    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::read_db;
+
+    /// The directory of the fixtures of tests/offline_golden.rs.
+    const OFFLINE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/offline");
+    /// The variable that makes offline_fixtures_are_current rewrite the fixtures.
+    const BLESS: &str = "UEFISETTINGS_BLESS";
+
+    /// Whether `value`, that of BLESS, asks for a rewrite: only "1" does, as in
+    /// tests/offline_golden.rs, whose test crate cannot reach this module.
+    fn blesses(value: Option<&OsStr>) -> bool {
+        value.is_some_and(|value| value == "1")
+    }
+
+    #[test]
+    fn only_bless_1_rewrites_the_fixtures() {
+        for (value, want) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("1"), true),
+        ] {
+            assert_eq!(blesses(value.map(OsStr::new)), want, "{BLESS}={value:?}");
+        }
+    }
 
     /// The package list of `root`, with no strings.
     fn package_list(root: &Rc<RefCell<IFROperation>>) -> ParsedPackageList {
@@ -754,5 +784,85 @@ mod tests {
             answers(&root, live.path()),
             "answers from the source"
         );
+    }
+
+    /// The HiiDB of the offline fixtures: CHECKBOXes Fast Boot and Wake on LAN on bytes 0 and 1 of
+    /// the EFI variable Setup, of 3 bytes.
+    fn offline_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 3),
+                form(1, &[checkbox_at(1, 2, 1, 0), checkbox_at(2, 3, 1, 1)]),
+            ]),
+            en_strings_package_of(&["Offline", "Fast Boot", "Wake on LAN", "Help"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// The dump of tests/offline_golden.rs is what dump-efivars writes from offline_hiidb and
+    /// its Setup, Fast Boot on, but for the version in the manifest, which readers ignore.
+    /// UEFISETTINGS_BLESS=1 rewrites it.
+    #[test]
+    fn offline_fixtures_are_current() {
+        let hiidb = offline_hiidb();
+        let live = efivars(&[(&efivar("Setup"), &[7, 0, 0, 0, 1, 0, 0xAA])]);
+        let (_parent, dir) = dump_dir();
+        let decoded =
+            decoded_bytes(read_db(&hiidb).expect("parse the HiiDB")).expect("find decoded bytes");
+        write_dump(
+            &hiidb,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
+        let fixture = Path::new(OFFLINE_FIXTURES).join("dump");
+
+        if blesses(std::env::var_os(BLESS).as_deref()) {
+            match fs::remove_dir_all(&fixture) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove {}: {error}", fixture.display()),
+            }
+            fs::create_dir_all(&fixture).expect("create the fixture directory");
+            for name in file_names(&dir) {
+                fs::copy(dir.join(&name), fixture.join(&name)).expect("copy a fixture");
+            }
+            return;
+        }
+        assert_eq!(
+            file_names(&fixture),
+            file_names(&dir),
+            "files of {}; {BLESS}=1 rewrites them",
+            fixture.display()
+        );
+        for name in file_names(&dir) {
+            let read = |dir: &Path| fs::read(dir.join(&name)).expect("read a dump file");
+            let (fixed, written) = (read(&fixture), read(&dir));
+            match name.as_str() {
+                DUMP_MANIFEST => assert_eq!(
+                    unversioned(&fixed),
+                    unversioned(&written),
+                    "{name}; {BLESS}=1 rewrites it"
+                ),
+                _ => assert_eq!(fixed, written, "{name}; {BLESS}=1 rewrites it"),
+            }
+        }
+    }
+
+    /// The DUMP_MANIFEST `json` without the version of the uefisettings that wrote it.
+    fn unversioned(json: &[u8]) -> serde_json::Value {
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(json).expect("parse the manifest");
+        let version = manifest
+            .as_object_mut()
+            .and_then(|fields| fields.remove("uefisettings"));
+        assert!(
+            version.is_some(),
+            "a manifest without a version: {manifest}"
+        );
+        manifest
     }
 }
