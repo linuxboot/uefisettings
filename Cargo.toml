@@ -46,11 +46,27 @@ libc = "0.2"
 [target.'cfg(target_os = "uefi")'.dependencies]
 uefi = { version = "0.41", features = ["alloc"] }
 
+# The Windows build reaches the firmware through Win32: Get/SetFirmwareEnvironmentVariableExW
+# for variables, and the HiiDB driver (src/lib/hii/hiidb_driver.rs) for the HiiDB.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
 [dev-dependencies]
 # fs: tests make FIFOs, also on macOS, whose build has no nix otherwise; inotify: a test sees
 # which files open_efivar opens
 nix = { version = "0.27", features = ["fs", "inotify"] }
 tempfile = "3.5"
+# The Win32 error codes and IOCTL constants of the Windows backends, whose logic the tests of
+# every host run
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Ioctl"] }
 
 # thrift/ is a package of its own; its generated crates build as dependencies that clippy
 # does not lint, and the Makefile's RUSTFLAGS fails the checks on their compiler warnings.

@@ -11,8 +11,12 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::fmt::Debug;
+#[cfg(all(system_hiidb, hiidb_files))]
+use std::fs;
 use std::io;
 use std::io::Write;
+#[cfg(all(system_hiidb, hiidb_files))]
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -45,6 +49,7 @@ use platform::SetupPasswordArgs;
 #[cfg_attr(target_os = "linux", path = "platform/linux.rs")]
 #[cfg_attr(target_os = "macos", path = "platform/macos.rs")]
 #[cfg_attr(target_os = "uefi", path = "platform/uefi.rs")]
+#[cfg_attr(target_os = "windows", path = "platform/windows.rs")]
 mod platform;
 
 // Every command lists its options and subcommands alphabetically, as under clap 3:
@@ -268,6 +273,23 @@ fn hii_set(
     Ok(())
 }
 
+/// Writes the HiiDB that `extract` reads to `path`, which it creates only after the read
+/// succeeded, so a failed read leaves no file and an existing one unchanged; a failed write can
+/// still leave it truncated, as it writes through a symlink or to /dev/stdout instead of
+/// renaming a temporary file.
+#[cfg(all(system_hiidb, hiidb_files))]
+fn write_extracted_db(path: &Path, extract: impl FnOnce() -> Result<Vec<u8>>) -> Result<()> {
+    let db = extract()?;
+    fs::write(path, &db)?;
+    Ok(())
+}
+
+/// What extract-db prints on stdout about the HiiDB written to `path`.
+#[cfg(all(system_hiidb, hiidb_files))]
+fn extract_db_report(path: &Path) -> serde_json::Value {
+    serde_json::json!({ "info": format!("HiiDB written to {}", path.display()) })
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum IncludeState {
     GrayedOut,
@@ -464,6 +486,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(efivar_dumps)]
     pub(super) const READING_COMMANDS: [&[&str]; 3] =
         [&["get", "Question"], &["show-ifr"], &["list-questions"]];
 
@@ -479,10 +502,16 @@ mod tests {
         }
     }
 
-    /// The selection flags of `uefisettings hii list-questions --efivars dir` with `args` after
-    /// it.
+    /// The flags with which hii get, list-questions and show-ifr read offline on every build that
+    /// runs the tests: the HiiDB file of -f and no EFI variables, as Windows takes no --efivars
+    /// and macOS takes --no-efivars only with -f. Only the tests of the efivar flags themselves
+    /// pass others, on the builds that take them.
+    const OFFLINE_SOURCE: [&str; 3] = ["-f", "hiidb.bin", "--no-efivars"];
+
+    /// The selection flags of `uefisettings hii list-questions` with OFFLINE_SOURCE and `args`
+    /// after it.
     pub(super) fn selection_of(args: &[&str]) -> SelectionArgs {
-        let command = [&["list-questions", "--efivars", "dir"][..], args].concat();
+        let command = [&["list-questions"][..], &OFFLINE_SOURCE, args].concat();
         let parsed = hii(&command).unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
         let HiiSubcommands::ListQuestions { selection, .. } = parsed else {
             panic!("{command:?} is no list-questions: {parsed:?}");
@@ -569,8 +598,13 @@ mod tests {
             );
         }
 
-        let error = hii(&["list-questions", "--efivars", "dir", "--access-level", "0"])
-            .expect_err("parse --access-level 0");
+        let error = hii(&[
+            &["list-questions"][..],
+            &OFFLINE_SOURCE,
+            &["--access-level", "0"],
+        ]
+        .concat())
+        .expect_err("parse --access-level 0");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "0");
     }
 
@@ -578,11 +612,15 @@ mod tests {
     /// set, not on show-ifr, which evaluates no conditions, nor on ilo.
     #[test]
     fn access_level_is_taken_where_include_is() {
-        let commands: [(&[&str], bool); 3] = [
-            (&["hii", "get", "Q", "--efivars", "dir"], true),
-            (&["hii", "list-questions", "--efivars", "dir"], true),
-            (&["hii", "show-ifr", "--efivars", "dir"], false),
+        let reading: [(&[&str], bool); 3] = [
+            (&["hii", "get", "Q"], true),
+            (&["hii", "list-questions"], true),
+            (&["hii", "show-ifr"], false),
         ];
+        let reading = reading.map(|(command, takes)| ([command, &OFFLINE_SOURCE].concat(), takes));
+        let commands = reading
+            .iter()
+            .map(|(command, takes)| (&command[..], *takes));
         #[cfg(all(system_hiidb, system_variables))]
         let commands = commands.into_iter().chain([
             (&["hii", "set", "Q", "V"][..], true),
@@ -612,18 +650,13 @@ mod tests {
     /// not, as before.
     #[test]
     fn json_flag_may_repeat() {
-        let commands: [&[&str]; 3] = [
-            &[
-                "hii",
-                "list-questions",
-                "--efivars",
-                "dir",
-                "--json",
-                "--json",
-            ],
-            &["hii", "get", "Q", "--efivars", "dir", "-j", "--json"],
-            &["show-translations", "-j", "-j"],
+        let reading: [&[&str]; 2] = [
+            &["hii", "list-questions", "--json", "--json"],
+            &["hii", "get", "Q", "-j", "--json"],
         ];
+        let reading = reading.map(|command| [command, &OFFLINE_SOURCE].concat());
+        let commands = reading.iter().map(|command| &command[..]);
+        let commands = commands.chain([&["show-translations", "-j", "-j"][..]]);
         // the Linux build's own command
         #[cfg(target_os = "linux")]
         let commands = commands
@@ -728,7 +761,12 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked > 0, "no help names a flag");
+        // Windows: no help names a flag (EfivarArgs names only -f), so only the builds with efivar
+        // dumps, whose --efivars and --no-efivars helps name --filename, check something.
+        assert!(
+            checked > 0 || cfg!(not(efivar_dumps)),
+            "no help names a flag"
+        );
     }
 
     /// The hii subcommand that `args`, after `uefisettings hii`, parse to.
@@ -740,6 +778,7 @@ mod tests {
         })
     }
 
+    #[cfg(efivar_dumps)]
     #[test]
     fn bad_efivars_fail_before_the_hiidb_is_read() {
         let dir = tempfile::tempdir().expect("create directory");
@@ -811,5 +850,65 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(is_broken_pipe(&error.into()));
+    }
+}
+
+#[cfg(test)]
+#[cfg(all(system_hiidb, hiidb_files))]
+mod extract_db_tests {
+    use anyhow::anyhow;
+
+    use super::*;
+
+    /// A failed read creates no file and leaves an existing one unchanged; a read writes its
+    /// HiiDB.
+    #[test]
+    fn write_extracted_db_writes_only_a_read_hii_db() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let absent = dir.path().join("absent.bin");
+        let existing = dir.path().join("existing.bin");
+        fs::write(&existing, b"old").expect("write the existing file");
+
+        for path in [&absent, &existing] {
+            let error = write_extracted_db(path, || Err(anyhow!("no HII database")))
+                .expect_err("a failed read");
+            assert_eq!(
+                format!("{error:#}"),
+                "no HII database",
+                "{}",
+                path.display()
+            );
+        }
+        assert!(
+            !absent.try_exists().expect("look for the absent file"),
+            "a failed read created {}",
+            absent.display()
+        );
+        assert_eq!(
+            fs::read(&existing).expect("read the existing file"),
+            b"old",
+            "a failed read changed the existing file"
+        );
+
+        for path in [&absent, &existing] {
+            write_extracted_db(path, || Ok(b"db".to_vec())).expect("write a read HiiDB");
+            assert_eq!(
+                fs::read(path).expect("read the written file"),
+                b"db",
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn extract_db_report_is_json_of_the_path() {
+        let report = extract_db_report(Path::new("db \"q\" \\ x.bin")).to_string();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report).expect("parse the report"),
+            serde_json::json!({ "info": "HiiDB written to db \"q\" \\ x.bin" }),
+            "a path holding a quote and a backslash"
+        );
     }
 }

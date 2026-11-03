@@ -117,6 +117,19 @@ Exit statuses, setup passwords, `hii variable-info` and Secure Boot: see the
 
 ---
 
+## On Windows
+
+On Windows, when a driver implementing the IOCTL contract in
+[hiidb_driver.rs](src/lib/hii/hiidb_driver.rs) is installed, `uefisettings` reads
+the live HiiDB through that driver, and reads the EFI variables through the firmware
+environment calls, which enable the SeSystemEnvironmentPrivilege. The privilege must
+be assigned to the process token; running elevated alone does not guarantee it.
+Pass `--no-efivars` to read no variables. No driver is shipped with this repository,
+and none has been tested here. Without a driver, `-f` still reads a HiiDB file, and,
+when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
+
+---
+
 ## On macOS
 
 `cargo install uefisettings` builds on macOS too. That build reads nothing of the Mac's firmware
@@ -194,7 +207,7 @@ mv lib.rs thrift/rust/uefisettings_spellings_db_thrift/uefisettings_spellings_db
 
 ## Checks
 
-The `Makefile` in the root of the repository runs the checks that a change should pass: the lints (`make lint`: rustfmt, clippy for x86_64, aarch64, i686, UEFI and macOS, and the docs), the tests (`make test`, and `make test-i686` on 32-bit glibc) and the QEMU tests (`make test-e2e-qemu`).
+The `Makefile` in the root of the repository runs the checks that a change should pass: the lints (`make lint`: rustfmt, clippy for x86_64, aarch64, i686, UEFI, macOS and Windows, and the docs), the tests (`make test`, and `make test-i686` on 32-bit glibc) and the QEMU tests (`make test-e2e-qemu`).
 
 The checks need GNU make and bash, and rustup unless `make RUST_TOOLCHAIN=` runs them on the cargo of `PATH`.
 

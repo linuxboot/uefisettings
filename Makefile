@@ -60,12 +60,12 @@ export RUSTFLAGS := -D warnings
 unexport CARGO_ENCODED_RUSTFLAGS
 
 # The targets that the checks build for, comma-separated as rustup takes them.
-TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi,i686-unknown-linux-musl,i686-unknown-uefi,aarch64-unknown-linux-musl,aarch64-unknown-uefi,x86_64-apple-darwin,aarch64-apple-darwin
+TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi,i686-unknown-linux-musl,i686-unknown-uefi,aarch64-unknown-linux-musl,aarch64-unknown-uefi,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
 comma := ,
 
 # CI runs lint test test-i686 and test-e2e-qemu, and test on macOS: a new check
 # joins LINTS or QEMU_TESTS or CI runs it too.
-LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi clippy-macos doc
+LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi clippy-macos clippy-windows doc
 QEMU_LINUX_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
 QEMU_SHELL_TESTS := test-e2e-qemu-shell-x86_64 test-e2e-qemu-shell-i686 test-e2e-qemu-shell-aarch64
 QEMU_TESTS := $(QEMU_LINUX_TESTS) $(QEMU_SHELL_TESTS)
@@ -125,6 +125,13 @@ clippy-uefi: toolchain
 clippy-macos: toolchain
 	cargo clippy --locked --all-targets --target x86_64-apple-darwin --target aarch64-apple-darwin \
 		-- -D warnings
+
+# The library and uefisettings.exe for Windows, through the HiiDB driver and the firmware
+# environment calls. Clippy checks without linking, so no Windows linker is needed, and
+# -p uefisettings keeps the QEMU guest crate out.
+clippy-windows: toolchain
+	cargo clippy --locked -p uefisettings --lib --bins --all-targets --target x86_64-pc-windows-msvc \
+		--target aarch64-pc-windows-msvc -- -D warnings
 
 test: toolchain
 	scripts/assert-tests-ran.sh cargo test --locked

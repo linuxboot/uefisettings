@@ -20,10 +20,16 @@ mod efivarfs;
 mod efivarfs_format;
 #[cfg(target_os = "linux")]
 pub mod extract;
+// The Windows backends, firmware_environment and hiidb_driver, and their Win32 conventions,
+// win32: the tests of every host build their logic.
+#[cfg(any(target_os = "windows", test))]
+mod firmware_environment;
 // The firmware memory maps of the efivar source.
 #[cfg(target_os = "linux")]
 mod firmware_memory;
 pub mod forms;
+#[cfg(any(target_os = "windows", test))]
+mod hiidb_driver;
 #[cfg(target_os = "linux")]
 mod lockdown;
 #[cfg(target_os = "linux")]
@@ -33,6 +39,8 @@ mod strings;
 #[cfg(target_os = "uefi")]
 mod variable_services;
 mod variables;
+#[cfg(any(target_os = "windows", test))]
+mod win32;
 // UEFI HII Library
 
 // Implements (partial) decoding of the Form and Strings packages.
@@ -51,6 +59,8 @@ pub use efivar_dump::EfivarRedaction;
 pub(crate) use efivar_dump::SavedDump;
 #[cfg(target_os = "linux")]
 pub(crate) use efivarfs::EfivarFiles;
+#[cfg(target_os = "windows")]
+pub(crate) use firmware_environment::FirmwareEnvironment;
 /// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
 #[cfg(firmware_memory_maps)]
 pub use firmware_memory::efi_memory_map::MemoryType;
@@ -59,6 +69,8 @@ pub use firmware_memory::efi_memory_map::MemoryType;
 pub use firmware_memory::efi_memory_map::RangeRefusal;
 #[cfg(target_os = "linux")]
 pub use firmware_memory::MemoryMapUnavailable;
+#[cfg(target_os = "windows")]
+pub(crate) use hiidb_driver::read_hiidb;
 #[cfg(target_os = "linux")]
 pub use lockdown::LockdownMode;
 #[cfg(target_os = "linux")]

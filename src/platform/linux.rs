@@ -10,11 +10,10 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The part of the CLI that only the Linux build has: the commands ilo, identify, hii
-//! extract-db and hii dump-efivars, the flag --efivars, an optional -f/--filename, and the
-//! machine's backend for get and set.
+//! The part of the CLI that only the Linux build has: the commands ilo, identify and hii
+//! dump-efivars, the flag --efivars, and the machine's identified backend for get and set; it
+//! shares hii extract-db and an optional -f/--filename with the Windows build.
 
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -36,10 +35,12 @@ use uefisettings::exports::SetupPasswordPolicy;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 
+use crate::extract_db_report;
 use crate::hii_get;
 use crate::hii_set;
 use crate::print_line;
 use crate::print_with_style;
+use crate::write_extracted_db;
 use crate::JsonArgs;
 use crate::SelectionArgs;
 
@@ -329,21 +330,6 @@ fn prioritize_backend(machine: &MachineInfo, json: bool) -> Result<Backend> {
     }
 }
 
-/// Writes the HiiDB that `extract` reads to `path`, which it creates only after the read
-/// succeeded, so a failed read leaves no file and an existing one unchanged; a failed write can
-/// still leave it truncated, as it writes through a symlink or to /dev/stdout instead of
-/// renaming a temporary file.
-fn write_extracted_db(path: &Path, extract: impl FnOnce() -> Result<Vec<u8>>) -> Result<()> {
-    let db = extract()?;
-    fs::write(path, &db)?;
-    Ok(())
-}
-
-/// What extract-db prints on stdout about the HiiDB written to `path`.
-fn extract_db_report(path: &Path) -> serde_json::Value {
-    serde_json::json!({ "info": format!("HiiDB written to {}", path.display()) })
-}
-
 /// What dump-efivars prints on stdout about `dump` into `dir`.
 fn dump_report(dir: &Path, redaction: EfivarRedaction, dump: EfivarDump) -> serde_json::Value {
     serde_json::json!({
@@ -551,58 +537,6 @@ mod tests {
                 "{command:?}"
             );
         }
-    }
-
-    /// A failed read creates no file and leaves an existing one unchanged; a read writes its
-    /// HiiDB.
-    #[test]
-    fn write_extracted_db_writes_only_a_read_hii_db() {
-        let dir = tempfile::tempdir().expect("create a directory");
-        let absent = dir.path().join("absent.bin");
-        let existing = dir.path().join("existing.bin");
-        fs::write(&existing, b"old").expect("write the existing file");
-
-        for path in [&absent, &existing] {
-            let error = write_extracted_db(path, || Err(anyhow!("no HII database")))
-                .expect_err("a failed read");
-            assert_eq!(
-                format!("{error:#}"),
-                "no HII database",
-                "{}",
-                path.display()
-            );
-        }
-        assert!(
-            !absent.try_exists().expect("look for the absent file"),
-            "a failed read created {}",
-            absent.display()
-        );
-        assert_eq!(
-            fs::read(&existing).expect("read the existing file"),
-            b"old",
-            "a failed read changed the existing file"
-        );
-
-        for path in [&absent, &existing] {
-            write_extracted_db(path, || Ok(b"db".to_vec())).expect("write a read HiiDB");
-            assert_eq!(
-                fs::read(path).expect("read the written file"),
-                b"db",
-                "{}",
-                path.display()
-            );
-        }
-    }
-
-    #[test]
-    fn extract_db_report_is_json_of_the_path() {
-        let report = extract_db_report(Path::new("db \"q\" \\ x.bin")).to_string();
-
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&report).expect("parse the report"),
-            serde_json::json!({ "info": "HiiDB written to db \"q\" \\ x.bin" }),
-            "a path holding a quote and a backslash"
-        );
     }
 
     #[test]

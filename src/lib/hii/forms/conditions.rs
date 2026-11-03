@@ -1355,6 +1355,7 @@ impl Arithmetic {
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;

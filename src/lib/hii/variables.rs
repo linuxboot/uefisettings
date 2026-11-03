@@ -11,7 +11,9 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The firmware variables that questions read and set, whatever holds them: efivarfs on Linux
-//! (efivarfs.rs), GetVariable() and SetVariable() in the UEFI Shell (variable_services.rs).
+//! (efivarfs.rs), GetVariable() and SetVariable() in the UEFI Shell (variable_services.rs),
+//! and GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW on Windows
+//! (firmware_environment.rs).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -65,8 +67,8 @@ impl fmt::Display for VariableKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VariableReach {
     #[cfg_attr(
-        target_os = "uefi",
-        allow(dead_code, reason = "no UEFI Shell variables reach Runtime")
+        any(target_os = "uefi", target_os = "windows"),
+        allow(dead_code, reason = "no UEFI Shell or Windows variables reach Runtime")
     )]
     Runtime,
     #[cfg_attr(
@@ -74,6 +76,14 @@ pub(crate) enum VariableReach {
         allow(dead_code, reason = "only UEFI Shell variables reach BootServices")
     )]
     BootServices,
+    /// GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW on Windows:
+    /// after ExitBootServices they reach only EFI_VARIABLE_RUNTIME_ACCESS variables, as
+    /// Runtime does, but their errors name the Win32 calls, not efivarfs.
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(dead_code, reason = "no variables on this build reach Windows")
+    )]
+    Windows,
 }
 
 /// The texts of errors about variables of each reach: Runtime as through Linux's efivarfs,
@@ -85,6 +95,7 @@ impl VariableReach {
         match self {
             Self::Runtime => "efivarfs payload",
             Self::BootServices => "GetVariable() data",
+            Self::Windows => "GetFirmwareEnvironmentVariableExW payload",
         }
     }
 
@@ -94,6 +105,9 @@ impl VariableReach {
         match self {
             Self::Runtime => "efivarfs file is missing its attributes header",
             Self::BootServices => "variable bytes are missing their attributes word",
+            Self::Windows => {
+                "GetFirmwareEnvironmentVariableExW data is missing its attributes word"
+            }
         }
     }
 
@@ -102,6 +116,7 @@ impl VariableReach {
         match self {
             Self::Runtime => "efivarfs write",
             Self::BootServices => "SetVariable() write",
+            Self::Windows => "SetFirmwareEnvironmentVariableExW write",
         }
     }
 
@@ -110,6 +125,7 @@ impl VariableReach {
         match self {
             Self::Runtime => " and cannot be written through efivarfs",
             Self::BootServices => ", so a write would not outlast a power cycle",
+            Self::Windows => ", so a write would not outlast a power cycle",
         }
     }
 
@@ -125,12 +141,19 @@ impl VariableReach {
             Self::BootServices => {
                 "the firmware has not created it, and set never creates variables"
             }
+            Self::Windows => {
+                "the firmware has not created it or does not expose it to the OS, so its \
+                 questions cannot be set from Windows; change them in the firmware setup, or ask \
+                 the board vendor for firmware that exposes it; see \
+                 https://github.com/linuxboot/uefisettings/issues/2"
+            }
         }
     }
 }
 
 /// The firmware variables that questions read and set: efivarfs on Linux, GetVariable/SetVariable
-/// in the UEFI Shell.
+/// in the UEFI Shell, and GetFirmwareEnvironmentVariableExW/SetFirmwareEnvironmentVariableExW
+/// on Windows, the third implementation, in firmware_environment.rs.
 /// A variable that does not exist is VariableNotFound, which get shows as missing and set
 /// explains.
 pub(crate) trait FirmwareVariables {
@@ -349,11 +372,15 @@ pub(super) struct VariableNotFound(pub(super) VariableKey);
 /// Where question values are read: the variables of this machine, a directory of efivar files,
 /// or none.
 // Each backend makes the variables of a source in EfivarSource::into_variables: efivarfs.rs,
-// variable_services.rs; a build without variables of its own makes them below.
+// variable_services.rs, firmware_environment.rs; a build without variables of its own makes them
+// below.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum EfivarSource {
-    /// This machine's variables: its efivarfs on Linux, GetVariable() in the UEFI Shell.
+    /// This machine's variables: its efivarfs on Linux, GetVariable() in the UEFI Shell,
+    /// GetFirmwareEnvironmentVariableExW on Windows, where opening them enables the
+    /// SeSystemEnvironmentPrivilege, so that a process that is not elevated fails there before
+    /// any read, even for a HiiDB whose questions read no variable.
     #[cfg(system_variables)]
     #[default]
     System,
@@ -570,6 +597,7 @@ pub(super) struct WithheldVariable(pub(super) VariableKey);
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::RefCell;
+    #[cfg(efivar_dumps)]
     use std::fs;
     use std::rc::Rc;
 
@@ -640,6 +668,7 @@ pub(crate) mod tests {
         }
 
         /// Fails the writes of the variable `key` with `error`.
+        #[cfg(efivar_dumps)]
         pub(crate) fn fail_writes(&mut self, key: VariableKey, error: WriteError) {
             self.failures.insert(key, error);
         }
@@ -753,7 +782,8 @@ pub(crate) mod tests {
     }
 
     /// The errors of a write word it as variables of their reach hold it: Runtime as efivarfs,
-    /// BootServices as GetVariable() and SetVariable(), never efivarfs.
+    /// BootServices as GetVariable() and SetVariable(), Windows as the firmware environment
+    /// calls, never efivarfs.
     #[test]
     fn write_errors_follow_their_reach() {
         let volatile = |reach| {
@@ -791,6 +821,16 @@ pub(crate) mod tests {
                 "variable bytes are missing their attributes word",
                 "SetVariable() write",
             ),
+            (
+                VariableReach::Windows,
+                "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
+                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
+                "GetFirmwareEnvironmentVariableExW payload is shorter than the declared \
+                 varstore: 2 < 4 bytes",
+                "write past the GetFirmwareEnvironmentVariableExW payload",
+                "GetFirmwareEnvironmentVariableExW data is missing its attributes word",
+                "SetFirmwareEnvironmentVariableExW write",
+            ),
         ];
         for (reach, want_volatile, want_short, want_past, want_headless, want_write) in cases {
             assert_eq!(
@@ -814,7 +854,8 @@ pub(crate) mod tests {
     }
 
     /// set's refusal of a variable that does not exist follows its reach: Runtime as on Linux,
-    /// BootServices, which reach every variable that the firmware has created.
+    /// Windows as on Windows, BootServices, which reach every variable that the firmware
+    /// has created.
     #[test]
     fn not_found_refusal_follows_its_reach() {
         assert_eq!(
@@ -828,6 +869,14 @@ pub(crate) mod tests {
             VariableReach::BootServices.not_found_refusal(),
             "the firmware has not created it, and set never creates variables",
             "BootServices"
+        );
+        assert_eq!(
+            VariableReach::Windows.not_found_refusal(),
+            "the firmware has not created it or does not expose it to the OS, so its \
+             questions cannot be set from Windows; change them in the firmware setup, or ask \
+             the board vendor for firmware that exposes it; see \
+             https://github.com/linuxboot/uefisettings/issues/2",
+            "Windows"
         );
     }
 
@@ -968,6 +1017,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(efivar_dumps)]
     #[test]
     fn directory_source_must_be_a_directory() {
         let dir = tempfile::tempdir().expect("create directory");

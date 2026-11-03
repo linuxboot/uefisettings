@@ -860,21 +860,24 @@ trait VariableStore {
         }
     }
 
-    /// Refuses, for variables of `reach` Runtime, an EFI variable without
-    /// EFI_VARIABLE_RUNTIME_ACCESS, which efivarfs neither lists nor writes (UEFI 2.10 §8.2.2,
-    /// §8.2.3).
+    /// Refuses, for variables of `reach` Runtime or Windows, an EFI variable without
+    /// EFI_VARIABLE_RUNTIME_ACCESS, which neither efivarfs nor
+    /// GetFirmwareEnvironmentVariableExW lists or writes (UEFI 2.10 §8.2.2, §8.2.3).
     fn check_runtime_access(
         &self,
         reach: VariableReach,
     ) -> std::result::Result<(), BootServiceOnlyVariable> {
         match reach {
-            VariableReach::Runtime
+            VariableReach::Runtime | VariableReach::Windows
                 if self.kind() == VariableStoreKind::EfiVariable
                     && !self.is_runtime_accessible() =>
             {
-                Err(BootServiceOnlyVariable(self.variable_key()))
+                Err(BootServiceOnlyVariable {
+                    key: self.variable_key(),
+                    reach,
+                })
             }
-            VariableReach::Runtime | VariableReach::BootServices => Ok(()),
+            VariableReach::Runtime | VariableReach::BootServices | VariableReach::Windows => Ok(()),
         }
     }
 }
@@ -901,13 +904,33 @@ impl VariableNotExported {
 }
 
 /// An EFI variable without EFI_VARIABLE_RUNTIME_ACCESS, which set refuses and get shows as
-/// unavailable.
-#[derive(Error, Debug)]
-#[error(
-    "EFI variable {0} is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs \
-     neither lists nor writes"
-)]
-struct BootServiceOnlyVariable(VariableKey);
+/// unavailable. The refusal names the variables of `reach`: efivarfs on Linux, the firmware
+/// environment calls on Windows.
+#[derive(Debug)]
+struct BootServiceOnlyVariable {
+    key: VariableKey,
+    reach: VariableReach,
+}
+
+impl fmt::Display for BootServiceOnlyVariable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let refusal = match self.reach {
+            VariableReach::Runtime => "which efivarfs neither lists nor writes",
+            VariableReach::Windows => {
+                "which GetFirmwareEnvironmentVariableExW neither lists nor writes"
+            }
+            // check_runtime_access never refuses for BootServices variables
+            VariableReach::BootServices => "which the firmware setup neither lists nor writes",
+        };
+        write!(
+            f,
+            "EFI variable {} is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), {refusal}",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for BootServiceOnlyVariable {}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum VariableStoreKind {
@@ -929,6 +952,7 @@ impl VarStoreVariable {
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod non_efi_varstore_tests {
     use std::path::Path;
 
@@ -1080,6 +1104,9 @@ mod non_efi_varstore_tests {
         let refusal = "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is \
                        boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs \
                        neither lists nor writes";
+        let windows_refusal = "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 \
+                               is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which \
+                               GetFirmwareEnvironmentVariableExW neither lists nor writes";
         let cases = [
             (
                 VariableReach::BootServices,
@@ -1092,6 +1119,13 @@ mod non_efi_varstore_tests {
                 VariableReach::Runtime,
                 Err(format!("<ValueUnavailable: {refusal}>")),
                 Err(refusal.to_string()),
+                vec![],
+                vec![],
+            ),
+            (
+                VariableReach::Windows,
+                Err(format!("<ValueUnavailable: {windows_refusal}>")),
+                Err(windows_refusal.to_string()),
                 vec![],
                 vec![],
             ),
@@ -1278,10 +1312,22 @@ mod non_efi_varstore_tests {
                 "<ValueUnavailable: varstore not found because we reached root>",
             ),
             (
-                ValueUnavailable::BootServiceOnly(BootServiceOnlyVariable(name.clone())),
+                ValueUnavailable::BootServiceOnly(BootServiceOnlyVariable {
+                    key: name.clone(),
+                    reach: VariableReach::Runtime,
+                }),
                 "<ValueUnavailable: EFI variable Setup-00000000-0000-0000-0000-000000000000 is \
                  boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither \
                  lists nor writes>",
+            ),
+            (
+                ValueUnavailable::BootServiceOnly(BootServiceOnlyVariable {
+                    key: name.clone(),
+                    reach: VariableReach::Windows,
+                }),
+                "<ValueUnavailable: EFI variable Setup-00000000-0000-0000-0000-000000000000 is \
+                 boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which \
+                 GetFirmwareEnvironmentVariableExW neither lists nor writes>",
             ),
             (
                 ValueUnavailable::NotRead(EfivarsNotRead),
@@ -1703,6 +1749,7 @@ fn stored_value(bytes: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod efivar_reader_tests {
     use std::collections::BTreeMap;
 
@@ -3093,6 +3140,7 @@ pub(crate) fn choice_for_set(
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod choice_for_set_tests {
     use super::ifr_fixtures::*;
     use super::*;
@@ -3781,6 +3829,7 @@ fn handle_numeric(
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod question_value_tests {
     use std::io::SeekFrom;
 
@@ -5165,6 +5214,7 @@ impl NotSetEverywhere {
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod set_questions_tests {
     use super::ifr_fixtures::*;
     use super::*;
@@ -5530,6 +5580,7 @@ fn find_corresponding_varstore(
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod tests {
     use super::ifr_fixtures::*;
     use super::*;
@@ -6103,6 +6154,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg(efivar_dumps)]
 mod write_validation_tests {
     use super::ifr_fixtures::*;
     use super::*;

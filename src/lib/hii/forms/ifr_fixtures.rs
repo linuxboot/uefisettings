@@ -12,23 +12,42 @@
 
 //! IFR byte builders and question answers shared by the tests of forms.rs and its modules.
 
+// The form tests that use most of these helpers are gated to efivar_dumps, as they read
+// efivar directories, so on other targets the helpers they alone use are dead.
+#![cfg_attr(
+    not(efivar_dumps),
+    allow(
+        dead_code,
+        reason = "the form tests using these helpers are gated to efivar_dumps"
+    )
+)]
+
+#[cfg(efivar_dumps)]
 use std::fs;
+#[cfg(efivar_dumps)]
 use std::path::Path;
 
+#[cfg(efivar_dumps)]
 use tempfile::TempDir;
 
 use super::conditions::QuestionValue;
 use super::conditions::QuestionValues;
+#[cfg(efivar_dumps)]
 use super::conditions::VarStoreValues;
 use super::*;
+#[cfg(efivar_dumps)]
 use crate::hii::efivarfs_format::EfivarFileName;
+#[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::variable_key;
 pub(crate) use crate::hii::variables::tests::MemoryVariables;
+#[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::WriteError;
+#[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::BS_RT;
 pub(crate) use crate::hii::variables::tests::NIL_GUID;
 pub(super) use crate::hii::variables::tests::NV_BS;
 pub(crate) use crate::hii::variables::tests::NV_BS_RT;
+#[cfg(efivar_dumps)]
 use crate::hii::variables::EfivarSource;
 pub(crate) use crate::hii::variables::VariableKey;
 pub(crate) use crate::hii::variables::VariableReach;
@@ -116,8 +135,10 @@ impl VariableStore for DeclaredVarStore {
 }
 
 /// A directory of efivar files, as efivarfs is.
+#[cfg(efivar_dumps)]
 pub(super) struct Efivars(TempDir);
 
+#[cfg(efivar_dumps)]
 impl Efivars {
     pub(super) fn new() -> Self {
         Self(tempfile::tempdir().expect("create efivars directory"))
@@ -157,11 +178,13 @@ impl Efivars {
 }
 
 /// A fresh EfivarReader of EfivarSource::Disabled.
+#[cfg(efivar_dumps)]
 pub(super) fn disabled_reader() -> EfivarReader {
     EfivarReader::new(EfivarSource::Disabled).expect("create a reader without efivars")
 }
 
 /// A question's VarStore, and the efivars that hold its value.
+#[cfg(efivar_dumps)]
 pub(super) struct VarStoreFixture {
     pub(super) store: Result<Box<dyn VariableStore>>,
     pub(super) efivars: Efivars,
@@ -197,12 +220,14 @@ pub(super) fn buffer(name: &'static str, size: usize) -> DeclaredVarStore {
 }
 
 /// An EFI variable VarStore whose efivar file holds `payload`.
+#[cfg(efivar_dumps)]
 pub(super) fn var_store_of(payload: &[u8]) -> VarStoreFixture {
     writable_var_store("VarStore", payload, &MemoryVariables::default())
 }
 
 /// var_store_of `payload` on the EFI variable `name`, which `variables` holds too, for set to
 /// write there.
+#[cfg(efivar_dumps)]
 pub(super) fn writable_var_store(
     name: &'static str,
     payload: &[u8],
@@ -220,6 +245,7 @@ pub(super) fn writable_var_store(
 
 /// A VarStore on the EFI variable `name`, whose efivar file holds 0, and whose writes to
 /// `variables` fail with `write_error`.
+#[cfg(efivar_dumps)]
 pub(super) fn failing_var_store(
     name: &'static str,
     write_error: WriteError,
@@ -250,6 +276,7 @@ pub(super) fn change_option(
     Ok(())
 }
 
+#[cfg(efivar_dumps)]
 pub(super) fn unavailable() -> VarStoreFixture {
     VarStoreFixture {
         store: Err(anyhow!("no VarStore 1")),
@@ -616,6 +643,7 @@ pub(super) fn one_of_data() -> Vec<u8> {
 }
 
 /// The QuestionDescriptor that list-questions, get and set use for `node`.
+#[cfg(efivar_dumps)]
 pub(super) fn question_descriptor(
     node: &Rc<RefCell<IFROperation>>,
     var_store: VarStoreFixture,
@@ -624,6 +652,7 @@ pub(super) fn question_descriptor(
 }
 
 /// Returns the root of the tree of `node`.
+#[cfg(efivar_dumps)]
 fn root_of(node: &Rc<RefCell<IFROperation>>) -> Rc<RefCell<IFROperation>> {
     let parent = node.borrow().parent.as_ref().and_then(Weak::upgrade);
     match parent {
@@ -633,6 +662,7 @@ fn root_of(node: &Rc<RefCell<IFROperation>>) -> Rc<RefCell<IFROperation>> {
 }
 
 /// The QuestionDescriptor of `node`, with the values that conditions refer to from `values`.
+#[cfg(efivar_dumps)]
 pub(super) fn question_descriptor_with(
     node: &Rc<RefCell<IFROperation>>,
     VarStoreFixture { store, efivars }: VarStoreFixture,
@@ -651,6 +681,7 @@ pub(super) fn question_descriptor_with(
 }
 
 /// The answer list-questions and get show for the question.
+#[cfg(efivar_dumps)]
 pub(super) fn answer(
     declarations: &[Vec<u8>],
     op_code: u8,
@@ -663,6 +694,7 @@ pub(super) fn answer(
 }
 
 /// The answer of the UINT8 ONE_OF of `one_of_data()` without a VarStore.
+#[cfg(efivar_dumps)]
 pub(super) fn one_of_default(declarations: &[Vec<u8>], children: &[Vec<u8>]) -> String {
     answer(
         declarations,
@@ -674,6 +706,7 @@ pub(super) fn one_of_default(declarations: &[Vec<u8>], children: &[Vec<u8>]) -> 
 }
 
 /// The answer of a question in the scope of an EFI_IFR_GUID of `guid`.
+#[cfg(efivar_dumps)]
 pub(super) fn answer_in_guid(
     guid: [u8; 16],
     op_code: u8,

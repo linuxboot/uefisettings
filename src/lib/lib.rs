@@ -13,8 +13,13 @@
 // Only the binary prints; the library logs.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "uefi")))]
-compile_error!("uefisettings builds for Linux, macOS and the UEFI Shell only");
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "uefi",
+    target_os = "windows"
+)))]
+compile_error!("uefisettings builds for Linux, macOS, the UEFI Shell and Windows only");
 
 #[cfg(target_os = "linux")]
 mod chattr;

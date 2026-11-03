@@ -10,8 +10,8 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! HiiDB files, which the Linux and macOS builds read: -f, and on Linux the HiiDB of an efivars
-//! dump.
+//! HiiDB files, which the Linux, macOS and Windows builds read with -f, and the HiiDB of an
+//! efivars dump, which the Linux and macOS builds read.
 
 use std::fs::File;
 use std::io::Read;
@@ -22,7 +22,8 @@ use anyhow::Result;
 use log::info;
 use thiserror::Error;
 
-/// The largest HiiDB file that read_db_bytes reads.
+/// The largest HiiDB file that read_db_bytes reads; the HiiDB efivar's length and
+/// `hiidb_driver.rs`'s cap on a read through the driver are bounded by it too.
 pub(crate) const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
 /// The HiiDB in the file at `path`.
@@ -65,13 +66,17 @@ pub(in crate::hii) struct DbFileTooBig;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::fs::File;
 
+    #[cfg(unix)]
     use super::*;
 
     /// A file of more than MAX_ALLOWED_FILESIZE bytes whose metadata says less, as a FIFO's does,
     /// is read one byte past the maximum and refused.
+    #[cfg(unix)]
     #[test]
     fn read_db_bytes_reads_no_more_than_its_maximum() {
         let dir = tempfile::tempdir().expect("create a directory");

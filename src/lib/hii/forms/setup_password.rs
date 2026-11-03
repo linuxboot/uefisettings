@@ -76,13 +76,13 @@ impl PasswordQuestions {
 
     /// The variables that questions read and set through variables of `reach` withhold:
     /// BootServices, as in the UEFI Shell, those of the VarStores that PASSWORD questions name, so
-    /// that no password bytes are read, written back or shown; Runtime none, as before.
-    /// Through variables that reach BootServices, a PASSWORD op whose VarStore is unknown could
-    /// name any variable, so this fails closed: UnresolvedPasswords, whatever the setup password
-    /// policy, and no variable of the HiiDB is read or written.
+    /// that no password bytes are read, written back or shown; Runtime and Windows none, as
+    /// before. Through variables that reach BootServices, a PASSWORD op whose VarStore is unknown
+    /// could name any variable, so this fails closed: UnresolvedPasswords, whatever the setup
+    /// password policy, and no variable of the HiiDB is read or written.
     fn withheld(&self, reach: VariableReach) -> Result<BTreeSet<VariableKey>, UnresolvedPasswords> {
         match (reach, self.unresolved.as_slice()) {
-            (VariableReach::Runtime, _) => Ok(BTreeSet::new()),
+            (VariableReach::Runtime | VariableReach::Windows, _) => Ok(BTreeSet::new()),
             (VariableReach::BootServices, []) => Ok(self.var_stores.clone()),
             (VariableReach::BootServices, unresolved) => {
                 Err(UnresolvedPasswords(unresolved.to_vec()))
@@ -101,7 +101,8 @@ impl PasswordQuestions {
 
     /// Refuses set through variables that reach BootServices, as in the UEFI Shell, in a HiiDB
     /// that declares a PASSWORD question, unless `policy` bypasses: no setup browser runs there,
-    /// so none asks for the password. Set through variables that reach Runtime writes as before.
+    /// so none asks for the password. Set through variables that reach Runtime or Windows writes
+    /// as before.
     pub(crate) fn check_set(
         &self,
         reach: VariableReach,
@@ -113,7 +114,7 @@ impl PasswordQuestions {
             }
             (VariableReach::BootServices, true, SetupPasswordPolicy::Bypass)
             | (VariableReach::BootServices, false, _)
-            | (VariableReach::Runtime, _, _) => Ok(()),
+            | (VariableReach::Runtime | VariableReach::Windows, _, _) => Ok(()),
         }
     }
 }
@@ -356,7 +357,7 @@ mod tests {
     }
 
     /// Variables that reach BootServices withhold those of password VarStores; variables that
-    /// reach Runtime read them, as before.
+    /// reach Runtime or Windows read them, as before.
     #[test]
     fn boot_services_withhold_password_var_stores() {
         let passwords = password_questions(&[password_on(2, 3, 2, 0)]);
@@ -375,11 +376,18 @@ mod tests {
             Ok(BTreeSet::new()),
             "Runtime"
         );
+        assert_eq!(
+            passwords
+                .withheld(VariableReach::Windows)
+                .map_err(|error| error.to_string()),
+            Ok(BTreeSet::new()),
+            "Windows"
+        );
     }
 
     /// Through variables that reach BootServices, a PASSWORD op whose VarStore is unknown makes
-    /// every variable withheld: withheld fails. Through those that reach Runtime nothing is
-    /// withheld, as before.
+    /// every variable withheld: withheld fails. Through those that reach Runtime or Windows
+    /// nothing is withheld, as before.
     #[test]
     fn boot_services_fail_closed_on_an_unresolved_password() {
         let passwords = password_questions(&[password_on(2, 3, 9, 0), password_on(3, 3, 2, 0)]);
@@ -404,11 +412,18 @@ mod tests {
             Ok(BTreeSet::new()),
             "Runtime"
         );
+        assert_eq!(
+            passwords
+                .withheld(VariableReach::Windows)
+                .map_err(|error| error.to_string()),
+            Ok(BTreeSet::new()),
+            "Windows"
+        );
     }
 
     /// set through variables that reach BootServices refuses a HiiDB that declares a password
-    /// question unless the caller bypasses; set through variables that reach Runtime, and set in
-    /// a HiiDB without one, write.
+    /// question unless the caller bypasses; set through variables that reach Runtime or
+    /// Windows, and set in a HiiDB without one, write.
     #[test]
     fn boot_services_refuse_set_with_a_declared_password() {
         let declared = password_questions(&[password_on(2, 3, 0, 0)]);
@@ -432,6 +447,12 @@ mod tests {
             (
                 &declared,
                 VariableReach::Runtime,
+                SetupPasswordPolicy::Refuse,
+                Ok(()),
+            ),
+            (
+                &declared,
+                VariableReach::Windows,
                 SetupPasswordPolicy::Refuse,
                 Ok(()),
             ),

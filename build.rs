@@ -31,20 +31,20 @@ const CAPABILITIES: [Capability; 5] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
-        target_oses: &["linux", "uefi"],
+        target_oses: &["linux", "uefi", "windows"],
         target_arches: None,
     },
     // HiiBackend::system_variables and EfivarSource::System: this machine's EFI variables, the
     // only ones that set writes
     Capability {
         cfg: "system_variables",
-        target_oses: &["linux", "uefi"],
+        target_oses: &["linux", "uefi", "windows"],
         target_arches: None,
     },
     // db_file: HiiDB files, which -f names
     Capability {
         cfg: "hiidb_files",
-        target_oses: &["linux", "macos"],
+        target_oses: &["linux", "macos", "windows"],
         target_arches: None,
     },
     // efivarfs_format, efivar_dump and EfivarSource::Directory: directories of efivar files, such

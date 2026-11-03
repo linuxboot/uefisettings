@@ -35,8 +35,8 @@ impl HiiBackend {
     }
 
     /// This firmware's variables.
-    pub(super) fn system_variables() -> impl FirmwareVariables {
-        VariableServices
+    pub(super) fn system_variables() -> Result<impl FirmwareVariables> {
+        Ok(VariableServices)
     }
 }
 

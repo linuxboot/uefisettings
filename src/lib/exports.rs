@@ -75,6 +75,8 @@ mod linux;
 mod macos;
 #[cfg(target_os = "uefi")]
 mod uefi;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "uefi")]
 pub use crate::hii::VariableInfo;
@@ -308,7 +310,7 @@ impl HiiBackend {
             selector,
             options,
             EfivarSource::System.into_variables()?,
-            &Self::system_variables(),
+            &Self::system_variables()?,
         )
     }
 
@@ -581,6 +583,7 @@ fn select_for_set(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(efivar_dumps)]
     use std::fs;
     use std::rc::Rc;
 
@@ -632,8 +635,12 @@ mod tests {
             form_set_list([0x33; 16], b'B'),
         ]
         .concat();
+        // no variables: on Windows, System enables a privilege that needs elevation
+        let options = ShowIfrOptions {
+            efivars: EfivarSource::Disabled,
+        };
 
-        let ifr = HiiBackend::show_ifr(&hiidb)
+        let ifr = HiiBackend::show_ifr_using(&hiidb, &options)
             .expect("show the IFR")
             .readable_representation;
 
@@ -664,8 +671,12 @@ mod tests {
             form_set_list([0x11; 16], b'C'),
         ]
         .concat();
+        // no variables: on Windows, System enables a privilege that needs elevation
+        let options = ShowIfrOptions {
+            efivars: EfivarSource::Disabled,
+        };
 
-        let ifr = HiiBackend::show_ifr(&hiidb)
+        let ifr = HiiBackend::show_ifr_using(&hiidb, &options)
             .expect("show the IFR")
             .readable_representation;
 
@@ -719,6 +730,7 @@ mod tests {
 
     /// get, list-questions and show-ifr read question values from the source that their
     /// options name.
+    #[cfg(efivar_dumps)]
     #[test]
     fn options_name_the_efivar_source() {
         let packages = [
@@ -1138,6 +1150,7 @@ mod tests {
 
     /// set selects at a stated access level, before any write, and refuses one for a HiiDB that
     /// declares no SystemAccess.
+    #[cfg(efivar_dumps)]
     #[test]
     fn set_selects_at_the_stated_access_level() {
         let ami = access_level_hiidb(var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1));
@@ -1289,6 +1302,7 @@ mod tests {
 
     /// get, list-questions and show-ifr refuse an efivars directory that is not one, rather
     /// than read every question as missing.
+    #[cfg(efivar_dumps)]
     #[test]
     fn options_refuse_an_efivars_directory_that_is_not_one() {
         let hiidb = package_list_with_guid(
@@ -1347,13 +1361,22 @@ mod tests {
         ]
         .concat();
         let want = "Failed to get string packages using GUID 44444444-4444-4444-4444-444444444444";
+        // no variables: on Windows, System enables a privilege that needs elevation
+        let efivars = EfivarSource::Disabled;
+        let show_options = ShowIfrOptions {
+            efivars: efivars.clone(),
+        };
+        let list_options = ListQuestionsOptions {
+            efivars,
+            ..ListQuestionsOptions::default()
+        };
 
-        let Err(err) = HiiBackend::show_ifr(&hiidb) else {
+        let Err(err) = HiiBackend::show_ifr_using(&hiidb, &show_options) else {
             panic!("show_ifr used the strings of another list");
         };
         assert_eq!(format!("{err:#}"), want, "show_ifr");
 
-        let Err(err) = HiiBackend::list_questions(&hiidb) else {
+        let Err(err) = HiiBackend::list_questions_using(&hiidb, &list_options) else {
             panic!("list_questions used the strings of another list");
         };
         assert_eq!(format!("{err:#}"), want, "list_questions");

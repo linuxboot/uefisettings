@@ -59,8 +59,8 @@ impl HiiBackend {
     }
 
     /// This machine's efivarfs.
-    pub(super) fn system_variables() -> impl FirmwareVariables {
-        EfivarFiles::system()
+    pub(super) fn system_variables() -> Result<impl FirmwareVariables> {
+        Ok(EfivarFiles::system())
     }
 }
 
