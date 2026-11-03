@@ -14,8 +14,7 @@
 //! extract-db and hii dump-efivars, the flag --efivars, an optional -f/--filename, and the
 //! machine's backend for get and set.
 
-use std::fs::File;
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -163,9 +162,7 @@ impl HiiPlatformCommands {
     pub(super) fn run(&self) -> Result<()> {
         match self {
             Self::ExtractDB { filename } => {
-                let mut file = File::create(filename)?;
-                let res = HiiBackend::extract_db()?;
-                file.write_all(&res.db)?;
+                write_extracted_db(filename, || HiiBackend::extract_db().map(|res| res.db))?;
 
                 print_line(format_args!("{}", extract_db_report(filename)))?;
             }
@@ -330,6 +327,16 @@ fn prioritize_backend(machine: &MachineInfo, json: bool) -> Result<Backend> {
     } else {
         Ok(Backend::Hii)
     }
+}
+
+/// Writes the HiiDB that `extract` reads to `path`, which it creates only after the read
+/// succeeded, so a failed read leaves no file and an existing one unchanged; a failed write can
+/// still leave it truncated, as it writes through a symlink or to /dev/stdout instead of
+/// renaming a temporary file.
+fn write_extracted_db(path: &Path, extract: impl FnOnce() -> Result<Vec<u8>>) -> Result<()> {
+    let db = extract()?;
+    fs::write(path, &db)?;
+    Ok(())
 }
 
 /// What extract-db prints on stdout about the HiiDB written to `path`.
@@ -542,6 +549,47 @@ mod tests {
                 error.kind(),
                 clap::error::ErrorKind::UnknownArgument,
                 "{command:?}"
+            );
+        }
+    }
+
+    /// A failed read creates no file and leaves an existing one unchanged; a read writes its
+    /// HiiDB.
+    #[test]
+    fn write_extracted_db_writes_only_a_read_hii_db() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let absent = dir.path().join("absent.bin");
+        let existing = dir.path().join("existing.bin");
+        fs::write(&existing, b"old").expect("write the existing file");
+
+        for path in [&absent, &existing] {
+            let error = write_extracted_db(path, || Err(anyhow!("no HII database")))
+                .expect_err("a failed read");
+            assert_eq!(
+                format!("{error:#}"),
+                "no HII database",
+                "{}",
+                path.display()
+            );
+        }
+        assert!(
+            !absent.try_exists().expect("look for the absent file"),
+            "a failed read created {}",
+            absent.display()
+        );
+        assert_eq!(
+            fs::read(&existing).expect("read the existing file"),
+            b"old",
+            "a failed read changed the existing file"
+        );
+
+        for path in [&absent, &existing] {
+            write_extracted_db(path, || Ok(b"db".to_vec())).expect("write a read HiiDB");
+            assert_eq!(
+                fs::read(path).expect("read the written file"),
+                b"db",
+                "{}",
+                path.display()
             );
         }
     }

@@ -15,6 +15,7 @@
 
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
@@ -30,6 +31,9 @@ const GLOBAL_VARIABLE_SUFFIX: &str = "-8be4df61-93ca-11d2-aa0d-00e098032b8c";
 
 /// Any question; no backend has questions here.
 const QUESTION: &str = "Serial port IO address";
+
+/// The file that extract-db is asked to write.
+const EXTRACT_DB_OUTPUT: &str = "/tmp/hiidb.bin";
 
 #[test]
 fn efivarfs_lists_the_global_variables() {
@@ -95,7 +99,16 @@ fn hii_show_ifr_fails() {
     json_error(&["hii", "show-ifr"]);
 }
 
+/// extract-db fails, and creates no file.
 #[test]
 fn hii_extract_db_fails() {
-    json_error(&["hii", "extract-db", "/tmp/hiidb.bin"]);
+    let output = Path::new(EXTRACT_DB_OUTPUT);
+    let exists = || output.try_exists().expect("look for the extract-db output");
+    assert!(!exists(), "{EXTRACT_DB_OUTPUT} exists before extract-db");
+
+    json_error(&["hii", "extract-db", EXTRACT_DB_OUTPUT]);
+    assert!(
+        !exists(),
+        "the failed extract-db created {EXTRACT_DB_OUTPUT}"
+    );
 }
