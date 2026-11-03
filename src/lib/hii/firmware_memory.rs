@@ -117,6 +117,18 @@ pub enum MemoryMapUnavailable {
         .0.display()
     )]
     NoFirmwareMemmap(PathBuf),
+    /// arm64 has no FDT from the EFI stub, which locates the EFI memory map.
+    #[error(
+        "{} does not exist, so no EFI memory map bounds the reads of firmware memory",
+        .0.display()
+    )]
+    NoFdt(PathBuf),
+    /// arm64 has no /proc/kcore (CONFIG_PROC_KCORE), which serves the EFI memory map.
+    #[error(
+        "{} does not exist, so no EFI memory map bounds the reads of firmware memory",
+        .0.display()
+    )]
+    NoKcore(PathBuf),
     /// uefisettings reads no firmware memory map on this architecture.
     #[error(
         "uefisettings reads no firmware memory map on {}, so nothing bounds the reads of firmware \
@@ -321,14 +333,22 @@ pub(in crate::hii) struct FdtMemoryMap {
 
 /// The EFI memory map whose address the FDT at `fdt` gives (fdt_params), read from /proc/kcore at
 /// `kcore`, with the lockdown file `lockdown` (read_kcore), after the caller's
-/// refuse_locked_down.
+/// refuse_locked_down. A missing FDT or /proc/kcore is MemoryMapUnavailable.
 #[cfg(any(target_arch = "aarch64", test))]
 pub(in crate::hii) fn read_fdt_memory_map(
     fdt: &Path,
     kcore: &Path,
     lockdown: &Path,
 ) -> Result<FdtMemoryMap> {
-    let fdt_bytes = fs::read(fdt).with_context(|| format!("Failed to read {}", fdt.display()))?;
+    let fdt_bytes = match fs::read(fdt) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(MemoryMapUnavailable::NoFdt(fdt.to_owned()).into())
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", fdt.display()))
+        }
+    };
     let params = UefiFdtParams::parse(&fdt_bytes)
         .with_context(|| format!("Failed to parse {}", fdt.display()))?;
     if params.mmap_size > MAX_MEMORY_MAP_SIZE {
@@ -390,10 +410,14 @@ pub(in crate::hii) mod fixture {
 
 #[cfg(test)]
 mod tests {
+    use super::efi_memory_map::fixture::descriptor;
+    use super::fdt_params::fixture::uefi_fdt;
     use super::fixture::write_firmware_memmap;
     use super::fixture::write_runtime_map;
+    use super::kcore::fixture::kcore_fixture;
     use super::runtime_memory::DevMem;
     use super::*;
+    use crate::hii::memory_access_denied::fixture::lockdown_file;
     use crate::hii::memory_access_denied::fixture::unreadable_file;
     use crate::hii::memory_access_denied::DenialCause;
     use crate::hii::memory_access_denied::MemoryAccessDenied;
@@ -446,6 +470,56 @@ mod tests {
             Some(&want(MemoryDevice::DevMem)),
             "/dev/mem: {error:#}"
         );
+    }
+
+    /// arm64's map is MemoryMapUnavailable only where its FDT or /proc/kcore is missing; an FDT
+    /// that cannot be read otherwise stays an error.
+    #[test]
+    fn read_fdt_memory_map_refuses_a_missing_fdt_or_kcore_as_no_map() {
+        const MMAP_AT: u64 = 0x4000_0000;
+        let dir = tempfile::tempdir().expect("create a directory");
+        let lockdown = lockdown_file(dir.path(), "none");
+        let (fdt, kcore) = (dir.path().join("fdt"), dir.path().join("kcore"));
+        let map = descriptor(48, MemoryType(7), 0x4000_0000, 0, 0x100, 0xf);
+        let params = UefiFdtParams {
+            mmap_start: MMAP_AT,
+            mmap_size: map.len(),
+            mmap_desc_size: 48,
+            mmap_desc_ver: 1,
+        };
+
+        let error = read_fdt_memory_map(&fdt, &kcore, &lockdown).expect_err("read no FDT");
+        assert_eq!(
+            error.downcast_ref::<MemoryMapUnavailable>(),
+            Some(&MemoryMapUnavailable::NoFdt(fdt.clone())),
+            "no FDT: {error:#}"
+        );
+
+        // read() of a directory fails with EISDIR
+        fs::create_dir(&fdt).expect("create a directory as the FDT");
+        let error = read_fdt_memory_map(&fdt, &kcore, &lockdown).expect_err("read a directory");
+        assert_eq!(
+            error.downcast_ref::<MemoryMapUnavailable>(),
+            None,
+            "an unreadable FDT: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").starts_with(&format!("Failed to read {}: ", fdt.display())),
+            "an unreadable FDT: {error:#}"
+        );
+        fs::remove_dir(&fdt).expect("remove the directory");
+
+        fs::write(&fdt, uefi_fdt(&params)).expect("write the FDT");
+        let error = read_fdt_memory_map(&fdt, &kcore, &lockdown).expect_err("read no kcore");
+        assert_eq!(
+            error.downcast_ref::<MemoryMapUnavailable>(),
+            Some(&MemoryMapUnavailable::NoKcore(kcore.clone())),
+            "no /proc/kcore: {error:#}"
+        );
+
+        kcore_fixture(&kcore, &[(MMAP_AT, &map)]);
+        let got = read_fdt_memory_map(&fdt, &kcore, &lockdown).expect("read the map");
+        assert_eq!(got.descriptors.len(), 1, "both files");
     }
 
     /// An address that x86 Linux prints in a runtime-map entry's phys_addr, such as 0x7f9e_8018,

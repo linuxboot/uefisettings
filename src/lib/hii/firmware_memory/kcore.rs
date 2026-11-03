@@ -22,6 +22,7 @@ use anyhow::Context;
 use anyhow::Result;
 
 use super::array_at;
+use super::MemoryMapUnavailable;
 use crate::hii::memory_access_denied::mark_refused_access;
 use crate::hii::memory_access_denied::mark_refused_open;
 use crate::hii::memory_access_denied::MemoryAccess;
@@ -45,7 +46,8 @@ const PT_LOAD: u32 = 1;
 /// first. It reads a page that it cannot read as zeros (read_kcore_iter()), so callers check
 /// what it returns. `open_file` opens it; a refused open, where the kernel refuses /proc/kcore
 /// (open_kcore()), is under MemoryAccessDenied (mark_refused_open, after the lockdown file
-/// `lockdown`), and so is a refused read (read_kcore_file).
+/// `lockdown`), and so is a refused read (read_kcore_file). A missing one, without
+/// CONFIG_PROC_KCORE, is MemoryMapUnavailable::NoKcore: it serves only the EFI memory map.
 pub(super) fn read_kcore(
     path: &Path,
     lockdown: &Path,
@@ -53,9 +55,14 @@ pub(super) fn read_kcore(
     address: u64,
     length: usize,
 ) -> Result<Vec<u8>> {
-    let kcore = open_file(path)
-        .with_context(|| format!("Failed to open {}", path.display()))
-        .map_err(|error| mark_refused_open(error, MemoryDevice::Kcore, lockdown))?;
+    let kcore = match open_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(MemoryMapUnavailable::NoKcore(path.to_owned()).into())
+        }
+        opened => opened
+            .with_context(|| format!("Failed to open {}", path.display()))
+            .map_err(|error| mark_refused_open(error, MemoryDevice::Kcore, lockdown))?,
+    };
     read_kcore_file(&kcore, path, address, length)
 }
 
@@ -262,6 +269,43 @@ mod tests {
                     cause,
                 }),
                 "{mode}: {error:#}"
+            );
+        }
+    }
+
+    /// Only a missing /proc/kcore, as without CONFIG_PROC_KCORE, is MemoryMapUnavailable: a
+    /// refused open stays MemoryAccessDenied, and another error is neither.
+    #[test]
+    fn read_kcore_refuses_only_a_missing_kcore_as_no_map() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let path = dir.path().join("kcore");
+        let lockdown = lockdown_file(dir.path(), "none");
+        for (errno, missing, refused) in [
+            (libc::ENOENT, true, false),
+            (libc::EACCES, false, true),
+            (libc::EPERM, false, true),
+            (libc::ENOTDIR, false, false),
+        ] {
+            let error = read_kcore(
+                &path,
+                &lockdown,
+                |_| Err(io::Error::from_raw_os_error(errno)),
+                0,
+                1,
+            )
+            .expect_err("open a failing /proc/kcore");
+
+            assert_eq!(
+                error.downcast_ref::<MemoryMapUnavailable>(),
+                missing
+                    .then(|| MemoryMapUnavailable::NoKcore(path.clone()))
+                    .as_ref(),
+                "errno {errno}: {error:#}"
+            );
+            assert_eq!(
+                error.downcast_ref::<MemoryAccessDenied>().is_some(),
+                refused,
+                "errno {errno}: {error:#}"
             );
         }
     }

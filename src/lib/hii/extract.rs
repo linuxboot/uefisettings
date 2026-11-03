@@ -831,6 +831,8 @@ mod tests {
         use crate::hii::firmware_memory::fdt_params::UefiFdtParams;
         use crate::hii::firmware_memory::kcore::fixture::kcore_fixture;
         use crate::hii::firmware_memory::runtime_memory::fixture::MemoryWithin;
+        use crate::hii::firmware_memory::runtime_memory::fixture::UnreadMemory;
+        use crate::hii::firmware_memory::MemoryMapUnavailable;
 
         /// The regions of the bound tests' memory maps: runtime data, reserved memory and ACPI NVS
         /// without the RUNTIME attribute, System RAM, ACPI tables, and a runtime descriptor of
@@ -959,6 +961,11 @@ mod tests {
             paths
         }
 
+        /// Opens no physical memory.
+        fn unopened(path: &Path, _lockdown: &Path) -> Result<UnreadMemory> {
+            panic!("opened {}", path.display())
+        }
+
         /// The efivar source reads only inside the memory that EfivarMemory names, by x86's and
         /// by arm64's maps: by default runtime data, and with FirmwareReserved also reserved
         /// memory and ACPI NVS, never System RAM, ACPI tables or runtime memory-mapped I/O. A
@@ -1068,6 +1075,38 @@ mod tests {
                         ),
                         (got, _) => panic!("{family}, {memory:?}: {case}: got {got:?}"),
                     }
+                }
+            }
+        }
+
+        /// Without the FDT or /proc/kcore, which give arm64's map, the efivar source refuses
+        /// before it opens /dev/mem, by either bound.
+        #[test]
+        fn efivar_refuses_without_arm64_map_files() {
+            for memory in [EfivarMemory::Runtime, EfivarMemory::FirmwareReserved] {
+                for (missing, unavailable) in [
+                    (
+                        "fdt",
+                        MemoryMapUnavailable::NoFdt as fn(PathBuf) -> MemoryMapUnavailable,
+                    ),
+                    ("kcore", MemoryMapUnavailable::NoKcore),
+                ] {
+                    let dir = tempfile::tempdir().expect("create a directory");
+                    let paths = bounded_paths(
+                        dir.path(),
+                        write_bound_fdt_maps(dir.path()),
+                        RUNTIME_DATA_AT + DB_OFFSET,
+                    );
+                    let path = dir.path().join(missing);
+                    std::fs::remove_file(&path).expect("remove a map file");
+
+                    let error = extract_db_with(&paths, memory, unopened).expect_err(missing);
+
+                    assert_eq!(
+                        error.downcast_ref::<MemoryMapUnavailable>(),
+                        Some(&unavailable(path)),
+                        "{memory:?}, no {missing}: {error:#}"
+                    );
                 }
             }
         }
