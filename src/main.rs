@@ -479,13 +479,13 @@ mod tests {
         }
     }
 
-    /// The selection flags of `uefisettings set Q V` with `args` after it.
+    /// The selection flags of `uefisettings hii list-questions --efivars dir` with `args` after
+    /// it.
     pub(super) fn selection_of(args: &[&str]) -> SelectionArgs {
-        let command = [&["uefisettings", "set", "Q", "V"][..], args].concat();
-        let parsed = UefiSettingsToolArgs::try_parse_from(&command)
-            .unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
-        let Commands::Set { selection, .. } = parsed.command else {
-            panic!("{command:?} is no set: {parsed:?}");
+        let command = [&["list-questions", "--efivars", "dir"][..], args].concat();
+        let parsed = hii(&command).unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
+        let HiiSubcommands::ListQuestions { selection, .. } = parsed else {
+            panic!("{command:?} is no list-questions: {parsed:?}");
         };
         selection
     }
@@ -524,6 +524,7 @@ mod tests {
             let selection = selection_of(&args);
             assert_eq!(selection.states(), states, "{name}");
             assert_eq!(GetOptions::from(&selection).include, states, "{name}: get");
+            #[cfg(all(system_hiidb, system_variables))]
             assert_eq!(SetOptions::from(&selection).include, states, "{name}: set");
             assert_eq!(
                 ListQuestionsOptions::from(&selection).include,
@@ -555,6 +556,7 @@ mod tests {
                 level,
                 "{name}: get"
             );
+            #[cfg(all(system_hiidb, system_variables))]
             assert_eq!(
                 SetOptions::from(&selection).access_level,
                 level,
@@ -567,15 +569,8 @@ mod tests {
             );
         }
 
-        let error = UefiSettingsToolArgs::try_parse_from([
-            "uefisettings",
-            "set",
-            "Q",
-            "V",
-            "--access-level",
-            "0",
-        ])
-        .expect_err("parse --access-level 0");
+        let error = hii(&["list-questions", "--efivars", "dir", "--access-level", "0"])
+            .expect_err("parse --access-level 0");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "0");
     }
 
@@ -583,15 +578,22 @@ mod tests {
     /// set, not on show-ifr, which evaluates no conditions, nor on ilo.
     #[test]
     fn access_level_is_taken_where_include_is() {
-        let commands: [(&[&str], bool); 7] = [
-            (&["hii", "get", "Q"], true),
-            (&["hii", "set", "Q", "V"], true),
-            (&["hii", "list-questions"], true),
+        let commands: [(&[&str], bool); 3] = [
+            (&["hii", "get", "Q", "--efivars", "dir"], true),
+            (&["hii", "list-questions", "--efivars", "dir"], true),
+            (&["hii", "show-ifr", "--efivars", "dir"], false),
+        ];
+        #[cfg(all(system_hiidb, system_variables))]
+        let commands = commands.into_iter().chain([
+            (&["hii", "set", "Q", "V"][..], true),
             (&["get", "Q"], true),
             (&["set", "Q", "V"], true),
-            (&["hii", "show-ifr"], false),
-            (&["ilo", "get", "Q"], false),
-        ];
+        ]);
+        // the Linux build's own command
+        #[cfg(target_os = "linux")]
+        let commands = commands
+            .into_iter()
+            .chain([(&["ilo", "get", "Q"][..], false)]);
         for (command, takes) in commands {
             let argv = [&["uefisettings"][..], command, &["--access-level", "user"]].concat();
             let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
@@ -610,20 +612,37 @@ mod tests {
     /// not, as before.
     #[test]
     fn json_flag_may_repeat() {
-        let commands: [&[&str]; 4] = [
-            &["hii", "list-questions", "--json", "--json"],
-            &["hii", "get", "Q", "-j", "--json"],
+        let commands: [&[&str]; 3] = [
+            &[
+                "hii",
+                "list-questions",
+                "--efivars",
+                "dir",
+                "--json",
+                "--json",
+            ],
+            &["hii", "get", "Q", "--efivars", "dir", "-j", "--json"],
             &["show-translations", "-j", "-j"],
-            &["ilo", "show-attributes", "--json", "-j"],
         ];
+        // the Linux build's own command
+        #[cfg(target_os = "linux")]
+        let commands = commands
+            .into_iter()
+            .chain([&["ilo", "show-attributes", "--json", "-j"][..]]);
         for command in commands {
             let argv = [&["uefisettings"][..], command].concat();
             let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
             assert!(parsed.is_ok(), "{command:?}: {parsed:?}");
         }
 
-        let error = hii(&["list-questions", "--no-efivars", "--no-efivars"])
-            .expect_err("parse --no-efivars twice");
+        let error = hii(&[
+            "list-questions",
+            "-f",
+            "hiidb.bin",
+            "--no-efivars",
+            "--no-efivars",
+        ])
+        .expect_err("parse --no-efivars twice");
         assert_eq!(
             error.kind(),
             clap::error::ErrorKind::ArgumentConflict,
@@ -749,6 +768,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(system_hiidb, system_variables))]
     fn set_takes_no_efivar_flags() {
         for flags in [&["--no-efivars"][..], &["--efivars", "dir"]] {
             let error = hii(&[&["set", "Question", "Value"][..], flags].concat())

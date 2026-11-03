@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 
-#[cfg(system_variables)]
+#[cfg(any(system_variables, test))]
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
@@ -80,7 +80,7 @@ pub(crate) enum VariableReach {
 /// BootServices as through GetVariable() and SetVariable() in the UEFI Shell.
 impl VariableReach {
     /// What errors call the data bytes of a variable, which follow its attributes word.
-    #[cfg(system_variables)]
+    #[cfg(any(system_variables, test))]
     fn data(self) -> &'static str {
         match self {
             Self::Runtime => "efivarfs payload",
@@ -89,7 +89,7 @@ impl VariableReach {
     }
 
     /// The error for variable bytes without their whole attributes word.
-    #[cfg(system_variables)]
+    #[cfg(any(system_variables, test))]
     fn missing_attributes(self) -> &'static str {
         match self {
             Self::Runtime => "efivarfs file is missing its attributes header",
@@ -209,7 +209,8 @@ pub(super) fn attributes_and_data(
 /// the data of variable `key`, which variables of `reach` hold: refuses a volatile or
 /// authenticated variable, then writes `encoded` at data offset `offset` as update_efivarfs_bytes
 /// does.
-#[cfg(system_variables)]
+// set writes this machine's variables; the tests' MemoryVariables write on any build
+#[cfg(any(system_variables, test))]
 pub(super) fn modify_variable_bytes(
     key: &VariableKey,
     reach: VariableReach,
@@ -227,7 +228,7 @@ pub(super) fn modify_variable_bytes(
 /// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
 /// shorter than the `payload_size` bytes of its VarStore, which VarStoreWrite::new fits the
 /// write in. Errors word it as variables of `reach` hold it.
-#[cfg(system_variables)]
+#[cfg(any(system_variables, test))]
 fn update_efivarfs_bytes(
     reach: VariableReach,
     bytes: &mut [u8],
@@ -974,8 +975,11 @@ pub(crate) mod tests {
         fs::write(&file, b"").expect("write a file");
         let missing = dir.path().join("missing");
 
+        #[cfg(system_variables)]
+        EfivarSource::System
+            .validate()
+            .expect("validate this machine's variables");
         for (case, source) in [
-            ("System", EfivarSource::System),
             ("Disabled", EfivarSource::Disabled),
             (
                 "directory",

@@ -25,8 +25,8 @@ use crate::hii::package::db_file::read_db_bytes;
 use crate::hii::package::db_file::read_db_file;
 use crate::hii::variables::EfivarSource;
 
-// what dump-efivars needs: this machine's efivarfs
-#[cfg(target_os = "linux")]
+// dump-efivars needs this machine's efivarfs; the tests write dumps on any build
+#[cfg(any(target_os = "linux", test))]
 mod write;
 
 #[cfg(target_os = "linux")]

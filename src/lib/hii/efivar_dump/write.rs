@@ -33,6 +33,7 @@ use super::DUMP_FILE_NOUN;
 use super::DUMP_FORMAT;
 use super::DUMP_HIIDB;
 use super::DUMP_MANIFEST;
+#[cfg(target_os = "linux")]
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::efivarfs_format::open_efivar;
 use crate::hii::efivarfs_format::read_efivar_file;
@@ -40,6 +41,7 @@ use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EfivarNotFound;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::IncludedStates;
+#[cfg(target_os = "linux")]
 use crate::hii::package::read_db;
 use crate::hii::package::ParsedPackageList;
 use crate::hii::variables::DecodedValue;
@@ -59,6 +61,7 @@ pub struct EfivarDump {
 
 /// Copies the efivar files that the questions of the HiiDB `db_bytes` read from this machine's
 /// efivarfs into the new directory `dir`, as `redaction` says, with the HiiDB and a manifest.
+#[cfg(target_os = "linux")]
 pub(crate) fn dump_efivars(
     db_bytes: &[u8],
     dir: &Path,

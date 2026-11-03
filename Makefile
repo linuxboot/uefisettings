@@ -120,10 +120,10 @@ clippy-uefi: toolchain
 		--target aarch64-unknown-uefi -- -D warnings
 	cargo clippy --locked --release --target x86_64-unknown-uefi --manifest-path tests/qemu/publish-hiidb/Cargo.toml -- -D warnings
 
-# The library and the CLI of the macOS build on its 2 targets, which clippy checks without a
-# linker, so any host runs it.
+# The library, the CLI and their tests of the macOS build on its 2 targets, which clippy checks
+# without a linker, so any host runs it.
 clippy-macos: toolchain
-	cargo clippy --locked --lib --bins --target x86_64-apple-darwin --target aarch64-apple-darwin \
+	cargo clippy --locked --all-targets --target x86_64-apple-darwin --target aarch64-apple-darwin \
 		-- -D warnings
 
 test: toolchain

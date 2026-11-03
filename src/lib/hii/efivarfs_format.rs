@@ -52,7 +52,7 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 /// The largest efivar file that read_efivar_file reads, far above EDK2's largest EFI variables:
 /// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
 /// (OvmfPkgX64.dsc), as of edk2-stable202508.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// What efivarfs, and so a copy of it, reaches.
 pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
@@ -231,7 +231,8 @@ pub(super) fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Resul
 /// since: each efivarfs read() reads the whole variable from the firmware (Linux v7.2
 /// fs/efivarfs/file.c efivarfs_file_read()). A file of more than MAX_EFIVAR_FILE_SIZE bytes, by
 /// its metadata or as read, is an error.
-#[cfg(target_os = "linux")]
+// efivarfs writes and dump-efivars read whole files; the tests write dumps on any build
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8>> {
     if size > MAX_EFIVAR_FILE_SIZE {
         return Err(efivar_file_too_large());
@@ -261,7 +262,7 @@ pub(super) fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8
 }
 
 /// read_efivar_file's error for a file of more than MAX_EFIVAR_FILE_SIZE bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn efivar_file_too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::FileTooLarge,
@@ -345,15 +346,21 @@ struct CopyOfEfivars;
 pub mod tests {
     use std::collections::VecDeque;
     use std::ffi::OsStr;
+    #[cfg(target_os = "linux")]
     use std::ffi::OsString;
     use std::path::Component;
 
+    #[cfg(target_os = "linux")]
     use nix::errno::Errno;
+    #[cfg(target_os = "linux")]
     use nix::sys::inotify::AddWatchFlags;
+    #[cfg(target_os = "linux")]
     use nix::sys::inotify::InitFlags;
+    #[cfg(target_os = "linux")]
     use nix::sys::inotify::Inotify;
 
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
     use crate::hii::package::Guid;
     use crate::hii::variables::tests::variable_key;
@@ -423,6 +430,8 @@ pub mod tests {
     /// A file longer than its metadata says, as an efivar written after open_efivar's fstat,
     /// still reads whole: procfs gives /proc/version the size 0.
     #[test]
+    // procfs, which macOS lacks
+    #[cfg(target_os = "linux")]
     fn efivar_files_longer_than_their_size_read_whole() {
         let path = Path::new("/proc/version");
         let file = File::open(path).expect("open /proc/version");
@@ -630,7 +639,7 @@ pub mod tests {
     #[test]
     fn open_error_keeps_permission_errors_with_the_path() {
         let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
-        let path = Path::new(EFIVARS_MOUNT_POINT).join(&name);
+        let path = Path::new("efivars").join(&name);
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
 
         let error = open_error(&path, "efivar file", denied);
@@ -700,6 +709,8 @@ pub mod tests {
     /// descriptor, false for a device node as for the directory, FIFO and symlink here, which a
     /// test can create without root.
     #[test]
+    // inotify, which macOS lacks; its opener checks before it opens
+    #[cfg(target_os = "linux")]
     fn open_efivar_opens_no_non_regular_file() {
         let dir = tempfile::tempdir().expect("create directory");
         let regular = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
@@ -747,6 +758,8 @@ pub mod tests {
 
     /// reopen opens the file that open_efivar checked, though another now has its path.
     #[test]
+    // reopen, of Linux's opener: macOS lacks /proc/self/fd
+    #[cfg(target_os = "linux")]
     fn reopen_reads_the_located_file_not_its_path() {
         let dir = tempfile::tempdir().expect("create directory");
         let name = EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE);
@@ -766,6 +779,8 @@ pub mod tests {
     }
 
     #[test]
+    // reopen_error, of Linux's opener: macOS lacks /proc/self/fd
+    #[cfg(target_os = "linux")]
     fn reopen_error_asks_for_proc_only_when_it_is_missing() {
         let path =
             Path::new(EFIVARS_MOUNT_POINT).join(EfivarFileName::new("Setup", EFI_GLOBAL_VARIABLE));

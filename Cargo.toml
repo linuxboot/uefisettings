@@ -31,7 +31,6 @@ bitflags = "2.4.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 nix = { version = "0.27", features = ["fs", "ioctl", "mount"] }
-tempfile = "3.5"
 libloading = "0.8"
 httparse = "1.8"
 rand = { version = "0.8", features = ["small_rng"] }
@@ -48,8 +47,10 @@ libc = "0.2"
 uefi = { version = "0.41", features = ["alloc"] }
 
 [dev-dependencies]
-# inotify: a test sees which files open_efivar opens
-nix = { version = "0.27", features = ["inotify"] }
+# fs: tests make FIFOs, also on macOS, whose build has no nix otherwise; inotify: a test sees
+# which files open_efivar opens
+nix = { version = "0.27", features = ["fs", "inotify"] }
+tempfile = "3.5"
 
 # thrift/ is a package of its own; its generated crates build as dependencies that clippy
 # does not lint, and the Makefile's RUSTFLAGS fails the checks on their compiler warnings.

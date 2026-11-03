@@ -934,7 +934,6 @@ mod non_efi_varstore_tests {
 
     use super::ifr_fixtures::*;
     use super::*;
-    use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
     use crate::hii::efivarfs_format::EfivarFileName;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
     use crate::hii::variables::VolatileVariable;
@@ -1366,6 +1365,8 @@ mod non_efi_varstore_tests {
 
     #[test]
     fn crafted_varstore_name_stays_in_efivarfs() {
+        /// A directory of efivar files: efivarfs, or a copy of it
+        const EFIVARS_DIR: &str = "efivars";
         for name in ["../T/ou", "/etc/passwd", "a/b", ".."] {
             let var_store = VarStore {
                 guid: NIL_GUID,
@@ -1384,10 +1385,10 @@ mod non_efi_varstore_tests {
                 EfivarFileName::from(&var_store.variable_key()),
                 EfivarFileName::from(&var_store_efi.variable_key()),
             ] {
-                let path = Path::new(EFIVARS_MOUNT_POINT).join(file_name);
+                let path = Path::new(EFIVARS_DIR).join(file_name);
                 assert_eq!(
                     path.parent(),
-                    Some(Path::new(EFIVARS_MOUNT_POINT)),
+                    Some(Path::new(EFIVARS_DIR)),
                     "VarStore name {name:?}"
                 );
             }
