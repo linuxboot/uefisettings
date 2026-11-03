@@ -46,6 +46,7 @@
 
 set -euo pipefail
 shopt -s nullglob
+source "$(dirname "$0")/control-sequence.sh"
 
 if (($# != 3)); then
     echo "usage: $0 ARCH EXPECTATIONS CONSOLE_LOG" >&2
@@ -66,8 +67,8 @@ esac
 logs=$(dirname "$console")
 steps=$(mktemp -d)
 trap 'rm -r "$steps"' EXIT
-# The console has CRLF line ends and the shell's ANSI escape sequences.
-if ! tr -d '\r' <"$console" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | awk -v steps="$steps" '
+# The console has CRLF line ends and control sequences.
+if ! tr -d '\r' <"$console" | LC_ALL=C sed "s|$control_sequence||g" | awk -v steps="$steps" '
     $0 == "uefisettings-shell: start" { started = 1; output = ""; next }
     !started { next }
     $0 == "uefisettings-shell: done" { done = 1; exit }
