@@ -34,6 +34,7 @@ use crate::hii::memory_access_denied::MemoryAccess;
 use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::package;
 use crate::hii::package::db_file::read_db_bytes;
+use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
 
 // TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
 // open_efivar, so efivarfs paths and missing-variable errors have one source.
@@ -235,7 +236,23 @@ impl HiiDBEFIVar {
             size => bail!("Unexpected HiiDB efivar size: {size} bytes"),
         }
     }
+
+    /// The length of the HII database that the efivar locates: 1 to MAX_ALLOWED_FILESIZE bytes.
+    fn checked_length(&self) -> Result<usize, HiiDbLengthInvalid> {
+        if !(1..=MAX_ALLOWED_FILESIZE).contains(&u64::from(self.length)) {
+            return Err(HiiDbLengthInvalid(self.length));
+        }
+        usize::try_from(self.length).map_err(|_| HiiDbLengthInvalid(self.length))
+    }
 }
+
+/// The OCP HiiDB efivar gives a length that no HII database has, so it locates none: a
+/// variable of that name and GUID that holds only an 8-byte pointer, as one firmware's does,
+/// parses as the 32-bit layout, with the pointer's low half as the length and its high half,
+/// 0 below 4 GiB, as the address.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("the HiiDB efivar gives a length of {0} bytes, not 1 to {MAX_ALLOWED_FILESIZE}")]
+struct HiiDbLengthInvalid(u32);
 
 /// The HiiDB that the OCP HiiDB efivar `ocp_hiidb` points to in `dev_mem`, under the kernel
 /// lockdown mode in `lockdown`.
@@ -251,14 +268,10 @@ fn extract_db_efivar(ocp_hiidb: &Path, dev_mem: &Path, lockdown: &Path) -> Resul
         .with_context(|| format!("Failed to read efivar file, {}", ocp_hiidb.display()))?;
 
     let db_info = HiiDBEFIVar::parse(&efivar_contents)?;
+    let length = db_info.checked_length()?;
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
-    read_physical_memory(
-        dev_mem,
-        lockdown,
-        db_info.address,
-        db_info.length.try_into()?,
-    )
+    read_physical_memory(dev_mem, lockdown, db_info.address, length)
 }
 
 /// Reads the HII database through the EFI configuration table: the
@@ -650,7 +663,6 @@ mod tests {
     use crate::hii::memory_access_denied::DenialCause;
     use crate::hii::memory_access_denied::MemoryAccessDenied;
     use crate::hii::memory_access_denied::MemoryOperation;
-    use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
 
@@ -846,6 +858,92 @@ mod tests {
                 ),
                 (read, _) => panic!("{case}: read {read:?}"),
             }
+        }
+    }
+
+    /// An HiiDB efivar whose length no HII database has is refused before anything else: before
+    /// the kernel lockdown, in integrity mode here, and /dev/mem, missing here. One firmware's
+    /// variable holds only a pointer below 4 GiB, whose low half is the length.
+    #[test]
+    fn hiidb_efivar_with_an_implausible_length_is_refused_first() {
+        let max = u32::try_from(MAX_ALLOWED_FILESIZE).expect("a u32 maximum");
+        let pointer = [&6u32.to_le_bytes()[..], &0x7a5b_3000u64.to_le_bytes()].concat();
+        for (case, efivar, length) in [
+            (
+                "length 0",
+                [
+                    &7u32.to_le_bytes()[..],
+                    &0u32.to_le_bytes(),
+                    &0x7f00_1000u64.to_le_bytes(),
+                ]
+                .concat(),
+                0,
+            ),
+            (
+                "length MAX_ALLOWED_FILESIZE + 1",
+                [
+                    &7u32.to_le_bytes()[..],
+                    &(max + 1).to_le_bytes(),
+                    &0x7f00_1000u64.to_le_bytes(),
+                ]
+                .concat(),
+                max + 1,
+            ),
+            ("an 8-byte pointer", pointer, 0x7a5b_3000),
+        ] {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let paths = HiiSourcePaths {
+                efi_config_table: dir.path().join("config_table"),
+                ocp_hiidb: dir.path().join("HiiDB"),
+                acpi_hiid: dir.path().join("HIID"),
+                dev_mem: dir.path().join("mem"),
+                lockdown: lockdown_file(dir.path(), "integrity"),
+            };
+            std::fs::write(&paths.ocp_hiidb, efivar).expect("write the HiiDB efivar");
+
+            let error = extract_db_efivar(&paths.ocp_hiidb, &paths.dev_mem, &paths.lockdown)
+                .expect_err("read an implausible length");
+
+            assert_eq!(
+                error.downcast_ref::<HiiDbLengthInvalid>(),
+                Some(&HiiDbLengthInvalid(length)),
+                "{case}: {error:#}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("the HiiDB efivar gives a length of {length} bytes, not 1 to 16777216"),
+                "{case}"
+            );
+        }
+    }
+
+    /// The shortest and the longest HII database that an HiiDB efivar may give are read.
+    #[test]
+    fn hiidb_efivar_reads_lengths_of_1_to_max_hiidb_size() {
+        let max = usize::try_from(MAX_ALLOWED_FILESIZE).expect("a usize maximum");
+        for (case, ocp) in [
+            ("1 byte", vec![0xa5]),
+            ("MAX_ALLOWED_FILESIZE", vec![0x5a; max]),
+        ] {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let address = X86_ZERO_FILL_END + 0x1000;
+            let length = u32::try_from(ocp.len()).expect("a u32 length");
+            let ocp_hiidb = dir.path().join("HiiDB");
+            let efivar = [
+                &7u32.to_le_bytes()[..],
+                &length.to_le_bytes(),
+                &address.to_le_bytes(),
+            ];
+            std::fs::write(&ocp_hiidb, efivar.concat()).expect("write the HiiDB efivar");
+            let dev_mem = dir.path().join("mem");
+            File::create(&dev_mem)
+                .and_then(|mem| mem.write_all_at(&ocp, address))
+                .expect("write the HiiDB into the fake /dev/mem");
+
+            let got = extract_db_efivar(&ocp_hiidb, &dev_mem, &dir.path().join("lockdown"))
+                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+            assert!(got == ocp, "{case}: read {} bytes", got.len());
         }
     }
 
