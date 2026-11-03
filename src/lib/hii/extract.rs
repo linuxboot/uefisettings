@@ -233,7 +233,7 @@ impl HiiDBEFIVar {
                     address: var.address,
                 })
             }
-            size => bail!("Unexpected HiiDB efivar size: {size} bytes"),
+            size => Err(HiiDbEfivarSizeInvalid::Exactly(size).into()),
         }
     }
 
@@ -244,6 +244,20 @@ impl HiiDBEFIVar {
         }
         usize::try_from(self.length).map_err(|_| HiiDbLengthInvalid(self.length))
     }
+}
+
+/// The OCP HiiDB efivar has the size of neither layout, so it locates no HII database.
+#[derive(Debug, Error, PartialEq, Eq)]
+enum HiiDbEfivarSizeInvalid {
+    /// It has this many bytes.
+    #[error("Unexpected HiiDB efivar size: {0} bytes")]
+    Exactly(usize),
+    /// It is longer than HiiDBEFIVar64::SIZE, so it is not read whole.
+    #[error(
+        "HiiDB efivar is longer than its maximum of {} bytes",
+        HiiDBEFIVar64::SIZE
+    )]
+    OverMaximum,
 }
 
 /// The OCP HiiDB efivar gives a length that no HII database has, so it locates none: a
@@ -362,10 +376,7 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
     if file.limit() == 0 {
-        bail!(
-            "HiiDB efivar is longer than its maximum of {} bytes",
-            HiiDBEFIVar64::SIZE
-        );
+        return Err(HiiDbEfivarSizeInvalid::OverMaximum.into());
     }
     Ok(contents)
 }
@@ -851,11 +862,18 @@ mod tests {
                 (Ok(contents), true) => {
                     assert_eq!(contents, [0; HiiDBEFIVar64::SIZE], "{case}: contents")
                 }
-                (Err(error), false) => assert_eq!(
-                    error.to_string(),
-                    "HiiDB efivar is longer than its maximum of 16 bytes",
-                    "{case}"
-                ),
+                (Err(error), false) => {
+                    assert_eq!(
+                        error.to_string(),
+                        "HiiDB efivar is longer than its maximum of 16 bytes",
+                        "{case}"
+                    );
+                    assert_eq!(
+                        error.downcast_ref::<HiiDbEfivarSizeInvalid>(),
+                        Some(&HiiDbEfivarSizeInvalid::OverMaximum),
+                        "{case}"
+                    );
+                }
                 (read, _) => panic!("{case}: read {read:?}"),
             }
         }
@@ -1059,6 +1077,11 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 format!("Unexpected HiiDB efivar size: {size} bytes")
+            );
+            assert_eq!(
+                err.downcast_ref::<HiiDbEfivarSizeInvalid>(),
+                Some(&HiiDbEfivarSizeInvalid::Exactly(size)),
+                "{size} bytes"
             );
         }
     }
