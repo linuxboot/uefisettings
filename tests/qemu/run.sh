@@ -238,10 +238,14 @@ cp "$guest/usr/bin/busybox" "$run/initramfs/bin/busybox"
 
 # Prints the guest tests' log of the Linux boot whose logs start with $1, and fails unless they
 # and the health checks passed: init prints their exit codes last. A filter that matches no
-# test passes too, so the tests must also report a passed test.
+# test passes too, so the tests must also report a passed test. The exit line can start with
+# control sequences that the firmware left on the console, such as ESC[2J ESC[01;01H ESC[=3h:
+# ESC [, bytes 0x30-0x3F, bytes 0x20-0x2F and one byte 0x40-0x7E (ECMA-48 5th edition, 5.4).
 linux_passed() {
     sed -n '/^uefisettings-qemu-test: start/,$p' "$1.test.log"
-    tr -d '\r' <"$1.console.log" | grep --quiet --line-regexp 'uefisettings-qemu-test: exit 0 0' &&
+    tr -d '\r' <"$1.console.log" |
+        LC_ALL=C grep --quiet --extended-regexp --line-regexp \
+            $'(\e\\[[0-?]*[ -/]*[@-~])*uefisettings-qemu-test: exit 0 0' &&
         grep --quiet '^test result: ok\. [1-9]' "$1.test.log"
 }
 
