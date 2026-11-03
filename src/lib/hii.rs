@@ -19,6 +19,10 @@ mod efivarfs;
 #[cfg(target_os = "linux")]
 pub mod extract;
 pub mod forms;
+#[cfg(target_os = "linux")]
+mod lockdown;
+#[cfg(target_os = "linux")]
+mod memory_access_denied;
 pub mod package;
 mod strings;
 #[cfg(target_os = "uefi")]
@@ -42,6 +46,18 @@ pub use efivar_dump::EfivarRedaction;
 pub(crate) use efivar_dump::SavedDump;
 #[cfg(target_os = "linux")]
 pub(crate) use efivarfs::EfivarFiles;
+#[cfg(target_os = "linux")]
+pub use lockdown::LockdownMode;
+#[cfg(target_os = "linux")]
+pub use lockdown::LockdownUnknown;
+#[cfg(target_os = "linux")]
+pub use memory_access_denied::DenialCause;
+#[cfg(target_os = "linux")]
+pub use memory_access_denied::MemoryAccessDenied;
+#[cfg(target_os = "linux")]
+pub use memory_access_denied::MemoryDevice;
+#[cfg(target_os = "linux")]
+pub use memory_access_denied::MemoryOperation;
 #[cfg(target_os = "uefi")]
 pub(crate) use variable_services::variable_info;
 #[cfg(target_os = "uefi")]

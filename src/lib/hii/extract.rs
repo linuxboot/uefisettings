@@ -27,6 +27,11 @@ use binrw::BinReaderExt;
 use log::debug;
 use thiserror::Error;
 
+use crate::hii::lockdown::LOCKDOWN_PATH;
+use crate::hii::memory_access_denied::mark_refused_access;
+use crate::hii::memory_access_denied::mark_refused_open;
+use crate::hii::memory_access_denied::MemoryAccess;
+use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::package;
 use crate::hii::package::db_file::read_db_bytes;
 
@@ -85,7 +90,8 @@ const DEV_MEM_PATH: &str = "/dev/mem";
 const X86_ZERO_FILL_END: u64 = 0x10_0000;
 
 /// Where extract_db reads the EFI configuration table, the HIID ACPI table, the OCP HiiDB
-/// efivar and physical memory; Default is this machine's.
+/// efivar and physical memory, and the lockdown mode for the efivar route; Default is this
+/// machine's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HiiSourcePaths {
     /// The address of the EFI configuration table, as Linux prints it.
@@ -96,6 +102,8 @@ struct HiiSourcePaths {
     acpi_hiid: PathBuf,
     /// Physical memory, which the OCP HiiDB efivar points into.
     dev_mem: PathBuf,
+    /// The kernel lockdown mode, which can refuse physical memory to the efivar source.
+    lockdown: PathBuf,
 }
 
 impl Default for HiiSourcePaths {
@@ -105,6 +113,7 @@ impl Default for HiiSourcePaths {
             ocp_hiidb: PathBuf::from(OCP_HIIDB_PATH),
             acpi_hiid: PathBuf::from(HIIDB_ACPI_PATH),
             dev_mem: PathBuf::from(DEV_MEM_PATH),
+            lockdown: PathBuf::from(LOCKDOWN_PATH),
         }
     }
 }
@@ -161,7 +170,7 @@ fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
         ),
     }
 
-    extract_db_efivar(&paths.ocp_hiidb, &paths.dev_mem)
+    extract_db_efivar(&paths.ocp_hiidb, &paths.dev_mem, &paths.lockdown)
 }
 
 #[derive(Debug, PartialEq)]
@@ -228,8 +237,9 @@ impl HiiDBEFIVar {
     }
 }
 
-/// The HiiDB that the OCP HiiDB efivar `ocp_hiidb` points to in `dev_mem`.
-fn extract_db_efivar(ocp_hiidb: &Path, dev_mem: &Path) -> Result<Vec<u8>> {
+/// The HiiDB that the OCP HiiDB efivar `ocp_hiidb` points to in `dev_mem`, under the kernel
+/// lockdown mode in `lockdown`.
+fn extract_db_efivar(ocp_hiidb: &Path, dev_mem: &Path, lockdown: &Path) -> Result<Vec<u8>> {
     // I haven't seen any documentation on extracting HiiDB anywhere on the internet
     // So this is directly based on what hiitool does.
 
@@ -243,7 +253,12 @@ fn extract_db_efivar(ocp_hiidb: &Path, dev_mem: &Path) -> Result<Vec<u8>> {
     let db_info = HiiDBEFIVar::parse(&efivar_contents)?;
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
-    read_physical_memory(dev_mem, db_info.address, db_info.length.try_into()?)
+    read_physical_memory(
+        dev_mem,
+        lockdown,
+        db_info.address,
+        db_info.length.try_into()?,
+    )
 }
 
 /// Reads the HII database through the EFI configuration table: the
@@ -342,7 +357,8 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
     Ok(contents)
 }
 
-/// Returns `length` bytes of physical memory, `dev_mem`, at `address`.
+/// Returns `length` bytes of physical memory, `dev_mem`, at `address`, under the kernel
+/// lockdown mode in `lockdown`.
 ///
 /// It reads /dev/mem with one pread(), so the kernel copies the whole range and
 /// the copy costs the same in unoptimized builds, unlike read_mapped()'s
@@ -350,13 +366,30 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
 /// valid_phys_addr_range() rejects the range (drivers/char/mem.c read_mem()).
 /// mmap() of /dev/mem still maps those ranges, so only
 /// EFAULT falls back to read_mapped(); every other error is returned, e.g.
-/// EPERM from CONFIG_STRICT_DEVMEM, which mmap() enforces too.
+/// EPERM from CONFIG_STRICT_DEVMEM, which mmap() enforces too. A refusal is under
+/// MemoryAccessDenied (mark_refused_open, mark_refused_access).
 ///
 /// Ranges for which pread_may_zero_fill() holds go straight to read_mapped().
-fn read_physical_memory(dev_mem: &Path, address: u64, length: usize) -> Result<Vec<u8>> {
-    let mem_file =
-        File::open(dev_mem).with_context(|| format!("Failed to open {}", dev_mem.display()))?;
+fn read_physical_memory(
+    dev_mem: &Path,
+    lockdown: &Path,
+    address: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    let mem_file = open_physical_memory(dev_mem, lockdown, |path| File::open(path))?;
     read_physical_memory_at(&mem_file, address, length, FileExt::read_exact_at)
+}
+
+/// Opens `dev_mem`, physical memory, with `open_file`; a refusal is under MemoryAccessDenied
+/// (mark_refused_open, after the lockdown file `lockdown`).
+fn open_physical_memory(
+    dev_mem: &Path,
+    lockdown: &Path,
+    open_file: impl FnOnce(&Path) -> std::io::Result<File>,
+) -> Result<File> {
+    open_file(dev_mem)
+        .with_context(|| format!("Failed to open {}", dev_mem.display()))
+        .map_err(|error| mark_refused_open(error, MemoryDevice::DevMem, lockdown))
 }
 
 /// Implements read_physical_memory; tests pass a fake `pread`.
@@ -370,9 +403,11 @@ fn read_physical_memory_at(
 
     if pread_may_zero_fill(address) {
         debug!("{DEV_MEM_PATH} at 0x{address:x} may read as zeros; using mmap()");
-        read_mapped(mem_file, address, &mut buf).with_context(|| {
-            format!("Failed to map 0x{length:x} bytes of {DEV_MEM_PATH} at 0x{address:x}")
-        })?;
+        read_mapped(mem_file, address, &mut buf)
+            .with_context(|| {
+                format!("Failed to map 0x{length:x} bytes of {DEV_MEM_PATH} at 0x{address:x}")
+            })
+            .map_err(|error| mark_refused_access(error, MemoryAccess::DevMemMap))?;
         return Ok(buf);
     }
 
@@ -380,17 +415,21 @@ fn read_physical_memory_at(
         Ok(()) => Ok(buf),
         Err(e) if e.raw_os_error() == Some(libc::EFAULT) => {
             debug!("pread() of {DEV_MEM_PATH} at 0x{address:x} returned EFAULT; using mmap()");
-            read_mapped(mem_file, address, &mut buf).with_context(|| {
-                format!(
-                    "pread() of 0x{length:x} bytes of {DEV_MEM_PATH} at 0x{address:x} returned \
-                     EFAULT and the mmap() fallback failed"
-                )
-            })?;
+            read_mapped(mem_file, address, &mut buf)
+                .with_context(|| {
+                    format!(
+                        "pread() of 0x{length:x} bytes of {DEV_MEM_PATH} at 0x{address:x} \
+                         returned EFAULT and the mmap() fallback failed"
+                    )
+                })
+                .map_err(|error| mark_refused_access(error, MemoryAccess::DevMemMap))?;
             Ok(buf)
         }
-        Err(e) => Err(e).with_context(|| {
-            format!("Failed to read 0x{length:x} bytes of {DEV_MEM_PATH} at 0x{address:x}")
-        }),
+        Err(e) => Err(e)
+            .with_context(|| {
+                format!("Failed to read 0x{length:x} bytes of {DEV_MEM_PATH} at 0x{address:x}")
+            })
+            .map_err(|error| mark_refused_access(error, MemoryAccess::DevMemRead)),
     }
 }
 
@@ -604,6 +643,13 @@ fn validate_hiid_table(bytes: &[u8]) -> Result<&[u8], HiidInvalid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hii::lockdown::LockdownMode;
+    use crate::hii::memory_access_denied::fixture::lockdown_file;
+    use crate::hii::memory_access_denied::fixture::refused_open;
+    use crate::hii::memory_access_denied::fixture::unreadable_file;
+    use crate::hii::memory_access_denied::DenialCause;
+    use crate::hii::memory_access_denied::MemoryAccessDenied;
+    use crate::hii::memory_access_denied::MemoryOperation;
     use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
@@ -623,6 +669,7 @@ mod tests {
             ocp_hiidb: file.join("HiiDB"),
             acpi_hiid: file.join("HIID"),
             dev_mem: file.join("mem"),
+            lockdown: file.join("lockdown"),
         };
 
         let error = hii_db_published_at(&paths).expect_err("checked a path through a file");
@@ -645,6 +692,7 @@ mod tests {
                 ocp_hiidb: dir.path().join("HiiDB"),
                 acpi_hiid: dir.path().join("HIID"),
                 dev_mem: dir.path().join("mem"),
+                lockdown: dir.path().join("lockdown"),
             };
             for (exists, path) in [(ocp_file, &paths.ocp_hiidb), (acpi_file, &paths.acpi_hiid)] {
                 if exists {
@@ -1022,16 +1070,116 @@ mod tests {
         assert_eq!(got, data);
     }
 
+    /// A pread() error other than EFAULT is returned, with no mmap() fallback; EPERM and EACCES
+    /// are refusals.
     #[test]
     fn read_physical_memory_at_returns_other_pread_errors() {
         let address = X86_ZERO_FILL_END + 5;
         let file = tempfile::tempfile().unwrap();
         // mmap() would succeed here, so a fallback would hide the error.
         file.write_all_at(&[1; 100], address).unwrap();
-        for errno in [libc::EPERM, libc::EIO, libc::EINVAL] {
+        for (errno, cause) in [
+            (libc::EPERM, Some(DenialCause::StrictDevmem)),
+            (libc::EACCES, Some(DenialCause::Permission)),
+            (libc::EIO, None),
+            (libc::EINVAL, None),
+        ] {
             let err =
                 read_physical_memory_at(&file, address, 100, failing_pread(errno)).unwrap_err();
             assert_eq!(root_errno(&err), Some(errno), "{err:#}");
+            let want = cause.map(|cause| MemoryAccessDenied {
+                device: MemoryDevice::DevMem,
+                operation: MemoryOperation::Read,
+                cause,
+            });
+            assert_eq!(
+                err.downcast_ref::<MemoryAccessDenied>(),
+                want.as_ref(),
+                "errno {errno}: {err:#}"
+            );
+        }
+    }
+
+    /// A refused mmap() is a refusal, both below 1 MiB on x86 and on the EFAULT fallback:
+    /// mmap() of a file open only for writing fails with EACCES (mmap(2)).
+    #[test]
+    fn read_physical_memory_at_marks_a_refused_mmap() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let path = dir.path().join("mem");
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create the fake /dev/mem for writing only");
+        let want = MemoryAccessDenied {
+            device: MemoryDevice::DevMem,
+            operation: MemoryOperation::Map,
+            cause: DenialCause::Permission,
+        };
+        for address in [0x1000, X86_ZERO_FILL_END + 5] {
+            let err = read_physical_memory_at(&file, address, 16, failing_pread(libc::EFAULT))
+                .expect_err("read a file open only for writing");
+
+            assert_eq!(
+                root_errno(&err),
+                Some(libc::EACCES),
+                "0x{address:x}: {err:#}"
+            );
+            assert_eq!(
+                err.downcast_ref::<MemoryAccessDenied>(),
+                Some(&want),
+                "0x{address:x}: {err:#}"
+            );
+        }
+    }
+
+    /// A refused open of /dev/mem by the OCP HiiDB efivar route is a refusal: EACCES from a file
+    /// without read permission, unless this process overrides the permission.
+    #[test]
+    fn a_refused_open_is_a_refusal() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let Some(unreadable) = unreadable_file(dir.path()) else {
+            return;
+        };
+
+        let lockdown = dir.path().join("lockdown");
+        let error = open_physical_memory(&unreadable, &lockdown, |path| File::open(path))
+            .expect_err("open /dev/mem");
+
+        assert_eq!(
+            error.downcast_ref::<MemoryAccessDenied>(),
+            Some(&MemoryAccessDenied {
+                device: MemoryDevice::DevMem,
+                operation: MemoryOperation::Open,
+                cause: DenialCause::Permission,
+            }),
+            "{error:#}"
+        );
+    }
+
+    /// A refused open of /dev/mem by the OCP HiiDB efivar route takes its cause from the
+    /// lockdown file it was given.
+    #[test]
+    fn open_physical_memory_marks_a_refusal_after_its_lockdown_file() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        for (mode, cause) in [
+            ("integrity", DenialCause::Lockdown(LockdownMode::Integrity)),
+            ("none", DenialCause::Capability),
+        ] {
+            let lockdown = lockdown_file(dir.path(), mode);
+
+            let error = open_physical_memory(&dir.path().join("mem"), &lockdown, refused_open)
+                .expect_err("open a refusing /dev/mem");
+
+            assert_eq!(
+                error.downcast_ref::<MemoryAccessDenied>(),
+                Some(&MemoryAccessDenied {
+                    device: MemoryDevice::DevMem,
+                    operation: MemoryOperation::Open,
+                    cause,
+                }),
+                "{mode}: {error:#}"
+            );
         }
     }
 

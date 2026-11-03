@@ -8,17 +8,20 @@
 #                test binary of tests/qemu/guest/tests, then "/" and a libtest filter if any,
 #                or "shell:" and a script of tests/qemu/shell, which the firmware's UEFI Shell
 #                runs instead of Linux (check-shell-log.sh)
+#   kernel       how the scenario's Linux runs: "vamap" has it call SetVirtualAddressMap(),
+#                which run.sh sets up per architecture; "lockdown" and "lockdown-conf" boot it
+#                with lockdown=integrity and lockdown=confidentiality; "-" does neither
 # The scenarios whose names start with "shell-" are those of make test-e2e-qemu-shell-<arch>.
 # "-" leaves a column empty.
-boot-smoke	-	-	boot_smoke
-hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii,hii_write,hii_persistence
-hii-reserved	/DriverSample.efi;/publish-hiidb.efi reserved	my-ifr-nv-data.json	hii
-hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard
-hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access
-hii-global-variables	/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables
-hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi
-shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-reboot,shell:then-linux
-shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions
-shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password
-shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27
-shell-authA7	/DriverSample.efi	my-ifr-nv-data-authA7.json	shell:authA7
+boot-smoke	-	-	boot_smoke	-
+hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii,hii_write,hii_persistence	-
+hii-reserved	/DriverSample.efi;/publish-hiidb.efi reserved	my-ifr-nv-data.json	hii	-
+hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard	-
+hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access	-
+hii-global-variables	/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables	-
+hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi	-
+shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-reboot,shell:then-linux	-
+shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions	-
+shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password	-
+shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
+shell-authA7	/DriverSample.efi	my-ifr-nv-data-authA7.json	shell:authA7	-

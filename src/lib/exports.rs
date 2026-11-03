@@ -31,12 +31,24 @@ use crate::hii::forms::Choice;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::package;
 #[cfg(target_os = "linux")]
+pub use crate::hii::DenialCause;
+#[cfg(target_os = "linux")]
 pub use crate::hii::EfivarDump;
 use crate::hii::EfivarReader;
 #[cfg(target_os = "linux")]
 pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
 use crate::hii::FirmwareVariables;
+#[cfg(target_os = "linux")]
+pub use crate::hii::LockdownMode;
+#[cfg(target_os = "linux")]
+pub use crate::hii::LockdownUnknown;
+#[cfg(target_os = "linux")]
+pub use crate::hii::MemoryAccessDenied;
+#[cfg(target_os = "linux")]
+pub use crate::hii::MemoryDevice;
+#[cfg(target_os = "linux")]
+pub use crate::hii::MemoryOperation;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
 use crate::translation::HiiTranslation;

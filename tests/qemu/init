@@ -22,6 +22,8 @@
 mkdir -p /dev /proc /run/lock /sys /tmp
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
+# securityfs holds the lockdown mode, which uefisettings reads when firmware memory is refused.
+mount -t securityfs securityfs /sys/kernel/security
 mount -t devtmpfs devtmpfs /dev
 # The modules that run.sh copies, which the guest's kernel has not built in.
 for module in /lib/modules/*.ko; do

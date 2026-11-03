@@ -34,6 +34,9 @@ shift
 # The test terminal is the second serial port, but QEMU's virt machine gives the guest one
 # PL011 UART, so the aarch64 guests write to a virtio console. Debian's i686 kernel has
 # efivarfs as a module. aarch64 runs under TCG, so it boots on x86_64 hosts like the others.
+# vamap_args, the QEMU arguments of the vamap scenarios, make the kernel call
+# SetVirtualAddressMap(), which x86 Linux does at every boot (Linux v6.11
+# arch/x86/platform/efi/efi.c efi_enter_virtual_mode()).
 case $arch in
 x86_64)
     qemu=(qemu-system-x86_64 -machine q35 -accel kvm -cpu host)
@@ -46,6 +49,7 @@ x86_64)
     tty_device=(-serial chardev:tty)
     edk2_arch=X64
     kernel_params=()
+    vamap_args=()
     ;;
 i686)
     qemu=(qemu-system-i386 -machine q35 -accel kvm -cpu host)
@@ -62,6 +66,7 @@ i686)
     # in PAE paging bits 5-11 address the PDPT, which Debian 12's kernel takes from a
     # 32-byte slab unless pti=on (Linux v6.1 _pgd_alloc; SHARED_KERNEL_PMD is !PTI).
     kernel_params=(pti=on)
+    vamap_args=()
     ;;
 aarch64)
     # With these devices, none of them virtio-rng, the firmware has no EFI_RNG_PROTOCOL, so
@@ -76,6 +81,9 @@ aarch64)
     tty_device=(-device virtio-serial-pci -device "virtconsole,chardev=tty")
     edk2_arch=AARCH64
     kernel_params=()
+    # For an eMAG processor, the EFI stub calls SetVirtualAddressMap() instead of setting
+    # efi_novamap (Linux v6.11 drivers/firmware/efi/libstub/arm64.c system_needs_vamap()).
+    vamap_args=(-smbios type=4,version=eMAG)
     # cc, the default, links for the host. Set the variable for another linker: it
     # overrides cargo's config files, as this default does.
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER-aarch64-linux-gnu-gcc}
@@ -95,12 +103,15 @@ run=$out/$arch/$(date -u +%Y%m%dT%H%M%SZ)
 guest=$out/$arch/guest
 target=$arch-unknown-linux-musl
 
-# Every row has the 4 columns that the header of scenarios.tsv lists and the loop below
+# Every row has the 5 columns that the header of scenarios.tsv lists and the loop below
 # reads, none of them empty, so that no row silently boots nothing.
 awk -F '\t' '$0 !~ /^(#|$)/ {
-    ok = NF == 4
+    ok = NF == 5
     for (i = 1; i <= NF; i++) if ($i == "") ok = 0
-    if (!ok) { printf "scenarios.tsv line %d needs 4 non-empty columns: %s\n", NR, $0; bad = 1 }
+    if (!ok) { printf "scenarios.tsv line %d needs 5 non-empty columns: %s\n", NR, $0; bad = 1 }
+    if (ok && $5 !~ /^(-|vamap|lockdown|lockdown-conf)$/) {
+        printf "scenarios.tsv line %d: kernel %s is not -, vamap, lockdown or lockdown-conf\n", NR, $5; bad = 1
+    }
 } END { exit bad }' "$here/scenarios.tsv" >&2
 mapfile -t known < <(awk -F '\t' '$1 !~ /^(#|$)/ { print $1 }' "$here/scenarios.tsv")
 for name in "$@"; do
@@ -109,9 +120,9 @@ for name in "$@"; do
         exit 2
     fi
 done
-# The test binaries that the Linux boots of the scenarios name, the last column.
+# The test binaries that the Linux boots of the scenarios name, the fourth column.
 mapfile -t named < <(awk -F '\t' '$1 !~ /^(#|$)/ {
-    n = split($NF, boots, ",")
+    n = split($4, boots, ",")
     for (i = 1; i <= n; i++) if (boots[i] !~ /^shell:/) { sub("/.*", "", boots[i]); print boots[i] }
 }' "$here/scenarios.tsv")
 
@@ -236,7 +247,7 @@ linux_passed() {
 
 failed=()
 # read fails on a last line without a newline, which still counts.
-while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
+while IFS=$'\t' read -r -u 3 name drivers variables boots kernel || [[ -n $name ]]; do
     [[ -z $name || $name == \#* ]] && continue
     (($# == 0)) || [[ " $* " == *" $name "* ]] || continue
     dir=$run/$name
@@ -257,6 +268,14 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
         </dev/null >"$dir/vars.json"
     virt-fw-vars --input "$guest/$firmware_vars" --set-json "$dir/vars.json" \
         --output "$dir/vars.fd" 2>>"$dir/virt-fw-vars.log"
+    kernel_qemu_args=()
+    # the kernel parameter that locks the scenario's Linux boots down, if any
+    lockdown_param=
+    case $kernel in
+    vamap) kernel_qemu_args=("${vamap_args[@]}") ;;
+    lockdown) lockdown_param=" lockdown=integrity" ;;
+    lockdown-conf) lockdown_param=" lockdown=confidentiality" ;;
+    esac
     boot=0
     IFS=, read -r -a specs <<<"$boots"
     for spec in "${specs[@]}"; do
@@ -293,7 +312,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
             guest_args=(
                 -drive "if=virtio,format=raw,readonly=on,file=fat:$run/esp"
                 -kernel "$vmlinuz" -initrd "$dir/initrd.img"
-                -append "console=$console quiet panic=-1${kernel_params[*]:+ ${kernel_params[*]}} uefisettings.tty=$tty uefisettings.test=$test${filter:+ uefisettings.filter=$filter}"
+                -append "console=$console quiet panic=-1${kernel_params[*]:+ ${kernel_params[*]}} uefisettings.tty=$tty uefisettings.test=$test${filter:+ uefisettings.filter=$filter}$lockdown_param"
                 -chardev "file,id=tty,path=$log.test.log" "${tty_device[@]}"
             )
             ;;
@@ -310,7 +329,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots || [[ -n $name ]]; do
             -display none -sandbox on -m 1024 -smp 2 \
             -drive "if=pflash,format=raw,unit=0,readonly=on,file=$guest/$firmware" \
             -drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \
-            -serial "file:$log.console.log" "${guest_args[@]}" \
+            -serial "file:$log.console.log" "${guest_args[@]}" "${kernel_qemu_args[@]}" \
             -d guest_errors,trace:qemu_system_shutdown_request,trace:kvm_run_exit \
             -D "$log.qemu.log" </dev/null || echo "run.sh: QEMU exited with $?"
         # A line per KVM exit, some MB a boot, of which only each CPU's last tells the end;
