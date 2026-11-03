@@ -306,6 +306,18 @@ pub fn published_crc32() -> u32 {
     u32::from_le_bytes(crc32.try_into().expect("HiiDBCrc32 holds no CRC-32"))
 }
 
+impl PublishedDatabase {
+    /// The efivar source's refusal of this database, which no `region`, such as
+    /// `EFI_MEMORY_RUNTIME`, holds (`src/lib/hii/firmware_memory/efi_memory_map.rs`
+    /// `RangeRefusal`).
+    pub fn refusal(&self, region: &str) -> String {
+        format!(
+            "{:#x}+{:#x} lies in no {region} region",
+            self.address, self.length
+        )
+    }
+}
+
 /// Reads the byte at physical `address` with read() of `/dev/mem`, which `uefisettings` tries
 /// before mmap().
 #[track_caller]

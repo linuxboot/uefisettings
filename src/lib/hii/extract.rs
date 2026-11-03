@@ -27,9 +27,19 @@ use binrw::BinReaderExt;
 use log::debug;
 use thiserror::Error;
 
+#[cfg(firmware_memory_maps)]
+use crate::hii::firmware_memory::runtime_memory::DevMem;
+#[cfg(firmware_memory_maps)]
+use crate::hii::firmware_memory::runtime_memory::PhysicalMemory;
+#[cfg(firmware_memory_maps)]
+use crate::hii::firmware_memory::runtime_memory::RuntimeMemory;
+#[cfg(firmware_memory_maps)]
+use crate::hii::firmware_memory::MemoryMapFiles;
+#[cfg(not(firmware_memory_maps))]
+use crate::hii::firmware_memory::MemoryMapUnavailable;
+use crate::hii::lockdown::refuse_locked_down;
 use crate::hii::lockdown::LOCKDOWN_PATH;
 use crate::hii::memory_access_denied::mark_refused_access;
-use crate::hii::memory_access_denied::mark_refused_open;
 use crate::hii::memory_access_denied::MemoryAccess;
 use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::package;
@@ -85,7 +95,7 @@ const PACKAGE_LIST_HEADER_LEN: usize = 20;
 // Upper bound for the database size found by walking its package lists.
 const MAX_HII_DB_LEN: usize = 64 * 1024 * 1024;
 
-const DEV_MEM_PATH: &str = "/dev/mem";
+pub(super) const DEV_MEM_PATH: &str = "/dev/mem";
 
 /// Below this address (1 MiB), x86 read() of /dev/mem may return zeros.
 const X86_ZERO_FILL_END: u64 = 0x10_0000;
@@ -105,6 +115,9 @@ struct HiiSourcePaths {
     dev_mem: PathBuf,
     /// The kernel lockdown mode, which can refuse physical memory to the efivar source.
     lockdown: PathBuf,
+    /// The firmware memory maps that bound the efivar source's read of physical memory.
+    #[cfg(firmware_memory_maps)]
+    maps: MemoryMapFiles,
 }
 
 impl Default for HiiSourcePaths {
@@ -115,6 +128,8 @@ impl Default for HiiSourcePaths {
             acpi_hiid: PathBuf::from(HIIDB_ACPI_PATH),
             dev_mem: PathBuf::from(DEV_MEM_PATH),
             lockdown: PathBuf::from(LOCKDOWN_PATH),
+            #[cfg(firmware_memory_maps)]
+            maps: MemoryMapFiles::default(),
         }
     }
 }
@@ -171,7 +186,7 @@ fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
         ),
     }
 
-    extract_db_efivar(&paths.ocp_hiidb, &paths.dev_mem, &paths.lockdown)
+    extract_db_efivar(paths)
 }
 
 #[derive(Debug, PartialEq)]
@@ -268,24 +283,53 @@ enum HiiDbEfivarSizeInvalid {
 #[error("the HiiDB efivar gives a length of {0} bytes, not 1 to {MAX_ALLOWED_FILESIZE}")]
 struct HiiDbLengthInvalid(u32);
 
-/// The HiiDB that the OCP HiiDB efivar `ocp_hiidb` points to in `dev_mem`, under the kernel
-/// lockdown mode in `lockdown`.
-fn extract_db_efivar(ocp_hiidb: &Path, dev_mem: &Path, lockdown: &Path) -> Result<Vec<u8>> {
+/// The physical address and length of the HII database that the OCP HiiDB efivar at
+/// paths.ocp_hiidb locates, once the kernel lockdown mode in paths.lockdown allows /dev/mem.
+fn locate_efivar_database(paths: &HiiSourcePaths) -> Result<(u64, usize)> {
     // I haven't seen any documentation on extracting HiiDB anywhere on the internet
     // So this is directly based on what hiitool does.
 
     // try to read data from varstore
-    let efivar_file =
-        File::open(ocp_hiidb).with_context(|| format!("Failed to open {}", ocp_hiidb.display()))?;
+    let efivar_file = File::open(&paths.ocp_hiidb)
+        .with_context(|| format!("Failed to open {}", paths.ocp_hiidb.display()))?;
 
     let efivar_contents = read_hiidb_efivar(efivar_file)
-        .with_context(|| format!("Failed to read efivar file, {}", ocp_hiidb.display()))?;
+        .with_context(|| format!("Failed to read efivar file, {}", paths.ocp_hiidb.display()))?;
 
     let db_info = HiiDBEFIVar::parse(&efivar_contents)?;
     let length = db_info.checked_length()?;
+    refuse_locked_down(MemoryDevice::DevMem, &paths.lockdown)?;
+    Ok((db_info.address, length))
+}
+
+/// The HiiDB that the OCP HiiDB efivar at paths.ocp_hiidb points to in paths.dev_mem, read only
+/// inside an EFI runtime region, under the kernel lockdown mode in paths.lockdown.
+#[cfg(firmware_memory_maps)]
+fn extract_db_efivar(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
+    extract_db_with(paths, DevMem::open)
+}
+
+/// extract_db_efivar on an architecture whose firmware memory maps uefisettings does not read,
+/// which refuses the read that nothing bounds.
+#[cfg(not(firmware_memory_maps))]
+fn extract_db_efivar(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
+    locate_efivar_database(paths)?;
+    Err(MemoryMapUnavailable::NoMapReader.into())
+}
+
+/// extract_db_efivar, reading physical memory that `open_memory` opens from paths.dev_mem and
+/// paths.lockdown: in that order, the efivar, its length, the lockdown mode, the memory map that
+/// bounds the read, /dev/mem, then the read that the map admits.
+#[cfg(firmware_memory_maps)]
+fn extract_db_with<M: PhysicalMemory>(
+    paths: &HiiSourcePaths,
+    open_memory: impl FnOnce(&Path, &Path) -> Result<M>,
+) -> Result<Vec<u8>> {
+    let (address, length) = locate_efivar_database(paths)?;
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
-    read_physical_memory(dev_mem, lockdown, db_info.address, length)
+    let map = paths.maps.runtime_bound(&paths.lockdown)?;
+    RuntimeMemory::new(map, open_memory(&paths.dev_mem, &paths.lockdown)?).read(address, length)
 }
 
 /// Reads the HII database through the EFI configuration table: the
@@ -299,6 +343,10 @@ fn extract_db_efi_config_table(config_table: &Path, dev_mem: &Path) -> Result<Ve
 
     let mem_file =
         File::open(dev_mem).with_context(|| format!("Failed to open {}", dev_mem.display()))?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the configuration table source reads without a firmware memory map's check"
+    )]
     let read = |address: u64, length: usize| {
         read_physical_memory_at(&mem_file, address, length, FileExt::read_exact_at)
     };
@@ -381,8 +429,8 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
     Ok(contents)
 }
 
-/// Returns `length` bytes of physical memory, `dev_mem`, at `address`, under the kernel
-/// lockdown mode in `lockdown`.
+/// Returns `length` bytes at `address` of `mem_file`, physical memory, which only DevMem and
+/// the configuration table source read (clippy.toml); tests pass a fake `pread`.
 ///
 /// It reads /dev/mem with one pread(), so the kernel copies the whole range and
 /// the copy costs the same in unoptimized builds, unlike read_mapped()'s
@@ -391,33 +439,10 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
 /// mmap() of /dev/mem still maps those ranges, so only
 /// EFAULT falls back to read_mapped(); every other error is returned, e.g.
 /// EPERM from CONFIG_STRICT_DEVMEM, which mmap() enforces too. A refusal is under
-/// MemoryAccessDenied (mark_refused_open, mark_refused_access).
+/// MemoryAccessDenied (mark_refused_access).
 ///
 /// Ranges for which pread_may_zero_fill() holds go straight to read_mapped().
-fn read_physical_memory(
-    dev_mem: &Path,
-    lockdown: &Path,
-    address: u64,
-    length: usize,
-) -> Result<Vec<u8>> {
-    let mem_file = open_physical_memory(dev_mem, lockdown, |path| File::open(path))?;
-    read_physical_memory_at(&mem_file, address, length, FileExt::read_exact_at)
-}
-
-/// Opens `dev_mem`, physical memory, with `open_file`; a refusal is under MemoryAccessDenied
-/// (mark_refused_open, after the lockdown file `lockdown`).
-fn open_physical_memory(
-    dev_mem: &Path,
-    lockdown: &Path,
-    open_file: impl FnOnce(&Path) -> std::io::Result<File>,
-) -> Result<File> {
-    open_file(dev_mem)
-        .with_context(|| format!("Failed to open {}", dev_mem.display()))
-        .map_err(|error| mark_refused_open(error, MemoryDevice::DevMem, lockdown))
-}
-
-/// Implements read_physical_memory; tests pass a fake `pread`.
-fn read_physical_memory_at(
+pub(super) fn read_physical_memory_at(
     mem_file: &File,
     address: u64,
     length: usize,
@@ -666,11 +691,16 @@ fn validate_hiid_table(bytes: &[u8]) -> Result<&[u8], HiidInvalid> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::FileExt;
+
     use super::*;
-    use crate::hii::lockdown::LockdownMode;
+    #[cfg(firmware_memory_maps)]
+    use crate::hii::firmware_memory::efi_memory_map::MemoryType;
+    #[cfg(firmware_memory_maps)]
+    use crate::hii::firmware_memory::efi_memory_map::EFI_MEMORY_RUNTIME;
+    #[cfg(firmware_memory_maps)]
+    use crate::hii::firmware_memory::fixture::write_runtime_map;
     use crate::hii::memory_access_denied::fixture::lockdown_file;
-    use crate::hii::memory_access_denied::fixture::refused_open;
-    use crate::hii::memory_access_denied::fixture::unreadable_file;
     use crate::hii::memory_access_denied::DenialCause;
     use crate::hii::memory_access_denied::MemoryAccessDenied;
     use crate::hii::memory_access_denied::MemoryOperation;
@@ -680,6 +710,239 @@ mod tests {
     /// Offset of Checksum in an ACPI table header, after Signature, Length and Revision.
     const ACPI_CHECKSUM_OFFSET: usize = 9;
 
+    /// The lockdown mode none.
+    const NO_LOCKDOWN: &str = "[none] integrity confidentiality\n";
+
+    /// HiiSourcePaths of files in `dir`, each missing until the test writes it, with x86's
+    /// memory maps.
+    fn paths_in(dir: &Path) -> HiiSourcePaths {
+        HiiSourcePaths {
+            efi_config_table: dir.join("config_table"),
+            ocp_hiidb: dir.join("HiiDB"),
+            acpi_hiid: dir.join("HIID"),
+            dev_mem: dir.join("mem"),
+            // the test's own lockdown file, never this machine's
+            lockdown: dir.join("lockdown"),
+            #[cfg(firmware_memory_maps)]
+            maps: MemoryMapFiles::Sysfs {
+                runtime_map: dir.join("runtime-map"),
+            },
+        }
+    }
+
+    /// Writes at `path` an OCP HiiDB efivar, in the 64-bit layout, that locates `length` bytes
+    /// at `address`.
+    fn write_efivar(path: &Path, address: u64, length: u32) {
+        let efivar = [
+            &7u32.to_le_bytes()[..],
+            &length.to_le_bytes(),
+            &address.to_le_bytes(),
+        ];
+        std::fs::write(path, efivar.concat()).expect("write the HiiDB efivar");
+    }
+
+    /// Writes x86's runtime-map into `dir`, at paths_in's path: the descriptors `runtime` of
+    /// (type, physical start, pages, attribute).
+    #[cfg(firmware_memory_maps)]
+    fn write_sysfs_maps(dir: &Path, runtime: &[(MemoryType, u64, u64, u64)]) {
+        let runtime: Vec<[String; 5]> = runtime
+            .iter()
+            .map(|&(memory_type, start, pages, attribute)| {
+                [
+                    format!("{:#x}\n", memory_type.0),
+                    format!("{start:#x}\n"),
+                    format!("{start:#x}\n"),
+                    format!("{pages:#x}\n"),
+                    format!("{attribute:#x}\n"),
+                ]
+            })
+            .collect();
+        let runtime: Vec<[&str; 5]> = runtime
+            .iter()
+            .map(|entry| entry.each_ref().map(String::as_str))
+            .collect();
+        write_runtime_map(&dir.join("runtime-map"), &runtime);
+    }
+
+    /// The efivar source's bound and the order of its checks, where it reads memory maps.
+    #[cfg(firmware_memory_maps)]
+    mod efivar_bound {
+        use super::*;
+        use crate::hii::firmware_memory::efi_memory_map::fixture::descriptor;
+        use crate::hii::firmware_memory::efi_memory_map::RangeRefusal;
+        use crate::hii::firmware_memory::fdt_params::fixture::uefi_fdt;
+        use crate::hii::firmware_memory::fdt_params::UefiFdtParams;
+        use crate::hii::firmware_memory::kcore::fixture::kcore_fixture;
+        use crate::hii::firmware_memory::runtime_memory::fixture::MemoryWithin;
+
+        /// The regions of the bound tests' memory maps: runtime data, reserved memory and ACPI NVS
+        /// without the RUNTIME attribute, System RAM, ACPI tables, and a runtime descriptor of
+        /// memory-mapped I/O inside the reserved memory, each of 4 pages but RAM.
+        const RUNTIME_DATA_AT: u64 = 0x20_0000;
+        const RESERVED_AT: u64 = 0x30_0000;
+        const MMIO_AT: u64 = 0x30_2000;
+        const NVS_AT: u64 = 0x40_0000;
+        const RAM_AT: u64 = 0x50_0000;
+        const ACPI_TABLES_AT: u64 = 0x60_0000;
+        /// The size of each region but RAM.
+        const REGION_SIZE: u64 = 0x4000;
+        /// Where the database starts in its region: unaligned.
+        const DB_OFFSET: u64 = 0x101;
+        /// The database that the bound tests' efivar locates.
+        const BOUNDED_DB: &[u8] = b"the bounded HiiDB";
+
+        /// Writes into `dir` x86's runtime-map of the bound tests' regions: runtime data and
+        /// memory-mapped I/O.
+        fn write_bound_sysfs_maps(dir: &Path) -> MemoryMapFiles {
+            write_sysfs_maps(
+                dir,
+                &[
+                    (
+                        MemoryType::RUNTIME_SERVICES_DATA,
+                        RUNTIME_DATA_AT,
+                        4,
+                        EFI_MEMORY_RUNTIME | 0xf,
+                    ),
+                    (
+                        MemoryType::MEMORY_MAPPED_IO,
+                        MMIO_AT,
+                        1,
+                        EFI_MEMORY_RUNTIME | 1,
+                    ),
+                ],
+            );
+            paths_in(dir).maps
+        }
+
+        /// Writes into `dir` arm64's maps of the bound tests' regions: an FDT whose EFI memory map
+        /// /proc/kcore serves.
+        fn write_bound_fdt_maps(dir: &Path) -> MemoryMapFiles {
+            const MMAP_AT: u64 = 0x4000_0000;
+            let desc_size = 48;
+            let pages = REGION_SIZE / 0x1000;
+            let map = [
+                descriptor(
+                    desc_size,
+                    MemoryType::RUNTIME_SERVICES_DATA,
+                    RUNTIME_DATA_AT,
+                    0,
+                    pages,
+                    EFI_MEMORY_RUNTIME | 0xf,
+                ),
+                // EfiReservedMemoryType
+                descriptor(desc_size, MemoryType(0), RESERVED_AT, 0, pages, 1),
+                descriptor(
+                    desc_size,
+                    MemoryType::MEMORY_MAPPED_IO,
+                    MMIO_AT,
+                    0,
+                    1,
+                    EFI_MEMORY_RUNTIME | 1,
+                ),
+                // EfiACPIMemoryNVS
+                descriptor(desc_size, MemoryType(10), NVS_AT, 0, pages, 0xf),
+                // EfiLoaderData and EfiACPIReclaimMemory
+                descriptor(desc_size, MemoryType(2), RAM_AT, 0, 0x100, 0xf),
+                descriptor(desc_size, MemoryType(9), ACPI_TABLES_AT, 0, pages, 0xf),
+            ]
+            .concat();
+            let (fdt, kcore) = (dir.join("fdt"), dir.join("kcore"));
+            let params = UefiFdtParams {
+                mmap_start: MMAP_AT,
+                mmap_size: map.len(),
+                mmap_desc_size: desc_size,
+                mmap_desc_ver: 1,
+            };
+            std::fs::write(&fdt, uefi_fdt(&params)).expect("write the FDT");
+            kcore_fixture(&kcore, &[(MMAP_AT, &map)]);
+            MemoryMapFiles::Fdt { fdt, kcore }
+        }
+
+        /// The length of BOUNDED_DB.
+        fn bounded_length() -> u32 {
+            u32::try_from(BOUNDED_DB.len()).expect("a u32 length")
+        }
+
+        /// HiiSourcePaths in `dir` with the memory maps `maps`, without lockdown, and an efivar
+        /// that locates BOUNDED_DB at `address`, where a fake /dev/mem holds it.
+        fn bounded_paths(dir: &Path, maps: MemoryMapFiles, address: u64) -> HiiSourcePaths {
+            let paths = HiiSourcePaths {
+                maps,
+                ..paths_in(dir)
+            };
+            std::fs::write(&paths.lockdown, NO_LOCKDOWN).expect("write lockdown");
+            write_efivar(&paths.ocp_hiidb, address, bounded_length());
+            let mem = File::create(&paths.dev_mem).expect("create the fake /dev/mem");
+            mem.write_all_at(BOUNDED_DB, address)
+                .expect("write the database");
+            paths
+        }
+
+        /// The efivar source reads only inside one EFI runtime region that is not memory-mapped
+        /// I/O, by x86's and by arm64's maps: runtime data, never reserved memory, ACPI NVS,
+        /// System RAM or memory-mapped I/O. A refused range is read nowhere.
+        #[test]
+        fn efivar_reads_only_runtime_memory() {
+            let length = u64::try_from(BOUNDED_DB.len()).expect("a u64 length");
+            let not_runtime = |address| RangeRefusal::NotRuntime { address, length };
+            let mmio = |address| RangeRefusal::MemoryMappedIo {
+                address,
+                length,
+                memory_type: MemoryType::MEMORY_MAPPED_IO,
+            };
+            for (case, address, refusal) in [
+                ("runtime data", RUNTIME_DATA_AT + DB_OFFSET, None),
+                (
+                    "reserved memory",
+                    RESERVED_AT + DB_OFFSET,
+                    Some(not_runtime(RESERVED_AT + DB_OFFSET)),
+                ),
+                (
+                    "ACPI NVS",
+                    NVS_AT + DB_OFFSET,
+                    Some(not_runtime(NVS_AT + DB_OFFSET)),
+                ),
+                (
+                    "System RAM",
+                    RAM_AT + DB_OFFSET,
+                    Some(not_runtime(RAM_AT + DB_OFFSET)),
+                ),
+                (
+                    "memory-mapped I/O",
+                    MMIO_AT + DB_OFFSET,
+                    Some(mmio(MMIO_AT + DB_OFFSET)),
+                ),
+            ] {
+                for (family, write_maps) in [
+                    ("x86", write_bound_sysfs_maps as fn(&Path) -> MemoryMapFiles),
+                    ("arm64", write_bound_fdt_maps),
+                ] {
+                    let dir = tempfile::tempdir().expect("create a directory");
+                    let paths = bounded_paths(dir.path(), write_maps(dir.path()), address);
+                    // a refused range is read nowhere, and only the database otherwise
+                    let readable = match refusal {
+                        Some(_) => 0..0,
+                        None => address..address + length,
+                    };
+
+                    let got = extract_db_with(&paths, |path, _| {
+                        MemoryWithin::open(path, readable.start, readable.end)
+                    });
+
+                    match (got, refusal) {
+                        (Ok(db), None) => assert_eq!(db, BOUNDED_DB, "{family}: {case}"),
+                        (Err(error), Some(refusal)) => assert_eq!(
+                            error.downcast_ref::<RangeRefusal>(),
+                            Some(&refusal),
+                            "{family}: {case}: {error:#}"
+                        ),
+                        (got, _) => panic!("{family}: {case}: got {got:?}"),
+                    }
+                }
+            }
+        }
+    }
+
     /// hii_db_published fails, rather than answers false, when it cannot check a file.
     #[test]
     fn hii_db_published_fails_when_a_file_cannot_be_checked() {
@@ -687,13 +950,7 @@ mod tests {
         let file = dir.path().join("file");
         std::fs::write(&file, b"").expect("create the file");
         // stat() of a path through a regular file fails with ENOTDIR, not ENOENT
-        let paths = HiiSourcePaths {
-            efi_config_table: file.join("config_table"),
-            ocp_hiidb: file.join("HiiDB"),
-            acpi_hiid: file.join("HIID"),
-            dev_mem: file.join("mem"),
-            lockdown: file.join("lockdown"),
-        };
+        let paths = paths_in(&file);
 
         let error = hii_db_published_at(&paths).expect_err("checked a path through a file");
 
@@ -710,13 +967,7 @@ mod tests {
             ("both files", true, true, true),
         ] {
             let dir = tempfile::tempdir().expect("create a directory");
-            let paths = HiiSourcePaths {
-                efi_config_table: dir.path().join("config_table"),
-                ocp_hiidb: dir.path().join("HiiDB"),
-                acpi_hiid: dir.path().join("HIID"),
-                dev_mem: dir.path().join("mem"),
-                lockdown: dir.path().join("lockdown"),
-            };
+            let paths = paths_in(dir.path());
             for (exists, path) in [(ocp_file, &paths.ocp_hiidb), (acpi_file, &paths.acpi_hiid)] {
                 if exists {
                     std::fs::write(path, b"").expect("create the file");
@@ -911,16 +1162,12 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().expect("create a directory");
             let paths = HiiSourcePaths {
-                efi_config_table: dir.path().join("config_table"),
-                ocp_hiidb: dir.path().join("HiiDB"),
-                acpi_hiid: dir.path().join("HIID"),
-                dev_mem: dir.path().join("mem"),
                 lockdown: lockdown_file(dir.path(), "integrity"),
+                ..paths_in(dir.path())
             };
             std::fs::write(&paths.ocp_hiidb, efivar).expect("write the HiiDB efivar");
 
-            let error = extract_db_efivar(&paths.ocp_hiidb, &paths.dev_mem, &paths.lockdown)
-                .expect_err("read an implausible length");
+            let error = extract_db_efivar(&paths).expect_err("read an implausible length");
 
             assert_eq!(
                 error.downcast_ref::<HiiDbLengthInvalid>(),
@@ -937,6 +1184,7 @@ mod tests {
 
     /// The shortest and the longest HII database that an HiiDB efivar may give are read.
     #[test]
+    #[cfg(firmware_memory_maps)]
     fn hiidb_efivar_reads_lengths_of_1_to_max_hiidb_size() {
         let max = usize::try_from(MAX_ALLOWED_FILESIZE).expect("a usize maximum");
         for (case, ocp) in [
@@ -944,22 +1192,26 @@ mod tests {
             ("MAX_ALLOWED_FILESIZE", vec![0x5a; max]),
         ] {
             let dir = tempfile::tempdir().expect("create a directory");
-            let address = X86_ZERO_FILL_END + 0x1000;
+            let paths = paths_in(dir.path());
+            std::fs::write(&paths.lockdown, NO_LOCKDOWN).expect("write lockdown");
+            // runtime data as long as the longest database, from where pread() reads
+            write_sysfs_maps(
+                dir.path(),
+                &[(
+                    MemoryType::RUNTIME_SERVICES_DATA,
+                    X86_ZERO_FILL_END,
+                    MAX_ALLOWED_FILESIZE / 0x1000,
+                    EFI_MEMORY_RUNTIME,
+                )],
+            );
             let length = u32::try_from(ocp.len()).expect("a u32 length");
-            let ocp_hiidb = dir.path().join("HiiDB");
-            let efivar = [
-                &7u32.to_le_bytes()[..],
-                &length.to_le_bytes(),
-                &address.to_le_bytes(),
-            ];
-            std::fs::write(&ocp_hiidb, efivar.concat()).expect("write the HiiDB efivar");
-            let dev_mem = dir.path().join("mem");
-            File::create(&dev_mem)
-                .and_then(|mem| mem.write_all_at(&ocp, address))
-                .expect("write the HiiDB into the fake /dev/mem");
+            write_efivar(&paths.ocp_hiidb, X86_ZERO_FILL_END, length);
+            File::create(&paths.dev_mem)
+                .expect("create the fake /dev/mem")
+                .write_all_at(&ocp, X86_ZERO_FILL_END)
+                .expect("write the database");
 
-            let got = extract_db_efivar(&ocp_hiidb, &dev_mem, &dir.path().join("lockdown"))
-                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            let got = extract_db_efivar(&paths).unwrap_or_else(|error| panic!("{case}: {error:#}"));
 
             assert!(got == ocp, "{case}: read {} bytes", got.len());
         }
@@ -1124,6 +1376,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tests read_physical_memory_at itself"
+    )]
     fn read_physical_memory_at_routes_by_pread_may_zero_fill() {
         let x86 = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
         let (file, data) = mapped_fixture(X86_ZERO_FILL_END as usize + 16);
@@ -1167,6 +1423,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tests read_physical_memory_at itself"
+    )]
     fn read_physical_memory_at_returns_pread_bytes() {
         let address = X86_ZERO_FILL_END + 5;
         let file = tempfile::tempfile().unwrap();
@@ -1181,6 +1441,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tests read_physical_memory_at itself"
+    )]
     fn read_physical_memory_at_maps_on_efault() {
         let address = X86_ZERO_FILL_END + 5;
         let file = tempfile::tempfile().unwrap();
@@ -1194,6 +1458,10 @@ mod tests {
     /// A pread() error other than EFAULT is returned, with no mmap() fallback; EPERM and EACCES
     /// are refusals.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tests read_physical_memory_at itself"
+    )]
     fn read_physical_memory_at_returns_other_pread_errors() {
         let address = X86_ZERO_FILL_END + 5;
         let file = tempfile::tempfile().unwrap();
@@ -1224,6 +1492,10 @@ mod tests {
     /// A refused mmap() is a refusal, both below 1 MiB on x86 and on the EFAULT fallback:
     /// mmap() of a file open only for writing fails with EACCES (mmap(2)).
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tests read_physical_memory_at itself"
+    )]
     fn read_physical_memory_at_marks_a_refused_mmap() {
         let dir = tempfile::tempdir().expect("create a directory");
         let path = dir.path().join("mem");
@@ -1250,56 +1522,6 @@ mod tests {
                 err.downcast_ref::<MemoryAccessDenied>(),
                 Some(&want),
                 "0x{address:x}: {err:#}"
-            );
-        }
-    }
-
-    /// A refused open of /dev/mem by the OCP HiiDB efivar route is a refusal: EACCES from a file
-    /// without read permission, unless this process overrides the permission.
-    #[test]
-    fn a_refused_open_is_a_refusal() {
-        let dir = tempfile::tempdir().expect("create a directory");
-        let Some(unreadable) = unreadable_file(dir.path()) else {
-            return;
-        };
-
-        let lockdown = dir.path().join("lockdown");
-        let error = open_physical_memory(&unreadable, &lockdown, |path| File::open(path))
-            .expect_err("open /dev/mem");
-
-        assert_eq!(
-            error.downcast_ref::<MemoryAccessDenied>(),
-            Some(&MemoryAccessDenied {
-                device: MemoryDevice::DevMem,
-                operation: MemoryOperation::Open,
-                cause: DenialCause::Permission,
-            }),
-            "{error:#}"
-        );
-    }
-
-    /// A refused open of /dev/mem by the OCP HiiDB efivar route takes its cause from the
-    /// lockdown file it was given.
-    #[test]
-    fn open_physical_memory_marks_a_refusal_after_its_lockdown_file() {
-        let dir = tempfile::tempdir().expect("create a directory");
-        for (mode, cause) in [
-            ("integrity", DenialCause::Lockdown(LockdownMode::Integrity)),
-            ("none", DenialCause::Capability),
-        ] {
-            let lockdown = lockdown_file(dir.path(), mode);
-
-            let error = open_physical_memory(&dir.path().join("mem"), &lockdown, refused_open)
-                .expect_err("open a refusing /dev/mem");
-
-            assert_eq!(
-                error.downcast_ref::<MemoryAccessDenied>(),
-                Some(&MemoryAccessDenied {
-                    device: MemoryDevice::DevMem,
-                    operation: MemoryOperation::Open,
-                    cause,
-                }),
-                "{mode}: {error:#}"
             );
         }
     }

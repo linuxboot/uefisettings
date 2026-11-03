@@ -48,7 +48,15 @@ pub use crate::hii::MemoryAccessDenied;
 #[cfg(target_os = "linux")]
 pub use crate::hii::MemoryDevice;
 #[cfg(target_os = "linux")]
+pub use crate::hii::MemoryMapUnavailable;
+#[cfg(target_os = "linux")]
 pub use crate::hii::MemoryOperation;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use crate::hii::MemoryType;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use crate::hii::RangeRefusal;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
 use crate::translation::HiiTranslation;

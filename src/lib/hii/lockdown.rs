@@ -18,13 +18,17 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Result;
 use nix::errno::Errno;
 use nix::sys::statfs::statfs;
 use nix::sys::statfs::FsType;
 use nix::sys::statfs::SECURITYFS_MAGIC;
 use thiserror::Error;
 
+use crate::hii::memory_access_denied::DenialCause;
+use crate::hii::memory_access_denied::MemoryAccessDenied;
 use crate::hii::memory_access_denied::MemoryDevice;
+use crate::hii::memory_access_denied::MemoryOperation;
 
 /// The kernel's lockdown mode, where securityfs is mounted (Linux v6.11
 /// security/lockdown/lockdown.c lockdown_read()).
@@ -144,6 +148,22 @@ fn mode_unless_securityfs(
         Ok(_) => Err(LockdownUnknown::SecurityfsNotMounted(dir.to_owned())),
         Err(Errno::ENOENT) => Err(LockdownUnknown::NoSecurityfs(dir.to_owned())),
         Err(errno) => Err(LockdownUnknown::Unreadable(dir.to_owned(), errno.into())),
+    }
+}
+
+/// Fails, before anything opens `device`, if the lockdown mode in `lockdown` (LOCKDOWN_PATH)
+/// refuses opening it, or is unknown (LockdownUnknown); no other way to the same memory then
+/// retries.
+pub(super) fn refuse_locked_down(device: MemoryDevice, lockdown: &Path) -> Result<()> {
+    let mode = read_lockdown_mode(lockdown)?;
+    match mode.refuses(device) {
+        true => Err(MemoryAccessDenied {
+            device,
+            operation: MemoryOperation::Open,
+            cause: DenialCause::Lockdown(mode),
+        }
+        .into()),
+        false => Ok(()),
     }
 }
 
@@ -281,6 +301,69 @@ mod tests {
                     .to_owned()
             ),
             "a statfs() error"
+        );
+    }
+
+    /// refuse_locked_down refuses /dev/mem at integrity and confidentiality, /proc/kcore at
+    /// confidentiality only, nothing at none, and anything while the mode is unknown.
+    #[test]
+    fn refuse_locked_down_refuses_by_mode_and_device() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let file = dir.path().join("lockdown");
+        for (contents, device, refused) in [
+            (NO_LOCKDOWN, MemoryDevice::DevMem, None),
+            (NO_LOCKDOWN, MemoryDevice::Kcore, None),
+            (
+                "none [integrity] confidentiality\n",
+                MemoryDevice::DevMem,
+                Some(LockdownMode::Integrity),
+            ),
+            (
+                "none [integrity] confidentiality\n",
+                MemoryDevice::Kcore,
+                None,
+            ),
+            (
+                "none integrity [confidentiality]\n",
+                MemoryDevice::DevMem,
+                Some(LockdownMode::Confidentiality),
+            ),
+            (
+                "none integrity [confidentiality]\n",
+                MemoryDevice::Kcore,
+                Some(LockdownMode::Confidentiality),
+            ),
+        ] {
+            let case = format!("{device} under {contents:?}");
+            fs::write(&file, contents).expect("write the lockdown file");
+
+            let got = refuse_locked_down(device, &file);
+
+            let want = refused.map(|mode| MemoryAccessDenied {
+                device,
+                operation: MemoryOperation::Open,
+                cause: DenialCause::Lockdown(mode),
+            });
+            match (got, want) {
+                (Ok(()), None) => {}
+                (Err(error), Some(want)) => assert_eq!(
+                    error.downcast_ref::<MemoryAccessDenied>(),
+                    Some(&want),
+                    "{case}: {error:#}"
+                ),
+                (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
+            }
+        }
+
+        // The temporary directory is not securityfs.
+        let error = refuse_locked_down(MemoryDevice::DevMem, &dir.path().join("missing"))
+            .expect_err("check an unknown lockdown mode");
+        assert!(
+            matches!(
+                error.downcast_ref::<LockdownUnknown>(),
+                Some(LockdownUnknown::SecurityfsNotMounted(got)) if got == dir.path()
+            ),
+            "unknown: {error:#}"
         );
     }
 }

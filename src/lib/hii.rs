@@ -20,6 +20,9 @@ mod efivarfs;
 mod efivarfs_format;
 #[cfg(target_os = "linux")]
 pub mod extract;
+// The firmware memory maps of the efivar source.
+#[cfg(target_os = "linux")]
+mod firmware_memory;
 pub mod forms;
 #[cfg(target_os = "linux")]
 mod lockdown;
@@ -48,6 +51,14 @@ pub use efivar_dump::EfivarRedaction;
 pub(crate) use efivar_dump::SavedDump;
 #[cfg(target_os = "linux")]
 pub(crate) use efivarfs::EfivarFiles;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use firmware_memory::efi_memory_map::MemoryType;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use firmware_memory::efi_memory_map::RangeRefusal;
+#[cfg(target_os = "linux")]
+pub use firmware_memory::MemoryMapUnavailable;
 #[cfg(target_os = "linux")]
 pub use lockdown::LockdownMode;
 #[cfg(target_os = "linux")]

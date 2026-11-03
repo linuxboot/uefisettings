@@ -13,11 +13,14 @@
 //! Refused physical memory access: MemoryAccessDenied and what the kernel refused it for.
 
 use std::fmt;
+#[cfg(any(firmware_memory_maps, test))]
 use std::io;
+#[cfg(any(firmware_memory_maps, test))]
 use std::path::Path;
 
 use thiserror::Error;
 
+#[cfg(any(firmware_memory_maps, test))]
 use crate::hii::lockdown::read_lockdown_mode;
 use crate::hii::lockdown::LockdownMode;
 
@@ -64,16 +67,23 @@ impl fmt::Display for MemoryOperation {
 
 /// A use of physical memory after its open, which kernel lockdown never refuses: it refuses
 /// only the opens (Linux v6.11 drivers/char/mem.c open_port(), fs/proc/kcore.c open_kcore()).
+#[cfg(any(firmware_memory_maps, test))]
 #[derive(Debug, Clone, Copy)]
 pub(super) enum MemoryAccess {
     DevMemRead,
     DevMemMap,
+    /// /proc/kcore has no mmap() (fs/proc/kcore.c kcore_proc_ops).
+    #[cfg(any(target_arch = "aarch64", test))]
+    KcoreRead,
 }
 
+#[cfg(any(firmware_memory_maps, test))]
 impl MemoryAccess {
     fn device(self) -> MemoryDevice {
         match self {
             Self::DevMemRead | Self::DevMemMap => MemoryDevice::DevMem,
+            #[cfg(any(target_arch = "aarch64", test))]
+            Self::KcoreRead => MemoryDevice::Kcore,
         }
     }
 
@@ -81,6 +91,8 @@ impl MemoryAccess {
         match self {
             Self::DevMemRead => MemoryOperation::Read,
             Self::DevMemMap => MemoryOperation::Map,
+            #[cfg(any(target_arch = "aarch64", test))]
+            Self::KcoreRead => MemoryOperation::Read,
         }
     }
 }
@@ -163,12 +175,14 @@ impl fmt::Display for MemoryAccessDenied {
 }
 
 /// The errnos with which the kernel refuses physical memory access.
+#[cfg(any(firmware_memory_maps, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefusalErrno {
     Eperm,
     Eacces,
 }
 
+#[cfg(any(firmware_memory_maps, test))]
 impl RefusalErrno {
     /// The refusal errno that is the root cause of `error`, if any.
     fn of(error: &anyhow::Error) -> Option<Self> {
@@ -187,6 +201,7 @@ impl RefusalErrno {
 /// `error`, of opening `device`, under a MemoryAccessDenied context if the kernel refused it,
 /// i.e. its root cause is EPERM or EACCES. EPERM reads the lockdown mode in `lockdown`
 /// (LOCKDOWN_PATH); an unknown one is a LockdownUnknown context under the mark.
+#[cfg(any(firmware_memory_maps, test))]
 pub(super) fn mark_refused_open(
     error: anyhow::Error,
     device: MemoryDevice,
@@ -212,6 +227,7 @@ pub(super) fn mark_refused_open(
 
 /// `error`, of `access` to opened physical memory, under a MemoryAccessDenied context if the
 /// kernel refused it, i.e. its root cause is EPERM or EACCES.
+#[cfg(any(firmware_memory_maps, test))]
 pub(super) fn mark_refused_access(error: anyhow::Error, access: MemoryAccess) -> anyhow::Error {
     let Some(errno) = RefusalErrno::of(&error) else {
         return error;
@@ -400,7 +416,8 @@ mod tests {
     }
 
     /// mark_refused_access marks EPERM and EACCES only: EPERM of /dev/mem as
-    /// CONFIG_STRICT_DEVMEM, and EACCES as Permission. It keeps the error under the mark.
+    /// CONFIG_STRICT_DEVMEM, of /proc/kcore as Permission, which a security module makes, and
+    /// EACCES as Permission. It keeps the error under the mark.
     #[test]
     fn mark_refused_access_marks_only_eperm_and_eacces() {
         for (access, errno, want) in [
@@ -423,6 +440,15 @@ mod tests {
                 )),
             ),
             (
+                MemoryAccess::KcoreRead,
+                libc::EPERM,
+                Some((
+                    MemoryDevice::Kcore,
+                    MemoryOperation::Read,
+                    DenialCause::Permission,
+                )),
+            ),
+            (
                 MemoryAccess::DevMemRead,
                 libc::EACCES,
                 Some((
@@ -440,8 +466,18 @@ mod tests {
                     DenialCause::Permission,
                 )),
             ),
+            (
+                MemoryAccess::KcoreRead,
+                libc::EACCES,
+                Some((
+                    MemoryDevice::Kcore,
+                    MemoryOperation::Read,
+                    DenialCause::Permission,
+                )),
+            ),
             (MemoryAccess::DevMemRead, libc::EIO, None),
             (MemoryAccess::DevMemMap, libc::EINVAL, None),
+            (MemoryAccess::KcoreRead, libc::EFAULT, None),
         ] {
             let case = format!("{access:?} errno {errno}");
 

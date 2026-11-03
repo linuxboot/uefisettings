@@ -19,46 +19,64 @@
 use std::env;
 use std::env::VarError;
 
-/// A cfg that builds for `target_oses` set, as they have what it names.
+/// A cfg that builds for `target_oses` set, on `target_arches` if given, as they have what it
+/// names.
 struct Capability {
     cfg: &'static str,
     target_oses: &'static [&'static str],
+    target_arches: Option<&'static [&'static str]>,
 }
 
-const CAPABILITIES: [Capability; 4] = [
+const CAPABILITIES: [Capability; 5] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
         target_oses: &["linux", "uefi"],
+        target_arches: None,
     },
     // HiiBackend::system_variables and EfivarSource::System: this machine's EFI variables, the
     // only ones that set writes
     Capability {
         cfg: "system_variables",
         target_oses: &["linux", "uefi"],
+        target_arches: None,
     },
     // db_file: HiiDB files, which -f names
     Capability {
         cfg: "hiidb_files",
         target_oses: &["linux", "macos"],
+        target_arches: None,
     },
     // efivarfs_format, efivar_dump and EfivarSource::Directory: directories of efivar files, such
     // as dump-efivars writes, which --efivars names
     Capability {
         cfg: "efivar_dumps",
         target_oses: &["linux", "macos"],
+        target_arches: None,
+    },
+    // firmware_memory: the firmware memory maps, which bound the reads of physical memory, from
+    // what Linux exports on these architectures
+    Capability {
+        cfg: "firmware_memory_maps",
+        target_oses: &["linux"],
+        target_arches: Some(&["x86", "x86_64", "aarch64"]),
     },
 ];
 
 fn main() -> Result<(), VarError> {
     println!("cargo:rerun-if-changed=build.rs");
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH")?;
     if target_os == "uefi" {
         println!("cargo:rustc-link-arg-bins=/entry:uefi_std_entry");
     }
     for capability in CAPABILITIES {
         println!("cargo:rustc-check-cfg=cfg({})", capability.cfg);
-        if capability.target_oses.contains(&target_os.as_str()) {
+        if capability.target_oses.contains(&target_os.as_str())
+            && capability
+                .target_arches
+                .is_none_or(|arches| arches.contains(&target_arch.as_str()))
+        {
             println!("cargo:rustc-cfg={}", capability.cfg);
         }
     }
