@@ -26,6 +26,18 @@ impl PhysicalRange {
         Some(Self { start, size })
     }
 
+    /// The range from `start` to `end`, both inclusive, unless `end` is before `start` or the
+    /// range ends past the end of memory.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
+    pub(in crate::hii) fn from_inclusive(start: u64, end: u64) -> Option<Self> {
+        Self::new(start, end.checked_sub(start)?.checked_add(1)?)
+    }
+
+    #[cfg(test)]
+    pub(in crate::hii) fn start(self) -> u64 {
+        self.start
+    }
+
     /// The end, exclusive.
     pub(in crate::hii) fn end(self) -> u64 {
         // Cannot overflow: new checked it.
@@ -54,6 +66,21 @@ impl PhysicalRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_inclusive_takes_both_ends() {
+        for (case, start, end, want) in [
+            ("one byte", 0x1000, 0x1000, Some((0x1000, 0x1001))),
+            ("a page", 0x1000, 0x1fff, Some((0x1000, 0x2000))),
+            ("an end before the start", 0x1000, 0xfff, None),
+            ("the last byte of memory", u64::MAX, u64::MAX, None),
+            ("all of memory", 0, u64::MAX, None),
+        ] {
+            let got =
+                PhysicalRange::from_inclusive(start, end).map(|range| (range.start(), range.end()));
+            assert_eq!(got, want, "{case}");
+        }
+    }
 
     #[test]
     fn new_refuses_an_end_past_the_end_of_memory() {

@@ -11,8 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The reads of firmware memory that the efivar source makes: RuntimeMemory
-//! checks each against the runtime descriptors of the EFI memory map before PhysicalMemory reads
-//! it.
+//! checks each against the runtime descriptors of the EFI memory map, and ReservedMemory against
+//! the firmware-reserved regions, before PhysicalMemory reads it.
 
 use std::fs::File;
 use std::io;
@@ -23,18 +23,19 @@ use anyhow::Context;
 use anyhow::Result;
 
 use super::efi_memory_map::EfiMemoryMap;
+use super::firmware_reserved::FirmwareReservedMap;
 use crate::hii::extract::read_physical_memory_at;
 use crate::hii::memory_access_denied::mark_refused_open;
 use crate::hii::memory_access_denied::MemoryDevice;
 
-/// Physical memory, which only RuntimeMemory reads: only this module makes the ReadToken that
-/// read takes.
+/// Physical memory, which only RuntimeMemory and ReservedMemory read: only this module makes the
+/// ReadToken that read takes.
 pub(in crate::hii) trait PhysicalMemory {
     /// `length` bytes at physical `address`.
     fn read(&self, address: u64, length: usize, token: ReadToken) -> Result<Vec<u8>>;
 }
 
-/// The proof that RuntimeMemory checked a read of PhysicalMemory.
+/// The proof that RuntimeMemory or ReservedMemory checked a read of PhysicalMemory.
 pub(in crate::hii) struct ReadToken(());
 
 /// /dev/mem, read as read_physical_memory_at reads it.
@@ -65,7 +66,8 @@ impl DevMem {
 impl PhysicalMemory for DevMem {
     #[expect(
         clippy::disallowed_methods,
-        reason = "RuntimeMemory reads DevMem only after its check against the EFI runtime regions"
+        reason = "RuntimeMemory and ReservedMemory read DevMem only after their checks against a \
+                  firmware memory map"
     )]
     fn read(&self, address: u64, length: usize, _: ReadToken) -> Result<Vec<u8>> {
         read_physical_memory_at(&self.0, address, length, FileExt::read_exact_at)
@@ -93,6 +95,26 @@ impl<M: PhysicalMemory> RuntimeMemory<M> {
     /// The end of the runtime region that holds `length` bytes at `address`.
     pub(in crate::hii) fn region_end(&self, address: u64, length: usize) -> Result<u64> {
         self.map.runtime_range_end(address, u64::try_from(length)?)
+    }
+}
+
+/// The firmware-reserved regions of `map` in `memory`: all that the efivar source reads with
+/// EfivarMemory::FirmwareReserved.
+pub(in crate::hii) struct ReservedMemory<M> {
+    map: FirmwareReservedMap,
+    memory: M,
+}
+
+impl<M: PhysicalMemory> ReservedMemory<M> {
+    pub(in crate::hii) fn new(map: FirmwareReservedMap, memory: M) -> Self {
+        Self { map, memory }
+    }
+
+    /// `length` bytes at `address`, which one firmware-reserved region must hold.
+    pub(in crate::hii) fn read(&self, address: u64, length: usize) -> Result<Vec<u8>> {
+        self.map
+            .reserved_range_end(address, u64::try_from(length)?)?;
+        self.memory.read(address, length, ReadToken(()))
     }
 }
 
@@ -149,6 +171,7 @@ mod tests {
     use crate::hii::firmware_memory::efi_memory_map::fixture::runtime_map;
     use crate::hii::firmware_memory::efi_memory_map::MemoryType;
     use crate::hii::firmware_memory::efi_memory_map::RangeRefusal;
+    use crate::hii::firmware_memory::physical_range::PhysicalRange;
     use crate::hii::lockdown::LockdownMode;
     use crate::hii::memory_access_denied::fixture::lockdown_file;
     use crate::hii::memory_access_denied::fixture::refused_open;
@@ -244,6 +267,57 @@ mod tests {
                     length: u64::try_from(length).expect("a u64 length"),
                     memory_type: MemoryType::MEMORY_MAPPED_IO,
                 }),
+                "{address:#x}+{length:#x}: {error:#}"
+            );
+        }
+    }
+
+    /// ReservedMemory reads only inside its firmware-reserved regions, and no runtime
+    /// memory-mapped I/O there.
+    #[test]
+    fn reserved_memory_reads_only_its_reserved_regions() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let file = memory_file(&bytes);
+        let map = || {
+            FirmwareReservedMap::new(
+                vec![PhysicalRange::new(REGION, PAGES * 0x1000).expect("a range")],
+                runtime_map(&[(REGION + 0x1000, 0, 1, MemoryType::MEMORY_MAPPED_IO)]),
+            )
+        };
+        let memory = ReservedMemory::new(
+            map(),
+            MemoryWithin::open(file.path(), REGION, REGION + 0x100).expect("open the memory"),
+        );
+
+        let got = memory.read(REGION + 0x10, 0x20).expect("read the region");
+
+        assert_eq!(got, bytes[0x10..0x30], "inside the region");
+        let unread = ReservedMemory::new(map(), UnreadMemory);
+        for (address, length, want) in [
+            (
+                REGION_END,
+                8,
+                RangeRefusal::NotFirmwareReserved {
+                    address: REGION_END,
+                    length: 8,
+                },
+            ),
+            (
+                REGION + 0xff8,
+                16,
+                RangeRefusal::MemoryMappedIo {
+                    address: REGION + 0xff8,
+                    length: 16,
+                    memory_type: MemoryType::MEMORY_MAPPED_IO,
+                },
+            ),
+        ] {
+            let error = unread
+                .read(address, length)
+                .expect_err("read outside the reserved region");
+            assert_eq!(
+                error.downcast_ref::<RangeRefusal>(),
+                Some(&want),
                 "{address:#x}+{length:#x}: {error:#}"
             );
         }

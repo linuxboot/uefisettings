@@ -109,6 +109,10 @@ of a `HIID` ACPI table through `EFI_ACPI_TABLE_PROTOCOL`, which `uefisettings` r
 `/sys/firmware/acpi/tables/HIID`. QEMU's `-acpitable` cannot add it: only the x86 machines
 take that option.
 
+`publish-hiidb.efi reserved` and `publish-hiidb.efi acpi-nvs` put the copy in memory that the
+firmware reserves without the RUNTIME attribute, which `uefisettings` refuses, as it reads only
+EFI runtime regions. No scenario boots them.
+
 `publish-hiidb.efi password-forms` publishes nothing: it registers the forms of
 [`publish-hiidb/src/password_forms.rs`](publish-hiidb/src/password_forms.rs) in the HII
 database, which `uefisettings.efi` exports in the UEFI Shell: PASSWORD questions in the

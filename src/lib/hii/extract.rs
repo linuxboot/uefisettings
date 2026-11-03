@@ -32,6 +32,8 @@ use crate::hii::firmware_memory::runtime_memory::DevMem;
 #[cfg(firmware_memory_maps)]
 use crate::hii::firmware_memory::runtime_memory::PhysicalMemory;
 #[cfg(firmware_memory_maps)]
+use crate::hii::firmware_memory::runtime_memory::ReservedMemory;
+#[cfg(firmware_memory_maps)]
 use crate::hii::firmware_memory::runtime_memory::RuntimeMemory;
 #[cfg(firmware_memory_maps)]
 use crate::hii::firmware_memory::MemoryMapFiles;
@@ -100,6 +102,24 @@ pub(super) const DEV_MEM_PATH: &str = "/dev/mem";
 /// Below this address (1 MiB), x86 read() of /dev/mem may return zeros.
 const X86_ZERO_FILL_END: u64 = 0x10_0000;
 
+/// The firmware memory that the efivar source reads, where the OCP HiiDB efivar's pointer may
+/// lead; the kernel's checks of /dev/mem apply either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EfivarMemory {
+    /// One EFI_MEMORY_RUNTIME region of the EFI memory map that is not memory-mapped I/O: from
+    /// x86's /sys/firmware/efi/runtime-map, or arm64's map from the FDT and /proc/kcore.
+    #[default]
+    Runtime,
+    /// One firmware-reserved region of the full firmware memory map: an entry of type
+    /// Reserved or ACPI Non-volatile Storage of x86's /sys/firmware/memmap, or an arm64 EFI
+    /// memory descriptor of type EfiReservedMemoryType, EfiRuntimeServicesCode or Data,
+    /// EfiACPIMemoryNVS or EfiPalCode; never one that touches runtime memory-mapped I/O. It
+    /// may still read device memory that firmware reports as reserved, as OVMF reports PCIe
+    /// ECAM.
+    FirmwareReserved,
+}
+
 /// Where extract_db reads the EFI configuration table, the HIID ACPI table, the OCP HiiDB
 /// efivar and physical memory, and the lockdown mode for the efivar route; Default is this
 /// machine's.
@@ -150,13 +170,16 @@ fn hii_db_published_at(paths: &HiiSourcePaths) -> std::io::Result<bool> {
     Ok(false)
 }
 
-pub fn extract_db() -> Result<Vec<u8>> {
-    extract_db_at(&HiiSourcePaths::default())
+/// extract_db returns the raw HII database bytes: those that the EFI configuration table points
+/// to, else those of the HIID ACPI table, which needs no /dev/mem, else those that the OCP HiiDB
+/// efivar points to, read only inside `efivar_memory`.
+pub fn extract_db(efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
+    extract_db_at(&HiiSourcePaths::default(), efivar_memory)
 }
 
 /// extract_db, reading the EFI configuration table, the HIID ACPI table, the OCP HiiDB efivar
 /// and physical memory at `paths`.
-fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
+fn extract_db_at(paths: &HiiSourcePaths, efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
     // Prefer the spec-standard route (the HII database configuration table
     // found through the EFI System Table), then the vendor ACPI table that
     // carries the database content directly (read from sysfs, no /dev/mem), and
@@ -186,7 +209,7 @@ fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
         ),
     }
 
-    extract_db_efivar(paths)
+    extract_db_efivar(paths, efivar_memory)
 }
 
 #[derive(Debug, PartialEq)]
@@ -303,16 +326,16 @@ fn locate_efivar_database(paths: &HiiSourcePaths) -> Result<(u64, usize)> {
 }
 
 /// The HiiDB that the OCP HiiDB efivar at paths.ocp_hiidb points to in paths.dev_mem, read only
-/// inside an EFI runtime region, under the kernel lockdown mode in paths.lockdown.
+/// inside `efivar_memory`, under the kernel lockdown mode in paths.lockdown.
 #[cfg(firmware_memory_maps)]
-fn extract_db_efivar(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
-    extract_db_with(paths, DevMem::open)
+fn extract_db_efivar(paths: &HiiSourcePaths, efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
+    extract_db_with(paths, efivar_memory, DevMem::open)
 }
 
 /// extract_db_efivar on an architecture whose firmware memory maps uefisettings does not read,
 /// which refuses the read that nothing bounds.
 #[cfg(not(firmware_memory_maps))]
-fn extract_db_efivar(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
+fn extract_db_efivar(paths: &HiiSourcePaths, _: EfivarMemory) -> Result<Vec<u8>> {
     locate_efivar_database(paths)?;
     Err(MemoryMapUnavailable::NoMapReader.into())
 }
@@ -323,13 +346,24 @@ fn extract_db_efivar(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
 #[cfg(firmware_memory_maps)]
 fn extract_db_with<M: PhysicalMemory>(
     paths: &HiiSourcePaths,
+    efivar_memory: EfivarMemory,
     open_memory: impl FnOnce(&Path, &Path) -> Result<M>,
 ) -> Result<Vec<u8>> {
     let (address, length) = locate_efivar_database(paths)?;
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
-    let map = paths.maps.runtime_bound(&paths.lockdown)?;
-    RuntimeMemory::new(map, open_memory(&paths.dev_mem, &paths.lockdown)?).read(address, length)
+    match efivar_memory {
+        EfivarMemory::Runtime => {
+            let map = paths.maps.runtime_bound(&paths.lockdown)?;
+            RuntimeMemory::new(map, open_memory(&paths.dev_mem, &paths.lockdown)?)
+                .read(address, length)
+        }
+        EfivarMemory::FirmwareReserved => {
+            let map = paths.maps.firmware_reserved_bound(&paths.lockdown)?;
+            ReservedMemory::new(map, open_memory(&paths.dev_mem, &paths.lockdown)?)
+                .read(address, length)
+        }
+    }
 }
 
 /// Reads the HII database through the EFI configuration table: the
@@ -699,6 +733,8 @@ mod tests {
     #[cfg(firmware_memory_maps)]
     use crate::hii::firmware_memory::efi_memory_map::EFI_MEMORY_RUNTIME;
     #[cfg(firmware_memory_maps)]
+    use crate::hii::firmware_memory::fixture::write_firmware_memmap;
+    #[cfg(firmware_memory_maps)]
     use crate::hii::firmware_memory::fixture::write_runtime_map;
     use crate::hii::memory_access_denied::fixture::lockdown_file;
     use crate::hii::memory_access_denied::DenialCause;
@@ -726,6 +762,7 @@ mod tests {
             #[cfg(firmware_memory_maps)]
             maps: MemoryMapFiles::Sysfs {
                 runtime_map: dir.join("runtime-map"),
+                firmware_memmap: dir.join("memmap"),
             },
         }
     }
@@ -741,10 +778,15 @@ mod tests {
         std::fs::write(path, efivar.concat()).expect("write the HiiDB efivar");
     }
 
-    /// Writes x86's runtime-map into `dir`, at paths_in's path: the descriptors `runtime` of
-    /// (type, physical start, pages, attribute).
+    /// Writes x86's memory maps into `dir`, at paths_in's paths: a runtime-map of the
+    /// descriptors `runtime` of (type, physical start, pages, attribute), and a firmware memory
+    /// map of the entries `memmap` of (start, inclusive end, type).
     #[cfg(firmware_memory_maps)]
-    fn write_sysfs_maps(dir: &Path, runtime: &[(MemoryType, u64, u64, u64)]) {
+    fn write_sysfs_maps(
+        dir: &Path,
+        runtime: &[(MemoryType, u64, u64, u64)],
+        memmap: &[(u64, u64, &str)],
+    ) {
         let runtime: Vec<[String; 5]> = runtime
             .iter()
             .map(|&(memory_type, start, pages, attribute)| {
@@ -762,6 +804,21 @@ mod tests {
             .map(|entry| entry.each_ref().map(String::as_str))
             .collect();
         write_runtime_map(&dir.join("runtime-map"), &runtime);
+        let memmap: Vec<[String; 3]> = memmap
+            .iter()
+            .map(|&(start, end, memory_type)| {
+                [
+                    format!("{start:#x}\n"),
+                    format!("{end:#x}\n"),
+                    format!("{memory_type}\n"),
+                ]
+            })
+            .collect();
+        let memmap: Vec<[&str; 3]> = memmap
+            .iter()
+            .map(|entry| entry.each_ref().map(String::as_str))
+            .collect();
+        write_firmware_memmap(&dir.join("memmap"), &memmap);
     }
 
     /// The efivar source's bound and the order of its checks, where it reads memory maps.
@@ -791,8 +848,8 @@ mod tests {
         /// The database that the bound tests' efivar locates.
         const BOUNDED_DB: &[u8] = b"the bounded HiiDB";
 
-        /// Writes into `dir` x86's runtime-map of the bound tests' regions: runtime data and
-        /// memory-mapped I/O.
+        /// Writes into `dir` x86's maps of the bound tests' regions, as the x86 EFI stub and Linux
+        /// export them: E820 reserved for runtime data, reserved memory and memory-mapped I/O.
         fn write_bound_sysfs_maps(dir: &Path) -> MemoryMapFiles {
             write_sysfs_maps(
                 dir,
@@ -808,6 +865,25 @@ mod tests {
                         MMIO_AT,
                         1,
                         EFI_MEMORY_RUNTIME | 1,
+                    ),
+                ],
+                &[
+                    (
+                        RUNTIME_DATA_AT,
+                        RUNTIME_DATA_AT + REGION_SIZE - 1,
+                        "Reserved",
+                    ),
+                    (RESERVED_AT, RESERVED_AT + REGION_SIZE - 1, "Reserved"),
+                    (
+                        NVS_AT,
+                        NVS_AT + REGION_SIZE - 1,
+                        "ACPI Non-volatile Storage",
+                    ),
+                    (RAM_AT, RAM_AT + 0xf_ffff, "System RAM"),
+                    (
+                        ACPI_TABLES_AT,
+                        ACPI_TABLES_AT + REGION_SIZE - 1,
+                        "ACPI Tables",
                     ),
                 ],
             );
@@ -829,8 +905,7 @@ mod tests {
                     pages,
                     EFI_MEMORY_RUNTIME | 0xf,
                 ),
-                // EfiReservedMemoryType
-                descriptor(desc_size, MemoryType(0), RESERVED_AT, 0, pages, 1),
+                descriptor(desc_size, MemoryType::RESERVED, RESERVED_AT, 0, pages, 1),
                 descriptor(
                     desc_size,
                     MemoryType::MEMORY_MAPPED_IO,
@@ -839,8 +914,14 @@ mod tests {
                     1,
                     EFI_MEMORY_RUNTIME | 1,
                 ),
-                // EfiACPIMemoryNVS
-                descriptor(desc_size, MemoryType(10), NVS_AT, 0, pages, 0xf),
+                descriptor(
+                    desc_size,
+                    MemoryType::ACPI_MEMORY_NVS,
+                    NVS_AT,
+                    0,
+                    pages,
+                    0xf,
+                ),
                 // EfiLoaderData and EfiACPIReclaimMemory
                 descriptor(desc_size, MemoryType(2), RAM_AT, 0, 0x100, 0xf),
                 descriptor(desc_size, MemoryType(9), ACPI_TABLES_AT, 0, pages, 0xf),
@@ -878,37 +959,84 @@ mod tests {
             paths
         }
 
-        /// The efivar source reads only inside one EFI runtime region that is not memory-mapped
-        /// I/O, by x86's and by arm64's maps: runtime data, never reserved memory, ACPI NVS,
-        /// System RAM or memory-mapped I/O. A refused range is read nowhere.
+        /// The efivar source reads only inside the memory that EfivarMemory names, by x86's and
+        /// by arm64's maps: by default runtime data, and with FirmwareReserved also reserved
+        /// memory and ACPI NVS, never System RAM, ACPI tables or runtime memory-mapped I/O. A
+        /// refused range is read nowhere.
         #[test]
-        fn efivar_reads_only_runtime_memory() {
+        fn efivar_reads_only_the_memory_that_efivar_memory_names() {
+            use EfivarMemory::FirmwareReserved;
+            use EfivarMemory::Runtime;
+
             let length = u64::try_from(BOUNDED_DB.len()).expect("a u64 length");
             let not_runtime = |address| RangeRefusal::NotRuntime { address, length };
+            let not_reserved = |address| RangeRefusal::NotFirmwareReserved { address, length };
             let mmio = |address| RangeRefusal::MemoryMappedIo {
                 address,
                 length,
                 memory_type: MemoryType::MEMORY_MAPPED_IO,
             };
-            for (case, address, refusal) in [
-                ("runtime data", RUNTIME_DATA_AT + DB_OFFSET, None),
+            let reserved_end = RESERVED_AT + REGION_SIZE - 8;
+            for (case, memory, address, refusal) in [
+                ("runtime data", Runtime, RUNTIME_DATA_AT + DB_OFFSET, None),
                 (
                     "reserved memory",
+                    Runtime,
                     RESERVED_AT + DB_OFFSET,
                     Some(not_runtime(RESERVED_AT + DB_OFFSET)),
                 ),
                 (
                     "ACPI NVS",
+                    Runtime,
                     NVS_AT + DB_OFFSET,
                     Some(not_runtime(NVS_AT + DB_OFFSET)),
                 ),
                 (
                     "System RAM",
+                    Runtime,
                     RAM_AT + DB_OFFSET,
                     Some(not_runtime(RAM_AT + DB_OFFSET)),
                 ),
                 (
                     "memory-mapped I/O",
+                    Runtime,
+                    MMIO_AT + DB_OFFSET,
+                    Some(mmio(MMIO_AT + DB_OFFSET)),
+                ),
+                (
+                    "runtime data",
+                    FirmwareReserved,
+                    RUNTIME_DATA_AT + DB_OFFSET,
+                    None,
+                ),
+                (
+                    "reserved memory",
+                    FirmwareReserved,
+                    RESERVED_AT + DB_OFFSET,
+                    None,
+                ),
+                ("ACPI NVS", FirmwareReserved, NVS_AT + DB_OFFSET, None),
+                (
+                    "System RAM",
+                    FirmwareReserved,
+                    RAM_AT + DB_OFFSET,
+                    Some(not_reserved(RAM_AT + DB_OFFSET)),
+                ),
+                (
+                    "ACPI tables",
+                    FirmwareReserved,
+                    ACPI_TABLES_AT + DB_OFFSET,
+                    Some(not_reserved(ACPI_TABLES_AT + DB_OFFSET)),
+                ),
+                (
+                    "past the end of reserved memory",
+                    FirmwareReserved,
+                    reserved_end,
+                    Some(not_reserved(reserved_end)),
+                ),
+                (
+                    "memory-mapped I/O in reserved memory",
+                    FirmwareReserved,
                     MMIO_AT + DB_OFFSET,
                     Some(mmio(MMIO_AT + DB_OFFSET)),
                 ),
@@ -925,22 +1053,34 @@ mod tests {
                         None => address..address + length,
                     };
 
-                    let got = extract_db_with(&paths, |path, _| {
+                    let got = extract_db_with(&paths, memory, |path, _| {
                         MemoryWithin::open(path, readable.start, readable.end)
                     });
 
                     match (got, refusal) {
-                        (Ok(db), None) => assert_eq!(db, BOUNDED_DB, "{family}: {case}"),
+                        (Ok(db), None) => {
+                            assert_eq!(db, BOUNDED_DB, "{family}, {memory:?}: {case}")
+                        }
                         (Err(error), Some(refusal)) => assert_eq!(
                             error.downcast_ref::<RangeRefusal>(),
                             Some(&refusal),
-                            "{family}: {case}: {error:#}"
+                            "{family}, {memory:?}: {case}: {error:#}"
                         ),
-                        (got, _) => panic!("{family}: {case}: got {got:?}"),
+                        (got, _) => panic!("{family}, {memory:?}: {case}: got {got:?}"),
                     }
                 }
             }
         }
+    }
+
+    /// Callers that name no bound get the runtime regions.
+    #[test]
+    fn efivar_memory_defaults_to_runtime() {
+        assert_eq!(
+            EfivarMemory::default(),
+            EfivarMemory::Runtime,
+            "the efivar source's default bound"
+        );
     }
 
     /// hii_db_published fails, rather than answers false, when it cannot check a file.
@@ -1167,7 +1307,8 @@ mod tests {
             };
             std::fs::write(&paths.ocp_hiidb, efivar).expect("write the HiiDB efivar");
 
-            let error = extract_db_efivar(&paths).expect_err("read an implausible length");
+            let error = extract_db_efivar(&paths, EfivarMemory::Runtime)
+                .expect_err("read an implausible length");
 
             assert_eq!(
                 error.downcast_ref::<HiiDbLengthInvalid>(),
@@ -1203,6 +1344,7 @@ mod tests {
                     MAX_ALLOWED_FILESIZE / 0x1000,
                     EFI_MEMORY_RUNTIME,
                 )],
+                &[],
             );
             let length = u32::try_from(ocp.len()).expect("a u32 length");
             write_efivar(&paths.ocp_hiidb, X86_ZERO_FILL_END, length);
@@ -1211,7 +1353,8 @@ mod tests {
                 .write_all_at(&ocp, X86_ZERO_FILL_END)
                 .expect("write the database");
 
-            let got = extract_db_efivar(&paths).unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            let got = extract_db_efivar(&paths, EfivarMemory::Runtime)
+                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
 
             assert!(got == ocp, "{case}: read {} bytes", got.len());
         }

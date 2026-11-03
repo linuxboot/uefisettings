@@ -25,6 +25,8 @@ use uefisettings_backend_thrift::Question;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
+#[cfg(target_os = "linux")]
+pub use crate::hii::extract::EfivarMemory;
 use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;

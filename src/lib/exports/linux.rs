@@ -55,7 +55,7 @@ use crate::translation::translate_response;
 impl HiiBackend {
     /// This machine's HiiDB.
     pub(super) fn system_hiidb() -> Result<Vec<u8>> {
-        extract::extract_db()
+        extract::extract_db(extract::EfivarMemory::Runtime)
     }
 
     /// This machine's efivarfs.
@@ -68,7 +68,7 @@ impl HiiBackend {
     /// extract_db extracts HiiDB from efivarfs and returns it in bytes (in HiiDatabase's db field which is `Vec<u8>`)
     pub fn extract_db() -> Result<HiiDatabase> {
         let resp = HiiDatabase {
-            db: extract::extract_db()?,
+            db: extract::extract_db(extract::EfivarMemory::Runtime)?,
             ..Default::default()
         };
         Ok(resp)

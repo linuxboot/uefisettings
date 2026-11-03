@@ -38,15 +38,21 @@ use efi_memory_map::MemoryDescriptor;
 use efi_memory_map::MemoryType;
 #[cfg(any(target_arch = "aarch64", test))]
 use fdt_params::UefiFdtParams;
+#[cfg(firmware_memory_maps)]
+use firmware_reserved::FirmwareReservedMap;
 #[cfg(any(target_arch = "aarch64", test))]
 use kcore::read_kcore;
 #[cfg(target_arch = "aarch64")]
 use kcore::KCORE_PATH;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
+use physical_range::PhysicalRange;
 
 #[cfg(any(firmware_memory_maps, test))]
 pub(super) mod efi_memory_map;
 #[cfg(any(target_arch = "aarch64", test))]
 pub(super) mod fdt_params;
+#[cfg(any(firmware_memory_maps, test))]
+pub(super) mod firmware_reserved;
 #[cfg(any(target_arch = "aarch64", test))]
 pub(super) mod kcore;
 #[cfg(any(firmware_memory_maps, test))]
@@ -62,6 +68,19 @@ pub(in crate::hii) const MAX_MEMORY_MAP_SIZE: usize = 1 << 20;
 /// each, with CONFIG_EFI_RUNTIME_MAP only (arch/x86/platform/efi/runtime-map.c).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const RUNTIME_MAP_PATH: &str = "/sys/firmware/efi/runtime-map";
+
+/// The firmware memory map that x86 Linux exports, a directory per entry, with
+/// CONFIG_FIRMWARE_MEMMAP only (drivers/firmware/memmap.c): the E820 table of the firmware, or
+/// of the EFI stub, which converts the EFI memory map (drivers/firmware/efi/libstub/x86-stub.c
+/// setup_e820()), before the kernel changes its own copy.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const FIRMWARE_MEMMAP_PATH: &str = "/sys/firmware/memmap";
+
+/// The types of the firmware memmap entries that firmware reserves (arch/x86/kernel/e820.c
+/// e820_type_to_string()): E820 reserved, which the x86 EFI stub gives EfiReservedMemoryType,
+/// runtime services code and data, memory-mapped I/O and PAL code, and ACPI NVS.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
+const FIRMWARE_RESERVED_E820_TYPES: [&str; 2] = ["Reserved", "ACPI Non-volatile Storage"];
 
 /// The FDT that the kernel got from arm64's EFI stub (drivers/of/fdt.c of_fdt_raw_init()).
 #[cfg(target_arch = "aarch64")]
@@ -92,6 +111,12 @@ pub enum MemoryMapUnavailable {
         .0.display()
     )]
     NoRuntimeMap(PathBuf),
+    /// x86 has no firmware memory map, which lists the firmware-reserved regions.
+    #[error(
+        "{} does not exist, so no firmware-reserved region bounds the reads of firmware memory",
+        .0.display()
+    )]
+    NoFirmwareMemmap(PathBuf),
     /// uefisettings reads no firmware memory map on this architecture.
     #[error(
         "uefisettings reads no firmware memory map on {}, so nothing bounds the reads of firmware \
@@ -155,14 +180,61 @@ pub(in crate::hii) fn read_runtime_map(dir: &Path) -> Result<EfiMemoryMap> {
     EfiMemoryMap::new(descriptors).with_context(|| format!("Failed to read {}", dir.display()))
 }
 
+/// The firmware-reserved regions of the firmware memory map that x86 Linux exports at `dir`
+/// (FIRMWARE_MEMMAP_PATH): its entries of FIRMWARE_RESERVED_E820_TYPES, whose end the kernel
+/// prints inclusive (drivers/firmware/memmap.c firmware_map_add_entry()). Without `dir`, a
+/// refusal.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
+fn read_firmware_memmap(dir: &Path) -> Result<Vec<PhysicalRange>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(MemoryMapUnavailable::NoFirmwareMemmap(dir.to_owned()).into())
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", dir.display()))
+        }
+    };
+    let mut reserved = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("Failed to read {}", dir.display()))?
+            .path();
+        let type_path = entry.join("type");
+        let contents = fs::read_to_string(&type_path)
+            .with_context(|| format!("Failed to read {}", type_path.display()))?;
+        let memory_type = contents.strip_suffix('\n').with_context(|| {
+            format!(
+                "{} holds {contents:?}, not a type and a newline",
+                type_path.display()
+            )
+        })?;
+        if !FIRMWARE_RESERVED_E820_TYPES.contains(&memory_type) {
+            continue;
+        }
+        let start = read_sysfs_hex(&entry.join("start"))?;
+        let end = read_sysfs_hex(&entry.join("end"))?;
+        reserved.push(PhysicalRange::from_inclusive(start, end).with_context(|| {
+            format!(
+                "{} ends at {end:#x}, before its start {start:#x} or at the end of memory",
+                entry.display()
+            )
+        })?);
+    }
+    Ok(reserved)
+}
+
 /// The files of this machine's firmware memory maps, as its architecture's Linux exports them;
 /// Default is this machine's.
 #[cfg(firmware_memory_maps)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::hii) enum MemoryMapFiles {
-    /// x86's runtime-map (read_runtime_map).
+    /// x86's runtime-map (read_runtime_map) and firmware memory map (read_firmware_memmap).
     #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
-    Sysfs { runtime_map: PathBuf },
+    Sysfs {
+        runtime_map: PathBuf,
+        firmware_memmap: PathBuf,
+    },
     /// arm64's FDT, whose EFI memory map /proc/kcore serves (read_fdt_memory_map).
     #[cfg(any(target_arch = "aarch64", test))]
     Fdt { fdt: PathBuf, kcore: PathBuf },
@@ -173,6 +245,7 @@ impl Default for MemoryMapFiles {
     fn default() -> Self {
         Self::Sysfs {
             runtime_map: PathBuf::from(RUNTIME_MAP_PATH),
+            firmware_memmap: PathBuf::from(FIRMWARE_MEMMAP_PATH),
         }
     }
 }
@@ -189,8 +262,8 @@ impl Default for MemoryMapFiles {
 
 #[cfg(firmware_memory_maps)]
 impl MemoryMapFiles {
-    /// The runtime descriptors of the EFI memory map, which bound the efivar source, read with
-    /// the lockdown file `lockdown` after the caller's refuse_locked_down.
+    /// The runtime descriptors of the EFI memory map, which bound EfivarMemory::Runtime, read
+    /// with the lockdown file `lockdown` after the caller's refuse_locked_down.
     pub(in crate::hii) fn runtime_bound(
         &self,
         #[cfg_attr(
@@ -201,12 +274,39 @@ impl MemoryMapFiles {
     ) -> Result<EfiMemoryMap> {
         match self {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
-            Self::Sysfs { runtime_map } => read_runtime_map(runtime_map),
+            Self::Sysfs { runtime_map, .. } => read_runtime_map(runtime_map),
             #[cfg(any(target_arch = "aarch64", test))]
             Self::Fdt { fdt, kcore } => {
                 EfiMemoryMap::new(read_fdt_memory_map(fdt, kcore, lockdown)?.descriptors)
                     .context("Failed to parse the EFI memory map")
             }
+        }
+    }
+
+    /// The firmware-reserved regions of the firmware memory map, which bound
+    /// EfivarMemory::FirmwareReserved, read as runtime_bound reads.
+    pub(in crate::hii) fn firmware_reserved_bound(
+        &self,
+        #[cfg_attr(
+            not(any(target_arch = "aarch64", test)),
+            allow(unused_variables, reason = "only arm64's /proc/kcore takes it")
+        )]
+        lockdown: &Path,
+    ) -> Result<FirmwareReservedMap> {
+        match self {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
+            Self::Sysfs {
+                runtime_map,
+                firmware_memmap,
+            } => Ok(FirmwareReservedMap::new(
+                read_firmware_memmap(firmware_memmap)?,
+                read_runtime_map(runtime_map)?,
+            )),
+            #[cfg(any(target_arch = "aarch64", test))]
+            Self::Fdt { fdt, kcore } => FirmwareReservedMap::from_efi_descriptors(
+                read_fdt_memory_map(fdt, kcore, lockdown)?.descriptors,
+            )
+            .context("Failed to parse the EFI memory map"),
         }
     }
 }
@@ -259,6 +359,19 @@ pub(in crate::hii) mod fixture {
     use std::fs;
     use std::path::Path;
 
+    /// A firmware memory map at `dir` with an entry of each start, end and type of `entries`,
+    /// as drivers/firmware/memmap.c prints them.
+    pub(in crate::hii) fn write_firmware_memmap(dir: &Path, entries: &[[&str; 3]]) {
+        for (index, attributes) in entries.iter().enumerate() {
+            let entry_dir = dir.join(index.to_string());
+            fs::create_dir_all(&entry_dir).expect("create a firmware memmap entry");
+            for (name, contents) in ["start", "end", "type"].iter().zip(attributes) {
+                fs::write(entry_dir.join(name), contents)
+                    .expect("write a firmware memmap attribute");
+            }
+        }
+    }
+
     /// A runtime-map at `dir` with an entry of each type, phys_addr, virt_addr, num_pages and
     /// attribute of `entries`, as arch/x86/platform/efi/runtime-map.c prints them.
     pub(in crate::hii) fn write_runtime_map(dir: &Path, entries: &[[&str; 5]]) {
@@ -277,6 +390,7 @@ pub(in crate::hii) mod fixture {
 
 #[cfg(test)]
 mod tests {
+    use super::fixture::write_firmware_memmap;
     use super::fixture::write_runtime_map;
     use super::runtime_memory::DevMem;
     use super::*;
@@ -468,25 +582,34 @@ mod tests {
         );
     }
 
-    /// A runtime-map that exists but cannot be read stays an error, not MemoryMapUnavailable.
+    /// A firmware memory map or runtime-map that exists but cannot be read stays an error, not
+    /// MemoryMapUnavailable.
     #[test]
     fn unreadable_maps_are_not_missing_maps() {
         let dir = tempfile::tempdir().expect("create a directory");
         // read_dir() of a regular file fails with ENOTDIR
         let file = dir.path().join("file");
         fs::write(&file, b"").expect("create a file");
-
-        let error = read_runtime_map(&file).expect_err("read a file as the runtime-map");
-
-        assert_eq!(
-            error.downcast_ref::<MemoryMapUnavailable>(),
-            None,
-            "{error:#}"
-        );
-        assert!(
-            format!("{error:#}").starts_with(&format!("Failed to read {}: ", file.display())),
-            "{error:#}"
-        );
+        for (case, error) in [
+            (
+                "memmap",
+                read_firmware_memmap(&file).expect_err("read a file as the memmap"),
+            ),
+            (
+                "runtime-map",
+                read_runtime_map(&file).expect_err("read a file as the runtime-map"),
+            ),
+        ] {
+            assert_eq!(
+                error.downcast_ref::<MemoryMapUnavailable>(),
+                None,
+                "{case}: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").starts_with(&format!("Failed to read {}: ", file.display())),
+                "{case}: {error:#}"
+            );
+        }
     }
 
     /// An entry that does not parse fails the map even next to good ones, as does a map with
@@ -530,6 +653,81 @@ mod tests {
             let error = read_runtime_map(dir.path()).expect_err("read a bad runtime map");
 
             assert!(format!("{error:#}").contains(message), "{case}: {error:#}");
+        }
+    }
+
+    /// Only the entries of type Reserved and ACPI Non-volatile Storage are firmware-reserved,
+    /// each with its inclusive end, as drivers/firmware/memmap.c prints them.
+    #[test]
+    fn read_firmware_memmap_reads_the_reserved_entries() {
+        let dir = tempfile::tempdir().expect("create a sysfs directory");
+        write_firmware_memmap(
+            dir.path(),
+            &[
+                ["0x0\n", "0x9fbff\n", "System RAM\n"],
+                ["0x9fc00\n", "0x9ffff\n", "Reserved\n"],
+                ["0x7f000000\n", "0x7f001fff\n", "ACPI Tables\n"],
+                [
+                    "0x7f002000\n",
+                    "0x7f005fff\n",
+                    "ACPI Non-volatile Storage\n",
+                ],
+                ["0x7f006000\n", "0x7f006fff\n", "Unusable memory\n"],
+                ["0x7f007000\n", "0x7f007fff\n", "Soft Reserved\n"],
+            ],
+        );
+
+        let mut got: Vec<(u64, u64)> = read_firmware_memmap(dir.path())
+            .expect("read the firmware memory map")
+            .into_iter()
+            .map(|range| (range.start(), range.end()))
+            .collect();
+
+        got.sort_unstable();
+        assert_eq!(got, [(0x9_fc00, 0xa_0000), (0x7f00_2000, 0x7f00_6000)]);
+    }
+
+    /// Without CONFIG_FIRMWARE_MEMMAP, no firmware-reserved region is known, so the source
+    /// refuses; an entry that does not parse fails the map.
+    #[test]
+    fn read_firmware_memmap_refuses_a_missing_or_bad_map() {
+        let dir = tempfile::tempdir().expect("create a sysfs directory");
+        let missing = dir.path().join("memmap");
+        let error = read_firmware_memmap(&missing).expect_err("read a missing map");
+        assert_eq!(
+            error.downcast_ref::<MemoryMapUnavailable>(),
+            Some(&MemoryMapUnavailable::NoFirmwareMemmap(missing)),
+            "{error:#}"
+        );
+
+        for (case, entry, want) in [
+            (
+                "a type without a newline",
+                ["0x1000\n", "0x1fff\n", "Reserved"],
+                "type holds \"Reserved\", not a type and a newline",
+            ),
+            (
+                "a bad start",
+                ["0x1000z\n", "0x1fff\n", "Reserved\n"],
+                "start holds \"0x1000z\\n\", not a hex number",
+            ),
+            (
+                "a bad end",
+                ["0x1000\n", "0x1fffz\n", "Reserved\n"],
+                "end holds \"0x1fffz\\n\", not a hex number",
+            ),
+            (
+                "an end before the start",
+                ["0x2000\n", "0x1fff\n", "Reserved\n"],
+                "ends at 0x1fff, before its start 0x2000 or at the end of memory",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("create a sysfs directory");
+            write_firmware_memmap(dir.path(), &[["0x0\n", "0xfff\n", "Reserved\n"], entry]);
+
+            let error = read_firmware_memmap(dir.path()).expect_err(case);
+
+            assert!(format!("{error:#}").contains(want), "{case}: {error:#}");
         }
     }
 

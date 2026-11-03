@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|install-config-tables]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|install-config-tables]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -21,6 +21,9 @@
 //! RAM, which it refuses.
 //! arm64 Linux maps neither `rt-data` nor `reserved`, so `/dev/mem` serves them only
 //! to mmap(), as 32-bit x86 Linux does above its low memory.
+//! `acpi-nvs` puts the copy in ACPI NVS memory, which firmware reserves without the RUNTIME
+//! attribute: x86 Linux marks it busy, which `/dev/mem` refuses under
+//! `CONFIG_IO_STRICT_DEVMEM`, while arm64 Linux serves it.
 //! The driver also puts the CRC-32 of the database in the volatile `HiiDBCrc32`
 //! variable, for the tests to check what `uefisettings` extracts.
 //! `rt-data-global-variable-forms` is `rt-data`, with the package lists of
@@ -126,8 +129,8 @@ fn efi_main() -> Status {
         None => {
             println!(
                 "usage: publish-hiidb \
-                 [rt-data|reserved|loader-data|rt-data-global-variable-forms|password-forms\
-                 |acpi-table|install-config-tables]"
+                 [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
+                 |password-forms|acpi-table|install-config-tables]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -167,6 +170,10 @@ fn load_option() -> Option<Task> {
         Ok(option) if option == cstr16!("reserved") => {
             Some(Task::Publish(MemoryType::RESERVED, Database::Exported))
         }
+        Ok(option) if option == cstr16!("acpi-nvs") => Some(Task::Publish(
+            MemoryType::ACPI_NON_VOLATILE,
+            Database::Exported,
+        )),
         Ok(option) if option == cstr16!("loader-data") => {
             Some(Task::Publish(MemoryType::LOADER_DATA, Database::Exported))
         }

@@ -47,13 +47,25 @@ const MEMORY_DESCRIPTOR_SIZE: usize = 40;
 pub struct MemoryType(pub u32);
 
 impl MemoryType {
+    /// EfiReservedMemoryType (EFI_MEMORY_TYPE; include/linux/efi.h).
+    #[cfg(any(target_arch = "aarch64", test))]
+    pub(in crate::hii) const RESERVED: Self = Self(0);
+    /// EfiRuntimeServicesCode (EFI_MEMORY_TYPE; include/linux/efi.h).
+    #[cfg(any(target_arch = "aarch64", test))]
+    pub(in crate::hii) const RUNTIME_SERVICES_CODE: Self = Self(5);
     /// EfiRuntimeServicesData (EFI_MEMORY_TYPE; include/linux/efi.h).
-    #[cfg(test)]
+    #[cfg(any(target_arch = "aarch64", test))]
     pub(in crate::hii) const RUNTIME_SERVICES_DATA: Self = Self(6);
+    /// EfiACPIMemoryNVS (EFI_MEMORY_TYPE; include/linux/efi.h).
+    #[cfg(any(target_arch = "aarch64", test))]
+    pub(in crate::hii) const ACPI_MEMORY_NVS: Self = Self(10);
     /// EfiMemoryMappedIO (UEFI 2.11 §7.2.1 EFI_MEMORY_TYPE).
     pub const MEMORY_MAPPED_IO: Self = Self(11);
     /// EfiMemoryMappedIOPortSpace (UEFI 2.11 §7.2.1 EFI_MEMORY_TYPE).
     pub const MEMORY_MAPPED_IO_PORT_SPACE: Self = Self(12);
+    /// EfiPalCode (EFI_MEMORY_TYPE; include/linux/efi.h).
+    #[cfg(any(target_arch = "aarch64", test))]
+    pub(in crate::hii) const PAL_CODE: Self = Self(13);
 
     /// Whether memory of this type is a device's, which firmware asks the OS to map for
     /// runtime services (UEFI 2.11 §7.2 Table 7.5).
@@ -61,6 +73,22 @@ impl MemoryType {
         matches!(
             self,
             Self::MEMORY_MAPPED_IO | Self::MEMORY_MAPPED_IO_PORT_SPACE
+        )
+    }
+
+    /// Whether firmware keeps memory of this type from the OS: EfiReservedMemoryType, runtime
+    /// services code and data, EfiACPIMemoryNVS and EfiPalCode, which arm64 Linux does not take
+    /// as System RAM (drivers/firmware/efi/efi-init.c is_usable_memory(); edk2
+    /// MdePkg/Include/Uefi/UefiMultiPhase.h EFI_MEMORY_TYPE).
+    #[cfg(any(target_arch = "aarch64", test))]
+    pub(super) fn is_firmware_reserved(self) -> bool {
+        matches!(
+            self,
+            Self::RESERVED
+                | Self::RUNTIME_SERVICES_CODE
+                | Self::RUNTIME_SERVICES_DATA
+                | Self::ACPI_MEMORY_NVS
+                | Self::PAL_CODE
         )
     }
 }
@@ -92,7 +120,7 @@ impl MemoryDescriptor {
     }
 
     /// The pages of the descriptor, unless their end overflows.
-    fn physical_range(&self) -> Option<PhysicalRange> {
+    pub(super) fn physical_range(&self) -> Option<PhysicalRange> {
         PhysicalRange::new(self.physical_start, self.pages.checked_mul(EFI_PAGE_SIZE)?)
     }
 
@@ -127,6 +155,9 @@ pub enum RangeRefusal {
     /// No EFI_MEMORY_RUNTIME descriptor holds the whole range.
     #[error("{address:#x}+{length:#x} lies in no EFI_MEMORY_RUNTIME region")]
     NotRuntime { address: u64, length: u64 },
+    /// No single firmware-reserved region holds the whole range (EfivarMemory::FirmwareReserved).
+    #[error("{address:#x}+{length:#x} lies in no firmware-reserved region")]
+    NotFirmwareReserved { address: u64, length: u64 },
     /// The range touches a runtime descriptor of memory-mapped I/O.
     #[error(
         "{address:#x}+{length:#x} lies in memory-mapped I/O, EFI memory type {}",
@@ -181,8 +212,8 @@ impl EfiMemoryMap {
     }
 
     /// The end of the runtime descriptor whose physical range holds `length` bytes at
-    /// `address`: the only memory that the efivar source reads.
-    /// Firmware pointers may be
+    /// `address`: the only memory that the efivar source reads by default
+    /// (EfivarMemory::Runtime). Firmware pointers may be
     /// wrong, or virtual where the source takes them as physical, and point at a device, which
     /// a read may change: memory-mapped I/O that runtime services use is runtime too (UEFI 2.11
     /// §7.2 Table 7.5), so a range that touches any of its descriptors is refused.
@@ -198,7 +229,11 @@ impl EfiMemoryMap {
     }
 
     /// Refuses `length` bytes at `address` that touch a runtime descriptor of memory-mapped I/O.
-    fn refuse_memory_mapped_io(&self, address: u64, length: u64) -> Result<(), RangeRefusal> {
+    pub(super) fn refuse_memory_mapped_io(
+        &self,
+        address: u64,
+        length: u64,
+    ) -> Result<(), RangeRefusal> {
         match self.runtime.iter().find(|descriptor| {
             descriptor.memory_type.is_memory_mapped_io()
                 && descriptor.range.overlaps(address, length)
@@ -413,6 +448,20 @@ mod tests {
                 ),
                 (got, want) => panic!("{case}: got {got:?}, want {want:?}"),
             }
+        }
+    }
+
+    /// Firmware reserves EfiReservedMemoryType, runtime services code and data, EfiACPIMemoryNVS
+    /// and EfiPalCode, and no other type.
+    #[test]
+    fn is_firmware_reserved_holds_for_the_types_that_firmware_keeps() {
+        for value in (0..=16).chain([0x7000_0000, 0x8000_0000]) {
+            let want = matches!(value, 0 | 5 | 6 | 10 | 13);
+            assert_eq!(
+                MemoryType(value).is_firmware_reserved(),
+                want,
+                "EFI memory type {value:#x}"
+            );
         }
     }
 

@@ -307,8 +307,8 @@ pub fn published_crc32() -> u32 {
 }
 
 impl PublishedDatabase {
-    /// The efivar source's refusal of this database, which no `region`, such as
-    /// `EFI_MEMORY_RUNTIME`, holds (`src/lib/hii/firmware_memory/efi_memory_map.rs`
+    /// The efivar source's refusal of this database, which no `region`, `EFI_MEMORY_RUNTIME` or
+    /// `firmware-reserved`, holds (`src/lib/hii/firmware_memory/efi_memory_map.rs`
     /// `RangeRefusal`).
     pub fn refusal(&self, region: &str) -> String {
         format!(
