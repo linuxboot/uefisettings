@@ -1,5 +1,5 @@
-# The checks of the Makefile; the QEMU boots, which need KVM and apt packages, in
-# a job of their own.
+# The checks of the Makefile; the QEMU boots, which need KVM and apt packages, and
+# the unit tests on macOS in jobs of their own.
 name: ci
 
 on:
@@ -38,6 +38,29 @@ jobs:
 
       # Every check but the boots.
       - run: make -k lint test test-i686
+
+  # The unit tests of the macOS build on both of its targets; lint-and-test lints them.
+  test-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # GNU make 4 as gmake: Apple's make 3.81 ignores the Makefile's .SHELLFLAGS (3.82).
+      - run: brew install make
+
+      - run: gmake setup
+
+      # After setup: the key covers installed toolchains.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - run: gmake -k test
 
   # QEMU 9.0 and newer fault unaligned loads from Device memory as arm64 does, which the
   # aarch64 guests check; Ubuntu 24.04 has QEMU 8.2.

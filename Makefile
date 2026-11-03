@@ -63,8 +63,8 @@ unexport CARGO_ENCODED_RUSTFLAGS
 TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi,i686-unknown-linux-musl,i686-unknown-uefi,aarch64-unknown-linux-musl,aarch64-unknown-uefi,x86_64-apple-darwin,aarch64-apple-darwin
 comma := ,
 
-# CI runs lint test test-i686 and test-e2e-qemu: a new check joins LINTS or
-# QEMU_TESTS or CI runs it too.
+# CI runs lint test test-i686 and test-e2e-qemu, and test on macOS: a new check
+# joins LINTS or QEMU_TESTS or CI runs it too.
 LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi clippy-macos doc
 QEMU_LINUX_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
 QEMU_SHELL_TESTS := test-e2e-qemu-shell-x86_64 test-e2e-qemu-shell-i686 test-e2e-qemu-shell-aarch64
