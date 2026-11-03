@@ -43,6 +43,16 @@ if [[ "$(uefisettings hii get --json 'Enable Intel(R) TXT' | jq -r '.responses |
 fi
 ```
 
+### Inspect a Linux machine's settings on macOS
+
+```sh
+# on the Linux machine
+sudo uefisettings hii extract-db hiidb.bin
+uefisettings hii dump-efivars -f hiidb.bin efivars
+# on the Mac, with the efivars directory copied over
+uefisettings hii list-questions --efivars efivars
+```
+
 ---
 
 ## Available commands
@@ -104,6 +114,17 @@ FS0:\> uefisettings.efi hii get --json "Activate this check box"
 
 Exit statuses, setup passwords, `hii variable-info` and Secure Boot: see the
 [appendix](#appendix).
+
+---
+
+## On macOS
+
+`cargo install uefisettings` builds on macOS too. That build reads nothing of the Mac's firmware
+and writes nothing: `hii get`, `hii list-questions` and `hii show-ifr` read question values from
+an efivars dump that `hii dump-efivars` wrote on Linux (`--efivars DIR`, with its HiiDB unless
+`-f` names one) or from none (`--no-efivars`, with `-f`), and `hii list-strings` reads the HiiDB
+file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `hii set`, `hii extract-db` or
+`hii dump-efivars`. Dumps: see the [appendix](#appendix).
 
 ---
 
@@ -191,7 +212,9 @@ make help            # lists the checks
 
 `make test-e2e-qemu`, the QEMU tests, also needs an x86_64 host with `/dev/kvm` and the packages that [`tests/qemu/README.md`](tests/qemu/README.md) lists.
 
-GitHub Actions runs the checks on every pull request and every push to main, as [`.github/workflows/checks.yml`](.github/workflows/checks.yml) describes.
+On macOS, whose make 3.81 ignores the `Makefile`'s `.SHELLFLAGS`, `brew install make` installs GNU make as `gmake`: `gmake setup test` runs the unit tests.
+
+GitHub Actions runs the checks, and the unit tests on arm64 and Intel Macs, on every pull request and every push to main, as [`.github/workflows/checks.yml`](.github/workflows/checks.yml) describes.
 
 ## QEMU tests
 
@@ -211,7 +234,7 @@ holds the HiiDB, as `hiidb.bin`, and records its format and redaction in
 # on the machine to inspect
 sudo uefisettings hii extract-db hiidb.bin
 uefisettings hii dump-efivars -f hiidb.bin efivars
-# on any machine
+# on any machine, Linux or macOS
 uefisettings hii list-questions --efivars efivars
 ```
 
@@ -227,6 +250,11 @@ of each EFI variable only the bytes that questions decode unless `--unredacted` 
 can be secrets, so share it only with people you trust. A redacted dump zeroes every other byte,
 so `--efivars` refuses it with another HiiDB (`-f`), whose questions would read those zeros as
 values; a later uefisettings that decodes more reads them as values too.
+
+On a case-insensitive file system, such as APFS unless formatted case-sensitive, `--efivars`
+reads each efivar file by its exact name. Two files whose names differ only in case become one
+there, which it cannot detect, so keep such a dump on a case-sensitive volume. HFS+, unlike APFS,
+stores names decomposed (NFD), so there an efivar file whose name is not ASCII may not match.
 
 Never copy a dump into /sys/firmware/efi/efivars: its files are in efivarfs's write format, so
 they would create absent variables and overwrite writable ones, such as BootOrder and Timeout.
