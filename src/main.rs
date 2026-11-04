@@ -79,9 +79,12 @@ enum Commands {
     // TODO: Auto(AutoCommand) after building a backend identifier function
     // TODO: Get/Set without having to specify Auto
     // The platform words get and set: only the Linux build identifies a backend.
+    // The questions and values of get and set take negative numbers, such as -1 for a numeric
+    // question; another value that starts with - follows --.
     #[cfg(all(system_hiidb, system_variables))]
     #[command(about = platform::GET_ABOUT, next_display_order = None)]
     Get {
+        #[arg(allow_negative_numbers = true)]
         question: String,
         #[command(flatten)]
         output: JsonArgs,
@@ -91,7 +94,9 @@ enum Commands {
     #[cfg(all(system_hiidb, system_variables))]
     #[command(about = platform::SET_ABOUT, next_display_order = None)]
     Set {
+        #[arg(allow_negative_numbers = true)]
         question: String,
+        #[arg(allow_negative_numbers = true)]
         value: String,
         #[command(flatten)]
         output: JsonArgs,
@@ -122,6 +127,7 @@ enum HiiSubcommands {
     /// Get the current value of a question
     #[command(next_display_order = None)]
     Get {
+        #[arg(allow_negative_numbers = true)]
         question: String,
         #[command(flatten)]
         hiidb: HiiDbArgs,
@@ -136,7 +142,9 @@ enum HiiSubcommands {
     #[cfg(all(system_hiidb, system_variables))]
     #[command(next_display_order = None)]
     Set {
+        #[arg(allow_negative_numbers = true)]
         question: String,
+        #[arg(allow_negative_numbers = true)]
         value: String,
         #[command(flatten)]
         output: JsonArgs,
@@ -513,6 +521,11 @@ mod tests {
     /// pass others, on the builds that take them.
     const OFFLINE_SOURCE: [&str; 3] = ["-f", "hiidb.bin", "--no-efivars"];
 
+    // clap_lex's is_number takes these for negative numbers, which allow_negative_numbers lets a
+    // positional take; it refuses the others, which need "--" before them.
+    const NEGATIVE_NUMBERS: [&str; 3] = ["-1", "-0.5", "-1e5"];
+    const OTHER_HYPHEN_VALUES: [&str; 3] = ["-0x10", "-.5", "-inf"];
+
     /// The selection flags of `uefisettings hii list-questions` with OFFLINE_SOURCE and `args`
     /// after it.
     pub(super) fn selection_of(args: &[&str]) -> SelectionArgs {
@@ -887,6 +900,108 @@ mod tests {
                     "{argv:?}"
                 );
             }
+        }
+    }
+
+    /// The values of the positionals `ids` of the innermost subcommand that `args` parse to.
+    fn positionals_of(args: &[&str], ids: &[&str]) -> Result<Vec<String>, clap::error::ErrorKind> {
+        let argv = [&["uefisettings"][..], args].concat();
+        let mut matches = UefiSettingsToolArgs::command()
+            .try_get_matches_from(argv)
+            .map_err(|error| error.kind())?;
+        while let Some((_, subcommand)) = matches.remove_subcommand() {
+            matches = subcommand;
+        }
+        Ok(ids
+            .iter()
+            .map(|id| {
+                matches
+                    .remove_one::<String>(id)
+                    .unwrap_or_else(|| panic!("{args:?} gives no {id}"))
+            })
+            .collect())
+    }
+
+    /// get commands take a negative number as the question, on every build.
+    #[test]
+    fn get_takes_a_negative_number_as_its_question() {
+        let hii_get = [&["hii", "get"][..], &OFFLINE_SOURCE].concat();
+        let commands: [&[&str]; 1] = [&hii_get];
+        #[cfg(all(system_hiidb, system_variables))]
+        let commands = commands.into_iter().chain([&["get"][..]]);
+        // the Linux build's own command
+        #[cfg(target_os = "linux")]
+        let commands = commands.into_iter().chain([&["ilo", "get"][..]]);
+        for command in commands {
+            for question in NEGATIVE_NUMBERS {
+                let args = [command, &[question]].concat();
+                assert_eq!(
+                    positionals_of(&args, &["question"]),
+                    Ok(vec![question.to_owned()]),
+                    "{args:?}"
+                );
+            }
+            for question in OTHER_HYPHEN_VALUES {
+                let args = [command, &[question]].concat();
+                assert_eq!(
+                    positionals_of(&args, &["question"]),
+                    Err(clap::error::ErrorKind::UnknownArgument),
+                    "{args:?}"
+                );
+                let args = [command, &["--", question]].concat();
+                assert_eq!(
+                    positionals_of(&args, &["question"]),
+                    Ok(vec![question.to_owned()]),
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    /// set commands take a negative number as the value, and flags stay flags around it.
+    #[test]
+    #[cfg(all(system_hiidb, system_variables))]
+    fn set_takes_a_negative_number_as_its_value() {
+        let commands: [&[&str]; 2] = [&["hii", "set"], &["set"]];
+        // the Linux build's own command
+        #[cfg(target_os = "linux")]
+        let commands = commands.into_iter().chain([&["ilo", "set"][..]]);
+        let positionals = ["question", "value"];
+        for command in commands {
+            for value in NEGATIVE_NUMBERS {
+                for (args, question) in [
+                    ([command, &["Q", value]].concat(), "Q"),
+                    ([command, &["Q", value, "--json"]].concat(), "Q"),
+                    ([command, &["-j", "Q", value]].concat(), "Q"),
+                    ([command, &[value, value]].concat(), value),
+                ] {
+                    assert_eq!(
+                        positionals_of(&args, &positionals),
+                        Ok(vec![question.to_owned(), value.to_owned()]),
+                        "{args:?}"
+                    );
+                }
+            }
+            for value in OTHER_HYPHEN_VALUES {
+                let args = [command, &["Q", value]].concat();
+                assert_eq!(
+                    positionals_of(&args, &positionals),
+                    Err(clap::error::ErrorKind::UnknownArgument),
+                    "{args:?}"
+                );
+                let args = [command, &["Q", "--", value]].concat();
+                assert_eq!(
+                    positionals_of(&args, &positionals),
+                    Ok(vec!["Q".to_owned(), value.to_owned()]),
+                    "{args:?}"
+                );
+            }
+            let args = [command, &["Q", "--json"]].concat();
+            assert_eq!(
+                positionals_of(&args, &positionals),
+                Err(clap::error::ErrorKind::MissingRequiredArgument),
+                "{args:?}"
+            );
         }
     }
 

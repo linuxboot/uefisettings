@@ -114,6 +114,8 @@ enum IloSubcommands {
     /// Get the current value of a question
     #[command(next_display_order = None)]
     Get {
+        // as the get and set of main.rs
+        #[arg(allow_negative_numbers = true)]
         question: String,
         #[command(flatten)]
         output: JsonArgs,
@@ -121,7 +123,9 @@ enum IloSubcommands {
     /// Set/change the value of a question
     #[command(next_display_order = None)]
     Set {
+        #[arg(allow_negative_numbers = true)]
         question: String,
+        #[arg(allow_negative_numbers = true)]
         value: String,
         #[command(flatten)]
         output: JsonArgs,
