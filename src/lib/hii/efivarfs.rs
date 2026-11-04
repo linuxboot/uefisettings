@@ -10,14 +10,17 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
@@ -39,6 +42,14 @@ use crate::efi_variables::VariableNames;
 use crate::efi_variables::VariableStorage;
 use crate::efi_variables::VariableStorageInfo;
 use crate::file_lock::FileLock;
+use crate::hii::boot_log::open_kmsg;
+use crate::hii::boot_log::require_char_device;
+use crate::hii::boot_log::rt_properties_in_boot_log;
+use crate::hii::boot_log::KernelLog;
+use crate::hii::boot_log::RtPropertiesInBootLog;
+use crate::hii::boot_log::Syslog;
+use crate::hii::boot_log::KMSG_DEVICE;
+use crate::hii::boot_log::KMSG_PATH;
 use crate::hii::efivarfs_format::as_variable_not_found;
 use crate::hii::efivarfs_format::check_regular_file;
 use crate::hii::efivarfs_format::listed_names;
@@ -49,6 +60,8 @@ use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EFIVARFS_INTERFACE;
 use crate::hii::efivarfs_format::EFIVARFS_REACH;
+use crate::hii::kallsyms::KernelSymbols;
+use crate::hii::kallsyms::KALLSYMS_PATH;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
@@ -70,6 +83,9 @@ const EFIVARFS_MAGIC: u32 = 0xde5e_81e4;
 const EFIVARFS_STATFS_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
     .union(VariableAttributes::BOOTSERVICE_ACCESS)
     .union(VariableAttributes::RUNTIME_ACCESS);
+/// EFI_RT_SUPPORTED_SET_VARIABLE, RuntimeServicesSupported's bit of SetVariable() (UEFI 2.11
+/// §4.6.2).
+const EFI_RT_SUPPORTED_SET_VARIABLE: u32 = 0x0040;
 
 impl EfivarSource {
     /// The firmware variables that questions read from this source, which validate accepts.
@@ -91,6 +107,10 @@ pub(crate) struct EfivarFiles {
     dir: PathBuf,
     /// The file that write_at locks while it remounts `dir` read-write.
     remount_lock: PathBuf,
+    /// What tells whether an efivarfs write crashes this Linux.
+    evidence: Box<dyn WriteSafetyEvidence>,
+    /// Set by the first write_at that finds that writes cannot crash this Linux.
+    survives: OnceLock<KernelSurvivesWrites>,
 }
 
 impl EfivarFiles {
@@ -99,7 +119,19 @@ impl EfivarFiles {
         Self {
             dir: PathBuf::from(EFIVARS_MOUNT_POINT),
             remount_lock: PathBuf::from(REMOUNT_LOCK_FILE),
+            evidence: Box::new(LinuxEvidence::system()),
+            survives: OnceLock::new(),
         }
+    }
+
+    /// The proof that an efivarfs write cannot crash this Linux, which the first call looks for
+    /// (kernel_survives_writes).
+    fn survives(&self) -> Result<&KernelSurvivesWrites> {
+        if let Some(survives) = self.survives.get() {
+            return Ok(survives);
+        }
+        let survives = kernel_survives_writes(self.evidence.as_ref())?;
+        Ok(self.survives.get_or_init(|| survives))
     }
 }
 
@@ -150,8 +182,9 @@ impl FirmwareVariables for EfivarFiles {
             encoded,
         )?;
 
-        let _efifs =
-            EfivarsMountGuard::new(&self.dir).context("Failed to create efivars fs mount guard")?;
+        let survives = self.survives()?;
+        let _efifs = EfivarsMountGuard::new(&self.dir, survives)
+            .context("Failed to create efivars fs mount guard")?;
 
         // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
         // validate temporarily writable.
@@ -239,6 +272,143 @@ fn write_efivar_file(path: &Path, contents: &[u8]) -> Result<()> {
         .map_err(efivarfs_write_error)
 }
 
+/// Proof that an efivarfs write cannot crash this Linux, which only kernel_survives_writes makes:
+/// EfivarsMountGuard::new takes it, so that no write goes unchecked.
+#[derive(Debug)]
+pub(super) struct KernelSurvivesWrites(());
+
+/// What tells kernel_survives_writes whether an efivarfs write crashes this Linux. Linux v5.8
+/// (f88814cc2578; stable 5.7.11) to v6.7 mount efivarfs read-only without a runtime SetVariable()
+/// but remount it read-write, and the next write calls a NULL set_variable (upstream 0e8d2444168d,
+/// which Linux v6.8 and stable 5.10.209, 5.15.148, 6.1.75, 6.6.14 and 6.7.2 have). Each method's
+/// error means that its source tells nothing.
+pub(super) trait WriteSafetyEvidence {
+    /// Whether the kernel's symbols name efivarfs_reconfigure(), which upstream 0e8d2444168d added
+    /// with the check that keeps such an efivarfs read-only.
+    fn names_efivarfs_reconfigure(&self) -> Result<bool>;
+    /// Whether the boot log names an EFI_RT_PROPERTIES_TABLE that Linux applied.
+    fn rt_properties_in_boot_log(&self) -> Result<RtPropertiesInBootLog>;
+    /// The RuntimeServicesSupported of the firmware's EFI_RT_PROPERTIES_TABLE, which Linux ANDs
+    /// into its mask of runtime services (Linux v6.7 drivers/firmware/efi/efi.c
+    /// efi_config_parse_tables()), or None without one.
+    fn rt_properties_supported(&self) -> Result<Option<u32>>;
+}
+
+/// Why an efivarfs write would crash this Linux, or may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+enum CrashingWrite {
+    #[error(
+        "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes on an \
+         efivarfs write without a runtime SetVariable(), as on firmware whose \
+         EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2) leaves it out, as this one does \
+         (RuntimeServicesSupported {0:#06x}); run uefisettings.efi in the UEFI Shell"
+    )]
+    TableOmitsSetVariable(u32),
+    #[error(
+        "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes on an \
+         efivarfs write without a runtime SetVariable(), as on firmware whose \
+         EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2) leaves it out, and uefisettings cannot tell \
+         whether this one does; run uefisettings.efi in the UEFI Shell"
+    )]
+    Unknown,
+}
+
+/// What the steps of kernel_survives_writes that decided nothing found.
+#[derive(Debug, Error)]
+struct UndecidedSteps(Vec<anyhow::Error>);
+
+impl fmt::Display for UndecidedSteps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, step) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{step:#}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether an efivarfs write cannot crash this Linux, from `evidence`. The first step that
+/// decides wins:
+/// 1. the kernel names efivarfs_reconfigure(): it keeps efivarfs read-only without SetVariable();
+/// 2. the boot log names no usable RT properties table: Linux kept SetVariable();
+/// 3. the firmware's RT properties table, which Linux applied, lists SetVariable(), or there is
+///    none; one that leaves it out refuses the write, and so does an unreadable one, with what
+///    each step found.
+fn kernel_survives_writes(evidence: &dyn WriteSafetyEvidence) -> Result<KernelSurvivesWrites> {
+    let mut undecided = Vec::new();
+    match evidence.names_efivarfs_reconfigure() {
+        Ok(true) => return Ok(KernelSurvivesWrites(())),
+        Ok(false) => undecided.push(anyhow!("the kernel names no efivarfs_reconfigure()")),
+        Err(error) => undecided.push(error),
+    }
+    match evidence.rt_properties_in_boot_log() {
+        Ok(RtPropertiesInBootLog::Absent) => return Ok(KernelSurvivesWrites(())),
+        Ok(RtPropertiesInBootLog::Present) => undecided.push(anyhow!(
+            "the kernel log names an EFI_RT_PROPERTIES_TABLE that Linux applied"
+        )),
+        Err(error) => undecided.push(error),
+    }
+    match evidence.rt_properties_supported() {
+        Ok(None) => Ok(KernelSurvivesWrites(())),
+        Ok(Some(supported)) if supported & EFI_RT_SUPPORTED_SET_VARIABLE != 0 => {
+            Ok(KernelSurvivesWrites(()))
+        }
+        Ok(Some(supported)) => Err(CrashingWrite::TableOmitsSetVariable(supported).into()),
+        Err(error) => {
+            undecided.push(error);
+            Err(anyhow::Error::new(UndecidedSteps(undecided)).context(CrashingWrite::Unknown))
+        }
+    }
+}
+
+/// The evidence of this Linux: its symbol table and its log.
+struct LinuxEvidence {
+    kallsyms: PathBuf,
+    kmsg: PathBuf,
+    /// The character device that `kmsg` must be, or None for any file, as the tests give.
+    kmsg_device: Option<libc::dev_t>,
+    /// syslog(2), where the kernel refuses `kmsg`.
+    kernel_log: Box<dyn KernelLog>,
+}
+
+impl LinuxEvidence {
+    /// This machine's.
+    fn system() -> Self {
+        Self {
+            kallsyms: PathBuf::from(KALLSYMS_PATH),
+            kmsg: PathBuf::from(KMSG_PATH),
+            kmsg_device: Some(KMSG_DEVICE),
+            kernel_log: Box::new(Syslog),
+        }
+    }
+}
+
+impl WriteSafetyEvidence for LinuxEvidence {
+    fn names_efivarfs_reconfigure(&self) -> Result<bool> {
+        Ok(KernelSymbols::read(&self.kallsyms)?.efivarfs_reconfigure)
+    }
+
+    fn rt_properties_in_boot_log(&self) -> Result<RtPropertiesInBootLog> {
+        rt_properties_in_boot_log(
+            &self.kmsg,
+            |path| {
+                let file = open_kmsg(path)?;
+                match self.kmsg_device {
+                    Some(device) => require_char_device(path, file, device),
+                    None => Ok(file),
+                }
+            },
+            self.kernel_log.as_ref(),
+        )
+    }
+
+    fn rt_properties_supported(&self) -> Result<Option<u32>> {
+        bail!("reading the firmware's EFI_RT_PROPERTIES_TABLE is not supported on Linux yet")
+    }
+}
+
 /// Keeps the efivarfs at `mount_point` read-write while it lives, remounting it read-only again
 /// if it was.
 pub struct EfivarsMountGuard {
@@ -247,7 +417,9 @@ pub struct EfivarsMountGuard {
 }
 
 impl EfivarsMountGuard {
-    pub fn new(mount_point: &Path) -> Result<Self> {
+    /// Remounts `mount_point` read-write if it is read-only, once `_survives` proves that a
+    /// write cannot crash this Linux.
+    pub fn new(mount_point: &Path, _survives: &KernelSurvivesWrites) -> Result<Self> {
         let original_flags = get_current_mount_flags(mount_point)?;
         if original_flags.contains(MsFlags::MS_RDONLY) {
             debug!(
@@ -570,6 +742,7 @@ struct NoVariableStorage;
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::ffi::OsStr;
     use std::ffi::OsString;
     use std::io::Read;
@@ -583,31 +756,57 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::hii::boot_log::fixture::FakeSyslog;
     use crate::hii::efivarfs_format::read_efivar_file;
     use crate::hii::efivarfs_format::tests::SETUP;
     use crate::hii::efivarfs_format::MAX_EFIVAR_FILE_SIZE;
+    use crate::hii::kallsyms::fixture::write_kallsyms;
+    use crate::hii::kallsyms::fixture::FIXED_KALLSYMS;
+    use crate::hii::kallsyms::fixture::UNFIXED_KALLSYMS;
     use crate::hii::variables::tests::variable_key;
     use crate::hii::variables::tests::BS_RT;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
     use crate::hii::variables::tests::NV_BS_RT;
 
+    /// LinuxEvidence of the files in `dir`, kallsyms with the symbol table `kallsyms`, and a
+    /// syslog(2) that fails; the others are missing unless a test writes them.
+    fn linux_evidence(dir: &Path, kallsyms: &str) -> LinuxEvidence {
+        let evidence = LinuxEvidence {
+            kallsyms: dir.join("kallsyms"),
+            kmsg: dir.join("kmsg"),
+            kmsg_device: None,
+            kernel_log: Box::new(FakeSyslog(Err(libc::ENOSYS))),
+        };
+        write_kallsyms(&evidence.kallsyms, kallsyms);
+        evidence
+    }
+
     /// EfivarFiles of a temporary directory, which no mount lists, and their remount lock, in a
-    /// directory of its own.
-    fn unmounted_efivar_files() -> (TempDir, TempDir, EfivarFiles) {
+    /// directory of its own, with the evidence of a temporary directory with the symbol table
+    /// `kallsyms`; the directories.
+    fn unmounted_efivar_files_of(kallsyms: &str) -> ([TempDir; 3], EfivarFiles) {
         let dir = tempfile::tempdir().expect("create efivars directory");
         let lock = tempfile::tempdir().expect("create lock directory");
+        let evidence = tempfile::tempdir().expect("create evidence directory");
         let files = EfivarFiles {
             dir: dir.path().to_path_buf(),
             remount_lock: lock.path().join("remount"),
+            evidence: Box::new(linux_evidence(evidence.path(), kallsyms)),
+            survives: OnceLock::new(),
         };
-        (dir, lock, files)
+        ([dir, lock, evidence], files)
+    }
+
+    /// unmounted_efivar_files_of a kernel that names efivarfs_reconfigure().
+    fn unmounted_efivar_files() -> ([TempDir; 3], EfivarFiles) {
+        unmounted_efivar_files_of(FIXED_KALLSYMS)
     }
 
     /// write_at refuses a volatile, short or missing variable before it remounts efivarfs, which
     /// fails for a directory that no mount lists, and writes nothing.
     #[test]
     fn efivar_files_refuse_a_variable_before_the_remount() {
-        let (dir, _lock, files) = unmounted_efivar_files();
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
         let volatile = [&BS_RT.to_ne_bytes()[..], &[0; 4]].concat();
         let short = [&NV_BS_RT.to_ne_bytes()[..], &[0; 2]].concat();
         for (name, bytes) in [("Volatile", &volatile), ("Short", &short)] {
@@ -655,7 +854,7 @@ mod tests {
     /// here, with read_efivar_file's error, and writes nothing.
     #[test]
     fn efivar_files_refuse_a_file_longer_than_the_maximum() {
-        let (dir, _lock, files) = unmounted_efivar_files();
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
         let key = variable_key("Setup");
         let path = dir.path().join(EfivarFileName::from(&key));
         let attributes = NV_BS_RT.to_ne_bytes();
@@ -820,7 +1019,7 @@ mod tests {
     /// it holds efivar files.
     #[test]
     fn efivar_files_list_no_variables_without_efivarfs() {
-        let (dir, _lock, files) = unmounted_efivar_files();
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
         let setup = variable_key("Setup");
         fs::write(
             dir.path().join(EfivarFileName::from(&setup)),
@@ -950,7 +1149,7 @@ mod tests {
     /// missing one, that no efivarfs is mounted, as the listing says.
     #[test]
     fn efivar_files_tell_a_variable_or_that_it_is_missing() {
-        let (dir, _lock, files) = unmounted_efivar_files();
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
         for (name, bytes) in [("Setup", &SETUP[..]), ("Empty", &[][..])] {
             fs::write(
                 dir.path().join(EfivarFileName::from(&variable_key(name))),
@@ -994,7 +1193,7 @@ mod tests {
     /// attributes before the statfs, naming them.
     #[test]
     fn efivar_files_tell_the_storage_of_non_volatile_runtime_variables_only() {
-        let (dir, _lock, files) = unmounted_efivar_files();
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
         for attributes in [
             EFIVARFS_STATFS_ATTRIBUTES,
             EFIVARFS_STATFS_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
@@ -1074,7 +1273,7 @@ mod tests {
     /// write_at writes nothing when it cannot remount efivarfs.
     #[test]
     fn efivar_files_write_nothing_without_the_remount() {
-        let (dir, _lock, files) = unmounted_efivar_files();
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
         let key = variable_key("Setup");
         let path = dir.path().join(EfivarFileName::from(&key));
         let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[0; 4]].concat();
@@ -1097,6 +1296,230 @@ mod tests {
             bytes,
             "bytes"
         );
+    }
+
+    /// On a kernel without efivarfs_reconfigure() whose log names an RT properties table that it
+    /// applied, write_at refuses before it remounts efivarfs when it cannot read the table, says
+    /// what each step found, and writes nothing.
+    #[test]
+    fn efivar_files_refuse_a_write_that_may_crash_before_the_remount() {
+        let ([dir, _lock, evidence], files) = unmounted_efivar_files_of(UNFIXED_KALLSYMS);
+        fs::write(
+            evidence.path().join("kmsg"),
+            "6,12,1000,-;efi: ACPI=0x3fb7e000 RTPROP=0x3f989998 \n",
+        )
+        .expect("write the kernel log");
+        let key = variable_key("Setup");
+        let path = dir.path().join(EfivarFileName::from(&key));
+        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[0; 4]].concat();
+        fs::write(&path, &bytes).expect("write the efivar file");
+
+        let error = files
+            .write_at(&key, 4, 0, &[1])
+            .expect_err("write on a kernel that may crash");
+
+        assert_eq!(
+            error.downcast_ref::<CrashingWrite>(),
+            Some(&CrashingWrite::Unknown),
+            "{error:#}"
+        );
+        let message = format!("{error:#}");
+        for step in [
+            "the kernel names no efivarfs_reconfigure()",
+            "the kernel log names an EFI_RT_PROPERTIES_TABLE that Linux applied",
+        ] {
+            assert!(message.contains(step), "{message:?} lacks {step:?}");
+        }
+        assert!(
+            !message.contains("mount guard"),
+            "{message:?}: refused after the remount"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read the efivar file"),
+            bytes,
+            "bytes"
+        );
+    }
+
+    /// The refusals say why, word for word, and point at uefisettings.efi in the UEFI Shell, as
+    /// NoRuntimeSetVariable does.
+    #[test]
+    fn crashing_write_texts() {
+        for (refusal, want) in [
+            (
+                CrashingWrite::TableOmitsSetVariable(0x3fbf),
+                "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes \
+                 on an efivarfs write without a runtime SetVariable(), as on firmware whose \
+                 EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2) leaves it out, as this one does \
+                 (RuntimeServicesSupported 0x3fbf); run uefisettings.efi in the UEFI Shell",
+            ),
+            (
+                CrashingWrite::Unknown,
+                "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes \
+                 on an efivarfs write without a runtime SetVariable(), as on firmware whose \
+                 EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2) leaves it out, and uefisettings \
+                 cannot tell whether this one does; run uefisettings.efi in the UEFI Shell",
+            ),
+        ] {
+            assert_eq!(refusal.to_string(), want, "{refusal:?}");
+        }
+    }
+
+    /// LinuxEvidence reads the boot log only from the kernel log's character device: a file in
+    /// its place, such as a container may bind-mount, tells nothing, though it names an applied
+    /// RT properties table, which the tests' evidence, taking any file, finds in it.
+    #[test]
+    fn linux_evidence_reads_the_boot_log_only_from_the_kmsg_device() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let mut evidence = linux_evidence(dir.path(), UNFIXED_KALLSYMS);
+        fs::write(
+            &evidence.kmsg,
+            "6,12,1000,-;efi: ACPI=0x3fb7e000 RTPROP=0x3f989998 \n",
+        )
+        .expect("write the kernel log");
+        assert_eq!(
+            evidence.rt_properties_in_boot_log().ok(),
+            Some(RtPropertiesInBootLog::Present),
+            "any file"
+        );
+
+        evidence.kmsg_device = Some(KMSG_DEVICE);
+        let error = evidence
+            .rt_properties_in_boot_log()
+            .expect_err("read a file as the kernel log's device");
+        let kmsg = evidence.kmsg.display();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("Failed to open {kmsg}: {kmsg} is not the character device 1:11"),
+            "the kernel log's device"
+        );
+    }
+
+    /// An outcome of a WriteSafetyEvidence step for FakeEvidence: a value, or an error.
+    type Outcome<T> = Result<T, &'static str>;
+
+    /// Evidence of these outcomes, which records the steps asked.
+    struct FakeEvidence {
+        reconfigure: Outcome<bool>,
+        boot_log: Outcome<RtPropertiesInBootLog>,
+        table: Outcome<Option<u32>>,
+        asked: RefCell<Vec<&'static str>>,
+    }
+
+    impl FakeEvidence {
+        fn new(
+            reconfigure: Outcome<bool>,
+            boot_log: Outcome<RtPropertiesInBootLog>,
+            table: Outcome<Option<u32>>,
+        ) -> Self {
+            Self {
+                reconfigure,
+                boot_log,
+                table,
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// `outcome` of the step `step`, recorded.
+        fn ask<T: Copy>(&self, step: &'static str, outcome: Outcome<T>) -> Result<T> {
+            self.asked.borrow_mut().push(step);
+            outcome.map_err(|error| anyhow!(error))
+        }
+    }
+
+    impl WriteSafetyEvidence for FakeEvidence {
+        fn names_efivarfs_reconfigure(&self) -> Result<bool> {
+            self.ask("kallsyms", self.reconfigure)
+        }
+
+        fn rt_properties_in_boot_log(&self) -> Result<RtPropertiesInBootLog> {
+            self.ask("boot log", self.boot_log)
+        }
+
+        fn rt_properties_supported(&self) -> Result<Option<u32>> {
+            self.ask("table", self.table)
+        }
+    }
+
+    /// What kernel_survives_writes decides.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Decision {
+        /// Proceed, after asking these steps.
+        Proceed(Vec<&'static str>),
+        Refuse(CrashingWrite),
+    }
+
+    /// Every combination of outcomes decides as the first step that decides says, and every
+    /// combination that a kernel which crashes on the write can give is a refusal.
+    #[test]
+    fn kernel_survives_writes_decides_by_the_first_step_that_decides() {
+        use RtPropertiesInBootLog::Absent;
+        use RtPropertiesInBootLog::Present;
+        const SET: u32 = 0x3fff;
+        const CLEAR: u32 = 0x3fbf;
+        for reconfigure in [Ok(true), Ok(false), Err("no kallsyms")] {
+            for boot_log in [Ok(Absent), Ok(Present), Err("no kernel log")] {
+                for table in [Ok(None), Ok(Some(SET)), Ok(Some(CLEAR)), Err("no table")] {
+                    let case = format!("{reconfigure:?}, {boot_log:?}, {table:?}");
+                    let evidence = FakeEvidence::new(reconfigure, boot_log, table);
+
+                    let got = kernel_survives_writes(&evidence);
+
+                    let all = vec!["kallsyms", "boot log", "table"];
+                    let want = match (reconfigure, boot_log, table) {
+                        (Ok(true), _, _) => Decision::Proceed(vec!["kallsyms"]),
+                        (_, Ok(Absent), _) => Decision::Proceed(vec!["kallsyms", "boot log"]),
+                        (_, _, Ok(None) | Ok(Some(SET))) => Decision::Proceed(all),
+                        (_, _, Ok(Some(supported))) => {
+                            Decision::Refuse(CrashingWrite::TableOmitsSetVariable(supported))
+                        }
+                        (_, _, Err(_)) => Decision::Refuse(CrashingWrite::Unknown),
+                    };
+                    let decision = match &got {
+                        Ok(_) => Decision::Proceed(evidence.asked.borrow().clone()),
+                        Err(error) => Decision::Refuse(
+                            *error
+                                .downcast_ref::<CrashingWrite>()
+                                .unwrap_or_else(|| panic!("{case}: {error:#}")),
+                        ),
+                    };
+                    assert_eq!(decision, want, "{case}");
+
+                    let crashing = reconfigure != Ok(true)
+                        && boot_log != Ok(Absent)
+                        && matches!(table, Ok(Some(CLEAR)) | Err(_));
+                    assert_eq!(got.is_err(), crashing, "{case}: refused");
+                    if let (Err(error), Err(_)) = (got, table) {
+                        let message = format!("{error:#}");
+                        for found in [reconfigure.err(), boot_log.err(), table.err()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            assert!(
+                                message.contains(found),
+                                "{case}: {message:?} lacks {found:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// EfivarFiles asks the evidence once and keeps the proof, but asks again after a refusal.
+    #[test]
+    fn efivar_files_keep_only_a_proof() {
+        let (_dirs, mut files) = unmounted_efivar_files();
+        files.evidence = Box::new(FakeEvidence::new(Ok(true), Err("unasked"), Err("unasked")));
+        files.survives().expect("check");
+        files.evidence = Box::new(FakeEvidence::new(Ok(false), Err("no log"), Err("no table")));
+        files.survives().expect("keep the proof of the first check");
+
+        let (_dirs, mut files) = unmounted_efivar_files();
+        files.evidence = Box::new(FakeEvidence::new(Ok(false), Err("no log"), Err("no table")));
+        files.survives().expect_err("refuse");
+        files.evidence = Box::new(FakeEvidence::new(Ok(true), Err("unasked"), Err("unasked")));
+        files.survives().expect("ask again after the refusal");
     }
 
     /// write_efivar_file names the statuses behind the errno of a refused write, ENOSPC from
