@@ -139,6 +139,13 @@ database, in a zeroed runtime pool a quarter larger, as the EFI configuration ta
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
 set to FALSE. No scenario boots it.
 
+`publish-hiidb.efi rt-properties-no-set-variable` publishes nothing: it installs an
+`EFI_RT_PROPERTIES_TABLE` that lists every runtime service but `SetVariable()`, as firmware
+that cannot write variables at runtime publishes, and `publish-hiidb.efi rt-properties-all` one
+that lists every runtime service.
+`rt-properties-version-2` and `rt-properties-version-2-all` install the same tables with
+Version 2, which no UEFI version defines and which Linux reads all the same.
+
 ## Secure Boot
 
 The scenarios with `firmware=secboot-setup` or `firmware=secboot-user` in their options boot

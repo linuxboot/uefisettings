@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -40,6 +40,12 @@
 //! edk2's HiiDatabaseDxe does when PcdHiiOsRuntimeSupport is TRUE (UEFI 2.11 §33.2.11.1), and
 //! puts its length and address in the volatile `HiiDBConfigTable` variable, in `HiiDB`'s
 //! layout, for the tests.
+//! `rt-properties-no-set-variable` publishes nothing: it installs an EFI_RT_PROPERTIES_TABLE
+//! (UEFI 2.11 §4.6.2) whose RuntimeServicesSupported lists every runtime service but
+//! SetVariable(), as firmware that cannot write variables at runtime publishes, and
+//! `rt-properties-all` one that lists every runtime service.
+//! `rt-properties-version-2` and `rt-properties-version-2-all` install the same tables with
+//! Version 2, which no UEFI version defines.
 //! `set-auth-variables=PATH[,PATH]...` publishes nothing: it runs the authenticated writes of
 //! [`auth_variables`] for the Secure Boot scenarios.
 
@@ -113,6 +119,19 @@ const ACPI_HEADER_SIZE: usize = 36;
 /// Revision of the `QHII` and `HIID` tables, which uefisettings does not read.
 const ACPI_TABLE_REVISION: u8 = 1;
 
+/// The configuration table GUID of EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2).
+static RT_PROPERTIES_TABLE_GUID: Guid = guid!("eb66918a-7eef-402a-842e-931d21c38ae9");
+/// EFI_RT_PROPERTIES_TABLE_VERSION.
+const RT_PROPERTIES_TABLE_VERSION: u16 = 1;
+/// The size of EFI_RT_PROPERTIES_TABLE: Version, Length, then RuntimeServicesSupported.
+const RT_PROPERTIES_TABLE_LEN: u16 = 8;
+/// RuntimeServicesSupported with every EFI_RT_SUPPORTED_* bit of UEFI 2.11 §4.6.2.
+const RT_SUPPORTED_ALL: u32 = 0x3fff;
+/// EFI_RT_SUPPORTED_SET_VARIABLE.
+const RT_SUPPORTED_SET_VARIABLE: u32 = 0x0040;
+/// A Version of EFI_RT_PROPERTIES_TABLE that no UEFI version defines.
+const RT_PROPERTIES_TABLE_VERSION_UNDEFINED: u16 = 2;
+
 /// A failed step and the firmware's status.
 type Failure = (&'static str, Status);
 
@@ -144,6 +163,9 @@ fn efi_main() -> Status {
             })
         }
         Some(Task::InstallConfigTables) => install_config_tables(),
+        Some(Task::InstallRtProperties(version, supported)) => {
+            install_rt_properties(version, supported)
+        }
         Some(Task::SetAuthVariables(payloads)) => auth_variables::set_auth_variables(&payloads)
             .map(|log| println!("publish-hiidb: AuthProbeLog {log}")),
         None => {
@@ -151,7 +173,9 @@ fn efi_main() -> Status {
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
                  |password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
-                 |install-config-tables|set-auth-variables=PATH[,PATH]...]"
+                 |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
+                 |rt-properties-version-2|rt-properties-version-2-all\
+                 |set-auth-variables=PATH[,PATH]...]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -178,6 +202,8 @@ enum Task {
     PublishJunkAcpiTable([u8; 4]),
     /// Install a copy of the database as the HII database protocol's configuration table.
     InstallConfigTables,
+    /// Install an EFI_RT_PROPERTIES_TABLE of this Version and RuntimeServicesSupported.
+    InstallRtProperties(u16, u32),
     /// Run the authenticated writes of [`auth_variables`] with the payloads.
     SetAuthVariables(Vec<auth_variables::Payload>),
 }
@@ -216,6 +242,25 @@ fn load_option() -> Option<Task> {
             Some(Task::PublishJunkAcpiTable(QHII_SIGNATURE))
         }
         Ok(option) if option == cstr16!("install-config-tables") => Some(Task::InstallConfigTables),
+        Ok(option) if option == cstr16!("rt-properties-no-set-variable") => {
+            Some(Task::InstallRtProperties(
+                RT_PROPERTIES_TABLE_VERSION,
+                RT_SUPPORTED_ALL & !RT_SUPPORTED_SET_VARIABLE,
+            ))
+        }
+        Ok(option) if option == cstr16!("rt-properties-all") => Some(Task::InstallRtProperties(
+            RT_PROPERTIES_TABLE_VERSION,
+            RT_SUPPORTED_ALL,
+        )),
+        Ok(option) if option == cstr16!("rt-properties-version-2") => {
+            Some(Task::InstallRtProperties(
+                RT_PROPERTIES_TABLE_VERSION_UNDEFINED,
+                RT_SUPPORTED_ALL & !RT_SUPPORTED_SET_VARIABLE,
+            ))
+        }
+        Ok(option) if option == cstr16!("rt-properties-version-2-all") => Some(
+            Task::InstallRtProperties(RT_PROPERTIES_TABLE_VERSION_UNDEFINED, RT_SUPPORTED_ALL),
+        ),
         Ok(option) => auth_variables::payloads(option).map(Task::SetAuthVariables),
         _ => None,
     }
@@ -427,5 +472,41 @@ fn install_config_tables() -> Result<(), Failure> {
     .map_err(|error| ("setting the HiiDBConfigTable variable", error.status()))?;
 
     println!("publish-hiidb: config table {HII_DATABASE_GUID} at {address:#x}, {length} bytes");
+    Ok(())
+}
+
+/// Installs an EFI_RT_PROPERTIES_TABLE of Version `version` whose RuntimeServicesSupported is
+/// `supported`, in a runtime-data pool, and logs its address.
+fn install_rt_properties(version: u16, supported: u32) -> Result<(), Failure> {
+    let mut table = [0; RT_PROPERTIES_TABLE_LEN as usize];
+    table[..2].copy_from_slice(&version.to_le_bytes());
+    table[2..4].copy_from_slice(&RT_PROPERTIES_TABLE_LEN.to_le_bytes());
+    table[4..].copy_from_slice(&supported.to_le_bytes());
+
+    let pool = boot::allocate_pool(MemoryType::RUNTIME_SERVICES_DATA, table.len())
+        .map_err(|error| ("allocating the runtime pool", error.status()))?;
+    #[expect(
+        unsafe_code,
+        reason = "the pool from allocate_pool() is only reachable through a raw pointer"
+    )]
+    // SAFETY: allocate_pool returned `table.len()` bytes that nothing else references, at an
+    // identity-mapped address, and `table` does not overlap them.
+    unsafe {
+        ptr::copy_nonoverlapping(table.as_ptr(), pool.as_ptr(), table.len());
+    }
+    #[expect(
+        unsafe_code,
+        reason = "InstallConfigurationTable() takes a raw pointer that must stay valid"
+    )]
+    // SAFETY: the table is a runtime-data pool allocation, as the function requires, that is
+    // never freed or written again.
+    unsafe { boot::install_configuration_table(&RT_PROPERTIES_TABLE_GUID, pool.as_ptr().cast()) }
+        .map_err(|error| ("installing the RT properties table", error.status()))?;
+
+    let address = pool.as_ptr().addr();
+    println!(
+        "publish-hiidb: RT properties table at {address:#x}, Version {version}, \
+         RuntimeServicesSupported {supported:#06x}"
+    );
     Ok(())
 }
