@@ -1,5 +1,5 @@
 # The checks of the Makefile; the QEMU boots, which need KVM and apt packages, and
-# the unit tests on macOS in jobs of their own.
+# the unit tests on macOS and Windows in jobs of their own.
 name: ci
 
 on:
@@ -61,6 +61,30 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - run: gmake -k test
+
+  # The unit tests of the Windows build on x86_64, whose firmware calls run against
+  # fakes; lint-and-test lints both of its targets.
+  test-windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    # Git for Windows' bash, which the Makefile's recipes and scripts need.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # GNU make, which the image lacks.
+      - run: choco install make --yes --no-progress
+
+      - run: make setup
+
+      # After setup: the key covers installed toolchains.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - run: make -k test
 
   # QEMU 9.0 and newer fault unaligned loads from Device memory as arm64 does, which the
   # aarch64 guests check; Ubuntu 24.04 has QEMU 8.2.
