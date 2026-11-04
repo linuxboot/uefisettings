@@ -284,7 +284,7 @@ mod tests {
     const BLESS: &str = "UEFISETTINGS_BLESS";
 
     /// Whether `value`, that of BLESS, asks for a rewrite: only "1" does, as in
-    /// tests/offline_golden.rs, whose test crate cannot reach this module.
+    /// tests/golden/mod.rs, whose test crates cannot reach this module.
     fn blesses(value: Option<&OsStr>) -> bool {
         value.is_some_and(|value| value == "1")
     }

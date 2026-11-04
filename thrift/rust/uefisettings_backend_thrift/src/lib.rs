@@ -49,6 +49,7 @@ pub struct SetResponse {
     pub question: crate::types::Question,
     pub modified: ::std::primitive::bool,
     pub is_translated: ::std::primitive::bool,
+    pub firmware_attribute_set_result: ::std::option::Option<crate::types::FirmwareAttributeSetResult>,
     // This field forces `..Default::default()` when instantiating this
     // struct, to make code future-proof against new fields added later to
     // the definition in Thrift. If you don't want this, add the annotation
@@ -96,6 +97,180 @@ pub struct GetResponseList {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Error {
     pub error_message: ::std::string::String,
+    pub kind: ::std::option::Option<::std::string::String>,
+    pub os_errno: ::std::option::Option<::std::primitive::i32>,
+    pub clear_error: ::std::option::Option<crate::types::ErrorCause>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ErrorCause {
+    pub error_message: ::std::string::String,
+    pub kind: ::std::option::Option<::std::string::String>,
+    pub os_errno: ::std::option::Option<::std::primitive::i32>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FirmwareAttributeIntegerBounds {
+    pub min_value: ::std::option::Option<::std::primitive::i64>,
+    pub max_value: ::std::option::Option<::std::primitive::i64>,
+    pub scalar_increment: ::std::option::Option<::std::primitive::i64>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FirmwareAttributeStringBounds {
+    pub min_length: ::std::option::Option<::std::primitive::i64>,
+    pub max_length: ::std::option::Option<::std::primitive::i64>,
+    pub possible_values: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum FirmwareAttributeKind {
+    enumeration(::std::vec::Vec<::std::string::String>),
+    integer(crate::types::FirmwareAttributeIntegerBounds),
+    string_value(crate::types::FirmwareAttributeStringBounds),
+    ordered_list(::std::vec::Vec<::std::string::String>),
+    other(::std::string::String),
+    UnknownField(::std::primitive::i32),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum FirmwareAttributeValue {
+    value(::std::string::String),
+    read_error(crate::types::Error),
+    UnknownField(::std::primitive::i32),
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FirmwareAttribute {
+    pub device: ::std::string::String,
+    pub name: ::std::string::String,
+    pub kind: crate::types::FirmwareAttributeKind,
+    pub current_value: crate::types::FirmwareAttributeValue,
+    pub default_value: ::std::option::Option<::std::string::String>,
+    pub display_name: ::std::option::Option<::std::string::String>,
+    pub display_name_language_code: ::std::option::Option<::std::string::String>,
+    pub not_writable_reason: ::std::option::Option<::std::string::String>,
+    pub dell_modifier: ::std::option::Option<::std::string::String>,
+    pub dell_value_modifier: ::std::option::Option<::std::string::String>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FirmwareAttributeLoadError {
+    pub device: ::std::string::String,
+    pub name: ::std::option::Option<::std::string::String>,
+    pub error: crate::types::Error,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FirmwareAttributeList {
+    pub attributes: ::std::vec::Vec<crate::types::FirmwareAttribute>,
+    pub errors: ::std::vec::Vec<crate::types::FirmwareAttributeLoadError>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FirmwareAttributeSetResult {
+    pub device: ::std::string::String,
+    pub name: ::std::string::String,
+    pub status: ::std::string::String,
+    pub read_back: ::std::option::Option<::std::string::String>,
+    pub pending_reboot: ::std::option::Option<::std::primitive::bool>,
+    pub read_back_error: ::std::option::Option<crate::types::Error>,
+    pub clear_error: ::std::option::Option<crate::types::Error>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FirmwareAttributeAuthentication {
+    pub device: ::std::string::String,
+    pub name: ::std::string::String,
+    pub role: ::std::string::String,
+    pub is_enabled: ::std::primitive::bool,
+    pub mechanism: ::std::option::Option<::std::string::String>,
+    pub min_password_length: ::std::option::Option<::std::primitive::i64>,
+    pub max_password_length: ::std::option::Option<::std::primitive::i64>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FirmwareAttributeAuthenticationList {
+    pub authentications: ::std::vec::Vec<crate::types::FirmwareAttributeAuthentication>,
+    pub errors: ::std::vec::Vec<crate::types::FirmwareAttributeLoadError>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FirmwareAttributePendingReboot {
+    pub device: ::std::string::String,
+    pub pending_reboot: ::std::option::Option<::std::primitive::bool>,
+    pub read_error: ::std::option::Option<crate::types::Error>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FirmwareAttributePendingRebootList {
+    pub devices: ::std::vec::Vec<crate::types::FirmwareAttributePendingReboot>,
     // This field forces `..Default::default()` when instantiating this
     // struct, to make code future-proof against new fields added later to
     // the definition in Thrift. If you don't want this, add the annotation
@@ -157,6 +332,7 @@ impl Backend {
     pub const Unknown: Self = Backend(0i32);
     pub const Hii: Self = Backend(1i32);
     pub const Ilo: Self = Backend(2i32);
+    pub const FirmwareAttributes: Self = Backend(3i32);
 }
 
 impl ::fbthrift::ThriftEnum for Backend {
@@ -165,6 +341,7 @@ impl ::fbthrift::ThriftEnum for Backend {
             (Self::Unknown, "Unknown"),
             (Self::Hii, "Hii"),
             (Self::Ilo, "Ilo"),
+            (Self::FirmwareAttributes, "FirmwareAttributes"),
         ]
     }
 
@@ -173,6 +350,7 @@ impl ::fbthrift::ThriftEnum for Backend {
             "Unknown",
             "Hii",
             "Ilo",
+            "FirmwareAttributes",
         ]
     }
 
@@ -181,6 +359,7 @@ impl ::fbthrift::ThriftEnum for Backend {
             Self::Unknown,
             Self::Hii,
             Self::Ilo,
+            Self::FirmwareAttributes,
         ]
     }
 }
@@ -219,6 +398,7 @@ impl ::std::fmt::Display for Backend {
             ("Unknown", 0),
             ("Hii", 1),
             ("Ilo", 2),
+            ("FirmwareAttributes", 3),
         ];
         ::fbthrift::help::enum_display(VARIANTS_BY_NUMBER, fmt, self.0)
     }
@@ -235,6 +415,7 @@ impl ::std::str::FromStr for Backend {
 
     fn from_str(string: &::std::primitive::str) -> ::std::result::Result<Self, Self::Err> {
         static VARIANTS_BY_NAME: &[(&::std::primitive::str, ::std::primitive::i32)] = &[
+            ("FirmwareAttributes", 3),
             ("Hii", 1),
             ("Ilo", 2),
             ("Unknown", 0),
@@ -572,6 +753,7 @@ impl ::std::default::Default for self::SetResponse {
             question: ::std::default::Default::default(),
             modified: ::std::default::Default::default(),
             is_translated: ::std::default::Default::default(),
+            firmware_attribute_set_result: ::std::option::Option::None,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         }
     }
@@ -586,6 +768,7 @@ impl ::std::fmt::Debug for self::SetResponse {
             .field("question", &self.question)
             .field("modified", &self.modified)
             .field("is_translated", &self.is_translated)
+            .field("firmware_attribute_set_result", &self.firmware_attribute_set_result)
             .finish()
     }
 }
@@ -619,6 +802,11 @@ where
         p.write_field_begin("is_translated", ::fbthrift::TType::Bool, 5);
         ::fbthrift::Serialize::write(&self.is_translated, p);
         p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.firmware_attribute_set_result {
+            p.write_field_begin("firmware_attribute_set_result", ::fbthrift::TType::Struct, 8);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
         p.write_field_stop();
         p.write_struct_end();
     }
@@ -631,6 +819,7 @@ where
     fn read(p: &mut P) -> ::anyhow::Result<Self> {
         static FIELDS: &[::fbthrift::Field] = &[
             ::fbthrift::Field::new("backend", ::fbthrift::TType::I32, 2),
+            ::fbthrift::Field::new("firmware_attribute_set_result", ::fbthrift::TType::Struct, 8),
             ::fbthrift::Field::new("is_translated", ::fbthrift::TType::Bool, 5),
             ::fbthrift::Field::new("modified", ::fbthrift::TType::Bool, 4),
             ::fbthrift::Field::new("question", ::fbthrift::TType::Struct, 3),
@@ -641,6 +830,7 @@ where
         let mut field_question = ::std::option::Option::None;
         let mut field_modified = ::std::option::Option::None;
         let mut field_is_translated = ::std::option::Option::None;
+        let mut field_firmware_attribute_set_result = ::std::option::Option::None;
         let _ = p.read_struct_begin(|_| ())?;
         loop {
             let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
@@ -651,6 +841,7 @@ where
                 (::fbthrift::TType::Struct, 3) => field_question = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::Bool, 4) => field_modified = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::Bool, 5) => field_is_translated = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 8) => field_firmware_attribute_set_result = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (fty, _) => p.skip(fty)?,
             }
             p.read_field_end()?;
@@ -662,6 +853,7 @@ where
             question: field_question.unwrap_or_default(),
             modified: field_modified.unwrap_or_default(),
             is_translated: field_is_translated.unwrap_or_default(),
+            firmware_attribute_set_result: field_firmware_attribute_set_result,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         })
     }
@@ -691,6 +883,8 @@ impl ::fbthrift::metadata::ThriftAnnotations for SetResponse {
             4 => {
             },
             5 => {
+            },
+            8 => {
             },
             _ => {}
         }
@@ -1017,6 +1211,9 @@ impl ::std::default::Default for self::Error {
     fn default() -> Self {
         Self {
             error_message: ::std::default::Default::default(),
+            kind: ::std::option::Option::None,
+            os_errno: ::std::option::Option::None,
+            clear_error: ::std::option::Option::None,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         }
     }
@@ -1027,6 +1224,9 @@ impl ::std::fmt::Debug for self::Error {
         formatter
             .debug_struct("Error")
             .field("error_message", &self.error_message)
+            .field("kind", &self.kind)
+            .field("os_errno", &self.os_errno)
+            .field("clear_error", &self.clear_error)
             .finish()
     }
 }
@@ -1048,6 +1248,21 @@ where
         p.write_field_begin("error_message", ::fbthrift::TType::String, 1);
         ::fbthrift::Serialize::write(&self.error_message, p);
         p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.kind {
+            p.write_field_begin("kind", ::fbthrift::TType::String, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.os_errno {
+            p.write_field_begin("os_errno", ::fbthrift::TType::I32, 3);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.clear_error {
+            p.write_field_begin("clear_error", ::fbthrift::TType::Struct, 4);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
         p.write_field_stop();
         p.write_struct_end();
     }
@@ -1059,15 +1274,24 @@ where
 {
     fn read(p: &mut P) -> ::anyhow::Result<Self> {
         static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("clear_error", ::fbthrift::TType::Struct, 4),
             ::fbthrift::Field::new("error_message", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("kind", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("os_errno", ::fbthrift::TType::I32, 3),
         ];
         let mut field_error_message = ::std::option::Option::None;
+        let mut field_kind = ::std::option::Option::None;
+        let mut field_os_errno = ::std::option::Option::None;
+        let mut field_clear_error = ::std::option::Option::None;
         let _ = p.read_struct_begin(|_| ())?;
         loop {
             let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
             match (fty, fid as ::std::primitive::i32) {
                 (::fbthrift::TType::Stop, _) => break,
                 (::fbthrift::TType::String, 1) => field_error_message = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_kind = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I32, 3) => field_os_errno = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 4) => field_clear_error = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (fty, _) => p.skip(fty)?,
             }
             p.read_field_end()?;
@@ -1075,6 +1299,9 @@ where
         p.read_struct_end()?;
         ::std::result::Result::Ok(Self {
             error_message: field_error_message.unwrap_or_default(),
+            kind: field_kind,
+            os_errno: field_os_errno,
+            clear_error: field_clear_error,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         })
     }
@@ -1082,6 +1309,1703 @@ where
 
 
 impl ::fbthrift::metadata::ThriftAnnotations for Error {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            4 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::ErrorCause {
+    fn default() -> Self {
+        Self {
+            error_message: ::std::default::Default::default(),
+            kind: ::std::option::Option::None,
+            os_errno: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::ErrorCause {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("ErrorCause")
+            .field("error_message", &self.error_message)
+            .field("kind", &self.kind)
+            .field("os_errno", &self.os_errno)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::ErrorCause {}
+unsafe impl ::std::marker::Sync for self::ErrorCause {}
+impl ::std::marker::Unpin for self::ErrorCause {}
+
+impl ::fbthrift::GetTType for self::ErrorCause {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::ErrorCause
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("ErrorCause");
+        p.write_field_begin("error_message", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.error_message, p);
+        p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.kind {
+            p.write_field_begin("kind", ::fbthrift::TType::String, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.os_errno {
+            p.write_field_begin("os_errno", ::fbthrift::TType::I32, 3);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::ErrorCause
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("error_message", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("kind", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("os_errno", ::fbthrift::TType::I32, 3),
+        ];
+        let mut field_error_message = ::std::option::Option::None;
+        let mut field_kind = ::std::option::Option::None;
+        let mut field_os_errno = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_error_message = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_kind = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I32, 3) => field_os_errno = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            error_message: field_error_message.unwrap_or_default(),
+            kind: field_kind,
+            os_errno: field_os_errno,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for ErrorCause {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributeIntegerBounds {
+    fn default() -> Self {
+        Self {
+            min_value: ::std::option::Option::None,
+            max_value: ::std::option::Option::None,
+            scalar_increment: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributeIntegerBounds {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributeIntegerBounds")
+            .field("min_value", &self.min_value)
+            .field("max_value", &self.max_value)
+            .field("scalar_increment", &self.scalar_increment)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributeIntegerBounds {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributeIntegerBounds {}
+impl ::std::marker::Unpin for self::FirmwareAttributeIntegerBounds {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributeIntegerBounds {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributeIntegerBounds
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeIntegerBounds");
+        if let ::std::option::Option::Some(some) = &self.min_value {
+            p.write_field_begin("min_value", ::fbthrift::TType::I64, 1);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.max_value {
+            p.write_field_begin("max_value", ::fbthrift::TType::I64, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.scalar_increment {
+            p.write_field_begin("scalar_increment", ::fbthrift::TType::I64, 3);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributeIntegerBounds
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("max_value", ::fbthrift::TType::I64, 2),
+            ::fbthrift::Field::new("min_value", ::fbthrift::TType::I64, 1),
+            ::fbthrift::Field::new("scalar_increment", ::fbthrift::TType::I64, 3),
+        ];
+        let mut field_min_value = ::std::option::Option::None;
+        let mut field_max_value = ::std::option::Option::None;
+        let mut field_scalar_increment = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::I64, 1) => field_min_value = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I64, 2) => field_max_value = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I64, 3) => field_scalar_increment = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            min_value: field_min_value,
+            max_value: field_max_value,
+            scalar_increment: field_scalar_increment,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeIntegerBounds {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributeStringBounds {
+    fn default() -> Self {
+        Self {
+            min_length: ::std::option::Option::None,
+            max_length: ::std::option::Option::None,
+            possible_values: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributeStringBounds {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributeStringBounds")
+            .field("min_length", &self.min_length)
+            .field("max_length", &self.max_length)
+            .field("possible_values", &self.possible_values)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributeStringBounds {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributeStringBounds {}
+impl ::std::marker::Unpin for self::FirmwareAttributeStringBounds {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributeStringBounds {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributeStringBounds
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeStringBounds");
+        if let ::std::option::Option::Some(some) = &self.min_length {
+            p.write_field_begin("min_length", ::fbthrift::TType::I64, 1);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.max_length {
+            p.write_field_begin("max_length", ::fbthrift::TType::I64, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.possible_values {
+            p.write_field_begin("possible_values", ::fbthrift::TType::List, 3);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributeStringBounds
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("max_length", ::fbthrift::TType::I64, 2),
+            ::fbthrift::Field::new("min_length", ::fbthrift::TType::I64, 1),
+            ::fbthrift::Field::new("possible_values", ::fbthrift::TType::List, 3),
+        ];
+        let mut field_min_length = ::std::option::Option::None;
+        let mut field_max_length = ::std::option::Option::None;
+        let mut field_possible_values = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::I64, 1) => field_min_length = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I64, 2) => field_max_length = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 3) => field_possible_values = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            min_length: field_min_length,
+            max_length: field_max_length,
+            possible_values: field_possible_values,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeStringBounds {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+
+impl ::std::default::Default for FirmwareAttributeKind {
+    fn default() -> Self {
+        Self::UnknownField(-1)
+    }
+}
+
+impl ::fbthrift::GetTType for FirmwareAttributeKind {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for FirmwareAttributeKind
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeKind");
+        match self {
+            Self::enumeration(inner) => {
+                p.write_field_begin("enumeration", ::fbthrift::TType::List, 1);
+                ::fbthrift::Serialize::write(inner, p);
+                p.write_field_end();
+            }
+            Self::integer(inner) => {
+                p.write_field_begin("integer", ::fbthrift::TType::Struct, 2);
+                ::fbthrift::Serialize::write(inner, p);
+                p.write_field_end();
+            }
+            Self::string_value(inner) => {
+                p.write_field_begin("string_value", ::fbthrift::TType::Struct, 3);
+                ::fbthrift::Serialize::write(inner, p);
+                p.write_field_end();
+            }
+            Self::ordered_list(inner) => {
+                p.write_field_begin("ordered_list", ::fbthrift::TType::List, 4);
+                ::fbthrift::Serialize::write(inner, p);
+                p.write_field_end();
+            }
+            Self::other(inner) => {
+                p.write_field_begin("other", ::fbthrift::TType::String, 5);
+                ::fbthrift::Serialize::write(inner, p);
+                p.write_field_end();
+            }
+            Self::UnknownField(_) => {}
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for FirmwareAttributeKind
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("enumeration", ::fbthrift::TType::List, 1),
+            ::fbthrift::Field::new("integer", ::fbthrift::TType::Struct, 2),
+            ::fbthrift::Field::new("ordered_list", ::fbthrift::TType::List, 4),
+            ::fbthrift::Field::new("other", ::fbthrift::TType::String, 5),
+            ::fbthrift::Field::new("string_value", ::fbthrift::TType::Struct, 3),
+        ];
+        let _ = p.read_struct_begin(|_| ())?;
+        let mut once = false;
+        let mut alt = ::std::option::Option::None;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32, once) {
+                (::fbthrift::TType::Stop, _, _) => break,
+                (::fbthrift::TType::List, 1, false) => {
+                    once = true;
+                    alt = ::std::option::Option::Some(Self::enumeration(::fbthrift::Deserialize::read(p)?));
+                }
+                (::fbthrift::TType::Struct, 2, false) => {
+                    once = true;
+                    alt = ::std::option::Option::Some(Self::integer(::fbthrift::Deserialize::read(p)?));
+                }
+                (::fbthrift::TType::Struct, 3, false) => {
+                    once = true;
+                    alt = ::std::option::Option::Some(Self::string_value(::fbthrift::Deserialize::read(p)?));
+                }
+                (::fbthrift::TType::List, 4, false) => {
+                    once = true;
+                    alt = ::std::option::Option::Some(Self::ordered_list(::fbthrift::Deserialize::read(p)?));
+                }
+                (::fbthrift::TType::String, 5, false) => {
+                    once = true;
+                    alt = ::std::option::Option::Some(Self::other(::fbthrift::Deserialize::read(p)?));
+                }
+                (fty, _, false) => p.skip(fty)?,
+                (badty, badid, true) => return ::std::result::Result::Err(::std::convert::From::from(::fbthrift::ProtocolError::UnwantedExtraUnionField(
+                    "FirmwareAttributeKind".to_string(),
+                    badty,
+                    badid,
+                ))),
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(alt.unwrap_or_default())
+    }
+}
+
+impl FirmwareAttributeKind {
+    /// Return current union variant name as a tuple of (Rust name, original name).
+    pub fn variant_name(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::enumeration(_) => Some(("enumeration", "enumeration")),
+            Self::integer(_) => Some(("integer", "integer")),
+            Self::string_value(_) => Some(("string_value", "string_value")),
+            Self::ordered_list(_) => Some(("ordered_list", "ordered_list")),
+            Self::other(_) => Some(("other", "other")),
+            Self::UnknownField(_) => None,
+        }
+    }
+}
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeKind {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            4 => {
+            },
+            5 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+impl ::std::default::Default for FirmwareAttributeValue {
+    fn default() -> Self {
+        Self::UnknownField(-1)
+    }
+}
+
+impl ::fbthrift::GetTType for FirmwareAttributeValue {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for FirmwareAttributeValue
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeValue");
+        match self {
+            Self::value(inner) => {
+                p.write_field_begin("value", ::fbthrift::TType::String, 1);
+                ::fbthrift::Serialize::write(inner, p);
+                p.write_field_end();
+            }
+            Self::read_error(inner) => {
+                p.write_field_begin("read_error", ::fbthrift::TType::Struct, 2);
+                ::fbthrift::Serialize::write(inner, p);
+                p.write_field_end();
+            }
+            Self::UnknownField(_) => {}
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for FirmwareAttributeValue
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("read_error", ::fbthrift::TType::Struct, 2),
+            ::fbthrift::Field::new("value", ::fbthrift::TType::String, 1),
+        ];
+        let _ = p.read_struct_begin(|_| ())?;
+        let mut once = false;
+        let mut alt = ::std::option::Option::None;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32, once) {
+                (::fbthrift::TType::Stop, _, _) => break,
+                (::fbthrift::TType::String, 1, false) => {
+                    once = true;
+                    alt = ::std::option::Option::Some(Self::value(::fbthrift::Deserialize::read(p)?));
+                }
+                (::fbthrift::TType::Struct, 2, false) => {
+                    once = true;
+                    alt = ::std::option::Option::Some(Self::read_error(::fbthrift::Deserialize::read(p)?));
+                }
+                (fty, _, false) => p.skip(fty)?,
+                (badty, badid, true) => return ::std::result::Result::Err(::std::convert::From::from(::fbthrift::ProtocolError::UnwantedExtraUnionField(
+                    "FirmwareAttributeValue".to_string(),
+                    badty,
+                    badid,
+                ))),
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(alt.unwrap_or_default())
+    }
+}
+
+impl FirmwareAttributeValue {
+    /// Return current union variant name as a tuple of (Rust name, original name).
+    pub fn variant_name(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::value(_) => Some(("value", "value")),
+            Self::read_error(_) => Some(("read_error", "read_error")),
+            Self::UnknownField(_) => None,
+        }
+    }
+}
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeValue {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttribute {
+    fn default() -> Self {
+        Self {
+            device: ::std::default::Default::default(),
+            name: ::std::default::Default::default(),
+            kind: ::std::default::Default::default(),
+            current_value: ::std::default::Default::default(),
+            default_value: ::std::option::Option::None,
+            display_name: ::std::option::Option::None,
+            display_name_language_code: ::std::option::Option::None,
+            not_writable_reason: ::std::option::Option::None,
+            dell_modifier: ::std::option::Option::None,
+            dell_value_modifier: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttribute {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttribute")
+            .field("device", &self.device)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("current_value", &self.current_value)
+            .field("default_value", &self.default_value)
+            .field("display_name", &self.display_name)
+            .field("display_name_language_code", &self.display_name_language_code)
+            .field("not_writable_reason", &self.not_writable_reason)
+            .field("dell_modifier", &self.dell_modifier)
+            .field("dell_value_modifier", &self.dell_value_modifier)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttribute {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttribute {}
+impl ::std::marker::Unpin for self::FirmwareAttribute {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttribute {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttribute
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttribute");
+        p.write_field_begin("device", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.device, p);
+        p.write_field_end();
+        p.write_field_begin("name", ::fbthrift::TType::String, 2);
+        ::fbthrift::Serialize::write(&self.name, p);
+        p.write_field_end();
+        p.write_field_begin("kind", ::fbthrift::TType::Struct, 3);
+        ::fbthrift::Serialize::write(&self.kind, p);
+        p.write_field_end();
+        p.write_field_begin("current_value", ::fbthrift::TType::Struct, 4);
+        ::fbthrift::Serialize::write(&self.current_value, p);
+        p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.default_value {
+            p.write_field_begin("default_value", ::fbthrift::TType::String, 5);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.display_name {
+            p.write_field_begin("display_name", ::fbthrift::TType::String, 6);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.display_name_language_code {
+            p.write_field_begin("display_name_language_code", ::fbthrift::TType::String, 7);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.not_writable_reason {
+            p.write_field_begin("not_writable_reason", ::fbthrift::TType::String, 8);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.dell_modifier {
+            p.write_field_begin("dell_modifier", ::fbthrift::TType::String, 9);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.dell_value_modifier {
+            p.write_field_begin("dell_value_modifier", ::fbthrift::TType::String, 10);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttribute
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("current_value", ::fbthrift::TType::Struct, 4),
+            ::fbthrift::Field::new("default_value", ::fbthrift::TType::String, 5),
+            ::fbthrift::Field::new("dell_modifier", ::fbthrift::TType::String, 9),
+            ::fbthrift::Field::new("dell_value_modifier", ::fbthrift::TType::String, 10),
+            ::fbthrift::Field::new("device", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("display_name", ::fbthrift::TType::String, 6),
+            ::fbthrift::Field::new("display_name_language_code", ::fbthrift::TType::String, 7),
+            ::fbthrift::Field::new("kind", ::fbthrift::TType::Struct, 3),
+            ::fbthrift::Field::new("name", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("not_writable_reason", ::fbthrift::TType::String, 8),
+        ];
+        let mut field_device = ::std::option::Option::None;
+        let mut field_name = ::std::option::Option::None;
+        let mut field_kind = ::std::option::Option::None;
+        let mut field_current_value = ::std::option::Option::None;
+        let mut field_default_value = ::std::option::Option::None;
+        let mut field_display_name = ::std::option::Option::None;
+        let mut field_display_name_language_code = ::std::option::Option::None;
+        let mut field_not_writable_reason = ::std::option::Option::None;
+        let mut field_dell_modifier = ::std::option::Option::None;
+        let mut field_dell_value_modifier = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_device = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_name = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 3) => field_kind = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 4) => field_current_value = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 5) => field_default_value = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 6) => field_display_name = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 7) => field_display_name_language_code = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 8) => field_not_writable_reason = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 9) => field_dell_modifier = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 10) => field_dell_value_modifier = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            device: field_device.unwrap_or_default(),
+            name: field_name.unwrap_or_default(),
+            kind: field_kind.unwrap_or_default(),
+            current_value: field_current_value.unwrap_or_default(),
+            default_value: field_default_value,
+            display_name: field_display_name,
+            display_name_language_code: field_display_name_language_code,
+            not_writable_reason: field_not_writable_reason,
+            dell_modifier: field_dell_modifier,
+            dell_value_modifier: field_dell_value_modifier,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttribute {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            4 => {
+            },
+            5 => {
+            },
+            6 => {
+            },
+            7 => {
+            },
+            8 => {
+            },
+            9 => {
+            },
+            10 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributeLoadError {
+    fn default() -> Self {
+        Self {
+            device: ::std::default::Default::default(),
+            name: ::std::option::Option::None,
+            error: ::std::default::Default::default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributeLoadError {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributeLoadError")
+            .field("device", &self.device)
+            .field("name", &self.name)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributeLoadError {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributeLoadError {}
+impl ::std::marker::Unpin for self::FirmwareAttributeLoadError {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributeLoadError {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributeLoadError
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeLoadError");
+        p.write_field_begin("device", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.device, p);
+        p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.name {
+            p.write_field_begin("name", ::fbthrift::TType::String, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_begin("error", ::fbthrift::TType::Struct, 3);
+        ::fbthrift::Serialize::write(&self.error, p);
+        p.write_field_end();
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributeLoadError
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("device", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("error", ::fbthrift::TType::Struct, 3),
+            ::fbthrift::Field::new("name", ::fbthrift::TType::String, 2),
+        ];
+        let mut field_device = ::std::option::Option::None;
+        let mut field_name = ::std::option::Option::None;
+        let mut field_error = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_device = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_name = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 3) => field_error = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            device: field_device.unwrap_or_default(),
+            name: field_name,
+            error: field_error.unwrap_or_default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeLoadError {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributeList {
+    fn default() -> Self {
+        Self {
+            attributes: ::std::default::Default::default(),
+            errors: ::std::default::Default::default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributeList {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributeList")
+            .field("attributes", &self.attributes)
+            .field("errors", &self.errors)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributeList {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributeList {}
+impl ::std::marker::Unpin for self::FirmwareAttributeList {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributeList {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributeList
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeList");
+        p.write_field_begin("attributes", ::fbthrift::TType::List, 1);
+        ::fbthrift::Serialize::write(&self.attributes, p);
+        p.write_field_end();
+        p.write_field_begin("errors", ::fbthrift::TType::List, 2);
+        ::fbthrift::Serialize::write(&self.errors, p);
+        p.write_field_end();
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributeList
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("attributes", ::fbthrift::TType::List, 1),
+            ::fbthrift::Field::new("errors", ::fbthrift::TType::List, 2),
+        ];
+        let mut field_attributes = ::std::option::Option::None;
+        let mut field_errors = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::List, 1) => field_attributes = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 2) => field_errors = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            attributes: field_attributes.unwrap_or_default(),
+            errors: field_errors.unwrap_or_default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeList {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributeSetResult {
+    fn default() -> Self {
+        Self {
+            device: ::std::default::Default::default(),
+            name: ::std::default::Default::default(),
+            status: ::std::default::Default::default(),
+            read_back: ::std::option::Option::None,
+            pending_reboot: ::std::option::Option::None,
+            read_back_error: ::std::option::Option::None,
+            clear_error: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributeSetResult {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributeSetResult")
+            .field("device", &self.device)
+            .field("name", &self.name)
+            .field("status", &self.status)
+            .field("read_back", &self.read_back)
+            .field("pending_reboot", &self.pending_reboot)
+            .field("read_back_error", &self.read_back_error)
+            .field("clear_error", &self.clear_error)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributeSetResult {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributeSetResult {}
+impl ::std::marker::Unpin for self::FirmwareAttributeSetResult {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributeSetResult {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributeSetResult
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeSetResult");
+        p.write_field_begin("device", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.device, p);
+        p.write_field_end();
+        p.write_field_begin("name", ::fbthrift::TType::String, 2);
+        ::fbthrift::Serialize::write(&self.name, p);
+        p.write_field_end();
+        p.write_field_begin("status", ::fbthrift::TType::String, 3);
+        ::fbthrift::Serialize::write(&self.status, p);
+        p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.read_back {
+            p.write_field_begin("read_back", ::fbthrift::TType::String, 4);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.pending_reboot {
+            p.write_field_begin("pending_reboot", ::fbthrift::TType::Bool, 5);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.read_back_error {
+            p.write_field_begin("read_back_error", ::fbthrift::TType::Struct, 6);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.clear_error {
+            p.write_field_begin("clear_error", ::fbthrift::TType::Struct, 7);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributeSetResult
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("clear_error", ::fbthrift::TType::Struct, 7),
+            ::fbthrift::Field::new("device", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("name", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("pending_reboot", ::fbthrift::TType::Bool, 5),
+            ::fbthrift::Field::new("read_back", ::fbthrift::TType::String, 4),
+            ::fbthrift::Field::new("read_back_error", ::fbthrift::TType::Struct, 6),
+            ::fbthrift::Field::new("status", ::fbthrift::TType::String, 3),
+        ];
+        let mut field_device = ::std::option::Option::None;
+        let mut field_name = ::std::option::Option::None;
+        let mut field_status = ::std::option::Option::None;
+        let mut field_read_back = ::std::option::Option::None;
+        let mut field_pending_reboot = ::std::option::Option::None;
+        let mut field_read_back_error = ::std::option::Option::None;
+        let mut field_clear_error = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_device = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_name = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 3) => field_status = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 4) => field_read_back = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Bool, 5) => field_pending_reboot = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 6) => field_read_back_error = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 7) => field_clear_error = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            device: field_device.unwrap_or_default(),
+            name: field_name.unwrap_or_default(),
+            status: field_status.unwrap_or_default(),
+            read_back: field_read_back,
+            pending_reboot: field_pending_reboot,
+            read_back_error: field_read_back_error,
+            clear_error: field_clear_error,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeSetResult {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            4 => {
+            },
+            5 => {
+            },
+            6 => {
+            },
+            7 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributeAuthentication {
+    fn default() -> Self {
+        Self {
+            device: ::std::default::Default::default(),
+            name: ::std::default::Default::default(),
+            role: ::std::default::Default::default(),
+            is_enabled: ::std::default::Default::default(),
+            mechanism: ::std::option::Option::None,
+            min_password_length: ::std::option::Option::None,
+            max_password_length: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributeAuthentication {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributeAuthentication")
+            .field("device", &self.device)
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("is_enabled", &self.is_enabled)
+            .field("mechanism", &self.mechanism)
+            .field("min_password_length", &self.min_password_length)
+            .field("max_password_length", &self.max_password_length)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributeAuthentication {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributeAuthentication {}
+impl ::std::marker::Unpin for self::FirmwareAttributeAuthentication {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributeAuthentication {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributeAuthentication
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeAuthentication");
+        p.write_field_begin("device", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.device, p);
+        p.write_field_end();
+        p.write_field_begin("name", ::fbthrift::TType::String, 2);
+        ::fbthrift::Serialize::write(&self.name, p);
+        p.write_field_end();
+        p.write_field_begin("role", ::fbthrift::TType::String, 3);
+        ::fbthrift::Serialize::write(&self.role, p);
+        p.write_field_end();
+        p.write_field_begin("is_enabled", ::fbthrift::TType::Bool, 4);
+        ::fbthrift::Serialize::write(&self.is_enabled, p);
+        p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.mechanism {
+            p.write_field_begin("mechanism", ::fbthrift::TType::String, 5);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.min_password_length {
+            p.write_field_begin("min_password_length", ::fbthrift::TType::I64, 6);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.max_password_length {
+            p.write_field_begin("max_password_length", ::fbthrift::TType::I64, 7);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributeAuthentication
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("device", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("is_enabled", ::fbthrift::TType::Bool, 4),
+            ::fbthrift::Field::new("max_password_length", ::fbthrift::TType::I64, 7),
+            ::fbthrift::Field::new("mechanism", ::fbthrift::TType::String, 5),
+            ::fbthrift::Field::new("min_password_length", ::fbthrift::TType::I64, 6),
+            ::fbthrift::Field::new("name", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("role", ::fbthrift::TType::String, 3),
+        ];
+        let mut field_device = ::std::option::Option::None;
+        let mut field_name = ::std::option::Option::None;
+        let mut field_role = ::std::option::Option::None;
+        let mut field_is_enabled = ::std::option::Option::None;
+        let mut field_mechanism = ::std::option::Option::None;
+        let mut field_min_password_length = ::std::option::Option::None;
+        let mut field_max_password_length = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_device = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_name = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 3) => field_role = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Bool, 4) => field_is_enabled = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 5) => field_mechanism = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I64, 6) => field_min_password_length = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I64, 7) => field_max_password_length = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            device: field_device.unwrap_or_default(),
+            name: field_name.unwrap_or_default(),
+            role: field_role.unwrap_or_default(),
+            is_enabled: field_is_enabled.unwrap_or_default(),
+            mechanism: field_mechanism,
+            min_password_length: field_min_password_length,
+            max_password_length: field_max_password_length,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeAuthentication {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            4 => {
+            },
+            5 => {
+            },
+            6 => {
+            },
+            7 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributeAuthenticationList {
+    fn default() -> Self {
+        Self {
+            authentications: ::std::default::Default::default(),
+            errors: ::std::default::Default::default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributeAuthenticationList {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributeAuthenticationList")
+            .field("authentications", &self.authentications)
+            .field("errors", &self.errors)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributeAuthenticationList {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributeAuthenticationList {}
+impl ::std::marker::Unpin for self::FirmwareAttributeAuthenticationList {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributeAuthenticationList {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributeAuthenticationList
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributeAuthenticationList");
+        p.write_field_begin("authentications", ::fbthrift::TType::List, 1);
+        ::fbthrift::Serialize::write(&self.authentications, p);
+        p.write_field_end();
+        p.write_field_begin("errors", ::fbthrift::TType::List, 2);
+        ::fbthrift::Serialize::write(&self.errors, p);
+        p.write_field_end();
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributeAuthenticationList
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("authentications", ::fbthrift::TType::List, 1),
+            ::fbthrift::Field::new("errors", ::fbthrift::TType::List, 2),
+        ];
+        let mut field_authentications = ::std::option::Option::None;
+        let mut field_errors = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::List, 1) => field_authentications = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 2) => field_errors = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            authentications: field_authentications.unwrap_or_default(),
+            errors: field_errors.unwrap_or_default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributeAuthenticationList {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributePendingReboot {
+    fn default() -> Self {
+        Self {
+            device: ::std::default::Default::default(),
+            pending_reboot: ::std::option::Option::None,
+            read_error: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributePendingReboot {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributePendingReboot")
+            .field("device", &self.device)
+            .field("pending_reboot", &self.pending_reboot)
+            .field("read_error", &self.read_error)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributePendingReboot {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributePendingReboot {}
+impl ::std::marker::Unpin for self::FirmwareAttributePendingReboot {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributePendingReboot {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributePendingReboot
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributePendingReboot");
+        p.write_field_begin("device", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.device, p);
+        p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.pending_reboot {
+            p.write_field_begin("pending_reboot", ::fbthrift::TType::Bool, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.read_error {
+            p.write_field_begin("read_error", ::fbthrift::TType::Struct, 3);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributePendingReboot
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("device", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("pending_reboot", ::fbthrift::TType::Bool, 2),
+            ::fbthrift::Field::new("read_error", ::fbthrift::TType::Struct, 3),
+        ];
+        let mut field_device = ::std::option::Option::None;
+        let mut field_pending_reboot = ::std::option::Option::None;
+        let mut field_read_error = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_device = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Bool, 2) => field_pending_reboot = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::Struct, 3) => field_read_error = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            device: field_device.unwrap_or_default(),
+            pending_reboot: field_pending_reboot,
+            read_error: field_read_error,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributePendingReboot {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::FirmwareAttributePendingRebootList {
+    fn default() -> Self {
+        Self {
+            devices: ::std::default::Default::default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::FirmwareAttributePendingRebootList {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("FirmwareAttributePendingRebootList")
+            .field("devices", &self.devices)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::FirmwareAttributePendingRebootList {}
+unsafe impl ::std::marker::Sync for self::FirmwareAttributePendingRebootList {}
+impl ::std::marker::Unpin for self::FirmwareAttributePendingRebootList {}
+
+impl ::fbthrift::GetTType for self::FirmwareAttributePendingRebootList {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::FirmwareAttributePendingRebootList
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("FirmwareAttributePendingRebootList");
+        p.write_field_begin("devices", ::fbthrift::TType::List, 1);
+        ::fbthrift::Serialize::write(&self.devices, p);
+        p.write_field_end();
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::FirmwareAttributePendingRebootList
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("devices", ::fbthrift::TType::List, 1),
+        ];
+        let mut field_devices = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::List, 1) => field_devices = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            devices: field_devices.unwrap_or_default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for FirmwareAttributePendingRebootList {
     fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
         #[allow(unused_variables)]
         let type_id = ::std::any::TypeId::of::<T>();

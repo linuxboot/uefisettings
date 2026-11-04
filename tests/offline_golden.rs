@@ -18,15 +18,12 @@
 // the builds that read efivars dumps
 #![cfg(efivar_dumps)]
 
-use std::ffi::OsStr;
-use std::fs;
-use std::path::Path;
 use std::process::Command;
+
+mod golden;
 
 /// The dump, in dump/, and the outputs.
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/offline");
-/// The variable that makes offline_output_is_golden rewrite the outputs.
-const BLESS: &str = "UEFISETTINGS_BLESS";
 
 /// Each output in FIXTURES, and the arguments that print it, run in FIXTURES.
 const CASES: [(&str, &[&str]); 5] = [
@@ -56,23 +53,6 @@ const CASES: [(&str, &[&str]); 5] = [
     ),
 ];
 
-/// Whether `value`, that of BLESS, asks for a rewrite: only "1" does.
-fn blesses(value: Option<&OsStr>) -> bool {
-    value.is_some_and(|value| value == "1")
-}
-
-#[test]
-fn only_bless_1_rewrites_the_outputs() {
-    for (value, want) in [
-        (None, false),
-        (Some(""), false),
-        (Some("0"), false),
-        (Some("1"), true),
-    ] {
-        assert_eq!(blesses(value.map(OsStr::new)), want, "{BLESS}={value:?}");
-    }
-}
-
 #[test]
 fn offline_output_is_golden() {
     for (name, args) in CASES {
@@ -82,19 +62,6 @@ fn offline_output_is_golden() {
             .output()
             .expect("run uefisettings");
         assert!(output.status.success(), "{name}: {output:?}");
-        let path = Path::new(FIXTURES).join(name);
-
-        if blesses(std::env::var_os(BLESS).as_deref()) {
-            fs::write(&path, &output.stdout)
-                .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
-            continue;
-        }
-        let golden =
-            fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        assert_eq!(
-            std::str::from_utf8(&output.stdout).expect("UTF-8 output"),
-            std::str::from_utf8(&golden).expect("UTF-8 golden output"),
-            "{name}; {BLESS}=1 rewrites it"
-        );
+        golden::assert_golden(FIXTURES, name, &output.stdout);
     }
 }

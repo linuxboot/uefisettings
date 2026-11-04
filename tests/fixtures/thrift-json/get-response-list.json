@@ -1,0 +1,1 @@
+{"responses":[{"selector":"pkglist","backend":1,"question":{"name":"q\"b\\n\nt\tc\u0001d é 日本 😀 </script>","answer":"Enabled <grayed-out>","options":["Enabled","","q\"b\\n\nt\tc\u0001d é 日本 😀 </script>"],"help":""},"is_translated":true},{"selector":"","backend":2,"question":{"name":"","answer":"","options":[],"help":""},"is_translated":false}]}
