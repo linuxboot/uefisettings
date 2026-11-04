@@ -313,6 +313,52 @@ impl fmt::Debug for Guid {
     }
 }
 
+// EFI_GUID's bytes: Data1, Data2 and Data3 little-endian, then Data4 (UEFI 2.10 Appendix A)
+impl From<Guid> for [u8; 16] {
+    fn from(guid: Guid) -> Self {
+        let [a, b, c, d] = guid.data1.to_le_bytes();
+        let [e, f] = guid.data2.to_le_bytes();
+        let [g, h] = guid.data3.to_le_bytes();
+        let [i, j, k, l, m, n, o, p] = guid.data4;
+        [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p]
+    }
+}
+
+impl From<[u8; 16]> for Guid {
+    fn from(bytes: [u8; 16]) -> Self {
+        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = bytes;
+        Self {
+            data1: u32::from_le_bytes([a, b, c, d]),
+            data2: u16::from_le_bytes([e, f]),
+            data3: u16::from_le_bytes([g, h]),
+            data4: [i, j, k, l, m, n, o, p],
+        }
+    }
+}
+
+/// The bytes of an EFI_DEVICE_PATH_PROTOCOL instance, as a device path package (UEFI 2.10
+/// §33.3.4) and a configuration string's PATH carry them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DevicePath(Vec<u8>);
+
+impl From<Vec<u8>> for DevicePath {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl FromIterator<u8> for DevicePath {
+    fn from_iter<I: IntoIterator<Item = u8>>(bytes: I) -> Self {
+        Self(bytes.into_iter().collect())
+    }
+}
+
+impl AsRef<[u8]> for DevicePath {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 type StringMap = BTreeMap<i32, String>;
 type IFRNodeLink = Rc<RefCell<IFROperation>>;
 

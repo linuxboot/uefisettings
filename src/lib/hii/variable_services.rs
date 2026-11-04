@@ -161,25 +161,14 @@ fn uefi_key(key: &VariableKey) -> Result<(CString16, VariableVendor)> {
     Ok((name, VariableVendor(key.guid.into())))
 }
 
-// EFI_GUID's bytes: Data1, Data2 and Data3 little-endian, then Data4 (UEFI 2.10 Appendix A)
 impl From<Guid> for uefi::Guid {
     fn from(guid: Guid) -> Self {
-        let [a, b, c, d] = guid.data1.to_le_bytes();
-        let [e, f] = guid.data2.to_le_bytes();
-        let [g, h] = guid.data3.to_le_bytes();
-        let [i, j, k, l, m, n, o, p] = guid.data4;
-        Self::from_bytes([a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p])
+        Self::from_bytes(guid.into())
     }
 }
 
 impl From<uefi::Guid> for Guid {
     fn from(guid: uefi::Guid) -> Self {
-        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = guid.to_bytes();
-        Self {
-            data1: u32::from_le_bytes([a, b, c, d]),
-            data2: u16::from_le_bytes([e, f]),
-            data3: u16::from_le_bytes([g, h]),
-            data4: [i, j, k, l, m, n, o, p],
-        }
+        guid.to_bytes().into()
     }
 }

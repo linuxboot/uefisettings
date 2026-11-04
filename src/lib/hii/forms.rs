@@ -59,7 +59,6 @@ use conditions::VarStoreValues;
 use defaults::option_text;
 use defaults::push_default;
 use defaults::question_scope;
-use defaults::DefaultId;
 use defaults::FormSetDefaultIds;
 
 pub use ami_access_level::AccessLevel;
@@ -72,6 +71,7 @@ pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Selection;
 pub(crate) use conditions::StateEvaluation;
+pub(crate) use defaults::DefaultId;
 pub(crate) use setup_password::PasswordQuestions;
 
 mod ami_access_level;
