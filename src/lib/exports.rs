@@ -27,8 +27,10 @@ use uefisettings_backend_thrift::SetResponseList;
 
 #[cfg(variable_names)]
 use crate::efi_variables::list_variables;
-#[cfg(variable_names)]
+#[cfg(any(variable_names, variable_info))]
 use crate::efi_variables::parse_vendor;
+#[cfg(variable_info)]
+use crate::efi_variables::VariableInfoSource;
 #[cfg(target_os = "linux")]
 pub use crate::hii::extract::EfivarMemory;
 use crate::hii::forms;
@@ -36,7 +38,7 @@ use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::package;
-#[cfg(variable_names)]
+#[cfg(any(variable_names, variable_info))]
 pub use crate::hii::package::Guid;
 #[cfg(target_os = "linux")]
 pub use crate::hii::DenialCause;
@@ -65,7 +67,7 @@ pub use crate::hii::MemoryType;
 /// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
 #[cfg(firmware_memory_maps)]
 pub use crate::hii::RangeRefusal;
-#[cfg(variable_names)]
+#[cfg(any(variable_names, variable_info))]
 pub use crate::hii::VariableKey;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
@@ -86,8 +88,8 @@ mod uefi;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(target_os = "uefi")]
-pub use crate::hii::VariableInfo;
+#[cfg(variable_info)]
+pub use crate::efi_variables::VariableInfo;
 #[cfg(target_os = "linux")]
 pub use linux::identify_machine;
 #[cfg(target_os = "linux")]
@@ -104,7 +106,7 @@ pub trait SettingsBackend {
 pub struct HiiBackend {}
 
 /// The EFI variables of this machine, never their data (UEFI 2.10 §8.2).
-#[cfg(variable_names)]
+#[cfg(any(variable_names, variable_info))]
 pub struct VariableBackend {}
 
 #[cfg(variable_names)]
@@ -115,6 +117,20 @@ impl VariableBackend {
     pub fn list(vendor: Option<&str>) -> Result<Vec<VariableKey>> {
         let vendor = vendor.map(parse_vendor).transpose()?;
         list_variables(&Self::system_variable_names(), vendor)
+    }
+}
+
+#[cfg(variable_info)]
+impl VariableBackend {
+    /// The VariableInfo of the EFI variable `name` of the vendor GUID `vendor`, such as
+    /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C", without its data, which only the Windows build
+    /// reads.
+    pub fn info(name: &str, vendor: &str) -> Result<VariableInfo> {
+        let key = VariableKey {
+            name: name.to_owned(),
+            guid: parse_vendor(vendor)?,
+        };
+        Self::system_variable_info()?.variable_info(&key)
     }
 }
 

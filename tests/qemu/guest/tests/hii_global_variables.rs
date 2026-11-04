@@ -16,7 +16,7 @@
 //! variable, naming it, and those whose variable it cannot read, with the read's error, before
 //! it writes anything, and writes the one on Timeout; `get` reads those on ConOutDev, LangCodes
 //! and Timeout. Each check of `set` compares every efivar file before and after. `variable list`
-//! lists the variables of the efivar files.
+//! lists the variables of the efivar files, and `variable info` tells their attributes and size.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -201,6 +201,32 @@ fn variable_list_lists_the_variables_of_the_efivar_files() {
     assert!(
         global.len() < listed.len(),
         "--guid kept every variable: {listed:#?}"
+    );
+}
+
+#[test]
+fn variable_info_tells_the_attributes_and_size_of_a_variable() {
+    for name in ["Timeout", "ConOutDev"] {
+        let (attributes, data) = global_variable(name);
+
+        let info: serde_json::Value = json(&["variable", "info", name, EFI_GLOBAL_VARIABLE]);
+
+        assert_eq!(
+            info,
+            serde_json::json!({
+                "variable": file_name(name),
+                "attributes": attributes,
+                "size": data.len(),
+            }),
+            "{name}"
+        );
+    }
+
+    let missing = json_error(&["variable", "info", "NoSuchVariable", EFI_GLOBAL_VARIABLE]);
+    assert_eq!(
+        missing.error_message,
+        format!("no EFI variable {}", file_name("NoSuchVariable")),
+        "a missing variable"
     );
 }
 

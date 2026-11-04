@@ -66,7 +66,7 @@ Commands:
   ilo                Commands which work on machines having HPE's Ilo BMC
   set                Auto-identify backend and set/change the value of a question
   show-translations  Show the translation/spellings database for questions and answers
-  variable           Commands on this machine's EFI variables, which never read their data
+  variable           Commands on this machine's EFI variables, which never print their data
 ```
 
 `hii`:
@@ -90,6 +90,7 @@ Commands:
 ```plain
 Commands:
   help  Print this message or the help of the given subcommand(s)
+  info  Show the attributes and the size of an EFI variable, never its data
   list  List the name and vendor GUID of every EFI variable, never its data
 ```
 
@@ -121,8 +122,7 @@ cargo build --release --target x86_64-unknown-uefi
 FS0:\> uefisettings.efi hii get --json "Activate this check box"
 ```
 
-Exit statuses, setup passwords, `hii variable-info` and Secure Boot: see the
-[appendix](#appendix).
+Exit statuses, setup passwords, `variable` and Secure Boot: see the [appendix](#appendix).
 
 ---
 
@@ -309,10 +309,24 @@ efivarfs, which shows each `/` of a name as `!` and holds the variables with run
 GetNextVariableName() gave when efivarfs was mounted, up to the first name longer than 255
 characters or given twice, and those written through it since. `uefisettings.efi` lists the
 boot-service-only variables too. A name with a surrogate code unit, which the UCS-2 of CHAR16 does
-not hold (UEFI 2.11 §2.3.1), lists with U+FFFD for each.
+not hold (UEFI 2.11 §2.3.1), lists with U+FFFD for each, under which `variable info` finds no
+variable.
 
 ```sh
 uefisettings variable list --guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+```
+
+`variable info NAME GUID` prints the attributes bitmask and the data size of an EFI variable, but
+never its data, such as of AMI firmware's `AMITSESetup`, as a JSON object of its own, with no `-j`.
+On Linux it reads the variable's efivar file and prints none of the data, as efivarfs sets the size
+of the file only when it lists or writes the variable but reads the variable from the firmware at
+each read; a variable without runtime access is missing there, and so is one that the firmware
+dropped after efivarfs listed it. On Windows it reads all of the data through
+GetFirmwareEnvironmentVariableExW, which tells the size no other way, and prints none of it.
+`uefisettings.efi` keeps `hii variable-info` for it.
+
+```plain
+FS0:\> uefisettings.efi variable info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
 ```
 
 </details>
@@ -326,14 +340,6 @@ Questions never read a VarStore that a password question names: they show
 `<ValueUnavailable: VarStore holds a password>`, and `set` refuses them. The UEFI Shell runs no
 setup browser, so nothing there asks for or checks a setup password: in a HiiDB that declares a
 password question, `set` writes nothing unless `--bypass-setup-password` is given.
-
-`hii variable-info NAME GUID`, of this build only, prints the attributes bitmask and the data
-size of an EFI variable, but never its data, such as of AMI firmware's `AMITSESetup`. It prints
-them as a JSON object of its own, outside the thrift IDL of the other commands, with no `-j`:
-
-```plain
-FS0:\> uefisettings.efi hii variable-info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
-```
 
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the

@@ -28,6 +28,8 @@ use uefi::Status;
 use crate::efi_variables::walk_variable_names;
 use crate::efi_variables::GetNextVariableName;
 use crate::efi_variables::NextVariableName;
+use crate::efi_variables::VariableInfo;
+use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::hii::package::Guid;
 use crate::hii::variables::attributes_and_data;
@@ -136,63 +138,48 @@ impl GetNextVariableName for RuntimeVariableNames {
     }
 }
 
-/// What variable_info tells of an EFI variable: never its data.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct VariableInfo {
-    /// The variable, named as its efivar file
-    pub variable: String,
-    /// Its attributes bitmask (UEFI 2.10 §8.2.1)
-    pub attributes: u32,
-    /// The size of its data, in bytes
-    pub size: usize,
-}
-
-/// The VariableInfo of the EFI variable `name` of the vendor GUID `vendor`, from GetVariable()
-/// with a DataSize of 0, which reads no byte of its data: as every variable holds one at least
-/// (UEFI 2.10 §8.2.3), the firmware returns EFI_BUFFER_TOO_SMALL with the attributes and the
-/// size (§8.2.1), and uefi::runtime::get_variable drops the attributes then.
-pub(crate) fn variable_info(name: &str, vendor: &str) -> Result<VariableInfo> {
-    let guid: uefi::Guid = vendor
-        .parse()
-        .with_context(|| format!("vendor {vendor} is not a GUID"))?;
-    let key = VariableKey {
-        name: name.to_owned(),
-        guid: guid.into(),
-    };
-    let (variable_name, variable_vendor) = uefi_key(&key)?;
-    let system_table = uefi::table::system_table_raw().context("no system table")?;
-    // SAFETY: the system table of the firmware, which the entry point set and boot services
-    // keep
-    let runtime_services = unsafe { system_table.as_ref() }.runtime_services;
-    // SAFETY: the firmware's runtime services, which the system table points at
-    let runtime_services = unsafe { runtime_services.as_ref() }.context("no runtime services")?;
-    let mut attributes = VariableAttributes::from_bits_retain(UNSET_ATTRIBUTES);
-    let mut size = 0;
-    // SAFETY: GetVariable() with a NUL-terminated name, a GUID and places for the attributes
-    // and the size; Data may be NULL as DataSize is 0 (§8.2.1)
-    let status = unsafe {
-        (runtime_services.get_variable)(
-            variable_name.as_ptr().cast(),
-            &variable_vendor.0,
-            &mut attributes,
-            &mut size,
-            ptr::null_mut(),
-        )
-    };
-    match status {
-        Status::BUFFER_TOO_SMALL | Status::SUCCESS if attributes.bits() == UNSET_ATTRIBUTES => {
-            Err(anyhow!(
-                "GetVariable() of EFI variable {key} returned {status:?} without its attributes"
-            ))
+impl VariableInfoSource for VariableServices {
+    /// The VariableInfo of `key`, from GetVariable() with a DataSize of 0, which reads no byte
+    /// of its data: as every variable holds one at least (UEFI 2.10 §8.2.3), the firmware
+    /// returns EFI_BUFFER_TOO_SMALL with the attributes and the size (§8.2.1), and
+    /// uefi::runtime::get_variable drops the attributes then.
+    fn variable_info(&self, key: &VariableKey) -> Result<VariableInfo> {
+        let (variable_name, variable_vendor) = uefi_key(key)?;
+        let system_table = uefi::table::system_table_raw().context("no system table")?;
+        // SAFETY: the system table of the firmware, which the entry point set and boot services
+        // keep
+        let runtime_services = unsafe { system_table.as_ref() }.runtime_services;
+        // SAFETY: the firmware's runtime services, which the system table points at
+        let runtime_services =
+            unsafe { runtime_services.as_ref() }.context("no runtime services")?;
+        let mut attributes = VariableAttributes::from_bits_retain(UNSET_ATTRIBUTES);
+        let mut size = 0;
+        // SAFETY: GetVariable() with a NUL-terminated name, a GUID and places for the
+        // attributes and the size; Data may be NULL as DataSize is 0 (§8.2.1)
+        let status = unsafe {
+            (runtime_services.get_variable)(
+                variable_name.as_ptr().cast(),
+                &variable_vendor.0,
+                &mut attributes,
+                &mut size,
+                ptr::null_mut(),
+            )
+        };
+        match status {
+            Status::BUFFER_TOO_SMALL | Status::SUCCESS if attributes.bits() == UNSET_ATTRIBUTES => {
+                Err(anyhow!(
+                    "GetVariable() of EFI variable {key} returned {status:?} without its \
+                     attributes"
+                ))
+            }
+            Status::BUFFER_TOO_SMALL | Status::SUCCESS => Ok(VariableInfo {
+                variable: key.to_string(),
+                attributes: attributes.bits(),
+                size,
+            }),
+            Status::NOT_FOUND => Err(VariableNotFound(key.clone()).into()),
+            status => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),
         }
-        Status::BUFFER_TOO_SMALL | Status::SUCCESS => Ok(VariableInfo {
-            variable: key.to_string(),
-            attributes: attributes.bits(),
-            size,
-        }),
-        Status::NOT_FOUND => Err(VariableNotFound(key).into()),
-        status => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),
     }
 }
 

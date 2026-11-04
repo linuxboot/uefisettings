@@ -17,12 +17,12 @@ use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-#[cfg(variable_names)]
+#[cfg(any(variable_names, variable_info))]
 use uefisettings::exports::VariableBackend;
 #[cfg(variable_names)]
 use uefisettings::exports::VariableKey;
 
-#[cfg(variable_names)]
+#[cfg(any(variable_names, variable_info))]
 use crate::print_line;
 
 #[derive(Debug, Parser)]
@@ -42,12 +42,22 @@ enum VariableSubcommands {
         #[arg(long)]
         guid: Option<String>,
     },
+    /// Show the attributes and the size of an EFI variable, never its data
+    #[cfg(variable_info)]
+    #[command(next_display_order = None)]
+    Info {
+        name: String,
+        /// The vendor GUID of the variable, such as 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+        guid: String,
+    },
 }
 
 impl VariableCommand {
     pub(super) fn run(&self) -> Result<()> {
         match &self.command {
             VariableSubcommands::List { guid } => list(guid.as_deref()),
+            #[cfg(variable_info)]
+            VariableSubcommands::Info { name, guid } => print_info(name, guid),
         }
     }
 }
@@ -80,6 +90,17 @@ fn list_report(keys: &[VariableKey]) -> serde_json::Value {
         .collect()
 }
 
+/// Prints the attributes and the size of the EFI variable `name` of the vendor GUID `guid`: info,
+/// and hii variable-info of the UEFI Shell build.
+#[cfg(variable_info)]
+pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
+    let info = VariableBackend::info(name, guid)?;
+    // its own JSON object, outside the thrift IDL that the hii commands print, and JSON always,
+    // as info takes no -j
+    print_line(format_args!("{}", serde_json::to_value(info)?))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -107,10 +128,41 @@ mod tests {
             (&["list"][..], None),
             (&["list", "--guid", guid], Some(guid)),
         ] {
-            let VariableSubcommands::List { guid } = variable(args);
+            let guid = match variable(args) {
+                VariableSubcommands::List { guid } => guid,
+                #[cfg(variable_info)]
+                parsed @ VariableSubcommands::Info { .. } => {
+                    panic!("{args:?} is no list: {parsed:?}")
+                }
+            };
 
             assert_eq!(guid.as_deref(), want, "{args:?}");
         }
+    }
+
+    #[cfg(variable_info)]
+    #[test]
+    fn info_takes_a_name_and_a_vendor_guid() {
+        let args = ["info", "Timeout", "8BE4DF61-93CA-11D2-AA0D-00E098032B8C"];
+
+        let (name, guid) = match variable(&args) {
+            VariableSubcommands::Info { name, guid } => (name, guid),
+            parsed @ VariableSubcommands::List { .. } => panic!("{args:?} is no info: {parsed:?}"),
+        };
+
+        assert_eq!(
+            (name.as_str(), guid.as_str()),
+            ("Timeout", "8BE4DF61-93CA-11D2-AA0D-00E098032B8C"),
+            "{args:?}"
+        );
+        let missing =
+            UefiSettingsToolArgs::try_parse_from(["uefisettings", "variable", "info", "Timeout"])
+                .map_err(|error| error.kind());
+        assert_eq!(
+            missing.err(),
+            Some(clap::error::ErrorKind::MissingRequiredArgument),
+            "info without a vendor GUID"
+        );
     }
 
     #[cfg(variable_names)]

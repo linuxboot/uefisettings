@@ -68,6 +68,9 @@ variable-list-guid	status	0x0
 variable-list-guid	json	all(.[]; .guid == "A04A27F4-DF00-4D42-B552-39511302113D") and any(.[]; .name == "MyIfrNVData") and any(.[]; .name == "MyEfiVar")
 variable-list-bad-guid	status	aborted
 variable-list-bad-guid	json	. == {"error_message": "vendor A04A27F4 is not a GUID: GUID string has wrong length (expected 36 bytes)"}
+# variable info tells the attributes and size that dmpstore shows: NV+BS, 0xDC
+variable-info	status	0x0
+variable-info	json	. == {"variable": "MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d", "attributes": 3, "size": 220}
 # the help names no command or flag of the Linux build only
 help	status	0x0
 help	line	^Usage: uefisettings.efi <COMMAND>$

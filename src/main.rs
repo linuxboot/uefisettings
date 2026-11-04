@@ -115,7 +115,7 @@ enum Commands {
         #[command(flatten)]
         output: JsonArgs,
     },
-    /// Commands on this machine's EFI variables, which never read their data
+    /// Commands on this machine's EFI variables, which never print their data
     #[cfg(system_variables)]
     Variable(VariableCommand),
     #[command(flatten)]
@@ -861,6 +861,13 @@ mod tests {
                 "8BE4DF61-93CA-11D2-AA0D-00E098032B8C",
             ],
         ];
+        #[cfg(variable_info)]
+        let commands = commands.into_iter().chain([&[
+            "variable",
+            "info",
+            "Timeout",
+            "8BE4DF61-93CA-11D2-AA0D-00E098032B8C",
+        ][..]]);
         for command in commands {
             let argv = [&["uefisettings"][..], command].concat();
             let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());

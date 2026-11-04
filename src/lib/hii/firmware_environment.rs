@@ -20,6 +20,10 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
+#[cfg(variable_info)]
+use crate::efi_variables::VariableInfo;
+#[cfg(variable_info)]
+use crate::efi_variables::VariableInfoSource;
 use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::FirmwareVariables;
@@ -199,6 +203,21 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
                 )
             })?;
         Ok(())
+    }
+}
+
+#[cfg(variable_info)]
+impl<C: FirmwareEnvironmentCalls> VariableInfoSource for FirmwareEnvironment<C> {
+    /// The VariableInfo of `key`, from all of its data, which is dropped:
+    /// GetFirmwareEnvironmentVariableExW tells the size only as "the number of bytes stored in
+    /// the pValue buffer" (Microsoft Learn, updated 2024-11-20).
+    fn variable_info(&self, key: &VariableKey) -> Result<VariableInfo> {
+        let (attributes, data) = self.read_all(key)?;
+        Ok(VariableInfo {
+            variable: key.to_string(),
+            attributes,
+            size: data.len(),
+        })
     }
 }
 
@@ -824,5 +843,42 @@ mod tests {
         );
         assert_eq!(calls.sets(), [], "empty variable: no set");
         assert_eq!(calls.privilege_calls(), 1, "empty variable: privilege");
+    }
+
+    /// variable_info tells the attributes and the data size of a variable larger than the first
+    /// buffer, writing nothing, and VariableNotFound for ERROR_ENVVAR_NOT_FOUND.
+    #[cfg(variable_info)]
+    #[test]
+    fn variable_info_tells_a_variable_or_that_it_is_missing() {
+        let calls = FakeFirmwareEnvironmentCalls::new();
+        calls.queue_get(FakeGet::Failed(Win32Error::INSUFFICIENT_BUFFER));
+        calls.queue_get(got(NV_BS_RT, &[0xAA; 300]));
+        let environment = fake_environment(&calls);
+        let key = variable_key("Setup");
+
+        assert_eq!(
+            environment
+                .variable_info(&key)
+                .map_err(|error| error.to_string()),
+            Ok(VariableInfo {
+                variable: "Setup-00000000-0000-0000-0000-000000000000".to_string(),
+                attributes: NV_BS_RT,
+                size: 300,
+            }),
+            "a variable of 300 bytes"
+        );
+        assert_eq!(calls.get_calls().len(), 2, "a variable of 300 bytes: gets");
+        assert_eq!(calls.sets(), [], "a variable of 300 bytes: sets");
+
+        calls.queue_get(FakeGet::Failed(Win32Error::ENVVAR_NOT_FOUND));
+        let error = environment
+            .variable_info(&key)
+            .expect_err("info of a missing variable");
+
+        assert_eq!(
+            error.downcast_ref::<VariableNotFound>(),
+            Some(&VariableNotFound(key)),
+            "ERROR_ENVVAR_NOT_FOUND"
+        );
     }
 }

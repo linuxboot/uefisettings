@@ -18,6 +18,8 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::HiiBackend;
+use super::VariableBackend;
+use crate::efi_variables::VariableInfoSource;
 use crate::hii::package::db_file;
 use crate::hii::read_hiidb;
 use crate::hii::EfivarSource;
@@ -34,6 +36,14 @@ impl HiiBackend {
 
     /// This machine's firmware environment variables.
     pub(super) fn system_variables() -> Result<impl FirmwareVariables> {
+        FirmwareEnvironment::new()
+    }
+}
+
+/// What the variable commands read: this machine's firmware environment variables.
+impl VariableBackend {
+    /// The attributes and sizes of this machine's firmware environment variables.
+    pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
         FirmwareEnvironment::new()
     }
 }

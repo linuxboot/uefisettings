@@ -11,10 +11,11 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The first boot of the UEFI Shell scenario shell-parity: prints the questions that
-//! `hii list-questions --json` lists here, and the variables of DriverSample that `variable
-//! list` lists, for `tests/qemu/check-shell-log.sh` to compare with those that
-//! `uefisettings.efi` lists in the UEFI Shell, the next boot, on the same variables. Both list
-//! the questions in every state, as the shell can evaluate conditions that Linux cannot.
+//! `hii list-questions --json` lists here, the variables of DriverSample that `variable list`
+//! lists and what `variable info` tells of MyIfrNVData, for `tests/qemu/check-shell-log.sh` to
+//! compare with what `uefisettings.efi` prints in the UEFI Shell, the next boot, on the same
+//! variables. Both list the questions in every state, as the shell can evaluate conditions that
+//! Linux cannot.
 
 use std::io::Write;
 
@@ -64,4 +65,17 @@ fn variable_list_for_the_shell() {
     );
 
     write_for_the_shell("variable-list", &output);
+}
+
+#[test]
+fn variable_info_for_the_shell() {
+    let output = uefisettings(&["variable", "info", "MyIfrNVData", DRIVER_SAMPLE_GUID]);
+    let info: serde_json::Value = output.json(0);
+    assert_eq!(
+        (&info["attributes"], &info["size"]),
+        (&serde_json::json!(7), &serde_json::json!(220)),
+        "MyIfrNVData, as tests/qemu/vars/my-ifr-nv-data.json creates it: {output:#?}"
+    );
+
+    write_for_the_shell("variable-info", &output);
 }

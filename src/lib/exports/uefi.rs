@@ -22,10 +22,11 @@ use anyhow::Result;
 
 use super::HiiBackend;
 use super::VariableBackend;
+use crate::efi_variables::VariableInfo;
+use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::hii::export_package_lists;
 use crate::hii::FirmwareVariables;
-use crate::hii::VariableInfo;
 use crate::hii::VariableServices;
 
 /// What set and get read and write when no file names them: this firmware's HII database and
@@ -48,6 +49,11 @@ impl VariableBackend {
     pub(super) fn system_variable_names() -> impl VariableNames {
         VariableServices
     }
+
+    /// The attributes and sizes of this firmware's variables, from GetVariable().
+    pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
+        Ok(VariableServices)
+    }
 }
 
 impl HiiBackend {
@@ -57,8 +63,9 @@ impl HiiBackend {
     }
 
     /// The VariableInfo of the EFI variable `name` of the vendor GUID `vendor`, such as
-    /// "8C78A505-BAA0-4C4A-869F-000000000101", whose data it never reads.
+    /// "8C78A505-BAA0-4C4A-869F-000000000101", whose data it never reads: as
+    /// VariableBackend::info.
     pub fn variable_info(name: &str, vendor: &str) -> Result<VariableInfo> {
-        crate::hii::variable_info(name, vendor)
+        VariableBackend::info(name, vendor)
     }
 }

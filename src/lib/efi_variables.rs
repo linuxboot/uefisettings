@@ -12,25 +12,29 @@
 
 //! The EFI variables of a machine, never their data (UEFI 2.10 §8.2): what the variable commands
 //! make of what each backend tells. The backends do the I/O: efivarfs on Linux (hii/efivarfs.rs),
-//! the runtime services in the UEFI Shell (hii/variable_services.rs).
+//! the runtime services in the UEFI Shell (hii/variable_services.rs), and the firmware environment
+//! calls on Windows (hii/firmware_environment.rs).
 
-#[cfg(any(target_os = "uefi", test))]
+#[cfg(all(variable_names, any(target_os = "uefi", test)))]
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(variable_info)]
+use serde::Serialize;
 
 use crate::hii::package::Guid;
 use crate::hii::VariableKey;
 
 /// GetNextVariableName() (UEFI 2.10 §8.2.2): the variables that a backend reaches, by name and
 /// vendor GUID.
+#[cfg(variable_names)]
 pub(crate) trait VariableNames {
     /// Every variable these reach, in no particular order.
     fn variable_names(&self) -> Result<Vec<VariableKey>>;
 }
 
 /// What one GetNextVariableName() call (UEFI 2.10 §8.2.2) did.
-#[cfg(any(target_os = "uefi", test))]
+#[cfg(all(variable_names, any(target_os = "uefi", test)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NextVariableName {
     /// EFI_SUCCESS: it wrote the next variable's name and vendor GUID over the previous ones
@@ -42,7 +46,7 @@ pub(crate) enum NextVariableName {
 }
 
 /// GetNextVariableName(), one call at a time.
-#[cfg(any(target_os = "uefi", test))]
+#[cfg(all(variable_names, any(target_os = "uefi", test)))]
 pub(crate) trait GetNextVariableName {
     /// Calls GetNextVariableName() with the NUL-terminated `name` and the `vendor` of the
     /// previous variable, or a NUL first on the first call; any other status than those of
@@ -58,7 +62,7 @@ pub(crate) trait GetNextVariableName {
 /// (UEFI 2.10 §8.2.2), each name as VariableKey::from_ucs2 reads it. A variable given twice
 /// fails the walk: some firmware gives one variable again and again (Linux v6.17
 /// fs/efivarfs/vars.c efivar_init()).
-#[cfg(any(target_os = "uefi", test))]
+#[cfg(all(variable_names, any(target_os = "uefi", test)))]
 pub(crate) fn walk_variable_names(
     calls: &mut impl GetNextVariableName,
 ) -> Result<Vec<VariableKey>> {
@@ -102,6 +106,7 @@ pub(crate) fn walk_variable_names(
 /// The variables that `names` reach, of the vendor `vendor` only if given, sorted by name, then
 /// vendor: GetNextVariableName() "cannot be used as a filter" (UEFI 2.10 §8.2.2), so those of
 /// other vendors drop out after the listing.
+#[cfg(variable_names)]
 pub(crate) fn list_variables(
     names: &impl VariableNames,
     vendor: Option<Guid>,
@@ -110,6 +115,28 @@ pub(crate) fn list_variables(
     keys.retain(|key| vendor.is_none_or(|vendor| key.guid == vendor));
     keys.sort();
     Ok(keys)
+}
+
+/// GetVariable() (UEFI 2.10 §8.2.1) without the data: what a backend tells of a variable that
+/// it reaches.
+#[cfg(variable_info)]
+pub(crate) trait VariableInfoSource {
+    /// The VariableInfo of `key`, or VariableNotFound.
+    fn variable_info(&self, key: &VariableKey) -> Result<VariableInfo>;
+}
+
+/// What variable_info tells of an EFI variable: never its data. `variable info` prints it as
+/// it serializes.
+#[cfg(variable_info)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct VariableInfo {
+    /// The variable, named as its efivar file
+    pub variable: String,
+    /// Its attributes bitmask (UEFI 2.10 §8.2.1)
+    pub attributes: u32,
+    /// The size of its data, in bytes
+    pub size: usize,
 }
 
 /// The vendor GUID `vendor` that a command names, such as 8BE4DF61-93CA-11D2-AA0D-00E098032B8C.
@@ -126,13 +153,17 @@ mod tests {
     /// EFI_GLOBAL_VARIABLE, the vendor GUID of the global variables (UEFI 2.10 §3.3).
     const EFI_GLOBAL_VARIABLE: &str = "8BE4DF61-93CA-11D2-AA0D-00E098032B8C";
     /// The formset GUID of EDK2's DriverSample, the vendor GUID of its variables.
+    #[cfg(variable_names)]
     const DRIVER_SAMPLE: &str = "A04A27F4-DF00-4D42-B552-39511302113D";
     /// A vendor GUID of no variable here.
+    #[cfg(variable_names)]
     const UNLISTED: &str = "00000000-0000-0000-0000-000000000001";
 
     /// VariableNames that reach the variables it holds.
+    #[cfg(variable_names)]
     struct ListedNames(Vec<VariableKey>);
 
+    #[cfg(variable_names)]
     impl VariableNames for ListedNames {
         fn variable_names(&self) -> Result<Vec<VariableKey>> {
             Ok(self.0.clone())
@@ -140,12 +171,14 @@ mod tests {
     }
 
     /// The GUID `text`.
+    #[cfg(variable_names)]
     fn guid(text: &str) -> Guid {
         text.parse()
             .unwrap_or_else(|error| panic!("parse GUID {text}: {error}"))
     }
 
     /// The variable `name` of the vendor GUID `vendor`.
+    #[cfg(variable_names)]
     fn key(name: &str, vendor: &str) -> VariableKey {
         VariableKey {
             name: name.to_string(),
@@ -154,6 +187,7 @@ mod tests {
     }
 
     /// What ScriptedNames answers to a call of GetNextVariableName().
+    #[cfg(variable_names)]
     enum Answer {
         /// Writes this name, of these CHAR16, then a NUL, and this vendor
         Name(Vec<u16>, &'static str),
@@ -166,11 +200,13 @@ mod tests {
 
     /// GetNextVariableName() that answers each call with the next of `answers`, and records the
     /// name that each call passes.
+    #[cfg(variable_names)]
     struct ScriptedNames {
         answers: std::collections::VecDeque<Answer>,
         passed: Vec<Vec<u16>>,
     }
 
+    #[cfg(variable_names)]
     impl ScriptedNames {
         fn new(answers: impl IntoIterator<Item = Answer>) -> Self {
             Self {
@@ -180,6 +216,7 @@ mod tests {
         }
     }
 
+    #[cfg(variable_names)]
     impl GetNextVariableName for ScriptedNames {
         fn get_next_variable_name(
             &mut self,
@@ -210,6 +247,7 @@ mod tests {
     }
 
     /// The CHAR16 of `text`.
+    #[cfg(variable_names)]
     fn char16(text: &str) -> Vec<u16> {
         text.encode_utf16().collect()
     }
@@ -217,6 +255,7 @@ mod tests {
     /// walk_variable_names passes each name back to get the next until EFI_NOT_FOUND, grows its
     /// buffer to the size that EFI_BUFFER_TOO_SMALL asks for and passes the same name again, and
     /// reads each surrogate code unit as U+FFFD, where two names can read alike.
+    #[cfg(variable_names)]
     #[test]
     fn walk_variable_names_lists_every_variable() {
         let long = "L".repeat(600);
@@ -258,6 +297,7 @@ mod tests {
 
     /// walk_variable_names fails where a call fails, asks for no larger buffer, gives a name
     /// without its NUL, or gives a variable again.
+    #[cfg(variable_names)]
     #[test]
     fn walk_variable_names_refuses_what_it_cannot_list() {
         for (answer, refusal) in [
@@ -293,6 +333,7 @@ mod tests {
         }
     }
 
+    #[cfg(variable_names)]
     #[test]
     fn list_variables_sorts_and_keeps_only_the_vendor_asked() {
         let names = ListedNames(vec![
@@ -350,6 +391,28 @@ mod tests {
             "vendor 8BE4DF61-93CA-11D2-AA0D is not a GUID: GUID string has wrong length \
              (expected 36 bytes)",
             "short vendor"
+        );
+    }
+
+    /// VariableInfo serializes as `variable info` prints it: the variable, its attributes and the
+    /// size of its data.
+    #[cfg(variable_info)]
+    #[test]
+    fn variable_info_serializes_as_info_prints_it() {
+        let info = VariableInfo {
+            variable: "MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d".to_string(),
+            attributes: 7,
+            size: 220,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&info).expect("serialize the info"),
+            serde_json::json!({
+                "variable": "MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d",
+                "attributes": 7,
+                "size": 220,
+            }),
+            "{info:?}"
         );
     }
 }

@@ -33,6 +33,8 @@ use proc_mounts::MountIter;
 use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
+use crate::efi_variables::VariableInfo;
+use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::file_lock::FileLock;
 use crate::hii::efivarfs_format::as_variable_not_found;
@@ -51,7 +53,9 @@ use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
+use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 pub(super) const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
 /// The file that EfivarFiles::system() locks while it remounts EFIVARS_MOUNT_POINT.
@@ -438,6 +442,56 @@ fn efivar_names(dir: &Path) -> Result<Vec<VariableKey>> {
     Ok(keys)
 }
 
+impl VariableInfoSource for EfivarFiles {
+    fn variable_info(&self, key: &VariableKey) -> Result<VariableInfo> {
+        let name = EfivarFileName::from(key);
+        let file = open_efivar(&self.dir, &name).map_err(|error| as_variable_not_found(key, error));
+        let file = match file {
+            Err(error) if error.is::<VariableNotFound>() => {
+                // as variable_names says, where no efivarfs is mounted
+                efivarfs_statfs(&self.dir)?;
+                return Err(error);
+            }
+            result => result?,
+        };
+        let bytes = file
+            .metadata()
+            .and_then(|metadata| read_efivar_file(&file, metadata.len()))
+            .with_context(|| {
+                format!(
+                    "failed to read efivar file '{}'",
+                    self.dir.join(&name).display()
+                )
+            })?;
+        efivar_info(key, &bytes)
+    }
+}
+
+/// The VariableInfo of `key` from the `bytes` of its efivar file: the size comes from what a
+/// read gives, as efivarfs reads the whole variable from the firmware on each read() (Linux
+/// v6.17 fs/efivarfs/file.c efivarfs_file_read()) but sets the file's size only when it lists
+/// or writes the variable (super.c efivarfs_create_dentry(), file.c efivarfs_file_write()). No
+/// bytes hold no variable (efivar_names), as a read gives none of one that the firmware dropped
+/// since efivarfs listed it (efivarfs_file_read()).
+fn efivar_info(key: &VariableKey, bytes: &[u8]) -> Result<VariableInfo> {
+    if bytes.is_empty() {
+        return Err(VariableNotFound(key.clone()).into());
+    }
+    let (attributes, data) = bytes
+        .split_first_chunk::<EFIVARFS_HEADER_SIZE>()
+        .with_context(|| {
+            format!(
+                "efivar file of EFI variable {key} holds {} bytes, fewer than its attributes",
+                bytes.len()
+            )
+        })?;
+    Ok(VariableInfo {
+        variable: key.to_string(),
+        attributes: u32::from_ne_bytes(*attributes),
+        size: data.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -453,6 +507,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::hii::efivarfs_format::read_efivar_file;
+    use crate::hii::efivarfs_format::tests::SETUP;
     use crate::hii::efivarfs_format::MAX_EFIVAR_FILE_SIZE;
     use crate::hii::variables::tests::variable_key;
     use crate::hii::variables::tests::BS_RT;
@@ -762,6 +818,99 @@ mod tests {
         ] {
             assert_eq!(format!("{:#}", statfs_error(dir, errno)), want, "{errno}");
         }
+    }
+
+    /// efivar_info tells the attributes and data size of a variable from the bytes of its
+    /// efivar file, and refuses no bytes as a missing variable and fewer than the attributes.
+    #[test]
+    fn efivar_info_tells_the_attributes_and_size_of_the_bytes_read() {
+        let key = variable_key("Setup");
+
+        assert_eq!(
+            efivar_info(&key, &SETUP).expect("tell the variable"),
+            VariableInfo {
+                variable: "Setup-00000000-0000-0000-0000-000000000000".to_string(),
+                attributes: NV_BS_RT,
+                size: SETUP.len() - EFIVARFS_HEADER_SIZE,
+            },
+            "info"
+        );
+        for (bytes, refusal) in [
+            (
+                &[][..],
+                "no EFI variable Setup-00000000-0000-0000-0000-000000000000",
+            ),
+            (
+                &SETUP[..3],
+                "efivar file of EFI variable Setup-00000000-0000-0000-0000-000000000000 holds 3 \
+                 bytes, fewer than its attributes",
+            ),
+        ] {
+            let error = efivar_info(&key, bytes).expect_err("tell an empty or short file");
+
+            assert_eq!(error.to_string(), refusal, "{} bytes", bytes.len());
+        }
+    }
+
+    /// efivar_info tells a variable that the firmware dropped since efivarfs listed it as
+    /// missing: its file keeps its size, but a read gives no bytes (Linux v6.17
+    /// fs/efivarfs/file.c efivarfs_file_read()).
+    #[test]
+    fn efivar_info_tells_a_variable_deleted_since_the_listing_missing() {
+        let key = variable_key("Setup");
+        let size = u64::try_from(SETUP.len()).expect("a u64 size");
+        let bytes = read_efivar_file(io::empty(), size).expect("read a deleted variable");
+
+        let error = efivar_info(&key, &bytes).expect_err("tell a deleted variable");
+
+        assert_eq!(
+            error.downcast_ref::<VariableNotFound>(),
+            Some(&VariableNotFound(key)),
+            "{error:#}"
+        );
+    }
+
+    /// EfivarFiles tell a variable from its efivar file, and that an empty one holds none; of a
+    /// missing one, that no efivarfs is mounted, as the listing says.
+    #[test]
+    fn efivar_files_tell_a_variable_or_that_it_is_missing() {
+        let (dir, _lock, files) = unmounted_efivar_files();
+        for (name, bytes) in [("Setup", &SETUP[..]), ("Empty", &[][..])] {
+            fs::write(
+                dir.path().join(EfivarFileName::from(&variable_key(name))),
+                bytes,
+            )
+            .expect("write the efivar file");
+        }
+
+        assert_eq!(
+            files
+                .variable_info(&variable_key("Setup"))
+                .expect("tell Setup"),
+            VariableInfo {
+                variable: "Setup-00000000-0000-0000-0000-000000000000".to_string(),
+                attributes: NV_BS_RT,
+                size: SETUP.len() - EFIVARFS_HEADER_SIZE,
+            },
+            "Setup"
+        );
+        let empty = files
+            .variable_info(&variable_key("Empty"))
+            .expect_err("tell an empty efivar file");
+        let missing = files
+            .variable_info(&variable_key("Missing"))
+            .expect_err("tell a missing efivar file");
+
+        assert_eq!(
+            empty.downcast_ref::<VariableNotFound>(),
+            Some(&VariableNotFound(variable_key("Empty"))),
+            "Empty: {empty:#}"
+        );
+        assert_eq!(
+            missing.downcast_ref::<NotEfivarfs>(),
+            Some(&NotEfivarfs(dir.path().to_path_buf())),
+            "Missing: {missing:#}"
+        );
     }
 
     /// write_at writes nothing when it cannot remount efivarfs.
