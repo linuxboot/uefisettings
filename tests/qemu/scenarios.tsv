@@ -8,22 +8,26 @@
 #                test binary of tests/qemu/guest/tests, then "/" and a libtest filter if any,
 #                or "shell:" and a script of tests/qemu/shell, which the firmware's UEFI Shell
 #                runs instead of Linux (check-shell-log.sh)
-#   kernel       how the scenario's Linux runs: "vamap" has it call SetVirtualAddressMap(),
-#                which run.sh sets up per architecture; "lockdown" and "lockdown-conf" boot it
-#                with lockdown=integrity and lockdown=confidentiality; "-" does neither
-#   architectures  the architectures that boot the scenario, separated by ","; "-" is all
+#   options      key=value tokens separated by single spaces, each key at most once, which
+#                scenario-options.sh parses: kernel= how the scenario's Linux runs, "vamap" to
+#                have it call SetVirtualAddressMap(), which run.sh sets up per architecture, or
+#                "lockdown" and "lockdown-conf" to boot it with lockdown=integrity and
+#                lockdown=confidentiality; arch= a comma list of the architectures that boot
+#                the scenario, of x86_64, i686 and aarch64, which the others skip; devices= a
+#                comma list of QEMU devices to add, of virtio-rng; "-" for none of them
 # The scenarios whose names start with "shell-" are those of make test-e2e-qemu-shell-<arch>.
 # "-" leaves a column empty.
-boot-smoke	-	-	boot_smoke	-	-
-hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data-runtime-my-efi-var.json	hii,hii_write,hii_persistence	-	-
-hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard	-	-
-hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access	-	-
-hii-global-variables	/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables	-	-
-hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi/qhii::	-	-
-hii-acpi-hiid	/DriverSample.efi;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/hiid::	-	-
-hii-acpi-two-tables	/DriverSample.efi;/publish-hiidb.efi acpi-table-junk-qhii;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/two_tables::	-	-
-shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-reboot,shell:then-linux	-	-
-shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions	-	-
-shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password	-	-
-shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-	-
-shell-authA7	/DriverSample.efi	my-ifr-nv-data-authA7.json	shell:authA7	-	-
+boot-smoke	-	-	boot_smoke	-
+hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data-runtime-my-efi-var.json	hii,hii_write,hii_persistence	-
+hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard	-
+hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access	-
+hii-global-variables	/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables	-
+hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi/qhii::	-
+hii-acpi-hiid	/DriverSample.efi;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/hiid::	-
+hii-acpi-two-tables	/DriverSample.efi;/publish-hiidb.efi acpi-table-junk-qhii;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/two_tables::	-
+shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-reboot,shell:then-linux	-
+shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions	-
+shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password	-
+shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
+shell-authA7	/DriverSample.efi	my-ifr-nv-data-authA7.json	shell:authA7	-
+shell-rng	-	-	shell:rng	devices=virtio-rng

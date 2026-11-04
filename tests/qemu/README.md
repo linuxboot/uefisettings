@@ -61,7 +61,11 @@ scenario. For each boot `N`, `bootN.console.log` has the firmware, kernel and `i
 output, `bootN.test.log` the test output and `bootN.qemu.log` how QEMU saw the guest end
 (`run.sh` explains its lines).
 
-[`scenarios.tsv`](scenarios.tsv) lists the scenarios and the boots of each; each file in
+[`scenarios.tsv`](scenarios.tsv) lists the scenarios and the boots of each. Its options column
+sets how a scenario's Linux runs, the architectures that boot it and the QEMU devices that it
+adds: [`scenario-options.sh`](scenario-options.sh) parses it, and `run.sh` runs
+that parser's table test, [`scenario-options-test.sh`](scenario-options-test.sh), before any
+boot. Each file in
 [`guest/tests/`](guest/tests/) is one test binary, which a boot names, and its module
 documentation says what it checks. The guest tests refuse to run on a machine whose kernel
 command line lacks `uefisettings.test=`. They build only with the `test-vm` feature, which

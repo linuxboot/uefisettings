@@ -69,8 +69,9 @@ i686)
     vamap_args=()
     ;;
 aarch64)
-    # With these devices, none of them virtio-rng, the firmware has no EFI_RNG_PROTOCOL, so
-    # std's RandomState panics in uefisettings.efi: what lets the UEFI Shell scenarios catch it.
+    # With these devices, none of them virtio-rng unless the options column adds it, the firmware
+    # has no EFI_RNG_PROTOCOL, so std's RandomState panics in uefisettings.efi: what lets the UEFI
+    # Shell scenarios catch it.
     qemu=(qemu-system-aarch64 -machine virt -accel tcg -cpu cortex-a57)
     firmware=usr/share/AAVMF/AAVMF_CODE.fd
     firmware_vars=usr/share/AAVMF/AAVMF_VARS.fd
@@ -96,6 +97,7 @@ esac
 
 here=$(realpath "$(dirname "$0")")
 source "$here/control-sequence.sh"
+source "$here/scenario-options.sh"
 repo=$(realpath "$here/../..")
 out=$repo/target/qemu-test
 driver_sample=$out/$arch/driver-sample
@@ -104,19 +106,20 @@ run=$out/$arch/$(date -u +%Y%m%dT%H%M%SZ)
 guest=$out/$arch/guest
 target=$arch-unknown-linux-musl
 
-# Every row has the 6 columns that the header of scenarios.tsv lists and the loop below
-# reads, none of them empty, so that no row silently boots nothing.
+# Every row has the 5 columns that the header of scenarios.tsv lists and the loop below
+# reads, none of them empty, so that no row silently boots nothing, and options that
+# scenario-options.sh parses, which its table test checks first.
 awk -F '\t' '$0 !~ /^(#|$)/ {
-    ok = NF == 6
+    ok = NF == 5
     for (i = 1; i <= NF; i++) if ($i == "") ok = 0
-    if (!ok) { printf "scenarios.tsv line %d needs 6 non-empty columns: %s\n", NR, $0; bad = 1; next }
-    if ($5 !~ /^(-|vamap|lockdown|lockdown-conf)$/) {
-        printf "scenarios.tsv line %d: kernel %s is not -, vamap, lockdown or lockdown-conf\n", NR, $5; bad = 1
-    }
-    if ($6 !~ /^(-|(x86_64|i686|aarch64)(,(x86_64|i686|aarch64))*)$/) {
-        printf "scenarios.tsv line %d: architectures %s is not - or a list of x86_64, i686 and aarch64\n", NR, $6; bad = 1
-    }
+    if (!ok) { printf "scenarios.tsv line %d needs 5 non-empty columns: %s\n", NR, $0; bad = 1 }
 } END { exit bad }' "$here/scenarios.tsv" >&2
+"$here/scenario-options-test.sh"
+# read fails on a last line without a newline, which still counts.
+while IFS=$'\t' read -r name _ _ _ options || [[ -n $name ]]; do
+    [[ -z $name || $name == \#* ]] && continue
+    scenario_options "$name" "$options"
+done <"$here/scenarios.tsv"
 mapfile -t known < <(awk -F '\t' '$1 !~ /^(#|$)/ { print $1 }' "$here/scenarios.tsv")
 for name in "$@"; do
     if [[ " ${known[*]} " != *" $name "* ]]; then
@@ -254,12 +257,12 @@ linux_passed() {
 
 failed=()
 # read fails on a last line without a newline, which still counts.
-while IFS=$'\t' read -r -u 3 name drivers variables boots kernel architectures ||
-    [[ -n $name ]]; do
+while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name ]]; do
     [[ -z $name || $name == \#* ]] && continue
     (($# == 0)) || [[ " $* " == *" $name "* ]] || continue
-    if [[ $architectures != - && ",$architectures," != *",$arch,"* ]]; then
-        echo "run.sh: $name: skipped, only $architectures boots it"
+    scenario_options "$name" "$options"
+    if ! scenario_runs_on "$arch"; then
+        (IFS=, && echo "run.sh: $name: skipped, only ${option_arches[*]} boots it")
         continue
     fi
     # The firmware and the template of its variable store.
@@ -286,11 +289,18 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots kernel architectures |
     kernel_qemu_args=()
     # the kernel parameter that locks the scenario's Linux boots down, if any
     lockdown_param=
-    case $kernel in
+    case $option_kernel in
     vamap) kernel_qemu_args=("${vamap_args[@]}") ;;
     lockdown) lockdown_param=" lockdown=integrity" ;;
     lockdown-conf) lockdown_param=" lockdown=confidentiality" ;;
     esac
+    device_args=()
+    for device in "${option_devices[@]}"; do
+        case $device in
+        # Its driver, VirtioRngDxe, gives the firmware EFI_RNG_PROTOCOL.
+        virtio-rng) device_args+=(-device virtio-rng-pci) ;;
+        esac
+    done
     boot=0
     IFS=, read -r -a specs <<<"$boots"
     for spec in "${specs[@]}"; do
@@ -345,6 +355,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots kernel architectures |
             -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
             -drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \
             -serial "file:$log.console.log" "${guest_args[@]}" "${kernel_qemu_args[@]}" \
+            "${device_args[@]}" \
             -d guest_errors,trace:qemu_system_shutdown_request,trace:kvm_run_exit \
             -D "$log.qemu.log" </dev/null || echo "run.sh: QEMU exited with $?"
         # A line per KVM exit, some MB a boot, of which only each CPU's last tells the end;

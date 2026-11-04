@@ -1,0 +1,4 @@
+# The checks of shell/rng.nsh, the boot of shell-rng. See check-shell-log.sh.
+rng-handles	status	0x0
+# dh lists each handle with EFI_RNG_PROTOCOL as its index, then its protocols, named Rng
+rng-handles	line	^ *[0-9a-fA-F]+: .*Rng
