@@ -51,6 +51,10 @@ use platform::SetupPasswordArgs;
 #[cfg_attr(target_os = "uefi", path = "platform/uefi.rs")]
 #[cfg_attr(target_os = "windows", path = "platform/windows.rs")]
 mod platform;
+// The UEFI Shell's `-` is in platform/uefi.rs; the macOS build has no secret flags, as it reads
+// only HiiDB files and efivar dumps.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod secret_stdin;
 
 // Every command lists its options and subcommands alphabetically, as under clap 3:
 // next_display_order = None leaves them unordered, and clap sorts those by name.

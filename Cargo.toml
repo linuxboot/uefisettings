@@ -25,6 +25,10 @@ serde_json = { version = "1.0", features = ["float_roundtrip", "unbounded_depth"
 binrw = { version = "0.13", default-features = false, features = ["std"] }
 thiserror = "1.0"
 bitflags = "2.4.1"
+# Secrets (src/lib/secret_file.rs) compare in constant time and zeroize on drop; 1.9.1, as
+# 1.9.0's Zeroizing prints its bytes in Debug.
+subtle = "2.6"
+zeroize = "1.9.1"
 
 # Only the Linux build uses these: efivarfs, the HiiDB in sysfs, iLO through
 # ilorest_chif.so, and the CLI's logging.
@@ -45,6 +49,9 @@ libc = "0.2"
 # GetVariable() and SetVariable().
 [target.'cfg(target_os = "uefi")'.dependencies]
 uefi = { version = "0.41", features = ["alloc"] }
+# EFI_SHELL_PARAMETERS_PROTOCOL.StdIn and EFI_SHELL_PROTOCOL's GetFileInfo and ReadFile, for the
+# secret that `-` names, which uefi does not wrap.
+uefi-raw = "0.17"
 
 # The Windows build reaches the firmware through Win32: Get/SetFirmwareEnvironmentVariableExW
 # for variables, and the HiiDB driver (src/lib/hii/hiidb_driver.rs) for the HiiDB.
@@ -61,8 +68,8 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 # fs: tests make FIFOs, also on macOS, whose build has no nix otherwise; inotify: a test sees
-# which files open_efivar opens
-nix = { version = "0.27", features = ["fs", "inotify"] }
+# which files open_efivar opens; term: a test opens a pseudo-terminal
+nix = { version = "0.27", features = ["fs", "inotify", "term"] }
 tempfile = "3.5"
 # The Win32 error codes and IOCTL constants of the Windows backends, whose logic the tests of
 # every host run

@@ -30,6 +30,7 @@ mod file_lock;
 mod hii;
 #[cfg(target_os = "linux")]
 mod ilorest;
+pub mod secret_file;
 mod translation;
 #[cfg(target_os = "uefi")]
 mod uefi_entry;
