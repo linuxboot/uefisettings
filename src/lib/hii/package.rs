@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Seek;
 use std::rc::Rc;
+use std::str::FromStr;
 
 use anyhow::ensure;
 use anyhow::Context;
@@ -277,7 +278,7 @@ fn get_packages(package_list: &PackageList) -> Result<Vec<Package>> {
     Ok(packages)
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone, BinRead)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone, BinRead)]
 #[br(little)]
 pub struct Guid {
     pub data1: u32,
@@ -310,6 +311,16 @@ impl fmt::Display for Guid {
 impl fmt::Debug for Guid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self)
+    }
+}
+
+/// The registry format that Display writes, such as 8BE4DF61-93CA-11D2-AA0D-00E098032B8C, in
+/// either case.
+impl FromStr for Guid {
+    type Err = uguid::GuidFromStrError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        uguid::Guid::try_parse(s).map(|guid| guid.to_bytes().into())
     }
 }
 

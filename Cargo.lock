@@ -1058,6 +1058,7 @@ dependencies = [
  "uefi-raw",
  "uefisettings_backend_thrift",
  "uefisettings_spellings_db_thrift",
+ "uguid",
  "windows-sys 0.61.2",
  "zeroize",
 ]

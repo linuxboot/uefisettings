@@ -60,12 +60,21 @@ show-translations	status	0x0
 show-translations	json	type == "object"
 no-efivars	status	0x0
 no-efivars	json	.responses[0].question.answer | startswith("<ValueUnavailable: EFI variables not read>")
+# variable list lists the boot-service-only variables of DriverSample too, sorted by name, then
+# vendor GUID
+variable-list	status	0x0
+variable-list	json	type == "array" and . == sort_by(.name, .guid) and any(.[]; . == {"name": "MyIfrNVData", "guid": "A04A27F4-DF00-4D42-B552-39511302113D"}) and any(.[]; . == {"name": "Timeout", "guid": "8BE4DF61-93CA-11D2-AA0D-00E098032B8C"})
+variable-list-guid	status	0x0
+variable-list-guid	json	all(.[]; .guid == "A04A27F4-DF00-4D42-B552-39511302113D") and any(.[]; .name == "MyIfrNVData") and any(.[]; .name == "MyEfiVar")
+variable-list-bad-guid	status	aborted
+variable-list-bad-guid	json	. == {"error_message": "vendor A04A27F4 is not a GUID: GUID string has wrong length (expected 36 bytes)"}
 # the help names no command or flag of the Linux build only
 help	status	0x0
 help	line	^Usage: uefisettings.efi <COMMAND>$
 help	none	^  (identify|ilo) 
 # get and set use the HII database here, with no backend to identify
 help	line	^  get +Get the current value of a question$
+help	line	^  variable +Commands on this machine's EFI variables
 help	none	Auto-identify
 hii-help	status	0x0
 hii-help	line	^  list-questions 

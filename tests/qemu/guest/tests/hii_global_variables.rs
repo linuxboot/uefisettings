@@ -15,7 +15,8 @@
 //! VarStores that declare every variable non-volatile. `set` refuses those on a volatile
 //! variable, naming it, and those whose variable it cannot read, with the read's error, before
 //! it writes anything, and writes the one on Timeout; `get` reads those on ConOutDev, LangCodes
-//! and Timeout. Each check of `set` compares every efivar file before and after.
+//! and Timeout. Each check of `set` compares every efivar file before and after. `variable list`
+//! lists the variables of the efivar files.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -25,6 +26,7 @@ use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::Responses;
+use uefisettings_qemu_guest::Variable;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::EFIVARFS_HEADER_SIZE;
 use uefisettings_qemu_guest::EFIVARS;
@@ -152,6 +154,54 @@ fn refuse(question: &str, name: &str, error: &str) {
             "{prefix:?} set {question:?} {value}"
         );
     }
+}
+
+/// The variables of the efivar files that hold one, which are not empty, from the files'
+/// names: `<name>-<GUID>`.
+#[track_caller]
+fn efivarfs_variables() -> Vec<Variable> {
+    let mut variables: Vec<Variable> = efivars()
+        .into_iter()
+        .filter(|(_, bytes)| !matches!(bytes, Ok(bytes) if bytes.is_empty()))
+        .map(|(file, _)| {
+            let (name, guid) = file
+                .len()
+                .checked_sub(EFI_GLOBAL_VARIABLE.len())
+                .and_then(|at| file.split_at_checked(at))
+                .and_then(|(name, guid)| Some((name.strip_suffix('-')?, guid)))
+                .unwrap_or_else(|| panic!("efivar file {file} is no <name>-<GUID>"));
+            Variable {
+                name: name.to_string(),
+                guid: guid.to_ascii_uppercase(),
+            }
+        })
+        .collect();
+    variables.sort();
+    variables
+}
+
+#[test]
+fn variable_list_lists_the_variables_of_the_efivar_files() {
+    let variables = efivarfs_variables();
+    let timeout = Variable {
+        name: "Timeout".to_string(),
+        guid: EFI_GLOBAL_VARIABLE.to_ascii_uppercase(),
+    };
+    assert!(variables.contains(&timeout), "no Timeout: {variables:#?}");
+
+    let listed: Vec<Variable> = json(&["variable", "list"]);
+    assert_eq!(listed, variables, "variable list");
+
+    let global: Vec<Variable> = json(&["variable", "list", "--guid", EFI_GLOBAL_VARIABLE]);
+    let want: Vec<&Variable> = variables
+        .iter()
+        .filter(|variable| variable.guid == timeout.guid)
+        .collect();
+    assert_eq!(global.iter().collect::<Vec<_>>(), want, "--guid");
+    assert!(
+        global.len() < listed.len(),
+        "--guid kept every variable: {listed:#?}"
+    );
 }
 
 #[test]

@@ -13,14 +13,16 @@
 //! The exports that only the UEFI Shell build has: those that read the HII database of the
 //! firmware it runs on and write its variables, through boot services.
 //!
-//! Every export that reaches this firmware, export_hiidb here and get, set, list-questions and
-//! show-ifr of EfivarSource::System, calls the uefi crate, which panics unless the image has
-//! initialized it: uefi::table::set_system_table, then uefi::boot::set_image_handle, as
-//! uefisettings.efi's entry point uefi_std_entry does.
+//! Every export that reaches this firmware, those here, VariableBackend's, and get, set,
+//! list-questions and show-ifr of EfivarSource::System, calls the uefi crate, which panics
+//! unless the image has initialized it: uefi::table::set_system_table, then
+//! uefi::boot::set_image_handle, as uefisettings.efi's entry point uefi_std_entry does.
 
 use anyhow::Result;
 
 use super::HiiBackend;
+use super::VariableBackend;
+use crate::efi_variables::VariableNames;
 use crate::hii::export_package_lists;
 use crate::hii::FirmwareVariables;
 use crate::hii::VariableInfo;
@@ -37,6 +39,14 @@ impl HiiBackend {
     /// This firmware's variables.
     pub(super) fn system_variables() -> Result<impl FirmwareVariables> {
         Ok(VariableServices)
+    }
+}
+
+/// What the variable commands read: this firmware's variables, through boot services.
+impl VariableBackend {
+    /// The names of this firmware's variables, from GetNextVariableName().
+    pub(super) fn system_variable_names() -> impl VariableNames {
+        VariableServices
     }
 }
 

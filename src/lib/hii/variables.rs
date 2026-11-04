@@ -43,10 +43,26 @@ const EFI_VARIABLE_AUTHENTICATED_ACCESS: u32 =
     0x00000010 | 0x00000020 | EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS;
 
 /// A firmware variable: its name and vendor GUID (UEFI 2.10 §8.2.1).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct VariableKey {
-    pub(crate) name: String,
-    pub(crate) guid: Guid,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VariableKey {
+    pub name: String,
+    pub guid: Guid,
+}
+
+#[cfg(variable_names)]
+impl VariableKey {
+    /// The variable of the CHAR16 `name` and the vendor `guid`: "all characters and strings are
+    /// stored in the UCS-2 encoding format" (UEFI 2.11 §2.3.1), which holds no surrogate code
+    /// unit, so each surrogate here becomes U+FFFD.
+    pub(crate) fn from_ucs2(name: &[u16], guid: Guid) -> Self {
+        Self {
+            name: name
+                .iter()
+                .map(|&unit| char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect(),
+            guid,
+        }
+    }
 }
 
 /// `<name>-<lowercase GUID>` with '!' for each '/', as Linux v7.2 fs/efivarfs/vars.c

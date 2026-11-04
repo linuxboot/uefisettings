@@ -263,6 +263,15 @@ pub struct Response {
     pub modified: bool,
 }
 
+/// A variable as `variable list` prints it.
+#[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Variable {
+    /// The name.
+    pub name: String,
+    /// The vendor GUID, in upper case.
+    pub guid: String,
+}
+
 /// Runs `uefisettings` with `args`, a `get` or `set` command; panics unless it exits with 0
 /// and prints exactly one response, from `backend`. Returns the question of the response,
 /// and whether it was modified.

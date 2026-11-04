@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write;
@@ -25,12 +26,18 @@ use log::warn;
 use nix::errno::Errno;
 use nix::mount::mount;
 use nix::mount::MsFlags;
+use nix::sys::statfs::statfs;
+use nix::sys::statfs::FsType;
+use nix::sys::statfs::Statfs;
 use proc_mounts::MountIter;
 use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
+use crate::efi_variables::VariableNames;
 use crate::file_lock::FileLock;
 use crate::hii::efivarfs_format::as_variable_not_found;
+use crate::hii::efivarfs_format::check_regular_file;
+use crate::hii::efivarfs_format::listed_names;
 use crate::hii::efivarfs_format::open_efivar;
 use crate::hii::efivarfs_format::read_efivar;
 use crate::hii::efivarfs_format::read_efivar_file;
@@ -49,6 +56,8 @@ use crate::hii::variables::VariableReach;
 pub(super) const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
 /// The file that EfivarFiles::system() locks while it remounts EFIVARS_MOUNT_POINT.
 const REMOUNT_LOCK_FILE: &str = "/run/lock/efibootmgr-remount";
+/// The f_type of an efivarfs's statfs (Linux v6.11 include/uapi/linux/magic.h).
+const EFIVARFS_MAGIC: u32 = 0xde5e_81e4;
 
 impl EfivarSource {
     /// The firmware variables that questions read from this source, which validate accepts.
@@ -358,19 +367,96 @@ fn to_ms_flags(options: &[String]) -> MsFlags {
         })
 }
 
+impl VariableNames for EfivarFiles {
+    fn variable_names(&self) -> Result<Vec<VariableKey>> {
+        efivarfs_statfs(&self.dir)?;
+        efivar_names(&self.dir)
+    }
+}
+
+/// The statfs of `dir`, which fails unless an efivarfs is mounted on it: else `dir` lists no
+/// variable, as EFIVARS_MOUNT_POINT is then the empty directory of sysfs that efisubsys_init()
+/// (Linux v6.11 drivers/firmware/efi/efi.c) creates for the mount.
+fn efivarfs_statfs(dir: &Path) -> Result<Statfs> {
+    let stat = statfs(dir).map_err(|errno| statfs_error(dir, errno))?;
+    match is_efivarfs(stat.filesystem_type()) {
+        true => Ok(stat),
+        false => Err(NotEfivarfs(dir.to_path_buf()).into()),
+    }
+}
+
+/// The error of the statfs of `dir` that failed with `errno`. Linux 6.5 to 6.5.4 fail the statfs
+/// of efivarfs where the firmware's QueryVariableInfo() fails, with EINVAL where it is not
+/// supported at runtime (Linux v6.5 fs/efivarfs/super.c efivarfs_statfs(),
+/// drivers/firmware/efi/efi.c efi_status_to_err()); 79b83606abc7 fixed it in 6.5.5 and 6.6.
+fn statfs_error(dir: &Path, errno: Errno) -> anyhow::Error {
+    let failed = format!("failed to statfs {}", dir.display());
+    let context = match errno {
+        Errno::EINVAL => format!(
+            "{failed}, as Linux 6.5 to 6.5.4 do where the firmware's QueryVariableInfo() fails or \
+             is not supported at runtime"
+        ),
+        _ => failed,
+    };
+    anyhow::Error::new(errno).context(context)
+}
+
+/// Whether `fs_type`, the f_type of a statfs, is EFIVARFS_MAGIC.
+fn is_efivarfs(fs_type: FsType) -> bool {
+    let fs_type = i128::from(fs_type.0);
+    // the same 32 bits where f_type is a signed 32-bit integer, as with 32-bit glibc
+    let signed = i32::from_ne_bytes(EFIVARFS_MAGIC.to_ne_bytes());
+    fs_type == i128::from(EFIVARFS_MAGIC) || fs_type == i128::from(signed)
+}
+
+/// Why EfivarFiles lists no variables of a directory.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("no efivarfs is mounted on {}", .0.display())]
+struct NotEfivarfs(PathBuf);
+
+/// The variables of the efivar files in `dir`, from its listing and their metadata, never their
+/// data. A file of no bytes holds no variable: efivarfs creates the file of a new name at once,
+/// and the variable once something writes it (Linux v6.11 fs/efivarfs/inode.c
+/// efivarfs_create()). A file removed since the listing is left out.
+fn efivar_names(dir: &Path) -> Result<Vec<VariableKey>> {
+    let names = listed_names(dir)
+        .and_then(Iterator::collect::<io::Result<Vec<_>>>)
+        .with_context(|| format!("failed to list efivars directory '{}'", dir.display()))?;
+    let mut keys = Vec::new();
+    for name in names {
+        let path = dir.join(&name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            result => result
+                .with_context(|| format!("failed to stat efivar file '{}'", path.display()))?,
+        };
+        check_regular_file(&path, &metadata, "efivar file")?;
+        if metadata.len() > 0 {
+            keys.push(VariableKey::from_efivar_file_name(&name)?);
+        }
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
     use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
 
     use anyhow::Context;
     use anyhow::Result;
+    use nix::sys::inotify::AddWatchFlags;
+    use nix::sys::inotify::InitFlags;
+    use nix::sys::inotify::Inotify;
     use tempfile::TempDir;
 
     use super::*;
     use crate::hii::efivarfs_format::MAX_EFIVAR_FILE_SIZE;
     use crate::hii::variables::tests::variable_key;
     use crate::hii::variables::tests::BS_RT;
+    use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
     use crate::hii::variables::tests::NV_BS_RT;
 
     /// EfivarFiles of a temporary directory, which no mount lists, and their remount lock, in a
@@ -475,6 +561,207 @@ mod tests {
             (MAX_EFIVAR_FILE_SIZE + 1, [&attributes[..], &[0]].concat()),
             "the efivar file"
         );
+    }
+
+    /// The names of the files in the directory that `watch` watches that were opened or read
+    /// since the last call.
+    fn touched(watch: &Inotify) -> Vec<OsString> {
+        match watch.read_events() {
+            Ok(events) => events.into_iter().filter_map(|event| event.name).collect(),
+            Err(Errno::EAGAIN) => Vec::new(),
+            Err(error) => panic!("read the inotify events: {error}"),
+        }
+    }
+
+    /// efivar_names lists the variable of every efivar file that holds one, by the file's name,
+    /// where a '!' stays one; it skips a file of no bytes, and opens no file.
+    #[test]
+    fn efivar_names_list_the_variables_of_the_files_without_opening_them() {
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        let timeout = VariableKey {
+            name: "Timeout".to_string(),
+            guid: EFI_GLOBAL_VARIABLE,
+        };
+        let timeout_file = dir.path().join(EfivarFileName::from(&timeout));
+        let files = [
+            (
+                timeout_file.clone(),
+                [&NV_BS_RT.to_ne_bytes()[..], &[5, 0]].concat(),
+            ),
+            (
+                dir.path().join(EfivarFileName::from(&variable_key("a/b"))),
+                [&NV_BS_RT.to_ne_bytes()[..], &[1]].concat(),
+            ),
+            (
+                dir.path()
+                    .join(EfivarFileName::from(&variable_key("Uncommitted"))),
+                vec![],
+            ),
+        ];
+        for (path, bytes) in files {
+            fs::write(path, bytes).expect("write the efivar file");
+        }
+        let watch = Inotify::init(InitFlags::IN_NONBLOCK).expect("create an inotify instance");
+        watch
+            .add_watch(
+                dir.path(),
+                AddWatchFlags::IN_OPEN | AddWatchFlags::IN_ACCESS,
+            )
+            .expect("watch the directory");
+
+        let mut keys = efivar_names(dir.path()).expect("list the efivar files");
+
+        keys.sort();
+        assert_eq!(keys, [timeout, variable_key("a!b")], "variables");
+        assert_eq!(
+            touched(&watch),
+            Vec::<OsString>::new(),
+            "files opened or read"
+        );
+        fs::read(&timeout_file).expect("read an efivar file");
+        let read = touched(&watch);
+        assert!(
+            !read.is_empty()
+                && read
+                    .iter()
+                    .all(|name| Some(name.as_os_str()) == timeout_file.file_name()),
+            "the watch misses a read of {}: {read:?}",
+            timeout_file.display()
+        );
+    }
+
+    /// efivar_names lists a variable whose name holds a surrogate code unit, with U+FFFD for it,
+    /// and the other variables too.
+    #[test]
+    fn efivar_names_list_a_name_with_a_surrogate() {
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        // the surrogate 0xD800 as ucs2_as_utf8() writes it
+        for name in [&b"A\xed\xa0\x80B"[..], b"Timeout"] {
+            let file = [name, b"-8be4df61-93ca-11d2-aa0d-00e098032b8c"].concat();
+            fs::write(dir.path().join(OsStr::from_bytes(&file)), [7, 0, 0, 0, 1])
+                .expect("write an efivar file");
+        }
+
+        let mut keys = efivar_names(dir.path()).expect("list a name with a surrogate");
+
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["A\u{fffd}B", "Timeout"].map(|name| VariableKey {
+                name: name.to_string(),
+                guid: EFI_GLOBAL_VARIABLE,
+            }),
+            "listed"
+        );
+    }
+
+    /// efivar_names refuses an entry that is no efivar file, by its name or its type.
+    #[test]
+    fn efivar_names_refuse_an_entry_that_is_no_efivar_file() {
+        /// The refusal of the entry at a path.
+        type Refusal = fn(&Path) -> String;
+        let cases: [(&str, bool, Refusal); 2] = [
+            ("README", false, |_| {
+                "'README' is not the name of an efivar file".to_string()
+            }),
+            (
+                "Directory-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                true,
+                |path| format!("efivar file '{}' is not a regular file", path.display()),
+            ),
+        ];
+        for (name, directory, refusal) in cases {
+            let dir = tempfile::tempdir().expect("create efivars directory");
+            let path = dir.path().join(name);
+            match directory {
+                true => fs::create_dir(&path).expect("create a directory"),
+                false => fs::write(&path, [7, 0, 0, 0]).expect("write a file"),
+            }
+
+            let error = efivar_names(dir.path()).expect_err("list a directory with the entry");
+
+            assert_eq!(error.to_string(), refusal(&path), "{name}");
+        }
+    }
+
+    /// EfivarFiles lists no variables of a directory on which no efivarfs is mounted, though
+    /// it holds efivar files.
+    #[test]
+    fn efivar_files_list_no_variables_without_efivarfs() {
+        let (dir, _lock, files) = unmounted_efivar_files();
+        let setup = variable_key("Setup");
+        fs::write(
+            dir.path().join(EfivarFileName::from(&setup)),
+            [&NV_BS_RT.to_ne_bytes()[..], &[1]].concat(),
+        )
+        .expect("write the efivar file");
+
+        let error = files
+            .variable_names()
+            .expect_err("list a directory without efivarfs");
+
+        assert_eq!(
+            error.downcast_ref::<NotEfivarfs>(),
+            Some(&NotEfivarfs(dir.path().to_path_buf())),
+            "{error:#}"
+        );
+        assert_eq!(
+            efivar_names(dir.path()).expect("list the efivar files"),
+            [setup],
+            "the efivar files"
+        );
+    }
+
+    /// is_efivarfs takes EFIVARFS_MAGIC as statfs gives it, also as a negative signed 32-bit
+    /// f_type, and no other file system type.
+    #[test]
+    fn is_efivarfs_takes_only_efivarfs_magic() {
+        let cases: [(&str, i128, bool); 4] = [
+            ("EFIVARFS_MAGIC", 0xde5e_81e4, true),
+            (
+                "EFIVARFS_MAGIC as a signed 32-bit f_type",
+                -0x21a1_7e1c,
+                true,
+            ),
+            ("TMPFS_MAGIC", 0x0102_1994, false),
+            ("EFIVARFS_MAGIC with a higher bit", 0x1_de5e_81e4, false),
+        ];
+        let mut checked = Vec::new();
+        for (case, fs_type, want) in cases {
+            // a value that the f_type of this target cannot hold, such as EFIVARFS_MAGIC for
+            // 32-bit glibc, is no f_type to check
+            let Ok(fs_type) = fs_type.try_into() else {
+                continue;
+            };
+
+            assert_eq!(is_efivarfs(FsType(fs_type)), want, "{case}");
+            checked.push(want);
+        }
+        assert!(
+            checked.contains(&true) && checked.contains(&false),
+            "checked: {checked:?}"
+        );
+    }
+
+    /// statfs_error tells of EINVAL why Linux 6.5 to 6.5.4 fail the statfs of efivarfs, and of
+    /// other errors only that the statfs failed.
+    #[test]
+    fn statfs_error_tells_why_linux_6_5_fails_with_einval() {
+        let dir = Path::new(EFIVARS_MOUNT_POINT);
+        for (errno, want) in [
+            (
+                Errno::EINVAL,
+                "failed to statfs /sys/firmware/efi/efivars, as Linux 6.5 to 6.5.4 do where the \
+                 firmware's QueryVariableInfo() fails or is not supported at runtime: EINVAL: \
+                 Invalid argument",
+            ),
+            (
+                Errno::ENOENT,
+                "failed to statfs /sys/firmware/efi/efivars: ENOENT: No such file or directory",
+            ),
+        ] {
+            assert_eq!(format!("{:#}", statfs_error(dir, errno)), want, "{errno}");
+        }
     }
 
     /// write_at writes nothing when it cannot remount efivarfs.

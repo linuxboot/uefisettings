@@ -100,3 +100,5 @@ pub(crate) use variable_services::VariableServices;
 pub(crate) use variables::EfivarReader;
 pub use variables::EfivarSource;
 pub(crate) use variables::FirmwareVariables;
+#[cfg(variable_names)]
+pub use variables::VariableKey;

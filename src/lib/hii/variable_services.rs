@@ -10,8 +10,9 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The firmware variables of the UEFI Shell build: GetVariable() and SetVariable() through the
-//! uefi crate, which the image's entry point initializes, while boot services run.
+//! The firmware variables of the UEFI Shell build: GetVariable(), GetNextVariableName() and
+//! SetVariable() through the uefi crate, which the image's entry point initializes, while boot
+//! services run.
 
 use core::ptr;
 
@@ -24,6 +25,10 @@ use uefi::runtime::VariableVendor;
 use uefi::CString16;
 use uefi::Status;
 
+use crate::efi_variables::walk_variable_names;
+use crate::efi_variables::GetNextVariableName;
+use crate::efi_variables::NextVariableName;
+use crate::efi_variables::VariableNames;
 use crate::hii::package::Guid;
 use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
@@ -92,6 +97,42 @@ impl FirmwareVariables for VariableServices {
         // whole variable.
         runtime::set_variable(&variable_name, &vendor, attributes, data)
             .map_err(|error| anyhow!("SetVariable() of EFI variable {key}: {:?}", error.status()))
+    }
+}
+
+impl VariableNames for VariableServices {
+    /// The variables of GetNextVariableName() calls of its own: uefi's variable_keys() fails at
+    /// a name with a surrogate code unit, as CStr16 holds UCS-2 only, with a status that the
+    /// firmware did not return.
+    fn variable_names(&self) -> Result<Vec<VariableKey>> {
+        walk_variable_names(&mut RuntimeVariableNames)
+    }
+}
+
+/// GetNextVariableName() of the runtime services, through the uefi crate.
+struct RuntimeVariableNames;
+
+impl GetNextVariableName for RuntimeVariableNames {
+    fn get_next_variable_name(
+        &mut self,
+        name: &mut [u16],
+        vendor: &mut Guid,
+    ) -> Result<NextVariableName> {
+        let mut uefi_vendor = VariableVendor((*vendor).into());
+        let result = runtime::get_next_variable_key(name, &mut uefi_vendor);
+        *vendor = uefi_vendor.0.into();
+        match result {
+            Ok(()) => Ok(NextVariableName::Found),
+            Err(error) => match (error.status(), *error.data()) {
+                (Status::NOT_FOUND, _) => Ok(NextVariableName::End),
+                (Status::BUFFER_TOO_SMALL, Some(size)) => {
+                    Ok(NextVariableName::BufferTooSmall(size))
+                }
+                (status, _) => Err(anyhow!(
+                    "GetNextVariableName() of EFI variables: {status:?}"
+                )),
+            },
+        }
     }
 }
 

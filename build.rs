@@ -27,7 +27,7 @@ struct Capability {
     target_arches: Option<&'static [&'static str]>,
 }
 
-const CAPABILITIES: [Capability; 5] = [
+const CAPABILITIES: [Capability; 6] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
@@ -60,6 +60,13 @@ const CAPABILITIES: [Capability; 5] = [
         cfg: "firmware_memory_maps",
         target_oses: &["linux"],
         target_arches: Some(&["x86", "x86_64", "aarch64"]),
+    },
+    // VariableNames and VariableBackend::list: the names of this machine's EFI variables, which
+    // Windows does not give programs
+    Capability {
+        cfg: "variable_names",
+        target_oses: &["linux", "uefi"],
+        target_arches: None,
     },
 ];
 

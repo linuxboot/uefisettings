@@ -40,6 +40,10 @@
 #                the same value here, every question on a variable that Linux finds missing
 #                or not present at OS runtime has a value here unless the firmware has no
 #                such variable, and at least one has
+#              linux: the argument is "LOG TAG FILTER"; LOG, a test log next to CONSOLE_LOG,
+#                has one line "uefisettings-qemu-test: TAG JSON" of a Linux boot, the step's
+#                output is one line of JSON, and the jq filter FILTER finds it true with
+#                $linux bound to the JSON of LOG
 #   argument   what the check takes
 # Every step of the log needs a status check, and every step that a check names must be in
 # the log once.
@@ -173,6 +177,17 @@ while IFS=$'\t' read -r step check argument || [[ -n $step ]]; do
         echo "check-shell-log: $step: parity with $argument: $parity"
         jq --exit-status '.compared > 0 and .differing == [] and .unreached == [] and .reached > 0' \
             <<<"$parity" >/dev/null || fail "$step" "no parity with $argument"
+        ;;
+    linux)
+        read -r log tag filter <<<"$argument"
+        # a file, as the JSON can exceed the length of an argument
+        if ! tr -d '\r' <"$logs/$log" |
+            sed -n "s/^uefisettings-qemu-test: $tag //p" >"$steps/$step.linux.json" ||
+            (($(wc -l <"$steps/$step.linux.json") != 1)) || (($(wc -l <"$out") != 1)) ||
+            ! jq --exit-status --slurpfile linux "$steps/$step.linux.json" \
+                "\$linux[0] as \$linux | $filter" <"$out" >/dev/null 2>&1; then
+            fail "$step" "not one line of JSON for which $filter holds with the line $tag of $log"
+        fi
         ;;
     *)
         echo "check-shell-log: unknown check $check of $step in $expectations" >&2

@@ -44,6 +44,8 @@ use platform::ListStringsHiiDbArgs;
 use platform::PlatformCommands;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::SetupPasswordArgs;
+#[cfg(system_variables)]
+use variable_command::VariableCommand;
 
 /// The commands and flags that only this build has, and where it reads the HiiDB.
 #[cfg_attr(target_os = "linux", path = "platform/linux.rs")]
@@ -55,6 +57,8 @@ mod platform;
 // only HiiDB files and efivar dumps.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod secret_stdin;
+#[cfg(system_variables)]
+mod variable_command;
 
 // Every command lists its options and subcommands alphabetically, as under clap 3:
 // next_display_order = None leaves them unordered, and clap sorts those by name.
@@ -111,6 +115,9 @@ enum Commands {
         #[command(flatten)]
         output: JsonArgs,
     },
+    /// Commands on this machine's EFI variables, which never read their data
+    #[cfg(system_variables)]
+    Variable(VariableCommand),
     #[command(flatten)]
     Platform(PlatformCommands),
 }
@@ -450,6 +457,8 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
         Commands::ShowTranslations { output } => {
             print_with_style(&*translation_db, output.json)?;
         }
+        #[cfg(system_variables)]
+        Commands::Variable(command) => command.run()?,
         Commands::Platform(command) => command.run()?,
     }
     Ok(())
@@ -836,6 +845,26 @@ mod tests {
                 clap::error::ErrorKind::UnknownArgument,
                 "{flags:?}"
             );
+        }
+    }
+
+    /// The variable commands parse, which the macOS build lacks, as it has no variables.
+    #[cfg(system_variables)]
+    #[test]
+    fn variable_commands_parse() {
+        let commands: [&[&str]; 2] = [
+            &["variable", "list"],
+            &[
+                "variable",
+                "list",
+                "--guid",
+                "8BE4DF61-93CA-11D2-AA0D-00E098032B8C",
+            ],
+        ];
+        for command in commands {
+            let argv = [&["uefisettings"][..], command].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            assert!(parsed.is_ok(), "{command:?}: {parsed:?}");
         }
     }
 

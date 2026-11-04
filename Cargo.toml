@@ -29,6 +29,8 @@ bitflags = "2.4.1"
 # 1.9.0's Zeroizing prints its bytes in Debug.
 subtle = "2.6"
 zeroize = "1.9.1"
+# GUIDs in registry format, such as the variable commands take; the uefi crate's Guid is uguid's.
+uguid = "2.2.1"
 
 # Only the Linux build uses these: efivarfs, the HiiDB in sysfs, iLO through
 # ilorest_chif.so, and the CLI's logging.

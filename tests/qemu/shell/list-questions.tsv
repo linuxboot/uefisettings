@@ -1,3 +1,7 @@
 # The checks of shell/list-questions.nsh. See check-shell-log.sh.
 list-questions	status	0x0
 list-questions	parity	boot1.test.log
+# every variable that Linux lists is listed here too, where the boot-service-only MyEfiVar,
+# which Linux cannot reach (UEFI 2.10 §8.2.2), is listed besides
+variable-list	status	0x0
+variable-list	linux	boot1.test.log variable-list ($linux | length) > 0 and ($linux - .) == [] and ((. - $linux) | any(.name == "MyEfiVar"))

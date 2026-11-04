@@ -14,12 +14,15 @@
 //! and read them.
 
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "macos", test))]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -59,6 +62,10 @@ pub(super) const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
 /// The interface of efivarfs, and so of a copy of it.
 pub(super) const EFIVARFS_INTERFACE: VariableInterface = VariableInterface::Efivarfs;
+/// The length of the GUID that ends the name of an efivar file (Linux v6.11 include/linux/efi.h
+/// EFI_VARIABLE_GUID_LEN).
+#[cfg(target_os = "linux")]
+const EFI_VARIABLE_GUID_LEN: usize = 36;
 
 /// The name of the efivar file of a variable, as VariableKey displays it: always exactly one path
 /// component.
@@ -82,6 +89,80 @@ impl fmt::Display for EfivarFileName {
         f.write_str(&self.0)
     }
 }
+
+#[cfg(target_os = "linux")]
+impl VariableKey {
+    /// The variable of the efivar file `name`, `<name>-<GUID>` as efivarfs_valid_name() (Linux
+    /// v6.11 fs/efivarfs/inode.c) takes it. A '!' stays one: efivarfs writes one for each '/'
+    /// of a variable's name (fs/efivarfs/super.c efivarfs_callback()), and so does Display. The
+    /// name's code units are as efivar_name_units reads them, a surrogate as U+FFFD
+    /// (VariableKey::from_ucs2).
+    pub(super) fn from_efivar_file_name(name: &OsStr) -> Result<Self, NotAnEfivarFileName> {
+        let refusal = || NotAnEfivarFileName(name.to_owned());
+        let bytes = name.as_bytes();
+        let (variable, guid) = bytes
+            .len()
+            .checked_sub(EFI_VARIABLE_GUID_LEN)
+            .and_then(|at| bytes.split_at_checked(at))
+            .ok_or_else(refusal)?;
+        let variable = variable
+            .strip_suffix(b"-")
+            .filter(|variable| !variable.is_empty())
+            .and_then(efivar_name_units)
+            .ok_or_else(refusal)?;
+        let guid = std::str::from_utf8(guid)
+            .ok()
+            .and_then(|guid| guid.parse().ok())
+            .ok_or_else(refusal)?;
+        Ok(Self::from_ucs2(&variable, guid))
+    }
+}
+
+/// The UCS-2 code units of the `bytes` of a variable's name in its efivar file, where efivarfs
+/// writes each unit, a surrogate too, in the 1 to 3 bytes that UTF-8 gives its code point (Linux
+/// v6.17 lib/ucs2_string.c ucs2_as_utf8()); None for bytes that it never writes.
+#[cfg(target_os = "linux")]
+fn efivar_name_units(bytes: &[u8]) -> Option<Vec<u16>> {
+    let mut units = Vec::new();
+    let mut rest = bytes;
+    while let Some((&lead, tail)) = rest.split_first() {
+        let (unit, tail) = match lead {
+            0x00..=0x7F => (u16::from(lead), tail),
+            // 0xC0 and 0xC1 lead only overlong pairs, of units below 0x80
+            0xC2..=0xDF => {
+                let (&[second], tail) = tail.split_first_chunk()?;
+                (
+                    u16::from(lead & 0x1F) << 6 | continuation_bits(second)?,
+                    tail,
+                )
+            }
+            0xE0..=0xEF => {
+                let (&[second, third], tail) = tail.split_first_chunk()?;
+                let unit = u16::from(lead & 0x0F) << 12
+                    | continuation_bits(second)? << 6
+                    | continuation_bits(third)?;
+                // three bytes of a unit below 0x800 are overlong
+                (unit >= 0x800).then_some((unit, tail))?
+            }
+            _ => return None,
+        };
+        units.push(unit);
+        rest = tail;
+    }
+    Some(units)
+}
+
+/// The 6 bits of a UTF-8 continuation byte `byte`, 0b10xxxxxx; None for another byte.
+#[cfg(target_os = "linux")]
+fn continuation_bits(byte: u8) -> Option<u16> {
+    (byte & 0xC0 == 0x80).then_some(u16::from(byte & 0x3F))
+}
+
+/// A name that is no efivar file's: no `<name>-<GUID>`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("'{}' is not the name of an efivar file", .0.to_string_lossy())]
+pub(super) struct NotAnEfivarFileName(OsString);
 
 /// An efivar file missing from its directory.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -189,7 +270,7 @@ fn check_same_file(
 }
 
 /// Fails unless `metadata`, of the `noun` at `path`, is a regular file's.
-fn check_regular_file(path: &Path, metadata: &fs::Metadata, noun: &str) -> Result<()> {
+pub(super) fn check_regular_file(path: &Path, metadata: &fs::Metadata, noun: &str) -> Result<()> {
     if !metadata.is_file() {
         return Err(anyhow!("{noun} '{}' is not a regular file", path.display()));
     }
@@ -336,12 +417,18 @@ fn check_exact_name(dir: &Path, name: &EfivarFileName) -> Result<()> {
 
 /// Whether `dir` lists an entry of exactly the name `name`.
 fn lists_entry(dir: &Path, name: &OsStr) -> io::Result<bool> {
-    for entry in fs::read_dir(dir)? {
-        if entry?.file_name() == name {
+    for listed in listed_names(dir)? {
+        if listed? == name {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// The names that `dir` lists, which read_dir reads from the directory alone: it opens none of
+/// the entries.
+pub(super) fn listed_names(dir: &Path) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
+    Ok(fs::read_dir(dir)?.map(|entry| entry.map(|entry| entry.file_name())))
 }
 
 /// Why an EfivarCopy refuses a write.
@@ -417,6 +504,84 @@ pub mod tests {
                 "VarStore name {name:?}"
             );
         }
+    }
+
+    /// A variable reads from the name of its efivar file, `<name>-<GUID>`, with each '!' of
+    /// the name kept and the GUID in either case; no other name reads as a variable.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn variable_key_reads_only_the_name_of_an_efivar_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
+        for (file, name) in [
+            (format!("Timeout-{guid}").into_bytes(), "Timeout"),
+            (format!("a!b-{guid}").into_bytes(), "a!b"),
+            (format!("a-b-{guid}").into_bytes(), "a-b"),
+            (format!("x-{}", guid.to_ascii_uppercase()).into_bytes(), "x"),
+            // U+00E9 and U+20AC, of 2 and 3 bytes
+            (
+                format!("\u{e9}\u{20ac}-{guid}").into_bytes(),
+                "\u{e9}\u{20ac}",
+            ),
+            // the surrogate 0xD800 alone, and the pair of U+1F600, as ucs2_as_utf8() writes them
+            (
+                [&b"A\xed\xa0\x80B-"[..], guid.as_bytes()].concat(),
+                "A\u{fffd}B",
+            ),
+            (
+                [&b"\xed\xa0\xbd\xed\xb8\x80-"[..], guid.as_bytes()].concat(),
+                "\u{fffd}\u{fffd}",
+            ),
+        ] {
+            let file = OsStr::from_bytes(&file);
+
+            assert_eq!(
+                VariableKey::from_efivar_file_name(file),
+                Ok(VariableKey {
+                    name: name.to_string(),
+                    guid: EFI_GLOBAL_VARIABLE,
+                }),
+                "{file:?}"
+            );
+        }
+
+        let mut refused: Vec<OsString> = [
+            "README".to_string(),
+            guid.to_string(),
+            format!("-{guid}"),
+            format!("Timeout{guid}"),
+            format!("Timeout-{}", &guid[1..]),
+            format!("Timeout-{guid}0"),
+            format!("Timeout-{}g", &guid[..35]),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        // bytes that ucs2_as_utf8() never writes: no lead byte, overlong units, a unit cut short
+        for name in [
+            &b"\xff"[..],
+            b"\x80",
+            b"\xc0\x80",
+            b"\xc1\xbf",
+            b"\xe0\x9f\xbf",
+            b"\xed\xa0",
+            b"\xc3",
+            b"\xf0\x9f\x98\x80",
+        ] {
+            refused.push(OsStr::from_bytes(&[name, b"-", guid.as_bytes()].concat()).to_owned());
+        }
+        for file in refused {
+            let error = VariableKey::from_efivar_file_name(&file)
+                .expect_err("read a variable from a name that is no efivar file's");
+
+            assert_eq!(error, NotAnEfivarFileName(file.clone()), "{file:?}");
+        }
+        assert_eq!(
+            NotAnEfivarFileName(OsString::from("README")).to_string(),
+            "'README' is not the name of an efivar file",
+            "message"
+        );
     }
 
     #[test]

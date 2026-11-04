@@ -66,6 +66,7 @@ Commands:
   ilo                Commands which work on machines having HPE's Ilo BMC
   set                Auto-identify backend and set/change the value of a question
   show-translations  Show the translation/spellings database for questions and answers
+  variable           Commands on this machine's EFI variables, which never read their data
 ```
 
 `hii`:
@@ -84,6 +85,14 @@ Commands:
   show-ifr        Show a human readable representation of the Hii Forms
 ```
 
+`variable`:
+
+```plain
+Commands:
+  help  Print this message or the help of the given subcommand(s)
+  list  List the name and vendor GUID of every EFI variable, never its data
+```
+
 `ilo`:
 
 ```plain
@@ -99,9 +108,9 @@ Commands:
 
 ## In the UEFI Shell
 
-`uefisettings.efi` runs `get`, `set`, `show-translations` and the `hii` commands but
-`extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots; it also reaches
-boot-service-only variables, and has no `-f` or `--efivars`.
+`uefisettings.efi` runs `get`, `set`, `show-translations`, the `variable` commands and the
+`hii` commands but `extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots; it
+also reaches boot-service-only variables, and has no `-f` or `--efivars`.
 
 ```sh
 rustup target add x86_64-unknown-uefi  # or i686-unknown-uefi, aarch64-unknown-uefi
@@ -127,6 +136,7 @@ be assigned to the process token; running elevated alone does not guarantee it.
 Pass `--no-efivars` to read no variables. No driver is shipped with this repository,
 and none has been tested here. Without a driver, `-f` still reads a HiiDB file, and,
 when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
+`variable list` fails there: the firmware environment calls reach a variable by its name only.
 
 ---
 
@@ -136,8 +146,8 @@ when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
 and writes nothing: `hii get`, `hii list-questions` and `hii show-ifr` read question values from
 an efivars dump that `hii dump-efivars` wrote on Linux (`--efivars DIR`, with its HiiDB unless
 `-f` names one) or from none (`--no-efivars`, with `-f`), and `hii list-strings` reads the HiiDB
-file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `hii set`, `hii extract-db` or
-`hii dump-efivars`. Dumps: see the [appendix](#appendix).
+file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `variable`, `hii set`,
+`hii extract-db` or `hii dump-efivars`. Dumps: see the [appendix](#appendix).
 
 ---
 
@@ -285,6 +295,25 @@ uefisettings never takes, checks or circumvents a firmware password, because UEF
 carry none. With an Administrator password installed, `administrator` lets root select from the OS
 the questions that the firmware's Setup reserves for Administrator sessions, as
 `--include grayed-out` already does more broadly.
+
+</details>
+
+<details>
+<summary>EFI variables</summary>
+
+`variable list [--guid GUID]` prints the name and vendor GUID of every EFI variable as a JSON
+array, sorted by name, then GUID, outside the thrift IDL of the other commands and with no `-j`;
+`--guid` keeps those of one vendor. It reads no variable's data. On Linux it lists the files of
+efivarfs, which shows each `/` of a name as `!` and holds the variables with runtime access only
+(UEFI 2.10 §8.2.2), none of Linux's own random seed (from Linux 6.2 on): those that
+GetNextVariableName() gave when efivarfs was mounted, up to the first name longer than 255
+characters or given twice, and those written through it since. `uefisettings.efi` lists the
+boot-service-only variables too. A name with a surrogate code unit, which the UCS-2 of CHAR16 does
+not hold (UEFI 2.11 §2.3.1), lists with U+FFFD for each.
+
+```sh
+uefisettings variable list --guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+```
 
 </details>
 

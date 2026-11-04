@@ -36,6 +36,8 @@ use uefisettings_backend_thrift::SetResponseList;
 use super::DumpEfivarsOptions;
 use super::HiiBackend;
 use super::SettingsBackend;
+use super::VariableBackend;
+use crate::efi_variables::VariableNames;
 use crate::hii::extract;
 use crate::hii::EfivarDump;
 use crate::hii::EfivarFiles;
@@ -61,6 +63,14 @@ impl HiiBackend {
     /// This machine's efivarfs.
     pub(super) fn system_variables() -> Result<impl FirmwareVariables> {
         Ok(EfivarFiles::system())
+    }
+}
+
+/// What the variable commands read: this machine's efivarfs.
+impl VariableBackend {
+    /// The names of this machine's EFI variables, as its efivarfs lists them.
+    pub(super) fn system_variable_names() -> impl VariableNames {
+        EfivarFiles::system()
     }
 }
 
