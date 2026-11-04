@@ -305,6 +305,7 @@ mod tests {
     fn package_list(root: &Rc<RefCell<IFROperation>>) -> ParsedPackageList {
         ParsedPackageList {
             guid: NIL_GUID,
+            device_path: None,
             strings: vec![BTreeMap::new()],
             forms: vec![Rc::clone(root)],
         }

@@ -134,3 +134,10 @@ pub(crate) fn form_package(children: &[Vec<u8>]) -> Vec<u8> {
     let length = PACKAGE_HEADER_SIZE + u32::try_from(ifr.len()).unwrap();
     [package_header(0x02, length), ifr].concat()
 }
+
+/// A device path package holding `device_path`.
+pub(super) fn device_path_package(device_path: &[u8]) -> Vec<u8> {
+    let length = PACKAGE_HEADER_SIZE
+        + u32::try_from(device_path.len()).expect("device path length fits a u32");
+    [&package_header(0x08, length)[..], device_path].concat()
+}

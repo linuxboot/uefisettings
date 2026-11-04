@@ -366,6 +366,16 @@ type IFRNodeLink = Rc<RefCell<IFROperation>>;
 /// of one package list.
 pub struct ParsedPackageList {
     pub guid: Guid,
+    /// The device path of the driver handle that added the list, from its device path package
+    /// (UEFI 2.10 §33.3.4), if it has one
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no Config Routing caller routes to a package list's driver yet"
+        )
+    )]
+    pub device_path: Option<DevicePath>,
     pub strings: Vec<StringMap>,
     pub forms: Vec<IFRNodeLink>,
 }
@@ -387,6 +397,7 @@ impl ParsedPackageList {
 /// For every package list, we will parse different packages. If package type is
 /// * string -> parse and save data
 /// * form -> parse and save data
+/// * device path -> save its bytes
 /// * something else (like fonts or animations) -> we don't care about them, so continue to the next package in the package list.
 ///
 /// In the end return the parsed package lists in HiiDB order; GUIDs may repeat.
@@ -401,11 +412,13 @@ pub fn read_db(source: &[u8]) -> Result<Vec<ParsedPackageList>> {
         .collect()
 }
 
-/// Parses the strings and form packages of a package list and skips the others.
+/// Parses the strings and form packages of a package list, keeps its device path package and
+/// skips the others.
 fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     // once filled this will have string maps from each string package in the package list.
     let mut package_list_string_maps: Vec<StringMap> = Vec::new();
     let mut roots: Vec<IFRNodeLink> = Vec::new();
+    let mut device_path = None;
 
     for package in get_packages(package_list)? {
         let mut package_cursor = Cursor::new(&package.data);
@@ -423,12 +436,24 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                     .context("failed to parse a form package")?;
                 roots.extend(form_sets);
             }
-            _ => continue,
+            // NewPackageList creates the one device path package of a list (UEFI 2.10 §33.3.4)
+            PackageType::DevicePath => {
+                ensure!(device_path.is_none(), "a second device path package");
+                device_path = Some(package.data.into());
+            }
+            PackageType::Guid
+            | PackageType::Fonts
+            | PackageType::Images
+            | PackageType::SimpleFonts
+            | PackageType::KeyboardLayout
+            | PackageType::End
+            | PackageType::Unknown(_) => continue,
         }
     }
 
     Ok(ParsedPackageList {
         guid: package_list.guid,
+        device_path,
         strings: package_list_string_maps,
         forms: roots,
     })
@@ -1426,6 +1451,61 @@ mod tests {
                 .borrow()
                 .op_code,
             root_node.op_code
+        );
+    }
+
+    /// PciRoot(0), then the End of Hardware Device Path node.
+    const PCI_ROOT_DEVICE_PATH: [u8; 16] = [
+        // ACPI PNP0A03, UID 0
+        0x02, 0x01, 0x0C, 0x00, 0xD0, 0x41, 0x03, 0x0A, 0x00, 0x00, 0x00, 0x00,
+        // End of Hardware Device Path
+        0x7F, 0xFF, 0x04, 0x00,
+    ];
+
+    /// read_db keeps the bytes of a list's device path package beside its strings, and no
+    /// device path for a list without one.
+    #[test]
+    fn test_read_db_keeps_the_device_path_package() {
+        let with_path = [
+            device_path_package(&PCI_ROOT_DEVICE_PATH),
+            en_strings_package(b'A'),
+            END_PACKAGE.to_vec(),
+        ]
+        .concat();
+        let hiidb = [package_list(&with_path), en_strings_list([0x22; 16], b'B')].concat();
+
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+
+        let got: Vec<_> = lists
+            .iter()
+            .map(|list| (list.device_path.clone(), list.strings.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    Some(DevicePath::from(PCI_ROOT_DEVICE_PATH.to_vec())),
+                    vec![BTreeMap::from([(1, "A".to_owned())])]
+                ),
+                (None, vec![BTreeMap::from([(1, "B".to_owned())])]),
+            ],
+            "lists with and without a device path package"
+        );
+    }
+
+    /// read_db refuses a list with two device path packages, as NewPackageList creates one.
+    #[test]
+    fn test_read_db_refuses_a_second_device_path_package() {
+        let path = device_path_package(&PCI_ROOT_DEVICE_PATH);
+        let hiidb = package_list(&[path.clone(), path, END_PACKAGE.to_vec()].concat());
+
+        let Err(err) = read_db(&hiidb) else {
+            panic!("read_db accepted two device path packages");
+        };
+
+        assert!(
+            format!("{err:#}").contains("a second device path package"),
+            "two device path packages: {err:#}"
         );
     }
 }
