@@ -23,6 +23,7 @@ use thiserror::Error;
 use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
@@ -86,7 +87,10 @@ pub(crate) struct FirmwareEnvironment<C> {
 
 impl<C: FirmwareEnvironmentCalls> FirmwareEnvironment<C> {
     /// What GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW reach.
-    const REACH: VariableReach = VariableReach::Windows;
+    const REACH: VariableReach = VariableReach::Runtime;
+    /// GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW, which errors
+    /// name.
+    const INTERFACE: VariableInterface = VariableInterface::FirmwareEnvironment;
 
     /// Firmware variables through `calls`, which tests fake, after it enables the
     /// SeSystemEnvironmentPrivilege: this process's token keeps it for every read and write.
@@ -161,6 +165,10 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
         Self::REACH
     }
 
+    fn interface(&self) -> VariableInterface {
+        Self::INTERFACE
+    }
+
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
         let (attributes, data) = self.read_all(key)?;
         attributes_and_data(key, attributes, &data, size)
@@ -173,7 +181,7 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
         let guid = variable_guid(key)?;
         let (attributes, data) = self.read_all(key)?;
         let mut bytes = [&attributes.to_ne_bytes()[..], &data].concat();
-        modify_variable_bytes(key, Self::REACH, &mut bytes, size, offset, encoded)?;
+        modify_variable_bytes(key, Self::INTERFACE, &mut bytes, size, offset, encoded)?;
         let data = bytes
             .get(EFIVARFS_HEADER_SIZE..)
             .context("data after the attributes word")?;

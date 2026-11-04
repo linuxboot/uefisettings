@@ -30,6 +30,7 @@ use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;
+use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
@@ -45,7 +46,10 @@ impl EfivarSource {
         self.validate()?;
         Ok(match self {
             Self::System => Box::new(VariableServices),
-            Self::Disabled => Box::new(UnreadVariables(VariableServices::REACH)),
+            Self::Disabled => Box::new(UnreadVariables {
+                reach: VariableServices::REACH,
+                interface: VariableServices::INTERFACE,
+            }),
         })
     }
 }
@@ -57,11 +61,17 @@ pub(crate) struct VariableServices;
 impl VariableServices {
     /// What GetVariable() and SetVariable() reach while boot services run.
     const REACH: VariableReach = VariableReach::BootServices;
+    /// GetVariable() and SetVariable(), which errors name.
+    const INTERFACE: VariableInterface = VariableInterface::VariableServices;
 }
 
 impl FirmwareVariables for VariableServices {
     fn reach(&self) -> VariableReach {
         Self::REACH
+    }
+
+    fn interface(&self) -> VariableInterface {
+        Self::INTERFACE
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -72,7 +82,7 @@ impl FirmwareVariables for VariableServices {
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
         let (data, attributes) = get_variable(key)?;
         let mut bytes = [&attributes.bits().to_ne_bytes()[..], &data].concat();
-        modify_variable_bytes(key, Self::REACH, &mut bytes, size, offset, encoded)?;
+        modify_variable_bytes(key, Self::INTERFACE, &mut bytes, size, offset, encoded)?;
         let data = bytes
             .get(EFIVARFS_HEADER_SIZE..)
             .context("data after the attributes word")?;

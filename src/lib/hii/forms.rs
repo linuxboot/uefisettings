@@ -42,6 +42,7 @@ use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EfivarsNotRead;
 use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
@@ -863,21 +864,26 @@ trait VariableStore {
         }
     }
 
-    /// Why variables of `reach` Runtime or Windows lack the variable of this VARSTORE_EFI, or
-    /// read none, as `error`, a VariableNotFound or EfivarsNotRead, says: the form declares it
-    /// without EFI_VARIABLE_RUNTIME_ACCESS. None for other errors, VarStores and reaches.
+    /// Why variables of `reach` Runtime lack the variable of this VARSTORE_EFI, or read none, as
+    /// `error`, a VariableNotFound or EfivarsNotRead, says, in the words of their `interface`: the
+    /// form declares it without EFI_VARIABLE_RUNTIME_ACCESS. None for other errors, VarStores and
+    /// reaches.
     fn explain_unread(
         &self,
         reach: VariableReach,
+        interface: VariableInterface,
         error: &anyhow::Error,
     ) -> Option<DeclaredBootServiceOnly> {
-        let reach = OsRuntimeReach::of(reach)?;
+        match reach {
+            VariableReach::Runtime => {}
+            VariableReach::BootServices => return None,
+        }
         if self.kind() != VariableStoreKind::EfiVariable || self.is_runtime_accessible() {
             return None;
         }
         let key = self.variable_key();
         match (error.is::<VariableNotFound>(), error.is::<EfivarsNotRead>()) {
-            (true, _) => Some(DeclaredBootServiceOnly::Missing { key, reach }),
+            (true, _) => Some(DeclaredBootServiceOnly::Missing { key, interface }),
             (false, true) => Some(DeclaredBootServiceOnly::NotRead { key }),
             (false, false) => None,
         }
@@ -888,26 +894,27 @@ trait VariableStore {
 /// variable from the OS, e.g. boot-service-only, leaves no file to rewrite; variables that reach
 /// BootServices reach every variable that the firmware has created.
 #[derive(Error, Debug)]
-#[error("{missing}: {}", .reach.not_found_refusal())]
+#[error("{missing}: {}", .interface.not_found_refusal())]
 struct VariableNotExported {
     missing: VariableNotFound,
-    reach: VariableReach,
+    interface: VariableInterface,
 }
 
 impl VariableNotExported {
-    /// Turns the VariableNotFound of FirmwareVariables of `reach` for the variable of `store`
-    /// into the DeclaredBootServiceOnly of VariableStore::explain_unread, if any, else into
-    /// VariableNotExported; other errors pass through unchanged.
+    /// Turns the VariableNotFound of FirmwareVariables of `reach` and `interface` for the variable
+    /// of `store` into the DeclaredBootServiceOnly of VariableStore::explain_unread, if any, else
+    /// into VariableNotExported; other errors pass through unchanged.
     fn explain(
         error: anyhow::Error,
         store: &dyn VariableStore,
         reach: VariableReach,
+        interface: VariableInterface,
     ) -> anyhow::Error {
-        if let Some(declared) = store.explain_unread(reach, &error) {
+        if let Some(declared) = store.explain_unread(reach, interface, &error) {
             return declared.into();
         }
         match error.downcast::<VariableNotFound>() {
-            Ok(missing) => Self { missing, reach }.into(),
+            Ok(missing) => Self { missing, interface }.into(),
             Err(error) => error,
         }
     }
@@ -920,12 +927,12 @@ enum DeclaredBootServiceOnly {
     /// VariableNotFound
     #[error(
         "EFI variable {key} is not present at OS runtime: {}, and its form declares it {}",
-        .reach.absence(),
+        .interface.absence(),
         DECLARED_BOOT_SERVICE_ONLY
     )]
     Missing {
         key: VariableKey,
-        reach: OsRuntimeReach,
+        interface: VariableInterface,
     },
     /// EfivarsNotRead
     #[error(
@@ -934,33 +941,6 @@ enum DeclaredBootServiceOnly {
         DECLARED_BOOT_SERVICE_ONLY
     )]
     NotRead { key: VariableKey },
-}
-
-/// A VariableReach at OS runtime, where firmware hides a variable without
-/// EFI_VARIABLE_RUNTIME_ACCESS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OsRuntimeReach {
-    Runtime,
-    Windows,
-}
-
-impl OsRuntimeReach {
-    /// `reach` at OS runtime; None for BootServices.
-    fn of(reach: VariableReach) -> Option<Self> {
-        match reach {
-            VariableReach::Runtime => Some(Self::Runtime),
-            VariableReach::Windows => Some(Self::Windows),
-            VariableReach::BootServices => None,
-        }
-    }
-
-    /// How variables of this reach lack a variable.
-    fn absence(self) -> &'static str {
-        match self {
-            Self::Runtime => "efivarfs does not list it",
-            Self::Windows => "GetFirmwareEnvironmentVariableExW does not find it",
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -999,7 +979,7 @@ mod non_efi_varstore_tests {
     const NOT_PRESENT: &str = "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 is \
         not present at OS runtime: efivarfs does not list it, and its form declares it \
         boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)";
-    /// NOT_PRESENT for variables that reach Windows.
+    /// NOT_PRESENT for variables through the firmware environment calls.
     const WINDOWS_NOT_PRESENT: &str = "EFI variable \
         TestVarStore-00000000-0000-0000-0000-000000000000 is not present at OS runtime: \
         GetFirmwareEnvironmentVariableExW does not find it, and its form declares it \
@@ -1087,35 +1067,50 @@ mod non_efi_varstore_tests {
     }
 
     /// Without efivars, get names the boot-service-only declaration of a VARSTORE_EFI for
-    /// variables that reach Runtime, as those of EfivarSource::Disabled do, or Windows, and shows
-    /// another VARSTORE_EFI, or any for variables that reach BootServices, as not read.
+    /// variables that reach Runtime, as those of EfivarSource::Disabled do, also through the
+    /// firmware environment calls, and shows another VARSTORE_EFI, or any for variables that reach
+    /// BootServices, as not read.
     #[test]
     fn unread_variable_of_a_boot_service_only_form_falls_back_to_the_form() {
         let declared = format!("<ValueUnavailable: {DECLARED_NOT_READ}>");
         let not_read = "<ValueUnavailable: EFI variables not read>".to_string();
-        let unread = |reach| EfivarReader::with_variables(Box::new(UnreadVariables(reach)));
+        let unread = |reach, interface| {
+            EfivarReader::with_variables(Box::new(UnreadVariables { reach, interface }))
+        };
+        let firmware_environment = || {
+            unread(
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+            )
+        };
+        let variable_services = || {
+            unread(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            )
+        };
         let cases = [
             ("Disabled", disabled_reader(), NV_BS, declared.clone()),
             ("Disabled", disabled_reader(), NV_BS_RT, not_read.clone()),
-            ("Windows", unread(VariableReach::Windows), NV_BS, declared),
             (
-                "Windows",
-                unread(VariableReach::Windows),
+                "FirmwareEnvironment",
+                firmware_environment(),
+                NV_BS,
+                declared,
+            ),
+            (
+                "FirmwareEnvironment",
+                firmware_environment(),
                 NV_BS_RT,
                 not_read.clone(),
             ),
             (
-                "BootServices",
-                unread(VariableReach::BootServices),
+                "VariableServices",
+                variable_services(),
                 NV_BS,
                 not_read.clone(),
             ),
-            (
-                "BootServices",
-                unread(VariableReach::BootServices),
-                NV_BS_RT,
-                not_read,
-            ),
+            ("VariableServices", variable_services(), NV_BS_RT, not_read),
         ];
         for (variables, mut reader, attributes, want) in cases {
             let without = read_current_value_bytes(
@@ -1134,15 +1129,18 @@ mod non_efi_varstore_tests {
         }
     }
 
-    /// get reads the variable of a VARSTORE_EFI that variables reaching Runtime or Windows hold,
-    /// whatever runtime access the form declares: firmware may give an NV|BS VarStore's variable
-    /// runtime access, as firmware whose EDK2 gives every non-volatile variable runtime access
-    /// does.
+    /// get reads the variable of a VARSTORE_EFI that variables reaching Runtime hold, through
+    /// efivarfs or the firmware environment calls, whatever runtime access the form declares:
+    /// firmware may give an NV|BS VarStore's variable runtime access, as firmware whose EDK2 gives
+    /// every non-volatile variable runtime access does.
     #[test]
     fn present_variable_of_a_boot_service_only_form_is_read() {
-        for reach in [VariableReach::Runtime, VariableReach::Windows] {
+        for interface in [
+            VariableInterface::Efivarfs,
+            VariableInterface::FirmwareEnvironment,
+        ] {
             for declared in [NV_BS, NV_BS_RT] {
-                let variables = MemoryVariables::with_reach(reach);
+                let variables = MemoryVariables::new(VariableReach::Runtime, interface);
                 variables.insert(variable_key("TestVarStore"), NV_BS_RT, &[1]);
                 let mut reader = EfivarReader::with_variables(Box::new(variables));
 
@@ -1155,7 +1153,7 @@ mod non_efi_varstore_tests {
                     .map(<[u8]>::to_vec)
                     .map_err(|reason| reason.to_answer()),
                     Ok(efivar_file_bytes(NV_BS_RT, &[1])),
-                    "{reach:?}, VarStore attributes {declared:#x}, efivar attributes 0x7"
+                    "{interface:?}, VarStore attributes {declared:#x}, efivar attributes 0x7"
                 );
             }
         }
@@ -1163,7 +1161,8 @@ mod non_efi_varstore_tests {
 
     /// Writes 1 at offset 0 of `store`, as set does, in `variables`.
     fn write_one(store: &VarStoreEfi, variables: &MemoryVariables) -> Result<()> {
-        VarStoreWrite::new(store, 0, TypeValue::NumSize8(1), variables.reach())?.write(variables)
+        VarStoreWrite::new(store, 0, TypeValue::NumSize8(1), variables.interface())?
+            .write(variables)
     }
 
     /// MemoryVariables holding TestVarStore: NV_BS_RT, then 0.
@@ -1174,14 +1173,14 @@ mod non_efi_varstore_tests {
     }
 
     /// get shows a missing variable of a boot-service-only form by the text of set's refusal of
-    /// it, in the words of the variables' reach.
+    /// it, in the words of the variables' interface.
     #[test]
     fn boot_service_only_text_is_shared_by_get_and_set() {
-        for (reach, want) in [
-            (VariableReach::Runtime, NOT_PRESENT),
-            (VariableReach::Windows, WINDOWS_NOT_PRESENT),
+        for (interface, want) in [
+            (VariableInterface::Efivarfs, NOT_PRESENT),
+            (VariableInterface::FirmwareEnvironment, WINDOWS_NOT_PRESENT),
         ] {
-            let variables = Rc::new(MemoryVariables::with_reach(reach));
+            let variables = Rc::new(MemoryVariables::new(VariableReach::Runtime, interface));
             let mut reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
 
             let refusal = write_one(&efi_varstore(NV_BS), &variables)
@@ -1192,11 +1191,11 @@ mod non_efi_varstore_tests {
                     .map(<[u8]>::to_vec)
                     .map_err(|reason| reason.to_answer());
 
-            assert_eq!(refusal, want, "{reach:?}: set");
+            assert_eq!(refusal, want, "{interface:?}: set");
             assert_eq!(
                 read,
                 Err(format!("<ValueUnavailable: {refusal}>")),
-                "{reach:?}: get"
+                "{interface:?}: get"
             );
         }
     }
@@ -1226,15 +1225,21 @@ mod non_efi_varstore_tests {
         }
     }
 
-    /// Variables of every reach read and write the variable of an NV|BS VARSTORE_EFI where it
-    /// exists, as only choice_for_set refuses a write by the variable's own attributes. Where it
-    /// is missing, variables that reach Runtime or Windows name the form's declaration.
+    /// Variables of every reach and interface read and write the variable of an NV|BS VARSTORE_EFI
+    /// where it exists, as only choice_for_set refuses a write by the variable's own attributes.
+    /// Where it is missing, variables that reach Runtime name the form's declaration, whatever
+    /// their interface.
     #[test]
     fn boot_service_only_form_decides_only_for_a_missing_variable() {
         let missing = |text: &str| Err(format!("<ValueUnavailable: {text}>"));
-        let present = |reach| {
+        let get_variable_not_present = "EFI variable \
+            TestVarStore-00000000-0000-0000-0000-000000000000 is not present at OS runtime: \
+            GetVariable() does not find it, and its form declares it boot-service-only (no \
+            EFI_VARIABLE_RUNTIME_ACCESS)";
+        let present = |reach, interface| {
             (
                 reach,
+                interface,
                 Some(NV_BS),
                 Ok(efivar_file_bytes(NV_BS, &[0])),
                 Ok(()),
@@ -1242,11 +1247,18 @@ mod non_efi_varstore_tests {
             )
         };
         let cases = [
-            present(VariableReach::BootServices),
-            present(VariableReach::Runtime),
-            present(VariableReach::Windows),
+            present(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+            present(VariableReach::Runtime, VariableInterface::Efivarfs),
+            present(
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+            ),
             (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 None,
                 missing("no EFI variable TestVarStore-00000000-0000-0000-0000-000000000000"),
                 Err(
@@ -1258,27 +1270,52 @@ mod non_efi_varstore_tests {
             ),
             (
                 VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 None,
                 missing(NOT_PRESENT),
                 Err(NOT_PRESENT.to_string()),
                 vec![],
             ),
             (
-                VariableReach::Windows,
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
                 None,
                 missing(WINDOWS_NOT_PRESENT),
                 Err(WINDOWS_NOT_PRESENT.to_string()),
                 vec![],
             ),
+            (
+                VariableReach::BootServices,
+                VariableInterface::Efivarfs,
+                None,
+                missing("no EFI variable TestVarStore-00000000-0000-0000-0000-000000000000"),
+                Err(
+                    "no EFI variable TestVarStore-00000000-0000-0000-0000-000000000000: the \
+                     firmware has not created it or does not expose it to the OS, so its \
+                     questions cannot be set from Linux; change them in the firmware setup, or \
+                     ask the board vendor for firmware that exposes it; see \
+                     https://github.com/linuxboot/uefisettings/issues/2"
+                        .to_string(),
+                ),
+                vec![],
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::VariableServices,
+                None,
+                missing(get_variable_not_present),
+                Err(get_variable_not_present.to_string()),
+                vec![],
+            ),
         ];
 
-        for (reach, attributes, read_outcome, write_outcome, writes) in cases {
-            let variables = Rc::new(MemoryVariables::with_reach(reach));
+        for (reach, interface, attributes, read_outcome, write_outcome, writes) in cases {
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
             if let Some(attributes) = attributes {
                 variables.insert(variable_key("TestVarStore"), attributes, &[0]);
             }
             let mut reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
-            let case = format!("{reach:?}, variable attributes {attributes:?}");
+            let case = format!("{reach:?}, {interface:?}, variable attributes {attributes:?}");
 
             let read =
                 read_current_value_bytes(&Ok(Box::new(efi_varstore(NV_BS))), 0..1, &mut reader)
@@ -1306,7 +1343,10 @@ mod non_efi_varstore_tests {
     /// itself has: a volatile one stays unwritten.
     #[test]
     fn boot_services_refuse_a_volatile_variable() {
-        let variables = MemoryVariables::with_reach(VariableReach::BootServices);
+        let variables = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
         variables.insert(variable_key("TestVarStore"), BS_RT, &[0]);
 
         let error =
@@ -1462,7 +1502,7 @@ mod non_efi_varstore_tests {
             (
                 ValueUnavailable::DeclaredBootServiceOnly(DeclaredBootServiceOnly::Missing {
                     key: name.clone(),
-                    reach: OsRuntimeReach::Runtime,
+                    interface: VariableInterface::Efivarfs,
                 }),
                 "<ValueUnavailable: EFI variable Setup-00000000-0000-0000-0000-000000000000 is not \
                  present at OS runtime: efivarfs does not list it, and its form declares it \
@@ -1471,7 +1511,7 @@ mod non_efi_varstore_tests {
             (
                 ValueUnavailable::DeclaredBootServiceOnly(DeclaredBootServiceOnly::Missing {
                     key: name.clone(),
-                    reach: OsRuntimeReach::Windows,
+                    interface: VariableInterface::FirmwareEnvironment,
                 }),
                 "<ValueUnavailable: EFI variable Setup-00000000-0000-0000-0000-000000000000 is not \
                  present at OS runtime: GetFirmwareEnvironmentVariableExW does not find it, and \
@@ -1684,6 +1724,7 @@ fn read_current_value_bytes<'a>(
         Err(error) => return Err(ValueUnavailable::NoVarStore(error.to_string())),
     };
     let reach = reader.reach();
+    let interface = reader.interface();
 
     // A variable that the read finds is read whatever runtime access its VARSTORE_EFI declares:
     // firmware may give an NV|BS VarStore's variable runtime access, as firmware whose EDK2 gives
@@ -1691,10 +1732,12 @@ fn read_current_value_bytes<'a>(
     // unread variable.
     let bytes = reader
         .read(EfivarRange::of(store.as_ref()), value)
-        .map_err(|error| match store.explain_unread(reach, error) {
-            Some(declared) => ValueUnavailable::DeclaredBootServiceOnly(declared),
-            None => ValueUnavailable::from_read_error(store.kind(), error),
-        })?;
+        .map_err(
+            |error| match store.explain_unread(reach, interface, error) {
+                Some(declared) => ValueUnavailable::DeclaredBootServiceOnly(declared),
+                None => ValueUnavailable::from_read_error(store.kind(), error),
+            },
+        )?;
     if let Some(attributes) = efivar_attributes(bytes) {
         check_decodable(&store.variable_key(), attributes)
             .map_err(ValueUnavailable::EnhancedAuthenticated)?;
@@ -3290,14 +3333,15 @@ pub(crate) fn choice_for_set(
     };
     let store = descriptor.store()?;
     let reach = reader.reach();
+    let interface = reader.interface();
     if let Some(error) = reader.read_error(store) {
-        if let Some(declared) = store.explain_unread(reach, error) {
+        if let Some(declared) = store.explain_unread(reach, interface, error) {
             return Err(declared.into());
         }
         return Err(match error.downcast_ref::<VariableNotFound>() {
             Some(missing) => VariableNotExported {
                 missing: missing.clone(),
-                reach,
+                interface,
             }
             .into(),
             None => anyhow!("{error:#}"),
@@ -3305,7 +3349,7 @@ pub(crate) fn choice_for_set(
     }
     if let Some(attributes) = reader.attributes(store) {
         let key = store.variable_key();
-        check_non_volatile(&key, reach, attributes)?;
+        check_non_volatile(&key, interface, attributes)?;
         check_unauthenticated(&key, attributes)?;
         check_runtime_writable(&key, reach, attributes)?;
     }
@@ -3319,7 +3363,7 @@ mod choice_for_set_tests {
     use super::*;
 
     /// The refusal of the efivar Present with the attributes NV_BS through variables that reach
-    /// Runtime or Windows.
+    /// Runtime.
     const PRESENT_BOOT_SERVICE_ONLY: &str = "EFI variable \
         Present-00000000-0000-0000-0000-000000000000 has no EFI_VARIABLE_RUNTIME_ACCESS \
         (attributes 0x3), so the firmware refuses to write it at OS runtime";
@@ -3328,7 +3372,7 @@ mod choice_for_set_tests {
     const MISSING_NOT_PRESENT: &str = "EFI variable Missing-00000000-0000-0000-0000-000000000000 \
         is not present at OS runtime: efivarfs does not list it, and its form declares it \
         boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)";
-    /// MISSING_NOT_PRESENT for variables that reach Windows.
+    /// MISSING_NOT_PRESENT for variables through the firmware environment calls.
     const WINDOWS_MISSING_NOT_PRESENT: &str = "EFI variable \
         Missing-00000000-0000-0000-0000-000000000000 is not present at OS runtime: \
         GetFirmwareEnvironmentVariableExW does not find it, and its form declares it \
@@ -3643,42 +3687,56 @@ mod choice_for_set_tests {
     }
 
     /// set chooses a question on an NV|BS variable from variables that reach BootServices, and
-    /// refuses it, having read it, from variables that reach Runtime or Windows.
+    /// refuses it, having read it, from variables that reach Runtime, through efivarfs or the
+    /// firmware environment calls.
     #[test]
     fn match_on_a_boot_service_only_efivar_is_refused_only_for_runtime_variables() {
         let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS, 1)], 1);
-        let choose = |reach| {
-            let variables = Rc::new(MemoryVariables::with_reach(reach));
+        let choose = |reach, interface| {
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
             variables.insert(variable_key("Present"), NV_BS, &[0]);
             let reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
             (choice_by(&root, reader, None), variables.reads())
         };
 
-        let (choice, reads) = choose(VariableReach::BootServices);
+        let (choice, reads) = choose(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
         assert!(
             matches!(choice, Ok(Choice::Chosen(..))),
             "BootServices: {choice:?}"
         );
         assert_eq!(reads, [(variable_key("Present"), 1)], "BootServices: reads");
-        for reach in [VariableReach::Runtime, VariableReach::Windows] {
-            let (choice, reads) = choose(reach);
+        for interface in [
+            VariableInterface::Efivarfs,
+            VariableInterface::FirmwareEnvironment,
+        ] {
+            let (choice, reads) = choose(VariableReach::Runtime, interface);
             assert_eq!(
                 choice.map_err(|error| error.to_string()).err().as_deref(),
                 Some(PRESENT_BOOT_SERVICE_ONLY),
-                "{reach:?}"
+                "{interface:?}"
             );
-            assert_eq!(reads, [(variable_key("Present"), 1)], "{reach:?}: reads");
+            assert_eq!(
+                reads,
+                [(variable_key("Present"), 1)],
+                "{interface:?}: reads"
+            );
         }
     }
 
     /// set refuses a match whose variable lacks EFI_VARIABLE_RUNTIME_ACCESS and chooses one whose
     /// variable has it, whatever runtime access its VARSTORE_EFI declares, from efivarfs and from
-    /// variables that reach Windows; the refusal comes before set tells whether the match is
+    /// the firmware environment calls; the refusal comes before set tells whether the match is
     /// selectable.
     #[test]
     fn match_is_decided_by_the_runtime_access_of_its_efivar() {
-        let windows = |root: &Rc<RefCell<IFROperation>>, attributes| {
-            let variables = MemoryVariables::with_reach(VariableReach::Windows);
+        let firmware_environment = |root: &Rc<RefCell<IFROperation>>, attributes| {
+            let variables = MemoryVariables::new(
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+            );
             variables.insert(variable_key("Present"), attributes, &[0]);
             choice_by(
                 root,
@@ -3698,7 +3756,11 @@ mod choice_for_set_tests {
                     choice_attributed(&root, NV_BS),
                     choice_attributed(&root, NV_BS_RT),
                 ),
-                ("Windows", windows(&root, NV_BS), windows(&root, NV_BS_RT)),
+                (
+                    "Windows",
+                    firmware_environment(&root, NV_BS),
+                    firmware_environment(&root, NV_BS_RT),
+                ),
             ];
 
             for (variables, boot_service_only, runtime) in cases {
@@ -3716,7 +3778,7 @@ mod choice_for_set_tests {
         }
         for (variables, undetermined) in [
             ("efivarfs", choice_attributed(&undetermined_on(3), NV_BS)),
-            ("Windows", windows(&undetermined_on(3), NV_BS)),
+            ("Windows", firmware_environment(&undetermined_on(3), NV_BS)),
         ] {
             assert_eq!(
                 refusal(undetermined).as_deref(),
@@ -3727,23 +3789,32 @@ mod choice_for_set_tests {
     }
 
     /// set refuses a match whose variable is missing by its VARSTORE_EFI's boot-service-only
-    /// declaration for variables that reach Runtime or Windows, with the text that get shows for
-    /// it, and as VariableNotExported otherwise.
+    /// declaration for variables that reach Runtime, in the words of their interface, with the
+    /// text that get shows for it, and as VariableNotExported otherwise.
     #[test]
     fn match_on_a_missing_efivar_of_a_boot_service_only_store_is_not_present() {
+        let efivarfs = (VariableReach::Runtime, VariableInterface::Efivarfs);
+        let firmware_environment = (
+            VariableReach::Runtime,
+            VariableInterface::FirmwareEnvironment,
+        );
+        let variable_services = (
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
         let cases = [
-            (NV_BS, VariableReach::Runtime, Some(MISSING_NOT_PRESENT)),
+            (NV_BS, efivarfs, Some(MISSING_NOT_PRESENT)),
             (
                 NV_BS,
-                VariableReach::Windows,
+                firmware_environment,
                 Some(WINDOWS_MISSING_NOT_PRESENT),
             ),
-            (NV_BS, VariableReach::BootServices, None),
-            (NV_BS_RT, VariableReach::Runtime, None),
-            (NV_BS_RT, VariableReach::Windows, None),
+            (NV_BS, variable_services, None),
+            (NV_BS_RT, efivarfs, None),
+            (NV_BS_RT, firmware_environment, None),
         ];
 
-        for (declared, reach, not_present) in cases {
+        for (declared, (reach, interface), not_present) in cases {
             let root = picked_one_of(&[var_store_efi(1, "Missing", declared, 1)], 1);
             let store = VarStoreEfi {
                 var_store_id: 1,
@@ -3753,8 +3824,8 @@ mod choice_for_set_tests {
                 name: "Missing".into(),
             };
             let mut reader =
-                EfivarReader::with_variables(Box::new(MemoryVariables::with_reach(reach)));
-            let case = format!("VarStore attributes {declared:#x}, {reach:?}");
+                EfivarReader::with_variables(Box::new(MemoryVariables::new(reach, interface)));
+            let case = format!("VarStore attributes {declared:#x}, {reach:?}, {interface:?}");
 
             let read = read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut reader)
                 .map(<[u8]>::to_vec)
@@ -3783,28 +3854,188 @@ mod choice_for_set_tests {
         }
     }
 
-    /// set's refusal of a match whose variable is missing follows the reach of the variables
+    /// set's refusal of a match whose variable is missing follows the interface of the variables
     /// that it reads.
     #[test]
-    fn match_on_a_missing_variable_is_explained_by_its_reach() {
+    fn match_on_a_missing_variable_is_explained_by_its_interface() {
         let root = picked_one_of(&[var_store_efi(1, "Missing", NV_BS_RT, 1)], 1);
         let cases = [
-            (VariableReach::Runtime, "does not expose it to the OS"),
+            (
+                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
+                "does not expose it to the OS",
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+                "cannot be set from Windows",
+            ),
             (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 ": the firmware has not created it, and set never creates variables",
             ),
         ];
 
-        for (reach, refusal) in cases {
-            let reader = EfivarReader::with_variables(Box::new(MemoryVariables::with_reach(reach)));
+        for (reach, interface, refusal) in cases {
+            let reader =
+                EfivarReader::with_variables(Box::new(MemoryVariables::new(reach, interface)));
             let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
 
             let text = error.to_string();
             assert!(
                 text.starts_with(MISSING_NOT_FOUND) && text.contains(refusal),
-                "{reach:?}: {text}"
+                "{interface:?}: {text}"
             );
+        }
+    }
+
+    /// set decides the runtime access of a match by the reach of its variables, whatever their
+    /// interface: it chooses a question on an NV|BS variable from variables that reach
+    /// BootServices and refuses it from those that reach Runtime.
+    #[test]
+    fn runtime_access_is_decided_by_reach_whatever_the_interface() {
+        let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS, 1)], 1);
+        for interface in [
+            VariableInterface::Efivarfs,
+            VariableInterface::VariableServices,
+            VariableInterface::FirmwareEnvironment,
+        ] {
+            for (reach, refusal) in [
+                (VariableReach::BootServices, None),
+                (VariableReach::Runtime, Some(PRESENT_BOOT_SERVICE_ONLY)),
+            ] {
+                let variables = MemoryVariables::new(reach, interface);
+                variables.insert(variable_key("Present"), NV_BS, &[0]);
+
+                let choice = choice_by(
+                    &root,
+                    EfivarReader::with_variables(Box::new(variables)),
+                    None,
+                );
+
+                let chosen = matches!(choice, Ok(Choice::Chosen(..)));
+                assert_eq!(
+                    (chosen, choice.err().map(|error| error.to_string())),
+                    (refusal.is_none(), refusal.map(str::to_string)),
+                    "{reach:?}, {interface:?}"
+                );
+            }
+        }
+    }
+
+    /// get and set explain a missing variable of a boot-service-only VARSTORE_EFI by the reach of
+    /// their variables, whatever their interface, in the words of that interface: by the form's
+    /// declaration for variables that reach Runtime, and otherwise as VariableNotExported.
+    #[test]
+    fn missing_variable_is_explained_by_reach_in_the_words_of_its_interface() {
+        let root = picked_one_of(&[var_store_efi(1, "Missing", NV_BS, 1)], 1);
+        let cases = [
+            (
+                VariableInterface::Efivarfs,
+                "efivarfs does not list it",
+                "cannot be set from Linux",
+            ),
+            (
+                VariableInterface::VariableServices,
+                "GetVariable() does not find it",
+                "set never creates variables",
+            ),
+            (
+                VariableInterface::FirmwareEnvironment,
+                "GetFirmwareEnvironmentVariableExW does not find it",
+                "cannot be set from Windows",
+            ),
+        ];
+
+        let crossed = cases.into_iter().flat_map(|case| {
+            [VariableReach::Runtime, VariableReach::BootServices].map(|reach| (case, reach))
+        });
+        for ((interface, absence, not_found_refusal), reach) in crossed {
+            let store = VarStoreEfi {
+                var_store_id: 1,
+                guid: NIL_GUID,
+                attributes: NV_BS,
+                size: 1,
+                name: "Missing".into(),
+            };
+            let mut reader =
+                EfivarReader::with_variables(Box::new(MemoryVariables::new(reach, interface)));
+            let case = format!("{reach:?}, {interface:?}");
+
+            let read = read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut reader)
+                .map(<[u8]>::to_vec)
+                .map_err(|reason| reason.to_answer());
+            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+
+            match reach {
+                VariableReach::Runtime => {
+                    let not_present = format!(
+                        "EFI variable Missing-00000000-0000-0000-0000-000000000000 is not \
+                         present at OS runtime: {absence}, and its form declares it \
+                         boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)"
+                    );
+                    assert_eq!(
+                        read,
+                        Err(format!("<ValueUnavailable: {not_present}>")),
+                        "{case}: get"
+                    );
+                    assert_eq!(error.to_string(), not_present, "{case}: set");
+                }
+                VariableReach::BootServices => {
+                    assert_eq!(
+                        read,
+                        Err(format!("<ValueUnavailable: {MISSING_NOT_FOUND}>")),
+                        "{case}: get"
+                    );
+                    let text = error.to_string();
+                    assert!(
+                        error.is::<VariableNotExported>()
+                            && text.starts_with(MISSING_NOT_FOUND)
+                            && text.contains(not_found_refusal),
+                        "{case}: set: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// set refuses a match on a volatile efivar in the words of the interface of its variables,
+    /// whatever their reach.
+    #[test]
+    fn match_on_a_volatile_efivar_is_refused_in_the_words_of_its_interface() {
+        let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS_RT, 1)], 1);
+        for (interface, refusal) in [
+            (
+                VariableInterface::Efivarfs,
+                " and cannot be written through efivarfs",
+            ),
+            (
+                VariableInterface::VariableServices,
+                ", so a write would not outlast a power cycle",
+            ),
+            (
+                VariableInterface::FirmwareEnvironment,
+                ", so a write would not outlast a power cycle",
+            ),
+        ] {
+            for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+                let variables = MemoryVariables::new(reach, interface);
+                variables.insert(variable_key("Present"), BS_RT, &[0]);
+                let reader = EfivarReader::with_variables(Box::new(variables));
+
+                let error =
+                    choice_by(&root, reader, None).expect_err("set refuses a volatile efivar");
+
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "EFI variable Present-00000000-0000-0000-0000-000000000000 is volatile \
+                         (no EFI_VARIABLE_NON_VOLATILE){refusal}"
+                    ),
+                    "{reach:?}, {interface:?}"
+                );
+            }
         }
     }
 
@@ -5265,13 +5496,13 @@ struct VarStoreWrite<'a> {
 }
 
 impl<'a> VarStoreWrite<'a> {
-    /// The write of `value` at VarOffset `offset` of `store`, through variables of `reach`: fails
-    /// unless `value` is a number that fits in the Size of `store` there.
+    /// The write of `value` at VarOffset `offset` of `store`, through variables of `interface`:
+    /// fails unless `value` is a number that fits in the Size of `store` there.
     fn new(
         store: &'a dyn VariableStore,
         offset: u16,
         value: TypeValue,
-        reach: VariableReach,
+        interface: VariableInterface,
     ) -> Result<Self> {
         let encoded = match value {
             TypeValue::NumSize8(value) => value.to_le_bytes().to_vec(),
@@ -5287,7 +5518,7 @@ impl<'a> VarStoreWrite<'a> {
             | TypeValue::Action(_)
             | TypeValue::Ref(_)
             | TypeValue::Unknown(_) => {
-                return Err(anyhow!("unsupported value type for {}", reach.write()))
+                return Err(anyhow!("unsupported value type for {}", interface.write()))
             }
         };
         if usize::from(offset) + encoded.len() > usize::from(store.size()) {
@@ -5318,16 +5549,23 @@ impl<'a> VarStoreWrite<'a> {
                 self.offset,
                 &self.encoded,
             )
-            .map_err(|error| VariableNotExported::explain(error, self.store, variables.reach()))
+            .map_err(|error| {
+                VariableNotExported::explain(
+                    error,
+                    self.store,
+                    variables.reach(),
+                    variables.interface(),
+                )
+            })
     }
 }
 
-/// The write that sets `question` to `new_value` through variables of `reach`; for a ONE_OF, to
-/// the option of that text that select_option picks without --include.
+/// The write that sets `question` to `new_value` through variables of `interface`; for a ONE_OF,
+/// to the option of that text that select_option picks without --include.
 fn value_write<'a>(
     question: &'a QuestionDescriptor,
     new_value: &str,
-    reach: VariableReach,
+    interface: VariableInterface,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
     let ValueLocation::Bytes { offset, .. } = question.location else {
@@ -5341,7 +5579,7 @@ fn value_write<'a>(
                 IncludedStates::empty(),
             )?
             .ok_or(ChangeValueError::InvalidOption)?;
-        return option_write(question, option, reach);
+        return option_write(question, option, interface);
     }
     let value = match &question.numeric_range {
         Some(range) => range.parse_value(new_value)?,
@@ -5384,15 +5622,15 @@ fn value_write<'a>(
             }
         },
     };
-    Ok(VarStoreWrite::new(store, offset, value, reach)?)
+    Ok(VarStoreWrite::new(store, offset, value, interface)?)
 }
 
 /// The write of `option`, one of the possible_options of the ONE_OF `question`, through
-/// variables of `reach`.
+/// variables of `interface`.
 fn option_write<'a>(
     question: &'a QuestionDescriptor,
     option: &AnswerOption,
-    reach: VariableReach,
+    interface: VariableInterface,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
     let ValueLocation::Bytes { offset, .. } = question.location else {
@@ -5402,7 +5640,7 @@ fn option_write<'a>(
         question.store()?,
         offset,
         option.raw_value,
-        reach,
+        interface,
     )?)
 }
 
@@ -5435,14 +5673,18 @@ pub(crate) fn set_questions<'a>(
             // (example whatever matches from [Enabled, Enable])
             // else try setting the new_value because it might be some arbitrary value like a number
             // (will return error if doesn't match constraints)
-            let reach = variables.reach();
+            let interface = variables.interface();
             if descriptor.possible_options.is_empty() {
-                return Ok((selector, value_write(descriptor, new_value, reach)?, None));
+                return Ok((
+                    selector,
+                    value_write(descriptor, new_value, interface)?,
+                    None,
+                ));
             }
             let option = descriptor.chosen_option(texts, include)?;
             Ok((
                 selector,
-                option_write(descriptor, option, reach)?,
+                option_write(descriptor, option, interface)?,
                 Some(option),
             ))
         })
@@ -5764,6 +6006,48 @@ mod set_questions_tests {
         }
     }
 
+    /// set refuses an option of a type that it does not write in the words of the interface of
+    /// its variables, whatever their reach, and writes nothing.
+    #[test]
+    fn unsupported_option_is_refused_in_the_words_of_its_interface() {
+        for (reach, interface, write) in [
+            (
+                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
+                "efivarfs write",
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+                "SetFirmwareEnvironmentVariableExW write",
+            ),
+            (
+                VariableReach::BootServices,
+                VariableInterface::Efivarfs,
+                "efivarfs write",
+            ),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+                "SetVariable() write",
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            let boolean_option = one_of_on_store(
+                one_of_option(6, 0x04, &[1]),
+                writable_var_store("Boolean", &[0], &variables),
+            );
+            let case = format!("{reach:?}, {interface:?}");
+
+            assert_eq!(
+                set_options(&variables, &[("B", &boolean_option)], "1", &["Enabled"]),
+                Err(format!("unsupported value type for {write}")),
+                "{case}"
+            );
+            assert_eq!(writes(&variables, "Boolean"), [], "{case}: writes");
+        }
+    }
+
     #[test]
     fn each_failure_is_named_once() {
         const FIRST: WriteError = WriteError {
@@ -6034,7 +6318,7 @@ mod tests {
                 &store,
                 u16::try_from(offset).expect("offset fits u16"),
                 data,
-                variables.reach(),
+                variables.interface(),
             )
             .unwrap_or_else(|error| panic!("write {data:?} at offset {offset}: {error}"));
             assert_eq!(write.encoded, encoded, "{data:?}");
@@ -6058,7 +6342,7 @@ mod tests {
         let store = efi_variable("Short", 4);
         let variables = MemoryVariables::default();
         variables.insert(store.variable_key(), NV_BS_RT, &[0; 2]);
-        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), variables.reach())
+        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), variables.interface())
             .expect("write 1");
 
         let error = write
@@ -6077,8 +6361,13 @@ mod tests {
     #[test]
     fn write_of_a_missing_variable_is_explained_as_not_exported() {
         let store = efi_variable("Setup", 1);
-        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), VariableReach::Runtime)
-            .expect("write 1");
+        let write = VarStoreWrite::new(
+            &store,
+            0,
+            TypeValue::NumSize8(1),
+            VariableInterface::Efivarfs,
+        )
+        .expect("write 1");
 
         let error = write
             .write(&MemoryVariables::default())
@@ -6102,7 +6391,7 @@ mod tests {
         ] {
             let store = efi_variable("Test", size);
             assert_eq!(
-                VarStoreWrite::new(&store, offset, data, VariableReach::Runtime)
+                VarStoreWrite::new(&store, offset, data, VariableInterface::Efivarfs)
                     .map(drop)
                     .map_err(|error| error.to_string()),
                 Err(format!(
@@ -6120,7 +6409,7 @@ mod tests {
                 &efi_variable("Test", 42),
                 0,
                 TypeValue::Boolean(true),
-                VariableReach::Runtime
+                VariableInterface::Efivarfs
             )
             .map(drop)
             .map_err(|error| error.to_string()),
@@ -6129,49 +6418,60 @@ mod tests {
         );
     }
 
-    /// set's error for a missing variable follows the reach of its variables: Runtime as on
-    /// Linux, BootServices, which would find any variable the firmware has created.
+    /// set's error for a missing variable follows the interface of its variables: efivarfs as on
+    /// Linux, the firmware environment calls as on Windows, GetVariable() as in the UEFI Shell,
+    /// whose variables would find any variable the firmware has created.
     #[test]
-    fn variable_not_exported_follows_its_reach() {
+    fn variable_not_exported_follows_its_interface() {
         let cases = [
             (
                 VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 "no EFI variable Setup-00000000-0000-0000-0000-000000000000: the firmware has not \
                  created it or does not expose it to the OS, so its questions cannot be set from \
                  Linux; change them in the firmware setup, or ask the board vendor for firmware \
                  that exposes it; see https://github.com/linuxboot/uefisettings/issues/2",
             ),
             (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+                "no EFI variable Setup-00000000-0000-0000-0000-000000000000: the firmware has not \
+                 created it or does not expose it to the OS, so its questions cannot be set from \
+                 Windows; change them in the firmware setup, or ask the board vendor for firmware \
+                 that exposes it; see https://github.com/linuxboot/uefisettings/issues/2",
+            ),
+            (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "no EFI variable Setup-00000000-0000-0000-0000-000000000000: the firmware has \
                  not created it, and set never creates variables",
             ),
         ];
-        for (reach, want) in cases {
-            let variables = MemoryVariables::with_reach(reach);
+        for (reach, interface, want) in cases {
+            let variables = MemoryVariables::new(reach, interface);
             let store = efi_variable("Setup", 1);
             let write =
-                VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), reach).expect("write 1");
+                VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), interface).expect("write 1");
 
             let error = write
                 .write(&variables)
                 .expect_err("write a missing variable");
 
-            assert_eq!(error.to_string(), want, "{reach:?}");
+            assert_eq!(error.to_string(), want, "{interface:?}");
         }
     }
 
-    /// A write of an unsupported value names the write of its variables: efivarfs for Runtime,
-    /// SetVariable() for BootServices.
+    /// A write of an unsupported value names the write of its variables: efivarfs, or
+    /// SetVariable() in the UEFI Shell.
     #[test]
-    fn unsupported_value_names_the_write_of_its_reach() {
-        for (reach, want) in [
+    fn unsupported_value_names_the_write_of_its_interface() {
+        for (interface, want) in [
             (
-                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 "unsupported value type for efivarfs write",
             ),
             (
-                VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "unsupported value type for SetVariable() write",
             ),
         ] {
@@ -6180,12 +6480,12 @@ mod tests {
                     &efi_variable("Test", 42),
                     0,
                     TypeValue::Boolean(true),
-                    reach
+                    interface
                 )
                 .map(drop)
                 .map_err(|error| error.to_string()),
                 Err(want.to_string()),
-                "{reach:?}"
+                "{interface:?}"
             );
         }
     }
@@ -6219,6 +6519,7 @@ mod tests {
             VariableNotFound(key).into(),
             &efi_variable("Setup", 1),
             VariableReach::Runtime,
+            VariableInterface::Efivarfs,
         );
 
         assert!(
@@ -6248,6 +6549,7 @@ mod tests {
             VariableNotFound(store.variable_key()).into(),
             &store,
             VariableReach::Runtime,
+            VariableInterface::Efivarfs,
         );
 
         assert!(
@@ -6276,6 +6578,7 @@ mod tests {
             open_error,
             &efi_variable("Setup", 1),
             VariableReach::Runtime,
+            VariableInterface::Efivarfs,
         );
 
         assert!(

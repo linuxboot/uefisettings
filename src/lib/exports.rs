@@ -596,6 +596,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::MemoryVariables;
+    use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
     use crate::hii::forms::ifr_fixtures::VariableReach;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
@@ -846,10 +847,13 @@ mod tests {
         package_list_with_guid([0x55; 16], &packages.concat())
     }
 
-    /// The variables of password_hiidb, which reach `reach`: Setup holds 0, AMITSESetup 80 bytes
-    /// of 0xAA, a password, and then 1.
-    fn password_variables(reach: VariableReach) -> Rc<MemoryVariables> {
-        let variables = MemoryVariables::with_reach(reach);
+    /// The variables of password_hiidb, which reach `reach` through `interface`: Setup holds 0,
+    /// AMITSESetup 80 bytes of 0xAA, a password, and then 1.
+    fn password_variables(
+        reach: VariableReach,
+        interface: VariableInterface,
+    ) -> Rc<MemoryVariables> {
+        let variables = MemoryVariables::new(reach, interface);
         variables.insert(setup(), NV_BS_RT, &[0]);
         variables.insert(
             amitse_setup(),
@@ -870,17 +874,24 @@ mod tests {
     #[test]
     fn password_var_stores_are_read_only_through_runtime_variables() {
         let cases = [
-            (VariableReach::Runtime, "1", "1", vec![81]),
+            (
+                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
+                "1",
+                "1",
+                vec![81],
+            ),
             (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "<ValueUnavailable: VarStore holds a password> <IFR default: 0>",
                 "<ValueUnavailable: VarStore holds a password>",
                 vec![],
             ),
         ];
 
-        for (reach, want, want_shown, want_reads) in cases {
-            let variables = password_variables(reach);
+        for (reach, interface, want, want_shown, want_reads) in cases {
+            let variables = password_variables(reach, interface);
             let got = HiiBackend::get_in(
                 &password_hiidb(),
                 "P",
@@ -925,7 +936,8 @@ mod tests {
 
     /// set through variables that reach BootServices, in a HiiDB that declares a password
     /// question, refuses unless the caller bypasses, and never reads or writes a VarStore that a
-    /// password question names; set through those that reach Runtime writes either, as before.
+    /// password question names; set through those that reach Runtime writes either, as before;
+    /// whatever their interface.
     #[test]
     fn set_follows_the_setup_password_policy() {
         let refusal = "this HiiDB declares a setup password question; the UEFI Shell runs no \
@@ -936,6 +948,7 @@ mod tests {
         let cases = [
             (
                 VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 "Q",
                 SetupPasswordPolicy::Refuse,
                 Ok(()),
@@ -944,6 +957,7 @@ mod tests {
             ),
             (
                 VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 "P",
                 SetupPasswordPolicy::Refuse,
                 Ok(()),
@@ -952,6 +966,7 @@ mod tests {
             ),
             (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "Q",
                 SetupPasswordPolicy::Refuse,
                 Err(refusal),
@@ -960,6 +975,7 @@ mod tests {
             ),
             (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "Q",
                 SetupPasswordPolicy::Bypass,
                 Ok(()),
@@ -968,6 +984,7 @@ mod tests {
             ),
             (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "P",
                 SetupPasswordPolicy::Refuse,
                 Err(refusal),
@@ -976,16 +993,44 @@ mod tests {
             ),
             (
                 VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "P",
                 SetupPasswordPolicy::Bypass,
                 Err(withheld),
                 vec![],
                 vec![],
             ),
+            (
+                VariableReach::BootServices,
+                VariableInterface::Efivarfs,
+                "Q",
+                SetupPasswordPolicy::Refuse,
+                Err(refusal),
+                vec![],
+                vec![],
+            ),
+            (
+                VariableReach::BootServices,
+                VariableInterface::Efivarfs,
+                "P",
+                SetupPasswordPolicy::Bypass,
+                Err(withheld),
+                vec![],
+                vec![],
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::VariableServices,
+                "P",
+                SetupPasswordPolicy::Refuse,
+                Ok(()),
+                vec![],
+                vec![(80, vec![0])],
+            ),
         ];
 
-        for (reach, question, policy, want, want_setup, want_amitse_setup) in cases {
-            let variables = password_variables(reach);
+        for (reach, interface, question, policy, want, want_setup, want_amitse_setup) in cases {
+            let variables = password_variables(reach, interface);
             let options = SetOptions {
                 setup_password: policy,
                 ..SetOptions::default()
@@ -1005,7 +1050,7 @@ mod tests {
                 &*variables,
             );
 
-            let case = format!("{reach:?}, set {question} {value}, {policy:?}");
+            let case = format!("{reach:?}, {interface:?}, set {question} {value}, {policy:?}");
             assert_eq!(
                 got.map(drop).map_err(|error| error.to_string()),
                 want.map_err(str::to_string),
@@ -1041,9 +1086,10 @@ mod tests {
         package_list_with_guid([0x55; 16], &packages.concat())
     }
 
-    /// set decides, through variables that reach Runtime or Windows, by the attributes of the
-    /// variable of a VARSTORE_EFI declared NV|BS: it refuses the variable without
-    /// EFI_VARIABLE_RUNTIME_ACCESS before any write, and writes the one with it, keeping them.
+    /// set decides, through variables that reach Runtime, through efivarfs or the firmware
+    /// environment calls, by the attributes of the variable of a VARSTORE_EFI declared NV|BS: it
+    /// refuses the variable without EFI_VARIABLE_RUNTIME_ACCESS before any write, and writes the
+    /// one with it, keeping them.
     #[test]
     fn set_decides_runtime_access_by_the_variables_own_attributes() {
         let refusal = "EFI variable Setup-00000000-0000-0000-0000-000000000000 has no \
@@ -1054,9 +1100,12 @@ mod tests {
             (NV_BS_RT, Ok(()), vec![(0, vec![1])], vec![7, 0, 0, 0, 1]),
         ];
 
-        for reach in [VariableReach::Runtime, VariableReach::Windows] {
+        for interface in [
+            VariableInterface::Efivarfs,
+            VariableInterface::FirmwareEnvironment,
+        ] {
             for (attributes, want, want_writes, want_bytes) in cases.clone() {
-                let variables = MemoryVariables::with_reach(reach);
+                let variables = MemoryVariables::new(VariableReach::Runtime, interface);
                 variables.insert(setup(), attributes, &[0]);
                 let variables = Rc::new(variables);
 
@@ -1070,7 +1119,7 @@ mod tests {
                     &*variables,
                 );
 
-                let case = format!("{reach:?}, attributes {attributes:#x}");
+                let case = format!("{interface:?}, attributes {attributes:#x}");
                 assert_eq!(
                     got.map(drop).map_err(|error| error.to_string()),
                     want.map_err(str::to_string),
@@ -1110,7 +1159,10 @@ mod tests {
             .map_err(|error| error.to_string())
         };
 
-        let variables = password_variables(VariableReach::BootServices);
+        let variables = password_variables(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
         let got = HiiBackend::get_in(
             &hiidb,
             "Q",
@@ -1152,7 +1204,7 @@ mod tests {
         assert_eq!(variables.reads(), [], "BootServices: reads");
         assert_eq!(variables.writes_to(&setup()), [], "BootServices: writes");
 
-        let variables = password_variables(VariableReach::Runtime);
+        let variables = password_variables(VariableReach::Runtime, VariableInterface::Efivarfs);
         let got = HiiBackend::get_in(
             &hiidb,
             "Q",

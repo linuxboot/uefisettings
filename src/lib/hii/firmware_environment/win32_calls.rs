@@ -51,9 +51,10 @@ impl EfivarSource {
         self.validate()?;
         Ok(match self {
             Self::System => Box::new(FirmwareEnvironment::new()?),
-            Self::Disabled => Box::new(UnreadVariables(
-                FirmwareEnvironment::<RealFirmwareEnvironmentCalls>::REACH,
-            )),
+            Self::Disabled => Box::new(UnreadVariables {
+                reach: FirmwareEnvironment::<RealFirmwareEnvironmentCalls>::REACH,
+                interface: FirmwareEnvironment::<RealFirmwareEnvironmentCalls>::INTERFACE,
+            }),
         })
     }
 }

@@ -49,6 +49,7 @@ pub(crate) use crate::hii::variables::tests::NV_BS;
 pub(crate) use crate::hii::variables::tests::NV_BS_RT;
 #[cfg(efivar_dumps)]
 use crate::hii::variables::EfivarSource;
+pub(crate) use crate::hii::variables::VariableInterface;
 pub(crate) use crate::hii::variables::VariableKey;
 pub(crate) use crate::hii::variables::VariableReach;
 
@@ -261,7 +262,7 @@ pub(super) fn change_value(
     new_value: &str,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    value_write(question, new_value, variables.reach())?.write(variables)?;
+    value_write(question, new_value, variables.interface())?.write(variables)?;
     Ok(())
 }
 
@@ -272,7 +273,7 @@ pub(super) fn change_option(
     option: &AnswerOption,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    option_write(question, option, variables.reach())?.write(variables)?;
+    option_write(question, option, variables.interface())?.write(variables)?;
     Ok(())
 }
 

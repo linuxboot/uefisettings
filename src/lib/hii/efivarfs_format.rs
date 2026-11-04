@@ -41,6 +41,7 @@ use nix::sys::stat::Mode;
 use thiserror::Error;
 
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
@@ -56,6 +57,8 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// What efivarfs, and so a copy of it, reaches.
 pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
+/// The interface of efivarfs, and so of a copy of it.
+pub(super) const EFIVARFS_INTERFACE: VariableInterface = VariableInterface::Efivarfs;
 
 /// The name of the efivar file of a variable, as VariableKey displays it: always exactly one path
 /// component.
@@ -294,6 +297,10 @@ impl EfivarCopy {
 impl FirmwareVariables for EfivarCopy {
     fn reach(&self) -> VariableReach {
         EFIVARFS_REACH
+    }
+
+    fn interface(&self) -> VariableInterface {
+        EFIVARFS_INTERFACE
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {

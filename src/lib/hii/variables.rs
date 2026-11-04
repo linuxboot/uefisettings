@@ -65,11 +65,12 @@ impl fmt::Display for VariableKey {
 /// Which variables FirmwareVariables reach: after ExitBootServices, as through efivarfs,
 /// GetVariable, GetNextVariableName and SetVariable reach only those with
 /// EFI_VARIABLE_RUNTIME_ACCESS; before it, as in the UEFI Shell, all (UEFI 2.10 §8.2.1-§8.2.3).
+/// Decisions on runtime access take this, never the VariableInterface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VariableReach {
     #[cfg_attr(
-        any(target_os = "uefi", target_os = "windows"),
-        allow(dead_code, reason = "no UEFI Shell or Windows variables reach Runtime")
+        target_os = "uefi",
+        allow(dead_code, reason = "no UEFI Shell variables reach Runtime")
     )]
     Runtime,
     #[cfg_attr(
@@ -77,26 +78,48 @@ pub(crate) enum VariableReach {
         allow(dead_code, reason = "only UEFI Shell variables reach BootServices")
     )]
     BootServices,
-    /// GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW on Windows:
-    /// after ExitBootServices they reach only EFI_VARIABLE_RUNTIME_ACCESS variables, as
-    /// Runtime does, but their errors name the Win32 calls, not efivarfs.
-    #[cfg_attr(
-        not(target_os = "windows"),
-        allow(dead_code, reason = "no variables on this build reach Windows")
-    )]
-    Windows,
 }
 
-/// The texts of errors about variables of each reach: Runtime as through Linux's efivarfs,
-/// BootServices as through GetVariable() and SetVariable() in the UEFI Shell.
-impl VariableReach {
+/// The interface through which FirmwareVariables read and write variables, which their error
+/// texts name; it decides no runtime access, which VariableReach does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariableInterface {
+    /// Linux's efivarfs, and copies of it (efivarfs.rs, efivarfs_format.rs)
+    #[cfg_attr(
+        any(target_os = "uefi", target_os = "windows"),
+        allow(
+            dead_code,
+            reason = "the UEFI Shell and Windows builds read no efivarfs"
+        )
+    )]
+    Efivarfs,
+    /// GetVariable() and SetVariable() in the UEFI Shell (variable_services.rs)
+    #[cfg_attr(
+        not(target_os = "uefi"),
+        allow(dead_code, reason = "only the UEFI Shell build calls GetVariable()")
+    )]
+    VariableServices,
+    /// GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW on Windows
+    /// (firmware_environment.rs)
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(
+            dead_code,
+            reason = "only the Windows build calls the firmware environment calls"
+        )
+    )]
+    FirmwareEnvironment,
+}
+
+/// The texts of errors about variables of each interface.
+impl VariableInterface {
     /// What errors call the data bytes of a variable, which follow its attributes word.
     #[cfg(any(system_variables, test))]
     fn data(self) -> &'static str {
         match self {
-            Self::Runtime => "efivarfs payload",
-            Self::BootServices => "GetVariable() data",
-            Self::Windows => "GetFirmwareEnvironmentVariableExW payload",
+            Self::Efivarfs => "efivarfs payload",
+            Self::VariableServices => "GetVariable() data",
+            Self::FirmwareEnvironment => "GetFirmwareEnvironmentVariableExW payload",
         }
     }
 
@@ -104,9 +127,9 @@ impl VariableReach {
     #[cfg(any(system_variables, test))]
     fn missing_attributes(self) -> &'static str {
         match self {
-            Self::Runtime => "efivarfs file is missing its attributes header",
-            Self::BootServices => "variable bytes are missing their attributes word",
-            Self::Windows => {
+            Self::Efivarfs => "efivarfs file is missing its attributes header",
+            Self::VariableServices => "variable bytes are missing their attributes word",
+            Self::FirmwareEnvironment => {
                 "GetFirmwareEnvironmentVariableExW data is missing its attributes word"
             }
         }
@@ -115,39 +138,48 @@ impl VariableReach {
     /// What errors call a write of a question's value.
     pub(super) fn write(self) -> &'static str {
         match self {
-            Self::Runtime => "efivarfs write",
-            Self::BootServices => "SetVariable() write",
-            Self::Windows => "SetFirmwareEnvironmentVariableExW write",
+            Self::Efivarfs => "efivarfs write",
+            Self::VariableServices => "SetVariable() write",
+            Self::FirmwareEnvironment => "SetFirmwareEnvironmentVariableExW write",
         }
     }
 
     /// Why set refuses a volatile variable, after its name.
     fn volatile_refusal(self) -> &'static str {
         match self {
-            Self::Runtime => " and cannot be written through efivarfs",
-            Self::BootServices => ", so a write would not outlast a power cycle",
-            Self::Windows => ", so a write would not outlast a power cycle",
+            Self::Efivarfs => " and cannot be written through efivarfs",
+            Self::VariableServices => ", so a write would not outlast a power cycle",
+            Self::FirmwareEnvironment => ", so a write would not outlast a power cycle",
         }
     }
 
     /// Why set cannot write a variable that does not exist, after its VariableNotFound.
     pub(super) fn not_found_refusal(self) -> &'static str {
         match self {
-            Self::Runtime => {
+            Self::Efivarfs => {
                 "the firmware has not created it or does not expose it to the OS, so its \
                  questions cannot be set from Linux; change them in the firmware setup, or ask \
                  the board vendor for firmware that exposes it; see \
                  https://github.com/linuxboot/uefisettings/issues/2"
             }
-            Self::BootServices => {
+            Self::VariableServices => {
                 "the firmware has not created it, and set never creates variables"
             }
-            Self::Windows => {
+            Self::FirmwareEnvironment => {
                 "the firmware has not created it or does not expose it to the OS, so its \
                  questions cannot be set from Windows; change them in the firmware setup, or ask \
                  the board vendor for firmware that exposes it; see \
                  https://github.com/linuxboot/uefisettings/issues/2"
             }
+        }
+    }
+
+    /// How this interface lacks a variable that is not present at OS runtime.
+    pub(super) fn absence(self) -> &'static str {
+        match self {
+            Self::Efivarfs => "efivarfs does not list it",
+            Self::VariableServices => "GetVariable() does not find it",
+            Self::FirmwareEnvironment => "GetFirmwareEnvironmentVariableExW does not find it",
         }
     }
 }
@@ -160,6 +192,8 @@ impl VariableReach {
 pub(crate) trait FirmwareVariables {
     /// Which variables these reach.
     fn reach(&self) -> VariableReach;
+    /// The interface that these read and write through, which their errors name.
+    fn interface(&self) -> VariableInterface;
     /// The attributes word and the first `size` data bytes of `key`, as an efivarfs file starts.
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>>;
     /// Writes `encoded` at data offset `offset` of `key`, whose VarStore has `size` bytes,
@@ -170,6 +204,10 @@ pub(crate) trait FirmwareVariables {
 impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
     fn reach(&self) -> VariableReach {
         (**self).reach()
+    }
+
+    fn interface(&self) -> VariableInterface {
+        (**self).interface()
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -184,6 +222,10 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
 impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
     fn reach(&self) -> VariableReach {
         (**self).reach()
+    }
+
+    fn interface(&self) -> VariableInterface {
+        (**self).interface()
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -230,31 +272,31 @@ pub(super) fn attributes_and_data(
 }
 
 /// The read-modify-write of FirmwareVariables::write_at on `bytes`, the attributes word and all
-/// the data of variable `key`, which variables of `reach` hold: refuses a volatile or
+/// the data of variable `key`, which variables of `interface` hold: refuses a volatile or
 /// authenticated variable, then writes `encoded` at data offset `offset` as update_efivarfs_bytes
 /// does.
 // set writes this machine's variables; the tests' MemoryVariables write on any build
 #[cfg(any(system_variables, test))]
 pub(super) fn modify_variable_bytes(
     key: &VariableKey,
-    reach: VariableReach,
+    interface: VariableInterface,
     bytes: &mut [u8],
     size: u16,
     offset: u16,
     encoded: &[u8],
 ) -> Result<()> {
-    let attributes = efivar_attributes(bytes).context(reach.missing_attributes())?;
-    check_non_volatile(key, reach, attributes)?;
+    let attributes = efivar_attributes(bytes).context(interface.missing_attributes())?;
+    check_non_volatile(key, interface, attributes)?;
     check_unauthenticated(key, attributes)?;
-    update_efivarfs_bytes(reach, bytes, size, offset, encoded)
+    update_efivarfs_bytes(interface, bytes, size, offset, encoded)
 }
 
 /// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
 /// shorter than the `payload_size` bytes of its VarStore, which VarStoreWrite::new fits the
-/// write in. Errors word it as variables of `reach` hold it.
+/// write in. Errors word it as variables of `interface` hold it.
 #[cfg(any(system_variables, test))]
 fn update_efivarfs_bytes(
-    reach: VariableReach,
+    interface: VariableInterface,
     bytes: &mut [u8],
     payload_size: u16,
     offset: u16,
@@ -262,11 +304,11 @@ fn update_efivarfs_bytes(
 ) -> Result<()> {
     let payload = bytes
         .get_mut(EFIVARFS_HEADER_SIZE..)
-        .context(reach.missing_attributes())?;
+        .context(interface.missing_attributes())?;
     if payload.len() < usize::from(payload_size) {
         return Err(anyhow!(
             "{} is shorter than the declared varstore: {} < {} bytes",
-            reach.data(),
+            interface.data(),
             payload.len(),
             payload_size
         ));
@@ -275,25 +317,25 @@ fn update_efivarfs_bytes(
     let start = usize::from(offset);
     payload
         .get_mut(start..start + encoded.len())
-        .with_context(|| format!("write past the {}", reach.data()))?
+        .with_context(|| format!("write past the {}", interface.data()))?
         .copy_from_slice(encoded);
     Ok(())
 }
 
 /// Refuses an EFI variable without EFI_VARIABLE_NON_VOLATILE, which efivarfs cannot write
-/// (UEFI 2.10 §8.2.3) and a power cycle would erase; errors word it as variables of `reach` hold
-/// it.
+/// (UEFI 2.10 §8.2.3) and a power cycle would erase; errors word it as variables of `interface`
+/// hold it.
 /// Takes the variable's own attribute word, which its write passes to SetVariable(), not
 /// VARSTORE_EFI's Attributes, as check_runtime_writable does.
 pub(super) fn check_non_volatile(
     key: &VariableKey,
-    reach: VariableReach,
+    interface: VariableInterface,
     attributes: u32,
 ) -> std::result::Result<(), VolatileVariable> {
     if attributes & EFI_VARIABLE_NON_VOLATILE == 0 {
         return Err(VolatileVariable {
             key: key.clone(),
-            reach,
+            interface,
         });
     }
     Ok(())
@@ -303,14 +345,14 @@ pub(super) fn check_non_volatile(
 #[derive(Error, Debug)]
 #[error(
     "EFI variable {key} is volatile (no EFI_VARIABLE_NON_VOLATILE){}",
-    .reach.volatile_refusal()
+    .interface.volatile_refusal()
 )]
 pub(super) struct VolatileVariable {
     key: VariableKey,
-    reach: VariableReach,
+    interface: VariableInterface,
 }
 
-/// Refuses, for variables of `reach` Runtime or Windows, an EFI variable whose own `attributes`
+/// Refuses, for variables of `reach` Runtime, an EFI variable whose own `attributes`
 /// word lacks EFI_VARIABLE_RUNTIME_ACCESS: after ExitBootServices, edk2-stable202608 refuses to
 /// write an existing variable without it, VariableServiceSetVariable with EFI_WRITE_PROTECTED
 /// and UpdateVariable with EFI_INVALID_PARAMETER.
@@ -320,20 +362,18 @@ pub(super) fn check_runtime_writable(
     attributes: u32,
 ) -> std::result::Result<(), BootServiceOnlyVariable> {
     match reach {
-        VariableReach::Runtime | VariableReach::Windows
-            if attributes & EFI_VARIABLE_RUNTIME_ACCESS == 0 =>
-        {
+        VariableReach::Runtime if attributes & EFI_VARIABLE_RUNTIME_ACCESS == 0 => {
             Err(BootServiceOnlyVariable {
                 key: key.clone(),
                 attributes,
             })
         }
-        VariableReach::Runtime | VariableReach::Windows | VariableReach::BootServices => Ok(()),
+        VariableReach::Runtime | VariableReach::BootServices => Ok(()),
     }
 }
 
 /// An EFI variable without EFI_VARIABLE_RUNTIME_ACCESS, which set refuses through variables that
-/// reach Runtime or Windows.
+/// reach Runtime.
 #[derive(Error, Debug)]
 #[error(
     "EFI variable {key} has no EFI_VARIABLE_RUNTIME_ACCESS (attributes {attributes:#x}), so the \
@@ -462,7 +502,10 @@ impl EfivarSource {
         Ok(match self {
             #[cfg(efivar_dumps)]
             Self::Directory(dir) => Box::new(EfivarCopy::new(dir)),
-            Self::Disabled => Box::new(UnreadVariables(VariableReach::Runtime)),
+            Self::Disabled => Box::new(UnreadVariables {
+                reach: VariableReach::Runtime,
+                interface: VariableInterface::Efivarfs,
+            }),
         })
     }
 }
@@ -480,12 +523,20 @@ pub(super) struct EfivarsNotRead;
 
 /// The variables of EfivarSource::Disabled: every read and write fails with EfivarsNotRead. They
 /// reach what the build's own variables reach, or Runtime, as Linux's efivarfs, on a build
-/// without any, so that each refusal of a VarStore stays.
-pub(super) struct UnreadVariables(pub(super) VariableReach);
+/// without any, so that each refusal of a VarStore stays, and through their interface, or
+/// efivarfs, so that it keeps its words.
+pub(super) struct UnreadVariables {
+    pub(super) reach: VariableReach,
+    pub(super) interface: VariableInterface,
+}
 
 impl FirmwareVariables for UnreadVariables {
     fn reach(&self) -> VariableReach {
-        self.0
+        self.reach
+    }
+
+    fn interface(&self) -> VariableInterface {
+        self.interface
     }
 
     fn read(&self, _key: &VariableKey, _size: u16) -> Result<Vec<u8>> {
@@ -557,6 +608,11 @@ impl EfivarReader {
         self.variables.reach()
     }
 
+    /// The interface that this reader reads through.
+    pub(crate) fn interface(&self) -> VariableInterface {
+        self.variables.interface()
+    }
+
     /// FirmwareVariables::read of `range`, read once.
     /// The caller decodes the payload bytes `value`, which this records in `decoded` with
     /// `range.size` unless they end past the `range.size` bytes that FirmwareVariables::read
@@ -609,6 +665,10 @@ impl<V> WithholdingVariables<V> {
 impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
     fn reach(&self) -> VariableReach {
         self.variables.reach()
+    }
+
+    fn interface(&self) -> VariableInterface {
+        self.variables.interface()
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -666,28 +726,30 @@ pub(crate) mod tests {
     }
 
     /// Firmware variables in memory, each its attributes word and data, as read gives them, that
-    /// reach `reach`. Records every read and the writes that succeed, and fails those of the
-    /// variables in `failures`.
+    /// reach `reach` through `interface`. Records every read and the writes that succeed, and
+    /// fails those of the variables in `failures`.
     pub(crate) struct MemoryVariables {
         reach: VariableReach,
+        interface: VariableInterface,
         variables: RefCell<BTreeMap<VariableKey, Vec<u8>>>,
         failures: BTreeMap<VariableKey, WriteError>,
         reads: RefCell<Vec<(VariableKey, u16)>>,
         writes: RefCell<Vec<(VariableKey, u16, Vec<u8>)>>,
     }
 
-    /// No variables, reaching what efivarfs reaches.
+    /// No variables, reaching what efivarfs reaches, through efivarfs.
     impl Default for MemoryVariables {
         fn default() -> Self {
-            Self::with_reach(VariableReach::Runtime)
+            Self::new(VariableReach::Runtime, VariableInterface::Efivarfs)
         }
     }
 
     impl MemoryVariables {
-        /// No variables, reaching `reach`.
-        pub(crate) fn with_reach(reach: VariableReach) -> Self {
+        /// No variables, reaching `reach` through `interface`.
+        pub(crate) fn new(reach: VariableReach, interface: VariableInterface) -> Self {
             Self {
                 reach,
+                interface,
                 variables: RefCell::default(),
                 failures: BTreeMap::new(),
                 reads: RefCell::default(),
@@ -743,6 +805,10 @@ pub(crate) mod tests {
             self.reach
         }
 
+        fn interface(&self) -> VariableInterface {
+            self.interface
+        }
+
         fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
             self.reads.borrow_mut().push((key.clone(), size));
             let variables = self.variables.borrow();
@@ -777,7 +843,7 @@ pub(crate) mod tests {
                 .get_mut(key)
                 .ok_or_else(|| VariableNotFound(key.clone()))?;
             let mut modified = bytes.clone();
-            modify_variable_bytes(key, self.reach, &mut modified, size, offset, encoded)?;
+            modify_variable_bytes(key, self.interface, &mut modified, size, offset, encoded)?;
             *bytes = modified;
             self.writes
                 .borrow_mut()
@@ -790,6 +856,10 @@ pub(crate) mod tests {
     impl FirmwareVariables for Rc<MemoryVariables> {
         fn reach(&self) -> VariableReach {
             self.as_ref().reach()
+        }
+
+        fn interface(&self) -> VariableInterface {
+            self.as_ref().interface()
         }
 
         fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -815,30 +885,30 @@ pub(crate) mod tests {
         }
     }
 
-    /// The errors of a write word it as variables of their reach hold it: Runtime as efivarfs,
-    /// BootServices as GetVariable() and SetVariable(), Windows as the firmware environment
-    /// calls, never efivarfs.
+    /// The errors of a write word it as variables of their interface hold it: Efivarfs as
+    /// efivarfs, VariableServices as GetVariable() and SetVariable(), FirmwareEnvironment as the
+    /// firmware environment calls, never efivarfs.
     #[test]
-    fn write_errors_follow_their_reach() {
-        let volatile = |reach| {
-            check_non_volatile(&variable_key("Volatile"), reach, BS_RT)
+    fn write_errors_follow_their_interface() {
+        let volatile = |interface| {
+            check_non_volatile(&variable_key("Volatile"), interface, BS_RT)
                 .map_err(|error| error.to_string())
         };
-        let short = |reach| {
-            update_efivarfs_bytes(reach, &mut variable_bytes(2), 4, 0, &[1])
+        let short = |interface| {
+            update_efivarfs_bytes(interface, &mut variable_bytes(2), 4, 0, &[1])
                 .map_err(|error| error.to_string())
         };
-        let past = |reach| {
-            update_efivarfs_bytes(reach, &mut variable_bytes(4), 4, 4, &[1])
+        let past = |interface| {
+            update_efivarfs_bytes(interface, &mut variable_bytes(4), 4, 4, &[1])
                 .map_err(|error| format!("{error:#}"))
         };
-        let headless = |reach| {
-            update_efivarfs_bytes(reach, &mut [7, 0], 0, 0, &[])
+        let headless = |interface| {
+            update_efivarfs_bytes(interface, &mut [7, 0], 0, 0, &[])
                 .map_err(|error| format!("{error:#}"))
         };
         let cases = [
             (
-                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
                  EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs",
                 "efivarfs payload is shorter than the declared varstore: 2 < 4 bytes",
@@ -847,7 +917,7 @@ pub(crate) mod tests {
                 "efivarfs write",
             ),
             (
-                VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
                  EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
                 "GetVariable() data is shorter than the declared varstore: 2 < 4 bytes",
@@ -856,7 +926,7 @@ pub(crate) mod tests {
                 "SetVariable() write",
             ),
             (
-                VariableReach::Windows,
+                VariableInterface::FirmwareEnvironment,
                 "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
                  EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
                 "GetFirmwareEnvironmentVariableExW payload is shorter than the declared \
@@ -866,51 +936,55 @@ pub(crate) mod tests {
                 "SetFirmwareEnvironmentVariableExW write",
             ),
         ];
-        for (reach, want_volatile, want_short, want_past, want_headless, want_write) in cases {
+        for (interface, want_volatile, want_short, want_past, want_headless, want_write) in cases {
             assert_eq!(
-                volatile(reach),
+                volatile(interface),
                 Err(want_volatile.to_string()),
-                "{reach:?}: volatile"
+                "{interface:?}: volatile"
             );
             assert_eq!(
-                short(reach),
+                short(interface),
                 Err(want_short.to_string()),
-                "{reach:?}: short"
+                "{interface:?}: short"
             );
-            assert_eq!(past(reach), Err(want_past.to_string()), "{reach:?}: past");
             assert_eq!(
-                headless(reach),
-                Err(want_headless.to_string()),
-                "{reach:?}: headless"
+                past(interface),
+                Err(want_past.to_string()),
+                "{interface:?}: past"
             );
-            assert_eq!(reach.write(), want_write, "{reach:?}: write");
+            assert_eq!(
+                headless(interface),
+                Err(want_headless.to_string()),
+                "{interface:?}: headless"
+            );
+            assert_eq!(interface.write(), want_write, "{interface:?}: write");
         }
     }
 
-    /// set's refusal of a variable that does not exist follows its reach: Runtime as on Linux,
-    /// Windows as on Windows, BootServices, which reach every variable that the firmware
-    /// has created.
+    /// set's refusal of a variable that does not exist follows its interface: efivarfs as on
+    /// Linux, the firmware environment calls as on Windows, GetVariable() as in the UEFI Shell,
+    /// whose variables reach every variable that the firmware has created.
     #[test]
-    fn not_found_refusal_follows_its_reach() {
+    fn not_found_refusal_follows_its_interface() {
         assert_eq!(
-            VariableReach::Runtime.not_found_refusal(),
+            VariableInterface::Efivarfs.not_found_refusal(),
             "the firmware has not created it or does not expose it to the OS, so its questions \
              cannot be set from Linux; change them in the firmware setup, or ask the board vendor \
              for firmware that exposes it; see https://github.com/linuxboot/uefisettings/issues/2",
-            "Runtime"
+            "Efivarfs"
         );
         assert_eq!(
-            VariableReach::BootServices.not_found_refusal(),
+            VariableInterface::VariableServices.not_found_refusal(),
             "the firmware has not created it, and set never creates variables",
-            "BootServices"
+            "VariableServices"
         );
         assert_eq!(
-            VariableReach::Windows.not_found_refusal(),
+            VariableInterface::FirmwareEnvironment.not_found_refusal(),
             "the firmware has not created it or does not expose it to the OS, so its \
              questions cannot be set from Windows; change them in the firmware setup, or ask \
              the board vendor for firmware that exposes it; see \
              https://github.com/linuxboot/uefisettings/issues/2",
-            "Windows"
+            "FirmwareEnvironment"
         );
     }
 
@@ -987,7 +1061,10 @@ pub(crate) mod tests {
     /// see it, and pass the others through.
     #[test]
     fn withheld_variable_is_neither_read_nor_written() {
-        let variables = MemoryVariables::with_reach(VariableReach::BootServices);
+        let variables = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
         variables.insert(variable_key("Setup"), NV_BS_RT, &[1]);
         variables.insert(variable_key("AMITSESetup"), NV_BS_RT, &[0xAA]);
         let withholding =
@@ -1133,7 +1210,7 @@ pub(crate) mod tests {
     fn trailing_thermal_fields_do_not_overlap() {
         let mut bytes = variable_bytes(42);
         update_efivarfs_bytes(
-            VariableReach::Runtime,
+            VariableInterface::Efivarfs,
             &mut bytes,
             42,
             38,
@@ -1141,7 +1218,7 @@ pub(crate) mod tests {
         )
         .expect("update 38");
         update_efivarfs_bytes(
-            VariableReach::Runtime,
+            VariableInterface::Efivarfs,
             &mut bytes,
             42,
             40,
@@ -1165,7 +1242,7 @@ pub(crate) mod tests {
             let mut bytes = variable_bytes(42);
             let original = bytes.clone();
             assert_eq!(
-                update_efivarfs_bytes(VariableReach::Runtime, &mut bytes, 42, offset, encoded)
+                update_efivarfs_bytes(VariableInterface::Efivarfs, &mut bytes, 42, offset, encoded)
                     .map_err(|error| error.to_string()),
                 Err("write past the efivarfs payload".to_string()),
                 "{} bytes at offset {offset}",
@@ -1186,7 +1263,7 @@ pub(crate) mod tests {
             let mut bytes = variable_bytes(39);
             let original = bytes.clone();
             assert!(update_efivarfs_bytes(
-                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 &mut bytes,
                 42,
                 offset,
@@ -1202,7 +1279,9 @@ pub(crate) mod tests {
         for length in 0..EFIVARFS_HEADER_SIZE {
             let mut bytes = vec![0xa5; length];
             let original = bytes.clone();
-            assert!(update_efivarfs_bytes(VariableReach::Runtime, &mut bytes, 1, 0, &[1]).is_err());
+            assert!(
+                update_efivarfs_bytes(VariableInterface::Efivarfs, &mut bytes, 1, 0, &[1]).is_err()
+            );
             assert_eq!(bytes, original);
         }
     }
@@ -1212,7 +1291,7 @@ pub(crate) mod tests {
         let mut bytes = variable_bytes(50);
         let original = bytes.clone();
         update_efivarfs_bytes(
-            VariableReach::Runtime,
+            VariableInterface::Efivarfs,
             &mut bytes,
             42,
             40,
@@ -1228,8 +1307,14 @@ pub(crate) mod tests {
     fn writes_small_and_maximum_sized_varstores() {
         for size in [1, 2, u16::MAX] {
             let mut bytes = variable_bytes(usize::from(size));
-            update_efivarfs_bytes(VariableReach::Runtime, &mut bytes, size, size - 1, &[95])
-                .unwrap_or_else(|error| panic!("update the last of {size} bytes: {error}"));
+            update_efivarfs_bytes(
+                VariableInterface::Efivarfs,
+                &mut bytes,
+                size,
+                size - 1,
+                &[95],
+            )
+            .unwrap_or_else(|error| panic!("update the last of {size} bytes: {error}"));
             assert_eq!(bytes.len(), EFIVARFS_HEADER_SIZE + usize::from(size));
             assert_eq!(bytes.last(), Some(&95));
         }
@@ -1251,7 +1336,7 @@ pub(crate) mod tests {
         ];
         for (attributes, want) in cases {
             assert_eq!(
-                check_non_volatile(&key, VariableReach::Runtime, attributes)
+                check_non_volatile(&key, VariableInterface::Efivarfs, attributes)
                     .map_err(|error| error.to_string()),
                 want,
                 "attributes {attributes:#x}"
@@ -1260,7 +1345,7 @@ pub(crate) mod tests {
     }
 
     /// check_runtime_writable refuses a variable without EFI_VARIABLE_RUNTIME_ACCESS for variables
-    /// that reach Runtime or Windows, and nothing else.
+    /// that reach Runtime, and nothing else.
     #[test]
     fn variable_without_runtime_access_is_refused_at_runtime() {
         let key = variable_key("TestVarStore");
@@ -1269,10 +1354,8 @@ pub(crate) mod tests {
                        write it at OS runtime";
         let cases = [
             (NV_BS, VariableReach::Runtime, Err(refusal.to_string())),
-            (NV_BS, VariableReach::Windows, Err(refusal.to_string())),
             (NV_BS, VariableReach::BootServices, Ok(())),
             (NV_BS_RT, VariableReach::Runtime, Ok(())),
-            (NV_BS_RT, VariableReach::Windows, Ok(())),
             (NV_BS_RT, VariableReach::BootServices, Ok(())),
         ];
         for (attributes, reach, want) in cases {
@@ -1330,46 +1413,49 @@ pub(crate) mod tests {
         );
     }
 
-    /// modify_variable_bytes refuses a volatile variable, in the words of its reach, and keeps its
-    /// bytes.
+    /// modify_variable_bytes refuses a volatile variable, in the words of its interface, and keeps
+    /// its bytes.
     #[test]
     fn modify_variable_bytes_refuses_a_volatile_variable() {
         let key = variable_key("Volatile");
         let cases = [
             (
-                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
                 "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
                  EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs",
             ),
             (
-                VariableReach::BootServices,
+                VariableInterface::VariableServices,
                 "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
                  EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
             ),
         ];
-        for (reach, want) in cases {
+        for (interface, want) in cases {
             let mut bytes = [&BS_RT.to_ne_bytes()[..], &[1]].concat();
             let before = bytes.clone();
 
-            let error = modify_variable_bytes(&key, reach, &mut bytes, 1, 0, &[0x2A])
+            let error = modify_variable_bytes(&key, interface, &mut bytes, 1, 0, &[0x2A])
                 .expect_err("modify a volatile variable");
 
-            assert_eq!(error.to_string(), want, "{reach:?}: refusal");
-            assert_eq!(bytes, before, "{reach:?}: bytes");
+            assert_eq!(error.to_string(), want, "{interface:?}: refusal");
+            assert_eq!(bytes, before, "{interface:?}: bytes");
         }
     }
 
     /// modify_variable_bytes refuses a variable with authenticated access, whose writes need a
-    /// signed descriptor (UEFI 2.10 §8.2.3), whatever its reach, and keeps its bytes.
+    /// signed descriptor (UEFI 2.10 §8.2.3), whatever its interface, and keeps its bytes.
     #[test]
     fn modify_variable_bytes_refuses_an_authenticated_variable() {
         let key = variable_key("Signed");
-        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+        for interface in [
+            VariableInterface::Efivarfs,
+            VariableInterface::VariableServices,
+        ] {
             for attributes in [NV_BS_RT | 0x10, NV_BS_RT | 0x20, NV_BS_RT | 0x80] {
                 let mut bytes = [&attributes.to_ne_bytes()[..], &[1]].concat();
                 let before = bytes.clone();
 
-                let error = modify_variable_bytes(&key, reach, &mut bytes, 1, 0, &[0x2A])
+                let error = modify_variable_bytes(&key, interface, &mut bytes, 1, 0, &[0x2A])
                     .expect_err("modify an authenticated variable");
 
                 assert_eq!(
@@ -1379,11 +1465,11 @@ pub(crate) mod tests {
                          authenticated access (attributes {attributes:#x}), which uefisettings \
                          does not write"
                     ),
-                    "{reach:?}, attributes {attributes:#x}: refusal"
+                    "{interface:?}, attributes {attributes:#x}: refusal"
                 );
                 assert_eq!(
                     bytes, before,
-                    "{reach:?}, attributes {attributes:#x}: bytes"
+                    "{interface:?}, attributes {attributes:#x}: bytes"
                 );
             }
         }
@@ -1397,8 +1483,9 @@ pub(crate) mod tests {
         let mut bytes = [&NV_BS_RT.to_ne_bytes()[..], &[1, 2]].concat();
         let before = bytes.clone();
 
-        let error = modify_variable_bytes(&key, VariableReach::Runtime, &mut bytes, 4, 0, &[0x2A])
-            .expect_err("modify a variable shorter than its VarStore");
+        let error =
+            modify_variable_bytes(&key, VariableInterface::Efivarfs, &mut bytes, 4, 0, &[0x2A])
+                .expect_err("modify a variable shorter than its VarStore");
 
         assert_eq!(
             error.to_string(),
@@ -1416,7 +1503,7 @@ pub(crate) mod tests {
         let mut bytes = vec![7, 0];
         let before = bytes.clone();
 
-        let error = modify_variable_bytes(&key, VariableReach::Runtime, &mut bytes, 0, 0, &[])
+        let error = modify_variable_bytes(&key, VariableInterface::Efivarfs, &mut bytes, 0, 0, &[])
             .expect_err("modify a variable without its attributes word");
 
         assert_eq!(

@@ -36,11 +36,13 @@ use crate::hii::efivarfs_format::read_efivar;
 use crate::hii::efivarfs_format::read_efivar_file;
 use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::efivarfs_format::EfivarFileName;
+use crate::hii::efivarfs_format::EFIVARFS_INTERFACE;
 use crate::hii::efivarfs_format::EFIVARFS_REACH;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;
+use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableReach;
 
@@ -55,7 +57,10 @@ impl EfivarSource {
         Ok(match self {
             Self::System => Box::new(EfivarFiles::system()),
             Self::Directory(dir) => Box::new(EfivarCopy::new(dir)),
-            Self::Disabled => Box::new(UnreadVariables(EFIVARFS_REACH)),
+            Self::Disabled => Box::new(UnreadVariables {
+                reach: EFIVARFS_REACH,
+                interface: EFIVARFS_INTERFACE,
+            }),
         })
     }
 }
@@ -80,6 +85,10 @@ impl EfivarFiles {
 impl FirmwareVariables for EfivarFiles {
     fn reach(&self) -> VariableReach {
         EFIVARFS_REACH
+    }
+
+    fn interface(&self) -> VariableInterface {
+        EFIVARFS_INTERFACE
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -115,7 +124,7 @@ impl FirmwareVariables for EfivarFiles {
 
         modify_variable_bytes(
             key,
-            EFIVARFS_REACH,
+            EFIVARFS_INTERFACE,
             &mut file_contents,
             size,
             offset,
