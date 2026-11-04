@@ -22,6 +22,7 @@ use anyhow::Result;
 use log::debug;
 use log::error;
 use log::warn;
+use nix::errno::Errno;
 use nix::mount::mount;
 use nix::mount::MsFlags;
 use proc_mounts::MountIter;
@@ -232,7 +233,7 @@ impl EfivarsMountGuard {
                 original_flags & !MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
                 None as Option<&str>,
             )
-            .context(format!("Failed to remount {} RW", mount_point.display()))?
+            .map_err(|errno| remount_error(mount_point, errno))?
         } else {
             debug!(
                 "{} is mounted read/write, skipping remount",
@@ -269,6 +270,28 @@ impl Drop for EfivarsMountGuard {
             }
         }
     }
+}
+
+/// Why Linux refuses a read-write efivarfs with EINVAL: efivarfs_reconfigure() (Linux v6.11
+/// fs/efivarfs/super.c) refuses it without a runtime SetVariable(), which generic_ops_register()
+/// (drivers/firmware/efi/efi.c) leaves out when the firmware's EFI_RT_PROPERTIES_TABLE does not
+/// list it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "Linux refuses a read-write efivarfs without a runtime SetVariable(), as on firmware whose \
+     EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2) leaves it out; run uefisettings.efi in the UEFI \
+     Shell"
+)]
+struct NoRuntimeSetVariable;
+
+/// `errno`, of remounting the efivarfs at `mount_point` read-write, explained when it is EINVAL.
+fn remount_error(mount_point: &Path, errno: Errno) -> anyhow::Error {
+    let error = anyhow::Error::new(errno);
+    match errno {
+        Errno::EINVAL => error.context(NoRuntimeSetVariable),
+        _ => error,
+    }
+    .context(format!("Failed to remount {} RW", mount_point.display()))
 }
 
 pub fn get_current_mount_flags(dest: impl AsRef<Path>) -> Result<MsFlags> {
@@ -513,6 +536,40 @@ mod tests {
                 format!("{:#}", efivarfs_write_error(os_error)),
                 want,
                 "errno {errno}"
+            );
+        }
+    }
+
+    /// A read-write remount refused with EINVAL explains that Linux has no runtime SetVariable()
+    /// and points at uefisettings.efi; a remount refused with another errno explains nothing.
+    #[test]
+    fn remount_error_explains_einval() {
+        let cases = [
+            (
+                Errno::EINVAL,
+                Some(
+                    "Linux refuses a read-write efivarfs without a runtime SetVariable(), as on \
+                     firmware whose EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2) leaves it out; run \
+                     uefisettings.efi in the UEFI Shell",
+                ),
+            ),
+            (Errno::EPERM, None),
+            (Errno::EACCES, None),
+            (Errno::EBUSY, None),
+        ];
+
+        for (errno, explanation) in cases {
+            let want = match explanation {
+                Some(explanation) => {
+                    format!("Failed to remount {EFIVARS_MOUNT_POINT} RW: {explanation}: {errno}")
+                }
+                None => format!("Failed to remount {EFIVARS_MOUNT_POINT} RW: {errno}"),
+            };
+
+            assert_eq!(
+                format!("{:#}", remount_error(Path::new(EFIVARS_MOUNT_POINT), errno)),
+                want,
+                "{errno}"
             );
         }
     }
