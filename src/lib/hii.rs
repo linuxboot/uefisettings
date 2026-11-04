@@ -14,7 +14,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "no Config Routing caller builds or parses configuration strings yet"
+        reason = "no Config Routing or Keyword Handler caller builds or parses these strings yet"
     )
 )]
 mod config_string;

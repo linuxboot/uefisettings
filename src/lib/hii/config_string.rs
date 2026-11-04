@@ -12,7 +12,8 @@
 
 //! UEFI 2.10 §35.2.1 configuration strings, which the HII Configuration Routing Protocol and
 //! the drivers' Config Access Protocols exchange: a `<ConfigRequest>` names the settings of one
-//! storage to read, and a `<ConfigResp>` carries their values.
+//! storage to read, and a `<ConfigResp>` carries their values. The Keyword Handler Protocol
+//! names settings by keyword instead (§35.2.1.6): `<KeywordRequest>` and `<KeywordResp>`.
 
 use std::fmt;
 use std::iter::Peekable;
@@ -20,6 +21,7 @@ use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::str::Split;
 
+use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::hii::forms::DefaultId;
@@ -34,6 +36,9 @@ const RESERVED_NAMES: [&str; 7] = ["GUID", "NAME", "PATH", "ALTCFG", "OFFSET", "
 /// WIDTH makes a value allocate more than 64 KiB.
 const MAX_BLOCK_END: usize = 0xFFFF;
 
+/// The length of an End node alone, the shortest device path: sizeof(EFI_DEVICE_PATH_PROTOCOL).
+const MIN_DEVICE_PATH_LEN: usize = 4;
+
 // What a value or an element should have been, for ConfigStringError
 const GUID: &str = "<Guid>: 32 hex digits";
 const STRING: &str = "<String>: 4 hex digits per CHAR16";
@@ -44,6 +49,10 @@ const NONZERO_NUMBER: &str = "a nonzero <Number>";
 const ALT_CFG_ID: &str = "<AltCfgId>: 4 hex digits";
 const CONFIG_RESP_END: &str = "the end of a <ConfigResp>";
 const CONFIG_ELEMENT: &str = "<ConfigElement>: OFFSET= or <Label>=";
+const DATA_FILTER: &str =
+    "<DataFilter>: Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time";
+const NUMERIC_TYPE: &str = "Numeric[:1|:2|:4|:8]";
+const KEYWORD_RESP_END: &str = "the next <KeywordResp> or the end";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ConfigStringError {
@@ -60,12 +69,23 @@ pub(crate) enum ConfigStringError {
         value: String,
         expected: &'static str,
     },
+    /// Leaves the value out, as a setting may be a password.
+    #[error("{name}= holds {len} characters, not {}", NUMBER)]
+    InvalidNumber { name: String, len: usize },
     #[error("{0:?} is not a <Label>: a letter or _, then letters, digits and _")]
     InvalidLabel(String),
     #[error("{0} is a reserved name, so no <Label>")]
     ReservedName(String),
-    #[error("VALUE={value} is wider than WIDTH={width}")]
-    ValueWiderThanWidth { value: String, width: usize },
+    #[error(
+        "{0:?} is not a <Keyword>: text without &, = or :, then optionally : and 1 to 4 digits"
+    )]
+    InvalidKeyword(String),
+    #[error(
+        "{0:?} is not a <NameSpaceId>: ASCII letters, digits and punctuation other than & and ="
+    )]
+    InvalidNamespace(String),
+    #[error("VALUE's {digits} hex digits hold a nonzero byte past WIDTH={width}")]
+    ValueWiderThanWidth { digits: usize, width: usize },
     #[error("the block at OFFSET={offset:#x} of WIDTH={width:#x} ends past every IFR varstore")]
     BlockBeyondStorage { offset: usize, width: usize },
     #[error("an <AltResp> comes before any <ConfigResp>")]
@@ -74,7 +94,14 @@ pub(crate) enum ConfigStringError {
     AltRespHeader,
     #[error("a <ConfigRequest> without <RequestElement>s requests every setting of its storage")]
     EmptyRequest,
-    #[error("a <BlockConfig> has at least one byte")]
+    #[error("a <MultiKeywordResp> has at least one <KeywordResp>")]
+    EmptyMultiKeywordResp,
+    #[error(
+        "a keyword string's PATH holds {0} bytes, fewer than the {} of an End node",
+        MIN_DEVICE_PATH_LEN
+    )]
+    ShortKeywordPath(usize),
+    #[error("a <Number> has at least one byte")]
     EmptyValue,
     #[error(
         "the block at OFFSET={offset:#x} of WIDTH={width:#x} is outside the {len}-byte buffer"
@@ -105,25 +132,10 @@ impl ConfigHdr {
             .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
             .ok_or_else(|| invalid_value("GUID", guid_digits, GUID))?;
 
-        let name_digits = elements.required_value("NAME=")?;
-        let name = name_digits
-            .as_bytes()
-            .chunks(4)
-            .map(|unit| match unit {
-                [a, b, c, d] => Some(u16::from_be_bytes([hex_byte(*a, *b)?, hex_byte(*c, *d)?])),
-                _ => None,
-            })
-            .collect::<Option<_>>()
-            .ok_or_else(|| invalid_value("NAME", name_digits, STRING))?;
-
-        let path_digits = elements.required_value("PATH=")?;
-        let device_path = hex_bytes(path_digits)
-            .ok_or_else(|| invalid_value("PATH", path_digits, DEVICE_PATH))?;
-
         Ok(Self {
             guid: guid.into(),
-            name,
-            device_path,
+            name: parse_string("NAME", elements.required_value("NAME=")?)?,
+            device_path: parse_device_path(elements.required_value("PATH=")?)?,
         })
     }
 }
@@ -133,9 +145,7 @@ impl fmt::Display for ConfigHdr {
         f.write_str("GUID=")?;
         write_hex(f, &<[u8; 16]>::from(self.guid))?;
         f.write_str("&NAME=")?;
-        self.name
-            .iter()
-            .try_for_each(|unit| write!(f, "{unit:04x}"))?;
+        write_string(f, &self.name)?;
         f.write_str("&PATH=")?;
         write_hex(f, self.device_path.as_ref())
     }
@@ -300,11 +310,11 @@ impl BlockConfig {
 
         let value_digits = elements.required_value("VALUE=")?;
         let mut value =
-            hex_number(value_digits).ok_or_else(|| invalid_value("VALUE", value_digits, NUMBER))?;
+            hex_number(value_digits).ok_or_else(|| invalid_number("VALUE", value_digits))?;
         let beyond_width = value.get(width.get()..);
         if beyond_width.is_some_and(|bytes| bytes.iter().any(|byte| *byte != 0)) {
             return Err(ConfigStringError::ValueWiderThanWidth {
-                value: value_digits.to_owned(),
+                digits: value_digits.len(),
                 width: width.get(),
             });
         }
@@ -339,7 +349,7 @@ pub(crate) struct NvConfig {
 impl NvConfig {
     pub(crate) fn new(label: Label, value: &str) -> Result<Self, ConfigStringError> {
         if !value.bytes().all(|digit| digit.is_ascii_hexdigit()) {
-            return Err(invalid_value(&label.0, value, NUMBER));
+            return Err(invalid_number(&label.0, value));
         }
         Ok(Self {
             label,
@@ -505,12 +515,497 @@ impl FromStr for MultiConfigAltResp {
 
 impl fmt::Display for MultiConfigAltResp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut resps = self.0.iter();
-        let Some(first) = resps.next() else {
-            return Ok(());
+        write_joined(f, &self.0)
+    }
+}
+
+/// `<Number>` outside a `<BlockConfig>`: a buffer's bytes, at least one, which no WIDTH fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Number(Vec<u8>);
+
+impl Number {
+    /// The buffer's bytes, as they lie in memory.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Parses `digits` as BlockConfig::parse reads VALUE, without a WIDTH. EDK2's Keyword
+    /// Handler copies a `<KeywordResp>`'s VALUE from the `<ConfigResp>` of ExtractConfig.
+    fn parse(name: &str, digits: &str) -> Result<Self, ConfigStringError> {
+        hex_number(digits)
+            .map(Self)
+            .ok_or_else(|| invalid_number(name, digits))
+    }
+}
+
+impl TryFrom<Vec<u8>> for Number {
+    type Error = ConfigStringError;
+
+    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+        if bytes.is_empty() {
+            return Err(ConfigStringError::EmptyValue);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for Number {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(f, self.0.iter().rev())
+    }
+}
+
+/// `<NameSpaceId>`'s platform configuration language, such as "x-UEFI-ns".
+///
+/// Plain text, although the BNF has a `<String>`: EDK2's Keyword Handler reads and writes it so
+/// (ExtractNameSpace, GenerateKeywordResp), as the §35.2.1.6 examples do, and converts it to
+/// ASCII (UnicodeStrToAsciiStrS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Namespace(String);
+
+impl TryFrom<&str> for Namespace {
+    type Error = ConfigStringError;
+
+    fn try_from(text: &str) -> Result<Self, Self::Error> {
+        let printable = text
+            .chars()
+            .all(|character| character.is_ascii_graphic() && !matches!(character, '&' | '='));
+        if text.is_empty() || !printable {
+            return Err(ConfigStringError::InvalidNamespace(text.to_owned()));
+        }
+        Ok(Self(text.to_owned()))
+    }
+}
+
+impl fmt::Display for Namespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `<Keyword>`'s keyword of the UEFI Configuration Namespace Registry, with the ':' and 1 to 4
+/// digits that tell instances of a keyword apart, as in "ChipsetSATAPortEnable:5".
+///
+/// Plain text, as for Namespace: EDK2's ExtractKeyword and GenerateKeywordResp, and the
+/// §35.2.1.6 examples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Keyword(String);
+
+impl TryFrom<&str> for Keyword {
+    type Error = ConfigStringError;
+
+    fn try_from(text: &str) -> Result<Self, Self::Error> {
+        let (name, instance) = match text.split_once(':') {
+            Some((name, instance)) => (name, Some(instance)),
+            None => (text, None),
         };
-        first.fmt(f)?;
-        resps.try_for_each(|resp| write!(f, "&{resp}"))
+        let name_ok = !name.is_empty()
+            && name
+                .chars()
+                .all(|character| !character.is_control() && !matches!(character, '&' | '='));
+        let instance_ok = instance.is_none_or(|digits| {
+            (1..=4).contains(&digits.len()) && digits.bytes().all(|digit| digit.is_ascii_digit())
+        });
+        if !name_ok || !instance_ok {
+            return Err(ConfigStringError::InvalidKeyword(text.to_owned()));
+        }
+        Ok(Self(text.to_owned()))
+    }
+}
+
+impl fmt::Display for Keyword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `<UsageFilter>`, and whether a `<KeywordResp>` has "&READONLY".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Usage {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl fmt::Display for Usage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ReadOnly => "ReadOnly",
+            Self::ReadWrite => "ReadWrite",
+        })
+    }
+}
+
+/// The byte width of 'Numeric':1, :2, :4 or :8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumericWidth {
+    One,
+    Two,
+    Four,
+    Eight,
+}
+
+/// 'Numeric'[':1'|':2'|':4'|':8']: a numeric value of the width, else of a width that "may vary".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Numeric {
+    pub(crate) width: Option<NumericWidth>,
+}
+
+impl Numeric {
+    fn parse(text: &str) -> Option<Self> {
+        let width = match text {
+            "Numeric" => None,
+            "Numeric:1" => Some(NumericWidth::One),
+            "Numeric:2" => Some(NumericWidth::Two),
+            "Numeric:4" => Some(NumericWidth::Four),
+            "Numeric:8" => Some(NumericWidth::Eight),
+            _ => return None,
+        };
+        Some(Self { width })
+    }
+}
+
+impl fmt::Display for Numeric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.width {
+            None => "Numeric",
+            Some(NumericWidth::One) => "Numeric:1",
+            Some(NumericWidth::Two) => "Numeric:2",
+            Some(NumericWidth::Four) => "Numeric:4",
+            Some(NumericWidth::Eight) => "Numeric:8",
+        })
+    }
+}
+
+/// `<DataFilter>`: a keyword's data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataFilter {
+    Buffer,
+    Numeric(Numeric),
+    String,
+    Boolean,
+    Date,
+    Time,
+}
+
+impl DataFilter {
+    fn parse(name: &str, text: &str) -> Result<Self, ConfigStringError> {
+        match text {
+            "Buffer" => Ok(Self::Buffer),
+            "String" => Ok(Self::String),
+            "Boolean" => Ok(Self::Boolean),
+            "Date" => Ok(Self::Date),
+            "Time" => Ok(Self::Time),
+            _ => Numeric::parse(text)
+                .map(Self::Numeric)
+                .ok_or_else(|| invalid_value(name, text, DATA_FILTER)),
+        }
+    }
+}
+
+impl fmt::Display for DataFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Buffer => f.write_str("Buffer"),
+            Self::Numeric(numeric) => numeric.fmt(f),
+            Self::String => f.write_str("String"),
+            Self::Boolean => f.write_str("Boolean"),
+            Self::Date => f.write_str("Date"),
+            Self::Time => f.write_str("Time"),
+        }
+    }
+}
+
+bitflags! {
+    /// `<KeywordInfoFilter>`: the `<KeywordInfoResp>` items that a `<KeywordRequest>` asks for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct KeywordInfoFilter: u64 {
+        const DATA_TYPE = 1;
+        const VALUE_ATTRIBUTE = 1 << 1;
+        const DEFAULT = 1 << 2;
+        const DISPLAY_NAME = 1 << 3;
+    }
+}
+
+impl fmt::Display for KeywordInfoFilter {
+    /// 'All' for every item, which means "all the supported information", else the items'
+    /// names in BNF order.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_all() {
+            return f.write_str("All");
+        }
+        [
+            (Self::DATA_TYPE, "DataType"),
+            (Self::VALUE_ATTRIBUTE, "ValueAttribute"),
+            (Self::DEFAULT, "Default"),
+            (Self::DISPLAY_NAME, "DisplayName"),
+        ]
+        .into_iter()
+        .filter(|(item, _)| self.contains(*item))
+        .try_for_each(|(_, name)| f.write_str(name))
+    }
+}
+
+/// A keyword string's `<PathHdr>`, which unlike a `<ConfigHdr>`'s holds at least an End node:
+/// EDK2's Keyword Handler refuses a shorter one (ExtractDevicePath) and writes the handle's whole
+/// device path (GenerateKeywordResp).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeywordPath(DevicePath);
+
+impl TryFrom<DevicePath> for KeywordPath {
+    type Error = ConfigStringError;
+
+    fn try_from(path: DevicePath) -> Result<Self, Self::Error> {
+        match path.as_ref().len() {
+            len if len < MIN_DEVICE_PATH_LEN => Err(ConfigStringError::ShortKeywordPath(len)),
+            _ => Ok(Self(path)),
+        }
+    }
+}
+
+impl AsRef<DevicePath> for KeywordPath {
+    fn as_ref(&self) -> &DevicePath {
+        &self.0
+    }
+}
+
+impl fmt::Display for KeywordPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(f, self.0.as_ref())
+    }
+}
+
+/// `<KeywordRequest>`: a keyword to read through GetData.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeywordRequest {
+    /// The device path of the instance to read; None reads "all instances".
+    pub(crate) device_path: Option<KeywordPath>,
+    pub(crate) keyword: Keyword,
+    pub(crate) info: Option<KeywordInfoFilter>,
+    pub(crate) usage: Option<Usage>,
+    pub(crate) data: Option<DataFilter>,
+}
+
+impl fmt::Display for KeywordRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(device_path) = &self.device_path {
+            write!(f, "PATH={device_path}&")?;
+        }
+        write!(f, "KEYWORD={}", self.keyword)?;
+        if let Some(info) = self.info {
+            write!(f, "&KEYWORDINFO={info}")?;
+        }
+        if let Some(usage) = self.usage {
+            write!(f, "&{usage}")?;
+        }
+        if let Some(data) = self.data {
+            write!(f, "&{data}")?;
+        }
+        Ok(())
+    }
+}
+
+/// `<ValueRange>`: a numeric question's bounds and step, or a string question's lengths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValueRange {
+    pub(crate) max: Number,
+    pub(crate) min: Number,
+    pub(crate) step: Option<Number>,
+}
+
+/// `<ValueOption>`: a one-of or ordered-list option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValueOption {
+    pub(crate) value: Number,
+    pub(crate) string: Vec<u16>,
+    /// The numeric type of an ordered list's buffer elements
+    pub(crate) value_type: Option<Numeric>,
+}
+
+/// `<KeywordInfoResp>`: what a `<KeywordInfoFilter>` asked about a keyword.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct KeywordInfo {
+    pub(crate) data_type: Option<DataFilter>,
+    pub(crate) range: Option<ValueRange>,
+    pub(crate) options: Vec<ValueOption>,
+    pub(crate) standard_default: Option<Number>,
+    pub(crate) manufacturing_default: Option<Number>,
+    pub(crate) safe_default: Option<Number>,
+    pub(crate) display_name: Option<Vec<u16>>,
+}
+
+impl KeywordInfo {
+    fn parse(elements: &mut Elements<'_>) -> Result<Self, ConfigStringError> {
+        let data_type = elements
+            .optional_value("DATATYPE=")
+            .map(|text| DataFilter::parse("DATATYPE", text))
+            .transpose()?;
+        let range = match elements.optional_value("MAX=") {
+            Some(max) => Some(ValueRange {
+                max: Number::parse("MAX", max)?,
+                min: Number::parse("MIN", elements.required_value("MIN=")?)?,
+                step: parse_optional_number(elements, "STEP")?,
+            }),
+            None => None,
+        };
+        let mut options = Vec::new();
+        while let Some(value) = elements.optional_value("OPTIONVALUE=") {
+            options.push(ValueOption {
+                value: Number::parse("OPTIONVALUE", value)?,
+                string: parse_string("OPTIONSTRING", elements.required_value("OPTIONSTRING=")?)?,
+                value_type: elements
+                    .optional_value("VALUETYPE=")
+                    .map(|text| {
+                        Numeric::parse(text)
+                            .ok_or_else(|| invalid_value("VALUETYPE", text, NUMERIC_TYPE))
+                    })
+                    .transpose()?,
+            });
+        }
+        Ok(Self {
+            data_type,
+            range,
+            options,
+            standard_default: parse_optional_number(elements, "STANDARDDEFAULT")?,
+            manufacturing_default: parse_optional_number(elements, "MFGDEFAULT")?,
+            safe_default: parse_optional_number(elements, "SAFEDEFAULT")?,
+            display_name: elements
+                .optional_value("DISPLAYNAME=")
+                .map(|digits| parse_string("DISPLAYNAME", digits))
+                .transpose()?,
+        })
+    }
+}
+
+impl fmt::Display for KeywordInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(data_type) = self.data_type {
+            write!(f, "&DATATYPE={data_type}")?;
+        }
+        if let Some(range) = &self.range {
+            write!(f, "&MAX={}&MIN={}", range.max, range.min)?;
+            if let Some(step) = &range.step {
+                write!(f, "&STEP={step}")?;
+            }
+        }
+        for option in &self.options {
+            write!(f, "&OPTIONVALUE={}&OPTIONSTRING=", option.value)?;
+            write_string(f, &option.string)?;
+            if let Some(value_type) = option.value_type {
+                write!(f, "&VALUETYPE={value_type}")?;
+            }
+        }
+        let defaults = [
+            ("STANDARDDEFAULT", &self.standard_default),
+            ("MFGDEFAULT", &self.manufacturing_default),
+            ("SAFEDEFAULT", &self.safe_default),
+        ];
+        for (name, default) in defaults {
+            if let Some(default) = default {
+                write!(f, "&{name}={default}")?;
+            }
+        }
+        if let Some(display_name) = &self.display_name {
+            f.write_str("&DISPLAYNAME=")?;
+            write_string(f, display_name)?;
+        }
+        Ok(())
+    }
+}
+
+/// `<KeywordResp>`: a keyword's value from GetData, or one to write through SetData.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeywordResp {
+    pub(crate) namespace: Namespace,
+    pub(crate) device_path: KeywordPath,
+    pub(crate) keyword: Keyword,
+    pub(crate) value: Number,
+    /// ReadOnly writes "&READONLY". EDK2's SetData refuses a `<KeywordResp>` whose READONLY
+    /// differs from the question's flag, and refuses any read-only keyword.
+    pub(crate) usage: Usage,
+    pub(crate) info: KeywordInfo,
+}
+
+impl KeywordResp {
+    fn parse(elements: &mut Elements<'_>) -> Result<Self, ConfigStringError> {
+        let namespace = Namespace::try_from(elements.required_value("NAMESPACE=")?)?;
+        let device_path =
+            KeywordPath::try_from(parse_device_path(elements.required_value("PATH=")?)?)?;
+        let keyword = Keyword::try_from(elements.required_value("KEYWORD=")?)?;
+        let value = Number::parse("VALUE", elements.required_value("VALUE=")?)?;
+        let usage = if elements.take_if_eq("READONLY") {
+            Usage::ReadOnly
+        } else {
+            Usage::ReadWrite
+        };
+        Ok(Self {
+            namespace,
+            device_path,
+            keyword,
+            value,
+            usage,
+            info: KeywordInfo::parse(elements)?,
+        })
+    }
+}
+
+impl fmt::Display for KeywordResp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "NAMESPACE={}&PATH={}&KEYWORD={}&VALUE={}",
+            self.namespace, self.device_path, self.keyword, self.value
+        )?;
+        match self.usage {
+            Usage::ReadOnly => f.write_str("&READONLY")?,
+            Usage::ReadWrite => {}
+        }
+        self.info.fmt(f)
+    }
+}
+
+/// `<MultiKeywordResp>`: at least one `<KeywordResp>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MultiKeywordResp(Vec<KeywordResp>);
+
+impl MultiKeywordResp {
+    pub(crate) fn as_slice(&self) -> &[KeywordResp] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<KeywordResp>> for MultiKeywordResp {
+    type Error = ConfigStringError;
+
+    fn try_from(resps: Vec<KeywordResp>) -> Result<Self, Self::Error> {
+        if resps.is_empty() {
+            return Err(ConfigStringError::EmptyMultiKeywordResp);
+        }
+        Ok(Self(resps))
+    }
+}
+
+impl FromStr for MultiKeywordResp {
+    type Err = ConfigStringError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut elements = Elements::new(text);
+        let mut resps = vec![KeywordResp::parse(&mut elements)?];
+        while let Some(element) = elements.peek() {
+            if !element.starts_with("NAMESPACE=") {
+                return Err(ConfigStringError::Unexpected {
+                    expected: KEYWORD_RESP_END,
+                    found: element.to_owned(),
+                });
+            }
+            resps.push(KeywordResp::parse(&mut elements)?);
+        }
+        Ok(Self(resps))
+    }
+}
+
+impl fmt::Display for MultiKeywordResp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_joined(f, &self.0)
     }
 }
 
@@ -529,6 +1024,11 @@ impl<'a> Elements<'a> {
     /// The next element unless it starts a `<ConfigHdr>`.
     fn next_unless_header(&mut self) -> Option<&'a str> {
         self.0.next_if(|element| !element.starts_with("GUID="))
+    }
+
+    /// Takes the next element if it is `element`.
+    fn take_if_eq(&mut self, element: &str) -> bool {
+        self.0.next_if_eq(&element).is_some()
     }
 
     /// The value of the next element, which starts with `prefix`, such as "GUID=".
@@ -574,14 +1074,47 @@ fn write_body(f: &mut fmt::Formatter<'_>, body: &[ConfigElement]) -> fmt::Result
     body.iter().try_for_each(|element| write!(f, "&{element}"))
 }
 
+/// Writes `items` separated by '&', as the Multi strings join theirs.
+fn write_joined(f: &mut fmt::Formatter<'_>, items: &[impl fmt::Display]) -> fmt::Result {
+    items
+        .iter()
+        .enumerate()
+        .try_for_each(|(index, item)| match index {
+            0 => item.fmt(f),
+            _ => write!(f, "&{item}"),
+        })
+}
+
 fn parse_alt_cfg_id(digits: &str) -> Result<u16, ConfigStringError> {
-    match digits.as_bytes() {
-        [a, b, c, d] => hex_byte(*a, *b)
-            .zip(hex_byte(*c, *d))
-            .map(|(high, low)| u16::from_be_bytes([high, low])),
-        _ => None,
-    }
-    .ok_or_else(|| invalid_value("ALTCFG", digits, ALT_CFG_ID))
+    hex_unit(digits.as_bytes()).ok_or_else(|| invalid_value("ALTCFG", digits, ALT_CFG_ID))
+}
+
+fn parse_optional_number(
+    elements: &mut Elements<'_>,
+    name: &str,
+) -> Result<Option<Number>, ConfigStringError> {
+    elements
+        .optional_value(&format!("{name}="))
+        .map(|digits| Number::parse(name, digits))
+        .transpose()
+}
+
+/// The CHAR16s of a `<String>`, 4 hex digits each.
+fn parse_string(name: &str, digits: &str) -> Result<Vec<u16>, ConfigStringError> {
+    digits
+        .as_bytes()
+        .chunks(4)
+        .map(hex_unit)
+        .collect::<Option<_>>()
+        .ok_or_else(|| invalid_value(name, digits, STRING))
+}
+
+fn write_string(f: &mut fmt::Formatter<'_>, units: &[u16]) -> fmt::Result {
+    units.iter().try_for_each(|unit| write!(f, "{unit:04x}"))
+}
+
+fn parse_device_path(digits: &str) -> Result<DevicePath, ConfigStringError> {
+    hex_bytes(digits).ok_or_else(|| invalid_value("PATH", digits, DEVICE_PATH))
 }
 
 /// OFFSET's or WIDTH's value.
@@ -635,6 +1168,14 @@ fn hex_bytes<B: FromIterator<u8>>(digits: &str) -> Option<B> {
         .collect()
 }
 
+/// The CHAR16 of 4 hex digits, most significant first.
+fn hex_unit(digits: &[u8]) -> Option<u16> {
+    match digits {
+        [a, b, c, d] => Some(u16::from_be_bytes([hex_byte(*a, *b)?, hex_byte(*c, *d)?])),
+        _ => None,
+    }
+}
+
 fn hex_byte(high: u8, low: u8) -> Option<u8> {
     Some((hex_digit(high)? << 4) | hex_digit(low)?)
 }
@@ -664,6 +1205,13 @@ fn invalid_value(name: &str, value: &str, expected: &'static str) -> ConfigStrin
         name: name.to_owned(),
         value: value.to_owned(),
         expected,
+    }
+}
+
+fn invalid_number(name: &str, value: &str) -> ConfigStringError {
+    ConfigStringError::InvalidNumber {
+        name: name.to_owned(),
+        len: value.chars().count(),
     }
 }
 
@@ -711,6 +1259,13 @@ mod tests {
             name: name.to_owned(),
             value: value.to_owned(),
             expected,
+        }
+    }
+
+    fn invalid_number(name: &str, len: usize) -> ConfigStringError {
+        ConfigStringError::InvalidNumber {
+            name: name.to_owned(),
+            len,
         }
     }
 
@@ -869,7 +1424,7 @@ mod tests {
         assert_eq!(
             parse_resp("&OFFSET=0&WIDTH=1&VALUE=0102"),
             Err(ConfigStringError::ValueWiderThanWidth {
-                value: "0102".to_owned(),
+                digits: 4,
                 width: 1,
             }),
             "nonzero byte past WIDTH"
@@ -877,7 +1432,7 @@ mod tests {
         assert_eq!(
             parse_resp("&OFFSET=0&WIDTH=1&VALUE=010002"),
             Err(ConfigStringError::ValueWiderThanWidth {
-                value: "010002".to_owned(),
+                digits: 6,
                 width: 1,
             }),
             "zero and nonzero bytes past WIDTH"
@@ -937,7 +1492,7 @@ mod tests {
         for invalid in ["xyz", "+1"] {
             assert_eq!(
                 NvConfig::new(label("fred"), invalid),
-                Err(invalid_value("fred", invalid, NUMBER)),
+                Err(invalid_number("fred", invalid.len())),
                 "value {invalid:?}"
             );
         }
@@ -1094,7 +1649,7 @@ mod tests {
             ),
             (
                 format!("{header}&OFFSET=0&WIDTH=1&VALUE="),
-                invalid_value("VALUE", "", NUMBER),
+                invalid_number("VALUE", 0),
             ),
             (
                 format!("{header}&OFFSET={usize_overflow}&WIDTH=1&VALUE=00"),
@@ -1120,10 +1675,7 @@ mod tests {
                 unexpected(CONFIG_ELEMENT, ""),
             ),
             (format!("{header}&fred"), unexpected(CONFIG_ELEMENT, "fred")),
-            (
-                format!("{header}&fred=xyz"),
-                invalid_value("fred", "xyz", NUMBER),
-            ),
+            (format!("{header}&fred=xyz"), invalid_number("fred", 3)),
             (
                 format!("{header}&9lives=00"),
                 ConfigStringError::InvalidLabel("9lives".to_owned()),
@@ -1234,6 +1786,529 @@ mod tests {
         ];
         for (text, error) in cases {
             assert_eq!(text.parse::<MultiConfigAltResp>(), Err(error), "{text:?}");
+        }
+    }
+
+    /// "Acme" as a string keyword's VALUE: its CHAR16s little-endian, printed most significant
+    /// byte first.
+    const ACME_VALUE: &str = "0065006d00630041";
+
+    fn keyword(text: &str) -> Keyword {
+        Keyword::try_from(text).expect("valid keyword")
+    }
+
+    fn namespace(text: &str) -> Namespace {
+        Namespace::try_from(text).expect("valid namespace")
+    }
+
+    fn number(bytes: &[u8]) -> Number {
+        Number::try_from(bytes.to_vec()).expect("nonempty number")
+    }
+
+    fn ucs2(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn end_keyword_path() -> KeywordPath {
+        KeywordPath::try_from(DevicePath::from(END_DEVICE_PATH.to_vec())).expect("an End node")
+    }
+
+    fn bios_vendor_resp(info: KeywordInfo) -> KeywordResp {
+        KeywordResp {
+            namespace: namespace("x-UEFI-ns"),
+            device_path: end_keyword_path(),
+            keyword: keyword("BIOSVendor"),
+            value: number(
+                &ucs2("Acme")
+                    .iter()
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            usage: Usage::ReadWrite,
+            info,
+        }
+    }
+
+    fn keyword_request(keyword_text: &str) -> KeywordRequest {
+        KeywordRequest {
+            device_path: None,
+            keyword: keyword(keyword_text),
+            info: None,
+            usage: None,
+            data: None,
+        }
+    }
+
+    /// UEFI 2.10 §35.2.1.6.1's `<KeywordRequest>`.
+    #[test]
+    fn keyword_request_example_builds() {
+        assert_eq!(
+            keyword_request("BIOSVendor").to_string(),
+            "KEYWORD=BIOSVendor",
+            "§35.2.1.6.1 example"
+        );
+    }
+
+    /// UEFI 2.10 §35.2.1.6.4's `<KeywordRequest>`.
+    #[test]
+    fn keyword_info_request_example_builds() {
+        let request = KeywordRequest {
+            info: Some(KeywordInfoFilter::all()),
+            ..keyword_request("BIOSVendor")
+        };
+
+        assert_eq!(
+            request.to_string(),
+            "KEYWORD=BIOSVendor&KEYWORDINFO=All",
+            "§35.2.1.6.4 example"
+        );
+    }
+
+    #[test]
+    fn keyword_request_lists_path_info_and_filters_in_order() {
+        let request = KeywordRequest {
+            device_path: Some(end_keyword_path()),
+            info: Some(KeywordInfoFilter::DATA_TYPE | KeywordInfoFilter::DEFAULT),
+            usage: Some(Usage::ReadOnly),
+            data: Some(DataFilter::Numeric(Numeric {
+                width: Some(NumericWidth::One),
+            })),
+            ..keyword_request("ChipsetSATAPortEnable:5")
+        };
+
+        assert_eq!(
+            request.to_string(),
+            "PATH=7fff0400&KEYWORD=ChipsetSATAPortEnable:5\
+             &KEYWORDINFO=DataTypeDefault&ReadOnly&Numeric:1",
+            "every optional part"
+        );
+    }
+
+    #[test]
+    fn keyword_path_holds_at_least_an_end_node() {
+        let end_node = DevicePath::from(END_DEVICE_PATH.to_vec());
+
+        assert_eq!(
+            KeywordPath::try_from(end_node.clone())
+                .map(|path| (path.as_ref().clone(), path.to_string())),
+            Ok((end_node, "7fff0400".to_owned())),
+            "an End node"
+        );
+        assert_eq!(
+            KeywordPath::try_from(DevicePath::from(vec![0x7F, 0xFF, 0x04])),
+            Err(ConfigStringError::ShortKeywordPath(3)),
+            "3 bytes"
+        );
+    }
+
+    #[test]
+    fn keyword_info_filter_lists_items_in_bnf_order() {
+        let cases = [
+            (KeywordInfoFilter::empty(), ""),
+            (KeywordInfoFilter::DISPLAY_NAME, "DisplayName"),
+            (
+                KeywordInfoFilter::DISPLAY_NAME | KeywordInfoFilter::VALUE_ATTRIBUTE,
+                "ValueAttributeDisplayName",
+            ),
+            (KeywordInfoFilter::all(), "All"),
+        ];
+        for (filter, text) in cases {
+            assert_eq!(filter.to_string(), text, "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn data_filters_print_as_the_bnf_spells_them() {
+        let cases = [
+            (DataFilter::Buffer, "Buffer"),
+            (DataFilter::Numeric(Numeric { width: None }), "Numeric"),
+            (
+                DataFilter::Numeric(Numeric {
+                    width: Some(NumericWidth::One),
+                }),
+                "Numeric:1",
+            ),
+            (
+                DataFilter::Numeric(Numeric {
+                    width: Some(NumericWidth::Two),
+                }),
+                "Numeric:2",
+            ),
+            (
+                DataFilter::Numeric(Numeric {
+                    width: Some(NumericWidth::Four),
+                }),
+                "Numeric:4",
+            ),
+            (
+                DataFilter::Numeric(Numeric {
+                    width: Some(NumericWidth::Eight),
+                }),
+                "Numeric:8",
+            ),
+            (DataFilter::String, "String"),
+            (DataFilter::Boolean, "Boolean"),
+            (DataFilter::Date, "Date"),
+            (DataFilter::Time, "Time"),
+        ];
+        for (filter, text) in cases {
+            assert_eq!(
+                (filter.to_string(), DataFilter::parse("DATATYPE", text)),
+                (text.to_owned(), Ok(filter)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_filters_print_as_the_bnf_spells_them() {
+        for (usage, text) in [
+            (Usage::ReadOnly, "ReadOnly"),
+            (Usage::ReadWrite, "ReadWrite"),
+        ] {
+            assert_eq!(usage.to_string(), text, "{usage:?}");
+        }
+    }
+
+    #[test]
+    fn keywords_and_namespaces_refuse_separators() {
+        for valid in [
+            "BIOSVendor",
+            "ChipsetSATAPortEnable:5",
+            "Port:1234",
+            "x-UEFI-AMI",
+        ] {
+            assert_eq!(
+                Keyword::try_from(valid).map(|keyword| keyword.to_string()),
+                Ok(valid.to_owned()),
+                "keyword {valid:?}"
+            );
+        }
+        for invalid in [
+            "",
+            ":5",
+            "Port:",
+            "Port:12345",
+            "Port:a",
+            "Port:5:6",
+            "a&b",
+            "a=b",
+            "a\0b",
+        ] {
+            assert_eq!(
+                Keyword::try_from(invalid),
+                Err(ConfigStringError::InvalidKeyword(invalid.to_owned())),
+                "keyword {invalid:?}"
+            );
+        }
+        for valid in ["x-UEFI-ns", "x-UEFI-extension-ACME"] {
+            assert_eq!(
+                Namespace::try_from(valid).map(|namespace| namespace.to_string()),
+                Ok(valid.to_owned()),
+                "namespace {valid:?}"
+            );
+        }
+        for invalid in ["", "x UEFI", "a&b", "a=b", "x-UEFI-\u{e9}"] {
+            assert_eq!(
+                Namespace::try_from(invalid),
+                Err(ConfigStringError::InvalidNamespace(invalid.to_owned())),
+                "namespace {invalid:?}"
+            );
+        }
+    }
+
+    /// UEFI 2.10 §35.2.1.6.2's and §35.2.1.6.3's responses, with the NAMESPACE= and PATH= that
+    /// `<KeywordResp>` has and hex VALUEs.
+    #[test]
+    fn keyword_resp_examples_parse_in_bnf_form() {
+        let text = format!(
+            "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVendor&VALUE={ACME_VALUE}\
+             &NAMESPACE=x-UEFI-extension-ACME&PATH=7fff0400&KEYWORD=SpecialSettingX&VALUE=3"
+        );
+        let multi: MultiKeywordResp = text.parse().expect("parses");
+
+        assert_eq!(
+            multi.as_slice(),
+            [
+                bios_vendor_resp(KeywordInfo::default()),
+                KeywordResp {
+                    namespace: namespace("x-UEFI-extension-ACME"),
+                    keyword: keyword("SpecialSettingX"),
+                    value: number(&[0x03]),
+                    ..bios_vendor_resp(KeywordInfo::default())
+                },
+            ],
+            "§35.2.1.6.2 and §35.2.1.6.3 examples"
+        );
+        assert_eq!(
+            multi.to_string(),
+            text.replace("VALUE=3", "VALUE=03"),
+            "a <Number> prints whole bytes"
+        );
+    }
+
+    #[test]
+    fn keyword_resp_examples_as_printed_are_refused() {
+        let cases = [
+            (
+                "x-UEFI-ns&KEYWORD=BIOSVendor&VALUE=AcmeBIOSCompany".to_owned(),
+                unexpected("NAMESPACE=", "x-UEFI-ns"),
+            ),
+            (
+                "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVendor&VALUE=AcmeBIOSCompany"
+                    .to_owned(),
+                invalid_number("VALUE", 15),
+            ),
+            (
+                format!(
+                    "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVendor&VALUE={ACME_VALUE}\
+                     &DataType=String&MAX=1e&MIN=06"
+                ),
+                unexpected(KEYWORD_RESP_END, "DataType=String"),
+            ),
+        ];
+        for (text, error) in cases {
+            assert_eq!(text.parse::<MultiKeywordResp>(), Err(error), "{text:?}");
+        }
+    }
+
+    /// UEFI 2.10 §35.2.1.6.4's response, in BNF form: NAMESPACE=, PATH=, hex values, DATATYPE=.
+    #[test]
+    fn keyword_info_resp_example_parses_in_bnf_form() {
+        let text = format!(
+            "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVendor&VALUE={ACME_VALUE}\
+             &DATATYPE=String&MAX=1e&MIN=06\
+             &STANDARDDEFAULT={ACME_VALUE}&MFGDEFAULT={ACME_VALUE}"
+        );
+        let resp: MultiKeywordResp = text.parse().expect("parses");
+        let acme = bios_vendor_resp(KeywordInfo::default()).value;
+
+        assert_eq!(
+            resp.as_slice(),
+            [bios_vendor_resp(KeywordInfo {
+                data_type: Some(DataFilter::String),
+                range: Some(ValueRange {
+                    max: number(&[0x1E]),
+                    min: number(&[0x06]),
+                    step: None,
+                }),
+                standard_default: Some(acme.clone()),
+                manufacturing_default: Some(acme),
+                ..KeywordInfo::default()
+            })],
+            "parsed"
+        );
+        assert_eq!(resp.to_string(), text, "printed");
+    }
+
+    #[test]
+    fn keyword_resp_keeps_readonly_options_and_display_name() {
+        let text = "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=ChipsetSATAPortEnable:2&VALUE=01\
+                    &READONLY&DATATYPE=Buffer&MAX=02&MIN=01&STEP=01\
+                    &OPTIONVALUE=00&OPTIONSTRING=004f00660066&VALUETYPE=Numeric:1\
+                    &OPTIONVALUE=01&OPTIONSTRING=004f006e\
+                    &SAFEDEFAULT=00&DISPLAYNAME=0050006f00720074";
+        let resp: MultiKeywordResp = text.parse().expect("parses");
+
+        assert_eq!(
+            resp.as_slice(),
+            [KeywordResp {
+                keyword: keyword("ChipsetSATAPortEnable:2"),
+                value: number(&[0x01]),
+                usage: Usage::ReadOnly,
+                info: KeywordInfo {
+                    data_type: Some(DataFilter::Buffer),
+                    range: Some(ValueRange {
+                        max: number(&[0x02]),
+                        min: number(&[0x01]),
+                        step: Some(number(&[0x01])),
+                    }),
+                    options: vec![
+                        ValueOption {
+                            value: number(&[0x00]),
+                            string: ucs2("Off"),
+                            value_type: Some(Numeric {
+                                width: Some(NumericWidth::One),
+                            }),
+                        },
+                        ValueOption {
+                            value: number(&[0x01]),
+                            string: ucs2("On"),
+                            value_type: None,
+                        },
+                    ],
+                    safe_default: Some(number(&[0x00])),
+                    display_name: Some(ucs2("Port")),
+                    ..KeywordInfo::default()
+                },
+                ..bios_vendor_resp(KeywordInfo::default())
+            }],
+            "parsed"
+        );
+        assert_eq!(resp.to_string(), text, "printed");
+    }
+
+    #[test]
+    fn multi_keyword_resp_joins_its_keyword_resps() {
+        let resps = vec![
+            bios_vendor_resp(KeywordInfo::default()),
+            KeywordResp {
+                keyword: keyword("BIOSVersion"),
+                usage: Usage::ReadOnly,
+                ..bios_vendor_resp(KeywordInfo::default())
+            },
+        ];
+        let multi = MultiKeywordResp::try_from(resps.clone()).expect("two KeywordResps");
+        let text = format!(
+            "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVendor&VALUE={ACME_VALUE}\
+             &NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVersion&VALUE={ACME_VALUE}&READONLY"
+        );
+
+        assert_eq!(multi.to_string(), text, "printed");
+        assert_eq!(
+            text.parse::<MultiKeywordResp>()
+                .map(|parsed| parsed.as_slice().to_vec()),
+            Ok(resps),
+            "parsed back"
+        );
+        assert_eq!(
+            MultiKeywordResp::try_from(Vec::new()),
+            Err(ConfigStringError::EmptyMultiKeywordResp),
+            "no KeywordResp"
+        );
+    }
+
+    /// A setting may be a password, so an error names it but leaves out its digits.
+    #[test]
+    fn errors_leave_setting_values_out() {
+        const SECRET: &str = "5ec2e7";
+        let cases = [
+            (
+                "VALUE wider than WIDTH",
+                parse_resp(&format!("&OFFSET=0&WIDTH=1&VALUE={SECRET}")).map(|_| ()),
+                "VALUE",
+            ),
+            (
+                "VALUE not hex",
+                parse_resp(&format!("&OFFSET=0&WIDTH=4&VALUE={SECRET}x")).map(|_| ()),
+                "VALUE",
+            ),
+            (
+                "<NvConfig> value not hex",
+                parse_resp(&format!("&fred={SECRET}x")).map(|_| ()),
+                "fred",
+            ),
+            (
+                "<KeywordResp> VALUE not hex",
+                format!("NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=a&VALUE={SECRET}x")
+                    .parse::<MultiKeywordResp>()
+                    .map(|_| ()),
+                "VALUE",
+            ),
+        ];
+        for (case, result, name) in cases {
+            let message = result.map_err(|error| error.to_string());
+            assert!(
+                message
+                    .as_ref()
+                    .is_err_and(|message| message.contains(name) && !message.contains(SECRET)),
+                "{case}: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn number_holds_at_least_one_byte_least_significant_first() {
+        assert_eq!(
+            Number::try_from(vec![0x55, 0xAA])
+                .map(|number| (number.to_string(), number.as_bytes().to_vec())),
+            Ok(("aa55".to_owned(), vec![0x55, 0xAA])),
+            "2 bytes"
+        );
+        assert_eq!(
+            Number::try_from(Vec::new()),
+            Err(ConfigStringError::EmptyValue),
+            "no byte"
+        );
+    }
+
+    #[test]
+    fn malformed_keyword_resp_is_refused() {
+        let start = "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVendor&VALUE=01";
+        let cases = [
+            ("".to_owned(), unexpected("NAMESPACE=", "")),
+            (
+                "NAMESPACE=&PATH=&KEYWORD=a&VALUE=01".to_owned(),
+                ConfigStringError::InvalidNamespace(String::new()),
+            ),
+            (
+                "NAMESPACE=x-UEFI-ns&KEYWORD=a&VALUE=01".to_owned(),
+                unexpected("PATH=", "KEYWORD=a"),
+            ),
+            (
+                "NAMESPACE=x-UEFI-ns&PATH=7ff&KEYWORD=a&VALUE=01".to_owned(),
+                invalid_value("PATH", "7ff", DEVICE_PATH),
+            ),
+            (
+                "NAMESPACE=x-UEFI-ns&PATH=&KEYWORD=a&VALUE=01".to_owned(),
+                ConfigStringError::ShortKeywordPath(0),
+            ),
+            (
+                "NAMESPACE=x-UEFI-ns&PATH=7fff&KEYWORD=a&VALUE=01".to_owned(),
+                ConfigStringError::ShortKeywordPath(2),
+            ),
+            (
+                "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=Port:12345&VALUE=01".to_owned(),
+                ConfigStringError::InvalidKeyword("Port:12345".to_owned()),
+            ),
+            (
+                "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=a".to_owned(),
+                ConfigStringError::Truncated { expected: "VALUE=" },
+            ),
+            (format!("{start}&"), unexpected(KEYWORD_RESP_END, "")),
+            (
+                format!("{start}&READONLY&READONLY"),
+                unexpected(KEYWORD_RESP_END, "READONLY"),
+            ),
+            (
+                format!("{start}&READONLYX"),
+                unexpected(KEYWORD_RESP_END, "READONLYX"),
+            ),
+            (
+                format!("{start}&DATATYPE=Numeric:3"),
+                invalid_value("DATATYPE", "Numeric:3", DATA_FILTER),
+            ),
+            (
+                format!("{start}&MAX=02"),
+                ConfigStringError::Truncated { expected: "MIN=" },
+            ),
+            (
+                format!("{start}&MAX=02&STEP=01"),
+                unexpected("MIN=", "STEP=01"),
+            ),
+            (
+                format!("{start}&OPTIONVALUE=00&VALUETYPE=Numeric"),
+                unexpected("OPTIONSTRING=", "VALUETYPE=Numeric"),
+            ),
+            (
+                format!("{start}&OPTIONVALUE=00&OPTIONSTRING=004&VALUETYPE=Numeric"),
+                invalid_value("OPTIONSTRING", "004", STRING),
+            ),
+            (
+                format!("{start}&OPTIONVALUE=00&OPTIONSTRING=004f&VALUETYPE=Buffer"),
+                invalid_value("VALUETYPE", "Buffer", NUMERIC_TYPE),
+            ),
+            (
+                format!("{start}&MFGDEFAULT=00&STANDARDDEFAULT=00"),
+                unexpected(KEYWORD_RESP_END, "STANDARDDEFAULT=00"),
+            ),
+            (
+                format!("{start}&DISPLAYNAME=0050&DATATYPE=String"),
+                unexpected(KEYWORD_RESP_END, "DATATYPE=String"),
+            ),
+        ];
+        for (text, error) in cases {
+            assert_eq!(text.parse::<MultiKeywordResp>(), Err(error), "{text:?}");
         }
     }
 }
