@@ -182,28 +182,13 @@ The opensource ilorest study results are published in [`doc/ilorest.md`](doc/ilo
 
 ## Update Thrift files
 
-If one needs to update a file inside [`thrift`](./thrift/) directory then:
+The Rust crates in [`thrift/rust`](./thrift/rust/) are generated from the IDL files in [`thrift`](./thrift/). Only their `Cargo.toml` files are written by hand; do not edit the generated `src/` directories.
 
-1. Install fbthrift compiler: `cargo install fbthrift_compiler && (sudo dnf install -y fbthrift || sudo apt install -y fbthrift)`
-2. Update the `.thrift` file.
-3. Run `~/.cargo/bin/compiler path/to/updated/file.thrift`.
-4. Run `mv lib.rs path/to/generated/rust/file.rs`.
+1. Edit `thrift/<name>.thrift`. A new IDL file also needs a crate manifest, `thrift/rust/<name>_thrift/Cargo.toml`, and a constant in `thrift/lib.rs`.
+2. Run `thrift/regenerate.sh`. The first run builds the code generator, `thrift1`, from the pinned fbthrift commit and caches it. The header of the script lists the requirements; `UEFISETTINGS_THRIFT_JOBS` sets how many compiler processes run at a time (default: 1).
+3. Commit the `.thrift` file together with the regenerated `thrift/rust/*/src`.
 
-For example:
-
-```sh
-# Install fbthrift compiler
-cargo install fbthrift_compiler
-sudo dnf install -y fbthrift
-
-# Update file
-vi thrift/uefisettings_spellings_db.thrift
-
-# Re-generate the rust file from the thrift file.
-cargo install fbthrift_compiler
-~/.cargo/bin/compiler thrift/uefisettings_spellings_db.thrift
-mv lib.rs thrift/rust/uefisettings_spellings_db_thrift/uefisettings_spellings_db.rs
-```
+`thrift/regenerate.sh --check` fails if the generated code is out of date or if `thrift/rust` or one of its crate directories holds files that the script does not manage, other than the `Cargo.lock` and `target/` that Cargo creates.
 
 ## Checks
 

@@ -1,1 +1,3 @@
 target
+# Cargo creates a lock file when it runs in a thrift crate directory.
+thrift/rust/*/Cargo.lock

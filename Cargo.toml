@@ -15,7 +15,7 @@ path = "src/lib/lib.rs"
 uefisettings_backend_thrift = { path = "thrift/rust/uefisettings_backend_thrift", version = "0.1.6" }
 uefisettings_spellings_db_thrift = { path = "thrift/rust/uefisettings_spellings_db_thrift", version = "0.1.6" }
 anyhow = "1.0"
-fbthrift = ">=0.0"
+fbthrift = { package = "fbthrift-git", version = "0.0.8" }
 clap = { version = "4.5.28", features = ["derive", "env", "unicode", "wrap_help"] }
 log = { version = "0.4", features = ["kv_unstable", "kv_unstable_std"] }
 serde = { version = "1.0", features = ["derive", "rc"]}

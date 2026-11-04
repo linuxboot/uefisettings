@@ -1,0 +1,3 @@
+# Written by thrift1 through thrift/regenerate.sh; GitHub collapses them in
+# diffs by default.
+thrift/rust/*/src/*.rs linguist-generated -whitespace
