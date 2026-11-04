@@ -445,9 +445,10 @@ mod tests {
     #[test]
     fn a_refused_open_is_a_refusal() {
         let dir = tempfile::tempdir().expect("create a directory");
-        let Some(unreadable) = unreadable_file(dir.path()) else {
+        let unreadable = dir.path().join("unreadable");
+        if !unreadable_file(&unreadable) {
             return;
-        };
+        }
         // read only for EPERM
         let lockdown = dir.path().join("lockdown");
         let want = |device| MemoryAccessDenied {

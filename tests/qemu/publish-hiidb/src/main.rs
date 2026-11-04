@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|install-config-tables]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -30,8 +30,11 @@
 //! [`global_variable_forms`] after those that the firmware exports.
 //! `password-forms` publishes nothing: it registers the package list of [`password_forms`]
 //! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
-//! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `HIID` ACPI table,
+//! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `QHII` ACPI table,
 //! where `src/lib/hii/extract.rs` also looks, and puts its CRC-32 in `HiiDBCrc32`.
+//! `acpi-table-hiid` does the same with an `HIID` table, the other vendor ACPI table that
+//! `src/lib/hii/extract.rs` reads. `acpi-table-junk-qhii` installs a `QHII` table whose body
+//! holds no HII package list, a table that fails the checks of `src/lib/hii/extract.rs`.
 //! `install-config-tables` sets no `HiiDB`: it installs a runtime-data copy of the database,
 //! with edk2's zeroed slack, as the configuration table of the HII database protocol's GUID, as
 //! edk2's HiiDatabaseDxe does when PcdHiiOsRuntimeSupport is TRUE (UEFI 2.11 §33.2.11.1), and
@@ -96,12 +99,16 @@ static HII_DATABASE_GUID: Guid = HiiDatabaseProtocol::GUID;
 const COPY_OFFSET: usize = 1;
 
 /// Signature of the ACPI table that `acpi-table` installs.
+const QHII_SIGNATURE: [u8; 4] = *b"QHII";
+/// Signature of the ACPI table that `acpi-table-hiid` installs.
 const HIID_SIGNATURE: [u8; 4] = *b"HIID";
+/// The body of the table that `acpi-table-junk-qhii` installs: no HII package list.
+const JUNK_TABLE_BODY: [u8; 64] = [0x5a; 64];
 /// Size of the header of an ACPI table, EFI_ACPI_DESCRIPTION_HEADER (edk2
 /// MdePkg/Include/IndustryStandard/Acpi10.h), which the database follows.
 const ACPI_HEADER_SIZE: usize = 36;
-/// Revision of the `HIID` table, which uefisettings does not read.
-const HIID_REVISION: u8 = 1;
+/// Revision of the `QHII` and `HIID` tables, which uefisettings does not read.
+const ACPI_TABLE_REVISION: u8 = 1;
 
 /// A failed step and the firmware's status.
 type Failure = (&'static str, Status);
@@ -123,14 +130,23 @@ fn efi_main() -> Status {
         }
         Some(Task::RegisterPasswordForms) => register_password_forms()
             .map(|()| println!("publish-hiidb: registered the password forms")),
-        Some(Task::PublishAcpiTable) => publish_acpi_table()
-            .map(|length| println!("publish-hiidb: {length} bytes in the HIID ACPI table")),
+        Some(Task::PublishAcpiTable(signature)) => publish_acpi_table(signature).map(|length| {
+            let signature = signature.escape_ascii();
+            println!("publish-hiidb: {length} bytes in the {signature} ACPI table");
+        }),
+        Some(Task::PublishJunkAcpiTable(signature)) => {
+            install_acpi_table(signature, &JUNK_TABLE_BODY).map(|length| {
+                let signature = signature.escape_ascii();
+                println!("publish-hiidb: {length} junk bytes in the {signature} ACPI table");
+            })
+        }
         Some(Task::InstallConfigTables) => install_config_tables(),
         None => {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
-                 |password-forms|acpi-table|install-config-tables]"
+                 |password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
+                 |install-config-tables]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -151,8 +167,10 @@ enum Task {
     Publish(MemoryType, Database),
     /// Register the package list of [`password_forms`] in the HII database.
     RegisterPasswordForms,
-    /// Publish the database in a `HIID` ACPI table.
-    PublishAcpiTable,
+    /// Publish the database in an ACPI table of the signature.
+    PublishAcpiTable([u8; 4]),
+    /// Install an ACPI table of the signature whose body is JUNK_TABLE_BODY.
+    PublishJunkAcpiTable([u8; 4]),
     /// Install a copy of the database as the HII database protocol's configuration table.
     InstallConfigTables,
 }
@@ -181,7 +199,15 @@ fn load_option() -> Option<Task> {
             Some(Task::Publish(rt_data, Database::WithGlobalVariableForms))
         }
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
-        Ok(option) if option == cstr16!("acpi-table") => Some(Task::PublishAcpiTable),
+        Ok(option) if option == cstr16!("acpi-table") => {
+            Some(Task::PublishAcpiTable(QHII_SIGNATURE))
+        }
+        Ok(option) if option == cstr16!("acpi-table-hiid") => {
+            Some(Task::PublishAcpiTable(HIID_SIGNATURE))
+        }
+        Ok(option) if option == cstr16!("acpi-table-junk-qhii") => {
+            Some(Task::PublishJunkAcpiTable(QHII_SIGNATURE))
+        }
         Ok(option) if option == cstr16!("install-config-tables") => Some(Task::InstallConfigTables),
         _ => None,
     }
@@ -300,26 +326,32 @@ fn publish(memory_type: MemoryType, database: Database) -> Result<(u64, u32), Fa
     Ok((address, length))
 }
 
-/// Installs the database that the firmware exports as the body of a `HIID` ACPI table, after
-/// its header. Returns the length of the database.
-fn publish_acpi_table() -> Result<usize, Failure> {
+/// Installs the database that the firmware exports as the body of an ACPI table of
+/// `signature`, after its header. Returns the length of the database.
+fn publish_acpi_table(signature: [u8; 4]) -> Result<usize, Failure> {
     let export = export_with_crc32(Database::Exported)?;
+    install_acpi_table(signature, &export)
+}
+
+/// Installs an ACPI table of `signature` whose body, after its header, is `body`. Returns the
+/// length of the body.
+fn install_acpi_table(signature: [u8; 4], body: &[u8]) -> Result<usize, Failure> {
     let table_length = ACPI_HEADER_SIZE
-        .checked_add(export.len())
+        .checked_add(body.len())
         .and_then(|length| u32::try_from(length).ok())
-        .ok_or(("the HIID table exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
+        .ok_or(("the ACPI table exceeds 4 GiB", Status::BAD_BUFFER_SIZE))?;
 
     // Signature, Length and Revision. The rest of the header is zeros: Checksum, which
     // InstallAcpiTable() corrects in its copy (UEFI 2.11 §20.2), then the OEM and creator fields,
     // which uefisettings does not read.
     let mut table = [
-        &HIID_SIGNATURE[..],
+        &signature[..],
         &table_length.to_le_bytes(),
-        &[HIID_REVISION],
+        &[ACPI_TABLE_REVISION],
     ]
     .concat();
     table.resize(ACPI_HEADER_SIZE, 0);
-    table.extend_from_slice(&export);
+    table.extend_from_slice(body);
 
     let acpi = boot::get_handle_for_protocol::<AcpiTable>()
         .and_then(boot::open_protocol_exclusive::<AcpiTable>)
@@ -334,8 +366,8 @@ fn publish_acpi_table() -> Result<usize, Failure> {
     // needs `table` only during the call, not in memory of a type that the OS keeps, which the
     // wrapper's documentation asks for.
     unsafe { acpi.install_acpi_table(table.as_ptr().cast(), table.len()) }
-        .map_err(|error| ("installing the HIID ACPI table", error.status()))?;
-    Ok(export.len())
+        .map_err(|error| ("installing the ACPI table", error.status()))?;
+    Ok(body.len())
 }
 
 /// Installs a runtime-data pool copy of the exported database as the configuration table of

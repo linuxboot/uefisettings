@@ -105,9 +105,13 @@ forms whose questions sit on EFI global variables of the firmware, some of them 
 under VarStores that declare every one non-volatile.
 
 `publish-hiidb.efi acpi-table` sets no `HiiDB` variable: it installs the database as the body
-of a `HIID` ACPI table through `EFI_ACPI_TABLE_PROTOCOL`, which `uefisettings` reads from
-`/sys/firmware/acpi/tables/HIID`. QEMU's `-acpitable` cannot add it: only the x86 machines
-take that option.
+of a `QHII` ACPI table through `EFI_ACPI_TABLE_PROTOCOL`, which `uefisettings` reads from
+`/sys/firmware/acpi/tables/QHII`. QEMU's `-acpitable` cannot add it: only the x86 machines
+take that option. `publish-hiidb.efi acpi-table-hiid` installs an `HIID` table instead, the
+other vendor ACPI table that `uefisettings` reads: the scenario `hii-acpi-hiid`.
+`publish-hiidb.efi acpi-table-junk-qhii` installs a `QHII` table whose body holds no HII
+package list: in the scenario `hii-acpi-two-tables`, `uefisettings` moves on past it to the
+`HIID` table.
 
 `publish-hiidb.efi reserved` and `publish-hiidb.efi acpi-nvs` put the copy in memory that the
 firmware reserves without the RUNTIME attribute, which `uefisettings` refuses, as it reads only

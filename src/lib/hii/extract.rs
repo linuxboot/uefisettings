@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -46,6 +47,7 @@ use crate::hii::memory_access_denied::MemoryAccess;
 use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::package;
 use crate::hii::package::db_file::read_db_bytes;
+use crate::hii::package::db_file::DbFileTooBig;
 use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
 
 // TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
@@ -56,19 +58,23 @@ use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
 pub const OCP_HIIDB_PATH: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 
-// Vendor ACPI table ("HIID"), with no public spec. Per the patch author, its
+// Vendor ACPI table ("QHII" or "HIID"), with no public spec. Per the patch author, its
 // body (after the 36-byte ACPI header) is a copy of the HII database itself, so
 // it is read straight from sysfs with no /dev/mem, which lockdown refuses (Linux
 // v6.11 drivers/char/mem.c:612, open_port()) and STRICT_DEVMEM refuses for System
 // RAM.
-pub const HIIDB_ACPI_PATH: &str = "/sys/firmware/acpi/tables/HIID";
+const HIIDB_ACPI_DIR: &str = "/sys/firmware/acpi/tables";
+
+/// Signatures of the vendor ACPI tables, the first field of their headers; each table is the
+/// file of HIIDB_ACPI_DIR named exactly after it. The tables are equal: the acpi source tries
+/// them in this order only so that its result is deterministic. Only a single instance of each
+/// is read: Linux names the files of a signature with two or more instances `<SIG>1`, `<SIG>2`,
+/// …, with no file `<SIG>` (Linux v6.11 drivers/acpi/sysfs.c:364-372).
+const HIIDB_ACPI_SIGNATURES: [[u8; 4]; 2] = [*b"QHII", *b"HIID"];
 
 // Size of the standard ACPI table header (EFI_ACPI_DESCRIPTION_HEADER) that
-// prefixes the HII database bytes in the HIID table.
+// prefixes the HII database bytes in the QHII or HIID table.
 const ACPI_HEADER_LEN: usize = 36;
-
-/// Signature of the HIID table, the first field of its header.
-const HIID_SIGNATURE: [u8; 4] = *b"HIID";
 
 // Linux prints the physical address of the EFI System Table's ConfigurationTable
 // array here (an EFI_CONFIGURATION_TABLE[]). Not every kernel creates it (e.g.
@@ -120,17 +126,16 @@ pub enum EfivarMemory {
     FirmwareReserved,
 }
 
-/// Where extract_db reads the EFI configuration table, the HIID ACPI table, the OCP HiiDB
-/// efivar and physical memory, and the lockdown mode for the efivar route; Default is this
-/// machine's.
+/// Where extract_db reads the EFI configuration table, the vendor ACPI tables and the OCP
+/// HiiDB efivar, and the lockdown mode for the efivar; Default is this machine's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HiiSourcePaths {
     /// The address of the EFI configuration table, as Linux prints it.
     efi_config_table: PathBuf,
     /// The OCP HiiDB efivar.
     ocp_hiidb: PathBuf,
-    /// The HIID ACPI table.
-    acpi_hiid: PathBuf,
+    /// The directory of the vendor ACPI tables.
+    acpi_tables: PathBuf,
     /// Physical memory, which the OCP HiiDB efivar points into.
     dev_mem: PathBuf,
     /// The kernel lockdown mode, which can refuse physical memory to the efivar source.
@@ -145,7 +150,7 @@ impl Default for HiiSourcePaths {
         Self {
             efi_config_table: PathBuf::from(EFI_CONFIG_TABLE_PATH),
             ocp_hiidb: PathBuf::from(OCP_HIIDB_PATH),
-            acpi_hiid: PathBuf::from(HIIDB_ACPI_PATH),
+            acpi_tables: PathBuf::from(HIIDB_ACPI_DIR),
             dev_mem: PathBuf::from(DEV_MEM_PATH),
             lockdown: PathBuf::from(LOCKDOWN_PATH),
             #[cfg(firmware_memory_maps)]
@@ -154,15 +159,16 @@ impl Default for HiiSourcePaths {
     }
 }
 
-/// Whether a source file of extract_db exists: the HIID ACPI table or the OCP
-/// variable.
+/// Whether a file that extract_db reads exists: a vendor ACPI table or the OCP variable.
 pub fn hii_db_published() -> std::io::Result<bool> {
     hii_db_published_at(&HiiSourcePaths::default())
 }
 
-/// hii_db_published, probing the acpi and efivar sources at `paths`, in extract_db's order.
+/// hii_db_published, probing the vendor ACPI tables, then the efivar, at `paths`.
 fn hii_db_published_at(paths: &HiiSourcePaths) -> std::io::Result<bool> {
-    for path in [&paths.acpi_hiid, &paths.ocp_hiidb] {
+    let acpi_tables = hiidb_acpi_tables(&paths.acpi_tables);
+    let acpi_paths = acpi_tables.iter().map(|(_, path)| path);
+    for path in acpi_paths.chain([&paths.ocp_hiidb]) {
         if path.try_exists()? {
             return Ok(true);
         }
@@ -171,17 +177,17 @@ fn hii_db_published_at(paths: &HiiSourcePaths) -> std::io::Result<bool> {
 }
 
 /// extract_db returns the raw HII database bytes: those that the EFI configuration table points
-/// to, else those of the HIID ACPI table, which needs no /dev/mem, else those that the OCP HiiDB
+/// to, else those of a vendor ACPI table, which needs no /dev/mem, else those that the OCP HiiDB
 /// efivar points to, read only inside `efivar_memory`.
 pub fn extract_db(efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
     extract_db_at(&HiiSourcePaths::default(), efivar_memory)
 }
 
-/// extract_db, reading the EFI configuration table, the HIID ACPI table, the OCP HiiDB efivar
+/// extract_db, reading the EFI configuration table, the vendor ACPI tables, the OCP HiiDB efivar
 /// and physical memory at `paths`.
 fn extract_db_at(paths: &HiiSourcePaths, efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
     // Prefer the spec-standard route (the HII database configuration table
-    // found through the EFI System Table), then the vendor ACPI table that
+    // found through the EFI System Table), then a vendor ACPI table that
     // carries the database content directly (read from sysfs, no /dev/mem), and
     // fall back to the OCP variable + /dev/mem. Each fallback reason is logged
     // at debug level so a failure here is not masked by the OCP error below.
@@ -195,21 +201,28 @@ fn extract_db_at(paths: &HiiSourcePaths, efivar_memory: EfivarMemory) -> Result<
         }
         Err(e) => debug!(
             "could not use the EFI configuration table ({}): {e:#}; \
-             falling back to the HII ACPI table",
+             falling back to the HII ACPI tables",
             paths.efi_config_table.display()
         ),
     }
 
-    match extract_db_acpi(paths.acpi_hiid.as_path()) {
+    match extract_db_acpi(&paths.acpi_tables) {
         Ok(bytes) => return Ok(bytes),
         Err(e) => debug!(
-            "could not use the HII ACPI table ({}): {e:#}; \
+            "could not use the HII ACPI tables in {}: {e:#}; \
              falling back to the OCP HiiDB variable + /dev/mem",
-            paths.acpi_hiid.display()
+            paths.acpi_tables.display()
         ),
     }
 
     extract_db_efivar(paths, efivar_memory)
+}
+
+/// Whether `error` says only that a file does not exist.
+fn is_missing_file(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[derive(Debug, PartialEq)]
@@ -645,36 +658,100 @@ unsafe fn copy_from_mapping(src: *const u8, dst: &mut [u8]) {
     }
 }
 
-/// Reads the HII database from the vendor ACPI table at `path` (HIIDB_ACPI_PATH) whose
+/// The vendor ACPI tables in `dir` (HIIDB_ACPI_DIR), as their signatures and paths, in the
+/// order of HIIDB_ACPI_SIGNATURES.
+fn hiidb_acpi_tables(dir: &Path) -> [([u8; 4], PathBuf); HIIDB_ACPI_SIGNATURES.len()] {
+    HIIDB_ACPI_SIGNATURES.map(|signature| {
+        let path = dir.join(String::from_utf8_lossy(&signature).as_ref());
+        (signature, path)
+    })
+}
+
+/// The HII database of the first vendor ACPI table in `dir` that extract_db_acpi_table reads,
+/// in the order of HIIDB_ACPI_SIGNATURES. It moves on only while a table is absent or fails
+/// its checks (AcpiTableInvalid); any other error stops it. With no table read, it fails with
+/// AcpiTablesInvalid.
+fn extract_db_acpi(dir: &Path) -> Result<Vec<u8>> {
+    let mut tried = Vec::new();
+    for (signature, path) in hiidb_acpi_tables(dir) {
+        let error = match extract_db_acpi_table(&path, signature) {
+            Ok(db) => {
+                debug!("HII database ACPI table: {}", path.display());
+                return Ok(db);
+            }
+            Err(error) => error,
+        };
+        if !(is_missing_file(&error) || error.is::<AcpiTableInvalid>()) {
+            return Err(error);
+        }
+        let name = String::from_utf8_lossy(&signature);
+        debug!("ACPI table {name} unavailable: {error:#}");
+        tried.push(error);
+    }
+    Err(AcpiTablesInvalid(tried).into())
+}
+
+/// No vendor ACPI table gave the HII database: each table's error, in the order of
+/// HIIDB_ACPI_SIGNATURES.
+#[derive(Debug)]
+struct AcpiTablesInvalid(Vec<anyhow::Error>);
+
+impl fmt::Display for AcpiTablesInvalid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("no vendor ACPI table holds an HII database (")?;
+        for (i, error) in self.0.iter().enumerate() {
+            if i > 0 {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "{error:#}")?;
+        }
+        formatter.write_str(")")
+    }
+}
+
+impl std::error::Error for AcpiTablesInvalid {}
+
+/// Reads the HII database from the vendor ACPI table at `path`, of `signature`, whose
 /// body IS the database content. The sysfs file is a 36-byte ACPI header
 /// (EFI_ACPI_DESCRIPTION_HEADER) followed by the database bytes, so we drop the
-/// header and return the rest, once validate_hiid_table accepts the table. No
+/// header and return the rest, once validate_acpi_table accepts the table. No
 /// /dev/mem — works where lockdown or STRICT_DEVMEM refuses /dev/mem; read_db_bytes caps it
 /// at MAX_ALLOWED_FILESIZE.
-fn extract_db_acpi(path: &Path) -> Result<Vec<u8>> {
+fn extract_db_acpi_table(path: &Path, signature: [u8; 4]) -> Result<Vec<u8>> {
     let mut acpi_file =
         File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
 
-    let contents = read_db_bytes(&mut acpi_file)
-        .with_context(|| format!("Failed to read ACPI table file, {}", path.display()))?;
+    let contents = match read_db_bytes(&mut acpi_file) {
+        Ok(contents) => contents,
+        Err(error) if error.is::<DbFileTooBig>() => {
+            return Err(AcpiTableInvalid::TooLong)
+                .with_context(|| format!("{} holds no HII database", path.display()));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read ACPI table file, {}", path.display()));
+        }
+    };
 
-    validate_hiid_table(&contents)
+    validate_acpi_table(&contents, signature)
         .map(<[u8]>::to_vec)
         .with_context(|| format!("{} holds no HII database", path.display()))
 }
 
-/// Why the bytes of a HIID table hold no HII database: the table is not one
-/// that publishes it, so the next source is tried.
+/// Why the bytes of a vendor ACPI table hold no HII database: the table is not one
+/// that publishes it, so the next table is tried.
 #[derive(Debug, Error)]
-enum HiidInvalid {
+enum AcpiTableInvalid {
     #[error("the table has {0} bytes, no more than its {ACPI_HEADER_LEN}-byte header")]
     TooShort(usize),
+    #[error("the table is longer than {MAX_ALLOWED_FILESIZE} bytes")]
+    TooLong,
     #[error(
         "the table's signature is {:?}, not {:?}",
-        String::from_utf8_lossy(.0),
-        String::from_utf8_lossy(&HIID_SIGNATURE)
+        String::from_utf8_lossy(.found),
+        String::from_utf8_lossy(.expected)
     )]
-    Signature([u8; 4]),
+    Signature { found: [u8; 4], expected: [u8; 4] },
     #[error("the table's header gives a length of {header} bytes, but it has {actual}")]
     Length { header: u32, actual: usize },
     #[error("the table fails its checksum: its bytes sum to {0:#04x}, not 0")]
@@ -683,31 +760,34 @@ enum HiidInvalid {
     Database(#[source] anyhow::Error),
 }
 
-/// The HII database in the HIID table `bytes`: its body, after the header, once the
-/// table checks and the body splits into HII package lists.
+/// The HII database in the vendor ACPI table `bytes` of `signature`: its body, after the
+/// header, once the table checks and the body splits into HII package lists.
 ///
 /// The packages inside are left to the parser, so that a database it cannot parse
 /// fails with the parse error instead of a fallback to the next source, and
 /// `hii extract-db` still copies it for a bug report.
 ///
-/// For HIIDB_ACPI_PATH, sysfs guarantees Signature and Length: the file is named
+/// For HIIDB_ACPI_DIR, sysfs guarantees Signature and Length: the file is named
 /// after the signature and holds Length bytes (Linux v6.11 drivers/acpi/sysfs.c
-/// acpi_table_attr_init, acpi_table_show). extract_db_acpi reads any path, so
+/// acpi_table_attr_init, acpi_table_show). extract_db_acpi_table reads any path, so
 /// they are checked too.
-fn validate_hiid_table(bytes: &[u8]) -> Result<&[u8], HiidInvalid> {
+fn validate_acpi_table(bytes: &[u8], signature: [u8; 4]) -> Result<&[u8], AcpiTableInvalid> {
     let (header, body) = bytes
         .split_first_chunk::<ACPI_HEADER_LEN>()
         .filter(|(_, body)| !body.is_empty())
-        .ok_or(HiidInvalid::TooShort(bytes.len()))?;
+        .ok_or(AcpiTableInvalid::TooShort(bytes.len()))?;
 
     let [s0, s1, s2, s3, l0, l1, l2, l3, ..] = *header;
-    let signature = [s0, s1, s2, s3];
-    if signature != HIID_SIGNATURE {
-        return Err(HiidInvalid::Signature(signature));
+    let found = [s0, s1, s2, s3];
+    if found != signature {
+        return Err(AcpiTableInvalid::Signature {
+            found,
+            expected: signature,
+        });
     }
     let length = u32::from_le_bytes([l0, l1, l2, l3]);
     if u32::try_from(bytes.len()).ok() != Some(length) {
-        return Err(HiidInvalid::Length {
+        return Err(AcpiTableInvalid::Length {
             header: length,
             actual: bytes.len(),
         });
@@ -716,10 +796,10 @@ fn validate_hiid_table(bytes: &[u8]) -> Result<&[u8], HiidInvalid> {
     // include/acpi/actbl.h struct acpi_table_header).
     let sum = bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
     if sum != 0 {
-        return Err(HiidInvalid::Checksum(sum));
+        return Err(AcpiTableInvalid::Checksum(sum));
     }
 
-    package::get_package_lists(body).map_err(HiidInvalid::Database)?;
+    package::get_package_lists(body).map_err(AcpiTableInvalid::Database)?;
     Ok(body)
 }
 
@@ -755,7 +835,7 @@ mod tests {
         HiiSourcePaths {
             efi_config_table: dir.join("config_table"),
             ocp_hiidb: dir.join("HiiDB"),
-            acpi_hiid: dir.join("HIID"),
+            acpi_tables: dir.to_owned(),
             dev_mem: dir.join("mem"),
             // the test's own lockdown file, never this machine's
             lockdown: dir.join("lockdown"),
@@ -1122,35 +1202,73 @@ mod tests {
         );
     }
 
-    /// hii_db_published fails, rather than answers false, when it cannot check a file.
+    /// hii_db_published fails, rather than answers false, when it cannot check a file: a vendor
+    /// ACPI table or the OCP HiiDB efivar.
     #[test]
     fn hii_db_published_fails_when_a_file_cannot_be_checked() {
         let dir = tempfile::tempdir().expect("create a directory");
         let file = dir.path().join("file");
         std::fs::write(&file, b"").expect("create the file");
         // stat() of a path through a regular file fails with ENOTDIR, not ENOENT
-        let paths = paths_in(&file);
+        for (case, paths) in [
+            (
+                "the ACPI tables",
+                HiiSourcePaths {
+                    acpi_tables: file.clone(),
+                    ..paths_in(dir.path())
+                },
+            ),
+            (
+                "the HiiDB efivar",
+                HiiSourcePaths {
+                    ocp_hiidb: file.join("HiiDB"),
+                    ..paths_in(dir.path())
+                },
+            ),
+        ] {
+            let error = hii_db_published_at(&paths).expect_err(case);
 
-        let error = hii_db_published_at(&paths).expect_err("checked a path through a file");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory, "{error}");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotADirectory,
+                "{case}: not ENOTDIR: {error}"
+            );
+        }
     }
 
-    /// hii_db_published holds once either file exists, the OCP HiiDB efivar or the HIID table.
+    /// hii_db_published holds once any file exists, the OCP HiiDB efivar or a vendor ACPI
+    /// table, and not for another ACPI table.
     #[test]
-    fn hii_db_published_once_either_file_exists() {
-        for (case, ocp_file, acpi_file, want) in [
-            ("neither file", false, false, false),
-            ("the HiiDB efivar only", true, false, true),
-            ("the HIID table only", false, true, true),
-            ("both files", true, true, true),
-        ] {
+    fn hii_db_published_once_any_file_exists() {
+        let each_table = HIIDB_ACPI_SIGNATURES.map(|signature| {
+            let name = String::from_utf8_lossy(&signature).into_owned();
+            (format!("the {name} table only"), false, Some(name), true)
+        });
+        for (case, ocp_file, acpi_table, want) in [
+            ("no file".to_owned(), false, None, false),
+            (
+                "another ACPI table only".to_owned(),
+                false,
+                Some("XSDT".to_owned()),
+                false,
+            ),
+            ("the HiiDB efivar only".to_owned(), true, None, true),
+            (
+                "the HiiDB efivar and HIID".to_owned(),
+                true,
+                Some("HIID".to_owned()),
+                true,
+            ),
+        ]
+        .into_iter()
+        .chain(each_table)
+        {
             let dir = tempfile::tempdir().expect("create a directory");
             let paths = paths_in(dir.path());
-            for (exists, path) in [(ocp_file, &paths.ocp_hiidb), (acpi_file, &paths.acpi_hiid)] {
-                if exists {
-                    std::fs::write(path, b"").expect("create the file");
-                }
+            let acpi_path = acpi_table.map(|name| paths.acpi_tables.join(name));
+            let ocp_path = ocp_file.then_some(&paths.ocp_hiidb);
+            for path in [ocp_path, acpi_path.as_ref()].into_iter().flatten() {
+                std::fs::write(path, b"").expect("create the file");
             }
 
             let got = hii_db_published_at(&paths).unwrap_or_else(|error| panic!("{case}: {error}"));
@@ -1169,24 +1287,24 @@ mod tests {
         table
     }
 
-    /// A HIID table of `body`, whose header and checksum hold.
-    fn hiid_table(body: &[u8]) -> Vec<u8> {
+    /// An ACPI table of `signature` and `body`, whose header and checksum hold.
+    fn signed_table(signature: [u8; 4], body: &[u8]) -> Vec<u8> {
         let length = u32::try_from(ACPI_HEADER_LEN + body.len()).expect("a u32 table length");
-        acpi_table(HIID_SIGNATURE, length, body)
+        acpi_table(signature, length, body)
     }
 
-    /// The body of a HIID table is the HiiDB only if the table is no longer than
-    /// MAX_ALLOWED_FILESIZE, its header and checksum hold, and the body parses. A table of other
-    /// content fails with HiidInvalid, so that the next source is tried.
+    /// The body of a vendor ACPI table is the HiiDB only if the table is no longer than
+    /// MAX_ALLOWED_FILESIZE, its header, of the table's own signature, and its checksum hold, and
+    /// the body parses, for each of HIIDB_ACPI_SIGNATURES. A table of other content, one longer
+    /// than MAX_ALLOWED_FILESIZE included, fails with AcpiTableInvalid, so that the next table is
+    /// tried.
     #[test]
-    fn extract_db_acpi_returns_only_a_checked_database() {
-        /// What extract_db_acpi returns for a case.
+    fn extract_db_acpi_table_returns_only_a_checked_database() {
+        /// What extract_db_acpi_table returns for a case.
         enum Want {
             Database(Vec<u8>),
-            /// HiidInvalid, as Display gives it
+            /// AcpiTableInvalid, as Display gives it
             Invalid(String),
-            /// read_db_bytes' error
-            Unread(&'static str),
         }
 
         let database = en_strings_list([0x11; 16], b'A');
@@ -1196,83 +1314,99 @@ mod tests {
             package::read_db(&unparsable).is_err(),
             "read_db parsed the unparsable package list"
         );
-        let mut bad_checksum = hiid_table(&database);
-        bad_checksum[ACPI_CHECKSUM_OFFSET] = bad_checksum[ACPI_CHECKSUM_OFFSET].wrapping_add(1);
         let length = u32::try_from(ACPI_HEADER_LEN + database.len()).expect("a u32 table length");
         let over_cap = usize::try_from(MAX_ALLOWED_FILESIZE + 1).expect("a usize size");
-        for (case, table, want) in [
-            (
-                "a database",
-                hiid_table(&database),
-                Want::Database(database.clone()),
-            ),
-            (
-                "a bad checksum",
-                bad_checksum,
-                Want::Invalid("the table fails its checksum: its bytes sum to 0x01, not 0".into()),
-            ),
-            (
-                "a body that is no database",
-                hiid_table(&[0x5a; 64]),
-                Want::Invalid("the table's body is not a series of HII package lists".into()),
-            ),
-            (
-                "package lists that the parser refuses",
-                hiid_table(&unparsable),
-                Want::Database(unparsable.clone()),
-            ),
-            (
-                "a header only",
-                hiid_table(&[]),
-                Want::Invalid("the table has 36 bytes, no more than its 36-byte header".into()),
-            ),
-            (
-                "shorter than a header",
-                vec![0x5a; 4],
-                Want::Invalid("the table has 4 bytes, no more than its 36-byte header".into()),
-            ),
-            (
-                "another signature",
-                acpi_table(*b"XSDT", length, &database),
-                Want::Invalid(r#"the table's signature is "XSDT", not "HIID""#.into()),
-            ),
-            (
-                "a Length past the end",
-                acpi_table(HIID_SIGNATURE, length + 1, &database),
-                Want::Invalid(format!(
-                    "the table's header gives a length of {} bytes, but it has {length}",
-                    length + 1
-                )),
-            ),
-            (
-                "a Length short of the end",
-                acpi_table(HIID_SIGNATURE, length - 1, &database),
-                Want::Invalid(format!(
-                    "the table's header gives a length of {} bytes, but it has {length}",
-                    length - 1
-                )),
-            ),
-            (
-                "longer than MAX_ALLOWED_FILESIZE",
-                vec![0; over_cap],
-                Want::Unread("File size is too big for the file to be a HII database."),
-            ),
-        ] {
-            let dir = tempfile::tempdir().expect("create a directory");
-            let path = dir.path().join("HIID");
-            std::fs::write(&path, &table).expect("write the table");
+        for signature in HIIDB_ACPI_SIGNATURES {
+            let name = String::from_utf8_lossy(&signature);
+            let mut bad_checksum = signed_table(signature, &database);
+            bad_checksum[ACPI_CHECKSUM_OFFSET] = bad_checksum[ACPI_CHECKSUM_OFFSET].wrapping_add(1);
+            let [s0, s1, s2, _] = signature;
+            let last_byte_differs = [s0, s1, s2, b'X'];
+            for (case, table, want) in [
+                (
+                    "a database",
+                    signed_table(signature, &database),
+                    Want::Database(database.clone()),
+                ),
+                (
+                    "a bad checksum",
+                    bad_checksum,
+                    Want::Invalid(
+                        "the table fails its checksum: its bytes sum to 0x01, not 0".into(),
+                    ),
+                ),
+                (
+                    "a body that is no database",
+                    signed_table(signature, &[0x5a; 64]),
+                    Want::Invalid("the table's body is not a series of HII package lists".into()),
+                ),
+                (
+                    "package lists that the parser refuses",
+                    signed_table(signature, &unparsable),
+                    Want::Database(unparsable.clone()),
+                ),
+                (
+                    "a header only",
+                    signed_table(signature, &[]),
+                    Want::Invalid("the table has 36 bytes, no more than its 36-byte header".into()),
+                ),
+                (
+                    "shorter than a header",
+                    vec![0x5a; 4],
+                    Want::Invalid("the table has 4 bytes, no more than its 36-byte header".into()),
+                ),
+                (
+                    "another signature",
+                    acpi_table(*b"XSDT", length, &database),
+                    Want::Invalid(format!(r#"the table's signature is "XSDT", not "{name}""#)),
+                ),
+                (
+                    "a signature that differs in its last byte",
+                    acpi_table(last_byte_differs, length, &database),
+                    Want::Invalid(format!(
+                        r#"the table's signature is "{}", not "{name}""#,
+                        String::from_utf8_lossy(&last_byte_differs)
+                    )),
+                ),
+                (
+                    "a Length past the end",
+                    acpi_table(signature, length + 1, &database),
+                    Want::Invalid(format!(
+                        "the table's header gives a length of {} bytes, but it has {length}",
+                        length + 1
+                    )),
+                ),
+                (
+                    "a Length short of the end",
+                    acpi_table(signature, length - 1, &database),
+                    Want::Invalid(format!(
+                        "the table's header gives a length of {} bytes, but it has {length}",
+                        length - 1
+                    )),
+                ),
+                (
+                    "longer than MAX_ALLOWED_FILESIZE",
+                    vec![0; over_cap],
+                    Want::Invalid(format!(
+                        "the table is longer than {MAX_ALLOWED_FILESIZE} bytes"
+                    )),
+                ),
+            ] {
+                let dir = tempfile::tempdir().expect("create a directory");
+                let path = dir.path().join(name.as_ref());
+                std::fs::write(&path, &table).expect("write the table");
 
-            match (extract_db_acpi(&path), want) {
-                (Ok(db), Want::Database(want)) => assert_eq!(db, want, "{case}"),
-                (Err(error), Want::Invalid(message)) => {
-                    let invalid = error.downcast_ref::<HiidInvalid>().map(ToString::to_string);
-                    assert_eq!(invalid, Some(message), "{case}: {error:#}");
+                match (extract_db_acpi_table(&path, signature), want) {
+                    (Ok(db), Want::Database(want)) => assert_eq!(db, want, "{case} ({name})"),
+                    (Err(error), Want::Invalid(message)) => assert_eq!(
+                        error
+                            .downcast_ref::<AcpiTableInvalid>()
+                            .map(ToString::to_string),
+                        Some(message),
+                        "{case} ({name}): {error:#}"
+                    ),
+                    (got, _) => panic!("{case} ({name}): got {got:?}"),
                 }
-                (Err(error), Want::Unread(message)) => {
-                    assert!(!error.is::<HiidInvalid>(), "{case}: {error:#}");
-                    assert!(format!("{error:#}").contains(message), "{case}: {error:#}");
-                }
-                (got, _) => panic!("{case}: got {got:?}"),
             }
         }
     }

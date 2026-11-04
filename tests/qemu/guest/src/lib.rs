@@ -162,9 +162,17 @@ impl Output {
 /// Runs `uefisettings` with `args` and empty standard input.
 #[track_caller]
 pub fn uefisettings(args: &[&str]) -> Output {
+    uefisettings_with_env(args, &[])
+}
+
+/// Runs `uefisettings` with `args`, the environment variables `env` added, and empty standard
+/// input.
+#[track_caller]
+pub fn uefisettings_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
     require_test_vm();
     let output = Command::new(UEFISETTINGS)
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|error| panic!("cannot run {UEFISETTINGS} {args:?}: {error}"));
@@ -269,6 +277,21 @@ pub fn variable_data(path: &str) -> Option<Vec<u8>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => panic!("cannot read {path}: {error}"),
     }
+}
+
+/// Panics unless `path` does not exist.
+#[track_caller]
+pub fn assert_absent(path: &str) {
+    require_test_vm();
+    match fs::metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        got => panic!("{path} exists or cannot be checked: {got:?}"),
+    }
+}
+
+/// The path of the vendor ACPI table of `signature`.
+pub fn acpi_table_path(signature: &str) -> String {
+    format!("/sys/firmware/acpi/tables/{signature}")
 }
 
 /// The HII database that publish-hiidb published.

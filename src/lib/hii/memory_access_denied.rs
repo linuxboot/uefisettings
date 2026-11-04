@@ -276,17 +276,17 @@ pub(super) mod fixture {
         path
     }
 
-    /// A file in `dir` without read permission, or None if this process opens it anyway, as
-    /// one with CAP_DAC_OVERRIDE does.
-    pub(in crate::hii) fn unreadable_file(dir: &Path) -> Option<PathBuf> {
-        let path = dir.join("unreadable");
-        fs::write(&path, b"").expect("create the file");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+    /// Takes the read permission of the file at `path`, created empty unless it exists; false if
+    /// this process opens it anyway, as one with CAP_DAC_OVERRIDE does.
+    pub(in crate::hii) fn unreadable_file(path: &Path) -> bool {
+        File::options()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("create the file");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000))
             .expect("take the read permission");
-        if File::open(&path).is_ok() {
-            return None;
-        }
-        Some(path)
+        File::open(path).is_err()
     }
 }
 

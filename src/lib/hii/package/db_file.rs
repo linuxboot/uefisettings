@@ -17,10 +17,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use log::info;
+use thiserror::Error;
 
 /// The largest HiiDB file that read_db_bytes reads.
 pub(crate) const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
@@ -43,7 +43,7 @@ pub(crate) fn read_db_bytes(file: &mut File) -> Result<Vec<u8>> {
         .len()
         > MAX_ALLOWED_FILESIZE
     {
-        return Err(db_file_too_big());
+        return Err(DbFileTooBig.into());
     }
 
     let mut file_contents = Vec::new();
@@ -52,16 +52,16 @@ pub(crate) fn read_db_bytes(file: &mut File) -> Result<Vec<u8>> {
     file.read_to_end(&mut file_contents)
         .context("Couldn't convert file bytes to Vec<u8>")?;
     if file.limit() == 0 {
-        return Err(db_file_too_big());
+        return Err(DbFileTooBig.into());
     }
 
     Ok(file_contents)
 }
 
 /// read_db_bytes's error for a file of more than MAX_ALLOWED_FILESIZE bytes.
-fn db_file_too_big() -> anyhow::Error {
-    anyhow!("File size is too big for the file to be a HII database.")
-}
+#[derive(Debug, Error)]
+#[error("longer than its maximum of {MAX_ALLOWED_FILESIZE} bytes")]
+pub(in crate::hii) struct DbFileTooBig;
 
 #[cfg(test)]
 mod tests {
@@ -92,7 +92,7 @@ mod tests {
                 (Ok(bytes), true) => assert_eq!(bytes.len(), length, "{case}: length"),
                 (Err(error), false) => assert_eq!(
                     error.to_string(),
-                    "File size is too big for the file to be a HII database.",
+                    format!("longer than its maximum of {MAX_ALLOWED_FILESIZE} bytes"),
                     "{case}"
                 ),
                 (read, _) => panic!("{case}: read {:?} bytes", read.map(|bytes| bytes.len())),
