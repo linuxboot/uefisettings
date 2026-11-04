@@ -11,6 +11,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::fs::File;
+use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ use log::warn;
 use nix::mount::mount;
 use nix::mount::MsFlags;
 use proc_mounts::MountIter;
+use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
 use crate::file_lock::FileLock;
@@ -129,13 +131,83 @@ impl FirmwareVariables for EfivarFiles {
 
         // All checks passed, now we can try to write.
         debug!("Writing value to {}", path.display());
-        File::create(&path)
-            .context("Failed to open efivarfs file for writing")?
-            .write_all(&file_contents)
-            .context("Failed to write to efivarfs file")?;
-
-        Ok(())
+        write_efivar_file(&path, &file_contents)
     }
+}
+
+/// The statuses behind the errno of a failed efivarfs write, after Linux v6.11
+/// drivers/firmware/efi/efi.c efi_status_to_err(): SetVariable()'s, or on x86 those of the
+/// QueryVariableInfo() that Linux calls first for a non-volatile variable
+/// (drivers/firmware/efi/vars.c check_var_size(), arch/x86/platform/efi/quirks.c
+/// efi_query_variable_store()). efivarfs_file_write() (fs/efivarfs/file.c) turns ENOENT
+/// (EFI_NOT_FOUND) into EIO, and write_all retries EINTR (EFI_ABORTED), so neither errno has a
+/// variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+enum SetVariableStatus {
+    /// EINVAL: efi_status_to_err()'s default, and efivarfs's own refusals. Its EFI_UNSUPPORTED is
+    /// SetVariable()'s, as check_var_size() turns QueryVariableInfo()'s into a size check, and
+    /// means a call the platform does not support at that time (UEFI 2.11 §8.2.3), as after
+    /// ExitBootServices(); the UEFI Shell runs before it.
+    #[error(
+        "the firmware returned EFI_INVALID_PARAMETER, EFI_UNSUPPORTED or another status that \
+         Linux reports as EINVAL, or efivarfs refused the attributes or data; for \
+         EFI_UNSUPPORTED, run uefisettings.efi in the UEFI Shell"
+    )]
+    InvalidParameter,
+    /// ENOSPC, also from Linux's check_var_size() (drivers/firmware/efi/vars.c) before the call.
+    #[error(
+        "the firmware returned EFI_OUT_OF_RESOURCES, or Linux found too little variable storage"
+    )]
+    OutOfResources,
+    /// EIO, also when Linux disabled runtime services (drivers/firmware/efi/runtime-wrappers.c
+    /// __efi_queue_work()).
+    #[error(
+        "the firmware returned EFI_DEVICE_ERROR, or the variable is gone (EFI_NOT_FOUND), or \
+         Linux has disabled EFI runtime services"
+    )]
+    DeviceErrorOrNotFound,
+    /// EROFS.
+    #[error("the firmware returned EFI_WRITE_PROTECTED (the variable is read-only)")]
+    WriteProtected,
+    /// EACCES, also a security module's refusal through vfs_write() rw_verify_area()
+    /// security_file_permission() (fs/read_write.c).
+    #[error(
+        "the firmware returned EFI_SECURITY_VIOLATION, or a security module refused the write"
+    )]
+    SecurityViolation,
+}
+
+impl SetVariableStatus {
+    /// The statuses behind `error`, of a write to an efivarfs file, if its errno carries any.
+    fn of(error: &io::Error) -> Option<Self> {
+        match error.raw_os_error()? {
+            libc::EINVAL => Some(Self::InvalidParameter),
+            libc::ENOSPC => Some(Self::OutOfResources),
+            libc::EIO => Some(Self::DeviceErrorOrNotFound),
+            libc::EROFS => Some(Self::WriteProtected),
+            libc::EACCES => Some(Self::SecurityViolation),
+            _ => None,
+        }
+    }
+}
+
+/// `error`, of a write to an efivarfs file, naming the statuses behind it.
+fn efivarfs_write_error(error: io::Error) -> anyhow::Error {
+    let status = SetVariableStatus::of(&error);
+    let error = anyhow::Error::new(error);
+    match status {
+        Some(status) => error.context(status),
+        None => error,
+    }
+    .context("Failed to write to efivarfs file")
+}
+
+/// Writes `contents` to the efivarfs file at `path`, naming the statuses behind a refused write.
+fn write_efivar_file(path: &Path, contents: &[u8]) -> Result<()> {
+    File::create(path)
+        .context("Failed to open efivarfs file for writing")?
+        .write_all(contents)
+        .map_err(efivarfs_write_error)
 }
 
 /// Keeps the efivarfs at `mount_point` read-write while it lives, remounting it read-only again
@@ -353,6 +425,96 @@ mod tests {
             bytes,
             "bytes"
         );
+    }
+
+    /// write_efivar_file names the statuses behind the errno of a refused write, ENOSPC from
+    /// /dev/full (full(4)), and none behind a refused open.
+    #[test]
+    fn write_efivar_file_names_the_status_behind_a_refused_write() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let cases = [
+            (
+                PathBuf::from("/dev/full"),
+                format!(
+                    "Failed to write to efivarfs file: {}: {}",
+                    SetVariableStatus::OutOfResources,
+                    io::Error::from_raw_os_error(libc::ENOSPC)
+                ),
+            ),
+            (
+                dir.path().join("missing").join("Setup"),
+                format!(
+                    "Failed to open efivarfs file for writing: {}",
+                    io::Error::from_raw_os_error(libc::ENOENT)
+                ),
+            ),
+        ];
+
+        for (path, want) in cases {
+            let error = write_efivar_file(&path, &[0; 8]).expect_err("write a refused file");
+
+            assert_eq!(format!("{error:#}"), want, "{}", path.display());
+        }
+    }
+
+    /// A failed efivarfs write names the statuses that Linux reports as its errno, and names none
+    /// for an errno that carries no status.
+    #[test]
+    fn efivarfs_write_error_names_the_set_variable_status() {
+        let cases = [
+            (
+                libc::EINVAL,
+                Some(
+                    "the firmware returned EFI_INVALID_PARAMETER, EFI_UNSUPPORTED or another \
+                     status that Linux reports as EINVAL, or efivarfs refused the attributes or \
+                     data; for EFI_UNSUPPORTED, run uefisettings.efi in the UEFI Shell",
+                ),
+            ),
+            (
+                libc::ENOSPC,
+                Some(
+                    "the firmware returned EFI_OUT_OF_RESOURCES, or Linux found too little \
+                     variable storage",
+                ),
+            ),
+            (
+                libc::EIO,
+                Some(
+                    "the firmware returned EFI_DEVICE_ERROR, or the variable is gone \
+                     (EFI_NOT_FOUND), or Linux has disabled EFI runtime services",
+                ),
+            ),
+            (
+                libc::EROFS,
+                Some("the firmware returned EFI_WRITE_PROTECTED (the variable is read-only)"),
+            ),
+            (
+                libc::EACCES,
+                Some(
+                    "the firmware returned EFI_SECURITY_VIOLATION, or a security module refused \
+                     the write",
+                ),
+            ),
+            (libc::ENOENT, None),
+            (libc::EINTR, None),
+            (libc::EPERM, None),
+            (libc::EFAULT, None),
+            (libc::ENOMEM, None),
+        ];
+
+        for (errno, status) in cases {
+            let os_error = io::Error::from_raw_os_error(errno);
+            let want = match status {
+                Some(status) => format!("Failed to write to efivarfs file: {status}: {os_error}"),
+                None => format!("Failed to write to efivarfs file: {os_error}"),
+            };
+
+            assert_eq!(
+                format!("{:#}", efivarfs_write_error(os_error)),
+                want,
+                "errno {errno}"
+            );
+        }
     }
 
     #[test]
