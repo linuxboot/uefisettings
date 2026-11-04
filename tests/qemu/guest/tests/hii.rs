@@ -10,9 +10,9 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! A guest whose firmware runs EDK2's DriverSample, with its variable readable at runtime,
-//! and publish-hiidb from `Driver####` load options before Linux starts. These checks only
-//! read, so the answers are DriverSample's defaults.
+//! A guest whose firmware runs EDK2's DriverSample, with its variables MyIfrNVData and MyEfiVar
+//! readable at runtime, and publish-hiidb from `Driver####` load options before Linux starts.
+//! These checks only read, so the answers are DriverSample's defaults.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -46,6 +46,8 @@ use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
 use uefisettings_qemu_guest::EFAULT;
 use uefisettings_qemu_guest::EFIVARFS_HEADER_SIZE;
+use uefisettings_qemu_guest::MY_EFI_VAR;
+use uefisettings_qemu_guest::MY_EFI_VAR_QUESTION;
 use uefisettings_qemu_guest::UNAVAILABLE;
 
 /// Linux's SIGBUS on arm64 (`include/uapi/asm-generic/signal.h`).
@@ -96,25 +98,19 @@ const DEFAULTS: [DefaultQuestion; 4] = [
 ];
 
 /// Questions whose values the HII backend cannot read from Linux: on DriverSample's
-/// variable without runtime access, on its name/value store, and on the RAM disk form of
-/// the firmware, which has no store.
-const UNAVAILABLE_QUESTIONS: [&str; 4] = [
-    "How tall are you? (Hex)",
-    "NameValueVar0",
-    "Disk Memory Type:",
-    "Size (Hex):",
-];
+/// name/value store, and on the RAM disk form of the firmware, which has no store.
+const UNAVAILABLE_QUESTIONS: [&str; 3] = ["NameValueVar0", "Disk Memory Type:", "Size (Hex):"];
 
-/// The answers of the questions on bit fields of DriverSample's EFI variable, which lacks
-/// runtime access, each ending with the default of Vfr.vfr if it has one, and then of its
-/// variable, which the HII backend reads.
+/// The answers of the questions on bit fields of DriverSample's EFI variable MyEfiBitVar,
+/// which lacks runtime access, each ending with the default of Vfr.vfr if it has one, and then
+/// of its variable, which the HII backend reads.
 const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
     (
         "NEST_BIT check box",
         [
             "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
-             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists \
-             nor writes> <IFR default: 1>",
+             not present at OS runtime: efivarfs does not list it, and its form declares it \
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: 1>",
             "1",
         ],
     ),
@@ -122,8 +118,8 @@ const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
         "NEST_BIT one-of",
         [
             "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
-             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists \
-             nor writes> <IFR default: LargeBootList>",
+             not present at OS runtime: efivarfs does not list it, and its form declares it \
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)> <IFR default: LargeBootList>",
             "LargeBootList",
         ],
     ),
@@ -131,8 +127,8 @@ const BIT_FIELD_QUESTIONS: [(&str, [&str; 2]); 3] = [
         "NEST_BIT numeric",
         [
             "<ValueUnavailable: EFI variable MyEfiBitVar-a04a27f4-df00-4d42-b552-39511302113d is \
-             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither lists \
-             nor writes>",
+             not present at OS runtime: efivarfs does not list it, and its form declares it \
+             boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)>",
             "6",
         ],
     ),
@@ -143,6 +139,15 @@ const INCLUDE_ALL: [&str; 2] = ["--include", "grayed-out,suppressed,disabled"];
 
 /// The answer of a question whose value `--no-efivars` leaves unread, before its IFR default.
 const NOT_READ: &str = "<ValueUnavailable: EFI variables not read>";
+
+/// NOT_READ for a question on MyEfiVar, whose form declares it boot-service-only.
+const MY_EFI_VAR_NOT_READ: &str = "<ValueUnavailable: EFI variables not read; the form declares \
+    EFI variable MyEfiVar-a04a27f4-df00-4d42-b552-39511302113d boot-service-only \
+    (no EFI_VARIABLE_RUNTIME_ACCESS)>";
+
+/// The questions on MyEfiVar in DriverSample's Vfr.vfr: on Field8, Field16 and
+/// SubmittedCallback.
+const MY_EFI_VAR_QUESTIONS: usize = 3;
 
 /// What `hii dump-efivars` prints.
 #[derive(Debug, Deserialize)]
@@ -346,7 +351,7 @@ fn show_ifr_shows_the_formsets() {
         assert!(formsets.contains(&name), "{name:?} is not in {formsets:?}");
     }
     // The stored numbers of the NEST_BIT check box, one-of and numeric on DriverSample's
-    // variable; those on its EFI variable, which lacks runtime access, have none.
+    // variable; those on its EFI variable MyEfiBitVar, which lacks runtime access, have none.
     let mut question = "";
     let mut answers = Vec::new();
     for line in output.stdout.lines().map(str::trim_start) {
@@ -401,6 +406,15 @@ fn get_returns_the_defaults() {
     }
 }
 
+/// get reads the question on MyEfiVar, which its form declares boot-service-only, by the
+/// variable's own attributes, which have runtime access here. It shows the value in decimal,
+/// though Vfr.vfr has it displayed in hex.
+#[test]
+fn question_on_a_runtime_variable_of_a_boot_service_only_form_is_read() {
+    let (got, _) = single_response(&["hii", "get", MY_EFI_VAR_QUESTION, "--json"], BACKEND_HII);
+    assert_eq!(got.answer, "18", "{got:#?}");
+}
+
 #[test]
 fn get_refuses_a_suppressed_question_by_default() {
     let error = json_error(&["hii", "get", SERIAL_PORT, "--json"]);
@@ -443,13 +457,19 @@ fn get_shows_a_question_that_may_be_grayed_out_with_its_states() {
 }
 
 /// With --no-efivars, get, list-questions and show-ifr read no question value: each value that
-/// they read from efivarfs without the flag shows as not read.
+/// they read from efivarfs without the flag shows as not read, naming the boot-service-only
+/// declaration of MyEfiVar's form for the questions on it.
 #[test]
 fn no_efivars_reads_no_question_value() {
-    for name in [ONE_OF, CHECK_BOX, NUMERIC] {
+    for (name, unread) in [
+        (ONE_OF, NOT_READ),
+        (CHECK_BOX, NOT_READ),
+        (NUMERIC, NOT_READ),
+        (MY_EFI_VAR_QUESTION, MY_EFI_VAR_NOT_READ),
+    ] {
         let (got, _) =
             single_response(&["hii", "get", name, "--json", "--no-efivars"], BACKEND_HII);
-        assert!(got.answer.starts_with(NOT_READ), "get {name}: {got:#?}");
+        assert!(got.answer.starts_with(unread), "get {name}: {got:#?}");
     }
 
     let listed = |flags: &[&str]| -> Vec<Question> {
@@ -470,15 +490,21 @@ fn no_efivars_reads_no_question_value() {
         .filter(|(live, _)| !live.answer.starts_with('<'))
         .collect();
     assert!(!read.is_empty(), "list-questions reads no value");
+    let mut declared = 0;
     for (live, unread) in read {
+        declared += usize::from(unread.answer.starts_with(MY_EFI_VAR_NOT_READ));
         assert!(
-            unread.answer.starts_with(NOT_READ),
+            unread.answer.starts_with(NOT_READ) || unread.answer.starts_with(MY_EFI_VAR_NOT_READ),
             "list-questions {:?}: {:?} with --no-efivars, {:?} without",
             live.name,
             unread.answer,
             live.answer
         );
     }
+    assert_eq!(
+        declared, MY_EFI_VAR_QUESTIONS,
+        "list-questions: questions on MyEfiVar"
+    );
 
     let answers = |flags: &[&str]| -> Vec<String> {
         let output = uefisettings(&[&["hii", "show-ifr"][..], flags].concat());
@@ -498,20 +524,30 @@ fn no_efivars_reads_no_question_value() {
         .filter(|(live, _)| !live.starts_with('<'))
         .collect();
     assert!(!read.is_empty(), "show-ifr reads no value");
+    let mut declared = 0;
     for (live, unread) in read {
-        assert_eq!(
-            unread, NOT_READ,
-            "show-ifr answer {live:?} with --no-efivars"
+        declared += usize::from(unread == MY_EFI_VAR_NOT_READ);
+        assert!(
+            unread == NOT_READ || unread == MY_EFI_VAR_NOT_READ,
+            "show-ifr answer {live:?}: {unread:?} with --no-efivars"
         );
     }
+    assert_eq!(
+        declared, MY_EFI_VAR_QUESTIONS,
+        "show-ifr: questions on MyEfiVar"
+    );
 }
 
 #[test]
 fn dumped_efivars_answer_as_efivarfs() {
-    let variable = DRIVER_SAMPLE_VARIABLE
-        .rsplit_once('/')
-        .map(|(_, name)| name)
-        .expect("a variable path");
+    let file_name = |path: &'static str| {
+        path.rsplit_once('/')
+            .map(|(_, name)| name)
+            .expect("a variable path")
+    };
+    let variable = file_name(DRIVER_SAMPLE_VARIABLE);
+    // whose form declares it boot-service-only
+    let my_efi_var = file_name(MY_EFI_VAR);
     let mode = |path: &str| {
         let metadata =
             fs::metadata(path).unwrap_or_else(|error| panic!("cannot stat {path}: {error}"));
@@ -553,7 +589,12 @@ fn dumped_efivars_answer_as_efivarfs() {
             saved == hiidb,
             "{dir}: the saved HiiDB is not the extracted one"
         );
-        assert!(dump.copied.iter().any(|name| name == variable), "{dump:#?}");
+        for copied in [variable, my_efi_var] {
+            assert!(
+                dump.copied.iter().any(|name| name == copied),
+                "{dir}: {copied} is not copied: {dump:#?}"
+            );
+        }
         assert_eq!((mode(dir), mode(&path)), (0o700, 0o600), "{dir}: modes");
         if unredacted {
             assert_eq!(dumped, live, "{path}");

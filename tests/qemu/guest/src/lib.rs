@@ -71,6 +71,16 @@ pub const PREFIXES: [&[&str]; 2] = [&["hii"], &[]];
 pub const DRIVER_SAMPLE_VARIABLE: &str =
     "/sys/firmware/efi/efivars/MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d";
 
+/// DriverSample's EFI variable `MyEfiVar`, which its `Vfr.vfr` declares without
+/// EFI_VARIABLE_RUNTIME_ACCESS: the scenario `hii` creates it with runtime access first
+/// (`tests/qemu/vars/my-ifr-nv-data-runtime-my-efi-var.json`), as some vendors' firmware does.
+pub const MY_EFI_VAR: &str =
+    "/sys/firmware/efi/efivars/MyEfiVar-a04a27f4-df00-4d42-b552-39511302113d";
+
+/// A numeric question of DriverSample's main form, from 0 to 250, on the first byte of the data
+/// of [`MY_EFI_VAR`]; `Vfr.vfr` has it displayed in hex.
+pub const MY_EFI_VAR_QUESTION: &str = "How tall are you? (Hex)";
+
 /// Size of the attributes that efivarfs puts before the data of a variable.
 pub const EFIVARFS_HEADER_SIZE: usize = 4;
 
@@ -264,19 +274,24 @@ pub fn single_response(args: &[&str], backend: i32) -> (Question, bool) {
     (response.question, response.modified)
 }
 
+/// The attributes and data of an efivarfs variable, or `None` if it does not exist.
+#[track_caller]
+pub fn variable_bytes(path: &str) -> Option<Vec<u8>> {
+    require_test_vm();
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot read {path}: {error}"),
+    }
+}
+
 /// The data of an efivarfs variable, without the attributes, or `None` if it does not
 /// exist.
 #[track_caller]
 pub fn variable_data(path: &str) -> Option<Vec<u8>> {
-    require_test_vm();
-    match fs::read(path) {
-        Ok(bytes) => {
-            assert!(bytes.len() >= EFIVARFS_HEADER_SIZE, "{path}: {bytes:02x?}");
-            Some(bytes[EFIVARFS_HEADER_SIZE..].to_vec())
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => panic!("cannot read {path}: {error}"),
-    }
+    let bytes = variable_bytes(path)?;
+    assert!(bytes.len() >= EFIVARFS_HEADER_SIZE, "{path}: {bytes:02x?}");
+    Some(bytes[EFIVARFS_HEADER_SIZE..].to_vec())
 }
 
 /// Panics unless `path` does not exist.

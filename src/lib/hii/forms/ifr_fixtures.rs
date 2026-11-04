@@ -45,7 +45,7 @@ pub(super) use crate::hii::variables::tests::WriteError;
 #[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::BS_RT;
 pub(crate) use crate::hii::variables::tests::NIL_GUID;
-pub(super) use crate::hii::variables::tests::NV_BS;
+pub(crate) use crate::hii::variables::tests::NV_BS;
 pub(crate) use crate::hii::variables::tests::NV_BS_RT;
 #[cfg(efivar_dumps)]
 use crate::hii::variables::EfivarSource;

@@ -34,10 +34,13 @@ use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
+use uefisettings_qemu_guest::variable_bytes;
 use uefisettings_qemu_guest::variable_data;
 use uefisettings_qemu_guest::ErrorObject;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
+use uefisettings_qemu_guest::MY_EFI_VAR;
+use uefisettings_qemu_guest::MY_EFI_VAR_QUESTION;
 use uefisettings_qemu_guest::PREFIXES;
 
 #[track_caller]
@@ -47,16 +50,18 @@ fn driver_sample_data() -> Vec<u8> {
 
 /// Sets `question` to `answer` with `set` and checks that `get` returns it, both after
 /// `prefix`: `["hii"]` for the HII commands, `[]` for the generic ones. Returns the bytes of
-/// the variable that changed.
+/// the data of the efivarfs variable `variable` that changed.
 /// `(flags, annotation)`: the flags of both commands, and the annotation that ends both answers.
 #[track_caller]
 fn set(
+    variable: &str,
     prefix: &[&str],
     question: &str,
     answer: &str,
     (flags, annotation): (&[&str], &str),
 ) -> Vec<(usize, u8)> {
-    let before = driver_sample_data();
+    let data = || variable_data(variable).unwrap_or_else(|| panic!("{variable} does not exist"));
+    let before = data();
     let answered = format!("{answer}{annotation}");
     let (set, modified) = single_response(
         &[prefix, &["set", question, answer, "--json"], flags].concat(),
@@ -72,7 +77,7 @@ fn set(
         BACKEND_HII,
     );
     assert_eq!(got.answer, answered, "{got:#?}");
-    changed_bytes(&before, &driver_sample_data())
+    changed_bytes(&before, &data())
 }
 
 /// What `set` takes and answers for a question that no condition hides.
@@ -95,7 +100,13 @@ fn refuse(prefix: &[&str], question: &str, answer: &str, flags: &[&str]) -> Erro
 
 #[test]
 fn set_one_of_is_stored() {
-    let changed = set(&["hii"], ONE_OF, "My one-of text #3", SELECTABLE);
+    let changed = set(
+        DRIVER_SAMPLE_VARIABLE,
+        &["hii"],
+        ONE_OF,
+        "My one-of text #3",
+        SELECTABLE,
+    );
     assert_eq!(changed, [(ONE_OF_OFFSET, 3)]);
 }
 
@@ -120,7 +131,7 @@ fn set_one_of_to_an_unknown_option_is_refused() {
 
 #[test]
 fn generic_set_check_box_is_stored() {
-    let changed = set(&[], CHECK_BOX, "0", SELECTABLE);
+    let changed = set(DRIVER_SAMPLE_VARIABLE, &[], CHECK_BOX, "0", SELECTABLE);
     assert_eq!(changed, [(CHECK_BOX_OFFSET, 0)]);
 }
 
@@ -129,12 +140,27 @@ fn set_check_box_to_2_is_refused() {
     refuse(&["hii"], CHECK_BOX, "2", &[]);
 }
 
+/// set writes a question on MyEfiVar, which Vfr.vfr declares boot-service-only, by the
+/// variable's own attributes, which have runtime access here, and keeps them.
 #[test]
-fn set_boot_service_only_question_is_refused_naming_its_variable() {
-    // On MyEfiVar, which DriverSample's Vfr.vfr declares without EFI_VARIABLE_RUNTIME_ACCESS
-    const QUESTION: &str = "How tall are you? (Hex)";
+fn set_question_on_a_runtime_variable_of_a_boot_service_only_form_is_stored() {
+    let changed = set(MY_EFI_VAR, &["hii"], MY_EFI_VAR_QUESTION, "32", SELECTABLE);
+
+    assert_eq!(changed, [(0, 0x20)], "{MY_EFI_VAR}: changed bytes");
+    assert_eq!(
+        variable_bytes(MY_EFI_VAR).expect("MyEfiVar exists"),
+        [7, 0, 0, 0, 0x20, 1, 0, 0, 0, 0, 0x12, 0],
+        "{MY_EFI_VAR}: attributes and data"
+    );
+}
+
+/// set refuses a question on MyEfiUnionVar, which DriverSample creates without runtime
+/// access, naming the boot-service-only declaration of its form, and writes nothing.
+#[test]
+fn set_question_on_a_missing_variable_of_a_boot_service_only_form_is_refused() {
+    const QUESTION: &str = "UNION EfiVarStore byte numeric";
     const VARIABLE: &str =
-        "/sys/firmware/efi/efivars/MyEfiVar-a04a27f4-df00-4d42-b552-39511302113d";
+        "/sys/firmware/efi/efivars/MyEfiUnionVar-a04a27f4-df00-4d42-b552-39511302113d";
     let file_name = Path::new(VARIABLE)
         .file_name()
         .and_then(OsStr::to_str)
@@ -145,8 +171,8 @@ fn set_boot_service_only_question_is_refused_naming_its_variable() {
     assert_eq!(
         error.error_message,
         format!(
-            "EFI variable {file_name} is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), \
-             which efivarfs neither lists nor writes"
+            "EFI variable {file_name} is not present at OS runtime: efivarfs does not list it, \
+             and its form declares it boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)"
         ),
         "{QUESTION}"
     );
@@ -156,7 +182,7 @@ fn set_boot_service_only_question_is_refused_naming_its_variable() {
 
 #[test]
 fn set_numeric_to_its_maximum_is_stored() {
-    let changed = set(&["hii"], NUMERIC, "243", SELECTABLE);
+    let changed = set(DRIVER_SAMPLE_VARIABLE, &["hii"], NUMERIC, "243", SELECTABLE);
     assert_eq!(changed, [(NUMERIC_OFFSET, 243)]);
 }
 
@@ -171,6 +197,7 @@ fn set_16_bit_one_of_is_stored() {
     // and hides it, so set selects it only with INCLUDE_SUPPRESSED. 0x3F8 becomes 0x2F8:
     // only the high byte changes.
     let changed = set(
+        DRIVER_SAMPLE_VARIABLE,
         &["hii"],
         SERIAL_PORT,
         "2F8",
@@ -209,7 +236,13 @@ fn set_of_a_question_that_may_be_grayed_out_is_refused_unless_grayed_out_is_incl
     );
 
     let annotation = format!(" <selectable or grayed-out: {MATCH2_REASON}>");
-    let changed = set(&["hii"], MATCH2, "5", (&INCLUDE_GRAYED_OUT, &annotation));
+    let changed = set(
+        DRIVER_SAMPLE_VARIABLE,
+        &["hii"],
+        MATCH2,
+        "5",
+        (&INCLUDE_GRAYED_OUT, &annotation),
+    );
     assert_eq!(
         changed,
         [(MATCH2_OFFSET, 5)],

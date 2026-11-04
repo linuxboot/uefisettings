@@ -34,6 +34,7 @@ use crate::hii::package::Guid;
 /// efivarfs does.
 pub(super) const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
 const EFI_VARIABLE_NON_VOLATILE: u32 = 0x00000001;
+pub(super) const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
 /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.10 §8.2.1)
 const EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: u32 = 0x00000080;
 /// EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS, EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
@@ -283,8 +284,7 @@ fn update_efivarfs_bytes(
 /// (UEFI 2.10 §8.2.3) and a power cycle would erase; errors word it as variables of `reach` hold
 /// it.
 /// Takes the variable's own attribute word, which its write passes to SetVariable(), not
-/// VARSTORE_EFI's Attributes; check_runtime_access cannot, as a boot-service-only variable has
-/// no file.
+/// VARSTORE_EFI's Attributes, as check_runtime_writable does.
 pub(super) fn check_non_volatile(
     key: &VariableKey,
     reach: VariableReach,
@@ -308,6 +308,40 @@ pub(super) fn check_non_volatile(
 pub(super) struct VolatileVariable {
     key: VariableKey,
     reach: VariableReach,
+}
+
+/// Refuses, for variables of `reach` Runtime or Windows, an EFI variable whose own `attributes`
+/// word lacks EFI_VARIABLE_RUNTIME_ACCESS: after ExitBootServices, edk2-stable202608 refuses to
+/// write an existing variable without it, VariableServiceSetVariable with EFI_WRITE_PROTECTED
+/// and UpdateVariable with EFI_INVALID_PARAMETER.
+pub(super) fn check_runtime_writable(
+    key: &VariableKey,
+    reach: VariableReach,
+    attributes: u32,
+) -> std::result::Result<(), BootServiceOnlyVariable> {
+    match reach {
+        VariableReach::Runtime | VariableReach::Windows
+            if attributes & EFI_VARIABLE_RUNTIME_ACCESS == 0 =>
+        {
+            Err(BootServiceOnlyVariable {
+                key: key.clone(),
+                attributes,
+            })
+        }
+        VariableReach::Runtime | VariableReach::Windows | VariableReach::BootServices => Ok(()),
+    }
+}
+
+/// An EFI variable without EFI_VARIABLE_RUNTIME_ACCESS, which set refuses through variables that
+/// reach Runtime or Windows.
+#[derive(Error, Debug)]
+#[error(
+    "EFI variable {key} has no EFI_VARIABLE_RUNTIME_ACCESS (attributes {attributes:#x}), so the \
+     firmware refuses to write it at OS runtime"
+)]
+pub(super) struct BootServiceOnlyVariable {
+    key: VariableKey,
+    attributes: u32,
 }
 
 /// Refuses an EFI variable with authenticated access, which its `attributes` word names: every
@@ -1221,6 +1255,31 @@ pub(crate) mod tests {
                     .map_err(|error| error.to_string()),
                 want,
                 "attributes {attributes:#x}"
+            );
+        }
+    }
+
+    /// check_runtime_writable refuses a variable without EFI_VARIABLE_RUNTIME_ACCESS for variables
+    /// that reach Runtime or Windows, and nothing else.
+    #[test]
+    fn variable_without_runtime_access_is_refused_at_runtime() {
+        let key = variable_key("TestVarStore");
+        let refusal = "EFI variable TestVarStore-00000000-0000-0000-0000-000000000000 has no \
+                       EFI_VARIABLE_RUNTIME_ACCESS (attributes 0x3), so the firmware refuses to \
+                       write it at OS runtime";
+        let cases = [
+            (NV_BS, VariableReach::Runtime, Err(refusal.to_string())),
+            (NV_BS, VariableReach::Windows, Err(refusal.to_string())),
+            (NV_BS, VariableReach::BootServices, Ok(())),
+            (NV_BS_RT, VariableReach::Runtime, Ok(())),
+            (NV_BS_RT, VariableReach::Windows, Ok(())),
+            (NV_BS_RT, VariableReach::BootServices, Ok(())),
+        ];
+        for (attributes, reach, want) in cases {
+            assert_eq!(
+                check_runtime_writable(&key, reach, attributes).map_err(|error| error.to_string()),
+                want,
+                "attributes {attributes:#x}, {reach:?}"
             );
         }
     }

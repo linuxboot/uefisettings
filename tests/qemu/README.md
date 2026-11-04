@@ -92,6 +92,10 @@ run two drivers from the ESP before the kernel, through `Driver####` load option
 [`vars/my-ifr-nv-data.json`](vars/my-ifr-nv-data.json) creates DriverSample's variable
 first, with runtime access, so that efivarfs shows it, and with DriverSample's defaults at
 that commit.
+[`vars/my-ifr-nv-data-runtime-my-efi-var.json`](vars/my-ifr-nv-data-runtime-my-efi-var.json)
+also creates its EFI variable `MyEfiVar` with runtime access, which its `Vfr.vfr` declares
+boot-service-only, as some vendors' firmware gives every non-volatile variable runtime
+access: in the scenario `hii`, `uefisettings` reads and writes it by its own attributes.
 [`vars/my-ifr-nv-data-auth27.json`](vars/my-ifr-nv-data-auth27.json) and
 [`vars/my-ifr-nv-data-authA7.json`](vars/my-ifr-nv-data-authA7.json) create it with the
 same data and authenticated access, the attributes 0x27 and 0xA7, for the UEFI Shell

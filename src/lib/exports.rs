@@ -600,6 +600,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::VariableReach;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
+    use crate::hii::forms::ifr_fixtures::NV_BS;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
@@ -1022,6 +1023,61 @@ mod tests {
                     Vec::<u16>::new(),
                     "{case}: reads of AMITSESetup"
                 );
+            }
+        }
+    }
+
+    /// A HiiDB whose FormSet has the CHECKBOX Q at byte 0 of the EFI variable Setup, which its
+    /// VARSTORE_EFI declares NV|BS.
+    fn boot_service_only_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS, 1),
+                form(1, &[checkbox_on(1, 1, 1)]),
+            ]),
+            en_strings_package_of(&["Q"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// set decides, through variables that reach Runtime or Windows, by the attributes of the
+    /// variable of a VARSTORE_EFI declared NV|BS: it refuses the variable without
+    /// EFI_VARIABLE_RUNTIME_ACCESS before any write, and writes the one with it, keeping them.
+    #[test]
+    fn set_decides_runtime_access_by_the_variables_own_attributes() {
+        let refusal = "EFI variable Setup-00000000-0000-0000-0000-000000000000 has no \
+                       EFI_VARIABLE_RUNTIME_ACCESS (attributes 0x3), so the firmware refuses to \
+                       write it at OS runtime";
+        let cases = [
+            (NV_BS, Err(refusal), vec![], vec![3, 0, 0, 0, 0]),
+            (NV_BS_RT, Ok(()), vec![(0, vec![1])], vec![7, 0, 0, 0, 1]),
+        ];
+
+        for reach in [VariableReach::Runtime, VariableReach::Windows] {
+            for (attributes, want, want_writes, want_bytes) in cases.clone() {
+                let variables = MemoryVariables::with_reach(reach);
+                variables.insert(setup(), attributes, &[0]);
+                let variables = Rc::new(variables);
+
+                let got = HiiBackend::set_in(
+                    &boot_service_only_hiidb(),
+                    "Q",
+                    "1",
+                    None,
+                    &SetOptions::default(),
+                    shared(&variables),
+                    &*variables,
+                );
+
+                let case = format!("{reach:?}, attributes {attributes:#x}");
+                assert_eq!(
+                    got.map(drop).map_err(|error| error.to_string()),
+                    want.map_err(str::to_string),
+                    "{case}"
+                );
+                assert_eq!(variables.writes_to(&setup()), want_writes, "{case}: writes");
+                assert_eq!(variables.bytes(&setup()), Some(want_bytes), "{case}: bytes");
             }
         }
     }

@@ -165,6 +165,7 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
 * It can ask questions about UEFI settings from HiiDB and get their answers.
 * `get`, `set` and `hii list-questions` evaluate the `suppressif`, `grayoutif` and `disableif` conditions of questions as EDK2's setup browser does, and select only questions that none of them suppresses, grays out or disables, unless `--include` names that state (`grayed-out`, `suppressed`, `disabled`); an answer ends with the state of a question that is not selectable. Where a condition cannot be evaluated from Linux, `set` refuses the question, while `get` and `hii list-questions` show it with the states it may be in and why. A one-of option in a `suppressif` counts as suppressed.
 * Change UEFI settings by calculating the correct offsets and writing to entries in `efivarfs`.
+* Questions read and set their EFI variable by its own attributes, as efivarfs gives them, since firmware may give a variable runtime access that its form does not declare. The attributes that the form (`VARSTORE_EFI`) declares explain only a variable that efivarfs does not list, or none read under `--no-efivars`.
 
 ### For HPE hardware
 
@@ -224,9 +225,10 @@ End-to-end tests boot QEMU guests and run `uefisettings` against emulated firmwa
 <summary>Inspecting a machine's settings elsewhere</summary>
 
 `hii dump-efivars` copies the EFI variables that the HiiDB's questions read, so that `hii get`,
-`hii list-questions` and `hii show-ifr` can answer from them on another machine. The dump also
-holds the HiiDB, as `hiidb.bin`, and records its format and redaction in
-`uefisettings-dump.json`:
+`hii list-questions` and `hii show-ifr` can answer from them on another machine: each that
+efivarfs lists, also one whose form declares it boot-service-only, while it reports the others
+as missing. The dump also holds the HiiDB, as `hiidb.bin`, and records its format and
+redaction in `uefisettings-dump.json`:
 
 ```sh
 # on the machine to inspect

@@ -3584,9 +3584,9 @@ mod tests {
                 "boot-service-only EFI variable SystemAccess",
                 var_store_efi_of(1, SYSTEM_ACCESS_GUID, "SystemAccess", NV_BS, 1),
                 "<ValueUnavailable: EFI variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac \
-                 is boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS), which efivarfs neither \
-                 lists nor writes; the AMI setup browser keeps its access level there \
-                 (0 Administrator, 1 User); \
+                 is not present at OS runtime: efivarfs does not list it, and its form declares it \
+                 boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS); the AMI setup browser keeps \
+                 its access level there (0 Administrator, 1 User); \
                  --access-level administrator|user states one>",
             ),
             (

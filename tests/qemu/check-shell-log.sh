@@ -38,8 +38,8 @@
 #                "uefisettings-qemu-test: list-questions JSON" of a Linux boot, where the
 #                questions are pairs: every question that Linux reads, at least one, has
 #                the same value here, every question on a variable that Linux finds missing
-#                or boot-service-only has a value here unless the firmware has no such
-#                variable, and at least one has
+#                or not present at OS runtime has a value here unless the firmware has no
+#                such variable, and at least one has
 #   argument   what the check takes
 # Every step of the log needs a status check, and every step that a check names must be in
 # the log once.
@@ -97,8 +97,8 @@ fi
 
 # Pairs the questions of $linux and of the input by name and rank among those of that name;
 # counts the pairs where Linux reads a value and lists those whose values differ; lists those
-# on a variable that Linux finds missing or boot-service-only where the input has no value
-# either, though the firmware has the variable, and counts those where it has.
+# on a variable that Linux finds missing or not present at OS runtime where the input has
+# no value either, though the firmware has the variable, and counts those where it has.
 parity_filter='
     def by_rank: group_by(.name) | map(to_entries | map({key: "\(.value.name) #\(.key)", value})) | add // [] | from_entries;
     def unavailable: .answer | startswith("<ValueUnavailable");
@@ -107,7 +107,7 @@ parity_filter='
     [$l | to_entries[] | select(.value | unavailable | not)] as $read |
     [$read[] | select($s[.key] == null or ($s[.key] | value) != (.value | value)) | .key] as $differing |
     [$l | to_entries[]
-        | select(.value.answer | test("^<ValueUnavailable: (no EFI variable |EFI variable [^ ]* is boot-service-only)"))] as $unread |
+        | select(.value.answer | test("^<ValueUnavailable: (no EFI variable |EFI variable [^ ]* is not present at OS runtime: )"))] as $unread |
     {
         compared: $read | length,
         differing: $differing,

@@ -276,6 +276,7 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::read_db;
+    use crate::hii::variables::tests::NV_BS;
 
     /// The directory of the fixtures of tests/offline_golden.rs.
     const OFFLINE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/offline");
@@ -778,6 +779,53 @@ mod tests {
             answers(&root, &dir),
             ["1", "1 <suppressed>"],
             "answers from the dump"
+        );
+        assert_eq!(
+            answers(&root, &dir),
+            answers(&root, live.path()),
+            "answers from the source"
+        );
+    }
+
+    /// A dump copies the variables of VARSTORE_EFIs that declare them boot-service-only, as get
+    /// reads those that efivarfs lists, and lists those that it does not as missing.
+    #[test]
+    fn dump_copies_the_variables_of_boot_service_only_var_stores() {
+        let root = parse_form_set(&[
+            var_store_efi(1, "Setup", NV_BS, 2),
+            var_store_efi(2, "Absent", NV_BS, 2),
+            form(1, &[checkbox_on(1, 3, 1), checkbox_on(2, 3, 2)]),
+        ]);
+        let live = efivars(&[(&efivar("Setup"), &[7, 0, 0, 0, 1, 0xAA])]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
+        let dump = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
+
+        assert_eq!(
+            dump,
+            EfivarDump {
+                copied: vec![efivar("Setup").to_string()],
+                missing: vec![efivar("Absent").to_string()],
+            },
+            "dump"
+        );
+        assert_eq!(
+            fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 1, 0],
+            "dumped Setup: its question's byte"
+        );
+        assert_eq!(
+            answers(&root, &dir).first().map(String::as_str),
+            Some("1"),
+            "answer of Setup from the dump"
         );
         assert_eq!(
             answers(&root, &dir),
