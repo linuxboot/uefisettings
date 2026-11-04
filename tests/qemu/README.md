@@ -28,9 +28,9 @@ Device memory as arm64 does. On Ubuntu 26.04 it also needs the packages of
 xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes
 ```
 
-The guest's kernel, firmware and busybox do not come from the host: they are the packages
-that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64), [i686](guest-packages-i686)
-or [aarch64](guest-packages-aarch64)) pins, which
+The guest's kernel, firmware, UEFI Shell and busybox do not come from the host: they are the
+packages that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64),
+[i686](guest-packages-i686) or [aarch64](guest-packages-aarch64)) pins, which
 [`fetch-packages.sh`](fetch-packages.sh) downloads.
 
 `run.sh` alone runs the scenarios of an architecture on the active toolchain of rustup,
@@ -43,10 +43,12 @@ tests/qemu/run.sh x86_64 boot-smoke   # the named scenarios
 ```
 
 Elsewhere, these tools must be on `PATH`: `qemu-system-x86_64`, `qemu-system-i386`,
-`qemu-system-aarch64`, `virt-fw-vars`, `jq`, `cpio` and `flock` for `run.sh`; `curl`,
-`rpm2cpio`, `cpio`, `ar`, `tar`, `xz` and `zstd` for `fetch-packages.sh`; and,
+`qemu-system-aarch64`, `virt-fw-vars`, `jq`, `cpio`, `flock` and `openssl` for `run.sh`;
+`curl`, `rpm2cpio`, `cpio`, `ar`, `tar`, `xz` and `zstd` for `fetch-packages.sh`; and,
 unless DriverSample.efi is already built, `gcc`, `g++`, `make`, `git`, `nasm`, `python3`
-and the libuuid headers for [`build-driver-sample.sh`](build-driver-sample.sh).
+and the libuuid headers for [`build-driver-sample.sh`](build-driver-sample.sh), which
+[`build-secboot-firmware.sh`](build-secboot-firmware.sh) needs too unless the i686 and
+aarch64 Secure Boot firmware is already built.
 The aarch64 builds also need `aarch64-linux-gnu-gcc` with the `libdl.a` of an aarch64
 glibc, or another linker that `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER` names, and
 the i686 build of `uefisettings` a 32-bit `libdl.a` (Fedora: `glibc-devel.i686`), as the
@@ -62,10 +64,10 @@ output, `bootN.test.log` the test output and `bootN.qemu.log` how QEMU saw the g
 (`run.sh` explains its lines).
 
 [`scenarios.tsv`](scenarios.tsv) lists the scenarios and the boots of each. Its options column
-sets how a scenario's Linux runs, the architectures that boot it and the QEMU devices that it
-adds: [`scenario-options.sh`](scenario-options.sh) parses it, and `run.sh` runs
-that parser's table test, [`scenario-options-test.sh`](scenario-options-test.sh), before any
-boot. Each file in
+sets how a scenario's Linux runs, the firmware that it boots, the architectures that boot it
+and the QEMU devices that it adds: [`scenario-options.sh`](scenario-options.sh) parses it, and
+`run.sh` runs that parser's table test,
+[`scenario-options-test.sh`](scenario-options-test.sh), before any boot. Each file in
 [`guest/tests/`](guest/tests/) is one test binary, which a boot names, and its module
 documentation says what it checks. The guest tests refuse to run on a machine whose kernel
 command line lacks `uefisettings.test=`. They build only with the `test-vm` feature, which
@@ -136,3 +138,31 @@ variable.
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
 set to FALSE. No scenario boots it.
+
+## Secure Boot
+
+The scenarios with `firmware=secboot-setup` or `firmware=secboot-user` in their options boot
+firmware with Secure Boot, which authenticated variable writes need (UEFI 2.11 §8.2.6): the
+pinned `OVMF_CODE_4M.secboot.fd` on x86_64, with SMM, and on i686 and aarch64 the firmware that
+[`build-secboot-firmware.sh`](build-secboot-firmware.sh) builds on the first run that needs it
+from `edk2-stable202508`, the last EDK2 release with OVMF IA32, which EDK2 commit
+1fb88ffe284782cc79e306306b8d19829b6248b7 ("OvmfPkg: Remove OVMF IA32") removed, with the
+`iasl` that [`host-packages`](host-packages) pins; its comments say why the pinned images do
+not serve.
+`run.sh` keeps that firmware in `target/qemu-test/<arch>/secboot-firmware/` and the EDK2 clone
+in `target/qemu-test/edk2-secboot/`; delete the first after a change to
+`build-secboot-firmware.sh` or `host-packages`. Secure Boot images hold no UEFI Shell, so the
+Shell boots of these scenarios get the pinned `efi-shell-*` package's on the ESP, as its
+removable media boot loader.
+
+`secboot-setup`'s variable store is a template copy, in Setup Mode. In `secboot-user`'s,
+`run.sh` enrolls as PK, KEK and db the certificates of keys that `openssl` generates for the
+scenario, in its directory of the run, and clears `SecureBootEnable`: the firmware is in User
+Mode and verifies authenticated variable writes, but not images, as the pinned Shell refuses
+to run under Secure Boot outside Setup Mode. [`auth-payload.sh`](auth-payload.sh) signs a db
+append of another certificate with KEK, with db's key, which KEK lacks, and with a foreign
+key, which `run.sh` generates with the others but enrolls nowhere, and `run.sh` flips a byte
+of a copy of the first, for the Linux test `secboot` and, through
+`publish-hiidb.efi set-auth-variables=PATH[,PATH]...`, for the Shell, which reads the
+statuses that the driver puts in `AuthProbeLog`: the firmware accepts the KEK-signed append
+and refuses the other three.

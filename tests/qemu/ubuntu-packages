@@ -1,3 +1,4 @@
+binutils-aarch64-linux-gnu
 build-essential
 cpio
 curl
@@ -7,6 +8,7 @@ jq
 libc6-dev-arm64-cross
 libc6-dev-i386
 nasm
+openssl
 python3
 python3-virt-firmware
 qemu-system-arm

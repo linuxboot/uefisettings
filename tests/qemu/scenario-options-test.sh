@@ -30,7 +30,8 @@ failed=0
 # Prints the variables that scenario_options set, in the form of the accepts cases.
 parsed() {
     local IFS=,
-    echo "kernel=$option_kernel arch=${option_arches[*]} devices=${option_devices[*]}"
+    echo "kernel=$option_kernel firmware=$option_firmware arch=${option_arches[*]}" \
+        "devices=${option_devices[*]}"
 }
 
 # Checks that scenario_options parses the column $1 into $2, quietly.
@@ -71,16 +72,20 @@ runs_on() {
     fi
 }
 
-all='arch=x86_64,i686,aarch64'
+all='firmware=default arch=x86_64,i686,aarch64'
 accepts - "kernel= $all devices="
 accepts kernel=vamap "kernel=vamap $all devices="
 accepts kernel=lockdown "kernel=lockdown $all devices="
 accepts kernel=lockdown-conf "kernel=lockdown-conf $all devices="
-accepts arch=i686 'kernel= arch=i686 devices='
-accepts arch=aarch64,x86_64 'kernel= arch=aarch64,x86_64 devices='
+accepts firmware=default "kernel= $all devices="
+accepts firmware=secboot-setup \
+    'kernel= firmware=secboot-setup arch=x86_64,i686,aarch64 devices='
+accepts firmware=secboot-user 'kernel= firmware=secboot-user arch=x86_64,i686,aarch64 devices='
+accepts arch=i686 'kernel= firmware=default arch=i686 devices='
+accepts arch=aarch64,x86_64 'kernel= firmware=default arch=aarch64,x86_64 devices='
 accepts devices=virtio-rng "kernel= $all devices=virtio-rng"
-accepts 'devices=virtio-rng kernel=lockdown arch=x86_64,i686' \
-    'kernel=lockdown arch=x86_64,i686 devices=virtio-rng'
+accepts 'devices=virtio-rng firmware=secboot-user kernel=lockdown arch=x86_64,i686' \
+    'kernel=lockdown firmware=secboot-user arch=x86_64,i686 devices=virtio-rng'
 # Each case starts from the defaults, not from the case before.
 accepts - "kernel= $all devices="
 
@@ -101,6 +106,9 @@ refuses kernel=integrity \
     'scenarios.tsv: test: unknown value kernel=integrity; the values are vamap lockdown lockdown-conf'
 refuses kernel=vamap=1 \
     'scenarios.tsv: test: unknown value kernel=vamap=1; the values are vamap lockdown lockdown-conf'
+refuses firmware=secboot \
+    'scenarios.tsv: test: unknown value firmware=secboot; the values are default secboot-setup secboot-user'
+refuses 'firmware=secboot-user firmware=secboot-setup' 'scenarios.tsv: test: repeated key firmware'
 refuses arch= 'scenarios.tsv: test: an empty element in arch='
 refuses arch=x86_64, 'scenarios.tsv: test: an empty element in arch=x86_64,'
 refuses arch=,x86_64 'scenarios.tsv: test: an empty element in arch=,x86_64'

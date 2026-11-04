@@ -1,0 +1,8 @@
+# The checks of shell/secboot-setup.nsh, the boot of shell-secboot-setup: Setup Mode, with
+# Secure Boot off. See check-shell-log.sh.
+setup-mode	status	0x0
+setup-mode	line	^Variable RT\+BS 'EFIGlobalVariable:SetupMode' DataSize = 0x01$
+setup-mode	line	^  00000000: 01 +\*
+secure-boot	status	0x0
+secure-boot	line	^Variable RT\+BS 'EFIGlobalVariable:SecureBoot' DataSize = 0x01$
+secure-boot	line	^  00000000: 00 +\*

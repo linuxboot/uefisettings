@@ -34,6 +34,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::slice;
 
+use rustix::fs::IFlags;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
@@ -292,6 +293,20 @@ pub fn variable_data(path: &str) -> Option<Vec<u8>> {
     let bytes = variable_bytes(path)?;
     assert!(bytes.len() >= EFIVARFS_HEADER_SIZE, "{path}: {bytes:02x?}");
     Some(bytes[EFIVARFS_HEADER_SIZE..].to_vec())
+}
+
+/// Clears the immutable flag of the efivarfs variable at `path`, which efivarfs sets on every
+/// variable that it does not know to be removable, such as db (Linux v6.1
+/// fs/efivarfs/inode.c efivarfs_get_inode()), so that a test can write it. The guest's
+/// busybox has no chattr. Panics if the flags cannot be read or set.
+#[track_caller]
+pub fn clear_immutable(path: &str) {
+    require_test_vm();
+    let file = File::open(path).unwrap_or_else(|error| panic!("cannot open {path}: {error}"));
+    let flags = rustix::fs::ioctl_getflags(&file)
+        .unwrap_or_else(|error| panic!("FS_IOC_GETFLAGS on {path}: {error}"));
+    rustix::fs::ioctl_setflags(&file, flags.difference(IFlags::IMMUTABLE))
+        .unwrap_or_else(|error| panic!("FS_IOC_SETFLAGS on {path}: {error}"));
 }
 
 /// Panics unless `path` does not exist.

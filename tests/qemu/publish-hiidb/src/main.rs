@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -40,12 +40,15 @@
 //! edk2's HiiDatabaseDxe does when PcdHiiOsRuntimeSupport is TRUE (UEFI 2.11 §33.2.11.1), and
 //! puts its length and address in the volatile `HiiDBConfigTable` variable, in `HiiDB`'s
 //! layout, for the tests.
+//! `set-auth-variables=PATH[,PATH]...` publishes nothing: it runs the authenticated writes of
+//! [`auth_variables`] for the Secure Boot scenarios.
 
 #![cfg_attr(target_os = "uefi", no_std, no_main)]
 #![deny(unsafe_code)]
 
 extern crate alloc;
 
+mod auth_variables;
 mod global_variable_forms;
 mod hii_package;
 mod password_forms;
@@ -141,12 +144,14 @@ fn efi_main() -> Status {
             })
         }
         Some(Task::InstallConfigTables) => install_config_tables(),
+        Some(Task::SetAuthVariables(payloads)) => auth_variables::set_auth_variables(&payloads)
+            .map(|log| println!("publish-hiidb: AuthProbeLog {log}")),
         None => {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
                  |password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
-                 |install-config-tables]"
+                 |install-config-tables|set-auth-variables=PATH[,PATH]...]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -161,7 +166,7 @@ fn efi_main() -> Status {
 }
 
 /// What the load option asks for.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Task {
     /// Publish the database in pages of the memory type.
     Publish(MemoryType, Database),
@@ -173,6 +178,8 @@ enum Task {
     PublishJunkAcpiTable([u8; 4]),
     /// Install a copy of the database as the HII database protocol's configuration table.
     InstallConfigTables,
+    /// Run the authenticated writes of [`auth_variables`] with the payloads.
+    SetAuthVariables(Vec<auth_variables::Payload>),
 }
 
 /// The task that the optional data of the load option, a NUL-terminated UCS-2 string,
@@ -209,6 +216,7 @@ fn load_option() -> Option<Task> {
             Some(Task::PublishJunkAcpiTable(QHII_SIGNATURE))
         }
         Ok(option) if option == cstr16!("install-config-tables") => Some(Task::InstallConfigTables),
+        Ok(option) => auth_variables::payloads(option).map(Task::SetAuthVariables),
         _ => None,
     }
 }

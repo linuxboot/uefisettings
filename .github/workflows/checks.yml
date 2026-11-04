@@ -112,15 +112,17 @@ jobs:
       # profile and logs errors; the builds take about a minute without it.
       - run: make setup
 
-      # The guests' packages and each architecture's DriverSample.efi, keyed also on the
-      # apt packages and the runner image (this file) that build DriverSample. Saved only
-      # on success, as run.sh reuses DriverSample.efi unchecked.
+      # The guests' packages, each architecture's DriverSample.efi and Secure Boot firmware,
+      # keyed also on the apt packages, the pinned iasl and the runner image (this file) that
+      # build them. Saved only on success, as run.sh reuses DriverSample.efi and the firmware
+      # unchecked.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/qemu-test/packages
             target/qemu-test/*/driver-sample
-          key: qemu-inputs-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh', 'tests/qemu/ubuntu-packages', '.github/workflows/checks.yml') }}
+            target/qemu-test/*/secboot-firmware
+          key: qemu-inputs-${{ hashFiles('tests/qemu/guest-packages-*', 'tests/qemu/build-driver-sample.sh', 'tests/qemu/build-secboot-firmware.sh', 'tests/qemu/host-packages', 'tests/qemu/ubuntu-packages', '.github/workflows/checks.yml') }}
 
       - run: make -k test-e2e-qemu
 

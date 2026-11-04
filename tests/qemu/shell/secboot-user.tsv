@@ -1,0 +1,13 @@
+# The checks of shell/secboot-user.nsh, the boot of shell-secboot-user: User Mode, with
+# Secure Boot off. See check-shell-log.sh.
+setup-mode	status	0x0
+setup-mode	line	^Variable RT\+BS 'EFIGlobalVariable:SetupMode' DataSize = 0x01$
+setup-mode	line	^  00000000: 00 +\*
+secure-boot	status	0x0
+secure-boot	line	^Variable RT\+BS 'EFIGlobalVariable:SecureBoot' DataSize = 0x01$
+secure-boot	line	^  00000000: 00 +\*
+# the KEK-signed append grows db by its signature list; its tampered copy and the same append
+# signed with db's key, which KEK lacks, and with a key that no variable holds are refused and
+# leave db as it was; and edk2 refuses the §3.3 mode variables, which it does not implement
+auth-probe-log	status	any
+auth-probe-log	line	^db-append=SUCCESS db-append-growth=([1-9][0-9]*) db-append-data=\1 db-tampered=SECURITY_VIOLATION db-tampered-growth=0 db-tampered-data=\1 db-unauthorized=SECURITY_VIOLATION db-unauthorized-growth=0 db-unauthorized-data=\1 db-foreign=SECURITY_VIOLATION db-foreign-growth=0 db-foreign-data=\1 AuditMode=INVALID_PARAMETER DeployedMode=INVALID_PARAMETER$

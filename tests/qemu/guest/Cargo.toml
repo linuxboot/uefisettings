@@ -7,6 +7,8 @@ publish = false
 description = "Tests of uefisettings that run inside the QEMU test guests (tests/qemu/run.sh)"
 
 [dependencies]
+# FS_IOC_GETFLAGS and FS_IOC_SETFLAGS without unsafe code, for clear_immutable.
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -57,4 +59,8 @@ required-features = ["test-vm"]
 
 [[test]]
 name = "hii_write"
+required-features = ["test-vm"]
+
+[[test]]
+name = "secboot"
 required-features = ["test-vm"]

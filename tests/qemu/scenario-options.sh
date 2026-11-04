@@ -15,19 +15,24 @@
 # options column of the scenario NAME of scenarios.tsv. "-" stands for the defaults; otherwise
 # the column holds key=value tokens, separated by single spaces, each key at most once:
 #   kernel=vamap|lockdown|lockdown-conf  how the scenario's Linux runs (run.sh); default: neither
+#   firmware=default|secboot-setup|secboot-user
+#                                        the firmware and its variable store (run.sh);
+#                                        default: default
 #   arch=ARCH[,ARCH]...                  the architectures, of x86_64, i686 and aarch64, that boot
 #                                        the scenario; default: all three
 #   devices=DEVICE[,DEVICE]...           QEMU devices to add, of virtio-rng; default: none
-# It sets option_kernel (empty without its key), option_arches and option_devices, and fails,
-# naming the scenario and the key, on an empty column or token, a token without "=", an unknown
-# or repeated key, an unknown value, and an empty or repeated element of a comma list.
+# It sets option_kernel (empty without its key), option_firmware, option_arches and
+# option_devices, and fails, naming the scenario and the key, on an empty column or token, a
+# token without "=", an unknown or repeated key, an unknown value, and an empty or repeated
+# element of a comma list.
 # scenario_runs_on ARCH then tells whether the scenario boots on ARCH.
 
-# Sets option_kernel, option_arches and option_devices from the options column $2 of scenario
-# $1.
+# Sets option_kernel, option_firmware, option_arches and option_devices from the options column
+# $2 of scenario $1.
 scenario_options() {
     local name=$1 column=$2 rest token key value seen=' '
     option_kernel=
+    option_firmware=default
     option_arches=(x86_64 i686 aarch64)
     option_devices=()
     if [[ -z $column ]]; then
@@ -58,6 +63,10 @@ scenario_options() {
         kernel)
             scenario_option_value "$name" "$key" "$value" vamap lockdown lockdown-conf || return 1
             option_kernel=$value
+            ;;
+        firmware)
+            scenario_option_value "$name" "$key" "$value" default secboot-setup secboot-user || return 1
+            option_firmware=$value
             ;;
         arch) scenario_option_list "$name" "$key" "$value" option_arches x86_64 i686 aarch64 || return 1 ;;
         devices) scenario_option_list "$name" "$key" "$value" option_devices virtio-rng || return 1 ;;

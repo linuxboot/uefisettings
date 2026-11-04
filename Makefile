@@ -29,11 +29,13 @@
 #
 # A CI host runs make setup && make -k under timeout, as nothing bounds the time
 # that cargo takes: timeout -k 60 <seconds> bash -c 'make setup && make -k'. It
-# may keep target/qemu-test/packages and target/qemu-test/*/driver-sample
-# between runs: tests/qemu/fetch-packages.sh downloads only the packages that are
-# missing there or fail their sha256 check, and tests/qemu/run.sh builds
-# DriverSample only when it is missing, so delete target/qemu-test/*/driver-sample
-# after a change to build-driver-sample.sh.
+# may keep target/qemu-test/packages, target/qemu-test/*/driver-sample and
+# target/qemu-test/*/secboot-firmware between runs: tests/qemu/fetch-packages.sh
+# downloads only the packages that are missing there or fail their sha256 check, and
+# tests/qemu/run.sh builds DriverSample and the Secure Boot firmware only when they
+# are missing, so delete target/qemu-test/*/driver-sample after a change to
+# build-driver-sample.sh, and target/qemu-test/*/secboot-firmware after one to
+# build-secboot-firmware.sh or host-packages.
 
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c

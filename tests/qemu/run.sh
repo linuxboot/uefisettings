@@ -22,6 +22,13 @@
 # packages of tests/qemu/guest-packages-ARCH. QEMU is the qemu-system-* of the table below
 # from PATH, or a wrapper that execs it: the timeout of a boot signals that program, not
 # its children.
+# The Secure Boot scenarios, those with firmware= in their options, boot the secboot firmware
+# of the table below, which has no UEFI Shell, so their Shell boots get the pinned one on the
+# ESP. On i686 and aarch64, build-secboot-firmware.sh builds that firmware on the first run that
+# needs it. Their variable store is a template copy, in Setup Mode, or, in User Mode, one where
+# PK, KEK and db hold certificates of keys that openssl generates for the scenario, with
+# SecureBootEnable cleared, so that the firmware verifies authenticated variable writes but no
+# images: the pinned Shell refuses to run under Secure Boot outside Setup Mode.
 
 set -euo pipefail
 
@@ -50,6 +57,18 @@ x86_64)
     edk2_arch=X64
     kernel_params=()
     vamap_args=()
+    # The secboot image needs SMM, as only SMM writes its variable store: QEMU refuses other
+    # writes to a secure flash device.
+    secboot_qemu=(qemu-system-x86_64 -machine q35,smm=on -accel kvm -cpu host
+        -global driver=cfi.pflash01,property=secure,value=on)
+    # where the secboot firmware comes from: guest, the guest's packages, or build,
+    # build-secboot-firmware.sh
+    secboot_source=guest
+    secboot_firmware=usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+    secboot_vars=usr/share/OVMF/OVMF_VARS_4M.fd
+    shell_efi=usr/share/efi-shell-x64/shellx64.efi
+    # the file name of the UEFI Shell as the removable media boot loader (UEFI 2.11 §3.5.1.1)
+    removable_loader=BOOTx64.EFI
     ;;
 i686)
     qemu=(qemu-system-i386 -machine q35 -accel kvm -cpu host)
@@ -67,6 +86,16 @@ i686)
     # 32-byte slab unless pti=on (Linux v6.1 _pgd_alloc; SHARED_KERNEL_PMD is !PTI).
     kernel_params=(pti=on)
     vamap_args=()
+    # Built, as the pinned OVMF32_CODE_4M.secboot.fd page-faults before its first console line
+    # under QEMU 10.1. Not with OvmfPkg/README's -cpu coreduo,-nx: without NX, Linux's EFI stub
+    # cannot set EFI_MEMORY_RO on this firmware and stops ("Failed to decompress kernel").
+    secboot_qemu=(qemu-system-i386 -machine q35,smm=on -accel kvm -cpu host
+        -global driver=cfi.pflash01,property=secure,value=on)
+    secboot_source=build
+    secboot_firmware=OVMF_CODE.fd
+    secboot_vars=OVMF_VARS.fd
+    shell_efi=usr/share/efi-shell-ia32/shellia32.efi
+    removable_loader=BOOTIA32.EFI
     ;;
 aarch64)
     # With these devices, none of them virtio-rng unless the options column adds it, the firmware
@@ -85,6 +114,14 @@ aarch64)
     # For an eMAG processor, the EFI stub calls SetVirtualAddressMap() instead of setting
     # efi_novamap (Linux v6.11 drivers/firmware/efi/libstub/arm64.c system_needs_vamap()).
     vamap_args=(-smbios type=4,version=eMAG)
+    # Built, as the pinned AAVMF_CODE.secboot.fd refuses every authenticated variable write
+    # (build-secboot-firmware.sh).
+    secboot_qemu=("${qemu[@]}")
+    secboot_source=build
+    secboot_firmware=AAVMF_CODE.fd
+    secboot_vars=AAVMF_VARS.fd
+    shell_efi=usr/share/efi-shell-aa64/shellaa64.efi
+    removable_loader=BOOTAA64.EFI
     # cc, the default, links for the host. Set the variable for another linker: it
     # overrides cargo's config files, as this default does.
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER-aarch64-linux-gnu-gcc}
@@ -115,10 +152,16 @@ awk -F '\t' '$0 !~ /^(#|$)/ {
     if (!ok) { printf "scenarios.tsv line %d needs 5 non-empty columns: %s\n", NR, $0; bad = 1 }
 } END { exit bad }' "$here/scenarios.tsv" >&2
 "$here/scenario-options-test.sh"
+# Whether a scenario of the run boots the secboot firmware.
+secboot=no
 # read fails on a last line without a newline, which still counts.
 while IFS=$'\t' read -r name _ _ _ options || [[ -n $name ]]; do
     [[ -z $name || $name == \#* ]] && continue
     scenario_options "$name" "$options"
+    if [[ $option_firmware != default ]] && scenario_runs_on "$arch" &&
+        { (($# == 0)) || [[ " $* " == *" $name "* ]]; }; then
+        secboot=yes
+    fi
 done <"$here/scenarios.tsv"
 mapfile -t known < <(awk -F '\t' '$1 !~ /^(#|$)/ { print $1 }' "$here/scenarios.tsv")
 for name in "$@"; do
@@ -238,6 +281,54 @@ guest_file() {
     echo "$guest/${files[0]}"
 }
 vmlinuz=$(guest_file "$vmlinuz_pattern")
+if [[ $secboot == yes ]]; then
+    case $secboot_source in
+    guest) secboot_dir=$guest ;;
+    build)
+        secboot_dir=$out/$arch/secboot-firmware
+        if [[ ! -f $secboot_dir/$secboot_firmware ]]; then
+            "$here/build-secboot-firmware.sh" "$edk2_arch" "$out/edk2-secboot" "$secboot_dir"
+        fi
+        ;;
+    esac
+fi
+# The owner of the enrolled certificates and of the signature lists that the scenarios append:
+# the tests' vendor GUID.
+secboot_owner=de145b29-c3cd-455f-91de-a76237b67c52
+# EFI_IMAGE_SECURITY_DATABASE_GUID, the vendor GUID of db
+db_guid=d719b2cb-3d3a-4596-a3bc-dad00e67656f
+
+# Generates the keys and payloads of a Secure Boot scenario in the new directory $1: PK, KEK and
+# db to enroll, a foreign key that none of them holds, and for its Shell boots (shell/) and Linux
+# boots (linux/) each a db append of a certificate of its own: signed with KEK, as
+# db-append.auth; its copy with the last byte, in the certificate, flipped, as db-tampered.auth;
+# and the same append signed with db's key, which KEK lacks, as db-unauthorized.auth, and with
+# the foreign key, as db-foreign.auth.
+secboot_files() {
+    local keys=$1 each file size byte
+    mkdir "$keys"
+    for each in PK KEK db foreign shell-db linux-db; do
+        openssl req -x509 -newkey rsa:2048 -noenc -days 2 -sha256 \
+            -subj "/CN=uefisettings test $each" -keyout "$keys/$each.key" \
+            -out "$keys/$each.crt" 2>>"$keys/openssl.log"
+    done
+    for each in shell linux; do
+        mkdir "$keys/$each"
+        "$here/auth-payload.sh" x509-esl "$secboot_owner" "$keys/$each-db.crt" "$keys/$each-db.esl"
+        "$here/auth-payload.sh" sign db "$db_guid" 0x67 "$keys/$each-db.esl" "$keys/KEK.crt" \
+            "$keys/KEK.key" "$keys/$each/db-append.auth"
+        "$here/auth-payload.sh" sign db "$db_guid" 0x67 "$keys/$each-db.esl" "$keys/db.crt" \
+            "$keys/db.key" "$keys/$each/db-unauthorized.auth"
+        "$here/auth-payload.sh" sign db "$db_guid" 0x67 "$keys/$each-db.esl" "$keys/foreign.crt" \
+            "$keys/foreign.key" "$keys/$each/db-foreign.auth"
+        file=$keys/$each/db-tampered.auth
+        cp "$keys/$each/db-append.auth" "$file"
+        size=$(stat --format=%s "$file")
+        byte=$(od --address-radix=n --format=u1 --skip-bytes=$((size - 1)) "$file")
+        printf "\\$(printf %03o $((byte ^ 1)))" |
+            dd of="$file" bs=1 seek=$((size - 1)) conv=notrunc status=none
+    done
+}
 for module in "${modules[@]}"; do
     cp "$(guest_file "$module")" "$run/initramfs/lib/modules/"
 done
@@ -271,6 +362,28 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
     dir=$run/$name
     mkdir "$dir"
     cp -r "$run/initramfs" "$dir/"
+    boot_qemu=("${qemu[@]}")
+    # the arguments of virt-fw-vars that enroll the keys of the scenario's variable store
+    enroll=()
+    case $option_firmware in
+    default) ;;
+    secboot-setup | secboot-user)
+        boot_qemu=("${secboot_qemu[@]}")
+        code=$secboot_dir/$secboot_firmware
+        code_vars=$secboot_dir/$secboot_vars
+        secboot_files "$dir/keys"
+        mkdir "$dir/initramfs/auth"
+        cp "$dir/keys/linux/"*.auth "$dir/initramfs/auth/"
+        ;;
+    esac
+    case $option_firmware in
+    default | secboot-setup) ;;
+    secboot-user)
+        enroll=(--set-pk "$secboot_owner" "$dir/keys/PK.crt"
+            --add-kek "$secboot_owner" "$dir/keys/KEK.crt"
+            --add-db "$secboot_owner" "$dir/keys/db.crt" --set-false SecureBootEnable)
+        ;;
+    esac
     (cd "$dir/initramfs" && find . | cpio --create --format=newc --quiet) >"$dir/initrd.img"
     # The firmware runs the Driver#### load options before it starts the kernel.
     seed=()
@@ -284,7 +397,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
     [[ $variables == - ]] || seed+=("$here/vars/$variables")
     jq --null-input '{version: 2, variables: [inputs.variables[]]}' "${seed[@]}" \
         </dev/null >"$dir/vars.json"
-    virt-fw-vars --input "$code_vars" --set-json "$dir/vars.json" \
+    virt-fw-vars --input "$code_vars" "${enroll[@]}" --set-json "$dir/vars.json" \
         --output "$dir/vars.fd" 2>>"$dir/virt-fw-vars.log"
     kernel_qemu_args=()
     # the kernel parameter that locks the scenario's Linux boots down, if any
@@ -312,10 +425,16 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
             # Without a kernel, the firmware boots its UEFI Shell, which runs startup.nsh:
             # the boot's script, on a copy of the ESP that also holds uefisettings.efi, and
             # the kernel and initrd, which the line @LINUX@ of the script starts from the
-            # shell, into the guest test boot_smoke.
+            # shell, into the guest test boot_smoke. The Secure Boot scenarios also get the
+            # pinned Shell, as the removable media boot loader, and their payloads in \auth.
             script=$here/shell/${spec#shell:}
             esp=$log.esp
             cp -r "$run/esp" "$esp"
+            if [[ $option_firmware != default ]]; then
+                mkdir -p "$esp/EFI/BOOT" "$esp/auth"
+                cp "$guest/$shell_efi" "$esp/EFI/BOOT/$removable_loader"
+                cp "$dir/keys/shell/"*.auth "$esp/auth/"
+            fi
             cp "$run/shell-esp/uefisettings.efi" "$esp/"
             cp "$vmlinuz" "$esp/vmlinuz.efi"
             cp "$dir/initrd.img" "$esp/initrd.img"
@@ -350,7 +469,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         # (KVM_EXIT_SHUTDOWN) after its triple fault and 2 (I/O) after a reset through a port.
         # The console is the first serial port, before any of guest_args.
         : >"$log.qemu.log"
-        timeout --foreground -k 10 120 "${qemu[@]}" -nodefaults -no-user-config -no-reboot \
+        timeout --foreground -k 10 120 "${boot_qemu[@]}" -nodefaults -no-user-config -no-reboot \
             -display none -sandbox on -m 1024 -smp 2 \
             -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
             -drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \

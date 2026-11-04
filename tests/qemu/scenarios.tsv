@@ -12,9 +12,12 @@
 #                scenario-options.sh parses: kernel= how the scenario's Linux runs, "vamap" to
 #                have it call SetVirtualAddressMap(), which run.sh sets up per architecture, or
 #                "lockdown" and "lockdown-conf" to boot it with lockdown=integrity and
-#                lockdown=confidentiality; arch= a comma list of the architectures that boot
-#                the scenario, of x86_64, i686 and aarch64, which the others skip; devices= a
-#                comma list of QEMU devices to add, of virtio-rng; "-" for none of them
+#                lockdown=confidentiality; firmware= "secboot-setup" or "secboot-user" to boot
+#                the Secure Boot firmware with its variable store in Setup Mode or, with keys
+#                that run.sh generates for the scenario, in User Mode, or "default"; arch= a
+#                comma list of the architectures that boot the scenario, of x86_64, i686 and
+#                aarch64, which the others skip; devices= a comma list of QEMU devices to add,
+#                of virtio-rng
 # The scenarios whose names start with "shell-" are those of make test-e2e-qemu-shell-<arch>.
 # "-" leaves a column empty.
 boot-smoke	-	-	boot_smoke	-
@@ -31,3 +34,7 @@ shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 shell-authA7	/DriverSample.efi	my-ifr-nv-data-authA7.json	shell:authA7	-
 shell-rng	-	-	shell:rng	devices=virtio-rng
+secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
+secboot-user	-	-	secboot/user_mode	firmware=secboot-user
+shell-secboot-setup	-	-	shell:secboot-setup	firmware=secboot-setup
+shell-secboot-user	/publish-hiidb.efi set-auth-variables=/auth/db-append.auth,/auth/db-tampered.auth,/auth/db-unauthorized.auth,/auth/db-foreign.auth	-	shell:secboot-user	firmware=secboot-user
