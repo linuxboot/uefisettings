@@ -11,7 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The exit status of uefisettings when it cannot print clap's message: clap's own, 0 for help
-//! and 2 for a usage error, as clap's Error::exit, which ignores the failed print, gives it.
+//! or the version and 2 for a usage error, as clap's Error::exit, which ignores the failed print,
+//! gives it.
 
 // Unix sockets and file descriptors
 #![cfg(unix)]
@@ -54,11 +55,14 @@ fn exit_code_when_writes_fail(args: &[&str]) -> Option<i32> {
 
 #[test]
 fn parse_errors_exit_as_clap_exits_when_nothing_prints() {
-    let cases: [(&[&str], i32); 4] = [
+    let cases: [(&[&str], i32); 7] = [
         (&["--help"], 0),
         (&["hii", "--help"], 0),
+        (&["--version"], 0),
+        (&["-V"], 0),
         (&["bogus"], 2),
         (&["hii", "get"], 2),
+        (&["hii", "--version"], 2),
     ];
     for (args, want) in cases {
         assert_eq!(exit_code_when_writes_fail(args), Some(want), "{args:?}");

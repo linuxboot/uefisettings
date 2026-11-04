@@ -61,6 +61,7 @@ mod secret_stdin;
 #[derive(Debug, Parser)]
 #[command(
     name = "uefisettings",
+    version,
     about = "UEFI Settings Manipulation Tool",
     long_about = None,
     next_display_order = None
@@ -362,7 +363,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The exit code of clap's Error::exit for `error`: 0 for help, else 2.
+/// The exit code of clap's Error::exit for `error`: 0 for help or the version, else 2.
 fn parse_error_exit_code(error: &clap::Error) -> ExitCode {
     u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
 }
@@ -839,6 +840,53 @@ mod tests {
             let error = UefiSettingsToolArgs::try_parse_from(argv).expect_err("parse error");
 
             assert_eq!(parse_error_exit_code(&error), want, "{args:?}");
+        }
+    }
+
+    /// --version and -V print the name and the package's version on stdout and exit 0; no
+    /// subcommand takes either.
+    #[test]
+    fn version_flags_print_the_package_version() {
+        for flag in ["--version", "-V"] {
+            let error = UefiSettingsToolArgs::try_parse_from(["uefisettings", flag])
+                .expect_err("print the version");
+
+            assert_eq!(
+                (
+                    error.kind(),
+                    error.to_string(),
+                    parse_error_exit_code(&error)
+                ),
+                (
+                    clap::error::ErrorKind::DisplayVersion,
+                    format!("uefisettings {}\n", env!("CARGO_PKG_VERSION")),
+                    ExitCode::SUCCESS
+                ),
+                "{flag}"
+            );
+        }
+        let root = UefiSettingsToolArgs::command();
+        let mut commands: Vec<(Vec<&str>, &clap::Command)> = root
+            .get_subcommands()
+            .map(|command| (vec![command.get_name()], command))
+            .collect();
+        while let Some((path, command)) = commands.pop() {
+            commands.extend(
+                command
+                    .get_subcommands()
+                    .map(|sub| ([&path[..], &[sub.get_name()]].concat(), sub)),
+            );
+            for flag in ["--version", "-V"] {
+                let argv = [&["uefisettings"][..], &path, &[flag]].concat();
+                let error = UefiSettingsToolArgs::try_parse_from(&argv)
+                    .expect_err("refuse the version flag of a subcommand");
+
+                assert_eq!(
+                    (error.kind(), parse_error_exit_code(&error)),
+                    (clap::error::ErrorKind::UnknownArgument, ExitCode::from(2)),
+                    "{argv:?}"
+                );
+            }
         }
     }
 
