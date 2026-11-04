@@ -63,6 +63,12 @@ uefisettings.efi variable list --guid A04A27F4
 echo uefisettings-shell: step variable-list-bad-guid %lasterror%
 uefisettings.efi variable info MyIfrNVData A04A27F4-DF00-4D42-B552-39511302113D
 echo uefisettings-shell: step variable-info %lasterror%
+uefisettings.efi variable storage
+echo uefisettings-shell: step variable-storage %lasterror%
+uefisettings.efi variable storage --attributes non-volatile,bootservice-access
+echo uefisettings-shell: step variable-storage-nv-bs %lasterror%
+uefisettings.efi variable storage --attributes runtime-access
+echo uefisettings-shell: step variable-storage-rt %lasterror%
 uefisettings.efi --help
 echo uefisettings-shell: step help %lasterror%
 uefisettings.efi hii --help

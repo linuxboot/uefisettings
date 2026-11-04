@@ -89,9 +89,11 @@ Commands:
 
 ```plain
 Commands:
-  help  Print this message or the help of the given subcommand(s)
-  info  Show the attributes and the size of an EFI variable, never its data
-  list  List the name and vendor GUID of every EFI variable, never its data
+  help     Print this message or the help of the given subcommand(s)
+  info     Show the attributes and the size of an EFI variable, never its data
+  list     List the name and vendor GUID of every EFI variable, never its data
+  storage  Show the storage space of the EFI variables of some attributes, and how much of it is
+           left
 ```
 
 `ilo`:
@@ -136,7 +138,8 @@ be assigned to the process token; running elevated alone does not guarantee it.
 Pass `--no-efivars` to read no variables. No driver is shipped with this repository,
 and none has been tested here. Without a driver, `-f` still reads a HiiDB file, and,
 when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
-`variable list` fails there: the firmware environment calls reach a variable by its name only.
+`variable list` and `variable storage` fail there: the firmware environment calls reach a
+variable by its name only, and have no QueryVariableInfo().
 
 ---
 
@@ -328,6 +331,16 @@ GetFirmwareEnvironmentVariableExW, which tells the size no other way, and prints
 ```plain
 FS0:\> uefisettings.efi variable info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
 ```
+
+`variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)
+tells of the storage of the variables of those attributes, by default the non-volatile ones that
+the OS reaches (`non-volatile,bootservice-access,runtime-access`), as a JSON object of its own:
+`maximum_variable_storage_size`, `remaining_variable_storage_size` and `maximum_variable_size`,
+in bytes. On Linux it reads the statfs of efivarfs, which tells, from Linux 6.5 on, the storage
+of those default attributes only, and no maximum variable size, which shows as `null`. Linux 6.5 to
+6.5.4 fail that statfs, and with it `variable list` and `variable info` of a missing variable, where
+the firmware's QueryVariableInfo() fails or is not supported at runtime (fixed by 79b83606abc7 in
+6.5.5 and 6.6).
 
 </details>
 

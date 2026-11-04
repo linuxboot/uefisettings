@@ -852,13 +852,20 @@ mod tests {
     #[cfg(system_variables)]
     #[test]
     fn variable_commands_parse() {
-        let commands: [&[&str]; 2] = [
+        let commands: [&[&str]; 4] = [
             &["variable", "list"],
             &[
                 "variable",
                 "list",
                 "--guid",
                 "8BE4DF61-93CA-11D2-AA0D-00E098032B8C",
+            ],
+            &["variable", "storage"],
+            &[
+                "variable",
+                "storage",
+                "--attributes",
+                "bootservice-access,runtime-access",
             ],
         ];
         #[cfg(variable_info)]

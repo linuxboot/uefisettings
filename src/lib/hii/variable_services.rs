@@ -10,9 +10,9 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The firmware variables of the UEFI Shell build: GetVariable(), GetNextVariableName() and
-//! SetVariable() through the uefi crate, which the image's entry point initializes, while boot
-//! services run.
+//! The firmware variables of the UEFI Shell build: GetVariable(), GetNextVariableName(),
+//! SetVariable() and QueryVariableInfo() through the uefi crate, which the image's entry point
+//! initializes, while boot services run.
 
 use core::ptr;
 
@@ -20,7 +20,6 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use uefi::runtime;
-use uefi::runtime::VariableAttributes;
 use uefi::runtime::VariableVendor;
 use uefi::CString16;
 use uefi::Status;
@@ -31,12 +30,15 @@ use crate::efi_variables::NextVariableName;
 use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
+use crate::efi_variables::VariableStorage;
+use crate::efi_variables::VariableStorageInfo;
 use crate::hii::package::Guid;
 use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;
+use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
@@ -152,7 +154,7 @@ impl VariableInfoSource for VariableServices {
         // SAFETY: the firmware's runtime services, which the system table points at
         let runtime_services =
             unsafe { runtime_services.as_ref() }.context("no runtime services")?;
-        let mut attributes = VariableAttributes::from_bits_retain(UNSET_ATTRIBUTES);
+        let mut attributes = runtime::VariableAttributes::from_bits_retain(UNSET_ATTRIBUTES);
         let mut size = 0;
         // SAFETY: GetVariable() with a NUL-terminated name, a GUID and places for the
         // attributes and the size; Data may be NULL as DataSize is 0 (§8.2.1)
@@ -183,8 +185,27 @@ impl VariableInfoSource for VariableServices {
     }
 }
 
+impl VariableStorageInfo for VariableServices {
+    fn variable_storage(&self, attributes: VariableAttributes) -> Result<VariableStorage> {
+        let info = runtime::query_variable_info(runtime::VariableAttributes::from_bits_retain(
+            attributes.bits(),
+        ))
+        .map_err(|error| {
+            anyhow!(
+                "QueryVariableInfo() of {attributes} variables: {:?}",
+                error.status()
+            )
+        })?;
+        Ok(VariableStorage {
+            maximum_variable_storage_size: info.maximum_variable_storage_size,
+            remaining_variable_storage_size: info.remaining_variable_storage_size,
+            maximum_variable_size: Some(info.maximum_variable_size),
+        })
+    }
+}
+
 /// GetVariable() of `key`: its data and attributes, or VariableNotFound.
-fn get_variable(key: &VariableKey) -> Result<(Box<[u8]>, VariableAttributes)> {
+fn get_variable(key: &VariableKey) -> Result<(Box<[u8]>, runtime::VariableAttributes)> {
     let (name, vendor) = uefi_key(key)?;
     runtime::get_variable_boxed(&name, &vendor).map_err(|error| match error.status() {
         Status::NOT_FOUND => VariableNotFound(key.clone()).into(),

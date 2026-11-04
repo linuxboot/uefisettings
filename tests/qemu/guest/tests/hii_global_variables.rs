@@ -16,7 +16,8 @@
 //! variable, naming it, and those whose variable it cannot read, with the read's error, before
 //! it writes anything, and writes the one on Timeout; `get` reads those on ConOutDev, LangCodes
 //! and Timeout. Each check of `set` compares every efivar file before and after. `variable list`
-//! lists the variables of the efivar files, and `variable info` tells their attributes and size.
+//! lists the variables of the efivar files, `variable info` tells their attributes and size, and
+//! `variable storage` the storage that efivarfs tells.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -227,6 +228,63 @@ fn variable_info_tells_the_attributes_and_size_of_a_variable() {
         missing.error_message,
         format!("no EFI variable {}", file_name("NoSuchVariable")),
         "a missing variable"
+    );
+}
+
+/// `variable storage` tells the storage of non-volatile runtime variables that efivarfs tells,
+/// which Linux does from v6.5 on, so not on the i686 guests, which run Linux 6.1
+/// (`tests/qemu/guest-packages-i686`); it refuses other attributes.
+#[test]
+fn variable_storage_tells_the_storage_that_efivarfs_tells() {
+    match cfg!(target_arch = "x86") {
+        true => assert_eq!(
+            json_error(&["variable", "storage"]).error_message,
+            "efivarfs tells no storage of variables: Linux before v6.5 tells none, nor does a \
+             later one where the firmware's QueryVariableInfo() fails or is not supported at \
+             runtime; ask uefisettings.efi in the UEFI Shell",
+            "Linux 6.1"
+        ),
+        false => {
+            let storage: serde_json::Value = json(&["variable", "storage"]);
+            let size = |field: &str| {
+                storage[field]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("no {field}: {storage}"))
+            };
+            let maximum = size("maximum_variable_storage_size");
+            assert!(
+                maximum > 0 && size("remaining_variable_storage_size") <= maximum,
+                "{storage}"
+            );
+            // f_bavail is f_bfree less what Linux keeps in reserve, 5 KiB on x86 without
+            // efi_no_storage_paranoia (Linux v6.17 fs/efivarfs/super.c efivarfs_statfs(),
+            // arch/x86/platform/efi/quirks.c)
+            let stat = rustix::fs::statfs(EFIVARS).expect("statfs efivarfs");
+            let bytes = |blocks: u64| blocks * u64::try_from(stat.f_bsize).expect("a block size");
+            assert_eq!(
+                (maximum, size("remaining_variable_storage_size")),
+                (bytes(stat.f_blocks), bytes(stat.f_bfree)),
+                "{storage}: f_blocks and f_bfree, not f_bavail"
+            );
+            assert_eq!(
+                (&storage["attributes"], &storage["maximum_variable_size"]),
+                (&serde_json::json!(NV_BS_RT), &serde_json::Value::Null),
+                "{storage}"
+            );
+        }
+    }
+
+    let refused = json_error(&[
+        "variable",
+        "storage",
+        "--attributes",
+        "bootservice-access,runtime-access",
+    ]);
+    assert_eq!(
+        refused.error_message,
+        "efivarfs tells the storage of NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS \
+         variables only, not of BOOTSERVICE_ACCESS | RUNTIME_ACCESS variables",
+        "volatile runtime variables"
     );
 }
 

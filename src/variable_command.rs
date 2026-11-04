@@ -12,17 +12,24 @@
 
 //! The variable command: this machine's EFI variables, never their data.
 
-#[cfg(not(variable_names))]
+#[cfg(not(all(variable_names, variable_storage_info)))]
 use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-#[cfg(any(variable_names, variable_info))]
+use clap::ValueEnum;
+#[cfg(variable_storage_info)]
+use serde::Serialize;
+#[cfg(variable_storage_info)]
+use uefisettings::exports::VariableAttributes;
+#[cfg(any(variable_names, variable_info, variable_storage_info))]
 use uefisettings::exports::VariableBackend;
 #[cfg(variable_names)]
 use uefisettings::exports::VariableKey;
+#[cfg(variable_storage_info)]
+use uefisettings::exports::VariableStorage;
 
-#[cfg(any(variable_names, variable_info))]
+#[cfg(any(variable_names, variable_info, variable_storage_info))]
 use crate::print_line;
 
 #[derive(Debug, Parser)]
@@ -50,6 +57,52 @@ enum VariableSubcommands {
         /// The vendor GUID of the variable, such as 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
         guid: String,
     },
+    /// Show the storage space of the EFI variables of some attributes, and how much of it is left
+    #[command(next_display_order = None)]
+    Storage {
+        /// The attributes of the variables whose storage to show
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            default_values_t = [
+                AttributeArg::NonVolatile,
+                AttributeArg::BootserviceAccess,
+                AttributeArg::RuntimeAccess,
+            ],
+        )]
+        attributes: Vec<AttributeArg>,
+    },
+}
+
+/// An attribute of EFI variables (UEFI 2.10 §8.2.1), but EFI_VARIABLE_APPEND_WRITE, which
+/// QueryVariableInfo() ignores (§8.2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AttributeArg {
+    NonVolatile,
+    BootserviceAccess,
+    RuntimeAccess,
+    HardwareErrorRecord,
+    AuthenticatedWriteAccess,
+    TimeBasedAuthenticatedWriteAccess,
+    EnhancedAuthenticatedAccess,
+}
+
+#[cfg(variable_storage_info)]
+impl From<AttributeArg> for VariableAttributes {
+    fn from(attribute: AttributeArg) -> Self {
+        match attribute {
+            AttributeArg::NonVolatile => Self::NON_VOLATILE,
+            AttributeArg::BootserviceAccess => Self::BOOTSERVICE_ACCESS,
+            AttributeArg::RuntimeAccess => Self::RUNTIME_ACCESS,
+            AttributeArg::HardwareErrorRecord => Self::HARDWARE_ERROR_RECORD,
+            AttributeArg::AuthenticatedWriteAccess => Self::AUTHENTICATED_WRITE_ACCESS,
+            AttributeArg::TimeBasedAuthenticatedWriteAccess => {
+                Self::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+            }
+            AttributeArg::EnhancedAuthenticatedAccess => Self::ENHANCED_AUTHENTICATED_ACCESS,
+        }
+    }
 }
 
 impl VariableCommand {
@@ -58,6 +111,7 @@ impl VariableCommand {
             VariableSubcommands::List { guid } => list(guid.as_deref()),
             #[cfg(variable_info)]
             VariableSubcommands::Info { name, guid } => print_info(name, guid),
+            VariableSubcommands::Storage { attributes } => storage(attributes),
         }
     }
 }
@@ -101,6 +155,45 @@ pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prints the storage of the EFI variables of `attributes`.
+#[cfg(variable_storage_info)]
+fn storage(attributes: &[AttributeArg]) -> Result<()> {
+    let attributes = attributes
+        .iter()
+        .copied()
+        .map(VariableAttributes::from)
+        .collect();
+    let storage = VariableBackend::storage(attributes)?;
+    let report = StorageReport {
+        attributes: attributes.bits(),
+        storage,
+    };
+    print_line(format_args!("{}", serde_json::to_value(report)?))?;
+    Ok(())
+}
+
+/// Fails: the Windows build has no QueryVariableInfo().
+#[cfg(not(variable_storage_info))]
+fn storage(_attributes: &[AttributeArg]) -> Result<()> {
+    Err(anyhow!(
+        "uefisettings cannot tell the storage of EFI variables on Windows: the Win32 calls that \
+         it uses, GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW, have \
+         no QueryVariableInfo(); ask Linux, or the UEFI Shell with uefisettings.efi"
+    ))
+}
+
+/// What storage prints on stdout about the storage of the variables of some attributes: its own
+/// JSON object, outside the thrift IDL that the hii commands print, and JSON always, as storage
+/// takes no -j.
+#[cfg(variable_storage_info)]
+#[derive(Serialize)]
+struct StorageReport {
+    /// The attributes bitmask asked about
+    attributes: u32,
+    #[serde(flatten)]
+    storage: VariableStorage,
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -134,6 +227,9 @@ mod tests {
                 parsed @ VariableSubcommands::Info { .. } => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
+                parsed @ VariableSubcommands::Storage { .. } => {
+                    panic!("{args:?} is no list: {parsed:?}")
+                }
             };
 
             assert_eq!(guid.as_deref(), want, "{args:?}");
@@ -147,7 +243,9 @@ mod tests {
 
         let (name, guid) = match variable(&args) {
             VariableSubcommands::Info { name, guid } => (name, guid),
-            parsed @ VariableSubcommands::List { .. } => panic!("{args:?} is no info: {parsed:?}"),
+            parsed @ (VariableSubcommands::List { .. } | VariableSubcommands::Storage { .. }) => {
+                panic!("{args:?} is no info: {parsed:?}")
+            }
         };
 
         assert_eq!(
@@ -163,6 +261,84 @@ mod tests {
             Some(clap::error::ErrorKind::MissingRequiredArgument),
             "info without a vendor GUID"
         );
+    }
+
+    /// storage takes the attributes of non-volatile variables that the OS reaches unless
+    /// --attributes names others, and none that it does not name.
+    #[test]
+    fn storage_takes_attributes() {
+        use AttributeArg::*;
+
+        let cases: [(&[&str], Vec<AttributeArg>); 3] = [
+            (
+                &["storage"],
+                vec![NonVolatile, BootserviceAccess, RuntimeAccess],
+            ),
+            (
+                &["storage", "--attributes", "bootservice-access"],
+                vec![BootserviceAccess],
+            ),
+            (
+                &[
+                    "storage",
+                    "--attributes",
+                    "non-volatile,bootservice-access",
+                    "--attributes",
+                    "hardware-error-record",
+                ],
+                vec![NonVolatile, BootserviceAccess, HardwareErrorRecord],
+            ),
+        ];
+        for (args, want) in cases {
+            let attributes = match variable(args) {
+                VariableSubcommands::Storage { attributes } => attributes,
+                #[cfg(variable_info)]
+                parsed @ VariableSubcommands::Info { .. } => {
+                    panic!("{args:?} is no storage: {parsed:?}")
+                }
+                parsed @ VariableSubcommands::List { .. } => {
+                    panic!("{args:?} is no storage: {parsed:?}")
+                }
+            };
+
+            assert_eq!(attributes, want, "{args:?}");
+        }
+        for value in ["append-write", "0x7", ""] {
+            let parsed = UefiSettingsToolArgs::try_parse_from([
+                "uefisettings",
+                "variable",
+                "storage",
+                "--attributes",
+                value,
+            ])
+            .map_err(|error| error.kind());
+
+            assert_eq!(
+                parsed.err(),
+                Some(clap::error::ErrorKind::InvalidValue),
+                "--attributes {value:?}"
+            );
+        }
+    }
+
+    /// Each attribute of storage names the one of its spec name.
+    #[cfg(variable_storage_info)]
+    #[test]
+    fn storage_attributes_are_the_spec_attributes() {
+        for attribute in AttributeArg::value_variants() {
+            let name = attribute
+                .to_possible_value()
+                .expect("a possible value")
+                .get_name()
+                .replace('-', "_")
+                .to_ascii_uppercase();
+
+            assert_eq!(
+                VariableAttributes::from(*attribute).to_string(),
+                name,
+                "{attribute:?}"
+            );
+        }
     }
 
     #[cfg(variable_names)]

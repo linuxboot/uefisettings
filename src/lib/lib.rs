@@ -23,7 +23,7 @@ compile_error!("uefisettings builds for Linux, macOS, the UEFI Shell and Windows
 
 #[cfg(target_os = "linux")]
 mod chattr;
-#[cfg(any(variable_names, variable_info))]
+#[cfg(any(variable_names, variable_info, variable_storage_info))]
 mod efi_variables;
 mod exit_status;
 pub mod exports;

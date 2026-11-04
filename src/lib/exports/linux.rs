@@ -39,6 +39,7 @@ use super::SettingsBackend;
 use super::VariableBackend;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
+use crate::efi_variables::VariableStorageInfo;
 use crate::hii::extract;
 use crate::hii::EfivarDump;
 use crate::hii::EfivarFiles;
@@ -77,6 +78,11 @@ impl VariableBackend {
     /// The attributes and sizes of this machine's EFI variables, from its efivarfs.
     pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
         Ok(EfivarFiles::system())
+    }
+
+    /// The storage of this machine's EFI variables, as the statfs of its efivarfs tells it.
+    pub(super) fn system_variable_storage() -> impl VariableStorageInfo {
+        EfivarFiles::system()
     }
 }
 

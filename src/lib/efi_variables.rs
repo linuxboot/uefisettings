@@ -17,12 +17,19 @@
 
 #[cfg(all(variable_names, any(target_os = "uefi", test)))]
 use anyhow::anyhow;
+#[cfg(any(variable_names, variable_info))]
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(variable_info)]
+#[cfg(any(variable_info, variable_storage_info))]
 use serde::Serialize;
+#[cfg(variable_storage_info)]
+use thiserror::Error;
 
+#[cfg(any(variable_names, variable_info))]
 use crate::hii::package::Guid;
+#[cfg(variable_storage_info)]
+use crate::hii::VariableAttributes;
+#[cfg(any(variable_names, variable_info))]
 use crate::hii::VariableKey;
 
 /// GetNextVariableName() (UEFI 2.10 §8.2.2): the variables that a backend reaches, by name and
@@ -139,7 +146,54 @@ pub struct VariableInfo {
     pub size: usize,
 }
 
+/// QueryVariableInfo() (UEFI 2.10 §8.2.4): the storage of the variables of some attributes.
+#[cfg(variable_storage_info)]
+pub(crate) trait VariableStorageInfo {
+    /// The storage of the variables of `attributes`, which query_storage takes.
+    fn variable_storage(&self, attributes: VariableAttributes) -> Result<VariableStorage>;
+}
+
+/// What QueryVariableInfo() tells of the storage of the variables of some attributes (UEFI 2.10
+/// §8.2.4), in bytes. `variable storage` prints it as it serializes, with the attributes.
+#[cfg(variable_storage_info)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct VariableStorage {
+    /// MaximumVariableStorageSize: the storage for those variables
+    pub maximum_variable_storage_size: u64,
+    /// RemainingVariableStorageSize: what is left of it
+    pub remaining_variable_storage_size: u64,
+    /// MaximumVariableSize: the largest of those variables, if the backend tells it
+    pub maximum_variable_size: Option<u64>,
+}
+
+/// The storage that `storage` tells of the variables of `attributes`, unless no variable has
+/// them: "Attributes that have EFI_VARIABLE_RUNTIME_ACCESS set must also have
+/// EFI_VARIABLE_BOOTSERVICE_ACCESS set. The caller is responsible for following this rule."
+/// (UEFI 2.10 §8.2.3).
+#[cfg(variable_storage_info)]
+pub(crate) fn query_storage(
+    storage: &impl VariableStorageInfo,
+    attributes: VariableAttributes,
+) -> Result<VariableStorage> {
+    if attributes.contains(VariableAttributes::RUNTIME_ACCESS)
+        && !attributes.contains(VariableAttributes::BOOTSERVICE_ACCESS)
+    {
+        return Err(RuntimeAccessWithoutBootServiceAccess(attributes).into());
+    }
+    storage.variable_storage(attributes)
+}
+
+/// Attributes that query_storage refuses. The message spells "section", as edk2's terminals
+/// but VT-UTF8 show '?' for '§' (edk2-stable202508 TerminalDxe/TerminalConOut.c
+/// TerminalConOutOutputString()).
+#[cfg(variable_storage_info)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("{0}: runtime access implies boot service access (UEFI 2.10 section 8.2.3)")]
+struct RuntimeAccessWithoutBootServiceAccess(VariableAttributes);
+
 /// The vendor GUID `vendor` that a command names, such as 8BE4DF61-93CA-11D2-AA0D-00E098032B8C.
+#[cfg(any(variable_names, variable_info))]
 pub(crate) fn parse_vendor(vendor: &str) -> Result<Guid> {
     vendor
         .parse()
@@ -151,6 +205,7 @@ mod tests {
     use super::*;
 
     /// EFI_GLOBAL_VARIABLE, the vendor GUID of the global variables (UEFI 2.10 §3.3).
+    #[cfg(any(variable_names, variable_info))]
     const EFI_GLOBAL_VARIABLE: &str = "8BE4DF61-93CA-11D2-AA0D-00E098032B8C";
     /// The formset GUID of EDK2's DriverSample, the vendor GUID of its variables.
     #[cfg(variable_names)]
@@ -371,6 +426,68 @@ mod tests {
         }
     }
 
+    /// VariableStorageInfo that tells `storage` and records the attributes asked.
+    #[cfg(variable_storage_info)]
+    struct RecordedStorage {
+        storage: VariableStorage,
+        asked: std::cell::RefCell<Vec<VariableAttributes>>,
+    }
+
+    #[cfg(variable_storage_info)]
+    impl VariableStorageInfo for RecordedStorage {
+        fn variable_storage(&self, attributes: VariableAttributes) -> Result<VariableStorage> {
+            self.asked.borrow_mut().push(attributes);
+            Ok(self.storage)
+        }
+    }
+
+    /// query_storage asks the backend of attributes that variables can have, runtime access
+    /// with boot service access among them, and refuses runtime access without it unasked.
+    #[cfg(variable_storage_info)]
+    #[test]
+    fn query_storage_refuses_runtime_access_without_boot_service_access() {
+        let backend = RecordedStorage {
+            storage: VariableStorage {
+                maximum_variable_storage_size: 100,
+                remaining_variable_storage_size: 40,
+                maximum_variable_size: Some(30),
+            },
+            asked: std::cell::RefCell::default(),
+        };
+        let nv = VariableAttributes::NON_VOLATILE;
+        let bs = VariableAttributes::BOOTSERVICE_ACCESS;
+        let rt = VariableAttributes::RUNTIME_ACCESS;
+        for attributes in [nv | bs | rt, bs | rt, nv | bs, bs] {
+            assert_eq!(
+                query_storage(&backend, attributes).expect("query the storage"),
+                backend.storage,
+                "{attributes}"
+            );
+        }
+        for (attributes, refusal) in [
+            (
+                rt,
+                "RUNTIME_ACCESS: runtime access implies boot service access (UEFI 2.10 section \
+                 8.2.3)",
+            ),
+            (
+                nv | rt,
+                "NON_VOLATILE | RUNTIME_ACCESS: runtime access implies boot service access \
+                 (UEFI 2.10 section 8.2.3)",
+            ),
+        ] {
+            let error = query_storage(&backend, attributes).expect_err("query a refused storage");
+
+            assert_eq!(error.to_string(), refusal, "{attributes}");
+        }
+        assert_eq!(
+            backend.asked.into_inner(),
+            [nv | bs | rt, bs | rt, nv | bs, bs],
+            "attributes asked"
+        );
+    }
+
+    #[cfg(any(variable_names, variable_info))]
     #[test]
     fn parse_vendor_takes_either_case_and_names_a_vendor_that_is_no_guid() {
         for vendor in [
@@ -414,5 +531,32 @@ mod tests {
             }),
             "{info:?}"
         );
+    }
+
+    /// VariableStorage serializes as `variable storage` prints it, the maximum variable size as
+    /// null where the backend does not tell it.
+    #[cfg(variable_storage_info)]
+    #[test]
+    fn variable_storage_serializes_as_storage_prints_it() {
+        for (maximum_variable_size, want) in [
+            (Some(30), serde_json::json!(30)),
+            (None, serde_json::Value::Null),
+        ] {
+            let storage = VariableStorage {
+                maximum_variable_storage_size: 100,
+                remaining_variable_storage_size: 40,
+                maximum_variable_size,
+            };
+
+            assert_eq!(
+                serde_json::to_value(storage).expect("serialize the storage"),
+                serde_json::json!({
+                    "maximum_variable_storage_size": 100,
+                    "remaining_variable_storage_size": 40,
+                    "maximum_variable_size": want,
+                }),
+                "{storage:?}"
+            );
+        }
     }
 }

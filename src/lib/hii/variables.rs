@@ -33,14 +33,43 @@ use crate::hii::package::Guid;
 /// The size of the attributes word that FirmwareVariables::read gives before the data, as
 /// efivarfs does.
 pub(super) const EFIVARFS_HEADER_SIZE: usize = std::mem::size_of::<u32>();
-const EFI_VARIABLE_NON_VOLATILE: u32 = 0x00000001;
-pub(super) const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x00000004;
+const EFI_VARIABLE_NON_VOLATILE: u32 = VariableAttributes::NON_VOLATILE.bits();
+pub(super) const EFI_VARIABLE_RUNTIME_ACCESS: u32 = VariableAttributes::RUNTIME_ACCESS.bits();
 /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.10 §8.2.1)
-const EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: u32 = 0x00000080;
+const EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: u32 =
+    VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS.bits();
 /// EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS, EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
 /// and EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.10 §8.2.1)
-const EFI_VARIABLE_AUTHENTICATED_ACCESS: u32 =
-    0x00000010 | 0x00000020 | EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS;
+const EFI_VARIABLE_AUTHENTICATED_ACCESS: u32 = VariableAttributes::AUTHENTICATED_WRITE_ACCESS
+    .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
+    .bits()
+    | EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS;
+
+bitflags::bitflags! {
+    /// The attributes of an EFI variable (UEFI 2.10 §8.2.1).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct VariableAttributes: u32 {
+        const NON_VOLATILE = 0x0000_0001;
+        const BOOTSERVICE_ACCESS = 0x0000_0002;
+        const RUNTIME_ACCESS = 0x0000_0004;
+        const HARDWARE_ERROR_RECORD = 0x0000_0008;
+        const AUTHENTICATED_WRITE_ACCESS = 0x0000_0010;
+        const TIME_BASED_AUTHENTICATED_WRITE_ACCESS = 0x0000_0020;
+        const APPEND_WRITE = 0x0000_0040;
+        const ENHANCED_AUTHENTICATED_ACCESS = 0x0000_0080;
+    }
+}
+
+/// The names of the attributes, such as NON_VOLATILE | BOOTSERVICE_ACCESS, and any bits besides
+/// them in hex, or "no attributes".
+impl fmt::Display for VariableAttributes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.is_empty() {
+            true => f.write_str("no attributes"),
+            false => bitflags::parser::to_writer(self, f),
+        }
+    }
+}
 
 /// A firmware variable: its name and vendor GUID (UEFI 2.10 §8.2.1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1014,6 +1043,25 @@ pub(crate) mod tests {
         );
         for length in 0..EFIVARFS_HEADER_SIZE {
             assert_eq!(efivar_attributes(&bytes[..length]), None, "{length} bytes");
+        }
+    }
+
+    /// VariableAttributes display the names of their attributes, any other bits in hex, and
+    /// "no attributes" for none.
+    #[test]
+    fn variable_attributes_display_their_names() {
+        for (attributes, names) in [
+            (
+                VariableAttributes::from_bits_retain(NV_BS_RT),
+                "NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS",
+            ),
+            (
+                VariableAttributes::RUNTIME_ACCESS | VariableAttributes::from_bits_retain(0x100),
+                "RUNTIME_ACCESS | 0x100",
+            ),
+            (VariableAttributes::empty(), "no attributes"),
+        ] {
+            assert_eq!(attributes.to_string(), names, "{attributes:?}");
         }
     }
 

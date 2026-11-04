@@ -36,6 +36,8 @@ use crate::chattr::EfivarsImmutabilityGuard;
 use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
+use crate::efi_variables::VariableStorage;
+use crate::efi_variables::VariableStorageInfo;
 use crate::file_lock::FileLock;
 use crate::hii::efivarfs_format::as_variable_not_found;
 use crate::hii::efivarfs_format::check_regular_file;
@@ -51,6 +53,7 @@ use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;
+use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
@@ -62,6 +65,11 @@ pub(super) const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
 const REMOUNT_LOCK_FILE: &str = "/run/lock/efibootmgr-remount";
 /// The f_type of an efivarfs's statfs (Linux v6.11 include/uapi/linux/magic.h).
 const EFIVARFS_MAGIC: u32 = 0xde5e_81e4;
+/// The attributes of the variables whose storage the statfs of efivarfs tells (Linux v6.11
+/// fs/efivarfs/super.c efivarfs_statfs()).
+const EFIVARFS_STATFS_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
+    .union(VariableAttributes::BOOTSERVICE_ACCESS)
+    .union(VariableAttributes::RUNTIME_ACCESS);
 
 impl EfivarSource {
     /// The firmware variables that questions read from this source, which validate accepts.
@@ -492,6 +500,79 @@ fn efivar_info(key: &VariableKey, bytes: &[u8]) -> Result<VariableInfo> {
     })
 }
 
+impl VariableStorageInfo for EfivarFiles {
+    /// What the statfs of efivarfs tells: QueryVariableInfo() of EFIVARFS_STATFS_ATTRIBUTES only,
+    /// and of those not MaximumVariableSize.
+    fn variable_storage(&self, attributes: VariableAttributes) -> Result<VariableStorage> {
+        // QueryVariableInfo() ignores EFI_VARIABLE_APPEND_WRITE (UEFI 2.10 §8.2.4)
+        if attributes.difference(VariableAttributes::APPEND_WRITE) != EFIVARFS_STATFS_ATTRIBUTES {
+            return Err(UnsupportedStorageAttributes(attributes).into());
+        }
+        StatfsSizes::try_from(&efivarfs_statfs(&self.dir)?)?.storage()
+    }
+}
+
+/// Attributes of variables whose storage the statfs of efivarfs does not tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "efivarfs tells the storage of {} variables only, not of {0} variables",
+    EFIVARFS_STATFS_ATTRIBUTES
+)]
+struct UnsupportedStorageAttributes(VariableAttributes);
+
+/// The sizes in a statfs: blocks of `block_size` bytes, `free_blocks` of them free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatfsSizes {
+    block_size: u64,
+    blocks: u64,
+    free_blocks: u64,
+}
+
+impl TryFrom<&Statfs> for StatfsSizes {
+    type Error = anyhow::Error;
+
+    fn try_from(stat: &Statfs) -> Result<Self> {
+        Ok(Self {
+            block_size: u64::try_from(stat.block_size())?,
+            blocks: stat.blocks(),
+            free_blocks: stat.blocks_free(),
+        })
+    }
+}
+
+impl StatfsSizes {
+    /// The VariableStorage that these, of efivarfs, tell: since Linux v6.5 (d86ff3333cb1)
+    /// efivarfs_statfs() puts MaximumVariableStorageSize in f_blocks and
+    /// RemainingVariableStorageSize in f_bfree, of blocks of 1 byte, and no blocks where
+    /// QueryVariableInfo() fails or is not supported at runtime.
+    fn storage(self) -> Result<VariableStorage> {
+        if self.blocks == 0 {
+            return Err(NoVariableStorage.into());
+        }
+        Ok(VariableStorage {
+            maximum_variable_storage_size: self.bytes(self.blocks)?,
+            remaining_variable_storage_size: self.bytes(self.free_blocks)?,
+            maximum_variable_size: None,
+        })
+    }
+
+    /// The bytes of `blocks` blocks.
+    fn bytes(self, blocks: u64) -> Result<u64> {
+        blocks
+            .checked_mul(self.block_size)
+            .with_context(|| format!("{blocks} blocks of {} bytes overflow u64", self.block_size))
+    }
+}
+
+/// Why efivarfs tells no storage of variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "efivarfs tells no storage of variables: Linux before v6.5 tells none, nor does a later one \
+     where the firmware's QueryVariableInfo() fails or is not supported at runtime; ask \
+     uefisettings.efi in the UEFI Shell"
+)]
+struct NoVariableStorage;
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -911,6 +992,88 @@ mod tests {
             Some(&NotEfivarfs(dir.path().to_path_buf())),
             "Missing: {missing:#}"
         );
+    }
+
+    /// EfivarFiles tell the storage of NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
+    /// variables only, with APPEND_WRITE or without, from the statfs of efivarfs, and refuse other
+    /// attributes before the statfs, naming them.
+    #[test]
+    fn efivar_files_tell_the_storage_of_non_volatile_runtime_variables_only() {
+        let (dir, _lock, files) = unmounted_efivar_files();
+        for attributes in [
+            EFIVARFS_STATFS_ATTRIBUTES,
+            EFIVARFS_STATFS_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+        ] {
+            let error = files
+                .variable_storage(attributes)
+                .expect_err("statfs a directory without efivarfs");
+
+            assert_eq!(
+                error.downcast_ref::<NotEfivarfs>(),
+                Some(&NotEfivarfs(dir.path().to_path_buf())),
+                "{attributes}: {error:#}"
+            );
+        }
+        for attributes in [
+            VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
+            VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS,
+            EFIVARFS_STATFS_ATTRIBUTES | VariableAttributes::HARDWARE_ERROR_RECORD,
+        ] {
+            let error = files
+                .variable_storage(attributes)
+                .expect_err("tell the storage of other attributes");
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "efivarfs tells the storage of NON_VOLATILE | BOOTSERVICE_ACCESS | \
+                     RUNTIME_ACCESS variables only, not of {attributes} variables"
+                ),
+                "{attributes}"
+            );
+        }
+    }
+
+    /// The sizes in the statfs of efivarfs tell its storage in bytes, but no maximum variable
+    /// size, and no storage where they hold no blocks.
+    #[test]
+    fn statfs_sizes_tell_the_storage_in_bytes() {
+        let storage = |maximum, remaining| VariableStorage {
+            maximum_variable_storage_size: maximum,
+            remaining_variable_storage_size: remaining,
+            maximum_variable_size: None,
+        };
+        let cases = [
+            ((1, 65536, 40000), Ok(storage(65536, 40000))),
+            ((4096, 2, 1), Ok(storage(8192, 4096))),
+            (
+                (1, 0, 0),
+                Err(
+                    "efivarfs tells no storage of variables: Linux before v6.5 tells none, nor \
+                     does a later one where the firmware's QueryVariableInfo() fails or is not \
+                     supported at runtime; ask uefisettings.efi in the UEFI Shell"
+                        .to_string(),
+                ),
+            ),
+            (
+                (2, u64::MAX, 0),
+                Err(format!("{} blocks of 2 bytes overflow u64", u64::MAX)),
+            ),
+        ];
+
+        for ((block_size, blocks, free_blocks), want) in cases {
+            let sizes = StatfsSizes {
+                block_size,
+                blocks,
+                free_blocks,
+            };
+
+            assert_eq!(
+                sizes.storage().map_err(|error| error.to_string()),
+                want,
+                "{sizes:?}"
+            );
+        }
     }
 
     /// write_at writes nothing when it cannot remount efivarfs.

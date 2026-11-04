@@ -29,8 +29,12 @@ use uefisettings_backend_thrift::SetResponseList;
 use crate::efi_variables::list_variables;
 #[cfg(any(variable_names, variable_info))]
 use crate::efi_variables::parse_vendor;
+#[cfg(variable_storage_info)]
+use crate::efi_variables::query_storage;
 #[cfg(variable_info)]
 use crate::efi_variables::VariableInfoSource;
+#[cfg(variable_storage_info)]
+pub use crate::efi_variables::VariableStorage;
 #[cfg(target_os = "linux")]
 pub use crate::hii::extract::EfivarMemory;
 use crate::hii::forms;
@@ -67,6 +71,8 @@ pub use crate::hii::MemoryType;
 /// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
 #[cfg(firmware_memory_maps)]
 pub use crate::hii::RangeRefusal;
+#[cfg(variable_storage_info)]
+pub use crate::hii::VariableAttributes;
 #[cfg(any(variable_names, variable_info))]
 pub use crate::hii::VariableKey;
 use crate::translation::get_qa_variations_hii;
@@ -106,7 +112,7 @@ pub trait SettingsBackend {
 pub struct HiiBackend {}
 
 /// The EFI variables of this machine, never their data (UEFI 2.10 §8.2).
-#[cfg(any(variable_names, variable_info))]
+#[cfg(any(variable_names, variable_info, variable_storage_info))]
 pub struct VariableBackend {}
 
 #[cfg(variable_names)]
@@ -131,6 +137,15 @@ impl VariableBackend {
             guid: parse_vendor(vendor)?,
         };
         Self::system_variable_info()?.variable_info(&key)
+    }
+}
+
+#[cfg(variable_storage_info)]
+impl VariableBackend {
+    /// What QueryVariableInfo() tells of the storage of this machine's EFI variables of
+    /// `attributes`.
+    pub fn storage(attributes: VariableAttributes) -> Result<VariableStorage> {
+        query_storage(&Self::system_variable_storage(), attributes)
     }
 }
 

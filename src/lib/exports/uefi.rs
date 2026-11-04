@@ -25,6 +25,7 @@ use super::VariableBackend;
 use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
+use crate::efi_variables::VariableStorageInfo;
 use crate::hii::export_package_lists;
 use crate::hii::FirmwareVariables;
 use crate::hii::VariableServices;
@@ -53,6 +54,11 @@ impl VariableBackend {
     /// The attributes and sizes of this firmware's variables, from GetVariable().
     pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
         Ok(VariableServices)
+    }
+
+    /// The storage of this firmware's variables, from QueryVariableInfo().
+    pub(super) fn system_variable_storage() -> impl VariableStorageInfo {
+        VariableServices
     }
 }
 
