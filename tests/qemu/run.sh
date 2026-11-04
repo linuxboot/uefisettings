@@ -104,14 +104,17 @@ run=$out/$arch/$(date -u +%Y%m%dT%H%M%SZ)
 guest=$out/$arch/guest
 target=$arch-unknown-linux-musl
 
-# Every row has the 5 columns that the header of scenarios.tsv lists and the loop below
+# Every row has the 6 columns that the header of scenarios.tsv lists and the loop below
 # reads, none of them empty, so that no row silently boots nothing.
 awk -F '\t' '$0 !~ /^(#|$)/ {
-    ok = NF == 5
+    ok = NF == 6
     for (i = 1; i <= NF; i++) if ($i == "") ok = 0
-    if (!ok) { printf "scenarios.tsv line %d needs 5 non-empty columns: %s\n", NR, $0; bad = 1 }
-    if (ok && $5 !~ /^(-|vamap|lockdown|lockdown-conf)$/) {
+    if (!ok) { printf "scenarios.tsv line %d needs 6 non-empty columns: %s\n", NR, $0; bad = 1; next }
+    if ($5 !~ /^(-|vamap|lockdown|lockdown-conf)$/) {
         printf "scenarios.tsv line %d: kernel %s is not -, vamap, lockdown or lockdown-conf\n", NR, $5; bad = 1
+    }
+    if ($6 !~ /^(-|(x86_64|i686|aarch64)(,(x86_64|i686|aarch64))*)$/) {
+        printf "scenarios.tsv line %d: architectures %s is not - or a list of x86_64, i686 and aarch64\n", NR, $6; bad = 1
     }
 } END { exit bad }' "$here/scenarios.tsv" >&2
 mapfile -t known < <(awk -F '\t' '$1 !~ /^(#|$)/ { print $1 }' "$here/scenarios.tsv")
@@ -251,9 +254,17 @@ linux_passed() {
 
 failed=()
 # read fails on a last line without a newline, which still counts.
-while IFS=$'\t' read -r -u 3 name drivers variables boots kernel || [[ -n $name ]]; do
+while IFS=$'\t' read -r -u 3 name drivers variables boots kernel architectures ||
+    [[ -n $name ]]; do
     [[ -z $name || $name == \#* ]] && continue
     (($# == 0)) || [[ " $* " == *" $name "* ]] || continue
+    if [[ $architectures != - && ",$architectures," != *",$arch,"* ]]; then
+        echo "run.sh: $name: skipped, only $architectures boots it"
+        continue
+    fi
+    # The firmware and the template of its variable store.
+    code=$guest/$firmware
+    code_vars=$guest/$firmware_vars
     dir=$run/$name
     mkdir "$dir"
     cp -r "$run/initramfs" "$dir/"
@@ -262,7 +273,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots kernel || [[ -n $name 
     seed=()
     if [[ $drivers != - ]]; then
         IFS=';' read -r -a files <<<"$drivers"
-        virt-fw-vars --input "$guest/$firmware_vars" "${files[@]/#/--append-boot-filepath=}" \
+        virt-fw-vars --input "$code_vars" "${files[@]/#/--append-boot-filepath=}" \
             --output-json "$dir/boot.json" 2>"$dir/virt-fw-vars.log"
         jq '.variables[].name |= sub("^Boot"; "Driver")' "$dir/boot.json" >"$dir/drivers.json"
         seed+=("$dir/drivers.json")
@@ -270,7 +281,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots kernel || [[ -n $name 
     [[ $variables == - ]] || seed+=("$here/vars/$variables")
     jq --null-input '{version: 2, variables: [inputs.variables[]]}' "${seed[@]}" \
         </dev/null >"$dir/vars.json"
-    virt-fw-vars --input "$guest/$firmware_vars" --set-json "$dir/vars.json" \
+    virt-fw-vars --input "$code_vars" --set-json "$dir/vars.json" \
         --output "$dir/vars.fd" 2>>"$dir/virt-fw-vars.log"
     kernel_qemu_args=()
     # the kernel parameter that locks the scenario's Linux boots down, if any
@@ -331,7 +342,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots kernel || [[ -n $name 
         : >"$log.qemu.log"
         timeout --foreground -k 10 120 "${qemu[@]}" -nodefaults -no-user-config -no-reboot \
             -display none -sandbox on -m 1024 -smp 2 \
-            -drive "if=pflash,format=raw,unit=0,readonly=on,file=$guest/$firmware" \
+            -drive "if=pflash,format=raw,unit=0,readonly=on,file=$code" \
             -drive "if=pflash,format=raw,unit=1,file=$dir/vars.fd" \
             -serial "file:$log.console.log" "${guest_args[@]}" "${kernel_qemu_args[@]}" \
             -d guest_errors,trace:qemu_system_shutdown_request,trace:kvm_run_exit \
