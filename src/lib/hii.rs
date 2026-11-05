@@ -35,9 +35,10 @@ pub mod extract;
 // win32: the tests of every host build their logic.
 #[cfg(any(target_os = "windows", test))]
 mod firmware_environment;
-// The firmware memory maps of the efivar source.
+// The firmware memory maps of the efivar source, and the byte readers that crate::memory_map
+// parses arm64's EFI memory map with.
 #[cfg(target_os = "linux")]
-mod firmware_memory;
+pub(crate) mod firmware_memory;
 pub mod forms;
 #[cfg(any(target_os = "windows", test))]
 mod hiidb_driver;
@@ -61,6 +62,12 @@ mod win32;
 // See UEFI 2.10 §33 "Human Interface Infrastructure Overview":
 // https://uefi.org/specifications
 
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use crate::memory_map::efi_memory_map::MemoryType;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use crate::memory_map::efi_memory_map::RangeRefusal;
 #[cfg(target_os = "uefi")]
 pub(crate) use database_protocol::export_package_lists;
 #[cfg(target_os = "linux")]
@@ -75,12 +82,6 @@ pub(crate) use efivar_dump::SavedDump;
 pub(crate) use efivarfs::EfivarFiles;
 #[cfg(target_os = "windows")]
 pub(crate) use firmware_environment::FirmwareEnvironment;
-/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
-#[cfg(firmware_memory_maps)]
-pub use firmware_memory::efi_memory_map::MemoryType;
-/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
-#[cfg(firmware_memory_maps)]
-pub use firmware_memory::efi_memory_map::RangeRefusal;
 #[cfg(target_os = "linux")]
 pub use firmware_memory::MemoryMapUnavailable;
 #[cfg(target_os = "windows")]

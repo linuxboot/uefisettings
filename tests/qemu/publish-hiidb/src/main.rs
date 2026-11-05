@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -51,6 +51,14 @@
 //! `rt-properties-all` one that lists every runtime service.
 //! `rt-properties-version-2` and `rt-properties-version-2-all` install the same tables with
 //! Version 2, which no UEFI version defines.
+//! `json-config-data` publishes nothing: it installs an EFI_JSON_CAPSULE_CONFIG_DATA (UEFI 2.11
+//! §23.5.2) of [`JSON_CONFIG_DATA_ITEMS`] as the configuration table of
+//! EFI_JSON_CONFIG_DATA_TABLE_GUID (§4.6.1.2). It never converts the table's address, which
+//! SetVirtualAddressMap() asks for after ExitBootServices() (§8.4.1), when no boot service driver
+//! runs. `json-config-data-past-region` installs the same table with a TotalLength of
+//! [`PAST_REGION_TOTAL_LENGTH`], and `json-config-data-boot-services` in boot services data,
+//! while `json-config-data-mmio` points the configuration table at the start of the first runtime
+//! memory-mapped I/O of the memory map, where it writes nothing.
 //! `set-auth-variables=PATH[,PATH]...` publishes nothing: it runs the authenticated writes of
 //! [`auth_variables`] for the Secure Boot scenarios.
 
@@ -71,11 +79,13 @@ use core::ptr;
 
 use uefi::boot;
 use uefi::boot::AllocateType;
+use uefi::boot::MemoryAttribute;
 use uefi::boot::MemoryType;
 use uefi::boot::PAGE_SIZE;
 use uefi::cstr16;
 use uefi::entry;
 use uefi::guid;
+use uefi::mem::memory_map::MemoryMap;
 use uefi::println;
 use uefi::proto::acpi::AcpiTable;
 use uefi::proto::hii::database::HiiDatabase;
@@ -139,6 +149,20 @@ const RT_SUPPORTED_SET_VARIABLE: u32 = 0x0040;
 /// A Version of EFI_RT_PROPERTIES_TABLE that no UEFI version defines.
 const RT_PROPERTIES_TABLE_VERSION_UNDEFINED: u16 = 2;
 
+/// EFI_JSON_CONFIG_DATA_TABLE_GUID (UEFI 2.11 §4.6.1.2).
+static JSON_CONFIG_DATA_TABLE_GUID: Guid = guid!("87367f87-1119-41ce-aaec-8be0111f558a");
+/// EFI_JSON_CAPSULE_CONFIG_DATA's Version, "initially 0x00000001" (UEFI 2.11 §23.5.2).
+const JSON_CONFIG_DATA_VERSION: u32 = 1;
+/// The ConfigData of the items of the table that `json-config-data` installs: JSON text, then
+/// bytes that are no UTF-8.
+const JSON_CONFIG_DATA_ITEMS: [&[u8]; 2] = [
+    br#"{"uefisettings":"json-config-data"}"#,
+    &[0xff, 0x00, 0x80, 0x7f],
+];
+/// The TotalLength of the table of `json-config-data-past-region`, 16 MiB, which runs past the
+/// end of the runtime-data region that holds the table.
+const PAST_REGION_TOTAL_LENGTH: u32 = 0x0100_0000;
+
 /// A failed step and the firmware's status.
 type Failure = (&'static str, Status);
 
@@ -184,6 +208,7 @@ fn efi_main() -> Status {
         Some(Task::InstallRtProperties(version, supported)) => {
             install_rt_properties(version, supported)
         }
+        Some(Task::InstallJsonConfigData(table)) => install_json_config_data(table),
         Some(Task::SetAuthVariables(payloads)) => auth_variables::set_auth_variables(&payloads)
             .map(|log| println!("publish-hiidb: AuthProbeLog {log}")),
         None => {
@@ -193,8 +218,9 @@ fn efi_main() -> Status {
                  |rt-data-readwrite-forms|password-forms|padded-strings|acpi-table\
                  |acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
-                 |rt-properties-version-2|rt-properties-version-2-all\
-                 |set-auth-variables=PATH[,PATH]...]"
+                 |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
+                 |json-config-data-past-region|json-config-data-boot-services\
+                 |json-config-data-mmio|set-auth-variables=PATH[,PATH]...]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -228,6 +254,8 @@ enum Task {
     InstallConfigTables,
     /// Install an EFI_RT_PROPERTIES_TABLE of this Version and RuntimeServicesSupported.
     InstallRtProperties(u16, u32),
+    /// Install this JSON configuration table.
+    InstallJsonConfigData(JsonConfigTable),
     /// Run the authenticated writes of [`auth_variables`] with the payloads.
     SetAuthVariables(Vec<auth_variables::Payload>),
 }
@@ -289,6 +317,18 @@ fn load_option() -> Option<Task> {
         Ok(option) if option == cstr16!("rt-properties-version-2-all") => Some(
             Task::InstallRtProperties(RT_PROPERTIES_TABLE_VERSION_UNDEFINED, RT_SUPPORTED_ALL),
         ),
+        Ok(option) if option == cstr16!("json-config-data") => {
+            Some(Task::InstallJsonConfigData(JsonConfigTable::Runtime))
+        }
+        Ok(option) if option == cstr16!("json-config-data-past-region") => {
+            Some(Task::InstallJsonConfigData(JsonConfigTable::PastRegion))
+        }
+        Ok(option) if option == cstr16!("json-config-data-boot-services") => {
+            Some(Task::InstallJsonConfigData(JsonConfigTable::BootServices))
+        }
+        Ok(option) if option == cstr16!("json-config-data-mmio") => {
+            Some(Task::InstallJsonConfigData(JsonConfigTable::MemoryMappedIo))
+        }
         Ok(option) => auth_variables::payloads(option).map(Task::SetAuthVariables),
         _ => None,
     }
@@ -564,4 +604,129 @@ fn install_rt_properties(version: u16, supported: u32) -> Result<(), Failure> {
          RuntimeServicesSupported {supported:#06x}"
     );
     Ok(())
+}
+
+/// The JSON configuration table that install_json_config_data installs.
+#[derive(Clone, Copy, Debug)]
+enum JsonConfigTable {
+    /// An EFI_JSON_CAPSULE_CONFIG_DATA of [`JSON_CONFIG_DATA_ITEMS`], in runtime services data.
+    Runtime,
+    /// That table with a TotalLength of [`PAST_REGION_TOTAL_LENGTH`].
+    PastRegion,
+    /// That table in boot services data, which the OS may take after ExitBootServices().
+    BootServices,
+    /// The start of the first EFI_MEMORY_RUNTIME descriptor of memory-mapped I/O.
+    MemoryMappedIo,
+}
+
+/// Installs `table` as the configuration table of EFI_JSON_CONFIG_DATA_TABLE_GUID, and logs its
+/// address.
+fn install_json_config_data(table: JsonConfigTable) -> Result<(), Failure> {
+    let address = match table {
+        JsonConfigTable::Runtime => {
+            copy_json_config_data(MemoryType::RUNTIME_SERVICES_DATA, TotalLength::OfItems)?
+        }
+        JsonConfigTable::PastRegion => {
+            copy_json_config_data(MemoryType::RUNTIME_SERVICES_DATA, TotalLength::PastRegion)?
+        }
+        JsonConfigTable::BootServices => {
+            copy_json_config_data(MemoryType::BOOT_SERVICES_DATA, TotalLength::OfItems)?
+        }
+        JsonConfigTable::MemoryMappedIo => runtime_memory_mapped_io()?,
+    };
+    #[expect(
+        unsafe_code,
+        reason = "InstallConfigurationTable() takes a raw pointer that must stay valid"
+    )]
+    // SAFETY: the table is in a pool allocation that is never freed or written again, or is
+    // memory-mapped I/O that the firmware keeps for runtime services: both stay valid as long as
+    // the firmware runs. The OS may take boot services data, which is what that table tests.
+    unsafe {
+        boot::install_configuration_table(
+            &JSON_CONFIG_DATA_TABLE_GUID,
+            ptr::with_exposed_provenance(address),
+        )
+    }
+    .map_err(|error| ("installing the JSON configuration table", error.status()))?;
+
+    println!("publish-hiidb: JSON configuration table at {address:#x}, {table:?}");
+    Ok(())
+}
+
+/// The TotalLength of the table that copy_json_config_data copies.
+#[derive(Clone, Copy, Debug)]
+enum TotalLength {
+    /// That of the table's Version, TotalLength and items.
+    OfItems,
+    /// [`PAST_REGION_TOTAL_LENGTH`].
+    PastRegion,
+}
+
+/// Copies an EFI_JSON_CAPSULE_CONFIG_DATA of [`JSON_CONFIG_DATA_ITEMS`], their
+/// EFI_JSON_CONFIG_DATA_ITEMs back to back after its Version and TotalLength (UEFI 2.11
+/// §23.5.2), with the TotalLength that `total_length` says, to `COPY_OFFSET` of a pool of
+/// `memory_type`. Returns the copy's address.
+fn copy_json_config_data(
+    memory_type: MemoryType,
+    total_length: TotalLength,
+) -> Result<usize, Failure> {
+    let too_large = (
+        "the JSON configuration data exceeds 4 GiB",
+        Status::BAD_BUFFER_SIZE,
+    );
+    let items: Vec<u8> = JSON_CONFIG_DATA_ITEMS
+        .iter()
+        .map(|data| {
+            let length = u32::try_from(data.len()).map_err(|_| too_large)?;
+            Ok([&length.to_le_bytes()[..], data].concat())
+        })
+        .collect::<Result<Vec<_>, Failure>>()?
+        .concat();
+    let total_length = match total_length {
+        TotalLength::OfItems => items
+            .len()
+            .checked_add(2 * size_of::<u32>())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or(too_large)?,
+        TotalLength::PastRegion => PAST_REGION_TOTAL_LENGTH,
+    };
+    let table = [
+        &JSON_CONFIG_DATA_VERSION.to_le_bytes()[..],
+        &total_length.to_le_bytes(),
+        &items,
+    ]
+    .concat();
+
+    let pool = boot::allocate_pool(memory_type, COPY_OFFSET + table.len())
+        .map_err(|error| ("allocating the pool", error.status()))?;
+    let copy = pool.as_ptr().wrapping_add(COPY_OFFSET);
+    #[expect(
+        unsafe_code,
+        reason = "the pool from allocate_pool() is only reachable through a raw pointer"
+    )]
+    // SAFETY: allocate_pool returned `COPY_OFFSET + table.len()` bytes that nothing else
+    // references, at an identity-mapped address, and `table` fits after `COPY_OFFSET` without
+    // overlapping them.
+    unsafe {
+        ptr::copy_nonoverlapping(table.as_ptr(), copy, table.len());
+    }
+    Ok(copy.addr())
+}
+
+/// The start of the first EFI_MEMORY_RUNTIME descriptor of memory-mapped I/O of the memory map.
+fn runtime_memory_mapped_io() -> Result<usize, Failure> {
+    let map = boot::memory_map(MemoryType::LOADER_DATA)
+        .map_err(|error| ("reading the memory map", error.status()))?;
+    let start = map
+        .entries()
+        .find(|descriptor| {
+            descriptor.ty == MemoryType::MMIO && descriptor.att.contains(MemoryAttribute::RUNTIME)
+        })
+        .ok_or((
+            "finding runtime memory-mapped I/O in the memory map",
+            Status::NOT_FOUND,
+        ))?
+        .phys_start;
+    usize::try_from(start)
+        .map_err(|_| ("the memory-mapped I/O lies past usize", Status::UNSUPPORTED))
 }

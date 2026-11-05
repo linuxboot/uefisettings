@@ -31,9 +31,12 @@ use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::efi_variables::VariableStorageInfo;
+use crate::efi_variables::VendorTable;
+use crate::efi_variables::EFI_JSON_CONFIG_DATA_TABLE_GUID;
 use crate::hii::export_package_lists;
 use crate::hii::FirmwareVariables;
 use crate::hii::VariableServices;
+use crate::uefi_config_table::SystemConfigurationTable;
 
 /// What set and get read and write when no file names them: this firmware's HII database and
 /// variables, through boot services.
@@ -72,11 +75,17 @@ impl VariableBackend {
     }
 }
 
-/// Where the capsule commands deliver: this firmware, through its Capsule Services.
+/// Where the capsule commands deliver: this firmware, through its Capsule Services. What they
+/// read: the configuration tables of its System Table.
 impl CapsuleBackend {
     /// QueryCapsuleCapabilities(), then UpdateCapsule().
     pub(super) fn system_capsule_delivery() -> impl CapsuleDelivery {
         UpdateCapsuleDelivery(RuntimeCapsuleServices)
+    }
+
+    /// The JSON configuration table.
+    pub(super) fn system_json_config_data_table() -> Result<Option<impl VendorTable>> {
+        SystemConfigurationTable::find(&EFI_JSON_CONFIG_DATA_TABLE_GUID)
     }
 }
 

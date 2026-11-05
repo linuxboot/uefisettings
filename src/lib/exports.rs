@@ -62,10 +62,14 @@ use crate::efi_variables::list_variables;
 use crate::efi_variables::parse_vendor;
 #[cfg(variable_storage_info)]
 use crate::efi_variables::query_storage;
+#[cfg(configuration_tables)]
+use crate::efi_variables::read_json_config_data;
 #[cfg(capsule_delivery)]
 pub use crate::efi_variables::CapsuleCapabilities;
 #[cfg(capsule_delivery)]
 pub use crate::efi_variables::CapsuleDelivered;
+#[cfg(configuration_tables)]
+pub use crate::efi_variables::JsonConfigData;
 #[cfg(capsule_delivery)]
 pub use crate::efi_variables::ResetType;
 #[cfg(variable_info)]
@@ -223,8 +227,9 @@ impl VariableBackend {
     }
 }
 
-/// The capsules for this machine's firmware (UEFI 2.11 §8.5.3).
-#[cfg(capsule_delivery)]
+/// The capsules for this machine's firmware (UEFI 2.11 §8.5.3), and the configuration data that
+/// it reports for them (§23.5.2).
+#[cfg(any(capsule_delivery, configuration_tables))]
 pub struct CapsuleBackend {}
 
 #[cfg(capsule_delivery)]
@@ -234,6 +239,15 @@ impl CapsuleBackend {
     /// refused first. It never resets the machine.
     pub fn deliver_json(payload: &[u8], capsule_id: u32) -> Result<CapsuleDelivered> {
         deliver_json_capsule(&Self::system_capsule_delivery(), payload, capsule_id)
+    }
+}
+
+#[cfg(configuration_tables)]
+impl CapsuleBackend {
+    /// The configuration data that this machine's firmware reports in its JSON configuration
+    /// table (UEFI 2.11 §23.5.2), which it must list.
+    pub fn json_config_data() -> Result<JsonConfigData> {
+        read_json_config_data(Self::system_json_config_data_table()?)
     }
 }
 

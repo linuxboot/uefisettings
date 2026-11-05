@@ -59,7 +59,8 @@ uefisettings hii list-questions --efivars efivars
 
 ```plain
 Commands:
-  capsule            Commands that pass capsules to this machine's firmware
+  capsule            Commands that pass capsules to this machine's firmware, or show the
+                     configuration data that it reports
   get                Auto-identify backend and get the current value of a question
   help               Print this message or the help of the given subcommand(s)
   hii                Commands which work on machines exposing the UEFI HiiDB
@@ -107,9 +108,11 @@ Commands:
 
 ```plain
 Commands:
-  deliver  Deliver a file to the firmware, unchanged, as the JSON payload of a configuration
-           capsule; it never resets the machine
-  help     Print this message or the help of the given subcommand(s)
+  config-data  Print the configuration data of the firmware's JSON configuration table: each item as
+               text if it is UTF-8, else as hex
+  deliver      Deliver a file to the firmware, unchanged, as the JSON payload of a configuration
+               capsule; it never resets the machine
+  help         Print this message or the help of the given subcommand(s)
 ```
 
 `ilo`:
@@ -157,7 +160,8 @@ and none has been tested here. Without a driver, `-f` still reads a HiiDB file, 
 when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
 `variable list` and `variable storage` fail there: the firmware environment calls reach a
 variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
-reach EFI variables only.
+reach EFI variables only. `capsule config-data` fails too: `uefisettings` reads the JSON
+configuration table only in the UEFI Shell.
 
 ---
 
@@ -495,6 +499,21 @@ MaximumCapsuleSize), and the reset type appears only in the kernel record of a s
 are not available in EFI runtime" (§23.5.1), the capsule asks the firmware to process it after a
 reset (CAPSULE_FLAGS_PERSIST_ACROSS_RESET), and Linux makes its next reboot the reset that the
 firmware asked for.
+
+`capsule config-data` prints the configuration data that the firmware reports in its JSON
+configuration table, the EFI_JSON_CAPSULE_CONFIG_DATA of the configuration table of
+EFI_JSON_CONFIG_DATA_TABLE_GUID (§4.6.1.2, §23.5.2), as a JSON object of its own, with no `-j`:
+`items`, the ConfigData of each item in order, as `{"text": ...}` if it is UTF-8, else as
+`{"hex": ...}`. It fails where the firmware lists no such table. Reading the table is not
+supported on Linux yet: `uefisettings.efi` reads it in the UEFI Shell. The firmware reports
+cached configuration data unless OsIndications held JSON_CONFIG_DATA_REFRESH at boot, when it
+collects the current data and clears that bit (§8.5.4):
+`variable set OsIndications JSON_CONFIG_DATA_REFRESH` asks for current data at the next boot,
+where OsIndicationsSupported lists that bit.
+
+```plain
+FS0:\> uefisettings.efi capsule config-data
+```
 
 </details>
 

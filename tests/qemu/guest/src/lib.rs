@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::ops::RangeInclusive;
 use std::os::unix::fs::FileExt;
 use std::process::Command;
@@ -53,6 +54,12 @@ pub const EFIVARS: &str = "/sys/firmware/efi/efivars";
 /// (`src/lib/hii/extract.rs`).
 pub const HIIDB_VARIABLE: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
+
+/// What the Linux build says to `capsule config-data` and `capsule result-table`, as it does not
+/// read their configuration tables yet (`src/capsule_command.rs`).
+pub const NO_CONFIGURATION_TABLES_ON_LINUX: &str =
+    "reading this configuration table is not supported on Linux yet; run uefisettings.efi in \
+     the UEFI Shell";
 
 /// The variable in which publish-hiidb puts the CRC-32 of the HII database that
 /// [`HIIDB_VARIABLE`] points at.
@@ -193,6 +200,21 @@ pub fn uefisettings_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
+}
+
+/// Writes the output of `output` to the test log, on the line "uefisettings-qemu-test: TAG
+/// OUTPUT", which check-shell-log.sh looks for, past libtest's capture, which takes print! but
+/// not writes to stdout, on a line of its own after libtest's "test ... ".
+#[track_caller]
+pub fn write_for_the_shell(tag: &str, output: &Output) {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(
+        stdout,
+        "\nuefisettings-qemu-test: {tag} {}",
+        output.stdout.trim_end()
+    )
+    .and_then(|()| stdout.flush())
+    .unwrap_or_else(|error| panic!("write the line {tag}: {error}"));
 }
 
 /// Runs `uefisettings` with `args`; panics unless it exits with 0 and prints one JSON value
@@ -462,7 +484,7 @@ pub fn published_crc32() -> u32 {
 
 impl PublishedDatabase {
     /// The efivar source's refusal of this database, which no `region`, `EFI_MEMORY_RUNTIME` or
-    /// `firmware-reserved`, holds (`src/lib/hii/firmware_memory/efi_memory_map.rs`
+    /// `firmware-reserved`, holds (`src/lib/memory_map/efi_memory_map.rs`
     /// `RangeRefusal`).
     pub fn refusal(&self, region: &str) -> String {
         format!(

@@ -1,0 +1,5 @@
+# The checks of shell/json-config-data.nsh, the boot of shell-json-config-data. See
+# check-shell-log.sh.
+# the items of publish-hiidb.efi json-config-data, the UTF-8 one as text and the other as hex
+config-data	status	0x0
+config-data	json	. == {"items": [{"text": "{\"uefisettings\":\"json-config-data\"}"}, {"hex": "ff00807f"}]}

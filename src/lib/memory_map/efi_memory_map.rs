@@ -16,29 +16,30 @@
 //! RUNTIME descriptors, plus boot-services ones with efi=debug and RAM ones in mixed mode
 //! (arch/x86/platform/efi/efi.c should_map_region(); otherwise quirks.c efi_free_boot_services()
 //! drops boot services memory before runtime-map.c's initcall, Linux v6.11). EfiMemoryMap keeps
-//! only RUNTIME.
+//! only RUNTIME. The UEFI Shell build bounds its reads of configuration tables with the memory
+//! map of boot services the same way (uefi_config_table.rs).
 
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
-#[cfg(any(target_arch = "aarch64", test))]
-use super::array_at;
-#[cfg(any(target_arch = "aarch64", test))]
-use super::le_u64_at;
 use super::physical_range::PhysicalRange;
+#[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+use crate::hii::firmware_memory::array_at;
+#[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+use crate::hii::firmware_memory::le_u64_at;
 
 /// EFI_MEMORY_RUNTIME (include/linux/efi.h).
-pub(in crate::hii) const EFI_MEMORY_RUNTIME: u64 = 1 << 63;
+pub(crate) const EFI_MEMORY_RUNTIME: u64 = 1 << 63;
 /// The size of an EFI page (include/linux/efi.h EFI_PAGE_SHIFT).
 const EFI_PAGE_SIZE: u64 = 1 << 12;
 /// EFI_MEMORY_DESCRIPTOR_VERSION (include/linux/efi.h), the layout of efi_memory_desc_t.
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
 const MEMORY_DESCRIPTOR_VERSION: u32 = 1;
 /// The bytes of efi_memory_desc_t (include/linux/efi.h) that a descriptor of the memory map
 /// starts with: type, pad, phys_addr, virt_addr, num_pages, attribute.
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
 const MEMORY_DESCRIPTOR_SIZE: usize = 40;
 
 /// An EFI_MEMORY_TYPE (UEFI 2.11 §7.2.1), whose values firmware and OS loaders extend from
@@ -48,24 +49,24 @@ pub struct MemoryType(pub u32);
 
 impl MemoryType {
     /// EfiReservedMemoryType (EFI_MEMORY_TYPE; include/linux/efi.h).
-    #[cfg(any(target_arch = "aarch64", test))]
-    pub(in crate::hii) const RESERVED: Self = Self(0);
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+    pub(crate) const RESERVED: Self = Self(0);
     /// EfiRuntimeServicesCode (EFI_MEMORY_TYPE; include/linux/efi.h).
-    #[cfg(any(target_arch = "aarch64", test))]
-    pub(in crate::hii) const RUNTIME_SERVICES_CODE: Self = Self(5);
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+    pub(crate) const RUNTIME_SERVICES_CODE: Self = Self(5);
     /// EfiRuntimeServicesData (EFI_MEMORY_TYPE; include/linux/efi.h).
-    #[cfg(any(target_arch = "aarch64", test))]
-    pub(in crate::hii) const RUNTIME_SERVICES_DATA: Self = Self(6);
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+    pub(crate) const RUNTIME_SERVICES_DATA: Self = Self(6);
     /// EfiACPIMemoryNVS (EFI_MEMORY_TYPE; include/linux/efi.h).
-    #[cfg(any(target_arch = "aarch64", test))]
-    pub(in crate::hii) const ACPI_MEMORY_NVS: Self = Self(10);
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+    pub(crate) const ACPI_MEMORY_NVS: Self = Self(10);
     /// EfiMemoryMappedIO (UEFI 2.11 §7.2.1 EFI_MEMORY_TYPE).
     pub const MEMORY_MAPPED_IO: Self = Self(11);
     /// EfiMemoryMappedIOPortSpace (UEFI 2.11 §7.2.1 EFI_MEMORY_TYPE).
     pub const MEMORY_MAPPED_IO_PORT_SPACE: Self = Self(12);
     /// EfiPalCode (EFI_MEMORY_TYPE; include/linux/efi.h).
-    #[cfg(any(target_arch = "aarch64", test))]
-    pub(in crate::hii) const PAL_CODE: Self = Self(13);
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+    pub(crate) const PAL_CODE: Self = Self(13);
 
     /// Whether memory of this type is a device's, which firmware asks the OS to map for
     /// runtime services (UEFI 2.11 §7.2 Table 7.5).
@@ -80,8 +81,8 @@ impl MemoryType {
     /// services code and data, EfiACPIMemoryNVS and EfiPalCode, which arm64 Linux does not take
     /// as System RAM (drivers/firmware/efi/efi-init.c is_usable_memory(); edk2
     /// MdePkg/Include/Uefi/UefiMultiPhase.h EFI_MEMORY_TYPE).
-    #[cfg(any(target_arch = "aarch64", test))]
-    pub(super) fn is_firmware_reserved(self) -> bool {
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+    pub(crate) fn is_firmware_reserved(self) -> bool {
         matches!(
             self,
             Self::RESERVED
@@ -96,17 +97,17 @@ impl MemoryType {
 /// The fields of an EFI memory descriptor (include/linux/efi.h efi_memory_desc_t) that
 /// EfiMemoryMap keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::hii) struct MemoryDescriptor {
-    pub(super) memory_type: MemoryType,
-    pub(super) physical_start: u64,
-    pub(super) virtual_start: u64,
-    pub(super) pages: u64,
-    pub(super) attribute: u64,
+pub(crate) struct MemoryDescriptor {
+    pub(crate) memory_type: MemoryType,
+    pub(crate) physical_start: u64,
+    pub(crate) virtual_start: u64,
+    pub(crate) pages: u64,
+    pub(crate) attribute: u64,
 }
 
 impl MemoryDescriptor {
     /// The descriptor that `bytes`, an efi_memory_desc_t, starts with.
-    #[cfg(any(target_arch = "aarch64", test))]
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
     fn parse(bytes: &[u8]) -> Result<Self> {
         Ok(Self {
             memory_type: array_at(bytes, 0)
@@ -120,14 +121,14 @@ impl MemoryDescriptor {
     }
 
     /// The pages of the descriptor, unless their end overflows.
-    pub(super) fn physical_range(&self) -> Option<PhysicalRange> {
+    pub(crate) fn physical_range(&self) -> Option<PhysicalRange> {
         PhysicalRange::new(self.physical_start, self.pages.checked_mul(EFI_PAGE_SIZE)?)
     }
 
     /// The descriptors of the memory map `map` of `desc_size`-byte descriptors of version
     /// `desc_ver`, which must hold whole descriptors.
-    #[cfg(any(target_arch = "aarch64", test))]
-    pub(super) fn parse_map(map: &[u8], desc_size: usize, desc_ver: u32) -> Result<Vec<Self>> {
+    #[cfg(any(all(firmware_memory_maps, target_arch = "aarch64"), test))]
+    pub(crate) fn parse_map(map: &[u8], desc_size: usize, desc_ver: u32) -> Result<Vec<Self>> {
         if desc_ver != MEMORY_DESCRIPTOR_VERSION {
             bail!("EFI memory descriptor version {desc_ver} is not {MEMORY_DESCRIPTOR_VERSION}");
         }
@@ -156,6 +157,7 @@ pub enum RangeRefusal {
     #[error("{address:#x}+{length:#x} lies in no EFI_MEMORY_RUNTIME region")]
     NotRuntime { address: u64, length: u64 },
     /// No single firmware-reserved region holds the whole range (EfivarMemory::FirmwareReserved).
+    #[cfg(any(firmware_memory_maps, test))]
     #[error("{address:#x}+{length:#x} lies in no firmware-reserved region")]
     NotFirmwareReserved { address: u64, length: u64 },
     /// The range touches a runtime descriptor of memory-mapped I/O.
@@ -179,7 +181,7 @@ struct RuntimeDescriptor {
 
 /// The runtime descriptors of an EFI memory map, in the order given to new.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::hii) struct EfiMemoryMap {
+pub(crate) struct EfiMemoryMap {
     runtime: Vec<RuntimeDescriptor>,
 }
 
@@ -187,9 +189,7 @@ impl EfiMemoryMap {
     /// The runtime descriptors of `descriptors`, in their order. At least one must be
     /// EFI_MEMORY_RUNTIME: a real map always has runtime code and data, and /proc/kcore reads a
     /// page that it cannot read as zeros.
-    pub(in crate::hii) fn new(
-        descriptors: impl IntoIterator<Item = MemoryDescriptor>,
-    ) -> Result<Self> {
+    pub(crate) fn new(descriptors: impl IntoIterator<Item = MemoryDescriptor>) -> Result<Self> {
         let runtime = descriptors
             .into_iter()
             .filter(|descriptor| descriptor.attribute & EFI_MEMORY_RUNTIME != 0)
@@ -217,7 +217,7 @@ impl EfiMemoryMap {
     /// wrong, or virtual where the source takes them as physical, and point at a device, which
     /// a read may change: memory-mapped I/O that runtime services use is runtime too (UEFI 2.11
     /// §7.2 Table 7.5), so a range that touches any of its descriptors is refused.
-    pub(super) fn runtime_range_end(&self, address: u64, length: u64) -> Result<u64> {
+    pub(crate) fn runtime_range_end(&self, address: u64, length: u64) -> Result<u64> {
         self.refuse_memory_mapped_io(address, length)?;
         Ok(self
             .runtime
@@ -229,7 +229,7 @@ impl EfiMemoryMap {
     }
 
     /// Refuses `length` bytes at `address` that touch a runtime descriptor of memory-mapped I/O.
-    pub(super) fn refuse_memory_mapped_io(
+    pub(crate) fn refuse_memory_mapped_io(
         &self,
         address: u64,
         length: u64,
@@ -250,11 +250,11 @@ impl EfiMemoryMap {
 
 /// Memory maps for the tests of the efivar source.
 #[cfg(test)]
-pub(in crate::hii) mod fixture {
+pub(crate) mod fixture {
     use super::*;
 
     /// An EFI memory descriptor of `desc_size` bytes.
-    pub(in crate::hii) fn descriptor(
+    pub(crate) fn descriptor(
         desc_size: usize,
         memory_type: MemoryType,
         physical: u64,
@@ -277,7 +277,7 @@ pub(in crate::hii) mod fixture {
 
     /// A memory map of the runtime regions `regions` of (physical start, virtual start, pages,
     /// type).
-    pub(in crate::hii) fn runtime_map(regions: &[(u64, u64, u64, MemoryType)]) -> EfiMemoryMap {
+    pub(crate) fn runtime_map(regions: &[(u64, u64, u64, MemoryType)]) -> EfiMemoryMap {
         EfiMemoryMap::new(regions.iter().map(
             |&(physical_start, virtual_start, pages, memory_type)| MemoryDescriptor {
                 memory_type,

@@ -17,10 +17,8 @@
 //! variables. Both list the questions in every state, as the shell can evaluate conditions that
 //! Linux cannot.
 
-use std::io::Write;
-
 use uefisettings_qemu_guest::uefisettings;
-use uefisettings_qemu_guest::Output;
+use uefisettings_qemu_guest::write_for_the_shell;
 use uefisettings_qemu_guest::Question;
 use uefisettings_qemu_guest::Variable;
 
@@ -29,20 +27,6 @@ const EVERY_STATE: [&str; 2] = ["--include", "grayed-out,suppressed,disabled"];
 /// The formset GUID of DriverSample, the vendor GUID of its variables, which
 /// shell/list-questions.nsh lists.
 const DRIVER_SAMPLE_GUID: &str = "A04A27F4-DF00-4D42-B552-39511302113D";
-
-/// Writes the output of `output` to the test log, on the line "uefisettings-qemu-test: TAG
-/// OUTPUT", which check-shell-log.sh looks for, past libtest's capture, which takes print! but
-/// not writes to stdout, on a line of its own after libtest's "test ... ".
-fn write_for_the_shell(tag: &str, output: &Output) {
-    let mut stdout = std::io::stdout().lock();
-    writeln!(
-        stdout,
-        "\nuefisettings-qemu-test: {tag} {}",
-        output.stdout.trim_end()
-    )
-    .and_then(|()| stdout.flush())
-    .unwrap_or_else(|error| panic!("write the line {tag}: {error}"));
-}
 
 #[test]
 fn list_questions_for_the_shell() {

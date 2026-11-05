@@ -31,11 +31,13 @@ use anyhow::Result;
 use thiserror::Error;
 
 #[cfg(any(firmware_memory_maps, test))]
-use efi_memory_map::EfiMemoryMap;
+use crate::memory_map::efi_memory_map::EfiMemoryMap;
 #[cfg(any(firmware_memory_maps, test))]
-use efi_memory_map::MemoryDescriptor;
+use crate::memory_map::efi_memory_map::MemoryDescriptor;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
-use efi_memory_map::MemoryType;
+use crate::memory_map::efi_memory_map::MemoryType;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
+use crate::memory_map::physical_range::PhysicalRange;
 #[cfg(any(target_arch = "aarch64", test))]
 use fdt_params::UefiFdtParams;
 #[cfg(firmware_memory_maps)]
@@ -46,11 +48,7 @@ use kcore::read_kcore;
 use kcore::KcoreAddress;
 #[cfg(target_arch = "aarch64")]
 use kcore::KCORE_PATH;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
-use physical_range::PhysicalRange;
 
-#[cfg(any(firmware_memory_maps, test))]
-pub(super) mod efi_memory_map;
 #[cfg(any(target_arch = "aarch64", test))]
 pub(super) mod fdt_params;
 #[cfg(any(firmware_memory_maps, test))]
@@ -58,8 +56,6 @@ pub(super) mod firmware_reserved;
 // arm64's EFI memory map and, on x86_64 and arm64, Linux's own data.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 pub(super) mod kcore;
-#[cfg(any(firmware_memory_maps, test))]
-mod physical_range;
 #[cfg(any(firmware_memory_maps, test))]
 pub(super) mod runtime_memory;
 
@@ -91,13 +87,13 @@ pub(in crate::hii) const FDT_PATH: &str = "/sys/firmware/fdt";
 
 /// The `N` bytes at `offset` of `bytes`, if it holds them.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-pub(in crate::hii) fn array_at<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+pub(crate) fn array_at<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..)?.first_chunk().copied()
 }
 
 /// The little-endian u64 at `offset` of `bytes`.
 #[cfg(any(target_arch = "aarch64", test))]
-pub(in crate::hii) fn le_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+pub(crate) fn le_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
     array_at(bytes, offset)
         .map(u64::from_le_bytes)
         .with_context(|| format!("no 8 bytes at offset {offset} of {} bytes", bytes.len()))
@@ -427,7 +423,6 @@ pub(in crate::hii) mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::efi_memory_map::fixture::descriptor;
     use super::fdt_params::fixture::uefi_fdt;
     use super::fixture::write_firmware_memmap;
     use super::fixture::write_runtime_map;
@@ -440,7 +435,8 @@ mod tests {
     use crate::hii::memory_access_denied::MemoryAccessDenied;
     use crate::hii::memory_access_denied::MemoryDevice;
     use crate::hii::memory_access_denied::MemoryOperation;
-    use efi_memory_map::RangeRefusal;
+    use crate::memory_map::efi_memory_map::fixture::descriptor;
+    use crate::memory_map::efi_memory_map::RangeRefusal;
 
     #[test]
     fn array_at_and_le_u64_at_read_only_what_bytes_hold() {

@@ -22,11 +22,11 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::Result;
 
-use super::efi_memory_map::EfiMemoryMap;
 use super::firmware_reserved::FirmwareReservedMap;
 use crate::hii::extract::read_physical_memory_at;
 use crate::hii::memory_access_denied::mark_refused_open;
 use crate::hii::memory_access_denied::MemoryDevice;
+use crate::memory_map::efi_memory_map::EfiMemoryMap;
 
 /// Physical memory, which only RuntimeMemory and ReservedMemory read: only this module makes the
 /// ReadToken that read takes.
@@ -168,16 +168,16 @@ pub(in crate::hii) mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
-    use crate::hii::firmware_memory::efi_memory_map::fixture::runtime_map;
-    use crate::hii::firmware_memory::efi_memory_map::MemoryType;
-    use crate::hii::firmware_memory::efi_memory_map::RangeRefusal;
-    use crate::hii::firmware_memory::physical_range::PhysicalRange;
     use crate::hii::lockdown::LockdownMode;
     use crate::hii::memory_access_denied::fixture::lockdown_file;
     use crate::hii::memory_access_denied::fixture::refused_open;
     use crate::hii::memory_access_denied::DenialCause;
     use crate::hii::memory_access_denied::MemoryAccessDenied;
     use crate::hii::memory_access_denied::MemoryOperation;
+    use crate::memory_map::efi_memory_map::fixture::runtime_map;
+    use crate::memory_map::efi_memory_map::MemoryType;
+    use crate::memory_map::efi_memory_map::RangeRefusal;
+    use crate::memory_map::physical_range::PhysicalRange;
 
     const REGION: u64 = 0x20_0000;
     const PAGES: u64 = 2;

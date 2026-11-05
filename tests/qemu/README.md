@@ -172,6 +172,19 @@ that lists every runtime service.
 `rt-properties-version-2` and `rt-properties-version-2-all` install the same tables with
 Version 2, which no UEFI version defines and which Linux reads all the same.
 
+`publish-hiidb.efi json-config-data` publishes nothing: it installs an
+`EFI_JSON_CAPSULE_CONFIG_DATA` of two items, JSON text and bytes that are no UTF-8, as the EFI
+configuration table of `EFI_JSON_CONFIG_DATA_TABLE_GUID`, at an address that it never converts,
+as it does not run when `SetVirtualAddressMap()` does. The scenario `json-config-data` checks
+that the Linux build refuses `capsule config-data`, and `shell-json-config-data` that
+`uefisettings.efi` prints it in the UEFI Shell.
+`publish-hiidb.efi json-config-data-past-region` installs the same
+table with a TotalLength of 16 MiB, past the runtime region that holds it,
+`json-config-data-boot-services` in boot services data, and `json-config-data-mmio` points the
+configuration table at runtime memory-mapped I/O; the scenarios
+`shell-json-config-data-past-region`, `-boot-services` and `-mmio` check that the UEFI Shell
+refuses each.
+
 ## Secure Boot
 
 The scenarios with `firmware=secboot-setup` or `firmware=secboot-user` in their options boot

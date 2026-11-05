@@ -13,10 +13,19 @@
 //! JSON capsules (UEFI 2.11 §23.5): the caller's payload, unchanged, behind an EFI_CAPSULE_HEADER
 //! (§8.5.3.1) and an EFI_JSON_CAPSULE_HEADER (§23.5.2), the bytes that UpdateCapsule() and Linux's
 //! capsule loader take. The backends deliver them: capsule_loader.rs on Linux, capsule_services.rs
-//! in the UEFI Shell.
+//! in the UEFI Shell. Also the EFI_JSON_CAPSULE_CONFIG_DATA (§23.5.2) of the firmware's JSON
+//! configuration table, from a VendorTable of uefi_config_table.rs in the UEFI Shell.
 
+#[cfg(configuration_tables)]
+use anyhow::anyhow;
+#[cfg(configuration_tables)]
+use anyhow::Context;
+#[cfg(configuration_tables)]
+use anyhow::Result;
 use thiserror::Error;
 
+#[cfg(configuration_tables)]
+use super::VendorTable;
 use crate::hii::package::Guid;
 
 /// EFI_JSON_CAPSULE_ID_GUID, the CapsuleGuid of a JSON capsule (UEFI 2.11 §23.5.1).
@@ -37,6 +46,26 @@ const JSON_CAPSULE_HEADER_SIZE: u32 = 3 * 4;
 const JSON_CAPSULE_HEADER_VERSION: u32 = 1;
 /// CAPSULE_FLAGS_PERSIST_ACROSS_RESET (UEFI 2.11 §8.5.3.1).
 const CAPSULE_FLAGS_PERSIST_ACROSS_RESET: u32 = 0x0001_0000;
+/// EFI_JSON_CONFIG_DATA_TABLE_GUID, the configuration table of the firmware's
+/// EFI_JSON_CAPSULE_CONFIG_DATA (UEFI 2.11 §4.6.1.2, §23.5.2).
+#[cfg(configuration_tables)]
+pub(crate) const EFI_JSON_CONFIG_DATA_TABLE_GUID: Guid = Guid {
+    data1: 0x8736_7f87,
+    data2: 0x1119,
+    data3: 0x41ce,
+    data4: [0xaa, 0xec, 0x8b, 0xe0, 0x11, 0x1f, 0x55, 0x8a],
+};
+/// sizeof (EFI_JSON_CAPSULE_CONFIG_DATA) before its ConfigDataList: the UINT32s Version and
+/// TotalLength (UEFI 2.11 §23.5.2).
+#[cfg(configuration_tables)]
+const CONFIG_DATA_HEADER_SIZE: usize = 2 * 4;
+/// EFI_JSON_CAPSULE_CONFIG_DATA's Version, "initially 0x00000001" (UEFI 2.11 §23.5.2).
+#[cfg(configuration_tables)]
+const CONFIG_DATA_VERSION: u32 = 1;
+/// sizeof (EFI_JSON_CONFIG_DATA_ITEM) before its ConfigData: the UINT32 ConfigDataLength (UEFI
+/// 2.11 §23.5.2).
+#[cfg(configuration_tables)]
+const CONFIG_DATA_ITEM_HEADER_SIZE: usize = 4;
 
 /// When the firmware processes a capsule: "If a capsule has the CAPSULE_FLAGS_PERSIST_ACROSS_RESET
 /// Flag set in its header, the firmware will process the capsules after system reset. [...] If
@@ -172,6 +201,178 @@ pub struct CapsuleCapabilities {
     pub reset_type: ResetType,
 }
 
+/// The configuration data that the firmware reports in its JSON configuration table, an
+/// EFI_JSON_CAPSULE_CONFIG_DATA (UEFI 2.11 §23.5.2).
+#[cfg(configuration_tables)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JsonConfigData {
+    /// The ConfigData of each EFI_JSON_CONFIG_DATA_ITEM, in order: "the JSON payload that
+    /// describes one group of configuration data", which uefisettings does not parse
+    pub items: Vec<Vec<u8>>,
+}
+
+#[cfg(configuration_tables)]
+impl JsonConfigData {
+    /// The configuration data of `table`, an EFI_JSON_CAPSULE_CONFIG_DATA: it reads its Version
+    /// and TotalLength, then its TotalLength bytes, which must hold its items whole.
+    pub(crate) fn read(table: &impl VendorTable) -> Result<Self> {
+        let header = table
+            .read(CONFIG_DATA_HEADER_SIZE)
+            .context("read the Version and TotalLength of the JSON configuration table")?;
+        let [v0, v1, v2, v3, t0, t1, t2, t3] = <[u8; CONFIG_DATA_HEADER_SIZE]>::try_from(header)
+            .map_err(|header| {
+                anyhow!(
+                    "read {} bytes of the JSON configuration table, not its Version and \
+                     TotalLength",
+                    header.len()
+                )
+            })?;
+        let version = u32::from_le_bytes([v0, v1, v2, v3]);
+        if version != CONFIG_DATA_VERSION {
+            return Err(ConfigDataError::Version(version).into());
+        }
+        let total_length = u32::from_le_bytes([t0, t1, t2, t3]);
+        let length = usize::try_from(total_length)?;
+        if length < CONFIG_DATA_HEADER_SIZE {
+            return Err(ConfigDataError::TotalLengthShort(total_length).into());
+        }
+
+        let table = table.read(length).with_context(|| {
+            format!("read the TotalLength {total_length} bytes of the JSON configuration table")
+        })?;
+        Ok(Self {
+            items: config_data_items(&table)?,
+        })
+    }
+}
+
+/// The ConfigData of the items of `table`, an EFI_JSON_CAPSULE_CONFIG_DATA of `table.len()`
+/// bytes. UEFI 2.11 §23.5.2 packs only EFI_JSON_CAPSULE_CONFIG_DATA, but each item starts right
+/// after the ConfigData of the one before, at any alignment, as edk2-stable202508 packs
+/// EFI_JSON_CONFIG_DATA_ITEM too (MdePkg/Include/Guid/JsonCapsule.h).
+#[cfg(configuration_tables)]
+fn config_data_items(table: &[u8]) -> Result<Vec<Vec<u8>>, ConfigDataError> {
+    let total_length = table.len();
+    let mut items = Vec::new();
+    let mut rest = table.get(CONFIG_DATA_HEADER_SIZE..).unwrap_or_default();
+    while !rest.is_empty() {
+        let offset = total_length - rest.len();
+        let Some((length, data)) = rest.split_first_chunk::<CONFIG_DATA_ITEM_HEADER_SIZE>() else {
+            return Err(ConfigDataError::TrailingBytes {
+                total_length,
+                count: rest.len(),
+            });
+        };
+        let length = u32::from_le_bytes(*length);
+        let (item, next) = usize::try_from(length)
+            .ok()
+            .and_then(|length| data.split_at_checked(length))
+            .ok_or(ConfigDataError::ItemPastTotalLength {
+                offset,
+                length,
+                total_length,
+            })?;
+        items.push(item.to_vec());
+        rest = next;
+    }
+    Ok(items)
+}
+
+/// An EFI_JSON_CAPSULE_CONFIG_DATA that JsonConfigData::read refuses. The messages spell
+/// "section", as PayloadError's do.
+#[cfg(configuration_tables)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum ConfigDataError {
+    #[error(
+        "the JSON configuration table's Version is {0}, not the {CONFIG_DATA_VERSION} that \
+         uefisettings reads: \"Version of the structure, initially 0x00000001\" (UEFI 2.11 \
+         section 23.5.2)"
+    )]
+    Version(u32),
+    #[error(
+        "the JSON configuration table's TotalLength {0} is less than the {CONFIG_DATA_HEADER_SIZE} \
+         bytes of its Version and TotalLength (UEFI 2.11 section 23.5.2)"
+    )]
+    TotalLengthShort(u32),
+    #[error(
+        "the item at offset {offset} of the JSON configuration table has a ConfigDataLength of \
+         {length}, which runs its ConfigData past the table's TotalLength {total_length} (UEFI \
+         2.11 section 23.5.2)"
+    )]
+    ItemPastTotalLength {
+        offset: usize,
+        length: u32,
+        total_length: usize,
+    },
+    #[error(
+        "the JSON configuration table's TotalLength {total_length} leaves {count} bytes after its \
+         Version, TotalLength and items, too few for a ConfigDataLength (UEFI 2.11 section \
+         23.5.2)"
+    )]
+    TrailingBytes { total_length: usize, count: usize },
+}
+
+/// VendorTables for the tests of the JSON configuration table.
+#[cfg(all(configuration_tables, test))]
+pub(super) mod fixture {
+    use std::cell::RefCell;
+
+    use anyhow::anyhow;
+    use anyhow::Result;
+
+    use crate::efi_variables::VendorTable;
+
+    /// A table at the start of a memory region of `region`, which records the length of each
+    /// read and refuses reads past the region's end.
+    #[derive(Debug)]
+    pub(in crate::efi_variables) struct TableInRegion {
+        region: Vec<u8>,
+        pub(in crate::efi_variables) reads: RefCell<Vec<usize>>,
+    }
+
+    impl TableInRegion {
+        pub(in crate::efi_variables) fn new(region: Vec<u8>) -> Self {
+            Self {
+                region,
+                reads: RefCell::default(),
+            }
+        }
+    }
+
+    impl VendorTable for TableInRegion {
+        fn read(&self, len: usize) -> Result<Vec<u8>> {
+            self.reads.borrow_mut().push(len);
+            self.region.get(..len).map(<[u8]>::to_vec).ok_or_else(|| {
+                anyhow!(
+                    "{len} bytes run past the region of {} bytes",
+                    self.region.len()
+                )
+            })
+        }
+    }
+
+    /// An EFI_JSON_CAPSULE_CONFIG_DATA of `version` and `total_length`, then `list`.
+    pub(in crate::efi_variables) fn config_data(
+        version: u32,
+        total_length: u32,
+        list: &[u8],
+    ) -> Vec<u8> {
+        [
+            &version.to_le_bytes()[..],
+            &total_length.to_le_bytes(),
+            list,
+        ]
+        .concat()
+    }
+
+    /// The EFI_JSON_CONFIG_DATA_ITEM of `data`.
+    pub(in crate::efi_variables) fn item(data: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(data.len()).expect("a UINT32 ConfigDataLength");
+        [&length.to_le_bytes()[..], data].concat()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +499,213 @@ mod tests {
              (UEFI 2.11 section 8.5.3.1)",
             "message"
         );
+    }
+
+    /// JsonConfigData reads the items of the ConfigDataList back to back, the next item right
+    /// after the ConfigData of the one before, whatever their lengths: JSON text of 7 bytes, an
+    /// empty item, then bytes that are no UTF-8.
+    #[cfg(configuration_tables)]
+    #[test]
+    fn json_config_data_reads_its_items_back_to_back() {
+        let list = [
+            fixture::item(br#"{"a":1}"#),
+            fixture::item(b""),
+            fixture::item(&[0xff, 0x00, 0x80]),
+        ]
+        .concat();
+        let table = fixture::TableInRegion::new(fixture::config_data(1, 30, &list));
+
+        let data = JsonConfigData::read(&table).expect("read the table");
+
+        assert_eq!(
+            data.items,
+            [br#"{"a":1}"#.to_vec(), Vec::new(), vec![0xff, 0x00, 0x80]],
+            "items"
+        );
+        assert_eq!(table.reads.into_inner(), [8, 30], "reads");
+    }
+
+    /// JsonConfigData reads the Version and TotalLength, then the TotalLength bytes, and never
+    /// what the region holds past them.
+    #[cfg(configuration_tables)]
+    #[test]
+    fn json_config_data_reads_only_its_total_length() {
+        for (case, region, want, total_length) in [
+            ("no items", fixture::config_data(1, 8, &[]), Vec::new(), 8),
+            (
+                "an item, then one past TotalLength",
+                fixture::config_data(
+                    1,
+                    15,
+                    &[fixture::item(b"abc"), fixture::item(b"past")].concat(),
+                ),
+                vec![b"abc".to_vec()],
+                15,
+            ),
+        ] {
+            let table = fixture::TableInRegion::new(region);
+
+            let data =
+                JsonConfigData::read(&table).unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+            assert_eq!(data.items, want, "{case}");
+            assert_eq!(table.reads.into_inner(), [8, total_length], "{case}: reads");
+        }
+    }
+
+    /// JsonConfigData refuses a Version but 1, a TotalLength short of its header, an item past
+    /// TotalLength and 1-3 bytes after the last item, which hold no ConfigDataLength; it reads
+    /// nothing past the header of a header that it refuses.
+    #[cfg(configuration_tables)]
+    #[test]
+    fn json_config_data_refuses_what_the_specification_does_not_lay_out() {
+        let past_item = [&5u32.to_le_bytes()[..], b"abcde"].concat();
+        let past_second = [fixture::item(b"x"), u32::MAX.to_le_bytes().to_vec()].concat();
+        for (case, region, want, reads) in [
+            (
+                "Version 2",
+                fixture::config_data(2, 8, &[]),
+                ConfigDataError::Version(2),
+                &[8][..],
+            ),
+            (
+                "Version 0",
+                fixture::config_data(0, 8, &[]),
+                ConfigDataError::Version(0),
+                &[8],
+            ),
+            (
+                "TotalLength 7",
+                fixture::config_data(1, 7, &[]),
+                ConfigDataError::TotalLengthShort(7),
+                &[8],
+            ),
+            (
+                "TotalLength 0",
+                fixture::config_data(1, 0, &[]),
+                ConfigDataError::TotalLengthShort(0),
+                &[8],
+            ),
+            (
+                "an item one byte past TotalLength, which the region holds",
+                fixture::config_data(1, 16, &past_item),
+                ConfigDataError::ItemPastTotalLength {
+                    offset: 8,
+                    length: 5,
+                    total_length: 16,
+                },
+                &[8, 16],
+            ),
+            (
+                "a second item of ConfigDataLength u32::MAX",
+                fixture::config_data(1, 17, &past_second),
+                ConfigDataError::ItemPastTotalLength {
+                    offset: 13,
+                    length: u32::MAX,
+                    total_length: 17,
+                },
+                &[8, 17],
+            ),
+            (
+                "1 byte after the last item",
+                fixture::config_data(1, 14, &[fixture::item(b"x"), vec![0]].concat()),
+                ConfigDataError::TrailingBytes {
+                    total_length: 14,
+                    count: 1,
+                },
+                &[8, 14],
+            ),
+            (
+                "2 bytes after the last item",
+                fixture::config_data(1, 15, &[fixture::item(b"x"), vec![0; 2]].concat()),
+                ConfigDataError::TrailingBytes {
+                    total_length: 15,
+                    count: 2,
+                },
+                &[8, 15],
+            ),
+            (
+                "3 bytes after the last item",
+                fixture::config_data(1, 16, &[fixture::item(b"x"), vec![0; 3]].concat()),
+                ConfigDataError::TrailingBytes {
+                    total_length: 16,
+                    count: 3,
+                },
+                &[8, 16],
+            ),
+        ] {
+            let table = fixture::TableInRegion::new(region);
+
+            let error = JsonConfigData::read(&table).expect_err(case);
+
+            assert_eq!(
+                error.downcast_ref::<ConfigDataError>(),
+                Some(&want),
+                "{case}: {error:#}"
+            );
+            assert_eq!(table.reads.into_inner(), reads, "{case}: reads");
+        }
+    }
+
+    /// JsonConfigData refuses a header or a TotalLength past the region that holds the table,
+    /// naming what it read.
+    #[cfg(configuration_tables)]
+    #[test]
+    fn json_config_data_refuses_a_table_past_its_region() {
+        for (case, region, want) in [
+            (
+                "a region of 4 bytes",
+                vec![1, 0, 0, 0],
+                "read the Version and TotalLength of the JSON configuration table: 8 bytes run \
+                 past the region of 4 bytes",
+            ),
+            (
+                "TotalLength 64 in a region of 13 bytes",
+                fixture::config_data(1, 64, &fixture::item(b"x")),
+                "read the TotalLength 64 bytes of the JSON configuration table: 64 bytes run past \
+                 the region of 13 bytes",
+            ),
+        ] {
+            let error = JsonConfigData::read(&fixture::TableInRegion::new(region)).expect_err(case);
+
+            assert_eq!(format!("{error:#}"), want, "{case}");
+        }
+    }
+
+    #[cfg(configuration_tables)]
+    #[test]
+    fn config_data_errors_name_the_field_and_the_section() {
+        for (error, want) in [
+            (
+                ConfigDataError::Version(2),
+                "the JSON configuration table's Version is 2, not the 1 that uefisettings reads: \
+                 \"Version of the structure, initially 0x00000001\" (UEFI 2.11 section 23.5.2)",
+            ),
+            (
+                ConfigDataError::TotalLengthShort(7),
+                "the JSON configuration table's TotalLength 7 is less than the 8 bytes of its \
+                 Version and TotalLength (UEFI 2.11 section 23.5.2)",
+            ),
+            (
+                ConfigDataError::ItemPastTotalLength {
+                    offset: 13,
+                    length: 5,
+                    total_length: 16,
+                },
+                "the item at offset 13 of the JSON configuration table has a ConfigDataLength of \
+                 5, which runs its ConfigData past the table's TotalLength 16 (UEFI 2.11 section \
+                 23.5.2)",
+            ),
+            (
+                ConfigDataError::TrailingBytes {
+                    total_length: 16,
+                    count: 3,
+                },
+                "the JSON configuration table's TotalLength 16 leaves 3 bytes after its Version, \
+                 TotalLength and items, too few for a ConfigDataLength (UEFI 2.11 section 23.5.2)",
+            ),
+        ] {
+            assert_eq!(error.to_string(), want, "{error:?}");
+        }
     }
 }

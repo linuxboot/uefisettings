@@ -27,7 +27,13 @@ mod capsule_loader;
 mod capsule_services;
 #[cfg(target_os = "linux")]
 mod chattr;
-#[cfg(any(variable_names, variable_info, variable_storage_info, capsule_delivery))]
+#[cfg(any(
+    variable_names,
+    variable_info,
+    variable_storage_info,
+    capsule_delivery,
+    configuration_tables
+))]
 mod efi_variables;
 mod exit_status;
 pub mod exports;
@@ -36,7 +42,17 @@ mod file_lock;
 mod hii;
 #[cfg(target_os = "linux")]
 mod ilorest;
+#[cfg(any(
+    firmware_memory_maps,
+    target_os = "uefi",
+    all(target_os = "linux", test)
+))]
+mod memory_map;
 pub mod secret_file;
 mod translation;
 #[cfg(target_os = "uefi")]
+mod uefi_config_table;
+#[cfg(target_os = "uefi")]
 mod uefi_entry;
+#[cfg(any(target_os = "uefi", test))]
+mod unaligned_array;

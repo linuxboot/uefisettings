@@ -22,11 +22,11 @@ use anyhow::Result;
 #[cfg(any(target_arch = "aarch64", test))]
 use anyhow::Context;
 
-use super::efi_memory_map::EfiMemoryMap;
+use crate::memory_map::efi_memory_map::EfiMemoryMap;
 #[cfg(any(target_arch = "aarch64", test))]
-use super::efi_memory_map::MemoryDescriptor;
-use super::efi_memory_map::RangeRefusal;
-use super::physical_range::PhysicalRange;
+use crate::memory_map::efi_memory_map::MemoryDescriptor;
+use crate::memory_map::efi_memory_map::RangeRefusal;
+use crate::memory_map::physical_range::PhysicalRange;
 
 /// The firmware-reserved regions of a firmware memory map, and the runtime descriptors of the
 /// EFI memory map, whose memory-mapped I/O stays refused.
@@ -82,9 +82,9 @@ impl FirmwareReservedMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hii::firmware_memory::efi_memory_map::fixture::runtime_map;
-    use crate::hii::firmware_memory::efi_memory_map::MemoryType;
-    use crate::hii::firmware_memory::efi_memory_map::EFI_MEMORY_RUNTIME;
+    use crate::memory_map::efi_memory_map::fixture::runtime_map;
+    use crate::memory_map::efi_memory_map::MemoryType;
+    use crate::memory_map::efi_memory_map::EFI_MEMORY_RUNTIME;
 
     /// The descriptor of `pages` pages of `memory_type` at `physical_start`, with `attribute`.
     fn descriptor(

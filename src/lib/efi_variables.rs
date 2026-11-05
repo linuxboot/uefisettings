@@ -16,11 +16,12 @@
 //! calls on Windows (hii/firmware_environment.rs). Capsules for the machine's firmware (UEFI 2.11
 //! §8.5.3) too: their bytes come from capsule.rs, and Linux's capsule loader
 //! (capsule_loader.rs) or the runtime services in the UEFI Shell (capsule_services.rs) take
-//! them.
+//! them. And the configuration data of the firmware's JSON configuration table (§23.5.2), which
+//! capsule.rs decodes from a VendorTable.
 
 #[cfg(variable_data)]
 pub(crate) mod authenticated;
-#[cfg(capsule_delivery)]
+#[cfg(any(capsule_delivery, configuration_tables))]
 mod capsule;
 #[cfg(capsule_delivery)]
 mod capsule_delivery;
@@ -32,17 +33,21 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(any(variable_info, variable_storage_info))]
 use serde::Serialize;
-#[cfg(any(variable_storage_info, variable_data))]
+#[cfg(any(variable_storage_info, variable_data, configuration_tables))]
 use thiserror::Error;
 
 #[cfg(capsule_delivery)]
 pub use capsule::CapsuleCapabilities;
 #[cfg(capsule_delivery)]
 pub(crate) use capsule::JsonCapsule;
+#[cfg(configuration_tables)]
+pub use capsule::JsonConfigData;
 #[cfg(capsule_delivery)]
 pub(crate) use capsule::Processing;
 #[cfg(capsule_delivery)]
 pub use capsule::ResetType;
+#[cfg(configuration_tables)]
+pub(crate) use capsule::EFI_JSON_CONFIG_DATA_TABLE_GUID;
 #[cfg(capsule_delivery)]
 pub(crate) use capsule_delivery::deliver_json_capsule;
 #[cfg(capsule_delivery)]
@@ -271,6 +276,33 @@ pub(crate) fn query_storage(
 #[error("{0}: runtime access implies boot service access (UEFI 2.10 section 8.2.3)")]
 struct RuntimeAccessWithoutBootServiceAccess(VariableAttributes);
 
+/// A configuration table of the EFI System Table (UEFI 2.11 §4.6), read from its VendorTable: one
+/// of gST in the UEFI Shell (uefi_config_table.rs).
+#[cfg(configuration_tables)]
+pub(crate) trait VendorTable {
+    /// The table's first `len` bytes, all of them, unless they run past the memory region that
+    /// holds the table.
+    fn read(&self, len: usize) -> Result<Vec<u8>>;
+}
+
+/// The configuration data of `table`, the firmware's JSON configuration table, which the
+/// firmware must list.
+#[cfg(configuration_tables)]
+pub(crate) fn read_json_config_data(table: Option<impl VendorTable>) -> Result<JsonConfigData> {
+    let table = table.ok_or(NoJsonConfigDataTable)?;
+    JsonConfigData::read(&table)
+}
+
+/// A firmware that lists no JSON configuration table, which UEFI 2.11 §4.6.1.2 does not require.
+/// The message spells "section", as PayloadError's do.
+#[cfg(configuration_tables)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "the firmware lists no configuration table of EFI_JSON_CONFIG_DATA_TABLE_GUID, \
+     {EFI_JSON_CONFIG_DATA_TABLE_GUID} (UEFI 2.11 section 4.6.1.2)"
+)]
+struct NoJsonConfigDataTable;
+
 /// The vendor GUID `vendor` that a command names, such as 8BE4DF61-93CA-11D2-AA0D-00E098032B8C.
 #[cfg(any(variable_names, variable_info))]
 pub(crate) fn parse_vendor(vendor: &str) -> Result<Guid> {
@@ -281,6 +313,12 @@ pub(crate) fn parse_vendor(vendor: &str) -> Result<Guid> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(configuration_tables)]
+    use super::capsule::fixture::config_data;
+    #[cfg(configuration_tables)]
+    use super::capsule::fixture::item;
+    #[cfg(configuration_tables)]
+    use super::capsule::fixture::TableInRegion;
     use super::*;
 
     /// EFI_GLOBAL_VARIABLE, the vendor GUID of the global variables (UEFI 2.10 §3.3).
@@ -656,5 +694,26 @@ mod tests {
                 "{storage:?}"
             );
         }
+    }
+
+    /// read_json_config_data decodes the table that the firmware lists, and names the GUID of
+    /// the one that it does not list.
+    #[cfg(configuration_tables)]
+    #[test]
+    fn read_json_config_data_names_a_missing_table() {
+        let listed = TableInRegion::new(config_data(1, 13, &item(b"{")));
+
+        let data = read_json_config_data(Some(listed)).expect("read a listed table");
+
+        assert_eq!(data.items, [b"{".to_vec()], "listed");
+
+        let error = read_json_config_data(None::<TableInRegion>).expect_err("read no table");
+
+        assert_eq!(
+            error.to_string(),
+            "the firmware lists no configuration table of EFI_JSON_CONFIG_DATA_TABLE_GUID, \
+             87367F87-1119-41CE-AAEC-8BE0111F558A (UEFI 2.11 section 4.6.1.2)",
+            "no table"
+        );
     }
 }

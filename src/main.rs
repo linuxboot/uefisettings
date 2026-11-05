@@ -122,7 +122,7 @@ enum Commands {
     /// Commands on this machine's EFI variables
     #[cfg(system_variables)]
     Variable(VariableCommand),
-    /// Commands that pass capsules to this machine's firmware
+    /// Commands that pass capsules to this machine's firmware, or show the configuration data that it reports
     #[cfg(system_variables)]
     Capsule(CapsuleCommand),
     #[command(flatten)]

@@ -43,6 +43,11 @@ shell-rng	-	-	shell:rng	devices=virtio-rng
 capsule	-	-	capsule	arch=x86_64,aarch64
 capsule-payload	-	-	capsule/deliver_refuses_an_empty_or_missing_payload	arch=i686
 shell-capsule	-	-	shell:capsule	-
+json-config-data	/publish-hiidb.efi json-config-data	-	capsule_config_data	-
+shell-json-config-data	/publish-hiidb.efi json-config-data	-	shell:json-config-data	-
+shell-json-config-data-past-region	/publish-hiidb.efi json-config-data-past-region	-	shell:json-config-data-refused	-
+shell-json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services	-	shell:json-config-data-refused	-
+shell-json-config-data-mmio	/publish-hiidb.efi json-config-data-mmio	-	shell:json-config-data-refused	-
 variable-get	-	-	global_variables/get_default_firmware	-
 variable-get-secboot-setup	-	-	global_variables/get_secboot_setup	firmware=secboot-setup
 variable-get-secboot-user	-	-	global_variables/get_secboot_user	firmware=secboot-user

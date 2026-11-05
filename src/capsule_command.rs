@@ -10,24 +10,25 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The capsule command: capsules for this machine's firmware (UEFI 2.11 §8.5.3).
+//! The capsule command: capsules for this machine's firmware (UEFI 2.11 §8.5.3), and the
+//! configuration data that it reports for them (§23.5.2).
 
 use std::path::Path;
 use std::path::PathBuf;
 
-#[cfg(not(capsule_delivery))]
+#[cfg(not(all(capsule_delivery, configuration_tables)))]
 use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-#[cfg(capsule_delivery)]
+#[cfg(any(capsule_delivery, configuration_tables))]
 use uefisettings::exports::CapsuleBackend;
 #[cfg(capsule_delivery)]
 use uefisettings::exports::CapsuleCapabilities;
 
 #[cfg(capsule_delivery)]
 use crate::platform;
-#[cfg(capsule_delivery)]
+#[cfg(any(capsule_delivery, configuration_tables))]
 use crate::print_line;
 
 #[derive(Debug, Parser)]
@@ -48,6 +49,9 @@ enum CapsuleSubcommands {
         #[arg(long)]
         capsule_id: u32,
     },
+    /// Print the configuration data of the firmware's JSON configuration table: each item as text if it is UTF-8, else as hex
+    #[command(next_display_order = None)]
+    ConfigData,
 }
 
 impl CapsuleCommand {
@@ -57,6 +61,7 @@ impl CapsuleCommand {
                 payload,
                 capsule_id,
             } => deliver(payload, *capsule_id),
+            CapsuleSubcommands::ConfigData => config_data(),
         }
     }
 }
@@ -82,6 +87,55 @@ fn deliver(_payload: &Path, _capsule_id: u32) -> Result<()> {
          GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW, reach EFI \
          variables only; deliver capsules on Linux, or in the UEFI Shell with uefisettings.efi"
     ))
+}
+
+/// Prints the configuration data of the firmware's JSON configuration table.
+#[cfg(configuration_tables)]
+fn config_data() -> Result<()> {
+    let data = CapsuleBackend::json_config_data()?;
+    print_line(format_args!("{}", config_data_report(&data.items)))?;
+    Ok(())
+}
+
+/// Fails: only the UEFI Shell build reads the configuration tables.
+#[cfg(not(configuration_tables))]
+fn config_data() -> Result<()> {
+    Err(no_system_table())
+}
+
+/// What config-data fails with on Linux.
+#[cfg(all(target_os = "linux", not(configuration_tables)))]
+fn no_system_table() -> anyhow::Error {
+    anyhow!(
+        "reading this configuration table is not supported on Linux yet; run uefisettings.efi \
+         in the UEFI Shell"
+    )
+}
+
+/// What config-data fails with on macOS and Windows.
+#[cfg(all(not(target_os = "linux"), not(configuration_tables)))]
+fn no_system_table() -> anyhow::Error {
+    anyhow!(
+        "uefisettings reads the configuration tables of the EFI System Table only in the UEFI \
+         Shell with uefisettings.efi"
+    )
+}
+
+/// What config-data prints on stdout about the ConfigData `items`: its own JSON object, as
+/// deliver's, whose "items" are each as {"text": ...} if it is UTF-8, as JSON text exchanged
+/// between systems is (RFC 8259 §8.1), else as {"hex": ...}, lowercase.
+#[cfg(configuration_tables)]
+fn config_data_report(items: &[Vec<u8>]) -> serde_json::Value {
+    let items: Vec<_> = items
+        .iter()
+        .map(|item| match std::str::from_utf8(item) {
+            Ok(text) => serde_json::json!({ "text": text }),
+            Err(_) => serde_json::json!({
+                "hex": item.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            }),
+        })
+        .collect();
+    serde_json::json!({ "items": items })
 }
 
 /// What deliver prints on stdout about a capsule of `capsule_size` bytes and the `capabilities`
@@ -135,10 +189,14 @@ mod tests {
                 ("b", u32::MAX),
             ),
         ] {
+            let parsed = capsule(args).unwrap_or_else(|error| panic!("parse {args:?}: {error}"));
             let CapsuleSubcommands::Deliver {
                 payload,
                 capsule_id,
-            } = capsule(args).unwrap_or_else(|error| panic!("parse {args:?}: {error}"));
+            } = parsed
+            else {
+                panic!("{args:?} is no deliver command: {parsed:?}");
+            };
 
             assert_eq!(
                 (payload.as_path(), capsule_id),
@@ -172,6 +230,21 @@ mod tests {
         }
     }
 
+    /// config-data takes no arguments.
+    #[test]
+    fn config_data_takes_no_arguments() {
+        assert_eq!(
+            capsule(&["config-data"]).map(|command| format!("{command:?}")),
+            Ok("ConfigData".to_owned()),
+            "config-data"
+        );
+        assert_eq!(
+            capsule(&["config-data", "a.json"]).err(),
+            Some(clap::error::ErrorKind::UnknownArgument),
+            "config-data a.json"
+        );
+    }
+
     /// deliver's report names the capsule's size, and the maximum size and reset type of
     /// QueryCapsuleCapabilities() as numbers, or null where the backend does not see them.
     #[cfg(capsule_delivery)]
@@ -201,6 +274,53 @@ mod tests {
         ] {
             assert_eq!(report, want, "{want}");
         }
+    }
+
+    /// config-data's report holds each item in order, as text if it is UTF-8, empty or not, and
+    /// as lowercase hex if it is not.
+    #[cfg(configuration_tables)]
+    #[test]
+    fn config_data_report_prints_utf8_as_text_and_the_rest_as_hex() {
+        let report = config_data_report(&[
+            br#"{"a":"\u00e9"}"#.to_vec(),
+            "é".as_bytes().to_vec(),
+            Vec::new(),
+            vec![0xff, 0x00, 0xab],
+            vec![0xc3],
+        ]);
+
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "items": [
+                    { "text": "{\"a\":\"\\u00e9\"}" },
+                    { "text": "é" },
+                    { "text": "" },
+                    { "hex": "ff00ab" },
+                    { "hex": "c3" },
+                ],
+            }),
+            "report"
+        );
+    }
+
+    /// What config-data fails with on Linux.
+    #[cfg(all(target_os = "linux", not(configuration_tables)))]
+    const NO_SYSTEM_TABLE: &str = "reading this configuration table is not supported on Linux \
+                                   yet; run uefisettings.efi in the UEFI Shell";
+
+    /// What config-data fails with on macOS and Windows.
+    #[cfg(all(not(target_os = "linux"), not(configuration_tables)))]
+    const NO_SYSTEM_TABLE: &str = "uefisettings reads the configuration tables of the EFI System \
+                                   Table only in the UEFI Shell with uefisettings.efi";
+
+    /// config-data refuses outside the UEFI Shell build, naming where it reads the table.
+    #[cfg(not(configuration_tables))]
+    #[test]
+    fn config_data_refuses_without_a_system_table() {
+        let error = config_data().expect_err("config-data without a System Table");
+
+        assert_eq!(error.to_string(), NO_SYSTEM_TABLE, "error");
     }
 
     /// deliver refuses on Windows before reading the payload, naming why.

@@ -809,10 +809,6 @@ mod tests {
 
     use super::*;
     #[cfg(firmware_memory_maps)]
-    use crate::hii::firmware_memory::efi_memory_map::MemoryType;
-    #[cfg(firmware_memory_maps)]
-    use crate::hii::firmware_memory::efi_memory_map::EFI_MEMORY_RUNTIME;
-    #[cfg(firmware_memory_maps)]
     use crate::hii::firmware_memory::fixture::write_firmware_memmap;
     #[cfg(firmware_memory_maps)]
     use crate::hii::firmware_memory::fixture::write_runtime_map;
@@ -822,6 +818,10 @@ mod tests {
     use crate::hii::memory_access_denied::MemoryOperation;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    #[cfg(firmware_memory_maps)]
+    use crate::memory_map::efi_memory_map::MemoryType;
+    #[cfg(firmware_memory_maps)]
+    use crate::memory_map::efi_memory_map::EFI_MEMORY_RUNTIME;
 
     /// Offset of Checksum in an ACPI table header, after Signature, Length and Revision.
     const ACPI_CHECKSUM_OFFSET: usize = 9;
@@ -905,14 +905,14 @@ mod tests {
     #[cfg(firmware_memory_maps)]
     mod efivar_bound {
         use super::*;
-        use crate::hii::firmware_memory::efi_memory_map::fixture::descriptor;
-        use crate::hii::firmware_memory::efi_memory_map::RangeRefusal;
         use crate::hii::firmware_memory::fdt_params::fixture::uefi_fdt;
         use crate::hii::firmware_memory::fdt_params::UefiFdtParams;
         use crate::hii::firmware_memory::kcore::fixture::kcore_fixture;
         use crate::hii::firmware_memory::runtime_memory::fixture::MemoryWithin;
         use crate::hii::firmware_memory::runtime_memory::fixture::UnreadMemory;
         use crate::hii::firmware_memory::MemoryMapUnavailable;
+        use crate::memory_map::efi_memory_map::fixture::descriptor;
+        use crate::memory_map::efi_memory_map::RangeRefusal;
 
         /// The regions of the bound tests' memory maps: runtime data, reserved memory and ACPI NVS
         /// without the RUNTIME attribute, System RAM, ACPI tables, and a runtime descriptor of

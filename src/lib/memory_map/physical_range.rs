@@ -14,38 +14,41 @@
 
 /// `size` bytes of physical memory at `start`, whose end does not overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::hii) struct PhysicalRange {
+pub(crate) struct PhysicalRange {
     start: u64,
     size: u64,
 }
 
 impl PhysicalRange {
     /// `size` bytes at `start`, unless the end overflows.
-    pub(in crate::hii) fn new(start: u64, size: u64) -> Option<Self> {
+    pub(crate) fn new(start: u64, size: u64) -> Option<Self> {
         start.checked_add(size)?;
         Some(Self { start, size })
     }
 
     /// The range from `start` to `end`, both inclusive, unless `end` is before `start` or the
     /// range ends past the end of memory.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
-    pub(in crate::hii) fn from_inclusive(start: u64, end: u64) -> Option<Self> {
+    #[cfg(any(
+        all(firmware_memory_maps, any(target_arch = "x86", target_arch = "x86_64")),
+        test
+    ))]
+    pub(crate) fn from_inclusive(start: u64, end: u64) -> Option<Self> {
         Self::new(start, end.checked_sub(start)?.checked_add(1)?)
     }
 
     #[cfg(test)]
-    pub(in crate::hii) fn start(self) -> u64 {
+    pub(crate) fn start(self) -> u64 {
         self.start
     }
 
     /// The end, exclusive.
-    pub(in crate::hii) fn end(self) -> u64 {
+    pub(crate) fn end(self) -> u64 {
         // Cannot overflow: new checked it.
         self.start + self.size
     }
 
     /// Whether the range holds `length` bytes at `address`.
-    pub(in crate::hii) fn holds(self, address: u64, length: u64) -> bool {
+    pub(crate) fn holds(self, address: u64, length: u64) -> bool {
         address
             .checked_sub(self.start)
             .and_then(|offset| self.size.checked_sub(offset))
@@ -53,7 +56,7 @@ impl PhysicalRange {
     }
 
     /// Whether the range shares a byte with `length` bytes at `address`.
-    pub(in crate::hii) fn overlaps(self, address: u64, length: u64) -> bool {
+    pub(crate) fn overlaps(self, address: u64, length: u64) -> bool {
         match address.checked_sub(self.start) {
             // `address` is in or past the range.
             Some(offset) => length > 0 && offset < self.size,

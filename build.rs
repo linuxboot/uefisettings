@@ -27,7 +27,7 @@ struct Capability {
     target_arches: Option<&'static [&'static str]>,
 }
 
-const CAPABILITIES: [Capability; 10] = [
+const CAPABILITIES: [Capability; 11] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
@@ -94,6 +94,13 @@ const CAPABILITIES: [Capability; 10] = [
     Capability {
         cfg: "variable_data",
         target_oses: &["linux", "uefi", "windows"],
+        target_arches: None,
+    },
+    // VendorTable and CapsuleBackend::json_config_data: the configuration tables of the EFI
+    // System Table, which the UEFI Shell build reads in place
+    Capability {
+        cfg: "configuration_tables",
+        target_oses: &["uefi"],
         target_arches: None,
     },
 ];

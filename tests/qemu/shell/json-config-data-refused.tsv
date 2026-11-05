@@ -1,0 +1,8 @@
+# The checks of shell/json-config-data-refused.nsh, the boot of
+# shell-json-config-data-past-region, -boot-services and -mmio. See check-shell-log.sh.
+# a TotalLength past the runtime region of the table, a table outside the runtime regions and one
+# in memory-mapped I/O are refused, before anything past the table's
+# Version and TotalLength is read; the address of a boot services pool may change from boot to
+# boot
+config-data	status	aborted
+config-data	json	.error_message | test("^read the (Version and TotalLength|TotalLength 16777216 bytes) of the JSON configuration table: 0x[0-9a-f]+\\+0x(8|1000000) lies in ")
