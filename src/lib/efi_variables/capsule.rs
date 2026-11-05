@@ -1,0 +1,302 @@
+// Copyright 2023 Meta Platforms, Inc. and affiliates.
+//
+// Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+//
+// 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+//! JSON capsules (UEFI 2.11 §23.5): the caller's payload, unchanged, behind an EFI_CAPSULE_HEADER
+//! (§8.5.3.1) and an EFI_JSON_CAPSULE_HEADER (§23.5.2), the bytes that UpdateCapsule() and Linux's
+//! capsule loader take. The backends deliver them: capsule_loader.rs on Linux, capsule_services.rs
+//! in the UEFI Shell.
+
+use thiserror::Error;
+
+use crate::hii::package::Guid;
+
+/// EFI_JSON_CAPSULE_ID_GUID, the CapsuleGuid of a JSON capsule (UEFI 2.11 §23.5.1).
+const EFI_JSON_CAPSULE_ID_GUID: Guid = Guid {
+    data1: 0x67d6_f4cd,
+    data2: 0xd6b8,
+    data3: 0x4573,
+    data4: [0xbf, 0x4a, 0xde, 0x5e, 0x25, 0x2d, 0x61, 0xae],
+};
+/// sizeof (EFI_CAPSULE_HEADER): CapsuleGuid, then the UINT32s HeaderSize, Flags and
+/// CapsuleImageSize (UEFI 2.11 §8.5.3.1). A JSON capsule's HeaderSize, as its
+/// EFI_JSON_CAPSULE_HEADER is "located at the lowest offset within the body" (§23.5.2).
+const CAPSULE_HEADER_SIZE: u32 = 16 + 3 * 4;
+/// sizeof (EFI_JSON_CAPSULE_HEADER) before its Payload: the UINT32s Version, CapsuleId and
+/// PayloadLength (UEFI 2.11 §23.5.2).
+const JSON_CAPSULE_HEADER_SIZE: u32 = 3 * 4;
+/// EFI_JSON_CAPSULE_HEADER's Version, "initially 0x00000001" (UEFI 2.11 §23.5.2).
+const JSON_CAPSULE_HEADER_VERSION: u32 = 1;
+/// CAPSULE_FLAGS_PERSIST_ACROSS_RESET (UEFI 2.11 §8.5.3.1).
+const CAPSULE_FLAGS_PERSIST_ACROSS_RESET: u32 = 0x0001_0000;
+
+/// When the firmware processes a capsule: "If a capsule has the CAPSULE_FLAGS_PERSIST_ACROSS_RESET
+/// Flag set in its header, the firmware will process the capsules after system reset. [...] If
+/// this flag is not set, the firmware will process the capsules immediately." (UEFI 2.11
+/// §8.5.3.1). A JSON capsule never has CAPSULE_FLAGS_POPULATE_SYSTEM_TABLE, which "must be 0"
+/// (§23.5.3), nor CAPSULE_FLAGS_INITIATE_RESET, as uefisettings never resets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Processing {
+    /// Before UpdateCapsule() returns, in boot services
+    #[cfg_attr(
+        all(target_os = "linux", not(test)),
+        expect(
+            dead_code,
+            reason = "only the UEFI Shell build delivers for immediate processing"
+        )
+    )]
+    Immediate,
+    /// At the next reset: "firmware configuration and firmware update are not available in EFI
+    /// runtime" (UEFI 2.11 §23.5.1)
+    #[cfg_attr(
+        all(target_os = "uefi", not(test)),
+        expect(
+            dead_code,
+            reason = "only Linux's capsule loader delivers for after a reset"
+        )
+    )]
+    AfterReset,
+}
+
+impl Processing {
+    /// The Flags of an EFI_CAPSULE_HEADER that ask for this.
+    fn flags(self) -> u32 {
+        match self {
+            Self::Immediate => 0,
+            Self::AfterReset => CAPSULE_FLAGS_PERSIST_ACROSS_RESET,
+        }
+    }
+}
+
+/// A JSON capsule: an EFI_CAPSULE_HEADER, an EFI_JSON_CAPSULE_HEADER, then the payload as the
+/// caller gave it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct JsonCapsule(Vec<u8>);
+
+impl JsonCapsule {
+    /// The capsule of `payload`, whose EFI_JSON_CAPSULE_HEADER carries `capsule_id`, for the
+    /// firmware to process as `processing` says. An empty payload is refused: "A capsule in
+    /// which PayloadLength is zero will not be processed." (UEFI 2.11 §23.5.3)
+    pub(crate) fn new(
+        payload: &[u8],
+        capsule_id: u32,
+        processing: Processing,
+    ) -> Result<Self, PayloadError> {
+        if payload.is_empty() {
+            return Err(PayloadError::Empty);
+        }
+        let too_large = PayloadError::TooLarge(payload.len());
+        let payload_length = u32::try_from(payload.len()).map_err(|_| too_large)?;
+        let image_size = capsule_image_size(payload_length).ok_or(too_large)?;
+        let fields = [
+            CAPSULE_HEADER_SIZE,
+            processing.flags(),
+            image_size,
+            JSON_CAPSULE_HEADER_VERSION,
+            capsule_id,
+            payload_length,
+        ];
+
+        let mut bytes = Vec::with_capacity(usize::try_from(image_size).map_err(|_| too_large)?);
+        bytes.extend_from_slice(&<[u8; 16]>::from(EFI_JSON_CAPSULE_ID_GUID));
+        bytes.extend(fields.iter().flat_map(|field| field.to_le_bytes()));
+        bytes.extend_from_slice(payload);
+        Ok(Self(bytes))
+    }
+
+    /// Its bytes, from its EFI_CAPSULE_HEADER on.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Its size, CapsuleImageSize: the bytes of its headers and payload.
+    pub(crate) fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// The CapsuleImageSize of a JSON capsule whose PayloadLength is `payload_length`, "Size in bytes
+/// of the capsule (including capsule header)" (UEFI 2.11 §8.5.3.1), unless it overflows its
+/// UINT32.
+fn capsule_image_size(payload_length: u32) -> Option<u32> {
+    payload_length.checked_add(CAPSULE_HEADER_SIZE + JSON_CAPSULE_HEADER_SIZE)
+}
+
+/// A payload that JsonCapsule::new refuses. The messages spell "section", as edk2's terminals
+/// but VT-UTF8 show '?' for '§' (edk2-stable202508 TerminalDxe/TerminalConOut.c
+/// TerminalConOutOutputString()).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum PayloadError {
+    #[error(
+        "the JSON payload is empty: \"A capsule in which PayloadLength is zero will not be \
+         processed.\" (UEFI 2.11 section 23.5.3)"
+    )]
+    Empty,
+    #[error(
+        "a JSON payload of {0} bytes does not fit a capsule, whose size is a UINT32 (UEFI 2.11 \
+         section 8.5.3.1)"
+    )]
+    TooLarge(usize),
+}
+
+/// EFI_RESET_TYPE (UEFI 2.11 §8.5.1.1), the reset that QueryCapsuleCapabilities() asks for: one
+/// of the consts below, or a value that later specifications define.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResetType(pub u32);
+
+impl ResetType {
+    /// EfiResetCold
+    pub const COLD: Self = Self(0);
+    /// EfiResetWarm
+    pub const WARM: Self = Self(1);
+    /// EfiResetShutdown
+    pub const SHUTDOWN: Self = Self(2);
+    /// EfiResetPlatformSpecific
+    pub const PLATFORM_SPECIFIC: Self = Self(3);
+}
+
+/// What QueryCapsuleCapabilities() tells of a capsule (UEFI 2.11 §8.5.3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CapsuleCapabilities {
+    /// MaximumCapsuleSize: the largest capsule that UpdateCapsule() takes, in bytes
+    pub maximum_capsule_size: u64,
+    /// ResetType: "the type of reset required for the capsule update"
+    pub reset_type: ResetType,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capsule of the payload b"{}" with CapsuleId 0x01020304, without its Flags (bytes
+    /// 20-23) and as the specification lays it out, field by field, little-endian.
+    const CAPSULE_OF_BRACES: [u8; 42] = [
+        // CapsuleGuid: 67D6F4CD-D6B8-4573-BF4A-DE5E252D61AE, Data1-Data3 little-endian
+        0xcd, 0xf4, 0xd6, 0x67, 0xb8, 0xd6, 0x73, 0x45, 0xbf, 0x4a, 0xde, 0x5e, 0x25, 0x2d, 0x61,
+        0xae, //
+        // HeaderSize: 28
+        28, 0, 0, 0, //
+        // Flags: the test sets them
+        0, 0, 0, 0, //
+        // CapsuleImageSize: 28 + 12 + 2
+        42, 0, 0, 0, //
+        // Version: 1
+        1, 0, 0, 0, //
+        // CapsuleId
+        0x04, 0x03, 0x02, 0x01, //
+        // PayloadLength: 2
+        2, 0, 0, 0, //
+        // Payload
+        b'{', b'}',
+    ];
+
+    /// Each processing has the header bytes of the specification, with only
+    /// CAPSULE_FLAGS_PERSIST_ACROSS_RESET of the flags, and that only after a reset.
+    #[test]
+    fn json_capsules_have_the_header_bytes_of_the_specification() {
+        for (processing, flags) in [
+            (Processing::Immediate, [0, 0, 0, 0]),
+            (Processing::AfterReset, [0, 0, 1, 0]),
+        ] {
+            let mut want = CAPSULE_OF_BRACES;
+            want[20..24].copy_from_slice(&flags);
+
+            let capsule = JsonCapsule::new(b"{}", 0x0102_0304, processing).expect("make a capsule");
+
+            assert_eq!(capsule.as_bytes(), want, "{processing:?}");
+            assert_eq!(capsule.size(), want.len(), "{processing:?}");
+        }
+    }
+
+    /// No capsule has CAPSULE_FLAGS_POPULATE_SYSTEM_TABLE (0x00020000),
+    /// CAPSULE_FLAGS_INITIATE_RESET (0x00040000) or a flag of its CapsuleGuid's (Flags[15:0]).
+    #[test]
+    fn json_capsules_never_populate_the_system_table_or_initiate_a_reset() {
+        for processing in [Processing::Immediate, Processing::AfterReset] {
+            let capsule = JsonCapsule::new(b"[]", 0, processing).expect("make a capsule");
+            let flags = capsule
+                .as_bytes()
+                .get(20..24)
+                .and_then(|flags| <[u8; 4]>::try_from(flags).ok())
+                .map(u32::from_le_bytes)
+                .expect("the Flags of the capsule");
+
+            assert_eq!(
+                flags & !CAPSULE_FLAGS_PERSIST_ACROSS_RESET,
+                0,
+                "{processing:?}: flags {flags:#010x}"
+            );
+        }
+    }
+
+    /// The payload follows the headers byte for byte, every byte value and a CapsuleId of
+    /// u32::MAX included, and CapsuleImageSize and PayloadLength count it.
+    #[test]
+    fn json_capsules_carry_the_payload_unchanged() {
+        let payload: Vec<u8> = (0..=255).cycle().take(5000).collect();
+
+        let capsule =
+            JsonCapsule::new(&payload, u32::MAX, Processing::AfterReset).expect("make a capsule");
+
+        let bytes = capsule.as_bytes();
+        assert_eq!(bytes.get(40..), Some(&payload[..]), "payload");
+        assert_eq!(bytes.get(24..28), Some(&5040u32.to_le_bytes()[..]), "size");
+        assert_eq!(bytes.get(32..36), Some(&[0xff; 4][..]), "CapsuleId");
+        assert_eq!(
+            bytes.get(36..40),
+            Some(&5000u32.to_le_bytes()[..]),
+            "length"
+        );
+    }
+
+    /// An empty payload makes no capsule, while one of a single byte makes one.
+    #[test]
+    fn an_empty_payload_makes_no_capsule() {
+        for processing in [Processing::Immediate, Processing::AfterReset] {
+            assert_eq!(
+                JsonCapsule::new(b"", 1, processing),
+                Err(PayloadError::Empty),
+                "{processing:?}"
+            );
+            assert_eq!(
+                JsonCapsule::new(b"0", 1, processing).map(|capsule| capsule.size()),
+                Ok(41),
+                "{processing:?}: one byte"
+            );
+        }
+        assert_eq!(
+            PayloadError::Empty.to_string(),
+            "the JSON payload is empty: \"A capsule in which PayloadLength is zero will not be \
+             processed.\" (UEFI 2.11 section 23.5.3)",
+            "message"
+        );
+    }
+
+    /// CapsuleImageSize counts the 40 bytes of the headers, up to u32::MAX, past which there is
+    /// none.
+    #[test]
+    fn capsule_image_size_is_a_uint32() {
+        for (payload_length, want) in [
+            (1, Some(41)),
+            (u32::MAX - 40, Some(u32::MAX)),
+            (u32::MAX - 39, None),
+            (u32::MAX, None),
+        ] {
+            assert_eq!(capsule_image_size(payload_length), want, "{payload_length}");
+        }
+        assert_eq!(
+            PayloadError::TooLarge(4_294_967_257).to_string(),
+            "a JSON payload of 4294967257 bytes does not fit a capsule, whose size is a UINT32 \
+             (UEFI 2.11 section 8.5.3.1)",
+            "message"
+        );
+    }
+}

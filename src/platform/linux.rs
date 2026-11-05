@@ -14,10 +14,12 @@
 //! dump-efivars, the flag --efivars, and the machine's identified backend for get and set; it
 //! shares hii extract-db and an optional -f/--filename with the Windows build.
 
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use clap::Parser;
@@ -315,6 +317,11 @@ pub(super) fn auto_set(
         hii_set(question, value, selection, setup_password, json)?;
     }
     Ok(())
+}
+
+/// The bytes of the file `path`, the payload of capsule deliver.
+pub(super) fn read_capsule_payload(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).with_context(|| format!("read the payload {}", path.display()))
 }
 
 fn prioritize_backend(machine: &MachineInfo, json: bool) -> Result<Backend> {

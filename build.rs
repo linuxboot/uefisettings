@@ -27,7 +27,7 @@ struct Capability {
     target_arches: Option<&'static [&'static str]>,
 }
 
-const CAPABILITIES: [Capability; 8] = [
+const CAPABILITIES: [Capability; 9] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
@@ -79,6 +79,13 @@ const CAPABILITIES: [Capability; 8] = [
     // variables, which Windows does not give programs
     Capability {
         cfg: "variable_storage_info",
+        target_oses: &["linux", "uefi"],
+        target_arches: None,
+    },
+    // CapsuleDelivery and CapsuleBackend: delivering capsules to this machine's firmware, which
+    // the Win32 calls of the Windows build cannot
+    Capability {
+        cfg: "capsule_delivery",
         target_oses: &["linux", "uefi"],
         target_arches: None,
     },

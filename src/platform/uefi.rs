@@ -15,11 +15,15 @@
 
 use std::fmt::Debug;
 use std::io;
+use std::path::Path;
+use std::ptr;
 use std::ptr::NonNull;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use clap::Subcommand;
+use log::warn;
 use uefi::boot;
 use uefi::boot::OpenProtocolAttributes;
 use uefi::boot::OpenProtocolParams;
@@ -29,8 +33,11 @@ use uefi::proto::console::text::InputEx;
 use uefi::proto::console::text::Key;
 use uefi::proto::console::text::ScanCode;
 use uefi::proto::unsafe_protocol;
+use uefi::CStr16;
+use uefi::CString16;
 use uefi::Handle;
 use uefi::StatusExt;
+use uefi_raw::protocol::file_system::FileMode;
 use uefi_raw::protocol::shell::ShellProtocol;
 use uefi_raw::protocol::shell_params::ShellFileHandle;
 use uefi_raw::protocol::shell_params::ShellParametersProtocol;
@@ -212,6 +219,92 @@ fn open_shell_protocol() -> io::Result<ScopedProtocol<ShellFileIo>> {
         )
     }
     .map_err(|error| firmware_error("OpenProtocol() of EFI_SHELL_PROTOCOL", error))
+}
+
+/// The bytes of the file `path`, the payload of capsule deliver, which EFI_SHELL_PROTOCOL opens
+/// as the Shell's own commands do: on a mapping such as fs0:, or relative to the current
+/// directory (edk2-stable202608 ShellProtocol.c:519-537, EfiShellGetDevicePathFromFilePath()).
+pub(super) fn read_capsule_payload(path: &Path) -> Result<Vec<u8>> {
+    let name = path
+        .to_str()
+        .and_then(|name| CString16::try_from(name).ok())
+        .with_context(|| format!("the payload path {} is not UCS-2", path.display()))?;
+    let protocol = open_shell_protocol()?;
+    let shell = protocol
+        .get()
+        .ok_or_else(|| io::Error::other("EFI_SHELL_PROTOCOL has no interface"))?;
+    let file = ShellFile::open(&shell.0, &name)
+        .with_context(|| format!("open the payload {}", path.display()))?;
+    file.read_to_end()
+        .with_context(|| format!("read the payload {}", path.display()))
+}
+
+/// A file that EFI_SHELL_PROTOCOL.OpenFileByName() opened for reading, which drop closes.
+struct ShellFile<'shell> {
+    shell: &'shell ShellProtocol,
+    handle: ShellFileHandle,
+}
+
+impl<'shell> ShellFile<'shell> {
+    fn open(shell: &'shell ShellProtocol, name: &CStr16) -> io::Result<Self> {
+        let mut handle = ptr::null_mut();
+        // SAFETY: OpenFileByName() of a NUL-terminated UCS-2 name, which stores a handle or NULL
+        // in `handle`
+        unsafe {
+            (shell.open_file_by_name)(name.as_ptr().cast(), &mut handle, FileMode::READ.bits())
+        }
+        .to_result()
+        .map_err(|error| firmware_error("OpenFileByName()", error))?;
+        Ok(Self { shell, handle })
+    }
+
+    /// Every byte of the file: GetFileSize() of them, which ReadFile() reads in turn.
+    fn read_to_end(&self) -> io::Result<Vec<u8>> {
+        let mut size = 0;
+        // SAFETY: GetFileSize() of the open handle, which stores its size in `size`
+        unsafe { (self.shell.get_file_size)(self.handle, &mut size) }
+            .to_result()
+            .map_err(|error| firmware_error("GetFileSize()", error))?;
+        let size = usize::try_from(size).map_err(io::Error::other)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size).map_err(io::Error::other)?;
+        bytes.resize(size, 0);
+
+        let mut filled = 0;
+        while let Some(rest) = bytes.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+            let asked = rest.len();
+            let mut read = asked;
+            // SAFETY: ReadFile() of the open handle stores at most BufferSize bytes, as many as
+            // rest holds, and their number in `read`
+            unsafe { (self.shell.read_file)(self.handle, &mut read, rest.as_mut_ptr().cast()) }
+                .to_result()
+                .map_err(|error| firmware_error("ReadFile()", error))?;
+            match read {
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("ReadFile() ended after {filled} of its {size} bytes"),
+                    ))
+                }
+                read if read > asked => {
+                    return Err(io::Error::other(format!(
+                        "ReadFile() read {read} bytes into a buffer of {asked}"
+                    )))
+                }
+                read => filled += read,
+            }
+        }
+        Ok(bytes)
+    }
+}
+
+impl Drop for ShellFile<'_> {
+    fn drop(&mut self) {
+        // SAFETY: CloseFile() of the handle that OpenFileByName() opened, once
+        if let Err(error) = unsafe { (self.shell.close_file)(self.handle) }.to_result() {
+            warn!("CloseFile() of the payload: {:?}", error.status());
+        }
+    }
 }
 
 /// The Shell's standard input: EFI_SHELL_PARAMETERS_PROTOCOL.StdIn of this image, through

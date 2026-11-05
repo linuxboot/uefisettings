@@ -1,0 +1,11 @@
+# The checks of shell/capsule.nsh, the boot of shell-capsule. See check-shell-log.sh.
+# The firmware's QueryCapsuleCapabilities() refuses a JSON capsule, so uefisettings.efi names
+# its status and calls no UpdateCapsule()
+deliver	status	aborted
+deliver	json	. == {"error_message": "deliver a JSON capsule of 67 bytes: QueryCapsuleCapabilities() of the JSON capsule: UNSUPPORTED"}
+# an empty payload is refused before the firmware is asked
+deliver-empty	status	aborted
+deliver-empty	json	. == {"error_message": "the JSON payload is empty: \"A capsule in which PayloadLength is zero will not be processed.\" (UEFI 2.11 section 23.5.3)"}
+# a missing payload is named with the status of the Shell's OpenFileByName()
+deliver-missing	status	aborted
+deliver-missing	json	. == {"error_message": "open the payload capsule\\missing.json: OpenFileByName(): NOT_FOUND"}

@@ -22,8 +22,12 @@
 compile_error!("uefisettings builds for Linux, macOS, the UEFI Shell and Windows only");
 
 #[cfg(target_os = "linux")]
+mod capsule_loader;
+#[cfg(target_os = "uefi")]
+mod capsule_services;
+#[cfg(target_os = "linux")]
 mod chattr;
-#[cfg(any(variable_names, variable_info, variable_storage_info))]
+#[cfg(any(variable_names, variable_info, variable_storage_info, capsule_delivery))]
 mod efi_variables;
 mod exit_status;
 pub mod exports;

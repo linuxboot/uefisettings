@@ -25,12 +25,20 @@ use uefisettings_backend_thrift::Question;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
+#[cfg(capsule_delivery)]
+use crate::efi_variables::deliver_json_capsule;
 #[cfg(variable_names)]
 use crate::efi_variables::list_variables;
 #[cfg(any(variable_names, variable_info))]
 use crate::efi_variables::parse_vendor;
 #[cfg(variable_storage_info)]
 use crate::efi_variables::query_storage;
+#[cfg(capsule_delivery)]
+pub use crate::efi_variables::CapsuleCapabilities;
+#[cfg(capsule_delivery)]
+pub use crate::efi_variables::CapsuleDelivered;
+#[cfg(capsule_delivery)]
+pub use crate::efi_variables::ResetType;
 #[cfg(variable_info)]
 use crate::efi_variables::VariableInfoSource;
 #[cfg(variable_storage_info)]
@@ -146,6 +154,20 @@ impl VariableBackend {
     /// `attributes`.
     pub fn storage(attributes: VariableAttributes) -> Result<VariableStorage> {
         query_storage(&Self::system_variable_storage(), attributes)
+    }
+}
+
+/// The capsules for this machine's firmware (UEFI 2.11 §8.5.3).
+#[cfg(capsule_delivery)]
+pub struct CapsuleBackend {}
+
+#[cfg(capsule_delivery)]
+impl CapsuleBackend {
+    /// Delivers `payload`, unchanged, to this machine's firmware as a JSON capsule whose
+    /// EFI_JSON_CAPSULE_HEADER carries `capsule_id` (UEFI 2.11 §23.5); an empty payload is
+    /// refused first. It never resets the machine.
+    pub fn deliver_json(payload: &[u8], capsule_id: u32) -> Result<CapsuleDelivered> {
+        deliver_json_capsule(&Self::system_capsule_delivery(), payload, capsule_id)
     }
 }
 

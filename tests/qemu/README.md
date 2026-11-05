@@ -84,7 +84,8 @@ command line lacks `uefisettings.test=`. They build only with the `test-vm` feat
 
 A UEFI Shell boot names a script of [`shell/`](shell/) instead of a test binary: `run.sh`
 boots no kernel, so the firmware starts its UEFI Shell, which runs the script as
-`startup.nsh` from a copy of the ESP that also holds `uefisettings.efi`. Then
+`startup.nsh` from a copy of the ESP that also holds `uefisettings.efi` and, in `\capsule`,
+the capsule payloads of [`shell/capsule/`](shell/capsule/). Then
 [`check-shell-log.sh`](check-shell-log.sh) checks each step of the script in
 `bootN.console.log` against the `.tsv` file of the script: its output, which `%lasterror%`
 the shell set, and the JSON of `uefisettings.efi`. The line `@LINUX@` of a script starts

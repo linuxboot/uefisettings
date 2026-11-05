@@ -37,6 +37,8 @@ use uefisettings::exports::SetOptions;
 use uefisettings::exports::ShowIfrOptions;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
+#[cfg(system_variables)]
+use capsule_command::CapsuleCommand;
 use platform::EfivarArgs;
 use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
@@ -55,6 +57,8 @@ use variable_command::VariableCommand;
 mod platform;
 // The UEFI Shell's `-` is in platform/uefi.rs; the macOS build has no secret flags, as it reads
 // only HiiDB files and efivar dumps.
+#[cfg(system_variables)]
+mod capsule_command;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod secret_stdin;
 #[cfg(system_variables)]
@@ -118,6 +122,9 @@ enum Commands {
     /// Commands on this machine's EFI variables, which never print their data
     #[cfg(system_variables)]
     Variable(VariableCommand),
+    /// Commands that pass capsules to this machine's firmware
+    #[cfg(system_variables)]
+    Capsule(CapsuleCommand),
     #[command(flatten)]
     Platform(PlatformCommands),
 }
@@ -459,6 +466,8 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
         }
         #[cfg(system_variables)]
         Commands::Variable(command) => command.run()?,
+        #[cfg(system_variables)]
+        Commands::Capsule(command) => command.run()?,
         Commands::Platform(command) => command.run()?,
     }
     Ok(())
@@ -876,6 +885,26 @@ mod tests {
             "8BE4DF61-93CA-11D2-AA0D-00E098032B8C",
         ][..]]);
         for command in commands {
+            let argv = [&["uefisettings"][..], command].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            assert!(parsed.is_ok(), "{command:?}: {parsed:?}");
+        }
+    }
+
+    /// The capsule commands parse, which the macOS build lacks, as it reaches no firmware.
+    #[cfg(system_variables)]
+    #[test]
+    fn capsule_commands_parse() {
+        for command in [
+            &["capsule", "deliver", "payload.json", "--capsule-id", "1"][..],
+            &[
+                "capsule",
+                "deliver",
+                "--capsule-id",
+                "4294967295",
+                "payload.json",
+            ],
+        ] {
             let argv = [&["uefisettings"][..], command].concat();
             let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
             assert!(parsed.is_ok(), "{command:?}: {parsed:?}");

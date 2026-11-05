@@ -13,7 +13,15 @@
 //! The EFI variables of a machine, never their data (UEFI 2.10 §8.2): what the variable commands
 //! make of what each backend tells. The backends do the I/O: efivarfs on Linux (hii/efivarfs.rs),
 //! the runtime services in the UEFI Shell (hii/variable_services.rs), and the firmware environment
-//! calls on Windows (hii/firmware_environment.rs).
+//! calls on Windows (hii/firmware_environment.rs). Capsules for the machine's firmware (UEFI 2.11
+//! §8.5.3) too: their bytes come from capsule.rs, and Linux's capsule loader
+//! (capsule_loader.rs) or the runtime services in the UEFI Shell (capsule_services.rs) take
+//! them.
+
+#[cfg(capsule_delivery)]
+mod capsule;
+#[cfg(capsule_delivery)]
+mod capsule_delivery;
 
 #[cfg(all(variable_names, any(target_os = "uefi", test)))]
 use anyhow::anyhow;
@@ -24,6 +32,25 @@ use anyhow::Result;
 use serde::Serialize;
 #[cfg(variable_storage_info)]
 use thiserror::Error;
+
+#[cfg(capsule_delivery)]
+pub use capsule::CapsuleCapabilities;
+#[cfg(capsule_delivery)]
+pub(crate) use capsule::JsonCapsule;
+#[cfg(capsule_delivery)]
+pub(crate) use capsule::Processing;
+#[cfg(capsule_delivery)]
+pub use capsule::ResetType;
+#[cfg(capsule_delivery)]
+pub(crate) use capsule_delivery::deliver_json_capsule;
+#[cfg(capsule_delivery)]
+pub use capsule_delivery::CapsuleDelivered;
+#[cfg(capsule_delivery)]
+pub(crate) use capsule_delivery::CapsuleDelivery;
+#[cfg(all(capsule_delivery, target_os = "uefi"))]
+pub(crate) use capsule_delivery::CapsuleServices;
+#[cfg(all(capsule_delivery, target_os = "uefi"))]
+pub(crate) use capsule_delivery::UpdateCapsuleDelivery;
 
 #[cfg(any(variable_names, variable_info))]
 use crate::hii::package::Guid;

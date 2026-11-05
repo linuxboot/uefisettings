@@ -13,15 +13,19 @@
 //! The exports that only the UEFI Shell build has: those that read the HII database of the
 //! firmware it runs on and write its variables, through boot services.
 //!
-//! Every export that reaches this firmware, those here, VariableBackend's, and get, set,
-//! list-questions and show-ifr of EfivarSource::System, calls the uefi crate, which panics
-//! unless the image has initialized it: uefi::table::set_system_table, then
+//! Every export that reaches this firmware, those here, VariableBackend's, CapsuleBackend's, and
+//! get, set, list-questions and show-ifr of EfivarSource::System, calls the uefi crate, which
+//! panics unless the image has initialized it: uefi::table::set_system_table, then
 //! uefi::boot::set_image_handle, as uefisettings.efi's entry point uefi_std_entry does.
 
 use anyhow::Result;
 
+use super::CapsuleBackend;
 use super::HiiBackend;
 use super::VariableBackend;
+use crate::capsule_services::RuntimeCapsuleServices;
+use crate::efi_variables::CapsuleDelivery;
+use crate::efi_variables::UpdateCapsuleDelivery;
 use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
@@ -59,6 +63,14 @@ impl VariableBackend {
     /// The storage of this firmware's variables, from QueryVariableInfo().
     pub(super) fn system_variable_storage() -> impl VariableStorageInfo {
         VariableServices
+    }
+}
+
+/// Where the capsule commands deliver: this firmware, through its Capsule Services.
+impl CapsuleBackend {
+    /// QueryCapsuleCapabilities(), then UpdateCapsule().
+    pub(super) fn system_capsule_delivery() -> impl CapsuleDelivery {
+        UpdateCapsuleDelivery(RuntimeCapsuleServices)
     }
 }
 

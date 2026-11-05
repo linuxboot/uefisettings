@@ -33,10 +33,13 @@ use uefisettings_backend_thrift::Question;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
+use super::CapsuleBackend;
 use super::DumpEfivarsOptions;
 use super::HiiBackend;
 use super::SettingsBackend;
 use super::VariableBackend;
+use crate::capsule_loader::CapsuleLoader;
+use crate::efi_variables::CapsuleDelivery;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::efi_variables::VariableStorageInfo;
@@ -83,6 +86,14 @@ impl VariableBackend {
     /// The storage of this machine's EFI variables, as the statfs of its efivarfs tells it.
     pub(super) fn system_variable_storage() -> impl VariableStorageInfo {
         EfivarFiles::system()
+    }
+}
+
+/// Where the capsule commands deliver: this machine's capsule loader.
+impl CapsuleBackend {
+    /// /dev/efi_capsule_loader, which passes a capsule to the firmware's UpdateCapsule().
+    pub(super) fn system_capsule_delivery() -> impl CapsuleDelivery {
+        CapsuleLoader::system()
     }
 }
 

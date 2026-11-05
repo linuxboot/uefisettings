@@ -68,3 +68,7 @@ required-features = ["test-vm"]
 [[test]]
 name = "secboot"
 required-features = ["test-vm"]
+
+[[test]]
+name = "capsule"
+required-features = ["test-vm"]

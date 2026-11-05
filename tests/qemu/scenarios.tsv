@@ -38,6 +38,9 @@ shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 shell-authA7	/DriverSample.efi	my-ifr-nv-data-authA7.json	shell:authA7	-
 shell-rng	-	-	shell:rng	devices=virtio-rng
+capsule	-	-	capsule	arch=x86_64,aarch64
+capsule-payload	-	-	capsule/deliver_refuses_an_empty_or_missing_payload	arch=i686
+shell-capsule	-	-	shell:capsule	-
 secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
 secboot-user	-	-	secboot/user_mode	firmware=secboot-user
 shell-secboot-setup	-	-	shell:secboot-setup	firmware=secboot-setup

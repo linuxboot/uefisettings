@@ -449,10 +449,11 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         case $spec in
         shell:*)
             # Without a kernel, the firmware boots its UEFI Shell, which runs startup.nsh:
-            # the boot's script, on a copy of the ESP that also holds uefisettings.efi, and
-            # the kernel and initrd, which the line @LINUX@ of the script starts from the
-            # shell, into the guest test boot_smoke. The Secure Boot scenarios also get the
-            # pinned Shell, as the removable media boot loader, and their payloads in \auth.
+            # the boot's script, on a copy of the ESP that also holds uefisettings.efi, the
+            # capsule payloads of shell/capsule in \capsule, and the kernel and initrd, which
+            # the line @LINUX@ of the script starts from the shell, into the guest test
+            # boot_smoke. The Secure Boot scenarios also get the pinned Shell, as the removable
+            # media boot loader, and their payloads in \auth.
             script=$here/shell/${spec#shell:}
             esp=$log.esp
             cp -r "$run/esp" "$esp"
@@ -462,6 +463,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
                 cp "$dir/keys/shell/"*.auth "$esp/auth/"
             fi
             cp "$run/shell-esp/uefisettings.efi" "$esp/"
+            cp -r "$here/shell/capsule" "$esp/"
             cp "$vmlinuz" "$esp/vmlinuz.efi"
             cp "$dir/initrd.img" "$esp/initrd.img"
             linux="vmlinuz.efi initrd=\\initrd.img console=$console panic=-1"

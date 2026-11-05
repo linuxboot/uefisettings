@@ -59,6 +59,7 @@ uefisettings hii list-questions --efivars efivars
 
 ```plain
 Commands:
+  capsule            Commands that pass capsules to this machine's firmware
   get                Auto-identify backend and get the current value of a question
   help               Print this message or the help of the given subcommand(s)
   hii                Commands which work on machines exposing the UEFI HiiDB
@@ -96,6 +97,15 @@ Commands:
            left
 ```
 
+`capsule`:
+
+```plain
+Commands:
+  deliver  Deliver a file to the firmware, unchanged, as the JSON payload of a configuration
+           capsule; it never resets the machine
+  help     Print this message or the help of the given subcommand(s)
+```
+
 `ilo`:
 
 ```plain
@@ -111,9 +121,9 @@ Commands:
 
 ## In the UEFI Shell
 
-`uefisettings.efi` runs `get`, `set`, `show-translations`, the `variable` commands and the
-`hii` commands but `extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots; it
-also reaches boot-service-only variables, and has no `-f` or `--efivars`.
+`uefisettings.efi` runs `get`, `set`, `show-translations`, the `variable` and `capsule` commands
+and the `hii` commands but `extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots;
+it also reaches boot-service-only variables, and has no `-f` or `--efivars`.
 
 ```sh
 rustup target add x86_64-unknown-uefi  # or i686-unknown-uefi, aarch64-unknown-uefi
@@ -124,7 +134,8 @@ cargo build --release --target x86_64-unknown-uefi
 FS0:\> uefisettings.efi hii get --json "Activate this check box"
 ```
 
-Exit statuses, setup passwords, `variable` and Secure Boot: see the [appendix](#appendix).
+Exit statuses, setup passwords, `variable`, capsules and Secure Boot: see the
+[appendix](#appendix).
 
 ---
 
@@ -139,7 +150,8 @@ Pass `--no-efivars` to read no variables. No driver is shipped with this reposit
 and none has been tested here. Without a driver, `-f` still reads a HiiDB file, and,
 when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
 `variable list` and `variable storage` fail there: the firmware environment calls reach a
-variable by its name only, and have no QueryVariableInfo().
+variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
+reach EFI variables only.
 
 ---
 
@@ -149,7 +161,7 @@ variable by its name only, and have no QueryVariableInfo().
 and writes nothing: `hii get`, `hii list-questions` and `hii show-ifr` read question values from
 an efivars dump that `hii dump-efivars` wrote on Linux (`--efivars DIR`, with its HiiDB unless
 `-f` names one) or from none (`--no-efivars`, with `-f`), and `hii list-strings` reads the HiiDB
-file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `variable`, `hii set`,
+file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `variable`, `capsule`, `hii set`,
 `hii extract-db` or `hii dump-efivars`. Dumps: see the [appendix](#appendix).
 
 ---
@@ -342,6 +354,41 @@ of those default attributes only, and no maximum variable size, which shows as `
 6.5.4 fail that statfs, and with it `variable list` and `variable info` of a missing variable, where
 the firmware's QueryVariableInfo() fails or is not supported at runtime (fixed by 79b83606abc7 in
 6.5.5 and 6.6).
+
+</details>
+
+<details>
+<summary>Capsules</summary>
+
+`capsule deliver PAYLOAD --capsule-id ID` passes the file PAYLOAD to the firmware, unchanged, as
+the JSON payload of a configuration capsule (UEFI 2.11 §23.5): an EFI_CAPSULE_HEADER whose
+CapsuleGuid is EFI_JSON_CAPSULE_ID_GUID, an EFI_JSON_CAPSULE_HEADER whose CapsuleId is ID, then
+the payload, which uefisettings neither parses nor checks against a schema; it refuses an empty
+one, which the firmware "will not" process (§23.5.3). It prints a JSON object of its own, with no
+`-j`: `capsule_size`, the bytes delivered, and what QueryCapsuleCapabilities() (§8.5.3.4) told of
+the capsule, `maximum_capsule_size` and `reset_type`, an EFI_RESET_TYPE (§8.5.1.1: 0 cold, 1 warm, 2
+shutdown, 3 platform-specific) that it returned for this capsule, or `null` where uefisettings does
+not see them. A capsule that `uefisettings.efi` delivers has no CAPSULE_FLAGS_PERSIST_ACROSS_RESET,
+so the firmware has processed it when UpdateCapsule() returns (§8.5.3.1), and its `reset_type`
+states no reset requirement, which only a query with that flag determines (§8.5.3.4; edk2 answers
+EfiResetCold for every such capsule). It never resets the machine.
+
+`uefisettings.efi` asks QueryCapsuleCapabilities() first, then passes a capsule no larger than it
+takes to UpdateCapsule(), for the firmware to process before that returns.
+
+```plain
+FS0:\> uefisettings.efi capsule deliver config.json --capsule-id 1
+```
+
+On Linux, `uefisettings` writes the capsule to `/dev/efi_capsule_loader`, which needs
+CONFIG_EFI_CAPSULE_LOADER. That loader asks QueryCapsuleCapabilities() and calls UpdateCapsule()
+itself, and tells its writer neither MaximumCapsuleSize nor ResetType: a refusal is the write's
+errno (EINVAL for EFI_UNSUPPORTED, ENOSPC for EFI_OUT_OF_RESOURCES or a capsule over
+MaximumCapsuleSize), and the reset type appears only in the kernel record of a successful upload, so
+`maximum_capsule_size` and `reset_type` are `null`. As "firmware configuration and firmware update
+are not available in EFI runtime" (§23.5.1), the capsule asks the firmware to process it after a
+reset (CAPSULE_FLAGS_PERSIST_ACROSS_RESET), and Linux makes its next reboot the reset that the
+firmware asked for.
 
 </details>
 
