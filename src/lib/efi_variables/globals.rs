@@ -33,14 +33,14 @@ use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 
 /// EFI_GLOBAL_VARIABLE, the vendor GUID of the global variables (UEFI 2.11 §3.3).
-const EFI_GLOBAL_VARIABLE: Guid = Guid {
+pub(super) const EFI_GLOBAL_VARIABLE: Guid = Guid {
     data1: 0x8BE4_DF61,
     data2: 0x93CA,
     data3: 0x11D2,
     data4: [0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
 };
 /// EFI_IMAGE_SECURITY_DATABASE_GUID, the vendor GUID of db, dbx, dbt and dbr (UEFI 2.11 §32.7.1).
-const EFI_IMAGE_SECURITY_DATABASE: Guid = Guid {
+pub(super) const EFI_IMAGE_SECURITY_DATABASE: Guid = Guid {
     data1: 0xD719_B2CB,
     data2: 0x3D3A,
     data3: 0x4596,
@@ -1075,7 +1075,7 @@ fn serialize_hex<S: Serializer>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
@@ -1105,21 +1105,21 @@ mod tests {
     const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     /// NV+BS+RT.
-    const NV_BS_RT: VariableAttributes = VariableAttributes::NON_VOLATILE
+    pub(crate) const NV_BS_RT: VariableAttributes = VariableAttributes::NON_VOLATILE
         .union(VariableAttributes::BOOTSERVICE_ACCESS)
         .union(VariableAttributes::RUNTIME_ACCESS);
 
     /// VariableData that hold `variables` and record each key read and set.
     #[derive(Default)]
-    struct HeldVariables {
-        variables: RefCell<BTreeMap<VariableKey, VariableContents>>,
-        read: RefCell<Vec<VariableKey>>,
-        set: RefCell<Vec<VariableKey>>,
+    pub(crate) struct HeldVariables {
+        pub(crate) variables: RefCell<BTreeMap<VariableKey, VariableContents>>,
+        pub(crate) read: RefCell<Vec<VariableKey>>,
+        pub(crate) set: RefCell<Vec<VariableKey>>,
     }
 
     impl HeldVariables {
         /// Holds `data` with NV+BS+RT as the variable `name` of `vendor`.
-        fn with(self, name: &str, vendor: Guid, data: &[u8]) -> Self {
+        pub(crate) fn with(self, name: &str, vendor: Guid, data: &[u8]) -> Self {
             self.with_attributes(name, vendor, NV_BS_RT, data)
         }
 
@@ -1162,7 +1162,7 @@ mod tests {
         }
     }
 
-    fn key(name: &str, vendor: Guid) -> VariableKey {
+    pub(crate) fn key(name: &str, vendor: Guid) -> VariableKey {
         VariableKey {
             name: name.to_string(),
             guid: vendor,

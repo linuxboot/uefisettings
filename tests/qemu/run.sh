@@ -313,7 +313,9 @@ db_guid=d719b2cb-3d3a-4596-a3bc-dad00e67656f
 # boots (linux/) each a db append of a certificate of its own: signed with KEK, as
 # db-append.auth; its copy with the last byte, in the certificate, flipped, as db-tampered.auth;
 # and the same append signed with db's key, which KEK lacks, as db-unauthorized.auth, and with
-# the foreign key, as db-foreign.auth.
+# the foreign key, as db-foreign.auth; and a write of a text of its own to WriteSignedProbe, a
+# new variable of the tests' vendor GUID, without EFI_VARIABLE_APPEND_WRITE and signed with KEK,
+# as probe-write.auth.
 secboot_files() {
     local keys=$1 each file size byte
     mkdir "$keys"
@@ -331,6 +333,9 @@ secboot_files() {
             "$keys/db.key" "$keys/$each/db-unauthorized.auth"
         "$here/auth-payload.sh" sign db "$db_guid" 0x67 "$keys/$each-db.esl" "$keys/foreign.crt" \
             "$keys/foreign.key" "$keys/$each/db-foreign.auth"
+        printf 'uefisettings test %s probe' "$each" >"$keys/$each-probe.data"
+        "$here/auth-payload.sh" sign WriteSignedProbe "$secboot_owner" 0x27 \
+            "$keys/$each-probe.data" "$keys/KEK.crt" "$keys/KEK.key" "$keys/$each/probe-write.auth"
         file=$keys/$each/db-tampered.auth
         cp "$keys/$each/db-append.auth" "$file"
         size=$(stat --format=%s "$file")

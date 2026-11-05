@@ -34,6 +34,9 @@ use uefisettings::exports::VariableStorage;
 #[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
 use crate::print_line;
 
+#[cfg(variable_data)]
+mod write_signed;
+
 #[derive(Debug, Parser)]
 #[command(next_display_order = None)]
 pub(super) struct VariableCommand {
@@ -101,6 +104,10 @@ enum VariableSubcommands {
         )]
         attributes: Vec<AttributeArg>,
     },
+    /// Write an EFI variable from a pre-signed payload, which the firmware verifies
+    #[cfg(variable_data)]
+    #[command(next_display_order = None)]
+    WriteSigned(write_signed::WriteSignedArgs),
 }
 
 /// An attribute of EFI variables (UEFI 2.10 §8.2.1), but EFI_VARIABLE_APPEND_WRITE, which
@@ -144,6 +151,8 @@ impl VariableCommand {
             #[cfg(variable_data)]
             VariableSubcommands::Set { name, value } => set(name, value),
             VariableSubcommands::Storage { attributes } => storage(attributes),
+            #[cfg(variable_data)]
+            VariableSubcommands::WriteSigned(args) => args.run(),
         }
     }
 }
@@ -280,7 +289,9 @@ mod tests {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
                 #[cfg(variable_data)]
-                parsed @ (VariableSubcommands::Get { .. } | VariableSubcommands::Set { .. }) => {
+                parsed @ (VariableSubcommands::Get { .. }
+                | VariableSubcommands::Set { .. }
+                | VariableSubcommands::WriteSigned(_)) => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::Storage { .. } => {
@@ -300,7 +311,9 @@ mod tests {
         let (name, guid) = match variable(&args) {
             VariableSubcommands::Info { name, guid } => (name, guid),
             #[cfg(variable_data)]
-            parsed @ (VariableSubcommands::Get { .. } | VariableSubcommands::Set { .. }) => {
+            parsed @ (VariableSubcommands::Get { .. }
+            | VariableSubcommands::Set { .. }
+            | VariableSubcommands::WriteSigned(_)) => {
                 panic!("{args:?} is no info: {parsed:?}")
             }
             parsed @ (VariableSubcommands::List { .. } | VariableSubcommands::Storage { .. }) => {
@@ -340,7 +353,8 @@ mod tests {
                 }
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Set { .. }
-                | VariableSubcommands::Storage { .. }) => {
+                | VariableSubcommands::Storage { .. }
+                | VariableSubcommands::WriteSigned(_)) => {
                     panic!("{args:?} is no get: {parsed:?}")
                 }
             };
@@ -372,7 +386,8 @@ mod tests {
                 }
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Get { .. }
-                | VariableSubcommands::Storage { .. }) => {
+                | VariableSubcommands::Storage { .. }
+                | VariableSubcommands::WriteSigned(_)) => {
                     panic!("{args:?} is no set: {parsed:?}")
                 }
             };
@@ -423,7 +438,9 @@ mod tests {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }
                 #[cfg(variable_data)]
-                parsed @ (VariableSubcommands::Get { .. } | VariableSubcommands::Set { .. }) => {
+                parsed @ (VariableSubcommands::Get { .. }
+                | VariableSubcommands::Set { .. }
+                | VariableSubcommands::WriteSigned(_)) => {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::List { .. } => {

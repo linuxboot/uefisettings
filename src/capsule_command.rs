@@ -65,7 +65,7 @@ impl CapsuleCommand {
 /// and prints what that told.
 #[cfg(capsule_delivery)]
 fn deliver(payload: &Path, capsule_id: u32) -> Result<()> {
-    let payload = platform::read_capsule_payload(payload)?;
+    let payload = platform::read_payload(payload)?;
     let delivered = CapsuleBackend::deliver_json(&payload, capsule_id)?;
     print_line(format_args!(
         "{}",

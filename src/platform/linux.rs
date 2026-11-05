@@ -319,8 +319,8 @@ pub(super) fn auto_set(
     Ok(())
 }
 
-/// The bytes of the file `path`, the payload of capsule deliver.
-pub(super) fn read_capsule_payload(path: &Path) -> Result<Vec<u8>> {
+/// The bytes of the file `path`, the payload of capsule deliver or variable write-signed.
+pub(super) fn read_payload(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("read the payload {}", path.display()))
 }
 

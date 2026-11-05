@@ -1,0 +1,29 @@
+# The checks of shell/write-signed-user.nsh, the Shell boot of shell-write-signed-user: User
+# Mode. See check-shell-log.sh.
+setup-mode	status	0x0
+setup-mode	line	^  00000000: 00 +\*
+# the firmware accepts the KEK-signed append, and uefisettings prints nothing
+append	status	0x0
+append	none	.
+db-appended	status	any
+db-appended	line	^Variable NV\+RT\+BS\+AT '[^':]+:db' DataSize = 0x[0-9A-F]+$
+# it refuses the tampered copy and the appends signed with db's key, which KEK lacks, and with
+# a key that no variable holds, and leaves db as it was
+tampered	status	aborted
+tampered	json	. == {"error_message": "SetVariable() of EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f: SECURITY_VIOLATION"}
+db-after-tampered	status	any
+db-after-tampered	same	db-appended
+unauthorized	status	aborted
+unauthorized	json	. == {"error_message": "SetVariable() of EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f: SECURITY_VIOLATION"}
+db-after-unauthorized	status	any
+db-after-unauthorized	same	db-appended
+foreign	status	aborted
+foreign	json	. == {"error_message": "SetVariable() of EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f: SECURITY_VIOLATION"}
+db-after-foreign	status	any
+db-after-foreign	same	db-appended
+# a KEK-signed write without EFI_VARIABLE_APPEND_WRITE creates WriteSignedProbe, with NV+BS+RT+AT
+# and the 29 bytes of run.sh's text
+probe-write	status	0x0
+probe-write	none	.
+probe-info	status	0x0
+probe-info	json	. == {"variable": "WriteSignedProbe-de145b29-c3cd-455f-91de-a76237b67c52", "attributes": 39, "size": 29}

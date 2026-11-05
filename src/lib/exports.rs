@@ -25,6 +25,8 @@ use uefisettings_backend_thrift::Question;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
+#[cfg(variable_data)]
+use crate::efi_variables::authenticated::write_signed;
 #[cfg(capsule_delivery)]
 use crate::efi_variables::deliver_json_capsule;
 #[cfg(variable_data)]
@@ -105,7 +107,7 @@ pub use crate::hii::MemoryType;
 /// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
 #[cfg(firmware_memory_maps)]
 pub use crate::hii::RangeRefusal;
-#[cfg(variable_storage_info)]
+#[cfg(any(variable_storage_info, variable_data))]
 pub use crate::hii::VariableAttributes;
 #[cfg(any(variable_names, variable_info))]
 pub use crate::hii::VariableKey;
@@ -188,6 +190,26 @@ impl VariableBackend {
     /// which names its value as get decodes it, after checking it; returns what it wrote.
     pub fn set(name: &str, value: &str) -> Result<GlobalVariable> {
         write_global(&Self::system_variable_data()?, name, value)
+    }
+
+    /// Writes `payload`, an EFI_VARIABLE_AUTHENTICATION_2 descriptor and the new data of the EFI
+    /// variable `name` of the vendor GUID `vendor`, such as
+    /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C" (UEFI 2.11 §8.2.6), with `attributes` and
+    /// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS; the firmware verifies its signature.
+    /// Refuses, before any write, other attributes, a payload without a complete descriptor,
+    /// attributes without access or a payload that would delete the variable, and a Secure Boot
+    /// Policy Variable in Setup Mode.
+    pub fn write_signed(
+        name: &str,
+        vendor: &str,
+        attributes: VariableAttributes,
+        payload: &[u8],
+    ) -> Result<()> {
+        let key = VariableKey {
+            name: name.to_owned(),
+            guid: parse_vendor(vendor)?,
+        };
+        write_signed(&Self::system_variable_data()?, &key, attributes, payload)
     }
 }
 

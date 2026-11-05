@@ -330,6 +330,75 @@ pub fn is_immutable(path: &str) -> bool {
         .contains(IFlags::IMMUTABLE)
 }
 
+/// EFI_GLOBAL_VARIABLE, the vendor GUID of SetupMode, SecureBoot, AuditMode and DeployedMode.
+pub const EFI_GLOBAL_VARIABLE: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
+/// EFI_IMAGE_SECURITY_DATABASE_GUID, the vendor GUID of db.
+pub const EFI_IMAGE_SECURITY_DATABASE: &str = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
+/// The KEK-signed db append that run.sh puts in the initramfs.
+pub const DB_APPEND: &str = "/auth/db-append.auth";
+/// Its copy with a data byte flipped.
+pub const DB_TAMPERED: &str = "/auth/db-tampered.auth";
+/// The same append signed with db's key, which KEK lacks.
+pub const DB_UNAUTHORIZED: &str = "/auth/db-unauthorized.auth";
+/// The same append signed with a key that no variable holds.
+pub const DB_FOREIGN: &str = "/auth/db-foreign.auth";
+/// The size of EFI_TIME, which starts an AUTH_2 descriptor, before WIN_CERTIFICATE.
+const EFI_TIME_SIZE: usize = 16;
+/// The release of the guest's kernel.
+const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+/// Linux's EACCES.
+pub const EACCES: i32 = 13;
+/// Linux's EINVAL.
+pub const EINVAL: i32 = 22;
+/// The errno of EFI_SECURITY_VIOLATION from each pinned guest kernel (guest-packages-*), by
+/// release. Linux's efi_status_to_err() makes it EACCES (v6.1 drivers/firmware/efi/efi.c).
+/// Fedora's kernel replaces that switch with a bsearch() whose size and count arguments are
+/// swapped (patch-6.17-redhat.patch:1359-1360 of kernel-6.17.1-300.fc43.src.rpm; the kernel's
+/// bsearch() takes the count first), so the lookup misses and falls back to EINVAL.
+const SECURITY_VIOLATION_ERRNO: [(&str, i32); 3] = [
+    ("6.1.0-50-686-pae", EACCES),
+    ("6.17.1-300.fc43.x86_64", EINVAL),
+    ("6.17.1-300.fc43.aarch64", EINVAL),
+];
+
+/// The data of the variable `name` of [`EFI_GLOBAL_VARIABLE`], or `None` if it does not exist.
+#[track_caller]
+pub fn global_variable(name: &str) -> Option<Vec<u8>> {
+    variable_data(&format!("{EFIVARS}/{name}-{EFI_GLOBAL_VARIABLE}"))
+}
+
+/// The efivarfs path of db.
+pub fn db_path() -> String {
+    format!("{EFIVARS}/db-{EFI_IMAGE_SECURITY_DATABASE}")
+}
+
+/// The errno of EFI_SECURITY_VIOLATION from the guest's kernel.
+#[track_caller]
+pub fn security_violation_errno() -> i32 {
+    require_test_vm();
+    let release = fs::read_to_string(OSRELEASE).expect("cannot read the kernel release");
+    let release = release.trim_end();
+    SECURITY_VIOLATION_ERRNO
+        .iter()
+        .find_map(|&(pinned, errno)| (pinned == release).then_some(errno))
+        .unwrap_or_else(|| panic!("no errno of EFI_SECURITY_VIOLATION for kernel {release}"))
+}
+
+/// The variable data of an AUTH_2 payload: what follows EFI_TIME and WIN_CERTIFICATE, whose
+/// first field, dwLength, is its size.
+#[track_caller]
+pub fn auth2_data(payload: &[u8]) -> &[u8] {
+    let length = payload
+        .get(EFI_TIME_SIZE..EFI_TIME_SIZE + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+        .expect("an AUTH_2 payload without WIN_CERTIFICATE");
+    let start = EFI_TIME_SIZE + usize::try_from(length).expect("dwLength fits usize");
+    payload
+        .get(start..)
+        .expect("an AUTH_2 payload shorter than its dwLength")
+}
+
 /// Panics unless `path` does not exist.
 #[track_caller]
 pub fn assert_absent(path: &str) {

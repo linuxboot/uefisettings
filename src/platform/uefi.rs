@@ -221,10 +221,11 @@ fn open_shell_protocol() -> io::Result<ScopedProtocol<ShellFileIo>> {
     .map_err(|error| firmware_error("OpenProtocol() of EFI_SHELL_PROTOCOL", error))
 }
 
-/// The bytes of the file `path`, the payload of capsule deliver, which EFI_SHELL_PROTOCOL opens
-/// as the Shell's own commands do: on a mapping such as fs0:, or relative to the current
-/// directory (edk2-stable202608 ShellProtocol.c:519-537, EfiShellGetDevicePathFromFilePath()).
-pub(super) fn read_capsule_payload(path: &Path) -> Result<Vec<u8>> {
+/// The bytes of the file `path`, the payload of capsule deliver or variable write-signed, which
+/// EFI_SHELL_PROTOCOL opens as the Shell's own commands do: on a mapping such as fs0:, or
+/// relative to the current directory (edk2-stable202608 ShellProtocol.c:519-537,
+/// EfiShellGetDevicePathFromFilePath()).
+pub(super) fn read_payload(path: &Path) -> Result<Vec<u8>> {
     let name = path
         .to_str()
         .and_then(|name| CString16::try_from(name).ok())

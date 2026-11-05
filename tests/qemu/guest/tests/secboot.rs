@@ -24,64 +24,26 @@ use std::fs::File;
 use std::io;
 use std::io::Write;
 
+use uefisettings_qemu_guest::auth2_data;
 use uefisettings_qemu_guest::clear_immutable;
+use uefisettings_qemu_guest::db_path;
+use uefisettings_qemu_guest::global_variable;
 use uefisettings_qemu_guest::require_test_vm;
+use uefisettings_qemu_guest::security_violation_errno;
 use uefisettings_qemu_guest::variable_data;
+use uefisettings_qemu_guest::DB_APPEND;
+use uefisettings_qemu_guest::DB_FOREIGN;
+use uefisettings_qemu_guest::DB_TAMPERED;
+use uefisettings_qemu_guest::DB_UNAUTHORIZED;
 use uefisettings_qemu_guest::EFIVARS;
+use uefisettings_qemu_guest::EFI_GLOBAL_VARIABLE;
+use uefisettings_qemu_guest::EINVAL;
 
-/// EFI_GLOBAL_VARIABLE, the vendor GUID of SetupMode, SecureBoot, AuditMode and DeployedMode.
-const EFI_GLOBAL_VARIABLE: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
-/// EFI_IMAGE_SECURITY_DATABASE_GUID, the vendor GUID of db.
-const EFI_IMAGE_SECURITY_DATABASE: &str = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
 /// NV+BS+RT+AT and EFI_VARIABLE_APPEND_WRITE, the attributes that the payloads were signed
 /// with.
 const DB_APPEND_ATTRIBUTES: u32 = 0x67;
 /// BS+RT, the attributes of AuditMode and DeployedMode in UEFI 2.11 §3.3.
 const MODE_ATTRIBUTES: u32 = 0x06;
-/// The KEK-signed db append that run.sh puts in the initramfs.
-const DB_APPEND: &str = "/auth/db-append.auth";
-/// Its copy with a data byte flipped.
-const DB_TAMPERED: &str = "/auth/db-tampered.auth";
-/// The same append signed with db's key, which KEK lacks.
-const DB_UNAUTHORIZED: &str = "/auth/db-unauthorized.auth";
-/// The same append signed with a key that no variable holds.
-const DB_FOREIGN: &str = "/auth/db-foreign.auth";
-/// The size of EFI_TIME, which starts an AUTH_2 descriptor, before WIN_CERTIFICATE.
-const EFI_TIME_SIZE: usize = 16;
-/// The release of the guest's kernel.
-const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
-/// Linux's EACCES.
-const EACCES: i32 = 13;
-/// Linux's EINVAL.
-const EINVAL: i32 = 22;
-/// The errno of EFI_SECURITY_VIOLATION from each pinned guest kernel (guest-packages-*), by
-/// release. Linux's efi_status_to_err() makes it EACCES (v6.1 drivers/firmware/efi/efi.c).
-/// Fedora's kernel replaces that switch with a bsearch() whose size and count arguments are
-/// swapped (patch-6.17-redhat.patch:1359-1360 of kernel-6.17.1-300.fc43.src.rpm; the kernel's
-/// bsearch() takes the count first), so the lookup misses and falls back to EINVAL.
-const SECURITY_VIOLATION_ERRNO: [(&str, i32); 3] = [
-    ("6.1.0-50-686-pae", EACCES),
-    ("6.17.1-300.fc43.x86_64", EINVAL),
-    ("6.17.1-300.fc43.aarch64", EINVAL),
-];
-
-fn global_variable(name: &str) -> Option<Vec<u8>> {
-    variable_data(&format!("{EFIVARS}/{name}-{EFI_GLOBAL_VARIABLE}"))
-}
-
-fn db_path() -> String {
-    format!("{EFIVARS}/db-{EFI_IMAGE_SECURITY_DATABASE}")
-}
-
-/// The errno of EFI_SECURITY_VIOLATION from the guest's kernel.
-fn security_violation_errno() -> i32 {
-    let release = fs::read_to_string(OSRELEASE).expect("cannot read the kernel release");
-    let release = release.trim_end();
-    SECURITY_VIOLATION_ERRNO
-        .iter()
-        .find_map(|&(pinned, errno)| (pinned == release).then_some(errno))
-        .unwrap_or_else(|| panic!("no errno of EFI_SECURITY_VIOLATION for kernel {release}"))
-}
 
 /// Writes a variable through efivarfs in one write(), as efivarfs requires, without
 /// O_TRUNC: each write() is one SetVariable() of its own.
@@ -96,20 +58,6 @@ fn write_variable(path: &str, attributes: u32, data: &[u8]) -> io::Result<()> {
         .write(&bytes)?;
     assert_eq!(written, bytes.len(), "{path}: a short write");
     Ok(())
-}
-
-/// The variable data of an AUTH_2 payload: what follows EFI_TIME and WIN_CERTIFICATE, whose
-/// first field, dwLength, is its size.
-fn auth2_data(payload: &[u8]) -> &[u8] {
-    let length = payload
-        .get(EFI_TIME_SIZE..EFI_TIME_SIZE + 4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_le_bytes)
-        .expect("an AUTH_2 payload without WIN_CERTIFICATE");
-    let start = EFI_TIME_SIZE + usize::try_from(length).expect("dwLength fits usize");
-    payload
-        .get(start..)
-        .expect("an AUTH_2 payload shorter than its dwLength")
 }
 
 /// Checks that the firmware refuses `payload`, `what`, as a db append with

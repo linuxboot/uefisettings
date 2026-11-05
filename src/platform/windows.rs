@@ -14,8 +14,11 @@
 //! the HiiDB driver, its variables through the firmware environment calls, and -f/--filename
 //! for a HiiDB file.
 
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use clap::Subcommand;
@@ -143,4 +146,9 @@ pub(super) fn auto_set(
     setup_password: &SetupPasswordArgs,
 ) -> Result<()> {
     hii_set(question, value, selection, setup_password, json)
+}
+
+/// The bytes of the file `path`, the payload of variable write-signed.
+pub(super) fn read_payload(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).with_context(|| format!("read the payload {}", path.display()))
 }

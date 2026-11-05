@@ -18,6 +18,8 @@
 //! (capsule_loader.rs) or the runtime services in the UEFI Shell (capsule_services.rs) take
 //! them.
 
+#[cfg(variable_data)]
+pub(crate) mod authenticated;
 #[cfg(capsule_delivery)]
 mod capsule;
 #[cfg(capsule_delivery)]
@@ -261,10 +263,10 @@ pub(crate) fn query_storage(
     storage.variable_storage(attributes)
 }
 
-/// Attributes that query_storage refuses. The message spells "section", as edk2's terminals
-/// but VT-UTF8 show '?' for '§' (edk2-stable202508 TerminalDxe/TerminalConOut.c
+/// Attributes that query_storage and write_signed refuse. The message spells "section", as
+/// edk2's terminals but VT-UTF8 show '?' for '§' (edk2-stable202508 TerminalDxe/TerminalConOut.c
 /// TerminalConOutOutputString()).
-#[cfg(variable_storage_info)]
+#[cfg(any(variable_storage_info, variable_data))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("{0}: runtime access implies boot service access (UEFI 2.10 section 8.2.3)")]
 struct RuntimeAccessWithoutBootServiceAccess(VariableAttributes);

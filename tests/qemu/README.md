@@ -181,4 +181,8 @@ key, which `run.sh` generates with the others but enrolls nowhere, and `run.sh` 
 of a copy of the first, for the Linux test `secboot` and, through
 `publish-hiidb.efi set-auth-variables=PATH[,PATH]...`, for the Shell, which reads the
 statuses that the driver puts in `AuthProbeLog`: the firmware accepts the KEK-signed append
-and refuses the other three.
+and refuses the other three. The `write-signed` scenarios write the same payloads with
+`variable write-signed`, from the Linux test `write_signed` and from `uefisettings.efi`, and in
+`secboot-setup`'s Setup Mode check that it refuses the db append before any write. In User Mode
+they also create `WriteSignedProbe`, a variable of no policy, with a KEK-signed write without
+`--append`, which `auth-payload.sh` signs too.

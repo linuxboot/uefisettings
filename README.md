@@ -90,11 +90,17 @@ Commands:
 
 ```plain
 Commands:
-  help     Print this message or the help of the given subcommand(s)
-  info     Show the attributes and the size of an EFI variable, never its data
-  list     List the name and vendor GUID of every EFI variable, never its data
-  storage  Show the storage space of the EFI variables of some attributes, and how much of it is
-           left
+  get           Show the attributes and the decoded value of a global variable of UEFI 2.11 section
+                3.3, but its load options, hot keys and device paths, or of a signature database, or
+                that it is absent
+  help          Print this message or the help of the given subcommand(s)
+  info          Show the attributes and the size of an EFI variable, never its data
+  list          List the name and vendor GUID of every EFI variable, never its data
+  set           Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
+                BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications
+  storage       Show the storage space of the EFI variables of some attributes, and how much of it
+                is left
+  write-signed  Write an EFI variable from a pre-signed payload, which the firmware verifies
 ```
 
 `capsule`:
@@ -390,6 +396,26 @@ of those default attributes only, and no maximum variable size, which shows as `
 6.5.4 fail that statfs, and with it `variable list` and `variable info` of a missing variable, where
 the firmware's QueryVariableInfo() fails or is not supported at runtime (fixed by 79b83606abc7 in
 6.5.5 and 6.6).
+
+`variable write-signed NAME GUID --attributes ATTRIBUTES [--append] --payload-file FILE` writes
+a pre-signed payload, an EFI_VARIABLE_AUTHENTICATION_2 descriptor and then the variable's new
+data (UEFI 2.11 §8.2.6), such as a db update, to an EFI variable unchanged, with those
+attributes and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, and with `--append` also
+EFI_VARIABLE_APPEND_WRITE. The firmware verifies the signature, which covers the name, the
+vendor GUID, the attributes and the time stamp that the payload was made for. Before any write,
+uefisettings refuses a payload without a complete descriptor, one without data unless `--append`
+is given, and attributes without bootservice-access or runtime-access, either of which would
+delete the variable, and a Secure Boot policy variable (PK, KEK, OsRecoveryOrder,
+OsRecovery####, and every variable of EFI_IMAGE_SECURITY_DATABASE_GUID, such as db, dbx, dbt and
+dbr; §3.3) while SetupMode is 1, when the firmware writes them without checking the signature.
+It prints nothing when the firmware accepts the payload. On Linux it checks first, as `set`
+does, that the write cannot crash Linux, then writes the variable's efivar file;
+`uefisettings.efi` calls SetVariable() and names the status that it returns, such as
+SECURITY_VIOLATION; on Windows it calls SetFirmwareEnvironmentVariableExW.
+
+```plain
+FS0:\> uefisettings.efi variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E67656F --attributes non-volatile,bootservice-access,runtime-access --append --payload-file db-append.auth
+```
 
 </details>
 
