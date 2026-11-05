@@ -44,7 +44,7 @@ use crate::hii::efivarfs_format::check_regular_file;
 use crate::hii::efivarfs_format::listed_names;
 use crate::hii::efivarfs_format::open_efivar;
 use crate::hii::efivarfs_format::read_efivar;
-use crate::hii::efivarfs_format::read_efivar_file;
+use crate::hii::efivarfs_format::read_efivar_file_of;
 use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EFIVARFS_INTERFACE;
@@ -138,9 +138,7 @@ impl FirmwareVariables for EfivarFiles {
         let file_ro = open_efivar(&self.dir, &file_name)
             .map_err(|error| as_variable_not_found(key, error))?;
 
-        let mut file_contents = file_ro
-            .metadata()
-            .and_then(|metadata| read_efivar_file(&file_ro, metadata.len()))
+        let mut file_contents = read_efivar_file_of(&file_ro)
             .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
         modify_variable_bytes(
@@ -462,15 +460,12 @@ impl VariableInfoSource for EfivarFiles {
             }
             result => result?,
         };
-        let bytes = file
-            .metadata()
-            .and_then(|metadata| read_efivar_file(&file, metadata.len()))
-            .with_context(|| {
-                format!(
-                    "failed to read efivar file '{}'",
-                    self.dir.join(&name).display()
-                )
-            })?;
+        let bytes = read_efivar_file_of(&file).with_context(|| {
+            format!(
+                "failed to read efivar file '{}'",
+                self.dir.join(&name).display()
+            )
+        })?;
         efivar_info(key, &bytes)
     }
 }

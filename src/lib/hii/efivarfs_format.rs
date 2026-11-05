@@ -345,6 +345,12 @@ pub(super) fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8
     Ok(bytes)
 }
 
+/// The bytes of the efivar `file`, as read_efivar_file reads them at the size its metadata gives.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn read_efivar_file_of(file: &File) -> io::Result<Vec<u8>> {
+    read_efivar_file(file, file.metadata()?.len())
+}
+
 /// read_efivar_file's error for a file of more than MAX_EFIVAR_FILE_SIZE bytes.
 #[cfg(any(target_os = "linux", test))]
 fn efivar_file_too_large() -> io::Error {
@@ -741,6 +747,27 @@ pub mod tests {
                 ),
             }
         }
+    }
+
+    /// read_efivar_file_of refuses a file of more than MAX_EFIVAR_FILE_SIZE bytes by its metadata,
+    /// unread: a read of this write-only handle would fail, while fstat(2) needs no read access.
+    #[test]
+    fn read_efivar_file_of_refuses_a_long_file_unread() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let file = File::create(dir.path().join("efivar")).expect("create a file");
+        file.set_len(MAX_EFIVAR_FILE_SIZE + 1)
+            .expect("make the file one byte longer than the maximum");
+
+        let error = read_efivar_file_of(&file).expect_err("read a write-only long file");
+
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (
+                io::ErrorKind::FileTooLarge,
+                format!("longer than its maximum of {MAX_EFIVAR_FILE_SIZE} bytes")
+            ),
+            "a write-only long file"
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ use super::DUMP_MANIFEST;
 #[cfg(target_os = "linux")]
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::efivarfs_format::open_efivar;
-use crate::hii::efivarfs_format::read_efivar_file;
+use crate::hii::efivarfs_format::read_efivar_file_of;
 use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EfivarNotFound;
 use crate::hii::forms::list_questions;
@@ -126,15 +126,12 @@ pub(super) fn write_dump(
             }
             Err(error) => return Err(error),
         };
-        let bytes = file
-            .metadata()
-            .and_then(|metadata| read_efivar_file(&file, metadata.len()))
-            .with_context(|| {
-                format!(
-                    "failed to read efivar file '{}'",
-                    efivars.join(name).display()
-                )
-            })?;
+        let bytes = read_efivar_file_of(&file).with_context(|| {
+            format!(
+                "failed to read efivar file '{}'",
+                efivars.join(name).display()
+            )
+        })?;
         let bytes = match redaction {
             EfivarRedaction::DecodedBytes => keep_decoded(&bytes, values),
             EfivarRedaction::Unredacted => bytes,
