@@ -548,39 +548,52 @@ mod tests {
             .unwrap_or_else(|| panic!("find package list {guid}"))
     }
 
+    /// A FormSet of the Guid of 16 `guid` bytes, holding `body`.
+    fn form_set_of_guid(guid: u8, body: &[u8]) -> Vec<u8> {
+        [
+            &[0x0E, 0x80 | 39][..], // FormSet: Length, Scope
+            &[guid; 16],
+            &[0x01, 0x00, 0x02, 0x00, 0x01], // FormSetTitle, Help, Flags: one ClassGuid
+            &[0x22; 16],                     // ClassGuid
+            body,
+            &END,
+        ]
+        .concat()
+    }
+
+    /// The roots that read_db reads from a form package of `ifr`, each by the last byte of the
+    /// Guid of the FormSet it holds, None if it holds no FormSet first.
+    fn form_set_guids(ifr: Vec<u8>) -> Result<Vec<Option<u8>>> {
+        let length = PACKAGE_HEADER_SIZE + u32::try_from(ifr.len()).expect("form package length");
+        let form_package = [package_header(0x02, length), ifr].concat();
+        let hiidb =
+            package_list_with_guid([0x22; 16], &[form_package, END_PACKAGE.to_vec()].concat());
+        let lists = read_db(&hiidb)?;
+        Ok(lists[0]
+            .forms
+            .iter()
+            .map(|root| {
+                let root = root.borrow();
+                let first = root.children.first()?.borrow();
+                match &first.parsed_data {
+                    forms::ParsedOperation::FormSet(parsed) => Some(parsed.guid.data4[7]),
+                    _ => None,
+                }
+            })
+            .collect())
+    }
+
     /// read_db keeps each FormSet of a form package as a root of its own. The walk for FormSets
     /// after the first skips other ops and ends, without failing the package, at an op that does
     /// not fit it or at a later FormSet whose bytes do not parse, and skips a later FormSet whose
     /// scopes nest deeper than MAX_SCOPE_NESTING; a malformed first FormSet still fails it.
     #[test]
     fn test_read_db_ends_the_form_set_walk_at_an_op_that_does_not_fit() {
-        let form_set = |guid: u8, body: &[u8]| {
-            [
-                &[0x0E, 0x80 | 39][..], // FormSet: Length, Scope
-                &[guid; 16],
-                &[0x01, 0x00, 0x02, 0x00, 0x01], // FormSetTitle, Help, Flags: one ClassGuid
-                &[0x22; 16],                     // ClassGuid
-                body,
-                &END,
-            ]
-            .concat()
-        };
-        let read = |ifr: Vec<u8>| {
-            let length =
-                PACKAGE_HEADER_SIZE + u32::try_from(ifr.len()).expect("form package length");
-            let form_package = [package_header(0x02, length), ifr].concat();
-            let hiidb =
-                package_list_with_guid([0x22; 16], &[form_package, END_PACKAGE.to_vec()].concat());
-            read_db(&hiidb).map(|lists| {
-                lists[0]
-                    .forms
-                    .iter()
-                    .map(
-                        |root| match &root.borrow().children[0].borrow().parsed_data {
-                            forms::ParsedOperation::FormSet(parsed) => parsed.guid.data4[7],
-                            other => panic!("root holds {other:?}, not a FormSet"),
-                        },
-                    )
+        let read = |ifr| {
+            form_set_guids(ifr).map(|roots| {
+                roots
+                    .into_iter()
+                    .map(|guid| guid.expect("a root holding a FormSet"))
                     .collect::<Vec<u8>>()
             })
         };
@@ -594,38 +607,46 @@ mod tests {
             ("Length 1", vec![0x29, 0x01], &[0xA0]),
             (
                 "zero bytes, then a FormSet",
-                [&[0x00, 0x00][..], &form_set(0xB0, &[])].concat(),
+                [&[0x00, 0x00][..], &form_set_of_guid(0xB0, &[])].concat(),
                 &[0xA0],
             ),
-            ("a FormSet", form_set(0xB0, &[]), &[0xA0, 0xB0]),
+            ("a FormSet", form_set_of_guid(0xB0, &[]), &[0xA0, 0xB0]),
             (
                 "a Subtitle, then a FormSet",
-                [&subtitle[..], &form_set(0xB0, &[])].concat(),
+                [&subtitle[..], &form_set_of_guid(0xB0, &[])].concat(),
                 &[0xA0, 0xB0],
             ),
             (
                 "a FormSet with a malformed CheckBox",
-                form_set(0xB0, &short_checkbox),
+                form_set_of_guid(0xB0, &short_checkbox),
                 &[0xA0],
             ),
             (
                 "a FormSet with a malformed CheckBox, then a FormSet",
-                [form_set(0xB0, &short_checkbox), form_set(0xC0, &[])].concat(),
+                [
+                    form_set_of_guid(0xB0, &short_checkbox),
+                    form_set_of_guid(0xC0, &[]),
+                ]
+                .concat(),
                 &[0xA0],
             ),
             (
                 "a FormSet nested too deep",
-                form_set(0xB0, &too_deep),
+                form_set_of_guid(0xB0, &too_deep),
                 &[0xA0],
             ),
             (
                 "a FormSet nested too deep, then a FormSet",
-                [form_set(0xB0, &too_deep), form_set(0xC0, &[])].concat(),
+                [
+                    form_set_of_guid(0xB0, &too_deep),
+                    form_set_of_guid(0xC0, &[]),
+                ]
+                .concat(),
                 &[0xA0, 0xC0],
             ),
         ];
         for (name, trailing, want) in cases {
-            let got = read([form_set(0xA0, &[]), trailing].concat())
+            let got = read([form_set_of_guid(0xA0, &[]), trailing].concat())
                 .unwrap_or_else(|error| panic!("read_db after {name}: {error:#}"));
             assert_eq!(
                 got, want,
@@ -633,18 +654,124 @@ mod tests {
             );
         }
 
-        let error = read(form_set(0xA0, &short_checkbox)).expect_err("a malformed first FormSet");
+        let error =
+            read(form_set_of_guid(0xA0, &short_checkbox)).expect_err("a malformed first FormSet");
         assert!(
             format!("{error:#}").contains("failed to parse CheckBox's data"),
             "a malformed first FormSet: {error:#}"
         );
-        let error = read(form_set(0xA0, &too_deep)).expect_err("a first FormSet nested too deep");
+        let error =
+            read(form_set_of_guid(0xA0, &too_deep)).expect_err("a first FormSet nested too deep");
         assert!(
             error
                 .chain()
                 .any(|cause| cause.is::<forms::ScopesTooDeep>()),
             "a first FormSet nested too deep: {error:#}"
         );
+    }
+
+    /// read_db reads a FormSet wherever edk2-stable202608 SetupBrowserDxe/Setup.c GetIfrBinaryData
+    /// finds one outside another FormSet, walking the form package op by op, scopes unread: in the
+    /// scope of an unknown op too.
+    #[test]
+    fn test_read_db_reads_a_form_set_in_an_unknown_scope() {
+        let unknown = [0x70, 0x80 | 2]; // Length, Scope
+        let cases: [(&str, Vec<u8>); 2] = [
+            (
+                "a FormSet in an unknown op's scope",
+                [&unknown[..], &form_set_of_guid(0xB0, &[]), &END].concat(),
+            ),
+            (
+                "an unknown op's scope, then a FormSet",
+                [&unknown[..], &END, &form_set_of_guid(0xB0, &[])].concat(),
+            ),
+        ];
+        for (name, ifr) in cases {
+            let roots = form_set_guids(ifr).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(roots, [Some(0xB0)], "roots of {name}");
+        }
+    }
+
+    /// read_db skips the ops that the walk for FormSets steps over before the first FormSet.
+    #[test]
+    fn test_read_db_skips_ops_before_the_first_form_set() {
+        let subtitle = [0x02, 0x07, 0x05, 0x00, 0x06, 0x00, 0x00];
+        let subtitle_scope = [0x02, 0x80 | 0x07, 0x05, 0x00, 0x06, 0x00, 0x00];
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("a Subtitle", subtitle.to_vec()),
+            ("a Subtitle's scope", [&subtitle_scope[..], &END].concat()),
+            ("an unknown op", vec![0x70, 0x02]),
+        ];
+        for (name, before) in cases {
+            let ifr = [before, form_set_of_guid(0xB0, &[])].concat();
+            let roots = form_set_guids(ifr).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(roots, [Some(0xB0)], "roots after {name}");
+        }
+    }
+
+    /// read_db fails at an op that does not fit the walk for FormSets before the first FormSet,
+    /// as it fails at one in that FormSet.
+    #[test]
+    fn test_read_db_fails_at_an_op_that_does_not_fit_before_the_first_form_set() {
+        let cases: [(&str, Vec<u8>, &str); 3] = [
+            (
+                "Length 1, then a FormSet",
+                [&[0x02, 0x01][..], &form_set_of_guid(0xB0, &[])].concat(),
+                "invalid IFR operation length 1",
+            ),
+            (
+                "zero bytes, then a FormSet",
+                [&[0x00, 0x00][..], &form_set_of_guid(0xB0, &[])].concat(),
+                "invalid IFR operation length 0",
+            ),
+            (
+                "a Subtitle without its last data byte",
+                vec![0x02, 0x07, 0x05, 0x00, 0x06, 0x00],
+                "not enough bytes in reader",
+            ),
+        ];
+        for (name, ifr, cause) in cases {
+            let error = form_set_guids(ifr).expect_err(name);
+            let msg = format!("{error:#}");
+            assert!(
+                msg.starts_with(
+                    "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+                     failed to parse a form package: failed to parse IFR operation: "
+                ) && msg.contains(cause),
+                "{name}: {msg}"
+            );
+        }
+    }
+
+    /// read_db keeps a FormSet inside another FormSet part of it, and walks on after the outer
+    /// FormSet's End.
+    #[test]
+    fn test_read_db_keeps_a_form_set_inside_another_part_of_it() {
+        let inner = form_set_of_guid(0xB0, &[]);
+        let ifr = [form_set_of_guid(0xA0, &inner), form_set_of_guid(0xC0, &[])].concat();
+        let roots = form_set_guids(ifr).expect("read nested FormSets");
+        assert_eq!(
+            roots,
+            [Some(0xA0), Some(0xC0)],
+            "roots of a FormSet holding a FormSet, then a FormSet"
+        );
+    }
+
+    /// read_db reads no root from a form package without a FORM_SET op, as GetIfrBinaryData finds
+    /// no FormSet there, and one root from a form package holding one.
+    #[test]
+    fn test_read_db_reads_no_root_without_a_form_set() {
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("an End", END.to_vec()),
+            ("a Subtitle", vec![0x02, 0x07, 0x05, 0x00, 0x06, 0x00, 0x00]),
+            ("an unknown op's scope", vec![0x70, 0x80 | 2, 0x29, 0x02]),
+        ];
+        for (name, ifr) in cases {
+            let roots = form_set_guids(ifr).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert!(roots.is_empty(), "roots of {name}: {roots:?}");
+        }
+        let roots = form_set_guids(form_set_of_guid(0xB0, &[])).expect("read a FormSet");
+        assert_eq!(roots, [Some(0xB0)], "roots of a FormSet");
     }
 
     /// A PackageLength below the header size is rejected as an invalid
@@ -1141,7 +1268,7 @@ mod tests {
             package_list_with_guid(
                 [0x33; 16],
                 &[
-                    &END_ONLY_FORM_PACKAGE[..],
+                    &form_set_package()[..],
                     &en_strings_package(b'A'),
                     &END_PACKAGE,
                 ]
@@ -1168,9 +1295,9 @@ mod tests {
     /// packages.
     #[test]
     fn test_check_form_strings_fails_for_forms_without_strings() {
-        let forms_only = [&END_ONLY_FORM_PACKAGE[..], &END_PACKAGE].concat();
+        let forms_only = [&form_set_package()[..], &END_PACKAGE].concat();
         let both = [
-            &END_ONLY_FORM_PACKAGE[..],
+            &form_set_package()[..],
             &en_strings_package(b'A'),
             &END_PACKAGE,
         ]
@@ -1323,8 +1450,8 @@ mod tests {
             (0x5C, "DefaultStore"),
         ];
         for (op_code, name) in ops {
-            // an op of Length 2: none of its data bytes
-            let form_package = [0x06, 0x00, 0x00, 0x02, op_code, 0x02];
+            // in a FormSet, an op of Length 2: none of its data bytes
+            let form_package = form_package(&[vec![op_code, 0x02]]);
             let hiidb = package_list_with_guid([0x22; 16], &form_package);
 
             let Err(err) = read_db(&hiidb) else {

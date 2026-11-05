@@ -22,9 +22,6 @@ use super::*;
 /// parses from `package_list(&END_PACKAGE)`.
 pub(crate) const END_PACKAGE: [u8; 4] = [0x04, 0x00, 0x00, 0xDF];
 
-/// A form package holding only the IFR End op.
-pub(crate) const END_ONLY_FORM_PACKAGE: [u8; 6] = [0x06, 0x00, 0x00, 0x02, 0x29, 0x02];
-
 /// encode_package_list encodes a package list header with the given
 /// GUID and PackageLength, followed by `packages`, whatever their size.
 ///

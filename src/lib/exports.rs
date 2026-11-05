@@ -671,7 +671,6 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::form_package;
     use crate::hii::package::hiidb_fixtures::form_set_package;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
-    use crate::hii::package::hiidb_fixtures::END_ONLY_FORM_PACKAGE;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::Guid;
 
@@ -1523,7 +1522,7 @@ mod tests {
     /// strings packages, rather than use those of a list of the same GUID.
     #[test]
     fn test_forms_without_strings_are_an_error() {
-        let forms_only = [&END_ONLY_FORM_PACKAGE[..], &END_PACKAGE].concat();
+        let forms_only = [&form_set_package()[..], &END_PACKAGE].concat();
         let hiidb = [
             package_list_with_guid([0x44; 16], &forms_only),
             en_strings_list([0x44; 16], b'S'),

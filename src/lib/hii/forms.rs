@@ -3011,25 +3011,30 @@ fn type_value_parser<R: Read + Seek>(
     }
 }
 
-/// Parses a form package into one root per FormSet: the first as handle_form_set parses it,
-/// then each FORM_SET op after it that edk2-stable202608 SetupBrowserDxe/Setup.c
-/// GetIfrBinaryData reaches when it looks for a FormSet by GUID, walking the package op by op.
+/// Parses a form package into one root per FORM_SET op, outside another FormSet, that
+/// edk2-stable202608 SetupBrowserDxe/Setup.c GetIfrBinaryData reaches when it looks for a FormSet
+/// by GUID, walking the package op by op, scopes unread, e.g. into an unknown op's scope; each as
+/// handle_form_set parses it, the walk going on after its End. A package without one has no root.
 /// That walk ends at an op whose Length runs past the package; here it also ends at one below the
 /// header size, which that walk loops on (Length 0) or steps into (Length 1), and at a later
 /// FormSet whose bytes do not parse. A later FormSet whose scopes nest deeper than
 /// MAX_SCOPE_NESTING is skipped to its End, as that walk steps over it.
-/// None of them fails the package: edk2 reads past the first FormSet only for such a walk.
+/// None of them fails the package after the first FormSet: edk2 reads past it only for such a
+/// walk. Before it, they fail the package as they fail the first FormSet.
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
     package_list_guid: Guid,
 ) -> Result<Vec<Rc<RefCell<IFROperation>>>> {
-    let mut roots = vec![handle_form_set(package_cursor)?];
+    let mut roots = Vec::new();
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
         let offset = package_cursor.position();
         let op: IFROperation = match package_cursor.read_ne() {
             Ok(op) => op,
+            Err(error) if roots.is_empty() => {
+                return Err(error).context("failed to parse IFR operation")
+            }
             Err(error)
                 if error.is_eof()
                     || matches!(error.root_cause(), binrw::Error::AssertFail { .. }) =>
@@ -3049,7 +3054,9 @@ pub(super) fn parse_form_sets(
         package_cursor.set_position(offset);
         match handle_form_set(package_cursor) {
             Ok(root) => roots.push(root),
-            Err(error) if error.chain().any(|cause| cause.is::<ScopesTooDeep>()) => {
+            Err(error)
+                if !roots.is_empty() && error.chain().any(|cause| cause.is::<ScopesTooDeep>()) =>
+            {
                 warn!(
                     "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
                      a form package: {error:#}"
@@ -3060,7 +3067,9 @@ pub(super) fn parse_form_sets(
                     break;
                 }
             }
-            Err(error) if error.chain().any(|cause| cause.is::<binrw::Error>()) => {
+            Err(error)
+                if !roots.is_empty() && error.chain().any(|cause| cause.is::<binrw::Error>()) =>
+            {
                 warn!(
                     "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
                      a form package and the ops after it: {error:#}"
