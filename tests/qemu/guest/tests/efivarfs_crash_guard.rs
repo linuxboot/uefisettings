@@ -40,6 +40,13 @@ const STORED: u8 = 3;
 /// arm64, "Unable to handle kernel NULL pointer dereference" and "Internal error: Oops".
 const OOPS_LINES: [&str; 3] = ["BUG:", "Oops", "Unable to handle kernel"];
 
+/// The refusal where the kernel's efivar_operations lacks SetVariable(), as Linux leaves it
+/// when the RT properties table does (src/lib/hii/efivarfs.rs CrashingWrite).
+const NO_SET_VARIABLE: &str =
+    "Linux has no runtime SetVariable() and, without efivarfs_reconfigure() (upstream \
+     0e8d2444168d, Linux v6.8), crashes on an efivarfs write; run uefisettings.efi in the UEFI \
+     Shell";
+
 /// The refusal where uefisettings cannot tell (src/lib/hii/efivarfs.rs CrashingWrite).
 const UNKNOWN: &str =
     "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes on an \
@@ -131,6 +138,13 @@ fn set_one_of(outcome: Outcome) {
         }
     }
     assert_eq!(efivarfs_options(), mount, "the efivarfs mount afterwards");
+}
+
+/// Linux without the fix applied the RT properties table, which leaves SetVariable() out, and
+/// its generic_ops shows it.
+#[test]
+fn set_refuses_a_kernel_without_set_variable() {
+    set_one_of(Outcome::Refuse(NO_SET_VARIABLE));
 }
 
 /// Linux without the fix applied an RT properties table that uefisettings does not read on

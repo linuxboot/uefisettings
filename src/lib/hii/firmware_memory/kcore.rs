@@ -10,9 +10,13 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! /proc/kcore, which serves arm64 Linux's EFI memory map: System RAM that /dev/mem refuses.
+//! /proc/kcore, which serves arm64 Linux's EFI memory map: System RAM that /dev/mem refuses, and
+//! Linux's own data.
 
+use std::fmt;
+#[cfg(any(target_arch = "aarch64", test))]
 use std::fs::File;
+#[cfg(any(target_arch = "aarch64", test))]
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -22,14 +26,17 @@ use anyhow::Context;
 use anyhow::Result;
 
 use super::array_at;
+#[cfg(any(target_arch = "aarch64", test))]
 use super::MemoryMapUnavailable;
 use crate::hii::memory_access_denied::mark_refused_access;
+#[cfg(any(target_arch = "aarch64", test))]
 use crate::hii::memory_access_denied::mark_refused_open;
 use crate::hii::memory_access_denied::MemoryAccess;
+#[cfg(any(target_arch = "aarch64", test))]
 use crate::hii::memory_access_denied::MemoryDevice;
 
 /// The kernel's memory as an ELF core file (fs/proc/kcore.c).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(in crate::hii) const KCORE_PATH: &str = "/proc/kcore";
 
 /// The start of e_ident of the Elf64_Ehdr that /proc/kcore starts with: ELFMAG, ELFCLASS64,
@@ -37,9 +44,45 @@ pub(in crate::hii) const KCORE_PATH: &str = "/proc/kcore";
 const ELF64_LE_IDENT: &[u8] = b"\x7fELF\x02\x01";
 /// The p_type of a loadable segment (include/uapi/linux/elf.h).
 const PT_LOAD: u32 = 1;
+/// The offsets of p_vaddr and p_paddr in Elf64_Phdr (include/uapi/linux/elf.h).
+const P_VADDR_OFFSET: usize = 16;
+const P_PADDR_OFFSET: usize = 24;
 
-/// Returns `length` bytes of System RAM at physical `address` from /proc/kcore at `path`, which
-/// serves System RAM that /dev/mem refuses under CONFIG_STRICT_DEVMEM. Both need CAP_SYS_RAWIO,
+/// An address of /proc/kcore: physical, which its PT_LOAD segments of RAM and kernel text give
+/// as p_paddr, or the kernel's virtual address, which each gives as p_vaddr (Linux v6.7
+/// fs/proc/kcore.c read_kcore_iter()).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::hii) enum KcoreAddress {
+    #[cfg_attr(
+        all(target_arch = "x86_64", not(test)),
+        allow(dead_code, reason = "x86 reads no memory map through /proc/kcore")
+    )]
+    Physical(u64),
+    Virtual(u64),
+}
+
+impl KcoreAddress {
+    /// The address, and the offset of the program header field that holds the start of a
+    /// segment's range.
+    fn with_field(self) -> (u64, usize) {
+        match self {
+            Self::Physical(address) => (address, P_PADDR_OFFSET),
+            Self::Virtual(address) => (address, P_VADDR_OFFSET),
+        }
+    }
+}
+
+impl fmt::Display for KcoreAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Physical(address) => write!(f, "physical {address:#x}"),
+            Self::Virtual(address) => write!(f, "virtual {address:#x}"),
+        }
+    }
+}
+
+/// Returns `length` bytes at `address` from /proc/kcore at `path`, which serves System RAM that
+/// /dev/mem refuses under CONFIG_STRICT_DEVMEM, and the kernel's own data. Both need CAP_SYS_RAWIO,
 /// but kernel lockdown refuses /proc/kcore from confidentiality on (LOCKDOWN_KCORE), while it
 /// refuses /dev/mem from integrity on (LOCKDOWN_DEV_MEM; include/linux/security.h,
 /// fs/proc/kcore.c open_kcore(), drivers/char/mem.c open_port()), so refuse_locked_down runs
@@ -48,11 +91,12 @@ const PT_LOAD: u32 = 1;
 /// (open_kcore()), is under MemoryAccessDenied (mark_refused_open, after the lockdown file
 /// `lockdown`), and so is a refused read (read_kcore_file). A missing one, without
 /// CONFIG_PROC_KCORE, is MemoryMapUnavailable::NoKcore: it serves only the EFI memory map.
+#[cfg(any(target_arch = "aarch64", test))]
 pub(super) fn read_kcore(
     path: &Path,
     lockdown: &Path,
     open_file: impl FnOnce(&Path) -> io::Result<File>,
-    address: u64,
+    address: KcoreAddress,
     length: usize,
 ) -> Result<Vec<u8>> {
     let kcore = match open_file(path) {
@@ -69,26 +113,28 @@ pub(super) fn read_kcore(
 /// The read of read_kcore from `kcore`, the open `path`. A refused read is under
 /// MemoryAccessDenied (mark_refused_access): a security module can refuse it (Linux v6.11
 /// fs/read_write.c vfs_read() rw_verify_area()).
-fn read_kcore_file(
+pub(in crate::hii) fn read_kcore_file(
     kcore: &impl FileExt,
     path: &Path,
-    address: u64,
+    address: KcoreAddress,
     length: usize,
 ) -> Result<Vec<u8>> {
     read_kcore_at(kcore, address, length)
         .with_context(|| {
             format!(
-                "Failed to read 0x{length:x} bytes of {} at physical 0x{address:x}",
+                "Failed to read 0x{length:x} bytes of {} at {address}",
                 path.display()
             )
         })
         .map_err(|error| mark_refused_access(error, MemoryAccess::KcoreRead))
 }
 
-/// Implements read_kcore on the ELF core file `kcore`: the PT_LOAD segment whose p_paddr range
-/// holds the whole range serves it; the kernel sets p_paddr to -1 for segments that are neither
-/// RAM nor kernel text (Linux v6.11 fs/proc/kcore.c read_kcore_iter()).
-fn read_kcore_at(kcore: &impl FileExt, address: u64, length: usize) -> Result<Vec<u8>> {
+/// Implements read_kcore on the ELF core file `kcore`: the PT_LOAD segment whose p_paddr range, or
+/// p_vaddr range for a virtual `address`, holds the whole range serves it; the kernel sets
+/// p_paddr to -1 for segments that are neither RAM nor kernel text (Linux v6.11
+/// fs/proc/kcore.c read_kcore_iter()).
+fn read_kcore_at(kcore: &impl FileExt, address: KcoreAddress, length: usize) -> Result<Vec<u8>> {
+    let (start, field) = address.with_field();
     // Elf64_Ehdr and Elf64_Phdr (include/uapi/linux/elf.h)
     let mut header = [0; 64];
     kcore.read_exact_at(&mut header, 0)?;
@@ -102,7 +148,7 @@ fn read_kcore_at(kcore: &impl FileExt, address: u64, length: usize) -> Result<Ve
     ) else {
         bail!("the ELF header is truncated");
     };
-    let end = address
+    let end = start
         .checked_add(u64::try_from(length)?)
         .context("the range overflows")?;
     for index in 0..u64::from(phnum) {
@@ -112,18 +158,18 @@ fn read_kcore_at(kcore: &impl FileExt, address: u64, length: usize) -> Result<Ve
             .and_then(|offset| offset.checked_add(phoff))
             .context("a program header offset overflows")?;
         kcore.read_exact_at(&mut phdr, at)?;
-        let (Some(p_type), Some(p_offset), Some(p_paddr), Some(p_filesz)) = (
+        let (Some(p_type), Some(p_offset), Some(segment_start), Some(p_filesz)) = (
             array_at(&phdr, 0).map(u32::from_le_bytes),
             array_at(&phdr, 8).map(u64::from_le_bytes),
-            array_at(&phdr, 24).map(u64::from_le_bytes),
+            array_at(&phdr, field).map(u64::from_le_bytes),
             array_at(&phdr, 32).map(u64::from_le_bytes),
         ) else {
             bail!("a program header is truncated");
         };
-        if p_type != PT_LOAD || p_paddr.saturating_add(p_filesz) < end {
+        if p_type != PT_LOAD || segment_start.saturating_add(p_filesz) < end {
             continue;
         }
-        let Some(segment_offset) = address.checked_sub(p_paddr) else {
+        let Some(segment_offset) = start.checked_sub(segment_start) else {
             continue;
         };
         let at = p_offset
@@ -133,7 +179,7 @@ fn read_kcore_at(kcore: &impl FileExt, address: u64, length: usize) -> Result<Ve
         kcore.read_exact_at(&mut bytes, at)?;
         return Ok(bytes);
     }
-    bail!("no segment holds physical 0x{address:x}+0x{length:x}")
+    bail!("no segment holds {address}+0x{length:x}")
 }
 
 /// /proc/kcore files for the tests.
@@ -147,6 +193,15 @@ pub(in crate::hii) mod fixture {
     /// after a PT_NOTE of 16 bytes at physical 0, like /proc/kcore's, whose program headers the
     /// kernel zero-allocates (fs/proc/kcore.c read_kcore_iter()).
     pub(in crate::hii) fn kcore_fixture(path: &Path, segments: &[(u64, &[u8])]) -> File {
+        let segments: Vec<(u64, u64, &[u8])> = segments
+            .iter()
+            .map(|&(paddr, bytes)| (paddr, 0, bytes))
+            .collect();
+        kcore_fixture_of(path, &segments)
+    }
+
+    /// kcore_fixture with segments of (p_paddr, p_vaddr, bytes).
+    pub(in crate::hii) fn kcore_fixture_of(path: &Path, segments: &[(u64, u64, &[u8])]) -> File {
         const PHENTSIZE: u64 = 56;
         const NOTE_SIZE: u64 = 16;
         let phoff = 64;
@@ -173,11 +228,12 @@ pub(in crate::hii) mod fixture {
             .expect("write the PT_NOTE header");
         file.write_all_at(&[0xcc; 16], note_offset)
             .expect("write the notes");
-        for (index, (paddr, bytes)) in (1..).zip(segments) {
+        for (index, (paddr, vaddr, bytes)) in (1..).zip(segments) {
             let size = u64::try_from(bytes.len()).expect("a u64 size");
             let mut phdr = [0; 56];
             phdr[..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
             phdr[8..16].copy_from_slice(&data_offset.to_le_bytes());
+            phdr[16..24].copy_from_slice(&vaddr.to_le_bytes());
             phdr[24..32].copy_from_slice(&paddr.to_le_bytes());
             phdr[32..40].copy_from_slice(&size.to_le_bytes());
             phdr[40..48].copy_from_slice(&size.to_le_bytes());
@@ -194,6 +250,7 @@ pub(in crate::hii) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::fixture::kcore_fixture;
+    use super::fixture::kcore_fixture_of;
     use super::*;
     use crate::hii::lockdown::LockdownMode;
     use crate::hii::memory_access_denied::fixture::lockdown_file;
@@ -222,7 +279,7 @@ mod tests {
             (0x4000_00f0, 16, &low[0xf0..]),
             (0x7c75_0010, 32, &high[0x10..0x30]),
         ] {
-            let got = read_kcore_at(&kcore, address, length)
+            let got = read_kcore_at(&kcore, KcoreAddress::Physical(address), length)
                 .unwrap_or_else(|error| panic!("{address:#x}: {error:#}"));
             assert_eq!(got, want, "{address:#x}");
         }
@@ -234,12 +291,53 @@ mod tests {
             (0x5000_0000, 1),
             (0, 1),
         ] {
-            let error = read_kcore_at(&kcore, address, length)
+            let error = read_kcore_at(&kcore, KcoreAddress::Physical(address), length)
                 .expect_err("read a range that no segment holds");
             assert_eq!(
                 error.to_string(),
                 format!("no segment holds physical {address:#x}+{length:#x}"),
                 "{address:#x}"
+            );
+        }
+    }
+
+    /// A virtual address selects the segment by p_vaddr, as for the kernel text, whose p_paddr
+    /// is that of its physical copy, and a physical one by p_paddr.
+    #[test]
+    fn read_kcore_at_reads_a_virtual_address_by_p_vaddr() {
+        const TEXT: u64 = 0xffff_ffff_8100_0000;
+        let text: Vec<u8> = (0..=255).collect();
+        let ram: Vec<u8> = (0..=255).rev().collect();
+        let dir = tempfile::tempdir().expect("create a directory");
+        let kcore = kcore_fixture_of(
+            &dir.path().join("kcore"),
+            &[
+                (0x100_0000, TEXT, &text),
+                (0x4000_0000, 0xffff_8880_4000_0000, &ram),
+            ],
+        );
+        for (address, want) in [
+            (KcoreAddress::Virtual(TEXT + 0x10), &text[0x10..0x20]),
+            (KcoreAddress::Physical(0x100_0010), &text[0x10..0x20]),
+            (
+                KcoreAddress::Virtual(0xffff_8880_4000_0010),
+                &ram[0x10..0x20],
+            ),
+        ] {
+            let got = read_kcore_at(&kcore, address, 16)
+                .unwrap_or_else(|error| panic!("{address}: {error:#}"));
+            assert_eq!(got, want, "{address}");
+        }
+        for address in [
+            KcoreAddress::Virtual(0x100_0010),
+            KcoreAddress::Physical(TEXT + 0x10),
+            KcoreAddress::Virtual(TEXT + 0xf8),
+        ] {
+            let error = read_kcore_at(&kcore, address, 16).expect_err("read outside every segment");
+            assert_eq!(
+                error.to_string(),
+                format!("no segment holds {address}+0x10"),
+                "{address}"
             );
         }
     }
@@ -258,8 +356,14 @@ mod tests {
         ] {
             let lockdown = lockdown_file(dir.path(), mode);
 
-            let error = read_kcore(&dir.path().join("kcore"), &lockdown, refused_open, 0, 1)
-                .expect_err("open a refusing /proc/kcore");
+            let error = read_kcore(
+                &dir.path().join("kcore"),
+                &lockdown,
+                refused_open,
+                KcoreAddress::Physical(0),
+                1,
+            )
+            .expect_err("open a refusing /proc/kcore");
 
             assert_eq!(
                 error.downcast_ref::<MemoryAccessDenied>(),
@@ -290,7 +394,7 @@ mod tests {
                 &path,
                 &lockdown,
                 |_| Err(io::Error::from_raw_os_error(errno)),
-                0,
+                KcoreAddress::Physical(0),
                 1,
             )
             .expect_err("open a failing /proc/kcore");
@@ -332,8 +436,13 @@ mod tests {
             (libc::EACCES, true),
             (libc::EIO, false),
         ] {
-            let error = read_kcore_file(&RefusedRead(errno), Path::new("kcore"), 0x1000, 16)
-                .expect_err("read a refusing /proc/kcore");
+            let error = read_kcore_file(
+                &RefusedRead(errno),
+                Path::new("kcore"),
+                KcoreAddress::Physical(0x1000),
+                16,
+            )
+            .expect_err("read a refusing /proc/kcore");
 
             let want = refused.then_some(MemoryAccessDenied {
                 device: MemoryDevice::Kcore,
@@ -357,7 +466,8 @@ mod tests {
     fn read_kcore_at_refuses_a_file_that_is_not_elf64() {
         let file = tempfile::tempfile().expect("create the file");
         file.write_all_at(&[0; 64], 0).expect("write zeros");
-        let error = read_kcore_at(&file, 0, 1).expect_err("read zeros as kcore");
+        let error =
+            read_kcore_at(&file, KcoreAddress::Physical(0), 1).expect_err("read zeros as kcore");
         assert_eq!(error.to_string(), "not a little-endian ELF64 file");
     }
 }

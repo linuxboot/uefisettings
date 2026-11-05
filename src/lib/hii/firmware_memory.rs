@@ -42,6 +42,8 @@ use fdt_params::UefiFdtParams;
 use firmware_reserved::FirmwareReservedMap;
 #[cfg(any(target_arch = "aarch64", test))]
 use kcore::read_kcore;
+#[cfg(any(target_arch = "aarch64", test))]
+use kcore::KcoreAddress;
 #[cfg(target_arch = "aarch64")]
 use kcore::KCORE_PATH;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
@@ -53,7 +55,8 @@ pub(super) mod efi_memory_map;
 pub(super) mod fdt_params;
 #[cfg(any(firmware_memory_maps, test))]
 pub(super) mod firmware_reserved;
-#[cfg(any(target_arch = "aarch64", test))]
+// arm64's EFI memory map and, on x86_64 and arm64, Linux's own data.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 pub(super) mod kcore;
 #[cfg(any(firmware_memory_maps, test))]
 mod physical_range;
@@ -87,7 +90,7 @@ const FIRMWARE_RESERVED_E820_TYPES: [&str; 2] = ["Reserved", "ACPI Non-volatile 
 pub(in crate::hii) const FDT_PATH: &str = "/sys/firmware/fdt";
 
 /// The `N` bytes at `offset` of `bytes`, if it holds them.
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 pub(in crate::hii) fn array_at<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
     bytes.get(offset..)?.first_chunk().copied()
 }
@@ -363,7 +366,7 @@ pub(in crate::hii) fn read_fdt_memory_map(
             kcore,
             lockdown,
             |path| File::open(path),
-            params.mmap_start,
+            KcoreAddress::Physical(params.mmap_start),
             params.mmap_size,
         )?,
         params.mmap_desc_size,
@@ -457,8 +460,14 @@ mod tests {
             cause: DenialCause::Permission,
         };
 
-        let error = read_kcore(&unreadable, &lockdown, |path| File::open(path), 0, 1)
-            .expect_err("open /proc/kcore");
+        let error = read_kcore(
+            &unreadable,
+            &lockdown,
+            |path| File::open(path),
+            KcoreAddress::Physical(0),
+            1,
+        )
+        .expect_err("open /proc/kcore");
         assert_eq!(
             error.downcast_ref::<MemoryAccessDenied>(),
             Some(&want(MemoryDevice::Kcore)),

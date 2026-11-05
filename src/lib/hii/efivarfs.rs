@@ -17,6 +17,8 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use anyhow::anyhow;
@@ -60,8 +62,23 @@ use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EFIVARFS_INTERFACE;
 use crate::hii::efivarfs_format::EFIVARFS_REACH;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::hii::firmware_memory::kcore::read_kcore_file;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::hii::firmware_memory::kcore::KcoreAddress;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::hii::firmware_memory::kcore::KCORE_PATH;
+use crate::hii::kallsyms::GenericSetVariable;
 use crate::hii::kallsyms::KernelSymbols;
 use crate::hii::kallsyms::KALLSYMS_PATH;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::hii::lockdown::refuse_locked_down;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::hii::lockdown::LOCKDOWN_PATH;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::hii::memory_access_denied::mark_refused_open;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
@@ -286,6 +303,11 @@ pub(super) trait WriteSafetyEvidence {
     /// Whether the kernel's symbols name efivarfs_reconfigure(), which upstream 0e8d2444168d added
     /// with the check that keeps such an efivarfs read-only.
     fn names_efivarfs_reconfigure(&self) -> Result<bool>;
+    /// Whether the efivar_operations through which efivarfs writes holds a SetVariable(): the NULL
+    /// one is what such a write calls, unless another efivars_register() caller replaced it (gsmi
+    /// before v6.3, qcom uefisecapp in v6.7), where a NULL set_variable refuses a write that would
+    /// not crash.
+    fn generic_set_variable(&self) -> Result<GenericSetVariable>;
     /// Whether the boot log names an EFI_RT_PROPERTIES_TABLE that Linux applied.
     fn rt_properties_in_boot_log(&self) -> Result<RtPropertiesInBootLog>;
     /// The RuntimeServicesSupported of the firmware's EFI_RT_PROPERTIES_TABLE, which Linux ANDs
@@ -297,6 +319,12 @@ pub(super) trait WriteSafetyEvidence {
 /// Why an efivarfs write would crash this Linux, or may.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 enum CrashingWrite {
+    #[error(
+        "Linux has no runtime SetVariable() and, without efivarfs_reconfigure() (upstream \
+         0e8d2444168d, Linux v6.8), crashes on an efivarfs write; run uefisettings.efi in the \
+         UEFI Shell"
+    )]
+    NoSetVariable,
     #[error(
         "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes on an \
          efivarfs write without a runtime SetVariable(), as on firmware whose \
@@ -332,8 +360,9 @@ impl fmt::Display for UndecidedSteps {
 /// Whether an efivarfs write cannot crash this Linux, from `evidence`. The first step that
 /// decides wins:
 /// 1. the kernel names efivarfs_reconfigure(): it keeps efivarfs read-only without SetVariable();
-/// 2. the boot log names no usable RT properties table: Linux kept SetVariable();
-/// 3. the firmware's RT properties table, which Linux applied, lists SetVariable(), or there is
+/// 2. generic_ops holds a SetVariable(), or refuses the write without one;
+/// 3. the boot log names no usable RT properties table: Linux kept SetVariable();
+/// 4. the firmware's RT properties table, which Linux applied, lists SetVariable(), or there is
 ///    none; one that leaves it out refuses the write, and so does an unreadable one, with what
 ///    each step found.
 fn kernel_survives_writes(evidence: &dyn WriteSafetyEvidence) -> Result<KernelSurvivesWrites> {
@@ -341,6 +370,11 @@ fn kernel_survives_writes(evidence: &dyn WriteSafetyEvidence) -> Result<KernelSu
     match evidence.names_efivarfs_reconfigure() {
         Ok(true) => return Ok(KernelSurvivesWrites(())),
         Ok(false) => undecided.push(anyhow!("the kernel names no efivarfs_reconfigure()")),
+        Err(error) => undecided.push(error),
+    }
+    match evidence.generic_set_variable() {
+        Ok(GenericSetVariable::Absent) => return Err(CrashingWrite::NoSetVariable.into()),
+        Ok(GenericSetVariable::Present) => return Ok(KernelSurvivesWrites(())),
         Err(error) => undecided.push(error),
     }
     match evidence.rt_properties_in_boot_log() {
@@ -363,9 +397,23 @@ fn kernel_survives_writes(evidence: &dyn WriteSafetyEvidence) -> Result<KernelSu
     }
 }
 
-/// The evidence of this Linux: its symbol table and its log.
+/// The evidence of this Linux: its symbol table, its memory and its log.
 struct LinuxEvidence {
     kallsyms: PathBuf,
+    /// The symbols of `kallsyms`, from the first pass that read it.
+    symbols: OnceLock<KernelSymbols>,
+    /// The lockdown mode, which may refuse `kcore`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    lockdown: PathBuf,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    kcore: PathBuf,
+    /// The kernel release, as uname(2) gives it (Linux v6.7 kernel/utsname_sysctl.c osrelease).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    osrelease: PathBuf,
+    /// The first release whose /proc/kcore reads generic_ops safely, if not every release's does:
+    /// KCORE_SAFE_SINCE.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    kcore_safe_since: Option<KernelRelease>,
     kmsg: PathBuf,
     /// The character device that `kmsg` must be, or None for any file, as the tests give.
     kmsg_device: Option<libc::dev_t>,
@@ -378,16 +426,131 @@ impl LinuxEvidence {
     fn system() -> Self {
         Self {
             kallsyms: PathBuf::from(KALLSYMS_PATH),
+            symbols: OnceLock::new(),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            lockdown: PathBuf::from(LOCKDOWN_PATH),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            kcore: PathBuf::from(KCORE_PATH),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            osrelease: PathBuf::from(OSRELEASE_PATH),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            kcore_safe_since: KCORE_SAFE_SINCE,
             kmsg: PathBuf::from(KMSG_PATH),
             kmsg_device: Some(KMSG_DEVICE),
             kernel_log: Box::new(Syslog),
         }
     }
+
+    /// The symbols of the symbol table, which the first call reads.
+    fn symbols(&self) -> Result<&KernelSymbols> {
+        if let Some(symbols) = self.symbols.get() {
+            return Ok(symbols);
+        }
+        let symbols = KernelSymbols::read(&self.kallsyms)?;
+        Ok(self.symbols.get_or_init(|| symbols))
+    }
+}
+
+/// The kernel release, as uname(2) gives it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const OSRELEASE_PATH: &str = "/proc/sys/kernel/osrelease";
+
+/// Before Linux v5.14 (2711032c64a9), read_kcore() calls __pa() on every /proc/kcore address
+/// (v5.13 fs/proc/kcore.c), which arm64's CONFIG_DEBUG_VIRTUAL warns on for an address outside
+/// the linear map (arch/arm64/mm/physaddr.c __virt_to_phys()), as generic_ops' kernel-image
+/// address is. On x86_64, __pa() of a kernel-image address only bounds-checks it.
+#[cfg(target_arch = "aarch64")]
+const KCORE_SAFE_SINCE: Option<KernelRelease> = Some(KernelRelease {
+    major: 5,
+    minor: 14,
+});
+#[cfg(target_arch = "x86_64")]
+const KCORE_SAFE_SINCE: Option<KernelRelease> = None;
+
+/// The major and minor numbers that start a Linux release, such as 5.13 in
+/// 5.13.19-100.fc33.aarch64.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct KernelRelease {
+    major: u32,
+    minor: u32,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl FromStr for KernelRelease {
+    type Err = anyhow::Error;
+
+    fn from_str(release: &str) -> Result<Self> {
+        let (major, rest) = release
+            .split_once('.')
+            .with_context(|| format!("kernel release {release:?} has no minor number"))?;
+        let minor = rest
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or_default();
+        Ok(Self {
+            major: major
+                .parse()
+                .with_context(|| format!("kernel release {release:?}: major number"))?,
+            minor: minor
+                .parse()
+                .with_context(|| format!("kernel release {release:?}: minor number"))?,
+        })
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl fmt::Display for KernelRelease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// Refuses a kernel before `since`, by its release at `osrelease`: its /proc/kcore read of
+/// generic_ops may warn (KCORE_SAFE_SINCE).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn refuse_kcore_before(osrelease: &Path, since: KernelRelease) -> Result<()> {
+    let text = fs::read_to_string(osrelease)
+        .with_context(|| format!("Failed to read {}", osrelease.display()))?;
+    let release: KernelRelease = text.trim_end().parse()?;
+    if release < since {
+        bail!(
+            "Linux before v{since} calls __pa() on every /proc/kcore address (2711032c64a9), \
+             which arm64's CONFIG_DEBUG_VIRTUAL warns on for generic_ops' kernel-image address"
+        );
+    }
+    Ok(())
 }
 
 impl WriteSafetyEvidence for LinuxEvidence {
     fn names_efivarfs_reconfigure(&self) -> Result<bool> {
-        Ok(KernelSymbols::read(&self.kallsyms)?.efivarfs_reconfigure)
+        Ok(self.symbols()?.efivarfs_reconfigure)
+    }
+
+    /// generic_ops' words, from /proc/kcore, which root reads under kernel lockdown integrity but
+    /// not confidentiality (LOCKDOWN_KCORE; Linux v6.7 fs/proc/kcore.c open_kcore()), so the
+    /// lockdown check comes first. A security module may audit the open.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn generic_set_variable(&self) -> Result<GenericSetVariable> {
+        let symbols = self.symbols()?;
+        symbols.require_generic_ops()?;
+        if let Some(since) = self.kcore_safe_since {
+            refuse_kcore_before(&self.osrelease, since)?;
+        }
+        refuse_locked_down(MemoryDevice::Kcore, &self.lockdown)?;
+        let kcore = File::open(&self.kcore)
+            .with_context(|| format!("Failed to open {}", self.kcore.display()))
+            .map_err(|error| mark_refused_open(error, MemoryDevice::Kcore, &self.lockdown))?;
+        symbols.generic_set_variable(|address, length| {
+            read_kcore_file(&kcore, &self.kcore, KcoreAddress::Virtual(address), length)
+        })
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn generic_set_variable(&self) -> Result<GenericSetVariable> {
+        bail!(
+            "uefisettings reads Linux's generic_ops through /proc/kcore only on x86_64 and aarch64"
+        )
     }
 
     fn rt_properties_in_boot_log(&self) -> Result<RtPropertiesInBootLog> {
@@ -773,6 +936,15 @@ mod tests {
     fn linux_evidence(dir: &Path, kallsyms: &str) -> LinuxEvidence {
         let evidence = LinuxEvidence {
             kallsyms: dir.join("kallsyms"),
+            symbols: OnceLock::new(),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            lockdown: dir.join("lockdown"),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            kcore: dir.join("kcore"),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            osrelease: dir.join("osrelease"),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            kcore_safe_since: None,
             kmsg: dir.join("kmsg"),
             kmsg_device: None,
             kernel_log: Box::new(FakeSyslog(Err(libc::ENOSYS))),
@@ -1341,11 +1513,259 @@ mod tests {
         );
     }
 
+    /// Writes, in `dir`, the lockdown file of `mode` and a /proc/kcore whose kernel text holds,
+    /// at the generic_ops of GENERIC_OPS_KALLSYMS, the words `words`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn write_generic_ops(dir: &Path, mode: &str, words: [u64; 3]) {
+        use crate::hii::firmware_memory::kcore::fixture::kcore_fixture_of;
+        use crate::hii::kallsyms::fixture::GENERIC_OPS_AT;
+
+        fs::write(dir.join("lockdown"), mode).expect("write the lockdown file");
+        let text = [
+            &[0xcc; 0x20][..],
+            &words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &[0xcc; 0x20],
+        ]
+        .concat();
+        kcore_fixture_of(
+            &dir.join("kcore"),
+            &[(0x3c1_a2c0, GENERIC_OPS_AT - 0x20, &text)],
+        );
+    }
+
+    /// On a kernel before the release that kcore_safe_since gives, LinuxEvidence refuses to read
+    /// generic_ops before it reads the lockdown mode or opens /proc/kcore; from that release on,
+    /// it reads them.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn linux_evidence_reads_kcore_only_since_the_release_given() {
+        use crate::hii::kallsyms::fixture::GENERIC_OPS_KALLSYMS;
+        use crate::hii::kallsyms::fixture::GET_NEXT_VARIABLE_AT;
+        use crate::hii::kallsyms::fixture::GET_VARIABLE_AT;
+        use crate::hii::kallsyms::fixture::SET_VARIABLE_AT;
+
+        for (release, want) in [
+            ("5.13.19-100.fc33.aarch64\n", None),
+            ("5.14.0\n", Some(GenericSetVariable::Present)),
+        ] {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let mut evidence = linux_evidence(dir.path(), GENERIC_OPS_KALLSYMS);
+            evidence.kcore_safe_since = Some(KernelRelease {
+                major: 5,
+                minor: 14,
+            });
+            write_generic_ops(
+                dir.path(),
+                "[none] integrity confidentiality\n",
+                [GET_VARIABLE_AT, GET_NEXT_VARIABLE_AT, SET_VARIABLE_AT],
+            );
+            fs::write(&evidence.osrelease, release).expect("write the kernel release");
+            let watch = Inotify::init(InitFlags::IN_NONBLOCK).expect("create an inotify instance");
+            watch
+                .add_watch(dir.path(), AddWatchFlags::IN_OPEN)
+                .expect("watch the directory");
+
+            let got = evidence.generic_set_variable();
+
+            let opened = touched(&watch);
+            match want {
+                Some(want) => {
+                    let got = got.unwrap_or_else(|error| panic!("{release:?}: {error:#}"));
+                    assert_eq!(got, want, "{release:?}");
+                    assert!(
+                        opened.iter().any(|name| name == "kcore"),
+                        "{release:?}: kcore unopened: {opened:?}"
+                    );
+                }
+                None => {
+                    let error = got.expect_err("read generic_ops before the release");
+                    assert_eq!(
+                        format!("{error:#}"),
+                        "Linux before v5.14 calls __pa() on every /proc/kcore address \
+                         (2711032c64a9), which arm64's CONFIG_DEBUG_VIRTUAL warns on for \
+                         generic_ops' kernel-image address",
+                        "{release:?}"
+                    );
+                    assert!(
+                        !opened
+                            .iter()
+                            .any(|name| name == "kcore" || name == "lockdown"),
+                        "{release:?}: opened {opened:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// LinuxEvidence reads generic_ops through the kernel text of /proc/kcore, under kernel
+    /// lockdown integrity too, but refuses to open it under confidentiality.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn linux_evidence_reads_generic_ops_through_kcore() {
+        use crate::hii::kallsyms::fixture::GENERIC_OPS_KALLSYMS;
+        use crate::hii::kallsyms::fixture::GET_NEXT_VARIABLE_AT;
+        use crate::hii::kallsyms::fixture::GET_VARIABLE_AT;
+        use crate::hii::kallsyms::fixture::SET_VARIABLE_AT;
+        use crate::hii::lockdown::LockdownMode;
+        use crate::hii::memory_access_denied::DenialCause;
+        use crate::hii::memory_access_denied::MemoryAccessDenied;
+        use crate::hii::memory_access_denied::MemoryOperation;
+
+        const NONE: &str = "[none] integrity confidentiality\n";
+        const INTEGRITY: &str = "none [integrity] confidentiality\n";
+        for (case, mode, set, want) in [
+            (
+                "SetVariable() left out",
+                NONE,
+                0,
+                GenericSetVariable::Absent,
+            ),
+            (
+                "SetVariable()",
+                NONE,
+                SET_VARIABLE_AT,
+                GenericSetVariable::Present,
+            ),
+            (
+                "lockdown integrity",
+                INTEGRITY,
+                0,
+                GenericSetVariable::Absent,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let evidence = linux_evidence(dir.path(), GENERIC_OPS_KALLSYMS);
+            write_generic_ops(
+                dir.path(),
+                mode,
+                [GET_VARIABLE_AT, GET_NEXT_VARIABLE_AT, set],
+            );
+
+            let got = evidence
+                .generic_set_variable()
+                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+            assert_eq!(got, want, "{case}");
+        }
+
+        let dir = tempfile::tempdir().expect("create a directory");
+        let evidence = linux_evidence(dir.path(), GENERIC_OPS_KALLSYMS);
+        write_generic_ops(
+            dir.path(),
+            "none integrity [confidentiality]\n",
+            [GET_VARIABLE_AT, GET_NEXT_VARIABLE_AT, 0],
+        );
+        let error = evidence
+            .generic_set_variable()
+            .expect_err("read /proc/kcore under confidentiality");
+        assert_eq!(
+            error.downcast_ref::<MemoryAccessDenied>(),
+            Some(&MemoryAccessDenied {
+                device: MemoryDevice::Kcore,
+                operation: MemoryOperation::Open,
+                cause: DenialCause::Lockdown(LockdownMode::Confidentiality),
+            }),
+            "confidentiality: {error:#}"
+        );
+
+        let dir = tempfile::tempdir().expect("create a directory");
+        let evidence = linux_evidence(dir.path(), GENERIC_OPS_KALLSYMS);
+        fs::write(dir.path().join("lockdown"), NONE).expect("write the lockdown file");
+        crate::hii::firmware_memory::kcore::fixture::kcore_fixture(
+            &dir.path().join("kcore"),
+            &[(0x100_0000, &[0; 0x40])],
+        );
+        let error = evidence
+            .generic_set_variable()
+            .expect_err("read generic_ops outside every segment");
+        assert!(
+            format!("{error:#}").contains("no segment holds virtual 0xffffffff83c1a2e0+0x18"),
+            "no segment: {error:#}"
+        );
+
+        let dir = tempfile::tempdir().expect("create a directory");
+        let evidence = linux_evidence(dir.path(), GENERIC_OPS_KALLSYMS);
+        fs::write(dir.path().join("lockdown"), NONE).expect("write the lockdown file");
+        let error = evidence
+            .generic_set_variable()
+            .expect_err("read generic_ops without /proc/kcore");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "Failed to open {}",
+                dir.path().join("kcore").display()
+            )) && !message.contains("memory map"),
+            "no kcore: {message}"
+        );
+
+        let dir = tempfile::tempdir().expect("create a directory");
+        let evidence = linux_evidence(dir.path(), FIXED_KALLSYMS);
+        fs::write(dir.path().join("lockdown"), NONE).expect("write the lockdown file");
+        let error = evidence
+            .generic_set_variable()
+            .expect_err("read generic_ops without its address");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no address of generic_ops") && !message.contains("Failed to open"),
+            "no address: {message}"
+        );
+    }
+
+    /// On a kernel without efivarfs_reconfigure() whose generic_ops lacks SetVariable(),
+    /// write_at refuses before it remounts efivarfs, whatever the boot log and the RT properties
+    /// table say, and writes nothing.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn efivar_files_refuse_a_kernel_without_set_variable_before_the_remount() {
+        use crate::hii::kallsyms::fixture::GENERIC_OPS_KALLSYMS;
+        use crate::hii::kallsyms::fixture::GET_NEXT_VARIABLE_AT;
+        use crate::hii::kallsyms::fixture::GET_VARIABLE_AT;
+
+        let ([dir, _lock, evidence], files) = unmounted_efivar_files_of(GENERIC_OPS_KALLSYMS);
+        write_generic_ops(
+            evidence.path(),
+            "[none] integrity confidentiality\n",
+            [GET_VARIABLE_AT, GET_NEXT_VARIABLE_AT, 0],
+        );
+        let key = variable_key("Setup");
+        let path = dir.path().join(EfivarFileName::from(&key));
+        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[0; 4]].concat();
+        fs::write(&path, &bytes).expect("write the efivar file");
+
+        let error = files
+            .write_at(&key, 4, 0, &[1])
+            .expect_err("write on a kernel without SetVariable()");
+
+        assert_eq!(
+            error.downcast_ref::<CrashingWrite>(),
+            Some(&CrashingWrite::NoSetVariable),
+            "{error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("mount guard"),
+            "{error:#}: refused after the remount"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read the efivar file"),
+            bytes,
+            "bytes"
+        );
+    }
+
     /// The refusals say why, word for word, and point at uefisettings.efi in the UEFI Shell, as
     /// NoRuntimeSetVariable does.
     #[test]
     fn crashing_write_texts() {
         for (refusal, want) in [
+            (
+                CrashingWrite::NoSetVariable,
+                "Linux has no runtime SetVariable() and, without efivarfs_reconfigure() (upstream \
+                 0e8d2444168d, Linux v6.8), crashes on an efivarfs write; run uefisettings.efi in \
+                 the UEFI Shell",
+            ),
             (
                 CrashingWrite::TableOmitsSetVariable(0x3fbf),
                 "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes \
@@ -1401,6 +1821,7 @@ mod tests {
     /// Evidence of these outcomes, which records the steps asked.
     struct FakeEvidence {
         reconfigure: Outcome<bool>,
+        generic: Outcome<GenericSetVariable>,
         boot_log: Outcome<RtPropertiesInBootLog>,
         table: Outcome<Option<u32>>,
         asked: RefCell<Vec<&'static str>>,
@@ -1409,11 +1830,13 @@ mod tests {
     impl FakeEvidence {
         fn new(
             reconfigure: Outcome<bool>,
+            generic: Outcome<GenericSetVariable>,
             boot_log: Outcome<RtPropertiesInBootLog>,
             table: Outcome<Option<u32>>,
         ) -> Self {
             Self {
                 reconfigure,
+                generic,
                 boot_log,
                 table,
                 asked: RefCell::new(Vec::new()),
@@ -1430,6 +1853,10 @@ mod tests {
     impl WriteSafetyEvidence for FakeEvidence {
         fn names_efivarfs_reconfigure(&self) -> Result<bool> {
             self.ask("kallsyms", self.reconfigure)
+        }
+
+        fn generic_set_variable(&self) -> Result<GenericSetVariable> {
+            self.ask("kcore", self.generic)
         }
 
         fn rt_properties_in_boot_log(&self) -> Result<RtPropertiesInBootLog> {
@@ -1450,55 +1877,76 @@ mod tests {
     }
 
     /// Every combination of outcomes decides as the first step that decides says, and every
-    /// combination that a kernel which crashes on the write can give is a refusal.
+    /// combination that a kernel which crashes on the write can give is a refusal: no fix, and
+    /// generic_ops without SetVariable(), or unknown with a boot log that names a table or tells
+    /// nothing and a table that leaves SetVariable() out or is unreadable.
     #[test]
     fn kernel_survives_writes_decides_by_the_first_step_that_decides() {
+        use GenericSetVariable as Generic;
         use RtPropertiesInBootLog::Absent;
         use RtPropertiesInBootLog::Present;
         const SET: u32 = 0x3fff;
         const CLEAR: u32 = 0x3fbf;
         for reconfigure in [Ok(true), Ok(false), Err("no kallsyms")] {
-            for boot_log in [Ok(Absent), Ok(Present), Err("no kernel log")] {
-                for table in [Ok(None), Ok(Some(SET)), Ok(Some(CLEAR)), Err("no table")] {
-                    let case = format!("{reconfigure:?}, {boot_log:?}, {table:?}");
-                    let evidence = FakeEvidence::new(reconfigure, boot_log, table);
+            for generic in [Ok(Generic::Absent), Ok(Generic::Present), Err("no kcore")] {
+                for boot_log in [Ok(Absent), Ok(Present), Err("no kernel log")] {
+                    for table in [Ok(None), Ok(Some(SET)), Ok(Some(CLEAR)), Err("no table")] {
+                        let case = format!("{reconfigure:?}, {generic:?}, {boot_log:?}, {table:?}");
+                        let evidence = FakeEvidence::new(reconfigure, generic, boot_log, table);
 
-                    let got = kernel_survives_writes(&evidence);
+                        let got = kernel_survives_writes(&evidence);
 
-                    let all = vec!["kallsyms", "boot log", "table"];
-                    let want = match (reconfigure, boot_log, table) {
-                        (Ok(true), _, _) => Decision::Proceed(vec!["kallsyms"]),
-                        (_, Ok(Absent), _) => Decision::Proceed(vec!["kallsyms", "boot log"]),
-                        (_, _, Ok(None) | Ok(Some(SET))) => Decision::Proceed(all),
-                        (_, _, Ok(Some(supported))) => {
-                            Decision::Refuse(CrashingWrite::TableOmitsSetVariable(supported))
-                        }
-                        (_, _, Err(_)) => Decision::Refuse(CrashingWrite::Unknown),
-                    };
-                    let decision = match &got {
-                        Ok(_) => Decision::Proceed(evidence.asked.borrow().clone()),
-                        Err(error) => Decision::Refuse(
-                            *error
-                                .downcast_ref::<CrashingWrite>()
-                                .unwrap_or_else(|| panic!("{case}: {error:#}")),
-                        ),
-                    };
-                    assert_eq!(decision, want, "{case}");
+                        let all = vec!["kallsyms", "kcore", "boot log", "table"];
+                        let want = match (reconfigure, generic, boot_log, table) {
+                            (Ok(true), ..) => Decision::Proceed(vec!["kallsyms"]),
+                            (_, Ok(Generic::Absent), ..) => {
+                                Decision::Refuse(CrashingWrite::NoSetVariable)
+                            }
+                            (_, Ok(Generic::Present), ..) => {
+                                Decision::Proceed(vec!["kallsyms", "kcore"])
+                            }
+                            (_, _, Ok(Absent), _) => {
+                                Decision::Proceed(vec!["kallsyms", "kcore", "boot log"])
+                            }
+                            (.., Ok(None) | Ok(Some(SET))) => Decision::Proceed(all),
+                            (.., Ok(Some(supported))) => {
+                                Decision::Refuse(CrashingWrite::TableOmitsSetVariable(supported))
+                            }
+                            (.., Err(_)) => Decision::Refuse(CrashingWrite::Unknown),
+                        };
+                        let decision = match &got {
+                            Ok(_) => Decision::Proceed(evidence.asked.borrow().clone()),
+                            Err(error) => Decision::Refuse(
+                                *error
+                                    .downcast_ref::<CrashingWrite>()
+                                    .unwrap_or_else(|| panic!("{case}: {error:#}")),
+                            ),
+                        };
+                        assert_eq!(decision, want, "{case}");
 
-                    let crashing = reconfigure != Ok(true)
-                        && boot_log != Ok(Absent)
-                        && matches!(table, Ok(Some(CLEAR)) | Err(_));
-                    assert_eq!(got.is_err(), crashing, "{case}: refused");
-                    if let (Err(error), Err(_)) = (got, table) {
-                        let message = format!("{error:#}");
-                        for found in [reconfigure.err(), boot_log.err(), table.err()]
+                        let crashing = reconfigure != Ok(true)
+                            && (generic == Ok(Generic::Absent)
+                                || generic.is_err()
+                                    && boot_log != Ok(Absent)
+                                    && matches!(table, Ok(Some(CLEAR)) | Err(_)));
+                        assert_eq!(got.is_err(), crashing, "{case}: refused");
+                        if let (Err(error), Decision::Refuse(CrashingWrite::Unknown)) = (got, want)
+                        {
+                            let message = format!("{error:#}");
+                            for found in [
+                                reconfigure.err(),
+                                generic.err(),
+                                boot_log.err(),
+                                table.err(),
+                            ]
                             .into_iter()
                             .flatten()
-                        {
-                            assert!(
-                                message.contains(found),
-                                "{case}: {message:?} lacks {found:?}"
-                            );
+                            {
+                                assert!(
+                                    message.contains(found),
+                                    "{case}: {message:?} lacks {found:?}"
+                                );
+                            }
                         }
                     }
                 }
@@ -1510,15 +1958,35 @@ mod tests {
     #[test]
     fn efivar_files_keep_only_a_proof() {
         let (_dirs, mut files) = unmounted_efivar_files();
-        files.evidence = Box::new(FakeEvidence::new(Ok(true), Err("unasked"), Err("unasked")));
+        files.evidence = Box::new(FakeEvidence::new(
+            Ok(true),
+            Err("unasked"),
+            Err("unasked"),
+            Err("unasked"),
+        ));
         files.survives().expect("check");
-        files.evidence = Box::new(FakeEvidence::new(Ok(false), Err("no log"), Err("no table")));
+        files.evidence = Box::new(FakeEvidence::new(
+            Ok(false),
+            Err("no kcore"),
+            Err("no log"),
+            Err("no table"),
+        ));
         files.survives().expect("keep the proof of the first check");
 
         let (_dirs, mut files) = unmounted_efivar_files();
-        files.evidence = Box::new(FakeEvidence::new(Ok(false), Err("no log"), Err("no table")));
+        files.evidence = Box::new(FakeEvidence::new(
+            Ok(false),
+            Err("no kcore"),
+            Err("no log"),
+            Err("no table"),
+        ));
         files.survives().expect_err("refuse");
-        files.evidence = Box::new(FakeEvidence::new(Ok(true), Err("unasked"), Err("unasked")));
+        files.evidence = Box::new(FakeEvidence::new(
+            Ok(true),
+            Err("unasked"),
+            Err("unasked"),
+            Err("unasked"),
+        ));
         files.survives().expect("ask again after the refusal");
     }
 

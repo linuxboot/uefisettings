@@ -73,7 +73,7 @@ pub(super) enum MemoryAccess {
     DevMemRead,
     DevMemMap,
     /// /proc/kcore has no mmap() (fs/proc/kcore.c kcore_proc_ops).
-    #[cfg(any(target_arch = "aarch64", test))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
     KcoreRead,
 }
 
@@ -82,7 +82,7 @@ impl MemoryAccess {
     fn device(self) -> MemoryDevice {
         match self {
             Self::DevMemRead | Self::DevMemMap => MemoryDevice::DevMem,
-            #[cfg(any(target_arch = "aarch64", test))]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
             Self::KcoreRead => MemoryDevice::Kcore,
         }
     }
@@ -91,7 +91,7 @@ impl MemoryAccess {
         match self {
             Self::DevMemRead => MemoryOperation::Read,
             Self::DevMemMap => MemoryOperation::Map,
-            #[cfg(any(target_arch = "aarch64", test))]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
             Self::KcoreRead => MemoryOperation::Read,
         }
     }
