@@ -19,9 +19,10 @@
 # Usage: tests/qemu/run.sh ARCH [SCENARIO...]
 #
 # ARCH is x86_64, i686 or aarch64. The guest's kernel, firmware and busybox are the
-# packages of tests/qemu/guest-packages-ARCH. QEMU is the qemu-system-* of the table below
-# from PATH, or a wrapper that execs it: the timeout of a boot signals that program, not
-# its children.
+# packages of tests/qemu/guest-packages-ARCH, or of guest-packages-ARCH-unfixed or
+# guest-packages-ARCH-unfixed-v5.8 for the scenarios whose guest= option asks for them. QEMU
+# is the qemu-system-* of the table below from PATH, or a wrapper that execs it: the timeout
+# of a boot signals that program, not its children.
 # The Secure Boot scenarios, those with firmware= in their options, boot the secboot firmware
 # of the table below, which has no UEFI Shell, so their Shell boots get the pinned one on the
 # ESP. On i686 and aarch64, build-secboot-firmware.sh builds that firmware on the first run that
@@ -41,9 +42,12 @@ shift
 # The test terminal is the second serial port, but QEMU's virt machine gives the guest one
 # PL011 UART, so the aarch64 guests write to a virtio console. Debian's i686 kernel has
 # efivarfs as a module. aarch64 runs under TCG, so it boots on x86_64 hosts like the others.
+# Fedora's kernel has that virtio console as a module. modules lists the modules of every guest
+# of the architecture, and guest_modules the one more module of a guest, if any.
 # vamap_args, the QEMU arguments of the vamap scenarios, make the kernel call
 # SetVirtualAddressMap(), which x86 Linux does at every boot (Linux v6.11
 # arch/x86/platform/efi/efi.c efi_enter_virtual_mode()).
+declare -A guest_modules=()
 case $arch in
 x86_64)
     qemu=(qemu-system-x86_64 -machine q35 -accel kvm -cpu host)
@@ -106,6 +110,7 @@ aarch64)
     firmware_vars=usr/share/AAVMF/AAVMF_VARS.fd
     vmlinuz_pattern='lib/modules/*/vmlinuz'
     modules=()
+    guest_modules=([unfixed]='lib/modules/*/kernel/drivers/char/virtio_console.ko.xz')
     console=ttyAMA0
     tty=hvc0
     tty_device=(-device virtio-serial-pci -device "virtconsole,chardev=tty")
@@ -139,7 +144,8 @@ repo=$(realpath "$here/../..")
 out=$repo/target/qemu-test
 driver_sample=$out/$arch/driver-sample
 run=$out/$arch/$(date -u +%Y%m%dT%H%M%SZ)
-# Unpacked again by every run, which keeps one copy per architecture.
+# The guest of guest-packages-$arch, which every run unpacks again, as it does the guest of
+# each guest= option of its scenarios into $guest-<guest>: one copy of each per architecture.
 guest=$out/$arch/guest
 target=$arch-unknown-linux-musl
 
@@ -154,13 +160,15 @@ awk -F '\t' '$0 !~ /^(#|$)/ {
 "$here/scenario-options-test.sh"
 # Whether a scenario of the run boots the secboot firmware.
 secboot=no
+# The guest= options of the run's scenarios.
+guests=()
 # read fails on a last line without a newline, which still counts.
 while IFS=$'\t' read -r name _ _ _ options || [[ -n $name ]]; do
     [[ -z $name || $name == \#* ]] && continue
     scenario_options "$name" "$options"
-    if [[ $option_firmware != default ]] && scenario_runs_on "$arch" &&
-        { (($# == 0)) || [[ " $* " == *" $name "* ]]; }; then
-        secboot=yes
+    if scenario_runs_on "$arch" && { (($# == 0)) || [[ " $* " == *" $name "* ]]; }; then
+        [[ $option_firmware == default ]] || secboot=yes
+        [[ -z $option_guest || " ${guests[*]} " == *" $option_guest "* ]] || guests+=("$option_guest")
     fi
 done <"$here/scenarios.tsv"
 mapfile -t known < <(awk -F '\t' '$1 !~ /^(#|$)/ { print $1 }' "$here/scenarios.tsv")
@@ -267,20 +275,22 @@ if [[ ! -f $driver_sample/DriverSample.efi ]]; then
 fi
 cp "$driver_sample/DriverSample.efi" "$run/esp/"
 
-rm -rf "$guest"
-"$here/fetch-packages.sh" "$here/guest-packages-$arch" "$out/packages" "$guest"
-# Prints the one file of the guest's packages that a pattern of the table matches.
+for each in "" "${guests[@]}"; do
+    rm -rf "$guest${each:+-$each}"
+    "$here/fetch-packages.sh" "$here/guest-packages-$arch${each:+-$each}" "$out/packages" \
+        "$guest${each:+-$each}"
+done
+# Prints the one file of the packages in the directory $1 that a pattern $2 of the table matches.
 guest_file() {
     local files
     # Only the pattern globs, not the path of the repository.
-    mapfile -t files < <(cd "$guest" && compgen -G "$1")
-    if ((${#files[@]} != 1)) || [[ ! -f $guest/${files[0]} ]]; then
-        echo "expected exactly one $1 in $guest" >&2
+    mapfile -t files < <(cd "$1" && compgen -G "$2")
+    if ((${#files[@]} != 1)) || [[ ! -f $1/${files[0]} ]]; then
+        echo "expected exactly one $2 in $1" >&2
         return 1
     fi
-    echo "$guest/${files[0]}"
+    echo "$1/${files[0]}"
 }
-vmlinuz=$(guest_file "$vmlinuz_pattern")
 if [[ $secboot == yes ]]; then
     case $secboot_source in
     guest) secboot_dir=$guest ;;
@@ -329,10 +339,6 @@ secboot_files() {
             dd of="$file" bs=1 seek=$((size - 1)) conv=notrunc status=none
     done
 }
-for module in "${modules[@]}"; do
-    cp "$(guest_file "$module")" "$run/initramfs/lib/modules/"
-done
-cp "$guest/usr/bin/busybox" "$run/initramfs/bin/busybox"
 
 # Prints the guest tests' log of the Linux boot whose logs start with $1, and fails unless they
 # and the health checks passed: init prints their exit codes last. A filter that matches no
@@ -347,6 +353,7 @@ linux_passed() {
 }
 
 failed=()
+ran=0
 # read fails on a last line without a newline, which still counts.
 while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name ]]; do
     [[ -z $name || $name == \#* ]] && continue
@@ -356,12 +363,29 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         (IFS=, && echo "run.sh: $name: skipped, only ${option_arches[*]} boots it")
         continue
     fi
+    ran=$((ran + 1))
+    # the packages of the scenario's guest
+    packages=$guest${option_guest:+-$option_guest}
+    vmlinuz=$(guest_file "$packages" "$vmlinuz_pattern")
     # The firmware and the template of its variable store.
-    code=$guest/$firmware
-    code_vars=$guest/$firmware_vars
+    code=$packages/$firmware
+    code_vars=$packages/$firmware_vars
     dir=$run/$name
     mkdir "$dir"
     cp -r "$run/initramfs" "$dir/"
+    patterns=("${modules[@]}")
+    if [[ -n $option_guest && -n ${guest_modules[$option_guest]-} ]]; then
+        patterns+=("${guest_modules[$option_guest]}")
+    fi
+    # busybox insmod takes no compressed module.
+    for module in "${patterns[@]}"; do
+        module=$(guest_file "$packages" "$module")
+        case $module in
+        *.ko.xz) xz --decompress --stdout "$module" >"$dir/initramfs/lib/modules/$(basename "$module" .xz)" ;;
+        *) cp "$module" "$dir/initramfs/lib/modules/" ;;
+        esac
+    done
+    cp "$packages/usr/bin/busybox" "$dir/initramfs/bin/busybox"
     boot_qemu=("${qemu[@]}")
     # the arguments of virt-fw-vars that enroll the keys of the scenario's variable store
     enroll=()
@@ -400,13 +424,15 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
     virt-fw-vars --input "$code_vars" "${enroll[@]}" --set-json "$dir/vars.json" \
         --output "$dir/vars.fd" 2>>"$dir/virt-fw-vars.log"
     kernel_qemu_args=()
-    # the kernel parameter that locks the scenario's Linux boots down, if any
-    lockdown_param=
+    # the kernel parameters of the scenario's Linux boots: the one that locks them down, if
+    # any, and those of params=
+    scenario_params=
     case $option_kernel in
     vamap) kernel_qemu_args=("${vamap_args[@]}") ;;
-    lockdown) lockdown_param=" lockdown=integrity" ;;
-    lockdown-conf) lockdown_param=" lockdown=confidentiality" ;;
+    lockdown) scenario_params=" lockdown=integrity" ;;
+    lockdown-conf) scenario_params=" lockdown=confidentiality" ;;
     esac
+    scenario_params+="${option_params[*]:+ ${option_params[*]}}"
     device_args=()
     for device in "${option_devices[@]}"; do
         case $device in
@@ -456,7 +482,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
             guest_args=(
                 -drive "if=virtio,format=raw,readonly=on,file=fat:$run/esp"
                 -kernel "$vmlinuz" -initrd "$dir/initrd.img"
-                -append "console=$console quiet panic=-1${kernel_params[*]:+ ${kernel_params[*]}} uefisettings.tty=$tty uefisettings.test=$test${filter:+ uefisettings.filter=$filter}$lockdown_param"
+                -append "console=$console quiet panic=-1${kernel_params[*]:+ ${kernel_params[*]}} uefisettings.tty=$tty uefisettings.test=$test${filter:+ uefisettings.filter=$filter}$scenario_params"
                 -chardev "file,id=tty,path=$log.test.log" "${tty_device[@]}"
             )
             ;;
@@ -502,6 +528,10 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
 done 3<"$here/scenarios.tsv"
 
 echo "run.sh: end $(date -u +%FT%TZ), logs in $run"
+if ((ran == 0)); then
+    echo "run.sh: FAILED: no selected scenario runs on $arch" >&2
+    exit 1
+fi
 if ((${#failed[@]} > 0)); then
     printf 'run.sh: FAILED: %s; see its console.log, test.log and qemu.log\n' "${failed[@]}"
     exit 1

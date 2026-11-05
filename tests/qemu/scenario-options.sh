@@ -21,20 +21,33 @@
 #   arch=ARCH[,ARCH]...                  the architectures, of x86_64, i686 and aarch64, that boot
 #                                        the scenario; default: all three
 #   devices=DEVICE[,DEVICE]...           QEMU devices to add, of virtio-rng; default: none
-# It sets option_kernel (empty without its key), option_firmware, option_arches and
-# option_devices, and fails, naming the scenario and the key, on an empty column or token, a
-# token without "=", an unknown or repeated key, an unknown value, and an empty or repeated
-# element of a comma list.
+#   guest=unfixed|unfixed-v5.8           the guest of guest-packages-<arch>-unfixed, or of
+#                                        guest-packages-x86_64-unfixed-v5.8, which needs
+#                                        arch=x86_64: Linux without upstream 0e8d2444168d (run.sh);
+#                                        default: that of guest-packages-<arch>
+#   params=PARAM[,PARAM]...              more kernel parameters of the Linux boots, such as those
+#                                        of tests/qemu/init, none with a comma, none that run.sh
+#                                        sets itself (console, quiet, panic, lockdown, which
+#                                        kernel= sets, pti, which i686 boots set, and
+#                                        uefisettings.tty, .test and .filter), and no name
+#                                        twice; default: none
+# It sets option_kernel and option_guest (empty without their keys), option_firmware,
+# option_arches, option_devices and option_params, and fails, naming the scenario and the key,
+# on an empty column or token, a token without "=", an unknown or repeated key, an unknown
+# value, an empty or repeated element of a comma list, guest=unfixed-v5.8 without arch=x86_64,
+# and a parameter of params= that run.sh sets or whose name repeats.
 # scenario_runs_on ARCH then tells whether the scenario boots on ARCH.
 
-# Sets option_kernel, option_firmware, option_arches and option_devices from the options column
-# $2 of scenario $1.
+# Sets option_kernel, option_firmware, option_arches, option_devices, option_guest and
+# option_params from the options column $2 of scenario $1.
 scenario_options() {
     local name=$1 column=$2 rest token key value seen=' '
     option_kernel=
     option_firmware=default
     option_arches=(x86_64 i686 aarch64)
     option_devices=()
+    option_guest=
+    option_params=()
     if [[ -z $column ]]; then
         echo "scenarios.tsv: $name: the options column is empty" >&2
         return 1
@@ -70,6 +83,11 @@ scenario_options() {
             ;;
         arch) scenario_option_list "$name" "$key" "$value" option_arches x86_64 i686 aarch64 || return 1 ;;
         devices) scenario_option_list "$name" "$key" "$value" option_devices virtio-rng || return 1 ;;
+        guest)
+            scenario_option_value "$name" "$key" "$value" unfixed unfixed-v5.8 || return 1
+            option_guest=$value
+            ;;
+        params) scenario_option_params "$name" "$value" || return 1 ;;
         *)
             echo "scenarios.tsv: $name: unknown key $key" >&2
             return 1
@@ -78,6 +96,11 @@ scenario_options() {
         [[ $rest == *' '* ]] || break
         rest=${rest#* }
     done
+    if [[ $option_guest == unfixed-v5.8 && ${option_arches[*]} != x86_64 ]]; then
+        echo "scenarios.tsv: $name: guest=unfixed-v5.8 needs arch=x86_64:" \
+            "only guest-packages-x86_64-unfixed-v5.8 pins its kernel" >&2
+        return 1
+    fi
 }
 
 # Fails unless the value $3 of key $2 of scenario $1 is one of the values that follow.
@@ -113,6 +136,35 @@ scenario_option_list() {
             return 1
         fi
         elements+=("$element")
+        [[ $rest == *,* ]] || break
+        rest=${rest#*,}
+    done
+}
+
+# Puts the kernel parameters of params=$2 of scenario $1 in option_params, and fails on an empty
+# one, one that run.sh sets itself, or a name, the part before any "=", that repeats.
+scenario_option_params() {
+    local name=$1 value=$2 rest param names=' '
+    option_params=()
+    rest=$value
+    while true; do
+        param=${rest%%,*}
+        if [[ -z $param ]]; then
+            echo "scenarios.tsv: $name: an empty element in params=$value" >&2
+            return 1
+        fi
+        case ${param%%=*} in
+        console | quiet | panic | lockdown | pti | uefisettings.tty | uefisettings.test | uefisettings.filter)
+            echo "scenarios.tsv: $name: run.sh sets ${param%%=*} itself, not params=$value" >&2
+            return 1
+            ;;
+        esac
+        if [[ $names == *" ${param%%=*} "* ]]; then
+            echo "scenarios.tsv: $name: repeated parameter ${param%%=*} in params=$value" >&2
+            return 1
+        fi
+        names+="${param%%=*} "
+        option_params+=("$param")
         [[ $rest == *,* ]] || break
         rest=${rest#*,}
     done

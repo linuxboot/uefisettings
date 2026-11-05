@@ -1,0 +1,8 @@
+# The kernel, firmware and busybox of the aarch64 guests of the scenarios whose kernel is unfixed,
+# in the format of fetch-packages.sh: Fedora 39's Linux 6.5.6, without upstream 0e8d2444168d, and
+# its kernel-modules-core, which holds virtio_console. Their sha256 are those of the Fedora 39
+# aarch64 primary.xml.gz that repomd.xml lists.
+e9fd6412384181815114c7bbdb7416790b0ad847153ef7acc40d94878596b6e4 https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/39/Everything/aarch64/os/Packages/k/kernel-core-6.5.6-300.fc39.aarch64.rpm
+f5274ca5788c8565c42d867d8265fc5ff5998b6ace9eed80b70ba0b9c878b583 https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/39/Everything/aarch64/os/Packages/k/kernel-modules-core-6.5.6-300.fc39.aarch64.rpm
+fad8e80e929cd00dae8c5c8e5dd3ec85f37d9a832eea776957e5e2cf86ef2ab5 https://archive.ubuntu.com/ubuntu/pool/main/e/edk2/qemu-efi-aarch64_2024.02-2ubuntu0.10_all.deb https://launchpad.net/ubuntu/+archive/primary/+files/qemu-efi-aarch64_2024.02-2ubuntu0.10_all.deb
+d96535e0402c011e0ee43449799df2f4504d44b842e4f2b3a6cbc845508eaafc https://ports.ubuntu.com/ubuntu-ports/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_arm64.deb https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_arm64.deb

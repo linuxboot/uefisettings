@@ -17,7 +17,11 @@
 #                that run.sh generates for the scenario, in User Mode, or "default"; arch= a
 #                comma list of the architectures that boot the scenario, of x86_64, i686 and
 #                aarch64, which the others skip; devices= a comma list of QEMU devices to add,
-#                of virtio-rng
+#                of virtio-rng; guest= "unfixed" to boot the kernel of
+#                guest-packages-<arch>-unfixed, or "unfixed-v5.8", with arch=x86_64, that of
+#                guest-packages-x86_64-unfixed-v5.8, both without upstream Linux 0e8d2444168d;
+#                params= a comma list of more kernel parameters of the Linux boots, such as
+#                those of tests/qemu/init
 # The scenarios whose names start with "shell-" are those of make test-e2e-qemu-shell-<arch>.
 # "-" leaves a column empty.
 boot-smoke	-	-	boot_smoke	-
@@ -38,3 +42,24 @@ secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
 secboot-user	-	-	secboot/user_mode	firmware=secboot-user
 shell-secboot-setup	-	-	shell:secboot-setup	firmware=secboot-setup
 shell-secboot-user	/publish-hiidb.efi set-auth-variables=/auth/db-append.auth,/auth/db-tampered.auth,/auth/db-unauthorized.auth,/auth/db-foreign.auth	-	shell:secboot-user	firmware=secboot-user
+crash-guard-nosetvar	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed
+crash-guard-nosetvar-ro	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed arch=x86_64 params=uefisettings.efivarfs=ro
+crash-guard-nosetvar-remounted-rw	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed arch=x86_64 params=uefisettings.efivarfs=remounted-rw
+crash-guard-nosetvar-lockdown	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown arch=x86_64
+crash-guard-nosetvar-ro-lockdown	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown arch=x86_64 params=uefisettings.efivarfs=ro
+crash-guard-nosetvar-remounted-rw-lockdown	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown arch=x86_64 params=uefisettings.efivarfs=remounted-rw
+crash-guard-nosetvar-lockdown-conf	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown-conf arch=x86_64
+crash-guard-nosetvar-ro-lockdown-conf	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown-conf arch=x86_64 params=uefisettings.efivarfs=ro
+crash-guard-nosetvar-remounted-rw-lockdown-conf	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown-conf arch=x86_64 params=uefisettings.efivarfs=remounted-rw
+crash-guard-all-ro	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-all	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed params=uefisettings.efivarfs=ro
+crash-guard-all-remounted-rw	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-all	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed arch=x86_64 params=uefisettings.efivarfs=remounted-rw
+crash-guard-all-ro-lockdown-conf	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-all	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown-conf arch=x86_64 params=uefisettings.efivarfs=ro
+crash-guard-none-ro	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	efivarfs_crash_guard/set_writes	guest=unfixed params=uefisettings.efivarfs=ro
+crash-guard-none-ro-lockdown	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	efivarfs_crash_guard/set_writes	guest=unfixed kernel=lockdown arch=x86_64 params=uefisettings.efivarfs=ro
+crash-guard-none-ro-lockdown-conf-devkmsg-off	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	efivarfs_crash_guard/set_writes	guest=unfixed kernel=lockdown-conf arch=x86_64 params=uefisettings.efivarfs=ro,printk.devkmsg=off
+crash-guard-none-ro-lockdown-conf-flood	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed kernel=lockdown-conf arch=x86_64 params=uefisettings.efivarfs=ro,printk.devkmsg=on,uefisettings.flood=6000
+crash-guard-version-2	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-version-2	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed arch=x86_64
+crash-guard-version-2-all	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-version-2-all	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed arch=x86_64
+crash-guard-v5.8-nosetvar	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed-v5.8 arch=x86_64
+crash-guard-v5.8-all-ro	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-all	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_what_it_cannot_tell	guest=unfixed-v5.8 arch=x86_64 params=uefisettings.efivarfs=ro
+crash-guard-fixed-nosetvar	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_meets_the_remount_refusal	params=uefisettings.allowed_error=SetVariableRT

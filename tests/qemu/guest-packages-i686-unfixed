@@ -1,0 +1,7 @@
+# The kernel, firmware and busybox of the i686 guests of the scenarios whose kernel is unfixed, in
+# the format of fetch-packages.sh: Debian 12.0's Linux 6.1.27, without upstream 0e8d2444168d, which
+# stable 6.1 has from 6.1.75. Its sha256 is the one of the bookworm main/binary-i386/Packages.xz
+# of snapshot.debian.org at 20230611T000000Z that its Release lists.
+f561d6374bb40d2ddf648c9fe8926c9741796df374bd660d83af4a049e1ac015 https://snapshot.debian.org/archive/debian/20230611T000000Z/pool/main/l/linux-signed-i386/linux-image-6.1.0-9-686-pae_6.1.27-1_i386.deb
+45fb466babfad1f5a51c65d656ba338ae46a7b8bbcda61234b79753a7359d423 https://archive.ubuntu.com/ubuntu/pool/universe/e/edk2/ovmf-ia32_2024.02-2ubuntu0.10_all.deb https://launchpad.net/ubuntu/+archive/primary/+files/ovmf-ia32_2024.02-2ubuntu0.10_all.deb
+39c410d5bc570ce2a4e14055bcf021afbae75bc0efe850634138234828b3416a https://archive.ubuntu.com/ubuntu/pool/main/b/busybox/busybox-static_1.36.1-6ubuntu3.1_i386.deb https://launchpad.net/ubuntu/+archive/primary/+files/busybox-static_1.36.1-6ubuntu3.1_i386.deb

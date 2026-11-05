@@ -15,7 +15,16 @@
 # mounts what uefisettings needs, runs the test binary that uefisettings.test= on the
 # kernel command line names (with the libtest filter from uefisettings.filter=, if any)
 # and then the health checks, both writing to the terminal that uefisettings.tty= names.
-# It prints both exit codes on the console and powers off.
+# It prints both exit codes on the console and powers off. These parameters set the
+# guest up first:
+#   uefisettings.efivarfs=  how efivarfs is mounted: "default", as systemd mounts it, "ro",
+#                           as an fstab may ask, or "remounted-rw", mounted and then
+#                           remounted read-write, as an administrator may do
+#   uefisettings.flood=N    N records that init writes to /dev/kmsg before the test, which
+#                           needs printk.devkmsg=on, to push the oldest out of the log
+#   uefisettings.kptr_restrict=N   the kernel.kptr_restrict sysctl for the test
+#   uefisettings.allowed_error=TEXT   kernel errors that contain TEXT, which the test
+#                           expects, pass the health checks
 
 /bin/busybox --install -s /bin
 # uefisettings locks a file in /run/lock before it writes a setting.
@@ -29,17 +38,26 @@ mount -t devtmpfs devtmpfs /dev
 for module in /lib/modules/*.ko; do
     [ -e "$module" ] && insmod "$module"
 done
-mount -t efivarfs efivarfs /sys/firmware/efi/efivars
 
 test=
 filter=
 tty=
+efivarfs=default
+flood=0
+kptr_restrict=
+allowed_error=
+devkmsg=
 read -r cmdline < /proc/cmdline
 for parameter in $cmdline; do
     case $parameter in
     uefisettings.test=*) test=${parameter#*=} ;;
     uefisettings.filter=*) filter=${parameter#*=} ;;
     uefisettings.tty=*) tty=/dev/${parameter#*=} ;;
+    uefisettings.efivarfs=*) efivarfs=${parameter#*=} ;;
+    uefisettings.flood=*) flood=${parameter#*=} ;;
+    uefisettings.kptr_restrict=*) kptr_restrict=${parameter#*=} ;;
+    uefisettings.allowed_error=*) allowed_error=${parameter#*=} ;;
+    printk.devkmsg=*) devkmsg=${parameter#*=} ;;
     esac
 done
 
@@ -47,42 +65,91 @@ done
 # the start and exit lines begin with a newline. run.sh prints the terminal's output from
 # the start line on.
 printf '\nuefisettings-qemu-test: start %s %s\n' "$test" "$filter" > "$tty"
+setup_status=0
+efivars=/sys/firmware/efi/efivars
+case $efivarfs in
+default) mount -t efivarfs efivarfs "$efivars" ;;
+ro) mount -t efivarfs -o ro efivarfs "$efivars" ;;
+remounted-rw) mount -t efivarfs efivarfs "$efivars" && mount -o remount,rw "$efivars" ;;
+*) false ;;
+esac > "$tty" 2>&1 || {
+    echo "cannot mount efivarfs as uefisettings.efivarfs=$efivarfs asks" > "$tty"
+    setup_status=1
+}
+i=0
+while [ "$i" -lt "$flood" ]; do
+    echo "uefisettings-qemu-test: flood record $i of $flood" > /dev/kmsg
+    i=$((i + 1))
+done
+if [ -n "$kptr_restrict" ]; then
+    echo "$kptr_restrict" > /proc/sys/kernel/kptr_restrict || setup_status=1
+fi
 # The health checks judge only the test: the kernel log and taint of the boot depend on
 # the host, e.g. a RETBleed error on Intel hosts that hide IBRS from the guest.
+# printk.devkmsg=off refuses every open of /dev/kmsg (Linux v6.7 kernel/printk/printk.c
+# devkmsg_open()), while dmesg, which reads the log through syslog(2), still reads it.
 read -r start < /proc/sys/kernel/random/uuid
-echo "uefisettings-qemu-test: start of test $start" > /dev/kmsg
+if [ "$devkmsg" = off ]; then
+    dmesg -r > /tmp/log-before
+else
+    echo "uefisettings-qemu-test: start of test $start" > /dev/kmsg
+fi
 # cat, not read: busybox read reads a byte at a time, and numeric sysctls answer only a
-# read at offset 0, so read would get only the first digit.
-taint=$(cat /proc/sys/kernel/tainted /sys/kernel/warn_count)
-"/tests/$test" --test-threads=1 ${filter:+"$filter"} > "$tty" 2>&1
-test_status=$?
+# read at offset 0, so read would get only the first digit. Linux v6.2 added warn_count
+# (kernel/panic.c), and stable kernels before it may lack it: there a WARN only taints.
+counts="/proc/sys/kernel/tainted /sys/kernel/warn_count"
+[ -e /sys/kernel/warn_count ] || counts=/proc/sys/kernel/tainted
+taint=$(cat $counts)
+if [ "$setup_status" = 0 ]; then
+    "/tests/$test" --test-threads=1 ${filter:+"$filter"} > "$tty" 2>&1
+    test_status=$?
+else
+    test_status=$setup_status
+fi
 # The test added no taint (TAINT_* in include/linux/panic.h) or warning (a repeated WARN
 # adds no taint bit), and the kernel kept its log
-# (/dev/kmsg still has the start record) and logged no error since: each /dev/kmsg record
-# starts with facility << 3 | level, and the kernel's own facility is 0. /dev/kmsg keeps
+# (/dev/kmsg still has the start record) and logged no error since, but one that contains
+# uefisettings.allowed_error=: each /dev/kmsg record starts with facility << 3 | level, and
+# the kernel's own facility is 0. /dev/kmsg keeps
 # the records that a log clear hides from dmesg. A read of it returns one record, fails if
 # the record does not fit and waits at the end of the log, so dd copies the records into
 # a FIFO, awk stops at a record that init writes last, and then dd is killed. The shell
-# opens the FIFO for dd, so awk also stops if dd cannot open /dev/kmsg.
+# opens the FIFO for dd, so awk also stops if dd cannot open /dev/kmsg. Under
+# printk.devkmsg=off, the log that dmesg read before the test must start the log after it,
+# and dmesg's lines start with <facility << 3 | level>.
 health_status=0
 {
-    tainted=$(cat /proc/sys/kernel/tainted /sys/kernel/warn_count)
+    tainted=$(cat $counts)
     set -- $taint
-    [ $# = 2 ] && [ "$tainted" = "$taint" ] || {
+    values=$#
+    set -- $counts
+    [ "$values" = $# ] && [ "$tainted" = "$taint" ] || {
         echo "the taint or warning count changed or is missing:" $taint, then $tainted
         health_status=1
     }
-    read -r end < /proc/sys/kernel/random/uuid
-    echo "uefisettings-qemu-test: end of log $end" > /dev/kmsg
-    mkfifo /tmp/kmsg
-    dd if=/dev/kmsg bs=8192 2> /dev/null > /tmp/kmsg &
-    awk -v start="$start" -v end="$end" '
-        index($0, end) { found = started; exit }
-        started && /^[0-3],/ { print; error = 1 }
-        index($0, start) { started = 1 }
-        END { if (!found) print "cannot read the kernel log"; exit !found || error }' /tmp/kmsg ||
-        health_status=1
-    kill "$!" 2> /dev/null
+    if [ "$devkmsg" = off ]; then
+        dmesg -r > /tmp/log-after
+        kept=$(wc -l < /tmp/log-before)
+        head -n "$kept" /tmp/log-after | cmp -s - /tmp/log-before || {
+            echo "the kernel log lost records"
+            health_status=1
+        }
+        tail -n "+$((kept + 1))" /tmp/log-after | awk -v allowed="$allowed_error" '
+            /^<[0-3]>/ && !(allowed != "" && index($0, allowed)) { print; error = 1 }
+            END { exit error }' || health_status=1
+    else
+        read -r end < /proc/sys/kernel/random/uuid
+        echo "uefisettings-qemu-test: end of log $end" > /dev/kmsg
+        mkfifo /tmp/kmsg
+        dd if=/dev/kmsg bs=8192 2> /dev/null > /tmp/kmsg &
+        awk -v start="$start" -v end="$end" -v allowed="$allowed_error" '
+            index($0, end) { found = started; exit }
+            started && /^[0-3],/ && !(allowed != "" && index($0, allowed)) { print; error = 1 }
+            index($0, start) { started = 1 }
+            END { if (!found) print "cannot read the kernel log"; exit !found || error }' /tmp/kmsg ||
+            health_status=1
+        kill "$!" 2> /dev/null
+    fi
 } > "$tty" 2>&1
 printf '\nuefisettings-qemu-test: exit %s %s\n' "$test_status" "$health_status"
 poweroff -f

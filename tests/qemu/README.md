@@ -31,7 +31,15 @@ xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes
 The guest's kernel, firmware, UEFI Shell and busybox do not come from the host: they are the
 packages that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64),
 [i686](guest-packages-i686) or [aarch64](guest-packages-aarch64)) pins, which
-[`fetch-packages.sh`](fetch-packages.sh) downloads.
+[`fetch-packages.sh`](fetch-packages.sh) downloads. The scenarios `crash-guard-*` whose
+options say `guest=unfixed` or `guest=unfixed-v5.8` boot the kernels without upstream Linux
+0e8d2444168d that [`guest-packages-x86_64-unfixed`](guest-packages-x86_64-unfixed),
+[`guest-packages-x86_64-unfixed-v5.8`](guest-packages-x86_64-unfixed-v5.8),
+[`guest-packages-i686-unfixed`](guest-packages-i686-unfixed) and
+[`guest-packages-aarch64-unfixed`](guest-packages-aarch64-unfixed) pin, which crash on an
+efivarfs write when the firmware's `EFI_RT_PROPERTIES_TABLE` leaves out `SetVariable()`: the
+guest test [`efivarfs_crash_guard`](guest/tests/efivarfs_crash_guard.rs) checks that
+`uefisettings` refuses those writes and makes the others.
 
 `run.sh` alone runs the scenarios of an architecture on the active toolchain of rustup,
 which then needs that architecture's musl and UEFI targets:

@@ -31,7 +31,7 @@ failed=0
 parsed() {
     local IFS=,
     echo "kernel=$option_kernel firmware=$option_firmware arch=${option_arches[*]}" \
-        "devices=${option_devices[*]}"
+        "devices=${option_devices[*]} guest=$option_guest params=${option_params[*]}"
 }
 
 # Checks that scenario_options parses the column $1 into $2, quietly.
@@ -73,21 +73,32 @@ runs_on() {
 }
 
 all='firmware=default arch=x86_64,i686,aarch64'
-accepts - "kernel= $all devices="
-accepts kernel=vamap "kernel=vamap $all devices="
-accepts kernel=lockdown "kernel=lockdown $all devices="
-accepts kernel=lockdown-conf "kernel=lockdown-conf $all devices="
-accepts firmware=default "kernel= $all devices="
+accepts - "kernel= $all devices= guest= params="
+accepts kernel=vamap "kernel=vamap $all devices= guest= params="
+accepts kernel=lockdown "kernel=lockdown $all devices= guest= params="
+accepts kernel=lockdown-conf "kernel=lockdown-conf $all devices= guest= params="
+accepts firmware=default "kernel= $all devices= guest= params="
 accepts firmware=secboot-setup \
-    'kernel= firmware=secboot-setup arch=x86_64,i686,aarch64 devices='
-accepts firmware=secboot-user 'kernel= firmware=secboot-user arch=x86_64,i686,aarch64 devices='
-accepts arch=i686 'kernel= firmware=default arch=i686 devices='
-accepts arch=aarch64,x86_64 'kernel= firmware=default arch=aarch64,x86_64 devices='
-accepts devices=virtio-rng "kernel= $all devices=virtio-rng"
+    'kernel= firmware=secboot-setup arch=x86_64,i686,aarch64 devices= guest= params='
+accepts firmware=secboot-user 'kernel= firmware=secboot-user arch=x86_64,i686,aarch64 devices= guest= params='
+accepts arch=i686 'kernel= firmware=default arch=i686 devices= guest= params='
+accepts arch=aarch64,x86_64 'kernel= firmware=default arch=aarch64,x86_64 devices= guest= params='
+accepts devices=virtio-rng "kernel= $all devices=virtio-rng guest= params="
 accepts 'devices=virtio-rng firmware=secboot-user kernel=lockdown arch=x86_64,i686' \
-    'kernel=lockdown firmware=secboot-user arch=x86_64,i686 devices=virtio-rng'
+    'kernel=lockdown firmware=secboot-user arch=x86_64,i686 devices=virtio-rng guest= params='
+accepts guest=unfixed "kernel= $all devices= guest=unfixed params="
+accepts 'guest=unfixed kernel=lockdown-conf arch=x86_64' \
+    'kernel=lockdown-conf firmware=default arch=x86_64 devices= guest=unfixed params='
+accepts 'arch=x86_64 guest=unfixed-v5.8' \
+    'kernel= firmware=default arch=x86_64 devices= guest=unfixed-v5.8 params='
+accepts params=uefisettings.efivarfs=ro "kernel= $all devices= guest= params=uefisettings.efivarfs=ro"
+# A parameter may have no value, or "=" in its value.
+accepts params=nokaslr,uefisettings.allowed_error=a=b \
+    "kernel= $all devices= guest= params=nokaslr,uefisettings.allowed_error=a=b"
+accepts 'guest=unfixed params=uefisettings.efivarfs=ro,printk.devkmsg=on,uefisettings.flood=6000' \
+    "kernel= $all devices= guest=unfixed params=uefisettings.efivarfs=ro,printk.devkmsg=on,uefisettings.flood=6000"
 # Each case starts from the defaults, not from the case before.
-accepts - "kernel= $all devices="
+accepts - "kernel= $all devices= guest= params="
 
 refuses '' 'scenarios.tsv: test: the options column is empty'
 refuses ' kernel=vamap' 'scenarios.tsv: test: an empty option: a space at the start or end, or two in a row'
@@ -124,12 +135,39 @@ refuses devices=virtio \
     'scenarios.tsv: test: unknown element virtio in devices=virtio; the elements are virtio-rng'
 refuses devices=virtio-rng,virtio-rng \
     'scenarios.tsv: test: repeated element virtio-rng in devices=virtio-rng,virtio-rng'
+refuses guest= 'scenarios.tsv: test: unknown value guest=; the values are unfixed unfixed-v5.8'
+refuses guest=fixed 'scenarios.tsv: test: unknown value guest=fixed; the values are unfixed unfixed-v5.8'
+refuses 'guest=unfixed guest=unfixed' 'scenarios.tsv: test: repeated key guest'
+refuses guest=unfixed-v5.8 \
+    'scenarios.tsv: test: guest=unfixed-v5.8 needs arch=x86_64: only guest-packages-x86_64-unfixed-v5.8 pins its kernel'
+refuses 'arch=x86_64,i686 guest=unfixed-v5.8' \
+    'scenarios.tsv: test: guest=unfixed-v5.8 needs arch=x86_64: only guest-packages-x86_64-unfixed-v5.8 pins its kernel'
+refuses params= 'scenarios.tsv: test: an empty element in params='
+refuses params=quiet, 'scenarios.tsv: test: run.sh sets quiet itself, not params=quiet,'
+refuses params=a=1, 'scenarios.tsv: test: an empty element in params=a=1,'
+refuses params=,a=1 'scenarios.tsv: test: an empty element in params=,a=1'
+refuses params=a=1,,b=2 'scenarios.tsv: test: an empty element in params=a=1,,b=2'
+refuses params=a=1,b,a=2 'scenarios.tsv: test: repeated parameter a in params=a=1,b,a=2'
+refuses 'params=a=1 params=b=2' 'scenarios.tsv: test: repeated key params'
+refuses params=console=ttyS1 'scenarios.tsv: test: run.sh sets console itself, not params=console=ttyS1'
+refuses params=panic=0 'scenarios.tsv: test: run.sh sets panic itself, not params=panic=0'
+refuses params=a=1,lockdown=integrity \
+    'scenarios.tsv: test: run.sh sets lockdown itself, not params=a=1,lockdown=integrity'
+refuses params=uefisettings.tty=ttyS0 \
+    'scenarios.tsv: test: run.sh sets uefisettings.tty itself, not params=uefisettings.tty=ttyS0'
+refuses params=uefisettings.test=hii \
+    'scenarios.tsv: test: run.sh sets uefisettings.test itself, not params=uefisettings.test=hii'
+refuses params=uefisettings.filter=x \
+    'scenarios.tsv: test: run.sh sets uefisettings.filter itself, not params=uefisettings.filter=x'
+refuses params=pti=off 'scenarios.tsv: test: run.sh sets pti itself, not params=pti=off'
 
 runs_on - aarch64 yes
 runs_on arch=x86_64,i686 x86_64 yes
 runs_on arch=x86_64,i686 i686 yes
 runs_on arch=x86_64,i686 aarch64 no
 runs_on arch=aarch64 x86_64 no
+runs_on 'guest=unfixed arch=x86_64,aarch64' aarch64 yes
+runs_on 'guest=unfixed arch=x86_64,aarch64' i686 no
 
 if ((failed > 0)); then
     echo "scenario-options-test: $failed of $cases cases failed"
