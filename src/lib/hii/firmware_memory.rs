@@ -165,8 +165,10 @@ pub(in crate::hii) fn read_sysfs_hex(path: &Path) -> Result<u64> {
 }
 
 /// The runtime descriptors of the EFI memory map that x86 Linux exports at `dir`
-/// (RUNTIME_MAP_PATH), in directory order. Without
-/// `dir`, a refusal: nothing else bounds the reads of firmware memory.
+/// (RUNTIME_MAP_PATH), in the map's order: Linux names each entry after its index in the map
+/// (arch/x86/platform/efi/runtime-map.c efi_runtime_map_init()), but lists them by the hash of
+/// the name (fs/kernfs/dir.c kernfs_fop_readdir()). Without `dir`, a refusal: nothing else
+/// bounds the reads of firmware memory.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
 pub(in crate::hii) fn read_runtime_map(dir: &Path) -> Result<EfiMemoryMap> {
     let entries = match fs::read_dir(dir) {
@@ -178,11 +180,23 @@ pub(in crate::hii) fn read_runtime_map(dir: &Path) -> Result<EfiMemoryMap> {
             return Err(error).with_context(|| format!("Failed to read {}", dir.display()))
         }
     };
-    let descriptors = entries
+    let mut entries = entries
         .map(|entry| {
             let entry = entry
                 .with_context(|| format!("Failed to read {}", dir.display()))?
                 .path();
+            let index = entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<usize>().ok())
+                .with_context(|| format!("{} is named after no map index", entry.display()))?;
+            Ok((index, entry))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_unstable_by_key(|&(index, _)| index);
+    let descriptors = entries
+        .into_iter()
+        .map(|(_, entry)| {
             Ok(MemoryDescriptor {
                 memory_type: MemoryType(u32::try_from(read_sysfs_hex(&entry.join("type"))?)?),
                 physical_start: read_sysfs_hex(&entry.join("phys_addr"))?,
@@ -646,6 +660,23 @@ mod tests {
                 memory_type: MemoryType::MEMORY_MAPPED_IO,
             }),
             "memory-mapped I/O: {error:#}"
+        );
+    }
+
+    /// An entry whose name is no map index is refused.
+    #[test]
+    fn read_runtime_map_refuses_an_entry_of_no_index() {
+        let dir = tempfile::tempdir().expect("create a sysfs directory");
+        write_runtime_map(dir.path(), &[RUNTIME_DATA]);
+        fs::create_dir(dir.path().join("runtime")).expect("create an entry of no index");
+        let error = read_runtime_map(dir.path()).expect_err("read an entry of no index");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "{} is named after no map index",
+                dir.path().join("runtime").display()
+            ),
+            "an entry of no index"
         );
     }
 
