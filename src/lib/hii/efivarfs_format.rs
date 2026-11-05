@@ -54,7 +54,7 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 /// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
 /// (OvmfPkgX64.dsc), as of edk2-stable202508.
 #[cfg(any(target_os = "linux", test))]
-const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// What efivarfs, and so a copy of it, reaches.
 pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
 /// The interface of efivarfs, and so of a copy of it.

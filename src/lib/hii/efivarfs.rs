@@ -361,12 +361,14 @@ fn to_ms_flags(options: &[String]) -> MsFlags {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Read;
 
     use anyhow::Context;
     use anyhow::Result;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::hii::efivarfs_format::MAX_EFIVAR_FILE_SIZE;
     use crate::hii::variables::tests::variable_key;
     use crate::hii::variables::tests::BS_RT;
     use crate::hii::variables::tests::NV_BS_RT;
@@ -429,6 +431,50 @@ mod tests {
                 "{name}: the efivar file"
             );
         }
+    }
+
+    /// write_at refuses an efivar file of more than MAX_EFIVAR_FILE_SIZE bytes, a sparse one
+    /// here, with read_efivar_file's error, and writes nothing.
+    #[test]
+    fn efivar_files_refuse_a_file_longer_than_the_maximum() {
+        let (dir, _lock, files) = unmounted_efivar_files();
+        let key = variable_key("Setup");
+        let path = dir.path().join(EfivarFileName::from(&key));
+        let attributes = NV_BS_RT.to_ne_bytes();
+        File::create(&path)
+            .and_then(|mut file| {
+                file.write_all(&attributes)?;
+                file.set_len(MAX_EFIVAR_FILE_SIZE + 1)
+            })
+            .expect("create an efivar file one byte longer than the maximum");
+        let too_long = format!(
+            "'{}': longer than its maximum of {MAX_EFIVAR_FILE_SIZE} bytes",
+            path.display()
+        );
+
+        let written = files
+            .write_at(&key, 4, 0, &[1])
+            .map_err(|error| format!("{error:#}"));
+
+        assert_eq!(
+            written,
+            Err(format!("Failed to read efivarfs file {too_long}")),
+            "write_at"
+        );
+        let mut head = [0xFF; 5];
+        File::open(&path)
+            .and_then(|mut file| file.read_exact(&mut head))
+            .expect("read the head of the efivar file");
+        assert_eq!(
+            (
+                fs::metadata(&path)
+                    .expect("read the efivar file's metadata")
+                    .len(),
+                head.to_vec()
+            ),
+            (MAX_EFIVAR_FILE_SIZE + 1, [&attributes[..], &[0]].concat()),
+            "the efivar file"
+        );
     }
 
     /// write_at writes nothing when it cannot remount efivarfs.
