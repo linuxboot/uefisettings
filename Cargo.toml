@@ -31,6 +31,8 @@ subtle = "2.6"
 zeroize = "1.9.1"
 # GUIDs in registry format, such as the variable commands take; the uefi crate's Guid is uguid's.
 uguid = "2.2.1"
+# The SHA-256 of each signature in the EFI_SIGNATURE_LISTs that variable get summarizes.
+sha2 = "0.10.9"
 
 # Only the Linux build uses these: efivarfs, the HiiDB in sysfs, iLO through
 # ilorest_chif.so, and the CLI's logging.

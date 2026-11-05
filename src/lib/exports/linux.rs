@@ -40,6 +40,7 @@ use super::SettingsBackend;
 use super::VariableBackend;
 use crate::capsule_loader::CapsuleLoader;
 use crate::efi_variables::CapsuleDelivery;
+use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::efi_variables::VariableStorageInfo;
@@ -80,6 +81,11 @@ impl VariableBackend {
 
     /// The attributes and sizes of this machine's EFI variables, from its efivarfs.
     pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
+        Ok(EfivarFiles::system())
+    }
+
+    /// The attributes and data of this machine's EFI variables, from its efivarfs.
+    pub(super) fn system_variable_data() -> Result<impl VariableData> {
         Ok(EfivarFiles::system())
     }
 

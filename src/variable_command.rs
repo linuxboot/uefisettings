@@ -10,7 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The variable command: this machine's EFI variables, never their data.
+//! The variable command: this machine's EFI variables.
 
 #[cfg(not(all(variable_names, variable_storage_info)))]
 use anyhow::anyhow;
@@ -22,14 +22,14 @@ use clap::ValueEnum;
 use serde::Serialize;
 #[cfg(variable_storage_info)]
 use uefisettings::exports::VariableAttributes;
-#[cfg(any(variable_names, variable_info, variable_storage_info))]
+#[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
 use uefisettings::exports::VariableBackend;
 #[cfg(variable_names)]
 use uefisettings::exports::VariableKey;
 #[cfg(variable_storage_info)]
 use uefisettings::exports::VariableStorage;
 
-#[cfg(any(variable_names, variable_info, variable_storage_info))]
+#[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
 use crate::print_line;
 
 #[derive(Debug, Parser)]
@@ -56,6 +56,19 @@ enum VariableSubcommands {
         name: String,
         /// The vendor GUID of the variable, such as 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
         guid: String,
+    },
+    /// Show the attributes and the decoded value of a global variable of UEFI 2.11 section 3.3,
+    /// but its load options, hot keys and device paths, or of a signature database, or that it is
+    /// absent
+    #[cfg(variable_data)]
+    #[command(next_display_order = None)]
+    Get {
+        /// The variable, such as Timeout, BootOrder, SecureBoot or db
+        name: String,
+        /// The vendor GUID of the variable, which must be its own:
+        /// D719B2CB-3D3A-4596-A3BC-DAD00E67656F for db, dbx, dbt and dbr, else
+        /// 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+        guid: Option<String>,
     },
     /// Show the storage space of the EFI variables of some attributes, and how much of it is left
     #[command(next_display_order = None)]
@@ -111,6 +124,8 @@ impl VariableCommand {
             VariableSubcommands::List { guid } => list(guid.as_deref()),
             #[cfg(variable_info)]
             VariableSubcommands::Info { name, guid } => print_info(name, guid),
+            #[cfg(variable_data)]
+            VariableSubcommands::Get { name, guid } => print_global(name, guid.as_deref()),
             VariableSubcommands::Storage { attributes } => storage(attributes),
         }
     }
@@ -152,6 +167,15 @@ pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
     // its own JSON object, outside the thrift IDL that the hii commands print, and JSON always,
     // as info takes no -j
     print_line(format_args!("{}", serde_json::to_value(info)?))?;
+    Ok(())
+}
+
+/// Prints the variable `name`, of the vendor GUID `guid` if given, decoded, as JSON always, as
+/// get takes no -j, outside the thrift IDL that the hii commands print.
+#[cfg(variable_data)]
+fn print_global(name: &str, guid: Option<&str>) -> Result<()> {
+    let global = VariableBackend::get(name, guid)?;
+    print_line(format_args!("{}", serde_json::to_string(&global)?))?;
     Ok(())
 }
 
@@ -227,6 +251,10 @@ mod tests {
                 parsed @ VariableSubcommands::Info { .. } => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
+                #[cfg(variable_data)]
+                parsed @ VariableSubcommands::Get { .. } => {
+                    panic!("{args:?} is no list: {parsed:?}")
+                }
                 parsed @ VariableSubcommands::Storage { .. } => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
@@ -243,6 +271,8 @@ mod tests {
 
         let (name, guid) = match variable(&args) {
             VariableSubcommands::Info { name, guid } => (name, guid),
+            #[cfg(variable_data)]
+            parsed @ VariableSubcommands::Get { .. } => panic!("{args:?} is no info: {parsed:?}"),
             parsed @ (VariableSubcommands::List { .. } | VariableSubcommands::Storage { .. }) => {
                 panic!("{args:?} is no info: {parsed:?}")
             }
@@ -260,6 +290,38 @@ mod tests {
             missing.err(),
             Some(clap::error::ErrorKind::MissingRequiredArgument),
             "info without a vendor GUID"
+        );
+    }
+
+    /// get takes a variable name, and its vendor GUID if given.
+    #[cfg(variable_data)]
+    #[test]
+    fn get_takes_a_name_and_a_vendor_guid_if_any() {
+        let db = "D719B2CB-3D3A-4596-A3BC-DAD00E67656F";
+        for (args, want) in [
+            (&["get", "Timeout"][..], ("Timeout", None)),
+            (&["get", "db", db], ("db", Some(db))),
+        ] {
+            let (name, guid) = match variable(args) {
+                VariableSubcommands::Get { name, guid } => (name, guid),
+                #[cfg(variable_info)]
+                parsed @ VariableSubcommands::Info { .. } => {
+                    panic!("{args:?} is no get: {parsed:?}")
+                }
+                parsed @ (VariableSubcommands::List { .. }
+                | VariableSubcommands::Storage { .. }) => {
+                    panic!("{args:?} is no get: {parsed:?}")
+                }
+            };
+
+            assert_eq!((name.as_str(), guid.as_deref()), want, "{args:?}");
+        }
+        let missing = UefiSettingsToolArgs::try_parse_from(["uefisettings", "variable", "get"])
+            .map_err(|error| error.kind());
+        assert_eq!(
+            missing.err(),
+            Some(clap::error::ErrorKind::MissingRequiredArgument),
+            "get without a name"
         );
     }
 
@@ -294,6 +356,10 @@ mod tests {
                 VariableSubcommands::Storage { attributes } => attributes,
                 #[cfg(variable_info)]
                 parsed @ VariableSubcommands::Info { .. } => {
+                    panic!("{args:?} is no storage: {parsed:?}")
+                }
+                #[cfg(variable_data)]
+                parsed @ VariableSubcommands::Get { .. } => {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::List { .. } => {

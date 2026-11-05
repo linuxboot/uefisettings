@@ -25,6 +25,8 @@ use binrw::io::SeekFrom;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
+use serde::Serialize;
+use serde::Serializer;
 
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
@@ -321,6 +323,13 @@ impl FromStr for Guid {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         uguid::Guid::try_parse(s).map(|guid| guid.to_bytes().into())
+    }
+}
+
+/// The registry format that Display writes, as a string.
+impl Serialize for Guid {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 

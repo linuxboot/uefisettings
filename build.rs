@@ -27,7 +27,7 @@ struct Capability {
     target_arches: Option<&'static [&'static str]>,
 }
 
-const CAPABILITIES: [Capability; 9] = [
+const CAPABILITIES: [Capability; 10] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
@@ -87,6 +87,13 @@ const CAPABILITIES: [Capability; 9] = [
     Capability {
         cfg: "capsule_delivery",
         target_oses: &["linux", "uefi"],
+        target_arches: None,
+    },
+    // VariableData and VariableBackend::get: the attributes and data of one of this machine's
+    // EFI variables
+    Capability {
+        cfg: "variable_data",
+        target_oses: &["linux", "uefi", "windows"],
         target_arches: None,
     },
 ];

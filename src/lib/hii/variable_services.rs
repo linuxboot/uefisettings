@@ -27,6 +27,8 @@ use uefi::Status;
 use crate::efi_variables::walk_variable_names;
 use crate::efi_variables::GetNextVariableName;
 use crate::efi_variables::NextVariableName;
+use crate::efi_variables::VariableContents;
+use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
@@ -182,6 +184,19 @@ impl VariableInfoSource for VariableServices {
             Status::NOT_FOUND => Err(VariableNotFound(key.clone()).into()),
             status => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),
         }
+    }
+}
+
+impl VariableData for VariableServices {
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        let (data, attributes) = match get_variable(key) {
+            Err(error) if error.is::<VariableNotFound>() => return Ok(None),
+            result => result?,
+        };
+        let attributes = VariableAttributes::from_bits_retain(attributes.bits());
+        VariableContents::new(attributes, data.into())
+            .map(Some)
+            .with_context(|| format!("GetVariable() of EFI variable {key}"))
     }
 }
 

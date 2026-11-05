@@ -20,6 +20,10 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
+#[cfg(variable_data)]
+use crate::efi_variables::VariableContents;
+#[cfg(variable_data)]
+use crate::efi_variables::VariableData;
 #[cfg(variable_info)]
 use crate::efi_variables::VariableInfo;
 #[cfg(variable_info)]
@@ -27,6 +31,8 @@ use crate::efi_variables::VariableInfoSource;
 use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::FirmwareVariables;
+#[cfg(variable_data)]
+use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
@@ -218,6 +224,19 @@ impl<C: FirmwareEnvironmentCalls> VariableInfoSource for FirmwareEnvironment<C> 
             attributes,
             size: data.len(),
         })
+    }
+}
+
+#[cfg(variable_data)]
+impl<C: FirmwareEnvironmentCalls> VariableData for FirmwareEnvironment<C> {
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        let (attributes, data) = match self.read_all(key) {
+            Err(error) if error.is::<VariableNotFound>() => return Ok(None),
+            result => result?,
+        };
+        VariableContents::new(VariableAttributes::from_bits_retain(attributes), data)
+            .map(Some)
+            .with_context(|| format!("GetFirmwareEnvironmentVariableExW of EFI variable {key}"))
     }
 }
 
@@ -880,5 +899,48 @@ mod tests {
             Some(&VariableNotFound(key)),
             "ERROR_ENVVAR_NOT_FOUND"
         );
+    }
+
+    /// variable_data reads the attributes and all the data of a variable larger than the first
+    /// buffer, writing nothing, None for ERROR_ENVVAR_NOT_FOUND, and an error for other codes.
+    #[cfg(variable_data)]
+    #[test]
+    fn variable_data_reads_a_variable_or_tells_it_absent() {
+        let calls = FakeFirmwareEnvironmentCalls::new();
+        calls.queue_get(FakeGet::Failed(Win32Error::INSUFFICIENT_BUFFER));
+        calls.queue_get(got(NV_BS_RT, &[0xAA; 300]));
+        calls.queue_get(FakeGet::Failed(Win32Error::ENVVAR_NOT_FOUND));
+        calls.queue_get(FakeGet::Failed(Win32Error(ERROR_ACCESS_DENIED)));
+        let environment = fake_environment(&calls);
+        let key = variable_key("Setup");
+
+        let contents = environment
+            .variable_data(&key)
+            .expect("read a variable of 300 bytes")
+            .expect("a variable of 300 bytes is present");
+        let missing = environment
+            .variable_data(&key)
+            .expect("read a missing variable");
+        let denied = environment
+            .variable_data(&key)
+            .expect_err("read a denied variable");
+
+        assert_eq!(
+            (contents.attributes().bits(), contents.data()),
+            (NV_BS_RT, &[0xAA; 300][..]),
+            "a variable of 300 bytes"
+        );
+        assert_eq!(missing, None, "ERROR_ENVVAR_NOT_FOUND");
+        assert_eq!(
+            denied.to_string(),
+            format!(
+                "GetFirmwareEnvironmentVariableExW of EFI variable \
+                 Setup-00000000-0000-0000-0000-000000000000 failed with {}",
+                Win32Error(ERROR_ACCESS_DENIED)
+            ),
+            "ERROR_ACCESS_DENIED"
+        );
+        assert_eq!(calls.get_calls().len(), 4, "gets");
+        assert_eq!(calls.sets(), [], "sets");
     }
 }

@@ -10,7 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The EFI variables of a machine, never their data (UEFI 2.10 §8.2): what the variable commands
+//! The EFI variables of a machine (UEFI 2.10 §8.2): what the variable commands
 //! make of what each backend tells. The backends do the I/O: efivarfs on Linux (hii/efivarfs.rs),
 //! the runtime services in the UEFI Shell (hii/variable_services.rs), and the firmware environment
 //! calls on Windows (hii/firmware_environment.rs). Capsules for the machine's firmware (UEFI 2.11
@@ -30,7 +30,7 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(any(variable_info, variable_storage_info))]
 use serde::Serialize;
-#[cfg(variable_storage_info)]
+#[cfg(any(variable_storage_info, variable_data))]
 use thiserror::Error;
 
 #[cfg(capsule_delivery)]
@@ -54,10 +54,13 @@ pub(crate) use capsule_delivery::UpdateCapsuleDelivery;
 
 #[cfg(any(variable_names, variable_info))]
 use crate::hii::package::Guid;
-#[cfg(variable_storage_info)]
+#[cfg(any(variable_storage_info, variable_data))]
 use crate::hii::VariableAttributes;
-#[cfg(any(variable_names, variable_info))]
+#[cfg(any(variable_names, variable_info, variable_data))]
 use crate::hii::VariableKey;
+
+#[cfg(variable_data)]
+pub(crate) mod globals;
 
 /// GetNextVariableName() (UEFI 2.10 §8.2.2): the variables that a backend reaches, by name and
 /// vendor GUID.
@@ -172,6 +175,50 @@ pub struct VariableInfo {
     /// The size of its data, in bytes
     pub size: usize,
 }
+
+/// GetVariable() (UEFI 2.10 §8.2.1) with the data: a variable that a backend reaches, whole.
+#[cfg(variable_data)]
+pub(crate) trait VariableData {
+    /// The attributes and data of `key`, or None if the backend reaches no such variable.
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>>;
+}
+
+/// The attributes and data of an EFI variable: "A variable must contain one or more bytes of
+/// Data" (UEFI 2.11 §8.2.3).
+#[cfg(variable_data)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VariableContents {
+    attributes: VariableAttributes,
+    data: Vec<u8>,
+}
+
+#[cfg(variable_data)]
+impl VariableContents {
+    /// A variable of `attributes` holding `data`, unless `data` is empty.
+    pub(crate) fn new(
+        attributes: VariableAttributes,
+        data: Vec<u8>,
+    ) -> std::result::Result<Self, EmptyVariable> {
+        match data.is_empty() {
+            true => Err(EmptyVariable),
+            false => Ok(Self { attributes, data }),
+        }
+    }
+
+    pub(crate) fn attributes(&self) -> VariableAttributes {
+        self.attributes
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// Data that VariableContents refuses.
+#[cfg(variable_data)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("an EFI variable holds one byte of data at least (UEFI 2.11 section 8.2.3)")]
+pub(crate) struct EmptyVariable;
 
 /// QueryVariableInfo() (UEFI 2.10 §8.2.4): the storage of the variables of some attributes.
 #[cfg(variable_storage_info)]
@@ -511,6 +558,25 @@ mod tests {
             backend.asked.into_inner(),
             [nv | bs | rt, bs | rt, nv | bs, bs],
             "attributes asked"
+        );
+    }
+
+    #[cfg(variable_data)]
+    #[test]
+    fn variable_contents_hold_one_byte_at_least() {
+        let attributes = VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS;
+
+        let contents = VariableContents::new(attributes, vec![0]).expect("hold one byte");
+
+        assert_eq!(
+            (contents.attributes(), contents.data()),
+            (attributes, &[0][..]),
+            "one byte"
+        );
+        assert_eq!(
+            VariableContents::new(attributes, Vec::new()),
+            Err(EmptyVariable),
+            "no byte"
         );
     }
 

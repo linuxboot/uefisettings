@@ -38,6 +38,8 @@ use proc_mounts::MountIter;
 use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
+use crate::efi_variables::VariableContents;
+use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
@@ -60,6 +62,7 @@ use crate::hii::efivarfs_format::read_efivar;
 use crate::hii::efivarfs_format::read_efivar_file_of;
 use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::efivarfs_format::EfivarFileName;
+use crate::hii::efivarfs_format::EfivarNotFound;
 use crate::hii::efivarfs_format::EFIVARFS_INTERFACE;
 use crate::hii::efivarfs_format::EFIVARFS_REACH;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -830,6 +833,44 @@ fn efivar_info(key: &VariableKey, bytes: &[u8]) -> Result<VariableInfo> {
     })
 }
 
+impl VariableData for EfivarFiles {
+    /// The contents of `key` from its efivar file, which read_efivar_file_of reads whole.
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        let name = EfivarFileName::from(key);
+        let file = match open_efivar(&self.dir, &name) {
+            Err(error) if error.is::<EfivarNotFound>() => return Ok(None),
+            result => result?,
+        };
+        let bytes = read_efivar_file_of(&file).with_context(|| {
+            format!(
+                "failed to read efivar file '{}'",
+                self.dir.join(&name).display()
+            )
+        })?;
+        efivar_contents(key, &bytes)
+    }
+}
+
+/// The contents of `key` from the `bytes` of its efivar file: its attributes word, then its data.
+/// A file of no bytes holds no variable (efivar_names).
+fn efivar_contents(key: &VariableKey, bytes: &[u8]) -> Result<Option<VariableContents>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let (attributes, data) = bytes
+        .split_first_chunk::<EFIVARFS_HEADER_SIZE>()
+        .with_context(|| {
+            format!(
+                "efivar file of EFI variable {key} holds {} bytes, fewer than its attributes",
+                bytes.len()
+            )
+        })?;
+    let attributes = VariableAttributes::from_bits_retain(u32::from_ne_bytes(*attributes));
+    VariableContents::new(attributes, data.to_vec())
+        .map(Some)
+        .with_context(|| format!("efivar file of EFI variable {key}"))
+}
+
 impl VariableStorageInfo for EfivarFiles {
     /// What the statfs of efivarfs tells: QueryVariableInfo() of EFIVARFS_STATFS_ATTRIBUTES only,
     /// and of those not MaximumVariableSize.
@@ -1358,6 +1399,64 @@ mod tests {
             Some(&NotEfivarfs(dir.path().to_path_buf())),
             "Missing: {missing:#}"
         );
+    }
+
+    /// EfivarFiles read the attributes and data of a variable from its efivar file, tell that a
+    /// missing or empty one holds none, and refuse one without data.
+    #[test]
+    fn efivar_files_read_a_variable_whole_or_tell_it_absent() {
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
+        let attributes_only = NV_BS_RT.to_ne_bytes();
+        for (name, bytes) in [
+            ("Setup", &SETUP[..]),
+            ("Empty", &[][..]),
+            ("AttributesOnly", &attributes_only[..]),
+            ("Short", &[7, 0, 0][..]),
+        ] {
+            fs::write(
+                dir.path().join(EfivarFileName::from(&variable_key(name))),
+                bytes,
+            )
+            .expect("write the efivar file");
+        }
+
+        let contents = files
+            .variable_data(&variable_key("Setup"))
+            .expect("read Setup")
+            .expect("Setup is present");
+
+        assert_eq!(
+            (contents.attributes().bits(), contents.data()),
+            (NV_BS_RT, &SETUP[EFIVARFS_HEADER_SIZE..]),
+            "Setup"
+        );
+        for name in ["Missing", "Empty"] {
+            assert_eq!(
+                files
+                    .variable_data(&variable_key(name))
+                    .unwrap_or_else(|error| panic!("read {name}: {error:#}")),
+                None,
+                "{name}"
+            );
+        }
+        for (name, refusal) in [
+            (
+                "AttributesOnly",
+                "efivar file of EFI variable AttributesOnly-00000000-0000-0000-0000-000000000000: \
+                 an EFI variable holds one byte of data at least (UEFI 2.11 section 8.2.3)",
+            ),
+            (
+                "Short",
+                "efivar file of EFI variable Short-00000000-0000-0000-0000-000000000000 holds 3 \
+                 bytes, fewer than its attributes",
+            ),
+        ] {
+            let error = files
+                .variable_data(&variable_key(name))
+                .expect_err("read a variable without data");
+
+            assert_eq!(format!("{error:#}"), refusal, "{name}");
+        }
     }
 
     /// EfivarFiles tell the storage of NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS

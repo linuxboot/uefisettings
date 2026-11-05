@@ -26,6 +26,7 @@ use super::VariableBackend;
 use crate::capsule_services::RuntimeCapsuleServices;
 use crate::efi_variables::CapsuleDelivery;
 use crate::efi_variables::UpdateCapsuleDelivery;
+use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
@@ -57,6 +58,11 @@ impl VariableBackend {
 
     /// The attributes and sizes of this firmware's variables, from GetVariable().
     pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
+        Ok(VariableServices)
+    }
+
+    /// The attributes and data of this firmware's variables, from GetVariable().
+    pub(super) fn system_variable_data() -> Result<impl VariableData> {
         Ok(VariableServices)
     }
 

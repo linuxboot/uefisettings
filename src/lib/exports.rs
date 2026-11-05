@@ -27,9 +27,33 @@ use uefisettings_backend_thrift::SetResponseList;
 
 #[cfg(capsule_delivery)]
 use crate::efi_variables::deliver_json_capsule;
+#[cfg(variable_data)]
+use crate::efi_variables::globals::read_global;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::BootOptionFlags;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::BootOptionSupport;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::GlobalContents;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::GlobalValue;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::GlobalVariable;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::LoadOptionKind;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::LoadOptionName;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::OsIndications;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::Signature;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::SignatureList;
+#[cfg(variable_data)]
+pub use crate::efi_variables::globals::Timeout;
 #[cfg(variable_names)]
 use crate::efi_variables::list_variables;
-#[cfg(any(variable_names, variable_info))]
+#[cfg(any(variable_names, variable_info, variable_data))]
 use crate::efi_variables::parse_vendor;
 #[cfg(variable_storage_info)]
 use crate::efi_variables::query_storage;
@@ -50,7 +74,7 @@ use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::package;
-#[cfg(any(variable_names, variable_info))]
+#[cfg(any(variable_names, variable_info, variable_data))]
 pub use crate::hii::package::Guid;
 #[cfg(target_os = "linux")]
 pub use crate::hii::DenialCause;
@@ -119,8 +143,8 @@ pub trait SettingsBackend {
 
 pub struct HiiBackend {}
 
-/// The EFI variables of this machine, never their data (UEFI 2.10 §8.2).
-#[cfg(any(variable_names, variable_info, variable_storage_info))]
+/// The EFI variables of this machine (UEFI 2.10 §8.2).
+#[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
 pub struct VariableBackend {}
 
 #[cfg(variable_names)]
@@ -145,6 +169,17 @@ impl VariableBackend {
             guid: parse_vendor(vendor)?,
         };
         Self::system_variable_info()?.variable_info(&key)
+    }
+}
+
+#[cfg(variable_data)]
+impl VariableBackend {
+    /// The global variable `name` of UEFI 2.11 §3.3, or the signature database `name` of §32.7.1,
+    /// decoded, or that it is absent; of the vendor GUID `vendor`, such as
+    /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C", if given, which must be its own.
+    pub fn get(name: &str, vendor: Option<&str>) -> Result<GlobalVariable> {
+        let vendor = vendor.map(parse_vendor).transpose()?;
+        read_global(&Self::system_variable_data()?, name, vendor)
     }
 }
 

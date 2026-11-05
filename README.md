@@ -67,7 +67,7 @@ Commands:
   ilo                Commands which work on machines having HPE's Ilo BMC
   set                Auto-identify backend and set/change the value of a question
   show-translations  Show the translation/spellings database for questions and answers
-  variable           Commands on this machine's EFI variables, which never print their data
+  variable           Commands on this machine's EFI variables
 ```
 
 `hii`:
@@ -343,6 +343,27 @@ GetFirmwareEnvironmentVariableExW, which tells the size no other way, and prints
 
 ```plain
 FS0:\> uefisettings.efi variable info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
+```
+
+`variable get NAME [GUID]` prints a global variable of UEFI 2.11 §3.3, or the signature database
+db, dbx, dbt or dbr, decoded, as a JSON object of its own, with no `-j`: `variable`, its efivar
+name, `attributes`, its bitmask, and `value`, or `"absent": true` if the firmware has not created
+it. GUID, if given, must be the variable's own, which it defaults to:
+`D719B2CB-3D3A-4596-A3BC-DAD00E67656F` for the signature databases, else
+`8BE4DF61-93CA-11D2-AA0D-00E098032B8C`. `Timeout` is its seconds, or `"wait for user input"` for
+0xFFFF; `BootOrder`, `DriverOrder` and `SysPrepOrder` list their load options, such as `"Boot0001"`,
+and `BootNext` and `BootCurrent` name one; `PlatformLang` and `PlatformLangCodes` are their text;
+`OsIndications` and `OsIndicationsSupported` list their bits, as `BOOT_TO_FW_UI` for
+`EFI_OS_INDICATIONS_BOOT_TO_FW_UI`, and each reserved bit in hex; `SecureBoot`, `SetupMode`,
+`AuditMode`, `DeployedMode`, `VendorKeys`, `devAuthBoot` and `HwErrRecSupport` are their number;
+`BootOptionSupport` lists its flags and its key press `count`; `SignatureSupport` and
+`OsRecoveryOrder` list their GUIDs; `PK`, `KEK`, the signature databases and their `*Default`
+list their EFI_SIGNATURE_LISTs, each a `type` GUID and its `signatures`, each an `owner` GUID and
+the `sha256` of its data. The load options, hot keys and device paths of §3.3 are left to
+`variable info`.
+
+```sh
+uefisettings variable get SecureBoot
 ```
 
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)
