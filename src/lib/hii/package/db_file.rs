@@ -19,7 +19,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
-use log::info;
+use log::debug;
 use thiserror::Error;
 
 /// The largest HiiDB file that read_db_bytes reads; the HiiDB efivar's length and
@@ -28,10 +28,12 @@ pub(crate) const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
 /// The HiiDB in the file at `path`.
 pub(crate) fn read_db_file(path: &Path) -> Result<Vec<u8>> {
-    info!("Using database dump from file: {}", path.display());
+    debug!("HII database file: {}", path.display());
 
-    let mut file = File::open(path).context(format!("opening dbdump from {}", path.display()))?;
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open HiiDB file '{}'", path.display()))?;
     read_db_bytes(&mut file)
+        .with_context(|| format!("failed to read HiiDB file '{}'", path.display()))
 }
 
 /// The HiiDB in `file`.
@@ -68,13 +70,11 @@ pub(in crate::hii) struct DbFileTooBig;
 mod tests {
     #[cfg(unix)]
     use std::fs;
-    #[cfg(unix)]
-    use std::fs::File;
     use std::io;
 
     use super::*;
 
-    /// A missing HiiDB file fails to open with an error that names its path after "from ".
+    /// A missing HiiDB file fails to open with an error that names it.
     #[test]
     fn missing_file_error_names_its_path() {
         let dir = tempfile::tempdir().expect("create a directory");
@@ -84,13 +84,84 @@ mod tests {
 
         let chain = format!("{error:#}");
         assert!(
-            chain.contains(&format!("opening dbdump from {}", path.display())),
+            chain.contains(&format!("failed to open HiiDB file '{}'", path.display())),
             "missing file: {chain}"
         );
         assert_eq!(
             error.downcast_ref::<io::Error>().map(io::Error::kind),
             Some(io::ErrorKind::NotFound),
             "missing file: {chain}"
+        );
+    }
+
+    /// A HiiDB file whose metadata gives more than MAX_ALLOWED_FILESIZE bytes is refused with an
+    /// error that names the file and the maximum.
+    #[test]
+    fn file_longer_than_the_maximum_is_refused() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let path = dir.path().join("hiidb.bin");
+        File::create(&path)
+            .and_then(|file| file.set_len(MAX_ALLOWED_FILESIZE + 1))
+            .expect("create a file one byte longer than the maximum");
+
+        let error = read_db_file(&path).expect_err("read a file past the maximum");
+
+        assert_eq!(
+            (format!("{error:#}"), error.is::<DbFileTooBig>()),
+            (
+                format!(
+                    "failed to read HiiDB file '{}': longer than its maximum of \
+                     {MAX_ALLOWED_FILESIZE} bytes",
+                    path.display()
+                ),
+                true
+            ),
+            "a file one byte longer than the maximum"
+        );
+    }
+
+    /// A HiiDB file that fails to read, a directory here, gives an error that names the file and
+    /// the read before the system's error. Unix only: File::open opens no directory on Windows,
+    /// whose CreateFileW needs FILE_FLAG_BACKUP_SEMANTICS for one.
+    #[cfg(unix)]
+    #[test]
+    fn failed_read_names_the_file_and_the_read() {
+        let dir = tempfile::tempdir().expect("create a directory");
+
+        let error = read_db_file(dir.path()).expect_err("read a directory as a HiiDB file");
+
+        assert_eq!(
+            (
+                error.chain().next().map(|cause| cause.to_string()),
+                error.downcast_ref::<io::Error>().map(io::Error::kind)
+            ),
+            (
+                Some(format!(
+                    "failed to read HiiDB file '{}'",
+                    dir.path().display()
+                )),
+                Some(io::ErrorKind::IsADirectory)
+            ),
+            "a directory"
+        );
+    }
+
+    /// read_db_bytes refuses a file of more than MAX_ALLOWED_FILESIZE bytes by its metadata,
+    /// unread: a read of this write-only handle would fail. Unix only: fstat(2) needs no read
+    /// access.
+    #[cfg(unix)]
+    #[test]
+    fn read_db_bytes_refuses_a_long_file_unread() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let mut file = File::create(dir.path().join("hiidb.bin")).expect("create a file");
+        file.set_len(MAX_ALLOWED_FILESIZE + 1)
+            .expect("make the file one byte longer than the maximum");
+
+        let error = read_db_bytes(&mut file).expect_err("read a write-only long file");
+
+        assert!(
+            error.is::<DbFileTooBig>(),
+            "a write-only long file: {error:#}"
         );
     }
 
