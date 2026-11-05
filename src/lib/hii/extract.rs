@@ -32,6 +32,18 @@ use log::debug;
 pub const OCP_HIIDB_PATH: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 
+// Vendor ACPI table ("HIID") published by the EDK2 PlatformHiiDatabase driver.
+// Its body (after the 36-byte ACPI header) is a copy of the HII database
+// itself, so it is read straight from sysfs with no /dev/mem - a workaround for
+// hosts where /dev/mem cannot reach the database (e.g. aarch64, whose EFI
+// runtime memory is nomap). Unlike a UEFI variable, an ACPI table has no
+// efivarfs single-read size limit, so a multi-MB database reads fine.
+pub const HIIDB_ACPI_PATH: &str = "/sys/firmware/acpi/tables/HIID";
+
+// Size of the standard ACPI table header (EFI_ACPI_DESCRIPTION_HEADER) that
+// prefixes the HII database bytes in the HIID table.
+const ACPI_HEADER_LEN: usize = 36;
+
 const DEV_MEM_PATH: &str = "/dev/mem";
 
 /// Below this address (1 MiB), x86 read() of /dev/mem may return zeros.
@@ -102,6 +114,19 @@ impl HiiDBEFIVar {
 }
 
 pub fn extract_db() -> Result<Vec<u8>> {
+    // Prefer the vendor ACPI table that carries the HII database content
+    // directly (read from sysfs, no /dev/mem); fall back to the OCP variable +
+    // /dev/mem when it is absent (e.g. genuine OCP hardware). The fallback
+    // reason is printed to stderr so a failure here is not masked by the OCP
+    // error below.
+    match extract_db_acpi() {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => eprintln!(
+            "[uefisettings] could not use the HII ACPI table ({HIIDB_ACPI_PATH}): {e:#}; \
+             falling back to the OCP HiiDB variable + /dev/mem"
+        ),
+    }
+
     // I haven't seen any documentation on extracting HiiDB anywhere on the internet
     // So this is directly based on what hiitool does.
 
@@ -116,6 +141,27 @@ pub fn extract_db() -> Result<Vec<u8>> {
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
     read_physical_memory(db_info.address, db_info.length.try_into()?)
+}
+
+/// Reads the HII database from the vendor ACPI table (HIIDB_ACPI_PATH) whose
+/// body IS the database content: a 36-byte ACPI header followed by the
+/// database bytes, so the header is dropped and the rest returned.
+fn extract_db_acpi() -> Result<Vec<u8>> {
+    let mut acpi_file =
+        File::open(HIIDB_ACPI_PATH).context(format!("Failed to open {HIIDB_ACPI_PATH}"))?;
+
+    let mut contents = Vec::new();
+    acpi_file
+        .read_to_end(&mut contents)
+        .context(format!("Failed to read ACPI table file, {HIIDB_ACPI_PATH}"))?;
+
+    if contents.len() <= ACPI_HEADER_LEN {
+        bail!(
+            "{HIIDB_ACPI_PATH} is too short ({} bytes) to contain a HII database",
+            contents.len()
+        );
+    }
+    Ok(contents.split_off(ACPI_HEADER_LEN))
 }
 
 /// The bytes of the HiiDB efivar `file`; one longer than HiiDBEFIVar64::SIZE, which
