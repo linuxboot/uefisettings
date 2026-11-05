@@ -14,6 +14,8 @@ use std::fs::File;
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::path::Path;
+use std::path::PathBuf;
 use std::ptr;
 
 use anyhow::bail;
@@ -24,6 +26,8 @@ use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
 
+use crate::hii::package::db_file::read_db_bytes;
+
 // TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
 // open_efivar, so efivarfs paths and missing-variable errors have one source.
 // A missing HiiDB variable fails every command that reads the live HII database with only
@@ -32,12 +36,11 @@ use log::debug;
 pub const OCP_HIIDB_PATH: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 
-// Vendor ACPI table ("HIID") published by the EDK2 PlatformHiiDatabase driver.
-// Its body (after the 36-byte ACPI header) is a copy of the HII database
-// itself, so it is read straight from sysfs with no /dev/mem - a workaround for
-// hosts where /dev/mem cannot reach the database (e.g. aarch64, whose EFI
-// runtime memory is nomap). Unlike a UEFI variable, an ACPI table has no
-// efivarfs single-read size limit, so a multi-MB database reads fine.
+// Vendor ACPI table ("HIID"), with no public spec. Per the patch author, its
+// body (after the 36-byte ACPI header) is a copy of the HII database itself, so
+// it is read straight from sysfs with no /dev/mem, which lockdown refuses (Linux
+// v6.11 drivers/char/mem.c:612, open_port()) and STRICT_DEVMEM refuses for System
+// RAM.
 pub const HIIDB_ACPI_PATH: &str = "/sys/firmware/acpi/tables/HIID";
 
 // Size of the standard ACPI table header (EFI_ACPI_DESCRIPTION_HEADER) that
@@ -75,6 +78,70 @@ const DEV_MEM_PATH: &str = "/dev/mem";
 
 /// Below this address (1 MiB), x86 read() of /dev/mem may return zeros.
 const X86_ZERO_FILL_END: u64 = 0x10_0000;
+
+/// Where extract_db reads the EFI configuration table, the HIID ACPI table, the OCP HiiDB
+/// efivar and physical memory; Default is this machine's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HiiSourcePaths {
+    /// The address of the EFI configuration table, as Linux prints it.
+    efi_config_table: PathBuf,
+    /// The OCP HiiDB efivar.
+    ocp_hiidb: PathBuf,
+    /// The HIID ACPI table.
+    acpi_hiid: PathBuf,
+    /// Physical memory, which the OCP HiiDB efivar points into.
+    dev_mem: PathBuf,
+}
+
+impl Default for HiiSourcePaths {
+    fn default() -> Self {
+        Self {
+            efi_config_table: PathBuf::from(EFI_CONFIG_TABLE_PATH),
+            ocp_hiidb: PathBuf::from(OCP_HIIDB_PATH),
+            acpi_hiid: PathBuf::from(HIIDB_ACPI_PATH),
+            dev_mem: PathBuf::from(DEV_MEM_PATH),
+        }
+    }
+}
+
+pub fn extract_db() -> Result<Vec<u8>> {
+    extract_db_at(&HiiSourcePaths::default())
+}
+
+/// extract_db, reading the EFI configuration table, the HIID ACPI table, the OCP HiiDB efivar
+/// and physical memory at `paths`.
+fn extract_db_at(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
+    // Prefer the spec-standard route (the HII database configuration table
+    // found through the EFI System Table), then the vendor ACPI table that
+    // carries the database content directly (read from sysfs, no /dev/mem), and
+    // fall back to the OCP variable + /dev/mem. Each fallback reason is printed
+    // to stderr so a failure here is not masked by the OCP error below.
+    match extract_db_efi_config_table(&paths.efi_config_table, &paths.dev_mem) {
+        Ok(bytes) => {
+            debug!(
+                "HII database source: EFI configuration table ({})",
+                paths.efi_config_table.display()
+            );
+            return Ok(bytes);
+        }
+        Err(e) => eprintln!(
+            "[uefisettings] could not use the EFI configuration table ({}): {e:#}; \
+             falling back to the HII ACPI table",
+            paths.efi_config_table.display()
+        ),
+    }
+
+    match extract_db_acpi(paths.acpi_hiid.as_path()) {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => eprintln!(
+            "[uefisettings] could not use the HII ACPI table ({}): {e:#}; \
+             falling back to the OCP HiiDB variable + /dev/mem",
+            paths.acpi_hiid.display()
+        ),
+    }
+
+    extract_db_efivar(&paths.ocp_hiidb, &paths.dev_mem)
+}
 
 #[derive(Debug, PartialEq)]
 struct HiiDBEFIVar {
@@ -140,58 +207,35 @@ impl HiiDBEFIVar {
     }
 }
 
-pub fn extract_db() -> Result<Vec<u8>> {
-    // Prefer the spec-standard route (the HII database configuration table
-    // found through the EFI System Table), then the vendor ACPI table that
-    // carries the database content directly (read from sysfs, no /dev/mem), and
-    // fall back to the OCP variable + /dev/mem. Each fallback reason is printed
-    // to stderr so a failure here is not masked by the OCP error below.
-    match extract_db_efi_config_table() {
-        Ok(bytes) => {
-            debug!("HII database source: EFI configuration table ({EFI_CONFIG_TABLE_PATH})");
-            return Ok(bytes);
-        }
-        Err(e) => eprintln!(
-            "[uefisettings] could not use the EFI configuration table \
-             ({EFI_CONFIG_TABLE_PATH}): {e:#}; falling back to the HII ACPI table"
-        ),
-    }
-
-    match extract_db_acpi() {
-        Ok(bytes) => return Ok(bytes),
-        Err(e) => eprintln!(
-            "[uefisettings] could not use the HII ACPI table ({HIIDB_ACPI_PATH}): {e:#}; \
-             falling back to the OCP HiiDB variable + /dev/mem"
-        ),
-    }
-
+/// The HiiDB that the OCP HiiDB efivar `ocp_hiidb` points to in `dev_mem`.
+fn extract_db_efivar(ocp_hiidb: &Path, dev_mem: &Path) -> Result<Vec<u8>> {
     // I haven't seen any documentation on extracting HiiDB anywhere on the internet
     // So this is directly based on what hiitool does.
 
     // try to read data from varstore
     let efivar_file =
-        File::open(OCP_HIIDB_PATH).context(format!("Failed to open {OCP_HIIDB_PATH}"))?;
+        File::open(ocp_hiidb).with_context(|| format!("Failed to open {}", ocp_hiidb.display()))?;
 
     let efivar_contents = read_hiidb_efivar(efivar_file)
-        .context(format!("Failed to read efivar file, {}", OCP_HIIDB_PATH))?;
+        .with_context(|| format!("Failed to read efivar file, {}", ocp_hiidb.display()))?;
 
     let db_info = HiiDBEFIVar::parse(&efivar_contents)?;
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
-    read_physical_memory(db_info.address, db_info.length.try_into()?)
+    read_physical_memory(dev_mem, db_info.address, db_info.length.try_into()?)
 }
 
 /// Reads the HII database through the EFI configuration table: the
-/// ConfigurationTable address from EFI_CONFIG_TABLE_PATH, the entry for
+/// ConfigurationTable address from `config_table` (EFI_CONFIG_TABLE_PATH), the entry for
 /// gEfiHiiDatabaseProtocolGuid in it, then the database that entry points to.
-/// Every step reads /dev/mem.
-fn extract_db_efi_config_table() -> Result<Vec<u8>> {
-    let text = std::fs::read_to_string(EFI_CONFIG_TABLE_PATH)
-        .context(format!("Failed to read {EFI_CONFIG_TABLE_PATH}"))?;
+/// Every step reads physical memory, `dev_mem`.
+fn extract_db_efi_config_table(config_table: &Path, dev_mem: &Path) -> Result<Vec<u8>> {
+    let text = std::fs::read_to_string(config_table)
+        .with_context(|| format!("Failed to read {}", config_table.display()))?;
     let table_address = parse_hex_address(&text)?;
 
     let mem_file =
-        File::open(DEV_MEM_PATH).with_context(|| format!("Failed to open {DEV_MEM_PATH}"))?;
+        File::open(dev_mem).with_context(|| format!("Failed to open {}", dev_mem.display()))?;
     let read = |address: u64, length: usize| {
         read_physical_memory_at(&mem_file, address, length, FileExt::read_exact_at)
     };
@@ -261,27 +305,6 @@ fn hii_db_length(read: impl Fn(usize, usize) -> Result<Vec<u8>>) -> Result<usize
     Ok(total)
 }
 
-/// Reads the HII database from the vendor ACPI table (HIIDB_ACPI_PATH) whose
-/// body IS the database content: a 36-byte ACPI header followed by the
-/// database bytes, so the header is dropped and the rest returned.
-fn extract_db_acpi() -> Result<Vec<u8>> {
-    let mut acpi_file =
-        File::open(HIIDB_ACPI_PATH).context(format!("Failed to open {HIIDB_ACPI_PATH}"))?;
-
-    let mut contents = Vec::new();
-    acpi_file
-        .read_to_end(&mut contents)
-        .context(format!("Failed to read ACPI table file, {HIIDB_ACPI_PATH}"))?;
-
-    if contents.len() <= ACPI_HEADER_LEN {
-        bail!(
-            "{HIIDB_ACPI_PATH} is too short ({} bytes) to contain a HII database",
-            contents.len()
-        );
-    }
-    Ok(contents.split_off(ACPI_HEADER_LEN))
-}
-
 /// The bytes of the HiiDB efivar `file`; one longer than HiiDBEFIVar64::SIZE, which
 /// HiiDBEFIVar::parse would refuse, is refused without being read whole.
 fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
@@ -298,7 +321,7 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
     Ok(contents)
 }
 
-/// Returns `length` bytes of physical memory at `address`.
+/// Returns `length` bytes of physical memory, `dev_mem`, at `address`.
 ///
 /// It reads /dev/mem with one pread(), so the kernel copies the whole range and
 /// the copy costs the same in unoptimized builds, unlike read_mapped()'s
@@ -309,9 +332,9 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
 /// EPERM from CONFIG_STRICT_DEVMEM, which mmap() enforces too.
 ///
 /// Ranges for which pread_may_zero_fill() holds go straight to read_mapped().
-fn read_physical_memory(address: u64, length: usize) -> Result<Vec<u8>> {
+fn read_physical_memory(dev_mem: &Path, address: u64, length: usize) -> Result<Vec<u8>> {
     let mem_file =
-        File::open(DEV_MEM_PATH).with_context(|| format!("Failed to open {DEV_MEM_PATH}"))?;
+        File::open(dev_mem).with_context(|| format!("Failed to open {}", dev_mem.display()))?;
     read_physical_memory_at(&mem_file, address, length, FileExt::read_exact_at)
 }
 
@@ -479,9 +502,75 @@ unsafe fn copy_from_mapping(src: *const u8, dst: &mut [u8]) {
     }
 }
 
+/// Reads the HII database from the vendor ACPI table at `path` (HIIDB_ACPI_PATH) whose
+/// body IS the database content. The sysfs file is a 36-byte ACPI header
+/// (EFI_ACPI_DESCRIPTION_HEADER) followed by the database bytes, so we drop the
+/// header and return the rest. No /dev/mem — works even where /dev/mem is
+/// unavailable/blocked, and (unlike a UEFI variable) has no efivarfs
+/// single-read size limit; read_db_bytes caps it at MAX_ALLOWED_FILESIZE.
+fn extract_db_acpi(path: &Path) -> Result<Vec<u8>> {
+    let mut acpi_file =
+        File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+
+    let mut contents = read_db_bytes(&mut acpi_file)
+        .with_context(|| format!("Failed to read ACPI table file, {}", path.display()))?;
+
+    if contents.len() <= ACPI_HEADER_LEN {
+        return Err(anyhow::anyhow!(
+            "{} is too short ({} bytes) to contain a HII database",
+            path.display(),
+            contents.len()
+        ));
+    }
+    Ok(contents.split_off(ACPI_HEADER_LEN))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
+
+    /// The HIID table is the HiiDB after its ACPI header, and no longer than MAX_ALLOWED_FILESIZE.
+    #[test]
+    fn extract_db_acpi_strips_the_header_and_caps_the_size() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let path = dir.path().join("HIID");
+        let over_cap = usize::try_from(MAX_ALLOWED_FILESIZE + 1).expect("a usize size");
+        for (case, size, want) in [
+            (
+                "a header and a HiiDB",
+                ACPI_HEADER_LEN + 3,
+                Ok(&[1, 1, 1][..]),
+            ),
+            (
+                "a header only",
+                ACPI_HEADER_LEN,
+                Err("is too short (36 bytes)"),
+            ),
+            ("shorter than a header", 4, Err("is too short (4 bytes)")),
+            (
+                "longer than MAX_ALLOWED_FILESIZE",
+                over_cap,
+                Err("File size is too big for the file to be a HII database."),
+            ),
+        ] {
+            let file = File::create(&path).expect("create the table");
+            file.set_len(u64::try_from(size).expect("a u64 size"))
+                .expect("size the table");
+            if size == ACPI_HEADER_LEN + 3 {
+                file.write_all_at(&[1, 1, 1], u64::try_from(ACPI_HEADER_LEN).expect("a u64"))
+                    .expect("write the HiiDB");
+            }
+
+            match (extract_db_acpi(&path), want) {
+                (Ok(db), Ok(want)) => assert_eq!(db, want, "{case}"),
+                (Err(error), Err(message)) => {
+                    assert!(format!("{error:#}").contains(message), "{case}: {error:#}")
+                }
+                (got, _) => panic!("{case}: got {got:?}"),
+            }
+        }
+    }
 
     /// A HiiDB efivar of HiiDBEFIVar64::SIZE bytes reads whole; one byte longer, it is
     /// refused.

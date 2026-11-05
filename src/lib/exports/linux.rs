@@ -76,8 +76,8 @@ impl HiiBackend {
 
     /// Reads the HiiDB that get, list-questions and show-ifr read with `efivars`: the file
     /// `filename` if given, else the one that an efivars dump in `efivars` saved, else this
-    /// machine's. A redacted dump refuses another `filename`, whose questions would read its zeros
-    /// as values.
+    /// machine's. A redacted dump refuses another `filename`, whose questions would read its
+    /// zeros as values.
     pub fn read_hiidb(filename: Option<&Path>, efivars: &EfivarSource) -> Result<Vec<u8>> {
         let dump = match efivars {
             EfivarSource::Directory(dir) => SavedDump::open(dir)?,

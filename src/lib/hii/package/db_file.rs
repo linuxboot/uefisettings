@@ -22,7 +22,7 @@ use anyhow::Result;
 use log::info;
 
 /// The largest HiiDB file that read_db_bytes reads.
-const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 
 /// The HiiDB in the file at `path`.
 pub(crate) fn read_db_file(path: &Path) -> Result<Vec<u8>> {
