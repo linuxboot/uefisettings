@@ -27,12 +27,14 @@ use super::conditions::ExpressionInputs;
 use super::conditions::QuestionValues;
 use super::conditions::Truth;
 use super::find_corresponding_string;
+use super::walk_scopes;
 use super::IFRDefault;
 use super::IFROpCode;
 use super::IFROperation;
 use super::IfrDefaultValue;
 use super::IncludedStates;
 use super::ParsedOperation;
+use super::Walk;
 
 // UEFI 2.10 §33.3.8.3.9, §33.3.8.3.51
 const EFI_IFR_CHECKBOX_DEFAULT: u8 = 0x01;
@@ -204,21 +206,17 @@ impl NestedScope {
 // DISABLE_IF, as UEFI 2.10 §33.3.8.3.14 says, for firmware that does; edk2-stable202608
 // IfrParse.c keeps them inside a question, as this does.
 pub(super) fn question_scope(question: &IFROperation) -> Vec<Rc<RefCell<IFROperation>>> {
-    fn walk(op: &IFROperation, scope: &mut Vec<Rc<RefCell<IFROperation>>>) {
-        for child in &op.children {
-            if skips_scope(&child.borrow()) {
-                continue;
-            }
-            scope.push(Rc::clone(child));
-            let child = child.borrow();
-            match NestedScope::of(child.op_code) {
-                NestedScope::Own => {}
-                NestedScope::Question => walk(&child, scope),
-            }
-        }
-    }
     let mut scope = Vec::new();
-    walk(question, &mut scope);
+    walk_scopes(&question.children, (), |child, ()| {
+        if skips_scope(&child.borrow()) {
+            return Walk::Skip;
+        }
+        scope.push(Rc::clone(child));
+        match NestedScope::of(child.borrow().op_code) {
+            NestedScope::Own => Walk::Skip,
+            NestedScope::Question => Walk::Enter(()),
+        }
+    });
     scope
 }
 
@@ -294,32 +292,23 @@ fn form_set_default_ids(
     // Nested ones too (UEFI 2.10 §33.2.5.1), except under a true DISABLE_IF
     // outside forms (§33.3.8.3.14), the only one edk2-stable202608
     // SetupBrowserDxe/IfrParse.c evaluates while parsing.
-    fn walk(
-        op: &IFROperation,
-        in_form: bool,
-        default_ids: &mut Vec<DefaultId>,
-        inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-    ) {
-        for child in &op.children {
-            let child = child.borrow();
-            if skips_scope(&child) {
-                continue;
-            }
-            if let ParsedOperation::DefaultStore(store) = &child.parsed_data {
-                default_ids.push(store.default_id);
-            }
-            if !in_form
-                && child.op_code == IFROpCode::DisableIf
-                && evaluate_condition(&child, inputs) == Truth::Known(true)
-            {
-                continue;
-            }
-            let in_form = in_form || matches!(child.op_code, IFROpCode::Form | IFROpCode::FormMap);
-            walk(&child, in_form, default_ids, inputs);
-        }
-    }
     let mut default_ids = Vec::new();
-    walk(form_set, false, &mut default_ids, inputs);
+    walk_scopes(&form_set.children, false, |child, &in_form| {
+        let child = child.borrow();
+        if skips_scope(&child) {
+            return Walk::Skip;
+        }
+        if let ParsedOperation::DefaultStore(store) = &child.parsed_data {
+            default_ids.push(store.default_id);
+        }
+        if !in_form
+            && child.op_code == IFROpCode::DisableIf
+            && evaluate_condition(&child, inputs) == Truth::Known(true)
+        {
+            return Walk::Skip;
+        }
+        Walk::Enter(in_form || matches!(child.op_code, IFROpCode::Form | IFROpCode::FormMap))
+    });
     default_ids.sort_unstable();
     default_ids.dedup();
     default_ids.retain(|&id| id != DefaultId::STANDARD);

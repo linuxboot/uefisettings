@@ -65,6 +65,8 @@ pub(crate) const GRAY_OUT_IF: u8 = 0x19;
 pub(super) const DISABLE_IF: u8 = 0x1E;
 
 pub(super) const FORM: u8 = 0x01;
+pub(crate) const SUBTITLE: u8 = 0x02;
+const LOCKED: u8 = 0x0B;
 const ONE_OF_OPTION: u8 = 0x09;
 const FORM_SET: u8 = 0x0E;
 const EQ_ID_VAL: u8 = 0x12;
@@ -104,6 +106,11 @@ pub(super) const PADDED_ENABLED: u16 = 8;
 
 /// The reason `unavailable()` gives.
 pub(super) const UNAVAILABLE: &str = "<ValueUnavailable: no VarStore 1>";
+
+/// Bytes of stack the tests of deep IFR scopes run on: UEFI DXE's 128 KiB (edk2-stable202608
+/// MdeModulePkg/Core/DxeIplPeim/DxeIpl.h STACK_SIZE), far less than a frame per IFR scope would
+/// take
+pub(crate) const SMALL_STACK: usize = 128 << 10;
 
 /// A VarStore declared without IFR bytes.
 pub(super) struct DeclaredVarStore {
@@ -293,6 +300,23 @@ pub(super) fn strings() -> Vec<BTreeMap<i32, String>> {
         (7, "AllOnes".to_string()),
         (PADDED_ENABLED.into(), "Enabled ".to_string()),
     ])]
+}
+
+/// `depth` copies of the op `scope`, each in the scope of the one before, around `body`, with
+/// their End ops.
+pub(crate) fn nested(scope: &[u8], depth: usize, body: &[Vec<u8>]) -> Vec<u8> {
+    [scope.repeat(depth), body.concat(), END.repeat(depth)].concat()
+}
+
+/// A SUBTITLE prompted by string `prompt`, opening a scope.
+pub(crate) fn subtitle_scope(prompt: u16) -> Vec<u8> {
+    let data = [&prompt.to_le_bytes()[..], &[0x00, 0x00, 0x00]].concat(); // Help, Flags
+    operation(SUBTITLE, true, &data)
+}
+
+/// A LOCKED op opening a scope.
+pub(super) fn locked_scope() -> Vec<u8> {
+    operation(LOCKED, true, &[])
 }
 
 pub(crate) fn operation(op_code: u8, open_scope: bool, data: &[u8]) -> Vec<u8> {
@@ -610,11 +634,14 @@ pub(super) fn find_op(
     node: &Rc<RefCell<IFROperation>>,
     data: &[u8],
 ) -> Option<Rc<RefCell<IFROperation>>> {
-    let op = node.borrow();
-    if op.data == data {
-        return Some(Rc::clone(node));
-    }
-    op.children.iter().find_map(|child| find_op(child, data))
+    let mut found = None;
+    walk_scopes(std::slice::from_ref(node), (), |op, ()| {
+        if found.is_none() && op.borrow().data == data {
+            found = Some(Rc::clone(op));
+        }
+        Walk::Enter(())
+    });
+    found
 }
 
 pub(crate) fn checkbox(offset: u16, flags: u8) -> Vec<u8> {
@@ -655,10 +682,13 @@ pub(super) fn question_descriptor(
 /// Returns the root of the tree of `node`.
 #[cfg(efivar_dumps)]
 fn root_of(node: &Rc<RefCell<IFROperation>>) -> Rc<RefCell<IFROperation>> {
-    let parent = node.borrow().parent.as_ref().and_then(Weak::upgrade);
-    match parent {
-        Some(parent) => root_of(&parent),
-        None => Rc::clone(node),
+    let mut node = Rc::clone(node);
+    loop {
+        let parent = node.borrow().parent.as_ref().and_then(Weak::upgrade);
+        match parent {
+            Some(parent) => node = parent,
+            None => return node,
+        }
     }
 }
 
@@ -751,4 +781,17 @@ pub(super) fn try_parse_question_in_guid(
     let guid = Rc::clone(&form_set.borrow().children[0]);
     let question = Rc::clone(&guid.borrow().children[0]);
     Ok((root, question))
+}
+
+/// Runs `run` on a thread named `name` of SMALL_STACK bytes, and returns what it returns.
+pub(crate) fn on_small_stack<T: Send>(name: &str, run: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(SMALL_STACK)
+            .spawn_scoped(scope, run)
+            .expect("spawn a thread")
+            .join()
+            .unwrap_or_else(|_| panic!("{name} panicked"))
+    })
 }

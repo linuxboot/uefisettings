@@ -369,15 +369,240 @@ pub struct IFROperation {
 
 // Debug is implemented manually because if we derived Debug instead then we'd
 // get a stack overflow caused by parent printing child which will try to print it's parent....
+// It prints what Debug derived for op_code, open_scope, length and children prints, from a stack
+// on the heap, as walk_scopes walks.
 impl fmt::Debug for IFROperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IFROperation")
-            .field("op_code", &self.op_code)
-            .field("open_scope", &self.open_scope)
-            .field("length", &self.length)
-            .field("children", &self.children)
-            .finish()
+        /// What is left to print after the fields of an op `depth` scopes down.
+        enum Pending {
+            /// An op of its scope, as RefCell prints it; `first` in the scope or not
+            Entry {
+                op: Rc<RefCell<IFROperation>>,
+                depth: usize,
+                first: bool,
+            },
+            /// The end of the RefCell of an op of its scope
+            EntryEnd { depth: usize },
+            /// The end of its scope and of the op
+            End { depth: usize, empty: bool },
+        }
+
+        /// Pushes what is left of `op`, `depth` scopes down, after its fields.
+        fn push_scope(pending: &mut Vec<Pending>, op: &IFROperation, depth: usize) {
+            pending.push(Pending::End {
+                depth,
+                empty: op.children.is_empty(),
+            });
+            pending.extend(op.children.iter().enumerate().rev().map(|(index, child)| {
+                Pending::Entry {
+                    op: Rc::clone(child),
+                    depth,
+                    first: index == 0,
+                }
+            }));
+        }
+
+        let mut printer = DebugPrinter {
+            pretty: f.alternate(),
+            f,
+        };
+        printer.fields(self, 0)?;
+        let mut pending = Vec::new();
+        push_scope(&mut pending, self, 0);
+        while let Some(next) = pending.pop() {
+            match next {
+                Pending::Entry { op, depth, first } => {
+                    printer.entry(depth, first)?;
+                    match op.try_borrow() {
+                        Ok(op) => {
+                            printer.fields(&op, depth + 1)?;
+                            pending.push(Pending::EntryEnd { depth });
+                            push_scope(&mut pending, &op, depth + 1);
+                        }
+                        Err(_) => {
+                            printer.f.write_str("<borrowed>")?;
+                            printer.entry_end(depth)?;
+                        }
+                    }
+                }
+                Pending::EntryEnd { depth } => printer.entry_end(depth)?,
+                Pending::End { depth, empty } => printer.end(depth, empty)?,
+            }
+        }
+        Ok(())
     }
+}
+
+/// Prints ops as Debug derived for IFROperation's op_code, open_scope, length and children would.
+struct DebugPrinter<'a, 'b> {
+    f: &'a mut fmt::Formatter<'b>,
+    pretty: bool,
+}
+
+impl DebugPrinter<'_, '_> {
+    /// The indentation of `{:#?}` for an op `depth` scopes down: each scope nests a list, a
+    /// RefCell and an op, which indent what they hold by 4 spaces each
+    fn indent(depth: usize) -> usize {
+        12 * depth
+    }
+
+    /// Prints `op` up to its children's opening bracket.
+    fn fields(&mut self, op: &IFROperation, depth: usize) -> fmt::Result {
+        if !self.pretty {
+            return write!(
+                self.f,
+                "IFROperation {{ op_code: {:?}, open_scope: {:?}, length: {:?}, children: [",
+                op.op_code, op.open_scope, op.length
+            );
+        }
+        let indent = Self::indent(depth) + 4;
+        self.f.write_str("IFROperation {\n")?;
+        let fields: [(&str, &dyn fmt::Debug); 3] = [
+            ("op_code", &op.op_code),
+            ("open_scope", &op.open_scope),
+            ("length", &op.length),
+        ];
+        for (name, value) in fields {
+            write!(self.f, "{:indent$}{name}: ", "")?;
+            let value = format!("{value:#?}");
+            for (index, line) in value.split('\n').enumerate() {
+                if index > 0 {
+                    write!(self.f, "\n{:indent$}", "")?;
+                }
+                self.f.write_str(line)?;
+            }
+            self.f.write_str(",\n")?;
+        }
+        write!(self.f, "{:indent$}children: [", "")?;
+        if !op.children.is_empty() {
+            self.f.write_str("\n")?;
+        }
+        Ok(())
+    }
+
+    /// Prints the start of a RefCell of an op in the scope of an op `depth` scopes down.
+    fn entry(&mut self, depth: usize, first: bool) -> fmt::Result {
+        match (self.pretty, first) {
+            (false, true) => self.f.write_str("RefCell { value: "),
+            (false, false) => self.f.write_str(", RefCell { value: "),
+            (true, _) => {
+                let indent = Self::indent(depth) + 8;
+                write!(
+                    self.f,
+                    "{:indent$}RefCell {{\n{:value_indent$}value: ",
+                    "",
+                    "",
+                    value_indent = indent + 4
+                )
+            }
+        }
+    }
+
+    /// Prints the end of a RefCell of an op in the scope of an op `depth` scopes down.
+    fn entry_end(&mut self, depth: usize) -> fmt::Result {
+        match self.pretty {
+            false => self.f.write_str(" }"),
+            true => {
+                let indent = Self::indent(depth) + 8;
+                write!(self.f, ",\n{:indent$}}},\n", "")
+            }
+        }
+    }
+
+    /// Prints the end of the children and of an op `depth` scopes down, `empty` if it has no
+    /// children.
+    fn end(&mut self, depth: usize, empty: bool) -> fmt::Result {
+        let indent = Self::indent(depth);
+        match (self.pretty, empty) {
+            (false, _) => self.f.write_str("] }"),
+            (true, true) => write!(self.f, "],\n{:indent$}}}", ""),
+            (true, false) => write!(
+                self.f,
+                "{:field_indent$}],\n{:indent$}}}",
+                "",
+                "",
+                field_indent = indent + 4
+            ),
+        }
+    }
+}
+
+// The ops in its scope are dropped from a stack on the heap, as walk_scopes walks, not by the
+// recursive drop glue.
+impl Drop for IFROperation {
+    fn drop(&mut self) {
+        let mut ops = std::mem::take(&mut self.children);
+        while let Some(op) = ops.pop() {
+            // otherwise the op's last Rc drops its scope
+            if let Ok(op) = Rc::try_unwrap(op) {
+                ops.append(&mut op.into_inner().children);
+            }
+        }
+    }
+}
+
+/// What walk_scopes does after it visits an op.
+enum Walk<C> {
+    /// Visit the ops in the op's scope, each with this context
+    Enter(C),
+    /// Leave the ops in the op's scope unvisited
+    Skip,
+}
+
+/// Visits `ops`, each with `context`, then the ops in the scope of each that `visit` enters, in
+/// IFR order. The ops left to visit wait on a stack on the heap, not in recursive calls, so that
+/// the thread's stack, e.g. the 128 KiB of UEFI DXE (edk2-stable202608
+/// MdeModulePkg/Core/DxeIplPeim/DxeIpl.h STACK_SIZE), does not bound how deep scopes nest.
+fn try_walk_scopes<C: Clone, E>(
+    ops: &[Rc<RefCell<IFROperation>>],
+    context: C,
+    mut visit: impl FnMut(&Rc<RefCell<IFROperation>>, &C) -> Result<Walk<C>, E>,
+) -> Result<(), E> {
+    let mut pending: Vec<_> = ops
+        .iter()
+        .rev()
+        .map(|op| (Rc::clone(op), context.clone()))
+        .collect();
+    while let Some((op, context)) = pending.pop() {
+        match visit(&op, &context)? {
+            Walk::Enter(inner) => pending.extend(
+                op.borrow()
+                    .children
+                    .iter()
+                    .rev()
+                    .map(|child| (Rc::clone(child), inner.clone())),
+            ),
+            Walk::Skip => {}
+        }
+    }
+    Ok(())
+}
+
+/// try_walk_scopes with a `visit` that cannot fail.
+fn walk_scopes<C: Clone>(
+    ops: &[Rc<RefCell<IFROperation>>],
+    context: C,
+    mut visit: impl FnMut(&Rc<RefCell<IFROperation>>, &C) -> Walk<C>,
+) {
+    let Ok(()) = try_walk_scopes(ops, context, |op, context| {
+        Ok::<_, Infallible>(visit(op, context))
+    });
+}
+
+/// The most IFR scopes open at once in a FormSet, its own counted. UEFI 2.11 §33.3.8.2.1 sets no
+/// limit and edk2-stable202608 SetupBrowserDxe parses any depth, but its count of the scopes in an
+/// unknown op (SetupBrowserDxe/IfrParse.c ParseOpCodes UnknownDepth) and HiiDatabaseDxe's of
+/// those in a question (HiiDatabaseDxe/HiiDatabase.h IFR_BLOCK_DATA Scope) are UINT8s, which wrap
+/// past 255; show-ifr indents each op by its depth.
+pub(crate) const MAX_SCOPE_NESTING: usize = 255;
+
+/// A FormSet whose IFR scopes nest deeper than `limit`, from the op at `offset` of its form
+/// package on.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("IFR scopes nest deeper than {limit} at offset {offset} of a form package")]
+pub(crate) struct ScopesTooDeep {
+    pub(crate) offset: u64,
+    pub(crate) limit: usize,
 }
 
 #[derive(Debug, Default)]
@@ -2791,7 +3016,8 @@ fn type_value_parser<R: Read + Seek>(
 /// GetIfrBinaryData reaches when it looks for a FormSet by GUID, walking the package op by op.
 /// That walk ends at an op whose Length runs past the package; here it also ends at one below the
 /// header size, which that walk loops on (Length 0) or steps into (Length 1), and at a later
-/// FormSet whose bytes do not parse.
+/// FormSet whose bytes do not parse. A later FormSet whose scopes nest deeper than
+/// MAX_SCOPE_NESTING is skipped to its End, as that walk steps over it.
 /// None of them fails the package: edk2 reads past the first FormSet only for such a walk.
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
@@ -2823,6 +3049,17 @@ pub(super) fn parse_form_sets(
         package_cursor.set_position(offset);
         match handle_form_set(package_cursor) {
             Ok(root) => roots.push(root),
+            Err(error) if error.chain().any(|cause| cause.is::<ScopesTooDeep>()) => {
+                warn!(
+                    "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
+                     a form package: {error:#}"
+                );
+                package_cursor.set_position(offset);
+                if let Err(error) = skip_scope(package_cursor) {
+                    debug!("ending the FormSet walk in the FormSet at offset {offset}: {error}");
+                    break;
+                }
+            }
             Err(error) if error.chain().any(|cause| cause.is::<binrw::Error>()) => {
                 warn!(
                     "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
@@ -2836,7 +3073,33 @@ pub(super) fn parse_form_sets(
     Ok(roots)
 }
 
+/// Moves `package_cursor` from the op at its position past the End that closes that op's scope,
+/// reading the ops in between undecoded, as GetIfrBinaryData's walk steps over them.
+fn skip_scope(package_cursor: &mut Cursor<&Vec<u8>>) -> binrw::BinResult<()> {
+    let mut depth: usize = 0;
+    loop {
+        let op: IFROperation = package_cursor.read_ne()?;
+        match (&op.op_code, op.open_scope) {
+            (IFROpCode::End, _) => depth = depth.saturating_sub(1),
+            (_, true) => depth = depth.saturating_add(1),
+            (_, false) => {}
+        }
+        if depth == 0 {
+            return Ok(());
+        }
+    }
+}
+
 pub fn handle_form_set(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<Rc<RefCell<IFROperation>>> {
+    handle_form_set_within(package_cursor, MAX_SCOPE_NESTING)
+}
+
+/// handle_form_set, failing with ScopesTooDeep at an op that opens more than `limit` scopes at
+/// once.
+fn handle_form_set_within(
+    package_cursor: &mut Cursor<&Vec<u8>>,
+    limit: usize,
+) -> Result<Rc<RefCell<IFROperation>>> {
     // this is the root element so all the values like op_code, length, etc are dummy
     debug!("new FormSet");
     let root = Rc::new(RefCell::new(IFROperation {
@@ -2854,10 +3117,13 @@ pub fn handle_form_set(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<Rc<RefCe
     // decoded, as edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes skips them unread
     // (InUnknownScope, UnknownDepth).
     let mut skipped_depth: usize = 0;
+    // The scopes open, the FormSet's own and skipped ones counted
+    let mut depth: usize = 0;
 
     // this loop will terminate when it sees the IFR:End opcode as a child of FormSet
     // if input data is malformed then it will exit on erroring out cause none of the magic bytes match
     loop {
+        let offset = package_cursor.position();
         let node: IFROperation = package_cursor
             .read_ne()
             .context("failed to parse IFR operation")?;
@@ -2869,6 +3135,7 @@ pub fn handle_form_set(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<Rc<RefCe
         // end of current scope
         if current_node.borrow().op_code == IFROpCode::End {
             skipped_depth = skipped_depth.saturating_sub(1);
+            depth = depth.saturating_sub(1);
             let current_scope_clone = Rc::clone(&current_scope);
             match current_scope_clone.borrow().parent.as_ref() {
                 Some(parent_ref) => {
@@ -2893,6 +3160,13 @@ pub fn handle_form_set(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<Rc<RefCe
                 break;
             }
             continue;
+        }
+
+        if current_node.borrow().open_scope {
+            if depth >= limit {
+                return Err(ScopesTooDeep { offset, limit }.into());
+            }
+            depth += 1;
         }
 
         // set current_node's parent
@@ -3234,16 +3508,14 @@ fn list_questions_in(
     node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
-    if skips_scope(&node.borrow()) {
-        return Vec::new();
-    }
-    let mut res: Vec<_> = listed_question(node, walk).into_iter().collect();
-
-    // Now look inside current node's children for more questions
-    for child in &node.borrow().children {
-        res.extend(list_questions_in(child, walk));
-    }
-
+    let mut res = Vec::new();
+    walk_scopes(std::slice::from_ref(node), (), |node, ()| {
+        if skips_scope(&node.borrow()) {
+            return Walk::Skip;
+        }
+        res.extend(listed_question(node, walk));
+        Walk::Enter(())
+    });
     res
 }
 
@@ -4090,15 +4362,11 @@ fn questions_named<T>(
 where
     T: AsRef<str>,
 {
-    fn walk<T: AsRef<str>>(
-        node: &Rc<RefCell<IFROperation>>,
-        string_packages: &[BTreeMap<i32, String>],
-        phrases: &BTreeSet<T>,
-        found: &mut Vec<Rc<RefCell<IFROperation>>>,
-    ) {
+    let mut found = Vec::new();
+    walk_scopes(std::slice::from_ref(node), (), |node, ()| {
         let op = node.borrow();
         if skips_scope(&op) {
-            return;
+            return Walk::Skip;
         }
         let prompt = prompt(&op, string_packages).trim();
         // Only Numeric, OneOf and CheckBox are questions.
@@ -4109,12 +4377,8 @@ where
         {
             found.push(Rc::clone(node));
         }
-        for child in &op.children {
-            walk(child, string_packages, phrases, found);
-        }
-    }
-    let mut found = Vec::new();
-    walk(node, string_packages, phrases, &mut found);
+        Walk::Enter(())
+    });
     found
 }
 
@@ -5313,14 +5577,30 @@ pub fn display(
     reader: &mut EfivarReader,
 ) -> Result<String> {
     let mut result = String::new();
+    walk_scopes(std::slice::from_ref(&node), level, |node, &level| {
+        display_op(node, level, string_packages, reader, &mut result)
+    });
+    Ok(result)
+}
+
+/// Appends the line of `node` that display shows `level` scopes down to `result`, and enters its
+/// scope unless edk2 skips it.
+fn display_op(
+    node: &Rc<RefCell<IFROperation>>,
+    level: usize,
+    string_packages: &[BTreeMap<i32, String>],
+    reader: &mut EfivarReader,
+    result: &mut String,
+) -> Walk<usize> {
     let extra_spaces = "    ".repeat(level);
 
     let current_node = node.borrow();
     if let IFROpCode::Unknown(code) = current_node.op_code {
         if skips_scope(&current_node) {
-            return Ok(format!(
+            result.push_str(&format!(
                 "{extra_spaces}OpCode: Unknown({code:#04x}) - skipped, as edk2 does\n"
             ));
+            return Walk::Skip;
         }
     }
 
@@ -5377,7 +5657,7 @@ pub fn display(
 
         ParsedOperation::OneOf(parsed) => {
             let varstore =
-                find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
+                find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
             let answer_disp = display_answer(&current_node, &varstore, reader);
 
             result.push_str(
@@ -5399,7 +5679,7 @@ pub fn display(
         }
         ParsedOperation::Numeric(parsed) => {
             let varstore =
-                find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
+                find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
             let answer_disp = display_answer(&current_node, &varstore, reader);
 
             result.push_str(
@@ -5421,7 +5701,7 @@ pub fn display(
         }
         ParsedOperation::CheckBox(parsed) => {
             let varstore =
-                find_corresponding_varstore(Rc::clone(&node), parsed.question_header().var_store_id);
+                find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
             let answer_disp = display_answer(&current_node, &varstore, reader);
 
             result.push_str(
@@ -5447,11 +5727,7 @@ pub fn display(
             .push_str(format!("{extra_spaces}OpCode: {:?}\n",  current_node.op_code).as_str()),
     }
 
-    for child in &node.borrow().children {
-        result.push_str(display(Rc::clone(child), level + 1, string_packages, reader)?.as_str());
-    }
-
-    Ok(result)
+    Walk::Enter(level + 1)
 }
 
 /// Returns the answer that show-ifr shows: the question's value, or why it cannot be read.
@@ -6128,48 +6404,55 @@ fn find_corresponding_varstore(
         ));
     }
 
-    let current_node = node.borrow();
-
-    if current_node.op_code == IFROpCode::FormSet {
-        // look at its children
-
-        for child in &current_node.children {
-            match &child.borrow().parsed_data {
-                ParsedOperation::VarStore(v) => {
-                    if v.var_store_id == var_store_id {
-                        return Ok(Box::new(v.clone()));
-                    }
-                }
-                ParsedOperation::VarStoreEfi(v) => {
-                    if v.var_store_id == var_store_id {
-                        return Ok(Box::new(v.clone()));
-                    }
-                }
-                ParsedOperation::VarStoreNameValue(v) => {
-                    if v.var_store_id == var_store_id {
-                        return Err(anyhow!(
-                            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
-                        ));
-                    }
-                }
-                _ => {}
+    let mut node = node;
+    loop {
+        let parent = {
+            let current_node = node.borrow();
+            if current_node.op_code == IFROpCode::FormSet {
+                return form_set_varstore(&current_node, var_store_id);
             }
+            match current_node.parent.as_ref() {
+                Some(parent_ref) => match parent_ref.upgrade() {
+                    Some(parent_ref_rc) => parent_ref_rc,
+                    None => return Err(anyhow!("could not upgrade parent_ref Weak<> to get Rc<>")),
+                },
+                None => return Err(anyhow!("varstore not found because we reached root")),
+            }
+        };
+        node = parent;
+    }
+}
+
+/// Returns the varstore of `var_store_id` among the children of `form_set`.
+fn form_set_varstore(form_set: &IFROperation, var_store_id: u16) -> Result<Box<dyn VariableStore>> {
+    // look at its children
+
+    for child in &form_set.children {
+        match &child.borrow().parsed_data {
+            ParsedOperation::VarStore(v) => {
+                if v.var_store_id == var_store_id {
+                    return Ok(Box::new(v.clone()));
+                }
+            }
+            ParsedOperation::VarStoreEfi(v) => {
+                if v.var_store_id == var_store_id {
+                    return Ok(Box::new(v.clone()));
+                }
+            }
+            ParsedOperation::VarStoreNameValue(v) => {
+                if v.var_store_id == var_store_id {
+                    return Err(anyhow!(
+                        "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
+                    ));
+                }
+            }
+            _ => {}
         }
-        return Err(anyhow!(
-            "no supported varstore with matching id {:#06x} found",
-            var_store_id
-        ));
     }
-
-    match current_node.parent.as_ref() {
-        Some(parent_ref) => match parent_ref.upgrade() {
-            Some(parent_ref_rc) => {
-                find_corresponding_varstore(Rc::clone(&parent_ref_rc), var_store_id)
-            }
-            None => Err(anyhow!("could not upgrade parent_ref Weak<> to get Rc<>")),
-        },
-        None => Err(anyhow!("varstore not found because we reached root")),
-    }
+    Err(anyhow!(
+        "no supported varstore with matching id {:#06x} found",
+        var_store_id
+    ))
 }
 
 #[cfg(test)]
@@ -7198,5 +7481,388 @@ mod write_validation_tests {
         for (name, format, value, want) in cases {
             assert_eq!(format.encode(value), want, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(efivar_dumps)]
+mod nesting_tests {
+    use super::conditions::evaluate_condition;
+    use super::conditions::Truth;
+    use super::ifr_fixtures::*;
+    use super::*;
+
+    /// IFR scopes nested in the trees that the walks below run on: a frame per scope would take
+    /// far more than SMALL_STACK
+    const DEEP: usize = 20_000;
+    /// IFR scopes nested in the tree that display runs on: its text grows with the square of the
+    /// depth, to 8 MB here, but a frame per scope would still take far more than SMALL_STACK
+    const DISPLAY_DEEP: usize = 2_000;
+
+    /// The strings of deep_form_set.
+    fn deep_strings() -> Vec<BTreeMap<i32, String>> {
+        vec![BTreeMap::from([
+            (3, "Deep".to_string()),
+            (4, "Help".to_string()),
+            (5, "Hidden".to_string()),
+        ])]
+    }
+
+    /// `op` opening a scope that holds `body`, with its End.
+    fn with_scope(mut op: Vec<u8>, body: &[Vec<u8>]) -> Vec<u8> {
+        op[1] |= 0x80;
+        [op, body.concat(), END.to_vec()].concat()
+    }
+
+    /// The CHECKBOX "Deep" on VarStore 1.
+    fn deep_checkbox() -> Vec<u8> {
+        checkbox_on(1, 3, 1)
+    }
+
+    /// The CHECKBOX "Hidden" without a VarStore.
+    fn hidden_checkbox() -> Vec<u8> {
+        checkbox_on(2, 5, 0)
+    }
+
+    /// A FormSet of the VarStore 1 whose Form nests `depth` Subtitle scopes around: deep_checkbox
+    /// holding `depth` nested LOCKED scopes; hidden_checkbox in a SUPPRESS_IF of TRUE holding
+    /// `nots` nested NOTs; and, if `password`, a PASSWORD on VarStore 1.
+    fn deep_form_set(depth: usize, nots: usize, password: bool) -> Vec<u8> {
+        let not = operation(NOT, true, &[]);
+        let condition = with_scope(operation(TRUE, false, &[]), &[nested(&not, nots, &[])]);
+        let mut body = vec![
+            with_scope(deep_checkbox(), &[nested(&locked_scope(), depth, &[])]),
+            conditional(SUPPRESS_IF, condition, &[hidden_checkbox()]),
+        ];
+        if password {
+            body.push(password_on(3, 3, 1, 0));
+        }
+        form_set(&[
+            var_store(1, [0x22; 16], "Deep", 1),
+            form(1, &[nested(&subtitle_scope(3), depth, &body)]),
+        ])
+    }
+
+    /// The root of deep_form_set, parsed past MAX_SCOPE_NESTING.
+    fn parse_deep(depth: usize, nots: usize, password: bool) -> Rc<RefCell<IFROperation>> {
+        let ifr = deep_form_set(depth, nots, password);
+        handle_form_set_within(&mut Cursor::new(&ifr), usize::MAX).expect("parse the FormSet")
+    }
+
+    /// The op of the tree of `root` whose data is that of the op `op`.
+    fn op_like(root: &Rc<RefCell<IFROperation>>, op: &[u8]) -> Rc<RefCell<IFROperation>> {
+        let data = op.get(2..).expect("an op past its header");
+        find_op(root, data).expect("find the op")
+    }
+
+    /// The limit counts the scopes open at once, not every scope of a FormSet: MAX_SCOPE_NESTING
+    /// + 1 sibling Subtitle scopes, each closed before the next, parse.
+    #[test]
+    fn scopes_that_close_do_not_count_toward_the_limit() {
+        let siblings: Vec<Vec<u8>> = (0..=MAX_SCOPE_NESTING)
+            .map(|_| nested(&subtitle_scope(3), 1, &[]))
+            .collect();
+        let root = handle_form_set(&mut Cursor::new(&form_set(&siblings)))
+            .unwrap_or_else(|error| panic!("{} sibling scopes: {error:#}", siblings.len()));
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        assert_eq!(
+            form_set.borrow().children.len(),
+            siblings.len(),
+            "the sibling Subtitles"
+        );
+    }
+
+    /// A FormSet nests up to MAX_SCOPE_NESTING scopes at once, its own and unknown ones counted;
+    /// handle_form_set fails with ScopesTooDeep at the op that opens one more.
+    #[test]
+    fn scopes_nest_up_to_the_limit() {
+        let unknown = operation(0x70, true, &[]);
+        let form_set_op = form_set(&[]).len() - END.len();
+        let subtitle_op = subtitle_scope(3).len();
+        for in_unknown_scope in [false, true] {
+            let outer = 1 + usize::from(in_unknown_scope);
+            let ifr = |subtitles: usize| {
+                let nested = nested(&subtitle_scope(3), subtitles, &[checkbox_op(1, 0)]);
+                let body = match in_unknown_scope {
+                    true => [unknown.clone(), nested, END.to_vec()].concat(),
+                    false => nested,
+                };
+                form_set(&[body])
+            };
+            let case = format!("in an unknown scope: {in_unknown_scope}");
+
+            let root = handle_form_set(&mut Cursor::new(&ifr(MAX_SCOPE_NESTING - outer)))
+                .unwrap_or_else(|error| panic!("at the limit, {case}: {error:#}"));
+            assert_eq!(
+                op_like(&root, &checkbox_op(1, 0)).borrow().op_code,
+                IFROpCode::CheckBox,
+                "the op in the innermost scope at the limit, {case}"
+            );
+
+            let error = handle_form_set(&mut Cursor::new(&ifr(MAX_SCOPE_NESTING - outer + 1)))
+                .expect_err("scopes past the limit");
+            let past_limit = form_set_op
+                + usize::from(in_unknown_scope) * unknown.len()
+                + (MAX_SCOPE_NESTING - outer) * subtitle_op;
+            assert_eq!(
+                error.downcast_ref::<ScopesTooDeep>(),
+                Some(&ScopesTooDeep {
+                    offset: u64::try_from(past_limit).expect("a u64 offset"),
+                    limit: MAX_SCOPE_NESTING,
+                }),
+                "past the limit, {case}: {error:#}"
+            );
+        }
+    }
+
+    /// The parser, every walk of the tree, Debug and Drop take the same stack however deep IFR
+    /// scopes nest: on SMALL_STACK, through DEEP nested scopes (display DISPLAY_DEEP), each finds
+    /// what lies at the bottom and nothing that does not.
+    #[test]
+    fn walks_take_a_stack_that_nesting_does_not_grow() {
+        on_small_stack("handle_form_set", || {
+            let root = parse_deep(DEEP, DEEP, true);
+            let deep = op_like(&root, &deep_checkbox());
+            assert_eq!(
+                deep.borrow().children.len(),
+                1,
+                "the Deep CheckBox's LOCKED"
+            );
+        });
+
+        on_small_stack("PasswordQuestions::of", || {
+            for password in [true, false] {
+                let declared = PasswordQuestions::of([&parse_deep(DEEP, DEEP, password)])
+                    .check_set(VariableReach::BootServices, SetupPasswordPolicy::Refuse)
+                    .is_err();
+                assert_eq!(declared, password, "declares the PASSWORD at the bottom");
+            }
+        });
+
+        on_small_stack("VarStoreValues::new", || {
+            let root = parse_deep(DEEP, DEEP, false);
+            let deep = op_like(&root, &deep_checkbox());
+            let values = VarStoreValues::new(&root, None);
+            let mut reader = disabled_reader();
+            for (id, indexed) in [(1, true), (9, false)] {
+                assert_eq!(
+                    values.value(&deep.borrow(), id, &mut reader).is_some(),
+                    indexed,
+                    "question {id} indexed"
+                );
+            }
+        });
+
+        on_small_stack("list_questions", || {
+            for (include, want) in [
+                (IncludedStates::all(), &["Deep", "Hidden"][..]),
+                (IncludedStates::empty(), &["Deep"][..]),
+            ] {
+                let listed = list_questions(
+                    parse_deep(DEEP, DEEP, false),
+                    &deep_strings(),
+                    include,
+                    None,
+                    &mut disabled_reader(),
+                );
+                let names: Vec<String> = listed
+                    .into_iter()
+                    .map(|(question, _)| question.question)
+                    .collect();
+                assert_eq!(names, want, "questions listed of {include:?}");
+            }
+        });
+
+        on_small_stack("find_question", || {
+            for (name, want) in [("Deep", true), ("Hidden", false)] {
+                let selection = find_question(
+                    parse_deep(DEEP, DEEP, false),
+                    &deep_strings(),
+                    &BTreeSet::from([name]),
+                    IncludedStates::empty(),
+                    None,
+                    &mut disabled_reader(),
+                );
+                assert_eq!(
+                    matches!(selection, Selection::Picked(..)),
+                    want,
+                    "{name} picked: {selection:?}"
+                );
+            }
+        });
+
+        on_small_stack("question_scope", || {
+            let root = parse_deep(DEEP, DEEP, false);
+            let deep = op_like(&root, &deep_checkbox());
+            let scope = question_scope(&deep.borrow());
+            assert_eq!(
+                scope.len(),
+                DEEP,
+                "the LOCKED ops in the Deep CheckBox's scope"
+            );
+        });
+
+        on_small_stack("find_corresponding_varstore", || {
+            let root = parse_deep(DEEP, DEEP, false);
+            let deep = op_like(&root, &deep_checkbox());
+            assert!(
+                find_corresponding_varstore(Rc::clone(&deep), 1).is_ok(),
+                "VarStore 1 found from the bottom"
+            );
+            let missing = find_corresponding_varstore(deep, 2)
+                .err()
+                .map(|error| error.to_string());
+            assert_eq!(
+                missing.as_deref(),
+                Some("no supported varstore with matching id 0x0002 found"),
+                "VarStore 2"
+            );
+        });
+
+        on_small_stack("evaluate_condition", || {
+            for (nots, want) in [(DEEP, true), (DEEP + 1, false)] {
+                let root = parse_deep(1, nots, false);
+                let hidden = op_like(&root, &hidden_checkbox());
+                let suppress_if = hidden
+                    .borrow()
+                    .parent
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .expect("the SUPPRESS_IF");
+                let values = VarStoreValues::new(&root, None);
+                let mut reader = disabled_reader();
+                let mut inputs = ExpressionInputs {
+                    reader: &mut reader,
+                    values: &values,
+                };
+                assert_eq!(
+                    evaluate_condition(&suppress_if.borrow(), &mut inputs),
+                    Truth::Known(want),
+                    "TRUE, then {nots} NOTs"
+                );
+            }
+        });
+
+        on_small_stack("Debug", || {
+            let root = parse_deep(DEEP, DEEP, true);
+            let printed = format!("{:?}", root.borrow());
+            // the root, the FormSet, its VarStore and Form, the Subtitles, the Deep CheckBox and
+            // its LOCKEDs, the SUPPRESS_IF, its TRUE and NOTs, Hidden and the PASSWORD
+            assert_eq!(
+                printed.matches("IFROperation {").count(),
+                3 * DEEP + 9,
+                "ops printed"
+            );
+            assert!(
+                printed.starts_with(
+                    "IFROperation { op_code: Unknown(255), open_scope: false, length: 0, children: \
+                     [RefCell { value: IFROperation { op_code: FormSet, open_scope: true"
+                ),
+                "printed from the root: {}",
+                printed.get(..200).unwrap_or(&printed)
+            );
+        });
+
+        on_small_stack("Drop", || {
+            let root = parse_deep(DEEP, DEEP, true);
+            let deep = op_like(&root, &deep_checkbox());
+            drop(root);
+            let deep = deep.borrow();
+            assert!(
+                deep.parent.as_ref().and_then(Weak::upgrade).is_none(),
+                "the Deep CheckBox's ancestors dropped"
+            );
+            assert_eq!(deep.children.len(), 1, "the Deep CheckBox's LOCKED kept");
+        });
+
+        on_small_stack("display", || {
+            let root = parse_deep(DISPLAY_DEEP, 1, false);
+            let shown = display(root, 0, &deep_strings(), &mut disabled_reader()).expect("display");
+            // the root, the FormSet, the Form, then the Subtitles
+            let want = format!(
+                "{}OpCode: CheckBox - Q: - Deep - Help: - Help",
+                "    ".repeat(DISPLAY_DEEP + 3)
+            );
+            assert!(
+                shown.lines().any(|line| line == want),
+                "the Deep CheckBox shown"
+            );
+            let subtitles = shown
+                .lines()
+                .filter(|line| line.trim_start() == "OpCode: Subtitle - S: Deep")
+                .count();
+            assert_eq!(subtitles, DISPLAY_DEEP, "the Subtitles shown");
+        });
+    }
+
+    /// Debug prints what Debug derived for op_code, open_scope, length and children prints, as
+    /// `{:?}` and as `{:#?}`, also for an op whose RefCell is borrowed mutably.
+    #[test]
+    fn debug_prints_as_derived_debug() {
+        mod derived {
+            use super::*;
+
+            /// IFROperation's printed fields, with Debug derived
+            #[derive(Debug)]
+            #[expect(dead_code, reason = "Debug, which the test compares, reads them")]
+            pub(super) struct IFROperation {
+                op_code: IFROpCode,
+                open_scope: bool,
+                length: u8,
+                pub(super) children: Vec<Rc<RefCell<IFROperation>>>,
+            }
+
+            /// `op`'s tree, recursively: its ops are few.
+            pub(super) fn of(op: &super::IFROperation) -> IFROperation {
+                IFROperation {
+                    op_code: op.op_code,
+                    open_scope: op.open_scope,
+                    length: op.length,
+                    children: op
+                        .children
+                        .iter()
+                        .map(|child| Rc::new(RefCell::new(of(&child.borrow()))))
+                        .collect(),
+                }
+            }
+        }
+
+        let root = parse_form_set(&[
+            var_store(1, [0x22; 16], "Deep", 1),
+            form(
+                1,
+                &[
+                    nested(&subtitle_scope(3), 2, &[deep_checkbox()]),
+                    [operation(0x70, true, &[]), END.to_vec()].concat(),
+                ],
+            ),
+        ]);
+        let want = derived::of(&root.borrow());
+        assert_eq!(
+            format!("{:?}", root.borrow()),
+            format!("{want:?}"),
+            "{{:?}}"
+        );
+        assert_eq!(
+            format!("{:#?}", root.borrow()),
+            format!("{want:#?}"),
+            "{{:#?}}"
+        );
+
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let form = Rc::clone(&form_set.borrow().children[1]);
+        let want_form = Rc::clone(&want.children[0].borrow().children[1]);
+        let _mutable = form.borrow_mut();
+        let _want_mutable = want_form.borrow_mut();
+        assert_eq!(
+            format!("{:?}", root.borrow()),
+            format!("{want:?}"),
+            "{{:?}}, borrowed"
+        );
+        assert_eq!(
+            format!("{:#?}", root.borrow()),
+            format!("{want:#?}"),
+            "{{:#?}}, borrowed"
+        );
     }
 }

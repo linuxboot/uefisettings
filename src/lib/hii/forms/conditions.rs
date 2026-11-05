@@ -27,7 +27,9 @@ use thiserror::Error;
 use super::ami_access_level::AMI_ACCESS_LEVEL;
 use super::find_corresponding_varstore;
 use super::read_question_value;
+use super::try_walk_scopes;
 use super::value_question;
+use super::walk_scopes;
 use super::AccessLevel;
 use super::EfivarReader;
 use super::IFROpCode;
@@ -37,6 +39,7 @@ use super::ValueLocation;
 use super::ValueQuestion;
 use super::ValueUnavailable;
 use super::VariableStore;
+use super::Walk;
 
 /// The opcode of IFROpCode::Match2, the highest that edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c IsUnKnownOpCode knows.
@@ -519,33 +522,26 @@ impl QuestionIndex {
     // edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes does not parse, so that a
     // reference to one gives UNDEFINED.
     pub(crate) fn new(root: &Rc<RefCell<IFROperation>>) -> Self {
-        fn walk(
-            node: &Rc<RefCell<IFROperation>>,
-            form: Option<&Rc<RefCell<IFROperation>>>,
-            index: &mut BTreeMap<u16, Vec<IndexedQuestion>>,
-        ) {
+        let mut index: BTreeMap<u16, Vec<IndexedQuestion>> = BTreeMap::new();
+        walk_scopes(std::slice::from_ref(root), None, |node, form| {
             let op = node.borrow();
             if skips_scope(&op) {
-                return;
+                return Walk::Skip;
             }
             // reserved (UEFI 2.10 §33.3.8.2.2)
             if let Some(id) = question_id(&op).filter(|&id| id != 0) {
                 index.entry(id).or_default().push(IndexedQuestion {
-                    form: form.cloned(),
+                    form: form.clone(),
                     question: Rc::clone(node),
                 });
             }
             let form = if matches!(op.op_code, IFROpCode::Form | IFROpCode::FormMap) {
-                Some(node)
+                Some(Rc::clone(node))
             } else {
-                form
+                form.clone()
             };
-            for child in &op.children {
-                walk(child, form, index);
-            }
-        }
-        let mut index = BTreeMap::new();
-        walk(root, None, &mut index);
+            Walk::Enter(form)
+        });
         QuestionIndex(index)
     }
 
@@ -1042,16 +1038,23 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         // out NOT and OR.
         // Ops that skips_scope names are left out, with their scopes: edk2 ParseOpCodes skips
         // them before it builds expressions (IsExpressionOpCode).
-        let expression = scope
+        let expression: Vec<_> = scope
             .children
             .iter()
             .filter(|child| !skips_scope(&child.borrow()))
-            .take_while(|child| {
-                matches!(OpRole::of(child.borrow().op_code), OpRole::Expression(_))
-            });
-        for op in expression {
-            self.run_tree(&op.borrow())?;
-        }
+            .take_while(|child| matches!(OpRole::of(child.borrow().op_code), OpRole::Expression(_)))
+            .cloned()
+            .collect();
+        // each op, then the ops in its scope, in IFR order
+        try_walk_scopes(&expression, (), |op, ()| {
+            let op = op.borrow();
+            if skips_scope(&op) {
+                return Ok(Walk::Skip);
+            }
+            let value = self.step(&op)?;
+            self.stack.push(value);
+            Ok(Walk::Enter(()))
+        })?;
         let result = self
             .stack
             .pop()
@@ -1060,16 +1063,6 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             0 => Ok(result),
             left => Err(Abort::Malformed(format!("{} values left", left + 1))),
         }
-    }
-
-    /// Evaluates `op` and then the ops in its scope, in IFR order.
-    fn run_tree(&mut self, op: &IFROperation) -> Result<(), Abort> {
-        let value = self.step(op)?;
-        self.stack.push(value);
-        op.children
-            .iter()
-            .filter(|child| !skips_scope(&child.borrow()))
-            .try_for_each(|child| self.run_tree(&child.borrow()))
     }
 
     /// Pops the operand of `op`.

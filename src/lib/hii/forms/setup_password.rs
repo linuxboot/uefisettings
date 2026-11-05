@@ -23,10 +23,12 @@ use log::warn;
 use thiserror::Error;
 
 use super::find_corresponding_varstore;
+use super::walk_scopes;
 use super::IFROpCode;
 use super::IFROperation;
 use super::ParsedOperation;
 use super::QuestionHeader;
+use super::Walk;
 use crate::hii::package::Guid;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableKey;
@@ -54,24 +56,24 @@ impl PasswordQuestions {
 
     /// Adds those of `node`, in the FormSet `form_set` if any, and the ops in its scope.
     fn add(&mut self, node: &Rc<RefCell<IFROperation>>, form_set: Option<Guid>) {
-        let op = node.borrow();
-        let form_set = match &op.parsed_data {
-            ParsedOperation::FormSet(form_set) => Some(form_set.guid),
-            _ => form_set,
-        };
-        if op.op_code == IFROpCode::Password {
-            self.declared = true;
-            match password_var_store(node, &op, form_set) {
-                Ok(var_store) => self.var_stores.extend(var_store),
-                Err(unresolved) => {
-                    warn!("{unresolved}");
-                    self.unresolved.push(unresolved);
+        walk_scopes(std::slice::from_ref(node), form_set, |node, &form_set| {
+            let op = node.borrow();
+            let form_set = match &op.parsed_data {
+                ParsedOperation::FormSet(form_set) => Some(form_set.guid),
+                _ => form_set,
+            };
+            if op.op_code == IFROpCode::Password {
+                self.declared = true;
+                match password_var_store(node, &op, form_set) {
+                    Ok(var_store) => self.var_stores.extend(var_store),
+                    Err(unresolved) => {
+                        warn!("{unresolved}");
+                        self.unresolved.push(unresolved);
+                    }
                 }
             }
-        }
-        for child in &op.children {
-            self.add(child, form_set);
-        }
+            Walk::Enter(form_set)
+        });
     }
 
     /// The variables that questions read and set through variables of `reach` withhold:

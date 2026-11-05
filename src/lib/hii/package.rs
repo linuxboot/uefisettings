@@ -483,8 +483,11 @@ mod tests {
 
     use super::hiidb_fixtures::*;
     use super::*;
+    use crate::hii::forms::ifr_fixtures::nested;
+    use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
+    use crate::hii::forms::MAX_SCOPE_NESTING;
 
     /// OPAQUE_PACKAGE is a package with Length 6, that is, 2 bytes of data:
     /// 0xAA 0xBB. Its Type 0xE0 is in the range that UEFI Spec v2.10 §33.3.1.1
@@ -547,8 +550,8 @@ mod tests {
 
     /// read_db keeps each FormSet of a form package as a root of its own. The walk for FormSets
     /// after the first skips other ops and ends, without failing the package, at an op that does
-    /// not fit it or at a later FormSet whose bytes do not parse; a malformed first FormSet still
-    /// fails it.
+    /// not fit it or at a later FormSet whose bytes do not parse, and skips a later FormSet whose
+    /// scopes nest deeper than MAX_SCOPE_NESTING; a malformed first FormSet still fails it.
     #[test]
     fn test_read_db_ends_the_form_set_walk_at_an_op_that_does_not_fit() {
         let form_set = |guid: u8, body: &[u8]| {
@@ -583,7 +586,9 @@ mod tests {
         };
         let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
         let subtitle = [0x02, 0x07, 0x05, 0x00, 0x06, 0x00, 0x00];
-        let cases: [(&str, Vec<u8>, &[u8]); 8] = [
+        // the FormSet's own scope and these
+        let too_deep = nested(&subtitle_scope(5), MAX_SCOPE_NESTING, &[]);
+        let cases: [(&str, Vec<u8>, &[u8]); 10] = [
             ("0xFF padding", vec![0xFF; 8], &[0xA0]),
             ("zero bytes", vec![0x00; 4], &[0xA0]),
             ("Length 1", vec![0x29, 0x01], &[0xA0]),
@@ -608,6 +613,16 @@ mod tests {
                 [form_set(0xB0, &short_checkbox), form_set(0xC0, &[])].concat(),
                 &[0xA0],
             ),
+            (
+                "a FormSet nested too deep",
+                form_set(0xB0, &too_deep),
+                &[0xA0],
+            ),
+            (
+                "a FormSet nested too deep, then a FormSet",
+                [form_set(0xB0, &too_deep), form_set(0xC0, &[])].concat(),
+                &[0xA0, 0xC0],
+            ),
         ];
         for (name, trailing, want) in cases {
             let got = read([form_set(0xA0, &[]), trailing].concat())
@@ -622,6 +637,13 @@ mod tests {
         assert!(
             format!("{error:#}").contains("failed to parse CheckBox's data"),
             "a malformed first FormSet: {error:#}"
+        );
+        let error = read(form_set(0xA0, &too_deep)).expect_err("a first FormSet nested too deep");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<forms::ScopesTooDeep>()),
+            "a first FormSet nested too deep: {error:#}"
         );
     }
 

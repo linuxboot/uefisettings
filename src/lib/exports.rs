@@ -646,18 +646,25 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::conditional;
     use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::form;
+    use crate::hii::forms::ifr_fixtures::form_set;
+    use crate::hii::forms::ifr_fixtures::nested;
+    use crate::hii::forms::ifr_fixtures::on_small_stack;
+    use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::password_on;
+    use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::MemoryVariables;
     use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
     use crate::hii::forms::ifr_fixtures::VariableReach;
+    use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NV_BS;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
+    use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::en_strings_package;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
@@ -1542,5 +1549,137 @@ mod tests {
             panic!("list_questions used the strings of another list");
         };
         assert_eq!(format!("{err:#}"), want, "list_questions");
+    }
+
+    /// The scopes of the FormSet and the Form of nested_subtitles_hiidb
+    const FORM_SCOPES: usize = 2;
+
+    /// A HiiDB whose Form nests `subtitles` Subtitle scopes around a CheckBox prompted "Deep", in
+    /// the scope of an unknown op if `in_unknown_scope`.
+    fn nested_subtitles_hiidb(subtitles: usize, in_unknown_scope: bool) -> Vec<u8> {
+        let nested = nested(&subtitle_scope(2), subtitles, &[checkbox_on(1, 2, 0)]);
+        let body = match in_unknown_scope {
+            true => [unknown_scope(), nested, END.to_vec()].concat(),
+            false => nested,
+        };
+        let packages = [
+            en_strings_package_of(&["FormSet", "Deep"]),
+            form_package(&[form(1, &[body])]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// An op of the unknown opcode 0x70 opening a scope.
+    fn unknown_scope() -> Vec<u8> {
+        operation(0x70, true, &[])
+    }
+
+    /// A command of the tests below: what it prints of a HiiDB, line by line.
+    type Command = fn(&[u8]) -> Result<Vec<String>>;
+
+    /// The commands of the tests below, each with its name.
+    fn commands() -> [(&'static str, Command); 4] {
+        [
+            ("list-strings", |hiidb| {
+                let strings = HiiBackend::list_strings(hiidb)?;
+                Ok(strings
+                    .into_iter()
+                    .flat_map(|package| package.string_package.into_values())
+                    .collect())
+            }),
+            ("list-questions", |hiidb| {
+                let options = ListQuestionsOptions {
+                    efivars: EfivarSource::Disabled,
+                    include: IncludedStates::all(),
+                    ..Default::default()
+                };
+                let questions = HiiBackend::list_questions_using(hiidb, &options)?;
+                Ok(questions
+                    .into_iter()
+                    .map(|question| question.name)
+                    .collect())
+            }),
+            ("show-ifr", |hiidb| {
+                let options = ShowIfrOptions {
+                    efivars: EfivarSource::Disabled,
+                };
+                let shown = HiiBackend::show_ifr_using(hiidb, &options)?;
+                Ok(shown
+                    .readable_representation
+                    .lines()
+                    .filter(|line| line.contains("CheckBox"))
+                    .map(|line| line.trim().to_string())
+                    .collect())
+            }),
+            ("get", |hiidb| {
+                let options = GetOptions {
+                    efivars: EfivarSource::Disabled,
+                    ..Default::default()
+                };
+                let got = HiiBackend::get_using(hiidb, "Deep", None, &options)?;
+                Ok(got
+                    .responses
+                    .into_iter()
+                    .map(|response| response.question.name)
+                    .collect())
+            }),
+        ]
+    }
+
+    /// Every command reads a HiiDB whose IFR scopes nest MAX_SCOPE_NESTING deep, unknown ones
+    /// counted, on SMALL_STACK, and shows its CheckBox, unless an unknown op's scope, which edk2
+    /// skips, holds it.
+    #[test]
+    fn commands_read_scopes_nested_to_the_limit_on_a_small_stack() {
+        for in_unknown_scope in [false, true] {
+            let subtitles = MAX_SCOPE_NESTING - FORM_SCOPES - usize::from(in_unknown_scope);
+            let hiidb = nested_subtitles_hiidb(subtitles, in_unknown_scope);
+            for (name, command) in commands() {
+                let got = on_small_stack(name, || command(&hiidb)).unwrap_or_else(|error| {
+                    panic!("{name}, in an unknown scope: {in_unknown_scope}: {error:#}")
+                });
+                let want: &[&str] = match (name, in_unknown_scope) {
+                    ("list-strings", _) => &["FormSet", "Deep"],
+                    (_, true) => &[],
+                    ("show-ifr", false) => &["OpCode: CheckBox - Q: - Deep - Help: -"],
+                    (_, false) => &["Deep"],
+                };
+                assert_eq!(got, want, "{name}, in an unknown scope: {in_unknown_scope}");
+            }
+        }
+    }
+
+    /// Every command refuses a HiiDB whose IFR scopes nest deeper than MAX_SCOPE_NESTING, unknown
+    /// ones counted, by one or by 20000 Subtitles, naming the op past the limit, on SMALL_STACK.
+    #[test]
+    fn commands_refuse_scopes_nested_past_the_limit_on_a_small_stack() {
+        let form_set_op = form_set(&[]).len() - END.len();
+        let form_op = form(1, &[]).len() - END.len();
+        let subtitle_op = subtitle_scope(2).len();
+        for in_unknown_scope in [false, true] {
+            let outer = FORM_SCOPES + usize::from(in_unknown_scope);
+            let past_limit = form_set_op
+                + form_op
+                + usize::from(in_unknown_scope) * unknown_scope().len()
+                + (MAX_SCOPE_NESTING - outer) * subtitle_op;
+            let want = format!(
+                "failed to parse package list 55555555-5555-5555-5555-555555555555: failed to \
+                 parse a form package: IFR scopes nest deeper than {MAX_SCOPE_NESTING} at offset \
+                 {past_limit} of a form package"
+            );
+            for subtitles in [MAX_SCOPE_NESTING - outer + 1, 20_000] {
+                let hiidb = nested_subtitles_hiidb(subtitles, in_unknown_scope);
+                for (name, command) in commands() {
+                    let case = format!(
+                        "{name}, {subtitles} Subtitles, in an unknown scope: {in_unknown_scope}"
+                    );
+                    let Err(error) = on_small_stack(name, || command(&hiidb)) else {
+                        panic!("{case}: read past the limit");
+                    };
+                    assert_eq!(format!("{error:#}"), want, "{case}");
+                }
+            }
+        }
     }
 }
