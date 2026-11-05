@@ -11,7 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The global variables of UEFI 2.11 §3.3 but its load options, hot keys and device paths, and
-//! the signature databases of §32.7.1, decoded as variable get prints them.
+//! the signature databases of §32.7.1, decoded as variable get prints them, and those that the OS
+//! may write, as variable set writes them.
 
 use std::fmt;
 
@@ -25,8 +26,10 @@ use sha2::Digest;
 use sha2::Sha256;
 use thiserror::Error;
 
+use crate::efi_variables::VariableContents;
 use crate::efi_variables::VariableData;
 use crate::hii::package::Guid;
+use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 
 /// EFI_GLOBAL_VARIABLE, the vendor GUID of the global variables (UEFI 2.11 §3.3).
@@ -52,42 +55,78 @@ const SIGNATURE_LIST_HEADER_SIZE: usize = GUID_SIZE + 3 * 4;
 const WAIT_FOR_USER_INPUT: u16 = 0xFFFF;
 /// What variable get prints for the Timeout that waits for user input.
 const WAIT_FOR_USER_INPUT_TEXT: &str = "wait for user input";
+/// What variable set takes for an OsIndications of none of its defined bits, as an empty
+/// argument does not reach uefisettings.efi from the UEFI Shell.
+const NO_OS_INDICATIONS: &str = "none";
 /// EFI_BOOT_OPTION_SUPPORT_COUNT, the bits of BootOptionSupport that hold a count (UEFI 2.11
 /// §3.1.4).
 const BOOT_OPTION_SUPPORT_COUNT: u32 = 0x0000_0300;
+/// NV, BS, RT: the attributes of each variable of UEFI 2.11 Table 3.1 that the OS may write, which
+/// variable set creates a missing one with.
+const WRITABLE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
+    .union(VariableAttributes::BOOTSERVICE_ACCESS)
+    .union(VariableAttributes::RUNTIME_ACCESS);
+/// Why the OS does not write a variable, in the words of UEFI 2.11 §3.3: those of Table 3.1 for
+/// most of them, of the text after it for the others.
+const TREATED_AS_READ_ONLY: &str = "Should be treated as read-only.";
+const AUDIT_MODE_READ_ONLY: &str = "Should be treated as read-only except when DeployedMode is 0. \
+                                    Always becomes read-only after ExitBootServices() is called.";
+const DEPLOYED_MODE_READ_ONLY: &str = "Should be treated as read-only when its value is 1. Always \
+                                       becomes read-only after ExitBootServices() is called.";
+const BOOT_CURRENT_READ_ONLY: &str =
+    "The platform sets this variable before signaling EFI_EVENT_GROUP_READY_TO_BOOT.";
+const HW_ERR_REC_SUPPORT_READ_ONLY: &str =
+    "This variable is only modified by firmware and is read-only to the OS.";
+const OS_INDICATIONS_SUPPORTED_READ_ONLY: &str =
+    "This variable is recreated by firmware every boot, and cannot be modified by the OS";
+const PLATFORM_LANG_CODES_READ_ONLY: &str = "This value is considered read-only.";
+const SECURE_BOOT_POLICY_VARIABLE: &str = "Secure Boot Policy Variables must be created using the \
+                                           EFI_VARIABLE_AUTHENTICATION_2 structure.";
 
 /// The variables that variable get decodes: those of UEFI 2.11 Table 3.1 but the load options,
-/// hot keys and device paths, and the signature databases.
+/// hot keys and device paths, and the signature databases; and whether variable set writes them.
 const GLOBALS: [Global; 33] = [
-    Global::efi_global("AuditMode", Codec::Byte),
-    Global::efi_global("BootCurrent", Codec::BootOption),
-    Global::efi_global("BootNext", Codec::BootOption),
-    Global::efi_global("BootOptionSupport", Codec::BootOptionSupport),
-    Global::efi_global("BootOrder", Codec::Order(LoadOptionKind::Boot)),
-    Global::efi_global("dbDefault", Codec::SignatureLists),
-    Global::efi_global("dbrDefault", Codec::SignatureLists),
-    Global::efi_global("dbtDefault", Codec::SignatureLists),
-    Global::efi_global("dbxDefault", Codec::SignatureLists),
-    Global::efi_global("DeployedMode", Codec::Byte),
-    Global::efi_global("devAuthBoot", Codec::Byte),
-    Global::efi_global("devdbDefault", Codec::SignatureLists),
-    Global::efi_global("DriverOrder", Codec::Order(LoadOptionKind::Driver)),
-    Global::efi_global("HwErrRecSupport", Codec::Word),
-    Global::efi_global("KEK", Codec::SignatureLists),
-    Global::efi_global("KEKDefault", Codec::SignatureLists),
-    Global::efi_global("OsIndications", Codec::OsIndications),
-    Global::efi_global("OsIndicationsSupported", Codec::OsIndications),
-    Global::efi_global("OsRecoveryOrder", Codec::Guids),
-    Global::efi_global("PK", Codec::SignatureLists),
-    Global::efi_global("PKDefault", Codec::SignatureLists),
-    Global::efi_global("PlatformLangCodes", Codec::Ascii),
-    Global::efi_global("PlatformLang", Codec::Ascii),
-    Global::efi_global("SignatureSupport", Codec::Guids),
-    Global::efi_global("SecureBoot", Codec::Byte),
-    Global::efi_global("SetupMode", Codec::Byte),
-    Global::efi_global("SysPrepOrder", Codec::Order(LoadOptionKind::SysPrep)),
-    Global::efi_global("Timeout", Codec::Timeout),
-    Global::efi_global("VendorKeys", Codec::Byte),
+    Global::read_only("AuditMode", Codec::Byte, AUDIT_MODE_READ_ONLY),
+    Global::read_only("BootCurrent", Codec::BootOption, BOOT_CURRENT_READ_ONLY),
+    Global::writable("BootNext", Setter::BootNext),
+    Global::read_only(
+        "BootOptionSupport",
+        Codec::BootOptionSupport,
+        TREATED_AS_READ_ONLY,
+    ),
+    Global::writable("BootOrder", Setter::Order(LoadOptionKind::Boot)),
+    Global::read_only("dbDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
+    Global::read_only("dbrDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
+    Global::read_only("dbtDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
+    Global::read_only("dbxDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
+    Global::read_only("DeployedMode", Codec::Byte, DEPLOYED_MODE_READ_ONLY),
+    Global::read_only("devAuthBoot", Codec::Byte, TREATED_AS_READ_ONLY),
+    Global::read_only("devdbDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
+    Global::writable("DriverOrder", Setter::Order(LoadOptionKind::Driver)),
+    Global::read_only("HwErrRecSupport", Codec::Word, HW_ERR_REC_SUPPORT_READ_ONLY),
+    Global::read_only("KEK", Codec::SignatureLists, SECURE_BOOT_POLICY_VARIABLE),
+    Global::read_only("KEKDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
+    Global::writable("OsIndications", Setter::OsIndications),
+    Global::read_only(
+        "OsIndicationsSupported",
+        Codec::OsIndications,
+        OS_INDICATIONS_SUPPORTED_READ_ONLY,
+    ),
+    Global::read_only("OsRecoveryOrder", Codec::Guids, SECURE_BOOT_POLICY_VARIABLE),
+    Global::read_only("PK", Codec::SignatureLists, SECURE_BOOT_POLICY_VARIABLE),
+    Global::read_only("PKDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
+    Global::read_only(
+        "PlatformLangCodes",
+        Codec::Ascii,
+        PLATFORM_LANG_CODES_READ_ONLY,
+    ),
+    Global::writable("PlatformLang", Setter::PlatformLang),
+    Global::read_only("SignatureSupport", Codec::Guids, TREATED_AS_READ_ONLY),
+    Global::read_only("SecureBoot", Codec::Byte, TREATED_AS_READ_ONLY),
+    Global::read_only("SetupMode", Codec::Byte, TREATED_AS_READ_ONLY),
+    Global::writable("SysPrepOrder", Setter::Order(LoadOptionKind::SysPrep)),
+    Global::writable("Timeout", Setter::Timeout),
+    Global::read_only("VendorKeys", Codec::Byte, TREATED_AS_READ_ONLY),
     Global::image_security("db"),
     Global::image_security("dbx"),
     Global::image_security("dbt"),
@@ -178,6 +217,15 @@ impl From<u16> for Timeout {
     }
 }
 
+impl From<Timeout> for u16 {
+    fn from(timeout: Timeout) -> Self {
+        match timeout {
+            Timeout::Seconds(seconds) => seconds,
+            Timeout::WaitForUserInput => WAIT_FOR_USER_INPUT,
+        }
+    }
+}
+
 /// The seconds as a number, else WAIT_FOR_USER_INPUT_TEXT.
 impl Serialize for Timeout {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -214,6 +262,33 @@ impl LoadOptionKind {
 pub struct LoadOptionName {
     pub kind: LoadOptionKind,
     pub number: u16,
+}
+
+impl LoadOptionName {
+    /// The load option of `kind` that `text` names as Display writes it, such as Boot0001.
+    fn parse(kind: LoadOptionKind, text: &str) -> std::result::Result<Self, SetRefusal> {
+        text.strip_prefix(kind.prefix())
+            .filter(|digits| {
+                digits.len() == 4
+                    && digits
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'F'))
+            })
+            .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+            .map(|number| Self { kind, number })
+            .ok_or_else(|| SetRefusal::OptionName {
+                kind,
+                text: text.to_owned(),
+            })
+    }
+
+    /// The variable of this load option.
+    fn key(self) -> VariableKey {
+        VariableKey {
+            name: self.to_string(),
+            guid: EFI_GLOBAL_VARIABLE,
+        }
+    }
 }
 
 impl fmt::Display for LoadOptionName {
@@ -341,30 +416,83 @@ pub(crate) fn read_global(
     })
 }
 
-/// A variable that variable get decodes: its name, vendor GUID and codec.
+/// Sets the variable `name` that `variables` hold to `text`, which names its value as variable
+/// get prints it, unless variable set refuses the variable or the value; a missing variable is
+/// created with WRITABLE_ATTRIBUTES, an existing one keeps its attributes.
+pub(crate) fn write_global(
+    variables: &impl VariableData,
+    name: &str,
+    text: &str,
+) -> Result<GlobalVariable> {
+    let (global, setter) = Global::writable_named(name)?;
+    let key = global.key();
+    let current = variables.variable_data(&key)?;
+    let setting = setter.setting(global, variables, text, current.as_ref())?;
+    let attributes = current.map_or(WRITABLE_ATTRIBUTES, |current| current.attributes());
+    let contents = VariableContents::new(attributes, setting.data)
+        .with_context(|| format!("EFI variable {key}"))?;
+    variables.set_variable(&key, &contents)?;
+    Ok(GlobalVariable {
+        variable: key.to_string(),
+        contents: Some(GlobalContents {
+            attributes: attributes.bits(),
+            value: setting.value,
+        }),
+    })
+}
+
+/// A variable that variable get decodes: its name, vendor GUID and codec, and whether variable
+/// set writes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Global {
     name: &'static str,
     vendor: Guid,
     codec: Codec,
+    access: Access,
 }
 
 impl Global {
-    /// The global variable `name` (UEFI 2.11 §3.3).
-    const fn efi_global(name: &'static str, codec: Codec) -> Self {
+    /// The global variable `name` (UEFI 2.11 §3.3), which the OS may write as `setter` checks.
+    const fn writable(name: &'static str, setter: Setter) -> Self {
+        Self {
+            name,
+            vendor: EFI_GLOBAL_VARIABLE,
+            codec: setter.codec(),
+            access: Access::Writable(setter),
+        }
+    }
+
+    /// The global variable `name` (UEFI 2.11 §3.3), which the OS does not write, for `reason`.
+    const fn read_only(name: &'static str, codec: Codec, reason: &'static str) -> Self {
         Self {
             name,
             vendor: EFI_GLOBAL_VARIABLE,
             codec,
+            access: Access::ReadOnly(reason),
         }
     }
 
-    /// The signature database `name` (UEFI 2.11 §32.7.1).
+    /// The signature database `name` (UEFI 2.11 §32.7.1), a Secure Boot Policy Variable (§3.3).
     const fn image_security(name: &'static str) -> Self {
         Self {
             name,
             vendor: EFI_IMAGE_SECURITY_DATABASE,
             codec: Codec::SignatureLists,
+            access: Access::ReadOnly(SECURE_BOOT_POLICY_VARIABLE),
+        }
+    }
+
+    /// The variable `name` of GLOBALS that variable set writes, and how.
+    fn writable_named(name: &str) -> std::result::Result<(Self, Setter), SetRefusal> {
+        let Some(global) = GLOBALS.iter().find(|global| global.name == name) else {
+            return Err(SetRefusal::NotWritable(name.to_owned()));
+        };
+        match global.access {
+            Access::Writable(setter) => Ok((*global, setter)),
+            Access::ReadOnly(reason) => Err(SetRefusal::ReadOnly {
+                name: global.name,
+                reason,
+            }),
         }
     }
 
@@ -418,6 +546,268 @@ fn global_names() -> String {
     GLOBALS.map(|global| global.name).join(", ")
 }
 
+/// The names of GLOBALS that variable set writes, comma-separated.
+fn writable_names() -> String {
+    GLOBALS
+        .iter()
+        .filter(|global| matches!(global.access, Access::Writable(_)))
+        .map(|global| global.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether variable set writes a variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// The OS may write it: "By using the SetVariable() function the data that contain these
+    /// environment variables can be modified" (UEFI 2.11 §3.1.1)
+    Writable(Setter),
+    /// The OS does not write it, for these words of UEFI 2.11 §3.3
+    ReadOnly(&'static str),
+}
+
+/// How variable set takes and checks the value of a variable that the OS may write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Setter {
+    /// Timeout: seconds, or WAIT_FOR_USER_INPUT_TEXT
+    Timeout,
+    /// BootOrder, DriverOrder and SysPrepOrder: load options of this kind, each of which exists,
+    /// none twice
+    Order(LoadOptionKind),
+    /// BootNext: a Boot#### that exists
+    BootNext,
+    /// PlatformLang, which "may be changed to any value supported by PlatformLangCodes" (UEFI
+    /// 2.11 §3.3)
+    PlatformLang,
+    /// OsIndications, which "The OS will supply ... with a SetVariable() call" (UEFI 2.11
+    /// §8.5.4): bits of OsIndicationsSupported, the reserved bits kept
+    OsIndications,
+}
+
+/// A value that variable set writes, and the data that holds it.
+struct Setting {
+    value: GlobalValue,
+    data: Vec<u8>,
+}
+
+impl Setter {
+    const fn codec(self) -> Codec {
+        match self {
+            Self::Timeout => Codec::Timeout,
+            Self::Order(kind) => Codec::Order(kind),
+            Self::BootNext => Codec::BootOption,
+            Self::PlatformLang => Codec::Ascii,
+            Self::OsIndications => Codec::OsIndications,
+        }
+    }
+
+    /// The value that `text` names of `global`, checked against `variables`, of which `current`
+    /// is the contents of `global`, if it exists.
+    fn setting(
+        self,
+        global: Global,
+        variables: &impl VariableData,
+        text: &str,
+        current: Option<&VariableContents>,
+    ) -> Result<Setting> {
+        let name = global.name;
+        Ok(match self {
+            Self::Timeout => {
+                let timeout = match text {
+                    WAIT_FOR_USER_INPUT_TEXT => Timeout::WaitForUserInput,
+                    seconds => seconds
+                        .parse::<u16>()
+                        .map(Timeout::from)
+                        .map_err(|_| SetRefusal::Timeout(text.to_owned()))?,
+                };
+                Setting {
+                    value: GlobalValue::Timeout(timeout),
+                    data: u16::from(timeout).to_le_bytes().to_vec(),
+                }
+            }
+            Self::Order(kind) => {
+                if text.is_empty() {
+                    return Err(SetRefusal::EmptyOrder(name).into());
+                }
+                let mut options = Vec::new();
+                for option in text.split(',') {
+                    let option = LoadOptionName::parse(kind, option)?;
+                    if options.contains(&option) {
+                        return Err(SetRefusal::Twice { name, option }.into());
+                    }
+                    options.push(option);
+                }
+                for &option in &options {
+                    check_present(variables, name, option)?;
+                }
+                Setting {
+                    data: options
+                        .iter()
+                        .flat_map(|option| option.number.to_le_bytes())
+                        .collect(),
+                    value: GlobalValue::LoadOptions(options),
+                }
+            }
+            Self::BootNext => {
+                let option = LoadOptionName::parse(LoadOptionKind::Boot, text)?;
+                check_present(variables, name, option)?;
+                Setting {
+                    value: GlobalValue::LoadOption(option),
+                    data: option.number.to_le_bytes().to_vec(),
+                }
+            }
+            Self::PlatformLang => {
+                if text.is_empty()
+                    || !text
+                        .bytes()
+                        .all(|byte| byte.is_ascii() && byte != 0 && byte != b';')
+                {
+                    return Err(SetRefusal::LanguageCode(text.to_owned()).into());
+                }
+                let codes = read_decoded(variables, "PlatformLangCodes", ascii)?
+                    .ok_or(SetRefusal::NoLanguageCodes)?;
+                if !codes.split(';').any(|code| code == text) {
+                    return Err(SetRefusal::UnsupportedLanguage {
+                        code: text.to_owned(),
+                        codes,
+                    }
+                    .into());
+                }
+                Setting {
+                    value: GlobalValue::Ascii(text.to_owned()),
+                    data: [text.as_bytes(), &[0]].concat(),
+                }
+            }
+            Self::OsIndications => {
+                let named = match text {
+                    NO_OS_INDICATIONS => OsIndications::empty(),
+                    bits => bits
+                        .split(',')
+                        .map(|bit| {
+                            OsIndications::from_name(bit)
+                                .ok_or_else(|| SetRefusal::OsIndication(bit.to_owned()))
+                        })
+                        .collect::<std::result::Result<_, _>>()?,
+                };
+                let supported = read_decoded(variables, "OsIndicationsSupported", os_indications)?
+                    .unwrap_or_else(OsIndications::empty);
+                let unsupported = named.difference(supported);
+                if !unsupported.is_empty() {
+                    return Err(SetRefusal::UnsupportedOsIndications(unsupported).into());
+                }
+                let current = current
+                    .map(|current| os_indications(current.data()))
+                    .transpose()
+                    .with_context(|| format!("EFI variable {} is malformed", global.key()))?
+                    .unwrap_or_else(OsIndications::empty);
+                let bits = named | current.difference(OsIndications::all());
+                Setting {
+                    value: GlobalValue::OsIndications(bits),
+                    data: bits.bits().to_le_bytes().to_vec(),
+                }
+            }
+        })
+    }
+}
+
+/// The global variable `name` that `variables` hold, decoded with `decode`, if present.
+fn read_decoded<T>(
+    variables: &impl VariableData,
+    name: &str,
+    decode: impl Fn(&[u8]) -> std::result::Result<T, MalformedData>,
+) -> Result<Option<T>> {
+    let key = VariableKey {
+        name: name.to_owned(),
+        guid: EFI_GLOBAL_VARIABLE,
+    };
+    variables
+        .variable_data(&key)?
+        .map(|contents| decode(contents.data()))
+        .transpose()
+        .with_context(|| format!("EFI variable {key} is malformed"))
+}
+
+/// Fails unless `variables` hold the load option `option` that the variable `name` names.
+fn check_present(
+    variables: &impl VariableData,
+    name: &'static str,
+    option: LoadOptionName,
+) -> Result<()> {
+    match variables.variable_data(&option.key())? {
+        Some(_) => Ok(()),
+        None => Err(SetRefusal::Absent { name, option }.into()),
+    }
+}
+
+/// A variable or value that variable set refuses, before it writes anything.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+enum SetRefusal {
+    #[error("variable set writes {}, not {0}", writable_names())]
+    NotWritable(String),
+    #[error("variable set does not write {name}: \"{reason}\" (UEFI 2.11 section 3.3)")]
+    ReadOnly {
+        name: &'static str,
+        reason: &'static str,
+    },
+    #[error(
+        "Timeout takes seconds from 0 to 65535, or \"{}\", not \"{0}\"",
+        WAIT_FOR_USER_INPUT_TEXT
+    )]
+    Timeout(String),
+    #[error(
+        "\"{text}\" is no {}####: \"#### is replaced by a unique option number in printable \
+         hexadecimal representation using the digits 0-9, and the upper case versions of the \
+         characters A-F\" (UEFI 2.11 section 3.1.1)",
+        kind.prefix()
+    )]
+    OptionName { kind: LoadOptionKind, text: String },
+    #[error(
+        "an empty {0} would delete it: \"using SetVariable() with a DataSize of zero will cause \
+         the entire variable to be deleted\" (UEFI 2.11 section 8.2.3)"
+    )]
+    EmptyOrder(&'static str),
+    #[error("{name} names {option} twice")]
+    Twice {
+        name: &'static str,
+        option: LoadOptionName,
+    },
+    #[error("{name} names {option}, which is absent")]
+    Absent {
+        name: &'static str,
+        option: LoadOptionName,
+    },
+    #[error("PlatformLang takes one language code of ASCII, such as en-US, not \"{0}\"")]
+    LanguageCode(String),
+    #[error("PlatformLangCodes is absent, so PlatformLang has no value that it supports")]
+    NoLanguageCodes,
+    #[error(
+        "PlatformLang \"may be changed to any value supported by PlatformLangCodes\" (UEFI 2.11 \
+         section 3.3), {codes}, not {code}"
+    )]
+    UnsupportedLanguage { code: String, codes: String },
+    #[error(
+        "OsIndications takes the bits {}, comma-separated, or {}, not \"{0}\"",
+        os_indication_names(),
+        NO_OS_INDICATIONS
+    )]
+    OsIndication(String),
+    #[error("OsIndicationsSupported lacks {}", bit_names(*.0))]
+    UnsupportedOsIndications(OsIndications),
+}
+
+/// The names of the bits of OsIndications, comma-separated.
+fn os_indication_names() -> String {
+    bit_names(OsIndications::all())
+}
+
+/// The names of `bits`, comma-separated.
+fn bit_names(bits: OsIndications) -> String {
+    bits.iter_names()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// How the data of a variable that variable get decodes is laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
@@ -463,9 +853,7 @@ impl Codec {
                 number: u16::from_le_bytes(exact(data, "a UINT16")?),
             }),
             Self::Ascii => GlobalValue::Ascii(ascii(data)?),
-            Self::OsIndications => GlobalValue::OsIndications(OsIndications::from_bits_retain(
-                u64::from_le_bytes(exact(data, "a UINT64")?),
-            )),
+            Self::OsIndications => GlobalValue::OsIndications(os_indications(data)?),
             Self::Byte => GlobalValue::Byte(u8::from_le_bytes(exact(data, "a UINT8")?)),
             Self::Word => GlobalValue::Word(u16::from_le_bytes(exact(data, "a UINT16")?)),
             Self::BootOptionSupport => {
@@ -558,6 +946,14 @@ fn items<'a, const N: usize>(
             what,
         }),
     }
+}
+
+/// The bits of OsIndications or OsIndicationsSupported in `data`, "a UINT64 bitmask" (UEFI 2.11
+/// §8.5.4).
+fn os_indications(data: &[u8]) -> std::result::Result<OsIndications, MalformedData> {
+    Ok(OsIndications::from_bits_retain(u64::from_le_bytes(exact(
+        data, "a UINT64",
+    )?)))
 }
 
 /// The null-terminated ASCII string of `data`, without its NUL.
@@ -713,26 +1109,56 @@ mod tests {
         .union(VariableAttributes::BOOTSERVICE_ACCESS)
         .union(VariableAttributes::RUNTIME_ACCESS);
 
-    /// VariableData that hold `variables` and record each key read.
+    /// VariableData that hold `variables` and record each key read and set.
     #[derive(Default)]
     struct HeldVariables {
-        variables: BTreeMap<VariableKey, VariableContents>,
+        variables: RefCell<BTreeMap<VariableKey, VariableContents>>,
         read: RefCell<Vec<VariableKey>>,
+        set: RefCell<Vec<VariableKey>>,
     }
 
     impl HeldVariables {
         /// Holds `data` with NV+BS+RT as the variable `name` of `vendor`.
-        fn with(mut self, name: &str, vendor: Guid, data: &[u8]) -> Self {
-            let contents = VariableContents::new(NV_BS_RT, data.to_vec()).expect("hold data");
-            self.variables.insert(key(name, vendor), contents);
+        fn with(self, name: &str, vendor: Guid, data: &[u8]) -> Self {
+            self.with_attributes(name, vendor, NV_BS_RT, data)
+        }
+
+        /// Holds `data` with `attributes` as the variable `name` of `vendor`.
+        fn with_attributes(
+            self,
+            name: &str,
+            vendor: Guid,
+            attributes: VariableAttributes,
+            data: &[u8],
+        ) -> Self {
+            let contents = VariableContents::new(attributes, data.to_vec()).expect("hold data");
+            self.variables
+                .borrow_mut()
+                .insert(key(name, vendor), contents);
             self
+        }
+
+        /// The attributes and data of the global variable `name`, if held.
+        fn global(&self, name: &str) -> Option<(VariableAttributes, Vec<u8>)> {
+            self.variables
+                .borrow()
+                .get(&key(name, EFI_GLOBAL_VARIABLE))
+                .map(|contents| (contents.attributes(), contents.data().to_vec()))
         }
     }
 
     impl VariableData for HeldVariables {
         fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
             self.read.borrow_mut().push(key.clone());
-            Ok(self.variables.get(key).cloned())
+            Ok(self.variables.borrow().get(key).cloned())
+        }
+
+        fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+            self.set.borrow_mut().push(key.clone());
+            self.variables
+                .borrow_mut()
+                .insert(key.clone(), contents.clone());
+            Ok(())
         }
     }
 
@@ -1229,6 +1655,461 @@ mod tests {
             ["db", "dbx", "dbt", "dbr"],
             "signature databases"
         );
+    }
+
+    /// Variables that the checks of variable set read: Boot0001, Boot0002, Driver0001,
+    /// SysPrep000A, PlatformLangCodes as EDK2 defaults it, OsIndicationsSupported of
+    /// BOOT_TO_FW_UI and START_PLATFORM_RECOVERY, and an OsIndications of BOOT_TO_FW_UI and a
+    /// reserved bit.
+    fn settable_variables() -> HeldVariables {
+        HeldVariables::default()
+            .with("Boot0001", EFI_GLOBAL_VARIABLE, &[1])
+            .with("Boot0002", EFI_GLOBAL_VARIABLE, &[1])
+            .with("Driver0001", EFI_GLOBAL_VARIABLE, &[1])
+            .with("SysPrep000A", EFI_GLOBAL_VARIABLE, &[1])
+            .with(
+                "PlatformLangCodes",
+                EFI_GLOBAL_VARIABLE,
+                b"en;fr;en-US;fr-FR\0",
+            )
+            .with(
+                "OsIndicationsSupported",
+                EFI_GLOBAL_VARIABLE,
+                &0x41_u64.to_le_bytes(),
+            )
+            .with(
+                "OsIndications",
+                EFI_GLOBAL_VARIABLE,
+                &0x101_u64.to_le_bytes(),
+            )
+    }
+
+    /// Each setter writes the data of the value that its text names, which get reads back as
+    /// that value, and an OsIndications keeps its reserved bits but not its defined ones; both
+    /// ways of each codec of the variables that the OS may write.
+    #[test]
+    fn set_writes_what_get_reads_back() {
+        let cases: Vec<(&str, &str, Vec<u8>, serde_json::Value)> = vec![
+            ("Timeout", "5", vec![5, 0], json!(5)),
+            ("Timeout", "0", vec![0, 0], json!(0)),
+            ("Timeout", "65534", vec![0xFE, 0xFF], json!(65534)),
+            (
+                "Timeout",
+                "65535",
+                vec![0xFF, 0xFF],
+                json!("wait for user input"),
+            ),
+            (
+                "Timeout",
+                "wait for user input",
+                vec![0xFF, 0xFF],
+                json!("wait for user input"),
+            ),
+            (
+                "BootOrder",
+                "Boot0002,Boot0001",
+                vec![2, 0, 1, 0],
+                json!(["Boot0002", "Boot0001"]),
+            ),
+            ("BootOrder", "Boot0001", vec![1, 0], json!(["Boot0001"])),
+            (
+                "DriverOrder",
+                "Driver0001",
+                vec![1, 0],
+                json!(["Driver0001"]),
+            ),
+            (
+                "SysPrepOrder",
+                "SysPrep000A",
+                vec![0x0A, 0],
+                json!(["SysPrep000A"]),
+            ),
+            ("BootNext", "Boot0002", vec![2, 0], json!("Boot0002")),
+            ("PlatformLang", "fr-FR", b"fr-FR\0".to_vec(), json!("fr-FR")),
+            ("PlatformLang", "en", b"en\0".to_vec(), json!("en")),
+            (
+                "OsIndications",
+                "START_PLATFORM_RECOVERY,BOOT_TO_FW_UI",
+                0x141_u64.to_le_bytes().to_vec(),
+                json!(["BOOT_TO_FW_UI", "START_PLATFORM_RECOVERY", "0x100"]),
+            ),
+            (
+                "OsIndications",
+                "START_PLATFORM_RECOVERY",
+                0x140_u64.to_le_bytes().to_vec(),
+                json!(["START_PLATFORM_RECOVERY", "0x100"]),
+            ),
+            (
+                "OsIndications",
+                "none",
+                0x100_u64.to_le_bytes().to_vec(),
+                json!(["0x100"]),
+            ),
+        ];
+        for (name, text, data, want) in cases {
+            let variables = settable_variables();
+
+            let written = write_global(&variables, name, text)
+                .unwrap_or_else(|error| panic!("set {name} {text:?}: {error:#}"));
+
+            let read = read_global(&variables, name, None).expect("read back");
+            assert_eq!(
+                variables.global(name).map(|(_, data)| data),
+                Some(data),
+                "{name} {text:?}: data"
+            );
+            assert_eq!(written, read, "{name} {text:?}: written and read back");
+            let value = read.contents.map(|contents| contents.value);
+            assert_eq!(
+                value.map(|value| serde_json::to_value(value).expect("serialize the value")),
+                Some(want),
+                "{name} {text:?}: value"
+            );
+            assert_eq!(
+                variables.set.into_inner(),
+                [key(name, EFI_GLOBAL_VARIABLE)],
+                "{name} {text:?}: sets"
+            );
+        }
+    }
+
+    /// set creates a missing variable with NV+BS+RT, as UEFI 2.11 Table 3.1 gives each that the
+    /// OS may write, and keeps the attributes of an existing one.
+    #[test]
+    fn set_creates_a_missing_variable_with_its_table_3_1_attributes() {
+        let nv_bs = VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS;
+        let variables =
+            settable_variables().with_attributes("BootNext", EFI_GLOBAL_VARIABLE, nv_bs, &[1, 0]);
+
+        for (name, text) in [("Timeout", "3"), ("BootNext", "Boot0002")] {
+            write_global(&variables, name, text)
+                .unwrap_or_else(|error| panic!("set {name}: {error:#}"));
+        }
+
+        assert_eq!(
+            variables.global("Timeout"),
+            Some((NV_BS_RT, vec![3, 0])),
+            "a missing Timeout"
+        );
+        assert_eq!(
+            variables.global("BootNext"),
+            Some((nv_bs, vec![2, 0])),
+            "an existing BootNext"
+        );
+        assert!(
+            WRITABLE_ATTRIBUTES.contains(VariableAttributes::BOOTSERVICE_ACCESS),
+            "\"Runtime access to a data variable implies boot service access\" (UEFI 2.11 \
+             section 8.2.3)"
+        );
+    }
+
+    /// set refuses, before it writes anything: a value that its variable does not take, a load
+    /// option twice or one that is absent, a PlatformLang outside PlatformLangCodes, a bit of
+    /// OsIndications outside OsIndicationsSupported, and a variable that the OS does not write.
+    #[test]
+    fn set_refusals_leave_the_variables_unchanged() {
+        let read_only = |name: &str, reason: &str| {
+            format!("variable set does not write {name}: \"{reason}\" (UEFI 2.11 section 3.3)")
+        };
+        let option_name = |text: &str, kind: &str| {
+            format!(
+                "\"{text}\" is no {kind}####: \"#### is replaced by a unique option number in \
+                 printable hexadecimal representation using the digits 0-9, and the upper case \
+                 versions of the characters A-F\" (UEFI 2.11 section 3.1.1)"
+            )
+        };
+        let os_indication = |text: &str| {
+            format!(
+                "OsIndications takes the bits BOOT_TO_FW_UI, TIMESTAMP_REVOCATION, \
+                 FILE_CAPSULE_DELIVERY_SUPPORTED, FMP_CAPSULE_SUPPORTED, \
+                 CAPSULE_RESULT_VAR_SUPPORTED, START_OS_RECOVERY, START_PLATFORM_RECOVERY, \
+                 JSON_CONFIG_DATA_REFRESH, comma-separated, or none, not \"{text}\""
+            )
+        };
+        let cases: Vec<(&str, &str, String)> =
+            vec![
+            (
+                "BootOrder",
+                "Boot0001,Boot0002,Boot0001",
+                "BootOrder names Boot0001 twice".to_string(),
+            ),
+            (
+                "BootOrder",
+                "Boot0001,Boot0003",
+                "BootOrder names Boot0003, which is absent".to_string(),
+            ),
+            (
+                "DriverOrder",
+                "Driver0002",
+                "DriverOrder names Driver0002, which is absent".to_string(),
+            ),
+            (
+                "BootOrder",
+                "",
+                "an empty BootOrder would delete it: \"using SetVariable() with a DataSize of \
+                 zero will cause the entire variable to be deleted\" (UEFI 2.11 section 8.2.3)"
+                    .to_string(),
+            ),
+            ("BootOrder", "Boot1", option_name("Boot1", "Boot")),
+            ("BootOrder", "boot0001", option_name("boot0001", "Boot")),
+            ("BootOrder", "Boot000a", option_name("Boot000a", "Boot")),
+            ("BootOrder", "Driver0001", option_name("Driver0001", "Boot")),
+            ("SysPrepOrder", "Boot0001", option_name("Boot0001", "SysPrep")),
+            (
+                "BootNext",
+                "Boot1234",
+                "BootNext names Boot1234, which is absent".to_string(),
+            ),
+            ("BootNext", "Boot0001,Boot0002", option_name("Boot0001,Boot0002", "Boot")),
+            (
+                "PlatformLang",
+                "xx-XX",
+                "PlatformLang \"may be changed to any value supported by PlatformLangCodes\" \
+                 (UEFI 2.11 section 3.3), en;fr;en-US;fr-FR, not xx-XX"
+                    .to_string(),
+            ),
+            (
+                "PlatformLang",
+                "fr-",
+                "PlatformLang \"may be changed to any value supported by PlatformLangCodes\" \
+                 (UEFI 2.11 section 3.3), en;fr;en-US;fr-FR, not fr-"
+                    .to_string(),
+            ),
+            (
+                "PlatformLang",
+                "en;fr",
+                "PlatformLang takes one language code of ASCII, such as en-US, not \"en;fr\""
+                    .to_string(),
+            ),
+            (
+                "PlatformLang",
+                "",
+                "PlatformLang takes one language code of ASCII, such as en-US, not \"\""
+                    .to_string(),
+            ),
+            (
+                "OsIndications",
+                "BOOT_TO_FW_UI,TIMESTAMP_REVOCATION",
+                "OsIndicationsSupported lacks TIMESTAMP_REVOCATION".to_string(),
+            ),
+            ("OsIndications", "BOOT_TO_FW_UI,0x100", os_indication("0x100")),
+            ("OsIndications", "", os_indication("")),
+            ("OsIndications", "BOOT_TO_FW_UI,", os_indication("")),
+            ("OsIndications", "none,BOOT_TO_FW_UI", os_indication("none")),
+            (
+                "Timeout",
+                "-1",
+                "Timeout takes seconds from 0 to 65535, or \"wait for user input\", not \"-1\""
+                    .to_string(),
+            ),
+            (
+                "Timeout",
+                "65536",
+                "Timeout takes seconds from 0 to 65535, or \"wait for user input\", not \
+                 \"65536\""
+                    .to_string(),
+            ),
+            (
+                "SecureBoot",
+                "1",
+                read_only("SecureBoot", "Should be treated as read-only."),
+            ),
+            (
+                "SetupMode",
+                "0",
+                read_only("SetupMode", "Should be treated as read-only."),
+            ),
+            (
+                "PlatformLangCodes",
+                "en",
+                read_only("PlatformLangCodes", "This value is considered read-only."),
+            ),
+            (
+                "OsIndicationsSupported",
+                "BOOT_TO_FW_UI",
+                read_only(
+                    "OsIndicationsSupported",
+                    "This variable is recreated by firmware every boot, and cannot be modified \
+                     by the OS",
+                ),
+            ),
+            (
+                "PK",
+                "",
+                read_only(
+                    "PK",
+                    "Secure Boot Policy Variables must be created using the \
+                     EFI_VARIABLE_AUTHENTICATION_2 structure.",
+                ),
+            ),
+            (
+                "db",
+                "",
+                read_only(
+                    "db",
+                    "Secure Boot Policy Variables must be created using the \
+                     EFI_VARIABLE_AUTHENTICATION_2 structure.",
+                ),
+            ),
+            (
+                "KEK",
+                "",
+                read_only(
+                    "KEK",
+                    "Secure Boot Policy Variables must be created using the \
+                     EFI_VARIABLE_AUTHENTICATION_2 structure.",
+                ),
+            ),
+            (
+                "OsRecoveryOrder",
+                "",
+                read_only(
+                    "OsRecoveryOrder",
+                    "Secure Boot Policy Variables must be created using the \
+                     EFI_VARIABLE_AUTHENTICATION_2 structure.",
+                ),
+            ),
+            (
+                "AuditMode",
+                "1",
+                read_only(
+                    "AuditMode",
+                    "Should be treated as read-only except when DeployedMode is 0. Always \
+                     becomes read-only after ExitBootServices() is called.",
+                ),
+            ),
+            (
+                "DeployedMode",
+                "1",
+                read_only(
+                    "DeployedMode",
+                    "Should be treated as read-only when its value is 1. Always becomes \
+                     read-only after ExitBootServices() is called.",
+                ),
+            ),
+            (
+                "BootCurrent",
+                "Boot0001",
+                read_only(
+                    "BootCurrent",
+                    "The platform sets this variable before signaling \
+                     EFI_EVENT_GROUP_READY_TO_BOOT.",
+                ),
+            ),
+            (
+                "HwErrRecSupport",
+                "1",
+                read_only(
+                    "HwErrRecSupport",
+                    "This variable is only modified by firmware and is read-only to the OS.",
+                ),
+            ),
+            (
+                "Boot0001",
+                "",
+                "variable set writes BootNext, BootOrder, DriverOrder, OsIndications, \
+                 PlatformLang, SysPrepOrder, Timeout, not Boot0001"
+                    .to_string(),
+            ),
+        ];
+        for (name, text, refusal) in cases {
+            let variables = settable_variables();
+            let before = variables.variables.borrow().clone();
+
+            let error = write_global(&variables, name, text).expect_err("a refused set");
+
+            assert_eq!(format!("{error:#}"), refusal, "{name} {text:?}");
+            assert_eq!(variables.set.into_inner(), [], "{name} {text:?}: sets");
+            assert_eq!(
+                variables.variables.into_inner(),
+                before,
+                "{name} {text:?}: variables"
+            );
+        }
+    }
+
+    /// A PlatformLang needs PlatformLangCodes, and an OsIndications bit needs
+    /// OsIndicationsSupported, which the firmware may not have created.
+    #[test]
+    fn set_refuses_what_the_firmware_does_not_tell_it_supports() {
+        let variables = HeldVariables::default();
+
+        let language =
+            write_global(&variables, "PlatformLang", "en").expect_err("set PlatformLang");
+        let bits = write_global(&variables, "OsIndications", "BOOT_TO_FW_UI")
+            .expect_err("set OsIndications");
+        let none = write_global(&variables, "OsIndications", "none").expect("set no OsIndications");
+
+        assert_eq!(
+            language.to_string(),
+            "PlatformLangCodes is absent, so PlatformLang has no value that it supports",
+            "PlatformLang"
+        );
+        assert_eq!(
+            bits.to_string(),
+            "OsIndicationsSupported lacks BOOT_TO_FW_UI",
+            "OsIndications"
+        );
+        assert_eq!(
+            none.contents.map(|contents| contents.value),
+            Some(GlobalValue::OsIndications(OsIndications::empty())),
+            "no OsIndications"
+        );
+        assert_eq!(
+            variables.global("OsIndications"),
+            Some((NV_BS_RT, vec![0; 8])),
+            "OsIndications created"
+        );
+    }
+
+    /// set refuses, before it writes anything, when a variable that it reads to check or keep
+    /// bits of is malformed: OsIndications itself, PlatformLangCodes and OsIndicationsSupported.
+    #[test]
+    fn set_refuses_over_malformed_variables_that_it_reads() {
+        let cases: [(&str, &[u8], &str, &str, &str); 3] = [
+            (
+                "OsIndications",
+                &[0; 4],
+                "OsIndications",
+                "BOOT_TO_FW_UI",
+                "4 bytes, not the 8 of a UINT64",
+            ),
+            (
+                "PlatformLangCodes",
+                b"en;fr",
+                "PlatformLang",
+                "en",
+                "no NUL at its end",
+            ),
+            (
+                "OsIndicationsSupported",
+                &[0; 9],
+                "OsIndications",
+                "none",
+                "9 bytes, not the 8 of a UINT64",
+            ),
+        ];
+        for (malformed, data, name, text, want) in cases {
+            let variables = settable_variables().with(malformed, EFI_GLOBAL_VARIABLE, data);
+            let before = variables.variables.borrow().clone();
+
+            let error = write_global(&variables, name, text).expect_err("set over malformed data");
+
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "EFI variable {} is malformed: {want}",
+                    key(malformed, EFI_GLOBAL_VARIABLE)
+                ),
+                "{malformed}"
+            );
+            assert_eq!(variables.set.into_inner(), [], "{malformed}: sets");
+            assert_eq!(
+                variables.variables.into_inner(),
+                before,
+                "{malformed}: variables"
+            );
+        }
     }
 
     fn vendor(text: &str) -> Guid {

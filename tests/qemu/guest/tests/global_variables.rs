@@ -15,8 +15,13 @@
 //! variable store holds no Secure Boot variables, and `get_secboot_setup` and `get_secboot_user`
 //! in variable-get-secboot-setup and variable-get-secboot-user, on the secboot firmware in Setup
 //! Mode and, with run.sh's PK, KEK and db enrolled, in User Mode. Each test records what get
-//! prints of each variable, for the Shell boots of the shell- scenarios to compare.
+//! prints of each variable. `variable set` of those that the OS may write: in global-variables,
+//! `set_before_reboot` checks that each refusal leaves every efivar file as it was and sets
+//! Timeout, BootOrder, SysPrepOrder, PlatformLang and OsIndications, and `after_reboot`, the next
+//! boot, reads what outlasted the reset.
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::io;
 use std::io::Write;
 
@@ -24,6 +29,7 @@ use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
 use uefisettings_qemu_guest::assert_absent;
+use uefisettings_qemu_guest::is_immutable;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::variable_bytes;
@@ -51,6 +57,18 @@ const SECBOOT_OWNER: &str = "DE145B29-C3CD-455F-91DE-A76237B67C52";
 /// OvmfPkg/Library/PlatformBootManagerLib/BdsPlatform.c:300-313,
 /// OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBm.c:857-870).
 const FIRMWARE_TIMEOUT: u16 = if cfg!(target_arch = "aarch64") { 5 } else { 0 };
+/// The load options that tests/qemu/vars/boot-options.json seeds in global-variables, of files
+/// that no ESP holds, which BootOrder does not list.
+const SEEDED_OPTIONS: [&str; 2] = ["Boot0101", "Boot0102"];
+/// The SysPrep#### that tests/qemu/vars/boot-options.json seeds, of a file that no ESP holds.
+const SEEDED_SYSPREP: &str = "SysPrep0101";
+/// The Timeout that set_before_reboot sets.
+const SET_TIMEOUT: u16 = 7;
+/// PlatformLangCodes as EDK2 defaults it, PcdUefiVariableDefaultPlatformLangCodes
+/// (edk2-stable202508 MdePkg/MdePkg.dec:2582).
+const PLATFORM_LANG_CODES: &str = "en;fr;en-US;fr-FR";
+/// The PlatformLang that set_before_reboot sets, of PLATFORM_LANG_CODES.
+const SET_PLATFORM_LANG: &str = "fr-FR";
 /// The Secure Boot variables of UEFI 2.11 §3.3 that edk2 implements without AuditMode and
 /// DeployedMode: AuthVariableLibNull leaves them uncreated.
 const SECURE_BOOT_MODES: [&str; 4] = ["SecureBoot", "SetupMode", "AuditMode", "DeployedMode"];
@@ -233,4 +251,206 @@ fn get_secboot_user() {
     assert_enrolled("PK", EFI_GLOBAL_VARIABLE);
     assert_enrolled("KEK", EFI_GLOBAL_VARIABLE);
     assert_enrolled("db", EFI_IMAGE_SECURITY_DATABASE);
+}
+
+/// The bytes of every efivar file, or why it cannot be read.
+type Efivars = BTreeMap<String, Result<Vec<u8>, String>>;
+
+/// Every efivar file.
+#[track_caller]
+fn efivars() -> Efivars {
+    require_test_vm();
+    fs::read_dir(EFIVARS)
+        .expect("cannot list the efivars")
+        .map(|entry| {
+            let entry = entry.expect("cannot list the efivars");
+            let bytes = fs::read(entry.path()).map_err(|error| error.to_string());
+            (entry.file_name().to_string_lossy().into_owned(), bytes)
+        })
+        .collect()
+}
+
+/// What `variable set NAME VALUE` prints, which the test log records as
+/// "uefisettings-qemu-test: set NAME JSON".
+#[track_caller]
+fn set(name: &str, value: &str) -> Global {
+    let output = uefisettings_qemu_guest::uefisettings(&["variable", "set", name, value]);
+    writeln!(
+        io::stderr(),
+        "uefisettings-qemu-test: set {name} {}",
+        output.stdout.trim_end()
+    )
+    .expect("cannot write to stderr");
+    output.json(0)
+}
+
+/// The global variable `name` of `attributes` and `value`, as get and set print it.
+fn global(name: &str, attributes: u32, value: serde_json::Value) -> Global {
+    Global {
+        variable: format!("{name}-{EFI_GLOBAL_VARIABLE}"),
+        attributes: Some(attributes),
+        value: Some(value),
+        absent: false,
+    }
+}
+
+/// What get prints of BootOrder.
+#[track_caller]
+fn boot_order() -> Vec<String> {
+    let value = get("BootOrder").value.expect("BootOrder is present");
+    serde_json::from_value(value).expect("BootOrder lists names")
+}
+
+/// The BootOrder that set_before_reboot sets: SEEDED_OPTIONS backwards, then the rest of
+/// `order`.
+fn reordered(order: &[String]) -> Vec<String> {
+    let rest = order
+        .iter()
+        .filter(|option| !SEEDED_OPTIONS.contains(&option.as_str()));
+    SEEDED_OPTIONS
+        .iter()
+        .rev()
+        .map(|option| option.to_string())
+        .chain(rest.cloned())
+        .collect()
+}
+
+#[test]
+fn set_before_reboot() {
+    require_test_vm();
+    let before = efivars();
+    let read_only = "variable set does not write SecureBoot: \"Should be treated as read-only.\" \
+                     (UEFI 2.11 section 3.3)";
+    let unsupported_language = format!(
+        "PlatformLang \"may be changed to any value supported by PlatformLangCodes\" (UEFI 2.11 \
+         section 3.3), {PLATFORM_LANG_CODES}, not xx-XX"
+    );
+    for (name, value, refusal) in [
+        (
+            "BootNext",
+            "Boot1234",
+            "BootNext names Boot1234, which is absent",
+        ),
+        (
+            "BootOrder",
+            "Boot0101,Boot0101",
+            "BootOrder names Boot0101 twice",
+        ),
+        (
+            "BootOrder",
+            "Boot0101,Boot1234",
+            "BootOrder names Boot1234, which is absent",
+        ),
+        (
+            "SysPrepOrder",
+            "SysPrep0102",
+            "SysPrepOrder names SysPrep0102, which is absent",
+        ),
+        ("PlatformLang", "xx-XX", unsupported_language.as_str()),
+        (
+            "OsIndications",
+            "TIMESTAMP_REVOCATION",
+            "OsIndicationsSupported lacks TIMESTAMP_REVOCATION",
+        ),
+        ("SecureBoot", "1", read_only),
+    ] {
+        let error = json_error(&["variable", "set", name, value]);
+
+        assert_eq!(error.error_message, refusal, "set {name} {value}");
+        assert_eq!(efivars(), before, "set {name} {value}: the efivar files");
+    }
+    // set creates SysPrepOrder and OsIndications
+    for name in ["BootNext", "SysPrepOrder", "OsIndications"] {
+        assert_absent_global(name, EFI_GLOBAL_VARIABLE);
+    }
+    assert_eq!(
+        get("PlatformLangCodes").value,
+        Some(serde_json::json!(PLATFORM_LANG_CODES)),
+        "PlatformLangCodes"
+    );
+
+    let order = reordered(&boot_order());
+    let cases = [
+        (
+            "Timeout",
+            SET_TIMEOUT.to_string(),
+            serde_json::json!(SET_TIMEOUT),
+        ),
+        ("BootOrder", order.join(","), serde_json::json!(order)),
+        // twice: once its file exists, efivarfs keeps SysPrepOrder, a variable that Linux does
+        // not know, immutable
+        (
+            "SysPrepOrder",
+            SEEDED_SYSPREP.to_string(),
+            serde_json::json!([SEEDED_SYSPREP]),
+        ),
+        (
+            "SysPrepOrder",
+            SEEDED_SYSPREP.to_string(),
+            serde_json::json!([SEEDED_SYSPREP]),
+        ),
+        (
+            "PlatformLang",
+            SET_PLATFORM_LANG.to_string(),
+            serde_json::json!(SET_PLATFORM_LANG),
+        ),
+        (
+            "OsIndications",
+            "BOOT_TO_FW_UI".to_string(),
+            serde_json::json!(["BOOT_TO_FW_UI"]),
+        ),
+        // so that the next boot does not stop at the firmware's UI
+        ("OsIndications", "none".to_string(), serde_json::json!([])),
+    ];
+    for (name, value, want) in cases {
+        let written = set(name, &value);
+
+        assert_eq!(written, global(name, NV_BS_RT, want), "set {name} {value}");
+        assert_eq!(get(name), written, "get {name} after set {name} {value}");
+    }
+    assert_eq!(
+        efivar("OsIndications", EFI_GLOBAL_VARIABLE),
+        (NV_BS_RT, vec![0; 8]),
+        "OsIndications in efivarfs"
+    );
+    // set leaves efivarfs' immutable flag as it was: on SysPrepOrder, which Linux does not know,
+    // and off Timeout, which it does
+    assert!(
+        is_immutable(&path("SysPrepOrder", EFI_GLOBAL_VARIABLE)),
+        "SysPrepOrder is no longer immutable"
+    );
+    assert!(
+        !is_immutable(&path("Timeout", EFI_GLOBAL_VARIABLE)),
+        "Timeout became immutable"
+    );
+}
+
+#[test]
+fn after_reboot() {
+    require_test_vm();
+    let order = boot_order();
+    // x86's OVMF writes its own Timeout at every boot, ArmVirtQemu the one it reads
+    // (FIRMWARE_TIMEOUT)
+    let timeout = if cfg!(target_arch = "aarch64") {
+        SET_TIMEOUT
+    } else {
+        FIRMWARE_TIMEOUT
+    };
+
+    assert_eq!(order, reordered(&order), "BootOrder");
+    assert!(
+        SEEDED_OPTIONS
+            .iter()
+            .all(|option| order.contains(&option.to_string())),
+        "BootOrder: {order:?}"
+    );
+    for (name, want) in [
+        ("Timeout", serde_json::json!(timeout)),
+        ("SysPrepOrder", serde_json::json!([SEEDED_SYSPREP])),
+        ("PlatformLang", serde_json::json!(SET_PLATFORM_LANG)),
+        ("OsIndications", serde_json::json!([])),
+    ] {
+        assert_eq!(get(name), global(name, NV_BS_RT, want), "{name}");
+    }
+    assert_absent_global("BootNext", EFI_GLOBAL_VARIABLE);
 }

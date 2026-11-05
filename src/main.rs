@@ -893,6 +893,8 @@ mod tests {
                 "db",
                 "D719B2CB-3D3A-4596-A3BC-DAD00E67656F",
             ],
+            &["variable", "set", "Timeout", "5"],
+            &["variable", "set", "BootOrder", "Boot0002,Boot0001"],
         ]);
         for command in commands {
             let argv = [&["uefisettings"][..], command].concat();

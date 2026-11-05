@@ -198,6 +198,14 @@ impl VariableData for VariableServices {
             .map(Some)
             .with_context(|| format!("GetVariable() of EFI variable {key}"))
     }
+
+    fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+        let (variable_name, vendor) = uefi_key(key)?;
+        let attributes =
+            runtime::VariableAttributes::from_bits_retain(contents.attributes().bits());
+        runtime::set_variable(&variable_name, &vendor, attributes, contents.data())
+            .map_err(|error| anyhow!("SetVariable() of EFI variable {key}: {:?}", error.status()))
+    }
 }
 
 impl VariableStorageInfo for VariableServices {

@@ -849,6 +849,49 @@ impl VariableData for EfivarFiles {
         })?;
         efivar_contents(key, &bytes)
     }
+
+    /// Writes the attributes and data of `contents` to the efivar file of `key` as write_at
+    /// writes, which creates the variable if the file is missing.
+    fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+        let mut lock = FileLock::new(&self.remount_lock);
+        lock.lock()?;
+
+        let path = self.dir.join(EfivarFileName::from(key));
+        let exists = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                check_regular_file(&path, &metadata, "efivar file")?;
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to stat efivar file '{}'", path.display()))
+            }
+        };
+
+        let survives = self.survives()?;
+        let _efifs = EfivarsMountGuard::new(&self.dir, survives)
+            .context("Failed to create efivars fs mount guard")?;
+
+        // efivarfs makes the file of a variable that Linux does not know immutable, as for
+        // write_at.
+        let _immutability_attribute_guard = exists
+            .then(|| EfivarsImmutabilityGuard::new(&path))
+            .transpose()
+            .context("failed to create immutability attribute guard")?;
+
+        debug!("Writing value to {}", path.display());
+        write_efivar_file(&path, &efivar_file_bytes(contents))
+    }
+}
+
+/// The bytes of the efivar file of `contents`, as efivar_contents reads them.
+fn efivar_file_bytes(contents: &VariableContents) -> Vec<u8> {
+    [
+        &contents.attributes().bits().to_ne_bytes()[..],
+        contents.data(),
+    ]
+    .concat()
 }
 
 /// The contents of `key` from the `bytes` of its efivar file: its attributes word, then its data.
@@ -1457,6 +1500,24 @@ mod tests {
 
             assert_eq!(format!("{error:#}"), refusal, "{name}");
         }
+    }
+
+    /// The bytes that set_variable writes to an efivar file read back as the contents written.
+    #[test]
+    fn efivar_file_bytes_read_back_as_their_contents() {
+        let contents = VariableContents::new(
+            VariableAttributes::from_bits_retain(NV_BS_RT),
+            vec![1, 2, 3],
+        )
+        .expect("hold three bytes");
+
+        let bytes = efivar_file_bytes(&contents);
+
+        assert_eq!(
+            efivar_contents(&variable_key("Setup"), &bytes).expect("read the bytes back"),
+            Some(contents),
+            "the contents read back"
+        );
     }
 
     /// EfivarFiles tell the storage of NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
@@ -2087,6 +2148,85 @@ mod tests {
             Err("unasked"),
         ));
         files.survives().expect("ask again after the refusal");
+    }
+
+    /// set_variable writes neither a variable nor a new one when it cannot remount efivarfs, and
+    /// refuses an efivar file that is no regular file before it tries.
+    #[test]
+    fn efivar_files_set_nothing_without_the_remount() {
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
+        let path = |name: &str| dir.path().join(EfivarFileName::from(&variable_key(name)));
+        fs::write(path("Setup"), SETUP).expect("write the efivar file");
+        fs::create_dir(path("Directory")).expect("create a directory");
+        let contents =
+            VariableContents::new(VariableAttributes::from_bits_retain(NV_BS_RT), vec![1])
+                .expect("hold one byte");
+
+        for name in ["Setup", "New"] {
+            let error = files
+                .set_variable(&variable_key(name), &contents)
+                .expect_err("set without the remount");
+
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "Failed to create efivars fs mount guard: mount {} is not in /proc/mounts",
+                    dir.path().display()
+                ),
+                "{name}"
+            );
+        }
+        let error = files
+            .set_variable(&variable_key("Directory"), &contents)
+            .expect_err("set a directory");
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "efivar file '{}' is not a regular file",
+                path("Directory").display()
+            ),
+            "Directory"
+        );
+        assert_eq!(fs::read(path("Setup")).expect("read Setup"), SETUP, "Setup");
+        assert!(!path("New").exists(), "New was created");
+    }
+
+    /// On a kernel without efivarfs_reconfigure() whose log names an RT properties table that it
+    /// applied, set_variable refuses before it remounts efivarfs when it cannot read the table,
+    /// as write_at does, and neither changes a variable nor creates one.
+    #[test]
+    fn efivar_files_set_nothing_on_a_kernel_that_may_crash() {
+        let ([dir, _lock, evidence], files) = unmounted_efivar_files_of(UNFIXED_KALLSYMS);
+        fs::write(
+            evidence.path().join("kmsg"),
+            "6,12,1000,-;efi: ACPI=0x3fb7e000 RTPROP=0x3f989998 \n",
+        )
+        .expect("write the kernel log");
+        let path = |name: &str| dir.path().join(EfivarFileName::from(&variable_key(name)));
+        fs::write(path("Setup"), SETUP).expect("write the efivar file");
+        let contents =
+            VariableContents::new(VariableAttributes::from_bits_retain(NV_BS_RT), vec![1])
+                .expect("hold one byte");
+
+        for name in ["Setup", "New"] {
+            let error = files
+                .set_variable(&variable_key(name), &contents)
+                .expect_err("set on a kernel that may crash");
+
+            assert_eq!(
+                error.downcast_ref::<CrashingWrite>(),
+                Some(&CrashingWrite::Unknown),
+                "{name}: {error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                !message.contains("mount guard"),
+                "{name}: {message:?}: refused after the remount"
+            );
+        }
+        assert_eq!(fs::read(path("Setup")).expect("read Setup"), SETUP, "Setup");
+        assert!(!path("New").exists(), "New was created");
     }
 
     /// write_efivar_file names the statuses behind the errno of a refused write, ENOSPC from

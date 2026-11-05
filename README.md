@@ -366,6 +366,21 @@ the `sha256` of its data. The load options, hot keys and device paths of §3.3 a
 uefisettings variable get SecureBoot
 ```
 
+`variable set NAME VALUE` sets a global variable of UEFI 2.11 §3.3 that the OS may write and prints
+what it wrote, as `variable get` prints it. VALUE is the value as `variable get` shows it, lists
+comma-separated: `Timeout` takes seconds or `"wait for user input"`; `BootOrder`, `DriverOrder` and
+`SysPrepOrder` take their load options, each of which must exist, none twice; `BootNext` takes one
+`Boot####` that exists; `PlatformLang` takes one of the codes of `PlatformLangCodes`;
+`OsIndications` takes bits of `OsIndicationsSupported`, such as `BOOT_TO_FW_UI`, or `none`, and
+keeps its reserved bits. A missing variable is created with the attributes of UEFI 2.11 Table 3.1,
+NV+BS+RT; an existing one keeps its own. It refuses, naming the spec's words, the variables that the
+OS does not write, such as `SetupMode`, `SecureBoot` and the Secure Boot Policy Variables, which
+take authenticated writes.
+
+```sh
+uefisettings variable set BootOrder Boot0002,Boot0001
+```
+
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)
 tells of the storage of the variables of those attributes, by default the non-volatile ones that
 the OS reaches (`non-volatile,bootservice-access,runtime-access`), as a JSON object of its own:

@@ -1,0 +1,22 @@
+# The checks of shell/global-variables.nsh, the first boot of shell-global-variables: each
+# refusal leaves the global variables as they were, and set writes Timeout, PlatformLang and
+# OsIndications, which it creates. See check-shell-log.sh.
+before	status	any
+boot-next-absent	status	aborted
+boot-next-absent	line	BootNext names Boot1234, which is absent
+boot-order-twice	status	aborted
+boot-order-twice	line	BootOrder names Boot0000 twice
+platform-lang-unsupported	status	aborted
+platform-lang-unsupported	line	en;fr;en-US;fr-FR, not xx-XX
+setup-mode	status	aborted
+setup-mode	line	variable set does not write SetupMode
+after	status	any
+after	same	before
+timeout	status	0x0
+timeout	json	. == {"variable": "Timeout-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": 9}
+timeout-get	status	0x0
+timeout-get	same	timeout
+platform-lang	status	0x0
+platform-lang	json	. == {"variable": "PlatformLang-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": "fr-FR"}
+os-indications	status	0x0
+os-indications	json	. == {"variable": "OsIndications-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": []}

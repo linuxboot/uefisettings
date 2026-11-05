@@ -238,6 +238,18 @@ impl<C: FirmwareEnvironmentCalls> VariableData for FirmwareEnvironment<C> {
             .map(Some)
             .with_context(|| format!("GetFirmwareEnvironmentVariableExW of EFI variable {key}"))
     }
+
+    fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+        let name = variable_name(key)?;
+        let guid = variable_guid(key)?;
+        self.calls
+            .set_variable(&name, &guid, contents.data(), contents.attributes().bits())
+            .map_err(|code| {
+                anyhow!(
+                    "SetFirmwareEnvironmentVariableExW of EFI variable {key} failed with {code}"
+                )
+            })
+    }
 }
 
 /// The UTF-16 NUL-terminated name of `key`, for the Win32 calls: an interior NUL is an
@@ -942,5 +954,44 @@ mod tests {
         );
         assert_eq!(calls.get_calls().len(), 4, "gets");
         assert_eq!(calls.sets(), [], "sets");
+    }
+
+    /// set_variable sets the whole data with the attributes given, by the Win32 name and GUID
+    /// of the variable, and names the code of a refused set.
+    #[cfg(variable_data)]
+    #[test]
+    fn set_variable_sets_the_data_and_attributes_given() {
+        let calls = FakeFirmwareEnvironmentCalls::new();
+        calls.fail_set(Win32Error(ERROR_ACCESS_DENIED));
+        let environment = fake_environment(&calls);
+        let key = variable_key("Timeout");
+        let contents =
+            VariableContents::new(VariableAttributes::from_bits_retain(NV_BS_RT), vec![5, 0])
+                .expect("hold two bytes");
+
+        let refused = environment
+            .set_variable(&key, &contents)
+            .expect_err("a refused set");
+        environment
+            .set_variable(&key, &contents)
+            .expect("set Timeout");
+
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "SetFirmwareEnvironmentVariableExW of EFI variable \
+                 Timeout-00000000-0000-0000-0000-000000000000 failed with {}",
+                Win32Error(ERROR_ACCESS_DENIED)
+            ),
+            "ERROR_ACCESS_DENIED"
+        );
+        let set = (
+            variable_name(&key).expect("a name"),
+            variable_guid(&key).expect("a GUID"),
+            vec![5, 0],
+            NV_BS_RT,
+        );
+        assert_eq!(calls.sets(), [set.clone(), set], "sets");
+        assert_eq!(calls.get_calls(), [], "gets");
     }
 }

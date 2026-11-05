@@ -47,6 +47,8 @@ variable-get-secboot-user	-	-	global_variables/get_secboot_user	firmware=secboot
 shell-variable-get	-	-	shell:variable-get	-
 shell-variable-get-secboot-setup	-	-	shell:variable-get-secboot-setup	firmware=secboot-setup
 shell-variable-get-secboot-user	-	-	shell:variable-get-secboot-user	firmware=secboot-user
+global-variables	-	boot-options.json	global_variables/set_before_reboot,global_variables/after_reboot	-
+shell-global-variables	-	-	shell:global-variables,shell:global-variables-reboot	-
 secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
 secboot-user	-	-	secboot/user_mode	firmware=secboot-user
 shell-secboot-setup	-	-	shell:secboot-setup	firmware=secboot-setup

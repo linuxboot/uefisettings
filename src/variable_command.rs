@@ -20,6 +20,8 @@ use clap::Subcommand;
 use clap::ValueEnum;
 #[cfg(variable_storage_info)]
 use serde::Serialize;
+#[cfg(variable_data)]
+use uefisettings::exports::GlobalVariable;
 #[cfg(variable_storage_info)]
 use uefisettings::exports::VariableAttributes;
 #[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
@@ -69,6 +71,19 @@ enum VariableSubcommands {
         /// D719B2CB-3D3A-4596-A3BC-DAD00E67656F for db, dbx, dbt and dbr, else
         /// 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
         guid: Option<String>,
+    },
+    /// Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout, BootOrder,
+    /// DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications
+    #[cfg(variable_data)]
+    #[command(next_display_order = None)]
+    Set {
+        /// The variable, such as Timeout
+        name: String,
+        /// Its value as get shows it, the list comma-separated: seconds or "wait for user input"
+        /// for Timeout, load options such as Boot0002,Boot0001 for the orders, one for BootNext,
+        /// a code of PlatformLangCodes for PlatformLang, bits such as BOOT_TO_FW_UI, or none,
+        /// for OsIndications, which keeps its reserved bits
+        value: String,
     },
     /// Show the storage space of the EFI variables of some attributes, and how much of it is left
     #[command(next_display_order = None)]
@@ -126,6 +141,8 @@ impl VariableCommand {
             VariableSubcommands::Info { name, guid } => print_info(name, guid),
             #[cfg(variable_data)]
             VariableSubcommands::Get { name, guid } => print_global(name, guid.as_deref()),
+            #[cfg(variable_data)]
+            VariableSubcommands::Set { name, value } => set(name, value),
             VariableSubcommands::Storage { attributes } => storage(attributes),
         }
     }
@@ -174,8 +191,19 @@ pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
 /// get takes no -j, outside the thrift IDL that the hii commands print.
 #[cfg(variable_data)]
 fn print_global(name: &str, guid: Option<&str>) -> Result<()> {
-    let global = VariableBackend::get(name, guid)?;
-    print_line(format_args!("{}", serde_json::to_string(&global)?))?;
+    print_global_variable(&VariableBackend::get(name, guid)?)
+}
+
+/// Sets the variable `name` to `value` and prints what it wrote, as print_global prints it.
+#[cfg(variable_data)]
+fn set(name: &str, value: &str) -> Result<()> {
+    print_global_variable(&VariableBackend::set(name, value)?)
+}
+
+/// Prints `global` as one line of JSON, for print_global and set.
+#[cfg(variable_data)]
+fn print_global_variable(global: &GlobalVariable) -> Result<()> {
+    print_line(format_args!("{}", serde_json::to_string(global)?))?;
     Ok(())
 }
 
@@ -252,7 +280,7 @@ mod tests {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
                 #[cfg(variable_data)]
-                parsed @ VariableSubcommands::Get { .. } => {
+                parsed @ (VariableSubcommands::Get { .. } | VariableSubcommands::Set { .. }) => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::Storage { .. } => {
@@ -272,7 +300,9 @@ mod tests {
         let (name, guid) = match variable(&args) {
             VariableSubcommands::Info { name, guid } => (name, guid),
             #[cfg(variable_data)]
-            parsed @ VariableSubcommands::Get { .. } => panic!("{args:?} is no info: {parsed:?}"),
+            parsed @ (VariableSubcommands::Get { .. } | VariableSubcommands::Set { .. }) => {
+                panic!("{args:?} is no info: {parsed:?}")
+            }
             parsed @ (VariableSubcommands::List { .. } | VariableSubcommands::Storage { .. }) => {
                 panic!("{args:?} is no info: {parsed:?}")
             }
@@ -309,6 +339,7 @@ mod tests {
                     panic!("{args:?} is no get: {parsed:?}")
                 }
                 parsed @ (VariableSubcommands::List { .. }
+                | VariableSubcommands::Set { .. }
                 | VariableSubcommands::Storage { .. }) => {
                     panic!("{args:?} is no get: {parsed:?}")
                 }
@@ -322,6 +353,39 @@ mod tests {
             missing.err(),
             Some(clap::error::ErrorKind::MissingRequiredArgument),
             "get without a name"
+        );
+    }
+
+    /// set takes a variable name and its value, and needs both.
+    #[cfg(variable_data)]
+    #[test]
+    fn set_takes_a_name_and_a_value() {
+        for (args, want) in [
+            (&["set", "Timeout", "5"][..], ("Timeout", "5")),
+            (&["set", "OsIndications", "none"], ("OsIndications", "none")),
+        ] {
+            let (name, value) = match variable(args) {
+                VariableSubcommands::Set { name, value } => (name, value),
+                #[cfg(variable_info)]
+                parsed @ VariableSubcommands::Info { .. } => {
+                    panic!("{args:?} is no set: {parsed:?}")
+                }
+                parsed @ (VariableSubcommands::List { .. }
+                | VariableSubcommands::Get { .. }
+                | VariableSubcommands::Storage { .. }) => {
+                    panic!("{args:?} is no set: {parsed:?}")
+                }
+            };
+
+            assert_eq!((name.as_str(), value.as_str()), want, "{args:?}");
+        }
+        let missing =
+            UefiSettingsToolArgs::try_parse_from(["uefisettings", "variable", "set", "Timeout"])
+                .map_err(|error| error.kind());
+        assert_eq!(
+            missing.err(),
+            Some(clap::error::ErrorKind::MissingRequiredArgument),
+            "set without a value"
         );
     }
 
@@ -359,7 +423,7 @@ mod tests {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }
                 #[cfg(variable_data)]
-                parsed @ VariableSubcommands::Get { .. } => {
+                parsed @ (VariableSubcommands::Get { .. } | VariableSubcommands::Set { .. }) => {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::List { .. } => {

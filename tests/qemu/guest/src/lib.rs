@@ -318,6 +318,18 @@ pub fn clear_immutable(path: &str) {
         .unwrap_or_else(|error| panic!("FS_IOC_SETFLAGS on {path}: {error}"));
 }
 
+/// Whether efivarfs holds the variable at `path` immutable, as it holds every variable that it
+/// does not know to be removable (Linux v6.1 fs/efivarfs/inode.c efivarfs_get_inode()). Panics
+/// if the flags cannot be read.
+#[track_caller]
+pub fn is_immutable(path: &str) -> bool {
+    require_test_vm();
+    let file = File::open(path).unwrap_or_else(|error| panic!("cannot open {path}: {error}"));
+    rustix::fs::ioctl_getflags(&file)
+        .unwrap_or_else(|error| panic!("FS_IOC_GETFLAGS on {path}: {error}"))
+        .contains(IFlags::IMMUTABLE)
+}
+
 /// Panics unless `path` does not exist.
 #[track_caller]
 pub fn assert_absent(path: &str) {

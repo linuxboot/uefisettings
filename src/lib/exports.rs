@@ -30,6 +30,8 @@ use crate::efi_variables::deliver_json_capsule;
 #[cfg(variable_data)]
 use crate::efi_variables::globals::read_global;
 #[cfg(variable_data)]
+use crate::efi_variables::globals::write_global;
+#[cfg(variable_data)]
 pub use crate::efi_variables::globals::BootOptionFlags;
 #[cfg(variable_data)]
 pub use crate::efi_variables::globals::BootOptionSupport;
@@ -180,6 +182,12 @@ impl VariableBackend {
     pub fn get(name: &str, vendor: Option<&str>) -> Result<GlobalVariable> {
         let vendor = vendor.map(parse_vendor).transpose()?;
         read_global(&Self::system_variable_data()?, name, vendor)
+    }
+
+    /// Sets the global variable `name` of UEFI 2.11 §3.3 that the OS may write to `value`,
+    /// which names its value as get decodes it, after checking it; returns what it wrote.
+    pub fn set(name: &str, value: &str) -> Result<GlobalVariable> {
+        write_global(&Self::system_variable_data()?, name, value)
     }
 }
 
