@@ -30,7 +30,7 @@ pub(crate) const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
 pub(crate) fn read_db_file(path: &Path) -> Result<Vec<u8>> {
     info!("Using database dump from file: {}", path.display());
 
-    let mut file = File::open(path).context(format!("opening dbdump from{}", path.display()))?;
+    let mut file = File::open(path).context(format!("opening dbdump from {}", path.display()))?;
     read_db_bytes(&mut file)
 }
 
@@ -70,9 +70,29 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::fs::File;
+    use std::io;
 
-    #[cfg(unix)]
     use super::*;
+
+    /// A missing HiiDB file fails to open with an error that names its path after "from ".
+    #[test]
+    fn missing_file_error_names_its_path() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let path = dir.path().join("missing.bin");
+
+        let error = read_db_file(&path).expect_err("read a missing HiiDB file");
+
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(&format!("opening dbdump from {}", path.display())),
+            "missing file: {chain}"
+        );
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::NotFound),
+            "missing file: {chain}"
+        );
+    }
 
     /// A file of more than MAX_ALLOWED_FILESIZE bytes whose metadata says less, as a FIFO's does,
     /// is read one byte past the maximum and refused.
