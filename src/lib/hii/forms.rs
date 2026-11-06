@@ -39,6 +39,7 @@ use crate::hii::variables::EfivarReader;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
 use conditions::question_state;
+use conditions::retrieve_question_value;
 use conditions::select;
 use conditions::skips_scope;
 use conditions::ExpressionInputs;
@@ -50,7 +51,6 @@ use question_values::describe_question;
 use question_values::questions_named;
 use question_values::value_question;
 use set::ChangeValueError;
-use storage::read_question_value;
 use storage::storage_width;
 use storage::ReadableLocation;
 use storage::ValueLocation;
@@ -1817,7 +1817,9 @@ impl QuestionDescriptor {
             .map_err(|reason| match reason.downcast_ref::<NoVarStore>() {
                 Some(NoVarStore(storageless)) => ChangeValueError::Storageless {
                     question: self.question.clone(),
-                    refusal: storageless.refusal(QuestionExpression::Write, reach),
+                    refusal: storageless
+                        .refusal(QuestionExpression::Write, reach)
+                        .unwrap_or(StoragelessRefusal::WriteNotApplied),
                 },
                 None => ChangeValueError::NoVarStore {
                     question: self.question.clone(),
@@ -1996,7 +1998,7 @@ fn listed_question(
     if !state.may_be_allowed(walk.include) {
         return None;
     }
-    let descriptor = describe_question(question, &op, value_question, walk);
+    let descriptor = describe_question(question, value_question, walk);
     Some((descriptor, state))
 }
 
@@ -2042,11 +2044,11 @@ where
         .filter_map(|(question, op)| {
             let value_question = value_question(op)?;
             let state = question_state(op, &mut walk.inputs);
-            Some(((question, op, value_question), state))
+            Some(((question, value_question), state))
         })
         .collect();
     select(matches, walk.include)
-        .map(|(question, op, value_question)| describe_question(question, op, value_question, walk))
+        .map(|(question, value_question)| describe_question(question, value_question, walk))
 }
 
 /// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
@@ -2828,8 +2830,13 @@ pub fn display(
     reader: &mut EfivarReader,
 ) -> Result<String> {
     let mut result = String::new();
+    let values = VarStoreValues::new(&node, None);
+    let mut inputs = ExpressionInputs {
+        reader,
+        values: &values,
+    };
     walk_scopes(std::slice::from_ref(&node), level, |node, &level| {
-        display_op(node, level, string_packages, reader, &mut result)
+        display_op(node, level, string_packages, &mut inputs, &mut result)
     });
     Ok(result)
 }
@@ -2840,7 +2847,7 @@ fn display_op(
     node: &Rc<RefCell<IFROperation>>,
     level: usize,
     string_packages: &[BTreeMap<i32, String>],
-    reader: &mut EfivarReader,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
     result: &mut String,
 ) -> Walk<usize> {
     let extra_spaces = "    ".repeat(level);
@@ -2909,7 +2916,7 @@ fn display_op(
         ParsedOperation::OneOf(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
-            let answer_disp = display_answer(&current_node, &varstore, reader);
+            let answer_disp = display_answer(node, &varstore, inputs);
 
             result.push_str(
                 format!(
@@ -2931,7 +2938,7 @@ fn display_op(
         ParsedOperation::Numeric(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
-            let answer_disp = display_answer(&current_node, &varstore, reader);
+            let answer_disp = display_answer(node, &varstore, inputs);
 
             result.push_str(
                 format!(
@@ -2953,7 +2960,7 @@ fn display_op(
         ParsedOperation::CheckBox(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
-            let answer_disp = display_answer(&current_node, &varstore, reader);
+            let answer_disp = display_answer(node, &varstore, inputs);
 
             result.push_str(
                 format!(
@@ -2983,11 +2990,11 @@ fn display_op(
 
 /// Returns the answer that show-ifr shows: the question's value, or why it cannot be read.
 fn display_answer(
-    question: &IFROperation,
+    question: &Rc<RefCell<IFROperation>>,
     varstore: &Result<Box<dyn VariableStore>>,
-    reader: &mut EfivarReader,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> String {
-    match read_question_value(question, varstore, reader) {
+    match retrieve_question_value(question, varstore, inputs) {
         Err(reason) => reason.to_answer(),
         Ok((_, value)) => value.to_string(),
     }

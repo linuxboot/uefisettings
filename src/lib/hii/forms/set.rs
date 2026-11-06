@@ -678,6 +678,7 @@ mod set_questions_tests {
 mod write_validation_tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     use super::super::ifr_fixtures::*;
     use super::super::question_values::handle_numeric;
@@ -773,7 +774,7 @@ mod write_validation_tests {
             },
             data: range,
         };
-        let node = RefCell::new(IFROperation {
+        let node = Rc::new(RefCell::new(IFROperation {
             op_code: IFROpCode::Numeric,
             length: 0,
             open_scope: false,
@@ -781,7 +782,7 @@ mod write_validation_tests {
             parent: None,
             children: Vec::new(),
             parsed_data: ParsedOperation::Numeric(parsed),
-        });
+        }));
         let mut payload = vec![0; 42];
         let width = (bits / 8) as usize;
         payload[2..2 + width].copy_from_slice(&initial.to_le_bytes()[..width]);
@@ -794,7 +795,7 @@ mod write_validation_tests {
             store,
             parsed,
             "Numeric test",
-            &current,
+            &node,
             &mut FormSetWalk::new(
                 &[],
                 &mut efivars.reader(),

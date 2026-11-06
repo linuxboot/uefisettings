@@ -758,9 +758,9 @@ pub(super) fn question_descriptor_with(
     let mut reader = efivars.reader();
     let walk = &mut FormSetWalk::new(&strings, &mut reader, values, IncludedStates::empty());
     match &current.parsed_data {
-        ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", &current, walk),
-        ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", &current, walk),
-        ParsedOperation::CheckBox(parsed) => handle_checkbox(store, parsed, "", &current, walk),
+        ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", node, walk),
+        ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", node, walk),
+        ParsedOperation::CheckBox(parsed) => handle_checkbox(store, parsed, "", node, walk),
         other => panic!("not a question: {other:?}"),
     }
 }

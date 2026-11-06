@@ -83,23 +83,21 @@ impl StoragelessQuestion {
         }
     }
 
-    /// Why get (`Read`) or set (`Write`) on a backend of `reach` gives or takes no value: a
-    /// route through CallBack() waits for a caller that calls it.
+    /// Why get (`Read`) or set (`Write`) on a backend of `reach` gives or takes no value
+    /// without the expression; None if the expression alone does: a route through CallBack()
+    /// waits for a caller that calls it.
     pub(crate) fn refusal(
         self,
         expression: QuestionExpression,
         reach: VariableReach,
-    ) -> StoragelessRefusal {
+    ) -> Option<StoragelessRefusal> {
         match self.route(expression) {
-            Ok(StoragelessRoute::Expression { callback: false }) => {
-                StoragelessRefusal::ExpressionNotApplied(expression)
-            }
-            Ok(StoragelessRoute::Value) => StoragelessRefusal::ValueNotApplied,
+            Ok(StoragelessRoute::Expression { callback: false } | StoragelessRoute::Value) => None,
             Ok(StoragelessRoute::Expression { callback: true }) => {
-                StoragelessRefusal::CallbackDecides(expression, reach)
+                Some(StoragelessRefusal::CallbackDecides(expression, reach))
             }
-            Ok(StoragelessRoute::DriverCallback) => StoragelessRefusal::DriverHeld(reach),
-            Err(refusal) => refusal,
+            Ok(StoragelessRoute::DriverCallback) => Some(StoragelessRefusal::DriverHeld(reach)),
+            Err(refusal) => Some(refusal),
         }
     }
 }
@@ -149,13 +147,14 @@ pub(crate) enum StoragelessRefusal {
          a changed value (UEFI 2.11 §33.2.5.4.1)"
     )]
     NoWrite,
-    #[error("question has no VarStore, and uefisettings does not apply its {0} expression")]
-    ExpressionNotApplied(QuestionExpression),
-    /// get of a question with an EFI_IFR_VALUE
+    /// get of a question whose READ expression gives UNDEFINED or fails
     #[error(
-        "question has no VarStore, and uefisettings does not apply its EFI_IFR_VALUE expression"
+        "its READ expression gives no value, and without a VarStore the question has no other \
+         (UEFI 2.11 §33.2.5.4.1)"
     )]
-    ValueNotApplied,
+    ReadUndefined,
+    #[error("question has no VarStore, and uefisettings does not apply its WRITE expression")]
+    WriteNotApplied,
     /// A question with EFI_IFR_FLAG_CALLBACK whose CallBack() this run does not call: after
     /// ExitBootServices() (`Runtime`) none may, and list-questions, show-ifr and dumps never do
     #[error("{}", DriverHeld(*.0))]
@@ -473,7 +472,7 @@ mod tests {
         }
     }
 
-    /// An EFI_IFR_VALUE routes get to its value, before any READ, also on a FORM_MAP without the
+    /// An EFI_IFR_VALUE gives get the value, before any READ, also on a FORM_MAP without the
     /// standard method, as edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue evaluates it
     /// on every form, and makes set refuse the question as read-only, with READ, WRITE or
     /// EFI_IFR_FLAG_CALLBACK too (UEFI 2.11 §33.3.8.3.88).
@@ -524,10 +523,7 @@ mod tests {
                             question.refusal(QuestionExpression::Read, reach),
                             question.refusal(QuestionExpression::Write, reach)
                         ),
-                        (
-                            StoragelessRefusal::ValueNotApplied,
-                            StoragelessRefusal::ReadOnly
-                        ),
+                        (None, Some(StoragelessRefusal::ReadOnly)),
                         "{name} on {place} through {reach:?}: refusals"
                     );
                 }
@@ -570,7 +566,7 @@ mod tests {
                         question.refusal(Read, reach),
                         question.refusal(Write, reach)
                     ),
-                    (want(Read, read), want(Write, write)),
+                    (Some(want(Read, read)), Some(want(Write, write))),
                     "{name} through {reach:?}"
                 );
             }
@@ -610,17 +606,13 @@ mod tests {
                  keeps a changed value (UEFI 2.11 §33.2.5.4.1)",
             ),
             (
-                StoragelessRefusal::ExpressionNotApplied(QuestionExpression::Read),
-                "question has no VarStore, and uefisettings does not apply its READ expression",
+                StoragelessRefusal::ReadUndefined,
+                "its READ expression gives no value, and without a VarStore the question has no \
+                 other (UEFI 2.11 §33.2.5.4.1)",
             ),
             (
-                StoragelessRefusal::ExpressionNotApplied(QuestionExpression::Write),
+                StoragelessRefusal::WriteNotApplied,
                 "question has no VarStore, and uefisettings does not apply its WRITE expression",
-            ),
-            (
-                StoragelessRefusal::ValueNotApplied,
-                "question has no VarStore, and uefisettings does not apply its EFI_IFR_VALUE \
-                 expression",
             ),
             (
                 StoragelessRefusal::DriverHeld(VariableReach::Runtime),
@@ -802,30 +794,32 @@ mod get_and_set_tests {
     }
 
     /// Why get (`Read`) or set (`Write`) through a reader of `reach` gives or takes no value of
-    /// the question of QUESTIONS that has `callback`, `read` and `write`.
+    /// the question of QUESTIONS that has `callback`, `read` and `write`; None if its expression
+    /// alone does.
     fn refusal(
         (callback, read, write): (bool, bool, bool),
         expression: QuestionExpression,
         reach: VariableReach,
-    ) -> StoragelessRefusal {
+    ) -> Option<StoragelessRefusal> {
         let (this, other) = match expression {
             QuestionExpression::Read => (read, write),
             QuestionExpression::Write => (write, read),
         };
         match (callback, this, other) {
-            (true, true, _) => StoragelessRefusal::CallbackDecides(expression, reach),
-            (true, false, _) => StoragelessRefusal::DriverHeld(reach),
-            (false, true, _) => StoragelessRefusal::ExpressionNotApplied(expression),
-            (false, false, true) => match expression {
+            (true, true, _) => Some(StoragelessRefusal::CallbackDecides(expression, reach)),
+            (true, false, _) => Some(StoragelessRefusal::DriverHeld(reach)),
+            (false, true, _) => None,
+            (false, false, true) => Some(match expression {
                 QuestionExpression::Read => StoragelessRefusal::NoRead,
                 QuestionExpression::Write => StoragelessRefusal::NoWrite,
-            },
-            (false, false, false) => StoragelessRefusal::NoValueSource,
+            }),
+            (false, false, false) => Some(StoragelessRefusal::NoValueSource),
         }
     }
 
-    /// list-questions and get show each question without a VarStore as unavailable, for the
-    /// reason that the classifier gives get on the reader's reach, and read no variable for it.
+    /// list-questions and get show the value of the READ expression of a question without a
+    /// VarStore or EFI_IFR_FLAG_CALLBACK, TRUE, and each other one as unavailable, for the reason
+    /// that the classifier gives get on the reader's reach.
     #[test]
     fn get_shows_why_each_storageless_question_has_no_value() {
         let root = storageless_form_set();
@@ -843,10 +837,13 @@ mod get_and_set_tests {
             .map(|(question, _)| (question.question, question.value))
             .collect();
             for (prompt, callback, read, write) in QUESTIONS {
-                let want = refusal((callback, read, write), QuestionExpression::Read, reach);
+                let want = match refusal((callback, read, write), QuestionExpression::Read, reach) {
+                    Some(refusal) => format!("<ValueUnavailable: {refusal}>{CHECKBOX_DEFAULT}"),
+                    None => "1".to_string(),
+                };
                 assert_eq!(
-                    listed.get(prompt).map(String::as_str),
-                    Some(format!("<ValueUnavailable: {want}>{CHECKBOX_DEFAULT}").as_str()),
+                    listed.get(prompt),
+                    Some(&want),
                     "{prompt} through {reach:?}"
                 );
             }
@@ -875,6 +872,7 @@ mod get_and_set_tests {
                 let want = format!(
                     "cannot set question {prompt:?}: {}",
                     refusal((callback, read, write), QuestionExpression::Write, reach)
+                        .unwrap_or(StoragelessRefusal::WriteNotApplied)
                 );
                 let mut reader = reader_reaching(reach);
                 let values = VarStoreValues::new(&root, None);

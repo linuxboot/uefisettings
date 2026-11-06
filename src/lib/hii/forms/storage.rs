@@ -18,7 +18,9 @@ use binrw::BinRead;
 use thiserror::Error;
 
 use super::bit_field_bits;
+use super::conditions::ExpressionRefusal;
 use super::conditions::QuestionExpression;
+use super::conditions::MAX_READ_DEPTH;
 use super::question_values::value_question;
 use super::storageless::NoVarStore;
 use super::storageless::StoragelessRefusal;
@@ -929,12 +931,16 @@ pub(super) fn read_current_value_bytes<'a>(
     let store = match varstore {
         Ok(store) => store,
         Err(error) => {
-            return Err(match error.downcast_ref::<NoVarStore>() {
-                Some(NoVarStore(question)) => {
-                    ValueUnavailable::Storageless(question.refusal(QuestionExpression::Read, reach))
-                }
-                None => ValueUnavailable::NoVarStore(error.to_string()),
-            })
+            return Err(
+                match error
+                    .downcast_ref::<NoVarStore>()
+                    .and_then(|NoVarStore(question)| {
+                        question.refusal(QuestionExpression::Read, reach)
+                    }) {
+                    Some(refusal) => ValueUnavailable::Storageless(refusal),
+                    None => ValueUnavailable::NoVarStore(error.to_string()),
+                },
+            )
         }
     };
     let interface = reader.interface();
@@ -968,6 +974,25 @@ pub(super) enum ValueUnavailable {
     /// Why get reads no value of a question without a VarStore
     #[error("{0}")]
     Storageless(StoragelessRefusal),
+    /// Why get does not take the value of the question's READ expression
+    #[error("{0}")]
+    Expression(ExpressionRefusal),
+    /// A READ expression that needs, through others, the value that it gives: of question `0`
+    #[error(
+        "the READ expressions of question {0:#06x} and the questions they refer to need its value"
+    )]
+    ReadCycle(u16),
+    /// A READ expression that takes the value of question `0` through more than
+    /// MAX_READ_DEPTH other READ expressions
+    #[error(
+        "question {0:#06x} is reached through more than {} READ expressions, each retrieving \
+         the value of the next",
+        MAX_READ_DEPTH
+    )]
+    ReadDepth(u16),
+    /// Why the EFI_IFR_VALUE expression of the question gives no value
+    #[error("its EFI_IFR_VALUE expression gives no value: {0}")]
+    ValueExpression(String),
     #[error("{0}")]
     DeclaredBootServiceOnly(DeclaredBootServiceOnly),
     #[error("{0}")]
@@ -1039,6 +1064,10 @@ impl ValueUnavailable {
             Self::AmiAccessLevel(reason) => reason.tag(),
             Self::NoVarStore(_)
             | Self::Storageless(_)
+            | Self::Expression(_)
+            | Self::ReadCycle(_)
+            | Self::ReadDepth(_)
+            | Self::ValueExpression(_)
             | Self::DeclaredBootServiceOnly(_)
             | Self::EnhancedAuthenticated(_)
             | Self::PasswordVarStore
@@ -1078,7 +1107,7 @@ impl ValueLocation {
 
     /// Refuses a bit field that edk2-stable202608 Setup.c GetBitsQuestionValue cannot read: it
     /// copies the StorageWidth bytes into a UINT32 and takes 1 to 32 bits from it.
-    fn check(self) -> Result<ReadableLocation, NumericFormatError> {
+    pub(super) fn check(self) -> Result<ReadableLocation, NumericFormatError> {
         match self {
             Self::Bytes { .. } => Ok(ReadableLocation(self)),
             Self::Bits { offset, width } => {
@@ -1178,6 +1207,7 @@ mod efivar_reader_tests {
     use anyhow::anyhow;
     use binrw::io::Cursor;
 
+    use super::super::conditions::ExpressionInputs;
     use super::super::conditions::IncludedStates;
     use super::super::display;
     use super::super::display_answer;
@@ -1223,9 +1253,12 @@ mod efivar_reader_tests {
         );
         efivars.write(&efi_variable("Setup", 1), &[43]);
         let answer = display_answer(
-            &question,
+            &node,
             &Ok(Box::new(efi_variable("Setup", 1))),
-            &mut reader,
+            &mut ExpressionInputs {
+                reader: &mut reader,
+                values: &MapValues(BTreeMap::new()),
+            },
         );
 
         assert_eq!(answer, "42", "display_answer after the file changed");

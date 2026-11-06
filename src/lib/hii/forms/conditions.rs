@@ -32,10 +32,13 @@ use super::question_values::ValueQuestion;
 use super::storage::read_current_value_bytes;
 use super::storage::read_question_value;
 use super::storage::stored_value;
+use super::storage::ReadableLocation;
 use super::storage::ValueLocation;
 use super::storage::ValueUnavailable;
 use super::storage::VariableStore;
 use super::storage::VariableStoreKind;
+use super::storageless::NoVarStore;
+use super::storageless::StoragelessRefusal;
 use super::walk_scopes;
 use super::AccessLevel;
 use super::DeclaredStore;
@@ -59,6 +62,11 @@ use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 /// The opcode of IFROpCode::Match2, the highest that edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c IsUnKnownOpCode knows.
 const EFI_IFR_MATCH2_OP: u8 = 0x64;
+
+/// The READ expressions that the value of one question goes through at most: each retrieves
+/// the value of the question that it refers to in a nested call, and the 128 KiB stack of UEFI
+/// DXE (edk2-stable202608 MdeModulePkg/Core/DxeIplPeim/DxeIpl.h STACK_SIZE) holds 8 of them.
+pub(super) const MAX_READ_DEPTH: usize = 8;
 
 /// What its conditions leave of a question in the setup browser, lowest priority first, as
 /// edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList ranks them:
@@ -640,6 +648,9 @@ pub(crate) struct VarStoreValues {
     index: QuestionIndex,
     /// What conditions read from AMI_ACCESS_LEVEL instead of its value, if stated
     access_level: Option<AccessLevel>,
+    /// The questions whose values are being retrieved, innermost last: a READ expression that
+    /// refers to one of them needs the value that it is to give
+    retrieving: RefCell<Vec<Rc<RefCell<IFROperation>>>>,
 }
 
 impl VarStoreValues {
@@ -649,6 +660,7 @@ impl VarStoreValues {
         VarStoreValues {
             index: QuestionIndex::new(root),
             access_level,
+            retrieving: RefCell::default(),
         }
     }
 }
@@ -668,32 +680,120 @@ impl QuestionValues for VarStoreValues {
                 reason: ValueUnavailable::NotDecoded(op.op_code).to_answer(),
             });
         };
+        if self.retrieving.borrow().len() >= MAX_READ_DEPTH {
+            return Some(QuestionValue::Unreadable {
+                kind: value_kind(value_question),
+                reason: ValueUnavailable::ReadDepth(id).to_answer(),
+            });
+        }
+        if self
+            .retrieving
+            .borrow()
+            .iter()
+            .any(|retrieving| Rc::ptr_eq(retrieving, question))
+        {
+            return Some(QuestionValue::Unreadable {
+                kind: value_kind(value_question),
+                reason: ValueUnavailable::ReadCycle(id).to_answer(),
+            });
+        }
         let varstore =
             find_corresponding_varstore(Rc::clone(question), value_question.header().var_store_id);
-        Some(question_value(
-            &op,
+        self.retrieving.borrow_mut().push(Rc::clone(question));
+        let value = question_value(
+            question,
             value_question,
             &varstore,
             self.access_level,
-            reader,
-        ))
+            &mut ExpressionInputs {
+                reader,
+                values: self,
+            },
+        );
+        self.retrieving.borrow_mut().pop();
+        Some(value)
     }
 }
 
-/// Returns the value of `question`, which is `value_question`, in `varstore`, typed as
-/// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes types it: on AMI_ACCESS_LEVEL,
-/// `access_level` instead, if stated.
+/// The EFI_HII_VALUE type of `value_question`'s value.
+fn value_kind(value_question: ValueQuestion) -> ValueKind {
+    match value_question {
+        ValueQuestion::CheckBox(_) => ValueKind::Boolean,
+        ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => ValueKind::Uint,
+    }
+}
+
+/// Returns where `question` keeps its value and the value that a browser retrieves for it (UEFI
+/// 2.11 §33.2.5.4.1): THIS is the value in `varstore`, which the value of its READ expression,
+/// if any, replaces; or why it has none. A READ that gives UNDEFINED or fails leaves the stored
+/// value, as edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue reads storage then; a
+/// question without a VarStore has none then. A question with an EFI_IFR_VALUE has the value of
+/// its expression instead, which GetQuestionValue takes before any READ or storage.
+pub(super) fn retrieve_question_value(
+    question: &Rc<RefCell<IFROperation>>,
+    varstore: &Result<Box<dyn VariableStore>>,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> std::result::Result<(ReadableLocation, u64), ValueUnavailable> {
+    let op = question.borrow();
+    let Some(value_question) = value_question(&op) else {
+        return Err(ValueUnavailable::NotDecoded(op.op_code));
+    };
+    let location = value_question
+        .location()
+        .check()
+        .map_err(ValueUnavailable::BitField)?;
+    if let Some(value) = question_value_expression(question) {
+        return evaluate_value(&value.borrow(), inputs)
+            .map(|value| (location, value))
+            .map_err(ValueUnavailable::ValueExpression);
+    }
+    let stored = read_question_value(&op, varstore, inputs.reader);
+    let storageless = varstore
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<NoVarStore>());
+    if let Some(NoVarStore(storageless)) = storageless {
+        if storageless
+            .refusal(QuestionExpression::Read, inputs.reader.reach())
+            .is_some()
+        {
+            return stored;
+        }
+    }
+    let unreadable = |reason: &ValueUnavailable| QuestionValue::Unreadable {
+        kind: value_kind(value_question),
+        reason: reason.to_answer(),
+    };
+    let this = match &stored {
+        Ok((_, value)) => {
+            typed_value(value_question, *value).unwrap_or_else(|reason| unreadable(&reason))
+        }
+        Err(reason) => unreadable(reason),
+    };
+    match evaluate_read(question, this, inputs) {
+        ReadOutcome::NoRead => stored,
+        ReadOutcome::Stored => match storageless {
+            Some(_) => Err(ValueUnavailable::Storageless(
+                StoragelessRefusal::ReadUndefined,
+            )),
+            None => stored,
+        },
+        ReadOutcome::Value(value) => Ok((location, value.as_u64())),
+        ReadOutcome::Refused(refusal) => Err(ValueUnavailable::Expression(refusal)),
+    }
+}
+
+/// Returns the value of `question`, which is `value_question`, as retrieve_question_value
+/// retrieves it from `varstore`, typed as edk2-stable202608 SetupBrowserDxe/IfrParse.c
+/// ParseOpCodes types it: on AMI_ACCESS_LEVEL, `access_level` instead, if stated.
 fn question_value(
-    question: &IFROperation,
+    question: &Rc<RefCell<IFROperation>>,
     value_question: ValueQuestion,
     varstore: &Result<Box<dyn VariableStore>>,
     access_level: Option<AccessLevel>,
-    reader: &mut EfivarReader,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> QuestionValue {
-    let kind = match value_question {
-        ValueQuestion::CheckBox(_) => ValueKind::Boolean,
-        ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => ValueKind::Uint,
-    };
+    let kind = value_kind(value_question);
     // the level is the one byte of SystemAccess that AMI IFR reads
     let on_access_level = value_question.location()
         == (ValueLocation::Bytes { offset: 0, size: 1 })
@@ -703,7 +803,7 @@ fn question_value(
         // around a REF, which either stated level suppresses
         (true, Some(level)) => Ok(u64::from(u8::from(level))),
         (true, None) | (false, Some(_) | None) => {
-            read_question_value(question, varstore, reader).map(|(_, value)| value)
+            retrieve_question_value(question, varstore, inputs).map(|(_, value)| value)
         }
     };
     let reason = match value.and_then(|value| typed_value(value_question, value)) {
@@ -839,10 +939,6 @@ pub(crate) enum ReadOutcome {
 
 /// Evaluates the READ expression of `question`, with THIS its stored value `this` (UEFI 2.11
 /// §33.2.5.4.1).
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    expect(dead_code, reason = "get and set do not evaluate READ and WRITE yet")
-)]
 pub(crate) fn evaluate_read(
     question: &Rc<RefCell<IFROperation>>,
     this: QuestionValue,
@@ -872,7 +968,7 @@ pub(crate) fn evaluate_read(
 /// Expression.c EvaluateExpression ends there and Setup.c SetQuestionValue goes on.
 #[cfg_attr(
     not(all(test, efivar_dumps)),
-    expect(dead_code, reason = "get and set do not evaluate READ and WRITE yet")
+    expect(dead_code, reason = "set does not evaluate WRITE yet")
 )]
 pub(crate) fn evaluate_write(
     question: &Rc<RefCell<IFROperation>>,
@@ -1035,6 +1131,15 @@ impl ExpressionValue {
         match operand {
             Operand::Boolean(value) => value.map(Self::Boolean),
             Operand::Uint(value) => value.map(Self::Uint),
+        }
+    }
+
+    /// Returns the value as edk2-stable202608 SetupBrowserDxe/Expression.c HiiValueToUINT64
+    /// does.
+    fn as_u64(self) -> u64 {
+        match self {
+            Self::Boolean(value) => u64::from(value),
+            Self::Uint(value) => value,
         }
     }
 }
@@ -4826,15 +4931,18 @@ mod tests {
         data: &[u8],
         VarStoreFixture { store, efivars }: VarStoreFixture,
     ) -> QuestionValue {
-        let (_root, question) = parse_question(&[], op_code, data, &[]);
-        let question = question.borrow();
+        let (_root, node) = parse_question(&[], op_code, data, &[]);
+        let question = node.borrow();
         let value_question = value_question(&question).expect("a ONE_OF, NUMERIC or CHECKBOX");
         question_value(
-            &question,
+            &node,
             value_question,
             &store,
             None,
-            &mut efivars.reader(),
+            &mut ExpressionInputs {
+                reader: &mut efivars.reader(),
+                values: &MapValues(BTreeMap::new()),
+            },
         )
     }
 
@@ -4913,17 +5021,20 @@ mod tests {
             ),
         ];
         for (name, op_code, data, byte, want) in bit_field_cases {
-            let (_root, bit_field) = parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &[]);
-            let bit_field = bit_field.borrow();
+            let (_root, node) = parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &[]);
+            let bit_field = node.borrow();
             let value_question = value_question(&bit_field).expect("a ONE_OF, NUMERIC or CHECKBOX");
             let VarStoreFixture { store, efivars } = var_store_of(&[byte]);
             assert_eq!(
                 question_value(
-                    &bit_field,
+                    &node,
                     value_question,
                     &store,
                     None,
-                    &mut efivars.reader()
+                    &mut ExpressionInputs {
+                        reader: &mut efivars.reader(),
+                        values: &MapValues(BTreeMap::new()),
+                    },
                 ),
                 want,
                 "{name}"
@@ -4937,6 +5048,7 @@ mod tests {
 mod store_expression_tests {
     use std::collections::BTreeMap;
 
+    use super::super::display_answer;
     use super::super::ifr_fixtures::*;
     use super::super::setup_password::PasswordQuestions;
     use super::super::MAX_SCOPE_NESTING;
@@ -5886,5 +5998,281 @@ mod store_expression_tests {
             .join()
             .expect("evaluate the nested MAPs");
         assert_eq!(value, Ok(7));
+    }
+
+    /// A UINT8 ONE_OF of QuestionId `id` at VarOffset 0 of VarStore `var_store_id`, with the
+    /// options Disabled (1) and Enabled (3), then `children`.
+    fn one_of_with(id: u16, var_store_id: u16, children: &[Vec<u8>]) -> Vec<u8> {
+        let data = [
+            question_header_on(id, 3, var_store_id, 0),
+            vec![0x00, 0, 4, 1],
+        ]
+        .concat();
+        [
+            operation(ONE_OF, true, &data),
+            one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[1]),
+            one_of_option(6, EFI_IFR_TYPE_NUM_SIZE_8, &[3]),
+            children.concat(),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// A FormSet with declarations() and FORM 1 holding `questions`; the root and the questions.
+    fn form_set_of(
+        questions: &[Vec<u8>],
+    ) -> (Rc<RefCell<IFROperation>>, Vec<Rc<RefCell<IFROperation>>>) {
+        let declarations = declarations();
+        let root = parse_form_set(&[declarations.concat(), form(1, questions)]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let form = Rc::clone(&form_set.borrow().children[declarations.len()]);
+        let questions = form.borrow().children.clone();
+        (root, questions)
+    }
+
+    /// The answer that get, list-questions and show-ifr give for the first question of
+    /// form_set_of(`questions`), reading `efivars`.
+    fn answers_of(questions: &[Vec<u8>], efivars: Efivars) -> (String, String) {
+        let (root, questions) = form_set_of(questions);
+        let question = &questions[0];
+        let id = value_question(&question.borrow()).map(|question| question.header().var_store_id);
+        let store = || find_corresponding_varstore(Rc::clone(question), id.unwrap_or_default());
+        let values = VarStoreValues::new(&root, None);
+        let shown = display_answer(
+            question,
+            &store(),
+            &mut ExpressionInputs {
+                reader: &mut efivars.reader(),
+                values: &values,
+            },
+        );
+        let listed = question_descriptor_with(
+            question,
+            VarStoreFixture {
+                store: store(),
+                efivars,
+            },
+            &values,
+        )
+        .value;
+        (listed, shown)
+    }
+
+    /// get, list-questions and show-ifr take a question's value from its READ expression, with
+    /// THIS its stored value, and the stored value when READ gives UNDEFINED, as
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue does.
+    #[test]
+    fn get_takes_the_value_of_the_read_expression() {
+        // the ONE_OF holds 1 (Disabled); byte 1 holds 8
+        let stored = || store_holding(&[1, 8, 0, 0, 0]);
+        let mapped = map(&[(uint8(7), uint8(1)), (uint8(8), uint8(3))]);
+        let cases = [
+            ("no READ", vec![], ("Disabled", "1")),
+            (
+                "MAP of a GET",
+                vec![
+                    op(READ),
+                    scoped_expression(&[get(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8), mapped], 0),
+                ],
+                ("Enabled", "3"),
+            ),
+            (
+                "THIS + 2",
+                vec![
+                    op(READ),
+                    scoped_expression(&[op(THIS), uint8(2), op(ADD)], 0),
+                ],
+                ("Enabled", "3"),
+            ),
+            (
+                "UNDEFINED",
+                vec![op(READ), op(UNDEFINED)],
+                ("Disabled", "1"),
+            ),
+        ];
+        for (name, children, (listed, shown)) in cases {
+            assert_eq!(
+                answers_of(&[one_of_with(1, STORE, &children)], stored()),
+                (listed.to_string(), shown.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    /// A READ that cannot be evaluated here makes the value unavailable, though the stored one
+    /// can be read: edk2 would show what READ gives.
+    #[test]
+    fn get_of_a_read_that_cannot_be_evaluated_says_why() {
+        let reason = "<ValueUnavailable: its READ expression uses EFI_IFR_TO_UINT, which \
+                      uefisettings does not evaluate>";
+        assert_eq!(
+            answers_of(
+                &[one_of_with(
+                    1,
+                    STORE,
+                    &[op(READ), scoped_expression(&[uint8(3), op(TO_UINT)], 0)]
+                )],
+                store_holding(&[1, 0, 0, 0, 0])
+            ),
+            (reason.to_string(), reason.to_string())
+        );
+    }
+
+    /// A question without a VarStore takes its value from READ alone: a READ that gives
+    /// UNDEFINED leaves it none, and one that needs THIS, which no storage holds, says so.
+    #[test]
+    fn get_of_a_storageless_question_takes_only_read() {
+        let cases = [
+            (
+                "GET",
+                vec![op(READ), get(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8)],
+                "Enabled".to_string(),
+                "3".to_string(),
+            ),
+            (
+                "UNDEFINED",
+                vec![op(READ), op(UNDEFINED)],
+                format!("<ValueUnavailable: {}>", StoragelessRefusal::ReadUndefined),
+                format!("<ValueUnavailable: {}>", StoragelessRefusal::ReadUndefined),
+            ),
+            (
+                "THIS",
+                vec![op(READ), op(THIS)],
+                "<ValueUnavailable: its READ expression takes a value that cannot be read: \
+                 EFI_IFR_THIS: <ValueUnavailable: question has no VarStore>>"
+                    .to_string(),
+                "<ValueUnavailable: its READ expression takes a value that cannot be read: \
+                 EFI_IFR_THIS: <ValueUnavailable: question has no VarStore>>"
+                    .to_string(),
+            ),
+        ];
+        for (name, children, listed, shown) in cases {
+            assert_eq!(
+                answers_of(
+                    &[one_of_with(1, 0, &children)],
+                    store_holding(&[1, 3, 0, 0, 0])
+                ),
+                (listed, shown),
+                "{name}"
+            );
+        }
+    }
+
+    /// get, list-questions and show-ifr take the value of a question with an EFI_IFR_VALUE from
+    /// that expression, before any READ and storage, also without a VarStore, as
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue does (UEFI 2.11 §33.3.8.3.88).
+    #[test]
+    fn get_takes_the_value_of_an_efi_ifr_value_before_read() {
+        let value = |expression: Vec<u8>| [operation(VALUE, true, &[]), expression, END.to_vec()];
+        let undefined = "<ValueUnavailable: its EFI_IFR_VALUE expression gives no value: \
+                         UNDEFINED result>";
+        let cases = [
+            (
+                "VALUE and READ",
+                one_of_with(1, STORE, &[value(uint8(3)).concat(), op(READ), uint8(1)]),
+                ("Enabled", "3"),
+            ),
+            (
+                "VALUE and READ without a VarStore",
+                one_of_with(1, 0, &[value(uint8(3)).concat(), op(READ), uint8(1)]),
+                ("Enabled", "3"),
+            ),
+            (
+                "VALUE without a VarStore",
+                one_of_with(1, 0, &[value(uint8(3)).concat()]),
+                ("Enabled", "3"),
+            ),
+            (
+                "VALUE of UNDEFINED",
+                one_of_with(1, STORE, &[value(op(UNDEFINED)).concat()]),
+                (undefined, undefined),
+            ),
+        ];
+        for (name, question, (listed, shown)) in cases {
+            assert_eq!(
+                answers_of(&[question], store_holding(&[1, 0, 0, 0, 0])),
+                (listed.to_string(), shown.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    /// Conditions take the value of a question that they refer to from its READ expression too,
+    /// and a READ that needs, through another question's READ, its own value, is unavailable
+    /// instead of endless.
+    #[test]
+    fn conditions_take_values_through_read_expressions() {
+        let (root, questions) = form_set_of(&[
+            one_of_with(1, 0, &[op(READ), get(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8)]),
+            one_of_with(2, 0, &[op(READ), question_ref1(3)]),
+            one_of_with(3, 0, &[op(READ), question_ref1(2)]),
+        ]);
+        let values = VarStoreValues::new(&root, None);
+        let efivars = store_holding(&[0, 3, 0, 0, 0]);
+        let mut reader = efivars.reader();
+        let referrer = questions[0].borrow();
+        assert_eq!(
+            values.value(&referrer, 1, &mut reader),
+            Some(QuestionValue::Uint(3)),
+            "READ of a GET"
+        );
+        let Some(QuestionValue::Unreadable { kind, reason }) =
+            values.value(&referrer, 2, &mut reader)
+        else {
+            panic!("question 2 has a value");
+        };
+        assert_eq!(kind, ValueKind::Uint, "kind of question 2");
+        assert!(
+            reason.contains(&ValueUnavailable::ReadCycle(2).to_string()),
+            "reason of question 2: {reason}"
+        );
+    }
+
+    /// QUESTION_REF1 of `id`.
+    fn question_ref1(id: u16) -> Vec<u8> {
+        operation(QUESTION_REF1, false, &id.to_le_bytes())
+    }
+
+    /// A question reached through more than MAX_READ_DEPTH READ expressions is unavailable, in
+    /// the 128 KiB stack of UEFI DXE; one reached through MAX_READ_DEPTH has its value.
+    #[test]
+    fn read_chains_end_at_max_read_depth_on_a_small_stack() {
+        let chain = |n: u16| {
+            std::thread::Builder::new()
+                .stack_size(128 << 10)
+                .spawn(move || {
+                    let questions: Vec<Vec<u8>> = (1..=n)
+                        .map(|id| match id == n {
+                            true => one_of_with(
+                                id,
+                                0,
+                                &[op(READ), get(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8)],
+                            ),
+                            false => one_of_with(id, 0, &[op(READ), question_ref1(id + 1)]),
+                        })
+                        .collect();
+                    let (root, questions) = form_set_of(&questions);
+                    let values = VarStoreValues::new(&root, None);
+                    let efivars = store_holding(&[0, 3, 0, 0, 0]);
+                    let referrer = questions[0].borrow();
+                    values.value(&referrer, 1, &mut efivars.reader())
+                })
+                .expect("spawn a thread with a small stack")
+                .join()
+                .expect("retrieve the first question of the chain")
+        };
+        let depth = u16::try_from(MAX_READ_DEPTH).expect("MAX_READ_DEPTH fits a QuestionId");
+        assert_eq!(
+            chain(depth),
+            Some(QuestionValue::Uint(3)),
+            "chain of MAX_READ_DEPTH"
+        );
+        let Some(QuestionValue::Unreadable { reason, .. }) = chain(50) else {
+            panic!("a chain of 50 has a value");
+        };
+        assert!(
+            reason.contains(&ValueUnavailable::ReadDepth(depth + 1).to_string()),
+            "reason of a chain of 50: {reason}"
+        );
     }
 }

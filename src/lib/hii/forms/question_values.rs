@@ -22,6 +22,7 @@ use std::rc::Rc;
 use anyhow::Result;
 
 use super::conditions::option_state;
+use super::conditions::retrieve_question_value;
 use super::conditions::skips_scope;
 use super::conditions::IncludedStates;
 use super::conditions::QuestionValues;
@@ -32,7 +33,6 @@ use super::defaults::question_scope;
 use super::find_corresponding_string;
 use super::find_corresponding_varstore;
 use super::numeric_format;
-use super::storage::read_question_value;
 use super::storage::ValueLocation;
 use super::storage::VariableStore;
 use super::walk_scopes;
@@ -142,10 +142,9 @@ fn prompt<'a>(op: &IFROperation, string_packages: &'a [BTreeMap<i32, String>]) -
     })
 }
 
-/// Returns the QuestionDescriptor of `question`, whose op `op` is `value_question`.
+/// Returns the QuestionDescriptor of `question`, whose op is `value_question`.
 pub(super) fn describe_question(
     question: &Rc<RefCell<IFROperation>>,
-    op: &std::cell::Ref<IFROperation>,
     value_question: ValueQuestion<'_>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
@@ -153,9 +152,11 @@ pub(super) fn describe_question(
     let prompt = find_corresponding_string(header.prompt_string_id, walk.string_packages);
     let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
     match value_question {
-        ValueQuestion::OneOf(parsed) => handle_oneof(varstore, parsed, prompt, op, walk),
-        ValueQuestion::Numeric(parsed) => handle_numeric(varstore, parsed, prompt, op, walk),
-        ValueQuestion::CheckBox(parsed) => handle_checkbox(varstore, parsed, prompt, op, walk),
+        ValueQuestion::OneOf(parsed) => handle_oneof(varstore, parsed, prompt, question, walk),
+        ValueQuestion::Numeric(parsed) => handle_numeric(varstore, parsed, prompt, question, walk),
+        ValueQuestion::CheckBox(parsed) => {
+            handle_checkbox(varstore, parsed, prompt, question, walk)
+        }
     }
 }
 
@@ -179,11 +180,12 @@ pub(super) fn handle_checkbox(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &CheckBox,
     question: &str,
-    current_node: &std::cell::Ref<IFROperation>,
+    node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
+    let current_node = &node.borrow();
     let mut answer = String::new();
-    let available = match read_question_value(current_node, &varstore, walk.inputs.reader) {
+    let available = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
         Err(reason) => {
             answer.push_str(&reason.to_answer());
             false
@@ -226,13 +228,14 @@ pub(super) fn handle_oneof(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &OneOf,
     question: &str,
-    current_node: &std::cell::Ref<IFROperation>,
+    node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
+    let current_node = &node.borrow();
     let mut answer = String::new();
     // None, with the reason in `answer`, when the current value cannot be read: any u64,
     // all ones too, can be stored.
-    let chosen_value = match read_question_value(current_node, &varstore, walk.inputs.reader) {
+    let chosen_value = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
         Err(reason) => {
             answer.push_str(&reason.to_answer());
             None
@@ -325,12 +328,13 @@ pub(super) fn handle_numeric(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &Numeric,
     question: &str,
-    current_node: &std::cell::Ref<IFROperation>,
+    node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
+    let current_node = &node.borrow();
     let mut answer = String::new();
 
-    let available = match read_question_value(current_node, &varstore, walk.inputs.reader) {
+    let available = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
         Err(reason) => {
             answer.push_str(&reason.to_answer());
             false
@@ -391,6 +395,7 @@ mod question_value_tests {
 
     use binrw::io::Cursor;
 
+    use super::super::conditions::ExpressionInputs;
     use super::super::default_value_parser;
     use super::super::display_answer;
     use super::super::ifr_fixtures::*;
@@ -891,12 +896,18 @@ mod question_value_tests {
     fn show_ifr_answer_of_bit_field_is_its_value() {
         for (guid, want) in [(BIT_VARSTORE_GUID, "1"), (OTHER_GUID, "2")] {
             let (_root, node) = parse_question_in_guid(guid, CHECKBOX, &checkbox(3, 0x00), &[]);
-            let question = node.borrow();
 
             // bit 3, and byte 3
             let VarStoreFixture { store, efivars } = var_store_of(&[0xF8, 0x00, 0x00, 0x02]);
 
-            let got = display_answer(&question, &store, &mut efivars.reader());
+            let got = display_answer(
+                &node,
+                &store,
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &MapValues(BTreeMap::new()),
+                },
+            );
 
             assert_eq!(got, want, "GUID {guid:02X?}");
         }
