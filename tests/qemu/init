@@ -149,7 +149,13 @@ health_status=0
             END { if (!found) print "cannot read the kernel log"; exit !found || error }' /tmp/kmsg ||
             health_status=1
         kill "$!" 2> /dev/null
+        # dd is init's only child: reaped before the printf, no SIGCHLD (ash catches it
+        # without SA_RESTART) can interrupt the line's write.
+        wait
     fi
 } > "$tty" 2>&1
 printf '\nuefisettings-qemu-test: exit %s %s\n' "$test_status" "$health_status"
+# poweroff does not drain the console, whose driver may still hold the line: setting
+# the console's own settings again waits until the line is sent (TCSADRAIN).
+stty "$(stty -g)"
 poweroff -f
