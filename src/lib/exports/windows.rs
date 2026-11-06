@@ -93,7 +93,7 @@ impl HiiBackend {
     }
 }
 
-/// What get does with a question whose driver holds its value: no driver is reached here.
+/// What get and set do with a question whose driver holds its value: no driver is reached here.
 impl HiiBackend {
     pub(super) fn driver_held_values(
         _hiidb: &[u8],

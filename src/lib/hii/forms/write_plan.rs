@@ -40,6 +40,7 @@ use super::ordered_list::ListRefusal;
 use super::ordered_list::ListWrite;
 use super::set::own_write;
 use super::set::ChangeValueError;
+use super::set::DriverStore;
 use super::set::NewValue;
 use super::set::VarStoreWrite;
 use super::storage::BufferExpression;
@@ -397,34 +398,43 @@ impl BatchedWrite<'_> {
     }
 }
 
-/// A write of set's batch: of EFI Date/Time Storage for the question of a selector, or of a
-/// variable.
+/// A write of set's batch: of EFI Date/Time Storage for the question of a selector, of a
+/// variable, or of a driver that applies a value.
 pub(super) enum BatchedStore<'b, 'a> {
     Time {
         selector: &'a str,
         write: &'b TimeWrite,
     },
     Variable(&'b BatchedWrite<'a>),
+    Driver(&'b dyn DriverStore),
 }
 
 impl BatchedStore<'_, '_> {
-    /// The write as set's errors name it: its selectors and its storage or variable.
+    /// The write as set's errors name it: its selectors and its storage or variable, or its
+    /// driver's label.
     pub(super) fn label(&self) -> String {
         match self {
             Self::Time { selector, write } => format!("{selector} ({})", write.storage()),
             Self::Variable(batched) => batched.label(),
+            Self::Driver(driver) => driver.label(),
         }
     }
 
     /// Writes it, a variable through `variables`, and returns its label with the EFI_TIME that a
-    /// write of EFI Date/Time Storage wrote.
-    pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<String> {
+    /// write of EFI Date/Time Storage wrote, and a driver's annotation of set's answer.
+    pub(super) fn write(
+        &self,
+        variables: &dyn FirmwareVariables,
+    ) -> Result<(String, Option<String>)> {
         match self {
-            Self::Time { selector, write } => Ok(format!("{selector} ({})", write.write()?)),
+            Self::Time { selector, write } => {
+                Ok((format!("{selector} ({})", write.write()?), None))
+            }
             Self::Variable(batched) => {
                 batched.write.write(variables)?;
-                Ok(batched.label())
+                Ok((batched.label(), None))
             }
+            Self::Driver(driver) => Ok((driver.label(), Some(driver.apply()?))),
         }
     }
 }
@@ -879,8 +889,9 @@ mod tests {
             volatile,
             pending,
             &WithholdingVariables::new(writes, WithheldBytes::default()),
+            &[],
         )
-        .map(|(written, _)| written.iter().map(|question| question.volatile).collect())
+        .map(|(written, _, _)| written.iter().map(|question| question.volatile).collect())
         .map_err(|error| format!("{error:#}"))
     }
 
@@ -1068,6 +1079,7 @@ mod tests {
                 &passwords
                     .withholding(&writes)
                     .expect("resolve the VarStore of the PASSWORD question"),
+                &[],
             )
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
@@ -1186,6 +1198,7 @@ mod tests {
             &passwords
                 .withholding(&writes)
                 .expect("resolve the VarStore of the PASSWORD question"),
+            &[],
         )
         .map(|_| ())
         .map_err(|error| format!("{error:#}"));
@@ -1348,6 +1361,7 @@ mod tests {
             &passwords
                 .withholding(&writes)
                 .expect("resolve the VarStore of the PASSWORD question"),
+            &[],
         )
         .map(|_| ())
         .map_err(|error| format!("{error:#}"));
@@ -1747,6 +1761,7 @@ mod tests {
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&writes, WithheldBytes::default()),
+            &[],
         )
         .expect("set both questions");
 

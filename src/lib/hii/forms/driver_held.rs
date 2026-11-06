@@ -12,7 +12,7 @@
 
 //! Questions whose value only their driver holds: a ONE_OF, NUMERIC or CHECKBOX without a VarStore
 //! that storageless.rs routes through its driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.Callback()
-//! (UEFI 2.11 §33.2.5.6): what get needs to reach it through the driver, and the stores
+//! (UEFI 2.11 §33.2.5.6): what get and set need to reach it through the driver, and the stores
 //! that the question's FormSet declares, with the settings that a forms browser requests of each.
 
 use std::fmt;
@@ -21,12 +21,17 @@ use thiserror::Error;
 
 use super::conditions::enclosing_form_set;
 use super::defaults::standard_default;
+use super::ordered_list::ListRefusal;
 #[cfg(any(target_os = "uefi", all(test, efivar_dumps)))]
 use super::question_values::checkbox_text;
 use super::question_values::form_set_guid;
 #[cfg(any(target_os = "uefi", all(test, efivar_dumps)))]
 use super::question_values::one_of_text;
 use super::question_values::ValueQuestion;
+use super::set::option_value;
+use super::set::text_value;
+use super::set::ChangeValueError;
+use super::set::NewAnswer;
 use super::storage::store_declarations;
 use super::storage::StoreDeclaration;
 use super::storage::VariableStore;
@@ -36,7 +41,6 @@ use super::storageless::StoragelessRoute;
 use super::DisabledForm;
 use super::FormSetWalk;
 use super::IFROperation;
-#[cfg(any(target_os = "uefi", all(test, efivar_dumps)))]
 use super::IncludedStates;
 use super::NumericFormat;
 use super::ParsedOperation;
@@ -123,13 +127,6 @@ impl fmt::Display for IfrValueType {
 /// The refusal of a question whose READ or WRITE expression a forms browser evaluates beside its
 /// driver's Callback()s: uefisettings evaluates them only for questions without
 /// EFI_IFR_FLAG_CALLBACK.
-#[cfg_attr(
-    not(all(variable_data, any(target_os = "uefi", test))),
-    allow(
-        dead_code,
-        reason = "only the UEFI Shell build calls a driver's Callback()"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error(
     "question has no VarStore, and uefisettings does not apply its {0} expression beside its \
@@ -259,9 +256,28 @@ impl DriverHeldQuestion {
 }
 
 impl QuestionDescriptor {
-    /// What get needs of a question whose value only its driver holds, if it is one.
+    /// What get and set need of a question whose value only its driver holds, if it is one.
     pub(crate) fn driver_held(&self) -> Option<&DriverHeldQuestion> {
         self.driver_held.as_ref()
+    }
+
+    /// The value of a question whose driver holds it that the text of `answer`, or the option of
+    /// one of its variations that chosen_option picks with `include`, names, as set takes it;
+    /// items are refused, as for a stored question other than an ORDERED_LIST.
+    pub(crate) fn driver_held_value(
+        &self,
+        answer: NewAnswer<'_>,
+        include: IncludedStates,
+    ) -> Result<u64, ChangeValueError> {
+        let (text, variations) = match answer {
+            NewAnswer::Text { text, variations } => (text, variations),
+            NewAnswer::Items(_) => return Err(ListRefusal::Items.of(self)),
+        };
+        let value = match self.possible_options.is_empty() {
+            true => text_value(self, text)?,
+            false => option_value(self, self.chosen_option(variations, include)?)?,
+        };
+        value.as_u64().ok_or(ChangeValueError::InvalidOption)
     }
 
     /// `value`, of a question whose driver holds it, as get shows a stored value: the option's
@@ -292,6 +308,7 @@ impl QuestionDescriptor {
 #[cfg(test)]
 #[cfg(efivar_dumps)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::num::NonZeroUsize;
     use std::rc::Rc;
 
@@ -627,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn values_show_as_get_shows_them() {
+    fn values_show_as_get_shows_them_and_parse_as_set_takes_them() {
         let body = [form(
             1,
             &[storage_less_one_of(0x0201, EFI_IFR_FLAG_CALLBACK)],
@@ -644,6 +661,19 @@ mod tests {
             descriptor.driver_held_text(7).as_deref(),
             Some("7 (no matching option)"),
             "another value shows its number"
+        );
+        assert_eq!(
+            descriptor
+                .driver_held_value(
+                    NewAnswer::Text {
+                        text: &option,
+                        variations: &BTreeSet::from([option.clone()]),
+                    },
+                    IncludedStates::empty()
+                )
+                .expect("the option"),
+            1,
+            "the option's text sets its value"
         );
     }
 }

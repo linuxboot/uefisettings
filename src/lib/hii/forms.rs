@@ -143,11 +143,12 @@ pub(crate) use conditions::StateEvaluation;
 pub(crate) use defaults::DeclaredDefault;
 pub(crate) use defaults::DefaultId;
 pub(crate) use driver_held::DriverHeldQuestion;
-#[cfg(all(variable_data, any(target_os = "uefi", test)))]
 pub(crate) use driver_held::ExpressionBesideCallback;
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
 pub(crate) use driver_held::IfrValueType;
+pub(crate) use set::check_one_kind;
 pub(crate) use set::set_questions;
+pub(crate) use set::DriverStore;
 pub(crate) use set::NewAnswer;
 pub(crate) use setup_password::PasswordQuestions;
 pub(crate) use setup_password::UnresolvedPassword;
@@ -4077,22 +4078,29 @@ pub(crate) fn choice_for_set(
     writer: ReadOnlyWriter<'_>,
     reader: &EfivarReader,
 ) -> Result<Choice<QuestionDescriptor>> {
-    let ((descriptor, evaluation), ranked_before) = match &selection {
-        Selection::Picked {
-            picked,
-            ranked_before,
-        } => (picked, *ranked_before),
-        Selection::Undetermined {
-            likely,
-            ranked_before,
-            ..
-        } => (likely, *ranked_before),
-        Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
-    };
     // the WRITE expression of a question without a VarStore names the stores that set writes
-    if let Some(store) = descriptor.store(reader.reach())? {
-        check_writable(store, reader, options.volatile)?;
+    if let Some(((descriptor, _), _)) = selection.written_or_likely() {
+        if let Some(store) = descriptor.store(reader.reach())? {
+            check_writable(store, reader, options.volatile)?;
+        }
     }
+    read_only_choice(selection, question, writer)
+}
+
+/// The choice of Selection::for_set, unless the match that set would write, or the likely match,
+/// is read-only by an EFI_IFR_VALUE, which nothing makes writable: then
+/// ChangeValueError::ReadOnly. A chosen match that EFI_IFR_FLAG_READ_ONLY makes read-only goes to
+/// `writer` after these refusals and those of Selection::for_set. choice_for_set checks the
+/// efivar of the match first; set takes this choice alone for a question whose driver holds its
+/// value, which has none.
+pub(crate) fn read_only_choice(
+    selection: Selection<QuestionDescriptor>,
+    question: &str,
+    writer: ReadOnlyWriter<'_>,
+) -> Result<Choice<QuestionDescriptor>> {
+    let Some(((descriptor, evaluation), ranked_before)) = selection.written_or_likely() else {
+        return Ok(selection.for_set(question)?);
+    };
     let name = descriptor.question.clone();
     match evaluation.read_only() {
         Some(cause @ ReadOnlyCause::ValueExpression) => Err(ChangeValueError::ReadOnly {

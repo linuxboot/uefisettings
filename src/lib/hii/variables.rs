@@ -1427,7 +1427,7 @@ impl<V: VariableData> VariableData for WithholdingVariables<V> {
     "EFI variable {key} holds a password {}, which set never writes",
     PasswordBytes(.bytes)
 )]
-pub(super) struct WithheldPassword {
+pub(crate) struct WithheldPassword {
     key: VariableKey,
     bytes: Range<usize>,
 }

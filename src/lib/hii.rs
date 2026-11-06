@@ -170,6 +170,5 @@ pub(crate) use variables::VariableNotFound;
 #[cfg(variable_data)]
 pub(crate) use variables::VariableReach;
 pub use variables::VolatileWrites;
-#[cfg(target_os = "uefi")]
 pub(crate) use variables::WithholdingVariables;
 pub(crate) use variables::VOLATILE_ANNOTATION;

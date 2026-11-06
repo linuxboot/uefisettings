@@ -1122,8 +1122,9 @@ mod write_tests {
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(variables, WithheldBytes::default()),
+            &[],
         )
-        .map(|(written, _)| {
+        .map(|(written, _, _)| {
             let [written] = written.as_slice() else {
                 panic!("one question written");
             };

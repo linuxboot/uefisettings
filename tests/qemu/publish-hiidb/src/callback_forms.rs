@@ -28,8 +28,11 @@
 //!   EFI_UNSUPPORTED. A driver binding starts on its handle, for the reconnection.
 //! - [`FormSet::Unreachable`] declares a Buffer store that its ExtractConfig() never answers.
 //! - [`FormSet::Driverless`] is registered by no handle.
-//! - [`FormSet::Password`], which `callback-forms-password` registers alone, declares a Buffer
-//!   store with a PASSWORD question; its question's CHANGED overwrites the store's other setting.
+//! - [`FormSet::Password`], which `callback-forms-password` registers, declares a Buffer store
+//!   with a PASSWORD question; its question's CHANGED overwrites the store's other setting.
+//! - [`FormSet::DisabledPassword`], which `callback-forms-password` registers too, declares a
+//!   Buffer store whose PASSWORD question is in a second form, which a CHECKBOX op shorter than
+//!   its minimum disables (UEFI 2.11 §33.2.5.10.1).
 //!
 //! Every Callback(), ExtractConfig(), RouteConfig() and driver binding Start() prints a line,
 //! which `shell/callback-forms.tsv` checks.
@@ -77,6 +80,7 @@ use crate::hii_package::package;
 use crate::hii_package::package_list;
 use crate::hii_package::strings_package;
 use crate::hii_package::EFI_HII_PACKAGE_FORMS;
+use crate::hii_package::EFI_IFR_CHECKBOX_OP;
 use crate::hii_package::EFI_IFR_FORM_OP;
 use crate::hii_package::EFI_IFR_FORM_SET_OP;
 use crate::hii_package::EFI_IFR_NUMERIC_OP;
@@ -100,11 +104,12 @@ const NV_BS_RT: VariableAttributes = VariableAttributes::NON_VOLATILE
 const EFI_STORE: &CStr16 = cstr16!("CallbackStore");
 const EFI_STORE_INITIAL: [u8; 4] = [0x5A; 4];
 const EFI_STORE_ID: u16 = 1;
-/// The VarStoreIds of the Buffer stores of [`FormSet::Stores`], [`FormSet::Unreachable`] and
-/// [`FormSet::Password`].
+/// The VarStoreIds of the Buffer stores of [`FormSet::Stores`], [`FormSet::Unreachable`],
+/// [`FormSet::Password`] and [`FormSet::DisabledPassword`].
 const BUFFER_STORE_ID: u16 = 2;
 const UNREACHABLE_STORE_ID: u16 = 3;
 const PASSWORD_STORE_ID: u16 = 5;
+const DISABLED_PASSWORD_STORE_ID: u16 = 6;
 
 /// A Buffer store that ExtractConfig() and RouteConfig() here serve, kept in the EFI variable of
 /// its name.
@@ -173,10 +178,12 @@ enum FormSet {
     Unreachable,
     Driverless,
     Password,
+    DisabledPassword,
 }
 
 /// The form sets that `callback-forms` registers, and those of `callback-forms-password`, apart
-/// as a PASSWORD question has uefisettings.efi refuse every set without --bypass-setup-password.
+/// as a PASSWORD question has uefisettings.efi refuse every set without
+/// --i-am-fine-to-brick-this-system.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Forms {
     Callbacks,
@@ -192,7 +199,7 @@ impl Forms {
                 FormSet::Unreachable,
                 FormSet::Driverless,
             ],
-            Self::Password => &[FormSet::Password],
+            Self::Password => &[FormSet::Password, FormSet::DisabledPassword],
         }
     }
 }
@@ -206,6 +213,7 @@ impl FormSet {
             Self::Unreachable => guid!("8c78a505-baa0-4c4a-869f-000000000202"),
             Self::Driverless => guid!("8c78a505-baa0-4c4a-869f-000000000203"),
             Self::Password => guid!("8c78a505-baa0-4c4a-869f-000000000204"),
+            Self::DisabledPassword => guid!("8c78a505-baa0-4c4a-869f-000000001a14"),
         }
     }
 
@@ -218,6 +226,7 @@ impl FormSet {
             Self::Unreachable => Some((&UNREACHABLE_PATH[..], &UNREACHABLE_ACCESS)),
             Self::Driverless => None,
             Self::Password => Some((&PASSWORD_PATH[..], &STORES_ACCESS)),
+            Self::DisabledPassword => Some((&DISABLED_PASSWORD_PATH[..], &PLAIN_ACCESS)),
         }
     }
 }
@@ -257,7 +266,7 @@ struct Question {
     behavior: Behavior,
 }
 
-const QUESTIONS: [Question; 13] = [
+const QUESTIONS: [Question; 14] = [
     Question {
         id: 0x0101,
         form_set: FormSet::Plain,
@@ -336,12 +345,19 @@ const QUESTIONS: [Question; 13] = [
         prompt: "Callback value beside a password",
         behavior: Behavior::OverwritesPasswordStore,
     },
+    Question {
+        id: 0x0601,
+        form_set: FormSet::DisabledPassword,
+        prompt: "Callback value beside a disabled password",
+        behavior: Behavior::Own,
+    },
 ];
 
 static PLAIN_PATH: [u8; 24] = vendor_device_path(FormSet::Plain.guid());
 static STORES_PATH: [u8; 24] = vendor_device_path(FormSet::Stores.guid());
 static UNREACHABLE_PATH: [u8; 24] = vendor_device_path(FormSet::Unreachable.guid());
 static PASSWORD_PATH: [u8; 24] = vendor_device_path(FormSet::Password.guid());
+static DISABLED_PASSWORD_PATH: [u8; 24] = vendor_device_path(FormSet::DisabledPassword.guid());
 
 static PLAIN_ACCESS: HiiConfigAccessProtocol = HiiConfigAccessProtocol {
     extract_config: extract_nothing,
@@ -462,6 +478,7 @@ fn strings(form_set: FormSet) -> Vec<&'static str> {
         FormSet::Stores => &["Buffer setting", "Buffer call count"],
         FormSet::Unreachable => &["Unreachable store setting"],
         FormSet::Password => &["Password", "Password store setting"],
+        FormSet::DisabledPassword => &["Disabled password"],
         FormSet::Plain | FormSet::Driverless => &[],
     };
     COMMON_STRINGS
@@ -472,7 +489,9 @@ fn strings(form_set: FormSet) -> Vec<&'static str> {
 }
 
 /// The form package of `form_set`: the form set, its stores, and one form with its questions,
-/// then its storage settings, whose prompts follow those of the questions in [`strings`].
+/// then its storage settings, whose prompts follow those of the questions in [`strings`]; for
+/// [`FormSet::DisabledPassword`], its PASSWORD question in a second form, which a CHECKBOX op of
+/// 3 bytes, shorter than any CHECKBOX, disables (UEFI 2.11 §33.2.5.10.1).
 fn form_package(form_set: FormSet) -> Vec<u8> {
     let form_set_op = [
         &form_set.guid().to_bytes()[..],
@@ -532,7 +551,29 @@ fn form_package(form_set: FormSet) -> Vec<u8> {
             ]
             .concat(),
         ),
+        FormSet::DisabledPassword => (
+            buffer_store(DISABLED_PASSWORD_STORE_ID, 4, b"CallbackDisabledPassword\0"),
+            Vec::new(),
+        ),
         FormSet::Plain | FormSet::Driverless => (Vec::new(), Vec::new()),
+    };
+    let disabled_form = match form_set {
+        FormSet::DisabledPassword => [
+            op(
+                EFI_IFR_FORM_OP,
+                true,
+                &[2u16.to_le_bytes(), TITLE.to_le_bytes()].concat(),
+            ),
+            password(0x0610, prompt, DISABLED_PASSWORD_STORE_ID, 0),
+            op(EFI_IFR_CHECKBOX_OP, false, &[0x00]),
+            end(),
+        ]
+        .concat(),
+        FormSet::Plain
+        | FormSet::Stores
+        | FormSet::Unreachable
+        | FormSet::Driverless
+        | FormSet::Password => Vec::new(),
     };
     let form = [1u16.to_le_bytes(), TITLE.to_le_bytes()].concat();
     let body = [
@@ -542,6 +583,7 @@ fn form_package(form_set: FormSet) -> Vec<u8> {
         body,
         settings,
         end(), // of the form
+        disabled_form,
         end(), // of the form set
     ]
     .concat();

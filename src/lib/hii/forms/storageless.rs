@@ -298,10 +298,10 @@ pub(crate) enum StoragelessRefusal {
     )]
     RetrieveFailed { status: String },
     #[cfg_attr(
-        not(test),
+        not(any(target_os = "uefi", test)),
         expect(
             dead_code,
-            reason = "for set's CallBack() sequence in the UEFI Shell build, which does not exist yet"
+            reason = "only the UEFI Shell build calls a driver's CallBack()"
         )
     )]
     /// `status`: the EFI_STATUS that CallBack(EFI_BROWSER_ACTION_CHANGING) returned
@@ -346,14 +346,14 @@ impl fmt::Display for CallbackDecides {
 }
 
 /// Why a run of `reach` calls no CallBack(): after ExitBootServices() no EFI device-handle-based
-/// protocol may be used; in uefisettings.efi only get, without --no-efivars, calls it.
+/// protocol may be used; in uefisettings.efi only get, without --no-efivars, and set call it.
 fn no_callback(reach: VariableReach) -> &'static str {
     match reach {
         VariableReach::Runtime => {
             ", and after ExitBootServices() no EFI device-handle-based protocol may be used (UEFI \
              2.11 §7.4.6); use uefisettings.efi in the UEFI Shell"
         }
-        VariableReach::BootServices => ", which only get (without --no-efivars) calls",
+        VariableReach::BootServices => ", which only get (without --no-efivars) and set call",
     }
 }
 
@@ -850,7 +850,7 @@ mod tests {
                 StoragelessRefusal::DriverHeld(VariableReach::BootServices),
                 "question has no VarStore; its driver keeps the value, which only \
                  EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 §33.2.5.6), which \
-                 only get (without --no-efivars) calls",
+                 only get (without --no-efivars) and set call",
             ),
             (
                 StoragelessRefusal::CallbackDecides(
@@ -882,7 +882,7 @@ mod tests {
                 "question has no VarStore, and its driver's \
                  EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack(EFI_BROWSER_ACTION_RETRIEVE) may replace \
                  the value of its READ expression (UEFI 2.11 §35.5.4), which only get (without \
-                 --no-efivars) calls",
+                 --no-efivars) and set call",
             ),
             (
                 StoragelessRefusal::CallbackUndecoded("EFI_IFR_DATE"),
@@ -1127,6 +1127,7 @@ mod get_and_set_tests {
                     VolatileWrites::Refuse,
                     PendingOperations::new(UnsafeOperations::Refuse),
                     &WithholdingVariables::new(&variables, WithheldBytes::default()),
+                    &[],
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string());
@@ -1257,6 +1258,7 @@ mod get_and_set_tests {
                     VolatileWrites::Refuse,
                     PendingOperations::new(UnsafeOperations::Refuse),
                     &WithholdingVariables::new(&variables, WithheldBytes::default()),
+                    &[],
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string());

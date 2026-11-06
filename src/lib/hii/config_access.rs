@@ -23,6 +23,7 @@ use uefi::boot::OpenProtocolAttributes;
 use uefi::boot::OpenProtocolParams;
 use uefi::boot::ScopedProtocol;
 use uefi::proto::unsafe_protocol;
+use uefi::Handle;
 use uefi_raw::protocol::hii::config::BrowserAction as RawBrowserAction;
 use uefi_raw::protocol::hii::config::HiiConfigAccessProtocol;
 use uefi_raw::protocol::hii::form_browser::BrowserActionRequest;
@@ -43,9 +44,10 @@ use crate::hii::question_callbacks::IfrValue;
 #[unsafe_protocol(HiiConfigAccessProtocol::GUID)]
 struct ConfigAccessFunctions(HiiConfigAccessProtocol);
 
-/// The driver of a package list: the EFI_HII_CONFIG_ACCESS_PROTOCOL on its handle, opened
-/// GetProtocol for as long as this lives.
+/// The driver of a package list: its handle and the EFI_HII_CONFIG_ACCESS_PROTOCOL on it,
+/// opened GetProtocol for as long as this lives.
 pub(crate) struct ConfigAccessDriver {
+    handle: Handle,
     protocol: ScopedProtocol<ConfigAccessFunctions>,
 }
 
@@ -75,7 +77,7 @@ impl ConfigAccessDriver {
         }
         .map_err(|error| anyhow!("OpenProtocol() returned {:?}", error.status()))
         .context(StoragelessRefusal::NoConfigAccess)?;
-        Ok(Self { protocol })
+        Ok(Self { handle, protocol })
     }
 }
 
@@ -111,5 +113,14 @@ impl DriverCallback for ConfigAccessDriver {
             status: EfiStatus(status.0),
             request: ActionRequest(request.0),
         }
+    }
+
+    /// As a forms browser does for EFI_BROWSER_ACTION_REQUEST_RECONNECT (edk2-stable202608
+    /// SetupBrowserDxe Presentation.c:1997-2009).
+    fn reconnect(&self) -> Result<(), EfiStatus> {
+        boot::disconnect_controller(self.handle, None, None)
+            .map_err(|error| EfiStatus(error.status().0))?;
+        boot::connect_controller(self.handle, &[], None, true)
+            .map_err(|error| EfiStatus(error.status().0))
     }
 }

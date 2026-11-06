@@ -521,6 +521,7 @@ mod tests {
                 VolatileWrites::Refuse,
                 PendingOperations::new(UnsafeOperations::Refuse),
                 &WithholdingVariables::new(&variables, WithheldBytes::default()),
+                &[],
             )
             .map(drop)
             .map_err(|error| format!("{error:#}"));

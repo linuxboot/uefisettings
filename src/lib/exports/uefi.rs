@@ -23,6 +23,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use log::debug;
 
+use super::set_refusal;
 use super::text_languages;
 use super::CapsuleBackend;
 use super::DriverHeldValues;
@@ -56,8 +57,10 @@ use crate::hii::forms::PasswordQuestions;
 use crate::hii::forms::QuestionDescriptor;
 use crate::hii::get_keywords;
 use crate::hii::package;
+use crate::hii::question_callbacks::change;
 use crate::hii::question_callbacks::retrieve;
 use crate::hii::question_callbacks::Call;
+use crate::hii::question_callbacks::ChangeOutcome;
 use crate::hii::question_callbacks::DriverQuestion;
 use crate::hii::question_callbacks::FormSetAccess;
 use crate::hii::question_callbacks::IfrValue;
@@ -218,8 +221,8 @@ pub struct KeywordSetOptions {
     pub volatile: VolatileWrites,
 }
 
-/// What get does with a question whose driver holds its value: call that driver's Callback()
-/// for it, unless --no-efivars keeps get from this firmware's state.
+/// What get and set do with a question whose driver holds its value: call that driver's
+/// Callback() for it, unless --no-efivars keeps get from this firmware's state.
 impl HiiBackend {
     pub(super) fn driver_held_values<'a>(
         hiidb: &'a [u8],
@@ -280,6 +283,10 @@ impl DriverCallbacks<'_> {
 }
 
 impl DriverHeldValues for DriverCallbacks<'_> {
+    fn store_name(&self) -> &'static str {
+        "its driver"
+    }
+
     fn get(
         &self,
         list: &QuestionList<'_>,
@@ -307,6 +314,54 @@ impl DriverHeldValues for DriverCallbacks<'_> {
         }
         answer
     }
+
+    /// set reaches the question's driver, its stores and the variables, as `reach` finds them.
+    fn check_set(
+        &self,
+        list: &QuestionList<'_>,
+        question: &QuestionDescriptor,
+        held: &DriverHeldQuestion,
+    ) -> Result<()> {
+        self.reach(list, held)
+            .map(drop)
+            .map_err(|error| set_refusal(&question.question, format!("{error:#}")))
+    }
+
+    fn set(
+        &self,
+        list: &QuestionList<'_>,
+        question: &QuestionDescriptor,
+        held: &DriverHeldQuestion,
+        value: u64,
+    ) -> Result<String> {
+        let reached = self
+            .reach(list, held)
+            .map_err(|error| set_refusal(&question.question, format!("{error:#}")))?;
+        let routing = RoutingProtocol::open();
+        let access = FormSetAccess {
+            stores: reached.stores,
+            routing: &routing,
+            variables: &reached.variables,
+        };
+        let new_value = IfrValue {
+            value_type: held.value_type,
+            value,
+        };
+        let changed = change(&reached.driver, driver_question(held), new_value, access);
+        log_calls(&changed.calls);
+        let outcome = changed.outcome.text(|value| shown(question, value));
+        let text = [outcome]
+            .into_iter()
+            .chain(changed.notes)
+            .collect::<Vec<_>>()
+            .join("; ");
+        match changed.outcome {
+            ChangeOutcome::Applied(_) => Ok(format!(" <{text}>")),
+            ChangeOutcome::Refused(_) | ChangeOutcome::NotApplied { .. } => {
+                Err(set_refusal(&question.question, text))
+            }
+        }
+    }
 }
 
 /// The error of a package list `index` that the HII database does not have.
@@ -324,6 +379,7 @@ fn driver_question(held: &DriverHeldQuestion) -> DriverQuestion {
         },
         form_set_has_stores: !held.stores.is_empty(),
         read_expression: held.read_expression,
+        write_expression: held.write_expression,
     }
 }
 

@@ -934,9 +934,9 @@ FS0:\> uefisettings.efi hii keyword set "NAMESPACE=x-UEFI-ns&PATH=<hex digits>&K
 A question without a VarStore whose value only its driver keeps (EFI_IFR_FLAG_CALLBACK, UEFI 2.11
 §33.2.5.6) is reached through that driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.Callback(), with the
 browser actions that a forms browser sends, as no forms browser runs. `get` sends FORM_OPEN,
-RETRIEVE and FORM_CLOSE, and shows the value that RETRIEVE gave; `set` refuses such a question.
-Only `get` calls a driver: `list-questions`, `show-ifr`, the dumps and `get --no-efivars` show why
-such a question has no value, and so does `get` on Linux, Windows and macOS.
+RETRIEVE and FORM_CLOSE, and shows the value that RETRIEVE gave. Only `get` and `set` call a driver:
+`list-questions`, `show-ifr`, the dumps and `get --no-efivars` show why such a question has no
+value, and so do `get` and `set` on Linux, Windows and macOS.
 
 uefisettings exchanges a value with Callback() only for a one-of, numeric or checkbox question: it
 refuses an ordered-list or string question, or a date or time question outside EFI Date/Time
@@ -961,6 +961,22 @@ a driver's Callback()s, so `get` refuses and says so. A Callback() that asks the
 save the FormSet's modified values, which only a forms browser's edit buffer holds, or returns an
 ActionRequest that UEFI 2.11 §35.5.4 does not define refuses the answer too; a request for a
 platform reset or to discard modified values is noted.
+
+`set` sends FORM_OPEN, RETRIEVE, CHANGING with the new value, CHANGED and FORM_CLOSE, then reads the
+value back with FORM_OPEN, RETRIEVE and FORM_CLOSE, and answers `applied`, `applied; the driver now
+reports <value>` for a driver that resets a transient value, or `applied; the driver offers no
+read-back`. A forms browser never sends SUBMITTED for a question without storage, so `set` does not
+either. `set` refuses the change when CHANGING refuses the value or CHANGED fails, and, before any
+write, a question with a WRITE expression, which a forms browser evaluates between CHANGING and
+CHANGED and uefisettings does not evaluate beside a driver's Callback()s. A RECONNECT request after
+an applied change disconnects and reconnects the driver's controller.
+`set` sends the value to the drivers of the matches after it writes the EFI variables of the
+others, in order, and stops at the first driver that refuses it, as at a failed write: its error
+names each driver by the package list of its question, followed by `(its driver)`. In a HiiDB that
+declares a setup password question, and for a question that EFI_IFR_FLAG_READ_ONLY makes
+read-only, `set` through a driver is an unsafe operation, as for a stored question, which only
+`--i-am-fine-to-brick-this-system` lets through, before the first Callback() (see
+[Unsafe operations](#unsafe-operations)).
 
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the

@@ -89,7 +89,8 @@
 //! `string-blocks` does the same with the package list of [`string_blocks`].
 //! `callback-forms` publishes nothing either: it registers the package lists of
 //! [`callback_forms`], each by a handle with its EFI_HII_CONFIG_ACCESS_PROTOCOL but the last, and
-//! `callback-forms-password` that of its form set with a PASSWORD question.
+//! `callback-forms-password` those of its form sets with a PASSWORD question, one in a disabled
+//! form.
 //! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `QHII` ACPI table,
 //! where `src/lib/hii/extract.rs` also looks, and puts its CRC-32 in `HiiDBCrc32`.
 //! `acpi-table-hiid` does the same with an `HIID` table, the other vendor ACPI table that

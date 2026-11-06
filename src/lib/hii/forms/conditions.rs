@@ -805,6 +805,23 @@ impl<T> Selection<T> {
         }
     }
 
+    /// The match that set would write, else the likely one, with the states that select a match
+    /// ranked before it; None for none.
+    pub(crate) fn written_or_likely(&self) -> Option<(&(T, StateEvaluation), RankedBefore)> {
+        match self {
+            Selection::Picked {
+                picked,
+                ranked_before,
+            } => Some((picked, *ranked_before)),
+            Selection::Undetermined {
+                likely,
+                ranked_before,
+                ..
+            } => Some((likely, *ranked_before)),
+            Selection::Excluded(_) | Selection::NotFound => None,
+        }
+    }
+
     /// set writes only a match that `include` certainly allows, and fails rather than guess.
     pub(crate) fn for_set(self, question: &str) -> Result<Choice<T>, SelectionError> {
         match self {
