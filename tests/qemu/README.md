@@ -126,7 +126,12 @@ In the scenario `hii-global-variables`, `publish-hiidb.efi padded-strings` runs 
 publishes nothing, but registers the package list of
 [`publish-hiidb/src/padded_strings.rs`](publish-hiidb/src/padded_strings.rs) in the HII
 database, a strings package whose header holds padding after its Language, which the firmware
-exports as it is.
+exports as it is. `publish-hiidb.efi string-blocks` then registers that of
+[`publish-hiidb/src/string_blocks.rs`](publish-hiidb/src/string_blocks.rs): a strings package
+of every string block type, then one of a single string, to which the firmware's HII database
+appends an `EFI_HII_SIBT_SKIP2` block up to the first package's last string ID. The test
+compares that ID with the last one that `uefisettings` reads, so it checks how `uefisettings`
+counts string IDs, not how it decodes SCSU strings, which edk2 widens byte by byte.
 
 `publish-hiidb.efi rt-data-readwrite-forms` creates the variable `ReadWriteData` unless it
 exists, as a driver creates its storage, registers the forms of

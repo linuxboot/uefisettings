@@ -323,11 +323,11 @@ pub(super) fn unavailable() -> VarStoreFixture {
 
 pub(super) fn strings() -> Vec<StringMap> {
     vec![StringMap::from([
-        (3, PROMPT.to_string()),
-        (5, "Disabled".to_string()),
-        (6, "Enabled".to_string()),
-        (7, "AllOnes".to_string()),
-        (PADDED_ENABLED, "Enabled ".to_string()),
+        (3, PROMPT.into()),
+        (5, "Disabled".into()),
+        (6, "Enabled".into()),
+        (7, "AllOnes".into()),
+        (PADDED_ENABLED, "Enabled ".into()),
     ])]
 }
 

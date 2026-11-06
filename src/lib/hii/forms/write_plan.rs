@@ -485,11 +485,7 @@ mod tests {
     /// The strings of form_set(): the prompts of questions().
     fn prompts() -> Vec<StringMap> {
         vec![(FIRST_PROMPT..)
-            .zip(
-                questions()
-                    .into_iter()
-                    .map(|(prompt, ..)| prompt.to_string()),
-            )
+            .zip(questions().into_iter().map(|(prompt, ..)| Rc::from(prompt)))
             .collect()]
     }
 
@@ -833,7 +829,7 @@ mod tests {
         ]
         .concat();
         let roots = [list(1, Vec::new()), list(0, write)];
-        let strings = vec![StringMap::from([(FIRST_PROMPT, "Dup".to_string())])];
+        let strings = vec![StringMap::from([(FIRST_PROMPT, "Dup".into())])];
         let mut reader = EfivarReader::with_variables(Box::new(variables(EFIVARFS)));
         let mut selections = Vec::new();
         for root in &roots {
@@ -906,7 +902,7 @@ mod tests {
             var_store_efi(STORE, "Store", NV_BS_RT, 6),
             form(1, &[checkbox]),
         ]);
-        let strings = vec![StringMap::from([(FIRST_PROMPT, "Checkbox".to_string())])];
+        let strings = vec![StringMap::from([(FIRST_PROMPT, "Checkbox".into())])];
         for (value, want) in [("1", vec![1, 0xA1, 0]), ("0", vec![0, 0xA1, 1])] {
             assert_eq!(
                 set_in(&root, &strings, "Checkbox", value, EFIVARFS),

@@ -504,6 +504,9 @@ mod tests {
     use std::fs;
     use std::fs::File;
     use std::io::Read;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::hiidb_fixtures::*;
     use super::*;
@@ -515,6 +518,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::MAX_SCOPE_NESTING;
+    use crate::hii::scsu::tests::EDK2_LANGUAGE_WINDOW;
     use crate::parse_error::ParseError;
 
     /// OPAQUE_PACKAGE is a package with Length 6, that is, 2 bytes of data:
@@ -1190,12 +1194,12 @@ mod tests {
         let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![StringMap::from([(1, "A".to_string())])],
+                vec![StringMap::from([(1, "A".into())])],
             ),
             ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![StringMap::from([(1, "B".to_string())])],
+                vec![StringMap::from([(1, "B".into())])],
             ),
         ];
         assert_eq!(strings_of_lists(lists), want, "strings of the lists");
@@ -1386,12 +1390,12 @@ mod tests {
         let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![StringMap::from([(1, "A".to_string())])],
+                vec![StringMap::from([(1, "A".into())])],
             ),
             ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![StringMap::from([(1, "B".to_string())])],
+                vec![StringMap::from([(1, "B".into())])],
             ),
         ];
         assert_eq!(strings_of_lists(lists), want, "strings of the lists");
@@ -1420,7 +1424,7 @@ mod tests {
             "languages of the strings packages"
         );
         let want = ["iSCSIBootEnable", "My Keyword Namespace Test"]
-            .map(|string| StringMap::from([(1, string.to_string())]));
+            .map(|string| StringMap::from([(1, string.into())]));
         assert_eq!(list.strings, want, "strings of the strings packages");
     }
 
@@ -1441,7 +1445,7 @@ mod tests {
             [strings::Language(b"en-\xe9".to_vec())],
             "languages of the strings packages"
         );
-        let want = [StringMap::from([(1, "A".to_string())])];
+        let want = [StringMap::from([(1, "A".into())])];
         assert_eq!(list.strings, want, "strings of the strings packages");
     }
 
@@ -1451,7 +1455,7 @@ mod tests {
 
     /// The strings that STRING_A_BLOCKS hold.
     fn string_a() -> StringMap {
-        StringMap::from([(1, "A".to_string())])
+        StringMap::from([(1, "A".into())])
     }
 
     /// The Language `language` of a strings package header.
@@ -1592,7 +1596,7 @@ mod tests {
             strings_packages_of(&packages),
             [
                 (language("en"), string_a()),
-                (language("fr"), StringMap::from([(1, "B".to_string())])),
+                (language("fr"), StringMap::from([(1, "B".into())])),
             ]
         );
     }
@@ -1788,15 +1792,15 @@ mod tests {
         let want = vec![
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![StringMap::from([(1, "A".to_string())])],
+                vec![StringMap::from([(1, "A".into())])],
             ),
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![StringMap::from([(1, "C".to_string())])],
+                vec![StringMap::from([(1, "C".into())])],
             ),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![StringMap::from([(1, "B".to_string())])],
+                vec![StringMap::from([(1, "B".into())])],
             ),
         ];
         assert_eq!(
@@ -1831,8 +1835,8 @@ mod tests {
             .map(|list| (list.forms.len(), list.strings))
             .collect();
         let want = vec![
-            (1, vec![StringMap::from([(1, "A".to_string())])]),
-            (0, vec![StringMap::from([(1, "B".to_string())])]),
+            (1, vec![StringMap::from([(1, "A".into())])]),
+            (0, vec![StringMap::from([(1, "B".into())])]),
         ];
         assert_eq!(got, want, "forms stay with the strings of their list");
     }
@@ -1915,12 +1919,18 @@ mod tests {
             // EFI_HII_SIBT_STRING_UCS2 "A" without its null terminator
             (
                 &[0x14, b'A', 0x00],
-                "failed to read a null-terminated 16-bit string",
+                "the StringText of an EFI_HII_SIBT_STRING_UCS2 block has no null terminator",
             ),
             // EFI_HII_SIBT_SKIP2 with 1 of the 2 bytes of its count
-            (&[0x21, 0x05], "failed to read a Skip2 count"),
+            (
+                &[0x21, 0x05],
+                "failed to read the SkipCount of an EFI_HII_SIBT_SKIP2 block",
+            ),
             // EFI_HII_SIBT_SKIP1 without its count
-            (&[0x22], "failed to read a Skip1 count"),
+            (
+                &[0x22],
+                "failed to read the SkipCount of an EFI_HII_SIBT_SKIP1 block",
+            ),
         ];
         for (blocks, read) in cases {
             let package = en_strings_package_with_blocks(blocks);
@@ -1931,45 +1941,13 @@ mod tests {
                 panic!("read_db parsed the string blocks {blocks:02x?}");
             };
 
-            let msg = format!("{err:#}");
-            let want = format!(
-                "failed to parse package list 22222222-2222-2222-2222-222222222222: \
-                 failed to parse a strings package: {read}: "
-            );
-            assert!(msg.starts_with(&want), "blocks {blocks:02x?}: {msg}");
-            assert!(
-                err.chain().any(|cause| cause.is::<ParseError>()),
-                "blocks {blocks:02x?} keep the cause: {msg}"
-            );
-        }
-    }
-
-    /// read_db names a string block type that it does not handle, and the code of one that UEFI
-    /// 2.10 §33.3.6.2 does not define.
-    #[test]
-    fn test_read_db_error_names_an_unhandled_string_block_type() {
-        let cases: [(&[u8], &str); 2] = [
-            // EFI_HII_SIBT_STRING_SCSU "A"
-            (
-                &[0x10, b'A', 0x00],
-                "unhandled string block type StringScsu",
-            ),
-            (&[0x41], "unknown string block type 0x41"),
-        ];
-        for (blocks, want) in cases {
-            let package = en_strings_package_with_blocks(blocks);
-            let hiidb =
-                package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat());
-
-            let Err(err) = read_db(&hiidb) else {
-                panic!("read_db parsed the string blocks {blocks:02x?}");
-            };
-
+            // the blocks are read without binrw, so no ParseError joins the chain: the text is
+            // the whole error, on one line
             assert_eq!(
                 format!("{err:#}"),
                 format!(
                     "failed to parse package list 22222222-2222-2222-2222-222222222222: \
-                     failed to parse a strings package: {want}"
+                     failed to parse a strings package: {read}"
                 ),
                 "blocks {blocks:02x?}"
             );
@@ -2091,7 +2069,8 @@ mod tests {
                 .first()
                 .unwrap()
                 .get(&8)
-                .unwrap(),
+                .unwrap()
+                .as_ref(),
             "MMIO Low Base"
         );
 
@@ -2195,9 +2174,9 @@ mod tests {
             [
                 (
                     Some(DevicePath::from(PCI_ROOT_DEVICE_PATH.to_vec())),
-                    vec![StringMap::from([(1, "A".to_owned())])]
+                    vec![StringMap::from([(1, "A".into())])]
                 ),
-                (None, vec![StringMap::from([(1, "B".to_owned())])]),
+                (None, vec![StringMap::from([(1, "B".into())])]),
             ],
             "lists with and without a device path package"
         );
@@ -2233,7 +2212,7 @@ mod tests {
             (
                 "EFI_HII_SIBT_STRING_UCS2 at 65535",
                 [&to_65535, &ucs2_a],
-                StringMap::from([(65535, "A".to_string())]),
+                StringMap::from([(65535, "A".into())]),
             ),
             (
                 "EFI_HII_SIBT_SKIP1 to 65536",
@@ -2275,6 +2254,657 @@ mod tests {
                 strings_package_refusal(package),
                 strings_block_refusal(refusal),
                 "{case}"
+            );
+        }
+    }
+
+    /// FONT_1 is an EFI_HII_SIBT_EXT2 block of BlockType2 EFI_HII_SIBT_FONT (UEFI 2.11
+    /// §33.3.6.2.4): FontId 1, FontSize 16, FontStyle 0, FontName "F".
+    const FONT_1: [u8; 15] = [
+        0x31, 0x40, 0x0F, 0x00, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, b'F', 0x00, 0x00, 0x00,
+    ];
+
+    /// FONT_1 with FontId `font_id`.
+    fn font_block(font_id: u8) -> Vec<u8> {
+        [&FONT_1[..4], &[font_id], &FONT_1[5..]].concat()
+    }
+
+    /// read_db reads every string block type of UEFI 2.11 §33.3.6.2 in one strings package:
+    /// each string block assigns StringIdCurrent, DUPLICATE copies an earlier string, the skips
+    /// leave IDs without strings, and the EXT1, EXT2 and EXT4 blocks of other BlockType2s are
+    /// skipped by their Length. The fonts of the _FONT blocks are not shown.
+    #[test]
+    fn test_read_db_reads_every_string_block_type() {
+        let blocks = [
+            &FONT_1[..],
+            // EFI_HII_SIBT_STRING_SCSU "A": 1
+            &[0x10, b'A', 0x00],
+            // EFI_HII_SIBT_STRING_SCSU_FONT of font 1 "B": 2
+            &[0x11, 0x01, b'B', 0x00],
+            // EFI_HII_SIBT_STRINGS_SCSU "C", "D": 3, 4
+            &[0x12, 0x02, 0x00, b'C', 0x00, b'D', 0x00],
+            // EFI_HII_SIBT_STRINGS_SCSU_FONT of font 0 "E": 5
+            &[0x13, 0x00, 0x01, 0x00, b'E', 0x00],
+            // EFI_HII_SIBT_STRING_UCS2 "F": 6
+            &[0x14, b'F', 0x00, 0x00, 0x00],
+            // EFI_HII_SIBT_STRING_UCS2_FONT of font 1 "G": 7
+            &[0x15, 0x01, b'G', 0x00, 0x00, 0x00],
+            // EFI_HII_SIBT_STRINGS_UCS2 "H", "I": 8, 9
+            &[
+                0x16, 0x02, 0x00, b'H', 0x00, 0x00, 0x00, b'I', 0x00, 0x00, 0x00,
+            ],
+            // EFI_HII_SIBT_STRINGS_UCS2_FONT of font 1 "J": 10
+            &[0x17, 0x01, 0x01, 0x00, b'J', 0x00, 0x00, 0x00],
+            // EFI_HII_SIBT_DUPLICATE of 6: 11
+            &[0x20, 0x06, 0x00],
+            // EFI_HII_SIBT_SKIP2 of 2, then EFI_HII_SIBT_SKIP1 of 1: 12-14
+            &[0x21, 0x02, 0x00, 0x22, 0x01],
+            // EFI_HII_SIBT_EXT1 of BlockType2 0x7E and Length 5
+            &[0x30, 0x7E, 0x05, 0xAA, 0xBB],
+            // EFI_HII_SIBT_EXT2 of BlockType2 0x7E and Length 4
+            &[0x31, 0x7E, 0x04, 0x00],
+            // EFI_HII_SIBT_EXT4 of BlockType2 0x41 and Length 7
+            &[0x32, 0x41, 0x07, 0x00, 0x00, 0x00, 0xCC],
+            // EFI_HII_SIBT_EXT1 of BlockType2 EFI_HII_SIBT_FONT, which only EXT2 carries
+            &[0x30, 0x40, 0x03],
+            // EFI_HII_SIBT_STRING_UCS2 "K": 15, then EFI_HII_SIBT_END
+            &[0x14, b'K', 0x00, 0x00, 0x00, 0x00],
+        ]
+        .concat();
+
+        let got = strings_packages_of(&[en_strings_package_with_window(
+            &EDK2_LANGUAGE_WINDOW,
+            &blocks,
+        )]);
+
+        let want = StringMap::from(
+            [
+                (1, "A"),
+                (2, "B"),
+                (3, "C"),
+                (4, "D"),
+                (5, "E"),
+                (6, "F"),
+                (7, "G"),
+                (8, "H"),
+                (9, "I"),
+                (10, "J"),
+                (11, "F"),
+                (15, "K"),
+            ]
+            .map(|(id, string)| (id, string.into())),
+        );
+        assert_eq!(got, [(language("en"), want)], "strings of every block type");
+    }
+
+    /// read_db decodes each SCSU string of an EFI_HII_SIBT_STRINGS_SCSU block from the
+    /// LanguageWindow, whatever windows the string before changed (UEFI 2.11 §33.3.6.1).
+    #[test]
+    fn test_read_db_restarts_each_scsu_string_from_the_language_window() {
+        // 3 strings: SC5 0x82, SD0 0xFD (0x3040) 0x82, then 0x82 in dynamic window 0 at 0x0080
+        let blocks = [
+            0x12, 0x03, 0x00, 0x15, 0x82, 0x00, 0x18, 0xFD, 0x82, 0x00, 0x82, 0x00, 0x00,
+        ];
+
+        let got = strings_packages_of(&[en_strings_package_with_window(
+            &EDK2_LANGUAGE_WINDOW,
+            &blocks,
+        )]);
+
+        let want = StringMap::from(
+            [(1, "\u{3042}"), (2, "\u{3042}"), (3, "\u{82}")]
+                .map(|(id, string)| (id, string.into())),
+        );
+        assert_eq!(got, [(language("en"), want)], "strings of STRINGS_SCSU");
+    }
+
+    /// read_db reads a FONT block that holds bytes after its FontName, within its Length, and
+    /// keeps its FontId: an EXT2 block's Length lets it "be easily skipped" (UEFI 2.11
+    /// §33.3.6.2.3), and edk2 moves past a FONT block by its Length (edk2-stable202608
+    /// MdeModulePkg/Universal/HiiDatabaseDxe/String.c FindStringBlock).
+    #[test]
+    fn test_read_db_reads_a_font_block_with_bytes_after_its_font_name() {
+        // FONT_1 of Length 17 with 2 bytes after its FontName, then EFI_HII_SIBT_STRING_UCS2_FONT
+        // of font 1 "A" and EFI_HII_SIBT_END
+        let blocks = [
+            &[0x31, 0x40, 0x11, 0x00][..],
+            &FONT_1[4..],
+            &[0xAA, 0xAA],
+            &[0x15, 0x01, b'A', 0x00, 0x00, 0x00, 0x00],
+        ]
+        .concat();
+
+        assert_eq!(
+            strings_packages_of(&[en_strings_package_with_blocks(&blocks)]),
+            [(language("en"), string_a())],
+            "strings after a FONT block of 2 bytes after its FontName"
+        );
+    }
+
+    /// read_db shares the text of a DUPLICATE's string with the string that it names, "a
+    /// previously defined string with the exact same string text" (UEFI 2.11 §33.3.6.2.1),
+    /// copying none.
+    #[test]
+    fn test_read_db_shares_the_text_of_duplicates() {
+        // EFI_HII_SIBT_STRING_UCS2 "AB": 1, EFI_HII_SIBT_DUPLICATEs of 1 and 2: 2 and 3, then
+        // EFI_HII_SIBT_END
+        let blocks = [
+            0x14, b'A', 0x00, b'B', 0x00, 0x00, 0x00, 0x20, 0x01, 0x00, 0x20, 0x02, 0x00, 0x00,
+        ];
+
+        let got = strings_packages_of(&[en_strings_package_with_blocks(&blocks)]);
+
+        let [(_, strings)] = got.as_slice() else {
+            panic!("{} strings packages, not 1", got.len());
+        };
+        assert_eq!(
+            *strings,
+            StringMap::from([(1, "AB".into()), (2, "AB".into()), (3, "AB".into())]),
+            "strings of the DUPLICATEs"
+        );
+        for id in [2, 3] {
+            assert!(
+                Rc::ptr_eq(&strings[&1], &strings[&id]),
+                "string {id} shares string 1's text"
+            );
+        }
+    }
+
+    /// read_db refuses a strings package whose strings decode to more than 16 characters per byte
+    /// of its Length, at the string that takes them past it: 65534 DUPLICATEs of a 1024-character
+    /// string would decode to 67 million characters from 198703 bytes.
+    #[test]
+    fn test_read_db_refuses_65534_duplicates_of_a_long_string() {
+        // EFI_HII_SIBT_STRING_UCS2 of 1024 "A"s: 1, then 65534 EFI_HII_SIBT_DUPLICATEs of 1 and
+        // EFI_HII_SIBT_END; the Length is 49 header bytes and 198654 of blocks, and the
+        // DUPLICATE of string 3105 brings the characters to 3105 * 1024, past 16 * 198703
+        let blocks = [
+            &[0x14][..],
+            &[b'A', 0x00].repeat(1024),
+            &[0x00, 0x00],
+            &[0x20, 0x01, 0x00].repeat(65534),
+            &[0x00],
+        ]
+        .concat();
+        let hiidb = package_list_with_guid(
+            [0x22; 16],
+            &[
+                en_strings_package_with_blocks(&blocks),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+
+        match read_db(&hiidb) {
+            Ok(lists) => panic!(
+                "read_db read {} strings",
+                lists
+                    .iter()
+                    .flat_map(|list| &list.strings)
+                    .map(StringMap::len)
+                    .sum::<usize>()
+            ),
+            Err(err) => assert_eq!(
+                format!("{err:#}"),
+                strings_block_refusal(
+                    "string 3105 brings the strings to 3179520 characters, past 16 per byte of \
+                     the strings package's Length 198703"
+                ),
+                "65534 DUPLICATEs of a 1024-character string"
+            ),
+        }
+    }
+
+    /// SCAN_BUDGET is far more time than read_db takes to read the package of
+    /// test_read_db_reads_scsu_strings_without_reading_past_each, and far less than reading on
+    /// to the END block after each of its strings takes.
+    const SCAN_BUDGET: Duration = Duration::from_secs(20);
+
+    /// read_db reads 65535 SCSU strings that end without a 0x00 byte, before 3 MiB of EXT2 blocks
+    /// without one: it looks for each string's first 0x00 byte within the string's own bytes.
+    /// Looking on to the first 0x00 byte after each string, the END block's, reads 65535 times
+    /// 3 MiB. Only the time shows how far each search reads, so the read runs on a thread of its
+    /// own, which a test past SCAN_BUDGET leaves behind.
+    #[test]
+    fn test_read_db_reads_scsu_strings_without_reading_past_each() {
+        // EFI_HII_SIBT_STRINGS_SCSU of 65535 strings `80`, each U+0000 through dynamic window 0
+        // at 0x0000, under a zero LanguageWindow
+        let strings = [&[0x12, 0xFF, 0xFF][..], &[0x80; 0xFFFF]].concat();
+        // an EFI_HII_SIBT_EXT2 block of BlockType2 0x7E and Length 0xFFFF, of 0xFF bytes
+        let ext2 = [&[0x31, 0x7E, 0xFF, 0xFF][..], &[0xFF; 0xFFFF - 4]].concat();
+        let blocks = [strings, ext2.repeat(48), vec![0x00]].concat();
+        let hiidb = package_list_with_guid(
+            [0x22; 16],
+            &[
+                en_strings_package_with_window(&[0; 16], &blocks),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let read = read_db(&hiidb)
+                .map(|lists| {
+                    lists
+                        .iter()
+                        .flat_map(|list| &list.strings)
+                        .map(StringMap::len)
+                        .sum::<usize>()
+                })
+                .map_err(|err| format!("{err:#}"));
+            sender.send(read).expect("send what read_db read");
+        });
+
+        let read = receiver
+            .recv_timeout(SCAN_BUDGET)
+            .unwrap_or_else(|err| panic!("read_db within {SCAN_BUDGET:?}: {err}"));
+        reader.join().expect("join the reader");
+        assert_eq!(read, Ok(65535), "strings read");
+    }
+
+    /// read_db refuses a string block that breaks a rule of UEFI 2.11 §33.3.6.2: a DUPLICATE of
+    /// no previously defined string, a FontIdentifier of no earlier FONT block, a FONT block
+    /// whose FontId is not unique or whose fields do not fit its Length, an EXT block whose
+    /// Length does not fit, an unknown block type, a string past string ID 65535, and an SCSU
+    /// string that fails to decode.
+    #[test]
+    fn test_read_db_refuses_every_bad_string_block() {
+        let edk2 = EDK2_LANGUAGE_WINDOW;
+        let mut static_window_0_moved = EDK2_LANGUAGE_WINDOW;
+        static_window_0_moved[0] = 0x0100;
+        let ucs2_a = [0x14, b'A', 0x00, 0x00, 0x00];
+        let to_65535 = [0x21, 0xFE, 0xFF];
+        let font_2 = font_block(2);
+        let undefined_font = "FontIdentifier 3 names no earlier EFI_HII_SIBT_FONT block";
+        let past_65535 =
+            "string identifier 65536 is past the last string identifier 65535 (UEFI 2.11 §33.3.8.2.1)";
+        // an EFI_HII_SIBT_FONT of FontId 1 whose EXT2 Length is `length`, then `rest`
+        let font_of_length = |length: u8, rest: &[u8]| -> Vec<u8> {
+            [&[0x31, 0x40, length, 0x00][..], rest, &[0x00]].concat()
+        };
+        let cases: Vec<(&str, [u16; 16], Vec<u8>, &str)> =
+            vec![
+            (
+                "DUPLICATE of an undefined string",
+                edk2,
+                vec![0x20, 0x07, 0x00, 0x00],
+                "EFI_HII_SIBT_DUPLICATE StringId 7 names no previously defined string",
+            ),
+            (
+                "DUPLICATE of itself",
+                edk2,
+                vec![0x20, 0x01, 0x00, 0x00],
+                "EFI_HII_SIBT_DUPLICATE StringId 1 names no previously defined string",
+            ),
+            (
+                "DUPLICATE of a later string",
+                edk2,
+                [&ucs2_a[..], &[0x20, 0x03, 0x00], &ucs2_a, &[0x00]].concat(),
+                "EFI_HII_SIBT_DUPLICATE StringId 3 names no previously defined string",
+            ),
+            (
+                "DUPLICATE of a skipped string",
+                edk2,
+                vec![0x22, 0x01, 0x20, 0x01, 0x00, 0x00],
+                "EFI_HII_SIBT_DUPLICATE StringId 1 names no previously defined string",
+            ),
+            (
+                "STRING_SCSU_FONT of an undefined font",
+                edk2,
+                vec![0x11, 0x03, b'A', 0x00, 0x00],
+                undefined_font,
+            ),
+            (
+                "STRINGS_SCSU_FONT of an undefined font",
+                edk2,
+                vec![0x13, 0x03, 0x01, 0x00, b'A', 0x00, 0x00],
+                undefined_font,
+            ),
+            (
+                "STRING_UCS2_FONT of an undefined font",
+                edk2,
+                vec![0x15, 0x03, b'A', 0x00, 0x00, 0x00, 0x00],
+                undefined_font,
+            ),
+            (
+                "STRINGS_UCS2_FONT of an undefined font",
+                edk2,
+                vec![0x17, 0x03, 0x01, 0x00, b'A', 0x00, 0x00, 0x00, 0x00],
+                undefined_font,
+            ),
+            (
+                "STRING_UCS2_FONT of a font before its FONT block",
+                edk2,
+                [&[0x15, 0x01, b'A', 0x00, 0x00, 0x00][..], &FONT_1, &[0x00]].concat(),
+                "FontIdentifier 1 names no earlier EFI_HII_SIBT_FONT block",
+            ),
+            (
+                "two FONT blocks of FontId 2",
+                edk2,
+                [&font_2[..], &font_2, &[0x00]].concat(),
+                "EFI_HII_SIBT_FONT FontId 2 is not unique",
+            ),
+            (
+                "FONT without its FontId",
+                edk2,
+                font_of_length(4, &[]),
+                "failed to read the FontId of an EFI_HII_SIBT_FONT block",
+            ),
+            (
+                "FONT without its FontSize",
+                edk2,
+                font_of_length(6, &[0x01, 0x10]),
+                "failed to read the FontSize of an EFI_HII_SIBT_FONT block",
+            ),
+            (
+                "FONT without its FontStyle",
+                edk2,
+                font_of_length(10, &[0x01, 0x10, 0x00, 0x00, 0x00, 0x00]),
+                "failed to read the FontStyle of an EFI_HII_SIBT_FONT block",
+            ),
+            (
+                "FONT whose FontName has no null terminator",
+                edk2,
+                font_of_length(13, &[0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, b'F', 0x00]),
+                "the FontName of an EFI_HII_SIBT_FONT block has no null terminator",
+            ),
+            (
+                "EXT1 past the string information",
+                edk2,
+                vec![0x30, 0x7E, 0x09, 0x00],
+                "EFI_HII_SIBT_EXT1 Length 9 runs past the string information",
+            ),
+            (
+                "EXT2 past the string information",
+                edk2,
+                vec![0x31, 0x7E, 0x09, 0x00, 0x00],
+                "EFI_HII_SIBT_EXT2 Length 9 runs past the string information",
+            ),
+            (
+                "EXT4 past the string information",
+                edk2,
+                vec![0x32, 0x7E, 0x09, 0x00, 0x00, 0x00, 0x00],
+                "EFI_HII_SIBT_EXT4 Length 9 runs past the string information",
+            ),
+            (
+                "EXT1 of Length 0",
+                edk2,
+                vec![0x30, 0x7E, 0x00, 0x00],
+                "EFI_HII_SIBT_EXT1 Length 0 is below its 3-byte header",
+            ),
+            (
+                "EXT1 of Length 2",
+                edk2,
+                vec![0x30, 0x7E, 0x02, 0x00],
+                "EFI_HII_SIBT_EXT1 Length 2 is below its 3-byte header",
+            ),
+            (
+                "EXT2 of Length 3",
+                edk2,
+                vec![0x31, 0x7E, 0x03, 0x00, 0x00],
+                "EFI_HII_SIBT_EXT2 Length 3 is below its 4-byte header",
+            ),
+            (
+                "EXT4 of Length 5",
+                edk2,
+                vec![0x32, 0x7E, 0x05, 0x00, 0x00, 0x00, 0x00],
+                "EFI_HII_SIBT_EXT4 Length 5 is below its 6-byte header",
+            ),
+            (
+                "EFI_HII_SIBT_FONT as a block type",
+                edk2,
+                [&[0x40], &FONT_1[1..], &[0x00]].concat(),
+                "unknown string block type 0x40",
+            ),
+            ("block type 0x41", edk2, vec![0x41], "unknown string block type 0x41"),
+            ("block type 0x01", edk2, vec![0x01], "unknown string block type 0x01"),
+            ("block type 0x18", edk2, vec![0x18], "unknown string block type 0x18"),
+            ("block type 0x23", edk2, vec![0x23], "unknown string block type 0x23"),
+            ("block type 0x33", edk2, vec![0x33], "unknown string block type 0x33"),
+            ("block type 0xff", edk2, vec![0xFF], "unknown string block type 0xff"),
+            (
+                "STRINGS_UCS2 from 65535",
+                edk2,
+                [
+                    &to_65535[..],
+                    &[0x16, 0x02, 0x00, b'A', 0x00, 0x00, 0x00, b'B', 0x00, 0x00, 0x00, 0x00],
+                ]
+                .concat(),
+                past_65535,
+            ),
+            (
+                "STRINGS_SCSU from 65535",
+                edk2,
+                [&to_65535[..], &[0x12, 0x02, 0x00, b'A', 0x00, b'B', 0x00, 0x00]].concat(),
+                past_65535,
+            ),
+            (
+                "STRING_SCSU at 65536",
+                edk2,
+                [&to_65535[..], &[0x10, b'A', 0x00, 0x10, b'B', 0x00, 0x00]].concat(),
+                past_65535,
+            ),
+            (
+                "DUPLICATE at 65536",
+                edk2,
+                [&to_65535[..], &ucs2_a, &[0x20, 0xFF, 0xFF, 0x00]].concat(),
+                past_65535,
+            ),
+            (
+                "SCSU string without its null terminator",
+                edk2,
+                vec![0x10, b'A'],
+                "failed to decode SCSU string 1: the SCSU string has no null terminator",
+            ),
+            (
+                "SCSU string that static window 0 reads otherwise",
+                static_window_0_moved,
+                vec![0x10, b'A', 0x00, 0x00],
+                "failed to decode SCSU string 1: static window 0 is 0x0100; UTS #6 reads bytes \
+                 20-7F both through it and as Basic Latin (UEFI 2.11 §33.3.6.3.1)",
+            ),
+            (
+                "second SCSU string of STRINGS_SCSU",
+                edk2,
+                vec![0x12, 0x02, 0x00, b'A', 0x00, 0x7F, 0x2C, 0x00, 0x00],
+                "failed to decode SCSU string 2: unknown control code 0x7F 0x2c (UEFI 2.11 \
+                 Table 33.3)",
+            ),
+        ];
+        for (case, language_window, blocks, refusal) in cases {
+            let package = en_strings_package_with_window(&language_window, &blocks);
+
+            assert_eq!(
+                strings_package_refusal(package),
+                strings_block_refusal(refusal),
+                "{case}"
+            );
+        }
+    }
+
+    /// read_db refuses a string block cut at any of its bytes, naming the field that the cut
+    /// leaves short, and refuses the whole block without the EFI_HII_SIBT_END after it.
+    #[test]
+    fn test_read_db_refuses_every_string_block_cut_short() {
+        let ucs2_a = [0x14, b'A', 0x00, 0x00, 0x00];
+        let read =
+            |field: &str, block: &str| format!("failed to read the {field} of an {block} block");
+        let no_terminator =
+            |block: &str| format!("the StringText of an {block} block has no null terminator");
+        let scsu =
+            "failed to decode SCSU string 1: the SCSU string has no null terminator".to_string();
+        // each block, the blocks before it, and the refusal at each cut from 1 byte on
+        type Case<'a> = (&'a str, &'a [u8], Vec<u8>, Vec<String>);
+        let cases: [Case; 15] = [
+            (
+                "EFI_HII_SIBT_SKIP2",
+                &[],
+                vec![0x21, 0x01, 0x00],
+                vec![read("SkipCount", "EFI_HII_SIBT_SKIP2"); 2],
+            ),
+            (
+                "EFI_HII_SIBT_SKIP1",
+                &[],
+                vec![0x22, 0x01],
+                vec![read("SkipCount", "EFI_HII_SIBT_SKIP1")],
+            ),
+            (
+                "EFI_HII_SIBT_DUPLICATE",
+                &ucs2_a,
+                vec![0x20, 0x01, 0x00],
+                vec![read("StringId", "EFI_HII_SIBT_DUPLICATE"); 2],
+            ),
+            (
+                "EFI_HII_SIBT_STRING_UCS2",
+                &[],
+                ucs2_a.to_vec(),
+                vec![no_terminator("EFI_HII_SIBT_STRING_UCS2"); 4],
+            ),
+            (
+                "EFI_HII_SIBT_STRING_UCS2_FONT",
+                &[],
+                vec![0x15, 0x00, b'A', 0x00, 0x00, 0x00],
+                [
+                    vec![read("FontIdentifier", "EFI_HII_SIBT_STRING_UCS2_FONT")],
+                    vec![no_terminator("EFI_HII_SIBT_STRING_UCS2_FONT"); 4],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_STRINGS_UCS2",
+                &[],
+                vec![0x16, 0x01, 0x00, b'A', 0x00, 0x00, 0x00],
+                [
+                    vec![read("StringCount", "EFI_HII_SIBT_STRINGS_UCS2"); 2],
+                    vec![no_terminator("EFI_HII_SIBT_STRINGS_UCS2"); 4],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_STRINGS_UCS2_FONT",
+                &[],
+                vec![0x17, 0x00, 0x01, 0x00, b'A', 0x00, 0x00, 0x00],
+                [
+                    vec![read("FontIdentifier", "EFI_HII_SIBT_STRINGS_UCS2_FONT")],
+                    vec![read("StringCount", "EFI_HII_SIBT_STRINGS_UCS2_FONT"); 2],
+                    vec![no_terminator("EFI_HII_SIBT_STRINGS_UCS2_FONT"); 4],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_STRING_SCSU",
+                &[],
+                vec![0x10, b'A', 0x00],
+                vec![scsu.clone(); 2],
+            ),
+            (
+                "EFI_HII_SIBT_STRING_SCSU_FONT",
+                &[],
+                vec![0x11, 0x00, b'A', 0x00],
+                [
+                    vec![read("FontIdentifier", "EFI_HII_SIBT_STRING_SCSU_FONT")],
+                    vec![scsu.clone(); 2],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_STRINGS_SCSU",
+                &[],
+                vec![0x12, 0x01, 0x00, b'A', 0x00],
+                [
+                    vec![read("StringCount", "EFI_HII_SIBT_STRINGS_SCSU"); 2],
+                    vec![scsu.clone(); 2],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_STRINGS_SCSU_FONT",
+                &[],
+                vec![0x13, 0x00, 0x01, 0x00, b'A', 0x00],
+                [
+                    vec![read("FontIdentifier", "EFI_HII_SIBT_STRINGS_SCSU_FONT")],
+                    vec![read("StringCount", "EFI_HII_SIBT_STRINGS_SCSU_FONT"); 2],
+                    vec![scsu.clone(); 2],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_EXT1",
+                &[],
+                vec![0x30, 0x7E, 0x04, 0xAA],
+                vec![
+                    read("BlockType2", "EFI_HII_SIBT_EXT1"),
+                    read("Length", "EFI_HII_SIBT_EXT1"),
+                    "EFI_HII_SIBT_EXT1 Length 4 runs past the string information".to_string(),
+                ],
+            ),
+            (
+                "EFI_HII_SIBT_EXT2",
+                &[],
+                vec![0x31, 0x7E, 0x05, 0x00, 0xAA],
+                [
+                    vec![read("BlockType2", "EFI_HII_SIBT_EXT2")],
+                    vec![read("Length", "EFI_HII_SIBT_EXT2"); 2],
+                    vec!["EFI_HII_SIBT_EXT2 Length 5 runs past the string information".to_string()],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_EXT4",
+                &[],
+                vec![0x32, 0x7E, 0x07, 0x00, 0x00, 0x00, 0xAA],
+                [
+                    vec![read("BlockType2", "EFI_HII_SIBT_EXT4")],
+                    vec![read("Length", "EFI_HII_SIBT_EXT4"); 4],
+                    vec!["EFI_HII_SIBT_EXT4 Length 7 runs past the string information".to_string()],
+                ]
+                .concat(),
+            ),
+            (
+                "EFI_HII_SIBT_FONT",
+                &[],
+                FONT_1.to_vec(),
+                [
+                    vec![read("BlockType2", "EFI_HII_SIBT_EXT2")],
+                    vec![read("Length", "EFI_HII_SIBT_EXT2"); 2],
+                    vec![
+                        "EFI_HII_SIBT_EXT2 Length 15 runs past the string information".to_string();
+                        11
+                    ],
+                ]
+                .concat(),
+            ),
+        ];
+        for (block_name, before, block, refusals) in cases {
+            assert_eq!(
+                refusals.len(),
+                block.len() - 1,
+                "{block_name}: a refusal per cut"
+            );
+            let whole = [before, &block[..], &[0x00]].concat();
+            strings_packages_of(&[en_strings_package_with_window(
+                &EDK2_LANGUAGE_WINDOW,
+                &whole,
+            )]);
+
+            for (cut, refusal) in (1..block.len()).zip(refusals) {
+                let blocks = [before, &block[..cut]].concat();
+                let package = en_strings_package_with_window(&EDK2_LANGUAGE_WINDOW, &blocks);
+
+                assert_eq!(
+                    strings_package_refusal(package),
+                    strings_block_refusal(&refusal),
+                    "{block_name} cut at {cut}"
+                );
+            }
+            let package = en_strings_package_with_window(
+                &EDK2_LANGUAGE_WINDOW,
+                &[before, &block[..]].concat(),
+            );
+            assert_eq!(
+                strings_package_refusal(package),
+                strings_block_refusal("failed to read a string block type"),
+                "{block_name} without EFI_HII_SIBT_END"
             );
         }
     }

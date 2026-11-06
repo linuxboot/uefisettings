@@ -3349,7 +3349,7 @@ mod tests {
     fn questions_are_found_by_their_listed_name() {
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
         let values = VarStoreValues::new(&root, None);
-        let prompted = |prompt: &str| vec![StringMap::from([(3, prompt.to_string())])];
+        let prompted = |prompt: &str| vec![StringMap::from([(3, prompt.into())])];
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
                 &root,
@@ -4008,9 +4008,9 @@ mod nesting_tests {
     /// The strings of deep_form_set.
     fn deep_strings() -> Vec<StringMap> {
         vec![StringMap::from([
-            (3, "Deep".to_string()),
-            (4, "Help".to_string()),
-            (5, "Hidden".to_string()),
+            (3, "Deep".into()),
+            (4, "Help".into()),
+            (5, "Hidden".into()),
         ])]
     }
 

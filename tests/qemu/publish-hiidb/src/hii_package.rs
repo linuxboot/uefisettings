@@ -24,8 +24,22 @@ const LANGUAGE_NAME: u16 = 1;
 pub(crate) const EFI_HII_PACKAGE_FORMS: u8 = 0x02;
 const EFI_HII_PACKAGE_STRINGS: u8 = 0x04;
 const EFI_HII_PACKAGE_END: u8 = 0xDF;
-const EFI_HII_SIBT_END: u8 = 0x00;
-const EFI_HII_SIBT_STRING_UCS2: u8 = 0x14;
+pub(crate) const EFI_HII_SIBT_END: u8 = 0x00;
+pub(crate) const EFI_HII_SIBT_STRING_SCSU: u8 = 0x10;
+pub(crate) const EFI_HII_SIBT_STRING_SCSU_FONT: u8 = 0x11;
+pub(crate) const EFI_HII_SIBT_STRINGS_SCSU: u8 = 0x12;
+pub(crate) const EFI_HII_SIBT_STRINGS_SCSU_FONT: u8 = 0x13;
+pub(crate) const EFI_HII_SIBT_STRING_UCS2: u8 = 0x14;
+pub(crate) const EFI_HII_SIBT_STRING_UCS2_FONT: u8 = 0x15;
+pub(crate) const EFI_HII_SIBT_STRINGS_UCS2: u8 = 0x16;
+pub(crate) const EFI_HII_SIBT_STRINGS_UCS2_FONT: u8 = 0x17;
+pub(crate) const EFI_HII_SIBT_DUPLICATE: u8 = 0x20;
+pub(crate) const EFI_HII_SIBT_SKIP2: u8 = 0x21;
+pub(crate) const EFI_HII_SIBT_SKIP1: u8 = 0x22;
+pub(crate) const EFI_HII_SIBT_EXT1: u8 = 0x30;
+pub(crate) const EFI_HII_SIBT_EXT2: u8 = 0x31;
+pub(crate) const EFI_HII_SIBT_EXT4: u8 = 0x32;
+pub(crate) const EFI_HII_SIBT_FONT: u8 = 0x40;
 pub(crate) const EFI_IFR_FORM_OP: u8 = 0x01;
 pub(crate) const EFI_IFR_ONE_OF_OP: u8 = 0x05;
 pub(crate) const EFI_IFR_NUMERIC_OP: u8 = 0x07;
@@ -70,34 +84,54 @@ pub(crate) fn strings_package_with_header_padding<'a>(
     padding: &[u8],
     strings: impl IntoIterator<Item = &'a str>,
 ) -> Vec<u8> {
-    const LANGUAGE: &[u8] = b"en-US\0";
-    // EFI_HII_STRING_PACKAGE_HDR: the package header, HdrSize, StringInfoOffset,
-    // LanguageWindow, LanguageName and Language, then `padding`
-    let header_size = u32::try_from(4 + 4 + 4 + 32 + 2 + LANGUAGE.len() + padding.len())
-        .expect("the header fits 4 GiB");
     // EFI_HII_SIBT_STRING_UCS2 blocks, then EFI_HII_SIBT_END
     let blocks: Vec<u8> = strings
         .into_iter()
-        .flat_map(|string| {
-            [EFI_HII_SIBT_STRING_UCS2]
-                .into_iter()
-                .chain(string.encode_utf16().chain([0]).flat_map(u16::to_le_bytes))
-        })
+        .flat_map(|string| [&[EFI_HII_SIBT_STRING_UCS2][..], &ucs2(string)].concat())
         .chain([EFI_HII_SIBT_END])
+        .collect();
+    strings_package_with_blocks(b"en-US\0", &[0; 16], padding, &blocks)
+}
+
+/// A strings package of Language `language`, null terminator included, and LanguageWindow
+/// `language_window`, whose header holds `padding` after Language and whose string blocks are
+/// `blocks` (UEFI 2.11 §33.3.6).
+pub(crate) fn strings_package_with_blocks(
+    language: &[u8],
+    language_window: &[u16; 16],
+    padding: &[u8],
+    blocks: &[u8],
+) -> Vec<u8> {
+    // EFI_HII_STRING_PACKAGE_HDR: the package header, HdrSize, StringInfoOffset,
+    // LanguageWindow, LanguageName and Language, then `padding`
+    let header_size = u32::try_from(4 + 4 + 4 + 32 + 2 + language.len() + padding.len())
+        .expect("the header fits 4 GiB");
+    let language_window: Vec<u8> = language_window
+        .iter()
+        .flat_map(|window| window.to_le_bytes())
         .collect();
     package(
         EFI_HII_PACKAGE_STRINGS,
         &[
             &header_size.to_le_bytes()[..],
             &header_size.to_le_bytes(),
-            &[0; 32],
+            &language_window,
             &LANGUAGE_NAME.to_le_bytes(),
-            LANGUAGE,
+            language,
             padding,
-            &blocks,
+            blocks,
         ]
         .concat(),
     )
+}
+
+/// `string` as a null-terminated CHAR16 string.
+pub(crate) fn ucs2(string: &str) -> Vec<u8> {
+    string
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }
 
 /// An IFR op: EFI_IFR_OP_HEADER (UEFI 2.10 §33.3.8.2.1), then `data`.

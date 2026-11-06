@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|enhanced-auth-forms|dropped-password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|enhanced-auth-forms|dropped-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -37,6 +37,7 @@
 //! `dropped-password-forms` does the same with the package list of [`dropped_password_forms`].
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
+//! `string-blocks` does the same with the package list of [`string_blocks`].
 //! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `QHII` ACPI table,
 //! where `src/lib/hii/extract.rs` also looks, and puts its CRC-32 in `HiiDBCrc32`.
 //! `acpi-table-hiid` does the same with an `HIID` table, the other vendor ACPI table that
@@ -82,6 +83,7 @@ mod hii_package;
 mod padded_strings;
 mod password_forms;
 mod readwrite_forms;
+mod string_blocks;
 
 use alloc::vec::Vec;
 use core::ptr;
@@ -229,6 +231,11 @@ fn efi_main() -> Status {
         Some(Task::PublishReadWriteForms) => publish_readwrite_forms().map(|(address, length)| {
             println!("publish-hiidb: read/write forms registered; {length} bytes at {address:#x}");
         }),
+        Some(Task::RegisterStringBlocks) => register_package_list(
+            &string_blocks::package_list_bytes(),
+            "registering the string blocks",
+        )
+        .map(|()| println!("publish-hiidb: registered the string blocks")),
         Some(Task::PublishAcpiTable(signature)) => publish_acpi_table(signature).map(|length| {
             let signature = signature.escape_ascii();
             println!("publish-hiidb: {length} bytes in the {signature} ACPI table");
@@ -253,7 +260,7 @@ fn efi_main() -> Status {
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
                  |rt-data-readwrite-forms|password-forms|enhanced-auth-forms\
                  |dropped-password-forms|padded-strings\
-                 |acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
+                 |string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
                  |json-config-data-past-region|json-config-data-boot-services\
@@ -287,6 +294,8 @@ enum Task {
     /// Create the variable of [`readwrite_forms`] if missing, register its package list in the
     /// HII database, then publish the database in runtime-data pages.
     PublishReadWriteForms,
+    /// Register the package list of [`string_blocks`] in the HII database.
+    RegisterStringBlocks,
     /// Publish the database in an ACPI table of the signature.
     PublishAcpiTable([u8; 4]),
     /// Install an ACPI table of the signature whose body is JUNK_TABLE_BODY.
@@ -337,6 +346,7 @@ fn load_option() -> Option<Task> {
             Some(Task::RegisterDroppedPasswordForms)
         }
         Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
+        Ok(option) if option == cstr16!("string-blocks") => Some(Task::RegisterStringBlocks),
         Ok(option) if option == cstr16!("acpi-table") => {
             Some(Task::PublishAcpiTable(QHII_SIGNATURE))
         }

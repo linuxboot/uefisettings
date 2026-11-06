@@ -20,6 +20,10 @@
 //! `variable storage` the storage that efivarfs tells. The firmware also exports the package list
 //! that publish-hiidb's `padded_strings` registers, whose strings package header holds padding
 //! after Language's null terminator: `hii list-strings` reads its strings at StringInfoOffset.
+//! It exports that of publish-hiidb's `string_blocks` too: `hii list-strings` reads the strings
+//! of a strings package of every string block type, and its last string ID is the one up to
+//! which the firmware pads the package list's other strings package with an EFI_HII_SIBT_SKIP2
+//! block, as `hii extract-db` shows.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -28,6 +32,7 @@ use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::single_response;
+use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::Responses;
 use uefisettings_qemu_guest::StringPackage;
 use uefisettings_qemu_guest::Variable;
@@ -76,6 +81,44 @@ const MAXIMUM_100: &str = "8C78A505-BAA0-4C4A-869F-000000000007";
 /// The strings of publish-hiidb's `padded_strings`, by string ID, after its padded header.
 const PADDED_HEADER_STRINGS: [(&str, &str); 2] =
     [("1", "English"), ("2", "Strings after a padded header")];
+
+/// The strings of the first strings package of publish-hiidb's `string_blocks`, by string ID,
+/// which a block of every string block type assigns; string IDs 12 to 14 have none.
+const EVERY_STRING_BLOCK_TYPE: [(&str, &str); 12] = [
+    ("1", "Every string block type"),
+    ("2", "SCSU in a font"),
+    ("3", "SCSU strings"),
+    ("4", "\u{3042}\u{3044}"),
+    ("5", "SCSU strings in a font"),
+    ("6", "UCS-2"),
+    ("7", "UCS-2 in a font"),
+    ("8", "UCS-2 strings"),
+    ("9", "of one block"),
+    ("10", "UCS-2 strings in a font"),
+    ("11", "UCS-2"),
+    ("15", "After every string block type"),
+];
+/// The one string of the second strings package of publish-hiidb's `string_blocks`, string ID 1.
+const SECOND_STRINGS_PACKAGE: &str = "Second strings package";
+/// The Language of that second strings package.
+const SECOND_LANGUAGE: &str = "fr-FR";
+/// The GUID of publish-hiidb's `string_blocks` package list, in EFI_GUID's byte order.
+const STRING_BLOCKS_PACKAGE_LIST: [u8; 16] = [
+    0x05, 0xA5, 0x78, 0x8C, 0xA0, 0xBA, 0x4A, 0x4C, 0x86, 0x9F, 0x00, 0x00, 0x00, 0x00, 0x16, 0x00,
+];
+/// The file that extract-db writes for the string blocks of publish-hiidb's `string_blocks`.
+const STRING_BLOCKS_HIIDB: &str = "/tmp/hiidb-string-blocks.bin";
+/// The offset of PackageLength in EFI_HII_PACKAGE_LIST_HEADER, after PackageListGuid (UEFI 2.11
+/// §33.3.1.2).
+const PACKAGE_LENGTH_OFFSET: usize = 16;
+/// The size of EFI_HII_PACKAGE_LIST_HEADER.
+const PACKAGE_LIST_HEADER_SIZE: usize = 20;
+/// EFI_HII_PACKAGE_STRINGS, the Type of a strings package (UEFI 2.11 §33.3.1.1).
+const EFI_HII_PACKAGE_STRINGS: u8 = 0x04;
+/// The offset of StringInfoOffset in a strings package (UEFI 2.11 §33.3.6.1).
+const STRING_INFO_OFFSET_OFFSET: usize = 8;
+/// The offset of Language there, after LanguageWindow and LanguageName.
+const LANGUAGE_OFFSET: usize = 46;
 
 /// The bytes of every efivar file, or why it cannot be read.
 type Efivars = BTreeMap<String, Result<Vec<u8>, String>>;
@@ -451,4 +494,149 @@ fn list_strings_reads_a_strings_package_whose_header_holds_padding() {
         [&want],
         "the packages holding {PADDED_HEADER_STRINGS:?}"
     );
+}
+
+/// list-strings reads the strings of publish-hiidb's `string_blocks`: those of a block of every
+/// string block type in the first strings package (UEFI 2.11 §33.3.6.2), and the one string of
+/// the second, to which the firmware's HII database appended an EFI_HII_SIBT_SKIP2 block.
+#[test]
+fn list_strings_reads_every_string_block_type() {
+    let packages: Vec<StringPackage> = json(&["hii", "list-strings", "--json"]);
+    let holding = |wanted: &str| -> Vec<&StringPackage> {
+        packages
+            .iter()
+            .filter(|package| {
+                package
+                    .string_package
+                    .values()
+                    .any(|string| string == wanted)
+            })
+            .collect()
+    };
+    let package = |strings: &[(&str, &str)], language: &str| StringPackage {
+        string_package: strings
+            .iter()
+            .map(|&(id, string)| (id.to_string(), string.to_string()))
+            .collect(),
+        language: Some(language.to_string()),
+    };
+
+    assert_eq!(
+        holding(EVERY_STRING_BLOCK_TYPE[0].1),
+        [&package(&EVERY_STRING_BLOCK_TYPE, "en-US")],
+        "the packages holding {:?}",
+        EVERY_STRING_BLOCK_TYPE[0].1
+    );
+    assert_eq!(
+        holding(SECOND_STRINGS_PACKAGE),
+        [&package(&[("1", SECOND_STRINGS_PACKAGE)], SECOND_LANGUAGE)],
+        "the packages holding {SECOND_STRINGS_PACKAGE:?}"
+    );
+}
+
+/// The firmware's HII database pads the second strings package of publish-hiidb's
+/// `string_blocks` with an EFI_HII_SIBT_SKIP2 block up to the last string ID that it counts in
+/// the first (edk2's AdjustStringPackage), which is the last string ID that list-strings reads
+/// there. This checks only how uefisettings counts string IDs: edk2 widens SCSU bytes, and
+/// decodes no SCSU string.
+#[test]
+fn list_strings_counts_string_ids_as_the_firmware_does() {
+    let packages: Vec<StringPackage> = json(&["hii", "list-strings", "--json"]);
+    let last_string_ids: Vec<u16> = packages
+        .iter()
+        .filter(|package| {
+            package.string_package.get("1").map(String::as_str)
+                == Some(EVERY_STRING_BLOCK_TYPE[0].1)
+        })
+        .map(|package| {
+            package
+                .string_package
+                .keys()
+                .map(|id| id.parse().expect("a string ID"))
+                .max()
+                .expect("a string")
+        })
+        .collect();
+    let [last_string_id] = last_string_ids[..] else {
+        panic!(
+            "the last string IDs of the packages holding {:?}: {last_string_ids:?}",
+            EVERY_STRING_BLOCK_TYPE[0].1
+        );
+    };
+
+    let extracted = uefisettings(&["hii", "extract-db", STRING_BLOCKS_HIIDB]);
+    assert_eq!(extracted.code, Some(0), "extract-db: {extracted:#?}");
+    let hiidb = fs::read(STRING_BLOCKS_HIIDB)
+        .unwrap_or_else(|error| panic!("cannot read {STRING_BLOCKS_HIIDB}: {error}"));
+    let blocks = string_blocks(&hiidb, &STRING_BLOCKS_PACKAGE_LIST);
+
+    // EFI_HII_SIBT_STRING_UCS2 of string ID 1, EFI_HII_SIBT_SKIP2 of the IDs after it, then
+    // EFI_HII_SIBT_END
+    let padded = [
+        &[0x14][..],
+        &ucs2(SECOND_STRINGS_PACKAGE),
+        &[0x21],
+        &(last_string_id - 1).to_le_bytes(),
+        &[0x00],
+    ]
+    .concat();
+    assert_eq!(
+        blocks.get(SECOND_LANGUAGE),
+        Some(&padded),
+        "the string blocks of {SECOND_LANGUAGE}, with the strings package of {} read up to \
+         string ID {last_string_id}",
+        EVERY_STRING_BLOCK_TYPE[0].1
+    );
+}
+
+/// The string blocks of each strings package in the package list `guid` of the HII database
+/// `hiidb`, by Language.
+#[track_caller]
+fn string_blocks(hiidb: &[u8], guid: &[u8; 16]) -> BTreeMap<String, Vec<u8>> {
+    let mut rest = hiidb;
+    let mut blocks = BTreeMap::new();
+    while !rest.is_empty() {
+        let (list, next) = rest.split_at(uint32(rest, PACKAGE_LENGTH_OFFSET));
+        rest = next;
+        if !list.starts_with(guid) {
+            continue;
+        }
+
+        let mut packages = &list[PACKAGE_LIST_HEADER_SIZE..];
+        while !packages.is_empty() {
+            // Length, the low 24 bits, then Type
+            let header = uint32(packages, 0);
+            let (package, next) = packages.split_at(header & 0x00FF_FFFF);
+            packages = next;
+            if header >> 24 != usize::from(EFI_HII_PACKAGE_STRINGS) {
+                continue;
+            }
+            let language = &package[LANGUAGE_OFFSET..];
+            let language = &language[..language
+                .iter()
+                .position(|&byte| byte == 0)
+                .expect("a null-terminated Language")];
+            blocks.insert(
+                String::from_utf8(language.to_vec()).expect("an ASCII Language"),
+                package[uint32(package, STRING_INFO_OFFSET_OFFSET)..].to_vec(),
+            );
+        }
+    }
+    blocks
+}
+
+/// The UINT32 at `offset` in `bytes`.
+#[track_caller]
+fn uint32(bytes: &[u8], offset: usize) -> usize {
+    let field = bytes[offset..offset + 4].try_into().expect("a UINT32");
+    usize::try_from(u32::from_le_bytes(field)).expect("a UINT32 fits usize")
+}
+
+/// `string` as a null-terminated CHAR16 string.
+fn ucs2(string: &str) -> Vec<u8> {
+    string
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }

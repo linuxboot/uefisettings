@@ -754,7 +754,7 @@ mod get_and_set_tests {
 
     fn string_packages() -> Vec<StringMap> {
         let prompts = QUESTIONS.iter().map(|(prompt, ..)| *prompt).chain([STORED]);
-        vec![(FIRST_PROMPT..).zip(prompts.map(str::to_string)).collect()]
+        vec![(FIRST_PROMPT..).zip(prompts.map(Rc::from)).collect()]
     }
 
     /// A FormSet holding a CHECKBOX without a VarStore for each of QUESTIONS, each READ and WRITE

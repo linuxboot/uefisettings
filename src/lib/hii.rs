@@ -50,6 +50,7 @@ mod lockdown;
 #[cfg(target_os = "linux")]
 mod memory_access_denied;
 pub mod package;
+mod scsu;
 mod strings;
 // The EFI System Table and its configuration tables, which the Linux build reads from physical
 // memory where a firmware memory map bounds the reads.

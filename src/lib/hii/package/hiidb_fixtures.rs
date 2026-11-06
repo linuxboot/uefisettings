@@ -146,13 +146,45 @@ pub(super) fn strings_package_with_offsets(
     string_info_offset: u32,
     rest: &[u8],
 ) -> Vec<u8> {
+    strings_package_with_fields(&[0; 16], hdr_size, string_info_offset, rest)
+}
+
+/// An "en" strings package of LanguageWindow `language_window` whose string blocks are
+/// `blocks`, valid or not.
+pub(super) fn en_strings_package_with_window(
+    language_window: &[u16; 16],
+    blocks: &[u8],
+) -> Vec<u8> {
+    const LANGUAGE: &[u8] = b"en\0";
+    let hdr_size = STRINGS_LANGUAGE_OFFSET
+        + u32::try_from(LANGUAGE.len()).expect("the fixture's lengths fit a u32");
+    strings_package_with_fields(
+        language_window,
+        hdr_size,
+        hdr_size,
+        &[LANGUAGE, blocks].concat(),
+    )
+}
+
+/// A strings package of LanguageWindow `language_window`, HdrSize `hdr_size` and
+/// StringInfoOffset `string_info_offset`, valid or not, whose bytes from Language on are `rest`.
+fn strings_package_with_fields(
+    language_window: &[u16; 16],
+    hdr_size: u32,
+    string_info_offset: u32,
+    rest: &[u8],
+) -> Vec<u8> {
     let length = STRINGS_LANGUAGE_OFFSET
         + u32::try_from(rest.len()).expect("the fixture's lengths fit a u32");
+    let language_window: Vec<u8> = language_window
+        .iter()
+        .flat_map(|window| window.to_le_bytes())
+        .collect();
     [
         &strings_package_header(length)[..],
         &hdr_size.to_le_bytes(),
         &string_info_offset.to_le_bytes(),
-        &[0x00; 32],         // LanguageWindow
+        &language_window,
         &1u16.to_le_bytes(), // LanguageName
         rest,
     ]
