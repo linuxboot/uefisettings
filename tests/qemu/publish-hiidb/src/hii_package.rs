@@ -32,9 +32,20 @@ pub(crate) const EFI_IFR_NUMERIC_OP: u8 = 0x07;
 pub(crate) const EFI_IFR_PASSWORD_OP: u8 = 0x08;
 pub(crate) const EFI_IFR_ONE_OF_OPTION_OP: u8 = 0x09;
 pub(crate) const EFI_IFR_FORM_SET_OP: u8 = 0x0E;
+pub(crate) const EFI_IFR_AND_OP: u8 = 0x15;
+pub(crate) const EFI_IFR_MAP_OP: u8 = 0x22;
 pub(crate) const EFI_IFR_VARSTORE_OP: u8 = 0x24;
 pub(crate) const EFI_IFR_VARSTORE_EFI_OP: u8 = 0x26;
 const EFI_IFR_END_OP: u8 = 0x29;
+pub(crate) const EFI_IFR_GET_OP: u8 = 0x2B;
+pub(crate) const EFI_IFR_SET_OP: u8 = 0x2C;
+pub(crate) const EFI_IFR_READ_OP: u8 = 0x2D;
+pub(crate) const EFI_IFR_WRITE_OP: u8 = 0x2E;
+pub(crate) const EFI_IFR_ADD_OP: u8 = 0x3A;
+pub(crate) const EFI_IFR_UINT8_OP: u8 = 0x42;
+pub(crate) const EFI_IFR_UINT16_OP: u8 = 0x43;
+pub(crate) const EFI_IFR_TO_UINT_OP: u8 = 0x48;
+pub(crate) const EFI_IFR_THIS_OP: u8 = 0x58;
 
 /// A package list of `guid`: EFI_HII_PACKAGE_LIST_HEADER (UEFI 2.10 §33.3.1.2), then
 /// `packages` and the End package.

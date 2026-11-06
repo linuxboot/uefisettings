@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -28,6 +28,9 @@
 //! variable, for the tests to check what `uefisettings` extracts.
 //! `rt-data-global-variable-forms` is `rt-data`, with the package lists of
 //! [`global_variable_forms`] after those that the firmware exports.
+//! `rt-data-readwrite-forms` is `rt-data`, after it creates the variable of
+//! [`readwrite_forms`] if it is missing and registers its package list in the HII database, so
+//! that both Linux and `uefisettings.efi` in the UEFI Shell find it.
 //! `password-forms` publishes nothing: it registers the package list of [`password_forms`]
 //! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
 //! `padded-strings` publishes nothing either: it registers the package list of
@@ -61,6 +64,7 @@ mod global_variable_forms;
 mod hii_package;
 mod padded_strings;
 mod password_forms;
+mod readwrite_forms;
 
 use alloc::vec::Vec;
 use core::ptr;
@@ -163,6 +167,9 @@ fn efi_main() -> Status {
             "registering the padded strings",
         )
         .map(|()| println!("publish-hiidb: registered the padded strings")),
+        Some(Task::PublishReadWriteForms) => publish_readwrite_forms().map(|(address, length)| {
+            println!("publish-hiidb: read/write forms registered; {length} bytes at {address:#x}");
+        }),
         Some(Task::PublishAcpiTable(signature)) => publish_acpi_table(signature).map(|length| {
             let signature = signature.escape_ascii();
             println!("publish-hiidb: {length} bytes in the {signature} ACPI table");
@@ -183,7 +190,8 @@ fn efi_main() -> Status {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
-                 |password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
+                 |rt-data-readwrite-forms|password-forms|padded-strings|acpi-table\
+                 |acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all\
                  |set-auth-variables=PATH[,PATH]...]"
@@ -209,6 +217,9 @@ enum Task {
     RegisterPasswordForms,
     /// Register the package list of [`padded_strings`] in the HII database.
     RegisterPaddedStrings,
+    /// Create the variable of [`readwrite_forms`] if missing, register its package list in the
+    /// HII database, then publish the database in runtime-data pages.
+    PublishReadWriteForms,
     /// Publish the database in an ACPI table of the signature.
     PublishAcpiTable([u8; 4]),
     /// Install an ACPI table of the signature whose body is JUNK_TABLE_BODY.
@@ -243,6 +254,9 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("rt-data-global-variable-forms") => {
             Some(Task::Publish(rt_data, Database::WithGlobalVariableForms))
+        }
+        Ok(option) if option == cstr16!("rt-data-readwrite-forms") => {
+            Some(Task::PublishReadWriteForms)
         }
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
         Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
@@ -311,6 +325,36 @@ fn register_package_list(list: &[u8], step: &'static str) -> Result<(), Failure>
         )
     };
     status.to_result().map_err(|error| (step, error.status()))
+}
+
+/// Creates the variable of [`readwrite_forms`] unless it exists, as a driver creates its
+/// storage, registers the package list of [`readwrite_forms`], then publishes the database in
+/// runtime-data pages. Returns the address and length of the copy.
+fn publish_readwrite_forms() -> Result<(u64, u32), Failure> {
+    let vendor = VariableVendor(readwrite_forms::STORE_VENDOR);
+    match runtime::get_variable(readwrite_forms::STORE_NAME, &vendor, &mut []) {
+        Err(error) if error.status() == Status::NOT_FOUND => runtime::set_variable(
+            readwrite_forms::STORE_NAME,
+            &vendor,
+            readwrite_forms::STORE_ATTRIBUTES,
+            &readwrite_forms::STORE_DATA,
+        )
+        .map_err(|error| ("creating the ReadWriteData variable", error.status()))?,
+        // it exists, with data
+        Err(error) if error.status() == Status::BUFFER_TOO_SMALL => {}
+        Err(error) => return Err(("reading the ReadWriteData variable", error.status())),
+        Ok(_) => {
+            return Err((
+                "reading the ReadWriteData variable",
+                Status::BAD_BUFFER_SIZE,
+            ))
+        }
+    }
+    register_package_list(
+        &readwrite_forms::package_list_bytes(),
+        "registering the read/write forms",
+    )?;
+    publish(MemoryType::RUNTIME_SERVICES_DATA, Database::Exported)
 }
 
 /// The HII database that publish-hiidb copies.

@@ -130,6 +130,16 @@ publishes nothing, but registers the package list of
 database, a strings package whose header holds padding after its Language, which the firmware
 exports as it is.
 
+`publish-hiidb.efi rt-data-readwrite-forms` creates the variable `ReadWriteData` unless it
+exists, as a driver creates its storage, registers the forms of
+[`publish-hiidb/src/readwrite_forms.rs`](publish-hiidb/src/readwrite_forms.rs) in the HII
+database, then publishes the database as `rt-data` does: questions whose values READ and WRITE
+expressions give and keep (UEFI 2.11 §33.2.5.4.1), over `ReadWriteData` and over the buffer
+VarStore `AbsentBuffer`, which has no variable, and questions without a VarStore that
+`uefisettings` refuses, each for its own reason. The scenarios `hii-readwrite` and
+`shell-readwrite` get and set them from Linux and from the UEFI Shell, and DriverSample's
+"Serial port number", whose WRITE sets three more fields.
+
 `publish-hiidb.efi acpi-table` sets no `HiiDB` variable: it installs the database as the body
 of a `QHII` ACPI table through `EFI_ACPI_TABLE_PROTOCOL`, which `uefisettings` reads from
 `/sys/firmware/acpi/tables/QHII`. QEMU's `-acpitable` cannot add it: only the x86 machines

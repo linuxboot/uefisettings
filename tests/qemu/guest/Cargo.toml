@@ -71,6 +71,10 @@ name = "hii_write"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_readwrite"
+required-features = ["test-vm"]
+
+[[test]]
 name = "secboot"
 required-features = ["test-vm"]
 

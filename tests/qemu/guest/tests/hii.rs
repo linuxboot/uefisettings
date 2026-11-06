@@ -99,8 +99,8 @@ const DEFAULTS: [DefaultQuestion; 4] = [
 ];
 
 /// Questions whose values the HII backend cannot read from Linux: on DriverSample's
-/// name/value store, and on the RAM disk form of the firmware, which has no store.
-const UNAVAILABLE_QUESTIONS: [&str; 3] = ["NameValueVar0", "Disk Memory Type:", "Size (Hex):"];
+/// name/value store.
+const UNAVAILABLE_QUESTIONS: [&str; 1] = ["NameValueVar0"];
 
 /// The answers of the questions on bit fields of DriverSample's EFI variable MyEfiBitVar,
 /// which lacks runtime access, each ending with the default of Vfr.vfr if it has one, and then

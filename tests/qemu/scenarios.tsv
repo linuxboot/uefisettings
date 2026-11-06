@@ -29,12 +29,14 @@ hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data-runtime-my-efi-v
 hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard	-
 hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access	-
 hii-global-variables	/publish-hiidb.efi padded-strings;/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables	-
+hii-readwrite	/DriverSample.efi;/publish-hiidb.efi rt-data-readwrite-forms	my-ifr-nv-data.json	hii_readwrite	-
 hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi/qhii::	-
 hii-acpi-hiid	/DriverSample.efi;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/hiid::	-
 hii-acpi-two-tables	/DriverSample.efi;/publish-hiidb.efi acpi-table-junk-qhii;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/two_tables::	-
 shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-reboot,shell:then-linux	-
 shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions	-
 shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password	-
+shell-readwrite	/DriverSample.efi;/publish-hiidb.efi rt-data-readwrite-forms	-	shell:readwrite	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 shell-authA7	/DriverSample.efi	my-ifr-nv-data-authA7.json	shell:authA7	-
 shell-rng	-	-	shell:rng	devices=virtio-rng
