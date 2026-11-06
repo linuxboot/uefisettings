@@ -98,6 +98,9 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
         | ParsedOperation::EqIdVal(_)
         | ParsedOperation::EqIdId(_)
         | ParsedOperation::EqIdValList(_)
+        | ParsedOperation::Get(_)
+        | ParsedOperation::Set(_)
+        | ParsedOperation::FormMap(_)
         | ParsedOperation::Placeholder => None,
     }
 }

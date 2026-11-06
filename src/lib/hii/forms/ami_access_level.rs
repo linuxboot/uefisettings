@@ -106,6 +106,9 @@ fn declares_ami_access_level(op: &IFROperation) -> bool {
         | ParsedOperation::EqIdVal(_)
         | ParsedOperation::EqIdId(_)
         | ParsedOperation::EqIdValList(_)
+        | ParsedOperation::Get(_)
+        | ParsedOperation::Set(_)
+        | ParsedOperation::FormMap(_)
         | ParsedOperation::Placeholder => false,
     }
 }

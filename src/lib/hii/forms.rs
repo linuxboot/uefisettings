@@ -626,6 +626,21 @@ pub enum ParsedOperation {
     EqIdVal(EqIdVal),
     EqIdId(EqIdId),
     EqIdValList(EqIdValList),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "decoded IFR payload; only tests read it yet")
+    )]
+    Get(VarStoreOperand),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "decoded IFR payload; only tests read it yet")
+    )]
+    Set(VarStoreOperand),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "decoded IFR payload; only tests read it yet")
+    )]
+    FormMap(FormMap),
     #[default]
     Placeholder,
 }
@@ -1127,6 +1142,75 @@ pub struct EqIdValList {
     pub value_list: Vec<u16>,
 }
 
+/// The stored value that an EFI_IFR_GET reads or an EFI_IFR_SET writes (UEFI 2.11 §33.3.8.3.27,
+/// §33.3.8.3.66).
+#[derive(BinRead, Debug, PartialEq, Clone, Copy)]
+#[br(little)]
+pub struct VarStoreOperand {
+    pub var_store_id: u16,
+    /// VarOffset in a VARSTORE or VARSTORE_EFI, VarName in a VARSTORE_NAME_VALUE
+    pub var_store_info: u16,
+    /// An EFI_IFR_TYPE_x
+    pub var_store_type: u8,
+}
+
+/// EFI_HII_STANDARD_FORM_GUID, the method of a standard map form (UEFI 2.11 §33.3.8.3.25).
+const EFI_HII_STANDARD_FORM_GUID: Guid = Guid {
+    data1: 0x3BD2_F4EC,
+    data2: 0xE524,
+    data3: 0x46E4,
+    data4: [0xA9, 0xD8, 0x51, 0x01, 0x17, 0x42, 0x55, 0x62],
+};
+
+/// The bytes of an EFI_IFR_FORM_MAP_METHOD: MethodTitle and MethodIdentifier.
+const EFI_IFR_FORM_MAP_METHOD_SIZE: usize = 18;
+
+/// An EFI_IFR_FORM_MAP_METHOD.
+#[derive(BinRead, Debug, PartialEq, Clone, Copy)]
+#[br(little)]
+pub struct FormMapMethod {
+    pub method_title: u16,
+    pub method_identifier: Guid,
+}
+
+/// An EFI_IFR_FORM_MAP.
+#[derive(Debug, PartialEq)]
+pub struct FormMap {
+    pub form_id: u16,
+    pub methods: Vec<FormMapMethod>,
+}
+
+impl FormMap {
+    /// Decodes the FormId and the methods that fit in `data`, or None without room for the
+    /// FormId. edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes fails the FormSet of a
+    /// FORM_MAP without a method; here its questions stay, as in other forms.
+    fn decode(data: &[u8]) -> Option<Self> {
+        let (form_id, methods) = data.split_first_chunk::<2>()?;
+        let methods = methods
+            .chunks_exact(EFI_IFR_FORM_MAP_METHOD_SIZE)
+            .map(|method| Cursor::new(method).read_le())
+            .collect::<BinResult<Vec<FormMapMethod>>>()
+            .ok()?;
+        Some(Self {
+            form_id: u16::from_le_bytes(*form_id),
+            methods,
+        })
+    }
+
+    /// Whether this is a standard map form, whose questions edk2-stable202608
+    /// SetupBrowserDxe/Setup.c GetQuestionValue and SetQuestionValue take through their READ and
+    /// WRITE expressions, as they take those of every FORM.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "nothing reads FORM_MAP methods yet")
+    )]
+    pub fn has_standard_method(&self) -> bool {
+        self.methods
+            .iter()
+            .any(|method| method.method_identifier == EFI_HII_STANDARD_FORM_GUID)
+    }
+}
+
 #[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 pub struct Time {
@@ -1563,6 +1647,21 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
             debug!("EqIdValList is {:?}", parsed);
             node.parsed_data = ParsedOperation::EqIdValList(parsed);
         }
+        // An undecoded GET, SET or FORM_MAP keeps the FormSet, whose other questions get and set
+        // still reach: an evaluation refuses an undecoded GET or SET, and an undecoded FORM_MAP is
+        // no standard map form.
+        IFROpCode::Get => match data_cursor.read_ne() {
+            Ok(parsed) => node.parsed_data = ParsedOperation::Get(parsed),
+            Err(error) => debug!("leaving a Get undecoded: {error}"),
+        },
+        IFROpCode::Set => match data_cursor.read_ne() {
+            Ok(parsed) => node.parsed_data = ParsedOperation::Set(parsed),
+            Err(error) => debug!("leaving a Set undecoded: {error}"),
+        },
+        IFROpCode::FormMap => match FormMap::decode(&node.data) {
+            Some(parsed) => node.parsed_data = ParsedOperation::FormMap(parsed),
+            None => debug!("leaving a FormMap without a FormId undecoded"),
+        },
         _ => (),
     }
 
@@ -3859,6 +3958,172 @@ mod nesting_tests {
             format!("{:#?}", root.borrow()),
             format!("{want:#?}"),
             "{{:#?}}, borrowed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expression_operand_tests {
+    use super::ifr_fixtures::*;
+    use super::*;
+
+    /// EFI_HII_STANDARD_FORM_GUID 3BD2F4EC-E524-46E4-A9D8-510117425562 as stored.
+    const STANDARD_FORM_GUID: [u8; 16] = [
+        0xEC, 0xF4, 0xD2, 0x3B, 0x24, 0xE5, 0xE4, 0x46, 0xA9, 0xD8, 0x51, 0x01, 0x17, 0x42, 0x55,
+        0x62,
+    ];
+
+    /// The ops of the FORM of a FormSet that holds `body` in it.
+    fn parsed_form(body: &[Vec<u8>]) -> Vec<Rc<RefCell<IFROperation>>> {
+        let root = parse_form_set(&[form(1, body)]);
+        let root = root.borrow();
+        let form_set = root.children[0].borrow();
+        let form = form_set.children[0].borrow();
+        form.children.clone()
+    }
+
+    /// A FORM_MAP of form 4 with a method per (MethodTitle, MethodIdentifier), holding no ops.
+    fn form_map(methods: &[(u16, [u8; 16])]) -> Vec<u8> {
+        let data: Vec<u8> = 4u16
+            .to_le_bytes()
+            .into_iter()
+            .chain(
+                methods
+                    .iter()
+                    .flat_map(|(title, guid)| title.to_le_bytes().into_iter().chain(*guid)),
+            )
+            .collect();
+        [operation(FORM_MAP, true, &data), END.to_vec()].concat()
+    }
+
+    /// The first op of a FormSet that holds `ops` outside forms.
+    fn parsed_first(ops: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
+        let root = parse_form_set(ops);
+        let root = root.borrow();
+        let form_set = root.children[0].borrow();
+        Rc::clone(&form_set.children[0])
+    }
+
+    /// GET and SET name a VarStore, a VarOffset or VarName, and the type of the value
+    /// (UEFI 2.11 §33.3.8.3.27, §33.3.8.3.66).
+    #[test]
+    fn get_and_set_decode_their_var_store_operand() {
+        let ops = parsed_form(&[
+            operation(0x2B, false, &[0x34, 0x12, 0xC1, 0x00, EFI_IFR_TYPE_BOOLEAN]),
+            operation(
+                0x2C,
+                false,
+                &[0x01, 0x00, 0x02, 0x01, EFI_IFR_TYPE_NUM_SIZE_16],
+            ),
+        ]);
+
+        let get = ops[0].borrow();
+        let ParsedOperation::Get(get) = &get.parsed_data else {
+            panic!("GET not decoded: {:?}", get.parsed_data);
+        };
+        assert_eq!(
+            *get,
+            VarStoreOperand {
+                var_store_id: 0x1234,
+                var_store_info: 0xC1,
+                var_store_type: EFI_IFR_TYPE_BOOLEAN,
+            },
+            "GET"
+        );
+        let set = ops[1].borrow();
+        let ParsedOperation::Set(set) = &set.parsed_data else {
+            panic!("SET not decoded: {:?}", set.parsed_data);
+        };
+        assert_eq!(
+            *set,
+            VarStoreOperand {
+                var_store_id: 1,
+                var_store_info: 0x102,
+                var_store_type: EFI_IFR_TYPE_NUM_SIZE_16,
+            },
+            "SET"
+        );
+    }
+
+    /// A GET or SET too short for its operand is left undecoded, for the evaluation to refuse,
+    /// and does not fail the FormSet, whose other questions get and set still reach.
+    #[test]
+    fn short_get_and_set_are_not_decoded_and_keep_the_form_set() {
+        for op_code in [0x2B, 0x2C] {
+            let ops = parsed_form(&[operation(op_code, false, &[0x34, 0x12, 0xC1, 0x00])]);
+
+            assert!(
+                matches!(ops[0].borrow().parsed_data, ParsedOperation::Placeholder),
+                "opcode {op_code:#x}: {:?}",
+                ops[0].borrow().parsed_data
+            );
+        }
+    }
+
+    /// A FORM_MAP decodes its methods; it is a standard map form if one of them is
+    /// EFI_HII_STANDARD_FORM_GUID (UEFI 2.11 §33.3.8.3.25), the forms whose READ and WRITE
+    /// expressions edk2-stable202608 SetupBrowserDxe evaluates (IfrParse.c ParseOpCodes).
+    #[test]
+    fn form_map_decodes_its_methods() {
+        let cases = [
+            (
+                "standard second",
+                vec![(5, OTHER_GUID), (6, STANDARD_FORM_GUID)],
+                true,
+            ),
+            ("standard only", vec![(6, STANDARD_FORM_GUID)], true),
+            ("no standard", vec![(5, OTHER_GUID)], false),
+        ];
+        for (name, methods, standard) in cases {
+            let op = parsed_first(&[form_map(&methods)]);
+
+            let op = op.borrow();
+            let ParsedOperation::FormMap(form_map) = &op.parsed_data else {
+                panic!("{name}: FORM_MAP not decoded: {:?}", op.parsed_data);
+            };
+            assert_eq!(form_map.form_id, 4, "{name}: FormId");
+            let titles: Vec<u16> = form_map
+                .methods
+                .iter()
+                .map(|method| method.method_title)
+                .collect();
+            let want: Vec<u16> = methods.iter().map(|&(title, _)| title).collect();
+            assert_eq!(titles, want, "{name}: MethodTitles");
+            assert_eq!(form_map.has_standard_method(), standard, "{name}");
+        }
+    }
+
+    /// A FORM_MAP keeps the methods that fit in its Length; one without room for its FormId is
+    /// left undecoded, and neither fails the FormSet.
+    #[test]
+    fn short_form_map_keeps_the_methods_that_fit() {
+        let truncated = [
+            operation(
+                FORM_MAP,
+                true,
+                &[
+                    &4u16.to_le_bytes()[..],
+                    &[0x06, 0x00],
+                    &STANDARD_FORM_GUID[..8],
+                ]
+                .concat(),
+            ),
+            END.to_vec(),
+        ]
+        .concat();
+        let op = parsed_first(&[truncated]);
+        let op = op.borrow();
+        let ParsedOperation::FormMap(form_map) = &op.parsed_data else {
+            panic!("FORM_MAP not decoded: {:?}", op.parsed_data);
+        };
+        assert!(form_map.methods.is_empty(), "{:?}", form_map.methods);
+        assert!(!form_map.has_standard_method(), "a cut-off method");
+
+        let op = parsed_first(&[[operation(FORM_MAP, true, &[0x04]), END.to_vec()].concat()]);
+        assert!(
+            matches!(op.borrow().parsed_data, ParsedOperation::Placeholder),
+            "{:?}",
+            op.borrow().parsed_data
         );
     }
 }
