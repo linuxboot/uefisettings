@@ -116,6 +116,12 @@ use crate::hii::VariableKey;
 #[cfg(variable_data)]
 pub(crate) mod globals;
 #[cfg(variable_data)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "nothing stages a set in a load option yet")
+)]
+pub(crate) mod load_option;
+#[cfg(variable_data)]
 pub(crate) mod secure_boot_mode;
 
 /// The size of EFI_TIME (UEFI 2.11 §8.3.1).
