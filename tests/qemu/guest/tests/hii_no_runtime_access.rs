@@ -59,13 +59,13 @@ fn check_box_answers() -> [String; 2] {
         format!(
             "{} <selectable or grayed-out or suppressed: {}; {}>",
             check_box_answer(),
-            unread("QuestionRef1", 1),
-            unread("EqIdVal", 1)
+            unread("EFI_IFR_QUESTION_REF1", 1),
+            unread("EFI_IFR_EQ_ID_VAL", 1)
         ),
         format!(
             "{} <selectable or suppressed: {}>",
             check_box_answer(),
-            unread("EqIdVal", 2)
+            unread("EFI_IFR_EQ_ID_VAL", 2)
         ),
     ]
 }
@@ -99,7 +99,10 @@ fn list_questions_reports_numeric_and_one_of_defaults() {
     // The standard defaults in DriverSample's Vfr.vfr: `default = 18` and the option
     // flagged DEFAULT.
     // The numeric is in a grayoutif on two questions on the variable.
-    let numeric_states = format!(" <selectable or grayed-out: {}>", unread("EqIdVal", 0x0c));
+    let numeric_states = format!(
+        " <selectable or grayed-out: {}>",
+        unread("EFI_IFR_EQ_ID_VAL", 0x0c)
+    );
     for (name, default, states) in [
         (NUMERIC, "18", numeric_states.as_str()),
         (ONE_OF, "My one-of text #2", ""),

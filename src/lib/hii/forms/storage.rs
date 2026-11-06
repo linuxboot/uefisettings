@@ -750,7 +750,7 @@ mod non_efi_varstore_tests {
             ),
             (
                 ValueUnavailable::NotDecoded(IFROpCode::FormSet),
-                "<ValueUnavailable: FormSet value not decoded>",
+                "<ValueUnavailable: EFI_IFR_FORM_SET value not decoded>",
             ),
             (
                 ValueUnavailable::Truncated { offset: 3, len: 8 },
@@ -972,7 +972,7 @@ pub(super) enum ValueUnavailable {
     ReadError(String),
     #[error("{0}")]
     BitField(NumericFormatError),
-    #[error("{0:?} value not decoded")]
+    #[error("{} value not decoded", .0.spec_name())]
     NotDecoded(IFROpCode),
     #[error("failed to fill whole buffer (offset: {offset}; buflen: {len})")]
     Truncated {
@@ -1421,7 +1421,7 @@ mod efivar_reader_tests {
     #[test]
     fn disabled_source_leaves_value_conditions_undetermined() {
         let efivars = Efivars::new();
-        let undetermined = " <selectable or suppressed: EqIdVal of question 0x0002: \
+        let undetermined = " <selectable or suppressed: EFI_IFR_EQ_ID_VAL of question 0x0002: \
             <ValueUnavailable: EFI variables not read>>";
 
         efivars.write(&efi_variable("Setup", 2), &[1, 0]);
@@ -1596,7 +1596,7 @@ mod efivar_reader_tests {
                 efi_variable("FormSet", 4),
                 &mut disabled_reader()
             ),
-            Err("<ValueUnavailable: FormSet value not decoded>".to_string()),
+            Err("<ValueUnavailable: EFI_IFR_FORM_SET value not decoded>".to_string()),
             "FORM_SET"
         );
     }
@@ -1660,7 +1660,7 @@ mod efivar_reader_tests {
             .expect_err("no VarStore");
         assert_eq!(
             question_bytes(&form_set.borrow(), efi_variable("FormSet", 4), &mut reader),
-            Err("<ValueUnavailable: FormSet value not decoded>".to_string()),
+            Err("<ValueUnavailable: EFI_IFR_FORM_SET value not decoded>".to_string()),
             "FORM_SET"
         );
 

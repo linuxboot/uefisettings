@@ -1156,7 +1156,7 @@ mod question_value_tests {
                 ifr_default_2(0x0000, eq_id_val()),
                 format!(
                     "<ValueUnavailable: {reason}> <IFR default: unknown (EFI_IFR_VALUE \
-                     expression not evaluated: EqIdVal of question 0x0001: \
+                     expression not evaluated: EFI_IFR_EQ_ID_VAL of question 0x0001: \
                      <ValueUnavailable: {reason}>)>"
                 ),
             ),

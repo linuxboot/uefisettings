@@ -98,7 +98,11 @@ const EFI_IFR_TYPE_NUM_SIZE_16: u8 = 0x01;
 const EFI_IFR_TYPE_NUM_SIZE_32: u8 = 0x02;
 const EFI_IFR_TYPE_NUM_SIZE_64: u8 = 0x03;
 const EFI_IFR_TYPE_BOOLEAN: u8 = 0x04;
+const EFI_IFR_TYPE_TIME: u8 = 0x05;
+const EFI_IFR_TYPE_DATE: u8 = 0x06;
+const EFI_IFR_TYPE_STRING: u8 = 0x07;
 const EFI_IFR_TYPE_OTHER: u8 = 0x08;
+const EFI_IFR_TYPE_REF: u8 = 0x0C;
 // edk2-stable202608 MdeModulePkg/Include/Guid/MdeModuleHii.h; the GUID is
 // 82DDD68B-9163-4187-9B27-20A8FD60A71D, here in its EFI_GUID byte order
 const EDKII_IFR_BIT_VARSTORE_GUID: [u8; 16] = [
@@ -328,6 +332,116 @@ pub enum IFROpCode {
     #[br(magic = 0x64u8)]
     Match2,
     Unknown(u8),
+}
+
+impl IFROpCode {
+    /// The name of the opcode in UEFI 2.11 Table 33.11, as edk2-stable202608
+    /// MdePkg/Include/Uefi/UefiInternalFormRepresentation.h defines it, without _OP.
+    pub(crate) fn spec_name(self) -> &'static str {
+        match self {
+            Self::Form => "EFI_IFR_FORM",
+            Self::Subtitle => "EFI_IFR_SUBTITLE",
+            Self::Text => "EFI_IFR_TEXT",
+            Self::Image => "EFI_IFR_IMAGE",
+            Self::OneOf => "EFI_IFR_ONE_OF",
+            Self::CheckBox => "EFI_IFR_CHECKBOX",
+            Self::Numeric => "EFI_IFR_NUMERIC",
+            Self::Password => "EFI_IFR_PASSWORD",
+            Self::OneOfOption => "EFI_IFR_ONE_OF_OPTION",
+            Self::SuppressIf => "EFI_IFR_SUPPRESS_IF",
+            Self::Locked => "EFI_IFR_LOCKED",
+            Self::Action => "EFI_IFR_ACTION",
+            Self::ResetButton => "EFI_IFR_RESET_BUTTON",
+            Self::FormSet => "EFI_IFR_FORM_SET",
+            Self::Ref => "EFI_IFR_REF",
+            Self::NoSubmitIf => "EFI_IFR_NO_SUBMIT_IF",
+            Self::InconsistentIf => "EFI_IFR_INCONSISTENT_IF",
+            Self::EqIdVal => "EFI_IFR_EQ_ID_VAL",
+            Self::EqIdId => "EFI_IFR_EQ_ID_ID",
+            Self::EqIdValList => "EFI_IFR_EQ_ID_VAL_LIST",
+            Self::And => "EFI_IFR_AND",
+            Self::Or => "EFI_IFR_OR",
+            Self::Not => "EFI_IFR_NOT",
+            Self::Rule => "EFI_IFR_RULE",
+            Self::GrayOutIf => "EFI_IFR_GRAY_OUT_IF",
+            Self::Date => "EFI_IFR_DATE",
+            Self::Time => "EFI_IFR_TIME",
+            Self::String => "EFI_IFR_STRING",
+            Self::Refresh => "EFI_IFR_REFRESH",
+            Self::DisableIf => "EFI_IFR_DISABLE_IF",
+            Self::Animation => "EFI_IFR_ANIMATION",
+            Self::ToLower => "EFI_IFR_TO_LOWER",
+            Self::ToUpper => "EFI_IFR_TO_UPPER",
+            Self::Map => "EFI_IFR_MAP",
+            Self::OrderedList => "EFI_IFR_ORDERED_LIST",
+            Self::VarStore => "EFI_IFR_VARSTORE",
+            Self::VarStoreNameValue => "EFI_IFR_VARSTORE_NAME_VALUE",
+            Self::VarStoreEfi => "EFI_IFR_VARSTORE_EFI",
+            Self::VarStoreDevice => "EFI_IFR_VARSTORE_DEVICE",
+            Self::Version => "EFI_IFR_VERSION",
+            Self::End => "EFI_IFR_END",
+            Self::Match => "EFI_IFR_MATCH",
+            Self::Get => "EFI_IFR_GET",
+            Self::Set => "EFI_IFR_SET",
+            Self::Read => "EFI_IFR_READ",
+            Self::Write => "EFI_IFR_WRITE",
+            Self::Equal => "EFI_IFR_EQUAL",
+            Self::NotEqual => "EFI_IFR_NOT_EQUAL",
+            Self::GreaterThan => "EFI_IFR_GREATER_THAN",
+            Self::GreaterEqual => "EFI_IFR_GREATER_EQUAL",
+            Self::LessThan => "EFI_IFR_LESS_THAN",
+            Self::LessEqual => "EFI_IFR_LESS_EQUAL",
+            Self::BitwiseAnd => "EFI_IFR_BITWISE_AND",
+            Self::BitwiseOr => "EFI_IFR_BITWISE_OR",
+            Self::BitwiseNot => "EFI_IFR_BITWISE_NOT",
+            Self::ShiftLeft => "EFI_IFR_SHIFT_LEFT",
+            Self::ShiftRight => "EFI_IFR_SHIFT_RIGHT",
+            Self::Add => "EFI_IFR_ADD",
+            Self::Subtract => "EFI_IFR_SUBTRACT",
+            Self::Multiply => "EFI_IFR_MULTIPLY",
+            Self::Divide => "EFI_IFR_DIVIDE",
+            Self::Modulo => "EFI_IFR_MODULO",
+            Self::RuleRef => "EFI_IFR_RULE_REF",
+            Self::QuestionRef1 => "EFI_IFR_QUESTION_REF1",
+            Self::QuestionRef2 => "EFI_IFR_QUESTION_REF2",
+            Self::Uint8 => "EFI_IFR_UINT8",
+            Self::Uint16 => "EFI_IFR_UINT16",
+            Self::Uint32 => "EFI_IFR_UINT32",
+            Self::Uint64 => "EFI_IFR_UINT64",
+            Self::True => "EFI_IFR_TRUE",
+            Self::False => "EFI_IFR_FALSE",
+            Self::ToUint => "EFI_IFR_TO_UINT",
+            Self::ToString => "EFI_IFR_TO_STRING",
+            Self::ToBoolean => "EFI_IFR_TO_BOOLEAN",
+            Self::Mid => "EFI_IFR_MID",
+            Self::Find => "EFI_IFR_FIND",
+            Self::Token => "EFI_IFR_TOKEN",
+            Self::StringRef1 => "EFI_IFR_STRING_REF1",
+            Self::StringRef2 => "EFI_IFR_STRING_REF2",
+            Self::Conditional => "EFI_IFR_CONDITIONAL",
+            Self::QuestionRef3 => "EFI_IFR_QUESTION_REF3",
+            Self::Zero => "EFI_IFR_ZERO",
+            Self::One => "EFI_IFR_ONE",
+            Self::Ones => "EFI_IFR_ONES",
+            Self::Undefined => "EFI_IFR_UNDEFINED",
+            Self::Length => "EFI_IFR_LENGTH",
+            Self::Dup => "EFI_IFR_DUP",
+            Self::This => "EFI_IFR_THIS",
+            Self::Span => "EFI_IFR_SPAN",
+            Self::Value => "EFI_IFR_VALUE",
+            Self::Default => "EFI_IFR_DEFAULT",
+            Self::DefaultStore => "EFI_IFR_DEFAULTSTORE",
+            Self::FormMap => "EFI_IFR_FORM_MAP",
+            Self::Catenate => "EFI_IFR_CATENATE",
+            Self::Guid => "EFI_IFR_GUID",
+            Self::Security => "EFI_IFR_SECURITY",
+            Self::ModalTag => "EFI_IFR_MODAL_TAG",
+            Self::RefreshId => "EFI_IFR_REFRESH_ID",
+            Self::WarningIf => "EFI_IFR_WARNING_IF",
+            Self::Match2 => "EFI_IFR_MATCH2",
+            Self::Unknown(_) => "an unknown IFR opcode",
+        }
+    }
 }
 
 /// IFROperation is a node for a tree data structure.
@@ -626,20 +740,8 @@ pub enum ParsedOperation {
     EqIdVal(EqIdVal),
     EqIdId(EqIdId),
     EqIdValList(EqIdValList),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "decoded IFR payload; only tests read it yet")
-    )]
     Get(VarStoreOperand),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "decoded IFR payload; only tests read it yet")
-    )]
     Set(VarStoreOperand),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "decoded IFR payload; only tests read it yet")
-    )]
     FormMap(FormMap),
     #[default]
     Placeholder,
@@ -1200,10 +1302,6 @@ impl FormMap {
     /// Whether this is a standard map form, whose questions edk2-stable202608
     /// SetupBrowserDxe/Setup.c GetQuestionValue and SetQuestionValue take through their READ and
     /// WRITE expressions, as they take those of every FORM.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing reads FORM_MAP methods yet")
-    )]
     pub fn has_standard_method(&self) -> bool {
         self.methods
             .iter()
@@ -1987,15 +2085,14 @@ mod choice_for_set_tests {
     /// The VariableNotFound of the efivar Missing.
     const MISSING_NOT_FOUND: &str = "no EFI variable Missing-00000000-0000-0000-0000-000000000000";
     /// Why the EQ_ID_VAL on question 2, on the efivar Missing, is not evaluated.
-    const MISSING_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI variable \
-        Missing-00000000-0000-0000-0000-000000000000>";
+    const MISSING_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: no EFI \
+        variable Missing-00000000-0000-0000-0000-000000000000>";
     /// Why the EQ_ID_VAL on question 2, on AMI firmware's buffer VarStore SystemAccess without
     /// an efivar, is not evaluated.
-    const SYSTEM_ACCESS_INPUT: &str = "EqIdVal of question 0x0002: <ValueUnavailable: no EFI \
-        variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore requires \
-        EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level there \
-        (0 Administrator, 1 User); \
-        --access-level administrator|user states one>";
+    const SYSTEM_ACCESS_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: \
+        no EFI variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore \
+        requires EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level \
+        there (0 Administrator, 1 User); --access-level administrator|user states one>";
 
     /// set's choice for PROMPT in the FormSet `root`, where only the efivar Present, of
     /// 1 byte, exists.
@@ -2916,34 +3013,45 @@ fn find_corresponding_varstore(
 
 /// Returns the varstore of `var_store_id` among the children of `form_set`.
 fn form_set_varstore(form_set: &IFROperation, var_store_id: u16) -> Result<Box<dyn VariableStore>> {
-    // look at its children
-
-    for child in &form_set.children {
-        match &child.borrow().parsed_data {
-            ParsedOperation::VarStore(v) => {
-                if v.var_store_id == var_store_id {
-                    return Ok(Box::new(v.clone()));
-                }
-            }
-            ParsedOperation::VarStoreEfi(v) => {
-                if v.var_store_id == var_store_id {
-                    return Ok(Box::new(v.clone()));
-                }
-            }
-            ParsedOperation::VarStoreNameValue(v) => {
-                if v.var_store_id == var_store_id {
-                    return Err(anyhow!(
-                        "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
-                    ));
-                }
-            }
-            _ => {}
-        }
+    match declared_var_store(form_set, var_store_id) {
+        Some(DeclaredStore::Variable(store)) => Ok(store),
+        Some(DeclaredStore::NameValue) => Err(anyhow!(
+            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
+        )),
+        None => Err(anyhow!(
+            "no supported varstore with matching id {:#06x} found",
+            var_store_id
+        )),
     }
-    Err(anyhow!(
-        "no supported varstore with matching id {:#06x} found",
-        var_store_id
-    ))
+}
+
+/// A VarStore that a FormSet declares.
+enum DeclaredStore {
+    /// A VARSTORE or VARSTORE_EFI, which an EFI variable of its Name and Guid holds; UEFI 2.11
+    /// §33.2.5.6 makes the EFI variable a specialized form of Buffer Storage
+    Variable(Box<dyn VariableStore>),
+    /// A VARSTORE_NAME_VALUE, whose values only the driver's EFI_HII_CONFIG_ACCESS_PROTOCOL reaches
+    NameValue,
+}
+
+/// Returns the VarStore of `var_store_id` that `form_set` declares, if any: the first among its
+/// children.
+fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Option<DeclaredStore> {
+    form_set
+        .children
+        .iter()
+        .find_map(|child| match &child.borrow().parsed_data {
+            ParsedOperation::VarStore(store) if store.var_store_id == var_store_id => {
+                Some(DeclaredStore::Variable(Box::new(store.clone())))
+            }
+            ParsedOperation::VarStoreEfi(store) if store.var_store_id == var_store_id => {
+                Some(DeclaredStore::Variable(Box::new(store.clone())))
+            }
+            ParsedOperation::VarStoreNameValue(store) if store.var_store_id == var_store_id => {
+                Some(DeclaredStore::NameValue)
+            }
+            _ => None,
+        })
 }
 
 #[cfg(test)]
@@ -3967,12 +4075,6 @@ mod expression_operand_tests {
     use super::ifr_fixtures::*;
     use super::*;
 
-    /// EFI_HII_STANDARD_FORM_GUID 3BD2F4EC-E524-46E4-A9D8-510117425562 as stored.
-    const STANDARD_FORM_GUID: [u8; 16] = [
-        0xEC, 0xF4, 0xD2, 0x3B, 0x24, 0xE5, 0xE4, 0x46, 0xA9, 0xD8, 0x51, 0x01, 0x17, 0x42, 0x55,
-        0x62,
-    ];
-
     /// The ops of the FORM of a FormSet that holds `body` in it.
     fn parsed_form(body: &[Vec<u8>]) -> Vec<Rc<RefCell<IFROperation>>> {
         let root = parse_form_set(&[form(1, body)]);
@@ -3980,20 +4082,6 @@ mod expression_operand_tests {
         let form_set = root.children[0].borrow();
         let form = form_set.children[0].borrow();
         form.children.clone()
-    }
-
-    /// A FORM_MAP of form 4 with a method per (MethodTitle, MethodIdentifier), holding no ops.
-    fn form_map(methods: &[(u16, [u8; 16])]) -> Vec<u8> {
-        let data: Vec<u8> = 4u16
-            .to_le_bytes()
-            .into_iter()
-            .chain(
-                methods
-                    .iter()
-                    .flat_map(|(title, guid)| title.to_le_bytes().into_iter().chain(*guid)),
-            )
-            .collect();
-        [operation(FORM_MAP, true, &data), END.to_vec()].concat()
     }
 
     /// The first op of a FormSet that holds `ops` outside forms.
@@ -4075,7 +4163,7 @@ mod expression_operand_tests {
             ("no standard", vec![(5, OTHER_GUID)], false),
         ];
         for (name, methods, standard) in cases {
-            let op = parsed_first(&[form_map(&methods)]);
+            let op = parsed_first(&[form_map(&methods, &[])]);
 
             let op = op.borrow();
             let ParsedOperation::FormMap(form_map) = &op.parsed_data else {

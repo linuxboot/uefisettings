@@ -139,7 +139,7 @@ pub mod driver_sample {
     pub const MATCH2_OFFSET: usize = 203;
     /// Why the condition of [`MATCH2`] is not evaluated: its first op is a stringref, which the
     /// library does not evaluate.
-    pub const MATCH2_REASON: &str = "StringRef1 not evaluated";
+    pub const MATCH2_REASON: &str = "EFI_IFR_STRING_REF1 not evaluated";
     /// The flag that makes `get` and `set` select questions that a GRAY_OUT_IF may gray out
     /// too, such as [`MATCH2`].
     pub const INCLUDE_GRAYED_OUT: [&str; 2] = ["--include", "grayed-out"];

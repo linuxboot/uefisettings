@@ -497,8 +497,9 @@ mod tests {
     const METHOD_IDENTIFIER: [u8; 16] = [0x33; 16];
 
     /// Why a condition on question 1, the question of `parse_question()`, is not evaluated.
-    const QUESTION_1_UNAVAILABLE: &str = "EqIdVal of question 0x0001: <ValueUnavailable: no \
-                                          supported varstore with matching id 0x0001 found>";
+    const QUESTION_1_UNAVAILABLE: &str = "EFI_IFR_EQ_ID_VAL of question 0x0001: \
+                                          <ValueUnavailable: no supported varstore with matching \
+                                          id 0x0001 found>";
 
     #[test]
     fn checkbox_default_comes_from_default_then_flags() {
@@ -1008,8 +1009,8 @@ mod tests {
             (
                 "question 2 unreadable",
                 unreadable,
-                "unknown (EFI_IFR_SUPPRESS_IF condition not evaluated: EqIdVal of question \
-                 0x0002: r)",
+                "unknown (EFI_IFR_SUPPRESS_IF condition not evaluated: EFI_IFR_EQ_ID_VAL of \
+                 question 0x0002: r)",
             ),
         ];
         for (name, value, default) in cases {

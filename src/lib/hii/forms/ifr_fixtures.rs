@@ -633,6 +633,31 @@ pub(crate) fn form(form_id: u16, body: &[Vec<u8>]) -> Vec<u8> {
     [operation(FORM, true, &data), body.concat(), END.to_vec()].concat()
 }
 
+/// EFI_HII_STANDARD_FORM_GUID 3BD2F4EC-E524-46E4-A9D8-510117425562 as stored.
+pub(super) const STANDARD_FORM_GUID: [u8; 16] = [
+    0xEC, 0xF4, 0xD2, 0x3B, 0x24, 0xE5, 0xE4, 0x46, 0xA9, 0xD8, 0x51, 0x01, 0x17, 0x42, 0x55, 0x62,
+];
+
+/// An EFI_IFR_FORM_MAP of form 4 with a method per (MethodTitle, MethodIdentifier), holding
+/// `body`.
+pub(super) fn form_map(methods: &[(u16, [u8; 16])], body: &[Vec<u8>]) -> Vec<u8> {
+    let data: Vec<u8> = 4u16
+        .to_le_bytes()
+        .into_iter()
+        .chain(
+            methods
+                .iter()
+                .flat_map(|(title, guid)| title.to_le_bytes().into_iter().chain(*guid)),
+        )
+        .collect();
+    [
+        operation(FORM_MAP, true, &data),
+        body.concat(),
+        END.to_vec(),
+    ]
+    .concat()
+}
+
 /// Parses a FormSet holding `body`, and returns the root.
 pub(crate) fn parse_form_set(body: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
     let data = form_set(body);
