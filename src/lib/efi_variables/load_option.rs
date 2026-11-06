@@ -134,7 +134,7 @@ impl Ucs2String {
     }
 
     /// The CHAR16s of the string, then a Null character.
-    fn to_char16_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_char16_bytes(&self) -> Vec<u8> {
         self.0
             .encode_utf16()
             .chain([0])

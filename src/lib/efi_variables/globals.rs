@@ -37,7 +37,7 @@ use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 
 /// EFI_GLOBAL_VARIABLE, the vendor GUID of the global variables (UEFI 2.11 §3.3).
-pub(super) const EFI_GLOBAL_VARIABLE: Guid = Guid {
+pub(crate) const EFI_GLOBAL_VARIABLE: Guid = Guid {
     data1: 0x8BE4_DF61,
     data2: 0x93CA,
     data3: 0x11D2,
@@ -299,7 +299,7 @@ impl LoadOptionName {
     }
 
     /// The variable of this load option.
-    fn key(self) -> VariableKey {
+    pub(crate) fn key(self) -> VariableKey {
         VariableKey {
             name: self.to_string(),
             guid: EFI_GLOBAL_VARIABLE,
@@ -775,6 +775,16 @@ impl Setter {
     }
 }
 
+/// The Boot#### that BootNext names, if present.
+pub(crate) fn boot_next(variables: &impl VariableData) -> Result<Option<LoadOptionName>> {
+    read_decoded(variables, "BootNext", boot_option)
+}
+
+/// The bits of OsIndications, if present.
+pub(crate) fn read_os_indications(variables: &impl VariableData) -> Result<Option<OsIndications>> {
+    read_decoded(variables, "OsIndications", os_indications)
+}
+
 /// The global variable `name` that `variables` hold, decoded with `decode`, if present.
 fn read_decoded<T>(
     variables: &impl VariableData,
@@ -885,7 +895,7 @@ fn os_indication_names() -> String {
 }
 
 /// The names of `bits`, comma-separated.
-fn bit_names(bits: OsIndications) -> String {
+pub(crate) fn bit_names(bits: OsIndications) -> String {
     bits.iter_names()
         .map(|(name, _)| name)
         .collect::<Vec<_>>()
@@ -932,10 +942,7 @@ impl Codec {
                     })
                     .collect(),
             ),
-            Self::BootOption => GlobalValue::LoadOption(LoadOptionName {
-                kind: LoadOptionKind::Boot,
-                number: u16::from_le_bytes(exact(data, "a UINT16")?),
-            }),
+            Self::BootOption => GlobalValue::LoadOption(boot_option(data)?),
             Self::Ascii => GlobalValue::Ascii(ascii(data)?),
             Self::OsIndications => GlobalValue::OsIndications(os_indications(data)?),
             Self::Byte => GlobalValue::Byte(u8::from_le_bytes(exact(data, "a UINT8")?)),
@@ -1030,6 +1037,14 @@ fn items<'a, const N: usize>(
             what,
         }),
     }
+}
+
+/// The Boot#### that `data`, "a single UINT16" (UEFI 2.11 §3.3), names.
+fn boot_option(data: &[u8]) -> std::result::Result<LoadOptionName, MalformedData> {
+    Ok(LoadOptionName {
+        kind: LoadOptionKind::Boot,
+        number: u16::from_le_bytes(exact(data, "a UINT16")?),
+    })
 }
 
 /// The bits of OsIndications or OsIndicationsSupported in `data`, "a UINT64 bitmask" (UEFI 2.11
@@ -1237,7 +1252,7 @@ pub(crate) mod tests {
         }
 
         /// Holds `data` with `attributes` as the variable `name` of `vendor`.
-        fn with_attributes(
+        pub(crate) fn with_attributes(
             self,
             name: &str,
             vendor: Guid,

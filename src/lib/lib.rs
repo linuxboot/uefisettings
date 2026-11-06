@@ -53,6 +53,12 @@ pub mod parse_error;
 #[cfg(target_os = "uefi")]
 mod runtime_time_services;
 pub mod secret_file;
+#[cfg(variable_data)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "nothing stages a set for the next boot yet")
+)]
+mod staged_set;
 pub mod terminal_text;
 mod translation;
 #[cfg(target_os = "uefi")]

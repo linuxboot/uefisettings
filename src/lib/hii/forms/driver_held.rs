@@ -16,6 +16,7 @@
 //! that the question's FormSet declares, with the settings that a forms browser requests of each.
 
 use std::fmt;
+use std::str::FromStr;
 
 use thiserror::Error;
 
@@ -124,6 +125,24 @@ impl fmt::Display for IfrValueType {
     }
 }
 
+/// The EFI_IFR_TYPE_x name that Display writes.
+impl FromStr for IfrValueType {
+    type Err = UnknownValueType;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        [
+            Self::NumSize8,
+            Self::NumSize16,
+            Self::NumSize32,
+            Self::NumSize64,
+            Self::Boolean,
+        ]
+        .into_iter()
+        .find(|value_type| value_type.to_string() == text)
+        .ok_or_else(|| UnknownValueType(text.to_owned()))
+    }
+}
+
 /// The refusal of a question whose READ or WRITE expression a forms browser evaluates beside its
 /// driver's Callback()s: uefisettings evaluates them only for questions without
 /// EFI_IFR_FLAG_CALLBACK.
@@ -155,6 +174,11 @@ pub(crate) struct DisabledFormStore {
     reason: String,
     op: &'static str,
 }
+
+/// A name of no IfrValueType.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{0:?} names no EFI_IFR_TYPE_x of a question that its driver holds")]
+pub(crate) struct UnknownValueType(String);
 
 /// The DriverHeldQuestion of the question op `op`, which is `value_question` of `varstore`, if
 /// it has no VarStore and get or set reaches its value through its driver's Callback().

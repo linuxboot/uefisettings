@@ -147,7 +147,7 @@ const EFI_JSON_CAPSULE_ID_GUID: Guid = Guid {
 };
 
 /// The vendor GUID of uefisettings' own EFI variables.
-#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+#[cfg(variable_data)]
 pub(crate) const UEFISETTINGS_VENDOR_GUID: Guid = Guid {
     data1: 0xdd16_f539,
     data2: 0x09ed,
