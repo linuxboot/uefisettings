@@ -21,12 +21,15 @@
 //! Each sequence runs between two reads of the stores that the question's FormSet declares
 //! (form_set_stores.rs): a store that cannot be read refuses before the first Callback(), and a
 //! store that the Callback()s changed is restored and refuses the change, which the driver has
-//! already acted on.
+//! already acted on. Every EFI variable that the sequence changed is listed too, as a
+//! Callback() may act on zeros outside the stores when the BrowserCallback() it calls fails,
+//! which nothing here can see.
 
 use std::fmt;
 
 use crate::efi_status::EfiStatus;
 use crate::efi_variables::VariableData;
+use crate::efi_variables::VariableNames;
 use crate::hii::config_routing::ConfigRouting;
 use crate::hii::form_set_stores::Baseline;
 use crate::hii::form_set_stores::FormSetStore;
@@ -35,6 +38,7 @@ use crate::hii::forms::ExpressionBesideCallback;
 pub(crate) use crate::hii::forms::IfrValueType;
 use crate::hii::forms::QuestionExpression;
 use crate::hii::forms::StoragelessRefusal;
+use crate::hii::variable_changes::VariableSnapshot;
 
 /// EFI_BROWSER_ACTION (UEFI 2.11 §35.5.4): what a Callback() is told happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,7 +328,7 @@ impl<'a, D: DriverCallback> Sequence<'a, D> {
 pub(crate) struct Retrieval {
     /// The value RETRIEVE gave, or why there is none
     pub(crate) value: Result<IfrValue, String>,
-    /// Notes on ActionRequests and settings left out, each a phrase
+    /// Notes on ActionRequests, settings left out and changed variables, each a phrase
     pub(crate) notes: Vec<String>,
     pub(crate) calls: Vec<Call>,
 }
@@ -333,7 +337,8 @@ pub(crate) struct Retrieval {
 #[derive(Debug)]
 pub(crate) struct Change {
     pub(crate) outcome: ChangeOutcome,
-    /// Notes on ActionRequests, the reconnection and settings left out, each a phrase
+    /// Notes on ActionRequests, the reconnection, settings left out and changed variables,
+    /// each a phrase
     pub(crate) notes: Vec<String>,
     pub(crate) calls: Vec<Call>,
 }
@@ -401,8 +406,9 @@ pub(crate) fn retrieve<D, R, V>(
 where
     D: DriverCallback,
     R: ConfigRouting,
-    V: VariableData,
+    V: VariableData + VariableNames,
 {
+    let before = VariableSnapshot::take(access.variables);
     let baseline = match Baseline::take(access.stores, access.routing, access.variables) {
         Ok(baseline) => baseline,
         Err(refusal) => {
@@ -418,6 +424,7 @@ where
     let check = baseline.check(access.routing, access.variables);
     let mut notes = sequence.request_notes();
     notes.extend(dynamic_note(&baseline));
+    notes.extend(variable_notes(before, access.variables));
     let value = match (check.refusal(), sequence.request_refusal(), retrieved) {
         (Some(reason), _, _) | (None, Some(reason), _) => Err(reason),
         (None, None, Ok(value)) => Ok(value),
@@ -449,7 +456,7 @@ pub(crate) fn change<D, R, V>(
 where
     D: DriverCallback,
     R: ConfigRouting,
-    V: VariableData,
+    V: VariableData + VariableNames,
 {
     // a forms browser evaluates WRITE in SetQuestionValue() once CHANGING has taken the value,
     // before CHANGED (edk2-stable202608 SetupBrowserDxe Presentation.c
@@ -457,6 +464,7 @@ where
     if question.write_expression {
         return refused(ExpressionBesideCallback(QuestionExpression::Write).to_string());
     }
+    let before = VariableSnapshot::take(access.variables);
     let baseline = match Baseline::take(access.stores, access.routing, access.variables) {
         Ok(baseline) => baseline,
         Err(refusal) => return refused(refusal.to_string()),
@@ -480,6 +488,7 @@ where
         });
     }
     notes.extend(dynamic_note(&baseline));
+    notes.extend(variable_notes(before, access.variables));
     Change {
         outcome,
         notes,
@@ -601,6 +610,15 @@ fn dynamic_note(baseline: &Baseline) -> Option<String> {
     })
 }
 
+/// The note listing the EFI variables that changed since `before`, if any.
+fn variable_notes(
+    before: VariableSnapshot,
+    variables: &(impl VariableData + VariableNames),
+) -> Option<String> {
+    let changes = before.changes(variables);
+    (!changes.is_empty()).then(|| format!("EFI variables changed: {}", changes.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -641,6 +659,8 @@ mod tests {
         Buffer,
         /// writes the EFI variable store
         Variable,
+        /// writes a variable outside the stores
+        Outside,
     }
 
     fn step(status: EfiStatus) -> Step {
@@ -736,6 +756,12 @@ mod tests {
                     self.variables.variables.borrow_mut().insert(
                         key("Store", STORE_GUID),
                         VariableContents::new(NV_BS_RT, vec![1, 2]).expect("data"),
+                    );
+                }
+                Effect::Outside => {
+                    self.variables.variables.borrow_mut().insert(
+                        key("Elsewhere", STORE_GUID),
+                        VariableContents::new(NV_BS_RT, vec![7]).expect("data"),
                     );
                 }
             }
@@ -957,13 +983,14 @@ mod tests {
     }
 
     #[test]
-    fn get_notes_requests_and_records_its_calls() {
+    fn get_notes_requests_and_changed_variables_and_records_its_calls() {
         let fixture = fixture();
         let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables).on(
             Retrieve,
             Step {
                 request: ActionRequest::RESET,
                 writes: Some(3),
+                effect: Effect::Outside,
                 ..step(EfiStatus::SUCCESS)
             },
         );
@@ -973,7 +1000,14 @@ mod tests {
         assert_eq!(got.value, Ok(value(3)), "a reset request keeps the value");
         assert_eq!(
             got.notes,
-            ["Callback(RETRIEVE) asks for a platform reset (EFI_BROWSER_ACTION_REQUEST_RESET)"],
+            [
+                "Callback(RETRIEVE) asks for a platform reset (EFI_BROWSER_ACTION_REQUEST_RESET)"
+                    .to_string(),
+                format!(
+                    "EFI variables changed: {} (created)",
+                    key("Elsewhere", STORE_GUID)
+                ),
+            ],
             "the notes"
         );
         assert_eq!(
@@ -1623,6 +1657,34 @@ mod tests {
                 "the calls when RETRIEVE returns {status}"
             );
         }
+    }
+
+    #[test]
+    fn variables_changed_outside_the_stores_are_listed_but_do_not_refuse() {
+        let fixture = fixture();
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables).on(
+            Changed,
+            Step {
+                effect: Effect::Outside,
+                ..step(EfiStatus::SUCCESS)
+            },
+        );
+
+        let changed = set(&driver, &fixture, 1);
+
+        assert_eq!(
+            changed.outcome,
+            ChangeOutcome::Applied(ReadBack::Same),
+            "a variable changed outside the stores does not refuse the change"
+        );
+        assert_eq!(
+            changed.notes,
+            [format!(
+                "EFI variables changed: {} (created)",
+                key("Elsewhere", STORE_GUID)
+            )],
+            "the listed variable"
+        );
     }
 
     #[test]

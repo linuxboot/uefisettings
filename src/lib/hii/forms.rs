@@ -144,7 +144,7 @@ pub(crate) use defaults::DeclaredDefault;
 pub(crate) use defaults::DefaultId;
 pub(crate) use driver_held::DriverHeldQuestion;
 pub(crate) use driver_held::ExpressionBesideCallback;
-#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
 pub(crate) use driver_held::IfrValueType;
 pub(crate) use set::check_one_kind;
 pub(crate) use set::set_questions;

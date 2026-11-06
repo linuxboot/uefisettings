@@ -140,12 +140,28 @@ const EFI_JSON_CAPSULE_ID_GUID: Guid = Guid {
     data4: [0xbf, 0x4a, 0xde, 0x5e, 0x25, 0x2d, 0x61, 0xae],
 };
 
+/// The vendor GUID of uefisettings' own EFI variables.
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+pub(crate) const UEFISETTINGS_VENDOR_GUID: Guid = Guid {
+    data1: 0xdd16_f539,
+    data2: 0x09ed,
+    data3: 0x41b9,
+    data4: [0x8b, 0x64, 0xd8, 0x5d, 0x6c, 0xd9, 0x3a, 0x8e],
+};
+
 /// GetNextVariableName() (UEFI 2.10 §8.2.2): the variables that a backend reaches, by name and
 /// vendor GUID.
 #[cfg(variable_names)]
 pub(crate) trait VariableNames {
     /// Every variable these reach, in no particular order.
     fn variable_names(&self) -> Result<Vec<VariableKey>>;
+}
+
+#[cfg(variable_names)]
+impl<T: VariableNames + ?Sized> VariableNames for &T {
+    fn variable_names(&self) -> Result<Vec<VariableKey>> {
+        (**self).variable_names()
+    }
 }
 
 /// What one GetNextVariableName() call (UEFI 2.10 §8.2.2) did.

@@ -68,8 +68,8 @@ mod lockdown;
 mod memory_access_denied;
 pub mod package;
 // Callback() of the driver of a question without a VarStore, which only the UEFI Shell build
-// calls; the tests run on every host with variables.
-#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+// calls; the tests run on every host that lists variables.
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
 pub(crate) mod question_callbacks;
 mod scsu;
 mod strings;
@@ -78,6 +78,8 @@ pub(crate) mod time_services;
 // memory where a firmware memory map bounds the reads.
 #[cfg(firmware_memory_maps)]
 mod system_table;
+#[cfg(all(variable_data, variable_names, any(target_os = "uefi", test)))]
+mod variable_changes;
 #[cfg(target_os = "uefi")]
 mod variable_services;
 mod variables;

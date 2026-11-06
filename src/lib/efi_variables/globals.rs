@@ -1287,6 +1287,13 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(variable_names)]
+    impl crate::efi_variables::VariableNames for HeldVariables {
+        fn variable_names(&self) -> Result<Vec<VariableKey>> {
+            Ok(self.variables.borrow().keys().cloned().collect())
+        }
+    }
+
     pub(crate) fn key(name: &str, vendor: Guid) -> VariableKey {
         VariableKey {
             name: name.to_string(),

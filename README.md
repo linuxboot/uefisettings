@@ -978,6 +978,9 @@ read-only, `set` through a driver is an unsafe operation, as for a stored questi
 `--i-am-fine-to-brick-this-system` lets through, before the first Callback() (see
 [Unsafe operations](#unsafe-operations)).
 
+`get` and `set` list every EFI variable that the sequence changed, as a Callback() may act outside
+the FormSet's stores, where nothing here can see it.
+
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
 machine's db trusts.

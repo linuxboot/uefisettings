@@ -29,7 +29,8 @@
 //! - [`FormSet::Unreachable`] declares a Buffer store that its ExtractConfig() never answers.
 //! - [`FormSet::Driverless`] is registered by no handle.
 //! - [`FormSet::Password`], which `callback-forms-password` registers, declares a Buffer store
-//!   with a PASSWORD question; its question's CHANGED overwrites the store's other setting.
+//!   with a PASSWORD question; its questions' CHANGED overwrites the store's other setting or
+//!   the password.
 //! - [`FormSet::DisabledPassword`], which `callback-forms-password` registers too, declares a
 //!   Buffer store whose PASSWORD question is in a second form, which a CHECKBOX op shorter than
 //!   its minimum disables (UEFI 2.11 §33.2.5.10.1).
@@ -252,6 +253,8 @@ enum Behavior {
     OverwritesBufferStore,
     /// CHANGED overwrites the setting beside the password of the password's Buffer store
     OverwritesPasswordStore,
+    /// CHANGED overwrites the password of the password's Buffer store
+    OverwritesPassword,
     /// CHANGING returns EFI_ACCESS_DENIED
     RefusedInChanging,
     /// CHANGED returns EFI_DEVICE_ERROR
@@ -266,7 +269,7 @@ struct Question {
     behavior: Behavior,
 }
 
-const QUESTIONS: [Question; 14] = [
+const QUESTIONS: [Question; 15] = [
     Question {
         id: 0x0101,
         form_set: FormSet::Plain,
@@ -344,6 +347,12 @@ const QUESTIONS: [Question; 14] = [
         form_set: FormSet::Password,
         prompt: "Callback value beside a password",
         behavior: Behavior::OverwritesPasswordStore,
+    },
+    Question {
+        id: 0x0502,
+        form_set: FormSet::Password,
+        prompt: "Callback value over a password",
+        behavior: Behavior::OverwritesPassword,
     },
     Question {
         id: 0x0601,
@@ -962,6 +971,10 @@ fn respond(
                 Behavior::OverwritesPasswordStore => {
                     (overwrite(&PASSWORD_BUFFER, 4, &[value]), none)
                 }
+                Behavior::OverwritesPassword => (
+                    overwrite(&PASSWORD_BUFFER, 0, &[value, 0xD1, 0xD2, 0xD3]),
+                    none,
+                ),
                 Behavior::RefusedInChanging => (Status::SUCCESS, none),
                 Behavior::FailsInChanged => (Status::DEVICE_ERROR, none),
             };

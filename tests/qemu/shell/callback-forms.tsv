@@ -15,9 +15,10 @@ get-beside	line	^callback-forms: Callback\(RETRIEVE\) question 0x0201 value 0x0:
 get-beside	line	^callback-forms: Callback\(FORM_CLOSE\) question 0x0201 value 0x0: UNSUPPORTED
 get-beside	none	^callback-forms: Callback\(CHANG
 get-beside	none	^callback-forms: RouteConfig
-# set runs CHANGING and CHANGED, then reads the value back; the stores stay
+# set runs CHANGING and CHANGED, then reads the value back; the stores stay, and the question's
+# own variable is listed
 set-beside	status	0x0
-set-beside	json-line	.responses | length == 1 and .[0].question.answer == "On <applied; not compared, as they changed between two reads before the first Callback(): VARSTORE 0x0002 CallbackBuffer: OFFSET=0004&WIDTH=0001>"
+set-beside	json-line	.responses | length == 1 and .[0].question.answer == "On <applied; not compared, as they changed between two reads before the first Callback(): VARSTORE 0x0002 CallbackBuffer: OFFSET=0004&WIDTH=0001; EFI variables changed: CallbackValue0201-de145b29-c3cd-455f-91de-a76237b67c52 (created)>"
 set-beside	line	^callback-forms: Callback\(CHANGING\) question 0x0201 value 0x1: SUCCESS
 set-beside	line	^callback-forms: Callback\(CHANGED\) question 0x0201 value 0x1: SUCCESS
 set-beside	line	^callback-forms: Callback\(RETRIEVE\) question 0x0201 value 0x1: SUCCESS, returned 0x1, request 0$
@@ -51,9 +52,9 @@ set-refused-in-changing	line	^callback-forms: Callback\(FORM_CLOSE\) question 0x
 set-failing-in-changed	status	aborted
 set-failing-in-changed	json-line	.error_message | contains("not applied: Callback(CHANGED) returned EFI_DEVICE_ERROR; the driver's Callback(FORM_CLOSE) had already run")
 set-failing-in-changed	line	^callback-forms: Callback\(FORM_CLOSE\) question 0x0205
-# a save request in a form set with stores is not applied
+# a save request in a form set with stores is not applied, and what the driver wrote is listed
 set-save	status	aborted
-set-save	json-line	.error_message | contains("not applied: Callback(CHANGED) asked the forms browser to save the FormSet's modified values (EFI_BROWSER_ACTION_REQUEST_SUBMIT), which only a forms browser's edit buffer holds; ")
+set-save	json-line	.error_message | contains("not applied: Callback(CHANGED) asked the forms browser to save the FormSet's modified values (EFI_BROWSER_ACTION_REQUEST_SUBMIT), which only a forms browser's edit buffer holds; ") and contains("EFI variables changed: CallbackValue0206-de145b29-c3cd-455f-91de-a76237b67c52 (created)")
 # a reconnection request disconnects and connects the driver's handle
 set-reconnect	status	0x0
 set-reconnect	json-line	.responses | length == 1 and (.[0].question.answer | startswith("On <applied; reconnected the driver's controller (EFI_BROWSER_ACTION_REQUEST_RECONNECT); "))
@@ -68,7 +69,7 @@ get-no-read-back	status	0x0
 get-no-read-back	json-line	.responses | length == 1 and (.[0].question.answer | startswith("<ValueUnavailable: its driver's CallBack(EFI_BROWSER_ACTION_RETRIEVE) returned EFI_UNSUPPORTED; without a VarStore the question has no other value (UEFI 2.11 "))
 # a reset request is noted, in a form set without stores
 set-reset	status	0x0
-set-reset	json-line	.responses | length == 1 and .[0].question.answer == "On <applied; Callback(CHANGED) asks for a platform reset (EFI_BROWSER_ACTION_REQUEST_RESET)>"
+set-reset	json-line	.responses | length == 1 and .[0].question.answer == "On <applied; Callback(CHANGED) asks for a platform reset (EFI_BROWSER_ACTION_REQUEST_RESET); EFI variables changed: CallbackValue0101-de145b29-c3cd-455f-91de-a76237b67c52 (created)>"
 # a store that ExtractConfig() does not answer refuses before any Callback()
 get-unreachable	status	0x0
 get-unreachable	json-line	.responses | length == 1 and (.[0].question.answer | startswith("<ValueUnavailable: cannot snapshot store VARSTORE 0x0003 CallbackUnreachable: ExtractConfig() returned EFI_NOT_FOUND"))

@@ -35,6 +35,8 @@ use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
 use crate::efi_variables::VariableContents;
 #[cfg(variable_data)]
 use crate::efi_variables::VariableData;
+#[cfg(variable_names)]
+use crate::efi_variables::VariableNames;
 use crate::hii::config_snapshot::SnapshotLookup;
 #[cfg(all(efivar_dumps, not(system_variables)))]
 use crate::hii::efivarfs_format::EfivarCopy;
@@ -1386,9 +1388,10 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
 }
 
 /// As for FirmwareVariables: the Callback() sequences of the UEFI Shell build read and restore
-/// a FormSet's EFI variable stores through these. A read gives the withheld bytes as zero, where
-/// the value holds them; SetVariable() and deletion replace every byte of the variable, so they
-/// fail with WithheldPassword for a variable with withheld bytes before `variables` see it.
+/// a FormSet's EFI variable stores, and list changed variables, through these. A read gives the
+/// withheld bytes as zero, where the value holds them; SetVariable() and deletion replace every
+/// byte of the variable, so they fail with WithheldPassword for a variable with withheld bytes
+/// before `variables` see it.
 #[cfg(variable_data)]
 impl<V: VariableData> VariableData for WithholdingVariables<V> {
     fn interface(&self) -> VariableInterface {
@@ -1418,6 +1421,14 @@ impl<V: VariableData> VariableData for WithholdingVariables<V> {
     fn delete_variable(&self, key: &VariableKey) -> Result<()> {
         self.withheld.check_replace(key)?;
         self.variables.delete_variable(key)
+    }
+}
+
+/// The names of every variable, also of the withheld ones, whose names hold no password.
+#[cfg(variable_names)]
+impl<V: VariableNames> VariableNames for WithholdingVariables<V> {
+    fn variable_names(&self) -> Result<Vec<VariableKey>> {
+        self.variables.variable_names()
     }
 }
 
@@ -2170,8 +2181,8 @@ pub(crate) mod tests {
     /// As FirmwareVariables, WithholdingVariables' VariableData read the withheld bytes of a
     /// variable as zero, and refuse to set or delete a variable with withheld bytes, which
     /// SetVariable() and deletion replace whole, before their variables see it; they pass the
-    /// other variables through.
-    #[cfg(variable_data)]
+    /// other variables through, and list every name.
+    #[cfg(all(variable_data, variable_names))]
     #[test]
     fn withheld_variable_data_reads_as_zero_and_is_neither_set_nor_deleted() {
         use crate::efi_variables::globals::tests::key;
@@ -2242,6 +2253,9 @@ pub(crate) mod tests {
             [1, 0xAA, 0xAA, 2],
             "AMITSESetup keeps its password"
         );
+        let mut names = withholding.variable_names().expect("names");
+        names.sort();
+        assert_eq!(names, [password, setup], "every name listed");
     }
 
     /// WithholdingVariables zero the withheld bytes of a variable with
