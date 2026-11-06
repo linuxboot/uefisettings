@@ -195,6 +195,25 @@ struct ShellParametersStdIn(ShellParametersProtocol);
 #[unsafe_protocol(ShellProtocol::GUID)]
 struct ShellFileIo(ShellProtocol);
 
+/// EFI_SHELL_PROTOCOL, for this image.
+fn open_shell_protocol() -> io::Result<ScopedProtocol<ShellFileIo>> {
+    let shell = boot::get_handle_for_protocol::<ShellFileIo>()
+        .map_err(|error| firmware_error("EFI_SHELL_PROTOCOL", error))?;
+    // SAFETY: the Shell uninstalls EFI_SHELL_PROTOCOL only as it exits (edk2-stable202608
+    // Shell.c:693, CleanUpShellEnvironment), after this image returns
+    unsafe {
+        boot::open_protocol::<ShellFileIo>(
+            OpenProtocolParams {
+                handle: shell,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .map_err(|error| firmware_error("OpenProtocol() of EFI_SHELL_PROTOCOL", error))
+}
+
 /// The Shell's standard input: EFI_SHELL_PARAMETERS_PROTOCOL.StdIn of this image, through
 /// EFI_SHELL_PROTOCOL.
 struct ShellStdinFile {
@@ -221,22 +240,10 @@ impl ShellStdinFile {
         .map_err(|error| {
             firmware_error("OpenProtocol() of EFI_SHELL_PARAMETERS_PROTOCOL", error)
         })?;
-        let shell = boot::get_handle_for_protocol::<ShellFileIo>()
-            .map_err(|error| firmware_error("EFI_SHELL_PROTOCOL", error))?;
-        // SAFETY: the Shell uninstalls EFI_SHELL_PROTOCOL only as it exits (edk2-stable202608
-        // Shell.c:693, CleanUpShellEnvironment), after this image returns
-        let shell = unsafe {
-            boot::open_protocol::<ShellFileIo>(
-                OpenProtocolParams {
-                    handle: shell,
-                    agent: image,
-                    controller: None,
-                },
-                OpenProtocolAttributes::GetProtocol,
-            )
-        }
-        .map_err(|error| firmware_error("OpenProtocol() of EFI_SHELL_PROTOCOL", error))?;
-        Ok(Self { parameters, shell })
+        Ok(Self {
+            parameters,
+            shell: open_shell_protocol()?,
+        })
     }
 
     /// StdIn and the Shell's functions.
