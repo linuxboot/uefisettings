@@ -167,10 +167,13 @@ use crate::hii::forms::keywords::KeywordStatement;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::DeclaredDefault;
+use crate::hii::forms::DriverHeldQuestion;
 use crate::hii::forms::Exclusion;
 use crate::hii::forms::PasswordQuestions;
+use crate::hii::forms::QuestionDescriptor;
 use crate::hii::forms::QuestionFlags;
 use crate::hii::package;
+use crate::hii::package::DevicePath;
 #[cfg(any(variable_names, variable_info, variable_data))]
 pub use crate::hii::package::Guid;
 use crate::hii::time_services::TimeServices;
@@ -666,6 +669,42 @@ impl From<TextLines> for HiiShowIfrResponse {
     }
 }
 
+/// The package list of a question in the HiiDB that get and set read.
+#[cfg_attr(
+    not(target_os = "uefi"),
+    allow(
+        dead_code,
+        reason = "only the UEFI Shell build reaches the list's driver"
+    )
+)]
+pub(crate) struct QuestionList<'a> {
+    /// Its index in the HiiDB
+    pub(crate) index: usize,
+    /// The device path of the driver handle that registered it, from its device path package
+    pub(crate) device_path: Option<&'a DevicePath>,
+}
+
+/// What get does with a question whose value only its driver holds (UEFI 2.11 §33.2.5.6), which
+/// each build reaches in its own way, if at all.
+pub(crate) trait DriverHeldValues {
+    /// get's answer for `question` of `list`.
+    fn get(
+        &self,
+        list: &QuestionList<'_>,
+        question: &QuestionDescriptor,
+        held: &DriverHeldQuestion,
+    ) -> String;
+}
+
+/// The driver that holds the value of `descriptor`, through `held`, and what it needs; None if
+/// get reads its VarStore, or, without one, shows why it has no value (storageless.rs).
+fn driver_of<'h, 'd>(
+    held: Option<&'h dyn DriverHeldValues>,
+    descriptor: &'d QuestionDescriptor,
+) -> Option<(&'h dyn DriverHeldValues, &'d DriverHeldQuestion)> {
+    held.zip(descriptor.driver_held())
+}
+
 impl HiiBackend {
     /// show_ifr returns a human readable representation of the forms in Hii
     ///
@@ -1091,12 +1130,18 @@ impl HiiBackend {
             options.efivars.clone().into_variables()?,
             system_snapshot(&options.efivars),
             options.efivars.platform_lang()?.as_deref(),
+            Self::driver_held_values(db_bytes, &options.efivars).as_deref(),
         )
     }
 
     /// get with `options`, reading question values from `variables`, or from the snapshot
     /// `exported` where they miss a variable, on a platform of PlatformLang `platform_lang`, if
-    /// any
+    /// any, and a question whose driver holds its value through `held`
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "get's inputs: the HiiDB, the question, the selector, the options, the variables, \
+                  the snapshot, the platform language and the driver-held values"
+    )]
     fn get_in(
         db_bytes: &[u8],
         question: impl Into<QuestionSelector>,
@@ -1105,6 +1150,7 @@ impl HiiBackend {
         variables: Box<dyn FirmwareVariables>,
         exported: Option<ExportedConfig>,
         platform_lang: Option<&str>,
+        held: Option<&dyn DriverHeldValues>,
     ) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
         // TODO: take a form@packagelist selector to pick one of the FormSets that select
@@ -1128,7 +1174,7 @@ impl HiiBackend {
 
         let requested = text_languages(options.language.as_deref(), platform_lang);
         let mut excluded = Exclusion::NONE;
-        for list in &parsed_db {
+        for (index, list) in parsed_db.iter().enumerate() {
             list.check_form_strings()?;
             let texts = list.texts(&requested);
             reader.enter_package_list(list, &texts);
@@ -1151,11 +1197,24 @@ impl HiiBackend {
                 };
                 let source_annotation = question_descriptor.value_source.annotation();
                 let option_annotation = question_descriptor.value_state.option_annotation();
+                let answer = match driver_of(held, &question_descriptor) {
+                    Some((held, driver_held)) => {
+                        let list = QuestionList {
+                            index,
+                            device_path: list.device_path.as_ref(),
+                        };
+                        held.get(&list, &question_descriptor, driver_held)
+                    }
+                    None => question_descriptor.value.clone(),
+                };
                 let mut get_resp = GetResponse {
                     selector: list.guid.to_string(),
                     backend: Backend::Hii,
                     is_translated,
-                    question: question_of(question_descriptor, include),
+                    question: Question {
+                        answer,
+                        ..question_of(question_descriptor, include)
+                    },
                     ..Default::default()
                 };
 
@@ -1499,6 +1558,7 @@ fn listed_defaults(defaults: Vec<DeclaredDefault>) -> Option<Vec<QuestionDefault
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     #[cfg(efivar_dumps)]
     use std::fs;
@@ -1587,6 +1647,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::VAR_STORE;
     use crate::hii::forms::ifr_fixtures::VAR_STORE_EFI;
     use crate::hii::forms::ifr_fixtures::VAR_STORE_NAME_VALUE;
+    use crate::hii::forms::StoragelessRefusal;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::package::hiidb_fixtures::device_path_package;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
@@ -2106,6 +2167,7 @@ mod tests {
             shared(&variables),
             None,
             None,
+            None,
         )
         .expect("get BootEnable");
         let set = set_responses(
@@ -2403,6 +2465,7 @@ mod tests {
             shared(&variables),
             None,
             None,
+            None,
         );
         let set = set_responses(
             &crossed_prompts_hiidb(),
@@ -2422,6 +2485,7 @@ mod tests {
             shared(&variables),
             None,
             Some("fr-FR"),
+            None,
         )
         .expect("get Start");
 
@@ -2493,6 +2557,7 @@ mod tests {
             shared(&variables),
             None,
             Some("fr-FR"),
+            None,
         )
         .expect("get Mode");
 
@@ -2653,6 +2718,7 @@ mod tests {
             shared(&variables),
             None,
             None,
+            None,
         )
         .expect("get Keyed");
         let set = set_responses(
@@ -2758,6 +2824,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
             None,
             None,
         )
@@ -2905,6 +2972,7 @@ mod tests {
                 shared(&variables),
                 None,
                 None,
+                None,
             )
             .map(|got| got.responses.len())
             .map_err(|error| format!("{error:#}"));
@@ -3004,6 +3072,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&variables),
+                None,
                 None,
                 None,
             )
@@ -3185,6 +3254,7 @@ mod tests {
                 shared(&variables),
                 None,
                 None,
+                None,
             )
             .unwrap_or_else(|error| panic!("get {question}: {error}"));
             // each answer shows the QuestionId, the FormSet's GUID and the keyword of 0x8001
@@ -3284,6 +3354,7 @@ mod tests {
                     None,
                     &GetOptions::default(),
                     shared(&variables),
+                    None,
                     None,
                     None,
                 )
@@ -3591,6 +3662,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
             None,
             None,
         );
@@ -4031,6 +4103,7 @@ mod tests {
                 ..GetOptions::default()
             },
             shared(&variables),
+            None,
             None,
             None,
         );
@@ -4753,6 +4826,7 @@ mod tests {
                 shared(&variables),
                 None,
                 None,
+                None,
             )
             .expect("get");
             let answers: Vec<&str> = got
@@ -4799,6 +4873,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
             None,
             None,
         )
@@ -4894,6 +4969,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&Rc::new(variables)),
+            None,
             None,
             None,
         )
@@ -5757,6 +5833,7 @@ mod tests {
                 shared(&variables),
                 None,
                 None,
+                None,
             )
             .expect("get");
             let listed = HiiBackend::list_questions_in(
@@ -6030,6 +6107,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(variables),
+            None,
             None,
             None,
         )
@@ -6418,6 +6496,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&variables),
+                None,
                 None,
                 None,
             )
@@ -7005,6 +7084,7 @@ mod tests {
                 variables(),
                 None,
                 None,
+                None,
             )
             .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
             .responses
@@ -7440,6 +7520,408 @@ mod tests {
         assert_eq!(variables.writes_to(&signed), vec![], "writes of Signed");
     }
 
+    /// A driver that records each get it is asked for.
+    #[derive(Default)]
+    struct RecordingDriver {
+        gets: RefCell<Vec<u16>>,
+    }
+
+    impl DriverHeldValues for RecordingDriver {
+        fn get(
+            &self,
+            _list: &QuestionList<'_>,
+            _question: &QuestionDescriptor,
+            held: &DriverHeldQuestion,
+        ) -> String {
+            self.gets.borrow_mut().push(held.question_id);
+            "from the driver".to_string()
+        }
+    }
+
+    /// A HiiDB of two FormSets with the CHECKBOX Q: the first without a VarStore, flagged
+    /// EFI_IFR_FLAG_CALLBACK, the second at byte 0 of the EFI variable Setup.
+    fn driver_held_hiidb() -> Vec<u8> {
+        let storageless = [
+            &1u16.to_le_bytes()[..],  // Prompt
+            &1u16.to_le_bytes(),      // Help
+            &7u16.to_le_bytes(),      // QuestionId
+            &0u16.to_le_bytes(),      // VarStoreId
+            &0xFFFFu16.to_le_bytes(), // VarStoreInfo
+            &[0x04, 0x00],            // EFI_IFR_FLAG_CALLBACK, CHECKBOX Flags
+        ]
+        .concat();
+        let list = |guid, children: &[Vec<u8>]| {
+            let packages = [
+                form_package(children),
+                en_strings_package_of(&["Q"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid(guid, &packages.concat())
+        };
+        [
+            list(
+                [0x66; 16],
+                &[form(1, &[operation(CHECKBOX, false, &storageless)])],
+            ),
+            list(
+                [0x55; 16],
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, 1),
+                    form(1, &[checkbox_on(1, 1, 1)]),
+                ],
+            ),
+        ]
+        .concat()
+    }
+
+    /// get takes a question whose driver holds its value to that driver where one is reached, and
+    /// elsewhere shows why it has no value; set refuses it before any write.
+    #[test]
+    fn driver_held_questions_go_to_their_driver_only_where_one_is_reached() {
+        let unreached = "question has no VarStore; its driver keeps the value, which only \
+                         EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 §33.2.5.6), \
+                         and after ExitBootServices() no EFI device-handle-based protocol may be \
+                         used (UEFI 2.11 §7.4.6); use uefisettings.efi in the UEFI Shell";
+        let hiidb = driver_held_hiidb();
+        for reached in [true, false] {
+            let driver = RecordingDriver::default();
+            let held = reached.then_some(&driver as &dyn DriverHeldValues);
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(setup(), NV_BS_RT, &[0]);
+            let variables = Rc::new(variables);
+
+            let got = HiiBackend::get_in(
+                &hiidb,
+                "Q",
+                None,
+                &GetOptions::default(),
+                shared(&variables),
+                None,
+                None,
+                held,
+            )
+            .expect("get Q");
+            let set = HiiBackend::set_in(
+                &hiidb,
+                "Q",
+                &SetValue::Text("1".to_owned()),
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            );
+
+            let answer = &got.responses[0].question.answer;
+            match reached {
+                true => {
+                    assert_eq!(answer, "from the driver", "get through the driver");
+                    assert_eq!(*driver.gets.borrow(), [7], "the driver's gets");
+                }
+                false => {
+                    assert!(
+                        answer.starts_with(&format!("<ValueUnavailable: {unreached}>")),
+                        "get without a driver: {answer}"
+                    );
+                    assert!(driver.gets.borrow().is_empty(), "no get by the driver");
+                }
+            }
+            assert_eq!(
+                set.map(drop).map_err(|error| error.to_string()),
+                Err(format!("cannot set question \"Q\": {unreached}")),
+                "set, with a driver reached: {reached}"
+            );
+            assert!(
+                variables.writes_to(&setup()).is_empty(),
+                "the refusal comes before any write, with a driver reached: {reached}"
+            );
+        }
+    }
+
+    /// A question without a VarStore, flagged EFI_IFR_FLAG_CALLBACK, whose QuestionId a PASSWORD
+    /// of its FormSet also has, never goes to its driver: a CallBack() names its question only
+    /// by QuestionId, so its driver could take it for the PASSWORD. get shows why, set refuses
+    /// it, and the driver is asked for nothing.
+    #[test]
+    fn a_question_that_shares_its_question_id_with_a_password_never_goes_to_its_driver() {
+        let storageless = [
+            &1u16.to_le_bytes()[..],  // Prompt
+            &1u16.to_le_bytes(),      // Help
+            &7u16.to_le_bytes(),      // QuestionId
+            &0u16.to_le_bytes(),      // VarStoreId
+            &0xFFFFu16.to_le_bytes(), // VarStoreInfo
+            &[0x04, 0x00],            // EFI_IFR_FLAG_CALLBACK, CHECKBOX Flags
+        ]
+        .concat();
+        let packages = [
+            form_package(&[
+                var_store(1, [0x77; 16], "PasswordStore", 40),
+                form(
+                    1,
+                    &[
+                        operation(CHECKBOX, false, &storageless),
+                        // on a VarStore: one of VarStoreId 0 closes every variable
+                        password_on(7, 2, 1, 0),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x66; 16], &packages.concat());
+        let refusal = StoragelessRefusal::CallbackSharedQuestionId("EFI_IFR_PASSWORD");
+        let driver = RecordingDriver::default();
+        let variables = Rc::new(MemoryVariables::new(
+            VariableReach::Runtime,
+            VariableInterface::Efivarfs,
+        ));
+
+        let got = HiiBackend::get_in(
+            &hiidb,
+            "Q",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            None,
+            Some(&driver as &dyn DriverHeldValues),
+        )
+        .expect("get Q");
+        let set = HiiBackend::set_in(
+            &hiidb,
+            "Q",
+            &SetValue::Text("1".to_owned()),
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        );
+
+        let answer = &got.responses[0].question.answer;
+        assert!(
+            answer.starts_with(&format!("<ValueUnavailable: {refusal}>")),
+            "get: {answer}"
+        );
+        assert!(driver.gets.borrow().is_empty(), "no get by the driver");
+        assert_eq!(
+            set.map(drop).map_err(|error| error.to_string()),
+            Err(format!("cannot set question \"Q\": {refusal}")),
+            "set"
+        );
+    }
+
+    /// The package list of a form that holds the CHECKBOX Q, QuestionId 9, which its driver holds
+    /// (callback_checkbox), and, flagged EFI_IFR_FLAG_CALLBACK and without a VarStore, the STRING
+    /// C, QuestionId 10, and the ORDERED_LIST L, QuestionId 11, which EFI_IFR_FLAG_READ_ONLY makes
+    /// read-only; then the STRINGs of MaxSize 4 on the EFI variable Setup: S, QuestionId 1, at
+    /// byte 0, and R, QuestionId 2, at byte 8, which EFI_IFR_FLAG_READ_ONLY makes read-only.
+    fn callback_and_strings_list() -> Vec<u8> {
+        // EFI_IFR_FLAG_CALLBACK | EFI_IFR_FLAG_READ_ONLY; MaxContainers 2, no Flags
+        let ordered_list = [question_header_with(11, 3, 0, 0, 0x05), vec![2, 0x00]].concat();
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 16),
+                form(
+                    1,
+                    &[
+                        callback_checkbox(9, 1),
+                        // EFI_IFR_FLAG_CALLBACK
+                        flagged_string_on(10, 2, (0, 0), (0, 4), (0x04, 0x00), &[]),
+                        [
+                            operation(ORDERED_LIST, true, &ordered_list),
+                            flagged_option(6, 0x00, 1),
+                            flagged_option(7, 0x00, 2),
+                            END.to_vec(),
+                        ]
+                        .concat(),
+                        string_on(1, 4, (1, 0), (0, 4), &[]),
+                        // EFI_IFR_FLAG_READ_ONLY
+                        flagged_string_on(2, 5, (1, 8), (0, 4), (0x01, 0x00), &[]),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "C", "L", "S", "R", "A", "B"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x5D; 16], &packages.concat())
+    }
+
+    /// The variables of callback_and_strings_list through `reach`, Setup holding "AB" for S and
+    /// "CD" for R.
+    fn strings_beside_a_driver(reach: VariableReach) -> Rc<MemoryVariables> {
+        let interface = match reach {
+            VariableReach::BootServices => VariableInterface::VariableServices,
+            VariableReach::Runtime => VariableInterface::Efivarfs,
+        };
+        let variables = MemoryVariables::new(reach, interface);
+        let stored = [
+            [0x41, 0, 0x42, 0, 0, 0, 0, 0],
+            [0x43, 0, 0x44, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+        variables.insert(setup(), NV_BS_RT, &stored);
+        Rc::new(variables)
+    }
+
+    /// get of a STRING beside a question that its driver holds asks no driver, and answers as
+    /// without one, through either reach: C, flagged EFI_IFR_FLAG_CALLBACK and without a
+    /// VarStore, shows why it has no value, as uefisettings exchanges no STRING with a CallBack()
+    /// (StoragelessRefusal::CallbackUndecoded), and S and R show the characters of Setup. get of
+    /// Q asks the driver.
+    #[test]
+    fn get_asks_no_driver_for_a_string() {
+        let hiidb = callback_and_strings_list();
+        let undecoded = format!(
+            "<ValueUnavailable: {}>",
+            StoragelessRefusal::CallbackUndecoded("EFI_IFR_STRING")
+        );
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            let driver = RecordingDriver::default();
+            let get = |question: &str, held: Option<&dyn DriverHeldValues>| {
+                HiiBackend::get_in(
+                    &hiidb,
+                    question,
+                    None,
+                    &GetOptions::default(),
+                    shared(&strings_beside_a_driver(reach)),
+                    None,
+                    None,
+                    held,
+                )
+                .map(|response| {
+                    response
+                        .responses
+                        .into_iter()
+                        .map(|response| response.question.answer)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| format!("{error:#}"))
+            };
+
+            for (question, want) in [("C", undecoded.as_str()), ("S", "AB"), ("R", "CD")] {
+                let got = get(question, Some(&driver));
+                assert_eq!(got, Ok(vec![want.to_owned()]), "{reach:?}: get {question}");
+                assert_eq!(
+                    got,
+                    get(question, None),
+                    "{reach:?}: get {question} without a driver"
+                );
+            }
+            assert!(
+                driver.gets.borrow().is_empty(),
+                "{reach:?}: no get by the driver"
+            );
+            assert_eq!(
+                get("Q", Some(&driver)),
+                Ok(vec!["from the driver".to_owned()]),
+                "{reach:?}: get Q"
+            );
+            assert_eq!(*driver.gets.borrow(), [9], "{reach:?}: the driver's gets");
+        }
+    }
+
+    /// A CHECKBOX of QuestionId `question_id` prompted by string `prompt`, without a VarStore,
+    /// flagged EFI_IFR_FLAG_CALLBACK.
+    fn callback_checkbox(question_id: u16, prompt: u16) -> Vec<u8> {
+        let data = [
+            &prompt.to_le_bytes()[..],
+            &1u16.to_le_bytes(),        // Help
+            &question_id.to_le_bytes(), // QuestionId
+            &0u16.to_le_bytes(),        // VarStoreId
+            &0xFFFFu16.to_le_bytes(),   // VarStoreInfo
+            &[0x04, 0x00],              // EFI_IFR_FLAG_CALLBACK, CHECKBOX Flags
+        ]
+        .concat();
+        operation(CHECKBOX, false, &data)
+    }
+
+    /// The IFR of name_value_hiidb's first list with a CHECKBOX C of its own, QuestionId 9, which
+    /// its driver holds (callback_checkbox), beside the VARSTORE_NAME_VALUE of VarStoreId 3 and B
+    /// on Backing, and with the PASSWORD on Pin of VarStoreId `password`, if any, in a form of
+    /// its own: edk2 may route one of VarStoreId 3 to the VARSTORE_NAME_VALUE, one of VarStoreId
+    /// 0 names no VarStore, and one of VarStoreId 1 is on Backing.
+    fn name_value_callback_ifr(password: Option<u16>) -> Vec<Vec<u8>> {
+        type I = NameValueIfr;
+        let mut children = vec![
+            I::name_value(),
+            I::backing(),
+            form(1, &[callback_checkbox(9, 1), I::b()]),
+        ];
+        if let Some(var_store_id) = password {
+            children.push(form(2, &[I::password(var_store_id)]));
+        }
+        vec![form_set(&children)]
+    }
+
+    /// What the refusal of a HiiDB with a PASSWORD of VarStoreId 0 says of it, after its
+    /// QuestionId and FormSet.
+    const VAR_STORE_ID_0: &str = ": VarStoreId 0 names no VarStore, so its callbacks or READ and \
+                                  WRITE ops keep its password where uefisettings cannot tell";
+
+    /// In a HiiDB with a PASSWORD that its driver may keep in any variable, one of VarStoreId 0,
+    /// which names no VarStore, or one that edk2 may route to a VARSTORE_NAME_VALUE, get of a
+    /// question that its driver holds asks that driver nothing and reads no variable: through
+    /// variables that reach Runtime it refuses the HiiDB as such (AnyVariablePasswords), through
+    /// those that reach BootServices as the password is unresolved. Beside a PASSWORD on Backing,
+    /// or none, get asks the driver.
+    #[test]
+    fn get_asks_no_driver_where_a_driver_may_keep_a_password_in_any_variable() {
+        for (reach, refusal) in [
+            (VariableReach::Runtime, ANY_VARIABLE),
+            (VariableReach::BootServices, BOOT_SERVICES_REFUSAL),
+        ] {
+            for password in [Some(0), Some(3), Some(1), None] {
+                let hiidb = name_value_hiidb(&name_value_callback_ifr(password));
+                let variables = name_value_variables(reach);
+                let driver = RecordingDriver::default();
+
+                let got = HiiBackend::get_in(
+                    &hiidb,
+                    "C",
+                    None,
+                    &GetOptions::default(),
+                    shared(&variables),
+                    None,
+                    None,
+                    Some(&driver as &dyn DriverHeldValues),
+                )
+                .map(|response| {
+                    response
+                        .responses
+                        .into_iter()
+                        .map(|response| response.question.answer)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| format!("{error:#}"));
+
+                let case = format!("{reach:?}, the PASSWORD of VarStoreId {password:?}");
+                match password {
+                    Some(var_store_id @ (0 | 3)) => {
+                        assert!(
+                            got.as_ref().is_err_and(|error| {
+                                error.starts_with("PASSWORD question 0x0003 in FormSet ")
+                                    && error.ends_with(refusal)
+                                    && (var_store_id == 3 || error.contains(VAR_STORE_ID_0))
+                            }),
+                            "{case}: get C: {got:?}"
+                        );
+                        assert!(
+                            driver.gets.borrow().is_empty(),
+                            "{case}: no get by the driver"
+                        );
+                        assert_eq!(variables.reads(), [], "{case}: no variable read");
+                    }
+                    Some(_) | None => {
+                        assert_eq!(got, Ok(vec!["from the driver".to_owned()]), "{case}: get C");
+                        assert_eq!(*driver.gets.borrow(), [9], "{case}: the driver's gets");
+                    }
+                }
+            }
+        }
+    }
+
     /// Through variables that reach BootServices, a HiiDB with a PASSWORD op whose VarStore is
     /// unknown has get, list-questions, show-ifr and set read and write no variable, even with
     /// UnsafeOperations::Allow, which lifts no refusal that would disclose a password; through
@@ -7516,6 +7998,7 @@ mod tests {
             shared(&variables),
             None,
             None,
+            None,
         );
         let listed = HiiBackend::list_questions_in(
             &hiidb,
@@ -7566,6 +8049,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
             None,
             None,
         )
@@ -7760,6 +8244,7 @@ mod tests {
                     shared(&variables),
                     None,
                     None,
+                    None,
                 )
                 .unwrap_or_else(|error| panic!("{reach:?}: get {question}: {error:#}"));
                 let answers: Vec<String> = got
@@ -7849,6 +8334,7 @@ mod tests {
                 shared(&boot_services),
                 None,
                 None,
+                None,
             )
             .map(drop)
             .map_err(|error| error.to_string());
@@ -7867,6 +8353,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&runtime),
+                None,
                 None,
                 None,
             )
@@ -8150,6 +8637,7 @@ mod tests {
                 shared(variables),
                 None,
                 None,
+                None,
             )
             .map(|got| {
                 got.responses
@@ -8260,6 +8748,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(variables),
+            None,
             None,
             None,
         )
@@ -8571,6 +9060,7 @@ mod tests {
                     None,
                     &GetOptions::default(),
                     shared(&variables),
+                    None,
                     None,
                     None,
                 )
@@ -9000,6 +9490,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&variables()),
+                None,
                 None,
                 None,
             )
@@ -9703,6 +10194,7 @@ mod tests {
                 shared(variables),
                 exported(),
                 None,
+                None,
             )
             .unwrap_or_else(|error| panic!("get {name}: {error:#}"));
             got.extend(
@@ -10015,6 +10507,7 @@ mod tests {
                 &GetOptions::default(),
                 shared(&no_variables()),
                 Some(ExportedConfig::new(text.clone())),
+                None,
                 None,
             )
             .map(|response| format!("{response:#?}"))
@@ -10473,6 +10966,7 @@ mod tests {
                     .expect("variables that read nothing"),
                 Some(ExportedConfig::new(snapshot.to_owned())),
                 None,
+                None,
             )
             .map(|response| {
                 response
@@ -10751,6 +11245,7 @@ mod tests {
                 shared(&variables),
                 exported(),
                 platform,
+                None,
             )
             .unwrap_or_else(|error| panic!("{case}: get: {error:#}"));
             let listed = HiiBackend::list_questions_in(
@@ -10876,6 +11371,7 @@ mod tests {
             },
             shared(variables),
             exported(),
+            None,
             None,
         )
         .map(|got| {
@@ -11719,6 +12215,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&variables),
+                None,
                 None,
                 None,
             )
@@ -12639,6 +13136,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(variables),
+                None,
                 None,
                 None,
             )
@@ -14311,6 +14809,7 @@ mod tests {
             shared(&Rc::new(variables)),
             None,
             None,
+            None,
         )
         .map(|got| {
             got.responses
@@ -14487,6 +14986,7 @@ mod tests {
             &GetOptions::default(),
             shared(variables),
             exported.map(|text| ExportedConfig::new(text.to_owned())),
+            None,
             None,
         )
         .map(|response| {

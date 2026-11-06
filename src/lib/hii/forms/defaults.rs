@@ -667,6 +667,21 @@ fn takes_option_defaults(op_code: IFROpCode) -> bool {
     }
 }
 
+/// Returns the question's standard default, which a forms browser gives a question without
+/// storage before it reads it (edk2-stable202608 SetupBrowserDxe Setup.c:5956).
+pub(super) fn standard_default(
+    question: &IFROperation,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Option<Result<u64, DefaultError>> {
+    default_for_id(
+        question,
+        &question_scope(question),
+        DefaultId::STANDARD,
+        inputs,
+    )
+    .map(|value| value.and_then(TypedDefault::number))
+}
+
 /// Returns the question's default for `default_id`: EFI_IFR_DEFAULT, then a flagged
 /// EFI_IFR_ONE_OF_OPTION, then CHECKBOX Flags (UEFI 2.10 §33.3.8.3.9, §33.3.8.3.47). A flagged
 /// option of an ORDERED_LIST gives its Value's bytes, whatever SUPPRESS_IF is around it, as

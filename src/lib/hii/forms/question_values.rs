@@ -42,6 +42,7 @@ use super::defaults::option_value;
 use super::defaults::push_default;
 use super::defaults::question_defaults;
 use super::defaults::question_scope;
+use super::driver_held;
 use super::find_corresponding_varstore;
 use super::keywords::keyword_of;
 use super::keywords::KeywordStatement;
@@ -874,13 +875,13 @@ fn class_question_flags(question: &IFROperation) -> QuestionFlags {
 /// Returns `value`, a current value or IFR default of a CHECKBOX, as list-questions and get show
 /// it: FALSE or TRUE (UEFI 2.10 §33.3.8.3.9) as 0 or 1, any nonzero value as 1, as
 /// edk2-stable202608 ProcessOptions.c shows it on.
-fn checkbox_text(value: u64) -> String {
+pub(super) fn checkbox_text(value: u64) -> String {
     u8::from(value != 0).to_string()
 }
 
 /// Returns `value`, a current value or IFR default of a ONE_OF in `format`, as list-questions and
 /// get show it: `option`, the text of the option that holds it, else its number.
-fn one_of_text(value: u64, format: NumericFormat, option: Option<&str>) -> String {
+pub(super) fn one_of_text(value: u64, format: NumericFormat, option: Option<&str>) -> String {
     match option {
         Some(text) => text.to_string(),
         None => format!("{} (no matching option)", format.decode(value)),
@@ -926,6 +927,12 @@ pub(super) fn handle_checkbox(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        driver_held: driver_held::driver_held(
+            current_node,
+            &varstore,
+            ValueQuestion::CheckBox(parsed),
+            walk,
+        ),
         varstore,
         location: parsed.location,
         input: TextInput::Maximum(RangeType::NumSize8(1)),
@@ -1028,6 +1035,12 @@ pub(super) fn handle_oneof(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options,
+        driver_held: driver_held::driver_held(
+            current_node,
+            &varstore,
+            ValueQuestion::OneOf(parsed),
+            walk,
+        ),
         varstore,
         location: parsed.location,
         input: TextInput::Maximum(maximum(&parsed.data)),
@@ -1124,6 +1137,12 @@ pub(super) fn handle_numeric(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        driver_held: driver_held::driver_held(
+            current_node,
+            &varstore,
+            ValueQuestion::Numeric(parsed),
+            walk,
+        ),
         varstore,
         location: parsed.location,
         // set refuses bit fields, whose Flags from_ifr would misread
@@ -1196,6 +1215,8 @@ pub(super) fn handle_date_time(
             .display(parsed.question_header().help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        // StoragelessQuestion::refusal refuses one that its driver holds
+        driver_held: None,
         varstore,
         location: parsed.location(),
         input: TextInput::DateTime(DateTimeInput { format, stored }),

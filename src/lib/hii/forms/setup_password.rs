@@ -2462,6 +2462,71 @@ mod tests {
         }
     }
 
+    /// A Callback() restore in the UEFI Shell, which sets back or deletes a FormSet's EFI variable
+    /// store whole through the withholding variables (VariableData), never replaces a variable that
+    /// a VarStore outside any FormSet of a PASSWORD's VarStoreId names: it fails with
+    /// WithheldPassword before the variables see it, and the password stays.
+    #[cfg(variable_data)]
+    #[test]
+    fn a_callback_restore_never_replaces_an_outside_var_store_of_a_password_s_id() {
+        use crate::efi_variables::globals::tests::HeldVariables;
+        use crate::efi_variables::VariableContents;
+        use crate::efi_variables::VariableData;
+        use crate::hii::form_set_stores::tests::efi_declaration;
+        use crate::hii::form_set_stores::tests::store;
+        use crate::hii::form_set_stores::tests::FakeRouting;
+        use crate::hii::form_set_stores::tests::STORE_GUID;
+        use crate::hii::form_set_stores::Baseline;
+
+        // bytes 0..40 of Shadow, which a FormSet declares as its VARSTORE_EFI 4, hold the password
+        let outside = var_store(2, STORE_GUID.into(), "Shadow", 81);
+        let withheld = passwords_of(&[outside, form_set_with(&[password_on(2, 3, 2, 0)])])
+            .withheld(&reaching(VariableReach::BootServices))
+            .expect("every password resolved");
+        let shadow = VariableKey {
+            name: "Shadow".to_string(),
+            guid: STORE_GUID,
+        };
+        let held = HeldVariables::default().with("Shadow", STORE_GUID, &[0xAA; 41]);
+        let variables = WithholdingVariables::new(&held, withheld);
+        let routing = FakeRouting::default();
+        let baseline = Baseline::take(
+            vec![store(&efi_declaration(4, "Shadow"))],
+            &routing,
+            &variables,
+        )
+        .expect("read Shadow");
+        let written = VariableContents::new(
+            crate::efi_variables::globals::tests::NV_BS_RT,
+            vec![0xBB; 41],
+        )
+        .expect("data");
+        held.set_variable(&shadow, &written)
+            .expect("the Callback writes");
+        held.set.borrow_mut().clear();
+
+        let check = baseline.check(&routing, &variables);
+
+        assert_eq!(
+            check.refusal().as_deref(),
+            Some(&*format!(
+                "the Callback sequence changed stores of the FormSet: VARSTORE_EFI 0x0004 \
+                 {shadow}; restore failed: VARSTORE_EFI 0x0004 {shadow}: EFI variable {shadow} \
+                 holds a password at bytes 0..40, which set never writes"
+            )),
+            "the restore of Shadow"
+        );
+        assert!(
+            held.set.borrow().is_empty() && held.deleted.borrow().is_empty(),
+            "Shadow neither set nor deleted"
+        );
+        assert_eq!(
+            held.variables.borrow()[&shadow].data(),
+            [0xBB; 41],
+            "the Callback's write stays"
+        );
+    }
+
     /// Asserts that the VarStore ops `outside`, outside any FormSet, before a FormSet with a
     /// PASSWORD of its VarStoreId 2 and VarStoreInfo 0, leaves that password `unresolved`, naming
     /// no variable that withholding could name: through variables that reach BootServices, fail

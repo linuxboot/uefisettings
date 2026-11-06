@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|control-text-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|rt-data-name-value-string-forms|storageless-password-forms|rt-data-storageless-password-forms|undeclared-password-forms|rt-data-undeclared-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|export-config-undeclared-password|export-config-name-value-string|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|control-text-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|rt-data-name-value-string-forms|storageless-password-forms|rt-data-storageless-password-forms|undeclared-password-forms|rt-data-undeclared-password-forms|padded-strings|string-blocks|callback-forms|callback-forms-password|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|export-config-undeclared-password|export-config-name-value-string|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -87,6 +87,9 @@
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `string-blocks` does the same with the package list of [`string_blocks`].
+//! `callback-forms` publishes nothing either: it registers the package lists of
+//! [`callback_forms`], each by a handle with its EFI_HII_CONFIG_ACCESS_PROTOCOL but the last, and
+//! `callback-forms-password` that of its form set with a PASSWORD question.
 //! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `QHII` ACPI table,
 //! where `src/lib/hii/extract.rs` also looks, and puts its CRC-32 in `HiiDBCrc32`.
 //! `acpi-table-hiid` does the same with an `HIID` table, the other vendor ACPI table that
@@ -136,8 +139,8 @@
 extern crate alloc;
 
 mod auth_variables;
+mod callback_forms;
 mod control_text_forms;
-#[allow(dead_code, reason = "no fixture registers its forms with a driver yet")]
 mod driver_handle;
 mod dropped_password_forms;
 mod enhanced_auth_forms;
@@ -429,6 +432,8 @@ fn efi_main() -> Status {
                 );
             })
         }
+        Some(Task::RegisterCallbackForms(forms)) => callback_forms::register(forms)
+            .map(|()| println!("publish-hiidb: registered the callback forms {forms:?}")),
         Some(Task::PublishAcpiTable(signature)) => publish_acpi_table(signature).map(|length| {
             let signature = signature.escape_ascii();
             println!("publish-hiidb: {length} bytes in the {signature} ACPI table");
@@ -469,7 +474,8 @@ fn efi_main() -> Status {
                  |storageless-password-forms|rt-data-storageless-password-forms\
                  |undeclared-password-forms|rt-data-undeclared-password-forms\
                  |rt-data-name-value-string-forms\
-                 |padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
+                 |padded-strings|string-blocks|callback-forms|callback-forms-password\
+                 |acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|export-config|export-config-name-value-password\
                  |export-config-storageless-password|export-config-undeclared-password\
                  |export-config-name-value-string\
@@ -569,6 +575,8 @@ enum Task {
     /// [`wakeup_time_forms`] if missing, register its package list in the HII database, then
     /// publish the database in runtime-data pages.
     PublishWakeupTimeForms,
+    /// Register these package lists of [`callback_forms`] by their handles.
+    RegisterCallbackForms(callback_forms::Forms),
     /// Publish the database in an ACPI table of the signature.
     PublishAcpiTable([u8; 4]),
     /// Install an ACPI table of the signature whose body is JUNK_TABLE_BODY.
@@ -700,6 +708,12 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
         Ok(option) if option == cstr16!("string-blocks") => Some(Task::RegisterStringBlocks),
+        Ok(option) if option == cstr16!("callback-forms") => Some(Task::RegisterCallbackForms(
+            callback_forms::Forms::Callbacks,
+        )),
+        Ok(option) if option == cstr16!("callback-forms-password") => {
+            Some(Task::RegisterCallbackForms(callback_forms::Forms::Password))
+        }
         Ok(option) if option == cstr16!("acpi-table") => {
             Some(Task::PublishAcpiTable(QHII_SIGNATURE))
         }

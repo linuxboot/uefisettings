@@ -157,6 +157,8 @@ pub(super) fn handle_cross_reference(
             .display(reference.question_header.help_string_id)
             .to_string(),
         possible_options: Vec::new(),
+        // a REF without a VarStore is no listed question
+        driver_held: None,
         varstore,
         location: reference.location(),
         input: TextInput::CrossReference,

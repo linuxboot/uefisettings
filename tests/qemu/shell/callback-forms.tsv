@@ -1,0 +1,28 @@
+# The checks of shell/callback-forms.nsh. See check-shell-log.sh.
+# list-questions, show-ifr and get --no-efivars call no Callback()
+list-questions	status	0x0
+list-questions	none	^callback-forms: Callback
+show-ifr	status	0x0
+show-ifr	none	^callback-forms: Callback
+get-no-efivars	status	0x0
+get-no-efivars	none	^callback-forms: Callback
+# get runs FORM_OPEN, RETRIEVE, FORM_CLOSE between two reads of the stores, which leave out
+# byte 4 of the Buffer store, whose ExtractConfig() answer changes at every call
+get-beside	status	0x0
+get-beside	json-line	.responses | length == 1 and .[0].question.answer == "Off <not compared, as they changed between two reads before the first Callback(): VARSTORE 0x0002 CallbackBuffer: OFFSET=0004&WIDTH=0001>"
+get-beside	line	^callback-forms: Callback\(FORM_OPEN\) question 0x0201 value 0x0: UNSUPPORTED
+get-beside	line	^callback-forms: Callback\(RETRIEVE\) question 0x0201 value 0x0: SUCCESS, returned 0x0, request 0$
+get-beside	line	^callback-forms: Callback\(FORM_CLOSE\) question 0x0201 value 0x0: UNSUPPORTED
+get-beside	none	^callback-forms: Callback\(CHANG
+get-beside	none	^callback-forms: RouteConfig
+# get of a question whose RETRIEVE returns EFI_UNSUPPORTED has no value
+get-no-read-back	status	0x0
+get-no-read-back	json-line	.responses | length == 1 and (.[0].question.answer | startswith("<ValueUnavailable: its driver's CallBack(EFI_BROWSER_ACTION_RETRIEVE) returned EFI_UNSUPPORTED; without a VarStore the question has no other value (UEFI 2.11 "))
+# a store that ExtractConfig() does not answer refuses before any Callback()
+get-unreachable	status	0x0
+get-unreachable	json-line	.responses | length == 1 and (.[0].question.answer | startswith("<ValueUnavailable: cannot snapshot store VARSTORE 0x0003 CallbackUnreachable: ExtractConfig() returned EFI_NOT_FOUND"))
+get-unreachable	line	^callback-forms: ExtractConfig unanswered
+get-unreachable	none	^callback-forms: Callback
+# a package list that no driver handle registered has no Callback() to call
+get-driverless	status	0x0
+get-driverless	json-line	.responses | length == 1 and (.[0].question.answer | startswith("<ValueUnavailable: question has no VarStore, and no driver handle of its package list has EFI_HII_CONFIG_ACCESS_PROTOCOL") and endswith(": GetPackageListHandle() names no driver handle>"))

@@ -19,13 +19,17 @@
 //! panics unless the image has initialized it: uefi::table::set_system_table, then
 //! uefi::boot::set_image_handle, as uefisettings.efi's entry point uefi_std_entry does.
 
+use anyhow::anyhow;
 use anyhow::Result;
+use log::debug;
 
 use super::text_languages;
 use super::CapsuleBackend;
+use super::DriverHeldValues;
 use super::EfivarSource;
 use super::HiiBackend;
 use super::IncludedStates;
+use super::QuestionList;
 use super::UnsafeOperation;
 use super::UnsafeOperations;
 use super::VariableBackend;
@@ -42,9 +46,21 @@ use crate::efi_variables::VendorTable;
 use crate::efi_variables::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
 use crate::efi_variables::EFI_JSON_CONFIG_DATA_TABLE_GUID;
 use crate::firmware_width::FirmwareWidth;
+use crate::hii::config_access::ConfigAccessDriver;
+use crate::hii::config_routing::RoutingProtocol;
+use crate::hii::database_protocol::PackageLists;
 use crate::hii::export_package_lists;
+use crate::hii::form_set_stores::FormSetStore;
+use crate::hii::forms::DriverHeldQuestion;
+use crate::hii::forms::PasswordQuestions;
+use crate::hii::forms::QuestionDescriptor;
 use crate::hii::get_keywords;
 use crate::hii::package;
+use crate::hii::question_callbacks::retrieve;
+use crate::hii::question_callbacks::Call;
+use crate::hii::question_callbacks::DriverQuestion;
+use crate::hii::question_callbacks::FormSetAccess;
+use crate::hii::question_callbacks::IfrValue;
 use crate::hii::set_keywords;
 use crate::hii::time_services::TimeServices;
 use crate::hii::FirmwareKeywordHandler;
@@ -53,6 +69,7 @@ use crate::hii::KeywordGetOptions;
 use crate::hii::KeywordValues;
 use crate::hii::VariableReach;
 use crate::hii::VariableServices;
+use crate::hii::WithholdingVariables;
 use crate::runtime_time_services::RuntimeTimeServices;
 use crate::uefi_config_table::SystemConfigurationTable;
 
@@ -199,4 +216,130 @@ pub struct KeywordSetOptions {
     /// Whether to write a keyword whose question keeps its value in a volatile variable, as
     /// SetOptions::volatile
     pub volatile: VolatileWrites,
+}
+
+/// What get does with a question whose driver holds its value: call that driver's Callback()
+/// for it, unless --no-efivars keeps get from this firmware's state.
+impl HiiBackend {
+    pub(super) fn driver_held_values<'a>(
+        hiidb: &'a [u8],
+        efivars: &EfivarSource,
+    ) -> Option<Box<dyn DriverHeldValues + 'a>> {
+        match efivars {
+            EfivarSource::System => Some(Box::new(DriverCallbacks { hiidb })),
+            EfivarSource::Disabled => None,
+        }
+    }
+}
+
+/// The Callback()s of the drivers of the package lists of `hiidb`, the HiiDB that get and set
+/// read.
+struct DriverCallbacks<'a> {
+    hiidb: &'a [u8],
+}
+
+/// What a Callback() sequence reaches: the driver, the stores of the question's FormSet, and the
+/// variables without the bytes of PASSWORD questions, which no sequence reads or writes.
+struct Reached {
+    driver: ConfigAccessDriver,
+    stores: Vec<FormSetStore>,
+    variables: WithholdingVariables<VariableServices>,
+}
+
+impl DriverCallbacks<'_> {
+    /// What the sequence for `held` of `list` reaches, after checking that the HII database still
+    /// exports `hiidb`, so that the list's index names its handle.
+    fn reach(&self, list: &QuestionList<'_>, held: &DriverHeldQuestion) -> Result<Reached> {
+        let lists = PackageLists::export()?;
+        if lists.hiidb() != self.hiidb {
+            return Err(anyhow!(
+                "the HII database changed since uefisettings read it; run the command again"
+            ));
+        }
+        let parsed = package::read_db(self.hiidb)?;
+        let package_list = parsed
+            .get(list.index)
+            .ok_or_else(|| no_package_list(list.index))?;
+        held.check_disabled_forms(&package_list.disabled_forms)?;
+        let variables = PasswordQuestions::of_lists(&parsed).withholding(VariableServices)?;
+        let handle = lists
+            .handle(list.index)
+            .ok_or_else(|| no_package_list(list.index))?;
+        let driver = ConfigAccessDriver::of_package_list(handle)?;
+        let stores = held
+            .stores
+            .iter()
+            .filter_map(|declaration| FormSetStore::of(declaration, list.device_path).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Reached {
+            driver,
+            stores,
+            variables,
+        })
+    }
+}
+
+impl DriverHeldValues for DriverCallbacks<'_> {
+    fn get(
+        &self,
+        list: &QuestionList<'_>,
+        question: &QuestionDescriptor,
+        held: &DriverHeldQuestion,
+    ) -> String {
+        let reached = match self.reach(list, held) {
+            Ok(reached) => reached,
+            Err(error) => return format!("<ValueUnavailable: {error:#}>"),
+        };
+        let routing = RoutingProtocol::open();
+        let access = FormSetAccess {
+            stores: reached.stores,
+            routing: &routing,
+            variables: &reached.variables,
+        };
+        let retrieval = retrieve(&reached.driver, driver_question(held), access);
+        log_calls(&retrieval.calls);
+        let mut answer = match retrieval.value {
+            Ok(value) => shown(question, value),
+            Err(reason) => format!("<ValueUnavailable: {reason}>"),
+        };
+        for note in retrieval.notes {
+            answer.push_str(&format!(" <{note}>"));
+        }
+        answer
+    }
+}
+
+/// The error of a package list `index` that the HII database does not have.
+fn no_package_list(index: usize) -> anyhow::Error {
+    anyhow!("the HII database has no package list {index}")
+}
+
+/// The DriverQuestion of `held`.
+fn driver_question(held: &DriverHeldQuestion) -> DriverQuestion {
+    DriverQuestion {
+        question_id: held.question_id,
+        initial: IfrValue {
+            value_type: held.value_type,
+            value: held.initial,
+        },
+        form_set_has_stores: !held.stores.is_empty(),
+        read_expression: held.read_expression,
+    }
+}
+
+/// `value` of `question` as get shows it.
+fn shown(question: &QuestionDescriptor, value: IfrValue) -> String {
+    question
+        .driver_held_text(value.value)
+        .unwrap_or_else(|| value.value.to_string())
+}
+
+/// Logs each Callback() of a sequence.
+fn log_calls(calls: &[Call]) {
+    for call in calls {
+        debug!(
+            "Callback({}) with {:#x}: {}, {}",
+            call.action, call.value.value, call.returned.status, call.returned.request
+        );
+    }
 }

@@ -73,6 +73,7 @@ shell-name-value-password	/publish-hiidb.efi name-value-password-forms	name-valu
 shell-storageless-password	/publish-hiidb.efi storageless-password-forms	storageless-password.json	shell:storageless-password	-
 shell-undeclared-password	/publish-hiidb.efi undeclared-password-forms	undeclared-password.json	shell:undeclared-password	-
 shell-time-storage	/DriverSample.efi;/publish-hiidb.efi wakeup-time-forms	my-ifr-nv-data.json	shell:time-storage	-
+shell-callback-forms	/publish-hiidb.efi callback-forms	-	shell:callback-forms	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 hii-auth87	/publish-hiidb.efi enhanced-auth-forms;/publish-hiidb.efi rt-data	enhanced-auth-87.json	hii_auth87	-
 shell-auth87	/publish-hiidb.efi enhanced-auth-forms	enhanced-auth-87.json	shell:auth87	-

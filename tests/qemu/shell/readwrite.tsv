@@ -66,12 +66,12 @@ set-absent-target	json	. == {"error_message": "cannot set question \"Absent targ
 # its EFI_IFR_VALUE makes "Computed value" read-only: set refuses it before any write
 set-computed	status	aborted
 set-computed	json	(.error_message | gsub("§"; "?")) == "cannot set question \"Computed value\": its EFI_IFR_VALUE expression makes it read-only (UEFI 2.11 ?33.3.8.3.88)"
-# what each question without a VarStore lacks, or that its driver keeps its value, which this
-# build does not call yet
+# what each question without a VarStore lacks, or that its driver keeps its value: get finds no
+# driver handle with EFI_HII_CONFIG_ACCESS_PROTOCOL for it, and set does not call a driver yet
 get-driver-held	status	0x0
-get-driver-held	json	.responses | length == 1 and (.[0].question.answer | gsub("§"; "?")) == "<ValueUnavailable: question has no VarStore; its driver keeps the value, which only EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 ?33.2.5.6), which uefisettings.efi does not call yet>"
+get-driver-held	json	.responses | length == 1 and (.[0].question.answer | gsub("§"; "?")) == "<ValueUnavailable: question has no VarStore, and no driver handle of its package list has EFI_HII_CONFIG_ACCESS_PROTOCOL, whose CallBack() alone reaches its value (UEFI 2.11 ?33.2.5.6): GetPackageListHandle() names no driver handle>"
 set-driver-held	status	aborted
-set-driver-held	json	(.error_message | gsub("§"; "?")) == "cannot set question \"Driver held\": question has no VarStore; its driver keeps the value, which only EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 ?33.2.5.6), which uefisettings.efi does not call yet"
+set-driver-held	json	(.error_message | gsub("§"; "?")) == "cannot set question \"Driver held\": question has no VarStore; its driver keeps the value, which only EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 ?33.2.5.6), which only get (without --no-efivars) calls"
 get-no-value-source	status	0x0
 get-no-value-source	json	.responses | length == 1 and (.[0].question.answer | gsub("§"; "?")) == "<ValueUnavailable: question has no VarStore, READ or WRITE expression, or EFI_IFR_FLAG_CALLBACK, one of which UEFI 2.11 ?33.2.5.6 requires>"
 set-no-value-source	status	aborted
@@ -82,10 +82,10 @@ set-read-only	status	aborted
 set-read-only	json	(.error_message | gsub("§"; "?")) == "cannot set question \"Read only\": question has no VarStore, WRITE expression or EFI_IFR_FLAG_CALLBACK, so nothing keeps a changed value (UEFI 2.11 ?33.2.5.4.1)"
 get-unevaluated-read	status	0x0
 get-unevaluated-read	json	.responses | length == 1 and .[0].question.answer == "<ValueUnavailable: its READ expression uses EFI_IFR_TO_UINT, which uefisettings does not evaluate>"
-# list-questions never calls a driver: it lists the question that its driver holds with get's
-# refusal
+# list-questions never calls a driver: it lists the question that its driver holds with the refusal
+# of get --no-efivars
 list-questions	status	0x0
-list-questions	json	any(.[]; .name == "Driver held" and (.answer | gsub("§"; "?")) == "<ValueUnavailable: question has no VarStore; its driver keeps the value, which only EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 ?33.2.5.6), which uefisettings.efi does not call yet>") and any(.[]; .name == "Read only" and .answer == "5") and any(.[]; .name == "Read transformed" and .answer == "101") and any(.[]; .name == "Computed value" and .answer == "21")
+list-questions	json	any(.[]; .name == "Driver held" and (.answer | gsub("§"; "?")) == "<ValueUnavailable: question has no VarStore; its driver keeps the value, which only EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 ?33.2.5.6), which only get (without --no-efivars) calls>") and any(.[]; .name == "Read only" and .answer == "5") and any(.[]; .name == "Read transformed" and .answer == "101") and any(.[]; .name == "Computed value" and .answer == "21")
 # no refused set wrote, nor created AbsentBuffer
 dmpstore-refused	status	any
 dmpstore-refused	same	dmpstore-after

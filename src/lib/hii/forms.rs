@@ -63,7 +63,6 @@ use conditions::retrieve_question_value;
 use conditions::select;
 use conditions::skips_scope;
 use conditions::ExpressionInputs;
-use conditions::QuestionExpression;
 use conditions::QuestionValues;
 use conditions::Truth;
 use conditions::VarStoreValues;
@@ -122,8 +121,6 @@ use storage::VariableNotExported;
 use storage::VariableStore;
 use storageless::NoVarStore;
 use storageless::StoragelessQuestion;
-use storageless::StoragelessRefusal;
-use storageless::StoragelessRoute;
 use string_question::display_string_answer;
 use string_question::StringInput;
 use string_question::StringQuestion;
@@ -138,12 +135,18 @@ pub use conditions::SelectionError;
 pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Exclusion;
+pub(crate) use conditions::QuestionExpression;
 pub(crate) use conditions::RankedBefore;
 pub(crate) use conditions::ReadOnlyCause;
 pub(crate) use conditions::Selection;
 pub(crate) use conditions::StateEvaluation;
 pub(crate) use defaults::DeclaredDefault;
 pub(crate) use defaults::DefaultId;
+pub(crate) use driver_held::DriverHeldQuestion;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use driver_held::ExpressionBesideCallback;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use driver_held::IfrValueType;
 pub(crate) use set::set_questions;
 pub(crate) use set::NewAnswer;
 pub(crate) use setup_password::PasswordQuestions;
@@ -152,12 +155,14 @@ pub(crate) use setup_password::UnresolvedPassword;
 pub(crate) use storage::DeclaredKind;
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
 pub(crate) use storage::StoreDeclaration;
+pub(crate) use storageless::StoragelessRefusal;
 
 mod ami_access_level;
 mod conditions;
 mod cross_reference;
 mod date_time;
 mod defaults;
+mod driver_held;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
 #[cfg_attr(
@@ -1294,7 +1299,7 @@ impl NumericRange {
 
 /// The stored width in bits, 1 to 64, of a NUMERIC or ONE_OF value, and, if
 /// EFI_IFR_DISPLAY_INT_DEC signs it, the width of its type.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NumericFormat {
     bits: u32,
     signed_type_bits: Option<u32>,
@@ -2665,6 +2670,9 @@ pub struct DisabledForm {
     /// The index of the root of its FormSet among the roots that its parse returns: in the forms
     /// of its package list (ParsedPackageList::forms) for read_db
     pub root_index: usize,
+    /// The name of its first PASSWORD or VarStore op, which record_disabled_var_stores finds
+    /// (DriverHeldQuestion::check_disabled_forms)
+    pub(crate) store_op: Option<&'static str>,
 }
 
 impl DisabledForm {
@@ -2864,7 +2872,7 @@ fn handle_form_set_within(
                 }
                 None => debug!("IFR:End when parent_ref is none"),
             };
-            if let Some(disabled) =
+            if let Some(mut disabled) =
                 disabling.take_if(|disabled| Rc::ptr_eq(&disabled.form, &current_scope_clone))
             {
                 // every op after the form went into its scope, so it is its parent's last child
@@ -2882,7 +2890,7 @@ fn handle_form_set_within(
                     }
                 }
                 drop(parent);
-                record_disabled_var_stores(&disabled.form);
+                disabled.store_op = record_disabled_var_stores(&disabled.form);
                 disabled_forms.push(disabled);
             }
 
@@ -2949,6 +2957,8 @@ fn handle_form_set_within(
                     form,
                     // the one root that this parse returns
                     root_index: 0,
+                    // record_disabled_var_stores finds it once the form's End is read
+                    store_op: None,
                 };
                 debug!(
                     "disabling, at offset {}, {}",
@@ -3286,10 +3296,23 @@ fn record_var_store_in_form(op: &IFROperation) {
 }
 
 /// Records the VarStoreId of each VarStore op of the disabled form `form` in the FormSet that
-/// holds it (FormSet::var_stores_in_disabled_forms).
-fn record_disabled_var_stores(form: &Rc<RefCell<IFROperation>>) {
+/// holds it (FormSet::var_stores_in_disabled_forms); returns the name of its first PASSWORD or
+/// VarStore op (DisabledForm::store_op).
+fn record_disabled_var_stores(form: &Rc<RefCell<IFROperation>>) -> Option<&'static str> {
+    let mut store_op = None;
     walk_scopes(std::slice::from_ref(form), (), |node, ()| {
         let op = node.borrow();
+        if store_op.is_none()
+            && matches!(
+                op.op_code,
+                IFROpCode::Password
+                    | IFROpCode::VarStore
+                    | IFROpCode::VarStoreNameValue
+                    | IFROpCode::VarStoreEfi
+            )
+        {
+            store_op = Some(op.op_code.spec_name());
+        }
         if let (Some((var_store_id, _)), Some(form_set)) =
             (declared_store(&op.parsed_data), form_set_of_form(&op))
         {
@@ -3299,6 +3322,7 @@ fn record_disabled_var_stores(form: &Rc<RefCell<IFROperation>>) {
         }
         Walk::Enter(())
     });
+    store_op
 }
 
 /// The FormSet that holds `op` if a FORM or FORM_MAP of that FormSet holds `op`.
@@ -3502,6 +3526,8 @@ pub struct QuestionDescriptor {
     pub(crate) value_source: ValueSource,
     /// The question's op, whose WRITE expression set evaluates
     node: Rc<RefCell<IFROperation>>,
+    /// What get and set need if no VarStore but the question's driver holds its value
+    driver_held: Option<DriverHeldQuestion>,
 }
 impl fmt::Debug for QuestionDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -3633,23 +3659,6 @@ impl QuestionDescriptor {
                 reason: format!("{reason:#}"),
             }),
         }
-    }
-
-    /// How get (`Read`) or set (`Write`) reaches the value of a question without a VarStore;
-    /// None for one with a VarStore.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
-        )
-    )]
-    pub(crate) fn storageless_route(
-        &self,
-        expression: QuestionExpression,
-    ) -> Option<std::result::Result<StoragelessRoute, StoragelessRefusal>> {
-        let NoVarStore(storageless) = self.varstore.as_ref().err()?.downcast_ref::<NoVarStore>()?;
-        Some(storageless.route(expression))
     }
 
     /// The texts of the options of the stored items of an ORDERED_LIST, in order, as get shows

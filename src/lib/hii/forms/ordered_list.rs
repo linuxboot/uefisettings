@@ -615,6 +615,8 @@ pub(super) fn handle_ordered_list(
             .display(list.question_header().help_string_id)
             .to_string(),
         possible_options,
+        // StoragelessQuestion::refusal refuses one that its driver holds
+        driver_held: None,
         varstore,
         location: question.location(),
         input: TextInput::OrderedList(ListInput {

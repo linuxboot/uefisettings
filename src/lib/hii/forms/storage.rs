@@ -77,37 +77,13 @@ use crate::hii::variables::EFI_VARIABLE_RUNTIME_ACCESS;
 
 /// EFI_QF_DATE_STORAGE, QF_TIME_STORAGE and their _NORMAL values (UEFI 2.11 §33.3.8.3.11,
 /// §33.3.8.3.78): only a DATE or TIME with normal storage has a VarStore setting.
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 const QF_STORAGE: u8 = 0x30;
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 const QF_STORAGE_NORMAL: u8 = 0x00;
 /// sizeof(EFI_HII_DATE), sizeof(EFI_HII_TIME), sizeof(EFI_HII_REF) (UEFI 2.11 §33.3.8.3.51)
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 const DATE_WIDTH: usize = 4;
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 const TIME_WIDTH: usize = 3;
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 const REF_WIDTH: usize = 22;
 /// The size of EFI_IFR_QUESTION_HEADER, which every question op's data starts with
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 const QUESTION_HEADER_SIZE: usize = 11;
 
 pub(super) trait VariableStore {
@@ -1156,6 +1132,7 @@ mod non_efi_varstore_tests {
                 parsed_data: ParsedOperation::Placeholder,
                 header_past_length: Vec::new(),
             })),
+            driver_held: None,
         };
 
         let variables = test_var_store_variables();
@@ -2668,10 +2645,6 @@ pub(super) enum ShortEfiReason {
     NoOptions,
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// A store as a FormSet's IFR declares it, with the settings of its questions that a forms
 /// browser requests, but those of PASSWORD questions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2685,10 +2658,6 @@ pub(crate) struct StoreDeclaration {
     pub(crate) holds_password: bool,
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// The kind of a StoreDeclaration, with what a forms browser requests of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeclaredKind {
@@ -2705,10 +2674,6 @@ pub(crate) enum DeclaredKind {
     EfiVariable { name: String },
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// The stores that `form_set` declares, in IFR order, each with the settings that the questions
 /// of its forms request of it, without repeats, as a forms browser adds them to the store's
 /// `<ConfigRequest>` (only questions in a form reach InitializeRequestElement): a Buffer store's
@@ -2838,10 +2803,6 @@ pub(crate) fn store_declarations(
         .collect()
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// The storage of a question: its VarStoreId and VarStoreInfo, the block it spans in a Buffer
 /// store, and whether it is a PASSWORD question's.
 struct QuestionStorage {
@@ -2851,10 +2812,6 @@ struct QuestionStorage {
     password: bool,
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 impl QuestionStorage {
     /// Whether this storage covers any of `other`'s: the same VarName in a Name/Value store,
     /// whose settings go `by_name`, a common byte in a Buffer store.
@@ -2876,10 +2833,6 @@ impl QuestionStorage {
     }
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 impl StoreDeclaration {
     /// A store of `kind`, as its VARSTORE op declares it, before its questions are added.
     fn new(id: u16, guid: Guid, kind: DeclaredKind) -> Self {
@@ -2892,10 +2845,6 @@ impl StoreDeclaration {
     }
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// The storage of the question op `op`, with the StorageWidth of edk2-stable202608
 /// SetupBrowserDxe IfrParse.c for its kind; None for an op without storage and a DATE or TIME
 /// kept elsewhere. A PASSWORD spans its MaxSize CHAR16s, also with EFI_IFR_FLAG_CALLBACK, whose
@@ -2952,19 +2901,11 @@ fn question_storage(op: &IFROperation) -> Option<QuestionStorage> {
     })
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// The byte `at` of the fields that follow the question header in `data`, a question op's data.
 fn after_header(data: &[u8], at: usize) -> Option<u8> {
     data.get(QUESTION_HEADER_SIZE + at).copied()
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// The storage of an EDKII bit varstore field of `bits` bits at bit `bit_offset`: the bytes it
 /// spans (IfrParse.c, QuestionReferBitField).
 fn bit_field_storage(var_store_id: u16, bit_offset: u16, bits: u8) -> Option<QuestionStorage> {
@@ -2977,10 +2918,6 @@ fn bit_field_storage(var_store_id: u16, bit_offset: u16, bits: u8) -> Option<Que
     })
 }
 
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    allow(dead_code, reason = "no caller lists a FormSet's stores yet")
-)]
 /// The width of an ORDERED_LIST's element: that of its first ONE_OF_OPTION's value type, 1 for
 /// another type, as IfrParse.c takes it.
 fn ordered_list_element_width(op: &IFROperation) -> Option<usize> {

@@ -31,6 +31,10 @@ use thiserror::Error;
 use crate::efi_variables::enhanced_authenticated::has_metadata;
 use crate::efi_variables::enhanced_authenticated::metadata_end;
 use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
+#[cfg(variable_data)]
+use crate::efi_variables::VariableContents;
+#[cfg(variable_data)]
+use crate::efi_variables::VariableData;
 use crate::hii::config_snapshot::SnapshotLookup;
 #[cfg(all(efivar_dumps, not(system_variables)))]
 use crate::hii::efivarfs_format::EfivarCopy;
@@ -1209,6 +1213,13 @@ impl WithheldBytes {
             .try_for_each(|patch| self.check_write(key, &patch.range()))
     }
 
+    /// Refuses a write that replaces every byte of `key`, as SetVariable() and deletion do, if it
+    /// has withheld bytes.
+    #[cfg(variable_data)]
+    fn check_replace(&self, key: &VariableKey) -> std::result::Result<(), WithheldPassword> {
+        self.check_write(key, &(0..usize::MAX))
+    }
+
     /// Zeroes the withheld bytes of `key` in `value`, the start of its value.
     fn zero(&self, key: &VariableKey, value: &mut [u8]) {
         let len = value.len();
@@ -1371,6 +1382,42 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
     ) -> Result<()> {
         self.variables
             .write_patches(key, size, patches, self.volatile, missing)
+    }
+}
+
+/// As for FirmwareVariables: the Callback() sequences of the UEFI Shell build read and restore
+/// a FormSet's EFI variable stores through these. A read gives the withheld bytes as zero, where
+/// the value holds them; SetVariable() and deletion replace every byte of the variable, so they
+/// fail with WithheldPassword for a variable with withheld bytes before `variables` see it.
+#[cfg(variable_data)]
+impl<V: VariableData> VariableData for WithholdingVariables<V> {
+    fn interface(&self) -> VariableInterface {
+        VariableData::interface(&self.variables)
+    }
+
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        let Some(contents) = self.variables.variable_data(key)? else {
+            return Ok(None);
+        };
+        if !self.withheld.withholds(key) {
+            return Ok(Some(contents));
+        }
+        let mut data = contents.data().to_vec();
+        let start = data.len() - value_of(key, contents.attributes().bits(), &data)?.len();
+        if let Some(value) = data.get_mut(start..) {
+            self.withheld.zero(key, value);
+        }
+        Ok(Some(VariableContents::new(contents.attributes(), data)?))
+    }
+
+    fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+        self.withheld.check_replace(key)?;
+        self.variables.set_variable(key, contents)
+    }
+
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        self.withheld.check_replace(key)?;
+        self.variables.delete_variable(key)
     }
 }
 
@@ -2118,6 +2165,83 @@ pub(crate) mod tests {
                 "{interface:?}: the password's bytes"
             );
         }
+    }
+
+    /// As FirmwareVariables, WithholdingVariables' VariableData read the withheld bytes of a
+    /// variable as zero, and refuse to set or delete a variable with withheld bytes, which
+    /// SetVariable() and deletion replace whole, before their variables see it; they pass the
+    /// other variables through.
+    #[cfg(variable_data)]
+    #[test]
+    fn withheld_variable_data_reads_as_zero_and_is_neither_set_nor_deleted() {
+        use crate::efi_variables::globals::tests::key;
+        use crate::efi_variables::globals::tests::HeldVariables;
+
+        let variables = HeldVariables::default()
+            .with("Setup", NIL_GUID, &[1])
+            .with("AMITSESetup", NIL_GUID, &[1, 0xAA, 0xAA, 2])
+            .with("Other", NIL_GUID, &[3]);
+        let password = key("AMITSESetup", NIL_GUID);
+        let setup = key("Setup", NIL_GUID);
+        let other = key("Other", NIL_GUID);
+        let mut withheld = WithheldBytes::default();
+        withheld.insert(password.clone(), 1..3);
+        let withholding = WithholdingVariables::new(variables, withheld);
+        let contents =
+            VariableContents::new(VariableAttributes::NON_VOLATILE, vec![0]).expect("contents");
+        let refusal = format!(
+            "EFI variable {password} holds a password at bytes 1..3, which set never writes"
+        );
+
+        assert_eq!(
+            withholding
+                .variable_data(&password)
+                .expect("read AMITSESetup")
+                .map(|read| read.data().to_vec()),
+            Some(vec![1, 0, 0, 2]),
+            "read AMITSESetup"
+        );
+        assert_eq!(
+            withholding
+                .set_variable(&password, &contents)
+                .map_err(|error| error.to_string()),
+            Err(refusal.clone()),
+            "set AMITSESetup"
+        );
+        assert_eq!(
+            withholding
+                .delete_variable(&password)
+                .map_err(|error| error.to_string()),
+            Err(refusal),
+            "delete AMITSESetup"
+        );
+        assert_eq!(
+            withholding
+                .variable_data(&setup)
+                .expect("read Setup")
+                .map(|read| read.data().to_vec()),
+            Some(vec![1]),
+            "read Setup"
+        );
+        withholding
+            .set_variable(&setup, &contents)
+            .expect("set Setup");
+        withholding.delete_variable(&other).expect("delete Other");
+        assert_eq!(
+            *withholding.variables.set.borrow(),
+            std::slice::from_ref(&setup),
+            "set: Setup only"
+        );
+        assert_eq!(
+            *withholding.variables.deleted.borrow(),
+            [other],
+            "deleted: Other only"
+        );
+        assert_eq!(
+            withholding.variables.variables.borrow()[&password].data(),
+            [1, 0xAA, 0xAA, 2],
+            "AMITSESetup keeps its password"
+        );
     }
 
     /// WithholdingVariables zero the withheld bytes of a variable with

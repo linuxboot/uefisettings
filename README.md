@@ -270,6 +270,11 @@ otherwise.
 which UEFI 2.11 has check it against a schema and answer per capsule (§8.5.6.1.3), unlike
 SetVariable(), which stores bytes with "no read, write, or delete security protection" (§8.2.3).
 
+`get` of a question whose value only its driver keeps takes no flag either: it restores any store
+that its RETRIEVE Callback() changed, which undoes only the driver's own change, and its
+ExtractConfig() reads of the FormSet's Buffer and Name/Value stores reach the driver without the
+flag too (see the UEFI Shell details).
+
 ---
 
 ## Changing UEFI settings with automation
@@ -552,17 +557,17 @@ and `set` refuses it, with or without a VarStore:
 | READ only | the value of READ | refused: nothing keeps a changed value |
 | WRITE only | refused: no value to retrieve | through WRITE |
 | neither, nor EFI_IFR_FLAG_CALLBACK | refused: one of them is required | refused |
-| EFI_IFR_FLAG_CALLBACK only | refused: its driver keeps the value | refused |
-| EFI_IFR_FLAG_CALLBACK with READ (get) or WRITE (set) | refused: its driver's CallBack() may override the expression | refused |
+| EFI_IFR_FLAG_CALLBACK only | its driver's CallBack(): see below | its driver's CallBack(): see below |
+| EFI_IFR_FLAG_CALLBACK with READ (get) or WRITE (set) | as above, but refused where RETRIEVE fails: uefisettings does not evaluate READ beside CallBack() | refused before any write: uefisettings does not evaluate WRITE beside CallBack() |
 
 `get` refuses too where READ gives no value, as no stored value takes its place, and `set` where
 WRITE sets no VarStore. A browser lets the driver override READ with
 CallBack(EFI_BROWSER_ACTION_RETRIEVE) and calls CallBack() around WRITE, so a question with
 EFI_IFR_FLAG_CALLBACK is its driver's to answer. On Linux, Windows and macOS, which run after
 ExitBootServices(), when no EFI device-handle-based protocol may be used (UEFI 2.11 §7.4.6), the
-refusal points to `uefisettings.efi` in the UEFI Shell, which calls no CallBack() yet and refuses
-it as well. `hii list-questions` and `hii show-ifr` never call CallBack(): they show such a
-question with the refusal of `get`.
+refusal points to `uefisettings.efi` in the UEFI Shell, which calls CallBack(): see the UEFI Shell
+details. `hii list-questions` and `hii show-ifr` never call CallBack(): they show such a question
+with the refusal of `get`.
 
 </details>
 
@@ -925,6 +930,37 @@ and a VALUE that is not the bytes that `set` writes for that text, NULL-padded (
 FS0:\> uefisettings.efi hii keyword get --namespace x-UEFI-ns KEYWORD=<keyword>
 FS0:\> uefisettings.efi hii keyword set "NAMESPACE=x-UEFI-ns&PATH=<hex digits>&KEYWORD=<keyword>&VALUE=<hex digits>"
 ```
+
+A question without a VarStore whose value only its driver keeps (EFI_IFR_FLAG_CALLBACK, UEFI 2.11
+§33.2.5.6) is reached through that driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.Callback(), with the
+browser actions that a forms browser sends, as no forms browser runs. `get` sends FORM_OPEN,
+RETRIEVE and FORM_CLOSE, and shows the value that RETRIEVE gave; `set` refuses such a question.
+Only `get` calls a driver: `list-questions`, `show-ifr`, the dumps and `get --no-efivars` show why
+such a question has no value, and so does `get` on Linux, Windows and macOS.
+
+uefisettings exchanges a value with Callback() only for a one-of, numeric or checkbox question: it
+refuses an ordered-list or string question, or a date or time question outside EFI Date/Time
+Storage, with EFI_IFR_FLAG_CALLBACK and no VarStore, and names its op. A Callback() names its question by
+QuestionId alone, "The unique value that identifies the particular question" (UEFI 2.11
+§33.3.8.2.2), so uefisettings calls none for a question whose QuestionId another question of its
+FormSet also has, such as a password question: it refuses that question and names the other's op.
+
+Each Callback() sequence runs between reads of the stores of the question's FormSet: of its Buffer
+and Name/Value stores by EFI_HII_CONFIG_ROUTING_PROTOCOL.ExtractConfig() of the settings that a
+forms browser requests, and of its EFI variable stores. A store that cannot be read refuses before
+the first Callback(). Settings that change between two reads before it, as a timestamp does, are
+listed and not compared. A store that the Callback()s changed is restored, a Buffer or Name/Value
+store by one RouteConfig() of all its settings, and the answer is refused: the driver has already
+acted on the change, and any effect outside the FormSet's stores stays. The reads never request the
+bytes of a PASSWORD question, and read them as zero in an EFI variable store, so a Callback() that
+changes only them goes unnoticed, and a changed store that holds one is not restored, as a
+RouteConfig() without the password bytes may clear it and SetVariable() would write zeros over them.
+`get` of a question with a READ expression shows RETRIEVE's value, as a forms browser does. Where
+RETRIEVE fails, a forms browser keeps READ's value, but uefisettings does not evaluate READ beside
+a driver's Callback()s, so `get` refuses and says so. A Callback() that asks the forms browser to
+save the FormSet's modified values, which only a forms browser's edit buffer holds, or returns an
+ActionRequest that UEFI 2.11 §35.5.4 does not define refuses the answer too; a request for a
+platform reset or to discard modified values is noted.
 
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the

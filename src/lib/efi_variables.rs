@@ -268,10 +268,32 @@ pub(crate) trait VariableData {
     /// Deletes `key`, as SetVariable() without data does (UEFI 2.11 §8.2.3); fails with
     /// VariableNotFound if the backend reaches no such variable.
     #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "no caller restores a FormSet's stores yet")
+        not(any(target_os = "uefi", test)),
+        allow(
+            dead_code,
+            reason = "only the UEFI Shell build restores a FormSet's stores"
+        )
     )]
     fn delete_variable(&self, key: &VariableKey) -> Result<()>;
+}
+
+#[cfg(variable_data)]
+impl<T: VariableData + ?Sized> VariableData for &T {
+    fn interface(&self) -> VariableInterface {
+        (**self).interface()
+    }
+
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        (**self).variable_data(key)
+    }
+
+    fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+        (**self).set_variable(key, contents)
+    }
+
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        (**self).delete_variable(key)
+    }
 }
 
 /// What SetVariable() returned, but EFI_SUCCESS, for a Secure Boot Mode transition that the

@@ -27,6 +27,9 @@
 #                "any" checks none, for a step that runs a command of the shell
 #              json: the step's output is one line, whose JSON the jq filter of the argument
 #                finds true
+#              json-line: one line of the step's output begins with "{", and the jq filter of
+#                the argument finds its JSON true; for a step whose other lines a fixture
+#                driver prints
 #              warned: the step's output is lines that start with "warning: ", at least one,
 #                which line checks read, and then one line of JSON, which the jq filter of the
 #                argument finds true
@@ -156,6 +159,13 @@ check_step() {
     json)
         if (($(wc -l <"$out") != 1)) || ! jq --exit-status "$argument" <"$out" >/dev/null 2>&1; then
             fail "$step" "not one line of JSON for which $argument holds"
+        fi
+        ;;
+    json-line)
+        json=$(grep -- '^{' "$out" || true)
+        if [[ -z $json || $(wc -l <<<"$json") != 1 ]] ||
+            ! jq --exit-status "$argument" <<<"$json" >/dev/null 2>&1; then
+            fail "$step" "not one line of JSON among its lines for which $argument holds"
         fi
         ;;
     warned)

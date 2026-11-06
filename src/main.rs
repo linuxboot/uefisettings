@@ -2265,6 +2265,78 @@ mod tests {
         }
     }
 
+    /// get's answer and set's refusal of a question that its driver holds, which name the HiiDB's
+    /// strings, its prompt and what its driver did, such as the EFI variables that it changed,
+    /// print as every answer and error does: text as Debug, its control characters and
+    /// Bidi_Control characters escaped, JSON exact but for what JsonText spells, and through a
+    /// console that renders ASCII only, every other character escaped too.
+    #[test]
+    fn driver_held_answers_and_refusals_escape_firmware_texts() {
+        let prompt = "Q\u{1b}[2J\u{202e}\u{10d}";
+        let answer = uefisettings_backend_thrift::GetResponseList {
+            responses: vec![uefisettings_backend_thrift::GetResponse {
+                question: uefisettings_backend_thrift::Question {
+                    name: prompt.to_owned(),
+                    answer: "On <EFI variables changed: V\u{1b}-8c78a505-baa0-4c4a-869f-\
+                             000000000a01 (created)>"
+                        .to_owned(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let refusal = uefisettings_backend_thrift::Error {
+            error_message: format!(
+                "cannot set question {prompt:?}: its driver's \
+                 CallBack(EFI_BROWSER_ACTION_CHANGING) refused the value: EFI_ACCESS_DENIED"
+            ),
+            ..Default::default()
+        };
+        let raw = ['\u{1b}', '\u{202e}', '\u{10d}'];
+        for json in [false, true] {
+            let mut ascii = Vec::new();
+            write_with_style(&mut ascii, &mut AsciiConsole, answer.clone(), json)
+                .expect("the answer through ASCII");
+            write_with_style(&mut ascii, &mut AsciiConsole, refusal.clone(), json)
+                .expect("the refusal through ASCII");
+            let ascii = String::from_utf8(ascii).expect("UTF-8");
+            assert!(
+                !ascii.contains(raw),
+                "json {json}, ASCII console: {ascii:?}"
+            );
+
+            let mut unicode = Vec::new();
+            write_with_style(&mut unicode, &mut UnicodeTerminal, answer.clone(), json)
+                .expect("the answer");
+            write_with_style(&mut unicode, &mut UnicodeTerminal, refusal.clone(), json)
+                .expect("the refusal");
+            let unicode = String::from_utf8(unicode).expect("UTF-8");
+            assert!(
+                !unicode.contains(['\u{1b}', '\u{202e}']),
+                "json {json}, UTF-8 terminal: {unicode:?}"
+            );
+            match json {
+                true => {
+                    let names: Vec<String> = unicode
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .filter_map(|value| {
+                            value["responses"][0]["question"]["name"]
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .collect();
+                    assert_eq!(names, [prompt], "the prompt read back from the JSON");
+                }
+                false => assert!(
+                    unicode.contains("Q\\u{1b}[2J\\u{202e}\u{10d}"),
+                    "the prompt as Debug: {unicode:?}"
+                ),
+            }
+        }
+    }
+
     /// Text and JSON through a console that renders ASCII only: each other character escaped as
     /// its syntax spells it, and each line break that uefisettings writes kept.
     #[test]

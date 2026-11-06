@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::CapsuleBackend;
+use super::DriverHeldValues;
 use super::HiiBackend;
 use super::VariableBackend;
 use crate::efi_variables::VariableData;
@@ -89,5 +90,15 @@ impl HiiBackend {
                 EfivarSource::System | EfivarSource::Disabled => Self::system_hiidb(),
             },
         }
+    }
+}
+
+/// What get does with a question whose driver holds its value: no driver is reached here.
+impl HiiBackend {
+    pub(super) fn driver_held_values(
+        _hiidb: &[u8],
+        _efivars: &EfivarSource,
+    ) -> Option<Box<dyn DriverHeldValues>> {
+        None
     }
 }

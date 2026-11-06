@@ -34,6 +34,7 @@ use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
 use super::CapsuleBackend;
+use super::DriverHeldValues;
 use super::DumpEfivarsOptions;
 use super::HiiBackend;
 use super::LiftedOperations;
@@ -580,4 +581,14 @@ fn compare_redfish_attributes(
         }
     }
     map
+}
+
+/// What get does with a question whose driver holds its value: no driver is reached here.
+impl HiiBackend {
+    pub(super) fn driver_held_values(
+        _hiidb: &[u8],
+        _efivars: &EfivarSource,
+    ) -> Option<Box<dyn DriverHeldValues>> {
+        None
+    }
 }

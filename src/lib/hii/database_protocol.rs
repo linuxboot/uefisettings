@@ -70,7 +70,6 @@ impl PackageLists {
     }
 
     /// The EFI_HII_HANDLE of the `index`-th package list.
-    #[expect(dead_code, reason = "no caller reaches a package list's driver yet")]
     pub(crate) fn handle(&self, index: usize) -> Option<HiiHandle> {
         self.lists.get(index).map(|(handle, _)| *handle)
     }
@@ -78,7 +77,6 @@ impl PackageLists {
 
 /// The driver handle that registered the package list of `handle`: GetPackageListHandle()
 /// (UEFI 2.11 §34.8.12), None if it names none.
-#[expect(dead_code, reason = "no caller reaches a package list's driver yet")]
 pub(crate) fn driver_handle(handle: HiiHandle) -> Result<Option<Handle>> {
     let database = open_database()?;
     let functions = database

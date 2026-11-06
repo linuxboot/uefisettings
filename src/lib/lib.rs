@@ -28,10 +28,6 @@ mod capsule_services;
 #[cfg(target_os = "linux")]
 mod chattr;
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "no caller reads a FormSet's stores yet")
-)]
 mod efi_status;
 mod efi_variables;
 mod exit_status;

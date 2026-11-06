@@ -365,6 +365,8 @@ pub(super) fn handle_string(
         value: answer,
         help: texts.display(header.help_string_id).to_string(),
         possible_options: Vec::new(),
+        // StoragelessQuestion::refusal refuses one that its driver holds
+        driver_held: None,
         varstore,
         location: question.location(),
         input: TextInput::String(StringInput {

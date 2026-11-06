@@ -18,25 +18,21 @@ pub(crate) mod config_snapshot;
     not(test),
     expect(
         dead_code,
-        reason = "no Config Routing caller builds or parses these strings yet, and only the UEFI \
-                  Shell build's Keyword Handler caller does some"
+        reason = "only the UEFI Shell build routes <ConfigRequest>s and calls the Keyword Handler \
+                  with these strings"
     )
 )]
 mod config_string;
+// EFI_HII_CONFIG_ACCESS_PROTOCOL of a package list's driver, whose Callback() question_callbacks
+// runs.
+#[cfg(target_os = "uefi")]
+pub(crate) mod config_access;
 // The Buffer and Name/Value stores of a FormSet, which only the UEFI Shell build reaches; the
 // tests run on every host with variables.
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "no caller reads a FormSet's stores yet"
-    )
-)]
 pub(crate) mod config_routing;
 #[cfg(target_os = "uefi")]
-mod database_protocol;
+pub(crate) mod database_protocol;
 #[cfg(efivar_dumps)]
 mod efivar_dump;
 #[cfg(target_os = "linux")]
@@ -54,10 +50,6 @@ mod firmware_environment;
 #[cfg(target_os = "linux")]
 pub(crate) mod firmware_memory;
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "no caller reads a FormSet's stores yet")
-)]
 pub(crate) mod form_set_stores;
 pub mod forms;
 #[cfg(any(target_os = "windows", test))]
@@ -75,6 +67,10 @@ mod lockdown;
 #[cfg(target_os = "linux")]
 mod memory_access_denied;
 pub mod package;
+// Callback() of the driver of a question without a VarStore, which only the UEFI Shell build
+// calls; the tests run on every host with variables.
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) mod question_callbacks;
 mod scsu;
 mod strings;
 pub(crate) mod time_services;
@@ -174,4 +170,6 @@ pub(crate) use variables::VariableNotFound;
 #[cfg(variable_data)]
 pub(crate) use variables::VariableReach;
 pub use variables::VolatileWrites;
+#[cfg(target_os = "uefi")]
+pub(crate) use variables::WithholdingVariables;
 pub(crate) use variables::VOLATILE_ANNOTATION;
