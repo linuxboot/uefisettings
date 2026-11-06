@@ -273,6 +273,7 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::read_db;
+    use crate::hii::strings::Language;
     use crate::hii::variables::tests::NV_BS;
 
     /// The directory of the fixtures of tests/offline_golden.rs.
@@ -304,6 +305,7 @@ mod tests {
             guid: NIL_GUID,
             device_path: None,
             strings: vec![BTreeMap::new()],
+            string_languages: vec![Language::default()],
             forms: vec![Rc::clone(root)],
         }
     }

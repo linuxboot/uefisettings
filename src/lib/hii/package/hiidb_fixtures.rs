@@ -83,6 +83,11 @@ pub(crate) fn en_strings_package(letter: u8) -> Vec<u8> {
 
 /// An "en" strings package holding `strings`, string ID 1 first.
 pub(crate) fn en_strings_package_of(strings: &[&str]) -> Vec<u8> {
+    strings_package_of(b"en", strings)
+}
+
+/// A strings package of Language `language` holding `strings`, string ID 1 first.
+pub(crate) fn strings_package_of(language: &[u8], strings: &[&str]) -> Vec<u8> {
     let mut blocks = Vec::new();
     for string in strings {
         blocks.push(0x14); // EFI_HII_SIBT_STRING_UCS2
@@ -90,15 +95,22 @@ pub(crate) fn en_strings_package_of(strings: &[&str]) -> Vec<u8> {
         blocks.extend([0x00, 0x00]);
     }
     blocks.push(0x00); // EFI_HII_SIBT_END
-    en_strings_package_with_blocks(&blocks)
+    strings_package_with_blocks(language, &blocks)
 }
 
 /// An "en" strings package whose string blocks are `blocks`, valid or not.
 pub(super) fn en_strings_package_with_blocks(blocks: &[u8]) -> Vec<u8> {
+    strings_package_with_blocks(b"en", blocks)
+}
+
+/// A strings package of Language `language`, which this adds the null terminator to, whose
+/// string blocks are `blocks`, valid or not.
+fn strings_package_with_blocks(language: &[u8], blocks: &[u8]) -> Vec<u8> {
     let language = [
         &[0x00; 32][..],     // LanguageWindow
         &1u16.to_le_bytes(), // LanguageName
-        b"en\0",             // Language
+        language,            // Language
+        &[0x00],             // its null terminator
     ]
     .concat();
 

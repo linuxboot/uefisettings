@@ -213,4 +213,7 @@ struct HiiDatabase {
 struct HiiStringsPackage {
   1: string package_list; // note that this isn't unique, multiple packages will be part of the same package list
   2: map<i32, string> string_package;
+  // the Language of the package's header (UEFI 2.11 §33.3.6.1): "en-US", for one, or a UEFI
+  // configuration language such as "x-UEFI-ns", which holds keywords (§35.3.1)
+  3: string language;
 }

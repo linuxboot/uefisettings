@@ -161,6 +161,8 @@ struct Dump {
 #[derive(Debug, Deserialize)]
 struct StringPackage {
     string_package: BTreeMap<String, String>,
+    // optional, so that a build without the field fails an assertion, not the parse
+    language: Option<String>,
 }
 
 fn question(name: &str, answer: &str, options: &[&str]) -> Question {
@@ -329,6 +331,31 @@ fn list_strings_lists_the_prompts() {
         .collect();
     for DefaultQuestion { name, .. } in DEFAULTS {
         assert!(strings.contains(&name), "{name:?} is not listed");
+    }
+}
+
+/// Each package of list-strings names its own language: DriverSample's VfrStrings.uni
+/// (edk2-stable202608) defines en-US, fr-FR and x-UEFI-ns, edk2's build puts each language in a
+/// strings package of its own, holding only the strings defined in it, and DriverSample adds
+/// those packages to both of its package lists (DriverSample.c, HiiAddPackages).
+#[test]
+fn list_strings_names_each_package_language() {
+    let packages: Vec<StringPackage> = json(&["hii", "list-strings", "--json"]);
+    for (string, language) in [
+        ("My one-of prompt #1", "en-US"),
+        ("Mi uno- de gu\u{ed}a # 1", "fr-FR"),
+        ("iSCSIBootEnable", "x-UEFI-ns"),
+    ] {
+        let languages: Vec<Option<&str>> = packages
+            .iter()
+            .filter(|package| package.string_package.values().any(|value| value == string))
+            .map(|package| package.language.as_deref())
+            .collect();
+        assert_eq!(
+            languages,
+            [Some(language); 2],
+            "languages of the packages holding {string:?}"
+        );
     }
 }
 

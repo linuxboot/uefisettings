@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::rc::Rc;
 
+use anyhow::Context;
 use anyhow::Result;
 
 use uefisettings_backend_thrift::Backend;
@@ -342,9 +343,20 @@ impl HiiBackend {
         let parsed_db = package::read_db(db_bytes)?;
 
         for list in parsed_db {
+            let mut languages = list.string_languages.into_iter();
             for string_package in list.strings {
                 let mut p = HiiStringsPackage {
                     package_list: list.guid.to_string(),
+                    language: languages
+                        .next()
+                        .context("a strings package without its language")?
+                        .to_ascii_string()
+                        .with_context(|| {
+                            format!(
+                                "failed to list a strings package of package list {}",
+                                list.guid
+                            )
+                        })?,
                     ..Default::default()
                 };
                 for (string_id, string) in string_package {
@@ -758,6 +770,7 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::form_package;
     use crate::hii::package::hiidb_fixtures::form_set_package;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::strings_package_of;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::Guid;
 
@@ -875,6 +888,116 @@ mod tests {
         ]
         .map(|(guid, string)| (guid.to_string(), BTreeMap::from([(1, string.to_string())])));
         assert_eq!(got, want, "strings packages in HiiDB order");
+    }
+
+    /// list_strings names each strings package's language, that of its header, beside its own
+    /// strings.
+    #[test]
+    fn test_list_strings_names_each_package_language() {
+        let hiidb = [
+            package_list_with_guid(
+                [0x11; 16],
+                &[
+                    // out of sorted order: each package keeps its own language
+                    strings_package_of(b"x-UEFI-ns", &["iSCSIBootEnable"]),
+                    strings_package_of(b"en-US", &["Boot"]),
+                    END_PACKAGE.to_vec(),
+                ]
+                .concat(),
+            ),
+            package_list_with_guid(
+                [0x33; 16],
+                &[
+                    strings_package_of(b"fr-FR", &["D\u{e9}marrage"]),
+                    END_PACKAGE.to_vec(),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat();
+
+        let got: Vec<(String, String, BTreeMap<i32, String>)> = HiiBackend::list_strings(&hiidb)
+            .expect("list the strings")
+            .into_iter()
+            .map(|package| {
+                (
+                    package.package_list,
+                    package.language,
+                    package.string_package,
+                )
+            })
+            .collect();
+
+        let want = [
+            (
+                "11111111-1111-1111-1111-111111111111",
+                "x-UEFI-ns",
+                "iSCSIBootEnable",
+            ),
+            ("11111111-1111-1111-1111-111111111111", "en-US", "Boot"),
+            (
+                "33333333-3333-3333-3333-333333333333",
+                "fr-FR",
+                "D\u{e9}marrage",
+            ),
+        ]
+        .map(|(guid, language, string)| {
+            (
+                guid.to_string(),
+                language.to_string(),
+                BTreeMap::from([(1, string.to_string())]),
+            )
+        });
+        assert_eq!(got, want, "languages and strings of the strings packages");
+    }
+
+    /// list_strings refuses a strings package whose Language is not ASCII, as UEFI 2.11
+    /// §33.3.6.1 defines it, valid UTF-8 or not, and lists one whose Language is.
+    #[test]
+    fn test_list_strings_refuses_a_language_that_is_not_ascii() {
+        let list = |language: &[u8]| {
+            let package = strings_package_of(language, &["A"]);
+            package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat())
+        };
+        let cases: [(&[u8], &str); 3] = [
+            ("en-\u{e9}".as_bytes(), r"en-\xc3\xa9"),
+            (b"en-\xe9", r"en-\xe9"),
+            (b"\xff", r"\xff"),
+        ];
+        for (language, shown) in cases {
+            let Err(err) = HiiBackend::list_strings(&list(language)) else {
+                panic!("list_strings listed the Language {language:02x?}");
+            };
+
+            let msg = format!("{err:#}");
+            let want = format!(
+                "failed to list a strings package of package list \
+                 22222222-2222-2222-2222-222222222222: its Language \"{shown}\" is not ASCII"
+            );
+            assert_eq!(msg, want, "Language {language:02x?}");
+        }
+
+        let packages = HiiBackend::list_strings(&list(b"en-US")).expect("list the Language en-US");
+        let languages: Vec<&str> = packages.iter().map(|p| p.language.as_str()).collect();
+        assert_eq!(languages, ["en-US"], "languages of the strings packages");
+    }
+
+    /// list_questions and show_ifr read a HiiDB whose strings package's Language is not ASCII:
+    /// neither shows a Language.
+    #[test]
+    fn test_questions_and_ifr_read_a_language_that_is_not_ascii() {
+        let packages = [strings_package_of(b"en-\xe9", &["A"]), END_PACKAGE.to_vec()].concat();
+        let hiidb = package_list_with_guid([0x22; 16], &packages);
+
+        let questions = ListQuestionsOptions {
+            efivars: EfivarSource::Disabled,
+            ..ListQuestionsOptions::default()
+        };
+        HiiBackend::list_questions_using(&hiidb, &questions).expect("list the questions");
+        let ifr = ShowIfrOptions {
+            efivars: EfivarSource::Disabled,
+        };
+        HiiBackend::show_ifr_using(&hiidb, &ifr).expect("show the IFR");
     }
 
     /// get, list-questions and show-ifr read question values from the source that their

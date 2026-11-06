@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::anyhow;
+use anyhow::ensure;
 use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
@@ -75,15 +76,39 @@ enum StringBlockType {
     Unknown(u8),
 }
 
-pub fn handle_string_package(
-    package_cursor: &mut Cursor<&Vec<u8>>,
-) -> Result<BTreeMap<i32, String>> {
+/// A strings package (UEFI 2.11 §33.3.6): the strings by id, in the language its header names.
+pub struct StringPackage {
+    pub language: Language,
+    pub strings: BTreeMap<i32, String>,
+}
+
+/// A strings package header's Language, as read: "en-US", for one, or a UEFI configuration
+/// language such as "x-UEFI-ns" (§35.3.1). Only list-strings shows it, so only it needs ASCII.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Language(pub Vec<u8>);
+
+impl Language {
+    /// "The null-terminated ASCII string that specifies the language of the strings in the
+    /// package" (UEFI 2.11 §33.3.6.1): fails if it is not ASCII.
+    pub fn to_ascii_string(&self) -> Result<String> {
+        ensure!(
+            self.0.is_ascii(),
+            "its Language \"{}\" is not ASCII",
+            self.0.escape_ascii()
+        );
+        // each ASCII byte is its char
+        Ok(self.0.iter().copied().map(char::from).collect())
+    }
+}
+
+pub fn handle_string_package(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<StringPackage> {
     let string_header: StringPackageHeader = package_cursor
         .read_ne()
         .context("failed to parse string package header")?;
+    let language = Language(string_header.language.0);
     debug!(
         "String package language is {} and language name is {:?}",
-        string_header.language.to_string(),
+        language.0.escape_ascii(),
         string_header.language_name
     );
 
@@ -163,5 +188,8 @@ pub fn handle_string_package(
         }
     }
 
-    Ok(string_map)
+    Ok(StringPackage {
+        language,
+        strings: string_map,
+    })
 }

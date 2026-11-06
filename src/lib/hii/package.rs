@@ -382,7 +382,7 @@ impl AsRef<[u8]> for DevicePath {
 type StringMap = BTreeMap<i32, String>;
 type IFRNodeLink = Rc<RefCell<IFROperation>>;
 
-/// String map (string id -> string) per strings package and IFR root per FormSet
+/// String map (string id -> string) and language per strings package and IFR root per FormSet
 /// of one package list.
 pub struct ParsedPackageList {
     pub guid: Guid,
@@ -397,6 +397,8 @@ pub struct ParsedPackageList {
     )]
     pub device_path: Option<DevicePath>,
     pub strings: Vec<StringMap>,
+    /// The Language of each strings package's header, in the order of `strings`
+    pub string_languages: Vec<strings::Language>,
     pub forms: Vec<IFRNodeLink>,
 }
 
@@ -437,6 +439,7 @@ pub fn read_db(source: &[u8]) -> Result<Vec<ParsedPackageList>> {
 fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     // once filled this will have string maps from each string package in the package list.
     let mut package_list_string_maps: Vec<StringMap> = Vec::new();
+    let mut string_languages = Vec::new();
     let mut roots: Vec<IFRNodeLink> = Vec::new();
     let mut device_path = None;
 
@@ -446,9 +449,10 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         match package.package_type {
             PackageType::Strings => {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
-                let string_map = strings::handle_string_package(&mut package_cursor)
+                let string_package = strings::handle_string_package(&mut package_cursor)
                     .context("failed to parse a strings package")?;
-                package_list_string_maps.push(string_map);
+                package_list_string_maps.push(string_package.strings);
+                string_languages.push(string_package.language);
             }
             PackageType::Form => {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
@@ -475,6 +479,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         guid: package_list.guid,
         device_path,
         strings: package_list_string_maps,
+        string_languages,
         forms: roots,
     })
 }
@@ -1234,6 +1239,54 @@ mod tests {
             ),
         ];
         assert_eq!(strings_of_lists(lists), want, "strings of the lists");
+    }
+
+    /// read_db keeps the Language of each strings package's header, in package order.
+    #[test]
+    fn test_read_db_keeps_each_strings_package_language() {
+        // out of sorted order: the languages keep the packages' order
+        let packages = [
+            strings_package_of(b"x-UEFI-ns", &["iSCSIBootEnable"]),
+            strings_package_of(b"en-US", &["My Keyword Namespace Test"]),
+            END_PACKAGE.to_vec(),
+        ]
+        .concat();
+        let hiidb = package_list_with_guid([0x11; 16], &packages);
+
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+
+        let [list] = lists.as_slice() else {
+            panic!("{} package lists, not 1", lists.len());
+        };
+        assert_eq!(
+            list.string_languages,
+            ["x-UEFI-ns", "en-US"].map(|language| strings::Language(language.as_bytes().to_vec())),
+            "languages of the strings packages"
+        );
+        let want = ["iSCSIBootEnable", "My Keyword Namespace Test"]
+            .map(|string| BTreeMap::from([(1, string.to_string())]));
+        assert_eq!(list.strings, want, "strings of the strings packages");
+    }
+
+    /// read_db reads a strings package whose Language is not ASCII, keeping its bytes and
+    /// strings: only list_strings, which shows the Language, refuses it.
+    #[test]
+    fn test_read_db_reads_a_language_that_is_not_ascii() {
+        let packages = [strings_package_of(b"en-\xe9", &["A"]), END_PACKAGE.to_vec()].concat();
+        let hiidb = package_list_with_guid([0x22; 16], &packages);
+
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+
+        let [list] = lists.as_slice() else {
+            panic!("{} package lists, not 1", lists.len());
+        };
+        assert_eq!(
+            list.string_languages,
+            [strings::Language(b"en-\xe9".to_vec())],
+            "languages of the strings packages"
+        );
+        let want = [BTreeMap::from([(1, "A".to_string())])];
+        assert_eq!(list.strings, want, "strings of the strings packages");
     }
 
     /// read_db keeps package lists in HiiDB order, duplicate GUIDs included.

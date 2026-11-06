@@ -81,7 +81,7 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
   list-questions  List questions HiiDB. Note that these are not all possible questions, because we
                   don't parse certain non-useful question types
-  list-strings    List all strings-id, string pairs in HiiDB
+  list-strings    List all strings-id, string pairs in HiiDB, with each strings package's language
   set             Set/change the value of a question
   show-ifr        Show a human readable representation of the Hii Forms
 ```

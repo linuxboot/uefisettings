@@ -175,7 +175,7 @@ enum HiiSubcommands {
         #[command(flatten)]
         efivars: EfivarArgs,
     },
-    /// List all strings-id, string pairs in HiiDB
+    /// List all strings-id, string pairs in HiiDB, with each strings package's language
     #[command(next_display_order = None)]
     ListStrings {
         #[command(flatten)]

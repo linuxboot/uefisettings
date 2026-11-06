@@ -56,6 +56,7 @@ show-ifr	status	0x0
 show-ifr	line	How old are you\? \(Step\)
 list-strings	status	0x0
 list-strings	json	type == "array" and any(.[]; .string_package | type == "object")
+list-strings	json	[.[] | select(any(.string_package[]; . == "iSCSIBootEnable")) | .language] == ["x-UEFI-ns", "x-UEFI-ns"] and [.[] | select(any(.string_package[]; . == "My one-of prompt #1")) | .language] == ["en-US", "en-US"]
 show-translations	status	0x0
 show-translations	json	type == "object"
 no-efivars	status	0x0

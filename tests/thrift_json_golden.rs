@@ -123,6 +123,7 @@ fn existing_types() -> Vec<(&'static str, Vec<u8>)> {
             (0, String::new()),
             (65535, TRICKY.to_owned()),
         ]),
+        language: "x-UEFI-ns".to_owned(),
         ..Default::default()
     }];
     let ifr = HiiShowIfrResponse {
