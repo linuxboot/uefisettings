@@ -40,8 +40,8 @@ use super::question_values::handle_checkbox;
 use super::question_values::handle_numeric;
 #[cfg(efivar_dumps)]
 use super::question_values::handle_oneof;
-use super::set::option_write;
-use super::set::value_write;
+use super::set::own_write;
+use super::set::NewValue;
 use super::storage::VariableStoreKind;
 use super::*;
 #[cfg(efivar_dumps)]
@@ -281,13 +281,15 @@ pub(super) fn change_value(
     new_value: &str,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    value_write(
+    let (_, write) = own_write(
         question,
-        new_value,
+        NewValue::Text(new_value),
         variables.reach(),
         variables.interface(),
-    )?
-    .write(variables)?;
+    )?;
+    write
+        .ok_or_else(|| anyhow!("a question without a VarStore"))?
+        .write(variables)?;
     Ok(())
 }
 
@@ -298,7 +300,15 @@ pub(super) fn change_option(
     option: &AnswerOption,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    option_write(question, option, variables.reach(), variables.interface())?.write(variables)?;
+    let (_, write) = own_write(
+        question,
+        NewValue::Option(option),
+        variables.reach(),
+        variables.interface(),
+    )?;
+    write
+        .ok_or_else(|| anyhow!("a question without a VarStore"))?
+        .write(variables)?;
     Ok(())
 }
 

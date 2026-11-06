@@ -966,10 +966,6 @@ pub(crate) fn evaluate_read(
 /// §33.2.5.4.1), and returns its SETs, in order, or None if it has no WRITE that
 /// edk2-stable202608 SetupBrowserDxe evaluates. An UNDEFINED ends it after the SETs before, as
 /// Expression.c EvaluateExpression ends there and Setup.c SetQuestionValue goes on.
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    expect(dead_code, reason = "set does not evaluate WRITE yet")
-)]
 pub(crate) fn evaluate_write(
     question: &Rc<RefCell<IFROperation>>,
     this: QuestionValue,
@@ -1235,15 +1231,25 @@ enum Gap {
 /// A SET of a WRITE expression: the little-endian `bytes` that it writes at VarOffset `offset` of
 /// `store`, VarStore `var_store_id`, as edk2-stable202608 SetupBrowserDxe/Expression.c
 /// EvaluateExpression copies them into its edit buffer.
-#[cfg_attr(
-    not(all(test, efivar_dumps)),
-    expect(dead_code, reason = "set does not write planned SETs yet")
-)]
 pub(crate) struct PlannedSet {
     pub(crate) var_store_id: u16,
     pub(crate) store: Box<dyn VariableStore>,
     pub(crate) offset: u16,
     pub(crate) bytes: Vec<u8>,
+}
+
+impl PlannedSet {
+    /// The refusal of a WRITE expression with this SET, of a VarStore that set does not write:
+    /// `reason`, a clause after the VarStore.
+    pub(super) fn unwritable(&self, reason: String) -> ExpressionRefusal {
+        ExpressionRefusal::VarStore {
+            expression: QuestionExpression::Write,
+            access: StoreAccess::Sets,
+            id: self.var_store_id,
+            store: store_label(self.store.as_ref()),
+            reason,
+        }
+    }
 }
 
 /// What THIS pushes and where a SET goes, by the expression that an evaluation runs.

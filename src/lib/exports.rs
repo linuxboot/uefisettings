@@ -495,7 +495,7 @@ impl HiiBackend {
 
         let parsed_db = package::read_db(db_bytes)?;
         let passwords = PasswordQuestions::of(parsed_db.iter().flat_map(|list| &list.forms));
-        let reader = EfivarReader::with_variables(Box::new(passwords.withholding(reads)?));
+        let mut reader = EfivarReader::with_variables(Box::new(passwords.withholding(reads)?));
         let writes = passwords.withholding(writes)?;
         passwords.check_set(writes.reach(), options.setup_password)?;
 
@@ -511,7 +511,13 @@ impl HiiBackend {
             } => (question_variations, answer_variations, false),
         };
 
-        let selected = select_for_set(&parsed_db, question, &question_variations, options, reader)?;
+        let selected = select_for_set(
+            &parsed_db,
+            question,
+            &question_variations,
+            options,
+            &mut reader,
+        )?;
 
         let option_annotations: Vec<String> = forms::set_questions(
             question,
@@ -522,6 +528,8 @@ impl HiiBackend {
             new_value,
             &new_value_variations,
             include,
+            &mut reader,
+            options.access_level,
             &writes,
         )?
         .into_iter()
@@ -688,7 +696,7 @@ fn select_for_set(
     question: &str,
     question_variations: &BTreeSet<String>,
     options: &SetOptions,
-    mut reader: EfivarReader,
+    reader: &mut EfivarReader,
 ) -> Result<Vec<(String, forms::QuestionDescriptor, forms::StateEvaluation)>> {
     forms::check_access_level(
         parsed_db.iter().flat_map(|list| &list.forms),
@@ -711,9 +719,9 @@ fn select_for_set(
                 question_variations,
                 options.include,
                 options.access_level,
-                &mut reader,
+                reader,
             );
-            match forms::choice_for_set(selection, question, &reader)? {
+            match forms::choice_for_set(selection, question, reader)? {
                 Choice::Chosen(question_descriptor, state) => {
                     selected.push((list.guid.to_string(), question_descriptor, state));
                 }
@@ -1551,7 +1559,7 @@ mod tests {
                 "Q",
                 &BTreeSet::from(["Q".to_string()]),
                 &options,
-                EfivarReader::new(EfivarSource::Directory(efivars.path().to_path_buf()))
+                &mut EfivarReader::new(EfivarSource::Directory(efivars.path().to_path_buf()))
                     .expect("create a reader of the efivars directory"),
             )
             .map(|selected| {

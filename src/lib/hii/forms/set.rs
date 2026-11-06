@@ -20,21 +20,28 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
+use super::ami_access_level::AccessLevel;
+use super::conditions::ExpressionRefusal;
 use super::conditions::IncludedStates;
 use super::conditions::SelectionError;
+use super::conditions::VALUE_MAKES_READ_ONLY;
 use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
 use super::storageless::StoragelessRefusal;
+use super::write_plan::write_in_turn;
+use super::write_plan::WritePlan;
 use super::AnswerOption;
 use super::IFROpCode;
 use super::QuestionDescriptor;
 use super::RangeType;
 use super::TypeValue;
+use crate::hii::variables::EfivarReader;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::WithholdingVariables;
+use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 #[derive(Error, Debug)]
 pub enum ChangeValueError {
@@ -55,6 +62,14 @@ pub enum ChangeValueError {
         question: String,
         refusal: StoragelessRefusal,
     },
+    #[error("cannot set question {question:?}: {refusal}")]
+    Expression {
+        question: String,
+        refusal: ExpressionRefusal,
+    },
+    /// A question with an EFI_IFR_VALUE, whose value that expression gives
+    #[error("cannot set question {question:?}: {}", VALUE_MAKES_READ_ONLY)]
+    ReadOnly { question: String },
     #[error(transparent)]
     Selection(#[from] SelectionError),
 
@@ -62,12 +77,11 @@ pub enum ChangeValueError {
     Other(#[from] anyhow::Error),
 }
 
-/// set's write of a value at VarOffset `offset` of `store`: `encoded`, its little-endian bytes,
-/// which fit in the Size of `store`.
+/// set's write of the variable of `store`: `patches`, each little-endian bytes at a VarOffset,
+/// within the Size of `store`, in order, later ones winning where they overlap.
 pub(super) struct VarStoreWrite<'a> {
-    store: &'a dyn VariableStore,
-    offset: u16,
-    pub(super) encoded: Vec<u8>,
+    pub(super) store: &'a dyn VariableStore,
+    pub(super) patches: Vec<(u16, Vec<u8>)>,
 }
 
 impl<'a> VarStoreWrite<'a> {
@@ -106,24 +120,20 @@ impl<'a> VarStoreWrite<'a> {
         }
         Ok(Self {
             store,
-            offset,
-            encoded,
+            patches: vec![(offset, encoded)],
         })
     }
 
-    /// Writes the value through `variables`. choice_for_set is the only check of runtime access
-    /// before a write: it refuses a variable without EFI_VARIABLE_RUNTIME_ACCESS that the
-    /// selection read, and set writes only questions whose variable the selection read. Firmware
-    /// refuses such a write if the variable changed since that read (edk2-stable202608
-    /// VariableServiceSetVariable, EFI_WRITE_PROTECTED).
+    /// Writes `patches` through `variables`. choice_for_set and WritePlan::variable_writes are the
+    /// only checks of runtime access before a write: they refuse a variable without
+    /// EFI_VARIABLE_RUNTIME_ACCESS that the selection or the plan read, and set writes only
+    /// variables that they read. Firmware refuses such a write if the variable changed since that
+    /// read (edk2-stable202608 VariableServiceSetVariable, EFI_WRITE_PROTECTED).
     pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<()> {
-        variables
-            .write_at(
-                &self.store.variable_key(),
-                self.store.size(),
-                self.offset,
-                &self.encoded,
-            )
+        self.span(variables)
+            .and_then(|(offset, span)| {
+                variables.write_at(&self.store.variable_key(), self.store.size(), offset, &span)
+            })
             .map_err(|error| {
                 VariableNotExported::explain(
                     error,
@@ -133,31 +143,94 @@ impl<'a> VarStoreWrite<'a> {
                 )
             })
     }
+
+    /// The first VarOffset that the patches change, and the bytes from there to the last that
+    /// they change: those of more than one patch with the bytes between them as `variables`
+    /// hold them now, after the writes before this one.
+    fn span(&self, variables: &dyn FirmwareVariables) -> Result<(u16, Vec<u8>)> {
+        let Some((first, rest)) = self.patches.split_first() else {
+            return Err(anyhow!("a variable write without bytes"));
+        };
+        if rest.is_empty() {
+            return Ok(first.clone());
+        }
+        let start = rest
+            .iter()
+            .fold(first.0, |start, (offset, _)| start.min(*offset));
+        let end = self
+            .patches
+            .iter()
+            .map(|(offset, bytes)| usize::from(*offset) + bytes.len())
+            .fold(0, usize::max);
+        let key = self.store.variable_key();
+        let held = variables.read(&key, self.store.size())?;
+        let mut span = held
+            .get(EFIVARFS_HEADER_SIZE..)
+            .and_then(|payload| payload.get(usize::from(start)..end))
+            .ok_or_else(|| {
+                anyhow!(
+                    "EFI variable {key} holds {} bytes, short of the {end} that set writes",
+                    held.len().saturating_sub(EFIVARFS_HEADER_SIZE)
+                )
+            })?
+            .to_vec();
+        for (offset, bytes) in &self.patches {
+            offset
+                .checked_sub(start)
+                .map(usize::from)
+                .and_then(|at| span.get_mut(at..at + bytes.len()))
+                .ok_or_else(|| anyhow!("bytes at VarOffset {offset} outside their span"))?
+                .copy_from_slice(bytes);
+        }
+        Ok((start, span))
+    }
 }
 
-/// The write that sets `question` to `new_value` through variables of `reach` and `interface`;
-/// for a ONE_OF, to the option of that text that select_option picks without --include.
-pub(super) fn value_write<'a>(
+/// What set takes for a question: the text of its value, or of a ONE_OF the option that it
+/// picked.
+#[derive(Clone, Copy)]
+pub(super) enum NewValue<'a> {
+    Text(&'a str),
+    Option(&'a AnswerOption),
+}
+
+/// The value that sets `question` to `new_value`, and its write through variables of `reach` and
+/// `interface`, or None for a question without a VarStore whose WRITE expression alone takes
+/// it; for a ONE_OF, a text sets the option of that text that select_option picks without
+/// --include.
+pub(super) fn own_write<'a>(
     question: &'a QuestionDescriptor,
-    new_value: &str,
+    new_value: NewValue<'_>,
     reach: VariableReach,
     interface: VariableInterface,
-) -> Result<VarStoreWrite<'a>, ChangeValueError> {
+) -> Result<(TypeValue, Option<VarStoreWrite<'a>>), ChangeValueError> {
     // writes take VarOffset in bytes
     let ValueLocation::Bytes { offset, .. } = question.location else {
         return Err(ChangeValueError::UnsupportedBitField);
     };
     let store = question.store(reach)?;
-    if question.opcode == IFROpCode::OneOf {
-        let option = question
-            .select_option(
-                &BTreeSet::from([new_value.to_owned()]),
-                IncludedStates::empty(),
-            )?
-            .ok_or(ChangeValueError::InvalidOption)?;
-        return option_write(question, option, reach, interface);
-    }
-    let value = match &question.numeric_range {
+    let value = match new_value {
+        NewValue::Option(option) => option.raw_value,
+        NewValue::Text(text) if question.opcode == IFROpCode::OneOf => {
+            question
+                .select_option(&BTreeSet::from([text.to_owned()]), IncludedStates::empty())?
+                .ok_or(ChangeValueError::InvalidOption)?
+                .raw_value
+        }
+        NewValue::Text(text) => numeric_value(question, text)?,
+    };
+    let write = store
+        .map(|store| VarStoreWrite::new(store, offset, value, interface))
+        .transpose()?;
+    Ok((value, write))
+}
+
+/// The value of the NUMERIC or CHECKBOX `question` that `new_value` gives, within its range.
+fn numeric_value(
+    question: &QuestionDescriptor,
+    new_value: &str,
+) -> Result<TypeValue, ChangeValueError> {
+    Ok(match &question.numeric_range {
         Some(range) => range.parse_value(new_value)?,
         None => match question.max_value {
             RangeType::NumSize8(m) => {
@@ -197,44 +270,31 @@ pub(super) fn value_write<'a>(
                 TypeValue::NumSize64(data_to_write)
             }
         },
-    };
-    Ok(VarStoreWrite::new(store, offset, value, interface)?)
-}
-
-/// The write of `option`, one of the possible_options of the ONE_OF `question`, through
-/// variables of `reach` and `interface`.
-pub(super) fn option_write<'a>(
-    question: &'a QuestionDescriptor,
-    option: &AnswerOption,
-    reach: VariableReach,
-    interface: VariableInterface,
-) -> Result<VarStoreWrite<'a>, ChangeValueError> {
-    // writes take VarOffset in bytes
-    let ValueLocation::Bytes { offset, .. } = question.location else {
-        return Err(ChangeValueError::UnsupportedBitField);
-    };
-    Ok(VarStoreWrite::new(
-        question.store(reach)?,
-        offset,
-        option.raw_value,
-        interface,
-    )?)
+    })
 }
 
 /// Sets each of the `selected` questions, by the selector of its package list, to `new_value`
 /// or to its option of one of `texts` that chosen_option picks with `include`, in `variables`,
 /// and returns one option per selected question, in its order; None for a value; fails with
 /// SelectionError::NotFound when nothing is selected.
-/// It builds every VarStoreWrite before the first write, so that a value that one question
-/// refuses leaves every variable unchanged; then it writes each, also after a failed one, and
-/// fails unless every write succeeds: with the error of a single write unchanged, else with
-/// NotSetEverywhere.
+/// It builds the WritePlan of every question before the first write, reading with `reader`, whose
+/// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
+/// one question refuses leaves every variable unchanged; then it writes each, also after a failed
+/// one, and fails unless every write succeeds: with the error of a single question unchanged,
+/// else with NotSetEverywhere.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set's inputs: the question, its matches, the value, how to pick an option, and the \
+              variables to read and write"
+)]
 pub(crate) fn set_questions<'a>(
     question: &str,
     selected: &[(&str, &'a QuestionDescriptor)],
     new_value: &str,
     texts: &BTreeSet<String>,
     include: IncludedStates,
+    reader: &mut EfivarReader,
+    access_level: Option<AccessLevel>,
     variables: &WithholdingVariables<impl FirmwareVariables>,
 ) -> Result<Vec<Option<&'a AnswerOption>>> {
     if selected.is_empty() {
@@ -243,38 +303,39 @@ pub(crate) fn set_questions<'a>(
         }
         .into());
     }
-    let writes = selected
+    let (reach, interface) = (variables.reach(), variables.interface());
+    let plans = selected
         .iter()
         .map(|&(selector, descriptor)| {
             // if the descriptor provides options then set the closest one from texts
             // (example whatever matches from [Enabled, Enable])
             // else try setting the new_value because it might be some arbitrary value like a number
             // (will return error if doesn't match constraints)
-            let (reach, interface) = (variables.reach(), variables.interface());
-            if descriptor.possible_options.is_empty() {
-                return Ok((
-                    selector,
-                    value_write(descriptor, new_value, reach, interface)?,
-                    None,
-                ));
-            }
-            let option = descriptor.chosen_option(texts, include)?;
-            Ok((
-                selector,
-                option_write(descriptor, option, reach, interface)?,
-                Some(option),
-            ))
+            let (value, option) = match descriptor.possible_options.is_empty() {
+                true => (NewValue::Text(new_value), None),
+                false => {
+                    let option = descriptor.chosen_option(texts, include)?;
+                    (NewValue::Option(option), Some(option))
+                }
+            };
+            let plan = WritePlan::new(descriptor, value, (reach, interface), reader, access_level)?;
+            Ok((selector, plan, option))
         })
         .collect::<Result<Vec<_>>>()?;
+    let options = plans.iter().map(|(_, _, option)| *option).collect();
+    let writes = plans
+        .iter()
+        .map(|(selector, plan, _)| Ok((*selector, plan.variable_writes(reader)?)))
+        .collect::<Result<Vec<_>>>()?;
 
-    if let [(_, write, option)] = writes.as_slice() {
-        write.write(variables)?;
-        return Ok(vec![*option]);
+    if let [(_, question_writes)] = writes.as_slice() {
+        write_in_turn(question_writes, variables)?;
+        return Ok(options);
     }
     let mut written = Vec::new();
     let mut failed = Vec::new();
-    for (selector, write, _) in &writes {
-        match write.write(variables) {
+    for (selector, question_writes) in &writes {
+        match write_in_turn(question_writes, variables) {
             Ok(()) => written.push(selector.to_string()),
             Err(error) => failed.push((*selector, error)),
         }
@@ -282,7 +343,7 @@ pub(crate) fn set_questions<'a>(
     if !failed.is_empty() {
         return Err(NotSetEverywhere::new(question, failed, written).into());
     }
-    Ok(writes.into_iter().map(|(_, _, option)| option).collect())
+    Ok(options)
 }
 
 /// set's error when a write fails while set writes several questions: each Failure, and the
@@ -396,12 +457,19 @@ mod set_questions_tests {
         new_value: &str,
         texts: &[&str],
     ) -> std::result::Result<Vec<Option<String>>, String> {
+        // no question here has a WRITE expression, whose GETs and merges would read
+        let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
+            variables.reach(),
+            variables.interface(),
+        )));
         set_questions(
             PROMPT,
             selected,
             new_value,
             &texts.iter().map(|text| text.to_string()).collect(),
             IncludedStates::empty(),
+            &mut reader,
+            None,
             &WithholdingVariables::new(variables, BTreeSet::new()),
         )
         .map(|options| {

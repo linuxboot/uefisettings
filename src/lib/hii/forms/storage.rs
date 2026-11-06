@@ -883,6 +883,15 @@ mod non_efi_varstore_tests {
             })),
             location: ValueLocation::Bytes { offset: 0, size: 1 },
             value_state: StateEvaluation::selectable(),
+            node: Rc::new(RefCell::new(IFROperation {
+                op_code: IFROpCode::OneOf,
+                length: 0,
+                open_scope: false,
+                data: Vec::new(),
+                parent: None,
+                children: Vec::new(),
+                parsed_data: ParsedOperation::Placeholder,
+            })),
         };
 
         let variables = test_var_store_variables();
@@ -899,7 +908,7 @@ mod non_efi_varstore_tests {
 
 impl EfivarRange {
     /// The efivar bytes that hold the value of `store`.
-    fn of(store: &dyn VariableStore) -> Self {
+    pub(super) fn of(store: &dyn VariableStore) -> Self {
         Self {
             key: store.variable_key(),
             size: store.size(),

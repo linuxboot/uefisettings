@@ -220,6 +220,7 @@ pub(super) fn handle_checkbox(
         numeric_range: None,
         opcode: current_node.op_code,
         value_state: StateEvaluation::selectable(),
+        node: Rc::clone(node),
     };
     res
 }
@@ -320,6 +321,7 @@ pub(super) fn handle_oneof(
         numeric_range: None,
         opcode: current_node.op_code,
         value_state,
+        node: Rc::clone(node),
     };
     res
 }
@@ -382,6 +384,7 @@ pub(super) fn handle_numeric(
         },
         opcode: current_node.op_code,
         value_state: StateEvaluation::selectable(),
+        node: Rc::clone(node),
     };
     res
 }

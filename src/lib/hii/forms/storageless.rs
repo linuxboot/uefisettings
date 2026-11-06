@@ -153,8 +153,12 @@ pub(crate) enum StoragelessRefusal {
          (UEFI 2.11 §33.2.5.4.1)"
     )]
     ReadUndefined,
-    #[error("question has no VarStore, and uefisettings does not apply its WRITE expression")]
-    WriteNotApplied,
+    /// set of a question whose WRITE expression gives UNDEFINED, or fails, before any SET
+    #[error(
+        "its WRITE expression sets no VarStore, and without a VarStore nothing keeps the value \
+         (UEFI 2.11 §33.2.5.4.1)"
+    )]
+    WriteSetsNothing,
     /// A question with EFI_IFR_FLAG_CALLBACK whose CallBack() this run does not call: after
     /// ExitBootServices() (`Runtime`) none may, and list-questions, show-ifr and dumps never do
     #[error("{}", DriverHeld(*.0))]
@@ -611,8 +615,9 @@ mod tests {
                  other (UEFI 2.11 §33.2.5.4.1)",
             ),
             (
-                StoragelessRefusal::WriteNotApplied,
-                "question has no VarStore, and uefisettings does not apply its WRITE expression",
+                StoragelessRefusal::WriteSetsNothing,
+                "its WRITE expression sets no VarStore, and without a VarStore nothing keeps the \
+                 value (UEFI 2.11 §33.2.5.4.1)",
             ),
             (
                 StoragelessRefusal::DriverHeld(VariableReach::Runtime),
@@ -727,6 +732,7 @@ mod get_and_set_tests {
 
     use super::super::ifr_fixtures::*;
     use super::super::*;
+    use crate::hii::variables::WithholdingVariables;
 
     /// Each storage-less CHECKBOX of storageless_form_set(): its prompt, then whether it has
     /// EFI_IFR_FLAG_CALLBACK, a READ and a WRITE.
@@ -862,18 +868,15 @@ mod get_and_set_tests {
     }
 
     /// set refuses each question without a VarStore, for the reason that the classifier gives
-    /// set on the reader's reach, both when it picks the question and when it builds its write.
+    /// set on the reader's reach, both when it picks the question and when it plans its writes;
+    /// a WRITE expression that sets nothing leaves nothing to keep the value.
     #[test]
     fn set_refuses_each_storageless_question_with_why() {
         let root = storageless_form_set();
         let strings = string_packages();
         for reach in [VariableReach::Runtime, VariableReach::BootServices] {
             for (prompt, callback, read, write) in QUESTIONS {
-                let want = format!(
-                    "cannot set question {prompt:?}: {}",
-                    refusal((callback, read, write), QuestionExpression::Write, reach)
-                        .unwrap_or(StoragelessRefusal::WriteNotApplied)
-                );
+                let refusal = refusal((callback, read, write), QuestionExpression::Write, reach);
                 let mut reader = reader_reaching(reach);
                 let values = VarStoreValues::new(&root, None);
                 let selection = find_question_in(
@@ -885,16 +888,33 @@ mod get_and_set_tests {
                     panic!("{prompt}: not picked");
                 };
                 let variables = MemoryVariables::new(reach, reader.interface());
+                let planned = set_questions(
+                    prompt,
+                    &[("selector", descriptor)],
+                    "1",
+                    &BTreeSet::from(["1".to_string()]),
+                    IncludedStates::empty(),
+                    &mut reader,
+                    None,
+                    &WithholdingVariables::new(&variables, BTreeSet::new()),
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+                let want = refusal
+                    .clone()
+                    .unwrap_or(StoragelessRefusal::WriteSetsNothing);
                 assert_eq!(
-                    change_value(descriptor, "1", &variables).map_err(|error| error.to_string()),
-                    Err(want.clone()),
-                    "{prompt}: write through {reach:?}"
+                    planned,
+                    Err(format!("cannot set question {prompt:?}: {want}")),
+                    "{prompt}: set through {reach:?}"
                 );
                 assert_eq!(
                     choice_for_set(selection, prompt, &reader)
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
-                    Err(want),
+                    refusal.map_or(Ok(()), |refusal| {
+                        Err(format!("cannot set question {prompt:?}: {refusal}"))
+                    }),
                     "{prompt}: choice through {reach:?}"
                 );
             }

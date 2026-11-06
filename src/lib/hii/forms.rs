@@ -36,9 +36,11 @@ use crate::hii::variables::check_non_volatile;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::EfivarReader;
+use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
 use conditions::question_state;
+use conditions::question_value_expression;
 use conditions::retrieve_question_value;
 use conditions::select;
 use conditions::skips_scope;
@@ -88,6 +90,7 @@ mod set;
 mod setup_password;
 mod storage;
 mod storageless;
+mod write_plan;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 /// How DeclaredBootServiceOnly names a form's declaration without EFI_VARIABLE_RUNTIME_ACCESS.
@@ -1787,6 +1790,8 @@ pub struct QuestionDescriptor {
     location: ValueLocation,
     /// The state of the option that `value` names: selectable if none does
     pub(crate) value_state: StateEvaluation,
+    /// The question's op, whose WRITE expression set evaluates
+    node: Rc<RefCell<IFROperation>>,
 }
 impl fmt::Debug for QuestionDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1807,25 +1812,37 @@ pub struct AnswerOption {
 }
 
 impl QuestionDescriptor {
-    /// The VarStore of the question, or why set, through variables of `reach`, cannot write it.
+    /// The VarStore of the question, or None for a question without one whose WRITE expression
+    /// alone takes the value, or why set, through variables of `reach`, cannot write it, as for a
+    /// question that an EFI_IFR_VALUE makes read-only.
     fn store(
         &self,
         reach: VariableReach,
-    ) -> std::result::Result<&dyn VariableStore, ChangeValueError> {
-        self.varstore
-            .as_deref()
-            .map_err(|reason| match reason.downcast_ref::<NoVarStore>() {
-                Some(NoVarStore(storageless)) => ChangeValueError::Storageless {
-                    question: self.question.clone(),
-                    refusal: storageless
-                        .refusal(QuestionExpression::Write, reach)
-                        .unwrap_or(StoragelessRefusal::WriteNotApplied),
-                },
-                None => ChangeValueError::NoVarStore {
-                    question: self.question.clone(),
-                    reason: format!("{reason:#}"),
-                },
-            })
+    ) -> std::result::Result<Option<&dyn VariableStore>, ChangeValueError> {
+        if question_value_expression(&self.node).is_some() {
+            return Err(ChangeValueError::ReadOnly {
+                question: self.question.clone(),
+            });
+        }
+        let reason = match &self.varstore {
+            Ok(store) => return Ok(Some(store.as_ref())),
+            Err(reason) => reason,
+        };
+        match reason.downcast_ref::<NoVarStore>() {
+            Some(NoVarStore(storageless)) => {
+                match storageless.refusal(QuestionExpression::Write, reach) {
+                    None => Ok(None),
+                    Some(refusal) => Err(ChangeValueError::Storageless {
+                        question: self.question.clone(),
+                        refusal,
+                    }),
+                }
+            }
+            None => Err(ChangeValueError::NoVarStore {
+                question: self.question.clone(),
+                reason: format!("{reason:#}"),
+            }),
+        }
     }
 
     /// How get (`Read`) or set (`Write`) reaches the value of a question without a VarStore;
@@ -2070,21 +2087,21 @@ pub(crate) fn choice_for_set(
         } => descriptor,
         Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
     };
+    // the WRITE expression of a question without a VarStore names the stores that set writes
+    if let Some(store) = descriptor.store(reader.reach())? {
+        check_writable(store, reader)?;
+    }
+    Ok(selection.for_set(question)?)
+}
+
+/// Refuses `store` unless set may write its variable, which `reader` has read: one that the read
+/// failed for, or whose attributes set does not write, a volatile, authenticated, or, at OS
+/// runtime, boot-service-only variable.
+fn check_writable(store: &dyn VariableStore, reader: &EfivarReader) -> Result<()> {
     let reach = reader.reach();
-    let store = descriptor.store(reach)?;
     let interface = reader.interface();
     if let Some(error) = reader.read_error(store) {
-        if let Some(declared) = store.explain_unread(reach, interface, error) {
-            return Err(declared.into());
-        }
-        return Err(match error.downcast_ref::<VariableNotFound>() {
-            Some(missing) => VariableNotExported {
-                missing: missing.clone(),
-                interface,
-            }
-            .into(),
-            None => anyhow!("{error:#}"),
-        });
+        return Err(unwritable(store, error, reach, interface));
     }
     if let Some(attributes) = reader.attributes(store) {
         let key = store.variable_key();
@@ -2092,7 +2109,28 @@ pub(crate) fn choice_for_set(
         check_unauthenticated(&key, attributes)?;
         check_runtime_writable(&key, reach, attributes)?;
     }
-    Ok(selection.for_set(question)?)
+    Ok(())
+}
+
+/// Why set does not write the variable of `store`, whose read through variables of `reach` and
+/// `interface` failed with `error`.
+fn unwritable(
+    store: &dyn VariableStore,
+    error: &anyhow::Error,
+    reach: VariableReach,
+    interface: VariableInterface,
+) -> anyhow::Error {
+    if let Some(declared) = store.explain_unread(reach, interface, error) {
+        return declared.into();
+    }
+    match error.downcast_ref::<VariableNotFound>() {
+        Some(missing) => VariableNotExported {
+            missing: missing.clone(),
+            interface,
+        }
+        .into(),
+        None => anyhow!("{error:#}"),
+    }
 }
 
 #[cfg(test)]
@@ -3251,7 +3289,14 @@ mod tests {
                 variables.interface(),
             )
             .unwrap_or_else(|error| panic!("write {data:?} at offset {offset}: {error}"));
-            assert_eq!(write.encoded, encoded, "{data:?}");
+            assert_eq!(
+                write.patches,
+                [(
+                    u16::try_from(offset).expect("offset fits u16"),
+                    encoded.clone()
+                )],
+                "{data:?}"
+            );
 
             write
                 .write(&variables)
