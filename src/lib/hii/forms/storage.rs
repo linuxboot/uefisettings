@@ -18,7 +18,10 @@ use binrw::BinRead;
 use thiserror::Error;
 
 use super::bit_field_bits;
+use super::conditions::QuestionExpression;
 use super::question_values::value_question;
+use super::storageless::NoVarStore;
+use super::storageless::StoragelessRefusal;
 use super::IFROpCode;
 use super::IFROperation;
 use super::NumericFormatError;
@@ -839,8 +842,9 @@ mod non_efi_varstore_tests {
         }
     }
 
+    /// An op on VarStoreId 0 whose value uefisettings does not decode has no classification.
     #[test]
-    fn question_without_varstore_is_reported_as_unavailable() {
+    fn op_without_a_decoded_value_on_var_store_0_names_its_op_code() {
         let node = Rc::new(RefCell::new(IFROperation {
             op_code: IFROpCode::Unknown(DUMMY_OPCODE),
             length: 0,
@@ -854,7 +858,7 @@ mod non_efi_varstore_tests {
         let error = find_corresponding_varstore(node, 0).err().unwrap();
         assert_eq!(
             error.to_string(),
-            "question is callback-driven or temporary and has no varstore"
+            "an unknown IFR opcode has VarStoreId 0 and no value that uefisettings decodes"
         );
     }
 
@@ -921,11 +925,18 @@ pub(super) fn read_current_value_bytes<'a>(
     value: std::ops::Range<usize>,
     reader: &'a mut EfivarReader,
 ) -> std::result::Result<&'a [u8], ValueUnavailable> {
+    let reach = reader.reach();
     let store = match varstore {
         Ok(store) => store,
-        Err(error) => return Err(ValueUnavailable::NoVarStore(error.to_string())),
+        Err(error) => {
+            return Err(match error.downcast_ref::<NoVarStore>() {
+                Some(NoVarStore(question)) => {
+                    ValueUnavailable::Storageless(question.refusal(QuestionExpression::Read, reach))
+                }
+                None => ValueUnavailable::NoVarStore(error.to_string()),
+            })
+        }
     };
-    let reach = reader.reach();
     let interface = reader.interface();
 
     // A variable that the read finds is read whatever runtime access its VARSTORE_EFI declares:
@@ -954,6 +965,9 @@ pub(super) enum ValueUnavailable {
     /// find_corresponding_varstore's error, its outermost context only
     #[error("{0}")]
     NoVarStore(String),
+    /// Why get reads no value of a question without a VarStore
+    #[error("{0}")]
+    Storageless(StoragelessRefusal),
     #[error("{0}")]
     DeclaredBootServiceOnly(DeclaredBootServiceOnly),
     #[error("{0}")]
@@ -1024,6 +1038,7 @@ impl ValueUnavailable {
             Self::Truncated { .. } => "ExtractEFIDataError",
             Self::AmiAccessLevel(reason) => reason.tag(),
             Self::NoVarStore(_)
+            | Self::Storageless(_)
             | Self::DeclaredBootServiceOnly(_)
             | Self::EnhancedAuthenticated(_)
             | Self::PasswordVarStore

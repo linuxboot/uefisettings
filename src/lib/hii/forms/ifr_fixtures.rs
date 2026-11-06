@@ -86,13 +86,15 @@ const UINT8: u8 = 0x42;
 pub(super) const TRUE: u8 = 0x46;
 pub(super) const FALSE: u8 = 0x47;
 const ONES: u8 = 0x54;
-const VALUE: u8 = 0x5A;
+pub(super) const VALUE: u8 = 0x5A;
 pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
 pub(super) const FORM_MAP: u8 = 0x5D;
 
 const VAR_STORE: u8 = 0x24;
 const VAR_STORE_EFI: u8 = 0x26;
+pub(super) const READ: u8 = 0x2D;
+pub(super) const WRITE: u8 = 0x2E;
 
 /// The Guid E770BB69-BCB4-4D04-9E97-23FF9456FEAC of AMI firmware's VarStore SystemAccess, as
 /// stored.
@@ -279,7 +281,13 @@ pub(super) fn change_value(
     new_value: &str,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    value_write(question, new_value, variables.interface())?.write(variables)?;
+    value_write(
+        question,
+        new_value,
+        variables.reach(),
+        variables.interface(),
+    )?
+    .write(variables)?;
     Ok(())
 }
 
@@ -290,7 +298,7 @@ pub(super) fn change_option(
     option: &AnswerOption,
     variables: &dyn FirmwareVariables,
 ) -> Result<(), ChangeValueError> {
-    option_write(question, option, variables.interface())?.write(variables)?;
+    option_write(question, option, variables.reach(), variables.interface())?.write(variables)?;
     Ok(())
 }
 
@@ -523,13 +531,24 @@ pub(super) fn question_header_on(
     var_store_id: u16,
     offset: u16,
 ) -> Vec<u8> {
+    question_header_with(question_id, prompt, var_store_id, offset, 0x00)
+}
+
+/// question_header_on() with Flags `flags`.
+pub(super) fn question_header_with(
+    question_id: u16,
+    prompt: u16,
+    var_store_id: u16,
+    offset: u16,
+    flags: u8,
+) -> Vec<u8> {
     [
         &prompt.to_le_bytes()[..],
         &[0x04, 0x00],
         &question_id.to_le_bytes(),
         &var_store_id.to_le_bytes(),
         &offset.to_le_bytes(),
-        &[0x00],
+        &[flags],
     ]
     .concat()
 }

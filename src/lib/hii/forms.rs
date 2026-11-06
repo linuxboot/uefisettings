@@ -37,10 +37,12 @@ use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::VariableNotFound;
+use crate::hii::variables::VariableReach;
 use conditions::question_state;
 use conditions::select;
 use conditions::skips_scope;
 use conditions::ExpressionInputs;
+use conditions::QuestionExpression;
 use conditions::QuestionValues;
 use conditions::VarStoreValues;
 use defaults::FormSetDefaultIds;
@@ -57,6 +59,10 @@ use storage::VarStoreEfi;
 use storage::VarStoreNameValue;
 use storage::VariableNotExported;
 use storage::VariableStore;
+use storageless::NoVarStore;
+use storageless::StoragelessQuestion;
+use storageless::StoragelessRefusal;
+use storageless::StoragelessRoute;
 
 pub use ami_access_level::AccessLevel;
 pub use conditions::IncludedStates;
@@ -81,6 +87,7 @@ mod question_values;
 mod set;
 mod setup_password;
 mod storage;
+mod storageless;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 /// How DeclaredBootServiceOnly names a form's declaration without EFI_VARIABLE_RUNTIME_ACCESS.
@@ -1800,14 +1807,40 @@ pub struct AnswerOption {
 }
 
 impl QuestionDescriptor {
-    /// The VarStore of the question, or why set cannot write it.
-    fn store(&self) -> std::result::Result<&dyn VariableStore, ChangeValueError> {
+    /// The VarStore of the question, or why set, through variables of `reach`, cannot write it.
+    fn store(
+        &self,
+        reach: VariableReach,
+    ) -> std::result::Result<&dyn VariableStore, ChangeValueError> {
         self.varstore
             .as_deref()
-            .map_err(|reason| ChangeValueError::NoVarStore {
-                question: self.question.clone(),
-                reason: format!("{reason:#}"),
+            .map_err(|reason| match reason.downcast_ref::<NoVarStore>() {
+                Some(NoVarStore(storageless)) => ChangeValueError::Storageless {
+                    question: self.question.clone(),
+                    refusal: storageless.refusal(QuestionExpression::Write, reach),
+                },
+                None => ChangeValueError::NoVarStore {
+                    question: self.question.clone(),
+                    reason: format!("{reason:#}"),
+                },
             })
+    }
+
+    /// How get (`Read`) or set (`Write`) reaches the value of a question without a VarStore;
+    /// None for one with a VarStore.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "for the CallBack() sequence of the UEFI Shell build, which does not exist yet"
+        )
+    )]
+    pub(crate) fn storageless_route(
+        &self,
+        expression: QuestionExpression,
+    ) -> Option<std::result::Result<StoragelessRoute, StoragelessRefusal>> {
+        let NoVarStore(storageless) = self.varstore.as_ref().err()?.downcast_ref::<NoVarStore>()?;
+        Some(storageless.route(expression))
     }
 
     /// The option that set writes for one of `texts`.
@@ -2035,8 +2068,8 @@ pub(crate) fn choice_for_set(
         } => descriptor,
         Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
     };
-    let store = descriptor.store()?;
     let reach = reader.reach();
+    let store = descriptor.store(reach)?;
     let interface = reader.interface();
     if let Some(error) = reader.read_error(store) {
         if let Some(declared) = store.explain_unread(reach, interface, error) {
@@ -2335,8 +2368,8 @@ mod choice_for_set_tests {
         assert_eq!(
             choice.map_err(|error| error.to_string()).err().as_deref(),
             Some(
-                "cannot set question \"Prompt\": question is callback-driven or temporary and \
-                 has no varstore"
+                "cannot set question \"Prompt\": question has no VarStore, READ or WRITE \
+                 expression, or EFI_IFR_FLAG_CALLBACK, one of which UEFI 2.11 §33.2.5.6 requires"
             ),
             "question 1 on VarStoreId 0"
         );
@@ -2987,9 +3020,13 @@ fn find_corresponding_varstore(
     var_store_id: u16,
 ) -> Result<Box<dyn VariableStore>> {
     if var_store_id == 0 {
-        return Err(anyhow!(
-            "question is callback-driven or temporary and has no varstore"
-        ));
+        return Err(match StoragelessQuestion::of(&node) {
+            Some(question) => NoVarStore(question).into(),
+            None => anyhow!(
+                "{} has VarStoreId 0 and no value that uefisettings decodes",
+                node.borrow().op_code.spec_name()
+            ),
+        });
     }
 
     let mut node = node;

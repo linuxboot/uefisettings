@@ -25,6 +25,7 @@ use super::conditions::SelectionError;
 use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
+use super::storageless::StoragelessRefusal;
 use super::AnswerOption;
 use super::IFROpCode;
 use super::QuestionDescriptor;
@@ -32,6 +33,7 @@ use super::RangeType;
 use super::TypeValue;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
+use crate::hii::variables::VariableReach;
 use crate::hii::variables::WithholdingVariables;
 
 #[derive(Error, Debug)]
@@ -48,6 +50,11 @@ pub enum ChangeValueError {
     UnsupportedBitField,
     #[error("cannot set question {question:?}: {reason}")]
     NoVarStore { question: String, reason: String },
+    #[error("cannot set question {question:?}: {refusal}")]
+    Storageless {
+        question: String,
+        refusal: StoragelessRefusal,
+    },
     #[error(transparent)]
     Selection(#[from] SelectionError),
 
@@ -128,18 +135,19 @@ impl<'a> VarStoreWrite<'a> {
     }
 }
 
-/// The write that sets `question` to `new_value` through variables of `interface`; for a ONE_OF,
-/// to the option of that text that select_option picks without --include.
+/// The write that sets `question` to `new_value` through variables of `reach` and `interface`;
+/// for a ONE_OF, to the option of that text that select_option picks without --include.
 pub(super) fn value_write<'a>(
     question: &'a QuestionDescriptor,
     new_value: &str,
+    reach: VariableReach,
     interface: VariableInterface,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
     let ValueLocation::Bytes { offset, .. } = question.location else {
         return Err(ChangeValueError::UnsupportedBitField);
     };
-    let store = question.store()?;
+    let store = question.store(reach)?;
     if question.opcode == IFROpCode::OneOf {
         let option = question
             .select_option(
@@ -147,7 +155,7 @@ pub(super) fn value_write<'a>(
                 IncludedStates::empty(),
             )?
             .ok_or(ChangeValueError::InvalidOption)?;
-        return option_write(question, option, interface);
+        return option_write(question, option, reach, interface);
     }
     let value = match &question.numeric_range {
         Some(range) => range.parse_value(new_value)?,
@@ -194,10 +202,11 @@ pub(super) fn value_write<'a>(
 }
 
 /// The write of `option`, one of the possible_options of the ONE_OF `question`, through
-/// variables of `interface`.
+/// variables of `reach` and `interface`.
 pub(super) fn option_write<'a>(
     question: &'a QuestionDescriptor,
     option: &AnswerOption,
+    reach: VariableReach,
     interface: VariableInterface,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     // writes take VarOffset in bytes
@@ -205,7 +214,7 @@ pub(super) fn option_write<'a>(
         return Err(ChangeValueError::UnsupportedBitField);
     };
     Ok(VarStoreWrite::new(
-        question.store()?,
+        question.store(reach)?,
         offset,
         option.raw_value,
         interface,
@@ -241,18 +250,18 @@ pub(crate) fn set_questions<'a>(
             // (example whatever matches from [Enabled, Enable])
             // else try setting the new_value because it might be some arbitrary value like a number
             // (will return error if doesn't match constraints)
-            let interface = variables.interface();
+            let (reach, interface) = (variables.reach(), variables.interface());
             if descriptor.possible_options.is_empty() {
                 return Ok((
                     selector,
-                    value_write(descriptor, new_value, interface)?,
+                    value_write(descriptor, new_value, reach, interface)?,
                     None,
                 ));
             }
             let option = descriptor.chosen_option(texts, include)?;
             Ok((
                 selector,
-                option_write(descriptor, option, interface)?,
+                option_write(descriptor, option, reach, interface)?,
                 Some(option),
             ))
         })

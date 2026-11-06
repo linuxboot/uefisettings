@@ -911,7 +911,7 @@ pub(crate) fn evaluate_write(
 /// uefisettings lists questions too, as on a FORM. IfrParse.c ParseOpCodes keeps the last READ or
 /// WRITE in the question's scope, and takes the op after it, with that op's scope, as its
 /// expression; here the leading expression ops after it, as in a condition.
-fn question_expression(
+pub(super) fn question_expression(
     question: &Rc<RefCell<IFROperation>>,
     kind: QuestionExpression,
 ) -> Option<Vec<Rc<RefCell<IFROperation>>>> {
@@ -963,6 +963,10 @@ pub(super) fn question_value_expression(
         .find(|child| child.borrow().op_code == IFROpCode::Value)
         .cloned()
 }
+
+/// Why set refuses a question with an EFI_IFR_VALUE.
+pub(super) const VALUE_MAKES_READ_ONLY: &str =
+    "its EFI_IFR_VALUE expression makes it read-only (UEFI 2.11 §33.3.8.3.88)";
 
 /// Whether edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue and SetQuestionValue take
 /// `question` through its READ and WRITE expressions: on a FORM and on a FORM_MAP with the
@@ -4942,8 +4946,6 @@ mod store_expression_tests {
     const VAR_STORE_NAME_VALUE: u8 = 0x25;
     const GET: u8 = 0x2B;
     const SET: u8 = 0x2C;
-    const READ: u8 = 0x2D;
-    const WRITE: u8 = 0x2E;
     const AND: u8 = 0x15;
     const EQUAL: u8 = 0x2F;
     const NOT_EQUAL: u8 = 0x30;

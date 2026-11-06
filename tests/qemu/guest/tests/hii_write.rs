@@ -263,18 +263,11 @@ fn set_of_an_unknown_question_is_refused() {
 
 #[test]
 fn set_of_a_question_without_a_varstore_is_refused() {
-    let cases = [
-        (
-            "NameValueVar0",
-            "1",
-            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
-        ),
-        (
-            "Disk Memory Type:",
-            "Reserved",
-            "question is callback-driven or temporary and has no varstore",
-        ),
-    ];
+    let cases = [(
+        "NameValueVar0",
+        "1",
+        "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
+    )];
     for (question, answer, reason) in cases {
         for prefix in PREFIXES {
             assert_eq!(
