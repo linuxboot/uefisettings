@@ -2053,4 +2053,33 @@ mod tests {
             "two device path packages: {err:#}"
         );
     }
+
+    #[test]
+    fn test_read_db_refuses_string_ids_that_overflow() {
+        // 32768 EFI_HII_SIBT_SKIP2 blocks of 0xFFFF, then one of 0x7FFE: string ID i32::MAX
+        let to_i32_max: Vec<u8> = std::iter::repeat_n([0x21, 0xFF, 0xFF], 32_768)
+            .flatten()
+            .chain([0x21, 0xFE, 0x7F])
+            .collect();
+        let cases: [(&str, &[u8]); 3] = [
+            ("EFI_HII_SIBT_SKIP2", &[0x21, 0x01, 0x00]),
+            ("EFI_HII_SIBT_SKIP1", &[0x22, 0x01]),
+            ("EFI_HII_SIBT_STRING_UCS2", &[0x14, b'A', 0x00, 0x00, 0x00]),
+        ];
+        for (block, overflowing) in cases {
+            let blocks = [&to_i32_max[..], overflowing, &[0x00]].concat();
+            let package = en_strings_package_with_blocks(&blocks);
+            let hiidb =
+                package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat());
+
+            let Err(err) = read_db(&hiidb) else {
+                panic!("read_db parsed a string ID past i32::MAX after {block}");
+            };
+
+            let msg = format!("{err:#}");
+            let want = "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+                        failed to parse a strings package: the string identifier overflows";
+            assert_eq!(msg, want, "{block} past i32::MAX");
+        }
+    }
 }

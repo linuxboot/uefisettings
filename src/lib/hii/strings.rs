@@ -208,14 +208,18 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
                 );
                 // save string here id changes later
                 string_map.insert(string_id_current, null_str.to_string());
-                string_id_current += 1;
+                string_id_current = string_id_current
+                    .checked_add(1)
+                    .context("the string identifier overflows")?;
             }
             StringBlockType::Skip2 => {
                 // Or we can break;
                 let skip_count: u16 = blocks_cursor
                     .read_ne()
                     .context("failed to read a Skip2 count")?;
-                string_id_current += skip_count as i32;
+                string_id_current = string_id_current
+                    .checked_add(i32::from(skip_count))
+                    .context("the string identifier overflows")?;
                 debug!("Skip count is {}", skip_count);
             }
             StringBlockType::Skip1 => {
@@ -223,7 +227,9 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
                 let skip_count: u8 = blocks_cursor
                     .read_ne()
                     .context("failed to read a Skip1 count")?;
-                string_id_current += skip_count as i32;
+                string_id_current = string_id_current
+                    .checked_add(i32::from(skip_count))
+                    .context("the string identifier overflows")?;
                 debug!("Skip count is {}", skip_count);
             }
             StringBlockType::End => {
