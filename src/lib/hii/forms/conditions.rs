@@ -26,19 +26,19 @@ use thiserror::Error;
 
 use super::ami_access_level::AMI_ACCESS_LEVEL;
 use super::find_corresponding_varstore;
-use super::read_question_value;
+use super::question_values::value_question;
+use super::question_values::ValueQuestion;
+use super::storage::read_question_value;
+use super::storage::ValueLocation;
+use super::storage::ValueUnavailable;
+use super::storage::VariableStore;
 use super::try_walk_scopes;
-use super::value_question;
 use super::walk_scopes;
 use super::AccessLevel;
 use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
 use super::ParsedOperation;
-use super::ValueLocation;
-use super::ValueQuestion;
-use super::ValueUnavailable;
-use super::VariableStore;
 use super::Walk;
 
 /// The opcode of IFROpCode::Match2, the highest that edk2-stable202608
@@ -1357,10 +1357,10 @@ mod tests {
     use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::storage::ValueLocation;
     use super::super::Cursor;
     use super::super::FormSetWalk;
     use super::super::QuestionDescriptor;
-    use super::super::ValueLocation;
     use super::*;
 
     const EQ_ID_ID: u8 = 0x13;

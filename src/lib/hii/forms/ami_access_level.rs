@@ -18,11 +18,11 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
+use super::storage::VarStoreVariable;
 use super::Guid;
 use super::IFROpCode;
 use super::IFROperation;
 use super::ParsedOperation;
-use super::VarStoreVariable;
 
 /// Where AMI firmware's setup browser keeps the access level of its session: its IFR shows
 /// Access Level Administrator at 0 and User at 1.

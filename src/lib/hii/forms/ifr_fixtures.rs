@@ -34,6 +34,15 @@ use super::conditions::QuestionValue;
 use super::conditions::QuestionValues;
 #[cfg(efivar_dumps)]
 use super::conditions::VarStoreValues;
+#[cfg(efivar_dumps)]
+use super::question_values::handle_checkbox;
+#[cfg(efivar_dumps)]
+use super::question_values::handle_numeric;
+#[cfg(efivar_dumps)]
+use super::question_values::handle_oneof;
+use super::set::option_write;
+use super::set::value_write;
+use super::storage::VariableStoreKind;
 use super::*;
 #[cfg(efivar_dumps)]
 use crate::hii::efivarfs_format::EfivarFileName;
@@ -49,6 +58,7 @@ pub(crate) use crate::hii::variables::tests::NV_BS;
 pub(crate) use crate::hii::variables::tests::NV_BS_RT;
 #[cfg(efivar_dumps)]
 use crate::hii::variables::EfivarSource;
+use crate::hii::variables::FirmwareVariables;
 pub(crate) use crate::hii::variables::VariableInterface;
 pub(crate) use crate::hii::variables::VariableKey;
 pub(crate) use crate::hii::variables::VariableReach;
