@@ -30,6 +30,9 @@ mod chattr;
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
 mod efi_status;
 mod efi_variables;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg_attr(not(test), allow(dead_code, reason = "nothing locates the ESP yet"))]
+mod esp;
 mod exit_status;
 pub mod exports;
 #[cfg(target_os = "linux")]

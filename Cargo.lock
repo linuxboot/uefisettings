@@ -1295,6 +1295,7 @@ dependencies = [
  "bitflags 2.4.1",
  "clap",
  "cms",
+ "crc32fast",
  "der",
  "env_logger",
  "fbthrift-git",
