@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -30,6 +30,8 @@
 //! [`global_variable_forms`] after those that the firmware exports.
 //! `password-forms` publishes nothing: it registers the package list of [`password_forms`]
 //! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
+//! `padded-strings` publishes nothing either: it registers the package list of
+//! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `QHII` ACPI table,
 //! where `src/lib/hii/extract.rs` also looks, and puts its CRC-32 in `HiiDBCrc32`.
 //! `acpi-table-hiid` does the same with an `HIID` table, the other vendor ACPI table that
@@ -57,6 +59,7 @@ extern crate alloc;
 mod auth_variables;
 mod global_variable_forms;
 mod hii_package;
+mod padded_strings;
 mod password_forms;
 
 use alloc::vec::Vec;
@@ -150,8 +153,16 @@ fn efi_main() -> Status {
                 println!("publish-hiidb: {length} bytes at {address:#x}, type {memory_type:?}");
             })
         }
-        Some(Task::RegisterPasswordForms) => register_password_forms()
-            .map(|()| println!("publish-hiidb: registered the password forms")),
+        Some(Task::RegisterPasswordForms) => register_package_list(
+            &password_forms::package_list_bytes(),
+            "registering the password forms",
+        )
+        .map(|()| println!("publish-hiidb: registered the password forms")),
+        Some(Task::RegisterPaddedStrings) => register_package_list(
+            &padded_strings::package_list_bytes(),
+            "registering the padded strings",
+        )
+        .map(|()| println!("publish-hiidb: registered the padded strings")),
         Some(Task::PublishAcpiTable(signature)) => publish_acpi_table(signature).map(|length| {
             let signature = signature.escape_ascii();
             println!("publish-hiidb: {length} bytes in the {signature} ACPI table");
@@ -172,7 +183,7 @@ fn efi_main() -> Status {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
-                 |password-forms|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
+                 |password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all\
                  |set-auth-variables=PATH[,PATH]...]"
@@ -196,6 +207,8 @@ enum Task {
     Publish(MemoryType, Database),
     /// Register the package list of [`password_forms`] in the HII database.
     RegisterPasswordForms,
+    /// Register the package list of [`padded_strings`] in the HII database.
+    RegisterPaddedStrings,
     /// Publish the database in an ACPI table of the signature.
     PublishAcpiTable([u8; 4]),
     /// Install an ACPI table of the signature whose body is JUNK_TABLE_BODY.
@@ -232,6 +245,7 @@ fn load_option() -> Option<Task> {
             Some(Task::Publish(rt_data, Database::WithGlobalVariableForms))
         }
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
+        Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
         Ok(option) if option == cstr16!("acpi-table") => {
             Some(Task::PublishAcpiTable(QHII_SIGNATURE))
         }
@@ -272,13 +286,12 @@ fn load_option() -> Option<Task> {
 #[unsafe_protocol(HiiDatabaseProtocol::GUID)]
 struct RawHiiDatabase(HiiDatabaseProtocol);
 
-/// Registers the package list of [`password_forms`] in the HII database, for no driver, until
-/// the reset: the UEFI Shell exports the database later.
-fn register_password_forms() -> Result<(), Failure> {
+/// Registers the package list `list` in the HII database, for no driver, until the reset: the
+/// UEFI Shell or a later publish-hiidb exports the database. A failure names `step`.
+fn register_package_list(list: &[u8], step: &'static str) -> Result<(), Failure> {
     let database = boot::get_handle_for_protocol::<RawHiiDatabase>()
         .and_then(boot::open_protocol_exclusive::<RawHiiDatabase>)
         .map_err(|error| ("opening the HII database", error.status()))?;
-    let list = password_forms::package_list_bytes();
     let mut handle = ptr::null_mut();
     #[expect(
         unsafe_code,
@@ -297,9 +310,7 @@ fn register_password_forms() -> Result<(), Failure> {
             &mut handle,
         )
     };
-    status
-        .to_result()
-        .map_err(|error| ("registering the password forms", error.status()))
+    status.to_result().map_err(|error| (step, error.status()))
 }
 
 /// The HII database that publish-hiidb copies.

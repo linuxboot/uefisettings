@@ -11,6 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::ffi::FromBytesUntilNulError;
 
 use anyhow::anyhow;
 use anyhow::ensure;
@@ -20,6 +22,18 @@ use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinReaderExt;
 use log::debug;
+use log::warn;
+
+use super::package::PACKAGE_HEADER_SIZE;
+
+/// LANGUAGE_OFFSET is the offset of Language in a strings package: the package header, HdrSize
+/// and StringInfoOffset (a u32 each), LanguageWindow (16 CHAR16) and LanguageName precede it
+/// (UEFI 2.11 §33.3.6.1).
+const LANGUAGE_OFFSET: u32 = PACKAGE_HEADER_SIZE + 4 + 4 + 32 + 2;
+
+/// MIN_HDR_SIZE is the smallest HdrSize of a strings package: the fields before Language, then
+/// Language's null terminator.
+const MIN_HDR_SIZE: u32 = LANGUAGE_OFFSET + 1;
 
 // UEFI 2.10 §33.3.6.1
 #[derive(BinRead, Debug, PartialEq)]
@@ -28,12 +42,6 @@ struct StringPackageHeader {
     /// Size of the entire string package header
     hdr_size: u32,
     string_info_offset: u32,
-    language_window: [u16; 16], // no char16 in rust so will store like this, convert later
-    language_name: u16,         // no char16 in rust so will store like this, convert later
-    // I think there are some undocumented things after language which is why we can't calc sizeof
-    // language via hdr_size - 42 (336 bits). Just stop reading language when the null terminated string ends.
-    /// Null Terminated ASCII string like en-US
-    language: binrw::NullString,
 }
 
 // UEFI 2.10 §33.3.6.2
@@ -101,16 +109,76 @@ impl Language {
     }
 }
 
-pub fn handle_string_package(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<StringPackage> {
-    let string_header: StringPackageHeader = package_cursor
+/// Parses the strings package `data`, the package after its EFI_HII_PACKAGE_HEADER. The offsets
+/// in its header count from the start of the package, so `data` holds offset `o` at index
+/// `o - PACKAGE_HEADER_SIZE` (see data_index). Fails if HdrSize, Language or StringInfoOffset
+/// break UEFI 2.11 §33.3.6.1, naming the first that does, or if a string block fails to parse.
+///
+/// Example: for edk2's "en" packages, HdrSize and StringInfoOffset are both 49, Language is
+/// bytes 46..49, and the string blocks are read from offset 49, index 45 of `data`.
+pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
+    let StringPackageHeader {
+        hdr_size,
+        string_info_offset,
+    } = Cursor::new(data)
         .read_ne()
         .context("failed to parse string package header")?;
-    let language = Language(string_header.language.0);
-    debug!(
-        "String package language is {} and language name is {:?}",
-        language.0.escape_ascii(),
-        string_header.language_name
+    let length = u64::try_from(data.len())
+        .context("failed to convert the package size into u64")?
+        .checked_add(u64::from(PACKAGE_HEADER_SIZE))
+        .context("the package Length overflows u64")?;
+
+    ensure!(
+        hdr_size >= MIN_HDR_SIZE,
+        "HdrSize {hdr_size} is below the {MIN_HDR_SIZE} bytes of the fixed header and \
+         Language's null terminator (UEFI 2.11 §33.3.6.1)"
     );
+    ensure!(
+        u64::from(hdr_size) <= length,
+        "HdrSize {hdr_size} runs past the package Length {length} (UEFI 2.11 §33.3.6.1)"
+    );
+
+    // HdrSize counts the 4-byte package header: Language is bytes 46..HdrSize; bytes after its
+    // NUL are header bytes that no member defines.
+    let language_field = data
+        .get(data_index(LANGUAGE_OFFSET)?..data_index(hdr_size)?)
+        .context("HdrSize runs past the package data")?;
+    let language =
+        CStr::from_bytes_until_nul(language_field).map_err(|_: FromBytesUntilNulError| {
+            anyhow!(
+                "Language has no null terminator within HdrSize {hdr_size} (UEFI 2.11 §33.3.6.1)"
+            )
+        })?;
+    let language = Language(language.to_bytes().to_vec());
+
+    ensure!(
+        string_info_offset >= hdr_size,
+        "StringInfoOffset {string_info_offset} is inside the {hdr_size}-byte header \
+         (UEFI 2.11 §33.3.6.1)"
+    );
+    ensure!(
+        u64::from(string_info_offset) < length,
+        "StringInfoOffset {string_info_offset} is outside the package Length {length} \
+         (UEFI 2.11 §33.3.6.1)"
+    );
+    // edk2-stable202608's HiiDatabase reads the string blocks from HdrSize
+    // (MdeModulePkg/Universal/HiiDatabaseDxe/Database.c InsertStringPackage), so it may show
+    // other strings
+    if string_info_offset > hdr_size {
+        warn!(
+            "StringInfoOffset {string_info_offset} is past HdrSize {hdr_size}: the strings are \
+             read from StringInfoOffset (UEFI 2.11 §33.3.6.1), while edk2's HiiDatabase reads \
+             them from HdrSize, so the firmware may show other strings"
+        );
+    }
+    let string_information = data
+        .get(data_index(string_info_offset)?..)
+        .context("StringInfoOffset runs past the package data")?;
+    debug!(
+        "String package language is {}, HdrSize {hdr_size}, StringInfoOffset {string_info_offset}",
+        language.0.escape_ascii()
+    );
+    let mut blocks_cursor = Cursor::new(string_information);
 
     // Now parse the blocks
 
@@ -123,7 +191,7 @@ pub fn handle_string_package(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<St
 
         // We can also break because if there is an error here we loose track of string_id_current
         // and want to immediately stop parsing this string package anything beyond this wont be useful.
-        let block_type: StringBlockType = package_cursor
+        let block_type: StringBlockType = blocks_cursor
             .read_ne()
             .context("failed to read a string block type")?;
         debug!("Blocktype is {:?}", block_type);
@@ -131,7 +199,7 @@ pub fn handle_string_package(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<St
         match block_type {
             StringBlockType::StringUcs2 => {
                 // Or we can break;
-                let null_str: binrw::NullWideString = package_cursor
+                let null_str: binrw::NullWideString = blocks_cursor
                     .read_ne()
                     .context("failed to read a null-terminated 16-bit string")?;
                 debug!(
@@ -144,7 +212,7 @@ pub fn handle_string_package(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<St
             }
             StringBlockType::Skip2 => {
                 // Or we can break;
-                let skip_count: u16 = package_cursor
+                let skip_count: u16 = blocks_cursor
                     .read_ne()
                     .context("failed to read a Skip2 count")?;
                 string_id_current += skip_count as i32;
@@ -152,7 +220,7 @@ pub fn handle_string_package(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<St
             }
             StringBlockType::Skip1 => {
                 // Or we can break;
-                let skip_count: u8 = package_cursor
+                let skip_count: u8 = blocks_cursor
                     .read_ne()
                     .context("failed to read a Skip1 count")?;
                 string_id_current += skip_count as i32;
@@ -192,4 +260,15 @@ pub fn handle_string_package(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<St
         language,
         strings: string_map,
     })
+}
+
+/// The index in a strings package's data, which starts after its package header, of the offset
+/// `offset` from the start of the package.
+///
+/// Example: `data_index(49)` is 45.
+fn data_index(offset: u32) -> Result<usize> {
+    let index = offset
+        .checked_sub(PACKAGE_HEADER_SIZE)
+        .context("the offset is inside the package header")?;
+    usize::try_from(index).context("failed to convert the offset into usize")
 }

@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -261,6 +262,16 @@ pub struct Response {
     /// Whether a `set` changed the answer; `get` does not print it.
     #[serde(default)]
     pub modified: bool,
+}
+
+/// One strings package of `hii list-strings --json` (`HiiStringsPackage`).
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct StringPackage {
+    /// The strings, by string ID.
+    pub string_package: BTreeMap<String, String>,
+    /// The Language of the package's header; optional, so that a build without the field fails
+    /// an assertion, not the parse.
+    pub language: Option<String>,
 }
 
 /// A variable as `variable list` prints it.

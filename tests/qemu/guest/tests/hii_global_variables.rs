@@ -17,7 +17,9 @@
 //! it writes anything, and writes the one on Timeout; `get` reads those on ConOutDev, LangCodes
 //! and Timeout. Each check of `set` compares every efivar file before and after. `variable list`
 //! lists the variables of the efivar files, `variable info` tells their attributes and size, and
-//! `variable storage` the storage that efivarfs tells.
+//! `variable storage` the storage that efivarfs tells. The firmware also exports the package list
+//! that publish-hiidb's `padded_strings` registers, whose strings package header holds padding
+//! after Language's null terminator: `hii list-strings` reads its strings at StringInfoOffset.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -27,6 +29,7 @@ use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::Responses;
+use uefisettings_qemu_guest::StringPackage;
 use uefisettings_qemu_guest::Variable;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::EFIVARFS_HEADER_SIZE;
@@ -69,6 +72,10 @@ const DIFFERENT_MAXIMA: &str = "Copies with different maxima";
 const MAXIMUM_200: &str = "8C78A505-BAA0-4C4A-869F-000000000006";
 /// The package list of the copy of [`DIFFERENT_MAXIMA`] up to 100, as `set` names it.
 const MAXIMUM_100: &str = "8C78A505-BAA0-4C4A-869F-000000000007";
+
+/// The strings of publish-hiidb's `padded_strings`, by string ID, after its padded header.
+const PADDED_HEADER_STRINGS: [(&str, &str); 2] =
+    [("1", "English"), ("2", "Strings after a padded header")];
 
 /// The bytes of every efivar file, or why it cannot be read.
 type Efivars = BTreeMap<String, Result<Vec<u8>, String>>;
@@ -413,5 +420,35 @@ fn a_value_that_one_copy_refuses_writes_no_copy() {
         global_variable("Timeout"),
         (attributes, vec![written, data[1]]),
         "Timeout after set {value}"
+    );
+}
+
+/// list-strings reads the strings package whose header holds padding after Language's null
+/// terminator, which the firmware's HII database exports as publish-hiidb registered it, from
+/// its StringInfoOffset (UEFI 2.11 §33.3.6.1).
+#[test]
+fn list_strings_reads_a_strings_package_whose_header_holds_padding() {
+    let packages: Vec<StringPackage> = json(&["hii", "list-strings", "--json"]);
+    let padded: Vec<&StringPackage> = packages
+        .iter()
+        .filter(|package| {
+            package
+                .string_package
+                .values()
+                .any(|string| string == PADDED_HEADER_STRINGS[1].1)
+        })
+        .collect();
+
+    let want = StringPackage {
+        string_package: PADDED_HEADER_STRINGS
+            .iter()
+            .map(|&(id, string)| (id.to_string(), string.to_string()))
+            .collect(),
+        language: Some("en-US".to_string()),
+    };
+    assert_eq!(
+        padded,
+        [&want],
+        "the packages holding {PADDED_HEADER_STRINGS:?}"
     );
 }

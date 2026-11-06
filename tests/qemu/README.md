@@ -122,6 +122,11 @@ package lists, those of
 [`publish-hiidb/src/global_variable_forms.rs`](publish-hiidb/src/global_variable_forms.rs):
 forms whose questions sit on EFI global variables of the firmware, some of them volatile,
 under VarStores that declare every one non-volatile.
+In the scenario `hii-global-variables`, `publish-hiidb.efi padded-strings` runs first: it
+publishes nothing, but registers the package list of
+[`publish-hiidb/src/padded_strings.rs`](publish-hiidb/src/padded_strings.rs) in the HII
+database, a strings package whose header holds padding after its Language, which the firmware
+exports as it is.
 
 `publish-hiidb.efi acpi-table` sets no `HiiDB` variable: it installs the database as the body
 of a `QHII` ACPI table through `EFI_ACPI_TABLE_PROTOCOL`, which `uefisettings` reads from

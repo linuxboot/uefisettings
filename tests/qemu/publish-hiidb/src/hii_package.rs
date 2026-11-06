@@ -46,11 +46,20 @@ pub(crate) fn package_list(guid: Guid, packages: &[Vec<u8>]) -> Vec<u8> {
 
 /// An en-US strings package of `strings`, from string ID [`LANGUAGE_NAME`].
 pub(crate) fn strings_package<'a>(strings: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
+    strings_package_with_header_padding(&[], strings)
+}
+
+/// [`strings_package`] whose header holds `padding` after Language's null terminator: HdrSize
+/// and StringInfoOffset cover it (UEFI 2.11 §33.3.6.1).
+pub(crate) fn strings_package_with_header_padding<'a>(
+    padding: &[u8],
+    strings: impl IntoIterator<Item = &'a str>,
+) -> Vec<u8> {
     const LANGUAGE: &[u8] = b"en-US\0";
     // EFI_HII_STRING_PACKAGE_HDR: the package header, HdrSize, StringInfoOffset,
-    // LanguageWindow, LanguageName and Language
-    let header_size =
-        u32::try_from(4 + 4 + 4 + 32 + 2 + LANGUAGE.len()).expect("the header fits 4 GiB");
+    // LanguageWindow, LanguageName and Language, then `padding`
+    let header_size = u32::try_from(4 + 4 + 4 + 32 + 2 + LANGUAGE.len() + padding.len())
+        .expect("the header fits 4 GiB");
     // EFI_HII_SIBT_STRING_UCS2 blocks, then EFI_HII_SIBT_END
     let blocks: Vec<u8> = strings
         .into_iter()
@@ -69,6 +78,7 @@ pub(crate) fn strings_package<'a>(strings: impl IntoIterator<Item = &'a str>) ->
             &[0; 32],
             &LANGUAGE_NAME.to_le_bytes(),
             LANGUAGE,
+            padding,
             &blocks,
         ]
         .concat(),

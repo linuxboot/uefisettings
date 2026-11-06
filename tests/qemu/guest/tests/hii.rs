@@ -42,6 +42,7 @@ use uefisettings_qemu_guest::variable_data;
 use uefisettings_qemu_guest::MachineInfo;
 use uefisettings_qemu_guest::Question;
 use uefisettings_qemu_guest::Responses;
+use uefisettings_qemu_guest::StringPackage;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
 use uefisettings_qemu_guest::EFAULT;
@@ -155,14 +156,6 @@ struct Dump {
     directory: String,
     redaction: String,
     copied: Vec<String>,
-}
-
-/// One string package of `hii list-strings --json` (`HiiStringsPackage`).
-#[derive(Debug, Deserialize)]
-struct StringPackage {
-    string_package: BTreeMap<String, String>,
-    // optional, so that a build without the field fails an assertion, not the parse
-    language: Option<String>,
 }
 
 fn question(name: &str, answer: &str, options: &[&str]) -> Question {

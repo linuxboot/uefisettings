@@ -106,26 +106,55 @@ pub(super) fn en_strings_package_with_blocks(blocks: &[u8]) -> Vec<u8> {
 /// A strings package of Language `language`, which this adds the null terminator to, whose
 /// string blocks are `blocks`, valid or not.
 fn strings_package_with_blocks(language: &[u8], blocks: &[u8]) -> Vec<u8> {
-    let language = [
-        &[0x00; 32][..],     // LanguageWindow
-        &1u16.to_le_bytes(), // LanguageName
-        language,            // Language
-        &[0x00],             // its null terminator
-    ]
-    .concat();
+    strings_package_with_header(&[language, &[0x00]].concat(), &[], blocks)
+}
 
-    // HdrSize covers the package header, HdrSize and StringInfoOffset
-    // (a u32 each) and `language`; the strings follow the header.
-    let hdr_size = PACKAGE_HEADER_SIZE
-        + u32::try_from(2 * std::mem::size_of::<u32>() + language.len()).unwrap();
-    let length = hdr_size + u32::try_from(blocks.len()).unwrap();
+/// STRINGS_LANGUAGE_OFFSET is the offset of Language in a strings package: the package header,
+/// HdrSize and StringInfoOffset (a u32 each), LanguageWindow (16 CHAR16) and LanguageName
+/// precede it (UEFI 2.11 §33.3.6.1).
+pub(super) const STRINGS_LANGUAGE_OFFSET: u32 = PACKAGE_HEADER_SIZE + 4 + 4 + 32 + 2;
 
+/// A strings package whose header ends with `language_field`, the bytes from Language on, and
+/// whose string blocks `blocks` follow `gap`: HdrSize covers `language_field`, and
+/// StringInfoOffset points past `gap`.
+///
+/// Example: `strings_package_with_header(b"en\0\xAA", &[], blocks)` pads the header with one
+/// byte after Language's null terminator.
+pub(super) fn strings_package_with_header(
+    language_field: &[u8],
+    gap: &[u8],
+    blocks: &[u8],
+) -> Vec<u8> {
+    let hdr_size = STRINGS_LANGUAGE_OFFSET
+        + u32::try_from(language_field.len()).expect("the fixture's lengths fit a u32");
+    let string_info_offset =
+        hdr_size + u32::try_from(gap.len()).expect("the fixture's lengths fit a u32");
+    strings_package_with_offsets(
+        hdr_size,
+        string_info_offset,
+        &[language_field, gap, blocks].concat(),
+    )
+}
+
+/// A strings package of HdrSize `hdr_size` and StringInfoOffset `string_info_offset`, valid or
+/// not, whose bytes from Language on are `rest`.
+///
+/// Example: `strings_package_with_offsets(0, 49, b"en\0\x00")` holds Language "en" and an
+/// EFI_HII_SIBT_END block, under a HdrSize of 0.
+pub(super) fn strings_package_with_offsets(
+    hdr_size: u32,
+    string_info_offset: u32,
+    rest: &[u8],
+) -> Vec<u8> {
+    let length = STRINGS_LANGUAGE_OFFSET
+        + u32::try_from(rest.len()).expect("the fixture's lengths fit a u32");
     [
         &strings_package_header(length)[..],
-        &hdr_size.to_le_bytes(), // HdrSize
-        &hdr_size.to_le_bytes(), // StringInfoOffset
-        &language,
-        blocks,
+        &hdr_size.to_le_bytes(),
+        &string_info_offset.to_le_bytes(),
+        &[0x00; 32],         // LanguageWindow
+        &1u16.to_le_bytes(), // LanguageName
+        rest,
     ]
     .concat()
 }

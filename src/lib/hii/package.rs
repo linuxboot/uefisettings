@@ -44,7 +44,7 @@ const PACKAGE_LIST_HEADER_SIZE: u32 = 20;
 ///
 /// Example: Length includes the header, so a package carries
 /// `length - PACKAGE_HEADER_SIZE` bytes of data.
-const PACKAGE_HEADER_SIZE: u32 = 4;
+pub(super) const PACKAGE_HEADER_SIZE: u32 = 4;
 
 /// PADDING_BYTES are the byte values of the padding that may follow the
 /// last package list of a HiiDB, one value throughout. edk2 exports the
@@ -449,7 +449,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         match package.package_type {
             PackageType::Strings => {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
-                let string_package = strings::handle_string_package(&mut package_cursor)
+                let string_package = strings::handle_string_package(&package.data)
                     .context("failed to parse a strings package")?;
                 package_list_string_maps.push(string_package.strings);
                 string_languages.push(string_package.language);
@@ -1289,6 +1289,325 @@ mod tests {
         assert_eq!(list.strings, want, "strings of the strings packages");
     }
 
+    /// STRING_A_BLOCKS are the string blocks of string ID 1, "A": EFI_HII_SIBT_STRING_UCS2, then
+    /// EFI_HII_SIBT_END.
+    const STRING_A_BLOCKS: [u8; 6] = [0x14, b'A', 0x00, 0x00, 0x00, 0x00];
+
+    /// The strings that STRING_A_BLOCKS hold.
+    fn string_a() -> StringMap {
+        BTreeMap::from([(1, "A".to_string())])
+    }
+
+    /// The Language `language` of a strings package header.
+    fn language(language: &str) -> strings::Language {
+        strings::Language(language.as_bytes().to_vec())
+    }
+
+    /// The Language and strings of each strings package that read_db reads from one package
+    /// list of `packages` and the End package.
+    fn strings_packages_of(packages: &[Vec<u8>]) -> Vec<(strings::Language, StringMap)> {
+        let hiidb = package_list_with_guid(
+            [0x22; 16],
+            &[packages.concat(), END_PACKAGE.to_vec()].concat(),
+        );
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+        let [list] = lists.as_slice() else {
+            panic!("{} package lists, not 1", lists.len());
+        };
+        assert_eq!(
+            list.string_languages.len(),
+            list.strings.len(),
+            "a Language per strings package"
+        );
+        list.string_languages
+            .iter()
+            .cloned()
+            .zip(list.strings.iter().cloned())
+            .collect()
+    }
+
+    /// read_db's error, as it renders, for one package list 22..22 of `package` and the End
+    /// package; panics if read_db parses the list.
+    fn strings_package_refusal(package: Vec<u8>) -> String {
+        let hiidb = package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat());
+        match read_db(&hiidb) {
+            Ok(lists) => panic!(
+                "read_db parsed it: {:?}",
+                lists
+                    .iter()
+                    .map(|list| (&list.string_languages, &list.strings))
+                    .collect::<Vec<_>>()
+            ),
+            Err(err) => format!("{err:#}"),
+        }
+    }
+
+    /// The error that strings_package_refusal returns when the header of the strings package is
+    /// refused for `refusal`.
+    fn strings_header_refusal(refusal: &str) -> String {
+        format!(
+            "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+             failed to parse a strings package: {refusal} (UEFI 2.11 §33.3.6.1)"
+        )
+    }
+
+    /// read_db reads a strings package whose header holds padding after Language's null
+    /// terminator, covered by HdrSize and StringInfoOffset: whatever the padding's bytes, the
+    /// strings start at StringInfoOffset.
+    #[test]
+    fn test_read_db_reads_strings_after_header_padding() {
+        for padding in [[0x00; 3], [0xAA; 3]] {
+            let package = strings_package_with_header(
+                &[&b"en\0"[..], &padding].concat(),
+                &[],
+                &STRING_A_BLOCKS,
+            );
+
+            assert_eq!(
+                strings_packages_of(&[package]),
+                [(language("en"), string_a())],
+                "padding {padding:02x?}"
+            );
+        }
+    }
+
+    /// read_db reads the strings at StringInfoOffset when it points past HdrSize, not at HdrSize.
+    #[test]
+    fn test_read_db_reads_strings_at_string_info_offset_past_hdr_size() {
+        // 0xAA is no string block type (UEFI 2.11 §33.3.6.2)
+        let package = strings_package_with_header(b"en\0", &[0xAA; 4], &STRING_A_BLOCKS);
+
+        assert_eq!(
+            strings_packages_of(&[package]),
+            [(language("en"), string_a())]
+        );
+    }
+
+    /// read_db reads a strings package whose HdrSize, 47, holds only the fixed header and
+    /// Language's null terminator: an empty Language.
+    #[test]
+    fn test_read_db_reads_the_shortest_strings_package_header() {
+        let package = strings_package_with_header(b"\0", &[], &STRING_A_BLOCKS);
+
+        assert_eq!(
+            strings_packages_of(&[package]),
+            [(language(""), string_a())]
+        );
+    }
+
+    /// read_db reads string information of one EFI_HII_SIBT_END block, the last byte of the
+    /// package, as no strings.
+    #[test]
+    fn test_read_db_reads_string_information_of_only_an_end_block() {
+        let package = strings_package_with_header(b"en\0\xAA\xAA\xAA", &[], &[0x00]);
+        let length = u32::from_le_bytes([package[0], package[1], package[2], 0]);
+        let string_info_offset = u32::from_le_bytes(
+            package[8..12]
+                .try_into()
+                .expect("StringInfoOffset is 4 bytes"),
+        );
+        assert_eq!(string_info_offset, length - 1, "StringInfoOffset");
+
+        assert_eq!(
+            strings_packages_of(&[package]),
+            [(language("en"), StringMap::new())]
+        );
+    }
+
+    /// read_db reads each strings package of a list by its own header: a padded one and one
+    /// whose strings follow Language's null terminator, as edk2's tools write them.
+    #[test]
+    fn test_read_db_reads_a_padded_and_an_edk2_shaped_strings_package_of_one_list() {
+        let packages = [
+            strings_package_with_header(b"en\0\xAA\xAA\xAA", &[], &STRING_A_BLOCKS),
+            strings_package_of(b"fr", &["B"]),
+        ];
+
+        assert_eq!(
+            strings_packages_of(&packages),
+            [
+                (language("en"), string_a()),
+                (language("fr"), BTreeMap::from([(1, "B".to_string())])),
+            ]
+        );
+    }
+
+    /// read_db refuses a strings package whose HdrSize leaves no room for the fixed header and
+    /// Language's null terminator, or runs past the package.
+    #[test]
+    fn test_read_db_refuses_a_hdr_size_outside_the_package() {
+        // Language "en", then the blocks of "A" from offset 49
+        let rest = [&b"en\0"[..], &STRING_A_BLOCKS].concat();
+        let length = STRINGS_LANGUAGE_OFFSET
+            + u32::try_from(rest.len()).expect("the fixture's lengths fit a u32");
+        let below = |hdr_size: u32| {
+            format!(
+                "HdrSize {hdr_size} is below the 47 bytes of the fixed header and Language's null \
+                 terminator"
+            )
+        };
+        let past =
+            |hdr_size: u32| format!("HdrSize {hdr_size} runs past the package Length {length}");
+        let cases = [
+            (0, below(0)),
+            (STRINGS_LANGUAGE_OFFSET, below(STRINGS_LANGUAGE_OFFSET)),
+            (length + 1, past(length + 1)),
+            (u32::MAX, past(u32::MAX)),
+        ];
+        for (hdr_size, refusal) in cases {
+            let package =
+                strings_package_with_offsets(hdr_size, STRINGS_LANGUAGE_OFFSET + 3, &rest);
+
+            assert_eq!(
+                strings_package_refusal(package),
+                strings_header_refusal(&refusal),
+                "HdrSize {hdr_size}"
+            );
+        }
+    }
+
+    /// read_db refuses a strings package whose Language has no null terminator before HdrSize,
+    /// including one whose only null terminator is the first byte of the string blocks.
+    #[test]
+    fn test_read_db_refuses_a_language_unterminated_within_hdr_size() {
+        let cases: [(&str, &[u8]); 2] = [
+            ("the blocks of \"A\"", &STRING_A_BLOCKS),
+            ("an EFI_HII_SIBT_END block", &[0x00]),
+        ];
+        for (case, blocks) in cases {
+            // HdrSize 48 ends after "en"
+            let package = strings_package_with_header(b"en", &[], blocks);
+
+            assert_eq!(
+                strings_package_refusal(package),
+                strings_header_refusal("Language has no null terminator within HdrSize 48"),
+                "\"en\", then {case}"
+            );
+        }
+    }
+
+    /// read_db refuses a strings package whose StringInfoOffset points into its header or
+    /// outside it.
+    #[test]
+    fn test_read_db_refuses_a_string_info_offset_outside_the_string_information() {
+        // Language "en" and 3 bytes of padding make HdrSize 52, then the blocks of "A"
+        let rest = [&b"en\0\xAA\xAA\xAA"[..], &STRING_A_BLOCKS].concat();
+        let length = STRINGS_LANGUAGE_OFFSET
+            + u32::try_from(rest.len()).expect("the fixture's lengths fit a u32");
+        let outside = |string_info_offset: u32| {
+            format!("StringInfoOffset {string_info_offset} is outside the package Length {length}")
+        };
+        let cases = [
+            (
+                51,
+                "StringInfoOffset 51 is inside the 52-byte header".to_string(),
+            ),
+            (length, outside(length)),
+            (u32::MAX, outside(u32::MAX)),
+        ];
+        for (string_info_offset, refusal) in cases {
+            let package = strings_package_with_offsets(52, string_info_offset, &rest);
+
+            assert_eq!(
+                strings_package_refusal(package),
+                strings_header_refusal(&refusal),
+                "StringInfoOffset {string_info_offset}"
+            );
+        }
+    }
+
+    /// read_db checks a strings package header in order: HdrSize against the fixed header, then
+    /// against the package, then Language, then StringInfoOffset, and names the first field
+    /// that fails.
+    #[test]
+    fn test_read_db_checks_the_strings_package_header_in_order() {
+        let terminated = [&b"en\0"[..], &STRING_A_BLOCKS].concat();
+        let unterminated = [&b"en"[..], &STRING_A_BLOCKS].concat();
+        let length = STRINGS_LANGUAGE_OFFSET
+            + u32::try_from(terminated.len()).expect("the fixture's lengths fit a u32");
+        let cases = [
+            (
+                (STRINGS_LANGUAGE_OFFSET, u32::MAX, &terminated),
+                "HdrSize 46 is below the 47 bytes of the fixed header and Language's null \
+                 terminator"
+                    .to_string(),
+            ),
+            (
+                (length + 1, 0, &terminated),
+                format!(
+                    "HdrSize {} runs past the package Length {length}",
+                    length + 1
+                ),
+            ),
+            // a HdrSize of the whole package holds Language's null terminator
+            (
+                (length, length, &terminated),
+                format!("StringInfoOffset {length} is outside the package Length {length}"),
+            ),
+            (
+                (48, 47, &unterminated),
+                "Language has no null terminator within HdrSize 48".to_string(),
+            ),
+            // Language's check comes before StringInfoOffset's against Length
+            (
+                (48, length, &unterminated),
+                "Language has no null terminator within HdrSize 48".to_string(),
+            ),
+        ];
+        for ((hdr_size, string_info_offset, rest), refusal) in cases {
+            let package = strings_package_with_offsets(hdr_size, string_info_offset, rest);
+
+            assert_eq!(
+                strings_package_refusal(package),
+                strings_header_refusal(&refusal),
+                "HdrSize {hdr_size}, StringInfoOffset {string_info_offset}"
+            );
+        }
+
+        // HdrSize's check against the fixed header comes before its check against Length: in
+        // a package of Length 14, HdrSize 20 fails both
+        let short = [
+            &strings_package_header(14)[..],
+            &20u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &[0x00; 2],
+        ]
+        .concat();
+        assert_eq!(
+            strings_package_refusal(short),
+            strings_header_refusal(
+                "HdrSize 20 is below the 47 bytes of the fixed header and Language's null \
+                 terminator"
+            ),
+            "HdrSize 20 in a package of Length 14"
+        );
+    }
+
+    /// read_db refuses a strings package too short for HdrSize and StringInfoOffset, keeping
+    /// binrw's error as the cause.
+    #[test]
+    fn test_read_db_refuses_a_strings_package_too_short_for_its_offsets() {
+        // HdrSize and 1 of the 4 bytes of StringInfoOffset
+        let data = [0x31, 0x00, 0x00, 0x00, 0x31];
+        let length = PACKAGE_HEADER_SIZE
+            + u32::try_from(data.len()).expect("the fixture's lengths fit a u32");
+        let package = [&strings_package_header(length)[..], &data].concat();
+        let hiidb = package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat());
+
+        let Err(err) = read_db(&hiidb) else {
+            panic!("read_db parsed a strings package of {} bytes", length);
+        };
+
+        let msg = format!("{err:#}");
+        let want = "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+                    failed to parse a strings package: failed to parse string package header: ";
+        assert!(msg.starts_with(want), "{msg}");
+        assert!(
+            err.chain().any(|cause| cause.is::<binrw::Error>()),
+            "the cause is kept: {msg}"
+        );
+    }
+
     /// read_db keeps package lists in HiiDB order, duplicate GUIDs included.
     #[test]
     fn test_read_db_keeps_hiidb_order_and_duplicate_guids() {
@@ -1423,7 +1742,11 @@ mod tests {
     #[test]
     fn test_read_db_error_names_the_strings_package_and_block() {
         let cases: [(&[u8], &str); 4] = [
-            (&[], "failed to read a string block type"),
+            // EFI_HII_SIBT_STRING_UCS2 "A", then no EFI_HII_SIBT_END
+            (
+                &[0x14, b'A', 0x00, 0x00, 0x00],
+                "failed to read a string block type",
+            ),
             // EFI_HII_SIBT_STRING_UCS2 "A" without its null terminator
             (
                 &[0x14, b'A', 0x00],
