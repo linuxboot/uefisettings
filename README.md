@@ -321,6 +321,50 @@ the questions that the firmware's Setup reserves for Administrator sessions, as
 </details>
 
 <details>
+<summary>Questions with READ and WRITE expressions, and without a VarStore</summary>
+
+A question can take its value through a READ expression and keep it through a WRITE expression
+(UEFI 2.11 §33.2.5.4.1), which a setup browser evaluates in a FORM, or in a FORM_MAP with the
+standard map method. `get`, `hii get`, `hii list-questions` and the conditions of other questions
+take the value of the question's EFI_IFR_VALUE expression, if any, else of its READ expression, or
+the stored value where it is UNDEFINED or malformed, as a browser does; where it uses an operator
+or a value that uefisettings cannot evaluate, or reaches a question through more than 8 nested READ
+expressions or back to itself, `get` says which. `set` sets THIS to the new value and evaluates the
+WRITE expression before any write: the SETs of the expression, then the question's own value, which
+wins where they overlap, go into one write per EFI variable, which keeps the bytes between them. It
+writes nothing when a SET names a VarStore whose variable it may not write, such as one that does
+not exist, or when the expression uses an operator that uefisettings does not evaluate, and names
+the VarStore or the operator. GET and SET take VarOffset on VARSTORE and VARSTORE_EFI; a
+VARSTORE_NAME_VALUE, which only its driver's EFI_HII_CONFIG_ACCESS_PROTOCOL reaches, is not read or
+set.
+
+A question without a VarStore (VarStoreId 0) has a value only through an EFI_IFR_VALUE, READ or
+WRITE expression, or, with EFI_IFR_FLAG_CALLBACK, through its driver's
+EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() (UEFI 2.11 §33.2.5.6, §33.3.8.2.2). `get` shows, and
+`set` refuses with, what it lacks:
+
+| The question has | `get` | `set` |
+|---|---|---|
+| EFI_IFR_VALUE | the value of VALUE | refused: read-only (UEFI 2.11 §33.3.8.3.88) |
+| READ and WRITE | the value of READ | through WRITE |
+| READ only | the value of READ | refused: nothing keeps a changed value |
+| WRITE only | refused: no value to retrieve | through WRITE |
+| neither, nor EFI_IFR_FLAG_CALLBACK | refused: one of them is required | refused |
+| EFI_IFR_FLAG_CALLBACK only | refused: its driver keeps the value | refused |
+| EFI_IFR_FLAG_CALLBACK with READ (get) or WRITE (set) | refused: its driver's CallBack() may override the expression | refused |
+
+`get` refuses too where READ gives no value, as no stored value takes its place, and `set` where
+WRITE sets no VarStore. A browser lets the driver override READ with
+CallBack(EFI_BROWSER_ACTION_RETRIEVE) and calls CallBack() around WRITE, so a question with
+EFI_IFR_FLAG_CALLBACK is its driver's to answer. On Linux, Windows and macOS, which run after
+ExitBootServices(), when no EFI device-handle-based protocol may be used (UEFI 2.11 §7.4.6), the
+refusal points to `uefisettings.efi` in the UEFI Shell, which calls no CallBack() yet and refuses
+it as well. `hii list-questions` and `hii show-ifr` never call CallBack(): they show such a
+question with the refusal of `get`.
+
+</details>
+
+<details>
 <summary>EFI variables</summary>
 
 `variable list [--guid GUID]` prints the name and vendor GUID of every EFI variable as a JSON
