@@ -1171,6 +1171,7 @@ pub(crate) mod tests {
     use crate::efi_variables::VariableContents;
     use crate::hii::VariableAttributes;
     use crate::hii::VariableInterface;
+    use crate::hii::VariableNotFound;
 
     /// EFI_CERT_SHA256_GUID (UEFI 2.11 §32.4.1) as its bytes.
     const EFI_CERT_SHA256: [u8; 16] = [
@@ -1208,6 +1209,7 @@ pub(crate) mod tests {
         pub(crate) variables: RefCell<BTreeMap<VariableKey, VariableContents>>,
         pub(crate) read: RefCell<Vec<VariableKey>>,
         pub(crate) set: RefCell<Vec<VariableKey>>,
+        pub(crate) deleted: RefCell<Vec<VariableKey>>,
         interface: VariableInterface,
     }
 
@@ -1217,6 +1219,7 @@ pub(crate) mod tests {
                 variables: RefCell::default(),
                 read: RefCell::default(),
                 set: RefCell::default(),
+                deleted: RefCell::default(),
                 interface: VariableInterface::VariableServices,
             }
         }
@@ -1273,6 +1276,14 @@ pub(crate) mod tests {
                 .borrow_mut()
                 .insert(key.clone(), contents.clone());
             Ok(())
+        }
+
+        fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+            self.deleted.borrow_mut().push(key.clone());
+            match self.variables.borrow_mut().remove(key) {
+                Some(_) => Ok(()),
+                None => Err(VariableNotFound(key.clone()).into()),
+            }
         }
     }
 
@@ -2337,6 +2348,10 @@ pub(crate) mod tests {
 
         fn set_variable(&self, key: &VariableKey, _contents: &VariableContents) -> Result<()> {
             panic!("set EFI variable {key}")
+        }
+
+        fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+            panic!("delete EFI variable {key}")
         }
     }
 

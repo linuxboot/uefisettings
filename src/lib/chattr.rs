@@ -146,6 +146,18 @@ impl EfivarsImmutabilityGuard {
             path,
         })
     }
+
+    /// Ends the guard of a file that was removed meanwhile: no file is left to make immutable.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "only the UEFI Shell build restores a FormSet's stores"
+        )
+    )]
+    pub fn file_removed(mut self) {
+        self.attrs_before_writing &= !FS_IMMUTABLE_FL;
+    }
 }
 
 impl Drop for EfivarsImmutabilityGuard {

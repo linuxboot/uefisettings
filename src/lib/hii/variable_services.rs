@@ -254,6 +254,14 @@ impl VariableData for VariableServices {
             },
         )
     }
+
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        let (variable_name, vendor) = uefi_key(key)?;
+        runtime::delete_variable(&variable_name, &vendor).map_err(|error| match error.status() {
+            Status::NOT_FOUND => VariableNotFound(key.clone()).into(),
+            status => anyhow!("SetVariable() deleting EFI variable {key}: {status:?}"),
+        })
+    }
 }
 
 impl VariableStorageInfo for VariableServices {

@@ -273,6 +273,22 @@ impl<C: FirmwareEnvironmentCalls> VariableData for FirmwareEnvironment<C> {
                 )
             })
     }
+
+    /// A zero-size SetFirmwareEnvironmentVariableExW of the variable's attributes, which
+    /// deletes it (Microsoft Learn, SetFirmwareEnvironmentVariableExW, updated 2024-11-20).
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        let (attributes, _) = self.read_all(key)?;
+        let name = variable_name(key)?;
+        let guid = variable_guid(key)?;
+        self.calls
+            .set_variable(&name, &guid, &[], attributes)
+            .map_err(|code| {
+                anyhow!(
+                    "SetFirmwareEnvironmentVariableExW deleting EFI variable {key} failed with \
+                     {code}"
+                )
+            })
+    }
 }
 
 /// The UTF-16 NUL-terminated name of `key`, for the Win32 calls: an interior NUL is an

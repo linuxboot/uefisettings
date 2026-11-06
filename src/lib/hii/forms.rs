@@ -148,6 +148,10 @@ pub(crate) use set::set_questions;
 pub(crate) use set::NewAnswer;
 pub(crate) use setup_password::PasswordQuestions;
 pub(crate) use setup_password::UnresolvedPassword;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use storage::DeclaredKind;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use storage::StoreDeclaration;
 
 mod ami_access_level;
 mod conditions;

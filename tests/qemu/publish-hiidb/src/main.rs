@@ -137,6 +137,8 @@ extern crate alloc;
 
 mod auth_variables;
 mod control_text_forms;
+#[allow(dead_code, reason = "no fixture registers its forms with a driver yet")]
+mod driver_handle;
 mod dropped_password_forms;
 mod enhanced_auth_forms;
 mod exported_config;

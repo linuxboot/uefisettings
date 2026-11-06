@@ -987,6 +987,37 @@ impl VariableData for EfivarFiles {
         debug!("Writing value to {}", path.display());
         write_efivar_file(&path, &efivar_file_bytes(contents))
     }
+
+    /// Removes the efivar file of `key`, which efivarfs turns into SetVariable() without data
+    /// (Linux v6.17 fs/efivarfs/inode.c efivarfs_unlink()).
+    fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+        let mut lock = FileLock::new(&self.remount_lock);
+        lock.lock()?;
+
+        let path = self.dir.join(EfivarFileName::from(key));
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => check_regular_file(&path, &metadata, "efivar file")?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(VariableNotFound(key.clone()).into())
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to stat efivar file '{}'", path.display()))
+            }
+        }
+
+        let survives = self.survives()?;
+        let _efifs = EfivarsMountGuard::new(&self.dir, survives)
+            .context("Failed to create efivars fs mount guard")?;
+        let immutability_attribute_guard = EfivarsImmutabilityGuard::new(&path)
+            .context("failed to create immutability attribute guard")?;
+
+        debug!("Removing {}", path.display());
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove efivar file '{}'", path.display()))?;
+        immutability_attribute_guard.file_removed();
+        Ok(())
+    }
 }
 
 /// The bytes of the efivar file of `contents`, as efivar_contents reads them.

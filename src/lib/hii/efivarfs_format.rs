@@ -430,6 +430,10 @@ impl VariableData for EfivarCopy {
     fn set_variable(&self, _key: &VariableKey, _contents: &VariableContents) -> Result<()> {
         Err(CopyOfEfivars.into())
     }
+
+    fn delete_variable(&self, _key: &VariableKey) -> Result<()> {
+        Err(CopyOfEfivars.into())
+    }
 }
 
 /// The contents of `key` from the `bytes` of its efivar file: its attributes word, then its data.

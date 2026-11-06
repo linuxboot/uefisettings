@@ -23,6 +23,18 @@ pub(crate) mod config_snapshot;
     )
 )]
 mod config_string;
+// The Buffer and Name/Value stores of a FormSet, which only the UEFI Shell build reaches; the
+// tests run on every host with variables.
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "no caller reads a FormSet's stores yet"
+    )
+)]
+pub(crate) mod config_routing;
 #[cfg(target_os = "uefi")]
 mod database_protocol;
 #[cfg(efivar_dumps)]
@@ -41,6 +53,12 @@ mod firmware_environment;
 // parses arm64's EFI memory map with.
 #[cfg(target_os = "linux")]
 pub(crate) mod firmware_memory;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "no caller reads a FormSet's stores yet")
+)]
+pub(crate) mod form_set_stores;
 pub mod forms;
 #[cfg(any(target_os = "windows", test))]
 mod hiidb_driver;
@@ -151,6 +169,8 @@ pub use variables::VariableAttributes;
 pub(crate) use variables::VariableInterface;
 #[cfg(any(variable_names, variable_info, variable_data))]
 pub use variables::VariableKey;
+#[cfg(all(variable_data, test))]
+pub(crate) use variables::VariableNotFound;
 #[cfg(variable_data)]
 pub(crate) use variables::VariableReach;
 pub use variables::VolatileWrites;

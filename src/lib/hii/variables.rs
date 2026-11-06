@@ -731,7 +731,7 @@ fn read_value_bytes(
 /// A variable that FirmwareVariables does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("no EFI variable {0}")]
-pub(super) struct VariableNotFound(pub(super) VariableKey);
+pub(crate) struct VariableNotFound(pub(crate) VariableKey);
 
 /// A variable of VariableLayout::OneValue whose value is not as wide as its question's, which get
 /// and set refuse. UEFI 2.11 §33.2.5.4.10 requires that size of a cross-reference question's

@@ -1262,6 +1262,10 @@ mod tests {
         fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
             self.0.set_variable(key, contents)
         }
+
+        fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+            self.0.delete_variable(key)
+        }
     }
 
     impl RecordsSets for UnreadableVariables {
@@ -1304,6 +1308,10 @@ mod tests {
 
         fn set_variable(&self, key: &VariableKey, _contents: &VariableContents) -> Result<()> {
             Err(anyhow::anyhow!("cannot write EFI variable {key}"))
+        }
+
+        fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+            Err(anyhow::anyhow!("cannot delete EFI variable {key}"))
         }
     }
 
