@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ffi::FromBytesUntilNulError;
+use std::num::TryFromIntError;
 
 use anyhow::anyhow;
 use anyhow::ensure;
@@ -84,10 +85,52 @@ enum StringBlockType {
     Unknown(u8),
 }
 
+/// A strings package's strings, by their string identifier: an EFI_STRING_ID, a UINT16 (UEFI 2.11
+/// §33.3.8.2.1).
+pub(crate) type StringMap = BTreeMap<u16, String>;
+
 /// A strings package (UEFI 2.11 §33.3.6): the strings by id, in the language its header names.
 pub struct StringPackage {
     pub language: Language,
-    pub strings: BTreeMap<i32, String>,
+    pub strings: StringMap,
+}
+
+/// StringIdCurrent (UEFI 2.11 §33.3.6.2): the string identifier that the next string block
+/// assigns, from 1 up to 65536, one past the last string identifier, 65535.
+#[derive(Clone, Copy, Debug)]
+struct StringIdCurrent(u32);
+
+impl StringIdCurrent {
+    /// "set initially to one (1)"
+    const FIRST: Self = Self(1);
+    /// One past the last string identifier.
+    const END: u32 = 1 << 16;
+
+    /// The string identifier that a string block assigns, after which StringIdCurrent is the
+    /// next one.
+    fn assign(&mut self) -> Result<u16> {
+        let id = u16::try_from(self.0).map_err(|_: TryFromIntError| {
+            anyhow!(
+                "string identifier {} is past the last string identifier 65535 \
+                 (UEFI 2.11 §33.3.8.2.1)",
+                self.0
+            )
+        })?;
+        self.0 += 1;
+        Ok(id)
+    }
+
+    /// Skips `count` string identifiers, as EFI_HII_SIBT_SKIP1 and EFI_HII_SIBT_SKIP2 do.
+    fn skip(&mut self, count: u16) -> Result<()> {
+        let next = self.0 + u32::from(count);
+        ensure!(
+            next <= Self::END,
+            "StringIdCurrent {next} runs past 65536, one past the last string identifier 65535 \
+             (UEFI 2.11 §33.3.6.2, §33.3.8.2.1)"
+        );
+        self.0 = next;
+        Ok(())
+    }
 }
 
 /// A strings package header's Language, as read: "en-US", for one, or a UEFI configuration
@@ -182,9 +225,9 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
 
     // Now parse the blocks
 
-    let mut string_id_current: i32 = 1;
+    let mut string_id_current = StringIdCurrent::FIRST;
 
-    let mut string_map: BTreeMap<i32, String> = BTreeMap::new();
+    let mut string_map = StringMap::new();
 
     loop {
         // for every block the first 8 bits are the block type
@@ -204,22 +247,17 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
                     .context("failed to read a null-terminated 16-bit string")?;
                 debug!(
                     "Null-terminated 16-bit string is {:?} and its id is {}",
-                    null_str, string_id_current
+                    null_str, string_id_current.0
                 );
                 // save string here id changes later
-                string_map.insert(string_id_current, null_str.to_string());
-                string_id_current = string_id_current
-                    .checked_add(1)
-                    .context("the string identifier overflows")?;
+                string_map.insert(string_id_current.assign()?, null_str.to_string());
             }
             StringBlockType::Skip2 => {
                 // Or we can break;
                 let skip_count: u16 = blocks_cursor
                     .parse_ne()
                     .context("failed to read a Skip2 count")?;
-                string_id_current = string_id_current
-                    .checked_add(i32::from(skip_count))
-                    .context("the string identifier overflows")?;
+                string_id_current.skip(skip_count)?;
                 debug!("Skip count is {}", skip_count);
             }
             StringBlockType::Skip1 => {
@@ -227,9 +265,7 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
                 let skip_count: u8 = blocks_cursor
                     .parse_ne()
                     .context("failed to read a Skip1 count")?;
-                string_id_current = string_id_current
-                    .checked_add(i32::from(skip_count))
-                    .context("the string identifier overflows")?;
+                string_id_current.skip(u16::from(skip_count))?;
                 debug!("Skip count is {}", skip_count);
             }
             StringBlockType::End => {

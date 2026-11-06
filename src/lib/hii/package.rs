@@ -11,7 +11,6 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Seek;
 use std::rc::Rc;
@@ -30,6 +29,7 @@ use serde::Serializer;
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
 use crate::hii::strings;
+use crate::hii::strings::StringMap;
 use crate::parse_error::ReadParsed;
 
 /// PACKAGE_LIST_HEADER_SIZE is the size of EFI_HII_PACKAGE_LIST_HEADER:
@@ -379,7 +379,6 @@ impl AsRef<[u8]> for DevicePath {
     }
 }
 
-type StringMap = BTreeMap<i32, String>;
 type IFRNodeLink = Rc<RefCell<IFROperation>>;
 
 /// String map (string id -> string) and language per strings package and IFR root per FormSet
@@ -1191,12 +1190,12 @@ mod tests {
         let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![BTreeMap::from([(1, "A".to_string())])],
+                vec![StringMap::from([(1, "A".to_string())])],
             ),
             ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![BTreeMap::from([(1, "B".to_string())])],
+                vec![StringMap::from([(1, "B".to_string())])],
             ),
         ];
         assert_eq!(strings_of_lists(lists), want, "strings of the lists");
@@ -1387,12 +1386,12 @@ mod tests {
         let want = vec![
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![BTreeMap::from([(1, "A".to_string())])],
+                vec![StringMap::from([(1, "A".to_string())])],
             ),
             ("22222222-2222-2222-2222-222222222222".to_string(), vec![]),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![BTreeMap::from([(1, "B".to_string())])],
+                vec![StringMap::from([(1, "B".to_string())])],
             ),
         ];
         assert_eq!(strings_of_lists(lists), want, "strings of the lists");
@@ -1421,7 +1420,7 @@ mod tests {
             "languages of the strings packages"
         );
         let want = ["iSCSIBootEnable", "My Keyword Namespace Test"]
-            .map(|string| BTreeMap::from([(1, string.to_string())]));
+            .map(|string| StringMap::from([(1, string.to_string())]));
         assert_eq!(list.strings, want, "strings of the strings packages");
     }
 
@@ -1442,7 +1441,7 @@ mod tests {
             [strings::Language(b"en-\xe9".to_vec())],
             "languages of the strings packages"
         );
-        let want = [BTreeMap::from([(1, "A".to_string())])];
+        let want = [StringMap::from([(1, "A".to_string())])];
         assert_eq!(list.strings, want, "strings of the strings packages");
     }
 
@@ -1452,7 +1451,7 @@ mod tests {
 
     /// The strings that STRING_A_BLOCKS hold.
     fn string_a() -> StringMap {
-        BTreeMap::from([(1, "A".to_string())])
+        StringMap::from([(1, "A".to_string())])
     }
 
     /// The Language `language` of a strings package header.
@@ -1505,6 +1504,15 @@ mod tests {
         format!(
             "failed to parse package list 22222222-2222-2222-2222-222222222222: \
              failed to parse a strings package: {refusal} (UEFI 2.11 §33.3.6.1)"
+        )
+    }
+
+    /// The error that strings_package_refusal returns when a string block of the strings package
+    /// is refused for `refusal`.
+    fn strings_block_refusal(refusal: &str) -> String {
+        format!(
+            "failed to parse package list 22222222-2222-2222-2222-222222222222: \
+             failed to parse a strings package: {refusal}"
         )
     }
 
@@ -1584,7 +1592,7 @@ mod tests {
             strings_packages_of(&packages),
             [
                 (language("en"), string_a()),
-                (language("fr"), BTreeMap::from([(1, "B".to_string())])),
+                (language("fr"), StringMap::from([(1, "B".to_string())])),
             ]
         );
     }
@@ -1780,15 +1788,15 @@ mod tests {
         let want = vec![
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![BTreeMap::from([(1, "A".to_string())])],
+                vec![StringMap::from([(1, "A".to_string())])],
             ),
             (
                 "11111111-1111-1111-1111-111111111111".to_string(),
-                vec![BTreeMap::from([(1, "C".to_string())])],
+                vec![StringMap::from([(1, "C".to_string())])],
             ),
             (
                 "33333333-3333-3333-3333-333333333333".to_string(),
-                vec![BTreeMap::from([(1, "B".to_string())])],
+                vec![StringMap::from([(1, "B".to_string())])],
             ),
         ];
         assert_eq!(
@@ -1823,8 +1831,8 @@ mod tests {
             .map(|list| (list.forms.len(), list.strings))
             .collect();
         let want = vec![
-            (1, vec![BTreeMap::from([(1, "A".to_string())])]),
-            (0, vec![BTreeMap::from([(1, "B".to_string())])]),
+            (1, vec![StringMap::from([(1, "A".to_string())])]),
+            (0, vec![StringMap::from([(1, "B".to_string())])]),
         ];
         assert_eq!(got, want, "forms stay with the strings of their list");
     }
@@ -2187,9 +2195,9 @@ mod tests {
             [
                 (
                     Some(DevicePath::from(PCI_ROOT_DEVICE_PATH.to_vec())),
-                    vec![BTreeMap::from([(1, "A".to_owned())])]
+                    vec![StringMap::from([(1, "A".to_owned())])]
                 ),
-                (None, vec![BTreeMap::from([(1, "B".to_owned())])]),
+                (None, vec![StringMap::from([(1, "B".to_owned())])]),
             ],
             "lists with and without a device path package"
         );
@@ -2211,32 +2219,63 @@ mod tests {
         );
     }
 
+    /// read_db reads string ID 65535, the last EFI_STRING_ID (a UINT16, UEFI 2.11 §33.3.8.2.1),
+    /// and a StringIdCurrent of 65536 that no block assigns; it refuses a string block that assigns
+    /// a string ID past 65535 and a skip that takes StringIdCurrent past 65536 (§33.3.6.2).
     #[test]
-    fn test_read_db_refuses_string_ids_that_overflow() {
-        // 32768 EFI_HII_SIBT_SKIP2 blocks of 0xFFFF, then one of 0x7FFE: string ID i32::MAX
-        let to_i32_max: Vec<u8> = std::iter::repeat_n([0x21, 0xFF, 0xFF], 32_768)
-            .flatten()
-            .chain([0x21, 0xFE, 0x7F])
-            .collect();
-        let cases: [(&str, &[u8]); 3] = [
-            ("EFI_HII_SIBT_SKIP2", &[0x21, 0x01, 0x00]),
-            ("EFI_HII_SIBT_SKIP1", &[0x22, 0x01]),
-            ("EFI_HII_SIBT_STRING_UCS2", &[0x14, b'A', 0x00, 0x00, 0x00]),
+    fn test_read_db_keeps_string_identifiers_within_a_uint16() {
+        // EFI_HII_SIBT_SKIP2 of 0xFFFE and of 0xFFFF: StringIdCurrent 65535 and 65536
+        let (to_65535, to_65536) = ([0x21, 0xFE, 0xFF], [0x21, 0xFF, 0xFF]);
+        let ucs2_a = [0x14, b'A', 0x00, 0x00, 0x00];
+        let past_65536 = "StringIdCurrent 65537 runs past 65536, one past the last string \
+                          identifier 65535 (UEFI 2.11 §33.3.6.2, §33.3.8.2.1)";
+        let read: [(&str, [&[u8]; 2], StringMap); 2] = [
+            (
+                "EFI_HII_SIBT_STRING_UCS2 at 65535",
+                [&to_65535, &ucs2_a],
+                StringMap::from([(65535, "A".to_string())]),
+            ),
+            (
+                "EFI_HII_SIBT_SKIP1 to 65536",
+                [&to_65535, &[0x22, 0x01]],
+                StringMap::new(),
+            ),
         ];
-        for (block, overflowing) in cases {
-            let blocks = [&to_i32_max[..], overflowing, &[0x00]].concat();
-            let package = en_strings_package_with_blocks(&blocks);
-            let hiidb =
-                package_list_with_guid([0x22; 16], &[package, END_PACKAGE.to_vec()].concat());
+        let refused: [(&str, [&[u8]; 2], &str); 3] = [
+            (
+                "EFI_HII_SIBT_STRING_UCS2 at 65536",
+                [&to_65536, &ucs2_a],
+                "string identifier 65536 is past the last string identifier 65535 \
+                 (UEFI 2.11 §33.3.8.2.1)",
+            ),
+            (
+                "EFI_HII_SIBT_SKIP2 to 65537",
+                [&to_65536, &[0x21, 0x01, 0x00]],
+                past_65536,
+            ),
+            (
+                "EFI_HII_SIBT_SKIP1 to 65537",
+                [&to_65536, &[0x22, 0x01]],
+                past_65536,
+            ),
+        ];
+        for (case, [to, block], strings) in read {
+            let package = en_strings_package_with_blocks(&[to, block, &[0x00]].concat());
 
-            let Err(err) = read_db(&hiidb) else {
-                panic!("read_db parsed a string ID past i32::MAX after {block}");
-            };
+            assert_eq!(
+                strings_packages_of(&[package]),
+                [(language("en"), strings)],
+                "{case}"
+            );
+        }
+        for (case, [to, block], refusal) in refused {
+            let package = en_strings_package_with_blocks(&[to, block, &[0x00]].concat());
 
-            let msg = format!("{err:#}");
-            let want = "failed to parse package list 22222222-2222-2222-2222-222222222222: \
-                        failed to parse a strings package: the string identifier overflows";
-            assert_eq!(msg, want, "{block} past i32::MAX");
+            assert_eq!(
+                strings_package_refusal(package),
+                strings_block_refusal(refusal),
+                "{case}"
+            );
         }
     }
 }

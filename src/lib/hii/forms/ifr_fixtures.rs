@@ -22,6 +22,7 @@
     )
 )]
 
+use std::collections::BTreeMap;
 #[cfg(efivar_dumps)]
 use std::fs;
 #[cfg(efivar_dumps)]
@@ -46,6 +47,7 @@ use super::storage::VariableStoreKind;
 use super::*;
 #[cfg(efivar_dumps)]
 use crate::hii::efivarfs_format::EfivarFileName;
+use crate::hii::strings::StringMap;
 #[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::variable_key;
 pub(crate) use crate::hii::variables::tests::MemoryVariables;
@@ -319,13 +321,13 @@ pub(super) fn unavailable() -> VarStoreFixture {
     }
 }
 
-pub(super) fn strings() -> Vec<BTreeMap<i32, String>> {
-    vec![BTreeMap::from([
+pub(super) fn strings() -> Vec<StringMap> {
+    vec![StringMap::from([
         (3, PROMPT.to_string()),
         (5, "Disabled".to_string()),
         (6, "Enabled".to_string()),
         (7, "AllOnes".to_string()),
-        (PADDED_ENABLED.into(), "Enabled ".to_string()),
+        (PADDED_ENABLED, "Enabled ".to_string()),
     ])]
 }
 

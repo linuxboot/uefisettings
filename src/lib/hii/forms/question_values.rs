@@ -14,7 +14,6 @@
 //! prompts, and the text that get shows for their values.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -52,6 +51,7 @@ use super::QuestionHeader;
 use super::Range;
 use super::RangeType;
 use super::Walk;
+use crate::hii::strings::StringMap;
 
 /// A question whose value get reads and set writes.
 #[derive(Clone, Copy)]
@@ -110,7 +110,7 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
 /// prompt is one of `phrases`, ignoring ASCII case and surrounding whitespace.
 pub(super) fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
-    string_packages: &[BTreeMap<i32, String>],
+    string_packages: &[StringMap],
     phrases: &BTreeSet<T>,
 ) -> Vec<Rc<RefCell<IFROperation>>>
 where
@@ -137,7 +137,7 @@ where
 }
 
 /// Returns the prompt of a ONE_OF, NUMERIC or CHECKBOX, empty for other ops.
-fn prompt<'a>(op: &IFROperation, string_packages: &'a [BTreeMap<i32, String>]) -> &'a str {
+fn prompt<'a>(op: &IFROperation, string_packages: &'a [StringMap]) -> &'a str {
     value_question(op).map_or("", |question| {
         find_corresponding_string(question.header().prompt_string_id, string_packages)
     })
@@ -404,6 +404,7 @@ pub(super) fn handle_numeric(
 #[cfg(test)]
 #[cfg(efivar_dumps)]
 mod question_value_tests {
+    use std::collections::BTreeMap;
     use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;

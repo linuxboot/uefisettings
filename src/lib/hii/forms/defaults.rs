@@ -38,6 +38,7 @@ use super::IncludedStates;
 use super::NumericFormatError;
 use super::ParsedOperation;
 use super::Walk;
+use crate::hii::strings::StringMap;
 
 // UEFI 2.10 §33.3.8.3.9, §33.3.8.3.51
 const EFI_IFR_CHECKBOX_DEFAULT: u8 = 0x01;
@@ -401,7 +402,7 @@ fn ifr_default_value(
 pub(super) fn question_defaults<V: QuestionValues>(
     question: &IFROperation,
     stores: &DefaultStores,
-    string_packages: &[BTreeMap<i32, String>],
+    string_packages: &[StringMap],
     inputs: &mut ExpressionInputs<'_, V>,
     mut text: impl FnMut(u64, &mut ExpressionInputs<'_, V>) -> Result<String, DefaultError>,
 ) -> Vec<DeclaredDefault> {
@@ -543,7 +544,7 @@ pub(super) fn push_default(
 pub(super) fn option_text(
     question: &IFROperation,
     value: u64,
-    string_packages: &[BTreeMap<i32, String>],
+    string_packages: &[StringMap],
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> Result<Option<String>, DefaultError> {
     question_scope(question)

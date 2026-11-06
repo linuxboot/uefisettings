@@ -752,11 +752,9 @@ mod get_and_set_tests {
     /// What answers add for the standard default that each CHECKBOX's Flags 0 give.
     const CHECKBOX_DEFAULT: &str = " <IFR default: 0>";
 
-    fn string_packages() -> Vec<BTreeMap<i32, String>> {
+    fn string_packages() -> Vec<StringMap> {
         let prompts = QUESTIONS.iter().map(|(prompt, ..)| *prompt).chain([STORED]);
-        vec![(i32::from(FIRST_PROMPT)..)
-            .zip(prompts.map(str::to_string))
-            .collect()]
+        vec![(FIRST_PROMPT..).zip(prompts.map(str::to_string)).collect()]
     }
 
     /// A FormSet holding a CHECKBOX without a VarStore for each of QUESTIONS, each READ and WRITE

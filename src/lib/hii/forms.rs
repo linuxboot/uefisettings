@@ -11,7 +11,6 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt;
@@ -33,6 +32,7 @@ use thiserror::Error;
 use crate::exports::SetOptions;
 use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
+use crate::hii::strings::StringMap;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::check_volatile_write;
@@ -2063,7 +2063,7 @@ impl QuestionDescriptor {
 // conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value
 pub fn list_questions(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &[BTreeMap<i32, String>],
+    string_packages: &[StringMap],
     include: IncludedStates,
     access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
@@ -2078,7 +2078,7 @@ pub fn list_questions(
 /// What walking the ops of a FormSet takes besides them.
 struct FormSetWalk<'a, V> {
     /// The string packages of the FormSet's package list
-    string_packages: &'a [BTreeMap<i32, String>],
+    string_packages: &'a [StringMap],
     default_stores: FormSetDefaultStores,
     inputs: ExpressionInputs<'a, V>,
     include: IncludedStates,
@@ -2086,7 +2086,7 @@ struct FormSetWalk<'a, V> {
 
 impl<'a, V> FormSetWalk<'a, V> {
     fn new(
-        string_packages: &'a [BTreeMap<i32, String>],
+        string_packages: &'a [StringMap],
         reader: &'a mut EfivarReader,
         values: &'a V,
         include: IncludedStates,
@@ -2139,7 +2139,7 @@ fn listed_question(
 /// `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value.
 pub fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &[BTreeMap<i32, String>],
+    string_packages: &[StringMap],
     possible_question_phrases: &BTreeSet<T>,
     include: IncludedStates,
     access_level: Option<AccessLevel>,
@@ -3029,7 +3029,7 @@ mod choice_for_set_tests {
 pub fn display(
     node: Rc<RefCell<IFROperation>>,
     level: usize,
-    string_packages: &[BTreeMap<i32, String>],
+    string_packages: &[StringMap],
     reader: &mut EfivarReader,
 ) -> Result<String> {
     let mut result = String::new();
@@ -3049,7 +3049,7 @@ pub fn display(
 fn display_op(
     node: &Rc<RefCell<IFROperation>>,
     level: usize,
-    string_packages: &[BTreeMap<i32, String>],
+    string_packages: &[StringMap],
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
     result: &mut String,
 ) -> Walk<usize> {
@@ -3203,12 +3203,12 @@ fn display_answer(
     }
 }
 
-fn find_corresponding_string(string_id: u16, string_packages: &[BTreeMap<i32, String>]) -> &str {
+fn find_corresponding_string(string_id: u16, string_packages: &[StringMap]) -> &str {
     // TODO: accept language pack parameter later
     // it defaults to the first language pack it can find and the first one is en-US
 
     for package in string_packages {
-        if let Some(s) = package.get(&(string_id as i32)) {
+        if let Some(s) = package.get(&string_id) {
             return s;
         }
     }
@@ -3349,7 +3349,7 @@ mod tests {
     fn questions_are_found_by_their_listed_name() {
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
         let values = VarStoreValues::new(&root, None);
-        let prompted = |prompt: &str| vec![BTreeMap::from([(3, prompt.to_string())])];
+        let prompted = |prompt: &str| vec![StringMap::from([(3, prompt.to_string())])];
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
                 &root,
@@ -4006,8 +4006,8 @@ mod nesting_tests {
     const DISPLAY_DEEP: usize = 2_000;
 
     /// The strings of deep_form_set.
-    fn deep_strings() -> Vec<BTreeMap<i32, String>> {
-        vec![BTreeMap::from([
+    fn deep_strings() -> Vec<StringMap> {
+        vec![StringMap::from([
             (3, "Deep".to_string()),
             (4, "Help".to_string()),
             (5, "Hidden".to_string()),

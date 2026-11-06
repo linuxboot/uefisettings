@@ -540,7 +540,7 @@ impl HiiBackend {
                     ..Default::default()
                 };
                 for (string_id, string) in string_package {
-                    p.string_package.insert(string_id, string);
+                    p.string_package.insert(i32::from(string_id), string);
                 }
                 resp.push(p);
             }
