@@ -10,8 +10,8 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! set on Linux of a question whose value only its driver holds: staged for the next boot, on the
-//! mounted EFI system partition that BootCurrent names.
+//! set on Linux and Windows of a question whose value only its driver holds: staged for the next
+//! boot, on the mounted EFI system partition that BootCurrent names.
 
 use std::fs;
 use std::path::Path;
@@ -32,8 +32,10 @@ use super::StagedSet;
 use super::StagedState;
 use crate::efi_variables::globals::secure_boot;
 use crate::efi_variables::VariableData;
+#[cfg(target_os = "linux")]
 use crate::esp::linux::LinuxPaths;
-use crate::esp::linux::PathDevices;
+#[cfg(target_os = "windows")]
+use crate::esp::win32_calls::RealEspCalls;
 use crate::esp::EspLocator;
 use crate::esp::MountedEsp;
 use crate::exports::set_refusal;
@@ -46,13 +48,16 @@ use crate::hii::forms::IncludedStates;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::forms::QuestionDescriptor;
 use crate::hii::package::ParsedPackageList;
+#[cfg(target_os = "linux")]
 use crate::hii::EfivarFiles;
+#[cfg(target_os = "windows")]
+use crate::hii::FirmwareEnvironment;
 use crate::hii::VariableReach;
 use crate::hii::WithholdingVariables;
 use crate::unsafe_operations::UnsafeOperations;
 
-/// What set does on Linux with a question whose value only its driver holds: stages it for the
-/// next boot, the first set with the uefisettings.efi `image`, with the `include` and
+/// What set does on Linux and Windows with a question whose value only its driver holds: stages
+/// it for the next boot, the first set with the uefisettings.efi `image`, with the `include` and
 /// `access_level` that set selected it with and its grant of `unsafe_operations`, writing no byte
 /// of the HiiDB's `passwords`.
 pub(crate) struct NextBootStaging {
@@ -87,19 +92,18 @@ impl NextBootStaging {
     /// Refuses, before anything is staged, what apply-staged would refuse before the OS, as its
     /// withholding through BootServices refuses a PASSWORD question whose VarStore is unknown
     /// (apply_staged_withholding), then what staging `question` through `variables` without the
-    /// bytes of PASSWORD questions, on the ESP that MountedEsp::locate finds in `paths`, would
-    /// refuse: prepare.
+    /// bytes of PASSWORD questions, on the ESP that `esp` finds, would refuse: prepare.
     fn check(
         &self,
         variables: impl VariableData,
-        paths: &LinuxPaths<impl PathDevices>,
+        esp: &impl EspLocator,
         question: &str,
     ) -> Result<()> {
         self.passwords
             .check_withholding(VariableReach::BootServices)?;
         prepare(
             &self.withholding(variables)?,
-            paths,
+            esp,
             self.image.as_deref(),
             question,
         )
@@ -107,17 +111,17 @@ impl NextBootStaging {
     }
 
     /// Stages `request` through `variables` without the bytes of PASSWORD questions, on the ESP
-    /// that MountedEsp::locate finds in `paths`, with --image: stage_request.
+    /// that `esp` finds, with --image: stage_request.
     fn stage(
         &self,
         variables: impl VariableData,
-        paths: &LinuxPaths<impl PathDevices>,
+        esp: &impl EspLocator,
         request: StagedRequest,
         nonce: Nonce,
     ) -> Result<String> {
         stage_request(
             &self.withholding(variables)?,
-            paths,
+            esp,
             self.image.as_deref(),
             request,
             nonce,
@@ -139,9 +143,9 @@ impl NextBootStaging {
     }
 
     /// get's answer for `question`, whose driver holds it as `held`: its refusal, with what the
-    /// records of staged sets in `records` tell of it.
+    /// records of staged sets in `records`, if readable, tell of it.
     pub(crate) fn answer(
-        records: &impl VariableData,
+        records: Result<impl VariableData>,
         question: &QuestionDescriptor,
         held: &DriverHeldQuestion,
     ) -> String {
@@ -149,13 +153,15 @@ impl NextBootStaging {
             form_set: held.form_set,
             question_id: held.question_id,
         };
-        let note = StagedState::read(records).map(|state| {
-            staged.note(&state, |value| {
-                question
-                    .driver_held_text(value)
-                    .unwrap_or_else(|| value.to_string())
-            })
-        });
+        let note = records
+            .and_then(|records| StagedState::read(&records))
+            .map(|state| {
+                staged.note(&state, |value| {
+                    question
+                        .driver_held_text(value)
+                        .unwrap_or_else(|| value.to_string())
+                })
+            });
         match note {
             Ok(Some(note)) => format!("{} <{note}>", question.value),
             Ok(None) => question.value.clone(),
@@ -172,7 +178,7 @@ impl DriverHeldValues for NextBootStaging {
         "staged for the next boot"
     }
 
-    /// get reaches no driver from Linux: it shows the question's refusal, with what the records of
+    /// get reaches no driver from the OS: it shows the question's refusal, with what the records of
     /// staged sets tell of the question.
     fn get(
         &self,
@@ -180,7 +186,7 @@ impl DriverHeldValues for NextBootStaging {
         question: &QuestionDescriptor,
         held: &DriverHeldQuestion,
     ) -> String {
-        Self::answer(&EfivarFiles::system(), question, held)
+        Self::answer(system_variables(), question, held)
     }
 
     /// apply-staged would apply the set, set finds the ESP, plan_stage allows staging there, and
@@ -191,11 +197,7 @@ impl DriverHeldValues for NextBootStaging {
         question: &QuestionDescriptor,
         _held: &DriverHeldQuestion,
     ) -> Result<()> {
-        self.check(
-            EfivarFiles::system(),
-            &LinuxPaths::default(),
-            &question.question,
-        )
+        self.check(system_variables()?, &system_esp(), &question.question)
     }
 
     fn set(
@@ -206,12 +208,36 @@ impl DriverHeldValues for NextBootStaging {
         value: u64,
     ) -> Result<String> {
         self.stage(
-            EfivarFiles::system(),
-            &LinuxPaths::default(),
+            system_variables()?,
+            &system_esp(),
             self.request(&question.question, held, value),
             Nonce(rand::thread_rng().gen()),
         )
     }
+}
+
+/// This machine's EFI variables: efivarfs on Linux, the firmware environment calls on Windows.
+#[cfg(target_os = "linux")]
+fn system_variables() -> Result<impl VariableData> {
+    Ok(EfivarFiles::system())
+}
+
+/// This machine's EFI variables: efivarfs on Linux, the firmware environment calls on Windows.
+#[cfg(target_os = "windows")]
+fn system_variables() -> Result<impl VariableData> {
+    FirmwareEnvironment::new()
+}
+
+/// What finds this machine's ESP: among its mounted vfat volumes on Linux, its volumes on Windows.
+#[cfg(target_os = "linux")]
+fn system_esp() -> impl EspLocator {
+    LinuxPaths::default()
+}
+
+/// What finds this machine's ESP: among its mounted vfat volumes on Linux, its volumes on Windows.
+#[cfg(target_os = "windows")]
+fn system_esp() -> impl EspLocator {
+    RealEspCalls
 }
 
 /// How stage_request stages a request, once prepare allowed it.
@@ -222,16 +248,16 @@ enum Prepared {
     New(Vec<u8>),
 }
 
-/// The ESP that `paths` locates, and how a request of `question` is staged there:
+/// The ESP that `esp` finds, and how a request of `question` is staged there:
 /// appended to the pending set, else in a new set with the bytes of `image`. Refused as set
 /// refuses `question`, before anything is staged.
 fn prepare(
     variables: &impl VariableData,
-    paths: &LinuxPaths<impl PathDevices>,
+    esp: &impl EspLocator,
     image: Option<&Path>,
     question: &str,
 ) -> Result<(MountedEsp, Prepared)> {
-    let esp = paths
+    let esp = esp
         .locate(variables)
         .map_err(|error| set_refusal(question, format!("{error:#}")))?;
     let prepared = match plan_stage(variables, &esp)
@@ -248,16 +274,16 @@ fn prepare(
     Ok((esp, prepared))
 }
 
-/// Stages `request` on the ESP that `paths` locates: appended to the pending set, else in
-/// a new set of `nonce` whose Boot#### starts a copy of `image`. Returns set's annotation.
+/// Stages `request` on the ESP that `esp` finds: appended to the pending set, else in a new set of
+/// `nonce` whose Boot#### starts a copy of `image`. Returns set's annotation.
 fn stage_request(
     variables: &impl VariableData,
-    paths: &LinuxPaths<impl PathDevices>,
+    esp: &impl EspLocator,
     image: Option<&Path>,
     request: StagedRequest,
     nonce: Nonce,
 ) -> Result<String> {
-    let (esp, prepared) = prepare(variables, paths, image, &request.question)?;
+    let (esp, prepared) = prepare(variables, esp, image, &request.question)?;
     let set = match prepared {
         Prepared::Append(mut set) => {
             set.requests.push(request);
@@ -289,8 +315,6 @@ fn missing_image(variables: &impl VariableData) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tempfile::TempDir;
 
     use super::*;
@@ -298,27 +322,12 @@ mod tests {
     use crate::efi_variables::globals::EFI_GLOBAL_VARIABLE;
     use crate::efi_variables::load_option::LoadOption;
     use crate::efi_variables::UEFISETTINGS_VENDOR_GUID;
+    #[cfg(target_os = "linux")]
     use crate::esp::linux::tests::FakeLinux;
     use crate::esp::tests::booted_from;
     use crate::esp::tests::gpt_512_esp;
-    use crate::hii::forms::ifr_fixtures::form;
-    use crate::hii::forms::ifr_fixtures::form_set;
-    use crate::hii::forms::ifr_fixtures::parse_form_set;
-    use crate::hii::forms::ifr_fixtures::password_on;
-    use crate::hii::forms::ifr_fixtures::var_store_efi;
-    use crate::hii::forms::ifr_fixtures::var_store_efi_of;
-    use crate::hii::forms::ifr_fixtures::NIL_GUID;
-    use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+    use crate::esp::windows::tests::FakeWindows;
     use crate::hii::forms::IfrValueType;
-    use crate::hii::forms::IgnoredIfr;
-    use crate::hii::forms::IgnoredPasswords;
-    use crate::hii::package::hiidb_fixtures::form_package_of;
-    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
-    use crate::hii::package::hiidb_fixtures::password_past_the_walk_hiidb;
-    use crate::hii::package::hiidb_fixtures::END_PACKAGE;
-    use crate::hii::package::hiidb_fixtures::PAST_THE_WALK_LIST_GUID;
-    use crate::hii::package::read_db;
-    use crate::hii::package::Guid;
     use crate::hii::VolatileWrites;
     use crate::staged_set::StagedSet;
     use crate::staged_set::StagedState;
@@ -383,15 +392,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn set_stages_a_new_set_on_the_esp_then_appends_to_it() {
-        let (linux, esp) = FakeLinux::with_esp();
+    /// Stages a new set on the ESP that `esp` finds, at `mount_point`, then appends to it.
+    fn stage_then_append(esp: &impl EspLocator, mount_point: &Path) {
         let variables = booted_from(Some(gpt_512_esp()));
         let images = TempDir::new().expect("a temporary directory");
         let image = images.path().join("uefisettings.efi");
         fs::write(&image, b"MZ uefisettings").expect("the image");
 
-        let staged = stage_request(&variables, &linux.paths, Some(&image), request(1), NONCE);
+        let staged = stage_request(&variables, esp, Some(&image), request(1), NONCE);
 
         assert_eq!(
             staged.map_err(|err| format!("{err:#}")),
@@ -400,7 +408,8 @@ mod tests {
         );
         assert_eq!(
             fs::read(
-                esp.join("EFI")
+                mount_point
+                    .join("EFI")
                     .join("uefisettings")
                     .join("uefisettings.efi")
             )
@@ -438,7 +447,7 @@ mod tests {
         );
 
         // a second set appends, without --image
-        let appended = stage_request(&variables, &linux.paths, None, request(2), Nonce([0; 16]));
+        let appended = stage_request(&variables, esp, None, request(2), Nonce([0; 16]));
 
         assert_eq!(
             appended.map_err(|err| format!("{err:#}")),
@@ -455,9 +464,25 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_stages_a_new_set_on_the_esp_then_appends_to_it() {
+        let (linux, mount_point) = FakeLinux::with_esp();
+        stage_then_append(&linux.paths, &mount_point);
+    }
+
+    /// On Windows, set copies the image through the ESP's volume GUID path, which a directory
+    /// stands for here.
+    #[test]
+    fn set_stages_a_new_set_on_the_esp_volume_then_appends_to_it() {
+        let root = TempDir::new().expect("a temporary directory");
+        let volume = format!("{}\\", root.path().join("volume").display());
+        stage_then_append(&FakeWindows::with_esp_volume(&volume), Path::new(&volume));
+    }
+
     #[test]
     fn a_new_set_needs_an_image_signed_for_db_under_secure_boot() {
-        let (linux, _esp) = FakeLinux::with_esp();
+        let windows = FakeWindows::with_esp();
         let staged = "cannot set question \"Generic Question\": its driver holds its value, which \
                       only uefisettings.efi reaches before the OS starts; so set stages it for the \
                       next boot, which starts a uefisettings.efi that set copies to the EFI \
@@ -489,7 +514,7 @@ mod tests {
                 None => variables,
             };
 
-            let got = stage_request(&variables, &linux.paths, None, request(1), NONCE);
+            let got = stage_request(&variables, &windows, None, request(1), NONCE);
 
             assert_eq!(got.map_err(|err| format!("{err:#}")), Err(want), "{case}");
             assert!(
@@ -506,8 +531,22 @@ mod tests {
     /// whose PASSWORD question keeps its password in BootNext, as its VarStore or as a VarStore
     /// outside any FormSet of its VarStoreId, a new set fails to write BootNext and undoes the
     /// steps before it, so nothing is staged and BootNext is never written.
+    #[cfg(target_os = "linux")]
     #[test]
     fn staging_writes_no_password_byte() {
+        use crate::hii::forms::ifr_fixtures::form;
+        use crate::hii::forms::ifr_fixtures::form_set;
+        use crate::hii::forms::ifr_fixtures::parse_form_set;
+        use crate::hii::forms::ifr_fixtures::password_on;
+        use crate::hii::forms::ifr_fixtures::var_store_efi;
+        use crate::hii::forms::ifr_fixtures::var_store_efi_of;
+        use crate::hii::forms::ifr_fixtures::NIL_GUID;
+        use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+        use crate::hii::package::hiidb_fixtures::form_package_of;
+        use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+        use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+        use crate::hii::package::read_db;
+
         let boot_next = var_store_efi_of(1, EFI_GLOBAL_VARIABLE.into(), "BootNext", NV_BS_RT, 40);
         let in_form_set = ParsedPackageList {
             guid: NIL_GUID,
@@ -597,8 +636,14 @@ mod tests {
     /// Staging writes through no variable of a HiiDB whose IFR past an op where the walk for
     /// FormSets ends may hold a PASSWORD in any variable (AnyVariablePasswords), as get and set do
     /// not: it refuses, and stages nothing.
+    #[cfg(target_os = "linux")]
     #[test]
     fn staging_refuses_a_hiidb_whose_ifr_past_the_walk_may_hold_a_password() {
+        use crate::hii::package::hiidb_fixtures::password_past_the_walk_hiidb;
+        use crate::hii::package::hiidb_fixtures::PAST_THE_WALK_LIST_GUID;
+        use crate::hii::package::read_db;
+        use crate::hii::package::Guid;
+
         let lists = read_db(&password_past_the_walk_hiidb()).expect("read_db");
         let (linux, esp) = FakeLinux::with_esp();
         let variables = booted_from(Some(gpt_512_esp()));
@@ -639,6 +684,7 @@ mod tests {
     /// one that edk2 may route to a VARSTORE_NAME_VALUE, as get and set do not, also with
     /// --i-am-fine-to-brick-this-system: it refuses, and stages nothing. Beside a PASSWORD on a
     /// buffer VarStore it stages.
+    #[cfg(target_os = "linux")]
     #[test]
     fn staging_refuses_a_hiidb_whose_password_a_driver_may_keep_in_any_variable() {
         use crate::hii::forms::ifr_fixtures::form;
@@ -721,8 +767,20 @@ mod tests {
     /// before the OS: in a HiiDB where IFR that uefisettings ignores may hold a PASSWORD question,
     /// or with --i-am-fine-to-brick-this-system beside a PASSWORD outside any FormSet, whose
     /// VarStore is then unknown, nothing is staged.
+    #[cfg(target_os = "linux")]
     #[test]
     fn staging_refuses_up_front_what_apply_staged_refuses() {
+        use std::sync::Arc;
+
+        use crate::hii::forms::ifr_fixtures::password_on;
+        use crate::hii::forms::ifr_fixtures::NIL_GUID;
+        use crate::hii::forms::IgnoredIfr;
+        use crate::hii::forms::IgnoredPasswords;
+        use crate::hii::package::hiidb_fixtures::form_package_of;
+        use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+        use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+        use crate::hii::package::read_db;
+
         let unresolved = "PASSWORD questions of package list 00000000-0000-0000-0000-000000000000 \
                           may be in the IFR that uefisettings ignores at offset 4 of a form \
                           package: an op that uefisettings cannot decode; as the variable of that \
@@ -813,6 +871,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn set_refuses_without_the_esp() {
         let linux = FakeLinux::new();
@@ -826,6 +885,24 @@ mod tests {
                  partition; mount it. Mounted: none"
                 .to_owned()),
             "no ESP"
+        );
+    }
+
+    #[test]
+    fn set_refuses_without_an_esp_volume() {
+        let variables = booted_from(Some(gpt_512_esp()));
+
+        let got = stage_request(&variables, &FakeWindows::default(), None, request(1), NONCE);
+
+        assert_eq!(
+            got.map_err(|err| format!("{err:#}")),
+            Err(
+                "cannot set question \"Generic Question\": no volume is the EFI system partition \
+                 that BootCurrent names, GPT partition 8C78A505-BAA0-4C4A-869F-000000001A0E. \
+                 Volumes: none"
+                    .to_owned()
+            ),
+            "no volume"
         );
     }
 }

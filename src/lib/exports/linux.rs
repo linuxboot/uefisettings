@@ -81,7 +81,7 @@ use crate::ilorest::requests;
 use crate::ilorest::requests::Ilo5Dev;
 use crate::ilorest::requests::IloDevice;
 use crate::ilorest::requests::RedfishAttributes;
-use crate::staged_set::linux::NextBootStaging;
+use crate::staged_set::next_boot::NextBootStaging;
 use crate::translation::ilo::get_qa_variations_ilo;
 use crate::translation::ilo::IloTranslation;
 use crate::translation::translate_response;

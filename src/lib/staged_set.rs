@@ -62,8 +62,8 @@ use crate::unsafe_operations::UnsafeOperations;
 
 #[cfg(any(target_os = "uefi", test))]
 pub(crate) mod apply;
-#[cfg(target_os = "linux")]
-pub(crate) mod linux;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) mod next_boot;
 
 /// The variables of UEFISETTINGS_VENDOR_GUID that hold the staged set, and the outcome of the
 /// last staged set's boot
@@ -78,16 +78,16 @@ const APPLY_STAGED: &str = "uefisettings.efi apply-staged";
 /// uefisettings' directory on the EFI system partition, and the path of a staged set's image in
 /// it, as File Path nodes name them
 #[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux build reaches the ESP yet")
+    not(any(target_os = "linux", target_os = "windows")),
+    allow(dead_code, reason = "only the Linux and Windows builds reach the ESP")
 )]
 pub(crate) const IMAGE_DIRECTORY: &str = "\\EFI\\uefisettings";
 pub(crate) const IMAGE_PATH: &str = "\\EFI\\uefisettings\\uefisettings.efi";
 /// The directory of capsules on disk, which the firmware processes at the next boot when
 /// OsIndications has FILE_CAPSULE_DELIVERY_SUPPORTED, letter case ignored (UEFI 2.11 §8.5.5)
 #[cfg_attr(
-    not(target_os = "linux"),
-    allow(dead_code, reason = "only the Linux build reaches the ESP yet")
+    not(any(target_os = "linux", target_os = "windows")),
+    allow(dead_code, reason = "only the Linux and Windows builds reach the ESP")
 )]
 pub(crate) const CAPSULE_DIRECTORY: &str = "\\EFI\\UpdateCapsule";
 /// The Description of a staged set's Boot####

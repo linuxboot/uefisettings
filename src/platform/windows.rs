@@ -48,6 +48,7 @@ use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
 use crate::READ_ONLY_WRITE;
+use crate::STAGED_SETUP_PASSWORD;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -156,18 +157,22 @@ impl EfivarArgs {
 
 /// The unsafe operations of set, which its long help lists: Windows writes through the
 /// firmware environment calls, which reach runtime variables like efivarfs, so no setup password
-/// gates them, as on Linux.
-pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE];
+/// gates them, as on Linux, and a set staged for the next boot, which one does.
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE, STAGED_SETUP_PASSWORD];
 
-/// None: the Windows build does not stage a set for the next boot yet.
+/// What set stages for the next boot.
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag
 #[group(skip)]
-pub(super) struct StagingArgs {}
+pub(super) struct StagingArgs {
+    /// The uefisettings.efi that set copies to the EFI system partition when it stages a question whose value only its driver holds, which the next boot applies. Under Secure Boot, it must be signed for db.
+    #[arg(long, value_name = "UEFISETTINGS_EFI")]
+    image: Option<PathBuf>,
+}
 
 impl StagingArgs {
     pub(super) fn image(&self) -> Option<PathBuf> {
-        None
+        self.image.clone()
     }
 }
 

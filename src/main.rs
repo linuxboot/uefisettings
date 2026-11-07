@@ -527,7 +527,11 @@ const READ_ONLY_WRITE: &str = "a write of a question that EFI_IFR_FLAG_READ_ONLY
 
 /// What set refuses without --i-am-fine-to-brick-this-system on the builds that stage a set for
 /// the next boot.
-#[cfg(all(system_hiidb, system_variables, target_os = "linux"))]
+#[cfg(all(
+    system_hiidb,
+    system_variables,
+    any(target_os = "linux", target_os = "windows")
+))]
 const STAGED_SETUP_PASSWORD: &str = "a set staged for the next boot in a HiiDB that declares a \
                                      setup password question, which the next boot applies before \
                                      the OS, where no setup browser asks for or checks it";
@@ -1660,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn set_takes_the_image_that_it_stages() {
         let image = "/boot/uefisettings.efi";
         let cases: [(&[&str], Option<std::path::PathBuf>); 2] = [

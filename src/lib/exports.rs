@@ -633,8 +633,8 @@ pub struct SetOptions {
     pub volatile: VolatileWrites,
     /// The language to show texts in instead of the platform language (PlatformLang), if stated
     pub language: Option<String>,
-    /// On Linux, the uefisettings.efi that set copies to the EFI system partition when it stages
-    /// a question that its driver holds for the next boot
+    /// On Linux and Windows, the uefisettings.efi that set copies to the EFI system partition when
+    /// it stages a question that its driver holds for the next boot
     pub staging_image: Option<PathBuf>,
 }
 
@@ -742,11 +742,11 @@ pub(crate) trait DriverHeldValues {
 
 /// The refusal of set of `question` for `reason`.
 #[cfg_attr(
-    not(any(target_os = "uefi", target_os = "linux")),
+    not(any(target_os = "uefi", target_os = "linux", target_os = "windows")),
     allow(
         dead_code,
-        reason = "only the UEFI Shell build reaches a question's driver, and only the Linux build \
-                  stages a set for it yet"
+        reason = "only the UEFI Shell build reaches a question's driver, and only the Linux and \
+                  Windows builds stage a set for it"
     )
 )]
 pub(crate) fn set_refusal(question: &str, reason: impl std::fmt::Display) -> anyhow::Error {
@@ -9597,13 +9597,13 @@ mod tests {
 
     /// set names a question that it stages for the next boot, in its errors, by its package list
     /// followed by `(staged for the next boot)`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn a_staged_question_s_store_is_named_staged_for_the_next_boot() {
         let parsed = package::read_db(&storageless_checkbox_list([0x77; 16], 7, 0x04))
             .expect("parse the HiiDB");
         let staging =
-            crate::staged_set::linux::NextBootStaging::of(&SetOptions::default(), &parsed);
+            crate::staged_set::next_boot::NextBootStaging::of(&SetOptions::default(), &parsed);
         let selected = select_for_set(
             &parsed,
             &QuestionSelector::from("Q"),
@@ -13793,7 +13793,7 @@ mod tests {
             question: &QuestionDescriptor,
             held: &DriverHeldQuestion,
         ) -> String {
-            crate::staged_set::linux::NextBootStaging::answer(self.0, question, held)
+            crate::staged_set::next_boot::NextBootStaging::answer(Ok(self.0), question, held)
         }
 
         fn check_set(

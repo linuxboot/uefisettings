@@ -1155,11 +1155,11 @@ impl PasswordQuestions {
     /// `variables`, which reach `reach` and read something, without the bytes that questions set
     /// through them withhold, as withholding gives them.
     #[cfg_attr(
-        not(any(target_os = "linux", target_os = "uefi", all(variable_data, test))),
+        not(variable_data),
         allow(
             dead_code,
-            reason = "only the Linux build stages a set for the next boot yet, and only the UEFI \
-                      Shell build applies one"
+            reason = "only the Linux and Windows builds stage a set for the next boot, and only \
+                      the UEFI Shell build applies one"
         )
     )]
     pub(crate) fn withholding_of<V>(
@@ -1238,10 +1238,10 @@ fn package_of(
 impl PasswordQuestions {
     /// Refuses what withholding_of refuses through variables that reach `reach`.
     #[cfg_attr(
-        not(target_os = "linux"),
+        not(any(target_os = "linux", target_os = "windows")),
         allow(
             dead_code,
-            reason = "only the Linux build stages a set for the next boot yet"
+            reason = "only the Linux and Windows builds stage a set for the next boot"
         )
     )]
     pub(crate) fn check_withholding(&self, reach: VariableReach) -> Result<(), WithholdingRefusal> {

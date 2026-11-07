@@ -777,10 +777,11 @@ impl Setter {
 
 /// The Boot#### that BootCurrent names, if present.
 #[cfg_attr(
-    not(any(target_os = "linux", target_os = "uefi")),
+    not(any(target_os = "linux", target_os = "windows", target_os = "uefi")),
     allow(
         dead_code,
-        reason = "only the Linux build stages a set for the next boot, and uefisettings.efi applies it"
+        reason = "only the Linux and Windows builds stage a set for the next boot, and \
+                  uefisettings.efi applies it"
     )
 )]
 pub(crate) fn boot_current(variables: &impl VariableData) -> Result<Option<LoadOptionName>> {
@@ -799,10 +800,10 @@ pub(crate) fn boot_option_support(
 /// SecureBoot, 1 while the platform firmware operates in Secure Boot mode (UEFI 2.11 §3.3), if
 /// present.
 #[cfg_attr(
-    not(target_os = "linux"),
+    not(any(target_os = "linux", target_os = "windows")),
     allow(
         dead_code,
-        reason = "only the Linux build stages a set for the next boot yet"
+        reason = "only the Linux and Windows builds stage a set for the next boot"
     )
 )]
 pub(crate) fn secure_boot(variables: &impl VariableData) -> Result<Option<u8>> {
@@ -818,10 +819,10 @@ pub(crate) fn boot_next(variables: &impl VariableData) -> Result<Option<LoadOpti
 
 /// The Boot#### options that BootOrder lists, in its order, if present.
 #[cfg_attr(
-    not(target_os = "linux"),
+    not(any(target_os = "linux", target_os = "windows")),
     allow(
         dead_code,
-        reason = "only the Linux build stages a set for the next boot yet"
+        reason = "only the Linux and Windows builds stage a set for the next boot"
     )
 )]
 pub(crate) fn boot_order(variables: &impl VariableData) -> Result<Option<Vec<LoadOptionName>>> {

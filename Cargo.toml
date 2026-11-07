@@ -45,9 +45,11 @@ rand_core = { version = "0.6", default-features = false }
 # The RNG of RSA blinding on every target, seeded once from the platform's source.
 rand_chacha = { version = "0.3", default-features = false }
 
-# The Linux and Windows builds find the ESP on a disk, whose GPT they check by its CRC32s.
+# The Linux and Windows builds find the ESP on a disk, whose GPT they check by its CRC32s, and
+# stage a set for the next boot under a random nonce.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 crc32fast = "1.4"
+rand = { version = "0.8", features = ["small_rng"] }
 
 # Only the Linux build uses these: efivarfs, the HiiDB in sysfs, iLO through
 # ilorest_chif.so, and the CLI's logging.
@@ -56,7 +58,6 @@ libc = "0.2"
 nix = { version = "0.27", features = ["fs", "ioctl", "mount"] }
 libloading = "0.8"
 httparse = "1.8"
-rand = { version = "0.8", features = ["small_rng"] }
 proc-mounts = "0.3"
 env_logger = "0.10"
 

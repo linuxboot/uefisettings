@@ -372,10 +372,14 @@ pub(crate) mod tests {
 
         /// GPT_512 as disk 0, with volumes of its ESP and its Linux partition.
         pub(crate) fn with_esp() -> Self {
+            Self::with_esp_volume(ESP).volume(DATA, GPT_512_DISK, (4096, 2048))
+        }
+
+        /// GPT_512 as disk 0, with the volume `path` of its ESP.
+        pub(crate) fn with_esp_volume(path: &str) -> Self {
             Self::default()
                 .disk(GPT_512_DISK, &GPT_512)
-                .volume(ESP, GPT_512_DISK, (2048, 2048))
-                .volume(DATA, GPT_512_DISK, (4096, 2048))
+                .volume(path, GPT_512_DISK, (2048, 2048))
         }
     }
 
