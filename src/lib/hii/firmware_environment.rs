@@ -46,6 +46,9 @@ use crate::hii::win32::Win32Error;
 #[cfg(target_os = "windows")]
 mod win32_calls;
 
+#[cfg(target_os = "windows")]
+pub(crate) use win32_calls::RealFirmwareEnvironmentCalls;
+
 /// The first buffer size that read_all reads a variable into, doubling from it.
 const INITIAL_VARIABLE_CAPACITY: usize = 256;
 
@@ -98,7 +101,7 @@ pub(crate) struct FirmwareEnvironment<C> {
 
 impl<C: FirmwareEnvironmentCalls> FirmwareEnvironment<C> {
     /// What GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW reach.
-    const REACH: VariableReach = VariableReach::Runtime;
+    pub(crate) const REACH: VariableReach = VariableReach::Runtime;
     /// GetFirmwareEnvironmentVariableExW and SetFirmwareEnvironmentVariableExW, which errors
     /// name.
     const INTERFACE: VariableInterface = VariableInterface::FirmwareEnvironment;

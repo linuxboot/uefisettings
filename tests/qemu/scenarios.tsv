@@ -70,6 +70,7 @@ shell-capsule-results-i686	/publish-hiidb.efi json-capsule-result	capsule-result
 variable-get	-	-	global_variables/get_default_firmware	-
 variable-get-secboot-setup	-	-	global_variables/get_secboot_setup	firmware=secboot-setup
 variable-get-secboot-user	-	-	global_variables/get_secboot_user	firmware=secboot-user
+variable-set-mode-secboot-user	-	-	global_variables/set_mode_from_linux	firmware=secboot-user
 shell-variable-get	-	-	shell:variable-get	-
 shell-variable-get-secboot-setup	-	-	shell:variable-get-secboot-setup	firmware=secboot-setup
 shell-variable-get-secboot-user	-	-	shell:variable-get-secboot-user	firmware=secboot-user
@@ -80,6 +81,8 @@ shell-global-variables	-	-	shell:global-variables,shell:global-variables-reboot	
 secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
 secboot-user	-	-	secboot/user_mode	firmware=secboot-user
 shell-secboot-setup	-	-	shell:secboot-setup	firmware=secboot-setup
+shell-secure-boot-modes-setup	-	-	shell:secure-boot-modes	firmware=secboot-setup
+shell-secure-boot-modes-user	-	-	shell:secure-boot-modes	firmware=secboot-user
 shell-secboot-user	/publish-hiidb.efi set-auth-variables=/auth/db-append.auth,/auth/db-tampered.auth,/auth/db-unauthorized.auth,/auth/db-foreign.auth	-	shell:secboot-user	firmware=secboot-user
 crash-guard-nosetvar	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_a_kernel_without_set_variable	guest=unfixed arch=x86_64,aarch64
 crash-guard-nosetvar-i686	/DriverSample.efi;/publish-hiidb.efi acpi-table;/publish-hiidb.efi rt-properties-no-set-variable	my-ifr-nv-data.json	efivarfs_crash_guard/set_refuses_a_table_without_set_variable	guest=unfixed arch=i686

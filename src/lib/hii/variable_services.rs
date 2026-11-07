@@ -27,6 +27,7 @@ use uefi::Status;
 use crate::efi_variables::walk_variable_names;
 use crate::efi_variables::GetNextVariableName;
 use crate::efi_variables::NextVariableName;
+use crate::efi_variables::SetVariableStatus;
 use crate::efi_variables::VariableContents;
 use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfo;
@@ -72,7 +73,7 @@ pub(crate) struct VariableServices;
 
 impl VariableServices {
     /// What GetVariable() and SetVariable() reach while boot services run.
-    const REACH: VariableReach = VariableReach::BootServices;
+    pub(crate) const REACH: VariableReach = VariableReach::BootServices;
     /// GetVariable() and SetVariable(), which errors name.
     const INTERFACE: VariableInterface = VariableInterface::VariableServices;
 }
@@ -216,8 +217,15 @@ impl VariableData for VariableServices {
         let (variable_name, vendor) = uefi_key(key)?;
         let attributes =
             runtime::VariableAttributes::from_bits_retain(contents.attributes().bits());
-        runtime::set_variable(&variable_name, &vendor, attributes, contents.data())
-            .map_err(|error| anyhow!("SetVariable() of EFI variable {key}: {:?}", error.status()))
+        runtime::set_variable(&variable_name, &vendor, attributes, contents.data()).map_err(
+            |error| match error.status() {
+                Status::WARN_RESET_REQUIRED => {
+                    SetVariableStatus::WarnResetRequired(key.clone()).into()
+                }
+                Status::ALREADY_STARTED => SetVariableStatus::AlreadyStarted(key.clone()).into(),
+                status => anyhow!("SetVariable() of EFI variable {key}: {status:?}"),
+            },
+        )
     }
 }
 

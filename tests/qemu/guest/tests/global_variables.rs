@@ -20,7 +20,10 @@
 //! may write: in global-variables,
 //! `set_before_reboot` checks that each refusal leaves every efivar file as it was and sets
 //! Timeout, BootOrder, SysPrepOrder, PlatformLang and OsIndications, and `after_reboot`, the next
-//! boot, reads what outlasted the reset.
+//! boot, reads what outlasted the reset. `set_mode_from_linux`, in variable-set-mode-secboot-user,
+//! on the secboot firmware in User Mode, checks that set refuses the Secure Boot mode transitions
+//! of src/lib/efi_variables/secure_boot_mode.rs, which only the UEFI Shell build makes, without
+//! changing any efivar file.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -311,6 +314,36 @@ fn get_secboot_user() {
     assert_enrolled("PK", EFI_GLOBAL_VARIABLE);
     assert_enrolled("KEK", EFI_GLOBAL_VARIABLE);
     assert_enrolled("db", EFI_IMAGE_SECURITY_DATABASE);
+}
+
+#[test]
+fn set_mode_from_linux() {
+    require_test_vm();
+    let before = efivars();
+    let cases: [(&[&str], &str); 2] = [
+        (
+            &["variable", "set", "AuditMode", "1"],
+            "variable set writes AuditMode only with --enter-audit-mode-clearing-pk, in the UEFI \
+             Shell: \"Entering Audit Mode has the side effect of changing SetupMode == 1, PK is \
+             cleared, and the new DeployedMode == 0\" (UEFI 2.11 section 32.3.3)",
+        ),
+        (
+            &[
+                "variable",
+                "set",
+                "AuditMode",
+                "1",
+                "--enter-audit-mode-clearing-pk",
+            ],
+            "AuditMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
+             2.11 section 3.3): run `uefisettings.efi variable set AuditMode 1 \
+             --enter-audit-mode-clearing-pk` in the UEFI Shell",
+        ),
+    ];
+    for (args, refusal) in cases {
+        assert_eq!(json_error(args).error_message, refusal, "{args:?}");
+    }
+    assert_eq!(efivars(), before, "the efivar files");
 }
 
 /// The bytes of every efivar file, or why it cannot be read.

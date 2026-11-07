@@ -85,8 +85,12 @@ pub use efivar_dump::EfivarRedaction;
 pub(crate) use efivar_dump::SavedDump;
 #[cfg(target_os = "linux")]
 pub(crate) use efivarfs::EfivarFiles;
+#[cfg(target_os = "linux")]
+pub(crate) use efivarfs_format::EFIVARFS_REACH;
 #[cfg(target_os = "windows")]
 pub(crate) use firmware_environment::FirmwareEnvironment;
+#[cfg(target_os = "windows")]
+pub(crate) use firmware_environment::RealFirmwareEnvironmentCalls;
 #[cfg(target_os = "linux")]
 pub use firmware_memory::MemoryMapUnavailable;
 #[cfg(target_os = "windows")]
@@ -119,4 +123,6 @@ pub(crate) use variables::FirmwareVariables;
 pub use variables::VariableAttributes;
 #[cfg(any(variable_names, variable_info, variable_data))]
 pub use variables::VariableKey;
+#[cfg(variable_data)]
+pub(crate) use variables::VariableReach;
 pub use variables::VolatileWrites;

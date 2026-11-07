@@ -113,6 +113,8 @@ use crate::hii::VariableKey;
 
 #[cfg(variable_data)]
 pub(crate) mod globals;
+#[cfg(variable_data)]
+pub(crate) mod secure_boot_mode;
 
 /// The size of EFI_TIME (UEFI 2.11 §8.3.1).
 const EFI_TIME_SIZE: usize = 16;
@@ -258,6 +260,27 @@ pub(crate) trait VariableData {
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>>;
     /// Sets `key` to `contents`, creating it if missing.
     fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()>;
+}
+
+/// What SetVariable() returned, but EFI_SUCCESS, for a Secure Boot Mode transition that the
+/// firmware queues instead of making (UEFI 2.11 §32.3), which set_variable fails with so that
+/// secure_boot_mode reports it as returned.
+#[cfg(variable_data)]
+#[cfg_attr(
+    not(any(target_os = "uefi", test)),
+    allow(
+        dead_code,
+        reason = "only SetVariable() of the UEFI Shell build returns these"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum SetVariableStatus {
+    /// The transition is queued, and a reset processes it
+    #[error("SetVariable() of EFI variable {0}: WARN_RESET_REQUIRED")]
+    WarnResetRequired(VariableKey),
+    /// A transition was queued already
+    #[error("SetVariable() of EFI variable {0}: ALREADY_STARTED")]
+    AlreadyStarted(VariableKey),
 }
 
 /// The attributes and data of an EFI variable: "A variable must contain one or more bytes of

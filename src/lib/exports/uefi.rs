@@ -37,6 +37,7 @@ use crate::efi_variables::EFI_JSON_CONFIG_DATA_TABLE_GUID;
 use crate::firmware_width::FirmwareWidth;
 use crate::hii::export_package_lists;
 use crate::hii::FirmwareVariables;
+use crate::hii::VariableReach;
 use crate::hii::VariableServices;
 use crate::uefi_config_table::SystemConfigurationTable;
 
@@ -65,6 +66,9 @@ impl VariableBackend {
     pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
         Ok(VariableServices)
     }
+
+    /// What system_variable_data reaches.
+    pub(super) const SYSTEM_VARIABLE_REACH: VariableReach = VariableServices::REACH;
 
     /// The attributes and data of this firmware's variables, from GetVariable().
     pub(super) fn system_variable_data() -> Result<impl VariableData> {

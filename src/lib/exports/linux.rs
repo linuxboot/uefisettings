@@ -65,6 +65,8 @@ use crate::hii::FirmwareVariables;
 #[cfg(configuration_tables)]
 use crate::hii::PointerSpace;
 use crate::hii::SavedDump;
+use crate::hii::VariableReach;
+use crate::hii::EFIVARFS_REACH;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
 use crate::ilorest::requests::Ilo5Dev;
@@ -98,6 +100,9 @@ impl VariableBackend {
     pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
         Ok(EfivarFiles::system())
     }
+
+    /// What system_variable_data reaches.
+    pub(super) const SYSTEM_VARIABLE_REACH: VariableReach = EFIVARFS_REACH;
 
     /// The attributes and data of this machine's EFI variables, from its efivarfs.
     pub(super) fn system_variable_data() -> Result<impl VariableData> {

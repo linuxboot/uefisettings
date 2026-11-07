@@ -28,6 +28,8 @@ use crate::hii::read_hiidb;
 use crate::hii::EfivarSource;
 use crate::hii::FirmwareEnvironment;
 use crate::hii::FirmwareVariables;
+use crate::hii::RealFirmwareEnvironmentCalls;
+use crate::hii::VariableReach;
 
 /// What set and get read and write when no file names them: this machine's HiiDB, through
 /// the HiiDB driver, and its firmware environment variables.
@@ -49,6 +51,10 @@ impl VariableBackend {
     pub(super) fn system_variable_info() -> Result<impl VariableInfoSource> {
         FirmwareEnvironment::new()
     }
+
+    /// What system_variable_data reaches.
+    pub(super) const SYSTEM_VARIABLE_REACH: VariableReach =
+        FirmwareEnvironment::<RealFirmwareEnvironmentCalls>::REACH;
 
     /// The attributes and data of this machine's firmware environment variables.
     pub(super) fn system_variable_data() -> Result<impl VariableData> {

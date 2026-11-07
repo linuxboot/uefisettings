@@ -40,6 +40,8 @@ use super::globals::EFI_DEVICE_SECURITY_DATABASE;
 use super::globals::EFI_GLOBAL_VARIABLE;
 use super::globals::EFI_IMAGE_SECURITY_DATABASE;
 use super::is_gmt_time_stamp;
+use super::secure_boot_mode::mode_variable;
+use super::secure_boot_mode::SETUP_MODE;
 use super::RuntimeAccessWithoutBootServiceAccess;
 use super::VariableContents;
 use super::VariableData;
@@ -69,9 +71,6 @@ const GLOBAL_POLICY_VARIABLES: [&str; 3] = ["PK", "KEK", "OsRecoveryOrder"];
 const OS_RECOVERY_PREFIX: &str = "OsRecovery";
 /// The number of hexadecimal digits of a load option's name (UEFI 2.11 §3.1.1).
 const OPTION_NUMBER_DIGITS: usize = 4;
-/// The variable of EFI_GLOBAL_VARIABLE that tells whether the firmware writes the Secure Boot
-/// Policy Variables without checking their signatures (UEFI 2.11 §3.3).
-const SETUP_MODE: &str = "SetupMode";
 /// The attributes that a signed write takes.
 const SIGNED_WRITE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
     .union(VariableAttributes::BOOTSERVICE_ACCESS)
@@ -173,7 +172,7 @@ fn refuse_deletion_and_setup_mode(
         }
         SetupModeWrite::Refuse | SetupModeWrite::WithoutSignatureCheck => return Ok(()),
     };
-    if in_setup_mode(variables)? {
+    if setup_mode_is_one(variables)? {
         return Err(refusal.into());
     }
     Ok(())
@@ -238,10 +237,6 @@ enum SignedWriteRefusal {
          write it without checking the payload's signature (UEFI 2.11 section 32.6.3)"
     )]
     SetupModeDeviceDatabaseWrite(VariableKey),
-    #[error("SetupMode holds {0} bytes, not the 1 of a UINT8 (UEFI 2.11 section 3.3)")]
-    SetupModeSize(usize),
-    #[error("SetupMode is {0}, neither 0 nor 1 (UEFI 2.11 section 3.3)")]
-    SetupModeValue(u8),
     #[error(
         "{0}: without BOOTSERVICE_ACCESS and RUNTIME_ACCESS, a write deletes the variable: \
          \"Setting a data variable with no access attributes causes it to be deleted\" (UEFI 2.11 \
@@ -331,23 +326,12 @@ fn is_os_recovery_name(name: &str) -> bool {
     })
 }
 
-/// Whether the firmware of `variables` is in Setup Mode, where it writes the Secure Boot Policy
-/// Variables without checking their signatures (UEFI 2.11 §8.2.6): SetupMode is 1. Firmware
-/// without SetupMode, which a firmware with Secure Boot creates (§3.3), is not.
-fn in_setup_mode(variables: &impl VariableData) -> Result<bool> {
-    let key = VariableKey {
-        name: SETUP_MODE.to_string(),
-        guid: EFI_GLOBAL_VARIABLE,
-    };
-    let Some(setup_mode) = variables.variable_data(&key)? else {
-        return Ok(false);
-    };
-    match setup_mode.data() {
-        [0] => Ok(false),
-        [1] => Ok(true),
-        [value] => Err(SignedWriteRefusal::SetupModeValue(*value).into()),
-        data => Err(SignedWriteRefusal::SetupModeSize(data.len()).into()),
-    }
+/// Whether SetupMode of `variables` is 1, as in Setup Mode and in Audit Mode (UEFI 2.11
+/// §32.3.3): the firmware then writes the Secure Boot Policy Variables without checking their
+/// signatures (§8.2.6). Firmware without SetupMode, which a firmware with Secure Boot creates
+/// (§3.3), is not.
+fn setup_mode_is_one(variables: &impl VariableData) -> Result<bool> {
+    Ok(mode_variable(variables, SETUP_MODE)?.is_some_and(|(_, setup_mode)| setup_mode))
 }
 
 #[cfg(test)]

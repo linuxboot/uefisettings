@@ -460,6 +460,21 @@ take authenticated writes.
 uefisettings variable set BootOrder Boot0002,Boot0001
 ```
 
+`variable set AuditMode 1 --enter-audit-mode-clearing-pk`, in the UEFI Shell, enters Audit Mode from
+Setup Mode or User Mode, which clears PK and sets SetupMode to 1 and DeployedMode to 0 (UEFI 2.11
+§32.3.3); setting PK then enters Deployed Mode, not User Mode (§32.3.4). Without the flag, set
+refuses AuditMode. It reads SetupMode, AuditMode and DeployedMode first and refuses, before any
+write, a firmware without them, as edk2 is, values that tell no mode of §32.3, and Audit Mode from
+Audit Mode or Deployed Mode. Linux and Windows refuse it, as AuditMode "Always becomes read-only
+after ExitBootServices() is called" (§3.3). It prints what it wrote, as set does, and `status`, what
+SetVariable() returned: `EFI_SUCCESS`, or `EFI_WARN_RESET_REQUIRED` if the firmware queued the
+transition for the next reset, the mode variables unchanged until then (§32.3); a firmware that has
+queued one refuses another with EFI_ALREADY_STARTED, which set reports as an error.
+
+```plain
+FS0:\> uefisettings.efi variable set AuditMode 1 --enter-audit-mode-clearing-pk
+```
+
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)
 tells of the storage of the variables of those attributes, by default the non-volatile ones that
 the OS reaches (`non-volatile,bootservice-access,runtime-access`), as a JSON object of its own:

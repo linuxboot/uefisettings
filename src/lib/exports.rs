@@ -87,6 +87,16 @@ use crate::efi_variables::query_storage;
 use crate::efi_variables::read_json_capsule_result;
 #[cfg(configuration_tables)]
 use crate::efi_variables::read_json_config_data;
+#[cfg(variable_data)]
+use crate::efi_variables::secure_boot_mode::set_mode;
+#[cfg(variable_data)]
+use crate::efi_variables::secure_boot_mode::ModeRequest;
+#[cfg(variable_data)]
+pub use crate::efi_variables::secure_boot_mode::ModeTransition;
+#[cfg(variable_data)]
+pub use crate::efi_variables::secure_boot_mode::ModeTransitionStatus;
+#[cfg(variable_data)]
+pub use crate::efi_variables::secure_boot_mode::ModeTransitionWrite;
 #[cfg(capsule_delivery)]
 pub use crate::efi_variables::CapsuleCapabilities;
 #[cfg(capsule_delivery)]
@@ -268,6 +278,21 @@ impl VariableBackend {
     /// which names its value as get decodes it, after checking it; returns what it wrote.
     pub fn set(name: &str, value: &str) -> Result<GlobalVariable> {
         write_global(&Self::system_variable_data()?, name, value)
+    }
+
+    /// Sets the global variable `name` to `value`, as set does, to make the Secure Boot mode
+    /// transition `transition` of UEFI 2.11 §32.3, which only the UEFI Shell build makes, as
+    /// AuditMode "Always becomes read-only after ExitBootServices() is called" (§3.3). Refuses,
+    /// before it opens the variables, another variable or value and the builds that run after
+    /// ExitBootServices(), and, before any write, a transition that the current mode does not
+    /// allow; returns what it wrote and what SetVariable() returned.
+    pub fn set_mode(
+        name: &str,
+        value: &str,
+        transition: ModeTransition,
+    ) -> Result<ModeTransitionWrite> {
+        let request = ModeRequest::new(transition, Self::SYSTEM_VARIABLE_REACH, name, value)?;
+        set_mode(&Self::system_variable_data()?, request)
     }
 
     /// Writes `payload`, an EFI_VARIABLE_AUTHENTICATION_2 descriptor and the new data of the EFI

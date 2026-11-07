@@ -15,6 +15,8 @@
 #[cfg(not(all(variable_names, variable_storage_info)))]
 use anyhow::anyhow;
 use anyhow::Result;
+#[cfg(variable_data)]
+use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
@@ -22,6 +24,8 @@ use clap::ValueEnum;
 use serde::Serialize;
 #[cfg(variable_data)]
 use uefisettings::exports::GlobalVariable;
+#[cfg(variable_data)]
+use uefisettings::exports::ModeTransition;
 #[cfg(variable_storage_info)]
 use uefisettings::exports::VariableAttributes;
 #[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
@@ -77,18 +81,11 @@ enum VariableSubcommands {
         guid: Option<String>,
     },
     /// Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout, BootOrder,
-    /// DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications
+    /// DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications; or, in the UEFI Shell,
+    /// AuditMode with --enter-audit-mode-clearing-pk
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
-    Set {
-        /// The variable, such as Timeout
-        name: String,
-        /// Its value as get shows it, the list comma-separated: seconds or "wait for user input"
-        /// for Timeout, load options such as Boot0002,Boot0001 for the orders, one for BootNext,
-        /// a code of PlatformLangCodes for PlatformLang, bits such as BOOT_TO_FW_UI, or none,
-        /// for OsIndications, which keeps its reserved bits
-        value: String,
-    },
+    Set(SetArgs),
     /// Show the storage space of the EFI variables of some attributes, and how much of it is left
     #[command(next_display_order = None)]
     Storage {
@@ -109,6 +106,47 @@ enum VariableSubcommands {
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
     WriteSigned(write_signed::WriteSignedArgs),
+}
+
+/// What variable set takes.
+#[cfg(variable_data)]
+#[derive(Debug, Args)]
+struct SetArgs {
+    /// The variable, such as Timeout
+    name: String,
+    /// Its value as get shows it, the list comma-separated: seconds or "wait for user input"
+    /// for Timeout, load options such as Boot0002,Boot0001 for the orders, one for BootNext,
+    /// a code of PlatformLangCodes for PlatformLang, bits such as BOOT_TO_FW_UI, or none,
+    /// for OsIndications, which keeps its reserved bits; 1 for AuditMode
+    value: String,
+    /// Set AuditMode to 1, in the UEFI Shell, from Setup Mode or User Mode, to enter Audit Mode,
+    /// which clears PK and sets SetupMode to 1 and DeployedMode to 0 (UEFI 2.11 section 32.3.3);
+    /// the firmware may queue it for the next reset (section 32.3); setting PK then enters
+    /// Deployed Mode, not User Mode (UEFI 2.11 section 32.3.4)
+    #[arg(long)]
+    enter_audit_mode_clearing_pk: bool,
+}
+
+#[cfg(variable_data)]
+impl SetArgs {
+    /// Sets the variable and prints what it wrote, as print_global prints it, and, for a Secure
+    /// Boot mode transition, what SetVariable() returned.
+    fn run(&self) -> Result<()> {
+        match self.transition() {
+            None => print_global_variable(&VariableBackend::set(&self.name, &self.value)?),
+            Some(transition) => {
+                let write = VariableBackend::set_mode(&self.name, &self.value, transition)?;
+                print_line(format_args!("{}", serde_json::to_string(&write)?))?;
+                Ok(())
+            }
+        }
+    }
+
+    /// The Secure Boot mode transition that the flags ask for, if any.
+    fn transition(&self) -> Option<ModeTransition> {
+        self.enter_audit_mode_clearing_pk
+            .then_some(ModeTransition::EnterAuditModeClearingPk)
+    }
 }
 
 /// An attribute of EFI variables (UEFI 2.10 §8.2.1), but EFI_VARIABLE_APPEND_WRITE, which
@@ -150,7 +188,7 @@ impl VariableCommand {
             #[cfg(variable_data)]
             VariableSubcommands::Get { name, guid } => print_global(name, guid.as_deref()),
             #[cfg(variable_data)]
-            VariableSubcommands::Set { name, value } => set(name, value),
+            VariableSubcommands::Set(args) => args.run(),
             VariableSubcommands::Storage { attributes } => storage(attributes),
             #[cfg(variable_data)]
             VariableSubcommands::WriteSigned(args) => args.run(),
@@ -202,12 +240,6 @@ pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
 #[cfg(variable_data)]
 fn print_global(name: &str, guid: Option<&str>) -> Result<()> {
     print_global_variable(&VariableBackend::get(name, guid)?)
-}
-
-/// Sets the variable `name` to `value` and prints what it wrote, as print_global prints it.
-#[cfg(variable_data)]
-fn set(name: &str, value: &str) -> Result<()> {
-    print_global_variable(&VariableBackend::set(name, value)?)
 }
 
 /// Prints `global` as one line of JSON, for print_global and set.
@@ -291,7 +323,7 @@ mod tests {
                 }
                 #[cfg(variable_data)]
                 parsed @ (VariableSubcommands::Get { .. }
-                | VariableSubcommands::Set { .. }
+                | VariableSubcommands::Set(_)
                 | VariableSubcommands::WriteSigned(_)) => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
@@ -313,7 +345,7 @@ mod tests {
             VariableSubcommands::Info { name, guid } => (name, guid),
             #[cfg(variable_data)]
             parsed @ (VariableSubcommands::Get { .. }
-            | VariableSubcommands::Set { .. }
+            | VariableSubcommands::Set(_)
             | VariableSubcommands::WriteSigned(_)) => {
                 panic!("{args:?} is no info: {parsed:?}")
             }
@@ -353,7 +385,7 @@ mod tests {
                     panic!("{args:?} is no get: {parsed:?}")
                 }
                 parsed @ (VariableSubcommands::List { .. }
-                | VariableSubcommands::Set { .. }
+                | VariableSubcommands::Set(_)
                 | VariableSubcommands::Storage { .. }
                 | VariableSubcommands::WriteSigned(_)) => {
                     panic!("{args:?} is no get: {parsed:?}")
@@ -380,7 +412,7 @@ mod tests {
             (&["set", "OsIndications", "none"], ("OsIndications", "none")),
         ] {
             let (name, value) = match variable(args) {
-                VariableSubcommands::Set { name, value } => (name, value),
+                VariableSubcommands::Set(SetArgs { name, value, .. }) => (name, value),
                 #[cfg(variable_info)]
                 parsed @ VariableSubcommands::Info { .. } => {
                     panic!("{args:?} is no set: {parsed:?}")
@@ -403,6 +435,50 @@ mod tests {
             Some(clap::error::ErrorKind::MissingRequiredArgument),
             "set without a value"
         );
+    }
+
+    /// set takes --enter-audit-mode-clearing-pk after its name and value, which asks for the
+    /// transition to Audit Mode, and asks for none without it.
+    #[cfg(variable_data)]
+    #[test]
+    fn set_takes_the_audit_mode_flag() {
+        let transition = ModeTransition::EnterAuditModeClearingPk;
+        let (name, flag) = (transition.variable(), transition.flag());
+        let argv = ["uefisettings", "variable", "set", name, "1", flag];
+
+        let parsed = UefiSettingsToolArgs::try_parse_from(argv);
+
+        assert!(
+            matches!(
+                parsed.as_ref().map(|args| &args.command),
+                Ok(Commands::Variable(VariableCommand {
+                    command: VariableSubcommands::Set(_)
+                }))
+            ),
+            "{argv:?}: {parsed:?}"
+        );
+        let cases = [
+            (&["set", name, "1", flag][..], Some(transition)),
+            (&["set", name, "1"], None),
+            (&["set", "Timeout", "5"], None),
+        ];
+        for (args, want) in cases {
+            let asked = match variable(args) {
+                VariableSubcommands::Set(set) => set.transition(),
+                #[cfg(variable_info)]
+                parsed @ VariableSubcommands::Info { .. } => {
+                    panic!("{args:?} is no set: {parsed:?}")
+                }
+                parsed @ (VariableSubcommands::List { .. }
+                | VariableSubcommands::Get { .. }
+                | VariableSubcommands::Storage { .. }
+                | VariableSubcommands::WriteSigned(_)) => {
+                    panic!("{args:?} is no set: {parsed:?}")
+                }
+            };
+
+            assert_eq!(asked, want, "{args:?}");
+        }
     }
 
     /// storage takes the attributes of non-volatile variables that the OS reaches unless
@@ -440,7 +516,7 @@ mod tests {
                 }
                 #[cfg(variable_data)]
                 parsed @ (VariableSubcommands::Get { .. }
-                | VariableSubcommands::Set { .. }
+                | VariableSubcommands::Set(_)
                 | VariableSubcommands::WriteSigned(_)) => {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }

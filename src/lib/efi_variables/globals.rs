@@ -28,6 +28,7 @@ use thiserror::Error;
 
 use crate::efi_variables::enhanced_authenticated::metadata_end;
 use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
+use crate::efi_variables::secure_boot_mode::ModeTransition;
 use crate::efi_variables::VariableContents;
 use crate::efi_variables::VariableData;
 use crate::hii::package::Guid;
@@ -78,8 +79,6 @@ const WRITABLE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
 /// Why the OS does not write a variable, in the words of UEFI 2.11 §3.3: those of Table 3.1 for
 /// most of them, of the text after it for the others.
 const TREATED_AS_READ_ONLY: &str = "Should be treated as read-only.";
-const AUDIT_MODE_READ_ONLY: &str = "Should be treated as read-only except when DeployedMode is 0. \
-                                    Always becomes read-only after ExitBootServices() is called.";
 const DEPLOYED_MODE_READ_ONLY: &str = "Should be treated as read-only when its value is 1. Always \
                                        becomes read-only after ExitBootServices() is called.";
 const BOOT_CURRENT_READ_ONLY: &str =
@@ -103,7 +102,7 @@ const DEVICE_SIGNATURE_DATABASE: Quote = Quote {
 /// The variables that variable get decodes: those of UEFI 2.11 Table 3.1 but the load options,
 /// hot keys and device paths, and the signature databases; and whether variable set writes them.
 const GLOBALS: [Global; 34] = [
-    Global::read_only("AuditMode", Codec::Byte, AUDIT_MODE_READ_ONLY),
+    Global::mode_transition(ModeTransition::EnterAuditModeClearingPk),
     Global::read_only("BootCurrent", Codec::BootOption, BOOT_CURRENT_READ_ONLY),
     Global::writable("BootNext", Setter::BootNext),
     Global::read_only(
@@ -497,6 +496,17 @@ impl Global {
         }
     }
 
+    /// The global variable that `transition` sets, a byte of UEFI 2.11 §3.3, which variable set
+    /// writes only with the transition's flag.
+    const fn mode_transition(transition: ModeTransition) -> Self {
+        Self {
+            name: transition.variable(),
+            vendor: EFI_GLOBAL_VARIABLE,
+            codec: Codec::Byte,
+            access: Access::ModeTransition(transition),
+        }
+    }
+
     /// The signature database `name` (UEFI 2.11 §32.7.1), a Secure Boot Policy Variable (§3.3).
     const fn image_security(name: &'static str) -> Self {
         Self {
@@ -532,6 +542,7 @@ impl Global {
                 name: global.name,
                 reason,
             }),
+            Access::ModeTransition(transition) => Err(SetRefusal::NeedsFlag(transition)),
         }
     }
 
@@ -603,6 +614,9 @@ enum Access {
     Writable(Setter),
     /// The OS does not write it, for these words of UEFI 2.11
     ReadOnly(Quote),
+    /// Setting it makes this Secure Boot mode transition (UEFI 2.11 §32.3), which variable set
+    /// makes only with its flag
+    ModeTransition(ModeTransition),
 }
 
 /// Words of UEFI 2.11 and the section that holds them.
@@ -798,6 +812,13 @@ enum SetRefusal {
     NotWritable(String),
     #[error("variable set does not write {name}: {reason}")]
     ReadOnly { name: &'static str, reason: Quote },
+    #[error(
+        "variable set writes {} only with {}, in the UEFI Shell: {}",
+        .0.variable(),
+        .0.flag(),
+        .0.consequence()
+    )]
+    NeedsFlag(ModeTransition),
     #[error(
         "Timeout takes seconds from 0 to 65535, or \"{}\", not \"{0}\"",
         WAIT_FOR_USER_INPUT_TEXT
@@ -2100,11 +2121,10 @@ pub(crate) mod tests {
             (
                 "AuditMode",
                 "1",
-                read_only(
-                    "AuditMode",
-                    "Should be treated as read-only except when DeployedMode is 0. Always \
-                     becomes read-only after ExitBootServices() is called.",
-                ),
+                "variable set writes AuditMode only with --enter-audit-mode-clearing-pk, in the \
+                 UEFI Shell: \"Entering Audit Mode has the side effect of changing SetupMode == \
+                 1, PK is cleared, and the new DeployedMode == 0\" (UEFI 2.11 section 32.3.3)"
+                    .to_string(),
             ),
             (
                 "DeployedMode",

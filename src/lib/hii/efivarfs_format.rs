@@ -59,7 +59,7 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 /// (OvmfPkgX64.dsc), as of edk2-stable202508.
 pub(super) const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// What efivarfs, and so a copy of it, reaches.
-pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
+pub(crate) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
 /// The interface of efivarfs, and so of a copy of it.
 pub(super) const EFIVARFS_INTERFACE: VariableInterface = VariableInterface::Efivarfs;
 /// The length of the GUID that ends the name of an efivar file (Linux v6.11 include/linux/efi.h
