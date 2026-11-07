@@ -13,14 +13,23 @@
 //! The variables of the boot manager (src/lib/efi_variables/boot_manager.rs) in the scenario
 //! boot-manager, whose variable store tests/qemu/vars/boot-manager.json seeds with Boot0099, of
 //! a file that no ESP holds, with an undefined attribute bit and OptionalData, and Key0099,
-//! CTRL-q to Boot0099, and whose Driver0000 loads DriverSample.efi: `before_shell` checks that
-//! `variable get` shows them as their bytes tell; that `variable set-attributes` refuses
-//! PlatformRecovery####, OsRecovery####, an absent load option and a flag both to set and to
-//! clear, writing nothing; and that it clears and sets Boot0099's LOAD_OPTION_ACTIVE, changing
-//! only its Attributes and the BootOptionCrc of Key0099, which follows it, and sets and clears
-//! Driver0000's LOAD_OPTION_FORCE_RECONNECT. The UEFI Shell boot after it,
-//! shell/boot-manager.nsh, does the same, and its checks compare what uefisettings.efi prints
-//! with the lines "uefisettings-qemu-test: TAG JSON" of this test log.
+//! CTRL-q to Boot0099, and whose Driver0000 loads DriverSample.efi. `before_shell` checks that:
+//! - `variable get` shows them as their bytes tell;
+//! - `variable set-attributes` refuses PlatformRecovery####, OsRecovery####, an absent load
+//!   option and a flag both to set and to clear, writing nothing, and clears and sets Boot0099's
+//!   LOAD_OPTION_ACTIVE, changing only its Attributes and the BootOptionCrc of Key0099, which
+//!   follows it, and sets and clears Driver0000's LOAD_OPTION_FORCE_RECONNECT;
+//! - `variable create-load-option` refuses Boot0099, which exists, and creates Boot009A, to the
+//!   UEFI Shell, by text, which BootNext then names, and Boot009C of the same device path's bytes
+//!   and of OptionalData, both from files;
+//! - `variable set-device-path` sets ConOut to its own text, which keeps its bytes, and refuses
+//!   ConOutDev.
+//!
+//! The UEFI Shell boots after it, shell/boot-manager.nsh through Boot009A and
+//! shell/boot-manager-next.nsh through Boot009B, which the first creates, do the same; their
+//! checks compare what uefisettings.efi prints with the lines "uefisettings-qemu-test: TAG JSON"
+//! of this test log, and with the lines of the firmware's boot manager that loaded them.
+//! `after_shell`, the last boot, reads what the Shell wrote.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -55,6 +64,24 @@ const SET_ATTRIBUTES_REFUSALS: [(&[&str], &str); 4] = [
         "set-attributes cannot both set and clear active",
     ),
 ];
+/// What create-load-option prints for Boot0099, which exists.
+const BOOT0099_EXISTS: &str = "Boot0099 exists: create-load-option creates load options; \
+                               set-attributes changes the Attributes of one, and variable set \
+                               BootOrder its place in BootOrder";
+/// gUefiShellFileGuid, the FILE_GUID of the UEFI Shell (edk2-stable202608
+/// ShellPkg/Application/Shell/Shell.inf), and its bytes.
+const UEFI_SHELL_FILE_GUID: &str = "7C04A583-9E3E-4F1C-AD65-E05268D0B4D1";
+const UEFI_SHELL_FILE_GUID_BYTES: [u8; 16] = [
+    0x83, 0xA5, 0x04, 0x7C, 0x3E, 0x9E, 0x1C, 0x4F, 0xAD, 0x65, 0xE0, 0x52, 0x68, 0xD0, 0xB4, 0xD1,
+];
+/// The Description of Boot009A, which starts the UEFI Shell.
+const SHELL_AGAIN: &str = "uefisettings Shell";
+/// The OptionalData of Boot009C, bytes that no Description or text holds.
+const OPTIONAL_DATA: &[u8] = &[0x00, 0xFF, 0x7F, 0x80, 0x0A];
+/// What set-device-path prints for ConOutDev.
+const CON_OUT_DEV_REFUSAL: &str = "set-device-path does not write ConOutDev: \"These variables \
+                                   are volatile, and are set dynamically on every boot.\" (UEFI \
+                                   2.11 section 3.3)";
 /// What set-attributes prints on stderr when it updates Key0099.
 const KEY0099_UPDATED: &str = "updated Key0099: its BootOptionCrc is the CRC-32 of the Boot#### \
                                that it starts again (UEFI 2.11 section 3.1.6)";
@@ -101,6 +128,66 @@ fn efivars() -> BTreeMap<String, Vec<u8>> {
             (name.into_owned(), bytes)
         })
         .collect()
+}
+
+/// What `variable create-load-option` and `args`, which must succeed, print on stdout, recorded
+/// as `tag`, and on stderr.
+#[track_caller]
+fn create_load_option(tag: &str, args: &[&str]) -> (serde_json::Value, String) {
+    let output = variable(tag, &[&["create-load-option"][..], args].concat());
+    (output.json(0), output.stderr)
+}
+
+/// The FilePathList and OptionalData of `option`, an EFI_LOAD_OPTION (UEFI 2.11 §3.1.3).
+#[track_caller]
+fn load_option_parts(option: &[u8]) -> (&[u8], &[u8]) {
+    let length = usize::from(u16::from_le_bytes([option[4], option[5]]));
+    let description = option[6..]
+        .chunks_exact(2)
+        .position(|unit| unit == [0, 0])
+        .expect("a Null-terminated Description");
+    option[6 + 2 * (description + 1)..].split_at(length)
+}
+
+/// The EFI_LOAD_OPTION of `attributes`, `description`, `file_paths` and `optional_data`.
+fn load_option(
+    attributes: u32,
+    description: &str,
+    file_paths: &[u8],
+    optional_data: &[u8],
+) -> Vec<u8> {
+    let description: Vec<u8> = description
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let length = u16::try_from(file_paths.len()).expect("a short FilePathList");
+    [
+        &attributes.to_le_bytes()[..],
+        &length.to_le_bytes(),
+        &description,
+        file_paths,
+        optional_data,
+    ]
+    .concat()
+}
+
+/// The instances of `path`, a device path, each without the End node that ends it.
+#[track_caller]
+fn instances(path: &[u8]) -> Vec<Vec<u8>> {
+    let mut instances = vec![Vec::new()];
+    let mut rest = path;
+    while let [node_type, _, low, high, ..] = *rest {
+        let length = usize::from(u16::from_le_bytes([low, high]));
+        let (node, after) = rest.split_at(length);
+        match node_type {
+            0x7F => instances.push(Vec::new()),
+            _ => instances.last_mut().expect("an instance").extend(node),
+        }
+        rest = after;
+    }
+    instances.pop();
+    instances
 }
 
 /// The data of the global variable `name`, which must exist.
@@ -254,4 +341,189 @@ fn before_shell() {
         "Driver0000 without LOAD_OPTION_FORCE_RECONNECT"
     );
     assert_eq!(data("Driver0000"), driver, "Driver0000 again");
+
+    // create-load-option: refused over Boot0099, then Boot009A to the UEFI Shell, which BootNext
+    // names, and Boot009C of its device path's bytes and OptionalData from files
+    let before = efivars();
+    let error = json_error(&[
+        "variable",
+        "create-load-option",
+        "Boot0099",
+        "--description",
+        "again",
+        "--device-path",
+        "\\missing-99.efi",
+    ]);
+    assert_eq!(error.error_message, BOOT0099_EXISTS, "create Boot0099");
+    assert_eq!(efivars(), before, "create Boot0099: the efivar files");
+
+    // the firmware creates the Shell's Boot#### only on a boot without a kernel, after this one
+    // (edk2-stable202608 OvmfPkg/Library/PlatformBootManagerLib/BdsPlatform.c:1666-1695), so the
+    // Shell's device path is that of Boot0000, UiApp, of the same firmware volume, with the
+    // Shell's FvFile
+    let ui_app = get("boot0000", "Boot0000");
+    let ui_app_path = ui_app["value"]["device_paths"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("Boot0000: {ui_app}"));
+    let (volume, _) = ui_app_path
+        .split_once("/FvFile(")
+        .unwrap_or_else(|| panic!("Boot0000 is no FvFile: {ui_app_path}"));
+    let shell_path = format!("{volume}/FvFile({UEFI_SHELL_FILE_GUID})");
+    let (created, warnings) = create_load_option(
+        "created-boot009a",
+        &[
+            "Boot009A",
+            "--description",
+            SHELL_AGAIN,
+            "--device-path",
+            &shell_path,
+        ],
+    );
+    let ui_app_option = data("Boot0000");
+    let (ui_app_file_paths, _) = load_option_parts(&ui_app_option);
+    // Fv(), of the Length that its bytes 2-3 hold, then the Type, Sub-Type and Length of
+    // FvFile(), then its GUID
+    let guid_at = usize::from(u16::from_le_bytes([
+        ui_app_file_paths[2],
+        ui_app_file_paths[3],
+    ])) + 4;
+    let shell_file_paths = [
+        &ui_app_file_paths[..guid_at],
+        &UEFI_SHELL_FILE_GUID_BYTES,
+        &ui_app_file_paths[guid_at + UEFI_SHELL_FILE_GUID_BYTES.len()..],
+    ]
+    .concat();
+    let shell_file_paths = shell_file_paths.as_slice();
+    assert_eq!(
+        data("Boot009A"),
+        load_option(1, SHELL_AGAIN, shell_file_paths, &[]),
+        "Boot009A: bytes"
+    );
+    assert_eq!(
+        created,
+        global(
+            "Boot009A",
+            json!({
+                "attributes": ["active"],
+                "category": "boot",
+                "description": SHELL_AGAIN,
+                "device_paths": [shell_path],
+                "optional_data": "",
+            })
+        ),
+        "Boot009A"
+    );
+    assert_eq!(warnings, "", "Boot009A: stderr");
+
+    let path_file = "/tmp/shell-path.bin";
+    let optional_file = "/tmp/optional-data.bin";
+    fs::write(path_file, shell_file_paths).expect("write the device path file");
+    fs::write(optional_file, OPTIONAL_DATA).expect("write the OptionalData file");
+    let (created, _) = create_load_option(
+        "created-boot009c",
+        &[
+            "Boot009C",
+            "--description",
+            "from files",
+            "--device-path-file",
+            path_file,
+            "--optional-data-file",
+            optional_file,
+            "--flags",
+            "hidden",
+            "--category",
+            "app",
+        ],
+    );
+    assert_eq!(
+        data("Boot009C"),
+        load_option(0x108, "from files", shell_file_paths, OPTIONAL_DATA),
+        "Boot009C: bytes"
+    );
+    assert_eq!(
+        created["value"]["device_paths"],
+        json!([shell_path]),
+        "Boot009C"
+    );
+
+    let written =
+        variable("boot-next", &["set", "BootNext", "Boot009A"]).json::<serde_json::Value>(0);
+    assert_eq!(written, global("BootNext", json!("Boot009A")), "BootNext");
+
+    // set-device-path: ConOut set to its own text keeps its bytes; ConOutDev is refused
+    let con_out = data("ConOut");
+    let text = get("con-out", "ConOut")["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("ConOut has no text"))
+        .to_owned();
+    let output = variable(
+        "con-out-set",
+        &["set-device-path", "ConOut", "--device-path", &text],
+    );
+    let set: serde_json::Value = output.json(0);
+    assert_eq!(
+        set,
+        global("ConOut", json!(text)),
+        "ConOut set to its own text"
+    );
+    assert_eq!(data("ConOut"), con_out, "ConOut: bytes");
+    let known = instances(&data("ConOutDev"));
+    let lacking = instances(&con_out)
+        .into_iter()
+        .filter(|instance| !known.contains(instance))
+        .count();
+    assert_eq!(
+        output
+            .stderr
+            .lines()
+            .filter(|line| line.starts_with("warning: ConOutDev lacks the instance "))
+            .count(),
+        lacking,
+        "ConOut: warnings: {}",
+        output.stderr
+    );
+    let before = efivars();
+    let error = json_error(&[
+        "variable",
+        "set-device-path",
+        "ConOutDev",
+        "--device-path",
+        &text,
+    ]);
+    assert_eq!(error.error_message, CON_OUT_DEV_REFUSAL, "set ConOutDev");
+    assert_eq!(efivars(), before, "set ConOutDev: the efivar files");
+}
+
+/// After the UEFI Shell boots, the first through Boot009A, which BootNext named, the second
+/// through Boot009B, which the first created and BootNext named: the Shell's writes outlast the
+/// resets, BootNext is gone, and Boot0099 and Key0099 are as seeded again.
+#[test]
+fn after_shell() {
+    require_test_vm();
+
+    let file_path: Vec<u8> = "\\uefisettings.efi"
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let length = u16::try_from(4 + file_path.len()).expect("a short node");
+    let path = [
+        &[0x04, 0x04][..],
+        &length.to_le_bytes(),
+        &file_path,
+        &[0x7F, 0xFF, 0x04, 0x00],
+    ]
+    .concat();
+    assert_eq!(
+        data("Boot009B"),
+        load_option(1, "uefisettings again", &path, &[]),
+        "Boot009B: bytes"
+    );
+    assert_eq!(global_variable("BootNext"), None, "BootNext is gone");
+    assert_eq!(
+        get("after-boot0099", "Boot0099"),
+        seeded_boot0099(json!(["active", "0x40000000"])),
+        "Boot0099"
+    );
+    assert_eq!(get("after-key0099", "Key0099"), seeded_key0099(), "Key0099");
 }

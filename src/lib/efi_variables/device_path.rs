@@ -134,6 +134,40 @@ pub(crate) fn device_paths(bytes: &[u8]) -> Result<Vec<&[u8]>, DevicePathTextErr
     }
 }
 
+/// The instances of `path`, one device path that its End Entire Device Path node ends, each
+/// without the End node that ends it.
+pub(crate) fn instances(path: &[u8]) -> Result<Vec<&[u8]>, DevicePathTextError> {
+    let mut instances = Vec::new();
+    let (mut start, mut end) = (0, 0);
+    for node in RawNodes::new(path) {
+        let node = node?;
+        if node.node_type == END {
+            instances.push(path.get(start..end).ok_or(DevicePathTextError::NoEnd)?);
+            start = end + NODE_HEADER_SIZE + node.data.len();
+        }
+        end += NODE_HEADER_SIZE + node.data.len();
+    }
+    Ok(instances)
+}
+
+/// The device path of the one instance `instance`, ended by an End Entire Device Path node.
+pub(crate) fn ended(instance: &[u8]) -> Vec<u8> {
+    [instance, &end_node(END_ENTIRE)].concat()
+}
+
+/// Whether `instance` holds a USB Class or USB WWID node: a short form, which edk2-stable202608's
+/// ConPlatformDxe matches to a device by its class or WWID, not by bytes
+/// (MatchUsbShortformDevicePath()).
+pub(crate) fn holds_usb_short_form(instance: &[u8]) -> Result<bool, DevicePathTextError> {
+    for node in RawNodes::new(instance) {
+        let node = node?;
+        if node.node_type == MESSAGING && matches!(node.sub_type, usb::USB_CLASS | usb::USB_WWID) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The text of `path`, one device path that its End Entire Device Path node ends: nodes
 /// separated by "/", instances by ",/" as edk2 writes them.
 pub(crate) fn to_text(path: &[u8]) -> Result<String, DevicePathTextError> {
@@ -175,10 +209,6 @@ pub(crate) fn to_text(path: &[u8]) -> Result<String, DevicePathTextError> {
 /// nodes separated by "/", instances by ",", as edk2's ConvertTextToDevicePath() reads them, but
 /// for the texts that it reads to a node of another form or to an instance of no node, which
 /// from_text refuses.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "nothing writes a device path from its text yet")
-)]
 pub(crate) fn from_text(text: &str) -> Result<Vec<u8>, DevicePathTextError> {
     let nodes = node_texts(text)?;
     if nodes.is_empty() {
@@ -645,7 +675,7 @@ pub(crate) mod tests {
     pub(crate) const X64_BOOT0001: &str = "010000001600550045004600490020004d006900730063002000440065007600690063006500000002010c00d041030a000000000101060000017fff04004eac0881119f594d850ee21a522c59b2";
     pub(crate) const X64_BOOT0002: &str = "010000002c00450046004900200049006e007400650072006e0061006c0020005300680065006c006c00000004071400c9bdb87cebf8344faaea3ee4af6516a10406140083a5047c3e9e1c4fad65e05268d0b4d17fff0400";
     pub(crate) const X64_CONOUT: &str = "02010c00d041030a0000000001010600001f02010c00d041010500000000030e13000000000000c2010000000000080101030a1400d6a015adec8bcf4aa073d01de77e2d887f01040002010c00d041030a0000000001010600001f02010c00d041010501000000030e13000000000000c2010000000000080101030a1400d6a015adec8bcf4aa073d01de77e2d887fff0400";
-    const X64_CONIN: &str = "02010c00d041030a0000000001010600001f02010c00d0410303000000007f01040002010c00d041030a0000000001010600001f02010c00d041010500000000030e13000000000000c2010000000000080101030a1400d6a015adec8bcf4aa073d01de77e2d887f01040002010c00d041030a0000000001010600001f02010c00d041010501000000030e13000000000000c2010000000000080101030a1400d6a015adec8bcf4aa073d01de77e2d887f010400030f0b00ffffffff0301017fff0400";
+    pub(crate) const X64_CONIN: &str = "02010c00d041030a0000000001010600001f02010c00d0410303000000007f01040002010c00d041030a0000000001010600001f02010c00d041010500000000030e13000000000000c2010000000000080101030a1400d6a015adec8bcf4aa073d01de77e2d887f01040002010c00d041030a0000000001010600001f02010c00d041010501000000030e13000000000000c2010000000000080101030a1400d6a015adec8bcf4aa073d01de77e2d887f010400030f0b00ffffffff0301017fff0400";
     pub(crate) const AA64_BOOT0000: &str = "090100002c0055006900410070007000000004071400fe4a07640a34e64b94ba91b5b4d0f71e0406140021aa2c4614760345836e8ab6f46623317fff0400";
     const AA64_BOOT0001: &str = "010000001600550045004600490020004d006900730063002000440065007600690063006500000002010c00d041030a000000000101060000027fff04004eac0881119f594d850ee21a522c59b2";
     const AA64_BOOT0002: &str = "010000002c00450046004900200049006e007400650072006e0061006c0020005300680065006c006c00000004071400fe4a07640a34e64b94ba91b5b4d0f71e0406140083a5047c3e9e1c4fad65e05268d0b4d17fff0400";

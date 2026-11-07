@@ -17,9 +17,12 @@
 //! and those that the OS writes, as attributes.rs writes them.
 
 mod attributes;
+mod consoles;
+mod creation;
 
 use std::fmt;
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use serde::ser::SerializeMap;
@@ -31,7 +34,9 @@ use super::device_path;
 use super::enhanced_authenticated::metadata_end;
 use super::enhanced_authenticated::MetadataRefusal;
 use super::globals::lower_hex;
+use super::globals::read_global;
 use super::globals::serialize_bits;
+use super::globals::BootOptionSupport;
 use super::globals::GlobalContents;
 use super::globals::GlobalValue;
 use super::globals::GlobalVariable;
@@ -42,6 +47,7 @@ use super::key_option::InputKey;
 use super::key_option::KeyModifier;
 use super::key_option::KeyModifiers;
 use super::key_option::KeyOption;
+use super::load_option::FilePathList;
 use super::load_option::LoadOption;
 use super::load_option::LoadOptionAttributes;
 use super::VariableContents;
@@ -56,6 +62,11 @@ pub(crate) use attributes::set_attributes;
 pub use attributes::AttributeChange;
 pub use attributes::AttributesSet;
 pub use attributes::HotKeysFollowing;
+pub(crate) use consoles::set_device_path;
+pub use consoles::DevicePathSet;
+pub(crate) use creation::create_load_option;
+pub use creation::LoadOptionCreated;
+pub use creation::NewLoadOption;
 
 /// The name of the hot key variables before their option number (UEFI 2.11 §3.1.6)
 const HOT_KEY_PREFIX: &str = "Key";
@@ -66,6 +77,13 @@ const DEFINED_ATTRIBUTES: LoadOptionAttributes =
 /// LOAD_OPTION_CATEGORY, a field whose values but LOAD_OPTION_CATEGORY_BOOT (0) and
 /// LOAD_OPTION_CATEGORY_APP (0x100) are reserved
 const CATEGORY: LoadOptionAttributes = LoadOptionAttributes::from_bits_retain(0x0000_1F00);
+/// NV, BS, RT: the attributes of the load options, hot keys, ConIn, ConOut and ErrOut in UEFI 2.11
+/// Table 3.1, which the subcommands create them with
+const BOOT_MANAGER_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
+    .union(VariableAttributes::BOOTSERVICE_ACCESS)
+    .union(VariableAttributes::RUNTIME_ACCESS);
+/// The variable that tells what the boot manager supports (UEFI 2.11 §3.1.4)
+const BOOT_OPTION_SUPPORT: &str = "BootOptionSupport";
 
 /// The kinds of load option variables (UEFI 2.11 §3.1.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +373,49 @@ fn value_after_metadata(contents: &VariableContents) -> Result<&[u8], MetadataRe
         .and_then(|end| data.get(end..).ok_or(MetadataRefusal::truncated(data)))
 }
 
+/// What BootOptionSupport tells that `variables` hold; when it is absent, no flag and a count of
+/// 0, as of a boot manager that supports none of what it tells.
+fn boot_option_support(variables: &impl VariableData) -> Result<BootOptionSupport> {
+    let global = read_global(variables, BOOT_OPTION_SUPPORT, None)?;
+    match global.contents.map(|contents| contents.value) {
+        None => Ok(BootOptionSupport::from(0)),
+        Some(GlobalValue::BootOptionSupport(support)) => Ok(support),
+        Some(other) => Err(anyhow!("{BOOT_OPTION_SUPPORT} decoded as {other:?}")),
+    }
+}
+
+/// The device paths of a load option or console variable: texts, as variable get shows them, or
+/// files of their bytes, an EFI_DEVICE_PATH_PROTOCOL each, written as they are.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DevicePathSource {
+    Texts(Vec<String>),
+    Bytes(Vec<Vec<u8>>),
+}
+
+impl DevicePathSource {
+    /// Their bytes, packed as a FilePathList; each file's must be device paths that decode.
+    fn file_path_list(&self) -> Result<FilePathList> {
+        let mut bytes = Vec::new();
+        match self {
+            Self::Texts(texts) => {
+                for text in texts {
+                    let path = device_path::from_text(text)
+                        .with_context(|| format!("--device-path {text:?}"))?;
+                    bytes.extend(path);
+                }
+            }
+            Self::Bytes(paths) => {
+                for (index, path) in paths.iter().enumerate() {
+                    FilePathList::try_from(path.as_slice())
+                        .with_context(|| format!("--device-path-file #{}", index + 1))?;
+                    bytes.extend(path);
+                }
+            }
+        }
+        Ok(FilePathList::try_from(bytes.as_slice())?)
+    }
+}
+
 /// The EFI_LOAD_OPTION of `data`, as variable get shows it.
 fn load_option_data(data: &[u8]) -> Result<LoadOptionData> {
     let option = LoadOption::decode(data)?;
@@ -584,6 +645,16 @@ impl DevicePathText {
                 bytes: path.to_vec(),
                 reason: error.to_string(),
             },
+        }
+    }
+}
+
+/// Its text, else its bytes in hex.
+impl fmt::Display for DevicePathText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f.write_str(text),
+            Self::NoText { bytes, .. } => f.write_str(&lower_hex(bytes)),
         }
     }
 }

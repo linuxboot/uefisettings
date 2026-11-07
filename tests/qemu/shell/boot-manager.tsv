@@ -1,9 +1,18 @@
-# The checks of shell/boot-manager.nsh, the UEFI Shell boot of boot-manager: get shows Boot0099 and
-# Key0099 as tests/qemu/vars/boot-manager.json seeds them, as Linux showed them in boot 1;
-# set-attributes refuses PlatformRecovery####, OsRecovery####, an absent load option and a flag both
-# to set and to clear, leaving the global variables as they were; it clears and sets Boot0099's
-# LOAD_OPTION_ACTIVE, keeping its undefined bit, and Key0099 follows it, and sets and clears
-# Driver0000's LOAD_OPTION_FORCE_RECONNECT, as Linux did in boot 1. See check-shell-log.sh.
+# The checks of shell/boot-manager.nsh, the first UEFI Shell boot of boot-manager: the firmware's
+# boot manager loaded it through Boot009A, which BootNext named and Linux created in boot 1, from
+# the device path that get shows, and BootNext is gone; get shows Boot0099 and Key0099 as
+# tests/qemu/vars/boot-manager.json seeds them, as Linux showed them; set-attributes refuses
+# PlatformRecovery####, OsRecovery####, an absent load option and a flag both to set and to clear,
+# create-load-option refuses Boot0099, which exists, and set-device-path ConOutDev, leaving the
+# global variables as they were; set-attributes clears and sets Boot0099's LOAD_OPTION_ACTIVE,
+# keeping its undefined bit, and Key0099 follows it, and sets and clears Driver0000's
+# LOAD_OPTION_FORCE_RECONNECT, as Linux did; create-load-option creates Boot009B, of the short-form
+# File Path of uefisettings.efi, which BootNext then names. See check-shell-log.sh.
+boot009a	status	0x0
+boot009a	firmware	.value as $v | . == {"variable": "Boot009A-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"attributes": ["active"], "category": "boot", "description": "uefisettings Shell", "device_paths": $v.device_paths, "optional_data": ""}} and ($firmware | any(. == "BdsDxe: loading Boot009A \"\($v.description)\" from \($v.device_paths[0])"))
+boot009a	linux	boot1.test.log created-boot009a . == $linux
+boot-next-gone	status	0x0
+boot-next-gone	json	. == {"variable": "BootNext-8be4df61-93ca-11d2-aa0d-00e098032b8c", "absent": true}
 seeded-boot0099	status	0x0
 seeded-boot0099	json	. == {"variable": "Boot0099-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"attributes": ["active", "0x40000000"], "category": "boot", "description": "file missing-99.efi", "device_paths": ["\\missing-99.efi"], "optional_data": "7565666973657474696e6773"}}
 seeded-boot0099	linux	boot1.test.log seeded-boot0099 . == $linux
@@ -19,6 +28,10 @@ absent	status	aborted
 absent	line	Boot1234 is absent
 set-and-clear	status	aborted
 set-and-clear	line	set-attributes cannot both set and clear active
+create-existing	status	aborted
+create-existing	line	Boot0099 exists: create-load-option creates load options
+con-out-dev	status	aborted
+con-out-dev	line	set-device-path does not write ConOutDev: .*These variables are volatile
 after-refusals	status	any
 after-refusals	same	before-refusals
 inactive-boot0099	status	0x0
@@ -38,3 +51,7 @@ driver-force-reconnect	linux	boot1.test.log driver-force-reconnect . == $linux
 driver-reconnect-cleared	status	0x0
 driver-reconnect-cleared	json	.variable == "Driver0000-8be4df61-93ca-11d2-aa0d-00e098032b8c" and .value.attributes == ["active"]
 driver-reconnect-cleared	linux	boot1.test.log driver-reconnect-cleared . == $linux
+created-boot009b	status	0x0
+created-boot009b	json	. == {"variable": "Boot009B-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"attributes": ["active"], "category": "boot", "description": "uefisettings again", "device_paths": ["\\uefisettings.efi"], "optional_data": ""}}
+boot-next	status	0x0
+boot-next	json	. == {"variable": "BootNext-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": "Boot009B"}

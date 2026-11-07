@@ -55,14 +55,22 @@ use crate::efi_variables::authenticated::SignedWrite;
 pub use crate::efi_variables::authenticated::TimeStamp;
 #[cfg(variable_data)]
 pub use crate::efi_variables::authenticated::TimeStampError;
+#[cfg(variable_data)]
+use crate::efi_variables::boot_manager::create_load_option;
 #[cfg(variable_names)]
 use crate::efi_variables::boot_manager::hot_key_listing;
 #[cfg(variable_data)]
 use crate::efi_variables::boot_manager::set_attributes;
 #[cfg(variable_data)]
+use crate::efi_variables::boot_manager::set_device_path;
+#[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::AttributeChange;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::AttributesSet;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::DevicePathSet;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::DevicePathSource;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::DevicePathText;
 #[cfg(variable_data)]
@@ -74,9 +82,13 @@ pub use crate::efi_variables::boot_manager::HotKeysFollowing;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::LoadOptionCategory;
 #[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::LoadOptionCreated;
+#[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::LoadOptionData;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::LoadOptionFlag;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::NewLoadOption;
 #[cfg(capsule_delivery)]
 use crate::efi_variables::deliver_json_capsule;
 #[cfg(variable_data)]
@@ -570,6 +582,19 @@ impl VariableBackend {
             name,
             change,
         )
+    }
+
+    /// Creates the load option `name`, a Boot####, Driver#### or SysPrep#### of
+    /// EFI_GLOBAL_VARIABLE that does not exist, as `new` says; returns what it wrote and why the
+    /// boot manager may not take it.
+    pub fn create_load_option(name: &str, new: &NewLoadOption) -> Result<LoadOptionCreated> {
+        create_load_option(&Self::system_variable_data()?, name, new)
+    }
+
+    /// Sets the console variable `name`, ConIn, ConOut or ErrOut, to the one device path of
+    /// `path`; returns what it wrote and why the firmware may not use it.
+    pub fn set_device_path(name: &str, path: &DevicePathSource) -> Result<DevicePathSet> {
+        set_device_path(&Self::system_variable_data()?, name, path)
     }
 
     /// The Key#### variables of this machine.

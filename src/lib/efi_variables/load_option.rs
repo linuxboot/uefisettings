@@ -225,6 +225,19 @@ impl FilePathList {
     }
 }
 
+/// `bytes` as a FilePathList, as parse checks them, and short enough for FilePathListLength.
+impl TryFrom<&[u8]> for FilePathList {
+    type Error = LoadOptionError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let list = Self::parse(bytes)?;
+        match u16::try_from(bytes.len()) {
+            Ok(_) => Ok(list),
+            Err(_) => Err(LoadOptionError::FilePathListTooLong(bytes.len())),
+        }
+    }
+}
+
 impl AsRef<[u8]> for FilePathList {
     fn as_ref(&self) -> &[u8] {
         &self.0

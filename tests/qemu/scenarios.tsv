@@ -113,7 +113,7 @@ shell-variable-get-secboot-user	-	-	shell:variable-get-secboot-user	firmware=sec
 variable-get-devdb	-	devdb.json	global_variables/get_devdb	-
 shell-variable-get-devdb	-	devdb.json	shell:variable-get-devdb	-
 global-variables	-	boot-options.json	global_variables/set_before_reboot,global_variables/after_reboot	-
-boot-manager	/DriverSample.efi	boot-manager.json	boot_manager/before_shell,shell:boot-manager	-
+boot-manager	/DriverSample.efi	boot-manager.json	boot_manager/before_shell,shell:boot-manager,shell:boot-manager-next,boot_manager/after_shell	-
 shell-global-variables	-	-	shell:global-variables,shell:global-variables-reboot	-
 secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
 secboot-user	-	-	secboot/user_mode	firmware=secboot-user

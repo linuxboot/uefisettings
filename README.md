@@ -140,25 +140,29 @@ writes no variable of a HiiDB with such a password question or with IFR that it 
 
 ```plain
 Commands:
-  get             Show the attributes and the decoded value of a global variable of UEFI 2.11
-                  section 3.3, its load options, hot keys and device paths as text among them, or of
-                  a signature database, or that it is absent
-  help            Print this message or the help of the given subcommand(s)
-  info            Show the attributes and the size of an EFI variable, and the
-                  EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access,
-                  never its data
-  list            List the name and vendor GUID of every EFI variable, never its data
-  set             Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
-                  BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications; or,
-                  in the UEFI Shell, AuditMode and DeployedMode with
-                  --i-am-fine-to-brick-this-system
-  set-attributes  Set and clear the flags and set the category of a Boot####, Driver#### or
-                  SysPrep####, keeping its other bits and bytes, and the Key#### of a Boot####
-                  following it
-  storage         Show the storage space of the EFI variables of some attributes, and how much of it
-                  is left
-  write-signed    Write an EFI variable from a signed payload, or from new data that a key signs;
-                  the firmware verifies the signature
+  create-load-option  Create a Boot####, Driver#### or SysPrep#### that does not exist, from device
+                      paths as text or files of their bytes
+  get                 Show the attributes and the decoded value of a global variable of UEFI 2.11
+                      section 3.3, its load options, hot keys and device paths as text among them,
+                      or of a signature database, or that it is absent
+  help                Print this message or the help of the given subcommand(s)
+  info                Show the attributes and the size of an EFI variable, and the
+                      EFI_VARIABLE_AUTHENTICATION_3 metadata of one with
+                      enhanced-authenticated-access, never its data
+  list                List the name and vendor GUID of every EFI variable, never its data
+  set                 Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
+                      BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications;
+                      or, in the UEFI Shell, AuditMode and DeployedMode with
+                      --i-am-fine-to-brick-this-system
+  set-attributes      Set and clear the flags and set the category of a Boot####, Driver#### or
+                      SysPrep####, keeping its other bits and bytes, and the Key#### of a Boot####
+                      following it
+  set-device-path     Set ConIn, ConOut or ErrOut to a device path, as text or a file of its bytes,
+                      keeping its attributes
+  storage             Show the storage space of the EFI variables of some attributes, and how much
+                      of it is left
+  write-signed        Write an EFI variable from a signed payload, or from new data that a key
+                      signs; the firmware verifies the signature
 ```
 
 `capsule`:
@@ -736,6 +740,45 @@ _2 descriptor writes (§8.2.3).
 
 ```sh
 uefisettings variable set-attributes Boot0001 --clear active
+```
+
+`variable create-load-option NAME --description TEXT (--device-path TEXT... | --device-path-file
+FILE...) [--optional-data-file FILE] [--flags FLAGS] [--category CATEGORY]` creates a Boot####,
+Driver#### or SysPrep#### of EFI_GLOBAL_VARIABLE that does not exist, with NV+BS+RT (UEFI 2.11 Table
+3.1): `--description` takes its Description, UCS-2 text without Null; `--device-path` takes a device
+path as `variable get` shows it, read back to bytes, once per device path of its FilePathList, the
+first of which locates the image; `--device-path-file` takes instead a file of the bytes of one, an
+EFI_DEVICE_PATH_PROTOCOL, which the FilePathList decoder checks and nothing changes;
+`--optional-data-file` takes its OptionalData, bytes never decoded, none if not given; `--flags` and
+`--category` take its Attributes, `active` and `boot` if not given, and `--flags none` no flag, so
+that an app that is not active, Attributes 0x100, takes one write: "When creating a new load option,
+all undefined attribute bits must be written as zero" (§3.1.3). It refuses an existing load option:
+`variable set-attributes` changes one, and `variable set BootOrder` its place in BootOrder, which a
+new one stays out of. A SysPrep#### while BootOptionSupport lacks EFI_BOOT_OPTION_SUPPORT_SYSPREP,
+and an app Boot#### while it lacks EFI_BOOT_OPTION_SUPPORT_APP, get a warning on stderr and are
+written all the same (§3.1.4); an absent BootOptionSupport supports neither. The category "is
+ignored for variables of the form Driver####, SysPrep####, or OsRecovery####" (§3.1.3), so theirs
+gets none. It prints what it wrote as `variable get` shows it, and refuses, before any write, a path
+that does not read or decode.
+
+```sh
+uefisettings variable create-load-option Boot0005 --description UiApp --device-path 'Fv(7CB8BDC9-F8EB-4F34-AAEA-3EE4AF6516A1)/FvFile(462CAA21-7614-4503-836E-8AB6F4662331)'
+```
+
+`variable set-device-path NAME (--device-path TEXT | --device-path-file FILE)` sets ConIn, ConOut or
+ErrOut to one device path, from text or a file of its bytes, keeping the variable's attributes, or
+with NV+BS+RT if it is missing. ConIn, ConOut and ErrOut "are always proper subsets of ConInDev,
+ConOutDev, and ErrOutDev" (UEFI 2.11 §3.3), so each instance that the `*Dev` variable lacks gets a
+warning on stderr, but one holding a USB Class or USB WWID node, which the firmware matches to the
+devices of that class or WWID (edk2-stable202608 ConPlatformDxe MatchUsbShortformDevicePath()); the
+write still proceeds. It refuses ConInDev, ConOutDev and ErrOutDev, which "are volatile, and are set
+dynamically on every boot". It prints what it wrote as `variable get` shows it, and refuses, before
+any write, a path that does not read or decode, and alike a console variable whose attributes hold
+EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS or EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+which only an EFI_VARIABLE_AUTHENTICATION_3 or _2 descriptor writes (§8.2.3).
+
+```sh
+uefisettings variable set-device-path ConOut --device-path 'PciRoot(0x0)/Pci(0x1F,0x0)/Serial(0x0)/Uart(115200,8,N,1)/VenUtf8()'
 ```
 
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)

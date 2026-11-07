@@ -500,7 +500,11 @@ undefined attribute bit and OptionalData, which `BootOrder` does not list, and `
 key, CTRL-q, to `Boot0099`, whose `BootOptionCrc` is the CRC-32 of that `Boot0099`. The
 firmware's boot manager keeps both, as it keeps every load option that it did not create, and
 ignores a key whose CRC does not match. Its `Driver0000` loads `DriverSample.efi`, as in the HII
-scenarios.
+scenarios. Its Linux boot creates `Boot009A`, to the firmware's UEFI Shell, and names it in
+`BootNext`; the firmware starts the Shell through it, and the Shell creates `Boot009B`, of the
+short-form File Path of `uefisettings.efi`, and names that in `BootNext`. In the next boot,
+`uefisettings.efi` prints its usage and returns, and the firmware starts the Shell of `BootOrder`.
+The Shell checks read the lines in which the firmware's boot manager logged each load.
 
 ## Secure Boot
 

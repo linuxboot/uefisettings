@@ -12,17 +12,25 @@
 
 //! The variable subcommands that write the boot manager's variables (UEFI 2.11 §3.1).
 
+use std::path::PathBuf;
+
+use anyhow::bail;
 use anyhow::Result;
+use clap::builder::PossibleValue;
+use clap::ArgGroup;
 use clap::Args;
 use clap::Subcommand;
 use clap::ValueEnum;
 use uefisettings::exports::AttributeChange;
+use uefisettings::exports::DevicePathSource;
 use uefisettings::exports::HotKeysFollowing;
 use uefisettings::exports::LoadOptionCategory;
 use uefisettings::exports::LoadOptionFlag;
+use uefisettings::exports::NewLoadOption;
 use uefisettings::exports::VariableBackend;
 
 use super::print_global_variable;
+use crate::platform;
 
 #[derive(Debug, Subcommand)]
 pub(super) enum BootManagerSubcommands {
@@ -30,12 +38,22 @@ pub(super) enum BootManagerSubcommands {
     /// keeping its other bits and bytes, and the Key#### of a Boot#### following it
     #[command(next_display_order = None)]
     SetAttributes(SetAttributesArgs),
+    /// Create a Boot####, Driver#### or SysPrep#### that does not exist, from device paths as
+    /// text or files of their bytes
+    #[command(next_display_order = None)]
+    CreateLoadOption(CreateLoadOptionArgs),
+    /// Set ConIn, ConOut or ErrOut to a device path, as text or a file of its bytes, keeping
+    /// its attributes
+    #[command(next_display_order = None)]
+    SetDevicePath(SetDevicePathArgs),
 }
 
 impl BootManagerSubcommands {
     pub(super) fn run(&self) -> Result<()> {
         match self {
             Self::SetAttributes(args) => args.run(),
+            Self::CreateLoadOption(args) => args.run(),
+            Self::SetDevicePath(args) => args.run(),
         }
     }
 }
@@ -79,6 +97,113 @@ impl SetAttributesArgs {
                 .collect(),
             category: self.category.map(LoadOptionCategory::from),
         }
+    }
+}
+
+/// The load option to create.
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("device_paths").required(true).args(["device_path", "device_path_file"])))]
+pub(super) struct CreateLoadOptionArgs {
+    /// The load option, such as Boot0001, of vendor 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+    name: String,
+    /// Its Description, UCS-2 text, which boot menus show
+    #[arg(long)]
+    description: String,
+    /// A device path as variable get shows it, such as PciRoot(0x0)/Pci(0x1,0x0), once per device path, the first of which locates the image
+    #[arg(long)]
+    device_path: Vec<String>,
+    /// A file of the bytes of a device path, an EFI_DEVICE_PATH_PROTOCOL ended by an End Entire Device Path node, written as they are, once per device path
+    #[arg(long)]
+    device_path_file: Vec<PathBuf>,
+    /// A file of its OptionalData, the bytes that the boot manager passes to the image, written as they are; none if not given
+    #[arg(long)]
+    optional_data_file: Option<PathBuf>,
+    /// Its flags, comma-separated, or none
+    #[arg(long, value_enum, value_delimiter = ',', default_values_t = [NewFlagArg::Flag(FlagArg::Active)])]
+    flags: Vec<NewFlagArg>,
+    /// Its category: boot options boot, app ones the boot manager starts only when asked to
+    #[arg(long, value_enum, default_value_t = CategoryArg::Boot)]
+    category: CategoryArg,
+}
+
+impl CreateLoadOptionArgs {
+    /// Creates the load option and prints it as get shows it, and each warning on stderr.
+    fn run(&self) -> Result<()> {
+        let optional_data = match &self.optional_data_file {
+            Some(path) => platform::read_payload(path)?,
+            None => Vec::new(),
+        };
+        let new = NewLoadOption {
+            flags: self.flags()?,
+            category: self.category.into(),
+            description: self.description.clone(),
+            device_paths: device_path_source(&self.device_path, &self.device_path_file)?,
+            optional_data,
+        };
+        let created = VariableBackend::create_load_option(&self.name, &new)?;
+        for warning in &created.warnings {
+            eprintln!("warning: {warning}");
+        }
+        print_global_variable(&created.option)
+    }
+
+    /// The flags of --flags: none for no flag, alone.
+    fn flags(&self) -> Result<Vec<LoadOptionFlag>> {
+        match self.flags.as_slice() {
+            [NewFlagArg::None] => Ok(Vec::new()),
+            flags => flags
+                .iter()
+                .map(|flag| match flag {
+                    NewFlagArg::None => bail!("--flags takes none alone, for no flag"),
+                    NewFlagArg::Flag(flag) => Ok(LoadOptionFlag::from(*flag)),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The console variable and its device path.
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("path").required(true).args(["device_path", "device_path_file"])))]
+pub(super) struct SetDevicePathArgs {
+    /// ConIn, ConOut or ErrOut
+    name: String,
+    /// The device path as variable get shows it, its instances separated by ","
+    #[arg(long)]
+    device_path: Option<String>,
+    /// A file of its bytes, an EFI_DEVICE_PATH_PROTOCOL ended by an End Entire Device Path node, written as they are
+    #[arg(long)]
+    device_path_file: Option<PathBuf>,
+}
+
+impl SetDevicePathArgs {
+    /// Writes the device path and prints the variable as get shows it, and each warning on
+    /// stderr.
+    fn run(&self) -> Result<()> {
+        let path = device_path_source(
+            self.device_path.as_slice(),
+            self.device_path_file.as_slice(),
+        )?;
+        let set = VariableBackend::set_device_path(&self.name, &path)?;
+        for warning in &set.warnings {
+            eprintln!("warning: {warning}");
+        }
+        print_global_variable(&set.console)
+    }
+}
+
+/// The device paths of `texts`, else of the files `files`, which the argument groups keep
+/// apart.
+fn device_path_source(texts: &[String], files: &[PathBuf]) -> Result<DevicePathSource> {
+    match files.is_empty() {
+        true => Ok(DevicePathSource::Texts(texts.to_vec())),
+        false => Ok(DevicePathSource::Bytes(
+            files
+                .iter()
+                .map(PathBuf::as_path)
+                .map(platform::read_payload)
+                .collect::<Result<_>>()?,
+        )),
     }
 }
 
@@ -134,6 +259,31 @@ impl From<CategoryArg> for LoadOptionCategory {
         match category {
             CategoryArg::Boot => Self::Boot,
             CategoryArg::App => Self::App,
+        }
+    }
+}
+
+/// A flag of create-load-option: a FlagArg, or none, for Attributes of the category alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewFlagArg {
+    None,
+    Flag(FlagArg),
+}
+
+impl ValueEnum for NewFlagArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Self::None,
+            Self::Flag(FlagArg::Active),
+            Self::Flag(FlagArg::ForceReconnect),
+            Self::Flag(FlagArg::Hidden),
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        match self {
+            Self::None => Some(PossibleValue::new("none")),
+            Self::Flag(flag) => flag.to_possible_value(),
         }
     }
 }
@@ -257,6 +407,19 @@ mod tests {
 
             assert_eq!(name, LoadOptionFlag::from(*flag).name(), "{flag:?}");
         }
+        assert_eq!(
+            NewFlagArg::value_variants(),
+            [
+                &[NewFlagArg::None][..],
+                &FlagArg::value_variants()
+                    .iter()
+                    .copied()
+                    .map(NewFlagArg::Flag)
+                    .collect::<Vec<_>>(),
+            ]
+            .concat(),
+            "create-load-option's flags: none, then each flag"
+        );
         for category in CategoryArg::value_variants() {
             let name = category
                 .to_possible_value()
@@ -269,6 +432,197 @@ mod tests {
                 LoadOptionCategory::from(*category).name(),
                 "{category:?}"
             );
+        }
+    }
+
+    /// create-load-option takes the load option, a Description, device paths as text or files,
+    /// not both, at least one, OptionalData from a file if any, and flags, or none alone, and a
+    /// category, active and boot if not given.
+    #[test]
+    fn create_load_option_takes_device_paths_as_text_or_files() {
+        let parse =
+            |args: &[&str]| match boot_manager(&[&["create-load-option"][..], args].concat()) {
+                Ok(BootManagerSubcommands::CreateLoadOption(parsed)) => Ok(parsed),
+                Ok(other) => panic!("{args:?} is no create-load-option: {other:?}"),
+                Err(kind) => Err(kind),
+            };
+
+        let texts = parse(&[
+            "Boot0001",
+            "--description",
+            "Shell",
+            "--device-path",
+            "Pci(0x1,0x0)",
+            "--device-path",
+            "Pci(0x2,0x0)",
+        ])
+        .expect("parse texts");
+        let files = parse(&[
+            "Boot0001",
+            "--description",
+            "Shell",
+            "--device-path-file",
+            "a.bin",
+            "--optional-data-file",
+            "o.bin",
+            "--flags",
+            "hidden,force-reconnect",
+            "--category",
+            "app",
+        ])
+        .expect("parse files");
+
+        assert_eq!(
+            (
+                texts.device_path.as_slice(),
+                texts.device_path_file.as_slice(),
+                texts.optional_data_file.as_deref(),
+                texts.flags().expect("the default flags"),
+                texts.category,
+            ),
+            (
+                &["Pci(0x1,0x0)".to_owned(), "Pci(0x2,0x0)".to_owned()][..],
+                &[][..],
+                None,
+                vec![LoadOptionFlag::Active],
+                CategoryArg::Boot,
+            ),
+            "texts, the default flags and category"
+        );
+        assert_eq!(
+            (
+                files.device_path.as_slice(),
+                files.device_path_file.as_slice(),
+                files.optional_data_file.as_deref(),
+                files.flags().expect("hidden,force-reconnect"),
+                files.category,
+            ),
+            (
+                &[][..],
+                &[PathBuf::from("a.bin")][..],
+                Some(std::path::Path::new("o.bin")),
+                vec![LoadOptionFlag::Hidden, LoadOptionFlag::ForceReconnect],
+                CategoryArg::App,
+            ),
+            "files"
+        );
+
+        // no flag: Attributes of the category alone, such as 0x100 of an app
+        let app = |flags: &str| {
+            parse(&[
+                "Boot0001",
+                "--description",
+                "Shell",
+                "--device-path",
+                "Pci(0x1,0x0)",
+                "--flags",
+                flags,
+                "--category",
+                "app",
+            ])
+            .unwrap_or_else(|kind| panic!("parse --flags {flags}: {kind}"))
+        };
+        let none = app("none");
+        assert_eq!(
+            (none.flags().expect("--flags none"), none.category),
+            (vec![], CategoryArg::App),
+            "--flags none"
+        );
+        for flags in ["none,active", "hidden,none", "none,none"] {
+            assert_eq!(
+                app(flags).flags().map_err(|error| error.to_string()),
+                Err("--flags takes none alone, for no flag".to_owned()),
+                "--flags {flags}"
+            );
+        }
+        for (args, want) in [
+            (
+                &["Boot0001", "--description", "Shell"][..],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["Boot0001", "--device-path", "Pci(0x1,0x0)"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &[
+                    "Boot0001",
+                    "--description",
+                    "Shell",
+                    "--device-path",
+                    "Pci(0x1,0x0)",
+                    "--device-path-file",
+                    "a.bin",
+                ],
+                ErrorKind::ArgumentConflict,
+            ),
+            (
+                &[
+                    "Boot0001",
+                    "--description",
+                    "Shell",
+                    "--device-path",
+                    "Pci(0x1,0x0)",
+                    "--flags",
+                    "app",
+                ],
+                ErrorKind::InvalidValue,
+            ),
+        ] {
+            assert_eq!(parse(args).map(|_| ()), Err(want), "{args:?}");
+        }
+    }
+
+    /// set-device-path takes the console variable and one device path, as text or a file.
+    #[test]
+    fn set_device_path_takes_one_device_path() {
+        let parse = |args: &[&str]| match boot_manager(&[&["set-device-path"][..], args].concat()) {
+            Ok(BootManagerSubcommands::SetDevicePath(parsed)) => Ok(parsed),
+            Ok(other) => panic!("{args:?} is no set-device-path: {other:?}"),
+            Err(kind) => Err(kind),
+        };
+
+        let text = parse(&["ConOut", "--device-path", "Pci(0x1,0x0)"]).expect("parse a text");
+        let file = parse(&["ConOut", "--device-path-file", "a.bin"]).expect("parse a file");
+
+        assert_eq!(
+            (
+                text.name.as_str(),
+                text.device_path.as_deref(),
+                text.device_path_file
+            ),
+            ("ConOut", Some("Pci(0x1,0x0)"), None),
+            "text"
+        );
+        assert_eq!(
+            (file.device_path, file.device_path_file),
+            (None, Some(PathBuf::from("a.bin"))),
+            "file"
+        );
+        for (args, want) in [
+            (&["ConOut"][..], ErrorKind::MissingRequiredArgument),
+            (
+                &[
+                    "ConOut",
+                    "--device-path",
+                    "Pci(0x1,0x0)",
+                    "--device-path-file",
+                    "a.bin",
+                ],
+                ErrorKind::ArgumentConflict,
+            ),
+            (
+                &[
+                    "ConOut",
+                    "--device-path",
+                    "Pci(0x1,0x0)",
+                    "--device-path",
+                    "Pci(0x2,0x0)",
+                ],
+                ErrorKind::ArgumentConflict,
+            ),
+        ] {
+            assert_eq!(parse(args).map(|_| ()), Err(want), "{args:?}");
         }
     }
 
