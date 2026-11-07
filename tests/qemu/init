@@ -34,9 +34,12 @@ mount -t sysfs sysfs /sys
 # securityfs holds the lockdown mode, which uefisettings reads before firmware memory.
 mount -t securityfs securityfs /sys/kernel/security
 mount -t devtmpfs devtmpfs /dev
-# The modules that run.sh copies, which the guest's kernel has not built in.
+# The modules that run.sh copies, which the guest's kernel has not built in. Those that do not
+# load fail the setup once the terminal is known.
+unloaded=
 for module in /lib/modules/*.ko; do
-    [ -e "$module" ] && insmod "$module"
+    [ -e "$module" ] || continue
+    insmod "$module" || unloaded="$unloaded ${module##*/}"
 done
 
 test=
@@ -66,6 +69,7 @@ done
 # the start line on.
 printf '\nuefisettings-qemu-test: start %s %s\n' "$test" "$filter" > "$tty"
 setup_status=0
+[ -z "$unloaded" ] || { echo "cannot load:$unloaded" > "$tty"; setup_status=1; }
 efivars=/sys/firmware/efi/efivars
 case $efivarfs in
 default) mount -t efivarfs efivarfs "$efivars" ;;
