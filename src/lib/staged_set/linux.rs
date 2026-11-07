@@ -33,8 +33,9 @@ use super::StagedState;
 use crate::efi_variables::globals::secure_boot;
 use crate::efi_variables::VariableData;
 use crate::esp::linux::LinuxPaths;
-use crate::esp::linux::MountedEsp;
 use crate::esp::linux::PathDevices;
+use crate::esp::EspLocator;
+use crate::esp::MountedEsp;
 use crate::exports::set_refusal;
 use crate::exports::DriverHeldValues;
 use crate::exports::QuestionList;
@@ -221,7 +222,7 @@ enum Prepared {
     New(Vec<u8>),
 }
 
-/// The ESP that MountedEsp::locate finds, and how a request of `question` is staged there:
+/// The ESP that `paths` locates, and how a request of `question` is staged there:
 /// appended to the pending set, else in a new set with the bytes of `image`. Refused as set
 /// refuses `question`, before anything is staged.
 fn prepare(
@@ -230,7 +231,8 @@ fn prepare(
     image: Option<&Path>,
     question: &str,
 ) -> Result<(MountedEsp, Prepared)> {
-    let esp = MountedEsp::locate(variables, paths)
+    let esp = paths
+        .locate(variables)
         .map_err(|error| set_refusal(question, format!("{error:#}")))?;
     let prepared = match plan_stage(variables, &esp)
         .map_err(|error| set_refusal(question, format!("{error:#}")))?
@@ -246,7 +248,7 @@ fn prepare(
     Ok((esp, prepared))
 }
 
-/// Stages `request` on the ESP that MountedEsp::locate finds: appended to the pending set, else in
+/// Stages `request` on the ESP that `paths` locates: appended to the pending set, else in
 /// a new set of `nonce` whose Boot#### starts a copy of `image`. Returns set's annotation.
 fn stage_request(
     variables: &impl VariableData,
@@ -296,9 +298,9 @@ mod tests {
     use crate::efi_variables::globals::EFI_GLOBAL_VARIABLE;
     use crate::efi_variables::load_option::LoadOption;
     use crate::efi_variables::UEFISETTINGS_VENDOR_GUID;
-    use crate::esp::linux::tests::booted_from;
-    use crate::esp::linux::tests::gpt_512_esp;
     use crate::esp::linux::tests::FakeLinux;
+    use crate::esp::tests::booted_from;
+    use crate::esp::tests::gpt_512_esp;
     use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::parse_form_set;

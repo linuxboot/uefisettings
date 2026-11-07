@@ -14,18 +14,39 @@
 //! node (UEFI 2.11 §10.3.5.1) that names it to firmware. The table is the primary GPT (UEFI 2.11
 //! §5.3) behind a protective MBR (UEFI 2.11 §5.2.3), or a legacy MBR (UEFI 2.11 §5.2.1).
 
+use std::fs;
+use std::fs::File;
 use std::io;
+use std::io::Write;
+use std::path::PathBuf;
 
+use anyhow::anyhow;
+use anyhow::Context;
+use anyhow::Result;
+use sha2::Digest;
+use sha2::Sha256;
 use thiserror::Error;
 
+use crate::efi_variables::globals::boot_current;
 use crate::efi_variables::load_option::HardDrive;
+use crate::efi_variables::load_option::LoadOption;
 use crate::efi_variables::load_option::PartitionSignature;
+use crate::efi_variables::VariableData;
 use crate::hii::package::Guid;
+use crate::staged_set::Sha256Digest;
+use crate::staged_set::StagedFiles;
+use crate::staged_set::CAPSULE_DIRECTORY;
+use crate::staged_set::IMAGE_DIRECTORY;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 #[cfg(test)]
 mod sfdisk_images;
+// The Win32 calls, built for Windows alone; the locator builds for the tests of every host too.
+#[cfg(target_os = "windows")]
+pub(crate) mod win32_calls;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod windows;
 
 /// UniqueMBRDiskSignature, the four partition records and Signature of an MBR (UEFI 2.11
 /// Table 5.1)
@@ -650,20 +671,274 @@ pub(crate) enum PartitionTableError {
     },
 }
 
+/// A mounted EFI system partition: its mount point and the Hard Drive node of its partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountedEsp {
+    pub(crate) mount_point: PathBuf,
+    pub(crate) hard_drive: HardDrive,
+}
+
+impl MountedEsp {
+    /// Writes the entries of uefisettings' directory to the disk.
+    #[cfg(unix)]
+    fn sync_directory(&self) -> io::Result<()> {
+        File::open(self.directory())?.sync_all()
+    }
+
+    /// Nothing: on Windows, the file's sync_all already wrote its directory entry, those of its
+    /// parent directories and the FAT (FatCommonFlushBuffers of a UserFileOpen, filesys/fastfat/
+    /// flush.c of Microsoft's Windows-driver-samples).
+    #[cfg(windows)]
+    fn sync_directory(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// uefisettings' directory on the ESP.
+    fn directory(&self) -> PathBuf {
+        self.path_of(IMAGE_DIRECTORY)
+    }
+
+    /// The path through the mount point of the directory that the File Path `directory` names.
+    fn path_of(&self, directory: &str) -> PathBuf {
+        directory
+            .split('\\')
+            .fold(self.mount_point.clone(), |path, component| {
+                path.join(component)
+            })
+    }
+
+    /// The File Paths of the files in the directory that the File Path `directory` names; none
+    /// if it is missing.
+    fn files_in(&self, directory: &str) -> Result<Vec<String>> {
+        let path = self.path_of(directory);
+        let entries = match fs::read_dir(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            entries => entries.with_context(|| format!("read {}", path.display()))?,
+        };
+        entries
+            .map(|entry| {
+                let name = entry
+                    .with_context(|| format!("read {}", path.display()))?
+                    .file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    anyhow!(
+                        "{} holds a file named in no UTF-8: {name:?}",
+                        path.display()
+                    )
+                })?;
+                Ok(format!("{directory}\\{name}"))
+            })
+            .collect()
+    }
+
+    /// The file that the File Path `path` names, refused unless it names a file of uefisettings'
+    /// directory.
+    fn file(&self, path: &str) -> Result<PathBuf> {
+        path.strip_prefix(IMAGE_DIRECTORY)
+            .and_then(|rest| rest.strip_prefix('\\'))
+            .filter(|name| !matches!(*name, "" | "." | "..") && !name.contains(['\\', '/']))
+            .map(|name| self.directory().join(name))
+            .ok_or_else(|| anyhow!("{path:?} names no file of {IMAGE_DIRECTORY}"))
+    }
+}
+
+impl StagedFiles for MountedEsp {
+    fn list(&self) -> Result<Vec<String>> {
+        self.files_in(IMAGE_DIRECTORY)
+    }
+
+    /// The FAT file system of the ESP ignores letter case, as UEFI 2.11 §8.5.5 does for
+    /// CAPSULE_DIRECTORY.
+    fn capsules(&self) -> Result<Vec<String>> {
+        self.files_in(CAPSULE_DIRECTORY)
+    }
+
+    fn sha256(&self, path: &str) -> Result<Option<Sha256Digest>> {
+        let file = self.file(path)?;
+        match fs::read(&file) {
+            Ok(bytes) => Ok(Some(Sha256Digest(Sha256::digest(bytes).into()))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read {}", file.display())),
+        }
+    }
+
+    fn delete(&self, path: &str) -> Result<()> {
+        let file = self.file(path)?;
+        fs::remove_file(&file).with_context(|| format!("delete {}", file.display()))?;
+        let directory = self.directory();
+        match fs::remove_dir(&directory) {
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
+            removed => removed.with_context(|| format!("delete {}", directory.display())),
+        }
+    }
+
+    fn place(&self, path: &str, image: &[u8]) -> Result<Sha256Digest> {
+        let file = self.file(path)?;
+        let directory = self.directory();
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let mut created = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .with_context(|| format!("create {}", file.display()))?;
+        let written = created
+            .write_all(image)
+            .and_then(|()| created.sync_all())
+            .and_then(|()| self.sync_directory())
+            .and_then(|()| fs::read(&file));
+        match written {
+            Ok(bytes) => Ok(Sha256Digest(Sha256::digest(bytes).into())),
+            Err(error) => {
+                let removed = match fs::remove_file(&file) {
+                    Ok(()) => "deleted it".to_owned(),
+                    Err(error) => format!("could not delete it: {error}"),
+                };
+                Err(error).with_context(|| format!("write {}, then {removed}", file.display()))
+            }
+        }
+    }
+}
+
+/// The Hard Drive node of the device path of the Boot#### that BootCurrent names; None without
+/// BootCurrent, or if that device path holds no Hard Drive node.
+pub(crate) fn boot_current_hard_drive(variables: &impl VariableData) -> Result<Option<HardDrive>> {
+    let Some(option) = boot_current(variables)? else {
+        return Ok(None);
+    };
+    let contents = variables
+        .variable_data(&option.key())?
+        .ok_or_else(|| anyhow!("BootCurrent names {option}, which is absent"))?;
+    LoadOption::decode(contents.data())
+        .and_then(|load_option| load_option.file_paths.hard_drive())
+        .with_context(|| format!("BootCurrent names {option}, which is malformed"))
+}
+
+/// Whether the Hard Drive node `named` names the partition of `hard_drive`.
+fn names_partition(named: &HardDrive, hard_drive: &HardDrive) -> bool {
+    match (named.signature, hard_drive.signature) {
+        (PartitionSignature::Gpt(named), PartitionSignature::Gpt(partition)) => named == partition,
+        (PartitionSignature::Mbr(named_disk), PartitionSignature::Mbr(disk)) => {
+            named_disk == disk && named.partition_number == hard_drive.partition_number
+        }
+        (
+            PartitionSignature::Gpt(_),
+            PartitionSignature::Mbr(_) | PartitionSignature::Other { .. },
+        )
+        | (
+            PartitionSignature::Mbr(_),
+            PartitionSignature::Gpt(_) | PartitionSignature::Other { .. },
+        )
+        | (
+            PartitionSignature::Other { .. },
+            PartitionSignature::Gpt(_)
+            | PartitionSignature::Mbr(_)
+            | PartitionSignature::Other { .. },
+        ) => false,
+    }
+}
+
+/// The partition that `hard_drive` names, in words.
+pub(crate) fn described(hard_drive: &HardDrive) -> String {
+    match hard_drive.signature {
+        PartitionSignature::Gpt(guid) => format!("GPT partition {guid}"),
+        PartitionSignature::Mbr(disk) => format!(
+            "MBR partition {} of disk {disk:#010X}",
+            hard_drive.partition_number
+        ),
+        PartitionSignature::Other {
+            format,
+            signature_type,
+            ..
+        } => format!(
+            "partition {} of Partition Format {format:#04X} and Signature Type \
+             {signature_type:#04X}",
+            hard_drive.partition_number
+        ),
+    }
+}
+
+/// What finds the mounted ESP that staging writes to.
+pub(crate) trait EspLocator {
+    /// The ESP whose partition the Hard Drive node of BootCurrent's Boot#### names, else, if it
+    /// names none, the only ESP; refused unless exactly one volume is that.
+    fn locate(&self, variables: &impl VariableData) -> Result<MountedEsp>;
+}
+
+/// Whether the partition of `hard_drive` is the ESP that staging writes to: the one that
+/// BootCurrent's Hard Drive node `named` names, else, if it names none, any ESP.
+pub(crate) fn is_wanted(named: Option<&HardDrive>, hard_drive: &HardDrive) -> bool {
+    named.is_none_or(|named| names_partition(named, hard_drive))
+}
+
+/// The ESP that staging writes to, in words, for refusals.
+pub(crate) fn wanted(named: Option<&HardDrive>) -> String {
+    match named {
+        Some(named) => format!(
+            "the EFI system partition that BootCurrent names, {}",
+            described(named)
+        ),
+        None => "an EFI system partition".to_owned(),
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use tempfile::TempDir;
+
     use super::sfdisk_images::SfdiskImage;
     use super::sfdisk_images::GPT_4096;
     use super::sfdisk_images::GPT_512;
     use super::sfdisk_images::MBR_512;
     use super::sfdisk_images::QEMU_ESP_DISK;
     use super::*;
+    use crate::efi_variables::globals::tests::HeldVariables;
+    use crate::efi_variables::globals::EFI_GLOBAL_VARIABLE;
+    use crate::efi_variables::load_option::DevicePathNode;
+    use crate::efi_variables::load_option::FilePathList;
+    use crate::efi_variables::load_option::LoadOptionAttributes;
+    use crate::efi_variables::load_option::Ucs2String;
 
     const LINUX_TYPE: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
     const ESP_UNIQUE: &str = "8C78A505-BAA0-4C4A-869F-000000001A0D";
     const OTHER_UNIQUE: &str = "8C78A505-BAA0-4C4A-869F-000000001A07";
     /// The LastUsableLBA of gpt_disk's header
     const LAST_USABLE: u64 = 999_998;
+
+    /// GPT_512's ESP, as its Hard Drive node names it.
+    pub(crate) fn gpt_512_esp() -> HardDrive {
+        HardDrive {
+            partition_number: 3,
+            start: 2048,
+            size: 2048,
+            signature: PartitionSignature::Gpt(
+                "8C78A505-BAA0-4C4A-869F-000000001A0E"
+                    .parse()
+                    .expect("a GUID"),
+            ),
+        }
+    }
+
+    /// Variables whose BootCurrent names Boot0001, which starts \EFI\BOOT\BOOTX64.EFI on the
+    /// partition of `hard_drive` if given.
+    pub(crate) fn booted_from(hard_drive: Option<HardDrive>) -> HeldVariables {
+        let file = DevicePathNode::FilePath(
+            Ucs2String::try_from("\\EFI\\BOOT\\BOOTX64.EFI").expect("a path"),
+        );
+        let nodes = match hard_drive {
+            Some(hard_drive) => vec![DevicePathNode::HardDrive(hard_drive), file],
+            None => vec![file],
+        };
+        let load_option = LoadOption {
+            attributes: LoadOptionAttributes::ACTIVE,
+            description: Ucs2String::try_from("an OS").expect("a description"),
+            file_paths: FilePathList::of(&nodes).expect("a FilePathList"),
+            optional_data: Vec::new(),
+        };
+        HeldVariables::default()
+            .with("BootCurrent", EFI_GLOBAL_VARIABLE, &[1, 0])
+            .with("Boot0001", EFI_GLOBAL_VARIABLE, &load_option.encode())
+    }
 
     /// An ESP's Hard Drive node, or why there is none
     type EspLookup = Result<HardDrive, String>;
@@ -1375,6 +1650,54 @@ mod tests {
                             && error.kind() == io::ErrorKind::UnexpectedEof
                 ),
                 "a disk of {blocks} blocks: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_esp_s_files_are_those_of_uefisettings_directory() {
+        let root = TempDir::new().expect("a temporary directory");
+        let mount_point = root.path().to_path_buf();
+        let esp = MountedEsp {
+            mount_point: mount_point.clone(),
+            hard_drive: gpt_512_esp(),
+        };
+        let image = "\\EFI\\uefisettings\\uefisettings.efi";
+        let directory = mount_point.join("EFI").join("uefisettings");
+        let digest = Sha256Digest(Sha256::digest(b"an image").into());
+
+        assert_eq!(esp.list().ok(), Some(Vec::new()), "no directory");
+        assert_eq!(esp.place(image, b"an image").ok(), Some(digest), "placed");
+        assert_eq!(
+            fs::read(directory.join("uefisettings.efi")).ok(),
+            Some(b"an image".to_vec()),
+            "its bytes"
+        );
+        assert!(esp.place(image, b"another").is_err(), "placed again");
+        assert_eq!(esp.sha256(image).ok(), Some(Some(digest)), "kept");
+        assert_eq!(esp.list().ok(), Some(vec![image.to_owned()]), "listed");
+
+        fs::write(directory.join("other.efi"), b"other").expect("another file");
+        esp.delete(image).expect("delete the image");
+        assert_eq!(esp.sha256(image).ok(), Some(None), "deleted");
+        assert!(directory.is_dir(), "a directory of another file stays");
+        esp.delete("\\EFI\\uefisettings\\other.efi")
+            .expect("delete the other file");
+        assert!(!directory.exists(), "an empty directory goes");
+
+        for path in [
+            "\\EFI\\other\\uefisettings.efi",
+            "\\EFI\\uefisettings",
+            "\\EFI\\uefisettings\\",
+            "\\EFI\\uefisettings\\.",
+            "\\EFI\\uefisettings\\..",
+            "\\EFI\\uefisettings\\a\\b",
+            "\\EFI\\uefisettings\\a/b",
+        ] {
+            assert_eq!(
+                esp.sha256(path).map_err(|err| err.to_string()),
+                Err(format!("{path:?} names no file of \\EFI\\uefisettings")),
+                "{path}"
             );
         }
     }

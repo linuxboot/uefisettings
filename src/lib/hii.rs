@@ -84,7 +84,7 @@ mod variable_changes;
 mod variable_services;
 mod variables;
 #[cfg(any(target_os = "windows", test))]
-mod win32;
+pub(crate) mod win32;
 // UEFI HII Library
 
 // Implements (partial) decoding of the Form and Strings packages.
