@@ -19,6 +19,9 @@ get-serial-after	json	.responses | length == 1 and .[0].question.answer == "Seri
 dmpstore-before	status	any
 dmpstore-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000201:ReadWriteData' DataSize = 0x08$
 dmpstore-before	line	^  00000000: 00 04 04 00 04 01 00 EE-
+# "Read transformed" holds 0xEE at byte 7, which its READ gives plus 1
+get-read-transformed-before	status	0x0
+get-read-transformed-before	json	.responses | length == 1 and .[0].question.answer == "239"
 # byte 0 holds no option of the MAP of "Mapped choice", whose WRITE sets it
 get-mapped-before	status	0x0
 get-mapped-before	json	.responses | length == 1 and (.[0].question.answer | gsub("§"; "?")) == "<ValueUnavailable: its READ expression gives no value, and without a VarStore the question has no other (UEFI 2.11 ?33.2.5.4.1)>"
@@ -36,8 +39,13 @@ get-read-only-after	status	0x0
 get-read-only-after	json	.responses | length == 1 and .[0].question.answer == "5"
 set-write-only	status	0x0
 set-write-only	json	.responses | length == 1 and .[0].question.answer == "9" and .[0].modified == true
+# set stores the value given, 100 at byte 7, which the READ of "Read transformed" then gives plus 1
+set-read-transformed	status	0x0
+set-read-transformed	json	.responses | length == 1 and .[0].question.answer == "100" and .[0].modified == true
+get-read-transformed-after	status	0x0
+get-read-transformed-after	json	.responses | length == 1 and .[0].question.answer == "101"
 dmpstore-after	status	any
-dmpstore-after	line	^  00000000: 02 05 05 00 05 01 09 EE-
+dmpstore-after	line	^  00000000: 02 05 05 00 05 01 09 64-
 # a WRITE that sets AbsentBuffer, which has no variable, refuses set before any write
 set-absent-target	status	aborted
 set-absent-target	json	. == {"error_message": "cannot set question \"Absent target\": its WRITE expression sets VarStore 0x0002 (EFI_IFR_VARSTORE \"AbsentBuffer\"), which set may not write: no EFI variable AbsentBuffer-8c78a505-baa0-4c4a-869f-000000000201: the firmware has not created it, and set never creates variables"}
@@ -60,7 +68,7 @@ get-unevaluated-read	json	.responses | length == 1 and .[0].question.answer == "
 # list-questions never calls a driver: it lists the question that its driver holds with get's
 # refusal
 list-questions	status	0x0
-list-questions	json	any(.[]; .name == "Driver held" and (.answer | gsub("§"; "?")) == "<ValueUnavailable: question has no VarStore; its driver keeps the value, which only EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 ?33.2.5.6), which uefisettings.efi does not call yet>") and any(.[]; .name == "Read only" and .answer == "5")
+list-questions	json	any(.[]; .name == "Driver held" and (.answer | gsub("§"; "?")) == "<ValueUnavailable: question has no VarStore; its driver keeps the value, which only EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 ?33.2.5.6), which uefisettings.efi does not call yet>") and any(.[]; .name == "Read only" and .answer == "5") and any(.[]; .name == "Read transformed" and .answer == "101")
 # no refused set wrote, nor created AbsentBuffer
 dmpstore-refused	status	any
 dmpstore-refused	same	dmpstore-after

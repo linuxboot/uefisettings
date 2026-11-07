@@ -64,7 +64,7 @@ pub(crate) const STORE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_
 /// The bytes that the driver creates ReadWriteData with: byte 0, which "Mapped choice" keeps,
 /// holds no option; "Linked value" holds 4 at byte 1, which its WRITE copies to byte 2 and, plus
 /// 0x100, to bytes 4 and 5; "Absent target" holds 0 at byte 3; byte 6 is what "Write only" sets,
-/// and byte 7 is in no question.
+/// and "Read transformed" holds 0xEE at byte 7, which its READ shows plus 1.
 pub(crate) const STORE_DATA: [u8; 8] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE];
 
 // The strings, from string ID 2, after the language name.
@@ -81,7 +81,8 @@ const UNEVALUATED_READ: u16 = 11;
 const FIRST: u16 = 12;
 const SECOND: u16 = 13;
 const THIRD: u16 = 14;
-const STRINGS: [&str; 14] = [
+const READ_TRANSFORMED: u16 = 15;
+const STRINGS: [&str; 15] = [
     "English",
     "uefisettings QEMU read/write forms",
     "Questions that READ and WRITE expressions give and keep the values of",
@@ -96,6 +97,7 @@ const STRINGS: [&str; 14] = [
     "First",
     "Second",
     "Third",
+    "Read transformed",
 ];
 
 // The VarStores
@@ -217,6 +219,14 @@ fn form_package() -> Vec<u8> {
             (NO_VAR_STORE, 0),
             0,
             &[read(&[uint8(3), op(EFI_IFR_TO_UINT_OP, false, &[])])],
+        ),
+        // READ gives the stored byte plus 1, which replaces the stored value
+        numeric(
+            9,
+            READ_TRANSFORMED,
+            (STORE, 7),
+            0,
+            &[read(&[this(), uint8(1), op(EFI_IFR_ADD_OP, false, &[])])],
         ),
     ];
     let form = [1u16.to_le_bytes(), TITLE.to_le_bytes()].concat();

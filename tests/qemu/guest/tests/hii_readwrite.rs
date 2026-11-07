@@ -35,6 +35,9 @@ const ABSENT_BUFFER: &str =
     "/sys/firmware/efi/efivars/AbsentBuffer-8c78a505-baa0-4c4a-869f-000000000201";
 /// The bytes that publish-hiidb creates ReadWriteData with (`readwrite_forms::STORE_DATA`).
 const STORE_DATA: [u8; 8] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE];
+/// The NUMERIC at byte 7 of ReadWriteData whose READ gives the stored byte plus 1.
+const READ_TRANSFORMED: &str = "Read transformed";
+const READ_TRANSFORMED_OFFSET: usize = 7;
 
 /// DriverSample's ONE_OF on SerialPortNo, at byte 0xC0, in a FORM_MAP with the standard method.
 /// Its READ reaches the UNDEFINED among the operands of its inner EFI_IFR_CONDITIONAL, which ends
@@ -177,9 +180,36 @@ fn get_and_set_take_values_through_read_and_write_expressions() {
     // "Write only" keeps its value in byte 6 through its WRITE alone
     assert_eq!(set("Write only", "9"), [(6, 9)], "Write only");
 
+    // the READ of "Read transformed" shows its stored byte 0xEE plus 1; set stores the value
+    // given, which get then shows plus 1 (UEFI 2.11 §33.2.5.4.1)
+    for prefix in PREFIXES {
+        assert_eq!(
+            get(prefix, READ_TRANSFORMED),
+            "239",
+            "{READ_TRANSFORMED} before {prefix:?}"
+        );
+    }
+    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
+    let listed: Vec<&str> = questions
+        .iter()
+        .filter(|question| question.name == READ_TRANSFORMED)
+        .map(|question| question.answer.as_str())
+        .collect();
+    assert_eq!(listed, ["239"], "list-questions {READ_TRANSFORMED} before");
+    assert_eq!(
+        set(READ_TRANSFORMED, "100"),
+        [(READ_TRANSFORMED_OFFSET, 100)],
+        "{READ_TRANSFORMED}"
+    );
+    assert_eq!(
+        get(&["hii"], READ_TRANSFORMED),
+        "101",
+        "{READ_TRANSFORMED} after"
+    );
+
     assert_eq!(
         read_write_data(),
-        [0x02, 0x05, 0x05, 0x00, 0x05, 0x01, 0x09, 0xEE],
+        [0x02, 0x05, 0x05, 0x00, 0x05, 0x01, 0x09, 0x64],
         "after"
     );
 }

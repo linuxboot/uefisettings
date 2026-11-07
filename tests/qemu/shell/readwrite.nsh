@@ -17,6 +17,8 @@ uefisettings.efi hii get --json "Serial port number"
 echo uefisettings-shell: step get-serial-after %lasterror%
 dmpstore ReadWriteData -guid 8C78A505-BAA0-4C4A-869F-000000000201
 echo uefisettings-shell: step dmpstore-before %lasterror%
+uefisettings.efi hii get --json "Read transformed"
+echo uefisettings-shell: step get-read-transformed-before %lasterror%
 uefisettings.efi hii get --json "Mapped choice"
 echo uefisettings-shell: step get-mapped-before %lasterror%
 uefisettings.efi hii set --json "Mapped choice" Second
@@ -31,6 +33,10 @@ uefisettings.efi hii get --json "Read only"
 echo uefisettings-shell: step get-read-only-after %lasterror%
 uefisettings.efi hii set --json "Write only" 9
 echo uefisettings-shell: step set-write-only %lasterror%
+uefisettings.efi hii set --json "Read transformed" 100
+echo uefisettings-shell: step set-read-transformed %lasterror%
+uefisettings.efi hii get --json "Read transformed"
+echo uefisettings-shell: step get-read-transformed-after %lasterror%
 dmpstore ReadWriteData -guid 8C78A505-BAA0-4C4A-869F-000000000201
 echo uefisettings-shell: step dmpstore-after %lasterror%
 uefisettings.efi hii set --json "Absent target" 5
