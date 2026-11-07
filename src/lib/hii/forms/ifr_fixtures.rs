@@ -90,7 +90,7 @@ pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
 pub(crate) const FORM_MAP: u8 = 0x5D;
 
-const VAR_STORE: u8 = 0x24;
+pub(crate) const VAR_STORE: u8 = 0x24;
 const VAR_STORE_EFI: u8 = 0x26;
 pub(super) const READ: u8 = 0x2D;
 pub(super) const WRITE: u8 = 0x2E;
@@ -528,6 +528,15 @@ pub(crate) fn form_set(children: &[Vec<u8>]) -> Vec<u8> {
     .concat()
 }
 
+/// The FORM_SET op of form_set without its Scope bit, then `children`, with no End of its own.
+pub(crate) fn scopeless_form_set(children: &[Vec<u8>]) -> Vec<u8> {
+    [
+        operation(FORM_SET, false, &form_set_data()),
+        children.concat(),
+    ]
+    .concat()
+}
+
 /// Prompt 3, Help 4, QuestionId 1, VarStoreId 1, VarOffset `offset`.
 pub(super) fn question_header(offset: u16) -> Vec<u8> {
     [
@@ -647,7 +656,7 @@ pub(crate) fn var_store_efi(id: u16, name: &str, attributes: u32, size: u16) -> 
 }
 
 /// var_store_efi of the Guid stored as `guid`.
-pub(super) fn var_store_efi_of(
+pub(crate) fn var_store_efi_of(
     id: u16,
     guid: [u8; 16],
     name: &str,

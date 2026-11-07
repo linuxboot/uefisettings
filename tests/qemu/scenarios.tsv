@@ -37,6 +37,7 @@ shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-
 shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions	-
 shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password	-
 shell-readwrite	/DriverSample.efi;/publish-hiidb.efi rt-data-readwrite-forms	-	shell:readwrite	-
+shell-dropped-password	/publish-hiidb.efi dropped-password-forms	dropped-password.json	shell:dropped-password	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 shell-auth87	/publish-hiidb.efi enhanced-auth-forms	enhanced-auth-87.json	shell:auth87	-
 shell-rng	-	-	shell:rng	devices=virtio-rng

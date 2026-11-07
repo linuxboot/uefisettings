@@ -31,6 +31,7 @@ use log::debug;
 use log::warn;
 use thiserror::Error;
 
+use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
@@ -1464,11 +1465,17 @@ fn type_value_parser<R: Read + Seek>(
 /// MAX_SCOPE_NESTING is skipped to its End, as that walk steps over it.
 /// None of them fails the package after the first FormSet: edk2 reads past it only for such a
 /// walk. Before it, they fail the package as they fail the first FormSet.
+/// The IFR that the walk leaves unread is returned too, as PASSWORD questions in it are unknown:
+/// such a later FormSet, with the ops after it if it does not parse or the package ends inside
+/// it, and the bytes after an op where the walk ends, unless they are padding. So is each
+/// FormSet, first or later, whose FORM_SET op opens no scope: edk2 parses its ops on to the end
+/// of the package, past the End where handle_form_set ends it.
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
     package_list_guid: Guid,
-) -> Result<Vec<Rc<RefCell<IFROperation>>>> {
+) -> Result<FormSets> {
     let mut roots = Vec::new();
+    let mut ignored = Vec::new();
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
@@ -1483,6 +1490,18 @@ pub(super) fn parse_form_sets(
                     || matches!(error.root_cause(), binrw::Error::AssertFail { .. }) =>
             {
                 debug!("ending the FormSet walk at offset {offset}: {error}");
+                let unread = usize::try_from(offset)
+                    .ok()
+                    .and_then(|offset| package_cursor.get_ref().get(offset..));
+                if !unread.is_some_and(is_padding) {
+                    ignored.push(IgnoredIfr {
+                        offset,
+                        reason: format!(
+                            "an op that does not fit the form package, and the bytes after it: \
+                             {error}"
+                        ),
+                    });
+                }
                 break;
             }
             Err(error) => return Err(error).context("failed to parse IFR operation"),
@@ -1494,6 +1513,19 @@ pub(super) fn parse_form_sets(
             );
             continue;
         }
+        if !op.open_scope {
+            let reason = format!(
+                "{} opens no scope, so edk2 parses its ops on to the end of the form package, past \
+                 the End where uefisettings ends it (edk2-stable202211 SetupBrowserDxe IfrParse.c \
+                 ParseOpCodes pushes a scope only for Scope != 0, and ends a FormSet only at the \
+                 End of a FORM_SET scope)",
+                form_set_name(&op)
+            );
+            warn!(
+                "package list {package_list_guid}: at offset {offset} of a form package, {reason}"
+            );
+            ignored.push(IgnoredIfr { offset, reason });
+        }
         package_cursor.set_position(offset);
         match handle_form_set(package_cursor) {
             Ok(root) => roots.push(root),
@@ -1504,10 +1536,27 @@ pub(super) fn parse_form_sets(
                     "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
                      a form package: {error:#}"
                 );
+                let name = form_set_name(&op);
                 package_cursor.set_position(offset);
-                if let Err(error) = skip_scope(package_cursor) {
-                    debug!("ending the FormSet walk in the FormSet at offset {offset}: {error}");
-                    break;
+                match skip_scope(package_cursor) {
+                    Ok(()) => ignored.push(IgnoredIfr {
+                        offset,
+                        reason: format!("{name}, which nests too deep: {error:#}"),
+                    }),
+                    Err(skip_error) => {
+                        debug!(
+                            "ending the FormSet walk in the FormSet at offset {offset}: \
+                             {skip_error}"
+                        );
+                        ignored.push(IgnoredIfr {
+                            offset,
+                            reason: format!(
+                                "{name}, which nests too deep; uefisettings ignores it and the \
+                                 ops after it, as the form package ends inside it: {error:#}"
+                            ),
+                        });
+                        break;
+                    }
                 }
             }
             Err(error)
@@ -1517,12 +1566,44 @@ pub(super) fn parse_form_sets(
                     "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
                      a form package and the ops after it: {error:#}"
                 );
+                ignored.push(IgnoredIfr {
+                    offset,
+                    reason: format!(
+                        "{}, which does not parse; uefisettings ignores it and the ops after it, \
+                         where UEFI 2.11 §33.2.5.10.1 disables only the form of a malformed op \
+                         and ignores only a malformed forms set: {error:#}",
+                        form_set_name(&op)
+                    ),
+                });
                 break;
             }
             Err(error) => return Err(error),
         }
     }
-    Ok(roots)
+    Ok(FormSets { roots, ignored })
+}
+
+/// The FormSet that the FORM_SET op `op` opens, named by its GUID, or "a FormSet" if its data is
+/// too short for one.
+fn form_set_name(op: &IFROperation) -> String {
+    match op.data.first_chunk() {
+        Some(&guid) => format!("the FormSet {}", Guid::from(guid)),
+        None => "a FormSet".to_string(),
+    }
+}
+
+/// The FormSets of a form package: a root for each that parse_form_sets parses, and the IFR that
+/// it ignores.
+pub(super) struct FormSets {
+    pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
+    pub(super) ignored: Vec<IgnoredIfr>,
+}
+
+/// IFR of a form package that parse_form_sets ignores, from `offset` on, and what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredIfr {
+    pub offset: u64,
+    pub reason: String,
 }
 
 /// Moves `package_cursor` from the op at its position past the End that closes that op's scope,

@@ -594,7 +594,7 @@ impl HiiBackend {
         let mut resp = Vec::new();
 
         let parsed_db = package::read_db(db_bytes)?;
-        let passwords = PasswordQuestions::of(parsed_db.iter().flat_map(|list| &list.forms));
+        let passwords = PasswordQuestions::of_lists(&parsed_db);
         let mut reader = EfivarReader::with_variables(Box::new(passwords.withholding(reads)?));
         let writes = passwords.withholding(writes)?;
         passwords.check_set(writes.reach(), options.setup_password)?;
@@ -798,7 +798,7 @@ fn read_db_withholding(
     variables: Box<dyn FirmwareVariables>,
 ) -> Result<(Vec<package::ParsedPackageList>, EfivarReader)> {
     let parsed_db = package::read_db(db_bytes)?;
-    let passwords = PasswordQuestions::of(parsed_db.iter().flat_map(|list| &list.forms));
+    let passwords = PasswordQuestions::of_lists(&parsed_db);
     let reader = EfivarReader::with_variables(Box::new(passwords.withholding(variables)?));
     Ok((parsed_db, reader))
 }
@@ -907,9 +907,11 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
+    use crate::hii::forms::ifr_fixtures::scopeless_form_set;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
+    use crate::hii::forms::ifr_fixtures::var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::MemoryVariables;
     use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
@@ -925,11 +927,13 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
+    use crate::hii::forms::ifr_fixtures::VAR_STORE;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::en_strings_package;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
     use crate::hii::package::hiidb_fixtures::form_package;
+    use crate::hii::package::hiidb_fixtures::form_package_of;
     use crate::hii::package::hiidb_fixtures::form_set_package;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::strings_package_of;
@@ -2459,6 +2463,220 @@ mod tests {
             [(0, vec![1])],
             "Runtime: writes"
         );
+    }
+
+    /// The Guid of dropped_password_store, as stored.
+    const DROPPED_PASSWORD_STORE_GUID: [u8; 16] = [0x88; 16];
+
+    /// The GUID of the package list of dropped_password_hiidb, as stored.
+    const DROPPED_PASSWORD_LIST_GUID: [u8; 16] = [0x99; 16];
+
+    /// The EFI variable that both FormSets of dropped_password_hiidb name.
+    fn dropped_password_store() -> VariableKey {
+        VariableKey {
+            name: "UefisettingsTest".to_string(),
+            guid: Guid::from(DROPPED_PASSWORD_STORE_GUID),
+        }
+    }
+
+    /// The VARSTORE_EFI of dropped_password_store, VarStore 1.
+    fn dropped_password_var_store() -> Vec<u8> {
+        var_store_efi_of(
+            1,
+            DROPPED_PASSWORD_STORE_GUID,
+            "UefisettingsTest",
+            NV_BS_RT,
+            20,
+        )
+    }
+
+    /// The first FormSet of dropped_password_hiidb, with the CHECKBOX Q at byte 0 of
+    /// dropped_password_store.
+    fn dropped_password_first_form_set() -> Vec<u8> {
+        form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(1, 1, 1)]),
+        ])
+    }
+
+    /// The ops of a second FormSet of dropped_password_hiidb: a form, a form with a PASSWORD at
+    /// byte 0 of dropped_password_store, and then `tail`, outside its forms.
+    fn dropped_password_second_ops(tail: Vec<u8>) -> [Vec<u8>; 4] {
+        [
+            dropped_password_var_store(),
+            form(1, &[]),
+            form(2, &[password_on(2, 2, 1, 0)]),
+            tail,
+        ]
+    }
+
+    /// A HiiDB of one package list holding dropped_password_first_form_set, the ops `between`
+    /// and then the FormSet `second`.
+    fn dropped_password_hiidb(between: Vec<u8>, second: Vec<u8>) -> Vec<u8> {
+        let first = dropped_password_first_form_set();
+        let packages = [
+            form_package_of(&[first, between, second].concat()),
+            en_strings_package_of(&["Q", "Password"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(DROPPED_PASSWORD_LIST_GUID, &packages.concat())
+    }
+
+    /// Through variables that reach BootServices, a HiiDB whose form package holds IFR that
+    /// uefisettings ignores, a FormSet that does not parse or nests too deep, the ops after one
+    /// where its walk for FormSets ends or a FormSet without its Scope bit, whose second form edk2
+    /// parses into it, has get and set read and write no variable: a PASSWORD question in it
+    /// could name any variable. A HiiDB without that IFR withholds the PASSWORD's variable as
+    /// before, and through variables that reach Runtime each reads as before.
+    #[test]
+    fn ignored_ifr_closes_every_variable_to_boot_services() {
+        let offset = dropped_password_first_form_set().len();
+        let ignored = format!(
+            "PASSWORD questions of package list {} may be in the IFR that uefisettings ignores at \
+             offset {offset} of a form package: ",
+            Guid::from(DROPPED_PASSWORD_LIST_GUID)
+        );
+        let second = "the FormSet 11111111-1111-1111-1111-111111111111";
+        let closed = "; as the variable of that password is unknown, the UEFI Shell build reads \
+                      and writes no variable of this HiiDB";
+        // a VARSTORE op that ends after 4 of the 20 bytes before its Name
+        let malformed = operation(VAR_STORE, false, &[0x00; 4]);
+        // the FormSet's own scope and these
+        let too_deep = nested(&subtitle_scope(5), MAX_SCOPE_NESTING, &[]);
+        // the Subtitle past the limit, after the second FormSet's other ops
+        let too_deep_at = offset + form_set(&dropped_password_second_ops(Vec::new())).len()
+            - END.len()
+            + (MAX_SCOPE_NESTING - 1) * subtitle_scope(5).len();
+        let dropped = [
+            (
+                "malformed",
+                Vec::new(),
+                form_set(&dropped_password_second_ops(malformed)),
+                format!(
+                    "{ignored}{second}, which does not parse; uefisettings ignores it and the ops \
+                     after it, where UEFI 2.11 §33.2.5.10.1 disables only the form of a malformed \
+                     op and ignores only a malformed forms set: failed to parse op_code VarStore \
+                     properly: failed to parse VarStore's data: "
+                ),
+            ),
+            (
+                "nested too deep",
+                Vec::new(),
+                form_set(&dropped_password_second_ops(too_deep)),
+                format!(
+                    "{ignored}{second}, which nests too deep: IFR scopes nest deeper than \
+                     {MAX_SCOPE_NESTING} at offset {too_deep_at} of a form package{closed}"
+                ),
+            ),
+            (
+                "an End op of Length 1 before it",
+                vec![0x29, 0x01],
+                form_set(&dropped_password_second_ops(Vec::new())),
+                format!(
+                    "{ignored}an op that does not fit the form package, and the bytes after it: \
+                     invalid IFR operation length 1"
+                ),
+            ),
+            (
+                "without its Scope bit",
+                Vec::new(),
+                scopeless_form_set(&dropped_password_second_ops(Vec::new())),
+                format!(
+                    "{ignored}{second} opens no scope, so edk2 parses its ops on to the end of the \
+                     form package, past the End where uefisettings ends it (edk2-stable202211 \
+                     SetupBrowserDxe IfrParse.c ParseOpCodes pushes a scope only for Scope != 0, \
+                     and ends a FormSet only at the End of a FORM_SET scope){closed}"
+                ),
+            ),
+        ];
+        let get = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
+            HiiBackend::get_in(hiidb, "Q", None, &GetOptions::default(), shared(variables)).map(
+                |got| {
+                    got.responses
+                        .iter()
+                        .map(|response| response.question.answer.clone())
+                        .collect::<Vec<_>>()
+                },
+            )
+        };
+        let set = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
+            HiiBackend::set_in(
+                hiidb,
+                "Q",
+                "0",
+                None,
+                &SetOptions::default(),
+                shared(variables),
+                &**variables,
+            )
+            .map(drop)
+        };
+        let variables_of = |reach, interface| {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+            Rc::new(variables)
+        };
+
+        for (case, between, second_form_set, want) in dropped {
+            let hiidb = dropped_password_hiidb(between, second_form_set);
+            let variables = variables_of(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            );
+            for (command, got) in [
+                (
+                    "get",
+                    get(&hiidb, &variables).map(|answers| format!("{answers:?}")),
+                ),
+                ("set", set(&hiidb, &variables).map(|()| String::new())),
+            ] {
+                let got = got.map_err(|error| error.to_string());
+                assert!(
+                    got.as_ref()
+                        .is_err_and(|error| error.starts_with(&want) && error.ends_with(closed)),
+                    "{case}: BootServices: {command}: {got:?}, reads {:?}",
+                    variables.reads()
+                );
+            }
+            assert_eq!(variables.reads(), [], "{case}: BootServices: reads");
+            assert_eq!(
+                variables.writes_to(&dropped_password_store()),
+                [],
+                "{case}: BootServices: writes"
+            );
+
+            let variables = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
+            assert_eq!(
+                get(&hiidb, &variables).map_err(|error| error.to_string()),
+                Ok(vec!["1".to_string()]),
+                "{case}: Runtime: get"
+            );
+            assert_eq!(
+                variables.reads_of(&dropped_password_store()),
+                [20],
+                "{case}: Runtime: reads"
+            );
+        }
+
+        let variables = variables_of(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        assert_eq!(
+            get(
+                &dropped_password_hiidb(
+                    Vec::new(),
+                    form_set(&dropped_password_second_ops(Vec::new())),
+                ),
+                &variables
+            )
+            .map_err(|error| error.to_string()),
+            Ok(vec![
+                "<ValueUnavailable: VarStore holds a password> <IFR default: 0>".to_string()
+            ]),
+            "no drop: BootServices: get"
+        );
+        assert_eq!(variables.reads(), [], "no drop: BootServices: reads");
     }
 
     /// A HiiDB of two package lists: one whose FormSet declares no VarStore, then one whose

@@ -170,6 +170,13 @@ metadata of `EnhancedAuthData`, refuses that of `EnhancedAuthRefused`, and write
 No edk2 firmware makes such variables, so the scenario checks only that `uefisettings.efi`
 decodes the bytes that GetVariable() returns as seeded.
 
+`publish-hiidb.efi dropped-password-forms` registers those of
+[`publish-hiidb/src/dropped_password_forms.rs`](publish-hiidb/src/dropped_password_forms.rs):
+two form sets on the variable that [`vars/dropped-password.json`](vars/dropped-password.json)
+creates, the second with a PASSWORD and an op shorter than its minimum, which UEFI 2.11
+§33.2.5.10.1 calls malformed. `uefisettings` ignores that form set, so in the scenario
+`shell-dropped-password` `uefisettings.efi` reads and writes no variable.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt

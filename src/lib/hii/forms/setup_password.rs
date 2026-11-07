@@ -30,6 +30,7 @@ use super::ParsedOperation;
 use super::QuestionHeader;
 use super::Walk;
 use crate::hii::package::Guid;
+use crate::hii::package::ParsedPackageList;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableReach;
@@ -50,6 +51,24 @@ impl PasswordQuestions {
         let mut found = Self::default();
         for root in roots {
             found.add(root, None);
+        }
+        found
+    }
+
+    /// Those of the package lists `lists`: IFR that read_db ignores may hold any PASSWORD question,
+    /// so each counts as one whose VarStore is unknown.
+    pub(crate) fn of_lists(lists: &[ParsedPackageList]) -> Self {
+        let mut found = Self::of(lists.iter().flat_map(|list| &list.forms));
+        for list in lists {
+            for ignored in &list.ignored_ifr {
+                let unresolved = UnresolvedPassword::InIgnoredIfr {
+                    package_list: list.guid,
+                    offset: ignored.offset,
+                    reason: ignored.reason.clone(),
+                };
+                warn!("{unresolved}");
+                found.unresolved.push(unresolved);
+            }
         }
         found
     }
@@ -163,6 +182,15 @@ pub(crate) enum UnresolvedPassword {
     NoVarStore {
         form_set: Option<Guid>,
         question_id: u16,
+        reason: String,
+    },
+    #[error(
+        "PASSWORD questions of package list {package_list} may be in the IFR that uefisettings \
+         ignores at offset {offset} of a form package: {reason}"
+    )]
+    InIgnoredIfr {
+        package_list: Guid,
+        offset: u64,
         reason: String,
     },
 }

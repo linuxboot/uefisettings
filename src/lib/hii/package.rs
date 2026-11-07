@@ -223,7 +223,7 @@ pub(crate) fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
 ///
 /// Example: `is_padding(&[0x00; 7])` is true, `is_padding(&[0x00, 0xFF])`
 /// is false.
-fn is_padding(bytes: &[u8]) -> bool {
+pub(super) fn is_padding(bytes: &[u8]) -> bool {
     PADDING_BYTES
         .iter()
         .any(|&padding| bytes.iter().all(|&b| b == padding))
@@ -400,6 +400,8 @@ pub struct ParsedPackageList {
     /// The Language of each strings package's header, in the order of `strings`
     pub string_languages: Vec<strings::Language>,
     pub forms: Vec<IFRNodeLink>,
+    /// The IFR of its form packages that read_db ignores, whose PASSWORD questions are unknown
+    pub ignored_ifr: Vec<forms::IgnoredIfr>,
 }
 
 impl ParsedPackageList {
@@ -441,6 +443,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     let mut package_list_string_maps: Vec<StringMap> = Vec::new();
     let mut string_languages = Vec::new();
     let mut roots: Vec<IFRNodeLink> = Vec::new();
+    let mut ignored_ifr = Vec::new();
     let mut device_path = None;
 
     for package in get_packages(package_list)? {
@@ -458,7 +461,8 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
                 let form_sets = forms::parse_form_sets(&mut package_cursor, package_list.guid)
                     .context("failed to parse a form package")?;
-                roots.extend(form_sets);
+                roots.extend(form_sets.roots);
+                ignored_ifr.extend(form_sets.ignored);
             }
             // NewPackageList creates the one device path package of a list (UEFI 2.10 §33.3.4)
             PackageType::DevicePath => {
@@ -481,6 +485,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         strings: package_list_string_maps,
         string_languages,
         forms: roots,
+        ignored_ifr,
     })
 }
 
@@ -497,7 +502,10 @@ mod tests {
 
     use super::hiidb_fixtures::*;
     use super::*;
+    use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::nested;
+    use crate::hii::forms::ifr_fixtures::password_on;
+    use crate::hii::forms::ifr_fixtures::scopeless_form_set;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
@@ -575,15 +583,22 @@ mod tests {
         .concat()
     }
 
+    /// The package list that read_db reads from a HiiDB of one list holding a form package of
+    /// `ifr`.
+    fn read_form_package(ifr: &[u8]) -> Result<ParsedPackageList> {
+        let hiidb = package_list_with_guid(
+            [0x22; 16],
+            &[form_package_of(ifr), END_PACKAGE.to_vec()].concat(),
+        );
+        let mut lists = read_db(&hiidb)?;
+        Ok(lists.remove(0))
+    }
+
     /// The roots that read_db reads from a form package of `ifr`, each by the last byte of the
     /// Guid of the FormSet it holds, None if it holds no FormSet first.
     fn form_set_guids(ifr: Vec<u8>) -> Result<Vec<Option<u8>>> {
-        let length = PACKAGE_HEADER_SIZE + u32::try_from(ifr.len()).expect("form package length");
-        let form_package = [package_header(0x02, length), ifr].concat();
-        let hiidb =
-            package_list_with_guid([0x22; 16], &[form_package, END_PACKAGE.to_vec()].concat());
-        let lists = read_db(&hiidb)?;
-        Ok(lists[0]
+        let list = read_form_package(&ifr)?;
+        Ok(list
             .forms
             .iter()
             .map(|root| {
@@ -595,6 +610,139 @@ mod tests {
                 }
             })
             .collect())
+    }
+
+    /// read_db lists the IFR of a form package that its walk for FormSets leaves unread, at its
+    /// offset: a later FormSet whose bytes do not parse, with the ops after it; one nested too
+    /// deep, with the ops after it if the package ends inside it; each named by its GUID if its
+    /// data holds one; the bytes from an op where the walk ends, unless they are padding; and a
+    /// FormSet, first or later, without its Scope bit, which edk2 parses on past the End that ends
+    /// it here; not the FormSets it reads.
+    #[test]
+    fn test_read_db_lists_the_ifr_that_it_ignores() {
+        let first = form_set_of_guid(0xA0, &[]);
+        // the FormSet's own scope and these
+        let too_deep = nested(&subtitle_scope(5), MAX_SCOPE_NESTING, &[]);
+        let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
+        let malformed = |form_set, op| {
+            format!(
+                "{form_set}, which does not parse; uefisettings ignores it and the ops after it, \
+                 where UEFI 2.11 §33.2.5.10.1 disables only the form of a malformed op and \
+                 ignores only a malformed forms set: failed to parse op_code {op} properly: \
+                 failed to parse {op}'s data: "
+            )
+        };
+        let b0 = format!("the FormSet {}", Guid::from([0xB0; 16]));
+        let nested_too_deep = format!(
+            "{b0}, which nests too deep: IFR scopes nest deeper than {MAX_SCOPE_NESTING} at offset "
+        );
+        let open_and_nested_too_deep = format!(
+            "{b0}, which nests too deep; uefisettings ignores it and the ops after it, as the form \
+             package ends inside it: IFR scopes nest deeper than {MAX_SCOPE_NESTING} at offset "
+        );
+        let opens_no_scope = |form_set| {
+            format!(
+                "{form_set} opens no scope, so edk2 parses its ops on to the end of the form \
+                 package, past the End where uefisettings ends it (edk2-stable202211 \
+                 SetupBrowserDxe IfrParse.c ParseOpCodes pushes a scope only for Scope != 0, and \
+                 ends a FormSet only at the End of a FORM_SET scope)"
+            )
+        };
+        let eleven = "the FormSet 11111111-1111-1111-1111-111111111111";
+        // a form, then a form with a PASSWORD that edk2 parses into the FormSet before them
+        let two_forms = [form(1, &[]), form(2, &[password_on(1, 1, 0, 0)])];
+        let without_end = |form_set: Vec<u8>| form_set[..form_set.len() - END.len()].to_vec();
+        let not_fit = |length| {
+            format!(
+                "an op that does not fit the form package, and the bytes after it: invalid IFR \
+                 operation length {length}"
+            )
+        };
+        let runs_past =
+            "an op that does not fit the form package, and the bytes after it: ".to_string();
+        let cases = [
+            ("0xFF padding", vec![0xFF; 8], None),
+            ("zero bytes", vec![0x00; 4], None),
+            ("a FormSet", form_set_of_guid(0xB0, &[]), None),
+            ("Length 1", vec![0x29, 0x01], Some(not_fit(1))),
+            ("an op without its Length", vec![0x29], Some(runs_past)),
+            (
+                "zero bytes, then a FormSet",
+                [&[0x00, 0x00][..], &form_set_of_guid(0xB0, &[])].concat(),
+                Some(not_fit(0)),
+            ),
+            (
+                "a FormSet with a malformed CheckBox, then a FormSet",
+                [
+                    form_set_of_guid(0xB0, &short_checkbox),
+                    form_set_of_guid(0xC0, &[]),
+                ]
+                .concat(),
+                Some(malformed(b0.as_str(), "CheckBox")),
+            ),
+            (
+                "a FormSet too short for its GUID, then a FormSet",
+                [&[0x0E, 0x84, 0xB0, 0xB0][..], &form_set_of_guid(0xC0, &[])].concat(),
+                Some(malformed("a FormSet", "FormSet")),
+            ),
+            (
+                "a FormSet nested too deep, then a FormSet",
+                [
+                    form_set_of_guid(0xB0, &too_deep),
+                    form_set_of_guid(0xC0, &[]),
+                ]
+                .concat(),
+                Some(nested_too_deep),
+            ),
+            (
+                "a FormSet open at the package end",
+                without_end(form_set_of_guid(0xB0, &[])),
+                Some(format!(
+                    "{b0}, which does not parse; uefisettings ignores it and the ops after it, \
+                     where UEFI 2.11 §33.2.5.10.1 disables only the form of a malformed op and \
+                     ignores only a malformed forms set: failed to parse IFR operation: "
+                )),
+            ),
+            (
+                "a FormSet nested too deep, open at the package end",
+                without_end(form_set_of_guid(0xB0, &too_deep)),
+                Some(open_and_nested_too_deep),
+            ),
+            (
+                "a FormSet without its Scope bit, its second form holding a PASSWORD",
+                scopeless_form_set(&two_forms),
+                Some(opens_no_scope(eleven)),
+            ),
+        ];
+        let after_first = u64::try_from(first.len()).expect("offset");
+        for (name, trailing, want) in cases {
+            let list = read_form_package(&[first.as_slice(), &trailing].concat())
+                .unwrap_or_else(|error| panic!("read_db after {name}: {error:#}"));
+            match (list.ignored_ifr.as_slice(), want) {
+                ([], None) => {}
+                ([ignored], Some(want)) => {
+                    assert_eq!(ignored.offset, after_first, "offset ignored after {name}");
+                    assert!(
+                        ignored.reason.starts_with(&want),
+                        "reason after {name}: {}",
+                        ignored.reason
+                    );
+                }
+                (got, want) => panic!("IFR ignored after {name}: {got:?}, want {want:?}"),
+            }
+        }
+
+        let list = read_form_package(&scopeless_form_set(&two_forms)).unwrap_or_else(|error| {
+            panic!("read_db of a first FormSet without its Scope bit: {error:#}")
+        });
+        assert_eq!(
+            list.ignored_ifr,
+            [forms::IgnoredIfr {
+                offset: 0,
+                reason: opens_no_scope(eleven),
+            }],
+            "IFR ignored with a first FormSet without its Scope bit"
+        );
     }
 
     /// read_db keeps each FormSet of a form package as a root of its own. The walk for FormSets
