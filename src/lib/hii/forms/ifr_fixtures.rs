@@ -471,11 +471,25 @@ pub(crate) fn default_store_named(name: u16, default_id: u16) -> Vec<u8> {
 
 /// Guid, FormSetTitle, Help, Flags and ClassGuid of an EFI_IFR_FORM_SET.
 fn form_set_data() -> Vec<u8> {
+    form_set_data_with(0x01, &[[0x22; 16]])
+}
+
+/// Guid, FormSetTitle, Help, `flags` and `class_guids` of an EFI_IFR_FORM_SET.
+fn form_set_data_with(flags: u8, class_guids: &[[u8; 16]]) -> Vec<u8> {
     [
         &[0x11; 16][..],           // Guid
         &[0x01, 0x00, 0x02, 0x00], // FormSetTitle, Help
-        &[0x01],                   // Flags: one ClassGuid
-        &[0x22; 16],               // ClassGuid
+        &[flags],
+        &class_guids.concat(),
+    ]
+    .concat()
+}
+
+/// An empty EFI_IFR_FORM_SET with `flags` and `class_guids`.
+pub(super) fn form_set_with_class_guids(flags: u8, class_guids: &[[u8; 16]]) -> Vec<u8> {
+    [
+        operation(FORM_SET, true, &form_set_data_with(flags, class_guids)),
+        END.to_vec(),
     ]
     .concat()
 }

@@ -100,6 +100,8 @@ mod write_plan;
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 /// How DeclaredBootServiceOnly names a form's declaration without EFI_VARIABLE_RUNTIME_ACCESS.
 const DECLARED_BOOT_SERVICE_ONLY: &str = "boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)";
+// UEFI 2.11 §33.3.8.3.26: "Bits 0:1 = number of members in ClassGuid"
+const EFI_IFR_FORM_SET_CLASS_GUID_COUNT: u8 = 0x03;
 // UEFI 2.10 §33.3.8.3.47
 const EFI_IFR_NUMERIC_SIZE: u8 = 0x03;
 const EFI_IFR_NUMERIC_SIZE_1: u8 = 0x00;
@@ -773,7 +775,9 @@ pub struct FormSet {
     pub title_string_id: u16,
     pub help_string_id: u16,
     pub flags: u8,
-    pub class_guid: Guid,
+    /// As many as bits 0:1 of Flags count; bits 2:7 are reserved (UEFI 2.11 §33.3.8.3.26)
+    #[br(count = usize::from(flags & EFI_IFR_FORM_SET_CLASS_GUID_COUNT))]
+    pub class_guids: Vec<Guid>,
 }
 
 pub trait Question {
@@ -3085,11 +3089,15 @@ fn display_op(
         ),
         ParsedOperation::FormSet(parsed) => result.push_str(
             format!(
-                "{extra_spaces}OpCode: {:?} - {} - GUID {} - ClassGUID {}\n",
+                "{extra_spaces}OpCode: {:?} - {} - GUID {}{}\n",
                 current_node.op_code,
                 find_corresponding_string(parsed.title_string_id, string_packages),
                 parsed.guid,
-                parsed.class_guid,
+                parsed
+                    .class_guids
+                    .iter()
+                    .map(|class_guid| format!(" - ClassGUID {class_guid}"))
+                    .collect::<String>(),
             )
             .as_str(),
         ),
@@ -4021,6 +4029,52 @@ mod tests {
         let form_set = root.children[0].borrow();
         assert_eq!(form_set.op_code, IFROpCode::FormSet);
         assert!(form_set.children.is_empty());
+    }
+
+    /// A FORM_SET holds as many ClassGuids as bits 0:1 of its Flags count, whatever its
+    /// reserved bits 2:7 hold (UEFI 2.11 §33.3.8.3.26), and show-ifr shows each.
+    #[test]
+    fn form_set_holds_the_class_guids_that_its_flags_count() {
+        let guids = [[0x22; 16], [0x33; 16], [0x44; 16]];
+        let three = [
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+            "44444444-4444-4444-4444-444444444444",
+        ];
+        let cases = [
+            (0x00, &guids[..0], &three[..0]),
+            (0x01, &guids[..1], &three[..1]),
+            (0x03, &guids[..], &three[..]),
+            (0x07, &guids[..], &three[..]),
+        ];
+        for (flags, class_guids, shown) in cases {
+            let data = form_set_with_class_guids(flags, class_guids);
+            let root = handle_form_set(&mut Cursor::new(&data))
+                .unwrap_or_else(|error| panic!("parse Flags {flags:#04x}: {error:#}"));
+
+            let display = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+
+            let line = display
+                .lines()
+                .find(|line| line.trim_start().starts_with("OpCode: FormSet "))
+                .unwrap_or_else(|| panic!("Flags {flags:#04x}: no FormSet line in {display:?}"));
+            let class_guids: Vec<&str> = line.split(" - ClassGUID ").skip(1).collect();
+            assert_eq!(class_guids, shown, "Flags {flags:#04x}: {line:?}");
+        }
+    }
+
+    /// A FORM_SET that holds fewer ClassGuids than its Flags count does not parse (UEFI 2.11
+    /// §33.2.5.10.1).
+    #[test]
+    fn form_set_short_of_its_class_guid_count_does_not_parse() {
+        let data = form_set_with_class_guids(0x03, &[[0x22; 16]]);
+
+        let error = handle_form_set(&mut Cursor::new(&data)).expect_err("3 counted, 1 held");
+
+        assert!(
+            format!("{error:#}").contains("failed to parse FormSet's data"),
+            "{error:#}"
+        );
     }
 }
 
