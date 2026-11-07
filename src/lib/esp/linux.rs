@@ -131,6 +131,16 @@ impl<D: PathDevices> EspLocator for LinuxPaths<D> {
             )),
         }
     }
+
+    /// Refused: Linux writes through the mount point where it finds the ESP mounted.
+    fn mounted_at(&self, esp: MountedEsp, mount_point: &Path) -> Result<MountedEsp> {
+        Err(anyhow!(
+            "an ESP mount point, {}, applies to Windows; Linux writes through {}, where it finds \
+             the ESP mounted",
+            mount_point.display(),
+            esp.mount_point.display()
+        ))
+    }
 }
 
 /// The mounted vfat volumes, each with its partition or why it is no ESP, in words.

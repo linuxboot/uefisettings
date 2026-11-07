@@ -636,6 +636,10 @@ pub struct SetOptions {
     /// On Linux and Windows, the uefisettings.efi that set copies to the EFI system partition when
     /// it stages a question that its driver holds for the next boot
     pub staging_image: Option<PathBuf>,
+    /// On Windows, where the user mounted the EFI system partition, such as S:\ after
+    /// `mountvol S: /s`: set writes the staged files through it instead of the partition's volume
+    /// GUID path, once it checks that the volume there is the ESP that it finds
+    pub staging_esp: Option<PathBuf>,
 }
 
 /// The options of HiiBackend::list_questions_using.

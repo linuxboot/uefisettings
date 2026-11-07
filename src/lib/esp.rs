@@ -18,6 +18,7 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
@@ -863,6 +864,10 @@ pub(crate) trait EspLocator {
     /// The ESP whose partition the Hard Drive node of BootCurrent's Boot#### names, else, if it
     /// names none, the only ESP; refused unless exactly one volume is that.
     fn locate(&self, variables: &impl VariableData) -> Result<MountedEsp>;
+
+    /// `esp`, whose files staging writes through `mount_point`, where the user mounted it; refused
+    /// unless the volume there is `esp`'s.
+    fn mounted_at(&self, esp: MountedEsp, mount_point: &Path) -> Result<MountedEsp>;
 }
 
 /// Whether the partition of `hard_drive` is the ESP that staging writes to: the one that

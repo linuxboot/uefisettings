@@ -355,6 +355,10 @@ impl StagingArgs {
     pub(super) fn image(&self) -> Option<PathBuf> {
         None
     }
+
+    pub(super) fn esp(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// get, in this firmware's HII database.

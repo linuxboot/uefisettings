@@ -578,6 +578,7 @@ fn set_options(
     options.unsafe_operations = unsafe_operations.operations();
     options.volatile = volatile.policy();
     options.staging_image = staging.image();
+    options.staging_esp = staging.esp();
     options
 }
 
@@ -1690,6 +1691,35 @@ mod tests {
             let options = set_options(&selection, &unsafe_operations, &volatile, &staging);
 
             assert_eq!(options.staging_image, want, "{args:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn set_on_windows_takes_the_mount_point_of_the_esp() {
+        let cases: [(&[&str], Option<std::path::PathBuf>); 2] = [
+            (&["set", "Question", "Value"], None),
+            (
+                &["set", "Question", "Value", "--esp", "S:"],
+                Some("S:".into()),
+            ),
+        ];
+        for (args, want) in cases {
+            let parsed = hii(args).unwrap_or_else(|error| panic!("parse {args:?}: {error}"));
+            let HiiSubcommands::Set {
+                selection,
+                unsafe_operations,
+                volatile,
+                staging,
+                ..
+            } = parsed
+            else {
+                panic!("{args:?} is no set: {parsed:?}");
+            };
+
+            let options = set_options(&selection, &unsafe_operations, &volatile, &staging);
+
+            assert_eq!(options.staging_esp, want, "{args:?}");
         }
     }
 

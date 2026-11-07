@@ -598,6 +598,7 @@ impl HiiBackend {
         match efivars {
             EfivarSource::System => Some(Box::new(NextBootStaging {
                 image: None,
+                esp: None,
                 include: IncludedStates::empty(),
                 access_level: None,
                 unsafe_operations: UnsafeOperations::Refuse,

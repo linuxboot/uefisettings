@@ -57,11 +57,12 @@ use crate::hii::WithholdingVariables;
 use crate::unsafe_operations::UnsafeOperations;
 
 /// What set does on Linux and Windows with a question whose value only its driver holds: stages
-/// it for the next boot, the first set with the uefisettings.efi `image`, with the `include` and
-/// `access_level` that set selected it with and its grant of `unsafe_operations`, writing no byte
-/// of the HiiDB's `passwords`.
+/// it for the next boot, the first set with the uefisettings.efi `image`, through the ESP's mount
+/// point `esp` if given, with the `include` and `access_level` that set selected it with and its
+/// grant of `unsafe_operations`, writing no byte of the HiiDB's `passwords`.
 pub(crate) struct NextBootStaging {
     pub(crate) image: Option<PathBuf>,
+    pub(crate) esp: Option<PathBuf>,
     pub(crate) include: IncludedStates,
     pub(crate) access_level: Option<AccessLevel>,
     pub(crate) unsafe_operations: UnsafeOperations,
@@ -73,6 +74,7 @@ impl NextBootStaging {
     pub(crate) fn of(options: &SetOptions, lists: &[ParsedPackageList]) -> Self {
         Self {
             image: options.staging_image.clone(),
+            esp: options.staging_esp.clone(),
             include: options.include,
             access_level: options.access_level,
             unsafe_operations: options.unsafe_operations,
@@ -92,18 +94,20 @@ impl NextBootStaging {
     /// Refuses, before anything is staged, what apply-staged would refuse before the OS, as its
     /// withholding through BootServices refuses a PASSWORD question whose VarStore is unknown
     /// (apply_staged_withholding), then what staging `question` through `variables` without the
-    /// bytes of PASSWORD questions, on the ESP that `esp` finds, would refuse: prepare.
+    /// bytes of PASSWORD questions, on the ESP that `locator` finds, through --esp if given,
+    /// would refuse: prepare.
     fn check(
         &self,
         variables: impl VariableData,
-        esp: &impl EspLocator,
+        locator: &impl EspLocator,
         question: &str,
     ) -> Result<()> {
         self.passwords
             .check_withholding(VariableReach::BootServices)?;
         prepare(
             &self.withholding(variables)?,
-            esp,
+            locator,
+            self.esp.as_deref(),
             self.image.as_deref(),
             question,
         )
@@ -111,17 +115,18 @@ impl NextBootStaging {
     }
 
     /// Stages `request` through `variables` without the bytes of PASSWORD questions, on the ESP
-    /// that `esp` finds, with --image: stage_request.
+    /// that `locator` finds, through --esp if given, with --image: stage_request.
     fn stage(
         &self,
         variables: impl VariableData,
-        esp: &impl EspLocator,
+        locator: &impl EspLocator,
         request: StagedRequest,
         nonce: Nonce,
     ) -> Result<String> {
         stage_request(
             &self.withholding(variables)?,
-            esp,
+            locator,
+            self.esp.as_deref(),
             self.image.as_deref(),
             request,
             nonce,
@@ -189,8 +194,8 @@ impl DriverHeldValues for NextBootStaging {
         Self::answer(system_variables(), question, held)
     }
 
-    /// apply-staged would apply the set, set finds the ESP, plan_stage allows staging there, and
-    /// a new set has a readable --image: check.
+    /// apply-staged would apply the set, set finds the ESP, through --esp if given, plan_stage
+    /// allows staging there, and a new set has a readable --image: check.
     fn check_set(
         &self,
         _list: &QuestionList<'_>,
@@ -248,17 +253,22 @@ enum Prepared {
     New(Vec<u8>),
 }
 
-/// The ESP that `esp` finds, and how a request of `question` is staged there:
-/// appended to the pending set, else in a new set with the bytes of `image`. Refused as set
-/// refuses `question`, before anything is staged.
+/// The ESP that `locator` finds, through its `mount_point` if given, and how a request of
+/// `question` is staged there: appended to the pending set, else in a new set with the bytes of
+/// `image`. Refused as set refuses `question`, before anything is staged.
 fn prepare(
     variables: &impl VariableData,
-    esp: &impl EspLocator,
+    locator: &impl EspLocator,
+    mount_point: Option<&Path>,
     image: Option<&Path>,
     question: &str,
 ) -> Result<(MountedEsp, Prepared)> {
-    let esp = esp
+    let esp = locator
         .locate(variables)
+        .and_then(|esp| match mount_point {
+            Some(mount_point) => locator.mounted_at(esp, mount_point),
+            None => Ok(esp),
+        })
         .map_err(|error| set_refusal(question, format!("{error:#}")))?;
     let prepared = match plan_stage(variables, &esp)
         .map_err(|error| set_refusal(question, format!("{error:#}")))?
@@ -274,16 +284,18 @@ fn prepare(
     Ok((esp, prepared))
 }
 
-/// Stages `request` on the ESP that `esp` finds: appended to the pending set, else in a new set of
-/// `nonce` whose Boot#### starts a copy of `image`. Returns set's annotation.
+/// Stages `request` on the ESP that `locator` finds, through its `mount_point` if given: appended
+/// to the pending set, else in a new set of `nonce` whose Boot#### starts a copy of `image`.
+/// Returns set's annotation.
 fn stage_request(
     variables: &impl VariableData,
-    esp: &impl EspLocator,
+    locator: &impl EspLocator,
+    mount_point: Option<&Path>,
     image: Option<&Path>,
     request: StagedRequest,
     nonce: Nonce,
 ) -> Result<String> {
-    let (esp, prepared) = prepare(variables, esp, image, &request.question)?;
+    let (esp, prepared) = prepare(variables, locator, mount_point, image, &request.question)?;
     let set = match prepared {
         Prepared::Append(mut set) => {
             set.requests.push(request);
@@ -352,7 +364,8 @@ mod tests {
     }
 
     /// set stages a request of the question and value with the states, access level and grant of
-    /// unsafe operations that it selected the question with, and the image that it names.
+    /// unsafe operations that it selected the question with, and the image and ESP mount point that
+    /// it names.
     #[test]
     fn set_stages_what_it_selected() {
         for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
@@ -365,6 +378,7 @@ mod tests {
                 // no request takes it: a request holds the value, not the text it was picked by
                 language: Some("fr-FR".to_owned()),
                 staging_image: Some(PathBuf::from("uefisettings.efi")),
+                staging_esp: Some(PathBuf::from("S:")),
             };
             let form_set = "8C78A505-BAA0-4C4A-869F-000000001A09"
                 .parse()
@@ -375,6 +389,7 @@ mod tests {
             let request = staging.request(QUESTION, &held, 1);
 
             assert_eq!(staging.image, options.staging_image, "the image");
+            assert_eq!(staging.esp, options.staging_esp, "the ESP mount point");
             assert_eq!(
                 request,
                 StagedRequest {
@@ -392,14 +407,15 @@ mod tests {
         }
     }
 
-    /// Stages a new set on the ESP that `esp` finds, at `mount_point`, then appends to it.
-    fn stage_then_append(esp: &impl EspLocator, mount_point: &Path) {
+    /// Stages a new set on the ESP that `esp` finds, through `mount` if given, then appends to it;
+    /// the files land under `root`.
+    fn stage_then_append(esp: &impl EspLocator, mount: Option<&Path>, root: &Path) {
         let variables = booted_from(Some(gpt_512_esp()));
         let images = TempDir::new().expect("a temporary directory");
         let image = images.path().join("uefisettings.efi");
         fs::write(&image, b"MZ uefisettings").expect("the image");
 
-        let staged = stage_request(&variables, esp, Some(&image), request(1), NONCE);
+        let staged = stage_request(&variables, esp, mount, Some(&image), request(1), NONCE);
 
         assert_eq!(
             staged.map_err(|err| format!("{err:#}")),
@@ -408,8 +424,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(
-                mount_point
-                    .join("EFI")
+                root.join("EFI")
                     .join("uefisettings")
                     .join("uefisettings.efi")
             )
@@ -447,7 +462,7 @@ mod tests {
         );
 
         // a second set appends, without --image
-        let appended = stage_request(&variables, esp, None, request(2), Nonce([0; 16]));
+        let appended = stage_request(&variables, esp, mount, None, request(2), Nonce([0; 16]));
 
         assert_eq!(
             appended.map_err(|err| format!("{err:#}")),
@@ -468,7 +483,7 @@ mod tests {
     #[test]
     fn set_stages_a_new_set_on_the_esp_then_appends_to_it() {
         let (linux, mount_point) = FakeLinux::with_esp();
-        stage_then_append(&linux.paths, &mount_point);
+        stage_then_append(&linux.paths, None, &mount_point);
     }
 
     /// On Windows, set copies the image through the ESP's volume GUID path, which a directory
@@ -477,7 +492,66 @@ mod tests {
     fn set_stages_a_new_set_on_the_esp_volume_then_appends_to_it() {
         let root = TempDir::new().expect("a temporary directory");
         let volume = format!("{}\\", root.path().join("volume").display());
-        stage_then_append(&FakeWindows::with_esp_volume(&volume), Path::new(&volume));
+        stage_then_append(
+            &FakeWindows::with_esp_volume(&volume),
+            None,
+            Path::new(&volume),
+        );
+    }
+
+    /// With --esp, set writes the files through the mount point where the user mounted the ESP,
+    /// once the volume there is the ESP, whose GUID may come in either case; a directory stands for
+    /// the mount point here.
+    #[test]
+    fn set_stages_through_the_mount_point_of_the_esp() {
+        let root = TempDir::new().expect("a temporary directory");
+        let volume = r"\\?\Volume{8c78a505-baa0-4c4a-869f-000000001a03}\";
+        let mounted = r"\\?\Volume{8C78A505-BAA0-4C4A-869F-000000001A03}\";
+        let mount = format!("{}\\", root.path().join("S").display());
+        let windows = FakeWindows::with_esp_volume(volume).mount(&mount, mounted);
+
+        stage_then_append(&windows, Some(Path::new(&mount)), Path::new(&mount));
+    }
+
+    /// --esp names a mount point that set refuses unless the ESP is mounted there, and Linux, which
+    /// finds the ESP mounted, refuses any.
+    #[test]
+    fn set_refuses_an_esp_mount_point_that_is_not_the_esp() {
+        let variables = booted_from(Some(gpt_512_esp()));
+        let esp = r"\\?\Volume{8c78a505-baa0-4c4a-869f-000000001a03}\";
+        let data = r"\\?\Volume{8c78a505-baa0-4c4a-869f-000000001a02}\";
+        let windows = FakeWindows::with_esp_volume(esp)
+            .volume(data, 0, (4096, 2048))
+            .mount("D:\\", data);
+        let refused = "cannot set question \"Generic Question\": ";
+
+        for (case, mount_point, want) in [
+            (
+                "another volume",
+                "D:",
+                format!(
+                    "{refused}D:\\ is volume {data}, not the EFI system partition, volume {esp}"
+                ),
+            ),
+            (
+                "no volume",
+                "Q:\\",
+                format!(
+                    "{refused}cannot find the volume at Q:\\: \
+                     GetVolumeNameForVolumeMountPointW failed: Win32 error 2"
+                ),
+            ),
+        ] {
+            let got = stage_request(
+                &variables,
+                &windows,
+                Some(Path::new(mount_point)),
+                None,
+                request(1),
+                NONCE,
+            );
+            assert_eq!(got.map_err(|err| format!("{err:#}")), Err(want), "{case}");
+        }
     }
 
     #[test]
@@ -514,7 +588,7 @@ mod tests {
                 None => variables,
             };
 
-            let got = stage_request(&variables, &windows, None, request(1), NONCE);
+            let got = stage_request(&variables, &windows, None, None, request(1), NONCE);
 
             assert_eq!(got.map_err(|err| format!("{err:#}")), Err(want), "{case}");
             assert!(
@@ -873,11 +947,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn set_on_linux_takes_no_esp_mount_point() {
+        let (linux, mount_point) = FakeLinux::with_esp();
+        let variables = booted_from(Some(gpt_512_esp()));
+
+        let got = stage_request(
+            &variables,
+            &linux.paths,
+            Some(Path::new("/mnt/esp")),
+            None,
+            request(1),
+            NONCE,
+        );
+
+        assert_eq!(
+            got.map_err(|err| format!("{err:#}")),
+            Err(format!(
+                "cannot set question \"Generic Question\": an ESP mount point, /mnt/esp, applies to \
+                 Windows; Linux writes through {}, where it finds the ESP mounted",
+                mount_point.display()
+            )),
+            "a mount point on Linux"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn set_refuses_without_the_esp() {
         let linux = FakeLinux::new();
         let variables = booted_from(None);
 
-        let got = stage_request(&variables, &linux.paths, None, request(1), NONCE);
+        let got = stage_request(&variables, &linux.paths, None, None, request(1), NONCE);
 
         assert_eq!(
             got.map_err(|err| format!("{err:#}")),
@@ -892,7 +992,14 @@ mod tests {
     fn set_refuses_without_an_esp_volume() {
         let variables = booted_from(Some(gpt_512_esp()));
 
-        let got = stage_request(&variables, &FakeWindows::default(), None, request(1), NONCE);
+        let got = stage_request(
+            &variables,
+            &FakeWindows::default(),
+            None,
+            None,
+            request(1),
+            NONCE,
+        );
 
         assert_eq!(
             got.map_err(|err| format!("{err:#}")),

@@ -17,6 +17,7 @@
 
 use std::fmt;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
@@ -107,6 +108,10 @@ pub(crate) trait EspCalls {
         offset: u64,
         buffer: &mut [u8],
     ) -> Result<usize, CallFailed>;
+
+    /// The volume GUID path, which ends in a backslash, of the volume mounted at `mount_point`,
+    /// which ends in one too: GetVolumeNameForVolumeMountPointW.
+    fn volume_name(&self, mount_point: &str) -> Result<String, CallFailed>;
 }
 
 impl<C: EspCalls> EspLocator for C {
@@ -155,6 +160,33 @@ impl<C: EspCalls> EspLocator for C {
                     .map(|esp| esp.mount_point.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            )),
+        }
+    }
+
+    /// `esp`, written through `mount_point`, where the user mounted it, as `mountvol S: /s` does:
+    /// refused unless the volume there is `esp`'s.
+    fn mounted_at(&self, esp: MountedEsp, mount_point: &Path) -> Result<MountedEsp> {
+        let text = mount_point
+            .to_str()
+            .ok_or_else(|| anyhow!("{} is no Unicode mount point", mount_point.display()))?;
+        // GetVolumeNameForVolumeMountPointW takes a mount point that ends in a backslash
+        let root = match text.ends_with('\\') {
+            true => text.to_owned(),
+            false => format!("{text}\\"),
+        };
+        let volume = self
+            .volume_name(&root)
+            .map_err(|failed| anyhow!("cannot find the volume at {root}: {failed}"))?;
+        let esp_volume = esp.mount_point.display().to_string();
+        // the hexadecimal digits of a GUID match in either case
+        match volume.eq_ignore_ascii_case(&esp_volume) {
+            true => Ok(MountedEsp {
+                mount_point: PathBuf::from(root),
+                hard_drive: esp.hard_drive,
+            }),
+            false => Err(anyhow!(
+                "{root} is volume {volume}, not the EFI system partition, volume {esp_volume}"
             )),
         }
     }
@@ -339,6 +371,8 @@ pub(crate) mod tests {
         disks: BTreeMap<u32, Result<FakeDisk, CallFailed>>,
         /// How IOCTL_DISK_GET_DRIVE_GEOMETRY fails, if it does
         block_size_failure: Option<CallFailed>,
+        /// Each mount point with the volume GUID path of the volume mounted there
+        mount_points: BTreeMap<String, String>,
     }
 
     impl FakeWindows {
@@ -355,7 +389,7 @@ pub(crate) mod tests {
 
         /// Adds the volume `path` of the partition of disk `disk` from LBA `start` on, `size`
         /// logical blocks long.
-        fn volume(mut self, path: &str, disk: u32, (start, size): (u64, u64)) -> Self {
+        pub(crate) fn volume(mut self, path: &str, disk: u32, (start, size): (u64, u64)) -> Self {
             let block_size = match self.disks.get(&disk) {
                 Some(Ok(disk)) => u64::from(disk.block_size),
                 Some(Err(_)) | None => 512,
@@ -373,6 +407,13 @@ pub(crate) mod tests {
         /// GPT_512 as disk 0, with volumes of its ESP and its Linux partition.
         pub(crate) fn with_esp() -> Self {
             Self::with_esp_volume(ESP).volume(DATA, GPT_512_DISK, (4096, 2048))
+        }
+
+        /// Mounts the volume `volume` at `mount_point`.
+        pub(crate) fn mount(mut self, mount_point: &str, volume: &str) -> Self {
+            self.mount_points
+                .insert(mount_point.to_owned(), volume.to_owned());
+            self
         }
 
         /// GPT_512 as disk 0, with the volume `path` of its ESP.
@@ -453,6 +494,16 @@ pub(crate) mod tests {
             let read = available.len().min(buffer.len());
             buffer[..read].copy_from_slice(&available[..read]);
             Ok(read)
+        }
+
+        fn volume_name(&self, mount_point: &str) -> Result<String, CallFailed> {
+            self.mount_points
+                .get(mount_point)
+                .cloned()
+                .ok_or(CallFailed {
+                    call: "GetVolumeNameForVolumeMountPointW",
+                    code: Win32Error::FILE_NOT_FOUND,
+                })
         }
     }
 

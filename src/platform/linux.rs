@@ -420,6 +420,11 @@ impl StagingArgs {
         self.image.clone()
     }
 
+    /// None: Linux writes through the mount point where it finds the ESP mounted.
+    pub(super) fn esp(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Fails if --image is given: Ilo attributes have no driver that holds their value.
     pub(super) fn refuse_on_ilo(&self) -> Result<()> {
         match self.image {

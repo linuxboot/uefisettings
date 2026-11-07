@@ -168,11 +168,18 @@ pub(super) struct StagingArgs {
     /// The uefisettings.efi that set copies to the EFI system partition when it stages a question whose value only its driver holds, which the next boot applies. Under Secure Boot, it must be signed for db.
     #[arg(long, value_name = "UEFISETTINGS_EFI")]
     image: Option<PathBuf>,
+    /// Where you mounted the EFI system partition, such as S: after `mountvol S: /s`, for set to write the staged files through instead of the partition's volume GUID path. set checks that the volume there is the EFI system partition that it finds.
+    #[arg(long, value_name = "MOUNT_POINT")]
+    esp: Option<PathBuf>,
 }
 
 impl StagingArgs {
     pub(super) fn image(&self) -> Option<PathBuf> {
         self.image.clone()
+    }
+
+    pub(super) fn esp(&self) -> Option<PathBuf> {
+        self.esp.clone()
     }
 }
 

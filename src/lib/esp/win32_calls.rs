@@ -32,6 +32,7 @@ use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::FindFirstVolumeW;
 use windows_sys::Win32::Storage::FileSystem::FindNextVolumeW;
 use windows_sys::Win32::Storage::FileSystem::FindVolumeClose;
+use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
@@ -53,6 +54,7 @@ use crate::hii::win32::Win32Error;
 /// The calls that name failures
 const EXTENTS_CALL: &str = "DeviceIoControl(IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS)";
 const GEOMETRY_CALL: &str = "DeviceIoControl(IOCTL_DISK_GET_DRIVE_GEOMETRY)";
+const MOUNT_POINT_CALL: &str = "GetVolumeNameForVolumeMountPointW";
 /// The failure of the extents' call whose count no buffer that it takes can hold
 const EXTENTS_UNHELD: CallFailed = CallFailed {
     call: EXTENTS_CALL,
@@ -230,6 +232,28 @@ impl EspCalls for RealEspCalls {
                 call: "ReadFile",
                 code: Win32Error::INSUFFICIENT_BUFFER,
             }),
+        }
+    }
+
+    fn volume_name(&self, mount_point: &str) -> Result<String, CallFailed> {
+        // what the call gives for a name that it cannot take
+        let root = nul_terminated_utf16(mount_point).ok_or(CallFailed {
+            call: MOUNT_POINT_CALL,
+            code: Win32Error(ERROR_INVALID_NAME),
+        })?;
+        let mut name = [0u16; VOLUME_NAME_CAPACITY as usize];
+        // SAFETY: GetVolumeNameForVolumeMountPointW with a NUL-terminated mount point and a buffer
+        // of VOLUME_NAME_CAPACITY CHAR16s and that count, which it writes at most.
+        let found = unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                root.as_ptr(),
+                name.as_mut_ptr(),
+                VOLUME_NAME_CAPACITY,
+            )
+        };
+        match found {
+            0 => Err(failed(MOUNT_POINT_CALL)),
+            _ => Ok(up_to_nul(&name)),
         }
     }
 }
