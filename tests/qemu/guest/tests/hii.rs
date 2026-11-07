@@ -491,6 +491,55 @@ fn list_strings_names_each_package_language() {
     }
 }
 
+/// Each question that list-questions lists shows its QuestionId, 1 to 65535, and the GUID of its
+/// FormSet as show-ifr prints it. ONE_OF lists its x-UEFI-ns prompt (VfrStrings.uni
+/// STR_ONE_OF_PROMPT_KEYWORD, edk2-stable202608) as its keyword; ONE_OF_PROMPT, which no x-
+/// package holds, lists none.
+#[test]
+fn questions_show_their_question_id_form_set_guid_and_keywords() {
+    let shown = uefisettings(&["hii", "show-ifr"]);
+    assert_eq!(shown.code, Some(0), "{shown:#?}");
+    let form_sets: Vec<&str> = shown
+        .stdout
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("OpCode: FormSet - "))
+        .filter_map(|line| line.split_once(" - GUID "))
+        .filter_map(|(_, rest)| rest.split_once(" - ClassGUID "))
+        .map(|(guid, _)| guid)
+        .collect();
+    let questions: Vec<serde_json::Value> = json(&["hii", "list-questions", "--json"]);
+
+    for question in &questions {
+        assert!(
+            matches!(question["question_id"].as_u64(), Some(1..=65535)),
+            "QuestionId of {question}"
+        );
+        let form_set = question["form_set_guid"].as_str().unwrap_or_default();
+        assert!(
+            form_sets.contains(&form_set),
+            "{question}: no FormSet of show-ifr, {form_sets:?}"
+        );
+    }
+    let keywords_of = |name: &str| -> Vec<Option<&serde_json::Value>> {
+        questions
+            .iter()
+            .filter(|question| question["name"] == name)
+            .map(|question| question.get("keywords"))
+            .collect()
+    };
+    let keyword = serde_json::json!([{"namespace_id": "x-UEFI-ns", "keyword": "iSCSIBootEnable"}]);
+    assert_eq!(
+        keywords_of(ONE_OF),
+        [Some(&keyword)],
+        "keywords of {ONE_OF:?}"
+    );
+    assert_eq!(
+        keywords_of(ONE_OF_PROMPT),
+        [None; 3],
+        "keywords of {ONE_OF_PROMPT:?}"
+    );
+}
+
 #[test]
 fn show_ifr_shows_the_formsets() {
     let output = uefisettings(&["hii", "show-ifr"]);

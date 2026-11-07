@@ -529,14 +529,14 @@ pub(crate) fn default_store_named(name: u16, default_id: u16) -> Vec<u8> {
 }
 
 /// Guid, FormSetTitle, Help, Flags and ClassGuid of an EFI_IFR_FORM_SET.
-fn form_set_data() -> Vec<u8> {
-    form_set_data_with(0x01, &[[0x22; 16]])
+fn form_set_data(guid: [u8; 16]) -> Vec<u8> {
+    form_set_data_with(guid, 0x01, &[[0x22; 16]])
 }
 
-/// Guid, FormSetTitle, Help, `flags` and `class_guids` of an EFI_IFR_FORM_SET.
-fn form_set_data_with(flags: u8, class_guids: &[[u8; 16]]) -> Vec<u8> {
+/// Guid `guid`, FormSetTitle, Help, `flags` and `class_guids` of an EFI_IFR_FORM_SET.
+fn form_set_data_with(guid: [u8; 16], flags: u8, class_guids: &[[u8; 16]]) -> Vec<u8> {
     [
-        &[0x11; 16][..],           // Guid
+        &guid[..],                 // Guid
         &[0x01, 0x00, 0x02, 0x00], // FormSetTitle, Help
         &[flags],
         &class_guids.concat(),
@@ -551,7 +551,11 @@ pub(super) fn form_set_with_class_guids(
     children: &[Vec<u8>],
 ) -> Vec<u8> {
     [
-        operation(FORM_SET, true, &form_set_data_with(flags, class_guids)),
+        operation(
+            FORM_SET,
+            true,
+            &form_set_data_with([0x11; 16], flags, class_guids),
+        ),
         children.concat(),
         END.to_vec(),
     ]
@@ -600,8 +604,13 @@ pub(super) fn try_parse_question(
 
 /// An EFI_IFR_FORM_SET holding `children`.
 pub(crate) fn form_set(children: &[Vec<u8>]) -> Vec<u8> {
+    form_set_with_guid([0x11; 16], children)
+}
+
+/// form_set() of Guid `guid`.
+pub(crate) fn form_set_with_guid(guid: [u8; 16], children: &[Vec<u8>]) -> Vec<u8> {
     [
-        operation(FORM_SET, true, &form_set_data()),
+        operation(FORM_SET, true, &form_set_data(guid)),
         children.concat(),
         END.to_vec(),
     ]
@@ -611,7 +620,7 @@ pub(crate) fn form_set(children: &[Vec<u8>]) -> Vec<u8> {
 /// The FORM_SET op of form_set without its Scope bit, then `children`, with no End of its own.
 pub(crate) fn scopeless_form_set(children: &[Vec<u8>]) -> Vec<u8> {
     [
-        operation(FORM_SET, false, &form_set_data()),
+        operation(FORM_SET, false, &form_set_data([0x11; 16])),
         children.concat(),
     ]
     .concat()

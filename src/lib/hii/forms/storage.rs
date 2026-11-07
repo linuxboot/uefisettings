@@ -172,6 +172,7 @@ mod non_efi_varstore_tests {
     use super::super::ParsedOperation;
     use super::super::QuestionDescriptor;
     use super::super::QuestionFlags;
+    use super::super::QuestionIdentity;
     use super::super::RangeType;
     use super::super::TypeValue;
     use super::super::DUMMY_OPCODE;
@@ -1046,6 +1047,11 @@ mod non_efi_varstore_tests {
             opcode: IFROpCode::OneOf,
             flags: QuestionFlags::empty(),
             defaults: Vec::new(),
+            identity: QuestionIdentity {
+                question_id: 1,
+                form_set: None,
+                keywords: Vec::new(),
+            },
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 texts: vec![(Language(b"en-US".to_vec()), "Enabled".to_string())],

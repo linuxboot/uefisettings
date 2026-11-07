@@ -25,6 +25,7 @@ use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
+use log::debug;
 use thiserror::Error;
 
 use super::choice_for_set;
@@ -636,6 +637,22 @@ impl<'a> KeywordQuestion<'a> {
 fn namespace_of(language: &Language) -> Option<Namespace> {
     let text = std::str::from_utf8(&language.0).ok()?;
     Namespace::try_from(text).ok()
+}
+
+/// The keyword string of the text `text` of a strings package of `language`, as a
+/// `<KeywordRequest>` names it: None unless `language` is a NAMESPACE and `text` a `<Keyword>`.
+pub(crate) fn keyword_of(language: &Language, text: &str) -> Option<(Namespace, Keyword)> {
+    let Some(namespace) = namespace_of(language) else {
+        debug!("language {} is no NAMESPACE", language.0.escape_ascii());
+        return None;
+    };
+    match Keyword::try_from(text) {
+        Ok(keyword) => Some((namespace, keyword)),
+        Err(error) => {
+            debug!("{namespace} string {text:?} is no keyword: {error}");
+            None
+        }
+    }
 }
 
 /// A statement of a package list, with the root of its form package.

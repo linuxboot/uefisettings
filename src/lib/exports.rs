@@ -28,6 +28,7 @@ use uefisettings_backend_thrift::HiiShowIfrResponse;
 use uefisettings_backend_thrift::HiiStringsPackage;
 use uefisettings_backend_thrift::Question;
 use uefisettings_backend_thrift::QuestionDefault;
+use uefisettings_backend_thrift::QuestionKeyword;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
@@ -811,18 +812,11 @@ impl HiiBackend {
                     options.access_level,
                     &mut reader,
                 ) {
-                    let question = Question {
-                        options: question_descriptor.listed_options(include),
-                        name: question_descriptor.question,
-                        answer: question_descriptor.value
-                            + question_descriptor.value_source.annotation()
-                            + &question_descriptor.value_state.option_annotation()
-                            + &state.annotation(),
-                        help: question_descriptor.help,
-                        flags: listed_flags(question_descriptor.flags),
-                        defaults: listed_defaults(question_descriptor.defaults),
-                        ..Default::default()
-                    };
+                    let annotation = String::from(question_descriptor.value_source.annotation())
+                        + &question_descriptor.value_state.option_annotation()
+                        + &state.annotation();
+                    let mut question = question_of(question_descriptor, include);
+                    question.answer += &annotation;
                     // don't show it if everything is empty
                     if !(question.name.is_empty()
                         && question.answer.is_empty()
@@ -971,16 +965,11 @@ impl HiiBackend {
                 backend: Backend::Hii,
                 is_translated,
                 question: Question {
-                    options: question_descriptor.listed_options(include),
-                    name: question_descriptor.question,
                     answer: new_value.to_owned()
                         + &option_annotation
                         + &state.annotation()
                         + volatile_annotation,
-                    help: question_descriptor.help,
-                    flags: listed_flags(question_descriptor.flags),
-                    defaults: listed_defaults(question_descriptor.defaults),
-                    ..Default::default()
+                    ..question_of(question_descriptor, include)
                 },
                 modified: true,
                 ..Default::default()
@@ -1079,20 +1068,13 @@ impl HiiBackend {
                         continue;
                     }
                 };
+                let source_annotation = question_descriptor.value_source.annotation();
+                let option_annotation = question_descriptor.value_state.option_annotation();
                 let mut get_resp = GetResponse {
                     selector: list.guid.to_string(),
                     backend: Backend::Hii,
                     is_translated,
-                    // mapping the hii module's QuestionDescriptor to thrift codegen's Question
-                    question: Question {
-                        options: question_descriptor.listed_options(include),
-                        name: question_descriptor.question,
-                        answer: question_descriptor.value,
-                        help: question_descriptor.help,
-                        flags: listed_flags(question_descriptor.flags),
-                        defaults: listed_defaults(question_descriptor.defaults),
-                        ..Default::default()
-                    },
+                    question: question_of(question_descriptor, include),
                     ..Default::default()
                 };
 
@@ -1101,8 +1083,8 @@ impl HiiBackend {
                         translate_response(question, &get_resp.question.answer, Backend::Hii);
                 }
                 // after translate_response, which matches whole answers
-                get_resp.question.answer += question_descriptor.value_source.annotation();
-                get_resp.question.answer += &question_descriptor.value_state.option_annotation();
+                get_resp.question.answer += source_annotation;
+                get_resp.question.answer += &option_annotation;
                 get_resp.question.answer += &state.annotation();
 
                 resp.push(get_resp)
@@ -1281,6 +1263,37 @@ fn select_for_set(
     Ok(selected)
 }
 
+/// The Question of `descriptor` that get, set and list-questions show, its answer the value as
+/// read, with the options that `include` allows.
+fn question_of(descriptor: forms::QuestionDescriptor, include: IncludedStates) -> Question {
+    Question {
+        options: descriptor.listed_options(include),
+        name: descriptor.question,
+        answer: descriptor.value,
+        help: descriptor.help,
+        flags: listed_flags(descriptor.flags),
+        defaults: listed_defaults(descriptor.defaults),
+        question_id: Some(i32::from(descriptor.identity.question_id)),
+        form_set_guid: descriptor.identity.form_set.map(|guid| guid.to_string()),
+        keywords: listed_keywords(descriptor.identity.keywords),
+        ..Default::default()
+    }
+}
+
+/// `keywords` as Question lists them: None, which --json leaves out, for none.
+fn listed_keywords(keywords: Vec<forms::Keyword>) -> Option<Vec<QuestionKeyword>> {
+    (!keywords.is_empty()).then(|| {
+        keywords
+            .into_iter()
+            .map(|keyword| QuestionKeyword {
+                namespace_id: keyword.namespace,
+                keyword: keyword.keyword,
+                ..Default::default()
+            })
+            .collect()
+    })
+}
+
 /// The names of `flags`, as Question lists them: None, which --json leaves out, for none.
 fn listed_flags(flags: QuestionFlags) -> Option<Vec<String>> {
     (!flags.is_empty()).then(|| {
@@ -1401,6 +1414,7 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
     use crate::hii::package::hiidb_fixtures::form_package;
     use crate::hii::package::hiidb_fixtures::form_package_of;
+    use crate::hii::package::hiidb_fixtures::form_package_with_guid;
     use crate::hii::package::hiidb_fixtures::form_set_package;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::strings_package_of;
@@ -2233,6 +2247,157 @@ mod tests {
             "set Mode Off"
         );
         assert_eq!(variables.writes_to(&setup()), [], "set Mode Off writes");
+    }
+
+    /// The GUIDs of keyed_hiidb's FormSet and of its package list.
+    const KEYED_FORM_SET: &str = "8C78A505-BAA0-4C4A-869F-000000000800";
+    const KEYED_LIST: &str = "8C78A505-BAA0-4C4A-869F-000000000801";
+
+    /// The EFI_GUID bytes of the GUID `text`.
+    fn guid_bytes(text: &str) -> [u8; 16] {
+        text.parse::<Guid>().expect("parse the GUID").into()
+    }
+
+    /// A HiiDB whose FormSet of Guid KEYED_FORM_SET holds the CHECKBOX "Keyed" of QuestionId
+    /// 0x8001, whose prompt x-UEFI-ns and x-i-UEFI translate, and the CHECKBOX "Plain", whose
+    /// prompt no package of a configuration language holds.
+    fn keyed_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package_with_guid(
+                guid_bytes(KEYED_FORM_SET),
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, 2),
+                    form(1, &[checkbox_at(0x8001, 3, 1, 0), checkbox_at(2, 5, 1, 1)]),
+                ],
+            ),
+            strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
+            strings_package_of(b"en-US", &["Title", "Help", "Keyed", "Help text", "Plain"]),
+            strings_package_of(b"x-i-UEFI", &["", "", "Other"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat())
+    }
+
+    /// The QuestionId, FormSet GUID and keywords of `question`, as --json prints them.
+    fn identity_json(question: &Question) -> [Option<serde_json::Value>; 3] {
+        ["question_id", "form_set_guid", "keywords"].map(|field| json_field(question, field))
+    }
+
+    /// list-questions, get and set show each question's QuestionId, its FormSet's GUID and its
+    /// prompt in each package of a configuration language, by package order; --json leaves
+    /// keywords out for a question without any.
+    #[test]
+    fn questions_show_their_question_id_form_set_guid_and_keywords() {
+        let form_set = Some(serde_json::json!(KEYED_FORM_SET));
+        let keyed = [
+            Some(serde_json::json!(32769)),
+            form_set.clone(),
+            Some(serde_json::json!([
+                {"namespace_id": "x-UEFI-ns", "keyword": "Keyword:5"},
+                {"namespace_id": "x-i-UEFI", "keyword": "Other"},
+            ])),
+        ];
+        let plain = [Some(serde_json::json!(2)), form_set, None];
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0, 0]);
+
+        let listed = HiiBackend::list_questions_in(
+            &keyed_hiidb(),
+            &ListQuestionsOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        )
+        .expect("list the questions");
+        let got = HiiBackend::get_in(
+            &keyed_hiidb(),
+            "Keyed",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        )
+        .expect("get Keyed");
+        let set = HiiBackend::set_in(
+            &keyed_hiidb(),
+            "Keyed",
+            "1",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        )
+        .expect("set Keyed 1");
+
+        let listed: Vec<(&str, [Option<serde_json::Value>; 3])> = listed
+            .iter()
+            .map(|question| (question.name.as_str(), identity_json(question)))
+            .collect();
+        assert_eq!(
+            listed,
+            [("Keyed", keyed.clone()), ("Plain", plain)],
+            "list-questions"
+        );
+        let got: Vec<[Option<serde_json::Value>; 3]> = got
+            .responses
+            .iter()
+            .map(|response| identity_json(&response.question))
+            .collect();
+        assert_eq!(got, std::slice::from_ref(&keyed), "get Keyed");
+        let set: Vec<[Option<serde_json::Value>; 3]> = set
+            .responses
+            .iter()
+            .map(|response| identity_json(&response.question))
+            .collect();
+        assert_eq!(set, [keyed], "set Keyed 1");
+    }
+
+    /// list-questions shows a prompt as a keyword only where a <KeywordRequest> can name it: in a
+    /// strings package whose language is a NAMESPACE, and as a <Keyword>, without '&' and with at
+    /// most 4 instance digits.
+    #[test]
+    fn questions_show_only_keywords_that_a_keyword_request_names() {
+        let packages = [
+            form_package_with_guid(
+                guid_bytes(KEYED_FORM_SET),
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, 2),
+                    form(1, &[checkbox_at(0x8001, 3, 1, 0)]),
+                ],
+            ),
+            strings_package_of(b"en-US", &["Title", "Help", "Keyed"]),
+            strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
+            strings_package_of(b"x-UEFI-amp", &["", "", "Key&word"]),
+            strings_package_of(b"x-UEFI-digits", &["", "", "Keyword:12345"]),
+            strings_package_of(b"x-UEFI=ns", &["", "", "Keyword"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat());
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0, 0]);
+
+        let listed = HiiBackend::list_questions_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        )
+        .expect("list the questions");
+
+        let keywords: Vec<Option<serde_json::Value>> = listed
+            .iter()
+            .map(|question| json_field(question, "keywords"))
+            .collect();
+        assert_eq!(
+            keywords,
+            [Some(serde_json::json!([
+                {"namespace_id": "x-UEFI-ns", "keyword": "Keyword:5"},
+            ]))],
+            "keywords of Keyed"
+        );
     }
 
     /// get, list-questions and show-ifr read question values from the source that their

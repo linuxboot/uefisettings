@@ -41,6 +41,18 @@ pub struct QuestionDefault {
     pub _dot_dot_Default_default: self::dot_dot::OtherFields,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuestionKeyword {
+    pub namespace_id: ::std::string::String,
+    pub keyword: ::std::string::String,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct Question {
     pub name: ::std::string::String,
@@ -48,6 +60,9 @@ pub struct Question {
     pub options: ::std::vec::Vec<::std::string::String>,
     pub help: ::std::string::String,
     pub flags: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
+    pub question_id: ::std::option::Option<::std::primitive::i32>,
+    pub form_set_guid: ::std::option::Option<::std::string::String>,
+    pub keywords: ::std::option::Option<::std::vec::Vec<crate::types::QuestionKeyword>>,
     pub defaults: ::std::option::Option<::std::vec::Vec<crate::types::QuestionDefault>>,
     // This field forces `..Default::default()` when instantiating this
     // struct, to make code future-proof against new fields added later to
@@ -771,6 +786,110 @@ impl ::fbthrift::metadata::ThriftAnnotations for QuestionDefault {
 
 
 #[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::QuestionKeyword {
+    fn default() -> Self {
+        Self {
+            namespace_id: ::std::default::Default::default(),
+            keyword: ::std::default::Default::default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::QuestionKeyword {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("QuestionKeyword")
+            .field("namespace_id", &self.namespace_id)
+            .field("keyword", &self.keyword)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::QuestionKeyword {}
+unsafe impl ::std::marker::Sync for self::QuestionKeyword {}
+impl ::std::marker::Unpin for self::QuestionKeyword {}
+
+impl ::fbthrift::GetTType for self::QuestionKeyword {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::QuestionKeyword
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("QuestionKeyword");
+        p.write_field_begin("namespace_id", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.namespace_id, p);
+        p.write_field_end();
+        p.write_field_begin("keyword", ::fbthrift::TType::String, 2);
+        ::fbthrift::Serialize::write(&self.keyword, p);
+        p.write_field_end();
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::QuestionKeyword
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("keyword", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("namespace_id", ::fbthrift::TType::String, 1),
+        ];
+        let mut field_namespace_id = ::std::option::Option::None;
+        let mut field_keyword = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_namespace_id = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_keyword = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            namespace_id: field_namespace_id.unwrap_or_default(),
+            keyword: field_keyword.unwrap_or_default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for QuestionKeyword {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
 impl ::std::default::Default for self::Question {
     fn default() -> Self {
         Self {
@@ -779,6 +898,9 @@ impl ::std::default::Default for self::Question {
             options: ::std::default::Default::default(),
             help: ::std::default::Default::default(),
             flags: ::std::option::Option::None,
+            question_id: ::std::option::Option::None,
+            form_set_guid: ::std::option::Option::None,
+            keywords: ::std::option::Option::None,
             defaults: ::std::option::Option::None,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         }
@@ -794,6 +916,9 @@ impl ::std::fmt::Debug for self::Question {
             .field("options", &self.options)
             .field("help", &self.help)
             .field("flags", &self.flags)
+            .field("question_id", &self.question_id)
+            .field("form_set_guid", &self.form_set_guid)
+            .field("keywords", &self.keywords)
             .field("defaults", &self.defaults)
             .finish()
     }
@@ -830,6 +955,21 @@ where
             ::fbthrift::Serialize::write(some, p);
             p.write_field_end();
         }
+        if let ::std::option::Option::Some(some) = &self.question_id {
+            p.write_field_begin("question_id", ::fbthrift::TType::I32, 6);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.form_set_guid {
+            p.write_field_begin("form_set_guid", ::fbthrift::TType::String, 7);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.keywords {
+            p.write_field_begin("keywords", ::fbthrift::TType::List, 8);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
         if let ::std::option::Option::Some(some) = &self.defaults {
             p.write_field_begin("defaults", ::fbthrift::TType::List, 9);
             ::fbthrift::Serialize::write(some, p);
@@ -849,15 +989,21 @@ where
             ::fbthrift::Field::new("answer", ::fbthrift::TType::String, 2),
             ::fbthrift::Field::new("defaults", ::fbthrift::TType::List, 9),
             ::fbthrift::Field::new("flags", ::fbthrift::TType::List, 5),
+            ::fbthrift::Field::new("form_set_guid", ::fbthrift::TType::String, 7),
             ::fbthrift::Field::new("help", ::fbthrift::TType::String, 4),
+            ::fbthrift::Field::new("keywords", ::fbthrift::TType::List, 8),
             ::fbthrift::Field::new("name", ::fbthrift::TType::String, 1),
             ::fbthrift::Field::new("options", ::fbthrift::TType::List, 3),
+            ::fbthrift::Field::new("question_id", ::fbthrift::TType::I32, 6),
         ];
         let mut field_name = ::std::option::Option::None;
         let mut field_answer = ::std::option::Option::None;
         let mut field_options = ::std::option::Option::None;
         let mut field_help = ::std::option::Option::None;
         let mut field_flags = ::std::option::Option::None;
+        let mut field_question_id = ::std::option::Option::None;
+        let mut field_form_set_guid = ::std::option::Option::None;
+        let mut field_keywords = ::std::option::Option::None;
         let mut field_defaults = ::std::option::Option::None;
         let _ = p.read_struct_begin(|_| ())?;
         loop {
@@ -869,6 +1015,9 @@ where
                 (::fbthrift::TType::List, 3) => field_options = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::String, 4) => field_help = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::List, 5) => field_flags = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I32, 6) => field_question_id = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 7) => field_form_set_guid = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 8) => field_keywords = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::List, 9) => field_defaults = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (fty, _) => p.skip(fty)?,
             }
@@ -881,6 +1030,9 @@ where
             options: field_options.unwrap_or_default(),
             help: field_help.unwrap_or_default(),
             flags: field_flags,
+            question_id: field_question_id,
+            form_set_guid: field_form_set_guid,
+            keywords: field_keywords,
             defaults: field_defaults,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         })
@@ -911,6 +1063,12 @@ impl ::fbthrift::metadata::ThriftAnnotations for Question {
             4 => {
             },
             5 => {
+            },
+            6 => {
+            },
+            7 => {
+            },
+            8 => {
             },
             9 => {
             },

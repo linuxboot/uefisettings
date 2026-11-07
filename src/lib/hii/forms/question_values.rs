@@ -33,6 +33,7 @@ use super::defaults::push_default;
 use super::defaults::question_defaults;
 use super::defaults::question_scope;
 use super::find_corresponding_varstore;
+use super::keywords::keyword_of;
 use super::numeric_format;
 use super::storage::RetrievedValue;
 use super::storage::ValueLocation;
@@ -243,6 +244,49 @@ pub(super) fn share_a_language(language_sets: &[&[String]]) -> bool {
     })
 }
 
+/// What tells a question apart besides its prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuestionIdentity {
+    /// The QuestionId of its question header (UEFI 2.11 §33.3.8.2.2)
+    pub(crate) question_id: u16,
+    /// The GUID of its FormSet
+    pub(crate) form_set: Option<Guid>,
+    /// Its prompt in each strings package of a configuration language, with that language, of
+    /// those that a `<KeywordRequest>` can name (keyword_of)
+    pub(crate) keywords: Vec<Keyword>,
+}
+
+/// A keyword string's NAMESPACE, the configuration language of a strings package, and KEYWORD,
+/// a question's prompt in it (UEFI 2.11 §35.2.1.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Keyword {
+    pub(crate) namespace: String,
+    pub(crate) keyword: String,
+}
+
+impl QuestionIdentity {
+    /// The identity of the question `op`, of header `header`, whose keywords `texts` hold.
+    fn of(op: &IFROperation, header: &QuestionHeader, texts: &ListTexts<'_>) -> Self {
+        let form_set =
+            enclosing_form_set(op).and_then(|form_set| match &form_set.borrow().parsed_data {
+                ParsedOperation::FormSet(parsed) => Some(parsed.guid),
+                _ => None,
+            });
+        Self {
+            question_id: header.question_id,
+            form_set,
+            keywords: texts
+                .keywords(header.prompt_string_id)
+                .filter_map(|(language, text)| keyword_of(language, text))
+                .map(|(namespace, keyword)| Keyword {
+                    namespace: namespace.to_string(),
+                    keyword: keyword.to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Returns the QuestionDescriptor of `question`, whose op is `value_question`.
 pub(super) fn describe_question(
     question: &Rc<RefCell<IFROperation>>,
@@ -338,6 +382,7 @@ pub(super) fn handle_checkbox(
         opcode: current_node.op_code,
         flags,
         defaults,
+        identity: QuestionIdentity::of(current_node, &parsed.question_header(), walk.texts),
         value_state: StateEvaluation::selectable(),
         value_source: source.unwrap_or(ValueSource::Current),
         node: Rc::clone(node),
@@ -444,6 +489,7 @@ pub(super) fn handle_oneof(
         opcode: current_node.op_code,
         flags,
         defaults,
+        identity: QuestionIdentity::of(current_node, &parsed.question_header(), walk.texts),
         value_state,
         value_source,
         node: Rc::clone(node),
@@ -549,6 +595,7 @@ pub(super) fn handle_numeric(
         opcode: current_node.op_code,
         flags,
         defaults,
+        identity: QuestionIdentity::of(current_node, &parsed.question_header(), walk.texts),
         value_state: StateEvaluation::selectable(),
         value_source: source.unwrap_or(ValueSource::Current),
         node: Rc::clone(node),

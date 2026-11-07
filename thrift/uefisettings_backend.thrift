@@ -46,6 +46,15 @@ struct QuestionDefault {
   3: optional string value;
 }
 
+struct QuestionKeyword {
+  // the configuration language of the strings package holding it, e.g. "x-UEFI-ns":
+  // a keyword string's NAMESPACE (UEFI 2.11 §35.2.1.6), the NamespaceId parameter of
+  // GetData() (§35.3.3); thrift reserves "namespace"
+  1: string namespace_id;
+  // the question's prompt in that package, any ":<DecCh>(1/4)" suffix included: its KEYWORD
+  2: string keyword;
+}
+
 struct Question {
   1: string name;
   // answer values:
@@ -71,6 +80,15 @@ struct Question {
   // REST_STYLE also when the FormSet's ClassGuids hold EFI_HII_REST_STYLE_FORMSET_GUID, which
   // lets the Flags omit it.
   5: optional list<string> flags;
+  // hii - the QuestionId of the question's EFI_IFR_QUESTION_HEADER (UEFI 2.11 §33.3.8.2.2),
+  // 1 to 65535; i32 because thrift's i16 is signed
+  6: optional i32 question_id;
+  // hii - the GUID of the question's FormSet, as --question-id takes it
+  7: optional string form_set_guid;
+  // hii - the question's prompt in each strings package of a configuration language (one
+  // whose language starts with "x-", UEFI 2.11 §33.2.6.1), of those that a <KeywordRequest>
+  // can name (§35.2.1.6): the language a <NameSpaceId>, the prompt a <Keyword>; absent if none
+  8: optional list<QuestionKeyword> keywords;
   // hii - the defaults that the IFR declares for the question, by default_id ascending. Unset if
   // it declares none.
   9: optional list<QuestionDefault> defaults;

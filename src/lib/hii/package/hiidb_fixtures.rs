@@ -10,7 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use crate::hii::forms::ifr_fixtures::form_set;
+use crate::hii::forms::ifr_fixtures::form_set_with_guid;
 
 use super::*;
 
@@ -200,7 +200,12 @@ pub(crate) fn form_set_package() -> Vec<u8> {
 /// A form package holding an EFI_IFR_FORM_SET titled by string ID 1 that holds
 /// `children`.
 pub(crate) fn form_package(children: &[Vec<u8>]) -> Vec<u8> {
-    form_package_of(&form_set(children))
+    form_package_with_guid([0x11; 16], children)
+}
+
+/// form_package() whose FormSet has Guid `guid`.
+pub(crate) fn form_package_with_guid(guid: [u8; 16], children: &[Vec<u8>]) -> Vec<u8> {
+    form_package_of(&form_set_with_guid(guid, children))
 }
 
 /// A form package holding the IFR `ifr`.

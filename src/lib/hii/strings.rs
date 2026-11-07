@@ -250,6 +250,8 @@ pub(crate) fn best_language<'a>(
 /// the current platform language setting" (UEFI 2.11 §33.2.6). No expression reads them, so the
 /// language they show in never changes a condition, READ or WRITE.
 pub(crate) struct ListTexts<'a> {
+    /// The packages, in list order
+    packages: &'a [StringPackage],
     /// The package that texts come from first
     chosen: Option<&'a StringPackage>,
     /// The packages of no configuration language, in list order, which texts fall back on
@@ -269,7 +271,11 @@ impl<'a> ListTexts<'a> {
             .iter()
             .find_map(|requested| best_language(packages, requested))
             .or_else(|| shown.first().copied());
-        Self { chosen, shown }
+        Self {
+            packages,
+            chosen,
+            shown,
+        }
     }
 
     /// The text of the string `id`: the chosen package's, else that of the first package of no
@@ -299,6 +305,31 @@ impl<'a> ListTexts<'a> {
                 .get(&id)
                 .map(|text| (&package.language, text.as_ref()))
         })
+    }
+
+    /// The text of the string `id` in each package of a configuration language that holds it,
+    /// with that package's language, in list order: a question's keywords, if `id` is its prompt
+    /// (UEFI 2.11 §35.2.1.6).
+    pub(crate) fn keywords(&self, id: u16) -> impl Iterator<Item = (&'a Language, &'a str)> {
+        self.texts_in(id, Language::is_configuration)
+    }
+
+    /// The text of the string `id` in each package whose language `keep` takes that holds it,
+    /// with that package's language, in list order.
+    fn texts_in(
+        &self,
+        id: u16,
+        keep: impl Fn(&Language) -> bool,
+    ) -> impl Iterator<Item = (&'a Language, &'a str)> {
+        self.packages
+            .iter()
+            .filter(move |package| keep(&package.language))
+            .filter_map(move |package| {
+                package
+                    .strings
+                    .get(&id)
+                    .map(|text| (&package.language, text.as_ref()))
+            })
     }
 }
 

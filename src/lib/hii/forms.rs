@@ -59,8 +59,10 @@ use question_values::describe_question;
 use question_values::questions_named;
 use question_values::share_a_language;
 use question_values::value_question;
+pub(crate) use question_values::Keyword;
 pub use question_values::OptionMatch;
 pub use question_values::PromptMatch;
+pub(crate) use question_values::QuestionIdentity;
 use set::ChangeValueError;
 use storage::storage_width;
 use storage::NameValueStore;
@@ -100,7 +102,14 @@ mod conditions;
 mod defaults;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
-#[cfg(any(target_os = "uefi", test))]
+#[cfg_attr(
+    not(any(target_os = "uefi", test)),
+    expect(
+        dead_code,
+        reason = "only the UEFI Shell build's Keyword Handler resolves keywords for GetData() and \
+                  SetData() and checks them; list-questions takes keyword_of on every build"
+    )
+)]
 pub(crate) mod keywords;
 mod question_values;
 mod set;
@@ -2033,6 +2042,8 @@ pub struct QuestionDescriptor {
     pub flags: QuestionFlags,
     /// The defaults that its IFR declares, by DefaultId ascending
     pub(crate) defaults: Vec<DeclaredDefault>,
+    /// Its QuestionId, FormSet GUID and keywords
+    pub(crate) identity: QuestionIdentity,
     pub possible_options: Vec<AnswerOption>,
     /// The VarStore of the question, or why set cannot write it
     varstore: Result<Box<dyn VariableStore>>,

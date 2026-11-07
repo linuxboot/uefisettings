@@ -43,6 +43,7 @@ use uefisettings_backend_thrift::IloAttributes;
 use uefisettings_backend_thrift::MachineInfo;
 use uefisettings_backend_thrift::Question;
 use uefisettings_backend_thrift::QuestionDefault;
+use uefisettings_backend_thrift::QuestionKeyword;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 use uefisettings_spellings_db_thrift::consts::translation_db;
@@ -448,11 +449,33 @@ fn defaulted_question() -> Question {
     }
 }
 
+/// question() with a QuestionId above 0x7FFF, its FormSet's GUID and keywords in two namespaces.
+fn identified_question() -> Question {
+    Question {
+        question_id: Some(0x8001),
+        form_set_guid: Some("8C78A505-BAA0-4C4A-869F-000000000800".to_owned()),
+        keywords: Some(vec![
+            QuestionKeyword {
+                namespace_id: "x-UEFI-ns".to_owned(),
+                keyword: "Keyword:5".to_owned(),
+                ..Default::default()
+            },
+            QuestionKeyword {
+                namespace_id: "x-i-UEFI".to_owned(),
+                keyword: TRICKY.to_owned(),
+                ..Default::default()
+            },
+        ]),
+        ..question()
+    }
+}
+
 /// The JSON of the optional fields that Question gained for hii questions.
 fn question_fields() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("question-flags.json", json(&flagged_question())),
         ("question-defaults.json", json(&defaulted_question())),
+        ("question-identity.json", json(&identified_question())),
     ]
 }
 
@@ -515,6 +538,12 @@ fn unset_optionals_are_omitted_and_set_ones_present() {
         &question(),
         &defaulted_question(),
         &["defaults"],
+    );
+    assert_optionals(
+        "Question",
+        &question(),
+        &identified_question(),
+        &["question_id", "form_set_guid", "keywords"],
     );
     assert_optionals(
         "QuestionDefault",
