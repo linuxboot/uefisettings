@@ -12,8 +12,8 @@
 
 //! `capsule results`, which prints the results of capsule processing that the variables of
 //! `tests/qemu/vars/capsule-results-64.json` or `-32.json` hold (UEFI 2.11 §8.5.6): Capsule0000,
-//! a JSON capsule's, Capsule0001, that of another CapsuleGuid, Capsule0003, 3 bytes, which do not
-//! decode, and CapsuleMax and CapsuleLast.
+//! a JSON capsule's, Capsule0001, that of another CapsuleGuid, Capsule0002, an FMP capsule's,
+//! Capsule0003, 3 bytes, which do not decode, and CapsuleMax and CapsuleLast.
 //! Their EFI_CAPSULE_RESULT_VARIABLE_HEADER is that of the firmware's width: 48 bytes on x86_64 and
 //! aarch64, 44 on i686, whose guest is 32-bit as its firmware is. `capsule results` writes what
 //! it printed to the test log, for `tests/qemu/check-shell-log.sh` to compare with what
@@ -28,9 +28,10 @@ use uefisettings_qemu_guest::NO_CONFIGURATION_TABLES_ON_LINUX;
 
 /// The size of the EFI_CAPSULE_RESULT_VARIABLE_HEADER of the firmware, of this guest's width.
 const HEADER_SIZE: u64 = 40 + usize::BITS as u64 / 8;
-/// EFI_INVALID_PARAMETER, whose high bit is that of a UINTN of the firmware's width
-/// (edk2-stable202508 MdePkg/Include/Base.h ENCODE_ERROR).
+/// EFI_INVALID_PARAMETER and EFI_ABORTED, whose high bit is that of a UINTN of the firmware's
+/// width (edk2-stable202508 MdePkg/Include/Base.h ENCODE_ERROR).
 const INVALID_PARAMETER: u64 = 1 << (usize::BITS - 1) | 2;
+const ABORTED: u64 = 1 << (usize::BITS - 1) | 21;
 
 /// `status` as the capsule commands print an EFI_STATUS: in hex.
 fn status(status: u64) -> String {
@@ -80,6 +81,22 @@ fn results_prints_the_result_variables() {
                         "capsule_processed": processed,
                         "capsule_status": "0x0",
                         "data": { "hex": "ff00807f" },
+                    },
+                },
+                {
+                    "name": "Capsule0002",
+                    "result": {
+                        "variable_total_size": HEADER_SIZE + 20 + 22 + 2,
+                        "capsule_guid": "6DCBD5ED-E82D-4C44-BDA1-7194199AD92A",
+                        "capsule_processed": processed,
+                        "capsule_status": status(ABORTED),
+                        "fmp": {
+                            "payload_index": 0,
+                            "update_image_index": 1,
+                            "update_image_type_id": "8C78A505-BAA0-4C4A-869F-000000001301",
+                            "capsule_file_name": "update.cap",
+                            "capsule_target": "",
+                        },
                     },
                 },
                 {

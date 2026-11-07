@@ -82,6 +82,8 @@ pub use capsule_result::CapsuleResults;
 #[cfg(variable_data)]
 pub use capsule_result::EfiTime;
 #[cfg(variable_data)]
+pub use capsule_result::FmpCapsuleResult;
+#[cfg(variable_data)]
 pub use capsule_result::JsonCapsuleResult;
 #[cfg(variable_data)]
 pub use capsule_result::NamedCapsuleResult;

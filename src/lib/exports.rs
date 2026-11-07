@@ -102,6 +102,8 @@ pub use crate::efi_variables::CapsuleResults;
 #[cfg(variable_data)]
 pub use crate::efi_variables::EfiTime;
 #[cfg(variable_data)]
+pub use crate::efi_variables::FmpCapsuleResult;
+#[cfg(variable_data)]
 pub use crate::efi_variables::JsonCapsuleResult;
 #[cfg(configuration_tables)]
 pub use crate::efi_variables::JsonConfigData;

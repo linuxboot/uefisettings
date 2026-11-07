@@ -1,9 +1,9 @@
 # The checks of shell/capsule-results.nsh, the second boot of shell-capsule-results and
 # shell-capsule-results-i686. See check-shell-log.sh.
-# the result variables, the JSON capsule's first and the one that does not decode last, as Linux
-# printed them the boot before, with the header of the firmware's width
+# the result variables, the JSON capsule's first, the FMP capsule's third and the one that does
+# not decode last, as Linux printed them the boot before, with the header of the firmware's width
 results	status	0x0
-results	json	.capsule_max == "Capsule0003" and .capsule_last == "Capsule0001" and ([.results[].name] == ["Capsule0000", "Capsule0001", "Capsule0003"]) and .results[0].result.json.capsule_id == 7 and .results[1].result.data.hex == "ff00807f" and .results[2].data.hex == "010203" and (.results[2].error | startswith("the capsule result holds 3 bytes"))
+results	json	.capsule_max == "Capsule0003" and .capsule_last == "Capsule0001" and ([.results[].name] == ["Capsule0000", "Capsule0001", "Capsule0002", "Capsule0003"]) and .results[0].result.json.capsule_id == 7 and .results[1].result.data.hex == "ff00807f" and .results[2].result.fmp == {"payload_index": 0, "update_image_index": 1, "update_image_type_id": "8C78A505-BAA0-4C4A-869F-000000001301", "capsule_file_name": "update.cap", "capsule_target": ""} and .results[3].data.hex == "010203" and (.results[3].error | startswith("the capsule result holds 3 bytes"))
 results	linux	boot1.test.log results . == $linux
 # the table of publish-hiidb.efi json-capsule-result, with the header and CapsuleStatus of the
 # firmware's width

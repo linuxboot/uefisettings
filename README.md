@@ -571,10 +571,13 @@ own, so one that does not decode hides no other: it shows as `{"name": ..., "err
 `variable_total_size`, `capsule_guid`, `capsule_processed`, an EFI_TIME of `year`, `month`, `day`,
 `hour`, `minute`, `second`, `nanosecond`, `time_zone` and `daylight`, and `capsule_status`, an
 EFI_STATUS in hex, such as `"0x8000000000000002"`: its high bit is that of the firmware's UINTN,
-and a JSON number that large loses its low bits where JSON numbers are doubles. The result of a
-JSON capsule has `json` (§8.5.6.1.3): its `capsule_id` and its `resp`, as `{"text": ...}` if it is
-UTF-8, else as `{"hex": ...}`; that of any other CapsuleGuid, or of a JSON part of a Version but 1,
-has `data`, the bytes after the header, as `{"hex": ...}`. The header's CapsuleStatus is a UINTN,
+and a JSON number that large loses its low bits where JSON numbers are doubles. The result of an
+FMP capsule has `fmp` (§8.5.6.1.2): its `payload_index`, `update_image_index`,
+`update_image_type_id`, `capsule_file_name` and `capsule_target`, each string empty where the
+firmware wrote only its zero terminator. The result of a JSON capsule has `json` (§8.5.6.1.3): its
+`capsule_id` and its `resp`, as `{"text": ...}` if it is UTF-8, else as `{"hex": ...}`; that of any
+other CapsuleGuid, or of an FMP or JSON part of a Version but 1, has `data`, the bytes after the
+header, as `{"hex": ...}`. The header's CapsuleStatus is a UINTN,
 so its size depends on the firmware's width, which Linux tells in
 `/sys/firmware/efi/fw_platform_size`; `uefisettings.efi` runs on firmware of its own width.
 Windows lists no variables, so there `uefisettings` reads CapsuleMax and CapsuleLast, then each name

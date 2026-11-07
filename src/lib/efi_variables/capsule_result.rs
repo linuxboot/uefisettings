@@ -14,8 +14,8 @@
 //! variable of EFI_CAPSULE_REPORT_GUID for each capsule payload that it processed, CapsuleMax and
 //! CapsuleLast, which name such variables, and the JSON capsule result table that it installs
 //! for a JSON capsule (§23.5.3). A result is an EFI_CAPSULE_RESULT_VARIABLE_HEADER, whose
-//! CapsuleStatus is an EFI_STATUS, a UINTN of the firmware's width, then for a JSON capsule an
-//! EFI_CAPSULE_RESULT_VARIABLE_JSON.
+//! CapsuleStatus is an EFI_STATUS, a UINTN of the firmware's width, then for an FMP capsule an
+//! EFI_CAPSULE_RESULT_VARIABLE_FMP, and for a JSON capsule an EFI_CAPSULE_RESULT_VARIABLE_JSON.
 
 use std::fmt;
 
@@ -70,6 +70,19 @@ const CAPSULE_STATUS_OFFSET: usize = CAPSULE_PROCESSED_OFFSET + EFI_TIME_SIZE;
 const JSON_RESULT_HEADER_SIZE: usize = 3 * 4;
 /// EFI_CAPSULE_RESULT_VARIABLE_JSON's Version, "currently 0x00000001" (UEFI 2.11 §8.5.6.1.3).
 const JSON_RESULT_VERSION: u32 = 1;
+/// EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID, the CapsuleGuid of an FMP capsule (UEFI 2.11
+/// §23.3.1), whose result adds an EFI_CAPSULE_RESULT_VARIABLE_FMP (§8.5.6.1.2).
+const EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID: Guid = Guid {
+    data1: 0x6dcb_d5ed,
+    data2: 0xe82d,
+    data3: 0x4c44,
+    data4: [0xbd, 0xa1, 0x71, 0x94, 0x19, 0x9a, 0xd9, 0x2a],
+};
+/// sizeof (EFI_CAPSULE_RESULT_VARIABLE_FMP) before its strings: the UINT16 Version, the UINT8s
+/// PayloadIndex and UpdateImageIndex, and the UpdateImageTypeId (UEFI 2.11 §8.5.6.1.2).
+const FMP_RESULT_HEADER_SIZE: usize = 2 + 1 + 1 + 16;
+/// EFI_CAPSULE_RESULT_VARIABLE_FMP's Version, "currently 0x00000001" (UEFI 2.11 §8.5.6.1.2).
+const FMP_RESULT_VERSION: u16 = 1;
 /// The name of a result variable before its 4 hexadecimal digits (UEFI 2.11 §8.5.6).
 const RESULT_NAME_PREFIX: &str = "Capsule";
 /// The hexadecimal digits of the name of a result variable.
@@ -260,6 +273,9 @@ fn serialize_status<S: Serializer>(status: &u64, serializer: S) -> Result<S::Ok,
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum CapsuleResultDetails {
+    /// The EFI_CAPSULE_RESULT_VARIABLE_FMP of an FMP capsule (§8.5.6.1.2)
+    #[serde(rename = "fmp")]
+    Fmp(FmpCapsuleResult),
     /// The EFI_CAPSULE_RESULT_VARIABLE_JSON of a JSON capsule (§8.5.6.1.3)
     #[serde(rename = "json")]
     Json(JsonCapsuleResult),
@@ -272,6 +288,25 @@ pub enum CapsuleResultDetails {
 /// `bytes` as Hex serializes them.
 fn serialize_hex<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
     Hex(bytes).serialize(serializer)
+}
+
+/// An EFI_CAPSULE_RESULT_VARIABLE_FMP of Version 1 (UEFI 2.11 §8.5.6.1.2).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct FmpCapsuleResult {
+    /// PayloadIndex: the index of the processed payload within the FMP capsule, from zero
+    pub payload_index: u8,
+    /// UpdateImageIndex: that of the payload's EFI_FIRMWARE_MANAGEMENT_CAPSULE_IMAGE_HEADER
+    pub update_image_index: u8,
+    /// UpdateImageTypeId: that of the payload's EFI_FIRMWARE_MANAGEMENT_CAPSULE_IMAGE_HEADER
+    pub update_image_type_id: Guid,
+    /// CapsuleFileName: the file that the capsule was loaded from, empty for a capsule passed to
+    /// UpdateCapsule()
+    pub capsule_file_name: String,
+    /// CapsuleTarget: the text of the device path of the device publishing the Firmware
+    /// Management Protocol, empty where the firmware knows none, or blocked or skipped the
+    /// payload
+    pub capsule_target: String,
 }
 
 /// An EFI_CAPSULE_RESULT_VARIABLE_JSON of Version 1 (UEFI 2.11 §8.5.6.1.3).
@@ -319,9 +354,14 @@ impl CapsuleResult {
             }
         }
 
-        let details = match fields.capsule_guid == EFI_JSON_CAPSULE_ID_GUID {
-            true => JsonCapsuleResult::decode(rest)?.map(CapsuleResultDetails::Json),
-            false => None,
+        let details = match fields.capsule_guid {
+            EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID => {
+                FmpCapsuleResult::decode(rest)?.map(CapsuleResultDetails::Fmp)
+            }
+            EFI_JSON_CAPSULE_ID_GUID => {
+                JsonCapsuleResult::decode(rest)?.map(CapsuleResultDetails::Json)
+            }
+            _ => None,
         }
         .unwrap_or_else(|| CapsuleResultDetails::Other(rest.to_vec()));
         Ok(Self {
@@ -388,6 +428,63 @@ impl HeaderFields {
     }
 }
 
+impl FmpCapsuleResult {
+    /// The EFI_CAPSULE_RESULT_VARIABLE_FMP `bytes`, all the bytes after a result's header: the
+    /// fixed fields, then CapsuleFileName and CapsuleTarget, each zero-terminated CHAR16s, and
+    /// nothing after them; or None if its Version is not the 1 that uefisettings reads, as
+    /// JsonCapsuleResult::decode.
+    fn decode(bytes: &[u8]) -> Result<Option<Self>, CapsuleResultError> {
+        let short = CapsuleResultError::FmpShort { count: bytes.len() };
+        let Some(version) = bytes.first_chunk().copied().map(u16::from_le_bytes) else {
+            return Err(short);
+        };
+        if version != FMP_RESULT_VERSION {
+            return Ok(None);
+        }
+        let Some((fields, strings)) = bytes.split_first_chunk::<FMP_RESULT_HEADER_SIZE>() else {
+            return Err(short);
+        };
+        let [_, _, payload_index, update_image_index, update_image_type_id @ ..] = *fields;
+        let (units, []) = strings.as_chunks::<2>() else {
+            return Err(CapsuleResultError::FmpStringsOdd {
+                count: strings.len(),
+            });
+        };
+        let units: Vec<u16> = units.iter().map(|&unit| u16::from_le_bytes(unit)).collect();
+        let (capsule_file_name, rest) = zero_terminated(&units, "CapsuleFileName")?;
+        let (capsule_target, rest) = zero_terminated(rest, "CapsuleTarget")?;
+        if !rest.is_empty() {
+            return Err(CapsuleResultError::FmpTrailing {
+                count: 2 * rest.len(),
+            });
+        }
+        Ok(Some(Self {
+            payload_index,
+            update_image_index,
+            update_image_type_id: Guid::from(update_image_type_id),
+            capsule_file_name,
+            capsule_target,
+        }))
+    }
+}
+
+/// The zero-terminated CHAR16 string `field` at the start of `units`, and the units after its
+/// terminator.
+fn zero_terminated<'a>(
+    units: &'a [u16],
+    field: &'static str,
+) -> Result<(String, &'a [u16]), CapsuleResultError> {
+    let mut parts = units.splitn(2, |&unit| unit == 0);
+    let (Some(text), Some(rest)) = (parts.next(), parts.next()) else {
+        return Err(CapsuleResultError::FmpUnterminated { field });
+    };
+    let text = String::from_utf16(text).map_err(|_| CapsuleResultError::FmpText {
+        field,
+        text: String::from_utf16_lossy(text),
+    })?;
+    Ok((text, rest))
+}
+
 impl JsonCapsuleResult {
     /// The EFI_CAPSULE_RESULT_VARIABLE_JSON `bytes`, all the bytes after a result's header, or
     /// None if its Version is not the 1 that uefisettings reads: a later Version may lay out more.
@@ -442,6 +539,29 @@ pub enum CapsuleResultError {
          8.5.6.1.1)"
     )]
     TotalSizeNotSize { total_size: u32, size: usize },
+    #[error(
+        "the {count} bytes after the capsule result's header are fewer than the \
+         {FMP_RESULT_HEADER_SIZE} of the Version, PayloadIndex, UpdateImageIndex and \
+         UpdateImageTypeId of an EFI_CAPSULE_RESULT_VARIABLE_FMP (UEFI 2.11 section 8.5.6.1.2)"
+    )]
+    FmpShort { count: usize },
+    #[error(
+        "the capsule result's CapsuleFileName and CapsuleTarget hold {count} bytes, an odd \
+         count of bytes for CHAR16s (UEFI 2.11 section 8.5.6.1.2)"
+    )]
+    FmpStringsOdd { count: usize },
+    #[error(
+        "the capsule result's {field} has no zero terminator, which VariableTotalSize includes \
+         (UEFI 2.11 section 8.5.6.1.2)"
+    )]
+    FmpUnterminated { field: &'static str },
+    #[error("the capsule result's {field} holds {text:?}, which is not UTF-16")]
+    FmpText { field: &'static str, text: String },
+    #[error(
+        "the capsule result holds {count} bytes after the zero terminator of its CapsuleTarget \
+         (UEFI 2.11 section 8.5.6.1.2)"
+    )]
+    FmpTrailing { count: usize },
     #[error(
         "the {count} bytes after the capsule result's header are fewer than the \
          {JSON_RESULT_HEADER_SIZE} of the Version, CapsuleId and RespLength of an \
@@ -793,6 +913,18 @@ mod tests {
         text.encode_utf16().flat_map(u16::to_le_bytes).collect()
     }
 
+    /// An EFI_CAPSULE_RESULT_VARIABLE_FMP of `version`, PayloadIndex 2, UpdateImageIndex 3 and
+    /// UpdateImageTypeId OTHER_GUID, then `strings`.
+    fn fmp(version: u16, strings: &[u8]) -> Vec<u8> {
+        [
+            &version.to_le_bytes()[..],
+            &[2, 3],
+            &<[u8; 16]>::from(OTHER_GUID),
+            strings,
+        ]
+        .concat()
+    }
+
     /// The result name `name`.
     fn name(name: &str) -> ResultName {
         ResultName::parse(name).unwrap_or_else(|| panic!("{name} is a result name"))
@@ -881,8 +1013,8 @@ mod tests {
         }
     }
 
-    /// decode keeps the bytes after the header of any CapsuleGuid but the JSON capsule's, none
-    /// or some.
+    /// decode keeps the bytes after the header of any CapsuleGuid but the FMP and JSON capsules',
+    /// none or some.
     #[test]
     fn decode_keeps_the_rest_of_other_guids_raw() {
         for (width, header, _) in WIDTHS {
@@ -1039,6 +1171,168 @@ mod tests {
             .to_string(),
             "the capsule result's RespLength 3 is not the 2 bytes after its Version, CapsuleId and \
              RespLength (UEFI 2.11 section 8.5.6.1.3)",
+            "message"
+        );
+    }
+
+    /// decode reads the EFI_CAPSULE_RESULT_VARIABLE_FMP of an FMP capsule's result of each width:
+    /// its fixed fields, then its CapsuleFileName and CapsuleTarget as text, or as empty text
+    /// where each is a single zero character.
+    #[test]
+    fn decode_reads_the_fmp_result_of_each_width() {
+        for (width, header, status) in WIDTHS {
+            for (file_name, target) in [("update.cap", "PciRoot(0x0)/Pci(0x1,0x0)"), ("", "")] {
+                let strings = [char16(file_name), vec![0, 0], char16(target), vec![0, 0]].concat();
+                let rest = fmp(1, &strings);
+                let bytes = whole(
+                    width,
+                    header,
+                    EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+                    status,
+                    &rest,
+                );
+
+                let decoded = CapsuleResult::decode(&bytes, width);
+
+                assert_eq!(
+                    decoded,
+                    Ok(CapsuleResult {
+                        variable_total_size: u32::try_from(header + rest.len()).expect("a UINT32"),
+                        capsule_guid: EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+                        capsule_processed: processed(),
+                        capsule_status: status,
+                        details: CapsuleResultDetails::Fmp(FmpCapsuleResult {
+                            payload_index: 2,
+                            update_image_index: 3,
+                            update_image_type_id: OTHER_GUID,
+                            capsule_file_name: file_name.to_owned(),
+                            capsule_target: target.to_owned(),
+                        }),
+                    }),
+                    "{width:?} {file_name:?} {target:?}"
+                );
+            }
+        }
+    }
+
+    /// decode keeps the bytes after the header of an FMP capsule's result raw where its
+    /// EFI_CAPSULE_RESULT_VARIABLE_FMP has a Version but 1, which may lay out more: "The version
+    /// of this structure, currently 0x00000001" (UEFI 2.11 §8.5.6.1.2).
+    #[test]
+    fn decode_keeps_an_fmp_part_of_another_version_raw() {
+        for (width, header, _) in WIDTHS {
+            for rest in [
+                fmp(2, &[0; 4]),
+                fmp(0x0100, &[0; 4]),
+                fmp(2, &[0; 5]),
+                fmp(2, &[])[..2].to_vec(),
+            ] {
+                let bytes = whole(
+                    width,
+                    header,
+                    EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+                    0,
+                    &rest,
+                );
+
+                assert_eq!(
+                    CapsuleResult::decode(&bytes, width),
+                    Ok(CapsuleResult {
+                        variable_total_size: u32::try_from(header + rest.len()).expect("a UINT32"),
+                        capsule_guid: EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+                        capsule_processed: processed(),
+                        capsule_status: 0,
+                        details: CapsuleResultDetails::Other(rest.clone()),
+                    }),
+                    "{width:?} {rest:?}"
+                );
+            }
+        }
+    }
+
+    /// decode refuses an FMP capsule's result whose EFI_CAPSULE_RESULT_VARIABLE_FMP is short of
+    /// its Version, or of Version 1 and short of its other fixed fields, with an odd count of
+    /// string bytes, without the zero terminator of either string, with a string that is not
+    /// UTF-16, or with bytes after the terminator of CapsuleTarget.
+    #[test]
+    fn decode_refuses_an_fmp_part_that_it_cannot_read() {
+        let name = char16("a.cap");
+        let nul = [0, 0];
+        let unpaired = |field| CapsuleResultError::FmpText {
+            field,
+            text: "\u{fffd}".to_owned(),
+        };
+        for (width, header, _) in WIDTHS {
+            for (rest, refusal) in [
+                (vec![1], CapsuleResultError::FmpShort { count: 1 }),
+                (
+                    fmp(1, &[])[..19].to_vec(),
+                    CapsuleResultError::FmpShort { count: 19 },
+                ),
+                (
+                    fmp(1, &[0; 5]),
+                    CapsuleResultError::FmpStringsOdd { count: 5 },
+                ),
+                (
+                    fmp(1, &[]),
+                    CapsuleResultError::FmpUnterminated {
+                        field: "CapsuleFileName",
+                    },
+                ),
+                (
+                    fmp(1, &name),
+                    CapsuleResultError::FmpUnterminated {
+                        field: "CapsuleFileName",
+                    },
+                ),
+                (
+                    fmp(1, &[&name[..], &nul].concat()),
+                    CapsuleResultError::FmpUnterminated {
+                        field: "CapsuleTarget",
+                    },
+                ),
+                (
+                    fmp(1, &[&name[..], &nul, &name].concat()),
+                    CapsuleResultError::FmpUnterminated {
+                        field: "CapsuleTarget",
+                    },
+                ),
+                (
+                    fmp(1, &[0x00, 0xd8, 0, 0, 0, 0]),
+                    unpaired("CapsuleFileName"),
+                ),
+                (fmp(1, &[0, 0, 0x00, 0xdc, 0, 0]), unpaired("CapsuleTarget")),
+                (
+                    fmp(1, &[0, 0, 0, 0, 0x41, 0]),
+                    CapsuleResultError::FmpTrailing { count: 2 },
+                ),
+                (
+                    fmp(1, &[0; 6]),
+                    CapsuleResultError::FmpTrailing { count: 2 },
+                ),
+            ] {
+                let bytes = whole(
+                    width,
+                    header,
+                    EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+                    0,
+                    &rest,
+                );
+
+                assert_eq!(
+                    CapsuleResult::decode(&bytes, width),
+                    Err(refusal),
+                    "{width:?} {rest:?}"
+                );
+            }
+        }
+        assert_eq!(
+            CapsuleResultError::FmpUnterminated {
+                field: "CapsuleTarget"
+            }
+            .to_string(),
+            "the capsule result's CapsuleTarget has no zero terminator, which VariableTotalSize \
+             includes (UEFI 2.11 section 8.5.6.1.2)",
             "message"
         );
     }
@@ -1368,9 +1662,10 @@ mod tests {
     }
 
     /// The results serialize as `capsule results` prints them: CapsuleMax and CapsuleLast by name,
-    /// and each result by name with its header's fields, CapsuleStatus in hex, and a JSON
-    /// capsule's CapsuleId and Resp as text if it is UTF-8, else as hex, or the bytes after
-    /// another's header as hex, UTF-8 or not; what does not decode, as why and its data in hex.
+    /// and each result by name with its header's fields, CapsuleStatus in hex, and an FMP
+    /// capsule's EFI_CAPSULE_RESULT_VARIABLE_FMP, a JSON capsule's CapsuleId and Resp as text if
+    /// it is UTF-8, else as hex, or the bytes after another's header as hex, UTF-8 or not; what
+    /// does not decode, as why and its data in hex.
     #[cfg(variable_names)]
     #[test]
     fn results_serialize_as_capsule_results_prints_them() {
@@ -1388,13 +1683,21 @@ mod tests {
             0x8000_0000_0000_0003,
             b"ab",
         );
+        let fmp_result = whole(
+            FirmwareWidth::Bits64,
+            48,
+            EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+            0,
+            &fmp(1, &[char16("update.cap"), vec![0, 0, 0, 0]].concat()),
+        );
         let variables = HeldVariables::default()
             .with(CAPSULE_MAX, EFI_CAPSULE_REPORT_GUID, &char16("Capsule0003"))
             .with(CAPSULE_LAST, EFI_CAPSULE_REPORT_GUID, &[0x41, 0x00])
             .with("Capsule0000", EFI_CAPSULE_REPORT_GUID, &json_result_bytes())
             .with("Capsule0001", EFI_CAPSULE_REPORT_GUID, &resp_not_utf8)
             .with("Capsule0002", EFI_CAPSULE_REPORT_GUID, &other_utf8)
-            .with("Capsule0003", EFI_CAPSULE_REPORT_GUID, &[1, 2, 3]);
+            .with("Capsule0003", EFI_CAPSULE_REPORT_GUID, &[1, 2, 3])
+            .with("Capsule0004", EFI_CAPSULE_REPORT_GUID, &fmp_result);
         let listed = variables.variables.borrow().keys().cloned().collect();
         let processed = serde_json::json!({
             "year": 2026,
@@ -1457,6 +1760,22 @@ mod tests {
                                   EFI_CAPSULE_RESULT_VARIABLE_HEADER of 64-bit firmware (UEFI \
                                   2.11 section 8.5.6.1.1)",
                         "data": { "hex": "010203" },
+                    },
+                    {
+                        "name": "Capsule0004",
+                        "result": {
+                            "variable_total_size": 92,
+                            "capsule_guid": "6DCBD5ED-E82D-4C44-BDA1-7194199AD92A",
+                            "capsule_processed": processed,
+                            "capsule_status": "0x0",
+                            "fmp": {
+                                "payload_index": 2,
+                                "update_image_index": 3,
+                                "update_image_type_id": "8C78A505-BAA0-4C4A-869F-000000001300",
+                                "capsule_file_name": "update.cap",
+                                "capsule_target": "",
+                            },
+                        },
                     },
                 ],
             }),

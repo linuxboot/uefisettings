@@ -210,10 +210,10 @@ that it never converts. The scenarios `capsule-results` (x86_64, aarch64) and
 `capsule-results-i686` check that the Linux build refuses `capsule result-table`, and print
 with `capsule results` the variables of
 [`vars/capsule-results-64.json`](vars/capsule-results-64.json) or
-[`vars/capsule-results-32.json`](vars/capsule-results-32.json): two results, of a JSON capsule
-and of a CapsuleGuid that no specification defines, with the 48-byte header of 64-bit firmware or
-the 44-byte header of 32-bit firmware, a third of 3 bytes, which do not decode, and CapsuleMax and
-CapsuleLast. Each is non-volatile, CapsuleMax too, which edk2 writes with BS|RT only
+[`vars/capsule-results-32.json`](vars/capsule-results-32.json): three results, of a JSON capsule,
+of a CapsuleGuid that no specification defines and of an FMP capsule, with the 48-byte header of
+64-bit firmware or the 44-byte header of 32-bit firmware, a fourth of 3 bytes, which do not decode,
+and CapsuleMax and CapsuleLast. Each is non-volatile, CapsuleMax too, which edk2 writes with BS|RT only
 (edk2-stable202608 MdeModulePkg/Library/DxeCapsuleLibFmp/DxeCapsuleReportLib.c
 InitCapsuleMaxVariable()), as the variable store that seeds them holds no volatile variable.
 `shell-capsule-results` and `shell-capsule-results-i686` check that `uefisettings.efi` prints the
