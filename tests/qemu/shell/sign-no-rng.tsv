@@ -1,0 +1,16 @@
+# The checks of shell/sign-no-rng.nsh, the Shell boot of shell-sign-no-rng: User Mode without
+# virtio-rng. See check-shell-log.sh.
+# dh lists each handle with EFI_RNG_PROTOCOL as its index, then its protocols, named Rng; the
+# firmware may have one without virtio-rng, such as RngDxe of the x86 OVMF builds
+rng-handles	status	any
+sign	status	any
+db	status	0x0
+# where dh lists one, uefisettings signs, the firmware takes the append, and db holds 2 lists
+sign	if-line	rng-handles	^ *[0-9a-fA-F]+: .*Rng	status	0x0
+sign	if-line	rng-handles	^ *[0-9a-fA-F]+: .*Rng	none	.
+db	if-line	rng-handles	^ *[0-9a-fA-F]+: .*Rng	json	.variable == "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f" and .attributes == 39 and (.value | length) == 2 and all(.value[]; .type == "A5C059A1-94E4-4AA7-87B5-AB155C2BF072" and (.signatures | length) == 1 and .signatures[0].owner == "DE145B29-C3CD-455F-91DE-A76237B67C52") and ([.value[].signatures[0].sha256] | unique | length) == 2
+# where it lists none, uefisettings refuses to sign, naming the protocol, and db holds the
+# enrolled list only
+sign	unless-line	rng-handles	^ *[0-9a-fA-F]+: .*Rng	status	aborted
+sign	unless-line	rng-handles	^ *[0-9a-fA-F]+: .*Rng	json	. == {"error_message": "cannot seed RSA blinding from EFI_RNG_PROTOCOL: no handle has it: NOT_FOUND"}
+db	unless-line	rng-handles	^ *[0-9a-fA-F]+: .*Rng	json	.variable == "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f" and .attributes == 39 and (.value | length) == 1 and all(.value[]; .type == "A5C059A1-94E4-4AA7-87B5-AB155C2BF072" and (.signatures | length) == 1 and .signatures[0].owner == "DE145B29-C3CD-455F-91DE-A76237B67C52") and ([.value[].signatures[0].sha256] | unique | length) == 1

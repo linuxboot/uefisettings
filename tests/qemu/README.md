@@ -216,3 +216,13 @@ and refuses the other three. The `write-signed` scenarios write the same payload
 `secboot-setup`'s Setup Mode check that it refuses the db append before any write. In User Mode
 they also create `WriteSignedProbe`, a variable of no policy, with a KEK-signed write without
 `--append`, which `auth-payload.sh` signs too.
+
+The `sign` scenarios have `variable write-signed` sign with keys that `run.sh` puts in `/sign`
+of the initramfs and `\sign` of the ESP, in User Mode: db appends with KEK's key over each
+digest, and with a leaf key whose bundle carries the CA that KEK issued it, which the firmware
+accepts, and with db's key, a foreign key and the leaf key without its CA, which it refuses.
+The Linux test signs at the system clock's second. `shell-sign-user`, with `devices=virtio-rng`,
+also creates `PrivateProbe`, a private authenticated variable, with the foreign key, then
+writes it again with that key and with db's. `shell-sign-no-rng`, without that device, lists the
+handles of EFI_RNG_PROTOCOL first, and expects the refusal to sign where `dh` lists none, as
+`check-shell-log.sh`'s `if-line` and `unless-line` checks tell.

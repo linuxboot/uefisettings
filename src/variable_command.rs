@@ -104,7 +104,7 @@ enum VariableSubcommands {
         )]
         attributes: Vec<AttributeArg>,
     },
-    /// Write an EFI variable from a pre-signed payload, which the firmware verifies
+    /// Write an EFI variable from a signed payload, or from new data that a key signs; the firmware verifies the signature
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
     WriteSigned(write_signed::WriteSignedArgs),

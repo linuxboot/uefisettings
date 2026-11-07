@@ -317,15 +317,38 @@ db_guid=d719b2cb-3d3a-4596-a3bc-dad00e67656f
 # and the same append signed with db's key, which KEK lacks, as db-unauthorized.auth, and with
 # the foreign key, as db-foreign.auth; and a write of a text of its own to WriteSignedProbe, a
 # new variable of the tests' vendor GUID, without EFI_VARIABLE_APPEND_WRITE and signed with KEK,
-# as probe-write.auth.
+# as probe-write.auth. In sign/, for uefisettings to sign with in both kinds of boots: the keys
+# and certificates of KEK, db and the foreign key; ca.key and ca.crt, of a CA that KEK issues,
+# and leaf.key and leaf.crt, of a certificate that the CA issues, with chain.pem, the leaf's
+# certificate then the CA's; an EFI_SIGNATURE_LIST of a certificate of its own for each db
+# append, sha256.esl, sha384.esl, sha512.esl, chain.esl and refused.esl; and two texts of a
+# private authenticated variable, probe.data and update.data.
 secboot_files() {
     local keys=$1 each file size byte
     mkdir "$keys"
-    for each in PK KEK db foreign shell-db linux-db; do
+    for each in PK KEK db foreign shell-db linux-db sign-sha256 sign-sha384 sign-sha512 \
+        sign-chain sign-refused; do
         openssl req -x509 -newkey rsa:2048 -noenc -days 2 -sha256 \
             -subj "/CN=uefisettings test $each" -keyout "$keys/$each.key" \
             -out "$keys/$each.crt" 2>>"$keys/openssl.log"
     done
+    mkdir "$keys/sign"
+    for each in KEK db foreign; do
+        cp "$keys/$each.key" "$keys/$each.crt" "$keys/sign/"
+    done
+    openssl req -x509 -newkey rsa:2048 -noenc -days 2 -sha256 -subj "/CN=uefisettings test CA" \
+        -CA "$keys/KEK.crt" -CAkey "$keys/KEK.key" -addext basicConstraints=critical,CA:TRUE \
+        -keyout "$keys/sign/ca.key" -out "$keys/sign/ca.crt" 2>>"$keys/openssl.log"
+    openssl req -x509 -newkey rsa:2048 -noenc -days 2 -sha256 -subj "/CN=uefisettings test leaf" \
+        -CA "$keys/sign/ca.crt" -CAkey "$keys/sign/ca.key" -keyout "$keys/sign/leaf.key" \
+        -out "$keys/sign/leaf.crt" 2>>"$keys/openssl.log"
+    cat "$keys/sign/leaf.crt" "$keys/sign/ca.crt" >"$keys/sign/chain.pem"
+    for each in sha256 sha384 sha512 chain refused; do
+        "$here/auth-payload.sh" x509-esl "$secboot_owner" "$keys/sign-$each.crt" \
+            "$keys/sign/$each.esl"
+    done
+    printf 'uefisettings test private probe' >"$keys/sign/probe.data"
+    printf 'uefisettings test private probe update' >"$keys/sign/update.data"
     for each in shell linux; do
         mkdir "$keys/$each"
         "$here/auth-payload.sh" x509-esl "$secboot_owner" "$keys/$each-db.crt" "$keys/$each-db.esl"
@@ -405,6 +428,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         secboot_files "$dir/keys"
         mkdir "$dir/initramfs/auth"
         cp "$dir/keys/linux/"*.auth "$dir/initramfs/auth/"
+        cp -r "$dir/keys/sign" "$dir/initramfs/"
         ;;
     esac
     case $option_firmware in
@@ -460,7 +484,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
             # capsule payloads of shell/capsule in \capsule, and the kernel and initrd, which
             # the line @LINUX@ of the script starts from the shell, into the guest test
             # boot_smoke. The Secure Boot scenarios also get the pinned Shell, as the removable
-            # media boot loader, and their payloads in \auth.
+            # media boot loader, their payloads in \auth and what uefisettings signs with in \sign.
             script=$here/shell/${spec#shell:}
             esp=$log.esp
             cp -r "$run/esp" "$esp"
@@ -468,6 +492,7 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
                 mkdir -p "$esp/EFI/BOOT" "$esp/auth"
                 cp "$guest/$shell_efi" "$esp/EFI/BOOT/$removable_loader"
                 cp "$dir/keys/shell/"*.auth "$esp/auth/"
+                cp -r "$dir/keys/sign" "$esp/"
             fi
             cp "$run/shell-esp/uefisettings.efi" "$esp/"
             cp -r "$here/shell/capsule" "$esp/"

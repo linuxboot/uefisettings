@@ -10,21 +10,32 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! Writes of time-based authenticated EFI variables from pre-signed payloads (UEFI 2.11
-//! §8.2.6), which `variable write-signed` makes: the payload, an EFI_VARIABLE_AUTHENTICATION_2
+//! Writes of time-based authenticated EFI variables (UEFI 2.11 §8.2.6), which `variable
+//! write-signed` makes: a payload that the caller brings, an EFI_VARIABLE_AUTHENTICATION_2
 //! descriptor and the variable's new data, goes to SetVariable() unchanged, as its signature
-//! covers the name, vendor GUID, attributes and time stamp that it was made for. uefisettings
-//! checks that the descriptor is complete and refuses, before any write, a payload that would
-//! delete the variable and a write that the firmware would make without checking the signature.
+//! covers the name, vendor GUID, attributes and time stamp that it was made for; new data that a
+//! caller's key signs (signing.rs) goes after the descriptor that uefisettings makes.
+//! uefisettings checks that a payload's descriptor is complete and refuses, before any write, a
+//! write that would delete the variable and one that the firmware would make without checking
+//! the signature.
 //! The backends' VariableData does the I/O: efivarfs on Linux (hii/efivarfs.rs), SetVariable() in
 //! the UEFI Shell (hii/variable_services.rs), and SetFirmwareEnvironmentVariableExW on Windows
 //! (hii/firmware_environment.rs), whose dwAttributes carries
 //! VARIABLE_ATTRIBUTE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS (Microsoft Learn, updated
 //! 2024-11-20).
 
+pub(crate) mod signing;
+
 use anyhow::Result;
 use thiserror::Error;
 
+use self::signing::seeded_rng;
+use self::signing::AuthenticatedWrite;
+use self::signing::SeedSource;
+pub use self::signing::SignatureDigest;
+use self::signing::Signer;
+pub use self::signing::TimeStamp;
+pub use self::signing::TimeStampError;
 use super::globals::EFI_GLOBAL_VARIABLE;
 use super::globals::EFI_IMAGE_SECURITY_DATABASE;
 use super::RuntimeAccessWithoutBootServiceAccess;
@@ -82,13 +93,61 @@ pub(crate) fn write_signed(
 ) -> Result<()> {
     let attributes = signed_write_attributes(attributes)?;
     let value = auth2_value(payload)?;
+    refuse_deletion_and_setup_mode(variables, key, attributes, value)?;
+    variables.set_variable(key, &VariableContents::new(attributes, payload.to_vec())?)
+}
+
+/// A write that sign_and_write signs: `data`, the new data of the variable `key`, with
+/// `attributes`, to which it adds EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, at
+/// `timestamp`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SignedWrite<'a> {
+    pub(crate) key: &'a VariableKey,
+    pub(crate) attributes: VariableAttributes,
+    pub(crate) data: &'a [u8],
+    pub(crate) timestamp: TimeStamp,
+}
+
+/// Signs `write` with `signer` into an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 §8.2.6), blinded
+/// over a ChaCha20Rng that `seed` seeds, and writes it, then the data. It refuses what
+/// write_signed refuses before it seeds, and a failing seed source refuses before any write.
+pub(crate) fn sign_and_write(
+    variables: &impl VariableData,
+    write: &SignedWrite<'_>,
+    signer: &Signer,
+    seed: &mut impl SeedSource,
+) -> Result<()> {
+    let attributes = signed_write_attributes(write.attributes)?;
+    refuse_deletion_and_setup_mode(variables, write.key, attributes, write.data)?;
+    let mut rng = seeded_rng(seed)?;
+    let payload = signer.authentication_2(
+        &AuthenticatedWrite {
+            key: write.key,
+            attributes,
+            timestamp: write.timestamp,
+            data: write.data,
+        },
+        &mut rng,
+    )?;
+    variables.set_variable(write.key, &VariableContents::new(attributes, payload)?)
+}
+
+/// Refuses a write of `value`, the new data of `key`, with `attributes`, that would delete the
+/// variable, as no data without APPEND_WRITE does (UEFI 2.11 §8.2.3), and one of a Secure Boot
+/// Policy Variable while SetupMode is 1, which the firmware makes without checking the signature.
+fn refuse_deletion_and_setup_mode(
+    variables: &impl VariableData,
+    key: &VariableKey,
+    attributes: VariableAttributes,
+    value: &[u8],
+) -> Result<()> {
     if value.is_empty() && !attributes.contains(VariableAttributes::APPEND_WRITE) {
         return Err(SignedWriteRefusal::Delete(key.clone()).into());
     }
     if is_secure_boot_policy_variable(key) && in_setup_mode(variables)? {
         return Err(SignedWriteRefusal::SetupModePolicyWrite(key.clone()).into());
     }
-    variables.set_variable(key, &VariableContents::new(attributes, payload.to_vec())?)
+    Ok(())
 }
 
 /// What write_signed refuses before any write. The messages spell "section", as edk2's
@@ -262,6 +321,8 @@ fn in_setup_mode(variables: &impl VariableData) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use rand_core::SeedableRng;
+
     use super::*;
     use crate::efi_variables::globals::tests::key;
     use crate::efi_variables::globals::tests::HeldVariables;
@@ -751,5 +812,121 @@ mod tests {
             "refusal"
         );
         assert_eq!(*variables.0.set.borrow(), [], "writes");
+    }
+
+    /// sign_and_write writes the descriptor that the key signs, then the data, with the
+    /// attributes it signed; without a seed source it refuses naming it and writes nothing.
+    #[test]
+    fn sign_and_write_writes_what_the_key_signs() {
+        let db = signing::tests::db();
+        let timestamp = signing::tests::TIME.parse().expect("the test TimeStamp");
+        let write = SignedWrite {
+            key: &db,
+            attributes: NV_BS_RT | VariableAttributes::APPEND_WRITE,
+            data: VALUE,
+            timestamp,
+        };
+        let signer = signing::tests::test_signer();
+        let variables = firmware(Some(&[0]));
+
+        sign_and_write(
+            &variables,
+            &write,
+            &signer,
+            &mut signing::tests::FakeSeed(Some(1)),
+        )
+        .expect("sign and write db");
+
+        let expected = signer
+            .authentication_2(
+                &AuthenticatedWrite {
+                    key: &db,
+                    attributes: signing::tests::append_attributes(),
+                    timestamp,
+                    data: VALUE,
+                },
+                &mut rand_chacha::ChaCha20Rng::seed_from_u64(0),
+            )
+            .expect("sign");
+        assert_eq!(held(&variables, &db), written(0x67, &expected), "db");
+
+        let variables = firmware(Some(&[0]));
+        let error = sign_and_write(
+            &variables,
+            &write,
+            &signer,
+            &mut signing::tests::FakeSeed(None),
+        )
+        .expect_err("sign without a seed source");
+        assert_eq!(
+            format!("{error:#}"),
+            "cannot seed RSA blinding from EFI_RNG_PROTOCOL: no handle has it: NOT_FOUND",
+            "refusal"
+        );
+        assert_eq!(*variables.set.borrow(), [], "writes");
+    }
+
+    /// sign_and_write refuses other attributes, a write without data, which deletes the
+    /// variable, and a Secure Boot Policy Variable while SetupMode is 1 before it seeds: without
+    /// a seed source, the refusal is these, and nothing is written.
+    #[test]
+    fn sign_and_write_refuses_before_seeding() {
+        let signed = key("Signed", VENDOR);
+        let kek = key("KEK", EFI_GLOBAL_VARIABLE);
+        let cases = [
+            (
+                "other attributes",
+                &signed,
+                VariableAttributes::HARDWARE_ERROR_RECORD | NV_BS_RT,
+                VALUE,
+                "HARDWARE_ERROR_RECORD: a signed write takes only NON_VOLATILE, \
+                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS and APPEND_WRITE, and adds \
+                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS"
+                    .to_owned(),
+            ),
+            (
+                "no data",
+                &signed,
+                NV_BS_RT,
+                &[][..],
+                "the payload holds no data after its EFI_VARIABLE_AUTHENTICATION_2, so without \
+                 APPEND_WRITE it would delete EFI variable \
+                 Signed-de145b29-c3cd-455f-91de-a76237b67c52 (UEFI 2.11 section 8.2.3), which a \
+                 signed write does not do"
+                    .to_owned(),
+            ),
+            (
+                "KEK in Setup Mode",
+                &kek,
+                NV_BS_RT,
+                VALUE,
+                format!(
+                    "EFI variable {kek} is a Secure Boot policy variable and SetupMode is 1, so \
+                     the firmware would write it without checking the payload's signature (UEFI \
+                     2.11 sections 3.3 and 8.2.6)"
+                ),
+            ),
+        ];
+        let signer = signing::tests::test_signer();
+        for (case, key, attributes, data, refusal) in cases {
+            let variables = firmware(Some(&[1]));
+            let write = SignedWrite {
+                key,
+                attributes,
+                data,
+                timestamp: signing::tests::TIME.parse().expect("the test TimeStamp"),
+            };
+
+            let error = sign_and_write(
+                &variables,
+                &write,
+                &signer,
+                &mut signing::tests::FakeSeed(None),
+            )
+            .expect_err(case);
+
+            assert_eq!(format!("{error:#}"), refusal, "{case}");
+            assert_eq!(*variables.set.borrow(), [], "{case}: writes");
+        }
     }
 }

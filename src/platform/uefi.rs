@@ -18,6 +18,7 @@ use std::io;
 use std::path::Path;
 use std::ptr;
 use std::ptr::NonNull;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -46,12 +47,14 @@ use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::secret_file;
 use uefisettings::secret_file::read_shell_secret;
 use uefisettings::secret_file::Keystroke;
 use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::ShellConsole;
 use uefisettings::secret_file::ShellStdin;
 use uefisettings::secret_file::StdinClaim;
+use uefisettings::secret_file::MAX_SECRET_LEN;
 
 use crate::hii_get;
 use crate::hii_set;
@@ -226,18 +229,43 @@ fn open_shell_protocol() -> io::Result<ScopedProtocol<ShellFileIo>> {
 /// relative to the current directory (edk2-stable202608 ShellProtocol.c:519-537,
 /// EfiShellGetDevicePathFromFilePath()).
 pub(super) fn read_payload(path: &Path) -> Result<Vec<u8>> {
+    read_shell_file(path, "payload", |mut file| Ok(file.read_whole()?))
+}
+
+/// The secret in the file `path`, the key or the certificate bundle of variable write-signed, in
+/// file mode: at most MAX_SECRET_LEN bytes, which ReadFile() reads into the secret's buffer.
+/// Errors name it as `what`.
+pub(super) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
+    read_shell_file(path, what, |file| {
+        Ok(secret_file::read_secret_file(file, MAX_SECRET_LEN)?)
+    })
+}
+
+/// What `read` reads of the file `path`, which EFI_SHELL_PROTOCOL opens as read_payload tells;
+/// errors name it as `what`.
+fn read_shell_file<T>(
+    path: &Path,
+    what: &str,
+    read: impl FnOnce(ShellFile<'_>) -> Result<T>,
+) -> Result<T> {
     let name = path
         .to_str()
         .and_then(|name| CString16::try_from(name).ok())
-        .with_context(|| format!("the payload path {} is not UCS-2", path.display()))?;
+        .with_context(|| format!("the {what} path {} is not UCS-2", path.display()))?;
     let protocol = open_shell_protocol()?;
     let shell = protocol
         .get()
         .ok_or_else(|| io::Error::other("EFI_SHELL_PROTOCOL has no interface"))?;
     let file = ShellFile::open(&shell.0, &name)
-        .with_context(|| format!("open the payload {}", path.display()))?;
-    file.read_to_end()
-        .with_context(|| format!("read the payload {}", path.display()))
+        .with_context(|| format!("open the {what} {}", path.display()))?;
+    read(file).with_context(|| format!("read the {what} {}", path.display()))
+}
+
+/// The clock of the TimeStamp that variable write-signed signs: none yet. GetTime() tells the
+/// local time, which gives UTC only through a TimeZone other than EFI_UNSPECIFIED_TIMEZONE
+/// ("Localtime = UTC - TimeZone", UEFI 2.11 §8.3.1), which uefisettings does not convert yet.
+pub(super) fn signing_clock() -> Option<SystemTime> {
+    None
 }
 
 /// A file that EFI_SHELL_PROTOCOL.OpenFileByName() opened for reading, which drop closes.
@@ -260,7 +288,7 @@ impl<'shell> ShellFile<'shell> {
     }
 
     /// Every byte of the file: GetFileSize() of them, which ReadFile() reads in turn.
-    fn read_to_end(&self) -> io::Result<Vec<u8>> {
+    fn read_whole(&mut self) -> io::Result<Vec<u8>> {
         let mut size = 0;
         // SAFETY: GetFileSize() of the open handle, which stores its size in `size`
         unsafe { (self.shell.get_file_size)(self.handle, &mut size) }
@@ -273,24 +301,12 @@ impl<'shell> ShellFile<'shell> {
 
         let mut filled = 0;
         while let Some(rest) = bytes.get_mut(filled..).filter(|rest| !rest.is_empty()) {
-            let asked = rest.len();
-            let mut read = asked;
-            // SAFETY: ReadFile() of the open handle stores at most BufferSize bytes, as many as
-            // rest holds, and their number in `read`
-            unsafe { (self.shell.read_file)(self.handle, &mut read, rest.as_mut_ptr().cast()) }
-                .to_result()
-                .map_err(|error| firmware_error("ReadFile()", error))?;
-            match read {
+            match io::Read::read(self, rest)? {
                 0 => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         format!("ReadFile() ended after {filled} of its {size} bytes"),
                     ))
-                }
-                read if read > asked => {
-                    return Err(io::Error::other(format!(
-                        "ReadFile() read {read} bytes into a buffer of {asked}"
-                    )))
                 }
                 read => filled += read,
             }
@@ -299,11 +315,30 @@ impl<'shell> ShellFile<'shell> {
     }
 }
 
+impl io::Read for ShellFile<'_> {
+    /// ReadFile() of at most as many bytes as `buffer` holds, none at the end of the file.
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let asked = buffer.len();
+        let mut read = asked;
+        // SAFETY: ReadFile() of the open handle stores at most BufferSize bytes, as many as
+        // buffer holds, and their number in `read`
+        unsafe { (self.shell.read_file)(self.handle, &mut read, buffer.as_mut_ptr().cast()) }
+            .to_result()
+            .map_err(|error| firmware_error("ReadFile()", error))?;
+        match read {
+            read if read > asked => Err(io::Error::other(format!(
+                "ReadFile() read {read} bytes into a buffer of {asked}"
+            ))),
+            read => Ok(read),
+        }
+    }
+}
+
 impl Drop for ShellFile<'_> {
     fn drop(&mut self) {
         // SAFETY: CloseFile() of the handle that OpenFileByName() opened, once
         if let Err(error) = unsafe { (self.shell.close_file)(self.handle) }.to_result() {
-            warn!("CloseFile() of the payload: {:?}", error.status());
+            warn!("CloseFile() of a file: {:?}", error.status());
         }
     }
 }

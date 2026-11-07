@@ -27,7 +27,21 @@ use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
 #[cfg(variable_data)]
+use crate::efi_variables::authenticated::sign_and_write;
+#[cfg(variable_data)]
+use crate::efi_variables::authenticated::signing::PlatformSeed;
+#[cfg(variable_data)]
+use crate::efi_variables::authenticated::signing::Signer;
+#[cfg(variable_data)]
 use crate::efi_variables::authenticated::write_signed;
+#[cfg(variable_data)]
+pub use crate::efi_variables::authenticated::SignatureDigest;
+#[cfg(variable_data)]
+use crate::efi_variables::authenticated::SignedWrite;
+#[cfg(variable_data)]
+pub use crate::efi_variables::authenticated::TimeStamp;
+#[cfg(variable_data)]
+pub use crate::efi_variables::authenticated::TimeStampError;
 #[cfg(capsule_delivery)]
 use crate::efi_variables::deliver_json_capsule;
 #[cfg(variable_data)]
@@ -116,6 +130,8 @@ pub use crate::hii::RangeRefusal;
 pub use crate::hii::VariableAttributes;
 #[cfg(any(variable_names, variable_info))]
 pub use crate::hii::VariableKey;
+#[cfg(variable_data)]
+use crate::secret_file::Secret;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
@@ -216,6 +232,52 @@ impl VariableBackend {
         };
         write_signed(&Self::system_variable_data()?, &key, attributes, payload)
     }
+
+    /// Signs `write` with the PEM RSA key `signing_key` into an EFI_VARIABLE_AUTHENTICATION_2
+    /// (UEFI 2.11 §8.2.6) that carries `certificates`, a PEM bundle of the key's certificate,
+    /// then any others, blinded over this platform's random source (EFI_RNG_PROTOCOL in the UEFI
+    /// Shell, getrandom elsewhere), and writes it, then the data. Refuses what write_signed
+    /// refuses before it signs.
+    pub fn sign_and_write(
+        write: &SignedVariableWrite<'_>,
+        signing_key: &Secret,
+        certificates: &[u8],
+    ) -> Result<()> {
+        let key = VariableKey {
+            name: write.name.to_owned(),
+            guid: parse_vendor(write.vendor)?,
+        };
+        let signer = Signer::from_pem(signing_key, certificates, write.digest)?;
+        sign_and_write(
+            &Self::system_variable_data()?,
+            &SignedWrite {
+                key: &key,
+                attributes: write.attributes,
+                data: write.data,
+                timestamp: write.timestamp,
+            },
+            &signer,
+            &mut PlatformSeed::default(),
+        )
+    }
+}
+
+/// A write that VariableBackend::sign_and_write signs.
+#[cfg(variable_data)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedVariableWrite<'a> {
+    /// The EFI variable
+    pub name: &'a str,
+    /// Its vendor GUID, such as "8BE4DF61-93CA-11D2-AA0D-00E098032B8C"
+    pub vendor: &'a str,
+    /// The attributes, to which the write adds EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+    pub attributes: VariableAttributes,
+    /// The new data of the variable
+    pub data: &'a [u8],
+    /// The TimeStamp of the descriptor
+    pub timestamp: TimeStamp,
+    /// The digest of the signature
+    pub digest: SignatureDigest,
 }
 
 #[cfg(variable_storage_info)]

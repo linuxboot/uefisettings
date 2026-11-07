@@ -1,0 +1,47 @@
+# The checks of shell/sign-user.nsh, the Shell boot of shell-sign-user: User Mode with
+# EFI_RNG_PROTOCOL. See check-shell-log.sh.
+# dh lists each handle with EFI_RNG_PROTOCOL as its index, then its protocols, named Rng
+rng-handles	status	0x0
+rng-handles	line	^ *[0-9a-fA-F]+: .*Rng
+# the firmware accepts the appends that KEK's key signs over each digest, and the one that the
+# leaf key signs with the CA in its bundle, and uefisettings prints nothing
+sha256	status	0x0
+sha256	none	.
+sha384	status	0x0
+sha384	none	.
+sha512	status	0x0
+sha512	none	.
+chain	status	0x0
+chain	none	.
+# db holds the enrolled certificate and the 4 appended, each in a list of its own
+db	status	0x0
+db	json	.variable == "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f" and .attributes == 39 and (.value | length) == 5 and all(.value[]; .type == "A5C059A1-94E4-4AA7-87B5-AB155C2BF072" and (.signatures | length) == 1 and .signatures[0].owner == "DE145B29-C3CD-455F-91DE-A76237B67C52") and ([.value[].signatures[0].sha256] | unique | length) == 5
+# it refuses the appends signed with db's key, which KEK lacks, with a key that no variable
+# holds and with the leaf key without the CA that links it to KEK, and leaves db as it was
+unauthorized	status	aborted
+unauthorized	json	. == {"error_message": "SetVariable() of EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f: SECURITY_VIOLATION"}
+foreign	status	aborted
+foreign	json	. == {"error_message": "SetVariable() of EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f: SECURITY_VIOLATION"}
+no-ca	status	aborted
+no-ca	json	. == {"error_message": "SetVariable() of EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f: SECURITY_VIOLATION"}
+db-after-refused	status	0x0
+db-after-refused	same	db
+# without a clock, uefisettings refuses a write without --append or --timestamp before it
+# signs, and PrivateProbe stays absent, as the next write creates it
+no-timestamp	status	aborted
+no-timestamp	json	. == {"error_message": "--data-file without --append needs --timestamp here, where uefisettings reads no clock: the firmware takes only a TimeStamp later than the variable's (UEFI 2.11 section 8.2.6)"}
+# the foreign key creates PrivateProbe with NV+BS+RT+AT and the 31 bytes of probe.data
+private-create	status	0x0
+private-create	none	.
+private-info	status	0x0
+private-info	json	. == {"variable": "PrivateProbe-de145b29-c3cd-455f-91de-a76237b67c52", "attributes": 39, "size": 31}
+# a later write by that key replaces them with the 38 bytes of update.data; the firmware refuses
+# one of the same TimeStamp, and a later one by db's key, which did not create the variable
+private-update	status	0x0
+private-update	none	.
+private-stale	status	aborted
+private-stale	json	. == {"error_message": "SetVariable() of EFI variable PrivateProbe-de145b29-c3cd-455f-91de-a76237b67c52: SECURITY_VIOLATION"}
+private-other-key	status	aborted
+private-other-key	json	. == {"error_message": "SetVariable() of EFI variable PrivateProbe-de145b29-c3cd-455f-91de-a76237b67c52: SECURITY_VIOLATION"}
+private-info-after	status	0x0
+private-info-after	json	. == {"variable": "PrivateProbe-de145b29-c3cd-455f-91de-a76237b67c52", "attributes": 39, "size": 38}

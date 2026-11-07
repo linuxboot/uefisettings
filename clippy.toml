@@ -5,6 +5,9 @@
 disallowed-types = [
     { path = "std::collections::HashMap", reason = "RandomState can panic on UEFI", replacement = "std::collections::BTreeMap" },
     { path = "std::collections::HashSet", reason = "RandomState can panic on UEFI", replacement = "std::collections::BTreeSet" },
+    # rsa's PSS SigningKey signs unblinded even with a random source (rsa 0.9.10
+    # src/pss/signing_key.rs: sign_digest(rng, false, ...)), as the disallowed-methods below say.
+    { path = "rsa::pss::SigningKey", reason = "unblinded RSA signing", replacement = "rsa::pss::BlindedSigningKey" },
 ]
 
 # The UEFI Shell build's main must return. Its entry point turns ExitCode::FAILURE into
@@ -21,4 +24,22 @@ disallowed-methods = [
     # firmware memory map first: their DevMem is the only caller besides the configuration table
     # source. Only the Linux build has hii::extract, hence allow-invalid.
     { path = "uefisettings::hii::extract::read_physical_memory_at", reason = "reads /dev/mem without RuntimeMemory's or ReservedMemory's check against a firmware memory map", allow-invalid = true },
+    # rsa has no release that fixes RUSTSEC-2023-0071's timing leak; blinding is partial
+    # hardening, and uefisettings runs as the advisory's workaround allows: local use on a
+    # non-compromised computer. rsa's SigningKey runs these unblinded, with no random source
+    # (rsa 0.9.10 src/pkcs1v15/signing_key.rs: sign::<DummyRng>(None, ...)), and signature's
+    # blanket SignerMut forwards to Signer::try_sign.
+    { path = "signature::Signer::try_sign", reason = "unblinded RSA signing", replacement = "signature::RandomizedSigner::try_sign_with_rng" },
+    { path = "signature::Signer::sign", reason = "unblinded RSA signing", replacement = "signature::RandomizedSigner::try_sign_with_rng" },
+    { path = "signature::SignerMut::try_sign", reason = "unblinded RSA signing", replacement = "signature::RandomizedSigner::try_sign_with_rng" },
+    { path = "signature::SignerMut::sign", reason = "unblinded RSA signing", replacement = "signature::RandomizedSigner::try_sign_with_rng" },
+    { path = "signature::DigestSigner::try_sign_digest", reason = "unblinded RSA signing", replacement = "signature::RandomizedDigestSigner::try_sign_digest_with_rng" },
+    { path = "signature::DigestSigner::sign_digest", reason = "unblinded RSA signing", replacement = "signature::RandomizedDigestSigner::try_sign_digest_with_rng" },
+    { path = "signature::hazmat::PrehashSigner::sign_prehash", reason = "unblinded RSA signing", replacement = "signature::hazmat::RandomizedPrehashSigner::sign_prehash_with_rng" },
+    { path = "rsa::RsaPrivateKey::sign", reason = "unblinded RSA signing", replacement = "rsa::RsaPrivateKey::sign_with_rng" },
+    { path = "rsa::traits::SignatureScheme::sign", reason = "blinds only with Some(rng)", replacement = "signature::RandomizedSigner::try_sign_with_rng" },
+    # Pss::new and new_with_salt make a PSS padding that signs unblinded even with a random
+    # source (rsa 0.9.10 src/pss.rs: blinded: false); a Pss literal sets blinded itself.
+    { path = "rsa::pss::Pss::new", reason = "unblinded RSA signing", replacement = "rsa::pss::Pss::new_blinded" },
+    { path = "rsa::pss::Pss::new_with_salt", reason = "unblinded RSA signing", replacement = "rsa::pss::Pss::new_blinded_with_salt" },
 ]

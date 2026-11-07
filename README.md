@@ -101,7 +101,8 @@ Commands:
                 BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications
   storage       Show the storage space of the EFI variables of some attributes, and how much of it
                 is left
-  write-signed  Write an EFI variable from a pre-signed payload, which the firmware verifies
+  write-signed  Write an EFI variable from a signed payload, or from new data that a key signs; the
+                firmware verifies the signature
 ```
 
 `capsule`:
@@ -446,8 +447,8 @@ the firmware's QueryVariableInfo() fails or is not supported at runtime (fixed b
 6.5.5 and 6.6).
 
 `variable write-signed NAME GUID --attributes ATTRIBUTES [--append] --payload-file FILE` writes
-a pre-signed payload, an EFI_VARIABLE_AUTHENTICATION_2 descriptor and then the variable's new
-data (UEFI 2.11 §8.2.6), such as a db update, to an EFI variable unchanged, with those
+a payload that the caller signed, an EFI_VARIABLE_AUTHENTICATION_2 descriptor and then the
+variable's new data (UEFI 2.11 §8.2.6), such as a db update, to an EFI variable unchanged, with those
 attributes and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, and with `--append` also
 EFI_VARIABLE_APPEND_WRITE. The firmware verifies the signature, which covers the name, the
 vendor GUID, the attributes and the time stamp that the payload was made for. Before any write,
@@ -463,6 +464,26 @@ SECURITY_VIOLATION; on Windows it calls SetFirmwareEnvironmentVariableExW.
 
 ```plain
 FS0:\> uefisettings.efi variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E67656F --attributes non-volatile,bootservice-access,runtime-access --append --payload-file db-append.auth
+```
+
+`variable write-signed NAME GUID --attributes ATTRIBUTES [--append] --data-file FILE
+--signing-key-file KEY --signing-certificate-file CERTIFICATES [--digest sha256|sha384|sha512]
+[--timestamp TIME]` signs the new data in FILE itself: KEY, an unencrypted PEM RSA private key of
+2048 to 4096 bits, signs the EFI_VARIABLE_AUTHENTICATION_2 of §8.2.6, a PKCS #7 SignedData without
+signed attributes over SHA-256 or the `--digest`, which carries CERTIFICATES, a PEM bundle of KEY's
+certificate and then any others, such as intermediate CAs, in the order of DER (X.690 §11.6).
+uefisettings writes it, then the data, as above, and refuses the same writes before it signs.
+The TimeStamp is TIME, a GMT time such as 2026-11-07T00:00:00Z, or else the current second of the
+system clock; `uefisettings.efi` reads no clock, so it signs the all-zero TimeStamp of §8.2.6 for
+`--append`, and needs `--timestamp` without it. RSA signs blinded, over a random source seeded
+once from getrandom, or from EFI_RNG_PROTOCOL in the UEFI Shell, which refuses to sign without
+it. rsa has no release that fixes RUSTSEC-2023-0071's timing leak; blinding is partial
+hardening, and uefisettings runs as the advisory's workaround allows: local use on a
+non-compromised computer. uefisettings reads KEY as a secret; KEY and CERTIFICATES hold at most
+64 KiB each.
+
+```sh
+uefisettings variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E67656F --attributes non-volatile,bootservice-access,runtime-access --append --data-file db.esl --signing-key-file kek.key --signing-certificate-file kek.pem
 ```
 
 </details>

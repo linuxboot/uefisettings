@@ -20,7 +20,12 @@
 //! without EFI_VARIABLE_APPEND_WRITE; `setup_mode` in write-signed-setup, whose variable store is a
 //! template copy, where uefisettings refuses the db append before any write, but not the same
 //! payload for another variable; `after_shell` in shell-write-signed-user, after its UEFI Shell
-//! boot appended to db the KEK-signed payload of the Shell boots.
+//! boot appended to db the KEK-signed payload of the Shell boots; `signing_in_user` in sign-user,
+//! where uefisettings signs with the keys that run.sh puts in /sign: db appends that KEK's key
+//! signs over each digest and that a leaf key signs with the CA that KEK issued in its bundle,
+//! which the firmware accepts, and those of db's key, a foreign key and the leaf key without its
+//! CA, which it refuses, then a write without EFI_VARIABLE_APPEND_WRITE at the system clock's
+//! second, after which the firmware refuses an earlier TimeStamp.
 
 use std::fs;
 use std::io;
@@ -57,6 +62,14 @@ const PROBE: &str = "WriteSignedProbe";
 const PROBE_WRITE: &str = "/auth/probe-write.auth";
 /// NV+BS+RT+AT, the attributes that the firmware keeps for PROBE after PROBE_WRITE.
 const PROBE_ATTRIBUTES: u32 = 0x27;
+/// The keys, certificates and data that uefisettings signs, which run.sh puts in the initramfs
+/// (secboot_files).
+const SIGN: &str = "/sign";
+/// A variable of OWNER that no Secure Boot policy names, which a write at the system clock's
+/// second creates.
+const CLOCK_PROBE: &str = "ClockProbe";
+/// A TimeStamp before any that the system clock gives.
+const EARLIER: &str = "2000-01-01T00:00:00Z";
 /// EFI_CERT_X509_GUID, a5c059a1-94e4-4aa7-87b5-ab155c2bf072, as an EFI_GUID's bytes.
 const EFI_CERT_X509_GUID: [u8; 16] = [
     0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a, 0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
@@ -95,6 +108,49 @@ fn write_args<'a>(name: &'a str, guid: &'a str, write: Write, payload: &'a str) 
     }
     args.extend(["--payload-file", payload]);
     args
+}
+
+/// The arguments of `uefisettings variable write-signed` that sign the file `data` of SIGN over
+/// `digest` with the key `key` and the certificates `certificates` of SIGN, and write it to the
+/// variable `name` of the vendor GUID `guid` as `write` says.
+fn sign_args(
+    name: &str,
+    guid: &str,
+    write: Write,
+    data: &str,
+    [key, certificates]: [&str; 2],
+    digest: &str,
+) -> Vec<String> {
+    let mut args = [
+        "variable",
+        "write-signed",
+        name,
+        guid,
+        "--attributes",
+        ATTRIBUTES,
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    match write {
+        Write::Append => args.push("--append".to_owned()),
+        Write::Replace => {}
+    }
+    args.extend([
+        "--data-file".to_owned(),
+        format!("{SIGN}/{data}"),
+        "--signing-key-file".to_owned(),
+        format!("{SIGN}/{key}"),
+        "--signing-certificate-file".to_owned(),
+        format!("{SIGN}/{certificates}"),
+        "--digest".to_owned(),
+        digest.to_owned(),
+    ]);
+    args
+}
+
+/// The `&str`s of `args`.
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 /// What uefisettings says of a write that the firmware refuses with EFI_SECURITY_VIOLATION, as
@@ -285,5 +341,114 @@ fn after_shell() {
     assert!(
         holds(lists[1], b"uefisettings test shell-db"),
         "the second list holds the certificate that the Shell boot appended"
+    );
+}
+
+#[test]
+fn signing_in_user() {
+    require_test_vm();
+    assert_eq!(global_variable("SetupMode"), Some(vec![0]), "SetupMode");
+    let db = db_path();
+    let mut expected = variable_data(&db).expect("db is missing");
+    let kek = ["KEK.key", "KEK.crt"];
+
+    for (data, signer, digest) in [
+        ("sha256.esl", kek, "sha256"),
+        ("sha384.esl", kek, "sha384"),
+        ("sha512.esl", kek, "sha512"),
+        ("chain.esl", ["leaf.key", "chain.pem"], "sha256"),
+    ] {
+        let output = uefisettings(&strs(&sign_args(
+            "db",
+            EFI_IMAGE_SECURITY_DATABASE,
+            Write::Append,
+            data,
+            signer,
+            digest,
+        )));
+
+        assert_eq!(
+            (output.code, output.stdout.as_str()),
+            (Some(0), ""),
+            "the append of {data} that {signer:?} signs over {digest}: {output:#?}"
+        );
+        expected.extend(fs::read(format!("{SIGN}/{data}")).expect("cannot read the data file"));
+        assert_eq!(
+            variable_data(&db).as_deref(),
+            Some(&expected[..]),
+            "db after the append of {data}: the old db, then the new list"
+        );
+    }
+
+    for (signer, what) in [
+        (["db.key", "db.crt"], "db's key"),
+        (["foreign.key", "foreign.crt"], "a foreign key"),
+        (["leaf.key", "leaf.crt"], "the leaf key without its CA"),
+    ] {
+        let error = json_error(&strs(&sign_args(
+            "db",
+            EFI_IMAGE_SECURITY_DATABASE,
+            Write::Append,
+            "refused.esl",
+            signer,
+            "sha256",
+        )));
+
+        assert_eq!(error.error_message, security_violation(), "{what}");
+        assert_eq!(
+            variable_data(&db).as_deref(),
+            Some(&expected[..]),
+            "db after the append signed with {what}"
+        );
+    }
+
+    let probe = format!("{EFIVARS}/{CLOCK_PROBE}-{OWNER}");
+    assert_absent(&probe);
+    let foreign = ["foreign.key", "foreign.crt"];
+    let create = sign_args(
+        CLOCK_PROBE,
+        OWNER,
+        Write::Replace,
+        "probe.data",
+        foreign,
+        "sha256",
+    );
+
+    let output = uefisettings(&strs(&create));
+
+    assert_eq!(
+        (output.code, output.stdout.as_str()),
+        (Some(0), ""),
+        "the write of {CLOCK_PROBE} at the clock's second: {output:#?}"
+    );
+    let data = fs::read(format!("{SIGN}/probe.data")).expect("cannot read probe.data");
+    assert_eq!(
+        variable_bytes(&probe),
+        Some([&PROBE_ATTRIBUTES.to_ne_bytes()[..], &data].concat()),
+        "{CLOCK_PROBE} after the write: its attributes, then the data"
+    );
+    // A write at the all-zero TimeStamp, not the clock's, would have let this one through.
+    let earlier = [
+        &sign_args(
+            CLOCK_PROBE,
+            OWNER,
+            Write::Replace,
+            "update.data",
+            foreign,
+            "sha256",
+        )[..],
+        &["--timestamp".to_owned(), EARLIER.to_owned()],
+    ]
+    .concat();
+    let error = json_error(&strs(&earlier));
+    assert_eq!(
+        error.error_message,
+        security_violation(),
+        "the write of {CLOCK_PROBE} at {EARLIER}"
+    );
+    assert_eq!(
+        variable_bytes(&probe),
+        Some([&PROBE_ATTRIBUTES.to_ne_bytes()[..], &data].concat()),
+        "{CLOCK_PROBE} after the write at {EARLIER}"
     );
 }

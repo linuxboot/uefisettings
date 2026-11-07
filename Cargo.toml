@@ -31,8 +31,19 @@ subtle = "2.6"
 zeroize = "1.9.1"
 # GUIDs in registry format, such as the variable commands take; the uefi crate's Guid is uguid's.
 uguid = "2.2.1"
-# The SHA-256 of each signature in the EFI_SIGNATURE_LISTs that variable get summarizes.
-sha2 = "0.10.9"
+# The SHA-256 of each signature in the EFI_SIGNATURE_LISTs that variable get summarizes, and
+# the digest of signed variable writes.
+sha2 = { version = "0.10.9", features = ["oid"] }
+# Signed authenticated variable writes (UEFI 2.11 §8.2.6), one feature set for every target:
+# rsa's std feature pulls getrandom through rand_core, which builds for no UEFI target, and cms
+# without its builder, which always adds the signed attributes that §8.2.6 forbids.
+rsa = { version = "0.9", default-features = false, features = ["sha2", "pem"] }
+cms = { version = "0.2", default-features = false }
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
+der = { version = "0.7", features = ["alloc", "pem", "std"] }
+rand_core = { version = "0.6", default-features = false }
+# The RNG of RSA blinding on every target, seeded once from the platform's source.
+rand_chacha = { version = "0.3", default-features = false }
 
 # Only the Linux build uses these: efivarfs, the HiiDB in sysfs, iLO through
 # ilorest_chif.so, and the CLI's logging.
@@ -56,6 +67,10 @@ uefi = { version = "0.41", features = ["alloc"] }
 # EFI_SHELL_PARAMETERS_PROTOCOL.StdIn and EFI_SHELL_PROTOCOL's GetFileInfo and ReadFile, for the
 # secret that `-` names, which uefi does not wrap.
 uefi-raw = "0.17"
+
+# The seed of RSA blinding outside the UEFI Shell: getrandom, which has no UEFI backend.
+[target.'cfg(not(target_os = "uefi"))'.dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # The Windows build reaches the firmware through Win32: Get/SetFirmwareEnvironmentVariableExW
 # for variables, and the HiiDB driver (src/lib/hii/hiidb_driver.rs) for the HiiDB.

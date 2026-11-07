@@ -44,6 +44,11 @@
 #                has one line "uefisettings-qemu-test: TAG JSON" of a Linux boot, the step's
 #                output is one line of JSON, and the jq filter FILTER finds it true with
 #                $linux bound to the JSON of LOG
+#              if-line and unless-line: the argument is "OTHER<TAB>REGEX<TAB>CHECK<TAB>
+#                ARGUMENT"; the check CHECK with ARGUMENT holds for the step if a line of the
+#                output of the step OTHER matches the extended regular expression REGEX, or
+#                for unless-line, if none does, such as where the firmware lacks a protocol
+#                that dh lists
 #   argument   what the check takes
 # Every step of the log needs a status check, and every step that a check names must be in
 # the log once.
@@ -130,14 +135,10 @@ fail() {
 }
 
 declare -A status_checked
-# read fails on a last line without a newline, which still counts.
-while IFS=$'\t' read -r step check argument || [[ -n $step ]]; do
-    [[ -z $step || $step == \#* ]] && continue
-    if [[ ! -f $steps/$step.out ]]; then
-        fail "$step" "not in the log"
-        continue
-    fi
-    out=$steps/$step.out
+# Runs the check $2 with the argument $3 on the step $1.
+check_step() {
+    local step=$1 check=$2 argument=$3 out=$steps/$1.out
+    local want got name other parity log tag filter regex inner inner_argument
     case $check in
     status)
         status_checked[$step]=1
@@ -172,7 +173,7 @@ while IFS=$'\t' read -r step check argument || [[ -n $step ]]; do
             ! parity=$(jq --compact-output --slurpfile linux "$steps/linux.json" \
                 "\$linux[0] as \$linux | $parity_filter" <"$out"); then
             fail "$step" "no JSON of list-questions here or in $argument"
-            continue
+            return
         fi
         echo "check-shell-log: $step: parity with $argument: $parity"
         jq --exit-status '.compared > 0 and .differing == [] and .unreached == [] and .reached > 0' \
@@ -189,11 +190,34 @@ while IFS=$'\t' read -r step check argument || [[ -n $step ]]; do
             fail "$step" "not one line of JSON for which $filter holds with the line $tag of $log"
         fi
         ;;
+    if-line | unless-line)
+        IFS=$'\t' read -r other regex inner inner_argument <<<"$argument"
+        if [[ ! -f $steps/$other.out ]]; then
+            fail "$step" "$check names $other, which is not in the log"
+            return
+        fi
+        if grep --quiet --extended-regexp -- "$regex" "$steps/$other.out"; then
+            [[ $check == if-line ]] || return 0
+        else
+            [[ $check == unless-line ]] || return 0
+        fi
+        echo "check-shell-log: $step: $check $other $regex holds, so $inner $inner_argument"
+        check_step "$step" "$inner" "$inner_argument"
+        ;;
     *)
         echo "check-shell-log: unknown check $check of $step in $expectations" >&2
         exit 2
         ;;
     esac
+}
+# read fails on a last line without a newline, which still counts.
+while IFS=$'\t' read -r step check argument || [[ -n $step ]]; do
+    [[ -z $step || $step == \#* ]] && continue
+    if [[ ! -f $steps/$step.out ]]; then
+        fail "$step" "not in the log"
+        continue
+    fi
+    check_step "$step" "$check" "$argument"
 done <"$expectations"
 for out in "$steps"/*.out; do
     step=$(basename "$out" .out)

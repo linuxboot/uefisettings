@@ -17,6 +17,7 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -34,6 +35,9 @@ use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IloBackend;
 use uefisettings::exports::SettingsBackend;
 use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::secret_file;
+use uefisettings::secret_file::Secret;
+use uefisettings::secret_file::MAX_SECRET_LEN;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 
@@ -322,6 +326,20 @@ pub(super) fn auto_set(
 /// The bytes of the file `path`, the payload of capsule deliver or variable write-signed.
 pub(super) fn read_payload(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("read the payload {}", path.display()))
+}
+
+/// The secret in the file `path`, the key or the certificate bundle of variable write-signed, in
+/// file mode: at most MAX_SECRET_LEN bytes. Errors name it as `what`.
+pub(super) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
+    let file =
+        fs::File::open(path).with_context(|| format!("open the {what} {}", path.display()))?;
+    secret_file::read_secret_file(file, MAX_SECRET_LEN)
+        .with_context(|| format!("read the {what} {}", path.display()))
+}
+
+/// The clock of the TimeStamp that variable write-signed signs: the system clock.
+pub(super) fn signing_clock() -> Option<SystemTime> {
+    Some(SystemTime::now())
 }
 
 fn prioritize_backend(machine: &MachineInfo, json: bool) -> Result<Backend> {

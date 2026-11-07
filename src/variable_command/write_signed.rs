@@ -10,14 +10,20 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! variable write-signed: writes a pre-signed payload to an EFI variable, which the firmware
-//! verifies (UEFI 2.11 §8.2.6).
+//! variable write-signed: writes to an EFI variable a payload that the caller signed, or new data
+//! that it signs with the caller's key, and the firmware verifies the signature (UEFI 2.11
+//! §8.2.6).
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
+use anyhow::bail;
 use anyhow::Result;
 use clap::Args;
 use clap::ValueEnum;
+use uefisettings::exports::SignatureDigest;
+use uefisettings::exports::SignedVariableWrite;
+use uefisettings::exports::TimeStamp;
 use uefisettings::exports::VariableAttributes;
 use uefisettings::exports::VariableBackend;
 
@@ -30,15 +36,34 @@ pub(super) struct WriteSignedArgs {
     name: String,
     /// The vendor GUID of the variable, such as D719B2CB-3D3A-4596-A3BC-DAD00E67656F
     guid: String,
-    /// The attributes that the payload was signed with, but EFI_VARIABLE_APPEND_WRITE, which --append names, and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which uefisettings adds
+    /// The attributes of the write, which the signature covers, but EFI_VARIABLE_APPEND_WRITE, which --append names, and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which uefisettings adds
     #[arg(long, value_enum, value_delimiter = ',', required = true)]
     attributes: Vec<SignedAttributeArg>,
-    /// Append the payload's data to the variable (EFI_VARIABLE_APPEND_WRITE), if the payload was signed with that attribute
+    /// Append the new data to the variable (EFI_VARIABLE_APPEND_WRITE), which the signature covers too
     #[arg(long)]
     append: bool,
     /// The payload: an EFI_VARIABLE_AUTHENTICATION_2 descriptor and then the new data of the variable (UEFI 2.11 section 8.2.6), which uefisettings writes unchanged
-    #[arg(long)]
-    payload_file: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "data_file",
+        conflicts_with = "data_file"
+    )]
+    payload_file: Option<PathBuf>,
+    /// The new data of the variable, which uefisettings signs with --signing-key-file into an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 section 8.2.6) and writes after it
+    #[arg(long, requires_all = ["signing_key_file", "signing_certificate_file"])]
+    data_file: Option<PathBuf>,
+    /// The unencrypted PEM RSA private key, PKCS #8 or PKCS #1 of 2048 to 4096 bits, that signs --data-file; read as a secret of at most 64 KiB
+    #[arg(long, requires = "data_file")]
+    signing_key_file: Option<PathBuf>,
+    /// The PEM X.509 certificates that the signature carries: the one of --signing-key-file's public key, then any others, such as intermediate CAs; DER sorts them (X.690 section 11.6); a file of at most 64 KiB
+    #[arg(long, requires = "data_file")]
+    signing_certificate_file: Option<PathBuf>,
+    /// The digest of the signature (UEFI 2.11 section 8.2.6)
+    #[arg(long, value_enum, default_value_t = DigestArg::Sha256, requires = "data_file")]
+    digest: DigestArg,
+    /// The TimeStamp to sign, a GMT time such as 2026-11-07T00:00:00Z, later than the variable's unless --append; by default the current second of the system clock, but in the UEFI Shell, which reads none, --append signs the all-zero TimeStamp of UEFI 2.11 section 8.2.6
+    #[arg(long, requires = "data_file")]
+    timestamp: Option<TimeStamp>,
 }
 
 /// An attribute of EFI variables (UEFI 2.11 §8.2.1) that a signed write takes as given.
@@ -59,11 +84,60 @@ impl From<SignedAttributeArg> for VariableAttributes {
     }
 }
 
+/// A digest that UEFI 2.11 §8.2.6 accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DigestArg {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl From<DigestArg> for SignatureDigest {
+    fn from(digest: DigestArg) -> Self {
+        match digest {
+            DigestArg::Sha256 => Self::Sha256,
+            DigestArg::Sha384 => Self::Sha384,
+            DigestArg::Sha512 => Self::Sha512,
+        }
+    }
+}
+
 impl WriteSignedArgs {
-    /// Writes the payload file to the variable, printing nothing.
+    /// Writes the payload file, or the data file that the key signs, to the variable, printing
+    /// nothing.
     pub(super) fn run(&self) -> Result<()> {
-        let payload = platform::read_payload(&self.payload_file)?;
-        VariableBackend::write_signed(&self.name, &self.guid, self.attributes(), &payload)
+        let (Some(data_file), Some(key_file), Some(certificate_file)) = (
+            &self.data_file,
+            &self.signing_key_file,
+            &self.signing_certificate_file,
+        ) else {
+            let Some(payload_file) = &self.payload_file else {
+                bail!("write-signed needs --payload-file or --data-file");
+            };
+            let payload = platform::read_payload(payload_file)?;
+            return VariableBackend::write_signed(
+                &self.name,
+                &self.guid,
+                self.attributes(),
+                &payload,
+            );
+        };
+        let timestamp = signed_time_stamp(self.timestamp, self.append, platform::signing_clock())?;
+        let data = platform::read_payload(data_file)?;
+        let signing_key = platform::read_secret_file(key_file, "signing key")?;
+        let certificates = platform::read_secret_file(certificate_file, "certificate bundle")?;
+        VariableBackend::sign_and_write(
+            &SignedVariableWrite {
+                name: &self.name,
+                vendor: &self.guid,
+                attributes: self.attributes(),
+                data: &data,
+                timestamp,
+                digest: self.digest.into(),
+            },
+            &signing_key,
+            certificates.as_bytes(),
+        )
     }
 
     /// The attributes that these name.
@@ -77,11 +151,33 @@ impl WriteSignedArgs {
     }
 }
 
+/// The TimeStamp to sign (UEFI 2.11 §8.2.6): `given`, else the current second of `clock`, the
+/// system clock, else, for an append, the all-zero TimeStamp of a platform without a reliable
+/// time source.
+fn signed_time_stamp(
+    given: Option<TimeStamp>,
+    append: bool,
+    clock: Option<SystemTime>,
+) -> Result<TimeStamp> {
+    match (given, clock) {
+        (Some(timestamp), _) => Ok(timestamp),
+        (None, Some(now)) => Ok(TimeStamp::from_system_time(now)?),
+        (None, None) if append => Ok(TimeStamp::ZERO),
+        (None, None) => bail!(
+            "--data-file without --append needs --timestamp here, where uefisettings reads no \
+             clock: the firmware takes only a TimeStamp later than the variable's (UEFI 2.11 \
+             section 8.2.6)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use clap::Parser;
+
+    use uefisettings::secret_file::MAX_SECRET_LEN;
 
     use super::*;
     use crate::variable_command::VariableSubcommands;
@@ -168,11 +264,109 @@ mod tests {
                     parsed.name.as_str(),
                     parsed.guid.as_str(),
                     parsed.attributes(),
-                    parsed.payload_file.as_path()
+                    parsed.payload_file.as_deref()
                 ),
-                ("db", db, want, Path::new("db.auth")),
+                ("db", db, want, Some(Path::new("db.auth"))),
                 "{args:?}"
             );
+        }
+    }
+
+    /// write-signed signs --data-file with --signing-key-file and --signing-certificate-file at
+    /// --timestamp over --digest, SHA-256 by default, and refuses a data file next to a payload
+    /// file, one without its key or certificate, a TimeStamp that is no GMT time, a digest that
+    /// UEFI 2.11 §8.2.6 does not accept, and --digest or --timestamp without a data file.
+    #[test]
+    fn write_signed_takes_a_data_file_to_sign() {
+        use clap::error::ErrorKind::ArgumentConflict;
+        use clap::error::ErrorKind::InvalidValue;
+        use clap::error::ErrorKind::MissingRequiredArgument;
+        use clap::error::ErrorKind::ValueValidation;
+
+        let kek = "8BE4DF61-93CA-11D2-AA0D-00E098032B8C";
+        let signed = [
+            "KEK",
+            kek,
+            "--attributes",
+            "non-volatile,bootservice-access,runtime-access",
+            "--data-file",
+            "kek.esl",
+            "--signing-key-file",
+            "pk.key",
+            "--signing-certificate-file",
+            "pk.crt",
+        ];
+
+        let parsed =
+            write_signed(&[&signed[..], &["--timestamp", "2026-11-07T00:00:00Z"]].concat())
+                .unwrap_or_else(|kind| panic!("parse a signed write: {kind}"));
+        assert_eq!(
+            (
+                parsed.payload_file.as_deref(),
+                parsed.data_file.as_deref(),
+                parsed.signing_key_file.as_deref(),
+                parsed.signing_certificate_file.as_deref(),
+                parsed.timestamp.map(|timestamp| timestamp.to_string()),
+                SignatureDigest::from(parsed.digest),
+            ),
+            (
+                None,
+                Some(Path::new("kek.esl")),
+                Some(Path::new("pk.key")),
+                Some(Path::new("pk.crt")),
+                Some("2026-11-07T00:00:00Z".to_owned()),
+                SignatureDigest::Sha256,
+            ),
+            "signed write"
+        );
+        for (name, digest) in [
+            ("sha256", SignatureDigest::Sha256),
+            ("sha384", SignatureDigest::Sha384),
+            ("sha512", SignatureDigest::Sha512),
+        ] {
+            let parsed = write_signed(&[&signed[..], &["--digest", name]].concat())
+                .unwrap_or_else(|kind| panic!("parse --digest {name}: {kind}"));
+            assert_eq!(
+                SignatureDigest::from(parsed.digest),
+                digest,
+                "--digest {name}"
+            );
+        }
+
+        let payload = [
+            "db",
+            "D719B2CB-3D3A-4596-A3BC-DAD00E67656F",
+            "--attributes",
+            "non-volatile",
+            "--payload-file",
+            "db.auth",
+        ];
+        let cases: [(Vec<&str>, clap::error::ErrorKind); 7] = [
+            (
+                [&signed[..], &["--payload-file", "kek.auth"]].concat(),
+                ArgumentConflict,
+            ),
+            (signed[..8].to_vec(), MissingRequiredArgument),
+            (
+                [&signed[..6], &["--signing-certificate-file", "pk.crt"]].concat(),
+                MissingRequiredArgument,
+            ),
+            (
+                [&signed[..], &["--timestamp", "2026-11-07T00:00:00+01:00"]].concat(),
+                ValueValidation,
+            ),
+            ([&signed[..], &["--digest", "sha1"]].concat(), InvalidValue),
+            (
+                [&payload[..], &["--digest", "sha384"]].concat(),
+                MissingRequiredArgument,
+            ),
+            (
+                [&payload[..], &["--timestamp", "2026-11-07T00:00:00Z"]].concat(),
+                MissingRequiredArgument,
+            ),
+        ];
+        for (args, want) in cases {
+            assert_eq!(write_signed(&args).err(), Some(want), "{args:?}");
         }
     }
 
@@ -257,6 +451,82 @@ mod tests {
         }
     }
 
+    /// signed_time_stamp signs --timestamp when given, else the clock's current second, else,
+    /// without a clock, the all-zero TimeStamp for an append, and refuses a write that is not.
+    #[test]
+    fn signed_time_stamp_takes_the_given_then_the_clock_then_zero_for_an_append() {
+        let given: TimeStamp = "2026-11-07T00:00:00Z".parse().expect("the given TimeStamp");
+        let clock = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_794_013_323);
+        let now = Ok("2026-11-07T01:02:03Z".to_owned());
+        let cases = [
+            (
+                Some(given),
+                false,
+                Some(clock),
+                Ok(given.to_string()),
+                "given, with a clock",
+            ),
+            (
+                Some(given),
+                true,
+                None,
+                Ok(given.to_string()),
+                "given append, without a clock",
+            ),
+            (
+                Some(given),
+                false,
+                None,
+                Ok(given.to_string()),
+                "given, without a clock",
+            ),
+            (None, false, Some(clock), now.clone(), "the clock's second"),
+            (
+                None,
+                true,
+                Some(clock),
+                now,
+                "the clock's second for an append",
+            ),
+            (
+                None,
+                true,
+                None,
+                Ok(TimeStamp::ZERO.to_string()),
+                "zero for an append without a clock",
+            ),
+            (
+                None,
+                false,
+                None,
+                Err(
+                    "--data-file without --append needs --timestamp here, where uefisettings \
+                     reads no clock: the firmware takes only a TimeStamp later than the \
+                     variable's (UEFI 2.11 section 8.2.6)"
+                        .to_owned(),
+                ),
+                "no TimeStamp without a clock",
+            ),
+            (
+                None,
+                false,
+                Some(SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+                Err("the system clock reads no time from 1970 to 9999".to_owned()),
+                "a clock before 1970",
+            ),
+        ];
+
+        for (given, append, clock, want, case) in cases {
+            assert_eq!(
+                signed_time_stamp(given, append, clock)
+                    .map(|timestamp| timestamp.to_string())
+                    .map_err(|error| error.to_string()),
+                want,
+                "{case}"
+            );
+        }
+    }
+
     /// The payload is the bytes of its file, and a missing file is an error that names it.
     #[cfg(not(target_os = "uefi"))]
     #[test]
@@ -275,6 +545,39 @@ mod tests {
         assert_eq!(
             platform::read_payload(&missing).map_err(|error| error.to_string()),
             Err(format!("read the payload {}", missing.display())),
+            "missing"
+        );
+    }
+
+    /// A secret file's errors name what it holds, and one over MAX_SECRET_LEN is refused.
+    #[cfg(not(target_os = "uefi"))]
+    #[test]
+    fn secret_file_errors_name_what_it_holds() {
+        let dir = tempfile::tempdir().expect("create a directory");
+        let read = |path: &Path| {
+            platform::read_secret_file(path, "certificate bundle")
+                .map(|secret| secret.as_bytes().len())
+                .map_err(|error| error.to_string())
+        };
+        let full = dir.path().join("full.pem");
+        std::fs::write(&full, vec![b'A'; MAX_SECRET_LEN]).expect("write a full file");
+        assert_eq!(
+            read(&full),
+            Ok(MAX_SECRET_LEN),
+            "a file of MAX_SECRET_LEN bytes"
+        );
+
+        let over = dir.path().join("over.pem");
+        std::fs::write(&over, vec![b'A'; MAX_SECRET_LEN + 1]).expect("write a larger file");
+        assert_eq!(
+            read(&over),
+            Err(format!("read the certificate bundle {}", over.display())),
+            "a file over MAX_SECRET_LEN bytes"
+        );
+        let missing = dir.path().join("missing.pem");
+        assert_eq!(
+            read(&missing),
+            Err(format!("open the certificate bundle {}", missing.display())),
             "missing"
         );
     }
