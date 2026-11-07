@@ -74,21 +74,47 @@ pub use crate::efi_variables::globals::SignatureList;
 #[cfg(variable_data)]
 pub use crate::efi_variables::globals::Timeout;
 #[cfg(variable_names)]
+use crate::efi_variables::list_capsule_results;
+#[cfg(variable_names)]
 use crate::efi_variables::list_variables;
 #[cfg(any(variable_names, variable_info, variable_data))]
 use crate::efi_variables::parse_vendor;
+#[cfg(target_os = "windows")]
+use crate::efi_variables::probe_capsule_results;
 #[cfg(variable_storage_info)]
 use crate::efi_variables::query_storage;
+#[cfg(configuration_tables)]
+use crate::efi_variables::read_json_capsule_result;
 #[cfg(configuration_tables)]
 use crate::efi_variables::read_json_config_data;
 #[cfg(capsule_delivery)]
 pub use crate::efi_variables::CapsuleCapabilities;
 #[cfg(capsule_delivery)]
 pub use crate::efi_variables::CapsuleDelivered;
+#[cfg(variable_data)]
+pub use crate::efi_variables::CapsuleResult;
+#[cfg(variable_data)]
+pub use crate::efi_variables::CapsuleResultDetails;
+#[cfg(variable_data)]
+pub use crate::efi_variables::CapsuleResultError;
+#[cfg(variable_data)]
+pub use crate::efi_variables::CapsuleResults;
+#[cfg(variable_data)]
+pub use crate::efi_variables::EfiTime;
+#[cfg(variable_data)]
+pub use crate::efi_variables::JsonCapsuleResult;
 #[cfg(configuration_tables)]
 pub use crate::efi_variables::JsonConfigData;
+#[cfg(variable_data)]
+pub use crate::efi_variables::NamedCapsuleResult;
 #[cfg(capsule_delivery)]
 pub use crate::efi_variables::ResetType;
+#[cfg(variable_data)]
+pub use crate::efi_variables::ResultName;
+#[cfg(variable_data)]
+pub use crate::efi_variables::TextOrHex;
+#[cfg(variable_data)]
+pub use crate::efi_variables::Undecoded;
 #[cfg(variable_info)]
 use crate::efi_variables::VariableInfoSource;
 #[cfg(variable_storage_info)]
@@ -310,9 +336,9 @@ impl VariableBackend {
     }
 }
 
-/// The capsules for this machine's firmware (UEFI 2.11 §8.5.3), and the configuration data that
-/// it reports for them (§23.5.2).
-#[cfg(any(capsule_delivery, configuration_tables))]
+/// The capsules for this machine's firmware (UEFI 2.11 §8.5.3), the configuration data that
+/// it reports for them (§23.5.2), and the results of their processing (§8.5.6, §23.5.3).
+#[cfg(any(capsule_delivery, configuration_tables, variable_data))]
 pub struct CapsuleBackend {}
 
 #[cfg(capsule_delivery)]
@@ -331,6 +357,38 @@ impl CapsuleBackend {
     /// table (UEFI 2.11 §23.5.2), which it must list.
     pub fn json_config_data() -> Result<JsonConfigData> {
         read_json_config_data(Self::system_json_config_data_table()?)
+    }
+
+    /// The result of processing a JSON capsule that this machine's firmware reports in its JSON
+    /// capsule result table (UEFI 2.11 §23.5.3), which it must list.
+    pub fn json_capsule_result() -> Result<CapsuleResult> {
+        read_json_capsule_result(Self::system_json_capsule_result_table()?)
+    }
+}
+
+#[cfg(variable_names)]
+impl CapsuleBackend {
+    /// The results of capsule processing that this machine's firmware reports in its result
+    /// variables (UEFI 2.11 §8.5.6), which its variables list.
+    pub fn results() -> Result<CapsuleResults> {
+        list_capsule_results(
+            &VariableBackend::system_variable_names(),
+            &VariableBackend::system_variable_data()?,
+            Self::system_firmware_width()?,
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl CapsuleBackend {
+    /// The results of capsule processing that this machine's firmware reports in its result
+    /// variables (UEFI 2.11 §8.5.6), read by name from Capsule0000 up to the greater of
+    /// CapsuleMax and CapsuleLast, as the firmware environment calls list no variables.
+    pub fn results() -> Result<CapsuleResults> {
+        probe_capsule_results(
+            &VariableBackend::system_variable_data()?,
+            Self::system_firmware_width()?,
+        )
     }
 }
 

@@ -32,7 +32,9 @@ use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::efi_variables::VariableStorageInfo;
 use crate::efi_variables::VendorTable;
+use crate::efi_variables::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
 use crate::efi_variables::EFI_JSON_CONFIG_DATA_TABLE_GUID;
+use crate::firmware_width::FirmwareWidth;
 use crate::hii::export_package_lists;
 use crate::hii::FirmwareVariables;
 use crate::hii::VariableServices;
@@ -86,6 +88,16 @@ impl CapsuleBackend {
     /// The JSON configuration table.
     pub(super) fn system_json_config_data_table() -> Result<Option<impl VendorTable>> {
         SystemConfigurationTable::find(&EFI_JSON_CONFIG_DATA_TABLE_GUID)
+    }
+
+    /// The JSON capsule result table.
+    pub(super) fn system_json_capsule_result_table() -> Result<Option<impl VendorTable>> {
+        SystemConfigurationTable::find(&EFI_JSON_CAPSULE_RESULT_TABLE_GUID)
+    }
+
+    /// The width of this firmware, which runs this build natively.
+    pub(super) fn system_firmware_width() -> Result<FirmwareWidth> {
+        Ok(FirmwareWidth::of_this_build())
     }
 }
 

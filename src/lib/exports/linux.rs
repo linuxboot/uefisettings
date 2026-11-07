@@ -44,6 +44,9 @@ use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::efi_variables::VariableStorageInfo;
+use crate::firmware_width::read_fw_platform_size;
+use crate::firmware_width::FirmwareWidth;
+use crate::firmware_width::FW_PLATFORM_SIZE_PATH;
 use crate::hii::extract;
 use crate::hii::EfivarDump;
 use crate::hii::EfivarFiles;
@@ -100,6 +103,11 @@ impl CapsuleBackend {
     /// /dev/efi_capsule_loader, which passes a capsule to the firmware's UpdateCapsule().
     pub(super) fn system_capsule_delivery() -> impl CapsuleDelivery {
         CapsuleLoader::system()
+    }
+
+    /// The width of the firmware, as Linux tells it in fw_platform_size.
+    pub(super) fn system_firmware_width() -> Result<FirmwareWidth> {
+        read_fw_platform_size(Path::new(FW_PLATFORM_SIZE_PATH))
     }
 }
 

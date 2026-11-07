@@ -60,7 +60,7 @@ uefisettings hii list-questions --efivars efivars
 ```plain
 Commands:
   capsule            Commands that pass capsules to this machine's firmware, or show the
-                     configuration data that it reports
+                     configuration data and the capsule processing results that it reports
   get                Auto-identify backend and get the current value of a question
   help               Print this message or the help of the given subcommand(s)
   hii                Commands which work on machines exposing the UEFI HiiDB
@@ -109,11 +109,15 @@ Commands:
 
 ```plain
 Commands:
-  config-data  Print the configuration data of the firmware's JSON configuration table: each item as
-               text if it is UTF-8, else as hex
-  deliver      Deliver a file to the firmware, unchanged, as the JSON payload of a configuration
-               capsule; it never resets the machine
-  help         Print this message or the help of the given subcommand(s)
+  config-data   Print the configuration data of the firmware's JSON configuration table: each item
+                as text if it is UTF-8, else as hex
+  deliver       Deliver a file to the firmware, unchanged, as the JSON payload of a configuration
+                capsule; it never resets the machine
+  help          Print this message or the help of the given subcommand(s)
+  result-table  Print the result of processing a JSON capsule that the firmware reports in its JSON
+                capsule result table
+  results       Print the results of capsule processing that the firmware reports in its Capsule####
+                variables, and the CapsuleMax and CapsuleLast variables that name them
 ```
 
 `ilo`:
@@ -161,8 +165,8 @@ and none has been tested here. Without a driver, `-f` still reads a HiiDB file, 
 when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
 `variable list` and `variable storage` fail there: the firmware environment calls reach a
 variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
-reach EFI variables only. `capsule config-data` fails too: `uefisettings` reads the JSON
-configuration table only in the UEFI Shell.
+reach EFI variables only. `capsule config-data` and `capsule result-table` fail too:
+`uefisettings` reads their configuration tables only in the UEFI Shell.
 
 ---
 
@@ -554,6 +558,39 @@ where OsIndicationsSupported lists that bit.
 
 ```plain
 FS0:\> uefisettings.efi capsule config-data
+```
+
+`capsule results` prints the results of capsule processing that the firmware reports in EFI
+variables of EFI_CAPSULE_REPORT_GUID (§8.5.6), as a JSON object of its own, with no `-j`:
+`capsule_max` and `capsule_last`, the names that CapsuleMax and CapsuleLast hold, or `null` where
+the firmware has no such variable, and `results`, each variable Capsule0000 to CapsuleFFFF that the
+firmware wrote, in name order, as `{"name": ..., "result": ...}`. Each variable is decoded on its
+own, so one that does not decode hides no other: it shows as `{"name": ..., "error": ..., "data":
+{"hex": ...}}`, its data in hex, and a CapsuleMax or CapsuleLast that holds no name as `{"error":
+..., "data": ...}`. A result holds the fields of its EFI_CAPSULE_RESULT_VARIABLE_HEADER:
+`variable_total_size`, `capsule_guid`, `capsule_processed`, an EFI_TIME of `year`, `month`, `day`,
+`hour`, `minute`, `second`, `nanosecond`, `time_zone` and `daylight`, and `capsule_status`, an
+EFI_STATUS in hex, such as `"0x8000000000000002"`: its high bit is that of the firmware's UINTN,
+and a JSON number that large loses its low bits where JSON numbers are doubles. The result of a
+JSON capsule has `json` (§8.5.6.1.3): its `capsule_id` and its `resp`, as `{"text": ...}` if it is
+UTF-8, else as `{"hex": ...}`; that of any other CapsuleGuid, or of a JSON part of a Version but 1,
+has `data`, the bytes after the header, as `{"hex": ...}`. The header's CapsuleStatus is a UINTN,
+so its size depends on the firmware's width, which Linux tells in
+`/sys/firmware/efi/fw_platform_size`; `uefisettings.efi` runs on firmware of its own width.
+Windows lists no variables, so there `uefisettings` reads CapsuleMax and CapsuleLast, then each name
+from Capsule0000 up to the greater of the two, one call each: with edk2's default CapsuleMax,
+CapsuleFFFF, that is 65,538 calls. It spells the names in the case of the letter digits of
+CapsuleMax, else of CapsuleLast, as names are case-sensitive, and without one it reads an absent
+name with a letter digit in uppercase, then in lowercase. It takes the firmware's width to be its
+own, which is wrong for a 32-bit build under WOW64 and for 64-bit Windows on 32-bit UEFI.
+
+`capsule result-table` prints the result of processing a JSON capsule that the firmware reports in
+the configuration table of EFI_JSON_CAPSULE_RESULT_TABLE_GUID (§4.6.1.2, §23.5.3), as `results`
+prints one, and fails where the firmware lists no such table, as it does until it processes a JSON
+capsule. It reads the table as `capsule config-data` reads its own.
+
+```plain
+FS0:\> uefisettings.efi capsule results
 ```
 
 </details>

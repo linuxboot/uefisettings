@@ -24,6 +24,7 @@ use uefi::boot::MemoryType;
 use uefi::mem::memory_map::MemoryMap;
 
 use crate::efi_variables::VendorTable;
+use crate::firmware_width::FirmwareWidth;
 use crate::hii::package::Guid;
 use crate::memory_map::efi_memory_map;
 use crate::memory_map::efi_memory_map::EfiMemoryMap;
@@ -87,6 +88,10 @@ impl VendorTable for SystemConfigurationTable {
         // AArch64), so the region's physical addresses are those read
         let bytes = unsafe { slice::from_raw_parts(self.start, len) };
         Ok(bytes.to_vec())
+    }
+
+    fn firmware_width(&self) -> FirmwareWidth {
+        FirmwareWidth::of_this_build()
     }
 }
 

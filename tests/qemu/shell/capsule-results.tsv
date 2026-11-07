@@ -1,0 +1,11 @@
+# The checks of shell/capsule-results.nsh, the second boot of shell-capsule-results and
+# shell-capsule-results-i686. See check-shell-log.sh.
+# the result variables, the JSON capsule's first and the one that does not decode last, as Linux
+# printed them the boot before, with the header of the firmware's width
+results	status	0x0
+results	json	.capsule_max == "Capsule0003" and .capsule_last == "Capsule0001" and ([.results[].name] == ["Capsule0000", "Capsule0001", "Capsule0003"]) and .results[0].result.json.capsule_id == 7 and .results[1].result.data.hex == "ff00807f" and .results[2].data.hex == "010203" and (.results[2].error | startswith("the capsule result holds 3 bytes"))
+results	linux	boot1.test.log results . == $linux
+# the table of publish-hiidb.efi json-capsule-result, with the header and CapsuleStatus of the
+# firmware's width
+result-table	status	0x0
+result-table	json	(.variable_total_size == 98 or .variable_total_size == 94) and .capsule_guid == "67D6F4CD-D6B8-4573-BF4A-DE5E252D61AE" and .capsule_processed == {"year": 2026, "month": 11, "day": 7, "hour": 1, "minute": 2, "second": 3, "nanosecond": 0, "time_zone": 2047, "daylight": 0} and (.capsule_status == "0x8000000000000003" or .capsule_status == "0x80000003") and .json == {"capsule_id": 9, "resp": {"text": "{\"uefisettings\":\"json-capsule-result\"}"}}

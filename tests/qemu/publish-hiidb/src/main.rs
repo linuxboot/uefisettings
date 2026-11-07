@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|enhanced-auth-forms|dropped-password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|enhanced-auth-forms|dropped-password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -61,6 +61,11 @@
 //! [`PAST_REGION_TOTAL_LENGTH`], and `json-config-data-boot-services` in boot services data,
 //! while `json-config-data-mmio` points the configuration table at the start of the first runtime
 //! memory-mapped I/O of the memory map, where it writes nothing.
+//! `json-capsule-result` publishes nothing either: it installs the result of processing a JSON
+//! capsule, an EFI_CAPSULE_RESULT_VARIABLE_HEADER and an EFI_CAPSULE_RESULT_VARIABLE_JSON (UEFI
+//! 2.11 §8.5.6.1), as the configuration table of EFI_JSON_CAPSULE_RESULT_TABLE_GUID (§23.5.3),
+//! whose CapsuleStatus is EFI_UNSUPPORTED, a UINTN of the driver's width, which is the
+//! firmware's. It never converts the table's address either.
 //! `set-auth-variables=PATH[,PATH]...` publishes nothing: it runs the authenticated writes of
 //! [`auth_variables`] for the Secure Boot scenarios.
 
@@ -167,6 +172,22 @@ const JSON_CONFIG_DATA_ITEMS: [&[u8]; 2] = [
 /// end of the runtime-data region that holds the table.
 const PAST_REGION_TOTAL_LENGTH: u32 = 0x0100_0000;
 
+/// EFI_JSON_CAPSULE_RESULT_TABLE_GUID (UEFI 2.11 §4.6.1.2).
+static JSON_CAPSULE_RESULT_TABLE_GUID: Guid = guid!("dbc461c3-b3de-422a-b9b4-9886fd49a1e5");
+/// EFI_JSON_CAPSULE_ID_GUID (UEFI 2.11 §23.5.1), the CapsuleGuid of the result that
+/// `json-capsule-result` installs.
+static JSON_CAPSULE_ID_GUID: Guid = guid!("67d6f4cd-d6b8-4573-bf4a-de5e252d61ae");
+/// EFI_CAPSULE_RESULT_VARIABLE_JSON's Version, "currently 0x00000001" (UEFI 2.11 §8.5.6.1.3).
+const JSON_CAPSULE_RESULT_VERSION: u32 = 1;
+/// The CapsuleId of the result that `json-capsule-result` installs.
+const JSON_CAPSULE_RESULT_ID: u32 = 9;
+/// The Resp of the result that `json-capsule-result` installs.
+const JSON_CAPSULE_RESULT_RESP: &[u8] = br#"{"uefisettings":"json-capsule-result"}"#;
+/// The CapsuleProcessed of that result, an EFI_TIME (UEFI 2.11 §8.3.1): 2026-11-07 01:02:03,
+/// TimeZone 2047, EFI_UNSPECIFIED_TIMEZONE.
+const JSON_CAPSULE_RESULT_PROCESSED: [u8; 16] =
+    [0xea, 0x07, 11, 7, 1, 2, 3, 0, 0, 0, 0, 0, 0xff, 0x07, 0, 0];
+
 /// A failed step and the firmware's status.
 type Failure = (&'static str, Status);
 
@@ -223,6 +244,7 @@ fn efi_main() -> Status {
             install_rt_properties(version, supported)
         }
         Some(Task::InstallJsonConfigData(table)) => install_json_config_data(table),
+        Some(Task::InstallJsonCapsuleResult) => install_json_capsule_result(),
         Some(Task::SetAuthVariables(payloads)) => auth_variables::set_auth_variables(&payloads)
             .map(|log| println!("publish-hiidb: AuthProbeLog {log}")),
         None => {
@@ -235,7 +257,7 @@ fn efi_main() -> Status {
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
                  |json-config-data-past-region|json-config-data-boot-services\
-                 |json-config-data-mmio|set-auth-variables=PATH[,PATH]...]"
+                 |json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]"
             );
             return Status::INVALID_PARAMETER;
         }
@@ -275,6 +297,8 @@ enum Task {
     InstallRtProperties(u16, u32),
     /// Install this JSON configuration table.
     InstallJsonConfigData(JsonConfigTable),
+    /// Install the JSON capsule result table of [`install_json_capsule_result`].
+    InstallJsonCapsuleResult,
     /// Run the authenticated writes of [`auth_variables`] with the payloads.
     SetAuthVariables(Vec<auth_variables::Payload>),
 }
@@ -353,6 +377,9 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("json-config-data-mmio") => {
             Some(Task::InstallJsonConfigData(JsonConfigTable::MemoryMappedIo))
+        }
+        Ok(option) if option == cstr16!("json-capsule-result") => {
+            Some(Task::InstallJsonCapsuleResult)
         }
         Ok(option) => auth_variables::payloads(option).map(Task::SetAuthVariables),
         _ => None,
@@ -736,6 +763,66 @@ fn copy_json_config_data(
         ptr::copy_nonoverlapping(table.as_ptr(), copy, table.len());
     }
     Ok(copy.addr())
+}
+
+/// Installs the result of processing a JSON capsule (UEFI 2.11 §8.5.6.1): an
+/// EFI_CAPSULE_RESULT_VARIABLE_HEADER of EFI_JSON_CAPSULE_ID_GUID, processed at
+/// [`JSON_CAPSULE_RESULT_PROCESSED`] with EFI_UNSUPPORTED, then an EFI_CAPSULE_RESULT_VARIABLE_JSON
+/// of [`JSON_CAPSULE_RESULT_ID`] and [`JSON_CAPSULE_RESULT_RESP`], in a runtime-data pool as the
+/// configuration table of EFI_JSON_CAPSULE_RESULT_TABLE_GUID (§23.5.3), and logs its address.
+fn install_json_capsule_result() -> Result<(), Failure> {
+    let too_large = (
+        "the JSON capsule result exceeds 4 GiB",
+        Status::BAD_BUFFER_SIZE,
+    );
+    let resp_length = u32::try_from(JSON_CAPSULE_RESULT_RESP.len()).map_err(|_| too_large)?;
+    let json = [
+        &JSON_CAPSULE_RESULT_VERSION.to_le_bytes()[..],
+        &JSON_CAPSULE_RESULT_ID.to_le_bytes(),
+        &resp_length.to_le_bytes(),
+        JSON_CAPSULE_RESULT_RESP,
+    ]
+    .concat();
+    // VariableTotalSize, Reserved, CapsuleGuid, CapsuleProcessed, then CapsuleStatus, a UINTN
+    let status = Status::UNSUPPORTED.0.to_le_bytes();
+    let total_size = (4 + 4 + 16 + JSON_CAPSULE_RESULT_PROCESSED.len() + status.len())
+        .checked_add(json.len())
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or(too_large)?;
+    let table = [
+        &total_size.to_le_bytes()[..],
+        &0_u32.to_le_bytes(),
+        &JSON_CAPSULE_ID_GUID.to_bytes(),
+        &JSON_CAPSULE_RESULT_PROCESSED,
+        &status,
+        &json,
+    ]
+    .concat();
+
+    let pool = boot::allocate_pool(MemoryType::RUNTIME_SERVICES_DATA, table.len())
+        .map_err(|error| ("allocating the runtime pool", error.status()))?;
+    #[expect(
+        unsafe_code,
+        reason = "the pool from allocate_pool() is only reachable through a raw pointer"
+    )]
+    // SAFETY: allocate_pool returned `table.len()` bytes that nothing else references, at an
+    // identity-mapped address, and `table` does not overlap them.
+    unsafe {
+        ptr::copy_nonoverlapping(table.as_ptr(), pool.as_ptr(), table.len());
+    }
+    #[expect(
+        unsafe_code,
+        reason = "InstallConfigurationTable() takes a raw pointer that must stay valid"
+    )]
+    // SAFETY: the table is a runtime-data pool allocation that is never freed or written again.
+    unsafe {
+        boot::install_configuration_table(&JSON_CAPSULE_RESULT_TABLE_GUID, pool.as_ptr().cast())
+    }
+    .map_err(|error| ("installing the JSON capsule result table", error.status()))?;
+
+    let address = pool.as_ptr().addr();
+    println!("publish-hiidb: JSON capsule result table at {address:#x}, {total_size} bytes");
+    Ok(())
 }
 
 /// The start of the first EFI_MEMORY_RUNTIME descriptor of memory-mapped I/O of the memory map.

@@ -17,10 +17,12 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use super::CapsuleBackend;
 use super::HiiBackend;
 use super::VariableBackend;
 use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfoSource;
+use crate::firmware_width::FirmwareWidth;
 use crate::hii::package::db_file;
 use crate::hii::read_hiidb;
 use crate::hii::EfivarSource;
@@ -51,6 +53,18 @@ impl VariableBackend {
     /// The attributes and data of this machine's firmware environment variables.
     pub(super) fn system_variable_data() -> Result<impl VariableData> {
         FirmwareEnvironment::new()
+    }
+}
+
+/// What the capsule commands read: this machine's firmware environment variables.
+impl CapsuleBackend {
+    /// The width of this machine's firmware, taken to be this build's: "The 64-bit version of
+    /// Windows PE can boot 64-bit UEFI and BIOS PCs", and its 32-bit version 32-bit UEFI PCs
+    /// (learn.microsoft.com/windows-hardware/manufacture/desktop/winpe-intro), and uefisettings
+    /// builds for Windows on x86_64 and aarch64 only (Makefile TARGETS). It is wrong for an i686
+    /// build under WOW64 and for 64-bit Windows on 32-bit UEFI.
+    pub(super) fn system_firmware_width() -> Result<FirmwareWidth> {
+        Ok(FirmwareWidth::of_this_build())
     }
 }
 

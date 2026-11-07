@@ -49,6 +49,10 @@ shell-json-config-data	/publish-hiidb.efi json-config-data	-	shell:json-config-d
 shell-json-config-data-past-region	/publish-hiidb.efi json-config-data-past-region	-	shell:json-config-data-refused	-
 shell-json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services	-	shell:json-config-data-refused	-
 shell-json-config-data-mmio	/publish-hiidb.efi json-config-data-mmio	-	shell:json-config-data-refused	-
+capsule-results	/publish-hiidb.efi json-capsule-result	capsule-results-64.json	capsule_results	arch=x86_64,aarch64
+capsule-results-i686	/publish-hiidb.efi json-capsule-result	capsule-results-32.json	capsule_results	arch=i686
+shell-capsule-results	/publish-hiidb.efi json-capsule-result	capsule-results-64.json	capsule_results/prints,shell:capsule-results	arch=x86_64,aarch64
+shell-capsule-results-i686	/publish-hiidb.efi json-capsule-result	capsule-results-32.json	capsule_results/prints,shell:capsule-results	arch=i686
 variable-get	-	-	global_variables/get_default_firmware	-
 variable-get-secboot-setup	-	-	global_variables/get_secboot_setup	firmware=secboot-setup
 variable-get-secboot-user	-	-	global_variables/get_secboot_user	firmware=secboot-user

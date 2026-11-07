@@ -26,7 +26,11 @@ pub(crate) mod authenticated;
 mod capsule;
 #[cfg(capsule_delivery)]
 mod capsule_delivery;
+#[cfg(variable_data)]
+mod capsule_result;
 pub(crate) mod enhanced_authenticated;
+#[cfg(variable_data)]
+mod json_bytes;
 
 #[cfg(all(variable_names, any(target_os = "uefi", test)))]
 use anyhow::anyhow;
@@ -61,8 +65,44 @@ pub(crate) use capsule_delivery::CapsuleDelivery;
 pub(crate) use capsule_delivery::CapsuleServices;
 #[cfg(all(capsule_delivery, target_os = "uefi"))]
 pub(crate) use capsule_delivery::UpdateCapsuleDelivery;
+#[cfg(variable_names)]
+pub(crate) use capsule_result::list_capsule_results;
+#[cfg(all(variable_data, any(target_os = "windows", test)))]
+pub(crate) use capsule_result::probe_capsule_results;
+#[cfg(configuration_tables)]
+pub(crate) use capsule_result::read_json_capsule_result;
+#[cfg(variable_data)]
+pub use capsule_result::CapsuleResult;
+#[cfg(variable_data)]
+pub use capsule_result::CapsuleResultDetails;
+#[cfg(variable_data)]
+pub use capsule_result::CapsuleResultError;
+#[cfg(variable_data)]
+pub use capsule_result::CapsuleResults;
+#[cfg(variable_data)]
+pub use capsule_result::EfiTime;
+#[cfg(variable_data)]
+pub use capsule_result::JsonCapsuleResult;
+#[cfg(variable_data)]
+pub use capsule_result::NamedCapsuleResult;
+#[cfg(variable_data)]
+pub use capsule_result::ResultName;
+#[cfg(variable_data)]
+pub use capsule_result::Undecoded;
+#[cfg(configuration_tables)]
+pub(crate) use capsule_result::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
+#[cfg(variable_data)]
+pub use json_bytes::TextOrHex;
 
-#[cfg(any(variable_names, variable_info))]
+#[cfg(configuration_tables)]
+use crate::firmware_width::FirmwareWidth;
+#[cfg(any(
+    variable_names,
+    variable_info,
+    capsule_delivery,
+    configuration_tables,
+    variable_data
+))]
 use crate::hii::package::Guid;
 #[cfg(any(variable_storage_info, variable_data))]
 use crate::hii::VariableAttributes;
@@ -83,6 +123,16 @@ fn is_gmt_time_stamp(time_stamp: &[u8; EFI_TIME_SIZE]) -> bool {
     let [_, _, _, _, _, _, _, gmt_fields @ ..] = *time_stamp;
     gmt_fields.iter().all(|&byte| byte == 0)
 }
+
+/// EFI_JSON_CAPSULE_ID_GUID, the CapsuleGuid of a JSON capsule (UEFI 2.11 §23.5.1), which the
+/// result of its processing names too (§8.5.6.1.3).
+#[cfg(any(capsule_delivery, configuration_tables, variable_data))]
+const EFI_JSON_CAPSULE_ID_GUID: Guid = Guid {
+    data1: 0x67d6_f4cd,
+    data2: 0xd6b8,
+    data3: 0x4573,
+    data4: [0xbf, 0x4a, 0xde, 0x5e, 0x25, 0x2d, 0x61, 0xae],
+};
 
 /// GetNextVariableName() (UEFI 2.10 §8.2.2): the variables that a backend reaches, by name and
 /// vendor GUID.
@@ -298,6 +348,8 @@ pub(crate) trait VendorTable {
     /// The table's first `len` bytes, all of them, unless they run past the memory region that
     /// holds the table.
     fn read(&self, len: usize) -> Result<Vec<u8>>;
+    /// The width of the firmware that lists the table.
+    fn firmware_width(&self) -> FirmwareWidth;
 }
 
 /// The configuration data of `table`, the firmware's JSON configuration table, which the

@@ -26,15 +26,10 @@ use thiserror::Error;
 
 #[cfg(configuration_tables)]
 use super::VendorTable;
+use super::EFI_JSON_CAPSULE_ID_GUID;
+#[cfg(configuration_tables)]
 use crate::hii::package::Guid;
 
-/// EFI_JSON_CAPSULE_ID_GUID, the CapsuleGuid of a JSON capsule (UEFI 2.11 §23.5.1).
-const EFI_JSON_CAPSULE_ID_GUID: Guid = Guid {
-    data1: 0x67d6_f4cd,
-    data2: 0xd6b8,
-    data3: 0x4573,
-    data4: [0xbf, 0x4a, 0xde, 0x5e, 0x25, 0x2d, 0x61, 0xae],
-};
 /// sizeof (EFI_CAPSULE_HEADER): CapsuleGuid, then the UINT32s HeaderSize, Flags and
 /// CapsuleImageSize (UEFI 2.11 §8.5.3.1). A JSON capsule's HeaderSize, as its
 /// EFI_JSON_CAPSULE_HEADER is "located at the lowest offset within the body" (§23.5.2).
@@ -322,19 +317,27 @@ pub(super) mod fixture {
     use anyhow::Result;
 
     use crate::efi_variables::VendorTable;
+    use crate::firmware_width::FirmwareWidth;
 
     /// A table at the start of a memory region of `region`, which records the length of each
-    /// read and refuses reads past the region's end.
+    /// read and refuses reads past the region's end, listed by firmware of `width`.
     #[derive(Debug)]
     pub(in crate::efi_variables) struct TableInRegion {
         region: Vec<u8>,
+        width: FirmwareWidth,
         pub(in crate::efi_variables) reads: RefCell<Vec<usize>>,
     }
 
     impl TableInRegion {
+        /// The table `region` of 64-bit firmware.
         pub(in crate::efi_variables) fn new(region: Vec<u8>) -> Self {
+            Self::of_width(region, FirmwareWidth::Bits64)
+        }
+
+        pub(in crate::efi_variables) fn of_width(region: Vec<u8>, width: FirmwareWidth) -> Self {
             Self {
                 region,
+                width,
                 reads: RefCell::default(),
             }
         }
@@ -349,6 +352,10 @@ pub(super) mod fixture {
                     self.region.len()
                 )
             })
+        }
+
+        fn firmware_width(&self) -> FirmwareWidth {
+            self.width
         }
     }
 

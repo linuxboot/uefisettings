@@ -32,6 +32,8 @@ mod exit_status;
 pub mod exports;
 #[cfg(target_os = "linux")]
 mod file_lock;
+#[cfg(variable_data)]
+mod firmware_width;
 mod hii;
 #[cfg(target_os = "linux")]
 mod ilorest;

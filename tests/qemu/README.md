@@ -202,6 +202,23 @@ configuration table at runtime memory-mapped I/O; the scenarios
 `shell-json-config-data-past-region`, `-boot-services` and `-mmio` check that the UEFI Shell
 refuses each.
 
+`publish-hiidb.efi json-capsule-result` publishes nothing either: it installs the result of
+processing a JSON capsule, an `EFI_CAPSULE_RESULT_VARIABLE_HEADER` and an
+`EFI_CAPSULE_RESULT_VARIABLE_JSON`, as the EFI configuration table of
+`EFI_JSON_CAPSULE_RESULT_TABLE_GUID`, with a CapsuleStatus of the driver's width, at an address
+that it never converts. The scenarios `capsule-results` (x86_64, aarch64) and
+`capsule-results-i686` check that the Linux build refuses `capsule result-table`, and print
+with `capsule results` the variables of
+[`vars/capsule-results-64.json`](vars/capsule-results-64.json) or
+[`vars/capsule-results-32.json`](vars/capsule-results-32.json): two results, of a JSON capsule
+and of a CapsuleGuid that no specification defines, with the 48-byte header of 64-bit firmware or
+the 44-byte header of 32-bit firmware, a third of 3 bytes, which do not decode, and CapsuleMax and
+CapsuleLast. Each is non-volatile, CapsuleMax too, which edk2 writes with BS|RT only
+(edk2-stable202608 MdeModulePkg/Library/DxeCapsuleLibFmp/DxeCapsuleReportLib.c
+InitCapsuleMaxVariable()), as the variable store that seeds them holds no volatile variable.
+`shell-capsule-results` and `shell-capsule-results-i686` check that `uefisettings.efi` prints the
+same results in the UEFI Shell, and the table.
+
 ## Secure Boot
 
 The scenarios with `firmware=secboot-setup` or `firmware=secboot-user` in their options boot

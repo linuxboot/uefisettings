@@ -10,8 +10,9 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The capsule command: capsules for this machine's firmware (UEFI 2.11 §8.5.3), and the
-//! configuration data that it reports for them (§23.5.2).
+//! The capsule command: capsules for this machine's firmware (UEFI 2.11 §8.5.3), the
+//! configuration data that it reports for them (§23.5.2), and the results of their processing
+//! (§8.5.6, §23.5.3).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -21,14 +22,14 @@ use anyhow::anyhow;
 use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
-#[cfg(any(capsule_delivery, configuration_tables))]
 use uefisettings::exports::CapsuleBackend;
 #[cfg(capsule_delivery)]
 use uefisettings::exports::CapsuleCapabilities;
+#[cfg(configuration_tables)]
+use uefisettings::exports::TextOrHex;
 
 #[cfg(capsule_delivery)]
 use crate::platform;
-#[cfg(any(capsule_delivery, configuration_tables))]
 use crate::print_line;
 
 #[derive(Debug, Parser)]
@@ -52,6 +53,12 @@ enum CapsuleSubcommands {
     /// Print the configuration data of the firmware's JSON configuration table: each item as text if it is UTF-8, else as hex
     #[command(next_display_order = None)]
     ConfigData,
+    /// Print the results of capsule processing that the firmware reports in its Capsule#### variables, and the CapsuleMax and CapsuleLast variables that name them
+    #[command(next_display_order = None)]
+    Results,
+    /// Print the result of processing a JSON capsule that the firmware reports in its JSON capsule result table
+    #[command(next_display_order = None)]
+    ResultTable,
 }
 
 impl CapsuleCommand {
@@ -62,6 +69,8 @@ impl CapsuleCommand {
                 capsule_id,
             } => deliver(payload, *capsule_id),
             CapsuleSubcommands::ConfigData => config_data(),
+            CapsuleSubcommands::Results => results(),
+            CapsuleSubcommands::ResultTable => result_table(),
         }
     }
 }
@@ -103,7 +112,29 @@ fn config_data() -> Result<()> {
     Err(no_system_table())
 }
 
-/// What config-data fails with on Linux.
+/// Prints the results of capsule processing that the firmware reports in its result variables.
+fn results() -> Result<()> {
+    let results = CapsuleBackend::results()?;
+    print_line(format_args!("{}", serde_json::to_value(&results)?))?;
+    Ok(())
+}
+
+/// Prints the result of processing a JSON capsule that the firmware reports in its JSON capsule
+/// result table.
+#[cfg(configuration_tables)]
+fn result_table() -> Result<()> {
+    let result = CapsuleBackend::json_capsule_result()?;
+    print_line(format_args!("{}", serde_json::to_value(&result)?))?;
+    Ok(())
+}
+
+/// Fails as config_data does.
+#[cfg(not(configuration_tables))]
+fn result_table() -> Result<()> {
+    Err(no_system_table())
+}
+
+/// What config-data and result-table fail with on Linux.
 #[cfg(all(target_os = "linux", not(configuration_tables)))]
 fn no_system_table() -> anyhow::Error {
     anyhow!(
@@ -112,7 +143,7 @@ fn no_system_table() -> anyhow::Error {
     )
 }
 
-/// What config-data fails with on macOS and Windows.
+/// What config-data and result-table fail with on macOS and Windows.
 #[cfg(all(not(target_os = "linux"), not(configuration_tables)))]
 fn no_system_table() -> anyhow::Error {
     anyhow!(
@@ -126,15 +157,7 @@ fn no_system_table() -> anyhow::Error {
 /// between systems is (RFC 8259 §8.1), else as {"hex": ...}, lowercase.
 #[cfg(configuration_tables)]
 fn config_data_report(items: &[Vec<u8>]) -> serde_json::Value {
-    let items: Vec<_> = items
-        .iter()
-        .map(|item| match std::str::from_utf8(item) {
-            Ok(text) => serde_json::json!({ "text": text }),
-            Err(_) => serde_json::json!({
-                "hex": item.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-            }),
-        })
-        .collect();
+    let items: Vec<_> = items.iter().map(|item| TextOrHex(item)).collect();
     serde_json::json!({ "items": items })
 }
 
@@ -304,15 +327,45 @@ mod tests {
         );
     }
 
-    /// What config-data fails with on Linux.
+    /// results and result-table take no arguments.
+    #[test]
+    fn results_and_result_table_take_no_arguments() {
+        for (args, want) in [
+            (&["results"][..], "Results"),
+            (&["result-table"], "ResultTable"),
+        ] {
+            assert_eq!(
+                capsule(args).map(|command| format!("{command:?}")),
+                Ok(want.to_owned()),
+                "{args:?}"
+            );
+            let extra = [args, &["a.json"]].concat();
+            assert_eq!(
+                capsule(&extra).err(),
+                Some(clap::error::ErrorKind::UnknownArgument),
+                "{extra:?}"
+            );
+        }
+    }
+
+    /// What config-data and result-table fail with on Linux.
     #[cfg(all(target_os = "linux", not(configuration_tables)))]
     const NO_SYSTEM_TABLE: &str = "reading this configuration table is not supported on Linux \
                                    yet; run uefisettings.efi in the UEFI Shell";
 
-    /// What config-data fails with on macOS and Windows.
+    /// What config-data and result-table fail with on macOS and Windows.
     #[cfg(all(not(target_os = "linux"), not(configuration_tables)))]
     const NO_SYSTEM_TABLE: &str = "uefisettings reads the configuration tables of the EFI System \
                                    Table only in the UEFI Shell with uefisettings.efi";
+
+    /// result-table refuses outside the UEFI Shell build, as config-data does.
+    #[cfg(not(configuration_tables))]
+    #[test]
+    fn result_table_refuses_without_a_system_table() {
+        let error = result_table().expect_err("result-table without a System Table");
+
+        assert_eq!(error.to_string(), NO_SYSTEM_TABLE, "error");
+    }
 
     /// config-data refuses outside the UEFI Shell build, naming where it reads the table.
     #[cfg(not(configuration_tables))]

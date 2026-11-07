@@ -16,11 +16,13 @@
 //! (`tests/qemu/guest-packages-x86_64`, `-aarch64`), so `uefisettings` names its absence. The
 //! i686 guests' Linux 6.1 has the loader, which logs the firmware's refusal at KERN_ERR, which
 //! `init` fails as an error of the test, so i686 boots only `capsule-payload`: a payload that is
-//! empty or missing, which is refused before the loader is opened.
+//! empty or missing, which is refused before the loader is opened. Their firmware reports no
+//! result of capsule processing, so `capsule results` reports none.
 
 use std::fs;
 use std::path::Path;
 
+use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::require_test_vm;
 
@@ -75,4 +77,17 @@ fn deliver_refuses_an_empty_or_missing_payload() {
 
         assert_eq!(error.error_message, want, "{payload}");
     }
+}
+
+/// `capsule results` reports no CapsuleMax, no CapsuleLast and no result of a firmware that
+/// writes no result variable.
+#[test]
+fn results_reports_none_of_a_firmware_without_result_variables() {
+    let report: serde_json::Value = json(&["capsule", "results"]);
+
+    assert_eq!(
+        report,
+        serde_json::json!({ "capsule_max": null, "capsule_last": null, "results": [] }),
+        "a firmware without result variables"
+    );
 }

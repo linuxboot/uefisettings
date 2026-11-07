@@ -1007,4 +1007,431 @@ mod tests {
         assert_eq!(calls.sets(), [set.clone(), set], "sets");
         assert_eq!(calls.get_calls(), [], "gets");
     }
+
+    /// probe_capsule_results, through this fake.
+    #[cfg(variable_data)]
+    mod probe_capsule_results_tests {
+        use super::*;
+        use crate::efi_variables::probe_capsule_results;
+        use crate::efi_variables::CapsuleResult;
+        use crate::efi_variables::CapsuleResultDetails;
+        use crate::efi_variables::CapsuleResultError;
+        use crate::efi_variables::CapsuleResults;
+        use crate::efi_variables::EfiTime;
+        use crate::efi_variables::JsonCapsuleResult;
+        use crate::efi_variables::NamedCapsuleResult;
+        use crate::efi_variables::ResultName;
+        use crate::efi_variables::Undecoded;
+        use crate::firmware_width::FirmwareWidth;
+        use crate::hii::package::Guid;
+
+        /// EFI_CAPSULE_REPORT_GUID, the vendor GUID of the result variables (UEFI 2.11 §8.5.6.1).
+        const EFI_CAPSULE_REPORT_GUID: &str = "39B68C46-F7FB-441B-B6EC-16B0F69821F3";
+        /// EFI_JSON_CAPSULE_ID_GUID (UEFI 2.11 §23.5.1).
+        const EFI_JSON_CAPSULE_ID_GUID: &str = "67D6F4CD-D6B8-4573-BF4A-DE5E252D61AE";
+        /// A CapsuleGuid that no specification defines.
+        const OTHER_CAPSULE_GUID: &str = "8C78A505-BAA0-4C4A-869F-000000001300";
+
+        /// The GUID `text`.
+        fn guid(text: &str) -> Guid {
+            text.parse()
+                .unwrap_or_else(|error| panic!("parse GUID {text}: {error}"))
+        }
+
+        /// The CHAR16 of `text` without a terminator, as CapsuleMax and CapsuleLast hold it.
+        fn char16_bytes(text: &str) -> Vec<u8> {
+            text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+        }
+
+        /// A result of 64-bit firmware for the CapsuleGuid `capsule_guid` with CapsuleStatus
+        /// `status`, processed at 2026-11-07 12:34:56 UTC, then `rest`.
+        fn result_bytes(capsule_guid: &str, status: u64, rest: &[u8]) -> Vec<u8> {
+            let total_size = u32::try_from(48 + rest.len()).expect("a UINT32 VariableTotalSize");
+            let processed = [0xea, 0x07, 11, 7, 12, 34, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            [
+                &total_size.to_le_bytes()[..],
+                &[0; 4],
+                &<[u8; 16]>::from(guid(capsule_guid)),
+                &processed,
+                &status.to_le_bytes(),
+                rest,
+            ]
+            .concat()
+        }
+
+        /// The result of result_bytes.
+        fn result(
+            capsule_guid: &str,
+            status: u64,
+            rest_len: usize,
+            details: CapsuleResultDetails,
+        ) -> CapsuleResult {
+            CapsuleResult {
+                variable_total_size: u32::try_from(48 + rest_len).expect("a UINT32"),
+                capsule_guid: guid(capsule_guid),
+                capsule_processed: EfiTime {
+                    year: 2026,
+                    month: 11,
+                    day: 7,
+                    hour: 12,
+                    minute: 34,
+                    second: 56,
+                    nanosecond: 0,
+                    time_zone: 0,
+                    daylight: 0,
+                },
+                capsule_status: status,
+                details,
+            }
+        }
+
+        /// The result name `name`.
+        fn result_name(name: &str) -> ResultName {
+            ResultName::parse(name).unwrap_or_else(|| panic!("{name} is a result name"))
+        }
+
+        /// The names that `calls` read, in order, each of EFI_CAPSULE_REPORT_GUID.
+        fn report_names_read(calls: &FakeFirmwareEnvironmentCalls) -> Vec<String> {
+            let report = variable_guid(&VariableKey {
+                name: "CapsuleMax".to_owned(),
+                guid: guid(EFI_CAPSULE_REPORT_GUID),
+            })
+            .expect("the report GUID");
+            calls
+                .get_calls()
+                .into_iter()
+                .map(|(_, name, vendor)| {
+                    assert_eq!(vendor, report, "the vendor of {name:?}");
+                    let units = name.strip_suffix(&[0]).expect("a NUL-terminated name");
+                    String::from_utf16(units).expect("a UTF-16 name")
+                })
+                .collect()
+        }
+
+        /// probe_capsule_results reads CapsuleMax, CapsuleLast, then Capsule0000 to CapsuleMax by
+        /// name, leaves out an absent one, and reads no name past CapsuleMax.
+        #[test]
+        fn probe_capsule_results_reads_by_name_up_to_capsule_max() {
+            let json = [
+                &1_u32.to_le_bytes()[..],
+                &7_u32.to_le_bytes(),
+                &2_u32.to_le_bytes(),
+                b"{}",
+            ]
+            .concat();
+            let calls = FakeFirmwareEnvironmentCalls::new();
+            calls.queue_get(got(NV_BS_RT, &char16_bytes("Capsule0002")));
+            calls.queue_get(got(NV_BS_RT, &char16_bytes("Capsule0000")));
+            calls.queue_get(got(
+                NV_BS_RT,
+                &result_bytes(EFI_JSON_CAPSULE_ID_GUID, 0, &json),
+            ));
+            calls.queue_get(FakeGet::Failed(Win32Error::ENVVAR_NOT_FOUND));
+            calls.queue_get(got(
+                NV_BS_RT,
+                &result_bytes(OTHER_CAPSULE_GUID, 0x8000_0000_0000_0003, &[9]),
+            ));
+            let environment = fake_environment(&calls);
+
+            let results = probe_capsule_results(&environment, FirmwareWidth::Bits64);
+
+            assert_eq!(
+                results.expect("probe the results"),
+                CapsuleResults {
+                    capsule_max: Some(Ok(result_name("Capsule0002"))),
+                    capsule_last: Some(Ok(result_name("Capsule0000"))),
+                    results: vec![
+                        NamedCapsuleResult {
+                            name: result_name("Capsule0000"),
+                            result: Ok(result(
+                                EFI_JSON_CAPSULE_ID_GUID,
+                                0,
+                                14,
+                                CapsuleResultDetails::Json(JsonCapsuleResult {
+                                    capsule_id: 7,
+                                    resp: b"{}".to_vec(),
+                                }),
+                            )),
+                        },
+                        NamedCapsuleResult {
+                            name: result_name("Capsule0002"),
+                            result: Ok(result(
+                                OTHER_CAPSULE_GUID,
+                                0x8000_0000_0000_0003,
+                                1,
+                                CapsuleResultDetails::Other(vec![9]),
+                            )),
+                        },
+                    ],
+                },
+                "results"
+            );
+            assert_eq!(
+                report_names_read(&calls),
+                [
+                    "CapsuleMax",
+                    "CapsuleLast",
+                    "Capsule0000",
+                    "Capsule0001",
+                    "Capsule0002"
+                ],
+                "names read"
+            );
+        }
+
+        /// Scripts the gets of the probe of `names`, in turn: the data that `present` holds under
+        /// the name, else ERROR_ENVVAR_NOT_FOUND.
+        fn queue_probe(
+            calls: &FakeFirmwareEnvironmentCalls,
+            names: &[String],
+            present: &[(&str, Vec<u8>)],
+        ) {
+            for name in names {
+                match present.iter().find(|(held, _)| held == name) {
+                    Some((_, data)) => calls.queue_get(got(NV_BS_RT, data)),
+                    None => calls.queue_get(FakeGet::Failed(Win32Error::ENVVAR_NOT_FOUND)),
+                }
+            }
+        }
+
+        /// CapsuleMax and CapsuleLast, then the names of the indexes from 0 up to `last` that
+        /// `spell` gives.
+        fn probed(last: u16, spell: impl Fn(u16) -> Vec<String>) -> Vec<String> {
+            ["CapsuleMax".to_owned(), "CapsuleLast".to_owned()]
+                .into_iter()
+                .chain((0..=last).flat_map(spell))
+                .collect()
+        }
+
+        /// The name of `index` in uppercase digits.
+        fn upper(index: u16) -> Vec<String> {
+            vec![format!("Capsule{index:04X}")]
+        }
+
+        /// The name of `index` in lowercase digits.
+        fn lower(index: u16) -> Vec<String> {
+            vec![format!("Capsule{index:04x}")]
+        }
+
+        /// probe_capsule_results reports no results without CapsuleMax and CapsuleLast, reading no
+        /// result variable.
+        #[test]
+        fn probe_capsule_results_without_capsule_max_and_last_reads_no_result() {
+            let calls = FakeFirmwareEnvironmentCalls::new();
+            calls.queue_get(FakeGet::Failed(Win32Error::ENVVAR_NOT_FOUND));
+            calls.queue_get(FakeGet::Failed(Win32Error::ENVVAR_NOT_FOUND));
+            let environment = fake_environment(&calls);
+
+            let results = probe_capsule_results(&environment, FirmwareWidth::Bits64);
+
+            assert_eq!(
+                results.expect("probe no results"),
+                CapsuleResults {
+                    capsule_max: None,
+                    capsule_last: None,
+                    results: Vec::new(),
+                },
+                "results"
+            );
+            assert_eq!(
+                report_names_read(&calls),
+                ["CapsuleMax", "CapsuleLast"],
+                "names read"
+            );
+        }
+
+        /// probe_capsule_results reads up to the greater of CapsuleMax and CapsuleLast, either
+        /// missing or not a result name, which it reports with why and its data.
+        #[test]
+        fn probe_capsule_results_reads_up_to_the_greater_of_capsule_max_and_last() {
+            let other = result_bytes(OTHER_CAPSULE_GUID, 0, &[9]);
+            let malformed = char16_bytes("Capsule00G2");
+            for (case, max, last, want_max, want_last) in [
+                (
+                    "CapsuleLast past CapsuleMax",
+                    Some(char16_bytes("Capsule0001")),
+                    Some(char16_bytes("Capsule0002")),
+                    Some(Ok(result_name("Capsule0001"))),
+                    Some(Ok(result_name("Capsule0002"))),
+                ),
+                (
+                    "no CapsuleMax",
+                    None,
+                    Some(char16_bytes("Capsule0002")),
+                    None,
+                    Some(Ok(result_name("Capsule0002"))),
+                ),
+                (
+                    "a malformed CapsuleMax",
+                    Some(malformed.clone()),
+                    Some(char16_bytes("Capsule0002")),
+                    Some(Err(capsule_max_undecoded(&malformed))),
+                    Some(Ok(result_name("Capsule0002"))),
+                ),
+            ] {
+                let calls = FakeFirmwareEnvironmentCalls::new();
+                let mut present = vec![("Capsule0002", other.clone())];
+                present.extend(max.map(|max| ("CapsuleMax", max)));
+                present.extend(last.map(|last| ("CapsuleLast", last)));
+                let names = probed(2, upper);
+                queue_probe(&calls, &names, &present);
+                let environment = fake_environment(&calls);
+
+                let results = probe_capsule_results(&environment, FirmwareWidth::Bits64);
+
+                assert_eq!(
+                    results.unwrap_or_else(|error| panic!("{case}: {error:#}")),
+                    CapsuleResults {
+                        capsule_max: want_max,
+                        capsule_last: want_last,
+                        results: vec![NamedCapsuleResult {
+                            name: result_name("Capsule0002"),
+                            result: Ok(result(
+                                OTHER_CAPSULE_GUID,
+                                0,
+                                1,
+                                CapsuleResultDetails::Other(vec![9]),
+                            )),
+                        }],
+                    },
+                    "{case}: results"
+                );
+                assert_eq!(report_names_read(&calls), names, "{case}: names read");
+            }
+        }
+
+        /// probe_capsule_results spells the names in the case of the letter digits of CapsuleMax,
+        /// else in that of CapsuleLast's, as the firmware chose the case (UEFI 2.11 §8.5.6).
+        #[test]
+        fn probe_capsule_results_spells_names_in_the_case_of_capsule_max_or_last() {
+            /// A case: CapsuleMax, CapsuleLast, the last index probed, how names are spelled,
+            /// and the one name present.
+            struct Case {
+                name: &'static str,
+                max: &'static str,
+                last: &'static str,
+                bound: u16,
+                spell: fn(u16) -> Vec<String>,
+                found: &'static str,
+            }
+            let other = result_bytes(OTHER_CAPSULE_GUID, 0, &[9]);
+            let cases = [
+                Case {
+                    name: "CapsuleMax lowercase",
+                    max: "Capsule000b",
+                    last: "Capsule000A",
+                    bound: 0xb,
+                    spell: lower,
+                    found: "Capsule000a",
+                },
+                Case {
+                    name: "CapsuleMax uppercase",
+                    max: "Capsule000B",
+                    last: "Capsule000a",
+                    bound: 0xb,
+                    spell: upper,
+                    found: "Capsule000A",
+                },
+                Case {
+                    name: "CapsuleLast lowercase",
+                    max: "Capsule0010",
+                    last: "Capsule000c",
+                    bound: 0x10,
+                    spell: lower,
+                    found: "Capsule000c",
+                },
+                Case {
+                    name: "CapsuleLast uppercase",
+                    max: "Capsule0010",
+                    last: "Capsule000C",
+                    bound: 0x10,
+                    spell: upper,
+                    found: "Capsule000C",
+                },
+            ];
+            for Case {
+                name: case,
+                max,
+                last,
+                bound,
+                spell,
+                found,
+            } in cases
+            {
+                let calls = FakeFirmwareEnvironmentCalls::new();
+                let names = probed(bound, spell);
+                let present = [
+                    ("CapsuleMax", char16_bytes(max)),
+                    ("CapsuleLast", char16_bytes(last)),
+                    (found, other.clone()),
+                ];
+                queue_probe(&calls, &names, &present);
+                let environment = fake_environment(&calls);
+
+                let results = probe_capsule_results(&environment, FirmwareWidth::Bits64)
+                    .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+                assert_eq!(report_names_read(&calls), names, "{case}: names read");
+                assert_eq!(
+                    results
+                        .results
+                        .iter()
+                        .map(|named| named.name.as_str())
+                        .collect::<Vec<_>>(),
+                    [found],
+                    "{case}: results"
+                );
+            }
+        }
+
+        /// Where neither CapsuleMax nor CapsuleLast has a letter digit, probe_capsule_results
+        /// spells names in uppercase, as edk2 does, and reads an absent one with a letter digit
+        /// again in lowercase.
+        #[test]
+        fn probe_capsule_results_retries_absent_names_with_letters_in_lowercase() {
+            let other = result_bytes(OTHER_CAPSULE_GUID, 0, &[9]);
+            let calls = FakeFirmwareEnvironmentCalls::new();
+            // Capsule000C is present, so it is not read again
+            let names = probed(0x10, |index| {
+                let [upper, lower] = [upper(index), lower(index)].map(|mut name| name.remove(0));
+                match upper == lower || upper == "Capsule000C" {
+                    true => vec![upper],
+                    false => vec![upper, lower],
+                }
+            });
+            let present = [
+                ("CapsuleMax", char16_bytes("Capsule0010")),
+                ("CapsuleLast", char16_bytes("Capsule0003")),
+                ("Capsule000C", other.clone()),
+                ("Capsule000d", other.clone()),
+            ];
+            queue_probe(&calls, &names, &present);
+            let environment = fake_environment(&calls);
+
+            let results = probe_capsule_results(&environment, FirmwareWidth::Bits64)
+                .expect("probe the results");
+
+            assert_eq!(report_names_read(&calls), names, "names read");
+            assert_eq!(
+                results
+                    .results
+                    .iter()
+                    .map(|named| named.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["Capsule000C", "Capsule000d"],
+                "results"
+            );
+        }
+
+        /// The Undecoded of a CapsuleMax of `data` that holds "Capsule00G2".
+        fn capsule_max_undecoded(data: &[u8]) -> Undecoded {
+            Undecoded {
+                error: CapsuleResultError::NameText {
+                    variable: "CapsuleMax",
+                    text: "Capsule00G2".to_owned(),
+                },
+                data: data.to_vec(),
+            }
+        }
+    }
 }
