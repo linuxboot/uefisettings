@@ -875,6 +875,7 @@ mod non_efi_varstore_tests {
             numeric_range: None,
             opcode: IFROpCode::OneOf,
             flags: QuestionFlags::empty(),
+            defaults: Vec::new(),
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 raw_value: TypeValue::NumSize8(1),

@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -33,6 +34,7 @@ use super::IFROpCode;
 use super::IFROperation;
 use super::IfrDefaultValue;
 use super::IncludedStates;
+use super::NumericFormatError;
 use super::ParsedOperation;
 use super::Walk;
 
@@ -41,6 +43,9 @@ const EFI_IFR_CHECKBOX_DEFAULT: u8 = 0x01;
 const EFI_IFR_CHECKBOX_DEFAULT_MFG: u8 = 0x02;
 const EFI_IFR_OPTION_DEFAULT: u8 = 0x10;
 const EFI_IFR_OPTION_DEFAULT_MFG: u8 = 0x20;
+
+/// The DEFAULTSTOREs of a question outside every FormSet.
+static NO_DEFAULT_STORES: DefaultStores = DefaultStores(BTreeMap::new());
 
 /// The identifier of a default store, from an open set (UEFI 2.10 §33.2.5.8).
 #[derive(BinRead, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -59,14 +64,43 @@ impl fmt::Display for DefaultId {
     }
 }
 
-/// A question's default and the default store it comes from.
-struct QuestionDefault {
-    default_id: DefaultId,
-    value: Result<u64, DefaultError>,
+/// A default that the IFR declares for a question (UEFI 2.11 §33.2.5.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredDefault {
+    pub(crate) default_id: DefaultId,
+    /// The DefaultName of the DEFAULTSTORE of `default_id`, if the FormSet declares one
+    pub(crate) store_name: Option<String>,
+    pub(crate) value: DefaultValue,
+}
+
+/// The value of a declared default, as the answer shows a current value, or why it is unknown;
+/// it shows as answers and `defaults` show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultValue(Result<String, DefaultError>);
+
+impl fmt::Display for DefaultValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Ok(value) => f.write_str(value),
+            Err(reason) => write!(f, "unknown ({reason})"),
+        }
+    }
+}
+
+/// The DEFAULTSTOREs of a FormSet by DefaultId, each with the string id of the DefaultName of
+/// its first DEFAULTSTORE.
+#[derive(Default)]
+pub(super) struct DefaultStores(BTreeMap<DefaultId, u16>);
+
+impl DefaultStores {
+    /// Whether a DEFAULTSTORE declares `default_id`.
+    fn is_declared(&self, default_id: DefaultId) -> bool {
+        self.0.contains_key(&default_id)
+    }
 }
 
 /// Why a question's default is not known.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(super) enum DefaultError {
     #[error("EFI_IFR_DEFAULT Type {0:#04x} value not decoded")]
     DefaultType(u8),
@@ -80,6 +114,8 @@ pub(super) enum DefaultError {
     SuppressIfCondition(String),
     #[error("EFI_IFR_ONE_OF_OPTION Type {0:#04x} value not decoded")]
     OptionType(u8),
+    #[error(transparent)]
+    NumericFormat(#[from] NumericFormatError),
 }
 
 /// What question_scope takes from the scope of an op nested in a question.
@@ -246,26 +282,26 @@ fn option_visibility(
     }
 }
 
-/// form_set_default_ids of the FormSet of the last question asked about: questions come FormSet
-/// by FormSet, so that a FormSet is walked once per run of its questions.
+/// form_set_default_stores of the FormSet of the last question asked about: questions come
+/// FormSet by FormSet, so that a FormSet is walked once per run of its questions.
 #[derive(Default)]
-pub(super) struct FormSetDefaultIds(Option<(Rc<RefCell<IFROperation>>, Vec<DefaultId>)>);
+pub(super) struct FormSetDefaultStores(Option<(Rc<RefCell<IFROperation>>, DefaultStores)>);
 
-impl FormSetDefaultIds {
-    /// Returns form_set_default_ids of the question's FormSet, or STANDARD outside FormSets.
+impl FormSetDefaultStores {
+    /// Returns form_set_default_stores of the question's FormSet, or none outside FormSets.
     pub(super) fn of(
         &mut self,
         question: &IFROperation,
         inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-    ) -> &[DefaultId] {
+    ) -> &DefaultStores {
         let Some(form_set) = form_set_of(question) else {
-            return &[DefaultId::STANDARD];
+            return &NO_DEFAULT_STORES;
         };
         let entry = match self.0.take() {
-            Some((known, default_ids)) if Rc::ptr_eq(&known, &form_set) => (known, default_ids),
+            Some((known, stores)) if Rc::ptr_eq(&known, &form_set) => (known, stores),
             _ => {
-                let default_ids = form_set_default_ids(&form_set.borrow(), inputs);
-                (form_set, default_ids)
+                let stores = form_set_default_stores(&form_set.borrow(), inputs);
+                (form_set, stores)
             }
         };
         &self.0.insert(entry).1
@@ -284,22 +320,24 @@ fn form_set_of(op: &IFROperation) -> Option<Rc<RefCell<IFROperation>>> {
     None
 }
 
-/// Returns STANDARD, then the DefaultIds of the DEFAULTSTOREs in `form_set`, ascending.
-fn form_set_default_ids(
+/// Returns the DEFAULTSTOREs in `form_set`.
+fn form_set_default_stores(
     form_set: &IFROperation,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-) -> Vec<DefaultId> {
+) -> DefaultStores {
     // Nested ones too (UEFI 2.10 §33.2.5.1), except under a true DISABLE_IF
     // outside forms (§33.3.8.3.14), the only one edk2-stable202608
     // SetupBrowserDxe/IfrParse.c evaluates while parsing.
-    let mut default_ids = Vec::new();
+    let mut stores = BTreeMap::new();
     walk_scopes(&form_set.children, false, |child, &in_form| {
         let child = child.borrow();
         if skips_scope(&child) {
             return Walk::Skip;
         }
         if let ParsedOperation::DefaultStore(store) = &child.parsed_data {
-            default_ids.push(store.default_id);
+            stores
+                .entry(store.default_id)
+                .or_insert(store.name_string_id);
         }
         if !in_form
             && child.op_code == IFROpCode::DisableIf
@@ -309,11 +347,7 @@ fn form_set_default_ids(
         }
         Walk::Enter(in_form || matches!(child.op_code, IFROpCode::Form | IFROpCode::FormMap))
     });
-    default_ids.sort_unstable();
-    default_ids.dedup();
-    default_ids.retain(|&id| id != DefaultId::STANDARD);
-    default_ids.insert(0, DefaultId::STANDARD);
-    default_ids
+    DefaultStores(stores)
 }
 
 /// Returns the value of the EFI_IFR_DEFAULT `op`.
@@ -340,18 +374,65 @@ fn ifr_default_value(
     evaluate_value(&value, inputs).map_err(DefaultError::ValueExpression)
 }
 
-/// Returns the question's default and its DefaultId, trying STANDARD, then the declared
-/// DEFAULTSTOREs ascending (edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault).
-fn question_default(
+/// Returns every default that the IFR declares for the question, by DefaultId ascending, each
+/// valued by `text`: of STANDARD; of MANUFACTURING, if `stores` declares it or the question or one
+/// of its options has a *_DEFAULT_MFG flag; of every DEFAULTSTORE of `stores`; and of every
+/// EFI_IFR_DEFAULT in its scope, also of a DefaultId that no DEFAULTSTORE declares, though UEFI
+/// 2.11 §33.3.8.3.12 requires one. edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault
+/// falls back to another default store and then to a value by type; these are not shown.
+pub(super) fn question_defaults<V: QuestionValues>(
     question: &IFROperation,
-    default_ids: &[DefaultId],
-    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-) -> Option<QuestionDefault> {
+    stores: &DefaultStores,
+    string_packages: &[BTreeMap<i32, String>],
+    inputs: &mut ExpressionInputs<'_, V>,
+    mut text: impl FnMut(u64, &mut ExpressionInputs<'_, V>) -> Result<String, DefaultError>,
+) -> Vec<DeclaredDefault> {
     let scope = question_scope(question);
-    default_ids.iter().find_map(|&default_id| {
-        default_for_id(question, &scope, default_id, inputs)
-            .map(|value| QuestionDefault { default_id, value })
-    })
+    let mut default_ids: BTreeSet<DefaultId> = stores.0.keys().copied().collect();
+    default_ids.insert(DefaultId::STANDARD);
+    if has_manufacturing_flag(question, &scope) {
+        default_ids.insert(DefaultId::MANUFACTURING);
+    }
+    default_ids.extend(
+        scope
+            .iter()
+            .filter_map(|op| match &op.borrow().parsed_data {
+                ParsedOperation::IFRDefault(default) => Some(default.default_id),
+                _ => None,
+            }),
+    );
+    default_ids
+        .into_iter()
+        .filter_map(|default_id| {
+            let value = default_for_id(question, &scope, default_id, inputs)?
+                .and_then(|value| text(value, inputs));
+            Some(DeclaredDefault {
+                default_id,
+                store_name: stores
+                    .0
+                    .get(&default_id)
+                    .map(|&name| find_corresponding_string(name, string_packages).to_string()),
+                value: DefaultValue(value),
+            })
+        })
+        .collect()
+}
+
+/// Whether the question, if a CHECKBOX, or one of its options has a manufacturing default flag
+/// (UEFI 2.11 §33.3.8.3.9, §33.3.8.3.51), which needs no DEFAULTSTORE.
+fn has_manufacturing_flag(question: &IFROperation, scope: &[Rc<RefCell<IFROperation>>]) -> bool {
+    let checkbox = matches!(
+        &question.parsed_data,
+        ParsedOperation::CheckBox(checkbox) if checkbox.flags & EFI_IFR_CHECKBOX_DEFAULT_MFG != 0
+    );
+    checkbox
+        || scope.iter().any(|op| {
+            matches!(
+                &op.borrow().parsed_data,
+                ParsedOperation::OneOfOption(option)
+                    if option.flags & EFI_IFR_OPTION_DEFAULT_MFG != 0
+            )
+        })
 }
 
 /// Returns the question's default for `default_id`: EFI_IFR_DEFAULT, then a flagged
@@ -416,26 +497,24 @@ fn default_for_id(
     Some(Ok(u64::from(checkbox.flags & checkbox_flag != 0)))
 }
 
-/// Appends the question's default, a value shown by `text`, to the reason its current
-/// value is unavailable.
-pub(super) fn push_default<V: QuestionValues, E: fmt::Display>(
+/// Appends the question's default among `defaults`, those of question_defaults, to the reason
+/// its current value is unavailable: that of STANDARD, else of the first DEFAULTSTORE of
+/// `stores` that holds one, ascending, as edk2-stable202608 SetupBrowserDxe/Setup.c
+/// GetQuestionDefault tries them.
+pub(super) fn push_default(
     answer: &mut String,
-    question: &IFROperation,
-    default_ids: &[DefaultId],
-    inputs: &mut ExpressionInputs<'_, V>,
-    text: impl FnOnce(u64, &mut ExpressionInputs<'_, V>) -> Result<String, E>,
+    defaults: &[DeclaredDefault],
+    stores: &DefaultStores,
 ) {
-    let Some(QuestionDefault { default_id, value }) =
-        question_default(question, default_ids, inputs)
+    let Some(DeclaredDefault {
+        default_id, value, ..
+    }) = defaults.iter().find(|default| {
+        default.default_id == DefaultId::STANDARD || stores.is_declared(default.default_id)
+    })
     else {
         return;
     };
-    let value = match value.map(|value| text(value, inputs)) {
-        Ok(Ok(shown)) => shown,
-        Ok(Err(reason)) => format!("unknown ({reason})"),
-        Err(reason) => format!("unknown ({reason})"),
-    };
-    match default_id {
+    match *default_id {
         DefaultId::STANDARD => answer.push_str(&format!(" <IFR default: {value}>")),
         _ => answer.push_str(&format!(" <IFR default (DefaultId {default_id}): {value}>")),
     }
@@ -492,6 +571,10 @@ mod tests {
     use super::super::list_questions;
     use super::super::IncludedStates;
     use super::super::Selection;
+    use super::DeclaredDefault;
+    use super::DefaultError;
+    use super::DefaultId;
+    use super::DefaultValue;
 
     /// The MethodIdentifier of the test EFI_IFR_FORM_MAP method.
     const METHOD_IDENTIFIER: [u8; 16] = [0x33; 16];
@@ -539,6 +622,42 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// question_defaults shows a default that it cannot evaluate as unknown, with why, and lists
+    /// no default for a flagged option that a SUPPRESS_IF hides.
+    #[test]
+    fn declared_defaults_tell_why_a_value_is_unknown() {
+        let (_root, node) = parse_question(
+            &[],
+            ONE_OF,
+            &one_of_data(),
+            &[
+                conditional(SUPPRESS_IF, ifr_true(), &[flagged_option(5, 0x20, 0)]),
+                conditional(SUPPRESS_IF, eq_id_val(), &[flagged_option(6, 0x10, 1)]),
+                ifr_default_2(0x4000, eq_id_val()),
+            ],
+        );
+        let unknown = |default_id, error: DefaultError| DeclaredDefault {
+            default_id: DefaultId(default_id),
+            store_name: None,
+            value: DefaultValue(Err(error)),
+        };
+
+        assert_eq!(
+            question_descriptor(&node, unavailable()).defaults,
+            [
+                unknown(
+                    0x0000,
+                    DefaultError::SuppressIfCondition(QUESTION_1_UNAVAILABLE.to_string())
+                ),
+                unknown(
+                    0x4000,
+                    DefaultError::ValueExpression(QUESTION_1_UNAVAILABLE.to_string())
+                ),
+            ],
+            "defaults"
+        );
     }
 
     #[test]

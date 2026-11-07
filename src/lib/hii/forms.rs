@@ -48,7 +48,7 @@ use conditions::ExpressionInputs;
 use conditions::QuestionExpression;
 use conditions::QuestionValues;
 use conditions::VarStoreValues;
-use defaults::FormSetDefaultIds;
+use defaults::FormSetDefaultStores;
 use question_values::describe_question;
 use question_values::questions_named;
 use question_values::value_question;
@@ -76,6 +76,7 @@ pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Selection;
 pub(crate) use conditions::StateEvaluation;
+pub(crate) use defaults::DeclaredDefault;
 pub(crate) use defaults::DefaultId;
 pub(crate) use set::set_questions;
 pub(crate) use setup_password::PasswordQuestions;
@@ -969,7 +970,7 @@ struct NumericFormat {
 }
 
 /// Why the Flags and VarOffset of a NUMERIC or ONE_OF give no value format.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 enum NumericFormatError {
     #[error("EDKII bit-field width {0}, not 1 to 32")]
     BitFieldWidth(u8),
@@ -1806,6 +1807,8 @@ pub struct QuestionDescriptor {
     opcode: IFROpCode,
     /// The Flags of its question header
     pub flags: QuestionFlags,
+    /// The defaults that its IFR declares, by DefaultId ascending
+    pub(crate) defaults: Vec<DeclaredDefault>,
     pub possible_options: Vec<AnswerOption>,
     /// The VarStore of the question, or why set cannot write it
     varstore: Result<Box<dyn VariableStore>>,
@@ -1989,7 +1992,7 @@ pub fn list_questions(
 struct FormSetWalk<'a, V> {
     /// The string packages of the FormSet's package list
     string_packages: &'a [BTreeMap<i32, String>],
-    default_ids: FormSetDefaultIds,
+    default_stores: FormSetDefaultStores,
     inputs: ExpressionInputs<'a, V>,
     include: IncludedStates,
 }
@@ -2003,7 +2006,7 @@ impl<'a, V> FormSetWalk<'a, V> {
     ) -> Self {
         Self {
             string_packages,
-            default_ids: FormSetDefaultIds::default(),
+            default_stores: FormSetDefaultStores::default(),
             inputs: ExpressionInputs { reader, values },
             include,
         }

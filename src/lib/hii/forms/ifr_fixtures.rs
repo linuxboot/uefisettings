@@ -362,13 +362,13 @@ pub(super) fn one_of_option(string_id: u16, value_type: u8, value: &[u8]) -> Vec
 }
 
 /// A UINT8 EFI_IFR_ONE_OF_OPTION with `flags`.
-pub(super) fn flagged_option(string_id: u16, flags: u8, value: u8) -> Vec<u8> {
+pub(crate) fn flagged_option(string_id: u16, flags: u8, value: u8) -> Vec<u8> {
     let data = [&string_id.to_le_bytes()[..], &[flags, 0x00, value]].concat();
     operation(ONE_OF_OPTION, false, &data)
 }
 
 /// An EFI_IFR_DEFAULT of Type UINT8.
-pub(super) fn ifr_default(default_id: u16, value: u8) -> Vec<u8> {
+pub(crate) fn ifr_default(default_id: u16, value: u8) -> Vec<u8> {
     let data = [&default_id.to_le_bytes()[..], &[0x00, value]].concat();
     operation(DEFAULT, false, &data)
 }
@@ -452,8 +452,14 @@ impl QuestionValues for MapValues {
     }
 }
 
+/// An EFI_IFR_DEFAULTSTORE of `default_id`, named by string 8.
 pub(super) fn default_store(default_id: u16) -> Vec<u8> {
-    let data = [&[0x08, 0x00][..], &default_id.to_le_bytes()].concat();
+    default_store_named(8, default_id)
+}
+
+/// An EFI_IFR_DEFAULTSTORE of `default_id`, named by string `name`.
+pub(crate) fn default_store_named(name: u16, default_id: u16) -> Vec<u8> {
+    let data = [name.to_le_bytes(), default_id.to_le_bytes()].concat();
     operation(DEFAULT_STORE, false, &data)
 }
 

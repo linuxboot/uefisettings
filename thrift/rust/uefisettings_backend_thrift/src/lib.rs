@@ -29,12 +29,26 @@ pub struct MachineInfo {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuestionDefault {
+    pub default_id: ::std::option::Option<::std::primitive::i32>,
+    pub default_store_name: ::std::option::Option<::std::string::String>,
+    pub value: ::std::option::Option<::std::string::String>,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
+#[derive(Clone, PartialEq)]
 pub struct Question {
     pub name: ::std::string::String,
     pub answer: ::std::string::String,
     pub options: ::std::vec::Vec<::std::string::String>,
     pub help: ::std::string::String,
     pub flags: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
+    pub defaults: ::std::option::Option<::std::vec::Vec<crate::types::QuestionDefault>>,
     // This field forces `..Default::default()` when instantiating this
     // struct, to make code future-proof against new fields added later to
     // the definition in Thrift. If you don't want this, add the annotation
@@ -621,6 +635,127 @@ impl ::fbthrift::metadata::ThriftAnnotations for MachineInfo {
 
 
 #[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::QuestionDefault {
+    fn default() -> Self {
+        Self {
+            default_id: ::std::option::Option::None,
+            default_store_name: ::std::option::Option::None,
+            value: ::std::option::Option::None,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::QuestionDefault {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("QuestionDefault")
+            .field("default_id", &self.default_id)
+            .field("default_store_name", &self.default_store_name)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::QuestionDefault {}
+unsafe impl ::std::marker::Sync for self::QuestionDefault {}
+impl ::std::marker::Unpin for self::QuestionDefault {}
+
+impl ::fbthrift::GetTType for self::QuestionDefault {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::QuestionDefault
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("QuestionDefault");
+        if let ::std::option::Option::Some(some) = &self.default_id {
+            p.write_field_begin("default_id", ::fbthrift::TType::I32, 1);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.default_store_name {
+            p.write_field_begin("default_store_name", ::fbthrift::TType::String, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        if let ::std::option::Option::Some(some) = &self.value {
+            p.write_field_begin("value", ::fbthrift::TType::String, 3);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::QuestionDefault
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("default_id", ::fbthrift::TType::I32, 1),
+            ::fbthrift::Field::new("default_store_name", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("value", ::fbthrift::TType::String, 3),
+        ];
+        let mut field_default_id = ::std::option::Option::None;
+        let mut field_default_store_name = ::std::option::Option::None;
+        let mut field_value = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::I32, 1) => field_default_id = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 2) => field_default_store_name = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 3) => field_value = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            default_id: field_default_id,
+            default_store_name: field_default_store_name,
+            value: field_value,
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for QuestionDefault {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
 impl ::std::default::Default for self::Question {
     fn default() -> Self {
         Self {
@@ -629,6 +764,7 @@ impl ::std::default::Default for self::Question {
             options: ::std::default::Default::default(),
             help: ::std::default::Default::default(),
             flags: ::std::option::Option::None,
+            defaults: ::std::option::Option::None,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         }
     }
@@ -643,6 +779,7 @@ impl ::std::fmt::Debug for self::Question {
             .field("options", &self.options)
             .field("help", &self.help)
             .field("flags", &self.flags)
+            .field("defaults", &self.defaults)
             .finish()
     }
 }
@@ -678,6 +815,11 @@ where
             ::fbthrift::Serialize::write(some, p);
             p.write_field_end();
         }
+        if let ::std::option::Option::Some(some) = &self.defaults {
+            p.write_field_begin("defaults", ::fbthrift::TType::List, 9);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
         p.write_field_stop();
         p.write_struct_end();
     }
@@ -690,6 +832,7 @@ where
     fn read(p: &mut P) -> ::anyhow::Result<Self> {
         static FIELDS: &[::fbthrift::Field] = &[
             ::fbthrift::Field::new("answer", ::fbthrift::TType::String, 2),
+            ::fbthrift::Field::new("defaults", ::fbthrift::TType::List, 9),
             ::fbthrift::Field::new("flags", ::fbthrift::TType::List, 5),
             ::fbthrift::Field::new("help", ::fbthrift::TType::String, 4),
             ::fbthrift::Field::new("name", ::fbthrift::TType::String, 1),
@@ -700,6 +843,7 @@ where
         let mut field_options = ::std::option::Option::None;
         let mut field_help = ::std::option::Option::None;
         let mut field_flags = ::std::option::Option::None;
+        let mut field_defaults = ::std::option::Option::None;
         let _ = p.read_struct_begin(|_| ())?;
         loop {
             let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
@@ -710,6 +854,7 @@ where
                 (::fbthrift::TType::List, 3) => field_options = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::String, 4) => field_help = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::List, 5) => field_flags = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 9) => field_defaults = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (fty, _) => p.skip(fty)?,
             }
             p.read_field_end()?;
@@ -721,6 +866,7 @@ where
             options: field_options.unwrap_or_default(),
             help: field_help.unwrap_or_default(),
             flags: field_flags,
+            defaults: field_defaults,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         })
     }
@@ -750,6 +896,8 @@ impl ::fbthrift::metadata::ThriftAnnotations for Question {
             4 => {
             },
             5 => {
+            },
+            9 => {
             },
             _ => {}
         }

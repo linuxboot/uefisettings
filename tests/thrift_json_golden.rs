@@ -42,6 +42,7 @@ use uefisettings_backend_thrift::HiiStringsPackage;
 use uefisettings_backend_thrift::IloAttributes;
 use uefisettings_backend_thrift::MachineInfo;
 use uefisettings_backend_thrift::Question;
+use uefisettings_backend_thrift::QuestionDefault;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 use uefisettings_spellings_db_thrift::consts::translation_db;
@@ -420,9 +421,39 @@ fn flagged_question() -> Question {
     }
 }
 
+/// A default of DefaultId 0x0001 whose FormSet declares no DEFAULTSTORE for it.
+fn undeclared_default() -> QuestionDefault {
+    QuestionDefault {
+        default_id: Some(1),
+        value: Some(TRICKY.to_owned()),
+        ..Default::default()
+    }
+}
+
+/// A default of the standard default store, which the FormSet declares.
+fn standard_default() -> QuestionDefault {
+    QuestionDefault {
+        default_id: Some(0),
+        default_store_name: Some("Standard Default".to_owned()),
+        value: Some("Enabled".to_owned()),
+        ..Default::default()
+    }
+}
+
+/// question() with the defaults of the standard and the manufacturing default stores.
+fn defaulted_question() -> Question {
+    Question {
+        defaults: Some(vec![standard_default(), undeclared_default()]),
+        ..question()
+    }
+}
+
 /// The JSON of the optional fields that Question gained for hii questions.
 fn question_fields() -> Vec<(&'static str, Vec<u8>)> {
-    vec![("question-flags.json", json(&flagged_question()))]
+    vec![
+        ("question-flags.json", json(&flagged_question())),
+        ("question-defaults.json", json(&defaulted_question())),
+    ]
 }
 
 #[test]
@@ -479,6 +510,18 @@ fn unset_optionals_are_omitted_and_set_ones_present() {
         &["kind", "os_errno"],
     );
     assert_optionals("Question", &question(), &flagged_question(), &["flags"]);
+    assert_optionals(
+        "Question",
+        &question(),
+        &defaulted_question(),
+        &["defaults"],
+    );
+    assert_optionals(
+        "QuestionDefault",
+        &QuestionDefault::default(),
+        &standard_default(),
+        &["default_id", "default_store_name", "value"],
+    );
     assert_optionals(
         "SetResponse",
         &SetResponse::default(),

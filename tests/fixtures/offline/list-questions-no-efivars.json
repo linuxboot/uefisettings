@@ -1,1 +1,1 @@
-[{"name":"Fast Boot","answer":"<ValueUnavailable: EFI variables not read> <IFR default: 0>","options":[],"help":"Help"},{"name":"Wake on LAN","answer":"<ValueUnavailable: EFI variables not read> <IFR default: 0>","options":[],"help":"Help"}]
+[{"name":"Fast Boot","answer":"<ValueUnavailable: EFI variables not read> <IFR default: 0>","options":[],"help":"Help","defaults":[{"default_id":0,"value":"0"}]},{"name":"Wake on LAN","answer":"<ValueUnavailable: EFI variables not read> <IFR default: 0>","options":[],"help":"Help","defaults":[{"default_id":0,"value":"0"}]}]

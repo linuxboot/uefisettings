@@ -8,6 +8,8 @@ get-numeric	status	0x0
 get-numeric	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "18"
 # How old are you? (Step) has no question Flags
 get-numeric	json	.responses[0].question | has("flags") | not
+# and the defaults 18 and 19 of MyStandardDefault and MyManufactureDefault
+get-numeric	json	.responses[0].question.defaults == [{"default_id": 0, "default_store_name": "Standard Default", "value": "18"}, {"default_id": 1, "default_store_name": "Manufacture Default", "value": "19"}]
 dmpstore-before	status	any
 dmpstore-before	line	^Variable NV\+BS 'A04A27F4-DF00-4D42-B552-39511302113D:MyIfrNVData' DataSize = 0xDC$
 # How old are you? (Step) is the byte at 0x55

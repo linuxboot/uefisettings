@@ -164,6 +164,31 @@ struct ListedQuestion {
     name: String,
     // optional, so that a build without the field fails an assertion, not the parse
     flags: Option<Vec<String>>,
+    defaults: Option<Vec<ListedDefault>>,
+}
+
+/// A default of a ListedQuestion.
+#[derive(Debug, Deserialize, PartialEq)]
+struct ListedDefault {
+    default_id: i32,
+    default_store_name: Option<String>,
+    value: String,
+}
+
+/// A ListedDefault of the default store `default_id` of DriverSample's formset: 0, which
+/// MyStandardDefault names "Standard Default", or 1, which MyManufactureDefault names
+/// "Manufacture Default" (Vfr.vfr and VfrStrings.uni, edk2-stable202608).
+fn driver_sample_default(default_id: i32, value: &str) -> ListedDefault {
+    let name = match default_id {
+        0 => "Standard Default",
+        1 => "Manufacture Default",
+        _ => panic!("DriverSample declares no default store {default_id}"),
+    };
+    ListedDefault {
+        default_id,
+        default_store_name: Some(name.to_owned()),
+        value: value.to_owned(),
+    }
 }
 
 fn question(name: &str, answer: &str, options: &[&str]) -> Question {
@@ -371,6 +396,64 @@ fn list_questions_lists_the_question_flags() {
             })
             .collect();
         assert_eq!(listed, [flags.map(<[&str]>::to_vec)], "flags of {name:?}");
+    }
+}
+
+/// list-questions lists the defaults that DriverSample's Vfr.vfr (edk2-stable202608) declares
+/// for a question, per default store: by `default`, with or without a `defaultstore`, and by the
+/// CHECKBOX_DEFAULT and CHECKBOX_DEFAULT_MFG flags, clear ones too, and none for a question
+/// without.
+#[test]
+fn list_questions_lists_the_declared_defaults() {
+    let questions: Vec<ListedQuestion> = json(&[
+        "hii",
+        "list-questions",
+        "--json",
+        INCLUDE_ALL[0],
+        INCLUDE_ALL[1],
+    ]);
+    let cases = [
+        (
+            NUMERIC,
+            vec![Some(vec![
+                driver_sample_default(0, "18"),
+                driver_sample_default(1, "19"),
+            ])],
+        ),
+        (
+            CHECK_BOX,
+            vec![
+                Some(vec![
+                    driver_sample_default(0, "1"),
+                    driver_sample_default(1, "1"),
+                ]),
+                Some(vec![
+                    driver_sample_default(0, "1"),
+                    driver_sample_default(1, "0"),
+                ]),
+            ],
+        ),
+        (
+            "How old are you?(Readonly)",
+            vec![Some(vec![driver_sample_default(0, "21")])],
+        ),
+        (
+            "Get Call Back default",
+            vec![Some(vec![driver_sample_default(0, "18")])],
+        ),
+        (MATCH2, vec![None]),
+    ];
+    for (name, defaults) in cases {
+        let listed: Vec<&Option<Vec<ListedDefault>>> = questions
+            .iter()
+            .filter(|question| question.name == name)
+            .map(|question| &question.defaults)
+            .collect();
+        assert_eq!(
+            listed,
+            defaults.iter().collect::<Vec<_>>(),
+            "defaults of {name:?}"
+        );
     }
 }
 

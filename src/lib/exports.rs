@@ -23,6 +23,7 @@ use uefisettings_backend_thrift::GetResponseList;
 use uefisettings_backend_thrift::HiiShowIfrResponse;
 use uefisettings_backend_thrift::HiiStringsPackage;
 use uefisettings_backend_thrift::Question;
+use uefisettings_backend_thrift::QuestionDefault;
 use uefisettings_backend_thrift::SetResponse;
 use uefisettings_backend_thrift::SetResponseList;
 
@@ -97,6 +98,7 @@ pub use crate::hii::extract::EfivarMemory;
 use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
+use crate::hii::forms::DeclaredDefault;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::forms::QuestionFlags;
 use crate::hii::package;
@@ -504,6 +506,7 @@ impl HiiBackend {
                             + &state.annotation(),
                         help: question_descriptor.help,
                         flags: listed_flags(question_descriptor.flags),
+                        defaults: listed_defaults(question_descriptor.defaults),
                         ..Default::default()
                     };
                     // don't show it if everything is empty
@@ -640,6 +643,7 @@ impl HiiBackend {
                     answer: new_value.to_owned() + &option_annotation + &state.annotation(),
                     help: question_descriptor.help,
                     flags: listed_flags(question_descriptor.flags),
+                    defaults: listed_defaults(question_descriptor.defaults),
                     ..Default::default()
                 },
                 modified: true,
@@ -735,6 +739,7 @@ impl HiiBackend {
                         answer: question_descriptor.value,
                         help: question_descriptor.help,
                         flags: listed_flags(question_descriptor.flags),
+                        defaults: listed_defaults(question_descriptor.defaults),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -843,6 +848,21 @@ fn listed_flags(flags: QuestionFlags) -> Option<Vec<String>> {
     })
 }
 
+/// `defaults` as Question lists them: None, which --json leaves out, for none.
+fn listed_defaults(defaults: Vec<DeclaredDefault>) -> Option<Vec<QuestionDefault>> {
+    (!defaults.is_empty()).then(|| {
+        defaults
+            .into_iter()
+            .map(|default| QuestionDefault {
+                default_id: Some(i32::from(default.default_id.0)),
+                default_store_name: default.store_name,
+                value: Some(default.value.to_string()),
+                ..Default::default()
+            })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -855,9 +875,12 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::checkbox_at;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
     use crate::hii::forms::ifr_fixtures::conditional;
+    use crate::hii::forms::ifr_fixtures::default_store_named;
     use crate::hii::forms::ifr_fixtures::eq_id_val_of;
+    use crate::hii::forms::ifr_fixtures::flagged_option;
     use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::form_set;
+    use crate::hii::forms::ifr_fixtures::ifr_default;
     use crate::hii::forms::ifr_fixtures::nested;
     use crate::hii::forms::ifr_fixtures::on_small_stack;
     use crate::hii::forms::ifr_fixtures::operation;
@@ -1410,6 +1433,216 @@ mod tests {
                 .map(|response| json_flags(&response.question))
                 .collect();
             assert_eq!(got, [want_flags(names)], "get {prompt}");
+        }
+    }
+
+    /// A HiiDB of two package lists. The first FormSet declares the DEFAULTSTOREs STANDARD "Std",
+    /// 0x4001 "Platform" and 0x4001 "Late name", and on the EFI variable Setup, from byte 0, the
+    /// UINT8 questions Numbers (EFI_IFR_DEFAULT STANDARD 5, 0x0001 6 and 0x4001 7), Undeclared
+    /// (EFI_IFR_DEFAULT 0x4000 9), Options (the options Zero, One flagged DEFAULT and Two flagged
+    /// DEFAULT_MFG), Mfg box (a CHECKBOX flagged DEFAULT_MFG), Plain box (a CHECKBOX without
+    /// flags) and None (no default). The second declares only MANUFACTURING "Mfg", and Bare box, a
+    /// CHECKBOX flagged DEFAULT, and Mfg store box, a CHECKBOX without flags.
+    fn defaults_hiidb() -> Vec<u8> {
+        let header = |id: u16| question_header_with(id, id, 1, id - 1, 0x00);
+        let numeric = |id: u16, children: &[Vec<u8>]| {
+            let data = [header(id), NUMERIC_0_TO_255.to_vec()].concat();
+            [
+                operation(NUMERIC, true, &data),
+                children.concat(),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let checkbox =
+            |id: u16, flags: u8| operation(CHECKBOX, false, &[header(id), vec![flags]].concat());
+        let one_of = [
+            operation(ONE_OF, true, &[header(3), vec![0x00, 0, 2, 1]].concat()),
+            flagged_option(9, 0x00, 0),
+            flagged_option(10, 0x10, 1),
+            flagged_option(11, 0x20, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let first = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 6),
+                default_store_named(7, 0x0000),
+                default_store_named(8, 0x4001),
+                default_store_named(12, 0x4001),
+                form(
+                    1,
+                    &[
+                        numeric(
+                            1,
+                            &[
+                                ifr_default(0x0000, 5),
+                                ifr_default(0x0001, 6),
+                                ifr_default(0x4001, 7),
+                            ],
+                        ),
+                        numeric(2, &[ifr_default(0x4000, 9)]),
+                        one_of,
+                        checkbox(4, 0x02),
+                        checkbox(5, 0x00),
+                        numeric(6, &[]),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&[
+                "Numbers",
+                "Undeclared",
+                "Options",
+                "Mfg box",
+                "Plain box",
+                "None",
+                "Std",
+                "Platform",
+                "Zero",
+                "One",
+                "Two",
+                "Late name",
+            ]),
+            END_PACKAGE.to_vec(),
+        ];
+        let second = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                default_store_named(3, 0x0001),
+                form(1, &[checkbox(1, 0x01), checkbox(2, 0x00)]),
+            ]),
+            en_strings_package_of(&["Bare box", "Mfg store box", "Mfg"]),
+            END_PACKAGE.to_vec(),
+        ];
+        [
+            package_list_with_guid([0x55; 16], &first.concat()),
+            package_list_with_guid([0x66; 16], &second.concat()),
+        ]
+        .concat()
+    }
+
+    /// The questions of defaults_hiidb and the defaults that --json lists for each, if any.
+    fn want_defaults() -> [(&'static str, Option<serde_json::Value>); 8] {
+        [
+            (
+                "Numbers",
+                Some(serde_json::json!([
+                    {"default_id": 0, "default_store_name": "Std", "value": "5"},
+                    {"default_id": 1, "value": "6"},
+                    {"default_id": 0x4001, "default_store_name": "Platform", "value": "7"},
+                ])),
+            ),
+            (
+                "Undeclared",
+                Some(serde_json::json!([{"default_id": 0x4000, "value": "9"}])),
+            ),
+            (
+                "Options",
+                Some(serde_json::json!([
+                    {"default_id": 0, "default_store_name": "Std", "value": "One"},
+                    {"default_id": 1, "value": "Two"},
+                ])),
+            ),
+            (
+                "Mfg box",
+                Some(serde_json::json!([
+                    {"default_id": 0, "default_store_name": "Std", "value": "0"},
+                    {"default_id": 1, "value": "1"},
+                ])),
+            ),
+            (
+                "Plain box",
+                Some(serde_json::json!([
+                    {"default_id": 0, "default_store_name": "Std", "value": "0"},
+                ])),
+            ),
+            ("None", None),
+            (
+                "Bare box",
+                Some(serde_json::json!([
+                    {"default_id": 0, "value": "1"},
+                    {"default_id": 1, "default_store_name": "Mfg", "value": "0"},
+                ])),
+            ),
+            (
+                "Mfg store box",
+                Some(serde_json::json!([
+                    {"default_id": 0, "value": "0"},
+                    {"default_id": 1, "default_store_name": "Mfg", "value": "0"},
+                ])),
+            ),
+        ]
+    }
+
+    /// get and list-questions list each default that the IFR declares for a question, per
+    /// DefaultId, ascending, with the name of the first DEFAULTSTORE of that DefaultId if the
+    /// FormSet declares one: from EFI_IFR_DEFAULT, also of a DefaultId that no DEFAULTSTORE
+    /// declares, from the DEFAULT and DEFAULT_MFG flags of the options and of a CHECKBOX, also
+    /// without a manufacturing DEFAULTSTORE, the cleared flag of a CHECKBOX for each declared
+    /// DEFAULTSTORE, and none for a question without.
+    #[test]
+    fn get_and_list_questions_list_the_declared_defaults() {
+        let hiidb = defaults_hiidb();
+        let listed = HiiBackend::list_questions_using(
+            &hiidb,
+            &ListQuestionsOptions {
+                efivars: EfivarSource::Disabled,
+                ..ListQuestionsOptions::default()
+            },
+        )
+        .expect("list questions");
+        let listed: Vec<(String, Option<serde_json::Value>)> = listed
+            .iter()
+            .map(|question| (question.name.clone(), json_field(question, "defaults")))
+            .collect();
+        let want = want_defaults().map(|(name, defaults)| (name.to_string(), defaults));
+        assert_eq!(listed, want, "list-questions");
+
+        for (name, defaults) in want_defaults() {
+            let got = HiiBackend::get_using(
+                &hiidb,
+                name,
+                None,
+                &GetOptions {
+                    efivars: EfivarSource::Disabled,
+                    ..GetOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("get {name}: {error:#}"));
+            let got: Vec<Option<serde_json::Value>> = got
+                .responses
+                .iter()
+                .map(|response| json_field(&response.question, "defaults"))
+                .collect();
+            assert_eq!(got, [defaults], "get {name}");
+        }
+    }
+
+    /// set's response lists the defaults of the question it wrote, and none for one without.
+    #[test]
+    fn set_lists_the_declared_defaults() {
+        let [numbers, _, _, _, _, none, _, _] = want_defaults();
+        for (name, defaults) in [numbers, none] {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(setup(), NV_BS_RT, &[0; 6]);
+            let variables = Rc::new(variables);
+            let got = HiiBackend::set_in(
+                &defaults_hiidb(),
+                name,
+                "3",
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+            )
+            .unwrap_or_else(|error| panic!("set {name}: {error:#}"));
+            let got: Vec<Option<serde_json::Value>> = got
+                .responses
+                .iter()
+                .map(|response| json_field(&response.question, "defaults"))
+                .collect();
+            assert_eq!(got, [defaults], "set {name}");
         }
     }
 

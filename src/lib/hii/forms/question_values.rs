@@ -16,7 +16,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::convert::Infallible;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -29,6 +28,7 @@ use super::conditions::QuestionValues;
 use super::conditions::StateEvaluation;
 use super::defaults::option_text;
 use super::defaults::push_default;
+use super::defaults::question_defaults;
 use super::defaults::question_scope;
 use super::find_corresponding_string;
 use super::find_corresponding_varstore;
@@ -202,15 +202,16 @@ pub(super) fn handle_checkbox(
             true
         }
     };
+    let stores = walk.default_stores.of(current_node, &mut walk.inputs);
+    let defaults = question_defaults(
+        current_node,
+        stores,
+        walk.string_packages,
+        &mut walk.inputs,
+        |v, _| Ok(checkbox_text(v)),
+    );
     if !available {
-        let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
-        push_default(
-            &mut answer,
-            current_node,
-            default_ids,
-            &mut walk.inputs,
-            |v, _| Ok::<_, Infallible>(checkbox_text(v)),
-        );
+        push_default(&mut answer, &defaults, stores);
     }
     let res = QuestionDescriptor {
         question: question.to_string(),
@@ -227,6 +228,7 @@ pub(super) fn handle_checkbox(
         numeric_range: None,
         opcode: current_node.op_code,
         flags,
+        defaults,
         value_state: StateEvaluation::selectable(),
         node: Rc::clone(node),
     };
@@ -253,27 +255,21 @@ pub(super) fn handle_oneof(
         Ok(stored) => Some(stored),
     };
 
+    let stores = walk.default_stores.of(current_node, &mut walk.inputs);
+    let format = numeric_format(parsed.location, parsed.flags, &parsed.data);
+    let defaults = question_defaults(
+        current_node,
+        stores,
+        walk.string_packages,
+        &mut walk.inputs,
+        |v, inputs| {
+            let format = format.clone()?;
+            option_text(current_node, format.cut(v), walk.string_packages, inputs)
+                .map(|option| one_of_text(v, format, option.as_deref()))
+        },
+    );
     if chosen_value.is_none() {
-        let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
-        match numeric_format(parsed.location, parsed.flags, &parsed.data) {
-            Ok(format) => push_default(
-                &mut answer,
-                current_node,
-                default_ids,
-                &mut walk.inputs,
-                |v, inputs| {
-                    option_text(current_node, format.cut(v), walk.string_packages, inputs)
-                        .map(|option| one_of_text(v, format, option.as_deref()))
-                },
-            ),
-            Err(error) => push_default(
-                &mut answer,
-                current_node,
-                default_ids,
-                &mut walk.inputs,
-                |_, _| Err::<String, _>(error),
-            ),
-        }
+        push_default(&mut answer, &defaults, stores);
     }
 
     let mut possible_options = Vec::new();
@@ -330,6 +326,7 @@ pub(super) fn handle_oneof(
         numeric_range: None,
         opcode: current_node.op_code,
         flags,
+        defaults,
         value_state,
         node: Rc::clone(node),
     };
@@ -358,18 +355,20 @@ pub(super) fn handle_numeric(
             true
         }
     };
+    let stores = walk.default_stores.of(current_node, &mut walk.inputs);
+    let defaults = question_defaults(
+        current_node,
+        stores,
+        walk.string_packages,
+        &mut walk.inputs,
+        |v, _| {
+            Ok(numeric_format(parsed.location, parsed.flags, &parsed.data)?
+                .decode(v)
+                .to_string())
+        },
+    );
     if !available {
-        let default_ids = walk.default_ids.of(current_node, &mut walk.inputs);
-        push_default(
-            &mut answer,
-            current_node,
-            default_ids,
-            &mut walk.inputs,
-            |v, _| {
-                numeric_format(parsed.location, parsed.flags, &parsed.data)
-                    .map(|format| format.decode(v).to_string())
-            },
-        );
+        push_default(&mut answer, &defaults, stores);
     }
     let res = QuestionDescriptor {
         question: question.to_string(),
@@ -395,6 +394,7 @@ pub(super) fn handle_numeric(
         },
         opcode: current_node.op_code,
         flags,
+        defaults,
         value_state: StateEvaluation::selectable(),
         node: Rc::clone(node),
     };

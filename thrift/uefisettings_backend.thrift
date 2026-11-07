@@ -31,13 +31,29 @@ struct MachineInfo {
   8: string product_version;
 }
 
+// hii - a default that the IFR declares for a question (UEFI 2.11 §33.2.5.8): by an
+// EFI_IFR_DEFAULT, by an option flagged DEFAULT or DEFAULT_MFG, or by the Flags of a CHECKBOX.
+// edk2's setup browser falls back to another default store and then to a value by type, which
+// are not shown.
+struct QuestionDefault {
+  // the DefaultId of the default store: 0x0000 standard, 0x0001 manufacturing, 0x0002 safe, ...;
+  // always set
+  1: optional i32 default_id;
+  // the DefaultName of the FormSet's EFI_IFR_DEFAULTSTORE of default_id; unset if the FormSet
+  // declares none
+  2: optional string default_store_name;
+  // the value, as the answer shows a current value, or "unknown (<reason>)"; always set
+  3: optional string value;
+}
+
 struct Question {
   1: string name;
   // answer values:
   // hii - the current value; if unreadable, the reason, followed, only if the IFR of a ONE_OF,
   // NUMERIC or CHECKBOX declares a default, by " <IFR default: v>" or
   // " <IFR default (DefaultId 0x0001): v>", v being "unknown (<reason>)" if undetermined;
-  // firmware Callback/ALTCFG defaults may differ.
+  // firmware Callback/ALTCFG defaults may differ. defaults lists every default that the IFR
+  // declares.
   // hii answers end with " <s>" if IFR conditions put the question in state s (grayed-out,
   // suppressed or disabled), or with " <s1 or s2: reasons>" if the reasons leave its state
   // undetermined among s1, s2, ... (selectable too).
@@ -51,6 +67,9 @@ struct Question {
   // without the EFI_IFR_FLAG_ prefix, in bit order: READ_ONLY, CALLBACK, RESET_REQUIRED,
   // REST_STYLE, RECONNECT_REQUIRED, OPTIONS_ONLY; reserved bits are left out. Unset if none is.
   5: optional list<string> flags;
+  // hii - the defaults that the IFR declares for the question, by default_id ascending. Unset if
+  // it declares none.
+  9: optional list<QuestionDefault> defaults;
 }
 
 struct SetResponse {
