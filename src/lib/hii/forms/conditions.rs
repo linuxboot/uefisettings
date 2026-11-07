@@ -2536,7 +2536,6 @@ mod tests {
     const OR: u8 = 0x16;
     const STRING: u8 = 0x1C;
     const PASSWORD: u8 = 0x08;
-    const EQUAL: u8 = 0x2F;
     const NOT_EQUAL: u8 = 0x30;
     const GREATER_THAN: u8 = 0x31;
     const GREATER_EQUAL: u8 = 0x32;
@@ -5524,7 +5523,6 @@ mod store_expression_tests {
     const GET: u8 = 0x2B;
     const SET: u8 = 0x2C;
     const AND: u8 = 0x15;
-    const EQUAL: u8 = 0x2F;
     const NOT_EQUAL: u8 = 0x30;
     const BITWISE_AND: u8 = 0x35;
     const SHIFT_RIGHT: u8 = 0x39;

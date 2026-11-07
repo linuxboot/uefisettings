@@ -3123,11 +3123,9 @@ fn display_op(
     }
 
     match &current_node.parsed_data {
-        ParsedOperation::Placeholder => {
-            // every op that handle_form_set parses has a parent; the root has none
-            if current_node.parent.is_none() {
-                result.push_str(format!("{extra_spaces}OpCode: ROOT\n").as_str())
-            }
+        // every op that handle_form_set parses has a parent; the root has none
+        ParsedOperation::Placeholder if current_node.parent.is_none() => {
+            result.push_str(format!("{extra_spaces}OpCode: ROOT\n").as_str())
         }
         ParsedOperation::Subtitle(parsed) => result.push_str(
             format!(
@@ -4189,6 +4187,45 @@ mod tests {
         assert!(
             format!("{error:#}").contains("failed to parse VarStoreEfi's data"),
             "Length 23: {error:#}"
+        );
+    }
+
+    /// show-ifr shows each op of which it decodes nothing, but the root, by its OpCode, one scope
+    /// down from its parent: here the condition and string ops of a SUPPRESS_IF.
+    #[test]
+    fn show_ifr_shows_ops_without_decoded_data_by_their_opcode() {
+        let string_ref1 = operation(STRING_REF1, false, &5u16.to_le_bytes());
+        let condition = [
+            string_ref1.clone(),
+            string_ref1,
+            operation(EQUAL, false, &[]),
+        ]
+        .concat();
+        let root = parse_form_set(&[form(
+            1,
+            &[conditional(SUPPRESS_IF, condition, &[checkbox_op(1, 0)])],
+        )]);
+
+        let display = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+
+        let ops: Vec<&str> = display
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('-'))
+            .map(|line| line.split(" - ").next().unwrap_or(line))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                "OpCode: ROOT",
+                "    OpCode: FormSet",
+                "        OpCode: Form",
+                "            OpCode: SuppressIf",
+                "                OpCode: StringRef1",
+                "                OpCode: StringRef1",
+                "                OpCode: Equal",
+                "                OpCode: CheckBox",
+            ],
+            "{display}"
         );
     }
 }

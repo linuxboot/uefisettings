@@ -534,6 +534,13 @@ fn show_ifr_shows_the_formsets() {
         ],
         "{output:#?}"
     );
+    // ops of which show-ifr decodes nothing show by their OpCode, as DriverSample's SUPPRESS_IFs
+    let suppress_ifs = output
+        .stdout
+        .lines()
+        .filter(|line| line.trim_start() == "OpCode: SuppressIf")
+        .count();
+    assert!(suppress_ifs > 0, "no SuppressIf line: {output:#?}");
 }
 
 #[test]
