@@ -119,9 +119,12 @@ for file in "${files[@]}"; do
     echo "fetch-packages.sh: unpacking $file"
     case $file in
     *.rpm)
+        # cpio stops reading at the archive's trailer, while rpm2cpio may still be writing the
+        # padding after it (rpm 6.0.2 pads to a multiple of 10240 bytes): reading on to EOF
+        # keeps rpm2cpio from dying of SIGPIPE, which bash reports with no message.
         rpm2cpio "$file" |
             (cd "$staging" && cpio --extract --make-directories --preserve-modification-time \
-                --no-absolute-filenames --quiet) ||
+                --no-absolute-filenames --quiet && cat >/dev/null) ||
             unpack_failed "$file" "rpm2cpio ${PIPESTATUS[0]}, cpio ${PIPESTATUS[1]}"
         ;;
     *.deb)

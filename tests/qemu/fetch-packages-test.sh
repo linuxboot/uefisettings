@@ -64,6 +64,9 @@ check() {
 }
 
 check fixture-1.0.noarch.rpm "$dir/archive.cpio" 'cat "$1"' unpacked
+# cpio stops reading at the archive's trailer, while rpm2cpio may still be writing padding
+# after it: 4 MiB of it, more than a pipe holds, outlasts cpio on every run.
+check fixture-1.0.noarch.rpm "$dir/archive.cpio" 'cat "$1" && head -c 4194304 /dev/zero' unpacked
 check fixture-1.0.noarch.rpm "$dir/archive.cpio" 'cat "$1"; exit 3' \
     'fetch-packages.sh: cannot unpack fixture-1.0.noarch.rpm (exit statuses: rpm2cpio 3, cpio 0)'
 
