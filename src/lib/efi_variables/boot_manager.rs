@@ -13,7 +13,10 @@
 //! The variables of the boot manager (UEFI 2.11 §3.1) that globals.rs leaves out, decoded as
 //! variable get prints them: the load options Boot####, Driver####, SysPrep####,
 //! PlatformRecovery#### and OsRecovery#### (§3.1.3, §3.4.1), the hot keys Key#### (§3.1.6) and
-//! the console device paths ConIn, ConOut, ErrOut, ConInDev, ConOutDev and ErrOutDev (§3.3).
+//! the console device paths ConIn, ConOut, ErrOut, ConInDev, ConOutDev and ErrOutDev (§3.3);
+//! and those that the OS writes, as attributes.rs writes them.
+
+mod attributes;
 
 use std::fmt;
 
@@ -43,8 +46,16 @@ use super::load_option::LoadOption;
 use super::load_option::LoadOptionAttributes;
 use super::VariableContents;
 use super::VariableData;
+#[cfg(variable_names)]
+use super::VariableNames;
 use crate::hii::package::Guid;
+use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
+
+pub(crate) use attributes::set_attributes;
+pub use attributes::AttributeChange;
+pub use attributes::AttributesSet;
+pub use attributes::HotKeysFollowing;
 
 /// The name of the hot key variables before their option number (UEFI 2.11 §3.1.6)
 const HOT_KEY_PREFIX: &str = "Key";
@@ -193,6 +204,55 @@ impl fmt::Display for BootManagerVariable {
     }
 }
 
+/// The Boot####, Driver#### or SysPrep#### that `name` names, which `command` writes.
+fn written_option(name: &str, command: &'static str) -> Result<LoadOptionName, OptionRefusal> {
+    let refused = name.to_owned();
+    match BootManagerVariable::parse(name) {
+        Some(BootManagerVariable::LoadOption(OptionName {
+            kind: OptionKind::Ordered(kind),
+            number,
+        })) => Ok(LoadOptionName { kind, number }),
+        Some(BootManagerVariable::LoadOption(OptionName {
+            kind: OptionKind::PlatformRecovery,
+            ..
+        })) => Err(OptionRefusal::PlatformRecovery(command, refused)),
+        Some(BootManagerVariable::LoadOption(OptionName {
+            kind: OptionKind::OsRecovery,
+            ..
+        })) => Err(OptionRefusal::OsRecovery(command, refused)),
+        Some(BootManagerVariable::HotKey(_) | BootManagerVariable::Console(_)) | None => {
+            Err(OptionRefusal::NotLoadOption(command, refused))
+        }
+    }
+}
+
+/// Refuses `key`, before any write, if `attributes` hold
+/// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS or
+/// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS: SetVariable() then takes only an
+/// EFI_VARIABLE_AUTHENTICATION_3 or EFI_VARIABLE_AUTHENTICATION_2 descriptor (UEFI 2.11 §8.2.3).
+fn refuse_authenticated(
+    key: &VariableKey,
+    attributes: VariableAttributes,
+) -> Result<(), AuthenticatedRefusal> {
+    match attributes.intersects(
+        VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS
+            | VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+    ) {
+        true => Err(AuthenticatedRefusal(key.clone())),
+        false => Ok(()),
+    }
+}
+
+/// A variable that the boot manager's writes refuse, as only a signed write sets it.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "EFI variable {0} has ENHANCED_AUTHENTICATED_ACCESS or TIME_BASED_AUTHENTICATED_WRITE_ACCESS: \
+     SetVariable() writes it only with an EFI_VARIABLE_AUTHENTICATION_3 or \
+     EFI_VARIABLE_AUTHENTICATION_2 descriptor (UEFI 2.11 section 8.2.3), as variable write-signed \
+     writes it"
+)]
+struct AuthenticatedRefusal(VariableKey);
+
 /// The option number of `text`, `prefix` and then four digits "in printable hexadecimal
 /// representation using the digits 0-9, and the upper case versions of the characters A-F"
 /// (UEFI 2.11 §3.1.1), as Boot0001 has.
@@ -217,6 +277,35 @@ pub(super) fn variable_names() -> String {
         .chain(Console::ALL.map(|console| console.name().to_owned()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The Key#### variables that a backend reaches, by option number, or that it cannot list them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HotKeyListing {
+    #[cfg_attr(
+        all(not(variable_names), not(test)),
+        allow(dead_code, reason = "the Windows build cannot list them")
+    )]
+    Listed(Vec<u16>),
+    /// On Windows, whose calls reach a variable by its name only
+    #[cfg_attr(
+        all(variable_names, not(test)),
+        allow(dead_code, reason = "only the Windows build cannot list them")
+    )]
+    Unlisted,
+}
+
+/// The Key#### variables of EFI_GLOBAL_VARIABLE that `names` list.
+#[cfg(variable_names)]
+pub(crate) fn hot_key_listing(names: &impl VariableNames) -> Result<HotKeyListing> {
+    Ok(HotKeyListing::Listed(
+        names
+            .variable_names()?
+            .into_iter()
+            .filter(|key| key.guid == EFI_GLOBAL_VARIABLE)
+            .filter_map(|key| option_number(&key.name, HOT_KEY_PREFIX))
+            .collect(),
+    ))
 }
 
 /// The variable `variable` that `variables` hold, of the vendor GUID `vendor` if given, decoded:
@@ -339,8 +428,9 @@ impl Serialize for LoadOptionData {
 }
 
 /// The flags of a load option's Attributes (UEFI 2.11 §3.1.3), LOAD_OPTION_ and these names.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum LoadOptionFlag {
+pub enum LoadOptionFlag {
     Active,
     ForceReconnect,
     Hidden,
@@ -349,8 +439,8 @@ pub(crate) enum LoadOptionFlag {
 impl LoadOptionFlag {
     const ALL: [Self; 3] = [Self::Active, Self::ForceReconnect, Self::Hidden];
 
-    /// The name that variable get prints.
-    pub(crate) fn name(self) -> &'static str {
+    /// The name that variable get prints and set-attributes takes.
+    pub fn name(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::ForceReconnect => "force-reconnect",
@@ -369,8 +459,9 @@ impl LoadOptionFlag {
 
 /// The values of the LOAD_OPTION_CATEGORY field that UEFI 2.11 §3.1.3 defines, LOAD_OPTION_CATEGORY_
 /// and these names.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum LoadOptionCategory {
+pub enum LoadOptionCategory {
     Boot,
     App,
 }
@@ -378,8 +469,8 @@ pub(crate) enum LoadOptionCategory {
 impl LoadOptionCategory {
     const ALL: [Self; 2] = [Self::Boot, Self::App];
 
-    /// The name that variable get prints.
-    pub(crate) fn name(self) -> &'static str {
+    /// The name that variable get prints and set-attributes takes.
+    pub fn name(self) -> &'static str {
         match self {
             Self::Boot => "boot",
             Self::App => "app",
@@ -528,6 +619,25 @@ enum VendorError {
     Foreign { name: String, vendor: Guid },
 }
 
+/// A name of a load option that a subcommand does not write, which it refuses before any read.
+/// The messages spell "section", as edk2's terminals but VT-UTF8 show '?' for '§'.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+enum OptionRefusal {
+    #[error("{0} takes a Boot####, Driver#### or SysPrep####, not {1}")]
+    NotLoadOption(&'static str, String),
+    #[error(
+        "{0} does not write {1}: \"These variables are only modified by firmware and are \
+         read-only to the OS.\" (UEFI 2.11 section 3.3)"
+    )]
+    PlatformRecovery(&'static str, String),
+    #[error(
+        "{0} does not write {1}, a Secure Boot Policy Variable: \"Secure Boot Policy Variables \
+         must be created using the EFI_VARIABLE_AUTHENTICATION_2 structure.\" (UEFI 2.11 section \
+         3.3); variable write-signed writes a payload signed so"
+    )]
+    OsRecovery(&'static str, String),
+}
+
 /// The data of a console variable, which holds one device path (UEFI 2.11 §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("{0} device paths, not the one of a console variable")]
@@ -549,7 +659,6 @@ mod tests {
     use crate::efi_variables::globals::tests::NV_BS_RT;
     use crate::efi_variables::key_option::boot_option_crc;
     use crate::efi_variables::key_option::tests::X64_KEY0000;
-    use crate::hii::VariableAttributes;
 
     /// A vendor GUID of OsRecovery####: the formset GUID of EDK2's DriverSample
     const RECOVERY_VENDOR: &str = "A04A27F4-DF00-4D42-B552-39511302113D";

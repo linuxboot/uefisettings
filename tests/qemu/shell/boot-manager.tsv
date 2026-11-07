@@ -1,9 +1,40 @@
 # The checks of shell/boot-manager.nsh, the UEFI Shell boot of boot-manager: get shows Boot0099 and
-# Key0099 as tests/qemu/vars/boot-manager.json seeds them, as Linux showed them in boot 1. See
-# check-shell-log.sh.
+# Key0099 as tests/qemu/vars/boot-manager.json seeds them, as Linux showed them in boot 1;
+# set-attributes refuses PlatformRecovery####, OsRecovery####, an absent load option and a flag both
+# to set and to clear, leaving the global variables as they were; it clears and sets Boot0099's
+# LOAD_OPTION_ACTIVE, keeping its undefined bit, and Key0099 follows it, and sets and clears
+# Driver0000's LOAD_OPTION_FORCE_RECONNECT, as Linux did in boot 1. See check-shell-log.sh.
 seeded-boot0099	status	0x0
 seeded-boot0099	json	. == {"variable": "Boot0099-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"attributes": ["active", "0x40000000"], "category": "boot", "description": "file missing-99.efi", "device_paths": ["\\missing-99.efi"], "optional_data": "7565666973657474696e6773"}}
 seeded-boot0099	linux	boot1.test.log seeded-boot0099 . == $linux
 seeded-key0099	status	0x0
 seeded-key0099	json	. == {"variable": "Key0099-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"revision": 0, "modifiers": ["control"], "keys": ["q"], "boot_option": "Boot0099", "crc_matches": true}}
 seeded-key0099	linux	boot1.test.log seeded-key0099 . == $linux
+before-refusals	status	any
+platform-recovery	status	aborted
+platform-recovery	line	set-attributes does not write PlatformRecovery0000: .*read-only to the OS
+os-recovery	status	aborted
+os-recovery	line	set-attributes does not write OsRecovery0000, a Secure Boot Policy Variable
+absent	status	aborted
+absent	line	Boot1234 is absent
+set-and-clear	status	aborted
+set-and-clear	line	set-attributes cannot both set and clear active
+after-refusals	status	any
+after-refusals	same	before-refusals
+inactive-boot0099	status	0x0
+inactive-boot0099	json-line	. == {"variable": "Boot0099-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"attributes": ["0x40000000"], "category": "boot", "description": "file missing-99.efi", "device_paths": ["\\missing-99.efi"], "optional_data": "7565666973657474696e6773"}}
+inactive-boot0099	line	^updated Key0099: its BootOptionCrc is the CRC-32 of the Boot#### that it starts again
+inactive-key0099	status	0x0
+inactive-key0099	json	. == {"variable": "Key0099-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"revision": 0, "modifiers": ["control"], "keys": ["q"], "boot_option": "Boot0099", "crc_matches": true}}
+inactive-key0099	linux	boot1.test.log inactive-key0099 . == $linux
+active-boot0099	status	0x0
+active-boot0099	json-line	. == {"variable": "Boot0099-8be4df61-93ca-11d2-aa0d-00e098032b8c", "attributes": 7, "value": {"attributes": ["active", "0x40000000"], "category": "boot", "description": "file missing-99.efi", "device_paths": ["\\missing-99.efi"], "optional_data": "7565666973657474696e6773"}}
+active-boot0099	line	^updated Key0099: its BootOptionCrc is the CRC-32 of the Boot#### that it starts again
+active-key0099	status	0x0
+active-key0099	same	seeded-key0099
+driver-force-reconnect	status	0x0
+driver-force-reconnect	json	.variable == "Driver0000-8be4df61-93ca-11d2-aa0d-00e098032b8c" and .value.attributes == ["active", "force-reconnect"]
+driver-force-reconnect	linux	boot1.test.log driver-force-reconnect . == $linux
+driver-reconnect-cleared	status	0x0
+driver-reconnect-cleared	json	.variable == "Driver0000-8be4df61-93ca-11d2-aa0d-00e098032b8c" and .value.attributes == ["active"]
+driver-reconnect-cleared	linux	boot1.test.log driver-reconnect-cleared . == $linux

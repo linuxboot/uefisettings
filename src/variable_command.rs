@@ -47,6 +47,8 @@ use crate::UnsafeArgs;
 use crate::UNSAFE_ARG;
 
 #[cfg(variable_data)]
+mod boot_manager;
+#[cfg(variable_data)]
 mod write_signed;
 
 #[derive(Debug, Parser)]
@@ -116,6 +118,9 @@ enum VariableSubcommands {
     #[command(next_display_order = None)]
     // Boxed, as its arguments outgrow every other variant's (clippy::large_enum_variant).
     WriteSigned(Box<write_signed::WriteSignedArgs>),
+    #[cfg(variable_data)]
+    #[command(flatten)]
+    BootManager(boot_manager::BootManagerSubcommands),
 }
 
 /// What variable set refuses without --i-am-fine-to-brick-this-system.
@@ -217,6 +222,8 @@ impl VariableCommand {
             VariableSubcommands::Storage { attributes } => storage(attributes),
             #[cfg(variable_data)]
             VariableSubcommands::WriteSigned(args) => args.run(),
+            #[cfg(variable_data)]
+            VariableSubcommands::BootManager(command) => command.run(),
         }
     }
 }
@@ -268,7 +275,7 @@ fn print_global(name: &str, guid: Option<&str>) -> Result<()> {
     print_global_variable(&VariableBackend::get(name, guid)?)
 }
 
-/// Prints `global` as one line of JSON, for print_global and set.
+/// Prints `global` as one line of JSON, for print_global, set and the boot manager's writes.
 #[cfg(variable_data)]
 fn print_global_variable(global: &GlobalVariable) -> Result<()> {
     print_json(global)?;
@@ -356,7 +363,8 @@ mod tests {
                 #[cfg(variable_data)]
                 parsed @ (VariableSubcommands::Get { .. }
                 | VariableSubcommands::Set(_)
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no list: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::Storage { .. } => {
@@ -378,7 +386,8 @@ mod tests {
             #[cfg(variable_data)]
             parsed @ (VariableSubcommands::Get { .. }
             | VariableSubcommands::Set(_)
-            | VariableSubcommands::WriteSigned(_)) => {
+            | VariableSubcommands::WriteSigned(_)
+            | VariableSubcommands::BootManager(_)) => {
                 panic!("{args:?} is no info: {parsed:?}")
             }
             parsed @ (VariableSubcommands::List { .. } | VariableSubcommands::Storage { .. }) => {
@@ -419,7 +428,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Set(_)
                 | VariableSubcommands::Storage { .. }
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no get: {parsed:?}")
                 }
             };
@@ -452,7 +462,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Get { .. }
                 | VariableSubcommands::Storage { .. }
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no set: {parsed:?}")
                 }
             };
@@ -517,7 +528,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Get { .. }
                 | VariableSubcommands::Storage { .. }
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no set: {parsed:?}")
                 }
             };
@@ -581,7 +593,8 @@ mod tests {
                 #[cfg(variable_data)]
                 parsed @ (VariableSubcommands::Get { .. }
                 | VariableSubcommands::Set(_)
-                | VariableSubcommands::WriteSigned(_)) => {
+                | VariableSubcommands::WriteSigned(_)
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{args:?} is no storage: {parsed:?}")
                 }
                 parsed @ VariableSubcommands::List { .. } => {

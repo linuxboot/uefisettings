@@ -370,7 +370,8 @@ mod tests {
                 parsed @ (VariableSubcommands::List { .. }
                 | VariableSubcommands::Get { .. }
                 | VariableSubcommands::Set { .. }
-                | VariableSubcommands::Storage { .. }) => {
+                | VariableSubcommands::Storage { .. }
+                | VariableSubcommands::BootManager(_)) => {
                     panic!("{argv:?} is no write-signed: {parsed:?}")
                 }
             },

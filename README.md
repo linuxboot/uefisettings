@@ -140,21 +140,25 @@ writes no variable of a HiiDB with such a password question or with IFR that it 
 
 ```plain
 Commands:
-  get           Show the attributes and the decoded value of a global variable of UEFI 2.11 section
-                3.3, its load options, hot keys and device paths as text among them, or of a
-                signature database, or that it is absent
-  help          Print this message or the help of the given subcommand(s)
-  info          Show the attributes and the size of an EFI variable, and the
-                EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access,
-                never its data
-  list          List the name and vendor GUID of every EFI variable, never its data
-  set           Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
-                BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications; or,
-                in the UEFI Shell, AuditMode and DeployedMode with --i-am-fine-to-brick-this-system
-  storage       Show the storage space of the EFI variables of some attributes, and how much of it
-                is left
-  write-signed  Write an EFI variable from a signed payload, or from new data that a key signs; the
-                firmware verifies the signature
+  get             Show the attributes and the decoded value of a global variable of UEFI 2.11
+                  section 3.3, its load options, hot keys and device paths as text among them, or of
+                  a signature database, or that it is absent
+  help            Print this message or the help of the given subcommand(s)
+  info            Show the attributes and the size of an EFI variable, and the
+                  EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access,
+                  never its data
+  list            List the name and vendor GUID of every EFI variable, never its data
+  set             Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
+                  BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications; or,
+                  in the UEFI Shell, AuditMode and DeployedMode with
+                  --i-am-fine-to-brick-this-system
+  set-attributes  Set and clear the flags and set the category of a Boot####, Driver#### or
+                  SysPrep####, keeping its other bits and bytes, and the Key#### of a Boot####
+                  following it
+  storage         Show the storage space of the EFI variables of some attributes, and how much of it
+                  is left
+  write-signed    Write an EFI variable from a signed payload, or from new data that a key signs;
+                  the firmware verifies the signature
 ```
 
 `capsule`:
@@ -705,6 +709,33 @@ firmware departure that set reports as returned.
 
 ```plain
 FS0:\> uefisettings.efi variable set DeployedMode 1 --i-am-fine-to-brick-this-system
+```
+
+`variable set-attributes NAME [--set FLAGS] [--clear FLAGS] [--category CATEGORY]` changes the
+Attributes (UEFI 2.11 §3.1.3) of a Boot####, Driver#### or SysPrep#### of EFI_GLOBAL_VARIABLE:
+`--set` and `--clear` take the flags `active`, `force-reconnect` and `hidden`, comma-separated, and
+`--category` `boot` or `app` gives the LOAD_OPTION_CATEGORY field a value, clearing the whole field
+first, a reserved value too; no flag names the bit of LOAD_OPTION_CATEGORY_APP. It patches the
+Attributes in place: "When updating a load option, all undefined attribute bits must be preserved",
+and every other byte stays as read, which a decode and encode would not keep for a Description
+holding a surrogate. The variable keeps its attributes. It prints the load option as `variable get`
+shows it. A Key#### starts its Boot#### only while its BootOptionCrc is the CRC-32 of that Boot####
+(§3.1.6), so after writing a Boot####, set-attributes sets the BootOptionCrc of each Key#### whose
+BootOption names it and whose BootOptionCrc was the CRC-32 of its old bytes to that of the new ones,
+every other byte kept, and prints each Key#### updated on stderr. A Key#### that is malformed, names
+another Boot#### or was already stale stays as it was. A Key#### write that fails names the Boot####
+as written, the Key#### updated and each one left with the old BootOptionCrc. Windows, whose calls
+cannot list variables, finds none, and set-attributes warns that the Key#### that name the Boot####
+are now ignored there. It refuses, before any write, PlatformRecovery####, which "are only modified
+by firmware and are read-only to the OS" (§3.3), OsRecovery####, a Secure Boot Policy Variable that
+needs EFI_VARIABLE_AUTHENTICATION_2 (§3.3), any other variable, an absent load option, a change of
+nothing and a flag both to set and to clear. It refuses too a load option, or a Key#### following
+it, whose attributes hold EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS or
+EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which only an EFI_VARIABLE_AUTHENTICATION_3 or
+_2 descriptor writes (§8.2.3).
+
+```sh
+uefisettings variable set-attributes Boot0001 --clear active
 ```
 
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)

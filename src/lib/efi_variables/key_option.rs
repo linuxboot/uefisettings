@@ -22,6 +22,9 @@ use thiserror::Error;
 
 /// KeyData, BootOptionCrc and BootOption, before the keys
 const KEY_OPTION_HEADER_SIZE: usize = 10;
+/// Where BootOptionCrc starts, after KeyData, and where BootOption starts, after BootOptionCrc
+const BOOT_OPTION_CRC_OFFSET: usize = 4;
+const BOOT_OPTION_OFFSET: usize = 8;
 /// ScanCode and UnicodeChar, the fields of an EFI_INPUT_KEY
 const INPUT_KEY_SIZE: usize = 4;
 /// The shift states and Reserved bits of KeyData, between Revision, its low byte, and
@@ -239,6 +242,15 @@ impl KeyOption {
     pub(crate) fn matches(&self, boot_option_bytes: &[u8]) -> bool {
         self.boot_option_crc == boot_option_crc(boot_option_bytes)
     }
+}
+
+/// `bytes`, an EFI_KEY_OPTION, with BootOptionCrc `crc` and every other byte as read.
+pub(crate) fn with_boot_option_crc(bytes: &[u8], crc: u32) -> Vec<u8> {
+    let mut changed = bytes.to_vec();
+    if let Some(field) = changed.get_mut(BOOT_OPTION_CRC_OFFSET..BOOT_OPTION_OFFSET) {
+        field.copy_from_slice(&crc.to_le_bytes());
+    }
+    changed
 }
 
 /// BootOptionCrc: "the CRC-32 of the entire EFI_LOAD_OPTION", the Boot#### variable's value,

@@ -55,12 +55,28 @@ use crate::efi_variables::authenticated::SignedWrite;
 pub use crate::efi_variables::authenticated::TimeStamp;
 #[cfg(variable_data)]
 pub use crate::efi_variables::authenticated::TimeStampError;
+#[cfg(variable_names)]
+use crate::efi_variables::boot_manager::hot_key_listing;
+#[cfg(variable_data)]
+use crate::efi_variables::boot_manager::set_attributes;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::AttributeChange;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::AttributesSet;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::DevicePathText;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::HotKey;
 #[cfg(variable_data)]
+use crate::efi_variables::boot_manager::HotKeyListing;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::HotKeysFollowing;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::LoadOptionCategory;
+#[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::LoadOptionData;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::LoadOptionFlag;
 #[cfg(capsule_delivery)]
 use crate::efi_variables::deliver_json_capsule;
 #[cfg(variable_data)]
@@ -538,6 +554,35 @@ pub struct SignedVariableWrite<'a> {
     /// Boot Policy Variable or a device signature database (any variable of
     /// EFI_DEVICE_SECURITY_DATABASE_GUID) while SetupMode is 1 or tells no mode
     pub unsafe_operations: UnsafeOperations,
+}
+
+/// The variables of the boot manager that the OS writes (UEFI 2.11 §3.1).
+#[cfg(variable_data)]
+impl VariableBackend {
+    /// Sets and clears the flags and sets the category of the load option `name`, a Boot####,
+    /// Driver#### or SysPrep#### of EFI_GLOBAL_VARIABLE, as `change` says, every other bit and
+    /// byte kept, and updates the BootOptionCrc of each Key#### that followed a Boot#### to
+    /// follow it still; returns what it wrote.
+    pub fn set_attributes(name: &str, change: &AttributeChange) -> Result<AttributesSet> {
+        set_attributes(
+            &Self::system_variable_data()?,
+            &Self::hot_key_listing()?,
+            name,
+            change,
+        )
+    }
+
+    /// The Key#### variables of this machine.
+    #[cfg(variable_names)]
+    fn hot_key_listing() -> Result<HotKeyListing> {
+        hot_key_listing(&Self::system_variable_names())
+    }
+
+    /// That the Key#### variables cannot be listed, as Windows gives programs no names.
+    #[cfg(not(variable_names))]
+    fn hot_key_listing() -> Result<HotKeyListing> {
+        Ok(HotKeyListing::Unlisted)
+    }
 }
 
 #[cfg(variable_storage_info)]

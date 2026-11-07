@@ -499,7 +499,8 @@ its variable store with `Boot0099`, a load option of a file that no ESP holds, w
 undefined attribute bit and OptionalData, which `BootOrder` does not list, and `Key0099`, a hot
 key, CTRL-q, to `Boot0099`, whose `BootOptionCrc` is the CRC-32 of that `Boot0099`. The
 firmware's boot manager keeps both, as it keeps every load option that it did not create, and
-ignores a key whose CRC does not match.
+ignores a key whose CRC does not match. Its `Driver0000` loads `DriverSample.efi`, as in the HII
+scenarios.
 
 ## Secure Boot
 
