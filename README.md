@@ -189,7 +189,8 @@ and the `hii` commands but `extract-db` and `dump-efivars` in the UEFI Shell, be
 it also reaches boot-service-only variables and the Time Services, which date and time questions
 of EFI Date/Time Storage read and write, and has no `-f` or `--efivars`. It reads the HiiDB
 through the HII Database Protocol, and accepts `--hii-source` and `--efivar-memory` only to ignore
-them.
+them. Its `apply-staged` applies a set that `set` staged from Linux or Windows for the next boot:
+see the [appendix](#appendix).
 
 ```sh
 rustup target add x86_64-unknown-uefi  # or i686-unknown-uefi, aarch64-unknown-uefi
@@ -200,8 +201,8 @@ cargo build --release --target x86_64-unknown-uefi
 FS0:\> uefisettings.efi hii get --json "Activate this check box"
 ```
 
-Exit statuses, setup passwords, `variable`, capsules and Secure Boot: see the
-[appendix](#appendix).
+Exit statuses, setup passwords, `variable`, capsules, Secure Boot and sets staged for the next
+boot: see the [appendix](#appendix).
 
 ---
 
@@ -220,7 +221,8 @@ when such a driver is installed, `hii extract-db` writes its HiiDB to a file. `-
 variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
 reach EFI variables only. `capsule config-data` and `capsule result-table` fail too:
 `uefisettings` reads the configuration tables of the EFI System Table only in the UEFI Shell, and on
-Linux on x86, x86_64 and aarch64.
+Linux on x86, x86_64 and aarch64. As on Linux, `set` stages a question whose value only its driver
+holds for the next boot, through the ESP's volume: see the [appendix](#appendix).
 
 ---
 
@@ -259,7 +261,7 @@ otherwise.
 | Operation | Commands | Build | Consequence |
 |---|---|---|---|
 | A write in a HiiDB that declares a setup password question | `set`, `hii set`, `hii keyword set` | UEFI Shell | No password is asked or checked, as the UEFI Shell runs no setup browser |
-| A set staged for the next boot in a HiiDB that declares a setup password question | `set`, `hii set`, which record the flag for `apply-staged` | Linux | The next boot applies it before the OS, where no setup browser asks for or checks the password |
+| A set staged for the next boot in a HiiDB that declares a setup password question | `set`, `hii set`, which record the flag for `apply-staged` | Linux, Windows | The next boot applies it before the OS, where no setup browser asks for or checks the password |
 | A write of a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only | `set`, `hii set` | Linux, UEFI Shell, Windows | A value changes that the firmware declares read-only; the Keyword Handler refuses it as "a violation of system policy" (UEFI 2.11 §35.3.2) |
 | A signed write of a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware writes it without checking the signature (UEFI 2.11 §3.3, §32.3) |
 | A signed write of a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware may write it without checking the signature (UEFI 2.11 §32.6.3) |
@@ -565,10 +567,11 @@ and `set` refuses it, with or without a VarStore:
 WRITE sets no VarStore. A browser lets the driver override READ with
 CallBack(EFI_BROWSER_ACTION_RETRIEVE) and calls CallBack() around WRITE, so a question with
 EFI_IFR_FLAG_CALLBACK is its driver's to answer. On Linux, Windows and macOS, which run after
-ExitBootServices(), when no EFI device-handle-based protocol may be used (UEFI 2.11 §7.4.6), the
-refusal points to `uefisettings.efi` in the UEFI Shell, which calls CallBack(): see the UEFI Shell
-details. `hii list-questions` and `hii show-ifr` never call CallBack(): they show such a question
-with the refusal of `get`.
+ExitBootServices(), when no EFI device-handle-based protocol may be used (UEFI 2.11 §7.4.6), `get`
+refuses such a question and points to `uefisettings.efi` in the UEFI Shell, which calls CallBack():
+see the UEFI Shell details; `set` on Linux and Windows stages it for the next boot instead: see the
+sets staged for the next boot. `hii list-questions` and `hii show-ifr` never call CallBack(): they
+show such a question with the refusal of `get`.
 
 </details>
 
@@ -872,9 +875,11 @@ The UEFI Shell runs no setup browser, so nothing there asks for or checks a setu
 HiiDB that declares a password question, `set` writes nothing unless
 `--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)). A set
 staged for the next boot follows the same rule, as `apply-staged` applies it before the OS: on
-Linux, `set` stages a question whose value only its driver holds in such a HiiDB only with
-`--i-am-fine-to-brick-this-system`, which it records with the question and which `apply-staged`
-honours.
+Linux and Windows, `set` stages a question whose value only its driver holds in such a HiiDB only
+with `--i-am-fine-to-brick-this-system`, which it records with the question and which
+`apply-staged` honours. Under Secure Boot, any `uefisettings.efi` that db trusts thus lets an OS
+administrator stage requests with `--i-am-fine-to-brick-this-system` that `apply-staged` honours
+before the OS, with no setup password: sign it only with keys whose machines accept that.
 
 `set` refuses a variable without EFI_VARIABLE_NON_VOLATILE unless `--allow-volatile` is given.
 The UEFI Shell runs before ExitBootServices, when SetVariable() still sets volatile variables
@@ -941,7 +946,8 @@ A question without a VarStore whose value only its driver keeps (EFI_IFR_FLAG_CA
 browser actions that a forms browser sends, as no forms browser runs. `get` sends FORM_OPEN,
 RETRIEVE and FORM_CLOSE, and shows the value that RETRIEVE gave. Only `get` and `set` call a driver:
 `list-questions`, `show-ifr`, the dumps and `get --no-efivars` show why such a question has no
-value, and so do `get` and `set` on Linux, Windows and macOS.
+value, and so does `get` on Linux, Windows and macOS, while `set` on Linux and Windows stages it for
+the next boot.
 
 uefisettings exchanges a value with Callback() only for a one-of, numeric or checkbox question: it
 refuses an ordered-list or string question, or a date or time question outside EFI Date/Time
@@ -989,5 +995,78 @@ the FormSet's stores, where nothing here can see it.
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
 machine's db trusts.
+
+</details>
+
+<details>
+<summary>Sets staged for the next boot</summary>
+
+Boot services, and with them every driver's EFI_HII_CONFIG_ACCESS_PROTOCOL.Callback(), end at
+ExitBootServices(), so from Linux or Windows `set` cannot reach a question whose value only its
+driver holds. It stages the request instead: the next boot starts `uefisettings.efi` from the EFI
+system partition (ESP) before the OS, from a Boot#### load option that BootNext names (UEFI 2.11
+§3.1.2), and that applies the set as `set` in the UEFI Shell does.
+
+```sh
+uefisettings set "<question>" "<value>" --image uefisettings.efi
+```
+
+`--image` names the `uefisettings.efi` to stage; under Secure Boot it must be signed for db, as the
+firmware starts no image whose signature db lacks (UEFI 2.11 §32.4.2). `set` copies it to
+`\EFI\uefisettings\uefisettings.efi` on the ESP, only as a new file, and reads the copy back to
+compare its SHA-256; a file there already, which a `set` running at the same time may have placed,
+fails `set` and stays. Then it records the set in the EFI variable `UefisettingsStagedSet` of
+uefisettings' own vendor GUID, writes the lowest Boot#### that neither exists nor BootOrder or
+BootNext names, ACTIVE and HIDDEN and in no BootOrder, so that no boot starts it unattended, whose
+device path is the ESP's Hard Drive node and the image's File Path node, and last writes BootNext. A
+step that fails undoes the ones before it. A `set` before that boot appends its request to the
+staged set and needs no `--image`.
+
+The ESP is the partition that the Hard Drive node of BootCurrent's Boot#### names: a GPT partition
+by its UniquePartitionGUID, an MBR one by its disk signature and partition number. When that
+Boot#### has no Hard Drive node, it is the only ESP. Staging refuses when no partition or several
+match, and names each one and why it is no match. On Linux the ESP must be mounted, at a mount point
+that no later mount shadows. On Windows `set` finds it among the volumes and writes through its
+volume GUID path; where Windows does not let it, mount the ESP with `mountvol S: /s` and pass `--esp
+S:`, and `set` checks that the volume there is that ESP. Windows refuses these calls without
+Administrator, and `set` says so.
+
+`set` does not stage while BootNext names another Boot####, which staging would replace, while
+OsIndications asks the next boot for the firmware's user interface or for recovery, which would not
+start BootNext's option unattended (UEFI 2.11 §8.5.4), while OsIndications has
+FILE_CAPSULE_DELIVERY_SUPPORTED and `\EFI\UpdateCapsule` on the ESP holds a file, as processing that
+capsule on disk clears BootNext without starting its option (UEFI 2.11 §8.5.5), or while
+`\EFI\uefisettings` holds a file that the staged set does not name. `set` checks these, the ESP and
+`--image` before it writes any question. It stages after it writes the EFI variables of the other
+matches, as the UEFI Shell build sends the value to the drivers after them, and its error names a
+staged question by its package list, followed by `(staged for the next boot)`.
+
+Staging and `apply-staged` write no byte of a password question: a write over one fails, staging
+then undoes the steps before it, and `apply-staged` applies no request if it could not record its
+start. Where `apply-staged` cannot tell those bytes, as for a password question whose VarStore it
+does not find, it writes nothing, so `set` refuses to stage that set.
+
+Before the OS, `uefisettings.efi apply-staged <nonce>` records in `UefisettingsStagedOutcome` that
+it started, before the first Callback(), then sets each request's question through its driver's
+Callback()s and records each result. It checks each request as `set` does, against
+`--i-am-fine-to-brick-this-system` as `set` recorded it with the request (see
+[Unsafe operations](#unsafe-operations)): a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only
+by then, or a HiiDB that declares a setup password question, is applied only with it, and the
+result keeps a warning for each operation that the flag let through. A nonce whose outcome is
+recorded already applies nothing again, as when its Boot#### starts a second time after a crash or
+a failed deletion. It deletes the set's Boot#### and a BootNext that names it, but no other tool's
+BootNext, prints each result after its `warning:` lines and each deletion, and resets the platform
+cold, so that the OS starts in a boot whose boot path holds no `uefisettings.efi`. On Linux and
+Windows, `get` of such a question then shows what the records tell: its value staged for the next
+boot, or what the last staged boot did, which is applied, refused with the reason, stopped while it
+applied the set, which may then be partly applied, or never started, with the warnings of an
+applied or refused request.
+The next `set` that stages settles the old set: it records its outcome, which `get` keeps showing,
+and deletes its image and its record. The firmware may remove a Boot#### that nothing references
+(UEFI 2.11 §3.1.1); `set` deletes it otherwise, but not one that no longer holds the set's command
+line, nor an image whose SHA-256 changed.
+
+[UNVERIFIED] No firmware here has booted a copy that Windows staged, and `--esp` has not run through
+a real `mountvol` mount point.
 
 </details>
