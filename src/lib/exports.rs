@@ -35,6 +35,8 @@ use crate::efi_variables::authenticated::signing::Signer;
 #[cfg(variable_data)]
 use crate::efi_variables::authenticated::write_signed;
 #[cfg(variable_data)]
+pub use crate::efi_variables::authenticated::SetupModeWrite;
+#[cfg(variable_data)]
 pub use crate::efi_variables::authenticated::SignatureDigest;
 #[cfg(variable_data)]
 use crate::efi_variables::authenticated::SignedWrite;
@@ -218,19 +220,26 @@ impl VariableBackend {
     /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C" (UEFI 2.11 §8.2.6), with `attributes` and
     /// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS; the firmware verifies its signature.
     /// Refuses, before any write, other attributes, a payload without a complete descriptor,
-    /// attributes without access or a payload that would delete the variable, and a Secure Boot
-    /// Policy Variable in Setup Mode.
+    /// attributes without access or a payload that would delete the variable, and, unless
+    /// `setup_mode` allows it, a Secure Boot Policy Variable in Setup Mode.
     pub fn write_signed(
         name: &str,
         vendor: &str,
         attributes: VariableAttributes,
         payload: &[u8],
+        setup_mode: SetupModeWrite,
     ) -> Result<()> {
         let key = VariableKey {
             name: name.to_owned(),
             guid: parse_vendor(vendor)?,
         };
-        write_signed(&Self::system_variable_data()?, &key, attributes, payload)
+        write_signed(
+            &Self::system_variable_data()?,
+            &key,
+            attributes,
+            payload,
+            setup_mode,
+        )
     }
 
     /// Signs `write` with the PEM RSA key `signing_key` into an EFI_VARIABLE_AUTHENTICATION_2
@@ -255,6 +264,7 @@ impl VariableBackend {
                 attributes: write.attributes,
                 data: write.data,
                 timestamp: write.timestamp,
+                setup_mode: write.setup_mode,
             },
             &signer,
             &mut PlatformSeed::default(),
@@ -278,6 +288,8 @@ pub struct SignedVariableWrite<'a> {
     pub timestamp: TimeStamp,
     /// The digest of the signature
     pub digest: SignatureDigest,
+    /// Whether a Secure Boot Policy Variable is written while SetupMode is 1
+    pub setup_mode: SetupModeWrite,
 }
 
 #[cfg(variable_storage_info)]

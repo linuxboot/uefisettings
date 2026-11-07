@@ -318,7 +318,8 @@ db_guid=d719b2cb-3d3a-4596-a3bc-dad00e67656f
 # the foreign key, as db-foreign.auth; and a write of a text of its own to WriteSignedProbe, a
 # new variable of the tests' vendor GUID, without EFI_VARIABLE_APPEND_WRITE and signed with KEK,
 # as probe-write.auth. In sign/, for uefisettings to sign with in both kinds of boots: the keys
-# and certificates of KEK, db and the foreign key; ca.key and ca.crt, of a CA that KEK issues,
+# and certificates of PK, KEK, db and the foreign key, and the EFI_SIGNATURE_LISTs of PK's and
+# KEK's certificates, PK.esl and KEK.esl; ca.key and ca.crt, of a CA that KEK issues,
 # and leaf.key and leaf.crt, of a certificate that the CA issues, with chain.pem, the leaf's
 # certificate then the CA's; an EFI_SIGNATURE_LIST of a certificate of its own for each db
 # append, sha256.esl, sha384.esl, sha512.esl, chain.esl and refused.esl; and two texts of a
@@ -333,8 +334,11 @@ secboot_files() {
             -out "$keys/$each.crt" 2>>"$keys/openssl.log"
     done
     mkdir "$keys/sign"
-    for each in KEK db foreign; do
+    for each in PK KEK db foreign; do
         cp "$keys/$each.key" "$keys/$each.crt" "$keys/sign/"
+    done
+    for each in PK KEK; do
+        "$here/auth-payload.sh" x509-esl "$secboot_owner" "$keys/$each.crt" "$keys/sign/$each.esl"
     done
     openssl req -x509 -newkey rsa:2048 -noenc -days 2 -sha256 -subj "/CN=uefisettings test CA" \
         -CA "$keys/KEK.crt" -CAkey "$keys/KEK.key" -addext basicConstraints=critical,CA:TRUE \

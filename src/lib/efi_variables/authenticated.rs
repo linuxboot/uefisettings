@@ -79,33 +79,43 @@ const SIGNED_WRITE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLA
     .union(VariableAttributes::APPEND_WRITE)
     .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
 
+/// Whether a signed write of a Secure Boot Policy Variable goes ahead while SetupMode is 1, when
+/// the firmware writes it without checking its signature (UEFI 2.11 §8.2.6, §32.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetupModeWrite {
+    Refuse,
+    WithoutSignatureCheck,
+}
+
 /// Writes `payload`, an EFI_VARIABLE_AUTHENTICATION_2 descriptor and the new data of the
 /// variable `key` (UEFI 2.11 §8.2.6), through `variables` with `attributes` and
 /// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS. Before any write, it refuses other
 /// attributes, attributes without access, a payload without a complete descriptor, one without
-/// data unless it appends, either of which would delete the variable, and a Secure Boot Policy
-/// Variable while SetupMode is 1.
+/// data unless it appends, either of which would delete the variable, and, unless `setup_mode`
+/// allows it, a Secure Boot Policy Variable while SetupMode is 1.
 pub(crate) fn write_signed(
     variables: &impl VariableData,
     key: &VariableKey,
     attributes: VariableAttributes,
     payload: &[u8],
+    setup_mode: SetupModeWrite,
 ) -> Result<()> {
     let attributes = signed_write_attributes(attributes)?;
     let value = auth2_value(payload)?;
-    refuse_deletion_and_setup_mode(variables, key, attributes, value)?;
+    refuse_deletion_and_setup_mode(variables, key, attributes, value, setup_mode)?;
     variables.set_variable(key, &VariableContents::new(attributes, payload.to_vec())?)
 }
 
 /// A write that sign_and_write signs: `data`, the new data of the variable `key`, with
 /// `attributes`, to which it adds EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, at
-/// `timestamp`.
+/// `timestamp`, and whether it goes ahead in Setup Mode.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SignedWrite<'a> {
     pub(crate) key: &'a VariableKey,
     pub(crate) attributes: VariableAttributes,
     pub(crate) data: &'a [u8],
     pub(crate) timestamp: TimeStamp,
+    pub(crate) setup_mode: SetupModeWrite,
 }
 
 /// Signs `write` with `signer` into an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 §8.2.6), blinded
@@ -118,7 +128,13 @@ pub(crate) fn sign_and_write(
     seed: &mut impl SeedSource,
 ) -> Result<()> {
     let attributes = signed_write_attributes(write.attributes)?;
-    refuse_deletion_and_setup_mode(variables, write.key, attributes, write.data)?;
+    refuse_deletion_and_setup_mode(
+        variables,
+        write.key,
+        attributes,
+        write.data,
+        write.setup_mode,
+    )?;
     let mut rng = seeded_rng(seed)?;
     let payload = signer.authentication_2(
         &AuthenticatedWrite {
@@ -133,18 +149,24 @@ pub(crate) fn sign_and_write(
 }
 
 /// Refuses a write of `value`, the new data of `key`, with `attributes`, that would delete the
-/// variable, as no data without APPEND_WRITE does (UEFI 2.11 §8.2.3), and one of a Secure Boot
-/// Policy Variable while SetupMode is 1, which the firmware makes without checking the signature.
+/// variable, as no data without APPEND_WRITE does (UEFI 2.11 §8.2.3), and, unless `setup_mode`
+/// allows it, one of a Secure Boot Policy Variable while SetupMode is 1, which the firmware makes
+/// without checking the signature.
 fn refuse_deletion_and_setup_mode(
     variables: &impl VariableData,
     key: &VariableKey,
     attributes: VariableAttributes,
     value: &[u8],
+    setup_mode: SetupModeWrite,
 ) -> Result<()> {
     if value.is_empty() && !attributes.contains(VariableAttributes::APPEND_WRITE) {
         return Err(SignedWriteRefusal::Delete(key.clone()).into());
     }
-    if is_secure_boot_policy_variable(key) && in_setup_mode(variables)? {
+    let refused = match setup_mode {
+        SetupModeWrite::Refuse => is_secure_boot_policy_variable(key) && in_setup_mode(variables)?,
+        SetupModeWrite::WithoutSignatureCheck => false,
+    };
+    if refused {
         return Err(SignedWriteRefusal::SetupModePolicyWrite(key.clone()).into());
     }
     Ok(())
@@ -454,8 +476,14 @@ mod tests {
         for (case, key, attributes, payload, set_attributes) in cases {
             let variables = firmware(Some(&[0]));
 
-            write_signed(&variables, &key, attributes, &payload)
-                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            write_signed(
+                &variables,
+                &key,
+                attributes,
+                &payload,
+                SetupModeWrite::Refuse,
+            )
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
 
             assert_eq!(
                 held(&variables, &key),
@@ -577,6 +605,7 @@ mod tests {
                 &db,
                 NV_BS_RT | VariableAttributes::APPEND_WRITE,
                 &payload,
+                SetupModeWrite::Refuse,
             )
             .expect_err(&case);
 
@@ -593,8 +622,14 @@ mod tests {
         let variables = firmware(Some(&[0]));
         let signed = key("Signed", VENDOR);
 
-        let error = write_signed(&variables, &signed, NV_BS_RT, &auth2(&[]))
-            .expect_err("write a payload without data");
+        let error = write_signed(
+            &variables,
+            &signed,
+            NV_BS_RT,
+            &auth2(&[]),
+            SetupModeWrite::Refuse,
+        )
+        .expect_err("write a payload without data");
 
         assert_eq!(
             error.to_string(),
@@ -644,8 +679,14 @@ mod tests {
         for key in &policy {
             let variables = firmware(Some(&[1]));
 
-            let error =
-                write_signed(&variables, key, attributes, &payload).expect_err(&key.to_string());
+            let error = write_signed(
+                &variables,
+                key,
+                attributes,
+                &payload,
+                SetupModeWrite::Refuse,
+            )
+            .expect_err(&key.to_string());
 
             assert_eq!(
                 error.to_string(),
@@ -662,8 +703,14 @@ mod tests {
             for key in &policy {
                 let variables = firmware(setup_mode);
 
-                write_signed(&variables, key, attributes, &payload)
-                    .unwrap_or_else(|error| panic!("{key}, {case}: {error:#}"));
+                write_signed(
+                    &variables,
+                    key,
+                    attributes,
+                    &payload,
+                    SetupModeWrite::Refuse,
+                )
+                .unwrap_or_else(|error| panic!("{key}, {case}: {error:#}"));
 
                 assert_eq!(
                     held(&variables, key),
@@ -675,8 +722,14 @@ mod tests {
         for key in &others {
             let variables = firmware(Some(&[1]));
 
-            write_signed(&variables, key, attributes, &payload)
-                .unwrap_or_else(|error| panic!("{key}: {error:#}"));
+            write_signed(
+                &variables,
+                key,
+                attributes,
+                &payload,
+                SetupModeWrite::Refuse,
+            )
+            .unwrap_or_else(|error| panic!("{key}: {error:#}"));
 
             assert_eq!(held(&variables, key), written(0x67, &payload), "{key}");
             assert_eq!(*variables.read.borrow(), [], "{key}: reads");
@@ -705,6 +758,7 @@ mod tests {
                 &db,
                 NV_BS_RT | VariableAttributes::APPEND_WRITE,
                 &auth2(VALUE),
+                SetupModeWrite::Refuse,
             )
             .expect_err("write with a malformed SetupMode");
 
@@ -770,8 +824,14 @@ mod tests {
         for (attributes, refusal) in cases {
             let variables = firmware(Some(&[0]));
 
-            let error = write_signed(&variables, &signed, attributes, &auth2(VALUE))
-                .expect_err(&attributes.to_string());
+            let error = write_signed(
+                &variables,
+                &signed,
+                attributes,
+                &auth2(VALUE),
+                SetupModeWrite::Refuse,
+            )
+            .expect_err(&attributes.to_string());
 
             assert_eq!(error.to_string(), refusal, "{attributes}");
             assert_eq!(*variables.set.borrow(), [], "{attributes}: writes");
@@ -803,6 +863,7 @@ mod tests {
             &db,
             NV_BS_RT | VariableAttributes::APPEND_WRITE,
             &auth2(VALUE),
+            SetupModeWrite::Refuse,
         )
         .expect_err("write db with an unreadable SetupMode");
 
@@ -812,6 +873,94 @@ mod tests {
             "refusal"
         );
         assert_eq!(*variables.0.set.borrow(), [], "writes");
+    }
+
+    /// With SetupModeWrite::WithoutSignatureCheck, write_signed writes a Secure Boot Policy
+    /// Variable while SetupMode is 1 without reading SetupMode, and still refuses a payload
+    /// that is no EFI_VARIABLE_AUTHENTICATION_2, and one without data and without APPEND_WRITE,
+    /// which edk2 takes as a deletion in Setup Mode (edk2-stable202608 AuthService.c:725-727).
+    #[test]
+    fn write_signed_writes_policy_variables_in_setup_mode_when_allowed() {
+        let kek = key("KEK", EFI_GLOBAL_VARIABLE);
+        let attributes = NV_BS_RT | VariableAttributes::APPEND_WRITE;
+        let variables = firmware(Some(&[1]));
+
+        write_signed(
+            &variables,
+            &kek,
+            attributes,
+            &auth2(VALUE),
+            SetupModeWrite::WithoutSignatureCheck,
+        )
+        .expect("write KEK in Setup Mode with the flag");
+
+        assert_eq!(held(&variables, &kek), written(0x67, &auth2(VALUE)), "KEK");
+        assert_eq!(*variables.read.borrow(), [], "reads");
+        let error = write_signed(
+            &variables,
+            &kek,
+            attributes,
+            VALUE,
+            SetupModeWrite::WithoutSignatureCheck,
+        )
+        .expect_err("write a bare signature list with the flag");
+        assert!(
+            error
+                .to_string()
+                .starts_with("the payload holds 16 bytes, fewer than"),
+            "refusal: {error}"
+        );
+
+        let variables = firmware(Some(&[1]));
+        let error = write_signed(
+            &variables,
+            &kek,
+            NV_BS_RT,
+            &auth2(&[]),
+            SetupModeWrite::WithoutSignatureCheck,
+        )
+        .expect_err("delete KEK in Setup Mode with the flag");
+        assert_eq!(
+            error.downcast_ref::<SignedWriteRefusal>(),
+            Some(&SignedWriteRefusal::Delete(kek.clone())),
+            "refusal: {error}"
+        );
+        assert_eq!(*variables.set.borrow(), [], "writes of the deletion");
+    }
+
+    /// sign_and_write refuses a signed KEK while SetupMode is 1 unless allowed: the firmware
+    /// would not check the signature.
+    #[test]
+    fn sign_and_write_refuses_setup_mode_unless_allowed() {
+        let kek = key("KEK", EFI_GLOBAL_VARIABLE);
+        let signer = signing::tests::test_signer();
+        let write = |variables: &HeldVariables, setup_mode| {
+            sign_and_write(
+                variables,
+                &SignedWrite {
+                    key: &kek,
+                    attributes: NV_BS_RT,
+                    data: VALUE,
+                    timestamp: signing::tests::TIME.parse().expect("the test TimeStamp"),
+                    setup_mode,
+                },
+                &signer,
+                &mut signing::tests::FakeSeed(Some(1)),
+            )
+        };
+
+        let refused = firmware(Some(&[1]));
+        let error = write(&refused, SetupModeWrite::Refuse).expect_err("KEK in Setup Mode");
+        assert_eq!(
+            error.downcast_ref::<SignedWriteRefusal>(),
+            Some(&SignedWriteRefusal::SetupModePolicyWrite(kek.clone())),
+            "refusal: {error}"
+        );
+        assert_eq!(*refused.set.borrow(), [], "writes without the flag");
+
+        let allowed = firmware(Some(&[1]));
+        write(&allowed, SetupModeWrite::WithoutSignatureCheck).expect("KEK with the flag");
+        assert!(held(&allowed, &kek).is_some(), "KEK written with the flag");
     }
 
     /// sign_and_write writes the descriptor that the key signs, then the data, with the
@@ -825,6 +974,7 @@ mod tests {
             attributes: NV_BS_RT | VariableAttributes::APPEND_WRITE,
             data: VALUE,
             timestamp,
+            setup_mode: SetupModeWrite::Refuse,
         };
         let signer = signing::tests::test_signer();
         let variables = firmware(Some(&[0]));
@@ -915,6 +1065,7 @@ mod tests {
                 attributes,
                 data,
                 timestamp: signing::tests::TIME.parse().expect("the test TimeStamp"),
+                setup_mode: SetupModeWrite::Refuse,
             };
 
             let error = sign_and_write(

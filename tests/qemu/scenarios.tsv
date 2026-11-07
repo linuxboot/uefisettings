@@ -94,3 +94,5 @@ shell-write-signed-user	-	-	shell:write-signed-user,write_signed/after_shell	fir
 sign-user	-	-	write_signed/signing_in_user	firmware=secboot-user
 shell-sign-user	-	-	shell:sign-user	firmware=secboot-user devices=virtio-rng
 shell-sign-no-rng	-	-	shell:sign-no-rng	firmware=secboot-user
+sign-setup	-	-	write_signed/signing_in_setup	firmware=secboot-setup
+shell-sign-setup	-	-	shell:sign-setup	firmware=secboot-setup devices=virtio-rng

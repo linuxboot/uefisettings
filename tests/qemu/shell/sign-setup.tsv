@@ -1,0 +1,23 @@
+# The checks of shell/sign-setup.nsh, the Shell boot of shell-sign-setup: Setup Mode, then User
+# Mode. See check-shell-log.sh.
+setup-mode	status	0x0
+setup-mode	line	^  00000000: 01 +\*
+# uefisettings refuses KEK before SetVariable(), which would write it unverified, and KEK stays
+# absent
+kek-refused	status	aborted
+kek-refused	json	. == {"error_message": "EFI variable KEK-8be4df61-93ca-11d2-aa0d-00e098032b8c is a Secure Boot policy variable and SetupMode is 1, so the firmware would write it without checking the payload's signature (UEFI 2.11 sections 3.3 and 8.2.6)"}
+kek-absent	status	aborted
+kek-absent	json	. == {"error_message": "no EFI variable KEK-8be4df61-93ca-11d2-aa0d-00e098032b8c"}
+# with the flag, it writes KEK, which holds KEK's certificate
+kek-written	status	0x0
+kek-written	none	.
+kek	status	0x0
+kek	json	.variable == "KEK-8be4df61-93ca-11d2-aa0d-00e098032b8c" and .attributes == 39 and (.value | length) == 1 and .value[0].type == "A5C059A1-94E4-4AA7-87B5-AB155C2BF072" and (.value[0].signatures | length) == 1 and .value[0].signatures[0].owner == "DE145B29-C3CD-455F-91DE-A76237B67C52"
+# PK, signed with its own key, moves the firmware to User Mode, where SecureBoot is 1 (UEFI 2.11
+# section 32.3.1)
+pk-written	status	0x0
+pk-written	none	.
+setup-mode-after	status	0x0
+setup-mode-after	line	^  00000000: 00 +\*
+secure-boot-after	status	0x0
+secure-boot-after	line	^  00000000: 01 +\*

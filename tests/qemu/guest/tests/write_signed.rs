@@ -25,7 +25,11 @@
 //! signs over each digest and that a leaf key signs with the CA that KEK issued in its bundle,
 //! which the firmware accepts, and those of db's key, a foreign key and the leaf key without its
 //! CA, which it refuses, then a write without EFI_VARIABLE_APPEND_WRITE at the system clock's
-//! second, after which the firmware refuses an earlier TimeStamp.
+//! second, after which the firmware refuses an earlier TimeStamp; `signing_in_setup` in
+//! sign-setup, whose variable store is a template copy, where uefisettings refuses KEK, signed
+//! with PK's key, before any write, writes it with
+//! --allow-setup-mode-write-without-signature-check, then PK, signed with its own key, after which
+//! the firmware is in User Mode and verifies KEK appends against PK, with the flag too.
 
 use std::fs;
 use std::io;
@@ -46,6 +50,7 @@ use uefisettings_qemu_guest::DB_TAMPERED;
 use uefisettings_qemu_guest::DB_UNAUTHORIZED;
 use uefisettings_qemu_guest::EACCES;
 use uefisettings_qemu_guest::EFIVARS;
+use uefisettings_qemu_guest::EFI_GLOBAL_VARIABLE;
 use uefisettings_qemu_guest::EFI_IMAGE_SECURITY_DATABASE;
 use uefisettings_qemu_guest::EINVAL;
 
@@ -450,5 +455,111 @@ fn signing_in_user() {
         variable_bytes(&probe),
         Some([&PROBE_ATTRIBUTES.to_ne_bytes()[..], &data].concat()),
         "{CLOCK_PROBE} after the write at {EARLIER}"
+    );
+}
+
+#[test]
+fn signing_in_setup() {
+    require_test_vm();
+    assert_eq!(global_variable("SetupMode"), Some(vec![1]), "SetupMode");
+    let kek = format!("{EFIVARS}/KEK-{EFI_GLOBAL_VARIABLE}");
+    assert_absent(&kek);
+    let pk = ["PK.key", "PK.crt"];
+    let flag = ["--allow-setup-mode-write-without-signature-check".to_owned()];
+    let kek_write = sign_args(
+        "KEK",
+        EFI_GLOBAL_VARIABLE,
+        Write::Replace,
+        "KEK.esl",
+        pk,
+        "sha256",
+    );
+
+    let error = json_error(&strs(&kek_write));
+
+    assert_eq!(
+        error.error_message,
+        format!(
+            "EFI variable KEK-{EFI_GLOBAL_VARIABLE} is a Secure Boot policy variable and SetupMode \
+             is 1, so the firmware would write it without checking the payload's signature (UEFI \
+             2.11 sections 3.3 and 8.2.6)"
+        ),
+        "KEK without the flag"
+    );
+    assert_absent(&kek);
+
+    let output = uefisettings(&strs(&[&kek_write[..], &flag].concat()));
+
+    assert_eq!(
+        (output.code, output.stdout.as_str()),
+        (Some(0), ""),
+        "KEK with the flag: {output:#?}"
+    );
+    let mut kek_lists = fs::read(format!("{SIGN}/KEK.esl")).expect("cannot read KEK.esl");
+    assert_eq!(
+        variable_bytes(&kek),
+        Some([&PROBE_ATTRIBUTES.to_ne_bytes()[..], &kek_lists].concat()),
+        "KEK after the write with the flag: its attributes, then its list"
+    );
+
+    let pk_write = sign_args(
+        "PK",
+        EFI_GLOBAL_VARIABLE,
+        Write::Replace,
+        "PK.esl",
+        pk,
+        "sha256",
+    );
+    let output = uefisettings(&strs(&[&pk_write[..], &flag].concat()));
+
+    assert_eq!(
+        (output.code, output.stdout.as_str()),
+        (Some(0), ""),
+        "PK, signed with its own key, with the flag: {output:#?}"
+    );
+    assert_eq!(
+        global_variable("SetupMode"),
+        Some(vec![0]),
+        "SetupMode after PK"
+    );
+
+    // User Mode: the firmware checks that PK signs a KEK append, with the flag too.
+    let foreign_append = sign_args(
+        "KEK",
+        EFI_GLOBAL_VARIABLE,
+        Write::Append,
+        "refused.esl",
+        ["foreign.key", "foreign.crt"],
+        "sha256",
+    );
+    for (args, case) in [
+        (foreign_append.clone(), "without the flag"),
+        ([&foreign_append[..], &flag].concat(), "with the flag"),
+    ] {
+        let error = json_error(&strs(&args));
+        assert_eq!(
+            error.error_message,
+            security_violation(),
+            "the KEK append signed with a foreign key {case}"
+        );
+    }
+    let output = uefisettings(&strs(&sign_args(
+        "KEK",
+        EFI_GLOBAL_VARIABLE,
+        Write::Append,
+        "sha256.esl",
+        pk,
+        "sha256",
+    )));
+    assert_eq!(
+        (output.code, output.stdout.as_str()),
+        (Some(0), ""),
+        "the KEK append signed with PK's key: {output:#?}"
+    );
+    kek_lists.extend(fs::read(format!("{SIGN}/sha256.esl")).expect("cannot read sha256.esl"));
+    assert_eq!(
+        variable_bytes(&kek),
+        Some([&PROBE_ATTRIBUTES.to_ne_bytes()[..], &kek_lists].concat()),
+        "KEK after the appends: the refused ones left it, PK's added its list"
     );
 }

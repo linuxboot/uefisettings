@@ -21,6 +21,7 @@ use anyhow::bail;
 use anyhow::Result;
 use clap::Args;
 use clap::ValueEnum;
+use uefisettings::exports::SetupModeWrite;
 use uefisettings::exports::SignatureDigest;
 use uefisettings::exports::SignedVariableWrite;
 use uefisettings::exports::TimeStamp;
@@ -64,6 +65,9 @@ pub(super) struct WriteSignedArgs {
     /// The TimeStamp to sign, a GMT time such as 2026-11-07T00:00:00Z, later than the variable's unless --append; by default the current second of the system clock, but in the UEFI Shell, which reads none, --append signs the all-zero TimeStamp of UEFI 2.11 section 8.2.6
     #[arg(long, requires = "data_file")]
     timestamp: Option<TimeStamp>,
+    /// Write a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, any OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID such as db, dbx, dbt and dbr) while SetupMode is 1, when the firmware checks no signature (UEFI 2.11 sections 3.3 and 32.3); the payload is still an EFI_VARIABLE_AUTHENTICATION_2. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed Mode (sections 32.3.1 and 32.3.4). PK may have to be signed with its own key (section 32.3.1)
+    #[arg(long)]
+    allow_setup_mode_write_without_signature_check: bool,
 }
 
 /// An attribute of EFI variables (UEFI 2.11 §8.2.1) that a signed write takes as given.
@@ -106,6 +110,7 @@ impl WriteSignedArgs {
     /// Writes the payload file, or the data file that the key signs, to the variable, printing
     /// nothing.
     pub(super) fn run(&self) -> Result<()> {
+        let setup_mode = self.setup_mode();
         let (Some(data_file), Some(key_file), Some(certificate_file)) = (
             &self.data_file,
             &self.signing_key_file,
@@ -120,6 +125,7 @@ impl WriteSignedArgs {
                 &self.guid,
                 self.attributes(),
                 &payload,
+                setup_mode,
             );
         };
         let timestamp = signed_time_stamp(self.timestamp, self.append, platform::signing_clock())?;
@@ -134,10 +140,19 @@ impl WriteSignedArgs {
                 data: &data,
                 timestamp,
                 digest: self.digest.into(),
+                setup_mode,
             },
             &signing_key,
             certificates.as_bytes(),
         )
+    }
+
+    /// What a write of a Secure Boot policy variable does while SetupMode is 1.
+    fn setup_mode(&self) -> SetupModeWrite {
+        match self.allow_setup_mode_write_without_signature_check {
+            true => SetupModeWrite::WithoutSignatureCheck,
+            false => SetupModeWrite::Refuse,
+        }
     }
 
     /// The attributes that these name.
@@ -273,9 +288,11 @@ mod tests {
     }
 
     /// write-signed signs --data-file with --signing-key-file and --signing-certificate-file at
-    /// --timestamp over --digest, SHA-256 by default, and refuses a data file next to a payload
-    /// file, one without its key or certificate, a TimeStamp that is no GMT time, a digest that
-    /// UEFI 2.11 §8.2.6 does not accept, and --digest or --timestamp without a data file.
+    /// --timestamp over --digest, SHA-256 by default, takes
+    /// --allow-setup-mode-write-without-signature-check, and refuses a data file next to a
+    /// payload file, one without its key or certificate, a TimeStamp that is no GMT time, a
+    /// digest that UEFI 2.11 §8.2.6 does not accept, and --digest or --timestamp without a data
+    /// file.
     #[test]
     fn write_signed_takes_a_data_file_to_sign() {
         use clap::error::ErrorKind::ArgumentConflict;
@@ -308,6 +325,7 @@ mod tests {
                 parsed.signing_certificate_file.as_deref(),
                 parsed.timestamp.map(|timestamp| timestamp.to_string()),
                 SignatureDigest::from(parsed.digest),
+                parsed.allow_setup_mode_write_without_signature_check,
             ),
             (
                 None,
@@ -316,9 +334,30 @@ mod tests {
                 Some(Path::new("pk.crt")),
                 Some("2026-11-07T00:00:00Z".to_owned()),
                 SignatureDigest::Sha256,
+                false,
             ),
             "signed write"
         );
+        for args in [
+            &signed[..],
+            &[
+                "db",
+                "D719B2CB-3D3A-4596-A3BC-DAD00E67656F",
+                "--attributes",
+                "non-volatile",
+                "--payload-file",
+                "db.auth",
+            ],
+        ] {
+            let parsed = write_signed(
+                &[args, &["--allow-setup-mode-write-without-signature-check"]].concat(),
+            )
+            .unwrap_or_else(|kind| panic!("parse a Setup Mode write of {args:?}: {kind}"));
+            assert!(
+                parsed.allow_setup_mode_write_without_signature_check,
+                "--allow-setup-mode-write-without-signature-check after {args:?}"
+            );
+        }
         for (name, digest) in [
             ("sha256", SignatureDigest::Sha256),
             ("sha384", SignatureDigest::Sha384),
@@ -429,6 +468,31 @@ mod tests {
 
         for (args, want) in cases {
             assert_eq!(write_signed(args).err(), Some(want), "{args:?}");
+        }
+    }
+
+    /// write-signed refuses a Secure Boot policy variable while SetupMode is 1, and writes it
+    /// without a signature check only with --allow-setup-mode-write-without-signature-check.
+    #[test]
+    fn setup_mode_write_is_without_signature_check_only_with_the_flag() {
+        let payload = [
+            "db",
+            "D719B2CB-3D3A-4596-A3BC-DAD00E67656F",
+            "--attributes",
+            "non-volatile",
+            "--payload-file",
+            "db.auth",
+        ];
+        for (flag, setup_mode) in [
+            (&[][..], SetupModeWrite::Refuse),
+            (
+                &["--allow-setup-mode-write-without-signature-check"][..],
+                SetupModeWrite::WithoutSignatureCheck,
+            ),
+        ] {
+            let parsed = write_signed(&[&payload[..], flag].concat())
+                .unwrap_or_else(|kind| panic!("parse a write with {flag:?}: {kind}"));
+            assert_eq!(parsed.setup_mode(), setup_mode, "a write with {flag:?}");
         }
     }
 

@@ -456,7 +456,8 @@ uefisettings refuses a payload without a complete descriptor, one without data u
 is given, and attributes without bootservice-access or runtime-access, either of which would
 delete the variable, and a Secure Boot policy variable (PK, KEK, OsRecoveryOrder,
 OsRecovery####, and every variable of EFI_IMAGE_SECURITY_DATABASE_GUID, such as db, dbx, dbt and
-dbr; §3.3) while SetupMode is 1, when the firmware writes them without checking the signature.
+dbr; §3.3) while SetupMode is 1, when the firmware writes them without checking the signature,
+unless `--allow-setup-mode-write-without-signature-check` is given.
 It prints nothing when the firmware accepts the payload. On Linux it checks first, as `set`
 does, that the write cannot crash Linux, then writes the variable's efivar file;
 `uefisettings.efi` calls SetVariable() and names the status that it returns, such as
@@ -481,6 +482,13 @@ it. rsa has no release that fixes RUSTSEC-2023-0071's timing leak; blinding is p
 hardening, and uefisettings runs as the advisory's workaround allows: local use on a
 non-compromised computer. uefisettings reads KEY as a secret; KEY and CERTIFICATES hold at most
 64 KiB each.
+
+`--allow-setup-mode-write-without-signature-check` has either form write a Secure Boot policy
+variable while SetupMode is 1, when the firmware checks no signature (§3.3, §32.3), as to enroll
+KEK and then PK; the payload is still an EFI_VARIABLE_AUTHENTICATION_2, and a write without data
+and without `--append` stays refused, as edk2 deletes the variable then. Writing PK moves Setup
+Mode to User Mode, and Audit Mode to Deployed Mode (§32.3.1, §32.3.4). PK may have to be signed
+with its own key (§32.3.1).
 
 ```sh
 uefisettings variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E67656F --attributes non-volatile,bootservice-access,runtime-access --append --data-file db.esl --signing-key-file kek.key --signing-certificate-file kek.pem
