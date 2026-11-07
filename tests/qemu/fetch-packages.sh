@@ -112,7 +112,7 @@ trap 'rm -rf "$work" "$staging"' EXIT
 # mkdir's mode, not mktemp's 0700.
 chmod "$(umask -S)" "$staging"
 unpack_failed() {
-    echo "fetch-packages.sh: cannot unpack $1" >&2
+    echo "fetch-packages.sh: cannot unpack $1 (exit statuses: $2)" >&2
     exit 1
 }
 for file in "${files[@]}"; do
@@ -122,14 +122,15 @@ for file in "${files[@]}"; do
         rpm2cpio "$file" |
             (cd "$staging" && cpio --extract --make-directories --preserve-modification-time \
                 --no-absolute-filenames --quiet) ||
-            unpack_failed "$file"
+            unpack_failed "$file" "rpm2cpio ${PIPESTATUS[0]}, cpio ${PIPESTATUS[1]}"
         ;;
     *.deb)
         # An ar archive whose member data.tar, compressed or not, holds the files.
         data=$(ar t "$file" | grep -E --line-regexp 'data\.tar(\.[a-z0-9]+)?') ||
-            unpack_failed "$file"
-        ar p "$file" "$data" >"$work/$data" || unpack_failed "$file"
-        tar --extract --file "$work/$data" --directory "$staging" || unpack_failed "$file"
+            unpack_failed "$file" "ar t | grep $?"
+        ar p "$file" "$data" >"$work/$data" || unpack_failed "$file" "ar p $?"
+        tar --extract --file "$work/$data" --directory "$staging" ||
+            unpack_failed "$file" "tar $?"
         ;;
     esac
 done

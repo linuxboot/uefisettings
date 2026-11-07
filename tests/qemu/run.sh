@@ -158,6 +158,8 @@ awk -F '\t' '$0 !~ /^(#|$)/ {
     if (!ok) { printf "scenarios.tsv line %d needs 5 non-empty columns: %s\n", NR, $0; bad = 1 }
 } END { exit bad }' "$here/scenarios.tsv" >&2
 "$here/scenario-options-test.sh"
+# The test of fetch-packages.sh, which unpacks the guests below, on local fixtures.
+"$here/fetch-packages-test.sh"
 # Whether a scenario of the run boots the secboot firmware.
 secboot=no
 # The guest= options of the run's scenarios.

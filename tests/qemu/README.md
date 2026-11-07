@@ -31,7 +31,9 @@ xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes
 The guest's kernel, firmware, UEFI Shell and busybox do not come from the host: they are the
 packages that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64),
 [i686](guest-packages-i686) or [aarch64](guest-packages-aarch64)) pins, which
-[`fetch-packages.sh`](fetch-packages.sh) downloads. The scenarios `crash-guard-*` whose
+[`fetch-packages.sh`](fetch-packages.sh) downloads. `run.sh` first runs
+[`fetch-packages-test.sh`](fetch-packages-test.sh), which checks on local fixtures how that
+script unpacks a package and how it fails. The scenarios `crash-guard-*` whose
 options say `guest=unfixed` or `guest=unfixed-v5.8` boot the kernels without upstream Linux
 0e8d2444168d that [`guest-packages-x86_64-unfixed`](guest-packages-x86_64-unfixed),
 [`guest-packages-x86_64-unfixed-v5.8`](guest-packages-x86_64-unfixed-v5.8),
