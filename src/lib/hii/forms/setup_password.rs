@@ -636,6 +636,30 @@ mod tests {
         }
     }
 
+    /// A PASSWORD op on a VARSTORE_EFI of the form before UEFI 2.3.1, whose EFI variable its
+    /// VarName names, is unresolved: through variables that reach BootServices, withheld fails.
+    #[test]
+    fn password_on_a_var_store_efi_before_uefi_2_3_1_is_unresolved() {
+        let root = parse_form_set(&[short_var_store_efi(7), form(1, &[password_on(2, 3, 7, 0)])]);
+
+        let passwords = PasswordQuestions::of([&root]);
+
+        assert_eq!(
+            passwords
+                .withheld(VariableReach::BootServices)
+                .map_err(|error| error.to_string()),
+            Err(
+                "PASSWORD question 0x0002 in FormSet 11111111-1111-1111-1111-111111111111: \
+                 VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1), whose EFI variables \
+                 are named by VarNames, which uefisettings does not resolve; as the variable of \
+                 that password is unknown, the UEFI Shell build reads and writes no variable of \
+                 this HiiDB"
+                    .to_string()
+            ),
+            "BootServices"
+        );
+    }
+
     /// set through variables that reach BootServices refuses a HiiDB that declares a password
     /// question unless the caller bypasses; set through variables that reach Runtime, and set in
     /// a HiiDB without one, write.

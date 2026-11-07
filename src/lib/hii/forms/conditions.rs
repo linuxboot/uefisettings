@@ -35,6 +35,7 @@ use super::storage::read_current_value_bytes;
 use super::storage::read_question_value;
 use super::storage::stored_value;
 use super::storage::ReadableLocation;
+use super::storage::ShortVarStoreEfi;
 use super::storage::ValueLocation;
 use super::storage::ValueUnavailable;
 use super::storage::VariableStore;
@@ -1504,6 +1505,18 @@ fn operand_store(op: &IFROperation, operand: &VarStoreOperand) -> Result<Declare
         })
 }
 
+/// Returns `declared` as an EFI variable VarStore, or, of one that a GET or SET does not reach,
+/// its label and why, after the VarStore.
+fn variable_store(
+    declared: DeclaredStore,
+) -> Result<Box<dyn VariableStore>, (&'static str, &'static str)> {
+    match declared {
+        DeclaredStore::Variable(store) => Ok(store),
+        DeclaredStore::NameValue => Err((NAME_VALUE_STORE, NAME_VALUE_REACH)),
+        DeclaredStore::ShortEfi => Err((ShortVarStoreEfi::LABEL, ShortVarStoreEfi::UNREAD)),
+    }
+}
+
 /// Returns the payload bytes of `store` that the GET or SET `op` of `kind` reads or writes: its
 /// VarOffset in a VARSTORE or VARSTORE_EFI, all within the Size of the VarStore.
 fn operand_range(
@@ -2175,15 +2188,15 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
-        let store = match operand_store(op, operand)? {
-            DeclaredStore::Variable(store) => store,
-            DeclaredStore::NameValue => {
+        let store = match variable_store(operand_store(op, operand)?) {
+            Ok(store) => store,
+            Err((store, reach)) => {
                 self.unreached(
                     op,
                     StoreAccess::Reads,
                     id,
-                    NAME_VALUE_STORE.to_string(),
-                    NAME_VALUE_REACH.to_string(),
+                    store.to_string(),
+                    reach.to_string(),
                 );
                 return Ok(kind.unknown());
             }
@@ -2235,15 +2248,15 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
-        let store = match operand_store(op, operand)? {
-            DeclaredStore::Variable(store) => store,
-            DeclaredStore::NameValue => {
+        let store = match variable_store(operand_store(op, operand)?) {
+            Ok(store) => store,
+            Err((store, reach)) => {
                 let why = self.unreached(
                     op,
                     StoreAccess::Sets,
                     id,
-                    NAME_VALUE_STORE.to_string(),
-                    NAME_VALUE_REACH.to_string(),
+                    store.to_string(),
+                    reach.to_string(),
                 );
                 return Err(Abort::NotEvaluated(why));
             }
@@ -5505,6 +5518,8 @@ mod store_expression_tests {
     const NAME_VALUE: u16 = 3;
     /// A VARSTORE, whose same-name EFI variable holds its values here.
     const BUFFER: u16 = 4;
+    /// A VARSTORE_EFI of the form before UEFI 2.3.1.
+    const SHORT_EFI: u16 = 5;
 
     fn op(op_code: u8) -> Vec<u8> {
         operation(op_code, false, &[])
@@ -6321,6 +6336,72 @@ mod store_expression_tests {
                  which cannot be read: "
             ),
             "{refusal}"
+        );
+    }
+
+    /// A GET or SET of a VARSTORE_EFI of the form before UEFI 2.3.1, whose EFI variable its
+    /// VarName names (UEFI 2.11 §33.3.8.3.27 and §33.3.8.3.66 VarStoreInfo), is not evaluated: a
+    /// GET pushes a value that cannot be read, and a WRITE that holds a SET is refused.
+    #[test]
+    fn get_and_set_of_a_var_store_efi_before_uefi_2_3_1_are_not_evaluated() {
+        let get_short = scoped_expression(
+            &[
+                get(SHORT_EFI, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                uint8(1),
+                op(EQUAL),
+            ],
+            0,
+        );
+        let set_short =
+            scoped_expression(&[op(THIS), set(SHORT_EFI, 0, EFI_IFR_TYPE_NUM_SIZE_8)], 0);
+        let question = [
+            operation(ONE_OF, true, &storage_less_one_of()),
+            conditional(
+                SUPPRESS_IF,
+                get_short,
+                &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[0])],
+            ),
+            op(WRITE),
+            set_short,
+            END.to_vec(),
+        ]
+        .concat();
+        let root = parse_form_set(&[short_var_store_efi(SHORT_EFI), form(1, &[question])]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let form = Rc::clone(&form_set.borrow().children[1]);
+        let question = Rc::clone(&form.borrow().children[0]);
+        let missing = Efivars::new();
+        let short = "VarStore 0x0005 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1), whose EFI \
+                     variables are named by VarNames, which uefisettings does not resolve";
+
+        let scope = Rc::clone(&question.borrow().children[0]);
+        let truth = evaluate_condition(
+            &scope.borrow(),
+            &mut ExpressionInputs {
+                reader: &mut missing.reader(),
+                values: &no_values(),
+            },
+        );
+        assert_eq!(
+            truth,
+            Truth::Unknown(format!("EFI_IFR_GET of {short}")),
+            "GET"
+        );
+
+        let Err(refusal) = evaluate_write(
+            &question,
+            QuestionValue::Uint(3),
+            &mut ExpressionInputs {
+                reader: &mut missing.reader(),
+                values: &no_values(),
+            },
+        ) else {
+            panic!("a SET of a VARSTORE_EFI before UEFI 2.3.1 was planned");
+        };
+        assert_eq!(
+            refusal.to_string(),
+            format!("its WRITE expression sets {short}"),
+            "SET"
         );
     }
 

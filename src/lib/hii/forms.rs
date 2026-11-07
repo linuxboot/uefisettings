@@ -59,6 +59,7 @@ use question_values::value_question;
 use set::ChangeValueError;
 use storage::storage_width;
 use storage::ReadableLocation;
+use storage::ShortVarStoreEfi;
 use storage::ValueLocation;
 use storage::VarStore;
 use storage::VarStoreEfi;
@@ -142,6 +143,11 @@ const EDKII_BIT_FIELD_VALUE_BITS: u32 = 32;
 /// Example: Length includes the header, so an operation carries
 /// `length - IFR_OPERATION_HEADER_SIZE` bytes of data.
 const IFR_OPERATION_HEADER_SIZE: u8 = 2;
+/// sizeof (EFI_IFR_VARSTORE_EFI) under #pragma pack(1), with a Name of one byte
+/// (edk2-stable202608 MdePkg/Include/Uefi/UefiInternalFormRepresentation.h): edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes takes a shorter VARSTORE_EFI for the form before UEFI
+/// 2.3.1.
+const VAR_STORE_EFI_SIZE: u8 = 27;
 
 // UEFI 2.10 §33.3.8.3, Table 33.11 IFR Opcodes
 #[derive(BinRead, Debug, PartialEq, Copy, Clone)]
@@ -746,6 +752,7 @@ pub enum ParsedOperation {
     VarStore(VarStore),
     VarStoreNameValue(VarStoreNameValue),
     VarStoreEfi(VarStoreEfi),
+    ShortVarStoreEfi(ShortVarStoreEfi),
     DefaultStore(DefaultStore),
     IFRDefault(IFRDefault),
     #[expect(dead_code, reason = "decoded IFR payload; nothing reads it yet")]
@@ -1794,6 +1801,13 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
             debug!("VarStoreNameValue is {:?}", parsed);
             node.parsed_data = ParsedOperation::VarStoreNameValue(parsed);
         }
+        IFROpCode::VarStoreEfi if node.length < VAR_STORE_EFI_SIZE => {
+            let parsed: ShortVarStoreEfi = data_cursor
+                .parse_ne()
+                .context("failed to parse VarStoreEfi's data")?;
+            debug!("ShortVarStoreEfi is {:?}", parsed);
+            node.parsed_data = ParsedOperation::ShortVarStoreEfi(parsed);
+        }
         IFROpCode::VarStoreEfi => {
             // this is implemented in hiilib and the docs for this are relatively clear
             // so I implemented this but I haven't seen it being used anywhere in the dbdumps I have
@@ -2567,6 +2581,25 @@ mod choice_for_set_tests {
         );
     }
 
+    /// set refuses a question on a VARSTORE_EFI of the form before UEFI 2.3.1, whose EFI
+    /// variable its VarName names, with why.
+    #[test]
+    fn match_on_a_var_store_efi_before_uefi_2_3_1_is_refused() {
+        let choice = choice_in(&parse_form_set(&[
+            short_var_store_efi(7),
+            form(1, &[checkbox_on(1, 3, 7)]),
+        ]));
+        assert_eq!(
+            choice.map_err(|error| error.to_string()).err().as_deref(),
+            Some(
+                "cannot set question \"Prompt\": VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before \
+                 UEFI 2.3.1), whose EFI variables are named by VarNames, which uefisettings does \
+                 not resolve"
+            ),
+            "question 1 on VarStore 7"
+        );
+    }
+
     #[test]
     fn match_on_an_unreadable_efivar_is_refused_with_the_read_error() {
         // VARSTORE_EFI's Size is 2
@@ -3276,6 +3309,11 @@ fn form_set_varstore(form_set: &IFROperation, var_store_id: u16) -> Result<Box<d
         Some(DeclaredStore::NameValue) => Err(anyhow!(
             "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
         )),
+        Some(DeclaredStore::ShortEfi) => Err(anyhow!(
+            "VarStore {var_store_id:#06x} ({}), {}",
+            ShortVarStoreEfi::LABEL,
+            ShortVarStoreEfi::UNREAD
+        )),
         None => Err(anyhow!(
             "no supported varstore with matching id {:#06x} found",
             var_store_id
@@ -3290,6 +3328,8 @@ enum DeclaredStore {
     Variable(Box<dyn VariableStore>),
     /// A VARSTORE_NAME_VALUE, whose values only the driver's EFI_HII_CONFIG_ACCESS_PROTOCOL reaches
     NameValue,
+    /// A VARSTORE_EFI of the form before UEFI 2.3.1, which names no EFI variable
+    ShortEfi,
 }
 
 /// Returns the VarStore of `var_store_id` that `form_set` declares, if any: the first among its
@@ -3307,6 +3347,9 @@ fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Option<Decl
             }
             ParsedOperation::VarStoreNameValue(store) if store.var_store_id == var_store_id => {
                 Some(DeclaredStore::NameValue)
+            }
+            ParsedOperation::ShortVarStoreEfi(store) if store.var_store_id == var_store_id => {
+                Some(DeclaredStore::ShortEfi)
             }
             _ => None,
         })
@@ -4074,6 +4117,61 @@ mod tests {
         assert!(
             format!("{error:#}").contains("failed to parse FormSet's data"),
             "{error:#}"
+        );
+    }
+
+    /// A VARSTORE_EFI of Length 24 to 26 is the form before UEFI 2.3.1, which ends at
+    /// Attributes, as edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes takes one
+    /// shorter than sizeof (EFI_IFR_VARSTORE_EFI): its FormSet parses, and a question on it lists
+    /// without a value. One of Length 27 is the later form; one of 23 ends inside Attributes and
+    /// does not parse (UEFI 2.11 §33.2.5.10.1).
+    #[test]
+    fn var_store_efi_of_24_to_26_bytes_is_the_form_before_uefi_2_3_1() {
+        let short = short_var_store_efi(7);
+        let fields = short.get(2..).expect("the fields past the header");
+        let parse = |store: Vec<u8>| {
+            let data = form_set(&[store, form(1, &[checkbox_on(1, 3, 7)])]);
+            handle_form_set(&mut Cursor::new(&data))
+        };
+        let unread = "<ValueUnavailable: VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI \
+                      2.3.1), whose EFI variables are named by VarNames, which uefisettings does \
+                      not resolve> <IFR default: 0>";
+
+        for tail in [&[][..], &[0x05], &[0x05, 0x00]] {
+            let data = [fields, tail].concat();
+            let length = data.len() + 2;
+            let root = parse(operation(VAR_STORE_EFI, false, &data))
+                .unwrap_or_else(|error| panic!("parse Length {length}: {error:#}"));
+
+            let listed = list_questions(
+                root,
+                &strings(),
+                IncludedStates::empty(),
+                None,
+                &mut disabled_reader(),
+            );
+
+            let values: Vec<&str> = listed
+                .iter()
+                .map(|(question, _)| question.value.as_str())
+                .collect();
+            assert_eq!(values, [unread], "Length {length}");
+        }
+
+        let root = parse(var_store_efi(7, "", NV_BS_RT, 5)).expect("parse Length 27");
+        let store = Rc::clone(&root.borrow().children[0].borrow().children[0]);
+        let parsed = format!("{:?}", store.borrow().parsed_data);
+        assert!(
+            parsed.starts_with("VarStoreEfi(VarStoreEfi { var_store_id: 7,")
+                && parsed.contains("size: 5,"),
+            "Length 27: {parsed}"
+        );
+
+        let error = parse(operation(VAR_STORE_EFI, false, &fields[..21]))
+            .expect_err("Length 23 ends inside Attributes");
+        assert!(
+            format!("{error:#}").contains("failed to parse VarStoreEfi's data"),
+            "Length 23: {error:#}"
         );
     }
 }

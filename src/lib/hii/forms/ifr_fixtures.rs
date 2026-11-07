@@ -93,7 +93,7 @@ const DEFAULT_STORE: u8 = 0x5C;
 pub(crate) const FORM_MAP: u8 = 0x5D;
 
 pub(crate) const VAR_STORE: u8 = 0x24;
-const VAR_STORE_EFI: u8 = 0x26;
+pub(super) const VAR_STORE_EFI: u8 = 0x26;
 pub(super) const READ: u8 = 0x2D;
 pub(super) const WRITE: u8 = 0x2E;
 
@@ -710,6 +710,13 @@ pub(crate) fn var_store_efi_of(
         &[0x00],
     ]
     .concat();
+    operation(VAR_STORE_EFI, false, &data)
+}
+
+/// A VARSTORE_EFI of `id` of the form before UEFI 2.3.1, which ends at Attributes: of NIL_GUID,
+/// with NV_BS_RT, of 24 bytes.
+pub(super) fn short_var_store_efi(id: u16) -> Vec<u8> {
+    let data = [&id.to_le_bytes()[..], &[0; 16], &NV_BS_RT.to_le_bytes()].concat();
     operation(VAR_STORE_EFI, false, &data)
 }
 

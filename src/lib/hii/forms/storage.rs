@@ -2014,3 +2014,23 @@ impl VariableStore for VarStoreEfi {
         (self.attributes & EFI_VARIABLE_RUNTIME_ACCESS) != 0
     }
 }
+
+/// An EFI_IFR_VARSTORE_EFI of the form before UEFI 2.3.1, which ends at Attributes; a Size short
+/// of a Name is not read. It names no EFI variable, as each question's VarName names its own
+/// (edk2-stable202608 SetupBrowserDxe/IfrParse.c CreateQuestion, Setup.c GetQuestionValue), and
+/// as the VarName of a GET or SET still may: "a Name/Value or EFI Variable name ( VarName )"
+/// (UEFI 2.11 §33.3.8.3.27 and §33.3.8.3.66 VarStoreInfo).
+#[derive(BinRead, Debug, PartialEq, Clone)]
+#[br(little)]
+pub struct ShortVarStoreEfi {
+    pub var_store_id: u16,
+    pub guid: Guid,
+    pub attributes: u32,
+}
+impl ShortVarStoreEfi {
+    /// Its label in refusals.
+    pub(super) const LABEL: &'static str = "EFI_IFR_VARSTORE_EFI before UEFI 2.3.1";
+    /// Why its values are not read, after the VarStore.
+    pub(super) const UNREAD: &'static str =
+        "whose EFI variables are named by VarNames, which uefisettings does not resolve";
+}

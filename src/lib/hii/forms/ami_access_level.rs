@@ -96,6 +96,7 @@ fn declares_ami_access_level(op: &IFROperation) -> bool {
         | ParsedOperation::CheckBox(_)
         | ParsedOperation::OneOfOption(_)
         | ParsedOperation::VarStoreNameValue(_)
+        | ParsedOperation::ShortVarStoreEfi(_)
         | ParsedOperation::DefaultStore(_)
         | ParsedOperation::IFRDefault(_)
         | ParsedOperation::Form(_)

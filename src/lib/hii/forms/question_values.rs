@@ -90,6 +90,7 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
         | ParsedOperation::VarStore(_)
         | ParsedOperation::VarStoreNameValue(_)
         | ParsedOperation::VarStoreEfi(_)
+        | ParsedOperation::ShortVarStoreEfi(_)
         | ParsedOperation::DefaultStore(_)
         | ParsedOperation::IFRDefault(_)
         | ParsedOperation::Form(_)
