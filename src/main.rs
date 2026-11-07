@@ -46,6 +46,8 @@ use platform::ListStringsHiiDbArgs;
 use platform::PlatformCommands;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::SetupPasswordArgs;
+#[cfg(all(system_hiidb, system_variables))]
+use platform::VolatileArgs;
 #[cfg(system_variables)]
 use variable_command::VariableCommand;
 
@@ -112,6 +114,8 @@ enum Commands {
         selection: SelectionArgs,
         #[command(flatten)]
         setup_password: SetupPasswordArgs,
+        #[command(flatten)]
+        volatile: VolatileArgs,
     },
     /// Show the translation/spellings database for questions and answers
     #[command(next_display_order = None)]
@@ -166,6 +170,8 @@ enum HiiSubcommands {
         selection: SelectionArgs,
         #[command(flatten)]
         setup_password: SetupPasswordArgs,
+        #[command(flatten)]
+        volatile: VolatileArgs,
     },
     /// Show a human readable representation of the Hii Forms
     #[command(next_display_order = None)]
@@ -265,11 +271,16 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
     }
 }
 
-/// The SetOptions of `selection` and `setup_password`.
+/// The SetOptions of `selection`, `setup_password` and `volatile`.
 #[cfg(all(system_hiidb, system_variables))]
-fn set_options(selection: &SelectionArgs, setup_password: &SetupPasswordArgs) -> SetOptions {
+fn set_options(
+    selection: &SelectionArgs,
+    setup_password: &SetupPasswordArgs,
+    volatile: &VolatileArgs,
+) -> SetOptions {
     let mut options = SetOptions::from(selection);
     options.setup_password = setup_password.policy();
+    options.volatile = volatile.policy();
     options
 }
 
@@ -280,22 +291,11 @@ fn hii_get(db_bytes: &[u8], question: &str, options: &GetOptions, json: bool) ->
     Ok(())
 }
 
-/// set of `question` to `value` with `selection` and `setup_password`, in this machine's HiiDB
-/// and variables, printed as JSON if `json`.
+/// set of `question` to `value` with `options`, in this machine's HiiDB and variables, printed
+/// as JSON if `json`.
 #[cfg(all(system_hiidb, system_variables))]
-fn hii_set(
-    question: &str,
-    value: &str,
-    selection: &SelectionArgs,
-    setup_password: &SetupPasswordArgs,
-    json: bool,
-) -> Result<()> {
-    let res = HiiBackend::set_using(
-        question,
-        value,
-        None,
-        &set_options(selection, setup_password),
-    )?;
+fn hii_set(question: &str, value: &str, options: &SetOptions, json: bool) -> Result<()> {
+    let res = HiiBackend::set_using(question, value, None, options)?;
     print_with_style(res, json)?;
     Ok(())
 }
@@ -418,7 +418,11 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 output,
                 selection,
                 setup_password,
-            } => hii_set(question, value, selection, setup_password, output.json)?,
+                volatile,
+            } => {
+                let options = set_options(selection, setup_password, volatile);
+                hii_set(question, value, &options, output.json)?
+            }
             HiiSubcommands::ShowIFR { hiidb, efivars } => {
                 let mut options = ShowIfrOptions::default();
                 options.efivars = efivars.source()?;
@@ -460,7 +464,11 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             output,
             selection,
             setup_password,
-        } => platform::auto_set(question, value, output.json, selection, setup_password)?,
+            volatile,
+        } => {
+            let options = set_options(selection, setup_password, volatile);
+            platform::auto_set(question, value, output.json, selection, &options)?
+        }
         Commands::ShowTranslations { output } => {
             print_with_style(&*translation_db, output.json)?;
         }

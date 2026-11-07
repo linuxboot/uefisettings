@@ -106,3 +106,4 @@ pub(crate) use variables::FirmwareVariables;
 pub use variables::VariableAttributes;
 #[cfg(any(variable_names, variable_info, variable_data))]
 pub use variables::VariableKey;
+pub use variables::VolatileWrites;

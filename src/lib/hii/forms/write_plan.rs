@@ -48,6 +48,7 @@ use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VolatileWrites;
 
 /// The writes that set one question: the SETs of its WRITE expression, in order, then its own
 /// value, which wins where they overlap.
@@ -106,17 +107,18 @@ impl<'a> WritePlan<'a> {
 
     /// The plan's writes, one per variable, in the order in which the plan first changes each,
     /// each of its patches in order. Refuses a SET of a VarStore whose variable set may not
-    /// write, through what `reader` read of it.
+    /// write, through what `reader` read of it, under `volatile`.
     pub(super) fn variable_writes(
         &self,
         reader: &mut EfivarReader,
+        volatile: VolatileWrites,
     ) -> Result<Vec<VarStoreWrite<'_>>, ChangeValueError> {
         let (reach, interface) = (reader.reach(), reader.interface());
         for set in &self.sets {
             let store = set.store.as_ref();
             let range = usize::from(set.offset)..usize::from(set.offset) + set.bytes.len();
             let checked = match reader.read(EfivarRange::of(store), range) {
-                Ok(_) => check_writable(store, reader),
+                Ok(_) => check_writable(store, reader, volatile),
                 Err(error) => Err(unwritable(store, error, reach, interface)),
             };
             checked.map_err(|error| ChangeValueError::Expression {
@@ -243,6 +245,7 @@ mod tests {
     #[cfg(efivar_dumps)]
     use super::write_in_turn;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
+    use crate::hii::variables::check_non_volatile;
     use crate::hii::variables::WithholdingVariables;
 
     const AND: u8 = 0x15;
@@ -281,10 +284,13 @@ mod tests {
     const BAD_METADATA: u16 = 7;
     /// The attributes of the variables of ENHANCED and BAD_METADATA.
     const NV_BS_RT_ENHANCED: u32 = NV_BS_RT | 0x80;
-    /// The bytes of the variables of STORE, OTHER and BOOT_ONLY before set.
+    /// A VARSTORE_EFI, and its variable, without EFI_VARIABLE_NON_VOLATILE.
+    const VOLATILE: u16 = 8;
+    /// The bytes of the variables of STORE, OTHER, BOOT_ONLY and VOLATILE before set.
     const STORE_BYTES: [u8; 6] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
     const OTHER_BYTES: [u8; 2] = [0xB0, 0xB1];
     const BOOT_ONLY_BYTES: [u8; 1] = [0xC0];
+    const VOLATILE_BYTES: [u8; 1] = [0xD0];
 
     /// Each question of the FormSet: its prompt, VarStore, VarOffset and the ops in its scope.
     fn questions() -> Vec<(&'static str, u16, u16, Vec<u8>)> {
@@ -404,6 +410,18 @@ mod tests {
                 0,
                 write(&[op(THIS), set(BAD_METADATA, 0, EFI_IFR_TYPE_NUM_SIZE_8)]),
             ),
+            (
+                "Volatile target",
+                STORE,
+                0,
+                write(&[op(THIS), set(VOLATILE, 0, EFI_IFR_TYPE_NUM_SIZE_8)]),
+            ),
+            (
+                "Volatile store",
+                VOLATILE,
+                0,
+                write(&[op(THIS), set(STORE, 2, EFI_IFR_TYPE_NUM_SIZE_8)]),
+            ),
         ]
     }
 
@@ -432,6 +450,7 @@ mod tests {
             var_store(SHORT, [0; 16], "Store", 3),
             var_store_efi(ENHANCED, "Enhanced", NV_BS_RT_ENHANCED, 1),
             var_store_efi(BAD_METADATA, "BadMetadata", NV_BS_RT_ENHANCED, 1),
+            var_store_efi(VOLATILE, "Volatile", BS_RT, 1),
             form(1, &body),
         ])
     }
@@ -443,8 +462,8 @@ mod tests {
         }
     }
 
-    /// Variables of `(reach, interface)` holding STORE, OTHER, BOOT_ONLY, ENHANCED and
-    /// BAD_METADATA as before set.
+    /// Variables of `(reach, interface)` holding STORE, OTHER, BOOT_ONLY, ENHANCED,
+    /// BAD_METADATA and VOLATILE as before set.
     fn variables((reach, interface): (VariableReach, VariableInterface)) -> MemoryVariables {
         let variables = MemoryVariables::new(reach, interface);
         variables.insert(key("Store"), NV_BS_RT, &STORE_BYTES);
@@ -456,11 +475,23 @@ mod tests {
             &[&timestamp_metadata()[..], &[0xD0]].concat(),
         );
         variables.insert(key("BadMetadata"), NV_BS_RT_ENHANCED, &[0xE0]);
+        variables.insert(key("Volatile"), BS_RT, &VOLATILE_BYTES);
         variables
     }
 
     /// The data offsets and bytes of the writes to each variable, by name.
     type Written = BTreeMap<&'static str, Vec<(u16, Vec<u8>)>>;
+
+    /// The strings of form_set(): the prompts of questions().
+    fn prompts() -> Vec<BTreeMap<i32, String>> {
+        vec![(i32::from(FIRST_PROMPT)..)
+            .zip(
+                questions()
+                    .into_iter()
+                    .map(|(prompt, ..)| prompt.to_string()),
+            )
+            .collect()]
+    }
 
     /// The outcome of set of `prompt` to `value` through variables of `through`, as the CLI
     /// prints an error, and the writes to each variable.
@@ -469,14 +500,7 @@ mod tests {
         value: &str,
         through: (VariableReach, VariableInterface),
     ) -> (Result<(), String>, Written) {
-        let strings = vec![(i32::from(FIRST_PROMPT)..)
-            .zip(
-                questions()
-                    .into_iter()
-                    .map(|(prompt, ..)| prompt.to_string()),
-            )
-            .collect()];
-        set_in(&form_set(), &strings, prompt, value, through)
+        set_in(&form_set(), &prompts(), prompt, value, through)
     }
 
     /// set() of `prompt` in the FormSet `root`, whose strings are `strings`.
@@ -487,6 +511,27 @@ mod tests {
         value: &str,
         through: (VariableReach, VariableInterface),
     ) -> (Result<(), String>, Written) {
+        let (outcome, written) = set_under(
+            root,
+            strings,
+            prompt,
+            value,
+            through,
+            VolatileWrites::Refuse,
+        );
+        (outcome.map(drop), written)
+    }
+
+    /// set_in() under `volatile`, with whether the writes of each question include a volatile
+    /// variable.
+    fn set_under(
+        root: &Rc<RefCell<IFROperation>>,
+        strings: &[BTreeMap<i32, String>],
+        prompt: &str,
+        value: &str,
+        through: (VariableReach, VariableInterface),
+        volatile: VolatileWrites,
+    ) -> (Result<Vec<bool>, String>, Written) {
         let mut reader = EfivarReader::with_variables(Box::new(variables(through)));
         let values = VarStoreValues::new(root, None);
         let selection = find_question_in(
@@ -506,9 +551,10 @@ mod tests {
             IncludedStates::empty(),
             &mut reader,
             None,
+            volatile,
             &WithholdingVariables::new(&writes, BTreeSet::new()),
         )
-        .map(|_| ())
+        .map(|written| written.iter().map(|question| question.volatile).collect())
         .map_err(|error| format!("{error:#}"));
         let written = [
             "Store",
@@ -517,6 +563,7 @@ mod tests {
             "Absent",
             "Enhanced",
             "BadMetadata",
+            "Volatile",
         ]
         .into_iter()
         .map(|name| (name, writes.writes_to(&key(name))))
@@ -670,6 +717,83 @@ mod tests {
         );
     }
 
+    /// A SET of a volatile variable follows the volatile policy as choice_for_set does: set writes
+    /// it under VolatileWrites::Allow through variables that reach BootServices, and says that
+    /// the question wrote a volatile variable; otherwise it refuses it before any write (UEFI
+    /// 2.11 §8.2.3). Under Allow, a question says so for its own volatile variable after a SET of
+    /// another, and says that it wrote none if none is volatile.
+    #[test]
+    fn a_set_of_a_volatile_variable_follows_the_volatile_policy() {
+        let refused = |through: (VariableReach, VariableInterface)| {
+            Err(format!(
+                "cannot set question \"Volatile target\": its WRITE expression sets VarStore \
+                 0x0008 (EFI_IFR_VARSTORE_EFI \"Volatile\"), which set may not write: {:#}",
+                check_non_volatile(&key("Volatile"), through.1, BS_RT)
+                    .expect_err("refuse a volatile variable")
+            ))
+        };
+        let cases = [
+            (
+                "Volatile target",
+                VARIABLE_SERVICES,
+                VolatileWrites::Allow,
+                Ok(vec![true]),
+                BTreeMap::from([
+                    ("Store", vec![(0, vec![1])]),
+                    ("Volatile", vec![(0, vec![1])]),
+                ]),
+            ),
+            (
+                "Volatile target",
+                VARIABLE_SERVICES,
+                VolatileWrites::Refuse,
+                refused(VARIABLE_SERVICES),
+                BTreeMap::new(),
+            ),
+            (
+                "Volatile target",
+                EFIVARFS,
+                VolatileWrites::Allow,
+                refused(EFIVARFS),
+                BTreeMap::new(),
+            ),
+            (
+                "Volatile target",
+                FIRMWARE_ENVIRONMENT,
+                VolatileWrites::Allow,
+                refused(FIRMWARE_ENVIRONMENT),
+                BTreeMap::new(),
+            ),
+            (
+                "Volatile store",
+                VARIABLE_SERVICES,
+                VolatileWrites::Allow,
+                Ok(vec![true]),
+                BTreeMap::from([
+                    ("Store", vec![(2, vec![1])]),
+                    ("Volatile", vec![(0, vec![1])]),
+                ]),
+            ),
+            (
+                "Other store",
+                VARIABLE_SERVICES,
+                VolatileWrites::Allow,
+                Ok(vec![false]),
+                BTreeMap::from([
+                    ("Other", vec![(0, vec![1, 0])]),
+                    ("Store", vec![(1, vec![1])]),
+                ]),
+            ),
+        ];
+        for (prompt, through, volatile, want, want_written) in cases {
+            assert_eq!(
+                set_under(&form_set(), &prompts(), prompt, "1", through, volatile),
+                (want, want_written),
+                "{prompt} through {through:?} under {volatile:?}"
+            );
+        }
+    }
+
     /// Two package lists' questions of one prompt on one variable: the first writes byte 1, and
     /// the second's write of its own byte 0 and its WRITE's byte 2 keeps byte 1 as the first left
     /// it, not as set read it before any write.
@@ -734,6 +858,7 @@ mod tests {
             IncludedStates::empty(),
             &mut reader,
             None,
+            VolatileWrites::Refuse,
             &WithholdingVariables::new(&writes, BTreeSet::new()),
         )
         .expect("set both questions");

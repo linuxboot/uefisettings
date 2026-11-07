@@ -907,6 +907,7 @@ mod get_and_set_tests {
                     IncludedStates::empty(),
                     &mut reader,
                     None,
+                    VolatileWrites::Refuse,
                     &WithholdingVariables::new(&variables, BTreeSet::new()),
                 )
                 .map(|_| ())
@@ -920,7 +921,7 @@ mod get_and_set_tests {
                     "{prompt}: set through {reach:?}"
                 );
                 assert_eq!(
-                    choice_for_set(selection, prompt, &reader)
+                    choice_for_set(selection, prompt, &reader, VolatileWrites::Refuse)
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
                     refusal.map_or(Ok(()), |refusal| {

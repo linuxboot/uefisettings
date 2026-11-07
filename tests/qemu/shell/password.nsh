@@ -29,8 +29,16 @@ uefisettings.efi hii set --json --bypass-setup-password "Quiet Boot" Disabled
 echo uefisettings-shell: step set-password-store %lasterror%
 uefisettings.efi set --json --bypass-setup-password "Quiet Boot" Disabled
 echo uefisettings-shell: step top-set-password-store %lasterror%
+dmpstore ConOutDev -guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+echo uefisettings-shell: step dmpstore-volatile-before %lasterror%
 uefisettings.efi hii set --json --bypass-setup-password "Volatile setting" 1
 echo uefisettings-shell: step set-volatile %lasterror%
+dmpstore ConOutDev -guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+echo uefisettings-shell: step dmpstore-volatile-refused %lasterror%
+uefisettings.efi hii set --json --bypass-setup-password --allow-volatile "Volatile setting" 3
+echo uefisettings-shell: step set-volatile-allowed %lasterror%
+dmpstore ConOutDev -guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+echo uefisettings-shell: step dmpstore-volatile-after %lasterror%
 uefisettings.efi hii get --json "Quiet Boot" >v captured
 echo uefisettings-shell: step capture %lasterror%
 set

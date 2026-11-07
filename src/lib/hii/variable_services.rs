@@ -45,6 +45,7 @@ use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 /// Attributes that no variable has, as GetVariable() never returns EFI_VARIABLE_APPEND_WRITE
@@ -95,10 +96,17 @@ impl FirmwareVariables for VariableServices {
         Ok([&attributes.bits().to_ne_bytes()[..], &data].concat())
     }
 
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        volatile: VolatileWrites,
+    ) -> Result<()> {
         let (data, attributes) = get_variable(key)?;
         let mut bytes = [&attributes.bits().to_ne_bytes()[..], &data].concat();
-        modify_variable_bytes(key, Self::INTERFACE, &mut bytes, size, offset, encoded)?;
+        modify_variable_bytes(self, key, volatile, &mut bytes, size, offset, encoded)?;
         let data = bytes
             .get(EFIVARFS_HEADER_SIZE..)
             .context("data after the attributes word")?;

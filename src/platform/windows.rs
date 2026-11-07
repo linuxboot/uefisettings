@@ -26,7 +26,9 @@ use clap::Subcommand;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
+use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::MAX_SECRET_LEN;
@@ -141,15 +143,29 @@ pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) ->
     )
 }
 
+/// None: Windows writes through the firmware environment calls, after ExitBootServices, when
+/// SetVariable() sets no volatile variable (UEFI 2.11 §8.2.3), as on Linux.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct VolatileArgs {}
+
+impl VolatileArgs {
+    /// The default, which set through runtime variables does not consult.
+    pub(super) fn policy(&self) -> VolatileWrites {
+        VolatileWrites::default()
+    }
+}
+
 /// set, in this machine's HiiDB.
 pub(super) fn auto_set(
     question: &str,
     value: &str,
     json: bool,
-    selection: &SelectionArgs,
-    setup_password: &SetupPasswordArgs,
+    _selection: &SelectionArgs,
+    options: &SetOptions,
 ) -> Result<()> {
-    hii_set(question, value, selection, setup_password, json)
+    hii_set(question, value, options, json)
 }
 
 /// The bytes of the file `path`, the payload of variable write-signed.

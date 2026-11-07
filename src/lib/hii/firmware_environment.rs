@@ -37,6 +37,7 @@ use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use crate::hii::win32::nul_terminated_utf16;
 use crate::hii::win32::Win32Error;
@@ -189,14 +190,21 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
         Ok([&attributes.to_ne_bytes()[..], &data].concat())
     }
 
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
-        // As VariableServices::write_at (variable_services.rs): read the whole variable,
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        volatile: VolatileWrites,
+    ) -> Result<()> {
+        // As VariableServices::write_at_with (variable_services.rs): read the whole variable,
         // modify its bytes, and write the whole data back with the same attributes.
         let name = variable_name(key)?;
         let guid = variable_guid(key)?;
         let (attributes, data) = self.read_all(key)?;
         let mut bytes = [&attributes.to_ne_bytes()[..], &data].concat();
-        modify_variable_bytes(key, Self::INTERFACE, &mut bytes, size, offset, encoded)?;
+        modify_variable_bytes(self, key, volatile, &mut bytes, size, offset, encoded)?;
         let data = bytes
             .get(EFIVARFS_HEADER_SIZE..)
             .context("data after the attributes word")?;

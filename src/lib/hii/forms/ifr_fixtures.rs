@@ -51,8 +51,7 @@ pub(super) use crate::hii::variables::tests::variable_key;
 pub(crate) use crate::hii::variables::tests::MemoryVariables;
 #[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::WriteError;
-#[cfg(efivar_dumps)]
-pub(super) use crate::hii::variables::tests::BS_RT;
+pub(crate) use crate::hii::variables::tests::BS_RT;
 pub(crate) use crate::hii::variables::tests::NIL_GUID;
 pub(crate) use crate::hii::variables::tests::NV_BS;
 pub(crate) use crate::hii::variables::tests::NV_BS_RT;

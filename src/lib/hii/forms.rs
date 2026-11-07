@@ -32,14 +32,15 @@ use log::warn;
 use thiserror::Error;
 
 use crate::hii::package::Guid;
-use crate::hii::variables::check_non_volatile;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
+use crate::hii::variables::check_volatile_write;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VolatileWrites;
 use conditions::question_state;
 use conditions::question_value_expression;
 use conditions::retrieve_question_value;
@@ -2106,6 +2107,7 @@ pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
     reader: &EfivarReader,
+    volatile: VolatileWrites,
 ) -> Result<Choice<QuestionDescriptor>> {
     let descriptor = match &selection {
         Selection::Picked(descriptor, _)
@@ -2117,15 +2119,19 @@ pub(crate) fn choice_for_set(
     };
     // the WRITE expression of a question without a VarStore names the stores that set writes
     if let Some(store) = descriptor.store(reader.reach())? {
-        check_writable(store, reader)?;
+        check_writable(store, reader, volatile)?;
     }
     Ok(selection.for_set(question)?)
 }
 
 /// Refuses `store` unless set may write its variable, which `reader` has read: one that the read
-/// failed for, or whose attributes set does not write, a volatile, authenticated, or, at OS
-/// runtime, boot-service-only variable.
-fn check_writable(store: &dyn VariableStore, reader: &EfivarReader) -> Result<()> {
+/// failed for, or whose attributes set does not write, a volatile one unless `volatile` allows
+/// it (check_volatile_write), an authenticated, or, at OS runtime, boot-service-only variable.
+fn check_writable(
+    store: &dyn VariableStore,
+    reader: &EfivarReader,
+    volatile: VolatileWrites,
+) -> Result<()> {
     let reach = reader.reach();
     let interface = reader.interface();
     if let Some(error) = reader.read_error(store) {
@@ -2133,7 +2139,7 @@ fn check_writable(store: &dyn VariableStore, reader: &EfivarReader) -> Result<()
     }
     if let Some(attributes) = reader.attributes(store) {
         let key = store.variable_key();
-        check_non_volatile(&key, interface, attributes)?;
+        check_volatile_write(&key, interface, reach, volatile, attributes)?;
         check_unauthenticated(&key, attributes)?;
         check_runtime_writable(&key, reach, attributes)?;
     }
@@ -2249,7 +2255,7 @@ mod choice_for_set_tests {
             &BTreeSet::from([PROMPT]),
             &mut FormSetWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
         );
-        choice_for_set(selection, PROMPT, &reader)
+        choice_for_set(selection, PROMPT, &reader, VolatileWrites::Refuse)
     }
 
     /// set's choice for PROMPT in the FormSet of `undetermined_on(own)`.
@@ -2825,7 +2831,8 @@ mod choice_for_set_tests {
             ),
             (
                 VariableInterface::VariableServices,
-                ", so a write would not outlast a power cycle",
+                ", so a write would not outlast a power cycle; pass --allow-volatile to write it \
+                 anyway",
             ),
             (
                 VariableInterface::FirmwareEnvironment,

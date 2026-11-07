@@ -11,7 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The part of the CLI that only the UEFI Shell build has: the HiiDB and the variables of the
-//! firmware it runs on, --bypass-setup-password, and the `-` of the secret flags.
+//! firmware it runs on, --bypass-setup-password, --allow-volatile, whose written value lasts only
+//! until the next reset or power cycle, and the `-` of the secret flags.
 
 use std::fmt::Debug;
 use std::io;
@@ -46,7 +47,9 @@ use uefi_raw::table::system::SystemTable;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
+use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::read_shell_secret;
 use uefisettings::secret_file::Keystroke;
@@ -156,6 +159,25 @@ impl SetupPasswordArgs {
     }
 }
 
+/// Whether set writes a volatile variable.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct VolatileArgs {
+    /// Write a variable without EFI_VARIABLE_NON_VOLATILE too. Its new value lasts only until the next reset or power cycle.
+    #[arg(long)]
+    allow_volatile: bool,
+}
+
+impl VolatileArgs {
+    pub(super) fn policy(&self) -> VolatileWrites {
+        match self.allow_volatile {
+            false => VolatileWrites::Refuse,
+            true => VolatileWrites::Allow,
+        }
+    }
+}
+
 /// get, in this firmware's HII database.
 pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) -> Result<()> {
     hii_get(
@@ -171,10 +193,10 @@ pub(super) fn auto_set(
     question: &str,
     value: &str,
     json: bool,
-    selection: &SelectionArgs,
-    setup_password: &SetupPasswordArgs,
+    _selection: &SelectionArgs,
+    options: &SetOptions,
 ) -> Result<()> {
-    hii_set(question, value, selection, setup_password, json)
+    hii_set(question, value, options, json)
 }
 
 /// The claim on standard input that every secret flag of the command shares.

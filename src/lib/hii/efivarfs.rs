@@ -92,6 +92,7 @@ use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 pub(super) const EFIVARS_MOUNT_POINT: &str = "/sys/firmware/efi/efivars";
@@ -175,7 +176,14 @@ impl FirmwareVariables for EfivarFiles {
             .map_err(|error| as_variable_not_found(key, error))
     }
 
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        volatile: VolatileWrites,
+    ) -> Result<()> {
         // Steps:
         // * Read bytes
         // * Seek to 4 + offset
@@ -200,8 +208,9 @@ impl FirmwareVariables for EfivarFiles {
             .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
         modify_variable_bytes(
+            self,
             key,
-            EFIVARFS_INTERFACE,
+            volatile,
             &mut file_contents,
             size,
             offset,

@@ -33,8 +33,10 @@ use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IloBackend;
+use uefisettings::exports::SetOptions;
 use uefisettings::exports::SettingsBackend;
 use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::MAX_SECRET_LEN;
@@ -301,13 +303,27 @@ pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) ->
     Ok(())
 }
 
+/// None: efivarfs writes from Linux, after ExitBootServices, when SetVariable() sets no volatile
+/// variable (UEFI 2.11 §8.2.3).
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct VolatileArgs {}
+
+impl VolatileArgs {
+    /// The default, which set through runtime variables does not consult.
+    pub(super) fn policy(&self) -> VolatileWrites {
+        VolatileWrites::default()
+    }
+}
+
 /// set, on this machine's backend.
 pub(super) fn auto_set(
     question: &str,
     value: &str,
     json: bool,
     selection: &SelectionArgs,
-    setup_password: &SetupPasswordArgs,
+    options: &SetOptions,
 ) -> Result<()> {
     let machine = identify_machine();
     if machine.backend.contains(&Backend::Unknown) {
@@ -318,7 +334,7 @@ pub(super) fn auto_set(
         let res = IloBackend::set(question, value, None)?;
         print_with_style(res, json)?;
     } else {
-        hii_set(question, value, selection, setup_password, json)?;
+        hii_set(question, value, options, json)?;
     }
     Ok(())
 }
@@ -551,6 +567,24 @@ mod tests {
             clap::error::ErrorKind::MissingRequiredArgument,
             "no DIR"
         );
+    }
+
+    /// The Linux build takes no --allow-volatile: efivarfs writes after ExitBootServices, when
+    /// SetVariable() sets no volatile variable (UEFI 2.11 §8.2.3).
+    #[test]
+    fn set_takes_no_allow_volatile_flag() {
+        let commands: [&[&str]; 2] = [&["hii", "set", "Q", "V"], &["set", "Q", "V"]];
+        for command in commands {
+            let argv = [&["uefisettings"][..], command, &["--allow-volatile"]].concat();
+            let error =
+                UefiSettingsToolArgs::try_parse_from(argv).expect_err("parse --allow-volatile");
+
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{command:?}"
+            );
+        }
     }
 
     /// The Linux build takes no --bypass-setup-password: set through efivarfs has no setup

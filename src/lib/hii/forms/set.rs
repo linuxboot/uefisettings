@@ -36,10 +36,13 @@ use super::IFROpCode;
 use super::QuestionDescriptor;
 use super::RangeType;
 use super::TypeValue;
+use crate::hii::variables::is_volatile;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VolatileWrites;
+use crate::hii::variables::VolatileWritingVariables;
 use crate::hii::variables::WithholdingVariables;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
@@ -273,10 +276,17 @@ fn numeric_value(
     })
 }
 
+/// What set wrote for one question: the option that it picked, None for a value, and whether a
+/// variable that it wrote is volatile, as the reader read its attributes before the write.
+pub(crate) struct WrittenQuestion<'a> {
+    pub(crate) option: Option<&'a AnswerOption>,
+    pub(crate) volatile: bool,
+}
+
 /// Sets each of the `selected` questions, by the selector of its package list, to `new_value`
 /// or to its option of one of `texts` that chosen_option picks with `include`, in `variables`,
-/// and returns one option per selected question, in its order; None for a value; fails with
-/// SelectionError::NotFound when nothing is selected.
+/// writing a volatile variable only if `volatile` allows it, and returns a WrittenQuestion per
+/// selected question, in its order; fails with SelectionError::NotFound when nothing is selected.
 /// It builds the WritePlan of every question before the first write, reading with `reader`, whose
 /// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
 /// one question refuses leaves every variable unchanged; then it writes each, also after a failed
@@ -295,8 +305,9 @@ pub(crate) fn set_questions<'a>(
     include: IncludedStates,
     reader: &mut EfivarReader,
     access_level: Option<AccessLevel>,
+    volatile: VolatileWrites,
     variables: &WithholdingVariables<impl FirmwareVariables>,
-) -> Result<Vec<Option<&'a AnswerOption>>> {
+) -> Result<Vec<WrittenQuestion<'a>>> {
     if selected.is_empty() {
         return Err(SelectionError::NotFound {
             question: question.to_owned(),
@@ -322,20 +333,30 @@ pub(crate) fn set_questions<'a>(
             Ok((selector, plan, option))
         })
         .collect::<Result<Vec<_>>>()?;
-    let options = plans.iter().map(|(_, _, option)| *option).collect();
     let writes = plans
         .iter()
-        .map(|(selector, plan, _)| Ok((*selector, plan.variable_writes(reader)?)))
+        .map(|(selector, plan, _)| Ok((*selector, plan.variable_writes(reader, volatile)?)))
         .collect::<Result<Vec<_>>>()?;
+    let written_questions = plans
+        .iter()
+        .zip(&writes)
+        .map(|((_, _, option), (_, question_writes))| WrittenQuestion {
+            option: *option,
+            volatile: question_writes
+                .iter()
+                .any(|write| reader.attributes(write.store).is_some_and(is_volatile)),
+        })
+        .collect();
+    let variables = VolatileWritingVariables::new(variables, volatile);
 
     if let [(_, question_writes)] = writes.as_slice() {
-        write_in_turn(question_writes, variables)?;
-        return Ok(options);
+        write_in_turn(question_writes, &variables)?;
+        return Ok(written_questions);
     }
     let mut written = Vec::new();
     let mut failed = Vec::new();
     for (selector, question_writes) in &writes {
-        match write_in_turn(question_writes, variables) {
+        match write_in_turn(question_writes, &variables) {
             Ok(()) => written.push(selector.to_string()),
             Err(error) => failed.push((*selector, error)),
         }
@@ -343,7 +364,7 @@ pub(crate) fn set_questions<'a>(
     if !failed.is_empty() {
         return Err(NotSetEverywhere::new(question, failed, written).into());
     }
-    Ok(options)
+    Ok(written_questions)
 }
 
 /// set's error when a write fails while set writes several questions: each Failure, and the
@@ -470,12 +491,13 @@ mod set_questions_tests {
             IncludedStates::empty(),
             &mut reader,
             None,
+            VolatileWrites::Refuse,
             &WithholdingVariables::new(variables, BTreeSet::new()),
         )
-        .map(|options| {
-            options
+        .map(|written| {
+            written
                 .into_iter()
-                .map(|option| option.map(|option| option.value.clone()))
+                .map(|question| question.option.map(|option| option.value.clone()))
                 .collect()
         })
         .map_err(|error| format!("{error:#}"))

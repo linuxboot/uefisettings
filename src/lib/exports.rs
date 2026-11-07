@@ -146,6 +146,10 @@ pub use crate::hii::forms::IncludedStates;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
 pub use crate::hii::forms::SetupPasswordPolicy;
+pub use crate::hii::VolatileWrites;
+
+/// The suffix of set's answer for a question that wrote a volatile variable (UEFI 2.11 §8.2.3).
+const VOLATILE_ANNOTATION: &str = " <volatile: lasts until the next reset or power cycle>";
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -350,6 +354,9 @@ pub struct SetOptions {
     pub access_level: Option<AccessLevel>,
     /// In the UEFI Shell, whether set writes in a HiiDB that declares a setup password question
     pub setup_password: SetupPasswordPolicy,
+    /// Whether set writes a volatile variable: only through variables that reach BootServices, as
+    /// in the UEFI Shell
+    pub volatile: VolatileWrites,
 }
 
 /// The options of HiiBackend::list_questions_using.
@@ -612,7 +619,7 @@ impl HiiBackend {
             &mut reader,
         )?;
 
-        let option_annotations: Vec<String> = forms::set_questions(
+        let annotations: Vec<(String, bool)> = forms::set_questions(
             question,
             &selected
                 .iter()
@@ -623,15 +630,25 @@ impl HiiBackend {
             include,
             &mut reader,
             options.access_level,
+            options.volatile,
             &writes,
         )?
         .into_iter()
-        .map(|chosen| chosen.map_or_else(String::new, |option| option.state.option_annotation()))
+        .map(|written| {
+            let option_annotation = written
+                .option
+                .map_or_else(String::new, |option| option.state.option_annotation());
+            (option_annotation, written.volatile)
+        })
         .collect();
 
-        for ((guid, question_descriptor, state), option_annotation) in
-            selected.into_iter().zip(option_annotations)
+        for ((guid, question_descriptor, state), (option_annotation, volatile)) in
+            selected.into_iter().zip(annotations)
         {
+            let volatile_annotation = match volatile {
+                true => VOLATILE_ANNOTATION,
+                false => "",
+            };
             let set_resp = SetResponse {
                 // TODO: GUIDs repeat, also in errors; identify lists by HiiDB index
                 selector: guid,
@@ -640,7 +657,10 @@ impl HiiBackend {
                 question: Question {
                     options: question_descriptor.listed_options(include),
                     name: question_descriptor.question,
-                    answer: new_value.to_owned() + &option_annotation + &state.annotation(),
+                    answer: new_value.to_owned()
+                        + &option_annotation
+                        + &state.annotation()
+                        + volatile_annotation,
                     help: question_descriptor.help,
                     flags: listed_flags(question_descriptor.flags),
                     defaults: listed_defaults(question_descriptor.defaults),
@@ -818,7 +838,7 @@ fn select_for_set(
                 options.access_level,
                 reader,
             );
-            match forms::choice_for_set(selection, question, reader)? {
+            match forms::choice_for_set(selection, question, reader, options.volatile)? {
                 Choice::Chosen(question_descriptor, state) => {
                     selected.push((list.guid.to_string(), question_descriptor, state));
                 }
@@ -894,6 +914,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
     use crate::hii::forms::ifr_fixtures::VariableReach;
+    use crate::hii::forms::ifr_fixtures::BS_RT;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
@@ -1908,7 +1929,7 @@ mod tests {
     /// set through variables that reach BootServices, in a HiiDB that declares a password
     /// question, refuses unless the caller bypasses, and never reads or writes a VarStore that a
     /// password question names; set through those that reach Runtime writes either, as before;
-    /// whatever their interface.
+    /// whatever their interface and whether volatile writes are allowed.
     #[test]
     fn set_follows_the_setup_password_policy() {
         let refusal = "this HiiDB declares a setup password question; the UEFI Shell runs no \
@@ -2000,10 +2021,16 @@ mod tests {
             ),
         ];
 
-        for (reach, interface, question, policy, want, want_setup, want_amitse_setup) in cases {
+        let cases = [VolatileWrites::Refuse, VolatileWrites::Allow]
+            .into_iter()
+            .flat_map(|volatile| cases.clone().map(|case| (volatile, case)));
+        for (volatile, (reach, interface, question, policy, want, want_setup, want_amitse_setup)) in
+            cases
+        {
             let variables = password_variables(reach, interface);
             let options = SetOptions {
                 setup_password: policy,
+                volatile,
                 ..SetOptions::default()
             };
             let value = match question {
@@ -2021,7 +2048,9 @@ mod tests {
                 &*variables,
             );
 
-            let case = format!("{reach:?}, {interface:?}, set {question} {value}, {policy:?}");
+            let case = format!(
+                "{reach:?}, {interface:?}, set {question} {value}, {policy:?}, {volatile:?}"
+            );
             assert_eq!(
                 got.map(drop).map_err(|error| error.to_string()),
                 want.map_err(str::to_string),
@@ -2100,6 +2129,236 @@ mod tests {
                 assert_eq!(variables.bytes(&setup()), Some(want_bytes), "{case}: bytes");
             }
         }
+    }
+
+    /// Through variables that reach BootServices, set with VolatileWrites::Allow writes a volatile
+    /// variable (UEFI 2.11 §8.2.3: only ExitBootServices ends volatile writes), past both
+    /// choice_for_set and the backend's check, and its answer says that the value is volatile; a
+    /// non-volatile variable's answer does not.
+    #[test]
+    fn set_writes_a_volatile_variable_if_allowed_before_exit_boot_services() {
+        let cases = [
+            (
+                BS_RT,
+                "1 <volatile: lasts until the next reset or power cycle>",
+            ),
+            (NV_BS_RT, "1"),
+        ];
+        for (attributes, want_answer) in cases {
+            let variables = MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            );
+            variables.insert(setup(), attributes, &[0]);
+            let variables = Rc::new(variables);
+            let options = SetOptions {
+                volatile: VolatileWrites::Allow,
+                ..SetOptions::default()
+            };
+
+            let got = HiiBackend::set_in(
+                &boot_service_only_hiidb(),
+                "Q",
+                "1",
+                None,
+                &options,
+                shared(&variables),
+                &*variables,
+            );
+
+            let case = format!("attributes {attributes:#x}");
+            let answers = got.map(|list| {
+                list.responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                answers.map_err(|error| error.to_string()),
+                Ok(vec![want_answer.to_string()]),
+                "{case}: answers"
+            );
+            assert_eq!(
+                variables.writes_to(&setup()),
+                vec![(0, vec![1])],
+                "{case}: writes"
+            );
+            assert_eq!(
+                variables.bytes(&setup()),
+                Some([&attributes.to_ne_bytes()[..], &[1]].concat()),
+                "{case}: bytes"
+            );
+        }
+    }
+
+    /// set refuses a volatile variable before any write without VolatileWrites::Allow, and
+    /// through variables that reach Runtime whatever the policy, keeping it.
+    #[test]
+    fn set_refuses_a_volatile_variable_unless_allowed_before_exit_boot_services() {
+        let cases = [
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+                VolatileWrites::Refuse,
+                ", so a write would not outlast a power cycle; pass --allow-volatile to write it \
+                 anyway",
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
+                VolatileWrites::Allow,
+                " and cannot be written through efivarfs",
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+                VolatileWrites::Allow,
+                ", so a write would not outlast a power cycle",
+            ),
+        ];
+        for (reach, interface, volatile, refusal) in cases {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(setup(), BS_RT, &[0]);
+            let variables = Rc::new(variables);
+            let options = SetOptions {
+                volatile,
+                ..SetOptions::default()
+            };
+
+            let got = HiiBackend::set_in(
+                &boot_service_only_hiidb(),
+                "Q",
+                "1",
+                None,
+                &options,
+                shared(&variables),
+                &*variables,
+            );
+
+            let case = format!("{reach:?}, {interface:?}, {volatile:?}");
+            assert_eq!(
+                got.map(drop).map_err(|error| error.to_string()),
+                Err(format!(
+                    "EFI variable Setup-00000000-0000-0000-0000-000000000000 is volatile (no \
+                     EFI_VARIABLE_NON_VOLATILE){refusal}"
+                )),
+                "{case}"
+            );
+            assert_eq!(variables.writes_to(&setup()), vec![], "{case}: writes");
+            assert_eq!(
+                variables.bytes(&setup()),
+                Some(vec![6, 0, 0, 0, 0]),
+                "{case}: bytes"
+            );
+        }
+    }
+
+    /// set's write follows SetOptions::volatile past choice_for_set: a variable that the read finds
+    /// non-volatile and the write finds volatile is refused by the backend's check under
+    /// VolatileWrites::Refuse, writing nothing, and written under Allow.
+    #[test]
+    fn set_writes_by_the_volatile_policy_past_choice_for_set() {
+        let refusal = "EFI variable Setup-00000000-0000-0000-0000-000000000000 is volatile (no \
+                       EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle; \
+                       pass --allow-volatile to write it anyway";
+        let cases = [
+            (VolatileWrites::Refuse, Err(refusal), vec![]),
+            (VolatileWrites::Allow, Ok(()), vec![(0, vec![1])]),
+        ];
+        let variables_reaching_boot_services = || {
+            MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            )
+        };
+        for (volatile, want, want_writes) in cases {
+            let reads = variables_reaching_boot_services();
+            reads.insert(setup(), NV_BS_RT, &[0]);
+            let reads = Rc::new(reads);
+            let writes = variables_reaching_boot_services();
+            writes.insert(setup(), BS_RT, &[0]);
+            let options = SetOptions {
+                volatile,
+                ..SetOptions::default()
+            };
+
+            let got = HiiBackend::set_in(
+                &boot_service_only_hiidb(),
+                "Q",
+                "1",
+                None,
+                &options,
+                shared(&reads),
+                &writes,
+            );
+
+            assert_eq!(
+                got.map(drop).map_err(|error| error.to_string()),
+                want.map_err(str::to_string),
+                "{volatile:?}"
+            );
+            assert_eq!(
+                writes.writes_to(&setup()),
+                want_writes,
+                "{volatile:?}: writes"
+            );
+        }
+    }
+
+    /// Under VolatileWrites::Allow, choice_for_set still refuses an authenticated variable before
+    /// set's first write, so that the question of another package list is not written first.
+    #[test]
+    fn set_refuses_an_authenticated_variable_before_any_write_if_volatile_writes_are_allowed() {
+        let list = |guid: u8, name: &str| {
+            let packages = [
+                form_package(&[
+                    var_store_efi(1, name, NV_BS, 1),
+                    form(1, &[checkbox_on(1, 1, 1)]),
+                ]),
+                en_strings_package_of(&["Q"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid([guid; 16], &packages.concat())
+        };
+        let hiidb = [list(0x55, "Setup"), list(0x66, "Signed")].concat();
+        let signed = VariableKey {
+            name: "Signed".to_string(),
+            guid: NIL_GUID,
+        };
+        let variables = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        variables.insert(setup(), BS_RT, &[0]);
+        // EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+        variables.insert(signed.clone(), BS_RT | 0x20, &[0]);
+        let variables = Rc::new(variables);
+        let options = SetOptions {
+            volatile: VolatileWrites::Allow,
+            ..SetOptions::default()
+        };
+
+        let got = HiiBackend::set_in(
+            &hiidb,
+            "Q",
+            "1",
+            None,
+            &options,
+            shared(&variables),
+            &*variables,
+        );
+
+        assert_eq!(
+            got.map(drop).map_err(|error| error.to_string()),
+            Err(
+                "EFI variable Signed-00000000-0000-0000-0000-000000000000 has authenticated \
+                 access (attributes 0x26), which uefisettings does not write"
+                    .to_string()
+            ),
+            "refusal"
+        );
+        assert_eq!(variables.writes_to(&setup()), vec![], "writes of Setup");
+        assert_eq!(variables.writes_to(&signed), vec![], "writes of Signed");
     }
 
     /// Through variables that reach BootServices, a HiiDB with a PASSWORD op whose VarStore is

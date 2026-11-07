@@ -560,6 +560,14 @@ Questions never read a VarStore that a password question names: they show
 setup browser, so nothing there asks for or checks a setup password: in a HiiDB that declares a
 password question, `set` writes nothing unless `--bypass-setup-password` is given.
 
+`set` refuses a variable without EFI_VARIABLE_NON_VOLATILE unless `--allow-volatile` is given.
+The UEFI Shell runs before ExitBootServices, when SetVariable() still sets volatile variables
+(UEFI 2.11 §8.2.3), but the written value lasts only until the next reset or power cycle: when a
+variable that `set` writes is volatile, as read before the write, its answer ends with
+` <volatile: lasts until the next reset or power cycle>`. Linux and Windows write after
+ExitBootServices, when SetVariable() sets no volatile variable (UEFI 2.11 §8.2.3), so they take
+no `--allow-volatile`.
+
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
 machine's db trusts.

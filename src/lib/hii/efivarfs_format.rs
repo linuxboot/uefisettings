@@ -48,6 +48,7 @@ use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 /// The directory of this process's file descriptors, through which reopen opens a located file.
@@ -406,12 +407,13 @@ impl FirmwareVariables for EfivarCopy {
             .map_err(|error| as_variable_not_found(key, error))
     }
 
-    fn write_at(
+    fn write_at_with(
         &self,
         _key: &VariableKey,
         _size: u16,
         _offset: u16,
         _encoded: &[u8],
+        _volatile: VolatileWrites,
     ) -> Result<()> {
         Err(CopyOfEfivars.into())
     }

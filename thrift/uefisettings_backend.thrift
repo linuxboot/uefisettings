@@ -58,6 +58,8 @@ struct Question {
   // suppressed or disabled), or with " <s1 or s2: reasons>" if the reasons leave its state
   // undetermined among s1, s2, ... (selectable too).
   // The stored option's state precedes it: " <option s>" or " <option s1 or s2: reasons>".
+  // set's hii answer ends with " <volatile: lasts until the next reset or power cycle>" when it
+  // wrote a volatile variable (UEFI Shell, --allow-volatile).
   2: string answer;
   // hii - the ONE_OF options that set takes: those that IFR conditions certainly leave
   // selectable or in a state that --include allows.

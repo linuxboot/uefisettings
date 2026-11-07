@@ -128,6 +128,18 @@ pub(crate) enum VariableReach {
     BootServices,
 }
 
+/// Whether set writes a variable without EFI_VARIABLE_NON_VOLATILE, whose value does not outlast
+/// a power cycle and which SetVariable() sets only before ExitBootServices (UEFI 2.11 §8.2.3), so
+/// only through variables that reach BootServices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum VolatileWrites {
+    /// Refuse it
+    #[default]
+    Refuse,
+    /// Write it through variables that reach BootServices; through others, refuse it
+    Allow,
+}
+
 /// The interface through which FirmwareVariables read and write variables, which their error
 /// texts name; it decides no runtime access, which VariableReach does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +207,10 @@ impl VariableInterface {
     fn volatile_refusal(self) -> &'static str {
         match self {
             Self::Efivarfs => " and cannot be written through efivarfs",
-            Self::VariableServices => ", so a write would not outlast a power cycle",
+            Self::VariableServices => {
+                ", so a write would not outlast a power cycle; pass --allow-volatile to write it \
+                 anyway"
+            }
             Self::FirmwareEnvironment => ", so a write would not outlast a power cycle",
         }
     }
@@ -246,8 +261,20 @@ pub(crate) trait FirmwareVariables {
     /// The attributes word and all the data of `key`, as its efivarfs file holds them.
     fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>>;
     /// Writes `encoded` at data offset `offset` of `key`, whose VarStore has `size` bytes,
-    /// keeping its attributes and other bytes.
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()>;
+    /// keeping its attributes and other bytes; a volatile `key` only as `volatile` allows
+    /// (check_volatile_write).
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        volatile: VolatileWrites,
+    ) -> Result<()>;
+    /// write_at_with under Refuse; a VolatileWritingVariables writes under its own policy instead.
+    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
+        self.write_at_with(key, size, offset, encoded, VolatileWrites::Refuse)
+    }
 }
 
 impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
@@ -267,8 +294,15 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
         (**self).read_whole(key)
     }
 
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
-        (**self).write_at(key, size, offset, encoded)
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        volatile: VolatileWrites,
+    ) -> Result<()> {
+        (**self).write_at_with(key, size, offset, encoded, volatile)
     }
 }
 
@@ -289,8 +323,15 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
         (**self).read_whole(key)
     }
 
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
-        (**self).write_at(key, size, offset, encoded)
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        volatile: VolatileWrites,
+    ) -> Result<()> {
+        (**self).write_at_with(key, size, offset, encoded, volatile)
     }
 }
 
@@ -326,22 +367,24 @@ pub(super) fn attributes_and_data(
     Ok([&attributes.to_ne_bytes()[..], data].concat())
 }
 
-/// The read-modify-write of FirmwareVariables::write_at on `bytes`, the attributes word and all
-/// the data of variable `key`, which variables of `interface` hold: refuses a volatile or
-/// authenticated variable, then writes `encoded` at data offset `offset` as update_efivarfs_bytes
-/// does.
+/// The read-modify-write of FirmwareVariables::write_at_with on `bytes`, the attributes word and
+/// all the data of variable `key`, which `variables` hold: refuses an authenticated variable, and
+/// a volatile one unless `volatile` allows it (check_volatile_write), then writes `encoded` at data
+/// offset `offset` as update_efivarfs_bytes does.
 // set writes this machine's variables; the tests' MemoryVariables write on any build
 #[cfg(any(system_variables, test))]
 pub(super) fn modify_variable_bytes(
+    variables: &dyn FirmwareVariables,
     key: &VariableKey,
-    interface: VariableInterface,
+    volatile: VolatileWrites,
     bytes: &mut [u8],
     size: u16,
     offset: u16,
     encoded: &[u8],
 ) -> Result<()> {
+    let interface = variables.interface();
     let attributes = efivar_attributes(bytes).context(interface.missing_attributes())?;
-    check_non_volatile(key, interface, attributes)?;
+    check_volatile_write(key, interface, variables.reach(), volatile, attributes)?;
     check_unauthenticated(key, attributes)?;
     update_efivarfs_bytes(interface, bytes, size, offset, encoded)
 }
@@ -387,13 +430,38 @@ pub(super) fn check_non_volatile(
     interface: VariableInterface,
     attributes: u32,
 ) -> std::result::Result<(), VolatileVariable> {
-    if attributes & EFI_VARIABLE_NON_VOLATILE == 0 {
+    if is_volatile(attributes) {
         return Err(VolatileVariable {
             key: key.clone(),
             interface,
         });
     }
     Ok(())
+}
+
+/// Whether a variable of the attribute word `attributes` is volatile: without
+/// EFI_VARIABLE_NON_VOLATILE, its value does not outlast a power cycle (UEFI 2.11 §8.2.3).
+pub(super) fn is_volatile(attributes: u32) -> bool {
+    attributes & EFI_VARIABLE_NON_VOLATILE == 0
+}
+
+/// check_non_volatile, unless `volatile` allows writing a volatile variable and `reach` is
+/// BootServices: SetVariable() sets a volatile variable only before ExitBootServices (UEFI 2.11
+/// §8.2.3).
+pub(super) fn check_volatile_write(
+    key: &VariableKey,
+    interface: VariableInterface,
+    reach: VariableReach,
+    volatile: VolatileWrites,
+    attributes: u32,
+) -> std::result::Result<(), VolatileVariable> {
+    match (reach, volatile) {
+        (VariableReach::BootServices, VolatileWrites::Allow) => Ok(()),
+        (VariableReach::BootServices, VolatileWrites::Refuse)
+        | (VariableReach::Runtime, VolatileWrites::Refuse | VolatileWrites::Allow) => {
+            check_non_volatile(key, interface, attributes)
+        }
+    }
 }
 
 /// An EFI variable without EFI_VARIABLE_NON_VOLATILE, which set refuses.
@@ -624,12 +692,13 @@ impl FirmwareVariables for UnreadVariables {
         Err(EfivarsNotRead.into())
     }
 
-    fn write_at(
+    fn write_at_with(
         &self,
         _key: &VariableKey,
         _size: u16,
         _offset: u16,
         _encoded: &[u8],
+        _volatile: VolatileWrites,
     ) -> Result<()> {
         Err(EfivarsNotRead.into())
     }
@@ -764,9 +833,64 @@ impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
         self.variables.read_whole(key)
     }
 
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        volatile: VolatileWrites,
+    ) -> Result<()> {
         self.check(key)?;
-        self.variables.write_at(key, size, offset, encoded)
+        self.variables
+            .write_at_with(key, size, offset, encoded, volatile)
+    }
+}
+
+/// `variables` whose write_at and write_at_with write a volatile variable as `volatile` says,
+/// whatever a caller passes, the policy of one set: the policy reaches the check of each backend's
+/// read-modify-write (modify_variable_bytes).
+pub(crate) struct VolatileWritingVariables<V> {
+    variables: V,
+    volatile: VolatileWrites,
+}
+
+impl<V> VolatileWritingVariables<V> {
+    pub(crate) fn new(variables: V, volatile: VolatileWrites) -> Self {
+        Self {
+            variables,
+            volatile,
+        }
+    }
+}
+
+impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
+    fn reach(&self) -> VariableReach {
+        self.variables.reach()
+    }
+
+    fn interface(&self) -> VariableInterface {
+        self.variables.interface()
+    }
+
+    fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
+        self.variables.read(key, size)
+    }
+
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        self.variables.read_whole(key)
+    }
+
+    fn write_at_with(
+        &self,
+        key: &VariableKey,
+        size: u16,
+        offset: u16,
+        encoded: &[u8],
+        _: VolatileWrites,
+    ) -> Result<()> {
+        self.variables
+            .write_at_with(key, size, offset, encoded, self.volatile)
     }
 }
 
@@ -916,12 +1040,13 @@ pub(crate) mod tests {
                 .ok_or_else(|| VariableNotFound(key.clone()).into())
         }
 
-        fn write_at(
+        fn write_at_with(
             &self,
             key: &VariableKey,
             size: u16,
             offset: u16,
             encoded: &[u8],
+            volatile: VolatileWrites,
         ) -> Result<()> {
             match self.failures.get(key) {
                 None => {}
@@ -939,7 +1064,7 @@ pub(crate) mod tests {
                 .get_mut(key)
                 .ok_or_else(|| VariableNotFound(key.clone()))?;
             let mut modified = bytes.clone();
-            modify_variable_bytes(key, self.interface, &mut modified, size, offset, encoded)?;
+            modify_variable_bytes(self, key, volatile, &mut modified, size, offset, encoded)?;
             *bytes = modified;
             self.writes
                 .borrow_mut()
@@ -966,15 +1091,28 @@ pub(crate) mod tests {
             self.as_ref().read_whole(key)
         }
 
-        fn write_at(
+        fn write_at_with(
             &self,
             key: &VariableKey,
             size: u16,
             offset: u16,
             encoded: &[u8],
+            volatile: VolatileWrites,
         ) -> Result<()> {
-            self.as_ref().write_at(key, size, offset, encoded)
+            self.as_ref()
+                .write_at_with(key, size, offset, encoded, volatile)
         }
+    }
+
+    /// No variables, reaching what variables of `interface` reach, through it.
+    fn variables_of(interface: VariableInterface) -> MemoryVariables {
+        let reach = match interface {
+            VariableInterface::VariableServices => VariableReach::BootServices,
+            VariableInterface::Efivarfs | VariableInterface::FirmwareEnvironment => {
+                VariableReach::Runtime
+            }
+        };
+        MemoryVariables::new(reach, interface)
     }
 
     /// The variable `name` of NIL_GUID.
@@ -1019,7 +1157,8 @@ pub(crate) mod tests {
             (
                 VariableInterface::VariableServices,
                 "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
-                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
+                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle; pass \
+                 --allow-volatile to write it anyway",
                 "GetVariable() data is shorter than the declared varstore: 2 < 4 bytes",
                 "write past the GetVariable() data",
                 "variable bytes are missing their attributes word",
@@ -1570,18 +1709,205 @@ pub(crate) mod tests {
             (
                 VariableInterface::VariableServices,
                 "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
-                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle",
+                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle; pass \
+                 --allow-volatile to write it anyway",
             ),
         ];
         for (interface, want) in cases {
             let mut bytes = [&BS_RT.to_ne_bytes()[..], &[1]].concat();
             let before = bytes.clone();
 
-            let error = modify_variable_bytes(&key, interface, &mut bytes, 1, 0, &[0x2A])
-                .expect_err("modify a volatile variable");
+            let error = modify_variable_bytes(
+                &variables_of(interface),
+                &key,
+                VolatileWrites::Refuse,
+                &mut bytes,
+                1,
+                0,
+                &[0x2A],
+            )
+            .expect_err("modify a volatile variable");
 
             assert_eq!(error.to_string(), want, "{interface:?}: refusal");
             assert_eq!(bytes, before, "{interface:?}: bytes");
+        }
+    }
+
+    /// Before ExitBootServices (UEFI 2.11 §8.2.3), modify_variable_bytes writes a volatile variable
+    /// of the UEFI Shell's GetVariable() and SetVariable() under VolatileWrites::Allow.
+    #[test]
+    fn modify_variable_bytes_writes_a_volatile_shell_variable_if_allowed() {
+        let key = variable_key("Volatile");
+        let mut bytes = [&BS_RT.to_ne_bytes()[..], &[1]].concat();
+
+        let got = modify_variable_bytes(
+            &variables_of(VariableInterface::VariableServices),
+            &key,
+            VolatileWrites::Allow,
+            &mut bytes,
+            1,
+            0,
+            &[0x2A],
+        );
+
+        assert_eq!(got.map_err(|error| error.to_string()), Ok(()), "write");
+        assert_eq!(bytes, [&BS_RT.to_ne_bytes()[..], &[0x2A]].concat(), "bytes");
+    }
+
+    /// modify_variable_bytes keeps refusing a volatile variable, and its bytes, without
+    /// VolatileWrites::Allow, and through variables that reach Runtime whatever the policy:
+    /// SetVariable() sets no volatile variable after ExitBootServices (UEFI 2.11 §8.2.3).
+    #[test]
+    fn modify_variable_bytes_refuses_a_volatile_variable_unless_allowed_before_exit_boot_services()
+    {
+        let key = variable_key("Volatile");
+        let cases = [
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+                VolatileWrites::Refuse,
+                ", so a write would not outlast a power cycle; pass --allow-volatile to write it \
+                 anyway",
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
+                VolatileWrites::Allow,
+                " and cannot be written through efivarfs",
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+                VolatileWrites::Allow,
+                ", so a write would not outlast a power cycle",
+            ),
+        ];
+        for (reach, interface, volatile, refusal) in cases {
+            let mut bytes = [&BS_RT.to_ne_bytes()[..], &[1]].concat();
+            let before = bytes.clone();
+
+            let got = modify_variable_bytes(
+                &MemoryVariables::new(reach, interface),
+                &key,
+                volatile,
+                &mut bytes,
+                1,
+                0,
+                &[0x2A],
+            );
+
+            let case = format!("{reach:?}, {interface:?}, {volatile:?}");
+            assert_eq!(
+                got.map_err(|error| error.to_string()),
+                Err(format!(
+                    "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
+                     EFI_VARIABLE_NON_VOLATILE){refusal}"
+                )),
+                "{case}: refusal"
+            );
+            assert_eq!(bytes, before, "{case}: bytes");
+        }
+    }
+
+    /// set's stacks write a volatile variable as the bound policy says, by write_at and by
+    /// write_at_with whatever policy it passes: WithholdingVariables over VolatileWritingVariables,
+    /// and set_questions's VolatileWritingVariables over WithholdingVariables, here over a boxed
+    /// backend.
+    #[test]
+    fn set_stack_writes_a_volatile_variable_by_its_bound_policy_alone() {
+        #[derive(Debug, Clone, Copy)]
+        enum Stack {
+            WithholdingOverDecorator,
+            DecoratorOverWithholdingOverBox,
+        }
+        let key = variable_key("Volatile");
+        let refusal = "EFI variable Volatile-00000000-0000-0000-0000-000000000000 is volatile (no \
+                       EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle; \
+                       pass --allow-volatile to write it anyway";
+        for stack in [
+            Stack::WithholdingOverDecorator,
+            Stack::DecoratorOverWithholdingOverBox,
+        ] {
+            for bound in [VolatileWrites::Refuse, VolatileWrites::Allow] {
+                for passed in [
+                    None,
+                    Some(VolatileWrites::Refuse),
+                    Some(VolatileWrites::Allow),
+                ] {
+                    let variables = MemoryVariables::new(
+                        VariableReach::BootServices,
+                        VariableInterface::VariableServices,
+                    );
+                    variables.insert(key.clone(), BS_RT, &[1]);
+                    let write = |stack: &dyn FirmwareVariables| match passed {
+                        None => stack.write_at(&key, 1, 0, &[0x2A]),
+                        Some(passed) => stack.write_at_with(&key, 1, 0, &[0x2A], passed),
+                    };
+
+                    let got = match stack {
+                        Stack::WithholdingOverDecorator => write(&WithholdingVariables::new(
+                            VolatileWritingVariables::new(&variables, bound),
+                            BTreeSet::new(),
+                        )),
+                        Stack::DecoratorOverWithholdingOverBox => {
+                            let boxed: Box<dyn FirmwareVariables + '_> = Box::new(&variables);
+                            write(&VolatileWritingVariables::new(
+                                &WithholdingVariables::new(boxed, BTreeSet::new()),
+                                bound,
+                            ))
+                        }
+                    };
+
+                    let case = format!("{stack:?}, {bound:?}, {passed:?}");
+                    let (want, want_data): (Result<(), String>, &[u8]) = match bound {
+                        VolatileWrites::Refuse => (Err(refusal.to_string()), &[1]),
+                        VolatileWrites::Allow => (Ok(()), &[0x2A]),
+                    };
+                    assert_eq!(got.map_err(|error| error.to_string()), want, "{case}");
+                    assert_eq!(
+                        variables.bytes(&key),
+                        Some([&BS_RT.to_ne_bytes()[..], want_data].concat()),
+                        "{case}: bytes"
+                    );
+                }
+            }
+        }
+    }
+
+    /// VolatileWritingVariables reach what their variables reach, through the same interface, and
+    /// read what they hold, whatever their policy.
+    #[test]
+    fn volatile_writing_variables_reach_and_read_as_their_variables() {
+        let key = variable_key("Volatile");
+        for interface in [
+            VariableInterface::Efivarfs,
+            VariableInterface::VariableServices,
+            VariableInterface::FirmwareEnvironment,
+        ] {
+            let variables = variables_of(interface);
+            variables.insert(key.clone(), BS_RT, &[1]);
+            for volatile in [VolatileWrites::Refuse, VolatileWrites::Allow] {
+                let decorated = VolatileWritingVariables::new(&variables, volatile);
+
+                let case = format!("{interface:?}, {volatile:?}");
+                assert_eq!(
+                    (decorated.reach(), decorated.interface()),
+                    (variables.reach(), interface),
+                    "{case}"
+                );
+                assert_eq!(
+                    decorated.read(&key, 1).map_err(|error| error.to_string()),
+                    Ok([&BS_RT.to_ne_bytes()[..], &[1]].concat()),
+                    "{case}: read"
+                );
+                assert_eq!(
+                    decorated
+                        .read_whole(&key)
+                        .map_err(|error| error.to_string()),
+                    Ok([&BS_RT.to_ne_bytes()[..], &[1]].concat()),
+                    "{case}: read_whole"
+                );
+            }
         }
     }
 
@@ -1598,8 +1924,16 @@ pub(crate) mod tests {
                 let mut bytes = [&attributes.to_ne_bytes()[..], &[1]].concat();
                 let before = bytes.clone();
 
-                let error = modify_variable_bytes(&key, interface, &mut bytes, 1, 0, &[0x2A])
-                    .expect_err("modify an authenticated variable");
+                let error = modify_variable_bytes(
+                    &variables_of(interface),
+                    &key,
+                    VolatileWrites::Allow,
+                    &mut bytes,
+                    1,
+                    0,
+                    &[0x2A],
+                )
+                .expect_err("modify an authenticated variable");
 
                 assert_eq!(
                     error.to_string(),
@@ -1626,9 +1960,16 @@ pub(crate) mod tests {
         let mut bytes = [&NV_BS_RT.to_ne_bytes()[..], &[1, 2]].concat();
         let before = bytes.clone();
 
-        let error =
-            modify_variable_bytes(&key, VariableInterface::Efivarfs, &mut bytes, 4, 0, &[0x2A])
-                .expect_err("modify a variable shorter than its VarStore");
+        let error = modify_variable_bytes(
+            &variables_of(VariableInterface::Efivarfs),
+            &key,
+            VolatileWrites::Refuse,
+            &mut bytes,
+            4,
+            0,
+            &[0x2A],
+        )
+        .expect_err("modify a variable shorter than its VarStore");
 
         assert_eq!(
             error.to_string(),
@@ -1646,8 +1987,16 @@ pub(crate) mod tests {
         let mut bytes = vec![7, 0];
         let before = bytes.clone();
 
-        let error = modify_variable_bytes(&key, VariableInterface::Efivarfs, &mut bytes, 0, 0, &[])
-            .expect_err("modify a variable without its attributes word");
+        let error = modify_variable_bytes(
+            &variables_of(VariableInterface::Efivarfs),
+            &key,
+            VolatileWrites::Refuse,
+            &mut bytes,
+            0,
+            0,
+            &[],
+        )
+        .expect_err("modify a variable without its attributes word");
 
         assert_eq!(
             error.to_string(),
