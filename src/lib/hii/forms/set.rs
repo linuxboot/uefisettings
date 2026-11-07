@@ -25,6 +25,7 @@ use super::conditions::ExpressionRefusal;
 use super::conditions::IncludedStates;
 use super::conditions::ReadOnlyCause;
 use super::conditions::SelectionError;
+use super::defaults::OptionValueError;
 use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
@@ -99,6 +100,13 @@ pub(crate) enum ChangeValueError {
         value: u64,
         value_width: u8,
         storage_width: u8,
+    },
+    /// A ONE_OF option whose value is not known
+    #[error("cannot set question {question:?} to option {option:?}: {reason}")]
+    OptionValue {
+        question: String,
+        option: String,
+        reason: OptionValueError,
     },
     #[error(transparent)]
     Selection(#[from] SelectionError),
@@ -295,12 +303,12 @@ pub(super) fn own_write<'a>(
     };
     let store = question.store(reach)?;
     let value = match new_value {
-        NewValue::Option(option) => option.raw_value,
+        NewValue::Option(option) => option_value(question, option)?,
         NewValue::Text(text) if question.opcode == IFROpCode::OneOf => {
-            question
+            let option = question
                 .select_option(&BTreeSet::from([text.to_owned()]), IncludedStates::empty())?
-                .ok_or(ChangeValueError::InvalidOption)?
-                .raw_value
+                .ok_or(ChangeValueError::InvalidOption)?;
+            option_value(question, option)?
         }
         NewValue::Text(text) => numeric_value(question, text)?,
     };
@@ -308,6 +316,21 @@ pub(super) fn own_write<'a>(
         .map(|store| VarStoreWrite::new(store, offset, size, value, interface))
         .transpose()?;
     Ok((value, write))
+}
+
+/// The value that set writes for `option` of the ONE_OF `question`, or why it has none.
+fn option_value(
+    question: &QuestionDescriptor,
+    option: &AnswerOption,
+) -> Result<TypeValue, ChangeValueError> {
+    option
+        .raw_value
+        .clone()
+        .map_err(|reason| ChangeValueError::OptionValue {
+            question: question.question.clone(),
+            option: option.value.clone(),
+            reason,
+        })
 }
 
 /// The value of the NUMERIC or CHECKBOX `question` that `new_value` gives, within its range.

@@ -53,6 +53,7 @@ use conditions::QuestionExpression;
 use conditions::QuestionValues;
 use conditions::VarStoreValues;
 use defaults::FormSetDefaultStores;
+use defaults::OptionValueError;
 use question_values::describe_question;
 use question_values::questions_named;
 use question_values::value_question;
@@ -1403,7 +1404,7 @@ pub enum TypeValue {
     Date(Date),
     #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     StringID(u16),
-    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
+    /// EFI_IFR_TYPE_OTHER, of no bytes: a nested EFI_IFR_VALUE gives the value
     Other,
     #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Undefined,
@@ -1466,6 +1467,7 @@ fn type_value_parser<R: Read + Seek>(
             }
             Ok(TypeValue::Boolean(false))
         }
+        EFI_IFR_TYPE_OTHER => Ok(TypeValue::Other),
         // TODO: handle other types like Date, Time & Ref. We have already made structs for them.
         _ => {
             let r: u8 = BinRead::read_options(reader, endian, ())?;
@@ -1943,8 +1945,20 @@ impl fmt::Debug for QuestionDescriptor {
 #[derive(Debug)]
 pub struct AnswerOption {
     pub value: String,
-    raw_value: TypeValue,
+    /// The option's value, or why it is not known
+    raw_value: Result<TypeValue, OptionValueError>,
     pub(crate) state: StateEvaluation,
+}
+
+impl AnswerOption {
+    /// The option's value as an unsigned integer; None if it is not known or not a number.
+    fn as_u64(&self) -> Option<u64> {
+        self.raw_value
+            .as_ref()
+            .ok()
+            .copied()
+            .and_then(TypeValue::as_u64)
+    }
 }
 
 impl QuestionDescriptor {
@@ -2004,12 +2018,15 @@ impl QuestionDescriptor {
     }
 
     /// The texts of the options that `include` certainly allows: those that get lists and set
-    /// takes.
+    /// takes, each whose value is not known with why.
     pub(crate) fn listed_options(&self, include: IncludedStates) -> Vec<String> {
         self.possible_options
             .iter()
             .filter(|option| option.state.is_allowed(include))
-            .map(|option| option.value.clone())
+            .map(|option| match &option.raw_value {
+                Ok(_) => option.value.clone(),
+                Err(reason) => format!("{} <ValueUnavailable: {reason}>", option.value),
+            })
             .collect()
     }
 

@@ -1230,13 +1230,30 @@ pub(super) fn question_expression(
 /// The EFI_IFR_VALUE that gives the value of `question`: the last in its scope (question_scope),
 /// never one in an EFI_IFR_DEFAULT or in a statement nested in it, as edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c ParseOpCodes makes each VALUE outside a DEFAULT the
-/// ValueExpression of its ParentStatement.
+/// ValueExpression of its ParentStatement. Nor one in an EFI_IFR_ONE_OF_OPTION, whose value it
+/// gives (UEFI 2.11 §33.3.8.3.51), though ParseOpCodes takes that one as the question's too.
 pub(super) fn question_value_expression(
     question: &IFROperation,
 ) -> Option<Rc<RefCell<IFROperation>>> {
-    question_scope(question)
-        .into_iter()
-        .rfind(|op| op.borrow().op_code == IFROpCode::Value)
+    question_scope(question).into_iter().rfind(|op| {
+        let op = op.borrow();
+        op.op_code == IFROpCode::Value && !in_one_of_option(&op, question)
+    })
+}
+
+/// Whether `op`, in the scope of `question`, is in the scope of an EFI_IFR_ONE_OF_OPTION there.
+fn in_one_of_option(op: &IFROperation, question: &IFROperation) -> bool {
+    let mut parent = op.parent.as_ref().and_then(Weak::upgrade);
+    while let Some(scope) = parent {
+        if std::ptr::eq(scope.as_ptr(), question) {
+            return false;
+        }
+        if scope.borrow().op_code == IFROpCode::OneOfOption {
+            return true;
+        }
+        parent = scope.borrow().parent.as_ref().and_then(Weak::upgrade);
+    }
+    false
 }
 
 /// Why set refuses a question with an EFI_IFR_VALUE.
@@ -3393,8 +3410,8 @@ mod tests {
     /// question_value_expression takes the last EFI_IFR_VALUE in the scope of the question, also
     /// one inside an op that is no statement or inside an EDKII bit-varstore GUID, as
     /// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes makes each the ValueExpression of
-    /// its ParentStatement, but none inside an EFI_IFR_DEFAULT, another nested statement or an op
-    /// that ParseOpCodes skips.
+    /// its ParentStatement, but none inside an EFI_IFR_DEFAULT, another nested statement, an op
+    /// that ParseOpCodes skips, or an EFI_IFR_ONE_OF_OPTION, whose value it gives.
     #[test]
     fn question_value_expression_is_the_last_value_in_the_question_scope() {
         let value = |value: u8| value_of(uint8(value));
@@ -3434,6 +3451,16 @@ mod tests {
                 "VALUE in an unknown op in its scope",
                 vec![in_scope(0x70, &[], value(2))],
                 None,
+            ),
+            (
+                "VALUE in a ONE_OF_OPTION in its scope",
+                vec![other_option(6, 0x00, &[uint8(2)])],
+                None,
+            ),
+            (
+                "VALUE after a ONE_OF_OPTION in its scope",
+                vec![other_option(6, 0x00, &[uint8(2)]), value(3)],
+                Some(3),
             ),
         ];
         for (name, children, want) in cases {
@@ -4242,7 +4269,7 @@ mod tests {
         let descriptor: QuestionDescriptor =
             question_descriptor_with(&question, unavailable(), &values());
         let option = descriptor.select_option(&BTreeSet::from(["Enabled".to_string()]), include)?;
-        Ok(option.and_then(|option| option.raw_value.as_u64()))
+        Ok(option.and_then(|option| option.as_u64()))
     }
 
     #[test]
@@ -4595,7 +4622,7 @@ mod tests {
         let options: Vec<(&str, Option<u64>)> = question
             .possible_options
             .iter()
-            .map(|option| (option.value.as_str(), option.raw_value.as_u64()))
+            .map(|option| (option.value.as_str(), option.as_u64()))
             .collect();
         assert_eq!(
             options,

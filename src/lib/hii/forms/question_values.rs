@@ -26,6 +26,7 @@ use super::conditions::IncludedStates;
 use super::conditions::QuestionValues;
 use super::conditions::StateEvaluation;
 use super::defaults::option_text;
+use super::defaults::option_value;
 use super::defaults::push_default;
 use super::defaults::question_defaults;
 use super::defaults::question_scope;
@@ -280,7 +281,7 @@ pub(super) fn handle_oneof(
         let op = op.borrow();
         if let ParsedOperation::OneOfOption(o) = &op.parsed_data {
             possible_options.push(AnswerOption {
-                raw_value: o.value,
+                raw_value: option_value(current_node, &op, o, &mut walk.inputs),
                 value: find_corresponding_string(o.option_string_id, walk.string_packages)
                     .to_string(),
                 state: option_state(&op, &mut walk.inputs),
@@ -289,7 +290,7 @@ pub(super) fn handle_oneof(
     }
     let chosen: Vec<&AnswerOption> = possible_options
         .iter()
-        .filter(|opt| chosen_value.is_some_and(|(_, value)| opt.raw_value.as_u64() == Some(value)))
+        .filter(|opt| chosen_value.is_some_and(|(_, value)| opt.as_u64() == Some(value)))
         .collect();
     // the first that may be shown, as edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption
     // finds it, else the first, which a SUPPRESS_IF hides
@@ -416,6 +417,7 @@ mod question_value_tests {
     use super::super::default_value_parser;
     use super::super::display_answer;
     use super::super::ifr_fixtures::*;
+    use super::super::DefaultId;
     use super::super::IfrDefaultValue;
     use super::super::Range16;
     use super::super::Range32;
@@ -459,6 +461,206 @@ mod question_value_tests {
             ifr_default(0x0001, 0),
         ];
         (data, children)
+    }
+
+    /// An EFI_IFR_ONE_OF_OPTION (UEFI 2.11 §33.3.8.3.51) of Type EFI_IFR_TYPE_OTHER takes the
+    /// value of its nested EFI_IFR_VALUE in the width of its ONE_OF: get answers it for that
+    /// value, and its DEFAULT flag gives that default. One whose VALUE does not fit that width,
+    /// is not known or is missing lists with why and matches no value. The VALUE is the
+    /// option's, not one that gives the ONE_OF its value.
+    #[test]
+    fn one_of_option_of_type_other_takes_the_value_of_its_value_op() {
+        let (data, _) = uint8_one_of(0);
+        let children = [
+            one_of_option(5, 0x00, &[0]),
+            other_option(6, 0x10, &[uint8(1)]),
+            other_option(7, 0x00, &[ifr_ones()]),
+            other_option(3, 0x00, &[uint8(1), uint8(2)]),
+            other_option(PADDED_ENABLED, 0x00, &[]),
+        ];
+        let cases = [
+            ("stored 1", var_store_of(&[1]), "Enabled"),
+            ("stored 0", var_store_of(&[0]), "Disabled"),
+            (
+                "stored 0xFF, all ones cut to the ONE_OF",
+                var_store_of(&[0xFF]),
+                "-1 (no matching option)",
+            ),
+            (
+                "no VarStore",
+                unavailable(),
+                "<ValueUnavailable: no VarStore 1> <IFR default: Enabled>",
+            ),
+        ];
+        for (name, var_store, want) in cases {
+            assert_eq!(one_of_value(&data, &children, var_store), want, "{name}");
+        }
+
+        let (_root, node) = parse_question(&[], ONE_OF, &data, &children);
+        let question = question_descriptor(&node, var_store_of(&[1]));
+        assert_eq!(
+            question.listed_options(IncludedStates::empty()),
+            [
+                "Disabled",
+                "Enabled",
+                "AllOnes <ValueUnavailable: its EFI_IFR_VALUE gives 0xffffffffffffffff, which \
+                 does not fit in the 8 bits of the ONE_OF>",
+                "Prompt <ValueUnavailable: its EFI_IFR_VALUE expression not evaluated: malformed \
+                 expression: 2 values left>",
+                "Enabled  <ValueUnavailable: EFI_IFR_TYPE_OTHER without a nested EFI_IFR_VALUE>",
+            ],
+            "listed options"
+        );
+    }
+
+    /// An EFI_IFR_TYPE_OTHER option of an EDKII bit varstore ONE_OF takes the value of its
+    /// EFI_IFR_VALUE within the width of the field: one that does not fit lists with why and
+    /// matches no value.
+    #[test]
+    fn bit_field_option_of_type_other_fits_in_the_field() {
+        let data = uint32_range_question(4, UINT_DEC | 2);
+        let children = [
+            other_option(6, 0x00, &[uint8(3)]),
+            other_option(7, 0x00, &[uint8(4)]),
+        ];
+        let (_root, node) = parse_question_in_guid(BIT_VARSTORE_GUID, ONE_OF, &data, &children);
+
+        let question = question_descriptor(&node, var_store_of(&[0x30]));
+
+        assert_eq!(question.value, "Enabled", "bits 4 and 5 hold 3");
+        assert_eq!(
+            question.listed_options(IncludedStates::empty()),
+            [
+                "Enabled",
+                "AllOnes <ValueUnavailable: its EFI_IFR_VALUE gives 0x4, which does not fit in \
+                 the 2 bits of the ONE_OF>",
+            ],
+            "listed options"
+        );
+    }
+
+    /// The text of a default skips an EFI_IFR_TYPE_OTHER option whose value is not known: it
+    /// names the first option of that value that follows.
+    #[test]
+    fn default_text_skips_an_option_of_type_other_without_a_value() {
+        let children = [other_option(3, 0x00, &[]), flagged_option(6, 0x10, 1)];
+
+        assert_eq!(
+            one_of_default(&[], &children),
+            format!("{UNAVAILABLE} <IFR default: Enabled>"),
+            "OTHER option without a VALUE, then DEFAULT-flagged option 1"
+        );
+    }
+
+    /// The DEFAULT flag of an EFI_IFR_TYPE_OTHER option whose value is not known gives a default
+    /// listed with why, never a value.
+    #[test]
+    fn default_of_an_option_of_type_other_that_does_not_fit_tells_why() {
+        let children = [
+            one_of_option(5, 0x00, &[0]),
+            other_option(7, 0x10, &[ifr_ones()]),
+        ];
+        let (_root, node) = parse_question(&[], ONE_OF, &one_of_data(), &children);
+
+        let question = question_descriptor(&node, unavailable());
+
+        let reason = "EFI_IFR_ONE_OF_OPTION value not known: its EFI_IFR_VALUE gives \
+                      0xffffffffffffffff, which does not fit in the 8 bits of the ONE_OF";
+        let defaults: Vec<(DefaultId, String)> = question
+            .defaults
+            .iter()
+            .map(|default| (default.default_id, default.value.to_string()))
+            .collect();
+        assert_eq!(
+            defaults,
+            [(DefaultId(0x0000), format!("unknown ({reason})"))],
+            "defaults"
+        );
+        assert_eq!(
+            question.value,
+            format!("{UNAVAILABLE} <IFR default: unknown ({reason})>"),
+            "answer"
+        );
+    }
+
+    /// set writes an EFI_IFR_TYPE_OTHER option's value in the width of its ONE_OF, all 64 bits of
+    /// a UINT64 one too, and refuses one whose value is not known with why; the option's
+    /// EFI_IFR_VALUE does not make the ONE_OF read-only.
+    #[test]
+    fn set_writes_an_option_of_type_other_in_the_width_of_its_one_of() {
+        let data = [
+            &question_header(0)[..],
+            &[0x01],                 // Flags: UINT16
+            &0u16.to_le_bytes(),     // MinValue
+            &u16::MAX.to_le_bytes(), // MaxValue
+            &1u16.to_le_bytes(),     // Step
+        ]
+        .concat();
+        let children = [
+            other_option(6, 0x00, &[uint8(0x34)]),
+            other_option(7, 0x00, &[ifr_ones()]),
+        ];
+        let (_root, node) = parse_question(&[], ONE_OF, &data, &children);
+        let variables = MemoryVariables::default();
+        let question = question_descriptor(
+            &node,
+            writable_var_store("VarStore", &[0xAA, 0xBB], &variables),
+        );
+        let [enabled, all_ones] = question.possible_options.as_slice() else {
+            panic!("options: {:?}", question.possible_options);
+        };
+
+        assert_eq!(
+            change_option(&question, enabled, &variables).map_err(|error| error.to_string()),
+            Ok(()),
+            "Enabled"
+        );
+        assert_eq!(
+            change_option(&question, all_ones, &variables).map_err(|error| error.to_string()),
+            Err(
+                "cannot set question \"\" to option \"AllOnes\": its EFI_IFR_VALUE gives \
+                 0xffffffffffffffff, which does not fit in the 16 bits of the ONE_OF"
+                    .to_string()
+            ),
+            "AllOnes"
+        );
+        assert_eq!(
+            variables.writes_to(&variable_key("VarStore")),
+            [(0, vec![0x34, 0x00])],
+            "writes"
+        );
+
+        let data = [
+            &question_header(0)[..],
+            &[0x03],                 // Flags: UINT64
+            &0u64.to_le_bytes(),     // MinValue
+            &u64::MAX.to_le_bytes(), // MaxValue
+            &1u64.to_le_bytes(),     // Step
+        ]
+        .concat();
+        let (_root, node) =
+            parse_question(&[], ONE_OF, &data, &[other_option(7, 0x00, &[ifr_ones()])]);
+        assert_eq!(
+            question_descriptor(&node, var_store_of(&[0xFF; 8])).value,
+            "AllOnes",
+            "UINT64 storing all ones"
+        );
+        let variables = MemoryVariables::default();
+        let question =
+            question_descriptor(&node, writable_var_store("VarStore", &[0; 8], &variables));
+        let [all_ones] = question.possible_options.as_slice() else {
+            panic!("UINT64 options: {:?}", question.possible_options);
+        };
+        assert_eq!(
+            change_option(&question, all_ones, &variables).map_err(|error| error.to_string()),
+            Ok(()),
+            "UINT64 AllOnes"
+        );
+        assert_eq!(
+            variables.writes_to(&variable_key("VarStore")),
+            [(0, vec![0xFF; 8])],
+            "UINT64 writes"
+        );
     }
 
     #[test]

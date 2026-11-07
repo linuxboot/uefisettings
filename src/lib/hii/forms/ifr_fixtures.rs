@@ -367,6 +367,23 @@ pub(super) fn one_of_option(string_id: u16, value_type: u8, value: &[u8]) -> Vec
     operation(ONE_OF_OPTION, false, &data)
 }
 
+/// An EFI_IFR_ONE_OF_OPTION of Type EFI_IFR_TYPE_OTHER with `flags`, holding an EFI_IFR_VALUE of
+/// `expression`, or none if `expression` is empty.
+pub(super) fn other_option(string_id: u16, flags: u8, expression: &[Vec<u8>]) -> Vec<u8> {
+    let data = [&string_id.to_le_bytes()[..], &[flags, EFI_IFR_TYPE_OTHER]].concat();
+    if expression.is_empty() {
+        return operation(ONE_OF_OPTION, false, &data);
+    }
+    [
+        operation(ONE_OF_OPTION, true, &data),
+        operation(VALUE, true, &[]),
+        expression.concat(),
+        END.to_vec(),
+        END.to_vec(),
+    ]
+    .concat()
+}
+
 /// A UINT8 EFI_IFR_ONE_OF_OPTION with `flags`.
 pub(crate) fn flagged_option(string_id: u16, flags: u8, value: u8) -> Vec<u8> {
     let data = [&string_id.to_le_bytes()[..], &[flags, 0x00, value]].concat();

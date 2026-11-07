@@ -29,6 +29,7 @@ use super::conditions::QuestionValues;
 use super::conditions::Truth;
 use super::find_corresponding_string;
 use super::is_bit_varstore_guid;
+use super::storage::ValueLocation;
 use super::walk_scopes;
 use super::IFRDefault;
 use super::IFROpCode;
@@ -36,7 +37,11 @@ use super::IFROperation;
 use super::IfrDefaultValue;
 use super::IncludedStates;
 use super::NumericFormatError;
+use super::OneOf;
+use super::OneOfOption;
 use super::ParsedOperation;
+use super::Range;
+use super::TypeValue;
 use super::Walk;
 use crate::hii::strings::StringMap;
 
@@ -118,6 +123,23 @@ pub(super) enum DefaultError {
     OptionType(u8),
     #[error(transparent)]
     NumericFormat(#[from] NumericFormatError),
+    #[error("EFI_IFR_ONE_OF_OPTION value not known: {0}")]
+    OptionValue(OptionValueError),
+}
+
+/// Why the value of an EFI_IFR_ONE_OF_OPTION of Type EFI_IFR_TYPE_OTHER is not known.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum OptionValueError {
+    #[error("EFI_IFR_TYPE_OTHER without a nested EFI_IFR_VALUE")]
+    ValueOpMissing,
+    #[error("its EFI_IFR_VALUE expression not evaluated: {0}")]
+    ValueExpression(String),
+    #[error(
+        "its EFI_IFR_VALUE gives {value:#x}, which does not fit in the {bits} bits of the ONE_OF"
+    )]
+    TooWide { value: u64, bits: u32 },
+    #[error("EFI_IFR_TYPE_OTHER outside a ONE_OF")]
+    OutsideOneOf,
 }
 
 /// What question_scope takes from the scope of an op nested in a question.
@@ -393,6 +415,52 @@ fn ifr_default_value(
     evaluate_value(&value, inputs).map_err(DefaultError::ValueExpression)
 }
 
+/// Returns the value of the EFI_IFR_ONE_OF_OPTION `op`, `option`, in the scope of `question`: its
+/// Value, or, of Type EFI_IFR_TYPE_OTHER, that of its nested EFI_IFR_VALUE (UEFI 2.11
+/// §33.3.8.3.51) in the width of the ONE_OF `question`. edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes instead copies no Value and makes that EFI_IFR_VALUE
+/// the question's, which makes the question read-only.
+pub(super) fn option_value(
+    question: &IFROperation,
+    op: &IFROperation,
+    option: &OneOfOption,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Result<TypeValue, OptionValueError> {
+    let TypeValue::Other = option.value else {
+        return Ok(option.value);
+    };
+    let ParsedOperation::OneOf(one_of) = &question.parsed_data else {
+        return Err(OptionValueError::OutsideOneOf);
+    };
+    let value = op
+        .children
+        .iter()
+        .find(|child| child.borrow().op_code == IFROpCode::Value)
+        .ok_or(OptionValueError::ValueOpMissing)?;
+    let value =
+        evaluate_value(&value.borrow(), inputs).map_err(OptionValueError::ValueExpression)?;
+    one_of_value(one_of, value)
+}
+
+/// Returns `value` as a value of `one_of`: of the size of its Range, and within the width of an
+/// EDKII bit varstore field.
+fn one_of_value(one_of: &OneOf, value: u64) -> Result<TypeValue, OptionValueError> {
+    let bits = match one_of.location {
+        ValueLocation::Bytes { size, .. } => u32::from(size) * u8::BITS,
+        ValueLocation::Bits { width, .. } => u32::from(width),
+    };
+    let fits = bits >= u64::BITS || value >> bits == 0;
+    let sized = match one_of.data {
+        Range::Range8(_) => u8::try_from(value).ok().map(TypeValue::NumSize8),
+        Range::Range16(_) => u16::try_from(value).ok().map(TypeValue::NumSize16),
+        Range::Range32(_) => u32::try_from(value).ok().map(TypeValue::NumSize32),
+        Range::Range64(_) => Some(TypeValue::NumSize64(value)),
+    };
+    sized
+        .filter(|_| fits)
+        .ok_or(OptionValueError::TooWide { value, bits })
+}
+
 /// Returns every default that the IFR declares for the question, by DefaultId ascending, each
 /// valued by `text`: of STANDARD; of MANUFACTURING, if `stores` declares it or the question or one
 /// of its options has a *_DEFAULT_MFG flag; of every DEFAULTSTORE of `stores`; and of every
@@ -491,10 +559,13 @@ fn default_for_id(
         }
         match option_visibility(&op, inputs) {
             OptionVisibility::Shown => Some(
-                option
-                    .value
-                    .as_u64()
-                    .ok_or(DefaultError::OptionType(option.value_type)),
+                option_value(question, &op, option, inputs)
+                    .map_err(DefaultError::OptionValue)
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .ok_or(DefaultError::OptionType(option.value_type))
+                    }),
             ),
             OptionVisibility::Suppressed => None,
             OptionVisibility::Unknown(reason) => {
@@ -554,8 +625,10 @@ pub(super) fn option_text(
             let ParsedOperation::OneOfOption(option) = &op.parsed_data else {
                 return None;
             };
-            if option.value.as_u64() != Some(value) {
-                return None;
+            // an option whose value is not known matches no value
+            match option_value(question, &op, option, inputs) {
+                Ok(option_value) if option_value.as_u64() == Some(value) => {}
+                Ok(_) | Err(_) => return None,
             }
             match option_visibility(&op, inputs) {
                 OptionVisibility::Shown => Some(Ok(find_corresponding_string(
@@ -594,6 +667,7 @@ mod tests {
     use super::DefaultError;
     use super::DefaultId;
     use super::DefaultValue;
+    use super::OptionValueError;
 
     /// The MethodIdentifier of the test EFI_IFR_FORM_MAP method.
     const METHOD_IDENTIFIER: [u8; 16] = [0x33; 16];
@@ -704,6 +778,30 @@ mod tests {
                     DefaultError::ValueExpression(QUESTION_1_UNAVAILABLE.to_string())
                 ),
             ],
+            "defaults"
+        );
+    }
+
+    /// A DEFAULT-flagged EFI_IFR_TYPE_OTHER option outside a ONE_OF, which gives it no width,
+    /// gives a default unknown with why.
+    #[test]
+    fn default_flag_of_an_option_of_type_other_outside_a_one_of_tells_why() {
+        let (_root, node) = parse_question(
+            &[],
+            NUMERIC,
+            &uint8_numeric(0x00, 0, 10),
+            &[other_option(6, 0x10, &[uint8(1)])],
+        );
+
+        assert_eq!(
+            question_descriptor(&node, unavailable()).defaults,
+            [DeclaredDefault {
+                default_id: DefaultId::STANDARD,
+                store_name: None,
+                value: DefaultValue(Err(DefaultError::OptionValue(
+                    OptionValueError::OutsideOneOf
+                ))),
+            }],
             "defaults"
         );
     }

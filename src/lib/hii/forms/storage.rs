@@ -1046,7 +1046,7 @@ mod non_efi_varstore_tests {
             defaults: Vec::new(),
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
-                raw_value: TypeValue::NumSize8(1),
+                raw_value: Ok(TypeValue::NumSize8(1)),
                 state: StateEvaluation::selectable(),
             }],
             varstore: Ok(Box::new(TestVariableStore {
