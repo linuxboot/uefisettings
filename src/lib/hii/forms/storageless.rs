@@ -26,11 +26,8 @@ use super::conditions::QuestionExpression;
 use super::conditions::VALUE_MAKES_READ_ONLY;
 use super::question_values::value_question;
 use super::IFROperation;
+use super::QuestionFlags;
 use crate::hii::variables::VariableReach;
-
-/// The question flag that has the browser call its driver's
-/// EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() (UEFI 2.11 §33.3.8.2.2).
-const EFI_IFR_FLAG_CALLBACK: u8 = 0x04;
 
 /// What a question without a VarStore declares for its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +49,7 @@ impl StoragelessQuestion {
         (header.var_store_id == 0).then(|| Self {
             read: question_expression(question, QuestionExpression::Read).is_some(),
             write: question_expression(question, QuestionExpression::Write).is_some(),
-            callback: header.question_flags & EFI_IFR_FLAG_CALLBACK != 0,
+            callback: header.flags().contains(QuestionFlags::CALLBACK),
             value: question_value_expression(question).is_some(),
         })
     }
@@ -423,7 +420,11 @@ mod tests {
                 .filter(|(present, _)| *present)
                 .map(|(_, op_code)| expression_of(op_code))
                 .collect();
-            let flags = if callback { EFI_IFR_FLAG_CALLBACK } else { 0 };
+            let flags = if callback {
+                QuestionFlags::CALLBACK.bits()
+            } else {
+                0
+            };
             let question = classify(|body| form(1, body), &storageless_one_of(flags), &children)
                 .unwrap_or_else(|| panic!("{name}: classified as having a VarStore"));
             assert_eq!(question.route(QuestionExpression::Read), get, "{name}: get");
@@ -488,7 +489,7 @@ mod tests {
             ("VALUE", 0, with_value(&[])),
             (
                 "VALUE, READ, WRITE, CALLBACK",
-                EFI_IFR_FLAG_CALLBACK,
+                QuestionFlags::CALLBACK.bits(),
                 with_value(&[expression_of(READ), expression_of(WRITE)]),
             ),
         ];
@@ -556,7 +557,7 @@ mod tests {
                 .collect();
             let question = classify(
                 |body| form(1, body),
-                &storageless_one_of(EFI_IFR_FLAG_CALLBACK),
+                &storageless_one_of(QuestionFlags::CALLBACK.bits()),
                 &children,
             )
             .unwrap_or_else(|| panic!("{name}: classified as having a VarStore"));
@@ -580,7 +581,7 @@ mod tests {
     /// A question that names a VarStore is not classified, flagged or not.
     #[test]
     fn questions_on_a_var_store_are_not_storageless() {
-        for flags in [0, EFI_IFR_FLAG_CALLBACK] {
+        for flags in [0, QuestionFlags::CALLBACK.bits()] {
             let data = [question_header_with(1, 3, 1, 0, flags), vec![0x00, 0, 4, 1]].concat();
             assert_eq!(
                 classify(|body| form(1, body), &data, &[expression_of(READ)]),
@@ -782,11 +783,21 @@ mod get_and_set_tests {
                     .filter(|(present, _)| *present)
                     .map(|(_, op_code)| [operation(op_code, false, &[]), ifr_true()].concat())
                     .collect();
-                checkbox(id, 0, if callback { 0x04 } else { 0x00 }, children)
+                let flags = if callback {
+                    QuestionFlags::CALLBACK.bits()
+                } else {
+                    0x00
+                };
+                checkbox(id, 0, flags, children)
             })
             .collect();
         let stored_id = u16::try_from(QUESTIONS.len() + 1).expect("question ids fit a u16");
-        questions.push(checkbox(stored_id, 1, 0x04, Vec::new()));
+        questions.push(checkbox(
+            stored_id,
+            1,
+            QuestionFlags::CALLBACK.bits(),
+            Vec::new(),
+        ));
         parse_form_set(&[var_store_efi(1, "Store", NV_BS_RT, 1), form(1, &questions)])
     }
 

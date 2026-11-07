@@ -65,9 +65,9 @@ pub(crate) use crate::hii::variables::VariableReach;
 
 pub(crate) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
 
-pub(super) const ONE_OF: u8 = 0x05;
+pub(crate) const ONE_OF: u8 = 0x05;
 pub(crate) const CHECKBOX: u8 = 0x06;
-pub(super) const NUMERIC: u8 = 0x07;
+pub(crate) const NUMERIC: u8 = 0x07;
 pub(super) const PASSWORD: u8 = 0x08;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
@@ -545,7 +545,7 @@ pub(super) fn question_header_on(
 }
 
 /// question_header_on() with Flags `flags`.
-pub(super) fn question_header_with(
+pub(crate) fn question_header_with(
     question_id: u16,
     prompt: u16,
     var_store_id: u16,
@@ -767,10 +767,14 @@ pub(super) fn question_descriptor_with(
     let strings = strings();
     let mut reader = efivars.reader();
     let walk = &mut FormSetWalk::new(&strings, &mut reader, values, IncludedStates::empty());
+    let flags = value_question(&current)
+        .expect("a question")
+        .header()
+        .flags();
     match &current.parsed_data {
-        ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", node, walk),
-        ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", node, walk),
-        ParsedOperation::CheckBox(parsed) => handle_checkbox(store, parsed, "", node, walk),
+        ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", flags, node, walk),
+        ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", flags, node, walk),
+        ParsedOperation::CheckBox(parsed) => handle_checkbox(store, parsed, "", flags, node, walk),
         other => panic!("not a question: {other:?}"),
     }
 }

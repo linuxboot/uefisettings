@@ -98,6 +98,7 @@ use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::PasswordQuestions;
+use crate::hii::forms::QuestionFlags;
 use crate::hii::package;
 #[cfg(any(variable_names, variable_info, variable_data))]
 pub use crate::hii::package::Guid;
@@ -502,6 +503,7 @@ impl HiiBackend {
                             + &question_descriptor.value_state.option_annotation()
                             + &state.annotation(),
                         help: question_descriptor.help,
+                        flags: listed_flags(question_descriptor.flags),
                         ..Default::default()
                     };
                     // don't show it if everything is empty
@@ -637,6 +639,7 @@ impl HiiBackend {
                     name: question_descriptor.question,
                     answer: new_value.to_owned() + &option_annotation + &state.annotation(),
                     help: question_descriptor.help,
+                    flags: listed_flags(question_descriptor.flags),
                     ..Default::default()
                 },
                 modified: true,
@@ -731,6 +734,7 @@ impl HiiBackend {
                         name: question_descriptor.question,
                         answer: question_descriptor.value,
                         help: question_descriptor.help,
+                        flags: listed_flags(question_descriptor.flags),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -829,12 +833,24 @@ fn select_for_set(
     Ok(selected)
 }
 
+/// The names of `flags`, as Question lists them: None, which --json leaves out, for none.
+fn listed_flags(flags: QuestionFlags) -> Option<Vec<String>> {
+    (!flags.is_empty()).then(|| {
+        flags
+            .iter_names()
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     #[cfg(efivar_dumps)]
     use std::fs;
     use std::rc::Rc;
+
+    use fbthrift::simplejson_protocol;
 
     use crate::hii::forms::ifr_fixtures::checkbox_at;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
@@ -846,6 +862,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::on_small_stack;
     use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::password_on;
+    use crate::hii::forms::ifr_fixtures::question_header_with;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
@@ -853,11 +870,14 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
     use crate::hii::forms::ifr_fixtures::VariableReach;
+    use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
+    use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::NV_BS;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+    use crate::hii::forms::ifr_fixtures::ONE_OF;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
@@ -1232,6 +1252,192 @@ mod tests {
     /// `variables`, shared with the caller.
     fn shared(variables: &Rc<MemoryVariables>) -> Box<dyn FirmwareVariables> {
         Box::new(Rc::clone(variables))
+    }
+
+    /// A question of flags_hiidb.
+    struct Flagged {
+        prompt: &'static str,
+        op_code: u8,
+        /// The data after the question header
+        data: &'static [u8],
+        /// The question Flags
+        flags: u8,
+        /// The names that --json lists for `flags` (UEFI 2.11 §33.3.8.2.2), without the reserved
+        /// bits 0x02 and 0x08
+        names: &'static [&'static str],
+    }
+
+    /// The questions of flags_hiidb.
+    const FLAGGED: [Flagged; 6] = [
+        Flagged {
+            prompt: "Mixed",
+            op_code: NUMERIC,
+            data: NUMERIC_0_TO_255,
+            flags: 0x11,
+            names: &["READ_ONLY", "RESET_REQUIRED"],
+        },
+        Flagged {
+            prompt: "Plain",
+            op_code: NUMERIC,
+            data: NUMERIC_0_TO_255,
+            flags: 0x00,
+            names: &[],
+        },
+        Flagged {
+            prompt: "Reserved",
+            op_code: NUMERIC,
+            data: NUMERIC_0_TO_255,
+            flags: 0x0A,
+            names: &[],
+        },
+        Flagged {
+            prompt: "All",
+            op_code: NUMERIC,
+            data: NUMERIC_0_TO_255,
+            flags: 0xFF,
+            names: &[
+                "READ_ONLY",
+                "CALLBACK",
+                "RESET_REQUIRED",
+                "REST_STYLE",
+                "RECONNECT_REQUIRED",
+                "OPTIONS_ONLY",
+            ],
+        },
+        Flagged {
+            prompt: "Box",
+            op_code: CHECKBOX,
+            data: &[0x00],
+            flags: 0x40,
+            names: &["RECONNECT_REQUIRED"],
+        },
+        Flagged {
+            prompt: "Pick",
+            op_code: ONE_OF,
+            data: &[0x00, 0, 1, 1],
+            flags: 0x84,
+            names: &["CALLBACK", "OPTIONS_ONLY"],
+        },
+    ];
+
+    /// The NUMERIC Flags, EFI_IFR_NUMERIC_SIZE_1 shown as EFI_IFR_DISPLAY_UINT_DEC, MinValue,
+    /// MaxValue and Step of a UINT8 NUMERIC from 0 to 255.
+    const NUMERIC_0_TO_255: &[u8] = &[0x10, 0, 255, 1];
+
+    /// A HiiDB whose EFI variable Setup holds the questions of FLAGGED, the first at byte 0,
+    /// each prompted by its own string.
+    fn flags_hiidb() -> Vec<u8> {
+        let questions: Vec<Vec<u8>> = FLAGGED
+            .iter()
+            .zip(1..)
+            .map(|(question, id)| {
+                let header = question_header_with(id, id, 1, id - 1, question.flags);
+                operation(
+                    question.op_code,
+                    false,
+                    &[&header[..], question.data].concat(),
+                )
+            })
+            .collect();
+        let size = u16::try_from(FLAGGED.len()).expect("FLAGGED fits a VarStore");
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, size),
+                form(1, &questions),
+            ]),
+            en_strings_package_of(&FLAGGED.map(|question| question.prompt)),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// The value of `field` in the JSON that --json prints for `question`, if it prints one.
+    fn json_field(question: &Question, field: &str) -> Option<serde_json::Value> {
+        let json: serde_json::Value =
+            serde_json::from_slice(&simplejson_protocol::serialize(question))
+                .expect("parse the JSON of a question");
+        json.get(field).cloned()
+    }
+
+    /// The flags that --json lists for `question`, if it lists any.
+    fn json_flags(question: &Question) -> Option<Vec<String>> {
+        json_field(question, "flags")
+            .map(|flags| serde_json::from_value(flags).expect("flags are a list of strings"))
+    }
+
+    /// What json_flags gives for a question with the flags `names`: None for none.
+    fn want_flags(names: &[&str]) -> Option<Vec<String>> {
+        (!names.is_empty()).then(|| names.iter().map(ToString::to_string).collect())
+    }
+
+    /// get and list-questions list the flags of each kind of question by their UEFI names,
+    /// without the reserved bits, and print no flags for a question with none.
+    #[test]
+    fn get_and_list_questions_name_the_question_flags() {
+        let hiidb = flags_hiidb();
+        let listed = HiiBackend::list_questions_using(
+            &hiidb,
+            &ListQuestionsOptions {
+                efivars: EfivarSource::Disabled,
+                ..ListQuestionsOptions::default()
+            },
+        )
+        .expect("list questions");
+        let listed: Vec<(String, Option<Vec<String>>)> = listed
+            .iter()
+            .map(|question| (question.name.clone(), json_flags(question)))
+            .collect();
+        let want: Vec<(String, Option<Vec<String>>)> = FLAGGED
+            .iter()
+            .map(|question| (question.prompt.to_string(), want_flags(question.names)))
+            .collect();
+        assert_eq!(listed, want, "list-questions");
+
+        for Flagged { prompt, names, .. } in FLAGGED {
+            let got = HiiBackend::get_using(
+                &hiidb,
+                prompt,
+                None,
+                &GetOptions {
+                    efivars: EfivarSource::Disabled,
+                    ..GetOptions::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("get {prompt}: {error:#}"));
+            let got: Vec<Option<Vec<String>>> = got
+                .responses
+                .iter()
+                .map(|response| json_flags(&response.question))
+                .collect();
+            assert_eq!(got, [want_flags(names)], "get {prompt}");
+        }
+    }
+
+    /// set's response lists the flags of the question it wrote, and none for one without.
+    #[test]
+    fn set_names_the_question_flags() {
+        for (prompt, want) in [("Mixed", want_flags(FLAGGED[0].names)), ("Plain", None)] {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(setup(), NV_BS_RT, &[0; FLAGGED.len()]);
+            let variables = Rc::new(variables);
+            let got = HiiBackend::set_in(
+                &flags_hiidb(),
+                prompt,
+                "9",
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+            )
+            .unwrap_or_else(|error| panic!("set {prompt}: {error:#}"));
+            let got: Vec<Option<Vec<String>>> = got
+                .responses
+                .iter()
+                .map(|response| json_flags(&response.question))
+                .collect();
+            assert_eq!(got, [want], "set {prompt}");
+        }
     }
 
     /// Through variables that reach BootServices, get, list-questions and show-ifr read no data

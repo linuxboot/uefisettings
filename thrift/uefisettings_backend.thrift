@@ -47,6 +47,10 @@ struct Question {
   // selectable or in a state that --include allows.
   3: list<string> options;
   4: string help;
+  // hii - the question's Flags (UEFI 2.11 §33.3.8.2.2) that are set, by their names there
+  // without the EFI_IFR_FLAG_ prefix, in bit order: READ_ONLY, CALLBACK, RESET_REQUIRED,
+  // REST_STYLE, RECONNECT_REQUIRED, OPTIONS_ONLY; reserved bits are left out. Unset if none is.
+  5: optional list<string> flags;
 }
 
 struct SetResponse {

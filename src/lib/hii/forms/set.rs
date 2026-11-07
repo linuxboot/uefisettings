@@ -863,6 +863,7 @@ mod write_validation_tests {
             store,
             parsed,
             "Numeric test",
+            parsed.question_header.flags(),
             &node,
             &mut FormSetWalk::new(
                 &[],

@@ -789,6 +789,27 @@ pub struct QuestionHeader {
     pub question_flags: u8,
 }
 
+bitflags::bitflags! {
+    /// The Flags of an EFI_IFR_QUESTION_HEADER (UEFI 2.11 §33.3.8.2.2), named as there.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub struct QuestionFlags: u8 {
+        const READ_ONLY = 0x01;
+        const CALLBACK = 0x04;
+        const RESET_REQUIRED = 0x10;
+        const REST_STYLE = 0x20;
+        const RECONNECT_REQUIRED = 0x40;
+        const OPTIONS_ONLY = 0x80;
+    }
+}
+
+impl QuestionHeader {
+    /// The question Flags without the reserved bits, which "the Forms Processor should ignore"
+    /// (UEFI 2.11 §33.2.5.10.1).
+    pub fn flags(&self) -> QuestionFlags {
+        QuestionFlags::from_bits_truncate(self.question_flags)
+    }
+}
+
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little, import(encoding: ValueEncoding))]
 pub struct OneOf {
@@ -1783,6 +1804,8 @@ pub struct QuestionDescriptor {
     max_value: RangeType,
     numeric_range: Option<NumericRange>,
     opcode: IFROpCode,
+    /// The Flags of its question header
+    pub flags: QuestionFlags,
     pub possible_options: Vec<AnswerOption>,
     /// The VarStore of the question, or why set cannot write it
     varstore: Result<Box<dyn VariableStore>>,
@@ -3148,6 +3171,34 @@ mod tests {
     use crate::hii::efivarfs_format::EfivarFileName;
     use crate::hii::variables::FirmwareVariables;
     use crate::hii::variables::EFIVARFS_HEADER_SIZE;
+
+    /// Each bit of the question Flags names its flag, and a reserved bit none.
+    #[test]
+    fn each_question_flag_bit_names_its_flag() {
+        let cases: [(u8, &[&str]); 9] = [
+            (0x01, &["READ_ONLY"]),
+            (0x02, &[]),
+            (0x04, &["CALLBACK"]),
+            (0x08, &[]),
+            (0x10, &["RESET_REQUIRED"]),
+            (0x20, &["REST_STYLE"]),
+            (0x40, &["RECONNECT_REQUIRED"]),
+            (0x80, &["OPTIONS_ONLY"]),
+            (0x00, &[]),
+        ];
+        for (question_flags, want) in cases {
+            let header = QuestionHeader {
+                prompt_string_id: 0,
+                help_string_id: 0,
+                question_id: 0,
+                var_store_id: 0,
+                var_store_info: 0,
+                question_flags,
+            };
+            let names: Vec<&str> = header.flags().iter_names().map(|(name, _)| name).collect();
+            assert_eq!(names, want, "Flags {question_flags:#04x}");
+        }
+    }
 
     /// find_question_in finds a question by the name that list_questions prints, whose leading
     /// and trailing whitespace the prompt string keeps, and by that name with other surrounding

@@ -171,6 +171,7 @@ mod non_efi_varstore_tests {
     use super::super::AnswerOption;
     use super::super::ParsedOperation;
     use super::super::QuestionDescriptor;
+    use super::super::QuestionFlags;
     use super::super::RangeType;
     use super::super::TypeValue;
     use super::super::DUMMY_OPCODE;
@@ -873,6 +874,7 @@ mod non_efi_varstore_tests {
             max_value: RangeType::NumSize8(1),
             numeric_range: None,
             opcode: IFROpCode::OneOf,
+            flags: QuestionFlags::empty(),
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 raw_value: TypeValue::NumSize8(1),

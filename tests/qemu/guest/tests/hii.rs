@@ -158,6 +158,14 @@ struct Dump {
     copied: Vec<String>,
 }
 
+/// A question of `hii list-questions --json`, with the fields that `Question` leaves out.
+#[derive(Debug, Deserialize)]
+struct ListedQuestion {
+    name: String,
+    // optional, so that a build without the field fails an assertion, not the parse
+    flags: Option<Vec<String>>,
+}
+
 fn question(name: &str, answer: &str, options: &[&str]) -> Question {
     Question {
         name: name.to_owned(),
@@ -324,6 +332,45 @@ fn list_strings_lists_the_prompts() {
         .collect();
     for DefaultQuestion { name, .. } in DEFAULTS {
         assert!(strings.contains(&name), "{name:?} is not listed");
+    }
+}
+
+/// list-questions lists the question Flags that DriverSample's Vfr.vfr (edk2-stable202608)
+/// gives its questions, and none for a question without: VfrCompile writes `flags = READ_ONLY`,
+/// `RESET_REQUIRED` and `REST_STYLE` as EFI_IFR_FLAG_READ_ONLY, _RESET_REQUIRED and _REST_STYLE.
+#[test]
+fn list_questions_lists_the_question_flags() {
+    let questions: Vec<ListedQuestion> = json(&[
+        "hii",
+        "list-questions",
+        "--json",
+        INCLUDE_ALL[0],
+        INCLUDE_ALL[1],
+    ]);
+    for (name, flags) in [
+        ("How old are you?(Readonly)", Some(&["READ_ONLY"][..])),
+        (NUMERIC, None),
+        (ONE_OF, Some(&["RESET_REQUIRED"][..])),
+        (
+            "x-UEFI HII Option",
+            Some(&["RESET_REQUIRED", "REST_STYLE"][..]),
+        ),
+        (
+            "Non x-UEFI HII Option",
+            Some(&["RESET_REQUIRED", "REST_STYLE"][..]),
+        ),
+    ] {
+        let listed: Vec<Option<Vec<&str>>> = questions
+            .iter()
+            .filter(|question| question.name == name)
+            .map(|question| {
+                question
+                    .flags
+                    .as_ref()
+                    .map(|flags| flags.iter().map(String::as_str).collect())
+            })
+            .collect();
+        assert_eq!(listed, [flags.map(<[&str]>::to_vec)], "flags of {name:?}");
     }
 }
 

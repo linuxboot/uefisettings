@@ -412,6 +412,26 @@ fn new_types_print_their_golden_json() {
     }
 }
 
+/// question() with the flags of a READ_ONLY question that needs a reset.
+fn flagged_question() -> Question {
+    Question {
+        flags: Some(vec!["READ_ONLY".to_owned(), "RESET_REQUIRED".to_owned()]),
+        ..question()
+    }
+}
+
+/// The JSON of the optional fields that Question gained for hii questions.
+fn question_fields() -> Vec<(&'static str, Vec<u8>)> {
+    vec![("question-flags.json", json(&flagged_question()))]
+}
+
+#[test]
+fn question_fields_print_their_golden_json() {
+    for (name, output) in question_fields() {
+        golden::assert_golden(FIXTURES, name, &output);
+    }
+}
+
 /// The keys of the JSON object `json`.
 fn keys(json: &[u8]) -> BTreeSet<String> {
     let value: serde_json::Value = serde_json::from_slice(json).expect("parse JSON");
@@ -458,6 +478,7 @@ fn unset_optionals_are_omitted_and_set_ones_present() {
         &error_cause(),
         &["kind", "os_errno"],
     );
+    assert_optionals("Question", &question(), &flagged_question(), &["flags"]);
     assert_optionals(
         "SetResponse",
         &SetResponse::default(),

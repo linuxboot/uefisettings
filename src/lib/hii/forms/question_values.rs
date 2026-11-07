@@ -47,6 +47,7 @@ use super::OneOf;
 use super::ParsedOperation;
 use super::Question;
 use super::QuestionDescriptor;
+use super::QuestionFlags;
 use super::QuestionHeader;
 use super::Range;
 use super::RangeType;
@@ -150,12 +151,17 @@ pub(super) fn describe_question(
 ) -> QuestionDescriptor {
     let header = value_question.header();
     let prompt = find_corresponding_string(header.prompt_string_id, walk.string_packages);
+    let flags = header.flags();
     let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
     match value_question {
-        ValueQuestion::OneOf(parsed) => handle_oneof(varstore, parsed, prompt, question, walk),
-        ValueQuestion::Numeric(parsed) => handle_numeric(varstore, parsed, prompt, question, walk),
+        ValueQuestion::OneOf(parsed) => {
+            handle_oneof(varstore, parsed, prompt, flags, question, walk)
+        }
+        ValueQuestion::Numeric(parsed) => {
+            handle_numeric(varstore, parsed, prompt, flags, question, walk)
+        }
         ValueQuestion::CheckBox(parsed) => {
-            handle_checkbox(varstore, parsed, prompt, question, walk)
+            handle_checkbox(varstore, parsed, prompt, flags, question, walk)
         }
     }
 }
@@ -180,6 +186,7 @@ pub(super) fn handle_checkbox(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &CheckBox,
     question: &str,
+    flags: QuestionFlags,
     node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
@@ -219,6 +226,7 @@ pub(super) fn handle_checkbox(
         max_value: RangeType::NumSize8(1),
         numeric_range: None,
         opcode: current_node.op_code,
+        flags,
         value_state: StateEvaluation::selectable(),
         node: Rc::clone(node),
     };
@@ -229,6 +237,7 @@ pub(super) fn handle_oneof(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &OneOf,
     question: &str,
+    flags: QuestionFlags,
     node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
@@ -320,6 +329,7 @@ pub(super) fn handle_oneof(
         },
         numeric_range: None,
         opcode: current_node.op_code,
+        flags,
         value_state,
         node: Rc::clone(node),
     };
@@ -330,6 +340,7 @@ pub(super) fn handle_numeric(
     varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
     parsed: &Numeric,
     question: &str,
+    flags: QuestionFlags,
     node: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
@@ -383,6 +394,7 @@ pub(super) fn handle_numeric(
             ValueLocation::Bits { .. } => None,
         },
         opcode: current_node.op_code,
+        flags,
         value_state: StateEvaluation::selectable(),
         node: Rc::clone(node),
     };
