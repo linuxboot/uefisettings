@@ -23,10 +23,10 @@ use thiserror::Error;
 use super::conditions::enclosing_form_set;
 use super::defaults::standard_default;
 use super::ordered_list::ListRefusal;
-#[cfg(any(target_os = "uefi", all(test, efivar_dumps)))]
+#[cfg(any(target_os = "uefi", target_os = "linux", all(test, efivar_dumps)))]
 use super::question_values::checkbox_text;
 use super::question_values::form_set_guid;
-#[cfg(any(target_os = "uefi", all(test, efivar_dumps)))]
+#[cfg(any(target_os = "uefi", target_os = "linux", all(test, efivar_dumps)))]
 use super::question_values::one_of_text;
 use super::question_values::ValueQuestion;
 use super::set::option_value;
@@ -306,7 +306,7 @@ impl QuestionDescriptor {
 
     /// `value`, of a question whose driver holds it, as get shows a stored value: the option's
     /// text, the number, or 0 or 1; None for another question.
-    #[cfg(any(target_os = "uefi", all(test, efivar_dumps)))]
+    #[cfg(any(target_os = "uefi", target_os = "linux", all(test, efivar_dumps)))]
     pub(crate) fn driver_held_text(&self, value: u64) -> Option<String> {
         let held = self.driver_held.as_ref()?;
         Some(match held.display {

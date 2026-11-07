@@ -26,8 +26,10 @@ use super::record_set;
 use super::stage_new;
 use super::Nonce;
 use super::StagePlan;
+use super::StagedQuestion;
 use super::StagedRequest;
 use super::StagedSet;
+use super::StagedState;
 use crate::efi_variables::globals::secure_boot;
 use crate::efi_variables::VariableData;
 use crate::esp::linux::LinuxPaths;
@@ -134,6 +136,34 @@ impl NextBootStaging {
             unsafe_operations: self.unsafe_operations,
         }
     }
+
+    /// get's answer for `question`, whose driver holds it as `held`: its refusal, with what the
+    /// records of staged sets in `records` tell of it.
+    pub(crate) fn answer(
+        records: &impl VariableData,
+        question: &QuestionDescriptor,
+        held: &DriverHeldQuestion,
+    ) -> String {
+        let staged = StagedQuestion {
+            form_set: held.form_set,
+            question_id: held.question_id,
+        };
+        let note = StagedState::read(records).map(|state| {
+            staged.note(&state, |value| {
+                question
+                    .driver_held_text(value)
+                    .unwrap_or_else(|| value.to_string())
+            })
+        });
+        match note {
+            Ok(Some(note)) => format!("{} <{note}>", question.value),
+            Ok(None) => question.value.clone(),
+            Err(error) => format!(
+                "{} <the records of staged sets are unreadable: {error:#}>",
+                question.value
+            ),
+        }
+    }
 }
 
 impl DriverHeldValues for NextBootStaging {
@@ -141,14 +171,15 @@ impl DriverHeldValues for NextBootStaging {
         "staged for the next boot"
     }
 
-    /// get reaches no driver from Linux, and shows the question's refusal instead.
+    /// get reaches no driver from Linux: it shows the question's refusal, with what the records of
+    /// staged sets tell of the question.
     fn get(
         &self,
         _list: &QuestionList<'_>,
         question: &QuestionDescriptor,
-        _held: &DriverHeldQuestion,
+        held: &DriverHeldQuestion,
     ) -> String {
-        question.value.clone()
+        Self::answer(&EfivarFiles::system(), question, held)
     }
 
     /// apply-staged would apply the set, set finds the ESP, plan_stage allows staging there, and

@@ -62,6 +62,8 @@ use crate::firmware_width::FirmwareWidth;
 use crate::firmware_width::FW_PLATFORM_SIZE_PATH;
 use crate::hii::extract;
 use crate::hii::extract::HiiSourceOptions;
+use crate::hii::forms::IncludedStates;
+use crate::hii::forms::PasswordQuestions;
 use crate::hii::package;
 #[cfg(configuration_tables)]
 use crate::hii::system_vendor_table;
@@ -586,13 +588,24 @@ fn compare_redfish_attributes(
 }
 
 /// What get and set do with a question whose driver holds its value: get reaches no driver here,
-/// and set stages it for the next boot.
+/// and shows what the records of staged sets tell of it, which this machine's EFI variables hold;
+/// set stages it for the next boot.
 impl HiiBackend {
     pub(super) fn driver_held_values(
         _hiidb: &[u8],
-        _efivars: &EfivarSource,
+        efivars: &EfivarSource,
     ) -> Option<Box<dyn DriverHeldValues>> {
-        None
+        match efivars {
+            EfivarSource::System => Some(Box::new(NextBootStaging {
+                image: None,
+                include: IncludedStates::empty(),
+                access_level: None,
+                unsafe_operations: UnsafeOperations::Refuse,
+                // get writes nothing
+                passwords: PasswordQuestions::default(),
+            })),
+            EfivarSource::Directory(_) | EfivarSource::Disabled => None,
+        }
     }
 
     pub(super) fn driver_held_setter(

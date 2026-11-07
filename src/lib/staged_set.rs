@@ -318,6 +318,82 @@ impl StagedState {
     }
 }
 
+/// A question as staged requests name it: by its FormSet GUID and QuestionId.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StagedQuestion {
+    pub(crate) form_set: Guid,
+    pub(crate) question_id: u16,
+}
+
+impl StagedQuestion {
+    fn names(self, request: &StagedRequest) -> bool {
+        request.form_set == self.form_set && request.question_id == self.question_id
+    }
+
+    /// The value of the last of `requests` that names this question.
+    fn last_value(self, requests: &[StagedRequest]) -> Option<u64> {
+        requests
+            .iter()
+            .rev()
+            .find(|request| self.names(request))
+            .map(|request| request.value)
+    }
+
+    /// get's note from an OS on this question, with each value as `shown` shows it: its last
+    /// request in the pending set, else its last result in the outcome of the last staged set's
+    /// boot, with the warning of each unsafe operation that applying it lifted, as `state` tells;
+    /// None if neither names it.
+    pub(crate) fn note(self, state: &StagedState, shown: impl Fn(u64) -> String) -> Option<String> {
+        match state {
+            StagedState::Pending(set) => self.last_value(&set.requests).map(|value| {
+                format!(
+                    "{} is staged for the next boot, as Boot{:04X}: restart to apply",
+                    shown(value),
+                    set.boot_option
+                )
+            }),
+            StagedState::Over(_, outcome) | StagedState::Idle(Some(outcome)) => match outcome {
+                Outcome::Finished { results, .. } => results
+                    .iter()
+                    .rev()
+                    .find(|result| self.names(&result.request))
+                    .map(|result| {
+                        let value = shown(result.request.value);
+                        let note = match result.applied {
+                            true => {
+                                format!("the last staged boot applied {value}: {}", result.result)
+                            }
+                            false => format!(
+                                "the last staged boot did not apply {value}: {}",
+                                result.result
+                            ),
+                        };
+                        result
+                            .warnings
+                            .iter()
+                            .fold(note, |note, warning| format!("{note}; warning: {warning}"))
+                    }),
+                Outcome::Interrupted { requests, .. } => self.last_value(requests).map(|value| {
+                    format!(
+                        "the last staged boot stopped while it applied {}, which may be partly \
+                         applied",
+                        shown(value)
+                    )
+                }),
+                Outcome::NotStarted { requests, .. } => self.last_value(requests).map(|value| {
+                    format!(
+                        "the last staged boot did not start uefisettings.efi, so {} is not applied",
+                        shown(value)
+                    )
+                }),
+                // a start whose set is gone: what became of it is unknown
+                Outcome::Started { .. } => None,
+            },
+            StagedState::Idle(None) => None,
+        }
+    }
+}
+
 /// The files of staged images on the EFI system partition, as the OS reaches them.
 pub(crate) trait StagedFiles {
     /// The paths of the files in uefisettings' directory, \EFI\uefisettings, as File Path nodes
@@ -1916,6 +1992,99 @@ mod tests {
             let got = plan_stage(&variables, &files).map_err(|err| format!("{err:#}"));
 
             assert_eq!(got, want.map_err(str::to_owned), "{case}");
+        }
+    }
+
+    #[test]
+    fn get_notes_a_question_s_last_request_or_result() {
+        let question = StagedQuestion {
+            form_set: FORM_SET.parse().expect("FORM_SET"),
+            question_id: 0x0201,
+        };
+        let other = StagedQuestion {
+            question_id: 0x0202,
+            ..question
+        };
+        let refused = |value| RequestOutcome {
+            request: request(value),
+            applied: false,
+            result: format!("refused {value}"),
+            warnings: Vec::new(),
+        };
+        let applied = |warnings| RequestOutcome {
+            request: request(2),
+            applied: true,
+            result: "applied 2".to_owned(),
+            warnings,
+        };
+        let finished = |warnings| Outcome::Finished {
+            nonce: NONCE,
+            results: vec![refused(1), applied(warnings)],
+        };
+        let cases = [
+            ("no set, no outcome", StagedState::Idle(None), None),
+            (
+                "pending",
+                StagedState::Pending(staged_set()),
+                Some("value 2 is staged for the next boot, as Boot0007: restart to apply"),
+            ),
+            (
+                "finished",
+                StagedState::Over(staged_set(), finished(Vec::new())),
+                Some("the last staged boot applied value 2: applied 2"),
+            ),
+            (
+                "finished after unsafe operations",
+                StagedState::Over(
+                    staged_set(),
+                    finished(vec!["one lifted".to_owned(), "another".to_owned()]),
+                ),
+                Some(
+                    "the last staged boot applied value 2: applied 2; warning: one lifted; \
+                     warning: another",
+                ),
+            ),
+            (
+                "settled, not applied",
+                StagedState::Idle(Some(Outcome::Finished {
+                    nonce: NONCE,
+                    results: vec![refused(1)],
+                })),
+                Some("the last staged boot did not apply value 1: refused 1"),
+            ),
+            (
+                "interrupted",
+                StagedState::Over(staged_set(), interrupted()),
+                Some(
+                    "the last staged boot stopped while it applied value 2, which may be partly \
+                     applied",
+                ),
+            ),
+            (
+                "not started",
+                StagedState::Idle(Some(not_started())),
+                Some(
+                    "the last staged boot did not start uefisettings.efi, so value 2 is not \
+                     applied",
+                ),
+            ),
+            (
+                "a start whose set is gone",
+                StagedState::Idle(Some(started(NONCE))),
+                None,
+            ),
+        ];
+        for (case, state, want) in cases {
+            assert_eq!(
+                question.note(&state, |value| format!("value {value}")),
+                want.map(str::to_owned),
+                "{case}"
+            );
+            assert_eq!(
+                other.note(&state, |value| format!("value {value}")),
+                None,
+                "{case}: another question"
+            );
         }
     }
 }

@@ -13777,6 +13777,145 @@ mod tests {
         );
     }
 
+    /// The records of staged sets that NextBootStaging's get reads, as `0` holds them.
+    #[cfg(target_os = "linux")]
+    struct StagingRecords<'a>(&'a crate::efi_variables::globals::tests::HeldVariables);
+
+    #[cfg(target_os = "linux")]
+    impl DriverHeldValues for StagingRecords<'_> {
+        fn store_name(&self) -> &'static str {
+            "staged for the next boot"
+        }
+
+        fn get(
+            &self,
+            _list: &QuestionList<'_>,
+            question: &QuestionDescriptor,
+            held: &DriverHeldQuestion,
+        ) -> String {
+            crate::staged_set::linux::NextBootStaging::answer(self.0, question, held)
+        }
+
+        fn check_set(
+            &self,
+            _list: &QuestionList<'_>,
+            _question: &QuestionDescriptor,
+            _held: &DriverHeldQuestion,
+        ) -> Result<()> {
+            Err(anyhow!("get only"))
+        }
+
+        fn set(
+            &self,
+            _list: &QuestionList<'_>,
+            _question: &QuestionDescriptor,
+            _held: &DriverHeldQuestion,
+            _value: u64,
+        ) -> Result<String> {
+            Err(anyhow!("get only"))
+        }
+    }
+
+    /// On Linux, get of a question whose driver holds its value reads nothing of the ExportConfig
+    /// snapshot, whose <ConfigResp>s hold the bytes of VarStores only: beside the snapshot, as
+    /// without it, it shows why the question has no value and its IFR default, with what the
+    /// records of staged sets tell of it, and no `<snapshot>` mark, while a stored question of the
+    /// same prompt reads the snapshot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_get_of_a_driver_held_question_reads_nothing_of_the_snapshot() {
+        use crate::efi_variables::globals::tests::HeldVariables;
+        use crate::efi_variables::globals::EFI_GLOBAL_VARIABLE;
+        use crate::staged_set::record_set;
+        use crate::staged_set::Nonce;
+        use crate::staged_set::Sha256Digest;
+        use crate::staged_set::StagedImage;
+        use crate::staged_set::StagedRequest;
+        use crate::staged_set::StagedSet;
+
+        // snapshot_hiidb's N, at byte 0 of NStore, which the snapshot holds as 1; then N of
+        // FormSet 11111111-…, QuestionId 7, held by its driver
+        let held = package_list_with_guid(
+            [0x66; 16],
+            &[
+                form_package(&[form(1, &[callback_checkbox(7, 1)])]),
+                en_strings_package_of(&["N"]),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let hiidb = [snapshot_hiidb(), held].concat();
+        // a set that waits for its boot, Boot0007, with a request of 1 for the held N
+        let records =
+            HeldVariables::default().with("BootNext", EFI_GLOBAL_VARIABLE, &7u16.to_le_bytes());
+        let request = StagedRequest {
+            question: "N".to_owned(),
+            form_set: "11111111-1111-1111-1111-111111111111"
+                .parse()
+                .expect("a GUID"),
+            question_id: 7,
+            value_type: IfrValueType::Boolean,
+            value: 1,
+            include: IncludedStates::empty(),
+            access_level: None,
+            unsafe_operations: UnsafeOperations::Refuse,
+        };
+        let staged = StagedSet {
+            nonce: Nonce([0x5A; 16]),
+            boot_option: 7,
+            image: StagedImage {
+                path: "\\EFI\\uefisettings\\uefisettings.efi".to_owned(),
+                sha256: Sha256Digest([0x42; 32]),
+            },
+            requests: vec![request],
+        };
+        record_set(&records, &staged).expect("record the staged set");
+        let unreached = "question has no VarStore; its driver keeps the value, which only \
+                         EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 §33.2.5.6), \
+                         and after ExitBootServices() no EFI device-handle-based protocol may be \
+                         used (UEFI 2.11 §7.4.6); use uefisettings.efi in the UEFI Shell";
+
+        let held_answer = format!(
+            "<ValueUnavailable: {unreached}> <IFR default: 0> <1 is staged for the next boot, as \
+             Boot0007: restart to apply>"
+        );
+
+        for (case, exported, stored_from_snapshot) in [
+            (
+                "beside the snapshot",
+                Some(ExportedConfig::new(snapshot_text())),
+                true,
+            ),
+            ("without the snapshot", None, false),
+        ] {
+            let got = HiiBackend::get_in(
+                &hiidb,
+                "N",
+                None,
+                &GetOptions::default(),
+                shared(&no_variables()),
+                exported,
+                None,
+                Some(&StagingRecords(&records)),
+            )
+            .unwrap_or_else(|error| panic!("get N {case}: {error:#}"));
+
+            let answers: Vec<&str> = got
+                .responses
+                .iter()
+                .map(|response| response.question.answer.as_str())
+                .collect();
+            assert_eq!(answers.len(), 2, "the stored N and the held N {case}");
+            assert_eq!(answers[1], held_answer, "the held N {case}");
+            assert_eq!(
+                answers[0] == "1 <snapshot>",
+                stored_from_snapshot,
+                "the stored N {case}: {}",
+                answers[0]
+            );
+        }
+    }
+
     /// Reading a snapshot logs none of its bytes, at any level, also when it is no
     /// <MultiConfigAltResp> or holds a <ConfigAltResp> that does not parse.
     #[test]
