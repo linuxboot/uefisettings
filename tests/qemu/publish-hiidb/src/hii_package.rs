@@ -42,10 +42,12 @@ pub(crate) const EFI_IFR_SET_OP: u8 = 0x2C;
 pub(crate) const EFI_IFR_READ_OP: u8 = 0x2D;
 pub(crate) const EFI_IFR_WRITE_OP: u8 = 0x2E;
 pub(crate) const EFI_IFR_ADD_OP: u8 = 0x3A;
+pub(crate) const EFI_IFR_QUESTION_REF1_OP: u8 = 0x40;
 pub(crate) const EFI_IFR_UINT8_OP: u8 = 0x42;
 pub(crate) const EFI_IFR_UINT16_OP: u8 = 0x43;
 pub(crate) const EFI_IFR_TO_UINT_OP: u8 = 0x48;
 pub(crate) const EFI_IFR_THIS_OP: u8 = 0x58;
+pub(crate) const EFI_IFR_VALUE_OP: u8 = 0x5A;
 /// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.10 §33.3.8.3.47).
 pub(crate) const UINT8_DECIMAL: u8 = 0x10;
 

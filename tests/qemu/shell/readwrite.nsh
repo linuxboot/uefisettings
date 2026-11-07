@@ -27,10 +27,14 @@ uefisettings.efi hii get --json "Mapped choice"
 echo uefisettings-shell: step get-mapped-after %lasterror%
 uefisettings.efi hii get --json "Read only"
 echo uefisettings-shell: step get-read-only-before %lasterror%
+uefisettings.efi hii get --json "Computed value"
+echo uefisettings-shell: step get-computed-before %lasterror%
 uefisettings.efi hii set --json "Linked value" 5
 echo uefisettings-shell: step set-linked %lasterror%
 uefisettings.efi hii get --json "Read only"
 echo uefisettings-shell: step get-read-only-after %lasterror%
+uefisettings.efi hii get --json "Computed value"
+echo uefisettings-shell: step get-computed-after %lasterror%
 uefisettings.efi hii set --json "Write only" 9
 echo uefisettings-shell: step set-write-only %lasterror%
 uefisettings.efi hii set --json "Read transformed" 100
@@ -41,6 +45,8 @@ dmpstore ReadWriteData -guid 8C78A505-BAA0-4C4A-869F-000000000201
 echo uefisettings-shell: step dmpstore-after %lasterror%
 uefisettings.efi hii set --json "Absent target" 5
 echo uefisettings-shell: step set-absent-target %lasterror%
+uefisettings.efi hii set --json "Computed value" 7
+echo uefisettings-shell: step set-computed %lasterror%
 uefisettings.efi hii get --json "Driver held"
 echo uefisettings-shell: step get-driver-held %lasterror%
 uefisettings.efi hii set --json "Driver held" First

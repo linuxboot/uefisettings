@@ -15,7 +15,8 @@
 //! `publish-hiidb/src/readwrite_forms.rs` before it publishes the HII database. get and set take
 //! the values of questions through their READ and WRITE expressions (UEFI 2.11 §33.2.5.4.1),
 //! and refuse each question without a VarStore that neither reaches, saying why, and a WRITE
-//! expression that sets a VarStore without its variable, before any write.
+//! expression that sets a VarStore without its variable, before any write. A question with an
+//! EFI_IFR_VALUE shows the value of that expression, and set refuses it (UEFI 2.11 §33.3.8.3.88).
 
 use uefisettings_qemu_guest::changed_bytes;
 use uefisettings_qemu_guest::json;
@@ -34,10 +35,13 @@ const READ_WRITE_DATA: &str =
 const ABSENT_BUFFER: &str =
     "/sys/firmware/efi/efivars/AbsentBuffer-8c78a505-baa0-4c4a-869f-000000000201";
 /// The bytes that publish-hiidb creates ReadWriteData with (`readwrite_forms::STORE_DATA`).
-const STORE_DATA: [u8; 8] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE];
+const STORE_DATA: [u8; 9] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE, 0x11];
 /// The NUMERIC at byte 7 of ReadWriteData whose READ gives the stored byte plus 1.
 const READ_TRANSFORMED: &str = "Read transformed";
 const READ_TRANSFORMED_OFFSET: usize = 7;
+/// The byte of ReadWriteData that "Computed value" holds, which its EFI_IFR_VALUE, "Linked value"
+/// plus 0x10, hides.
+const COMPUTED_VALUE_OFFSET: usize = 8;
 
 /// DriverSample's ONE_OF on SerialPortNo, at byte 0xC0, in a FORM_MAP with the standard method.
 /// Its READ reaches the UNDEFINED among the operands of its inner EFI_IFR_CONDITIONAL, which ends
@@ -63,6 +67,8 @@ const READ_UNDEFINED: &str = "its READ expression gives no value, and without a 
      question has no other (UEFI 2.11 §33.2.5.4.1)";
 const UNEVALUATED_READ: &str =
     "its READ expression uses EFI_IFR_TO_UINT, which uefisettings does not evaluate";
+const VALUE_MAKES_READ_ONLY: &str =
+    "its EFI_IFR_VALUE expression makes it read-only (UEFI 2.11 §33.3.8.3.88)";
 
 #[track_caller]
 fn read_write_data() -> Vec<u8> {
@@ -170,12 +176,22 @@ fn get_and_set_take_values_through_read_and_write_expressions() {
         "Read only takes byte 1 through its READ"
     );
     assert_eq!(
+        get(&["hii"], "Computed value"),
+        "20",
+        "Computed value takes Linked value plus 0x10 through its VALUE"
+    );
+    assert_eq!(
         set("Linked value", "5"),
         [(1, 5), (2, 5), (4, 5)],
         "Linked value"
     );
     assert_eq!(get(&["hii"], "Linked value"), "5", "Linked value after");
     assert_eq!(get(&["hii"], "Read only"), "5", "Read only after");
+    assert_eq!(
+        get(&["hii"], "Computed value"),
+        "21",
+        "Computed value after"
+    );
 
     // "Write only" keeps its value in byte 6 through its WRITE alone
     assert_eq!(set("Write only", "9"), [(6, 9)], "Write only");
@@ -209,9 +225,44 @@ fn get_and_set_take_values_through_read_and_write_expressions() {
 
     assert_eq!(
         read_write_data(),
-        [0x02, 0x05, 0x05, 0x00, 0x05, 0x01, 0x09, 0x64],
+        [0x02, 0x05, 0x05, 0x00, 0x05, 0x01, 0x09, 0x64, 0x11],
         "after"
     );
+}
+
+/// get and list-questions show the value of the EFI_IFR_VALUE of "Computed value", "Linked
+/// value" plus 0x10, never its stored byte; set refuses it as read-only and writes nothing.
+#[test]
+fn a_question_with_a_value_expression_shows_its_value_and_refuses_set() {
+    let question = "Computed value";
+    let stored = read_write_data()[COMPUTED_VALUE_OFFSET];
+    assert_eq!(stored, STORE_DATA[COMPUTED_VALUE_OFFSET], "stored byte");
+    // "Linked value" holds 4, or 5 once the test that sets it has run
+    let linked: u16 = get(&["hii"], "Linked value")
+        .parse()
+        .expect("Linked value is a number");
+    let computed = (linked + 0x10).to_string();
+    assert_ne!(
+        computed,
+        stored.to_string(),
+        "the VALUE hides the stored byte"
+    );
+
+    for prefix in PREFIXES {
+        assert_eq!(get(prefix, question), computed, "get {prefix:?}");
+        assert_eq!(
+            refuse(prefix, question, "7"),
+            format!("cannot set question {question:?}: {VALUE_MAKES_READ_ONLY}"),
+            "set {prefix:?}"
+        );
+    }
+    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
+    let listed: Vec<&str> = questions
+        .iter()
+        .filter(|listed| listed.name == question)
+        .map(|listed| listed.answer.as_str())
+        .collect();
+    assert_eq!(listed, [computed.as_str()], "list-questions");
 }
 
 /// A WRITE expression that sets AbsentBuffer, whose variable does not exist, refuses set before

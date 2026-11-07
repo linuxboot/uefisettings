@@ -15,8 +15,9 @@
 //! scenario `shell-readwrite` of `tests/qemu/scenarios.tsv`: a form set whose questions take
 //! their values through READ and WRITE expressions (UEFI 2.11 §33.2.5.4.1), over the
 //! VARSTORE_EFI ReadWriteData, which the driver creates when it is missing, and questions without
-//! a VarStore that get and set refuse, each for its own reason. The VARSTORE AbsentBuffer has no
-//! variable.
+//! a VarStore that get and set refuse, each for its own reason. One more question over
+//! ReadWriteData takes its value from an EFI_IFR_VALUE expression instead, which makes it
+//! read-only (UEFI 2.11 §33.3.8.3.88). The VARSTORE AbsentBuffer has no variable.
 
 use alloc::vec::Vec;
 
@@ -41,12 +42,14 @@ use crate::hii_package::EFI_IFR_MAP_OP;
 use crate::hii_package::EFI_IFR_NUMERIC_OP;
 use crate::hii_package::EFI_IFR_ONE_OF_OP;
 use crate::hii_package::EFI_IFR_ONE_OF_OPTION_OP;
+use crate::hii_package::EFI_IFR_QUESTION_REF1_OP;
 use crate::hii_package::EFI_IFR_READ_OP;
 use crate::hii_package::EFI_IFR_SET_OP;
 use crate::hii_package::EFI_IFR_THIS_OP;
 use crate::hii_package::EFI_IFR_TO_UINT_OP;
 use crate::hii_package::EFI_IFR_UINT16_OP;
 use crate::hii_package::EFI_IFR_UINT8_OP;
+use crate::hii_package::EFI_IFR_VALUE_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_EFI_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_OP;
 use crate::hii_package::EFI_IFR_WRITE_OP;
@@ -64,8 +67,9 @@ pub(crate) const STORE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_
 /// The bytes that the driver creates ReadWriteData with: byte 0, which "Mapped choice" keeps,
 /// holds no option; "Linked value" holds 4 at byte 1, which its WRITE copies to byte 2 and, plus
 /// 0x100, to bytes 4 and 5; "Absent target" holds 0 at byte 3; byte 6 is what "Write only" sets,
-/// and "Read transformed" holds 0xEE at byte 7, which its READ shows plus 1.
-pub(crate) const STORE_DATA: [u8; 8] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE];
+/// "Read transformed" holds 0xEE at byte 7, which its READ shows plus 1, and "Computed value"
+/// holds 0x11 at byte 8, which its VALUE hides.
+pub(crate) const STORE_DATA: [u8; 9] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE, 0x11];
 
 // The strings, from string ID 2, after the language name.
 const TITLE: u16 = 2;
@@ -82,7 +86,8 @@ const FIRST: u16 = 12;
 const SECOND: u16 = 13;
 const THIRD: u16 = 14;
 const READ_TRANSFORMED: u16 = 15;
-const STRINGS: [&str; 15] = [
+const COMPUTED_VALUE: u16 = 16;
+const STRINGS: [&str; 16] = [
     "English",
     "uefisettings QEMU read/write forms",
     "Questions that READ and WRITE expressions give and keep the values of",
@@ -98,6 +103,7 @@ const STRINGS: [&str; 15] = [
     "Second",
     "Third",
     "Read transformed",
+    "Computed value",
 ];
 
 // The VarStores
@@ -105,6 +111,9 @@ const STORE: u16 = 1;
 const ABSENT_BUFFER: u16 = 2;
 /// VarStoreId 0: no VarStore (UEFI 2.11 §33.3.8.2.2).
 const NO_VAR_STORE: u16 = 0;
+
+/// The QuestionId of "Linked value", whose value the VALUE of "Computed value" takes.
+const LINKED_VALUE_QUESTION: u16 = 2;
 
 /// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.11 §33.3.8.3.47).
 const UINT8_DECIMAL: u8 = 0x10;
@@ -170,7 +179,7 @@ fn form_package() -> Vec<u8> {
             ],
         ),
         numeric(
-            2,
+            LINKED_VALUE_QUESTION,
             LINKED_VALUE,
             (STORE, 1),
             0,
@@ -227,6 +236,22 @@ fn form_package() -> Vec<u8> {
             (STORE, 7),
             0,
             &[read(&[this(), uint8(1), op(EFI_IFR_ADD_OP, false, &[])])],
+        ),
+        // VALUE gives "Linked value" plus 0x10, never byte 8, and makes the question read-only
+        numeric(
+            10,
+            COMPUTED_VALUE,
+            (STORE, 8),
+            0,
+            &[value(&[
+                op(
+                    EFI_IFR_QUESTION_REF1_OP,
+                    false,
+                    &LINKED_VALUE_QUESTION.to_le_bytes(),
+                ),
+                uint8(0x10),
+                op(EFI_IFR_ADD_OP, false, &[]),
+            ])],
         ),
     ];
     let form = [1u16.to_le_bytes(), TITLE.to_le_bytes()].concat();
@@ -312,6 +337,12 @@ fn read(ops: &[Vec<u8>]) -> Vec<u8> {
 /// A WRITE, then the expression of `ops` (UEFI 2.11 §33.3.8.3.94).
 fn write(ops: &[Vec<u8>]) -> Vec<u8> {
     [op(EFI_IFR_WRITE_OP, false, &[]), expression(ops)].concat()
+}
+
+/// An EFI_IFR_VALUE whose scope holds the ops of its expression (UEFI 2.11 §33.3.8.3.88), as
+/// edk2's VfrCompile emits `value = <expression>;` (VfrSyntax.g vfrStatementValue).
+fn value(ops: &[Vec<u8>]) -> Vec<u8> {
+    [op(EFI_IFR_VALUE_OP, true, &[]), expression(ops), end()].concat()
 }
 
 /// The expression of `ops`: of more than one, the first opens a scope that an End closes, as
