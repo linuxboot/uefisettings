@@ -19,6 +19,7 @@
 mod attributes;
 mod consoles;
 mod creation;
+mod hot_keys;
 
 use std::fmt;
 
@@ -67,6 +68,9 @@ pub use consoles::DevicePathSet;
 pub(crate) use creation::create_load_option;
 pub use creation::LoadOptionCreated;
 pub use creation::NewLoadOption;
+pub(crate) use hot_keys::create_key;
+pub use hot_keys::HotKeyCreated;
+pub use hot_keys::NewHotKey;
 
 /// The name of the hot key variables before their option number (UEFI 2.11 §3.1.6)
 const HOT_KEY_PREFIX: &str = "Key";
@@ -295,6 +299,14 @@ pub(super) fn variable_names() -> String {
         .chain(Console::ALL.map(|console| console.name().to_owned()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The Key#### variable `number`.
+fn hot_key_variable(number: u16) -> VariableKey {
+    VariableKey {
+        name: format!("{HOT_KEY_PREFIX}{number:04X}"),
+        guid: EFI_GLOBAL_VARIABLE,
+    }
 }
 
 /// The Key#### variables that a backend reaches, by option number, or that it cannot list them.

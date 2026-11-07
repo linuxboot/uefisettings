@@ -140,6 +140,7 @@ writes no variable of a HiiDB with such a password question or with IFR that it 
 
 ```plain
 Commands:
+  create-key          Create a Key#### that does not exist: a hot key that starts a Boot####
   create-load-option  Create a Boot####, Driver#### or SysPrep#### that does not exist, from device
                       paths as text or files of their bytes
   get                 Show the attributes and the decoded value of a global variable of UEFI 2.11
@@ -283,6 +284,11 @@ otherwise.
 `capsule deliver` takes no flag: its payload goes to the firmware's JSON configuration processor,
 which UEFI 2.11 has check it against a schema and answer per capsule (§8.5.6.1.3), unlike
 SetVariable(), which stores bytes with "no read, write, or delete security protection" (§8.2.3).
+
+The boot manager's writes take no flag either: `variable set` of its variables and `variable
+set-attributes`, `create-load-option`, `set-device-path` and `create-key` write variables of UEFI
+2.11 Table 3.1 that the OS writes, and another write or a deletion undoes each (§8.2.3); each
+`warning:` line they print names what the boot manager may ignore, not a harm to the machine.
 
 `get` of a question whose value only its driver keeps takes no flag either: it restores any store
 that its RETRIEVE Callback() changed, which undoes only the driver's own change, and its
@@ -779,6 +785,27 @@ which only an EFI_VARIABLE_AUTHENTICATION_3 or _2 descriptor writes (§8.2.3).
 
 ```sh
 uefisettings variable set-device-path ConOut --device-path 'PciRoot(0x0)/Pci(0x1F,0x0)/Serial(0x0)/Uart(115200,8,N,1)/VenUtf8()'
+```
+
+`variable create-key NAME --boot BOOT [--modifiers MODIFIERS] [--key KEY]...` creates a Key#### of
+EFI_GLOBAL_VARIABLE that does not exist, with NV+BS+RT, a hot key that starts a Boot#### (UEFI 2.11
+§3.1.6): `--boot` takes the Boot####, which must exist; BootOptionCrc gets the CRC-32 of its
+EFI_LOAD_OPTION, the bytes after any EFI_VARIABLE_AUTHENTICATION_3 metadata (§8.2.1), without which
+the boot manager ignores the key; `--modifiers` takes the shift states to hold, of `shift`,
+`control`, `alt`, `logo`, `menu` and `sys-req`, comma-separated, none if not given; `--key` takes
+each key, 0 to 3, as InputKeyCount counts them, by the name after `SCAN_` of its scan code in edk2's
+SimpleTextIn.h and SimpleTextInEx.h, such as `F2`, `ESC` or `EJECT`, else by its one UCS-2
+character, else as `ScanCode=0x####,UnicodeChar=0x####`, which `variable get` shows for any other
+key. KeyData gets Revision 0 and no Reserved bits, as the spec's examples. It prints the key as
+`variable get` shows it. It refuses, before any write, an existing Key####, a missing Boot####, a
+BootOptionSupport without EFI_BOOT_OPTION_SUPPORT_KEY or with an EFI_BOOT_OPTION_SUPPORT_COUNT below
+the keys (§3.1.4), an absent one supporting none, and the shift states and keys of a Key#### that
+the boot manager takes, as its Boot#### exists and its BootOptionCrc matches: edk2-stable202608
+EfiBootManagerAddKeyOptionVariable() (BmHotkey.c) refuses those too. Windows, whose calls cannot
+list variables, cannot check the last; create-key warns there and writes the key all the same.
+
+```sh
+uefisettings variable create-key Key0005 --boot Boot0001 --modifiers alt --key F11
 ```
 
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)

@@ -56,6 +56,8 @@ pub use crate::efi_variables::authenticated::TimeStamp;
 #[cfg(variable_data)]
 pub use crate::efi_variables::authenticated::TimeStampError;
 #[cfg(variable_data)]
+use crate::efi_variables::boot_manager::create_key;
+#[cfg(variable_data)]
 use crate::efi_variables::boot_manager::create_load_option;
 #[cfg(variable_names)]
 use crate::efi_variables::boot_manager::hot_key_listing;
@@ -76,6 +78,8 @@ pub use crate::efi_variables::boot_manager::DevicePathText;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::HotKey;
 #[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::HotKeyCreated;
+#[cfg(variable_data)]
 use crate::efi_variables::boot_manager::HotKeyListing;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::HotKeysFollowing;
@@ -87,6 +91,8 @@ pub use crate::efi_variables::boot_manager::LoadOptionCreated;
 pub use crate::efi_variables::boot_manager::LoadOptionData;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::LoadOptionFlag;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::NewHotKey;
 #[cfg(variable_data)]
 pub use crate::efi_variables::boot_manager::NewLoadOption;
 #[cfg(capsule_delivery)]
@@ -125,6 +131,10 @@ pub use crate::efi_variables::globals::SignatureList;
 pub use crate::efi_variables::globals::Timeout;
 #[cfg(variable_data)]
 pub use crate::efi_variables::key_option::InputKey;
+#[cfg(variable_data)]
+pub use crate::efi_variables::key_option::KeyModifier;
+#[cfg(variable_data)]
+pub use crate::efi_variables::key_option::KeyNameError;
 #[cfg(variable_names)]
 use crate::efi_variables::list_capsule_results;
 #[cfg(variable_names)]
@@ -595,6 +605,17 @@ impl VariableBackend {
     /// `path`; returns what it wrote and why the firmware may not use it.
     pub fn set_device_path(name: &str, path: &DevicePathSource) -> Result<DevicePathSet> {
         set_device_path(&Self::system_variable_data()?, name, path)
+    }
+
+    /// Creates the hot key `name`, a Key#### of EFI_GLOBAL_VARIABLE that does not exist, as
+    /// `new` says; returns what it wrote and what it could not check.
+    pub fn create_key(name: &str, new: &NewHotKey) -> Result<HotKeyCreated> {
+        create_key(
+            &Self::system_variable_data()?,
+            &Self::hot_key_listing()?,
+            name,
+            new,
+        )
     }
 
     /// The Key#### variables of this machine.

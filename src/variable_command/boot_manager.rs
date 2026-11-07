@@ -24,8 +24,11 @@ use clap::ValueEnum;
 use uefisettings::exports::AttributeChange;
 use uefisettings::exports::DevicePathSource;
 use uefisettings::exports::HotKeysFollowing;
+use uefisettings::exports::InputKey;
+use uefisettings::exports::KeyModifier;
 use uefisettings::exports::LoadOptionCategory;
 use uefisettings::exports::LoadOptionFlag;
+use uefisettings::exports::NewHotKey;
 use uefisettings::exports::NewLoadOption;
 use uefisettings::exports::VariableBackend;
 
@@ -46,6 +49,9 @@ pub(super) enum BootManagerSubcommands {
     /// its attributes
     #[command(next_display_order = None)]
     SetDevicePath(SetDevicePathArgs),
+    /// Create a Key#### that does not exist: a hot key that starts a Boot####
+    #[command(next_display_order = None)]
+    CreateKey(CreateKeyArgs),
 }
 
 impl BootManagerSubcommands {
@@ -54,6 +60,7 @@ impl BootManagerSubcommands {
             Self::SetAttributes(args) => args.run(),
             Self::CreateLoadOption(args) => args.run(),
             Self::SetDevicePath(args) => args.run(),
+            Self::CreateKey(args) => args.run(),
         }
     }
 }
@@ -192,6 +199,43 @@ impl SetDevicePathArgs {
     }
 }
 
+/// The hot key to create.
+#[derive(Debug, Args)]
+pub(super) struct CreateKeyArgs {
+    /// The hot key, such as Key0001, of vendor 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+    name: String,
+    /// The Boot#### that it starts, such as Boot0001
+    #[arg(long)]
+    boot: String,
+    /// The shift states that must be pressed with the keys, comma-separated; the others must not be
+    #[arg(long, value_enum, value_delimiter = ',')]
+    modifiers: Vec<ModifierArg>,
+    /// A key, by the name after SCAN_ of its scan code, such as F2, ESC or PAGE_UP, a character, or ScanCode=0x####,UnicodeChar=0x#### as variable get shows other keys, once per key, in order, at most 3
+    #[arg(long)]
+    key: Vec<InputKey>,
+}
+
+impl CreateKeyArgs {
+    /// Creates the hot key and prints it as get shows it, and each warning on stderr.
+    fn run(&self) -> Result<()> {
+        let new = NewHotKey {
+            boot_option: self.boot.clone(),
+            modifiers: self
+                .modifiers
+                .iter()
+                .copied()
+                .map(KeyModifier::from)
+                .collect(),
+            keys: self.key.clone(),
+        };
+        let created = VariableBackend::create_key(&self.name, &new)?;
+        for warning in &created.warnings {
+            eprintln!("warning: {warning}");
+        }
+        print_global_variable(&created.key)
+    }
+}
+
 /// The device paths of `texts`, else of the files `files`, which the argument groups keep
 /// apart.
 fn device_path_source(texts: &[String], files: &[PathBuf]) -> Result<DevicePathSource> {
@@ -242,6 +286,30 @@ impl From<FlagArg> for LoadOptionFlag {
             FlagArg::Active => Self::Active,
             FlagArg::ForceReconnect => Self::ForceReconnect,
             FlagArg::Hidden => Self::Hidden,
+        }
+    }
+}
+
+/// A shift state of EFI_BOOT_KEY_DATA (UEFI 2.11 §3.1.6), these names and Pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModifierArg {
+    Shift,
+    Control,
+    Alt,
+    Logo,
+    Menu,
+    SysReq,
+}
+
+impl From<ModifierArg> for KeyModifier {
+    fn from(modifier: ModifierArg) -> Self {
+        match modifier {
+            ModifierArg::Shift => Self::Shift,
+            ModifierArg::Control => Self::Control,
+            ModifierArg::Alt => Self::Alt,
+            ModifierArg::Logo => Self::Logo,
+            ModifierArg::Menu => Self::Menu,
+            ModifierArg::SysReq => Self::SysReq,
         }
     }
 }
@@ -623,6 +691,86 @@ mod tests {
             ),
         ] {
             assert_eq!(parse(args).map(|_| ()), Err(want), "{args:?}");
+        }
+    }
+
+    /// create-key takes the hot key, the Boot#### that it starts, shift states, comma-separated,
+    /// and keys, by scan code name, character or codes, in order; other names are refused.
+    #[test]
+    fn create_key_takes_shift_states_and_keys() {
+        let parse = |args: &[&str]| match boot_manager(&[&["create-key"][..], args].concat()) {
+            Ok(BootManagerSubcommands::CreateKey(parsed)) => Ok(parsed),
+            Ok(other) => panic!("{args:?} is no create-key: {other:?}"),
+            Err(kind) => Err(kind),
+        };
+
+        let parsed = parse(&[
+            "Key0001",
+            "--boot",
+            "Boot0001",
+            "--modifiers",
+            "control,sys-req",
+            "--key",
+            "F2",
+            "--key",
+            "q",
+            "--key",
+            "ScanCode=0x0099,UnicodeChar=0x0000",
+        ])
+        .expect("parse create-key");
+
+        assert_eq!(
+            (
+                parsed.name.as_str(),
+                parsed.boot.as_str(),
+                parsed.modifiers.as_slice(),
+                parsed
+                    .key
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "Key0001",
+                "Boot0001",
+                &[ModifierArg::Control, ModifierArg::SysReq][..],
+                vec![
+                    "F2".to_owned(),
+                    "q".to_owned(),
+                    "ScanCode=0x0099,UnicodeChar=0x0000".to_owned(),
+                ],
+            ),
+            "create-key"
+        );
+        for (args, want) in [
+            (
+                &["Key0001", "--key", "F2"][..],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["Key0001", "--boot", "Boot0001", "--key", "f2"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["Key0001", "--boot", "Boot0001", "--modifiers", "ctrl"],
+                ErrorKind::InvalidValue,
+            ),
+        ] {
+            assert_eq!(parse(args).map(|_| ()), Err(want), "{args:?}");
+        }
+    }
+
+    /// The shift states that create-key takes are those that variable get prints.
+    #[test]
+    fn modifier_names_are_those_that_get_prints() {
+        for modifier in ModifierArg::value_variants() {
+            let name = modifier
+                .to_possible_value()
+                .expect("a possible value")
+                .get_name()
+                .to_owned();
+
+            assert_eq!(name, KeyModifier::from(*modifier).name(), "{modifier:?}");
         }
     }
 

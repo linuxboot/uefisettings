@@ -23,7 +23,9 @@
 //!   UEFI Shell, by text, which BootNext then names, and Boot009C of the same device path's bytes
 //!   and of OptionalData, both from files;
 //! - `variable set-device-path` sets ConOut to its own text, which keeps its bytes, and refuses
-//!   ConOutDev.
+//!   ConOutDev;
+//! - `variable create-key` refuses Key0099, which exists, an absent Boot#### and Key0099's own
+//!   shift states and keys, and creates Key009A, ALT-F11 to Boot0099.
 //!
 //! The UEFI Shell boots after it, shell/boot-manager.nsh through Boot009A and
 //! shell/boot-manager-next.nsh through Boot009B, which the first creates, do the same; their
@@ -82,6 +84,33 @@ const OPTIONAL_DATA: &[u8] = &[0x00, 0xFF, 0x7F, 0x80, 0x0A];
 const CON_OUT_DEV_REFUSAL: &str = "set-device-path does not write ConOutDev: \"These variables \
                                    are volatile, and are set dynamically on every boot.\" (UEFI \
                                    2.11 section 3.3)";
+/// The refusals of create-key, by its arguments.
+const CREATE_KEY_REFUSALS: [(&[&str], &str); 3] = [
+    (
+        &["Key0099", "--boot", "Boot0099", "--key", "F2"],
+        "Key0099 exists: create-key creates hot keys",
+    ),
+    (
+        &["Key009A", "--boot", "Boot1234", "--key", "F2"],
+        "Boot1234 is absent",
+    ),
+    (
+        &[
+            "Key009A",
+            "--boot",
+            "Boot0000",
+            "--modifiers",
+            "control",
+            "--key",
+            "q",
+        ],
+        "Key0099 holds these shift states and keys, and the boot manager takes it; it refuses \
+         another of the same",
+    ),
+];
+/// SCAN_F11 and SCAN_F12 (edk2-stable202608 MdePkg/Include/Protocol/SimpleTextIn.h)
+const SCAN_F11: u16 = 0x0015;
+const SCAN_F12: u16 = 0x0016;
 /// What set-attributes prints on stderr when it updates Key0099.
 const KEY0099_UPDATED: &str = "updated Key0099: its BootOptionCrc is the CRC-32 of the Boot#### \
                                that it starts again (UEFI 2.11 section 3.1.6)";
@@ -170,6 +199,23 @@ fn load_option(
         optional_data,
     ]
     .concat()
+}
+
+/// The EFI_KEY_OPTION of KeyData `key_data`, whose BootOptionCrc is the CRC-32 of the global
+/// variable `boot` as efivarfs holds it, to its number `boot_option`, of `keys`.
+#[track_caller]
+fn hot_key_bytes(key_data: u32, boot: &str, boot_option: u16, keys: &[(u16, u16)]) -> Vec<u8> {
+    let mut bytes = [
+        &key_data.to_le_bytes()[..],
+        &crc32fast::hash(&data(boot)).to_le_bytes(),
+        &boot_option.to_le_bytes(),
+    ]
+    .concat();
+    for (scan_code, unicode_char) in keys {
+        bytes.extend(scan_code.to_le_bytes());
+        bytes.extend(unicode_char.to_le_bytes());
+    }
+    bytes
 }
 
 /// The instances of `path`, a device path, each without the End node that ends it.
@@ -492,6 +538,49 @@ fn before_shell() {
     ]);
     assert_eq!(error.error_message, CON_OUT_DEV_REFUSAL, "set ConOutDev");
     assert_eq!(efivars(), before, "set ConOutDev: the efivar files");
+
+    // create-key: refused over Key0099, for an absent Boot####, and for Key0099's own keys, which
+    // the boot manager takes; then Key009A, ALT-F11 to Boot0099
+    for (args, refusal) in CREATE_KEY_REFUSALS {
+        let error = json_error(&[&["variable", "create-key"][..], args].concat());
+
+        assert_eq!(error.error_message, refusal, "{args:?}");
+        assert_eq!(efivars(), before, "{args:?}: the efivar files");
+    }
+    let created = variable(
+        "created-key009a",
+        &[
+            "create-key",
+            "Key009A",
+            "--boot",
+            "Boot0099",
+            "--modifiers",
+            "alt",
+            "--key",
+            "F11",
+        ],
+    )
+    .json::<serde_json::Value>(0);
+    assert_eq!(
+        data("Key009A"),
+        hot_key_bytes(0x4000_0400, "Boot0099", 0x99, &[(SCAN_F11, 0)]),
+        "Key009A: bytes"
+    );
+    assert_eq!(
+        created,
+        global(
+            "Key009A",
+            json!({
+                "revision": 0,
+                "modifiers": ["alt"],
+                "keys": ["F11"],
+                "boot_option": "Boot0099",
+                "crc_matches": true,
+            })
+        ),
+        "Key009A"
+    );
+    assert_eq!(get("key009a", "Key009A"), created, "get Key009A");
 }
 
 /// After the UEFI Shell boots, the first through Boot009A, which BootNext named, the second
@@ -526,4 +615,13 @@ fn after_shell() {
         "Boot0099"
     );
     assert_eq!(get("after-key0099", "Key0099"), seeded_key0099(), "Key0099");
+    assert_eq!(
+        data("Key009B"),
+        hot_key_bytes(0x4000_0100, "Boot009B", 0x9B, &[(SCAN_F12, 0)]),
+        "Key009B: bytes"
+    );
+    for name in ["Key009A", "Key009B"] {
+        let key = get(&format!("after-{name}"), name);
+        assert_eq!(key["value"]["crc_matches"], json!(true), "{name}: {key}");
+    }
 }

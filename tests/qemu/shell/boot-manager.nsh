@@ -45,5 +45,11 @@ uefisettings.efi variable create-load-option Boot009B --description "uefisetting
 echo uefisettings-shell: step created-boot009b %lasterror%
 uefisettings.efi variable set BootNext Boot009B
 echo uefisettings-shell: step boot-next %lasterror%
+uefisettings.efi variable create-key Key0099 --boot Boot0099 --key F2
+echo uefisettings-shell: step key-existing %lasterror%
+uefisettings.efi variable create-key Key009C --boot Boot009B --modifiers alt --key F11
+echo uefisettings-shell: step key-taken %lasterror%
+uefisettings.efi variable create-key Key009B --boot Boot009B --modifiers shift --key F12
+echo uefisettings-shell: step created-key009b %lasterror%
 echo uefisettings-shell: done
 reset -s

@@ -18,6 +18,7 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
+use super::hot_key_variable;
 use super::load_option_data;
 use super::refuse_authenticated;
 use super::value_after_metadata;
@@ -26,13 +27,11 @@ use super::HotKeyListing;
 use super::LoadOptionCategory;
 use super::LoadOptionFlag;
 use super::CATEGORY;
-use super::HOT_KEY_PREFIX;
 use crate::efi_variables::globals::GlobalContents;
 use crate::efi_variables::globals::GlobalValue;
 use crate::efi_variables::globals::GlobalVariable;
 use crate::efi_variables::globals::LoadOptionKind;
 use crate::efi_variables::globals::LoadOptionName;
-use crate::efi_variables::globals::EFI_GLOBAL_VARIABLE;
 use crate::efi_variables::key_option::boot_option_crc;
 use crate::efi_variables::key_option::with_boot_option_crc;
 use crate::efi_variables::key_option::KeyOption;
@@ -41,7 +40,6 @@ use crate::efi_variables::load_option::LoadOptionAttributes;
 use crate::efi_variables::load_option::LoadOptionError;
 use crate::efi_variables::VariableContents;
 use crate::efi_variables::VariableData;
-use crate::hii::VariableKey;
 
 /// The size of Attributes, which starts an EFI_LOAD_OPTION
 const ATTRIBUTES_SIZE: usize = 4;
@@ -177,7 +175,7 @@ pub(crate) fn set_attributes(
         let numbers: Vec<u16> = followers.iter().map(|(number, _)| *number).collect();
         for (written, (number, contents)) in followers.iter().enumerate() {
             variables
-                .set_variable(&hot_key(*number), contents)
+                .set_variable(&hot_key_variable(*number), contents)
                 .with_context(|| stale_keys(option, &numbers[..written], &numbers[written..]))?;
         }
     }
@@ -207,7 +205,7 @@ fn followers(
     let (old_crc, new_crc) = (boot_option_crc(old), boot_option_crc(new));
     let mut followers = Vec::new();
     for &number in numbers {
-        let key = hot_key(number);
+        let key = hot_key_variable(number);
         let Some(contents) = variables.variable_data(&key)? else {
             continue;
         };
@@ -226,14 +224,6 @@ fn followers(
         }
     }
     Ok(followers)
-}
-
-/// The Key#### variable `number`.
-fn hot_key(number: u16) -> VariableKey {
-    VariableKey {
-        name: format!("{HOT_KEY_PREFIX}{number:04X}"),
-        guid: EFI_GLOBAL_VARIABLE,
-    }
 }
 
 /// What set-attributes wrote before a Key#### write failed: the Boot#### `option`, the Key####
@@ -288,9 +278,11 @@ mod tests {
     use crate::efi_variables::globals::tests::key;
     use crate::efi_variables::globals::tests::HeldVariables;
     use crate::efi_variables::globals::tests::NV_BS_RT;
+    use crate::efi_variables::globals::EFI_GLOBAL_VARIABLE;
     use crate::efi_variables::key_option::tests::X64_KEY0000;
     use crate::hii::VariableAttributes;
     use crate::hii::VariableInterface;
+    use crate::hii::VariableKey;
 
     /// HeldVariables whose SetVariable() fails for the variable `.1`.
     struct UnwritableVariable(HeldVariables, VariableKey);

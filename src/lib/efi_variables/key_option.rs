@@ -15,6 +15,7 @@
 //! of that Boot#### variable.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::Serialize;
 use serde::Serializer;
@@ -32,6 +33,8 @@ const INPUT_KEY_SIZE: usize = 4;
 const MODIFIERS_MASK: u32 = 0x3FFF_FF00;
 /// InputKeyCount, the top 2 bits of KeyData
 const INPUT_KEY_COUNT_SHIFT: u32 = 30;
+/// The most keys that InputKeyCount, 2 bits, counts
+const MAX_KEYS: usize = 3;
 
 /// The scan codes of EFI_INPUT_KEY by their names after SCAN_, as edk2-stable202608
 /// MdePkg/Include/Protocol/SimpleTextIn.h and SimpleTextInEx.h define them
@@ -99,8 +102,9 @@ bitflags::bitflags! {
 }
 
 /// The shift states of EFI_BOOT_KEY_DATA, these names and Pressed (UEFI 2.11 §3.1.6).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum KeyModifier {
+pub enum KeyModifier {
     Shift,
     Control,
     Alt,
@@ -119,8 +123,8 @@ impl KeyModifier {
         Self::SysReq,
     ];
 
-    /// The name that variable get prints.
-    pub(crate) fn name(self) -> &'static str {
+    /// The name that variable get prints and create-key takes.
+    pub fn name(self) -> &'static str {
         match self {
             Self::Shift => "shift",
             Self::Control => "control",
@@ -172,6 +176,51 @@ impl fmt::Display for InputKey {
     }
 }
 
+/// The key that `text` names: the name after SCAN_ of its scan code, such as F2, else its one
+/// character, of UCS-2 but Null, else ScanCode=0x####,UnicodeChar=0x####, as Display writes it.
+impl FromStr for InputKey {
+    type Err = KeyNameError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if let Some((scan_code, _)) = SCAN_CODES.iter().find(|(_, name)| *name == text) {
+            return Ok(Self {
+                scan_code: *scan_code,
+                unicode_char: 0,
+            });
+        }
+        if let Some((scan_code, unicode_char)) = text
+            .strip_prefix("ScanCode=0x")
+            .and_then(|codes| codes.split_once(",UnicodeChar=0x"))
+        {
+            return match (four_hex_digits(scan_code), four_hex_digits(unicode_char)) {
+                (Some(scan_code), Some(unicode_char)) => Ok(Self {
+                    scan_code,
+                    unicode_char,
+                }),
+                (None, _) | (_, None) => Err(KeyNameError(text.to_owned())),
+            };
+        }
+        let mut units = text.encode_utf16();
+        match (units.next(), units.next()) {
+            (Some(unit), None) if unit != 0 && char::from_u32(u32::from(unit)).is_some() => {
+                Ok(Self {
+                    scan_code: 0,
+                    unicode_char: unit,
+                })
+            }
+            (Some(_) | None, _) => Err(KeyNameError(text.to_owned())),
+        }
+    }
+}
+
+/// The value of `digits`, four hex digits.
+fn four_hex_digits(digits: &str) -> Option<u16> {
+    match digits.len() == 4 && digits.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+        true => u16::from_str_radix(digits, 16).ok(),
+        false => None,
+    }
+}
+
 /// As Display writes it.
 impl Serialize for InputKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -192,6 +241,39 @@ pub(crate) struct KeyOption {
 }
 
 impl KeyOption {
+    /// A hot key of Revision 0 that starts the Boot#### `boot_option`, whose variable holds
+    /// `boot_option_bytes`, when `keys` are pressed with exactly the shift states `modifiers`.
+    pub(crate) fn new(
+        modifiers: KeyModifiers,
+        keys: Vec<InputKey>,
+        boot_option: u16,
+        boot_option_bytes: &[u8],
+    ) -> Result<Self, KeyOptionError> {
+        let count = u8::try_from(keys.len())
+            .ok()
+            .filter(|count| usize::from(*count) <= MAX_KEYS)
+            .ok_or(KeyOptionError::KeyCount(keys.len()))?;
+        Ok(Self {
+            key_data: (modifiers & KeyModifiers::all()).bits()
+                | u32::from(count) << INPUT_KEY_COUNT_SHIFT,
+            boot_option_crc: boot_option_crc(boot_option_bytes),
+            boot_option,
+            keys,
+        })
+    }
+
+    /// The bytes of the EFI_KEY_OPTION.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut bytes = self.key_data.to_le_bytes().to_vec();
+        bytes.extend(self.boot_option_crc.to_le_bytes());
+        bytes.extend(self.boot_option.to_le_bytes());
+        for key in &self.keys {
+            bytes.extend(key.scan_code.to_le_bytes());
+            bytes.extend(key.unicode_char.to_le_bytes());
+        }
+        bytes
+    }
+
     /// The EFI_KEY_OPTION that `bytes` hold: exactly InputKeyCount keys after its header, as
     /// edk2-stable202608 BmIsKeyOptionValid() (BmHotkey.c) requires.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, KeyOptionError> {
@@ -261,12 +343,22 @@ pub(crate) fn boot_option_crc(boot_option_bytes: &[u8]) -> u32 {
     crc32fast::hash(boot_option_bytes)
 }
 
-/// Why bytes are no EFI_KEY_OPTION.
+/// Why bytes are no EFI_KEY_OPTION, or keys no hot key.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum KeyOptionError {
     #[error("an EFI_KEY_OPTION of {length} bytes is not the {want} that InputKeyCount gives")]
     Length { length: usize, want: usize },
+    #[error("a hot key takes 0 to {MAX_KEYS} keys, which InputKeyCount counts, not {0}")]
+    KeyCount(usize),
 }
+
+/// A text that names no key.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "{0:?} is neither the name after SCAN_ of a scan code, such as F2, ESC or PAGE_UP, one \
+     character of UCS-2, nor ScanCode=0x####,UnicodeChar=0x####"
+)]
+pub struct KeyNameError(String);
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -386,6 +478,117 @@ pub(crate) mod tests {
                 }),
                 "{name}"
             );
+        }
+    }
+
+    /// KeyOption::new packs KeyData as UEFI 2.11 §3.1.6's examples do, without Reserved bits,
+    /// and its bytes decode back to it; 4 keys are more than InputKeyCount counts.
+    #[test]
+    fn key_options_build_the_spec_examples() {
+        let key = |text: &str| text.parse::<InputKey>().expect("a key");
+        let boot = bytes(X64_BOOT0000);
+        let cases = [
+            ("ALT", KeyModifiers::ALT, vec![], 0x0000_0400),
+            (
+                "CTRL-ALT-P-R",
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                vec![key("p"), key("r")],
+                0x8000_0600,
+            ),
+            (
+                "CTRL-F1",
+                KeyModifiers::CONTROL,
+                vec![key("F1")],
+                0x4000_0200,
+            ),
+            (
+                "CTRL with a Reserved bit",
+                KeyModifiers::CONTROL | KeyModifiers::from_bits_retain(1 << 14),
+                vec![key("F1")],
+                0x4000_0200,
+            ),
+        ];
+        for (name, modifiers, keys, key_data) in cases {
+            let option = KeyOption::new(modifiers, keys.clone(), 0x99, &boot).expect("a hot key");
+
+            assert_eq!(option.key_data, key_data, "{name}: KeyData");
+            assert_eq!(
+                (option.boot_option, option.boot_option_crc, &option.keys),
+                (0x99, 0x9F97_D751, &keys),
+                "{name}: BootOption, BootOptionCrc and keys"
+            );
+            assert_eq!(
+                KeyOption::decode(&option.encode()),
+                Ok(option.clone()),
+                "{name}: decoded back"
+            );
+            assert_eq!(option.encode().len(), 10 + 4 * keys.len(), "{name}: length");
+        }
+        assert_eq!(
+            KeyOption::new(KeyModifiers::empty(), vec![key("a"); 4], 0, &boot),
+            Err(KeyOptionError::KeyCount(4)),
+            "4 keys"
+        );
+    }
+
+    #[test]
+    fn input_keys_parse_from_their_scan_code_names_or_characters() {
+        for (text, want) in [
+            ("F2", Some((0x000C, 0))),
+            ("PAGE_UP", Some((0x0009, 0))),
+            ("TOGGLE_DISPLAY", Some((0x0104, 0))),
+            ("q", Some((0, 0x0071))),
+            ("\u{E9}", Some((0, 0x00E9))),
+            ("F", Some((0, 0x0046))),
+            ("ScanCode=0x0099,UnicodeChar=0x0000", Some((0x0099, 0))),
+            ("ScanCode=0x000C,UnicodeChar=0x0070", Some((0x000C, 0x0070))),
+            ("ScanCode=0x0000,UnicodeChar=0xD800", Some((0, 0xD800))),
+            ("", None),
+            ("pq", None),
+            ("f2", None),
+            ("SCAN_F2", None),
+            ("\u{1F41A}", None),
+            ("\0", None),
+            ("ScanCode=0x99,UnicodeChar=0x0000", None),
+            ("ScanCode=0x0099,UnicodeChar=0x00000", None),
+            ("ScanCode=0x+099,UnicodeChar=0x0000", None),
+            ("ScanCode=0x0099,UnicodeChar=0xG000", None),
+            ("ScanCode=0x0099", None),
+            ("ScanCode=0x0099,UnicodeChar=0x0000,", None),
+        ] {
+            let parsed = text.parse::<InputKey>();
+
+            assert_eq!(
+                parsed
+                    .clone()
+                    .map(|key| (key.scan_code, key.unicode_char))
+                    .ok(),
+                want,
+                "{text:?}"
+            );
+            match parsed {
+                Ok(key) => assert_eq!(key.to_string(), text, "{text:?} written back"),
+                Err(error) => {
+                    assert_eq!(error, KeyNameError(text.to_owned()), "{text:?}: the error")
+                }
+            }
+        }
+    }
+
+    /// What Display writes of any key reads back to that key: every scan code with no character,
+    /// every character with scan code 0, and both together.
+    #[test]
+    fn input_keys_read_back_from_what_display_writes() {
+        let keys = (0..=u16::MAX)
+            .flat_map(|code| [(code, 0), (0, code), (code, 0x0070), (0x000C, code)])
+            .map(|(scan_code, unicode_char)| InputKey {
+                scan_code,
+                unicode_char,
+            });
+        for key in keys {
+            let text = key.to_string();
+
+            assert_eq!(text.parse::<InputKey>(), Ok(key), "{key:?} as {text:?}");
         }
     }
 
