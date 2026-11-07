@@ -194,6 +194,7 @@ impl HiiBackend {
             options,
             EfivarSource::System.into_variables()?,
             &Self::system_variables()?,
+            EfivarSource::System.platform_lang()?.as_deref(),
         )
     }
 

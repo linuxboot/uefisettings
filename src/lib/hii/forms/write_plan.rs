@@ -624,7 +624,7 @@ mod tests {
             root,
             &BTreeSet::from([prompt]),
             &mut FormSetWalk::new(
-                &ListTexts::new(strings),
+                &ListTexts::new(strings, &[]),
                 &mut reader,
                 &values,
                 IncludedStates::empty(),
@@ -801,7 +801,7 @@ mod tests {
                 &root,
                 &BTreeSet::from(["Around"]),
                 &mut FormSetWalk::new(
-                    &ListTexts::new(&strings),
+                    &ListTexts::new(&strings, &[]),
                     &mut reader,
                     &values,
                     IncludedStates::empty(),
@@ -928,7 +928,7 @@ mod tests {
             &root,
             &BTreeSet::from(["Around"]),
             &mut FormSetWalk::new(
-                &ListTexts::new(&strings),
+                &ListTexts::new(&strings, &[]),
                 &mut reader,
                 &values,
                 IncludedStates::empty(),
@@ -1252,7 +1252,7 @@ mod tests {
                 root,
                 &BTreeSet::from(["Dup"]),
                 &mut FormSetWalk::new(
-                    &ListTexts::new(&strings),
+                    &ListTexts::new(&strings, &[]),
                     &mut reader,
                     &values,
                     IncludedStates::empty(),

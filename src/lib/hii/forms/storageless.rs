@@ -846,7 +846,7 @@ mod get_and_set_tests {
             let mut reader = reader_reaching(reach);
             let listed: BTreeMap<String, String> = list_questions(
                 Rc::clone(&root),
-                &ListTexts::new(&strings),
+                &ListTexts::new(&strings, &[]),
                 IncludedStates::empty(),
                 None,
                 &mut reader,
@@ -895,7 +895,7 @@ mod get_and_set_tests {
                     &root,
                     &BTreeSet::from([prompt]),
                     &mut FormSetWalk::new(
-                        &ListTexts::new(&strings),
+                        &ListTexts::new(&strings, &[]),
                         &mut reader,
                         &values,
                         IncludedStates::empty(),
@@ -957,7 +957,7 @@ mod get_and_set_tests {
         let mut reader = reader_reaching(VariableReach::BootServices);
         let listed: BTreeMap<String, QuestionDescriptor> = list_questions(
             Rc::clone(&root),
-            &ListTexts::new(&string_packages()),
+            &ListTexts::new(&string_packages(), &[]),
             IncludedStates::empty(),
             None,
             &mut reader,

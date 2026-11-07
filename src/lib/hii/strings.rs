@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::ffi::FromBytesUntilNulError;
+use std::fmt;
 use std::num::TryFromIntError;
 use std::rc::Rc;
 
@@ -168,8 +169,8 @@ impl StringIdCurrent {
 }
 
 /// A strings package header's Language, as read: "en-US", for one, or a UEFI configuration
-/// language such as "x-UEFI-ns" (§35.3.1). Only list-strings shows it, so only it needs ASCII.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// language such as "x-UEFI-ns" (§35.3.1). Only list-strings shows it as is, so only it needs ASCII.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Language(pub Vec<u8>);
 
 impl Language {
@@ -202,10 +203,52 @@ pub(crate) fn is_configuration_language(language: &[u8]) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PRIVATE_USE_PREFIX))
 }
 
+/// The bytes as read, escaped where they are not printable ASCII.
+impl fmt::Display for Language {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.escape_ascii())
+    }
+}
+
+/// The package of `packages` whose language edk2-stable202608 MdePkg/Library/UefiLib/UefiLib.c
+/// GetBestLanguage picks for the language code `requested` in RFC 4646 mode: the first that
+/// starts with the code before any ';', or with that code cut back to each '-' in turn. Unlike
+/// GetBestLanguage's AsciiStrnCmp (UefiLib.c:1584), the comparison ignores ASCII case, as
+/// edk2-stable202608 HiiDatabaseDxe/String.c HiiCompareLanguage does when the HII database takes
+/// a language.
+pub(crate) fn best_language<'a>(
+    packages: &'a [StringPackage],
+    requested: &str,
+) -> Option<&'a StringPackage> {
+    let code = requested.split(';').next().unwrap_or_default().as_bytes();
+    let mut len = code.len();
+    while len > 0 {
+        let prefix = code.get(..len)?;
+        let picked = packages.iter().find(|package| {
+            package
+                .language
+                .0
+                .get(..len)
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        });
+        if picked.is_some() {
+            return picked;
+        }
+        // GetBestLanguage's `for (LanguageLength--; LanguageLength > 0 &&
+        // Language[LanguageLength] != '-'; LanguageLength--)`
+        len = code
+            .get(1..len)?
+            .iter()
+            .rposition(|&byte| byte == b'-')
+            .map_or(0, |at| at + 1);
+    }
+    None
+}
+
 /// The texts of the strings packages of one package list, as get, set, list-questions and
-/// show-ifr show them; "the Forms Browser selects the actual text to display based on the
-/// current platform language setting" (UEFI 2.11 §33.2.6). No expression reads them, so the
-/// language they come in never changes a condition, READ or WRITE.
+/// show-ifr show and match them; "the Forms Browser selects the actual text to display based on
+/// the current platform language setting" (UEFI 2.11 §33.2.6). No expression reads them, so the
+/// language they show in never changes a condition, READ or WRITE.
 pub(crate) struct ListTexts<'a> {
     /// The package that texts come from first
     chosen: Option<&'a StringPackage>,
@@ -214,17 +257,19 @@ pub(crate) struct ListTexts<'a> {
 }
 
 impl<'a> ListTexts<'a> {
-    /// The texts of `packages`, those of one package list, from the first package of no
-    /// configuration language.
-    pub(crate) fn new(packages: &'a [StringPackage]) -> Self {
+    /// The texts of `packages`, those of one package list, from the package that best_language
+    /// picks for the first of `requested` that it picks one for, else from the first package of
+    /// no configuration language.
+    pub(crate) fn new(packages: &'a [StringPackage], requested: &[&str]) -> Self {
         let shown: Vec<&StringPackage> = packages
             .iter()
             .filter(|package| !package.language.is_configuration())
             .collect();
-        Self {
-            chosen: shown.first().copied(),
-            shown,
-        }
+        let chosen = requested
+            .iter()
+            .find_map(|requested| best_language(packages, requested))
+            .or_else(|| shown.first().copied());
+        Self { chosen, shown }
     }
 
     /// The text of the string `id`: the chosen package's, else that of the first package of no
@@ -243,6 +288,17 @@ impl<'a> ListTexts<'a> {
                 ""
             }
         }
+    }
+
+    /// The text of the string `id` in each package of no configuration language that holds it,
+    /// with that package's language: the texts that QUESTION and VALUE match.
+    pub(crate) fn matching(&self, id: u16) -> impl Iterator<Item = (&'a Language, &'a str)> + '_ {
+        self.shown.iter().filter_map(move |package| {
+            package
+                .strings
+                .get(&id)
+                .map(|text| (&package.language, text.as_ref()))
+        })
     }
 }
 
@@ -612,6 +668,37 @@ fn data_index(offset: u32) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// best_language picks as edk2-stable202608 GetBestLanguage does in RFC 4646 mode, but
+    /// ignoring ASCII case: the first language that starts with the requested code, before any
+    /// ';', or with that code cut back to each '-' in turn.
+    #[test]
+    fn best_language_picks_as_get_best_language() {
+        let packages = ["x-UEFI-ns", "en-US", "fr-FR", "zh-Hant-TW", "fr"].map(package);
+        let cases = [
+            ("en-US", Some("en-US")),
+            ("fr-FR", Some("fr-FR")),
+            ("FR-fr", Some("fr-FR")),
+            ("fr", Some("fr-FR")),
+            ("fr-CA", Some("fr-FR")),
+            ("fr-", Some("fr-FR")),
+            ("zh-Hant-HK", Some("zh-Hant-TW")),
+            ("zh-Hans", Some("zh-Hant-TW")),
+            ("x-UEFI", Some("x-UEFI-ns")),
+            ("de-DE", None),
+            ("de;fr", None),
+            ("fr;de", Some("fr-FR")),
+            ("", None),
+            ("-", None),
+        ];
+        for (requested, want) in cases {
+            assert_eq!(
+                best_language(&packages, requested).map(|picked| picked.language.to_string()),
+                want.map(str::to_string),
+                "requested {requested:?}"
+            );
+        }
+    }
 
     /// A language is a configuration language if it starts with "x-" in either case, and only
     /// then.

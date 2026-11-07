@@ -965,7 +965,7 @@ mod tests {
         let efivars = Efivars::new();
         let listed = list_questions(
             Rc::clone(&root),
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
             None,
             &mut efivars.reader(),
@@ -974,7 +974,7 @@ mod tests {
             picked: (found, _), ..
         } = find_question(
             root,
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             &BTreeSet::from([PROMPT]),
             IncludedStates::empty(),
             None,
@@ -1006,7 +1006,7 @@ mod tests {
 
         let listed = list_questions(
             root,
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),
@@ -1049,7 +1049,7 @@ mod tests {
 
         let listed = list_questions(
             root,
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),
@@ -1092,7 +1092,7 @@ mod tests {
 
         let listed = list_questions(
             root,
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),

@@ -38,6 +38,7 @@ use proc_mounts::MountIter;
 use thiserror::Error;
 
 use crate::chattr::EfivarsImmutabilityGuard;
+use crate::efi_variables::globals::platform_lang;
 use crate::efi_variables::VariableContents;
 use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfo;
@@ -56,6 +57,7 @@ use crate::hii::boot_log::KMSG_DEVICE;
 use crate::hii::boot_log::KMSG_PATH;
 use crate::hii::efivarfs_format::as_variable_not_found;
 use crate::hii::efivarfs_format::check_regular_file;
+use crate::hii::efivarfs_format::efivar_contents;
 use crate::hii::efivarfs_format::listed_names;
 use crate::hii::efivarfs_format::open_efivar;
 use crate::hii::efivarfs_format::read_efivar;
@@ -148,6 +150,16 @@ impl EfivarSource {
                 interface: EFIVARFS_INTERFACE,
             }),
         })
+    }
+
+    /// The platform language, PlatformLang, that this source holds (globals::platform_lang); none
+    /// for Disabled.
+    pub(crate) fn platform_lang(&self) -> Result<Option<String>> {
+        match self {
+            Self::System => platform_lang(&EfivarFiles::system()),
+            Self::Directory(dir) => platform_lang(&EfivarCopy::new(dir.clone())),
+            Self::Disabled => Ok(None),
+        }
     }
 }
 
@@ -966,26 +978,6 @@ fn efivar_file_bytes(contents: &VariableContents) -> Vec<u8> {
         contents.data(),
     ]
     .concat()
-}
-
-/// The contents of `key` from the `bytes` of its efivar file: its attributes word, then its data.
-/// A file of no bytes holds no variable (efivar_names).
-fn efivar_contents(key: &VariableKey, bytes: &[u8]) -> Result<Option<VariableContents>> {
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let (attributes, data) = bytes
-        .split_first_chunk::<EFIVARFS_HEADER_SIZE>()
-        .with_context(|| {
-            format!(
-                "efivar file of EFI variable {key} holds {} bytes, fewer than its attributes",
-                bytes.len()
-            )
-        })?;
-    let attributes = VariableAttributes::from_bits_retain(u32::from_ne_bytes(*attributes));
-    VariableContents::new(attributes, data.to_vec())
-        .map(Some)
-        .with_context(|| format!("efivar file of EFI variable {key}"))
 }
 
 impl VariableStorageInfo for EfivarFiles {

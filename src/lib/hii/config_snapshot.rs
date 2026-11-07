@@ -671,7 +671,7 @@ pub(crate) mod tests {
                 None,
             ),
         ] {
-            lookup.enter(&list, &list.texts());
+            lookup.enter(&list, &list.texts(&[]));
 
             assert_eq!(lookup.buffer(&store, 0..1), want_buffer, "{case}: NStore");
             assert_eq!(
@@ -693,7 +693,7 @@ pub(crate) mod tests {
                 .expect("look up the snapshot");
         let list = labelled_list(&[(b"x-UEFI-ns", "Var0"), (b"en-US", "Var1")]);
 
-        lookup.enter(&list, &list.texts());
+        lookup.enter(&list, &list.texts(&[]));
 
         assert_eq!(
             lookup.number(Guid::from(N_GUID), 1).map(Number::as_bytes),

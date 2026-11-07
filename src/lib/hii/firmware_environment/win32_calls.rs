@@ -40,6 +40,7 @@ use windows_sys::Win32::System::WindowsProgramming::SetFirmwareEnvironmentVariab
 use super::FirmwareEnvironment;
 use super::FirmwareEnvironmentCalls;
 use super::GotVariable;
+use crate::efi_variables::globals::platform_lang;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;
@@ -56,6 +57,15 @@ impl EfivarSource {
                 interface: FirmwareEnvironment::<RealFirmwareEnvironmentCalls>::INTERFACE,
             }),
         })
+    }
+
+    /// The platform language, PlatformLang, that this source holds (globals::platform_lang); none
+    /// for Disabled.
+    pub(crate) fn platform_lang(&self) -> Result<Option<String>> {
+        match self {
+            Self::System => platform_lang(&FirmwareEnvironment::new()?),
+            Self::Disabled => Ok(None),
+        }
     }
 }
 

@@ -399,6 +399,33 @@ pub(crate) fn other_option(string_id: u16, flags: u8, expression: &[Vec<u8>]) ->
     .concat()
 }
 
+/// A UINT8 ONE_OF of QuestionId `question_id`, prompted string `prompt`, at VarOffset `offset`
+/// of VarStore `var_store_id`, with an option of each string and value of `options`.
+pub(crate) fn one_of_at(
+    question_id: u16,
+    prompt: u16,
+    var_store_id: u16,
+    offset: u16,
+    options: &[(u16, u8)],
+) -> Vec<u8> {
+    // Flags EFI_IFR_NUMERIC_SIZE_1, MinValue 0, MaxValue 0xFF, Step 1
+    let data = [
+        question_header_on(question_id, prompt, var_store_id, offset),
+        vec![0x00, 0x00, 0xFF, 0x01],
+    ]
+    .concat();
+    let children: Vec<Vec<u8>> = options
+        .iter()
+        .map(|&(string_id, value)| one_of_option(string_id, 0x00, &[value]))
+        .collect();
+    [
+        operation(ONE_OF, true, &data),
+        children.concat(),
+        END.to_vec(),
+    ]
+    .concat()
+}
+
 /// A UINT8 EFI_IFR_ONE_OF_OPTION with `flags`.
 pub(crate) fn flagged_option(string_id: u16, flags: u8, value: u8) -> Vec<u8> {
     let data = [&string_id.to_le_bytes()[..], &[flags, 0x00, value]].concat();
@@ -872,7 +899,7 @@ pub(super) fn question_descriptor_with(
 ) -> QuestionDescriptor {
     let current = node.borrow();
     let strings = strings();
-    let texts = ListTexts::new(&strings);
+    let texts = ListTexts::new(&strings, &[]);
     let mut reader = efivars.reader();
     let walk = &mut FormSetWalk::new(&texts, &mut reader, values, IncludedStates::empty());
     let flags = value_question(&current)

@@ -90,7 +90,8 @@ fn decoded_bytes(
         .reader(EfivarSource::Disabled.into_variables()?)?;
     for list in package_lists {
         list.check_form_strings()?;
-        let texts = list.texts();
+        // which questions read which bytes holds in every language
+        let texts = list.texts(&[]);
         for root in &list.forms {
             list_questions(
                 Rc::clone(root),
@@ -464,7 +465,7 @@ mod tests {
         let source = EfivarSource::Directory(efivars.to_path_buf());
         list_questions(
             Rc::clone(root),
-            &ListTexts::new(&[]),
+            &ListTexts::new(&[], &[]),
             IncludedStates::CONDITIONS,
             None,
             &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),

@@ -361,7 +361,7 @@ impl<'a> KeywordQuestion<'a> {
             keyword: keyword.clone(),
             namespace,
             path,
-            texts: list.texts(),
+            texts: list.texts(&[]),
             roots: &list.forms,
             root,
             op,

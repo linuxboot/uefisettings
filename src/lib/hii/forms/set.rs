@@ -1638,7 +1638,7 @@ mod write_validation_tests {
             parsed.question_header.flags(),
             &node,
             &mut FormSetWalk::new(
-                &ListTexts::new(&[]),
+                &ListTexts::new(&[], &[]),
                 &mut efivars.reader(),
                 &MapValues(BTreeMap::new()),
                 IncludedStates::empty(),

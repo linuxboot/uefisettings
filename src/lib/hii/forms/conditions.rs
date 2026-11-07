@@ -31,6 +31,8 @@ use super::defaults::question_scope;
 use super::find_corresponding_varstore;
 use super::named_records;
 use super::question_values::value_question;
+use super::question_values::OptionMatch;
+use super::question_values::PromptMatch;
 use super::question_values::ValueQuestion;
 use super::storage::read_current_value_bytes;
 use super::storage::read_question_value;
@@ -286,6 +288,26 @@ pub enum SelectionError {
     MaybeInIgnoredIfr {
         question: String,
         ignored: Vec<IgnoredIfr>,
+    },
+    /// get's and set's refusal of a QUESTION that names questions through the prompts of
+    /// different languages
+    #[error(
+        "{question:?} is the prompt {}: no one language holds it as the prompt of every question \
+         it names",
+        PromptMatch::list(.matches)
+    )]
+    Ambiguous {
+        question: String,
+        matches: Vec<PromptMatch>,
+    },
+    /// set's refusal of a VALUE that names options through the texts of different languages
+    #[error(
+        "the value is the text {}: no one language holds it as the text of every option it names",
+        OptionMatch::list(.question, .matches)
+    )]
+    AmbiguousOption {
+        question: String,
+        matches: Vec<OptionMatch>,
     },
 }
 
@@ -4377,7 +4399,7 @@ mod tests {
             &root,
             &BTreeSet::from([PROMPT]),
             &mut FormSetWalk::new(
-                &ListTexts::new(&strings()),
+                &ListTexts::new(&strings(), &[]),
                 &mut Efivars::new().reader(),
                 &values(),
                 include,
@@ -5076,7 +5098,7 @@ mod tests {
 
             let got: Vec<u16> = list_questions(
                 Rc::clone(&root),
-                &ListTexts::new(&strings()),
+                &ListTexts::new(&strings(), &[]),
                 IncludedStates::empty(),
                 None,
                 &mut Efivars::new().reader(),

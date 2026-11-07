@@ -116,6 +116,8 @@ access: in the scenario `hii`, `uefisettings` reads and writes it by its own att
 [`vars/my-ifr-nv-data-auth27.json`](vars/my-ifr-nv-data-auth27.json) creates it with
 authenticated access, the attributes 0x27, for the UEFI Shell scenario `shell-auth27`:
 `uefisettings.efi` decodes it, and does not write it.
+The scenario `hii-platform-lang` boots the guest of `hii` and sets `PlatformLang` to `fr-FR`
+first, so that the texts of `hii list-questions` follow it unless `--language` states another.
 
 `publish-hiidb.efi rt-data-global-variable-forms` publishes, after the firmware's own
 package lists, those of

@@ -18,6 +18,7 @@ use std::fmt;
 
 use anyhow::Context;
 use anyhow::Result;
+use log::warn;
 use serde::ser::SerializeMap;
 use serde::ser::SerializeSeq;
 use serde::Serialize;
@@ -789,6 +790,23 @@ fn read_decoded<T>(
         .map(|contents| decode(contents.data()))
         .transpose()
         .with_context(|| format!("EFI variable {key} is malformed"))
+}
+
+/// The platform language, PlatformLang, that `variables` hold, unless it is absent or malformed.
+pub(crate) fn platform_lang(variables: &impl VariableData) -> Result<Option<String>> {
+    Ok(
+        match read_decoded(variables, "PlatformLang", |data| Ok(ascii(data)))? {
+            Some(Ok(code)) => Some(code),
+            Some(Err(error)) => {
+                warn!("EFI variable PlatformLang is malformed, so it picks no texts: {error}");
+                None
+            }
+            None => {
+                warn!("EFI variable PlatformLang is absent, so it picks no texts");
+                None
+            }
+        },
+    )
 }
 
 /// Fails unless `variables` hold the load option `option` that the variable `name` names.
@@ -2282,5 +2300,59 @@ pub(crate) mod tests {
     fn vendor(text: &str) -> Guid {
         text.parse()
             .unwrap_or_else(|error| panic!("parse GUID {text}: {error}"))
+    }
+
+    /// platform_lang decodes PlatformLang, a "null-terminated ASCII string language code"
+    /// (UEFI 2.11 §3.3), and gives None for one that is absent or that is no such string.
+    #[test]
+    fn platform_lang_decodes_or_skips_a_malformed_one() {
+        let cases: [(Option<&[u8]>, Option<&str>); 5] = [
+            (Some(b"fr-FR\0"), Some("fr-FR")),
+            (None, None),
+            (Some(b"fr-FR"), None),
+            (Some(b"fr\0FR\0"), None),
+            (Some(b"fr-\xc9\0"), None),
+        ];
+        for (data, want) in cases {
+            let variables = match data {
+                Some(data) => {
+                    HeldVariables::default().with("PlatformLang", EFI_GLOBAL_VARIABLE, data)
+                }
+                None => HeldVariables::default(),
+            };
+
+            let got = platform_lang(&variables).expect("read PlatformLang");
+
+            assert_eq!(got.as_deref(), want, "PlatformLang {data:?}");
+        }
+    }
+
+    /// VariableData whose every read fails.
+    struct FailingReads;
+
+    impl VariableData for FailingReads {
+        fn interface(&self) -> VariableInterface {
+            panic!("ask for the variable interface")
+        }
+
+        fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+            Err(anyhow::anyhow!("cannot read EFI variable {key}"))
+        }
+
+        fn set_variable(&self, key: &VariableKey, _contents: &VariableContents) -> Result<()> {
+            panic!("set EFI variable {key}")
+        }
+    }
+
+    /// platform_lang fails with a read's error, which is no malformed PlatformLang.
+    #[test]
+    fn platform_lang_fails_on_a_read_error() {
+        let error = platform_lang(&FailingReads).expect_err("read PlatformLang");
+
+        assert_eq!(
+            error.to_string(),
+            "cannot read EFI variable PlatformLang-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+            "error"
+        );
     }
 }

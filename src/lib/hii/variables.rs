@@ -694,6 +694,11 @@ impl EfivarSource {
             }),
         })
     }
+
+    /// No platform language: a build without VariableData reads none, from a Directory either.
+    pub(crate) fn platform_lang(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Why EfivarSource::validate refuses a Directory.

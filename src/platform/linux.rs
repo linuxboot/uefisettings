@@ -304,22 +304,25 @@ impl<S> SelectionArgs<S>
 where
     S: clap::ValueEnum + Clone + Send + Sync + 'static,
 {
-    /// Fails if any state is included or an access level stated: Ilo attributes have no IFR
-    /// conditions.
+    /// Fails if any state is included, or an access level or a language stated: Ilo attributes
+    /// have no IFR conditions and no HII strings.
     pub(super) fn refuse_on_ilo(&self) -> Result<()> {
-        match (self.include.include.as_slice(), self.access_level) {
-            ([], None) => Ok(()),
-            ([_, ..], None) => Err(anyhow!(
-                "--include applies to the HII backend, not to the Ilo backend of this machine"
-            )),
-            ([], Some(_)) => Err(anyhow!(
-                "--access-level applies to the HII backend, not to the Ilo backend of this machine"
-            )),
-            ([_, ..], Some(_)) => Err(anyhow!(
-                "--include and --access-level apply to the HII backend, not to the Ilo backend of \
-                 this machine"
-            )),
-        }
+        let stated: Vec<&str> = [
+            ("--include", !self.include.include.is_empty()),
+            ("--access-level", self.access_level.is_some()),
+            ("--language", self.language.language.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, stated)| stated.then_some(flag))
+        .collect();
+        let flags = match stated.as_slice() {
+            [] => return Ok(()),
+            [flag] => format!("{flag} applies"),
+            [first @ .., last] => format!("{} and {last} apply", first.join(", ")),
+        };
+        Err(anyhow!(
+            "{flags} to the HII backend, not to the Ilo backend of this machine"
+        ))
     }
 }
 
@@ -555,6 +558,28 @@ mod tests {
                 Err(
                     "--include and --access-level apply to the HII backend, not to the Ilo \
                      backend of this machine",
+                ),
+            ),
+            (
+                "--language",
+                vec!["--language", "fr-FR"],
+                Err(
+                    "--language applies to the HII backend, not to the Ilo backend of this machine",
+                ),
+            ),
+            (
+                "--include, --access-level and --language",
+                vec![
+                    "--include",
+                    "grayed-out",
+                    "--access-level",
+                    "user",
+                    "--language",
+                    "fr-FR",
+                ],
+                Err(
+                    "--include, --access-level and --language apply to the HII backend, not to \
+                     the Ilo backend of this machine",
                 ),
             ),
         ];

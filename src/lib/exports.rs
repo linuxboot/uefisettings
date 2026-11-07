@@ -223,6 +223,8 @@ use crate::translation::HiiTranslation;
 pub use crate::hii::forms::AccessLevel;
 pub use crate::hii::forms::IgnoredIfr;
 pub use crate::hii::forms::IncludedStates;
+pub use crate::hii::forms::OptionMatch;
+pub use crate::hii::forms::PromptMatch;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
 pub use crate::hii::forms::SetupPasswordPolicy;
@@ -560,6 +562,8 @@ pub struct GetOptions {
     pub efivars: EfivarSource,
     /// The AMI Setup access level that conditions read instead of the stored one, if stated
     pub access_level: Option<AccessLevel>,
+    /// The language to show texts in instead of the platform language (PlatformLang), if stated
+    pub language: Option<String>,
 }
 
 /// The options of HiiBackend::set_using.
@@ -575,6 +579,8 @@ pub struct SetOptions {
     /// Whether set writes a volatile variable: only through variables that reach BootServices, as
     /// in the UEFI Shell
     pub volatile: VolatileWrites,
+    /// The language to show texts in instead of the platform language (PlatformLang), if stated
+    pub language: Option<String>,
 }
 
 /// The options of HiiBackend::list_questions_using.
@@ -587,6 +593,8 @@ pub struct ListQuestionsOptions {
     pub efivars: EfivarSource,
     /// The AMI Setup access level that conditions read instead of the stored one, if stated
     pub access_level: Option<AccessLevel>,
+    /// The language to show texts in instead of the platform language (PlatformLang), if stated
+    pub language: Option<String>,
 }
 
 /// The options of HiiBackend::show_ifr_using.
@@ -595,6 +603,8 @@ pub struct ListQuestionsOptions {
 pub struct ShowIfrOptions {
     /// Where to read question values
     pub efivars: EfivarSource,
+    /// The language to show texts in instead of the platform language (PlatformLang), if stated
+    pub language: Option<String>,
 }
 
 /// The options of HiiBackend::dump_efivars.
@@ -622,17 +632,22 @@ impl HiiBackend {
     pub fn show_ifr_using(db_bytes: &[u8], options: &ShowIfrOptions) -> Result<HiiShowIfrResponse> {
         Self::show_ifr_in(
             db_bytes,
+            options,
             options.efivars.clone().into_variables()?,
             system_snapshot(&options.efivars),
+            options.efivars.platform_lang()?.as_deref(),
         )
     }
 
-    /// show_ifr, reading question values from `variables`, or from the snapshot `exported`
-    /// where they miss a variable
+    /// show_ifr with `options`, reading question values from `variables`, or from the snapshot
+    /// `exported` where they miss a variable, on a platform of PlatformLang `platform_lang`, if
+    /// any
     fn show_ifr_in(
         db_bytes: &[u8],
+        options: &ShowIfrOptions,
         variables: Box<dyn FirmwareVariables>,
         exported: Option<ExportedConfig>,
+        platform_lang: Option<&str>,
     ) -> Result<HiiShowIfrResponse> {
         // We depend on the caller to provide us with the hiidb instead of calling extract here
         // because they might want to provide a file instead.
@@ -648,7 +663,7 @@ impl HiiBackend {
                 continue;
             }
             writeln!(readable_representation, "Packagelist {}", list.guid)?;
-            let texts = list.texts();
+            let texts = list.texts(&text_languages(options.language.as_deref(), platform_lang));
             reader.enter_package_list(&list, &texts);
             for root in &list.forms {
                 readable_representation.push_str(&forms::display(
@@ -723,6 +738,7 @@ impl HiiBackend {
             options,
             options.efivars.clone().into_variables()?,
             system_snapshot(&options.efivars),
+            options.efivars.platform_lang()?.as_deref(),
         )
     }
 
@@ -736,18 +752,28 @@ impl HiiBackend {
             options,
             options.efivars.clone().into_variables()?,
             system_snapshot(&options.efivars),
+            options.efivars.platform_lang()?.as_deref(),
         )
     }
 
     /// list_questions with `options`, reading question values from `variables`, or from the
-    /// snapshot `exported` where they miss a variable
+    /// snapshot `exported` where they miss a variable, on a platform of PlatformLang
+    /// `platform_lang`, if any
     fn list_questions_in(
         db_bytes: &[u8],
         options: &ListQuestionsOptions,
         variables: Box<dyn FirmwareVariables>,
         exported: Option<ExportedConfig>,
+        platform_lang: Option<&str>,
     ) -> Result<Vec<Question>> {
-        Ok(Self::list_questions_and_ignored_ifr_in(db_bytes, options, variables, exported)?.0)
+        Ok(Self::list_questions_and_ignored_ifr_in(
+            db_bytes,
+            options,
+            variables,
+            exported,
+            platform_lang,
+        )?
+        .0)
     }
 
     /// list_questions_in, and the IFR that uefisettings ignores in the HiiDB
@@ -756,6 +782,7 @@ impl HiiBackend {
         options: &ListQuestionsOptions,
         variables: Box<dyn FirmwareVariables>,
         exported: Option<ExportedConfig>,
+        platform_lang: Option<&str>,
     ) -> Result<(Vec<Question>, Vec<IgnoredIfr>)> {
         let include = options.include;
         let mut res = Vec::new();
@@ -768,9 +795,10 @@ impl HiiBackend {
             parsed_db.iter().flat_map(|list| &list.forms),
             options.access_level,
         )?;
+        let requested = text_languages(options.language.as_deref(), platform_lang);
         for list in parsed_db {
             list.check_form_strings()?;
-            let texts = list.texts();
+            let texts = list.texts(&requested);
             reader.enter_package_list(&list, &texts);
 
             for root in &list.forms {
@@ -843,20 +871,26 @@ impl HiiBackend {
             options,
             EfivarSource::System.into_variables()?,
             &Self::system_variables()?,
+            EfivarSource::System.platform_lang()?.as_deref(),
         )
     }
 
     /// set in the HiiDB `db_bytes` with `options`, selecting by the values of `reads`, which it
     /// reads before the first write, and writing through `writes`, neither of them the bytes of
-    /// password questions (PasswordQuestions::reader and withholding): fails with
-    /// SelectionError::NotFound when no question has the text, and unless every selected match
-    /// is written, also after writing the others.
+    /// password questions (PasswordQuestions::reader and withholding), on a platform of
+    /// PlatformLang `platform_lang`, if any: fails with SelectionError::NotFound when no question
+    /// has the text, and unless every selected match is written, also after writing the others.
     #[cfg_attr(
         not(system_variables),
         allow(
             dead_code,
             reason = "set writes only the variables of the machine, which this build does not reach"
         )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "set's inputs: the HiiDB, the question, the value, the selector, the options, the \
+                  variables to read and write, and the platform language"
     )]
     fn set_in(
         db_bytes: &[u8],
@@ -866,6 +900,7 @@ impl HiiBackend {
         options: &SetOptions,
         reads: Box<dyn FirmwareVariables>,
         writes: &dyn FirmwareVariables,
+        platform_lang: Option<&str>,
     ) -> Result<SetResponseList> {
         // TODO: use selector to only change values which match question + selector
         let include = options.include;
@@ -896,6 +931,7 @@ impl HiiBackend {
             question,
             &question_variations,
             options,
+            &text_languages(options.language.as_deref(), platform_lang),
             &mut reader,
         )?;
 
@@ -977,11 +1013,13 @@ impl HiiBackend {
             options,
             options.efivars.clone().into_variables()?,
             system_snapshot(&options.efivars),
+            options.efivars.platform_lang()?.as_deref(),
         )
     }
 
     /// get with `options`, reading question values from `variables`, or from the snapshot
-    /// `exported` where they miss a variable
+    /// `exported` where they miss a variable, on a platform of PlatformLang `platform_lang`, if
+    /// any
     fn get_in(
         db_bytes: &[u8],
         question: &str,
@@ -989,6 +1027,7 @@ impl HiiBackend {
         options: &GetOptions,
         variables: Box<dyn FirmwareVariables>,
         exported: Option<ExportedConfig>,
+        platform_lang: Option<&str>,
     ) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
         // TODO: take a form@packagelist selector to pick one of the FormSets that select
@@ -1015,11 +1054,13 @@ impl HiiBackend {
             options.access_level,
         )?;
         let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
+        check_question_languages(&parsed_db, question, &question_variations)?;
 
+        let requested = text_languages(options.language.as_deref(), platform_lang);
         let mut excluded = Exclusion::NONE;
         for list in parsed_db {
             list.check_form_strings()?;
-            let texts = list.texts();
+            let texts = list.texts(&requested);
             reader.enter_package_list(&list, &texts);
 
             for root in &list.forms {
@@ -1141,17 +1182,44 @@ fn read_db_withholding(
     Ok((parsed_db, reader))
 }
 
+/// The languages that ParsedPackageList::texts takes, in order: `stated` (--language), then
+/// `platform` (PlatformLang), those that are given.
+fn text_languages<'a>(stated: Option<&'a str>, platform: Option<&'a str>) -> Vec<&'a str> {
+    [stated, platform].into_iter().flatten().collect()
+}
+
+/// Refuses `question` unless one language holds it as the prompt of every question that its
+/// `variations` name in `parsed_db` (forms::check_prompt_language).
+fn check_question_languages(
+    parsed_db: &[package::ParsedPackageList],
+    question: &str,
+    variations: &BTreeSet<String>,
+) -> Result<()> {
+    let mut matches = Vec::new();
+    for list in parsed_db {
+        // whichever language texts show in, QUESTION matches those of every language
+        let texts = list.texts(&[]);
+        for root in &list.forms {
+            matches.extend(forms::prompt_matches(root, &texts, variations));
+        }
+    }
+    forms::check_prompt_language(question, matches)?;
+    Ok(())
+}
+
 /// set's phase before its first write, so that no error follows a write: checks every package
-/// list of `parsed_db` and the stated access level, then selects, in each FormSet, the question
-/// of `question_variations` that set writes, reading each range once with `reader`; returns them
-/// with the GUID of their package list, or SelectionError::Excluded for `question` if each
-/// FormSet skips it for its states, or else MaybeInIgnoredIfr if none holds it and read_db
-/// ignores IFR of `parsed_db`.
+/// list of `parsed_db`, the stated access level and the languages of `question`'s prompt, then
+/// selects, in each FormSet, the question of `question_variations` that set writes, its texts
+/// shown in the languages `requested` takes (ParsedPackageList::texts), reading each range once
+/// with `reader`; returns them with the GUID of their package list, or SelectionError::Excluded
+/// for `question` if each FormSet skips it for its states, or else MaybeInIgnoredIfr if none
+/// holds it and read_db ignores IFR of `parsed_db`.
 fn select_for_set(
     parsed_db: &[package::ParsedPackageList],
     question: &str,
     question_variations: &BTreeSet<String>,
     options: &SetOptions,
+    requested: &[&str],
     reader: &mut EfivarReader,
 ) -> Result<Vec<(String, forms::QuestionDescriptor, forms::StateEvaluation)>> {
     forms::check_access_level(
@@ -1161,13 +1229,14 @@ fn select_for_set(
     parsed_db
         .iter()
         .try_for_each(package::ParsedPackageList::check_form_strings)?;
+    check_question_languages(parsed_db, question, question_variations)?;
 
     // Every FormSet selects its question and option before the first write, so that a
     // selection error leaves every variable unchanged.
     let mut selected = Vec::new();
     let mut excluded = Exclusion::NONE;
     for list in parsed_db {
-        let texts = list.texts();
+        let texts = list.texts(requested);
         for root in &list.forms {
             // try to find the question
             let selection = forms::find_question(
@@ -1288,6 +1357,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::locked_op;
     use crate::hii::forms::ifr_fixtures::nested;
     use crate::hii::forms::ifr_fixtures::on_small_stack;
+    use crate::hii::forms::ifr_fixtures::one_of_at;
     use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::other_option;
     use crate::hii::forms::ifr_fixtures::password_on;
@@ -1435,6 +1505,7 @@ mod tests {
         // no variables: on Windows, System enables a privilege that needs elevation
         let options = ShowIfrOptions {
             efivars: EfivarSource::Disabled,
+            ..Default::default()
         };
 
         let ifr = HiiBackend::show_ifr_using(&hiidb, &options)
@@ -1471,6 +1542,7 @@ mod tests {
         // no variables: on Windows, System enables a privilege that needs elevation
         let options = ShowIfrOptions {
             efivars: EfivarSource::Disabled,
+            ..Default::default()
         };
 
         let ifr = HiiBackend::show_ifr_using(&hiidb, &options)
@@ -1631,6 +1703,7 @@ mod tests {
         HiiBackend::list_questions_using(&hiidb, &questions).expect("list the questions");
         let ifr = ShowIfrOptions {
             efivars: EfivarSource::Disabled,
+            ..Default::default()
         };
         HiiBackend::show_ifr_using(&hiidb, &ifr).expect("show the IFR");
     }
@@ -1667,6 +1740,7 @@ mod tests {
             &ListQuestionsOptions::default(),
             Box::new(MemoryVariables::default()),
             None,
+            None,
         )
         .expect("list the questions")
         .into_iter()
@@ -1690,16 +1764,7 @@ mod tests {
         ];
         let hiidb = package_list_with_guid([0x6D; 16], &packages.concat());
 
-        let names: Vec<String> = HiiBackend::list_questions_in(
-            &hiidb,
-            &ListQuestionsOptions::default(),
-            Box::new(MemoryVariables::default()),
-            None,
-        )
-        .expect("list the questions")
-        .into_iter()
-        .map(|question| question.name)
-        .collect();
+        let names = names_listed(&hiidb, &ListQuestionsOptions::default(), None);
 
         assert_eq!(names, [""], "names of the questions");
     }
@@ -1729,6 +1794,7 @@ mod tests {
             &GetOptions::default(),
             shared(&variables),
             None,
+            None,
         )
         .expect("get BootEnable");
         let set = HiiBackend::set_in(
@@ -1739,6 +1805,7 @@ mod tests {
             &SetOptions::default(),
             shared(&variables),
             &*variables,
+            None,
         );
         let keyword_writes = variables.writes_to(&setup());
         let boot = HiiBackend::set_in(
@@ -1749,6 +1816,7 @@ mod tests {
             &SetOptions::default(),
             shared(&variables),
             &*variables,
+            None,
         )
         .expect("set Boot 1");
 
@@ -1787,18 +1855,384 @@ mod tests {
         ];
         let hiidb = package_list_with_guid([0x6E; 16], &packages.concat());
 
-        let names: Vec<String> = HiiBackend::list_questions_in(
-            &hiidb,
-            &ListQuestionsOptions::default(),
+        let names = names_listed(&hiidb, &ListQuestionsOptions::default(), None);
+
+        assert_eq!(names, ["Boot", ""], "names of the questions");
+    }
+
+    /// The names of the questions that list-questions lists in `hiidb` with `options`, whose
+    /// variables hold nothing, on a platform of PlatformLang `platform`, if any.
+    fn names_listed(
+        hiidb: &[u8],
+        options: &ListQuestionsOptions,
+        platform: Option<&str>,
+    ) -> Vec<String> {
+        HiiBackend::list_questions_in(
+            hiidb,
+            options,
             Box::new(MemoryVariables::default()),
             None,
+            platform,
         )
         .expect("list the questions")
         .into_iter()
         .map(|question| question.name)
-        .collect();
+        .collect()
+    }
 
-        assert_eq!(names, ["Boot", ""], "names of the questions");
+    /// A HiiDB whose CHECKBOXes 1, 2 and 3 are prompted by strings 1, 2 and 3, of which the
+    /// x-UEFI-ns package holds all three, the en-US package 1 and 2, and the fr-FR package 1.
+    fn translated_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 3),
+                form(
+                    1,
+                    &[
+                        checkbox_at(1, 1, 1, 0),
+                        checkbox_at(2, 2, 1, 1),
+                        checkbox_at(3, 3, 1, 2),
+                    ],
+                ),
+            ]),
+            strings_package_of(
+                b"x-UEFI-ns",
+                &["BootEnable", "SecondKeyword", "ThirdKeyword"],
+            ),
+            strings_package_of(b"en-US", &["Boot", "Second"]),
+            strings_package_of(b"fr-FR", &["D\u{e9}marrage"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x66; 16], &packages.concat())
+    }
+
+    /// Texts come from the strings package that edk2 GetBestLanguage picks for --language,
+    /// ignoring ASCII case, else from the first package of no x- language; a string that the
+    /// chosen package lacks comes from another package of no x- language, never from an x- one.
+    #[test]
+    fn prompts_come_from_the_best_language_package() {
+        let french = ["D\u{e9}marrage", "Second", ""];
+        let cases = [
+            (None, ["Boot", "Second", ""]),
+            (Some("fr-FR"), french),
+            (Some("fr"), french),
+            (Some("fr-CA"), french),
+            (Some("FR-fr"), french),
+            (Some("de-DE"), ["Boot", "Second", ""]),
+            (
+                Some("x-UEFI-ns"),
+                ["BootEnable", "SecondKeyword", "ThirdKeyword"],
+            ),
+        ];
+        for (language, want) in cases {
+            let options = ListQuestionsOptions {
+                language: language.map(str::to_string),
+                ..ListQuestionsOptions::default()
+            };
+
+            let names = names_listed(&translated_hiidb(), &options, None);
+
+            assert_eq!(names, want, "--language {language:?}");
+        }
+    }
+
+    /// Without --language, texts come from the package that PlatformLang picks; --language
+    /// picks before it.
+    #[test]
+    fn platform_lang_picks_below_the_stated_language() {
+        let cases = [
+            (None, Some("fr-FR"), "D\u{e9}marrage"),
+            (Some("en-US"), Some("fr-FR"), "Boot"),
+            (None, Some("de-DE"), "Boot"),
+            (None, None, "Boot"),
+        ];
+        for (language, platform, want) in cases {
+            let options = ListQuestionsOptions {
+                language: language.map(str::to_string),
+                ..ListQuestionsOptions::default()
+            };
+
+            let names = names_listed(&translated_hiidb(), &options, platform);
+
+            assert_eq!(
+                names.first().map(String::as_str),
+                Some(want),
+                "--language {language:?}, PlatformLang {platform:?}"
+            );
+        }
+    }
+
+    /// The efivar file of PlatformLang holding `data` after the attributes NV+BS+RT.
+    #[cfg(all(efivar_dumps, variable_data))]
+    fn platform_lang_file(dir: &std::path::Path, data: &[u8]) {
+        fs::write(
+            dir.join("PlatformLang-8be4df61-93ca-11d2-aa0d-00e098032b8c"),
+            [&[7, 0, 0, 0][..], data].concat(),
+        )
+        .expect("write the efivar file of PlatformLang");
+    }
+
+    /// The name of the first question that list-questions lists in translated_hiidb() through
+    /// --efivars DIR, where DIR holds `platform_lang`, if any, as the data of PlatformLang, with
+    /// --language `language`, if any.
+    #[cfg(all(efivar_dumps, variable_data))]
+    fn first_name_listed(platform_lang: Option<&[u8]>, language: Option<&str>) -> Option<String> {
+        let efivars = tempfile::tempdir().expect("create efivars directory");
+        if let Some(data) = platform_lang {
+            platform_lang_file(efivars.path(), data);
+        }
+        let options = ListQuestionsOptions {
+            efivars: EfivarSource::Directory(efivars.path().to_path_buf()),
+            language: language.map(str::to_string),
+            ..ListQuestionsOptions::default()
+        };
+
+        HiiBackend::list_questions_using(&translated_hiidb(), &options)
+            .expect("list the questions")
+            .into_iter()
+            .map(|question| question.name)
+            .next()
+    }
+
+    /// list-questions through --efivars DIR shows texts in the language of the PlatformLang that
+    /// DIR holds, unless --language picks one: an absent PlatformLang, or one that is no
+    /// null-terminated ASCII string (UEFI 2.11 §3.3), picks none.
+    #[cfg(all(efivar_dumps, variable_data))]
+    #[test]
+    fn platform_lang_chooses_the_texts() {
+        let cases: [(Option<&[u8]>, &str); 4] = [
+            (Some(b"fr-FR\0"), "D\u{e9}marrage"),
+            (Some(b"fr\0"), "D\u{e9}marrage"),
+            (None, "Boot"),
+            (Some(b"fr-FR"), "Boot"),
+        ];
+        for (data, want) in cases {
+            let name = first_name_listed(data, None);
+
+            assert_eq!(name.as_deref(), Some(want), "PlatformLang {data:?}");
+        }
+        let stated = first_name_listed(Some(b"fr-FR\0"), Some("en-US"));
+        assert_eq!(
+            stated.as_deref(),
+            Some("Boot"),
+            "PlatformLang fr-FR, --language en-US"
+        );
+    }
+
+    /// get and show-ifr through --efivars DIR show texts in the language of DIR's PlatformLang,
+    /// and get still selects the question by its en-US prompt.
+    #[cfg(all(efivar_dumps, variable_data))]
+    #[test]
+    fn efivars_dump_platform_lang_chooses_the_texts() {
+        let efivars = tempfile::tempdir().expect("create efivars directory");
+        platform_lang_file(efivars.path(), b"fr-FR\0");
+        let source = EfivarSource::Directory(efivars.path().to_path_buf());
+        let get = GetOptions {
+            efivars: source.clone(),
+            ..GetOptions::default()
+        };
+        let ifr = ShowIfrOptions {
+            efivars: source,
+            ..ShowIfrOptions::default()
+        };
+
+        let got = HiiBackend::get_using(&translated_hiidb(), "Boot", None, &get).expect("get Boot");
+        let shown = HiiBackend::show_ifr_using(&translated_hiidb(), &ifr)
+            .expect("show the IFR")
+            .readable_representation;
+
+        let names: Vec<&str> = got
+            .responses
+            .iter()
+            .map(|response| response.question.name.as_str())
+            .collect();
+        assert_eq!(names, ["D\u{e9}marrage"], "get Boot");
+        assert!(
+            shown.contains("Q: - D\u{e9}marrage -"),
+            "show-ifr shows the fr-FR prompt: {shown}"
+        );
+        assert!(
+            !shown.contains("Q: - Boot -"),
+            "show-ifr shows no en-US prompt: {shown}"
+        );
+    }
+
+    /// A HiiDB whose CHECKBOX 0xA is prompted "Start" in en-US and "Boot" in fr-FR, and whose
+    /// CHECKBOX 0x14 is prompted "Boot" in en-US.
+    fn crossed_prompts_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                form(1, &[checkbox_at(0xA, 1, 1, 0), checkbox_at(0x14, 2, 1, 1)]),
+            ]),
+            strings_package_of(b"en-US", &["Start", "Boot"]),
+            strings_package_of(b"fr-FR", &["Boot", "D\u{e9}marrage"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x67; 16], &packages.concat())
+    }
+
+    /// get and set refuse a QUESTION that no one language holds as the prompt of every question
+    /// it names, naming each, and set writes nothing; a QUESTION that one language holds as the
+    /// prompt of every question it names selects as before.
+    #[test]
+    fn get_refuses_a_prompt_of_different_questions_in_different_languages() {
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0, 0]);
+        let want = "\"Boot\" is the prompt of QuestionId 0x000A of FormSet \
+                    11111111-1111-1111-1111-111111111111 in fr-FR and of QuestionId 0x0014 of \
+                    FormSet 11111111-1111-1111-1111-111111111111 in en-US: no one language holds \
+                    it as the prompt of every question it names";
+
+        let got = HiiBackend::get_in(
+            &crossed_prompts_hiidb(),
+            "Boot",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        );
+        let set = HiiBackend::set_in(
+            &crossed_prompts_hiidb(),
+            "Boot",
+            "1",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        );
+        let started = HiiBackend::get_in(
+            &crossed_prompts_hiidb(),
+            "Start",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            Some("fr-FR"),
+        )
+        .expect("get Start");
+
+        assert_eq!(
+            got.map(drop).map_err(|error| error.to_string()),
+            Err(want.to_string()),
+            "get Boot"
+        );
+        assert_eq!(
+            set.map(drop).map_err(|error| error.to_string()),
+            Err(want.to_string()),
+            "set Boot 1"
+        );
+        assert_eq!(variables.writes_to(&setup()), [], "set Boot 1 writes");
+        let names: Vec<&str> = started
+            .responses
+            .iter()
+            .map(|response| response.question.name.as_str())
+            .collect();
+        assert_eq!(names, ["Boot"], "get Start shows its fr-FR prompt");
+    }
+
+    /// A HiiDB whose ONE_OF "Mode" at byte 0 of Setup has the options 0 and 1, of strings 2 and
+    /// 3, which `en_us` and `fr_fr` translate.
+    fn mode_hiidb(en_us: [&str; 3], fr_fr: [&str; 3]) -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                form(1, &[one_of_at(1, 1, 1, 0, &[(2, 0), (3, 1)])]),
+            ]),
+            strings_package_of(b"en-US", &en_us),
+            strings_package_of(b"fr-FR", &fr_fr),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x68; 16], &packages.concat())
+    }
+
+    /// On a platform of PlatformLang fr-FR, set selects a question and an option by their
+    /// en-US texts and writes the option's value, and get shows their fr-FR texts.
+    #[test]
+    fn english_question_and_value_select_on_a_french_platform() {
+        let hiidb = mode_hiidb(
+            ["Mode", "Disabled", "Enabled"],
+            [
+                "Mode de d\u{e9}marrage",
+                "D\u{e9}sactiv\u{e9}",
+                "Activ\u{e9}",
+            ],
+        );
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0]);
+
+        HiiBackend::set_in(
+            &hiidb,
+            "Mode",
+            "Enabled",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            Some("fr-FR"),
+        )
+        .expect("set Mode Enabled");
+        let got = HiiBackend::get_in(
+            &hiidb,
+            "Mode",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            Some("fr-FR"),
+        )
+        .expect("get Mode");
+
+        assert_eq!(variables.writes_to(&setup()), [(0, vec![1])], "set writes");
+        let shown: Vec<(&str, &str)> = got
+            .responses
+            .iter()
+            .map(|response| {
+                (
+                    response.question.name.as_str(),
+                    response.question.answer.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [("Mode de d\u{e9}marrage", "Activ\u{e9}")],
+            "get Mode"
+        );
+    }
+
+    /// set refuses a VALUE that no one language holds as the text of every option it names,
+    /// naming each, and writes nothing.
+    #[test]
+    fn set_refuses_a_value_of_different_options_in_different_languages() {
+        let hiidb = mode_hiidb(["Mode", "Off", "Stop"], ["Mode", "Arr\u{ea}t", "Off"]);
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[1]);
+
+        let got = HiiBackend::set_in(
+            &hiidb,
+            "Mode",
+            "Off",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        );
+
+        assert_eq!(
+            got.map(drop).map_err(|error| error.to_string()),
+            Err(
+                "the value is the text of option \"Off\" of question \"Mode\" in en-US and of \
+                 option \"Stop\" in fr-FR: no one language holds it as the text of every option \
+                 it names"
+                    .to_string()
+            ),
+            "set Mode Off"
+        );
+        assert_eq!(variables.writes_to(&setup()), [], "set Mode Off writes");
     }
 
     /// get, list-questions and show-ifr read question values from the source that their
@@ -1851,9 +2285,15 @@ mod tests {
             let got = HiiBackend::get_using(&hiidb, "Q", None, &get_options).expect("get");
             let listed =
                 HiiBackend::list_questions_using(&hiidb, &list_options).expect("list questions");
-            let ifr = HiiBackend::show_ifr_using(&hiidb, &ShowIfrOptions { efivars })
-                .expect("show the IFR")
-                .readable_representation;
+            let ifr = HiiBackend::show_ifr_using(
+                &hiidb,
+                &ShowIfrOptions {
+                    efivars,
+                    ..Default::default()
+                },
+            )
+            .expect("show the IFR")
+            .readable_representation;
 
             let answers: Vec<&str> = got
                 .responses
@@ -2220,6 +2660,7 @@ mod tests {
                 &GetOptions::default(),
                 shared(&variables),
                 None,
+                None,
             )
             .expect("get");
             let answers: Vec<&str> = got
@@ -2266,6 +2707,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
             None,
         )
         .expect("get T");
@@ -2343,6 +2785,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&Rc::new(variables)),
+            None,
             None,
         )
         .expect("get T");
@@ -2825,6 +3268,7 @@ mod tests {
                 &SetOptions::default(),
                 shared(&variables),
                 &*variables,
+                None,
             )
             .unwrap_or_else(|error| panic!("set {name}: {error:#}"));
             let got: Vec<Option<serde_json::Value>> = got
@@ -2895,6 +3339,7 @@ mod tests {
             },
             shared(&variables),
             &*variables,
+            None,
         );
         (
             got.map(drop).map_err(|error| error.to_string()),
@@ -3021,6 +3466,7 @@ mod tests {
                 &options,
                 shared(&variables),
                 &*variables,
+                None,
             )
             .unwrap_or_else(|error| panic!("set {prompt}: {error:#}"));
             let got: Vec<Option<Vec<String>>> = got
@@ -3051,6 +3497,7 @@ mod tests {
                 &GetOptions::default(),
                 shared(&variables),
                 None,
+                None,
             )
             .expect("get");
             let listed = HiiBackend::list_questions_in(
@@ -3058,11 +3505,18 @@ mod tests {
                 &ListQuestionsOptions::default(),
                 shared(&variables),
                 None,
+                None,
             )
             .expect("list questions");
-            let ifr = HiiBackend::show_ifr_in(&password_hiidb(), shared(&variables), None)
-                .expect("show the IFR")
-                .readable_representation;
+            let ifr = HiiBackend::show_ifr_in(
+                &password_hiidb(),
+                &ShowIfrOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .expect("show the IFR")
+            .readable_representation;
 
             let answers: Vec<&str> = got
                 .responses
@@ -3203,6 +3657,7 @@ mod tests {
                 &options,
                 shared(&variables),
                 &*variables,
+                None,
             );
 
             let case = format!(
@@ -3254,6 +3709,7 @@ mod tests {
             &GetOptions::default(),
             shared(variables),
             None,
+            None,
         )
         .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
         .responses
@@ -3282,6 +3738,7 @@ mod tests {
             &options,
             shared(variables),
             &**variables,
+            None,
         )
         .map(drop)
         .map_err(|error| format!("{error:#}"))
@@ -3308,6 +3765,7 @@ mod tests {
                 &hiidb,
                 &ListQuestionsOptions::default(),
                 shared(&variables),
+                None,
                 None,
             )
             .expect("list questions")
@@ -3444,15 +3902,22 @@ mod tests {
                 &ListQuestionsOptions::default(),
                 shared(&variables),
                 None,
+                None,
             )
             .expect("list questions")
             .into_iter()
             .filter(|question| question.name.starts_with('N'))
             .map(|question| question.answer)
             .collect();
-            let ifr = HiiBackend::show_ifr_in(&hiidb, shared(&variables), None)
-                .expect("show the IFR")
-                .readable_representation;
+            let ifr = HiiBackend::show_ifr_in(
+                &hiidb,
+                &ShowIfrOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .expect("show the IFR")
+            .readable_representation;
 
             let shown = format!("{answers:?} {listed:?} {ifr}").to_lowercase();
             let leaked: Vec<String> = groups
@@ -3706,6 +4171,7 @@ mod tests {
                 &GetOptions::default(),
                 variables(),
                 None,
+                None,
             )
             .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
             .responses
@@ -3716,6 +4182,7 @@ mod tests {
                 &hiidb,
                 &ListQuestionsOptions::default(),
                 variables(),
+                None,
                 None,
             )
             .expect("list questions")
@@ -3810,6 +4277,7 @@ mod tests {
                     &SetOptions::default(),
                     shared(&variables),
                     &*variables,
+                    None,
                 );
 
                 let case = format!("{interface:?}, attributes {attributes:#x}");
@@ -3857,6 +4325,7 @@ mod tests {
                 &options,
                 shared(&variables),
                 &*variables,
+                None,
             );
 
             let case = format!("attributes {attributes:#x}");
@@ -3926,6 +4395,7 @@ mod tests {
                 &options,
                 shared(&variables),
                 &*variables,
+                None,
             );
 
             let case = format!("{reach:?}, {interface:?}, {volatile:?}");
@@ -3983,6 +4453,7 @@ mod tests {
                 &options,
                 shared(&reads),
                 &writes,
+                None,
             );
 
             assert_eq!(
@@ -4039,6 +4510,7 @@ mod tests {
             &options,
             shared(&variables),
             &*variables,
+            None,
         );
 
         assert_eq!(
@@ -4077,6 +4549,7 @@ mod tests {
                 &options,
                 shared(variables),
                 &**variables,
+                None,
             )
             .map(drop)
             .map_err(|error| error.to_string())
@@ -4093,14 +4566,22 @@ mod tests {
             &GetOptions::default(),
             shared(&variables),
             None,
+            None,
         );
         let listed = HiiBackend::list_questions_in(
             &hiidb,
             &ListQuestionsOptions::default(),
             shared(&variables),
             None,
+            None,
         );
-        let shown = HiiBackend::show_ifr_in(&hiidb, shared(&variables), None);
+        let shown = HiiBackend::show_ifr_in(
+            &hiidb,
+            &ShowIfrOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        );
         assert_eq!(
             got.map(drop).map_err(|error| error.to_string()),
             Err(closed.to_string()),
@@ -4136,6 +4617,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
             None,
         )
         .expect("get through Runtime");
@@ -4289,6 +4771,7 @@ mod tests {
                 &GetOptions::default(),
                 shared(variables),
                 None,
+                None,
             )
             .map(|got| {
                 got.responses
@@ -4306,6 +4789,7 @@ mod tests {
                 &SetOptions::default(),
                 shared(variables),
                 &**variables,
+                None,
             )
             .map(drop)
         };
@@ -4399,6 +4883,7 @@ mod tests {
             &GetOptions::default(),
             shared(variables),
             None,
+            None,
         )
         .map(|got| {
             got.responses
@@ -4429,6 +4914,7 @@ mod tests {
             &options,
             shared(variables),
             &**variables,
+            None,
         )
         .map(|got| got.responses.len())
         .map_err(|error| error.to_string())
@@ -4885,6 +5371,7 @@ mod tests {
                 &GetOptions::default(),
                 shared(&variables()),
                 None,
+                None,
             )
             .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
         };
@@ -4898,6 +5385,7 @@ mod tests {
                 &SetOptions::default(),
                 shared(&variables),
                 &*variables,
+                None,
             )
             .map_err(|error| error.to_string())
         };
@@ -5002,6 +5490,7 @@ mod tests {
                 "Q",
                 &BTreeSet::from(["Q".to_string()]),
                 &options,
+                &[],
                 &mut EfivarReader::new(EfivarSource::Directory(efivars.path().to_path_buf()))
                     .expect("create a reader of the efivars directory"),
             )
@@ -5169,7 +5658,14 @@ mod tests {
             ),
             (
                 "show-ifr",
-                HiiBackend::show_ifr_using(&hiidb, &ShowIfrOptions { efivars }).map(drop),
+                HiiBackend::show_ifr_using(
+                    &hiidb,
+                    &ShowIfrOptions {
+                        efivars,
+                        ..Default::default()
+                    },
+                )
+                .map(drop),
             ),
         ];
         for (case, result) in errors {
@@ -5194,6 +5690,7 @@ mod tests {
         let efivars = EfivarSource::Disabled;
         let show_options = ShowIfrOptions {
             efivars: efivars.clone(),
+            ..Default::default()
         };
         let list_options = ListQuestionsOptions {
             efivars,
@@ -5308,6 +5805,7 @@ mod tests {
             ("show-ifr", |hiidb| {
                 let options = ShowIfrOptions {
                     efivars: EfivarSource::Disabled,
+                    ..Default::default()
                 };
                 let shown = HiiBackend::show_ifr_using(hiidb, &options)?;
                 Ok(shown
@@ -5563,6 +6061,7 @@ mod tests {
                 &GetOptions::default(),
                 shared(variables),
                 exported(),
+                None,
             )
             .unwrap_or_else(|error| panic!("get {name}: {error:#}"));
             got.extend(
@@ -5580,6 +6079,7 @@ mod tests {
             &ListQuestionsOptions::default(),
             shared(variables),
             exported(),
+            None,
         )
         .expect("list questions");
         let listed = names
@@ -5595,8 +6095,14 @@ mod tests {
             outputs.push(format!("{question:#?}"));
             outputs.push(String::from_utf8_lossy(&simplejson_protocol::serialize(question)).into());
         }
-        let ifr =
-            HiiBackend::show_ifr_in(hiidb, shared(variables), exported()).expect("show the IFR");
+        let ifr = HiiBackend::show_ifr_in(
+            hiidb,
+            &ShowIfrOptions::default(),
+            shared(variables),
+            exported(),
+            None,
+        )
+        .expect("show the IFR");
         outputs.push(format!("{ifr:#?}"));
         outputs.push(String::from_utf8_lossy(&simplejson_protocol::serialize(&ifr)).into());
         (got, listed, ifr.readable_representation, outputs)
@@ -5915,6 +6421,104 @@ mod tests {
         }
     }
 
+    /// A name/value question takes its snapshot number by the label that its VarName string
+    /// shows in the language of the other texts: PlatformLang, or --language before it.
+    #[test]
+    fn snapshot_labels_follow_the_text_language() {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                var_store_name_value(3, N_GUID),
+                form(1, &[checkbox_at(1, 1, 3, 2)]),
+            ]),
+            strings_package_of(b"en-US", &["C", "Flag"]),
+            strings_package_of(b"fr-FR", &["C", "Drapeau"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let text = format!(
+            "{}&Flag=00&Drapeau=01",
+            config_hdr(N_GUID, "", &DRIVER_PATH)
+        );
+        let exported = || Some(ExportedConfig::new(text.clone()));
+        let variables = no_variables();
+
+        for (case, language, platform, want) in [
+            ("no language", None, None, "0 <snapshot>"),
+            ("PlatformLang fr-FR", None, Some("fr-FR"), "1 <snapshot>"),
+            (
+                "--language fr-FR",
+                Some("fr-FR"),
+                Some("en-US"),
+                "1 <snapshot>",
+            ),
+        ] {
+            let language = language.map(str::to_owned);
+            let got = HiiBackend::get_in(
+                &hiidb,
+                "C",
+                None,
+                &GetOptions {
+                    language: language.clone(),
+                    ..GetOptions::default()
+                },
+                shared(&variables),
+                exported(),
+                platform,
+            )
+            .unwrap_or_else(|error| panic!("{case}: get: {error:#}"));
+            let listed = HiiBackend::list_questions_in(
+                &hiidb,
+                &ListQuestionsOptions {
+                    language: language.clone(),
+                    ..ListQuestionsOptions::default()
+                },
+                shared(&variables),
+                exported(),
+                platform,
+            )
+            .unwrap_or_else(|error| panic!("{case}: list-questions: {error:#}"));
+            let ifr = HiiBackend::show_ifr_in(
+                &hiidb,
+                &ShowIfrOptions {
+                    language,
+                    ..ShowIfrOptions::default()
+                },
+                shared(&variables),
+                exported(),
+                platform,
+            )
+            .unwrap_or_else(|error| panic!("{case}: show-ifr: {error:#}"))
+            .readable_representation;
+
+            let answers = |questions: Vec<&Question>| {
+                questions
+                    .into_iter()
+                    .map(|question| question.answer.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                answers(
+                    got.responses
+                        .iter()
+                        .map(|response| &response.question)
+                        .collect()
+                ),
+                [want],
+                "{case}: get"
+            );
+            assert_eq!(
+                answers(listed.iter().collect()),
+                [want],
+                "{case}: list-questions"
+            );
+            assert!(
+                ifr.contains(&format!("-Answer: {want}\n")),
+                "{case}: show-ifr lacks {want:?}: {ifr}"
+            );
+        }
+    }
+
     /// A storage's later <BlockConfig> past the end of the bytes so far, as ExportConfig() gives
     /// a buffer of one block per question, extends it.
     #[test]
@@ -5986,6 +6590,7 @@ mod tests {
             },
             shared(variables),
             exported(),
+            None,
         )
         .map(|got| {
             got.responses
@@ -6002,6 +6607,7 @@ mod tests {
             },
             shared(variables),
             exported(),
+            None,
         )
         .expect("list questions")
         .into_iter()
@@ -6250,6 +6856,7 @@ mod tests {
             &SetOptions::default(),
             shared(&variables),
             &*variables,
+            None,
         )
         .expect_err("set N");
 

@@ -1048,6 +1048,7 @@ mod non_efi_varstore_tests {
             defaults: Vec::new(),
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
+                texts: vec![(Language(b"en-US".to_vec()), "Enabled".to_string())],
                 raw_value: Ok(TypeValue::NumSize8(1)),
                 source: ValueSource::Current,
                 state: StateEvaluation::selectable(),
@@ -1753,7 +1754,7 @@ mod efivar_reader_tests {
 
         let listed: Vec<String> = list_questions(
             root,
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
             None,
             &mut disabled_reader(),
@@ -1786,7 +1787,7 @@ mod efivar_reader_tests {
         ]);
         list_questions(
             root,
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             IncludedStates::CONDITIONS,
             None,
             reader,
@@ -1831,8 +1832,13 @@ mod efivar_reader_tests {
             &[],
         );
         let show = |reader: &mut EfivarReader| {
-            display(Rc::clone(&root), 0, &ListTexts::new(&strings()), reader)
-                .expect("display the FormSet")
+            display(
+                Rc::clone(&root),
+                0,
+                &ListTexts::new(&strings(), &[]),
+                reader,
+            )
+            .expect("display the FormSet")
         };
         let efivars = Efivars::new();
         efivars.write(&efi_variable("Setup", 2), &[1, 0]);
@@ -1841,7 +1847,7 @@ mod efivar_reader_tests {
 
         let listed: Vec<String> = list_questions(
             Rc::clone(&root),
-            &ListTexts::new(&strings()),
+            &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
             None,
             &mut reader,
@@ -1996,7 +2002,7 @@ mod efivar_reader_tests {
                 let root = Rc::clone(&root);
                 let listed: Vec<String> = list_questions(
                     Rc::clone(&root),
-                    &ListTexts::new(&strings()),
+                    &ListTexts::new(&strings(), &[]),
                     IncludedStates::empty(),
                     None,
                     &mut reader,
@@ -2004,8 +2010,8 @@ mod efivar_reader_tests {
                 .into_iter()
                 .map(|(question, _)| question.value)
                 .collect();
-                let shown =
-                    display(root, 0, &ListTexts::new(&strings()), &mut reader).expect("display");
+                let shown = display(root, 0, &ListTexts::new(&strings(), &[]), &mut reader)
+                    .expect("display");
                 (listed, shown)
             };
 

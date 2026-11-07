@@ -114,6 +114,11 @@ pub fn require_test_vm() {
 pub mod driver_sample {
     /// A one-of question whose options "My one-of text #1", "#2" and "#3" store 0, 1 and 3.
     pub const ONE_OF: &str = "My Keyword Namespace Test";
+    /// The en-US prompt of three questions, the first of them the one-of MyOneOf
+    /// (VfrStrings.uni STR_ONE_OF_PROMPT, edk2-stable202608).
+    pub const ONE_OF_PROMPT: &str = "My one-of prompt #1";
+    /// The fr-FR text of [`ONE_OF_PROMPT`].
+    pub const ONE_OF_PROMPT_FR_FR: &str = "Mi uno- de gu\u{ed}a # 1";
     /// Offset of the 8-bit answer of [`ONE_OF`].
     pub const ONE_OF_OFFSET: usize = 91;
     /// A check box, which the form shows twice, both times on one field.

@@ -138,7 +138,7 @@ mod tests {
     fn reading_args(command: &HiiSubcommands) -> (&HiiDbArgs, &EfivarArgs) {
         match command {
             HiiSubcommands::Get { hiidb, efivars, .. }
-            | HiiSubcommands::ShowIFR { hiidb, efivars }
+            | HiiSubcommands::ShowIFR { hiidb, efivars, .. }
             | HiiSubcommands::ListQuestions { hiidb, efivars, .. } => (hiidb, efivars),
             HiiSubcommands::ListStrings { .. } | HiiSubcommands::Platform(_) => {
                 panic!("no efivar flags: {command:?}")

@@ -26,6 +26,7 @@
 # "-" leaves a column empty.
 boot-smoke	-	-	boot_smoke	-
 hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data-runtime-my-efi-var.json	hii,hii_write,hii_persistence	-
+hii-platform-lang	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data-runtime-my-efi-var.json	hii_platform_lang	-
 hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard	-
 hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access	-
 hii-none	-	-	hii_none	-

@@ -220,6 +220,8 @@ enum HiiSubcommands {
         hiidb: HiiDbArgs,
         #[command(flatten)]
         efivars: EfivarArgs,
+        #[command(flatten)]
+        language: LanguageArgs,
     },
     /// List all strings-id, string pairs in HiiDB, with each strings package's language
     #[command(next_display_order = None)]
@@ -298,6 +300,20 @@ where
     /// nothing (UEFI variable writes carry no password).
     #[arg(long, value_enum, value_name = "LEVEL")]
     access_level: Option<AccessLevelArg>,
+    #[command(flatten)]
+    language: LanguageArgs,
+}
+
+/// The language that texts show in, which commands that show texts take.
+#[derive(Debug, Args)]
+struct LanguageArgs {
+    /// Show prompts, help and option texts in this language instead of the platform language
+    /// (PlatformLang): in each package list, the strings package that edk2 GetBestLanguage picks
+    /// for TAG (TAG, then TAG cut at each '-', ignoring ASCII case), else the one it picks for
+    /// PlatformLang, else the first whose language does not start with "x-". QUESTION and VALUE
+    /// still match the texts of every such language.
+    #[arg(long, value_name = "TAG")]
+    language: Option<String>,
 }
 
 impl<S> SelectionArgs<S>
@@ -319,6 +335,7 @@ impl From<&SelectionArgs> for GetOptions {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
+        options.language.clone_from(&args.language.language);
         options
     }
 }
@@ -329,6 +346,7 @@ impl From<&SelectionArgs<SetIncludeState>> for SetOptions {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
+        options.language.clone_from(&args.language.language);
         options
     }
 }
@@ -338,6 +356,7 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
+        options.language.clone_from(&args.language.language);
         options
     }
 }
@@ -545,9 +564,14 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 let options = set_options(selection, setup_password, volatile);
                 hii_set(question, value, &options, output.json, source)?
             }
-            HiiSubcommands::ShowIFR { hiidb, efivars } => {
+            HiiSubcommands::ShowIFR {
+                hiidb,
+                efivars,
+                language,
+            } => {
                 let mut options = ShowIfrOptions::default();
                 options.efivars = efivars.source()?;
+                options.language.clone_from(&language.language);
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let res =
@@ -871,6 +895,69 @@ mod tests {
             .chain([(&["ilo", "get", "Q"][..], false)]);
         for (command, takes) in commands {
             let argv = [&["uefisettings"][..], command, &["--access-level", "user"]].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            match takes {
+                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
+                false => assert_eq!(
+                    parsed.err(),
+                    Some(clap::error::ErrorKind::UnknownArgument),
+                    "{command:?}"
+                ),
+            }
+        }
+    }
+
+    /// --language goes to the options of hii get, set and list-questions, get and set through
+    /// their selection flags, and show-ifr; list-strings, which shows every language, and ilo
+    /// take none.
+    #[test]
+    fn language_is_taken_where_texts_show() {
+        let selection = selection_of(&["--language", "fr-FR"]);
+        let stated = Some("fr-FR".to_string());
+        assert_eq!(GetOptions::from(&selection).language, stated, "get");
+        #[cfg(all(system_hiidb, system_variables))]
+        assert_eq!(
+            SetOptions::from(&set_selection_of(&["--language", "fr-FR"])).language,
+            stated,
+            "set"
+        );
+        assert_eq!(
+            ListQuestionsOptions::from(&selection).language,
+            stated,
+            "list-questions"
+        );
+        assert_eq!(selection_of(&[]).language.language, None, "no flag");
+        let show_ifr = [&["show-ifr"][..], &OFFLINE_SOURCE, &["--language", "fr-FR"]].concat();
+        match hii(&show_ifr).expect("parse show-ifr --language fr-FR") {
+            HiiSubcommands::ShowIFR { language, .. } => {
+                assert_eq!(language.language, stated, "show-ifr")
+            }
+            other => panic!("not show-ifr: {other:?}"),
+        }
+
+        // list-strings takes -f but no --no-efivars
+        let reading: [(&[&str], &[&str], bool); 4] = [
+            (&["hii", "get", "Q"], &OFFLINE_SOURCE, true),
+            (&["hii", "list-questions"], &OFFLINE_SOURCE, true),
+            (&["hii", "show-ifr"], &OFFLINE_SOURCE, true),
+            (&["hii", "list-strings"], &OFFLINE_SOURCE[..2], false),
+        ];
+        let reading = reading.map(|(command, source, takes)| ([command, source].concat(), takes));
+        let commands = reading
+            .iter()
+            .map(|(command, takes)| (&command[..], *takes));
+        #[cfg(all(system_hiidb, system_variables))]
+        let commands = commands.into_iter().chain([
+            (&["hii", "set", "Q", "V"][..], true),
+            (&["get", "Q"], true),
+            (&["set", "Q", "V"], true),
+        ]);
+        #[cfg(target_os = "linux")]
+        let commands = commands
+            .into_iter()
+            .chain([(&["ilo", "get", "Q"][..], false)]);
+        for (command, takes) in commands {
+            let argv = [&["uefisettings"][..], command, &["--language", "fr-FR"]].concat();
             let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
             match takes {
                 true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),

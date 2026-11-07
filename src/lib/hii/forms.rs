@@ -32,6 +32,7 @@ use thiserror::Error;
 use crate::exports::SetOptions;
 use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
+use crate::hii::strings::Language;
 use crate::hii::strings::ListTexts;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
@@ -56,7 +57,10 @@ use defaults::FormSetDefaultStores;
 use defaults::OptionValueError;
 use question_values::describe_question;
 use question_values::questions_named;
+use question_values::share_a_language;
 use question_values::value_question;
+pub use question_values::OptionMatch;
+pub use question_values::PromptMatch;
 use set::ChangeValueError;
 use storage::storage_width;
 use storage::NameValueStore;
@@ -2054,7 +2058,11 @@ impl fmt::Debug for QuestionDescriptor {
 
 #[derive(Debug)]
 pub struct AnswerOption {
+    /// The option's text, as get shows it
     pub value: String,
+    /// The option's text in each strings package of no configuration language that holds it,
+    /// with its language: those that VALUE matches
+    texts: Vec<(Language, String)>,
     /// The option's value, or why it is not known
     raw_value: Result<TypeValue, OptionValueError>,
     /// Snapshot if the EFI_IFR_VALUE of an option of Type OTHER took a value from there
@@ -2129,6 +2137,27 @@ impl QuestionDescriptor {
             .ok_or_else(|| ChangeValueError::InvalidOption.into())
     }
 
+    /// The options of a text in a language of no configuration language that `names` takes,
+    /// each with those languages.
+    fn options_named(&self, names: impl Fn(&str) -> bool) -> Vec<(&AnswerOption, OptionMatch)> {
+        self.possible_options
+            .iter()
+            .filter_map(|option| {
+                let languages: Vec<String> = option
+                    .texts
+                    .iter()
+                    .filter(|(_, text)| names(text))
+                    .map(|(language, _)| language.to_string())
+                    .collect();
+                let named = OptionMatch {
+                    option: option.value.clone(),
+                    languages,
+                };
+                (!named.languages.is_empty()).then_some((option, named))
+            })
+            .collect()
+    }
+
     /// The texts of the options that `include` certainly allows: those that get lists and set
     /// takes, each whose value is not known with why.
     pub(crate) fn listed_options(&self, include: IncludedStates) -> Vec<String> {
@@ -2142,38 +2171,42 @@ impl QuestionDescriptor {
             .collect()
     }
 
-    /// Returns the option that select() picks with `include` among those whose text is one of
-    /// `texts` ignoring ASCII case, or, if there are none, among those whose text is one of
-    /// `texts` ignoring surrounding whitespace too (get shows the text trimmed), or None if there
-    /// are none either. So a text as stored never picks an option that differs from it only by
-    /// such whitespace.
+    /// Returns the option that select() picks with `include` among those whose text in a
+    /// language of no configuration language is one of `texts` ignoring ASCII case, or, if there
+    /// are none, among those whose text is one of `texts` ignoring surrounding whitespace too
+    /// (get shows the text trimmed), or None if there are none either. So a text as stored never
+    /// picks an option that differs from it only by such whitespace. Refuses with
+    /// SelectionError::AmbiguousOption options that no one language names all.
     pub(crate) fn select_option(
         &self,
         texts: &BTreeSet<String>,
         include: IncludedStates,
     ) -> std::result::Result<Option<&AnswerOption>, SelectionError> {
-        let stored: Vec<&AnswerOption> = self
-            .possible_options
-            .iter()
-            .filter(|option| {
+        let stored =
+            self.options_named(|text| texts.iter().any(|named| named.eq_ignore_ascii_case(text)));
+        let candidates = if stored.is_empty() {
+            self.options_named(|text| {
                 texts
                     .iter()
-                    .any(|text| text.eq_ignore_ascii_case(&option.value))
+                    .any(|named| named.trim().eq_ignore_ascii_case(text.trim()))
             })
-            .collect();
-        let candidates = if stored.is_empty() {
-            self.possible_options
-                .iter()
-                .filter(|option| {
-                    texts
-                        .iter()
-                        .any(|text| text.trim().eq_ignore_ascii_case(option.value.trim()))
-                })
-                .collect()
         } else {
             stored
         };
-        self.pick_option(candidates, include)
+        let language_sets: Vec<&[String]> = candidates
+            .iter()
+            .map(|(_, named)| named.languages.as_slice())
+            .collect();
+        if !share_a_language(&language_sets) {
+            return Err(SelectionError::AmbiguousOption {
+                question: self.question.clone(),
+                matches: candidates.into_iter().map(|(_, named)| named).collect(),
+            });
+        }
+        self.pick_option(
+            candidates.into_iter().map(|(option, _)| option).collect(),
+            include,
+        )
     }
 
     /// Returns the option of `candidates`, in IFR order, that select() picks with `include`, or
@@ -2323,7 +2356,11 @@ fn find_question_in<T>(
 where
     T: AsRef<str>,
 {
-    let questions = questions_named(node, walk.texts, possible_question_phrases);
+    let questions: Vec<Rc<RefCell<IFROperation>>> =
+        questions_named(node, walk.texts, possible_question_phrases)
+            .into_iter()
+            .map(|named| named.node)
+            .collect();
     let ops: Vec<std::cell::Ref<IFROperation>> =
         questions.iter().map(|question| question.borrow()).collect();
     let matches = questions
@@ -2337,6 +2374,44 @@ where
         .collect();
     select(matches, walk.include)
         .map(|(question, value_question)| describe_question(question, value_question, walk))
+}
+
+/// The questions under the root `node` of a FormSet whose prompt is one of
+/// `possible_question_phrases` in a language of `texts`, as find_question finds them, for
+/// check_prompt_language.
+pub(crate) fn prompt_matches<T>(
+    node: &Rc<RefCell<IFROperation>>,
+    texts: &ListTexts<'_>,
+    possible_question_phrases: &BTreeSet<T>,
+) -> Vec<PromptMatch>
+where
+    T: AsRef<str>,
+{
+    questions_named(node, texts, possible_question_phrases)
+        .into_iter()
+        .map(|named| named.prompt)
+        .collect()
+}
+
+/// Refuses `question` with SelectionError::Ambiguous unless one language holds it as the prompt
+/// of each of `matches`, the questions that it names in every FormSet: a QUESTION in the
+/// language of one question could otherwise select another, whose prompt in another language
+/// it is.
+pub(crate) fn check_prompt_language(
+    question: &str,
+    matches: Vec<PromptMatch>,
+) -> std::result::Result<(), SelectionError> {
+    let language_sets: Vec<&[String]> = matches
+        .iter()
+        .map(|named| named.languages.as_slice())
+        .collect();
+    match share_a_language(&language_sets) {
+        true => Ok(()),
+        false => Err(SelectionError::Ambiguous {
+            question: question.to_owned(),
+            matches,
+        }),
+    }
 }
 
 /// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
@@ -2520,7 +2595,7 @@ mod choice_for_set_tests {
             root,
             &BTreeSet::from([PROMPT]),
             &mut FormSetWalk::new(
-                &ListTexts::new(&strings()),
+                &ListTexts::new(&strings(), &[]),
                 &mut reader,
                 &values,
                 IncludedStates::empty(),
@@ -3543,7 +3618,7 @@ mod tests {
 
             let listed = list_questions(
                 root,
-                &ListTexts::new(&[]),
+                &ListTexts::new(&[], &[]),
                 IncludedStates::empty(),
                 None,
                 &mut Efivars::new().reader(),
@@ -3574,7 +3649,7 @@ mod tests {
                 &root,
                 &BTreeSet::from([phrase]),
                 &mut FormSetWalk::new(
-                    &ListTexts::new(&prompted(prompt)),
+                    &ListTexts::new(&prompted(prompt), &[]),
                     &mut Efivars::new().reader(),
                     &values,
                     IncludedStates::empty(),
@@ -3584,7 +3659,7 @@ mod tests {
         };
         let listed = list_questions(
             Rc::clone(&root),
-            &ListTexts::new(&prompted("  Prompt ")),
+            &ListTexts::new(&prompted("  Prompt "), &[]),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),
@@ -4117,8 +4192,13 @@ mod tests {
     fn display_shows_only_the_root_as_root() {
         let root = parse_form_set(&[form(1, &[operation(DUMMY_OPCODE, false, &[])])]);
 
-        let shown =
-            display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader()).expect("display");
+        let shown = display(
+            root,
+            0,
+            &ListTexts::new(&strings(), &[]),
+            &mut disabled_reader(),
+        )
+        .expect("display");
 
         let roots: Vec<&str> = shown
             .lines()
@@ -4133,8 +4213,13 @@ mod tests {
         let skipped_scope = [operation(0x70, true, &[]), checkbox_op(2, 1), END.to_vec()].concat();
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0), skipped_scope])]);
 
-        let shown =
-            display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader()).expect("display");
+        let shown = display(
+            root,
+            0,
+            &ListTexts::new(&strings(), &[]),
+            &mut disabled_reader(),
+        )
+        .expect("display");
 
         let check_boxes = shown
             .lines()
@@ -4262,8 +4347,13 @@ mod tests {
             let root = handle_form_set(&mut Cursor::new(&data))
                 .unwrap_or_else(|error| panic!("parse Flags {flags:#04x}: {error:#}"));
 
-            let display = display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader())
-                .expect("display");
+            let display = display(
+                root,
+                0,
+                &ListTexts::new(&strings(), &[]),
+                &mut disabled_reader(),
+            )
+            .expect("display");
 
             let line = display
                 .lines()
@@ -4313,7 +4403,7 @@ mod tests {
 
             let listed = list_questions(
                 root,
-                &ListTexts::new(&strings()),
+                &ListTexts::new(&strings(), &[]),
                 IncludedStates::empty(),
                 None,
                 &mut disabled_reader(),
@@ -4359,8 +4449,13 @@ mod tests {
             &[conditional(SUPPRESS_IF, condition, &[checkbox_op(1, 0)])],
         )]);
 
-        let display =
-            display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader()).expect("display");
+        let display = display(
+            root,
+            0,
+            &ListTexts::new(&strings(), &[]),
+            &mut disabled_reader(),
+        )
+        .expect("display");
 
         let ops: Vec<&str> = display
             .lines()
@@ -4564,7 +4659,7 @@ mod nesting_tests {
             ] {
                 let listed = list_questions(
                     parse_deep(DEEP, DEEP, false),
-                    &ListTexts::new(&deep_strings()),
+                    &ListTexts::new(&deep_strings(), &[]),
                     include,
                     None,
                     &mut disabled_reader(),
@@ -4581,7 +4676,7 @@ mod nesting_tests {
             for (name, want) in [("Deep", true), ("Hidden", false)] {
                 let selection = find_question(
                     parse_deep(DEEP, DEEP, false),
-                    &ListTexts::new(&deep_strings()),
+                    &ListTexts::new(&deep_strings(), &[]),
                     &BTreeSet::from([name]),
                     IncludedStates::GRAYED_OUT,
                     None,
@@ -4684,7 +4779,7 @@ mod nesting_tests {
             let shown = display(
                 root,
                 0,
-                &ListTexts::new(&deep_strings()),
+                &ListTexts::new(&deep_strings(), &[]),
                 &mut disabled_reader(),
             )
             .expect("display");

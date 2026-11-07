@@ -42,9 +42,15 @@ use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use thiserror::Error;
 
+#[cfg(variable_data)]
+use crate::efi_variables::VariableContents;
+#[cfg(variable_data)]
+use crate::efi_variables::VariableData;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::FirmwareVariables;
+#[cfg(variable_data)]
+use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
@@ -394,6 +400,55 @@ impl FirmwareVariables for EfivarCopy {
     ) -> Result<()> {
         Err(CopyOfEfivars.into())
     }
+}
+
+#[cfg(variable_data)]
+impl VariableData for EfivarCopy {
+    fn interface(&self) -> VariableInterface {
+        EFIVARFS_INTERFACE
+    }
+
+    /// The contents of `key` from its efivar file, by its exact name, as read reads it.
+    fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+        let name = EfivarFileName::from(key);
+        let file =
+            match check_exact_name(&self.dir, &name).and_then(|()| open_efivar(&self.dir, &name)) {
+                Err(error) if error.is::<EfivarNotFound>() => return Ok(None),
+                result => result?,
+            };
+        let bytes = read_efivar_file_of(&file).with_context(|| {
+            format!(
+                "failed to read efivar file '{}'",
+                self.dir.join(&name).display()
+            )
+        })?;
+        efivar_contents(key, &bytes)
+    }
+
+    fn set_variable(&self, _key: &VariableKey, _contents: &VariableContents) -> Result<()> {
+        Err(CopyOfEfivars.into())
+    }
+}
+
+/// The contents of `key` from the `bytes` of its efivar file: its attributes word, then its data.
+/// A file of no bytes holds no variable (efivar_names).
+#[cfg(variable_data)]
+pub(super) fn efivar_contents(key: &VariableKey, bytes: &[u8]) -> Result<Option<VariableContents>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let (attributes, data) = bytes
+        .split_first_chunk::<EFIVARFS_HEADER_SIZE>()
+        .with_context(|| {
+            format!(
+                "efivar file of EFI variable {key} holds {} bytes, fewer than its attributes",
+                bytes.len()
+            )
+        })?;
+    let attributes = VariableAttributes::from_bits_retain(u32::from_ne_bytes(*attributes));
+    VariableContents::new(attributes, data.to_vec())
+        .map(Some)
+        .with_context(|| format!("efivar file of EFI variable {key}"))
 }
 
 /// Fails with EfivarNotFound unless `dir` lists an entry named exactly `name`: a case-insensitive

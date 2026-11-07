@@ -31,6 +31,8 @@ use uefisettings_qemu_guest::driver_sample::NUMERIC;
 use uefisettings_qemu_guest::driver_sample::NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF;
 use uefisettings_qemu_guest::driver_sample::ONE_OF_OFFSET;
+use uefisettings_qemu_guest::driver_sample::ONE_OF_PROMPT;
+use uefisettings_qemu_guest::driver_sample::ONE_OF_PROMPT_FR_FR;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json;
@@ -547,6 +549,32 @@ fn show_ifr_shows_the_formsets() {
 fn show_translations_prints_the_spellings_database() {
     let translations: BTreeMap<String, serde_json::Value> = json(&["show-translations", "--json"]);
     assert!(translations.contains_key("TPM State"), "{translations:#?}");
+}
+
+/// --language fr-FR shows DriverSample's fr-FR texts instead of the platform language's en-US
+/// ones, and get still selects by the en-US prompt.
+#[test]
+fn language_shows_the_texts_of_its_strings_package() {
+    let questions: Vec<Question> =
+        json(&["hii", "list-questions", "--language", "fr-FR", "--json"]);
+    let names: Vec<&str> = questions
+        .iter()
+        .map(|question| question.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&ONE_OF_PROMPT_FR_FR),
+        "{ONE_OF_PROMPT_FR_FR:?} is not listed: {names:?}"
+    );
+    assert!(
+        !names.contains(&ONE_OF_PROMPT),
+        "{ONE_OF_PROMPT:?} is listed: {names:?}"
+    );
+
+    let (got, _) = single_response(
+        &["hii", "get", ONE_OF_PROMPT, "--language", "fr-FR", "--json"],
+        BACKEND_HII,
+    );
+    assert_eq!(got.name, ONE_OF_PROMPT_FR_FR, "{got:#?}");
 }
 
 #[test]

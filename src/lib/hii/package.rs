@@ -395,9 +395,10 @@ pub struct ParsedPackageList {
 
 impl ParsedPackageList {
     /// The texts of the list's questions and other ops, as get, set, list-questions and show-ifr
-    /// show them.
-    pub(crate) fn texts(&self) -> ListTexts<'_> {
-        ListTexts::new(&self.strings)
+    /// show and match them, shown in the language that ListTexts::new picks for `requested`, the
+    /// stated language and PlatformLang, in that order, those that are given.
+    pub(crate) fn texts(&self, requested: &[&str]) -> ListTexts<'_> {
+        ListTexts::new(&self.strings, requested)
     }
 
     /// Fails if the list has forms but no strings packages.

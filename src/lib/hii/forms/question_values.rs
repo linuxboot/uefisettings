@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -54,6 +55,7 @@ use super::QuestionHeader;
 use super::Range;
 use super::RangeType;
 use super::Walk;
+use crate::hii::package::Guid;
 use crate::hii::strings::ListTexts;
 
 /// A question whose value get reads and set writes.
@@ -110,40 +112,134 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
     }
 }
 
-/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, whose
-/// prompt is one of `phrases`, ignoring ASCII case and surrounding whitespace.
+/// A ONE_OF, NUMERIC or CHECKBOX whose prompt is one of the phrases of questions_named.
+pub(super) struct NamedQuestion {
+    pub(super) node: Rc<RefCell<IFROperation>>,
+    /// Which question it is, and the languages whose text of its prompt is a phrase
+    pub(super) prompt: PromptMatch,
+}
+
+/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, whose prompt
+/// in a language of `texts` of no configuration language is one of `phrases`, ignoring ASCII
+/// case and surrounding whitespace, with those languages.
 pub(super) fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     phrases: &BTreeSet<T>,
-) -> Vec<Rc<RefCell<IFROperation>>>
+) -> Vec<NamedQuestion>
 where
     T: AsRef<str>,
 {
     let mut found = Vec::new();
-    walk_scopes(std::slice::from_ref(node), (), |node, ()| {
+    walk_scopes(std::slice::from_ref(node), None, |node, &form_set| {
         let op = node.borrow();
         if skips_scope(&op) {
             return Walk::Skip;
         }
-        let prompt = prompt(&op, texts).trim();
+        let form_set = match &op.parsed_data {
+            ParsedOperation::FormSet(parsed) => Some(parsed.guid),
+            _ => form_set,
+        };
         // Only Numeric, OneOf and CheckBox are questions.
-        if value_question(&op).is_some()
-            && phrases
-                .iter()
-                .any(|phrase| phrase.as_ref().trim().eq_ignore_ascii_case(prompt))
-        {
-            found.push(Rc::clone(node));
+        let Some(question) = value_question(&op) else {
+            return Walk::Enter(form_set);
+        };
+        let header = question.header();
+        let languages: Vec<String> = texts
+            .matching(header.prompt_string_id)
+            .filter(|(_, prompt)| {
+                phrases
+                    .iter()
+                    .any(|phrase| phrase.as_ref().trim().eq_ignore_ascii_case(prompt.trim()))
+            })
+            .map(|(language, _)| language.to_string())
+            .collect();
+        if !languages.is_empty() {
+            found.push(NamedQuestion {
+                node: Rc::clone(node),
+                prompt: PromptMatch {
+                    question_id: header.question_id,
+                    form_set,
+                    languages,
+                },
+            });
         }
-        Walk::Enter(())
+        Walk::Enter(form_set)
     });
     found
 }
 
-/// Returns the prompt of a ONE_OF, NUMERIC or CHECKBOX, empty for other ops.
-fn prompt<'a>(op: &IFROperation, texts: &ListTexts<'a>) -> &'a str {
-    value_question(op).map_or("", |question| {
-        texts.display(question.header().prompt_string_id)
+/// A question that a QUESTION of get or set names, and the languages in which it is its prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct PromptMatch {
+    pub question_id: u16,
+    /// The GUID of the question's FormSet
+    pub form_set: Option<Guid>,
+    /// The languages, of no configuration language, whose text of the prompt is the QUESTION
+    pub languages: Vec<String>,
+}
+
+impl PromptMatch {
+    /// `matches` as SelectionError::Ambiguous names them.
+    pub(super) fn list(matches: &[PromptMatch]) -> String {
+        let listed: Vec<String> = matches.iter().map(|named| format!("of {named}")).collect();
+        listed.join(" and ")
+    }
+}
+
+impl fmt::Display for PromptMatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "QuestionId {:#06X}", self.question_id)?;
+        if let Some(form_set) = &self.form_set {
+            write!(f, " of FormSet {form_set}")?;
+        }
+        write!(f, " in {}", self.languages.join(", "))
+    }
+}
+
+/// An option that a VALUE of set names, and the languages in which it is its text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct OptionMatch {
+    /// The option's text, as get shows it
+    pub option: String,
+    /// The languages, of no configuration language, whose text of the option is the VALUE
+    pub languages: Vec<String>,
+}
+
+impl OptionMatch {
+    /// `matches`, options of the question `question`, as SelectionError::AmbiguousOption names
+    /// them.
+    pub(super) fn list(question: &str, matches: &[OptionMatch]) -> String {
+        let listed: Vec<String> = matches
+            .iter()
+            .enumerate()
+            .map(|(index, named)| {
+                let of_question = match index {
+                    0 => format!(" of question {question:?}"),
+                    _ => String::new(),
+                };
+                format!(
+                    "of option {:?}{of_question} in {}",
+                    named.option,
+                    named.languages.join(", ")
+                )
+            })
+            .collect();
+        listed.join(" and ")
+    }
+}
+
+/// Whether one language is in each of `language_sets`, comparing them as edk2-stable202608
+/// HiiDatabaseDxe/String.c HiiCompareLanguage does: ignoring ASCII case.
+pub(super) fn share_a_language(language_sets: &[&[String]]) -> bool {
+    let Some((first, rest)) = language_sets.split_first() else {
+        return true;
+    };
+    first.iter().any(|language| {
+        rest.iter()
+            .all(|set| set.iter().any(|other| other.eq_ignore_ascii_case(language)))
     })
 }
 
@@ -298,6 +394,11 @@ pub(super) fn handle_oneof(
                 raw_value,
                 source: ValueSource::since(taken, walk.inputs.reader),
                 value: walk.texts.display(o.option_string_id).to_string(),
+                texts: walk
+                    .texts
+                    .matching(o.option_string_id)
+                    .map(|(language, text)| (language.clone(), text.to_string()))
+                    .collect(),
                 state: option_state(&op, &mut walk.inputs),
             });
         }

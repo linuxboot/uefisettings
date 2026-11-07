@@ -354,6 +354,47 @@ the questions that the firmware's Setup reserves for Administrator sessions, as
 </details>
 
 <details>
+<summary>Languages of prompts, help and option texts</summary>
+
+A package list holds a strings package per language (UEFI 2.11 §33.2.6). uefisettings shows each
+package list's texts in the platform language, the EFI variable `PlatformLang`: from the strings
+package that edk2's `GetBestLanguage` picks for it (the language, then the language cut at each
+`-`, ignoring ASCII case), else from the first package whose language does not start with `x-`.
+Languages that start with `x-` are configuration languages (§33.2.6.1), whose strings are keywords,
+not texts; uefisettings takes `X-` as `x-`, as it compares languages ignoring ASCII case. A string
+that the chosen package lacks comes from another package of a display language, and one that only
+`x-` packages hold shows as `""`.
+
+`PlatformLang` falls back in three cases:
+
+- An absent or malformed `PlatformLang` picks no package: uefisettings warns, and texts come from
+  the first package of a display language.
+- A `PlatformLang` outside `PlatformLangCodes` picks its package as any other does, as edk2's
+  `HiiGetString` takes it. On a running machine the firmware replaces an unsupported value at
+  initialization (UEFI 2.11 §3.3), so only an `--efivars DIR` dump can carry one.
+- A `PlatformLang` that starts with `x-` shows the keywords as names, as `--language x-UEFI-ns`
+  does.
+
+`--language TAG`, on `get`, `set`, `hii get`, `hii set`, `hii list-questions` and `hii show-ifr`,
+shows the texts in TAG instead, else in `PlatformLang`; `--language x-UEFI-ns` shows the keywords. `--efivars DIR` takes `PlatformLang` from the
+dump, except on macOS, which reads none; `--no-efivars` takes none.
+
+QUESTION and VALUE still match the texts of every display language. `get` and `set` select by
+QUESTION only when one language holds it as the prompt of every question it names, and a ONE_OF
+VALUE names an option only when one language holds it as the text of every option it names;
+otherwise they refuse, naming each match, and write nothing.
+
+Texts used to come from the first strings package that held each string, in any language. Since
+they follow `PlatformLang`, the name of a question changes where an `x-` package, or a package of
+another language, precedes the chosen one; scripts that parse names should pin the language:
+
+```sh
+uefisettings hii list-questions --language en-US --json
+```
+
+</details>
+
+<details>
 <summary>Questions with READ and WRITE expressions, and without a VarStore</summary>
 
 A question can take its value through a READ expression and keep it through a WRITE expression

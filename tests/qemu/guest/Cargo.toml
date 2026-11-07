@@ -72,6 +72,10 @@ name = "hii_persistence"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_platform_lang"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_shell_parity"
 required-features = ["test-vm"]
 

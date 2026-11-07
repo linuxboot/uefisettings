@@ -24,6 +24,7 @@ use uefi::runtime::VariableVendor;
 use uefi::CString16;
 use uefi::Status;
 
+use crate::efi_variables::globals::platform_lang;
 use crate::efi_variables::walk_variable_names;
 use crate::efi_variables::GetNextVariableName;
 use crate::efi_variables::NextVariableName;
@@ -65,6 +66,15 @@ impl EfivarSource {
                 interface: VariableServices::INTERFACE,
             }),
         })
+    }
+
+    /// The platform language, PlatformLang, that this source holds (globals::platform_lang); none
+    /// for Disabled.
+    pub(crate) fn platform_lang(&self) -> Result<Option<String>> {
+        match self {
+            Self::System => platform_lang(&VariableServices),
+            Self::Disabled => Ok(None),
+        }
     }
 }
 
