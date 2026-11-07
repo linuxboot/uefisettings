@@ -22,6 +22,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -89,10 +90,11 @@ fn decoded_bytes(
         .reader(EfivarSource::Disabled.into_variables()?)?;
     for list in package_lists {
         list.check_form_strings()?;
-        for root in list.forms {
+        let texts = list.texts();
+        for root in &list.forms {
             list_questions(
-                root,
-                &list.strings,
+                Rc::clone(root),
+                &texts,
                 IncludedStates::CONDITIONS,
                 None,
                 &mut reader,
@@ -302,6 +304,8 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::read_db;
     use crate::hii::strings::Language;
+    use crate::hii::strings::ListTexts;
+    use crate::hii::strings::StringPackage;
     use crate::hii::variables::tests::NV_BS;
     use crate::hii::variables::EfivarReader;
 
@@ -445,8 +449,10 @@ mod tests {
         ParsedPackageList {
             guid: NIL_GUID,
             device_path: None,
-            strings: vec![BTreeMap::new()],
-            string_languages: vec![Language::default()],
+            strings: vec![StringPackage {
+                language: Language::default(),
+                strings: BTreeMap::new(),
+            }],
             forms: vec![Rc::clone(root)],
             ignored_ifr: Vec::new(),
         }
@@ -458,7 +464,7 @@ mod tests {
         let source = EfivarSource::Directory(efivars.to_path_buf());
         list_questions(
             Rc::clone(root),
-            &[BTreeMap::new()],
+            &ListTexts::new(&[]),
             IncludedStates::CONDITIONS,
             None,
             &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),

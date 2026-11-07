@@ -542,10 +542,12 @@ mod tests {
     type Written = BTreeMap<&'static str, Vec<(u16, Vec<u8>)>>;
 
     /// The strings of form_set(): the prompts of questions().
-    fn prompts() -> Vec<StringMap> {
-        vec![(FIRST_PROMPT..)
-            .zip(questions().into_iter().map(|(prompt, ..)| Rc::from(prompt)))
-            .collect()]
+    fn prompts() -> Vec<StringPackage> {
+        vec![en_us_package(
+            (FIRST_PROMPT..)
+                .zip(questions().into_iter().map(|(prompt, ..)| Rc::from(prompt)))
+                .collect(),
+        )]
     }
 
     /// The outcome of set of `prompt` to `value` through variables of `through`, as the CLI
@@ -561,7 +563,7 @@ mod tests {
     /// set() of `prompt` in the FormSet `root`, whose strings are `strings`.
     fn set_in(
         root: &Rc<RefCell<IFROperation>>,
-        strings: &[StringMap],
+        strings: &[StringPackage],
         prompt: &str,
         value: &str,
         through: (VariableReach, VariableInterface),
@@ -581,7 +583,7 @@ mod tests {
     /// variable.
     fn set_under(
         root: &Rc<RefCell<IFROperation>>,
-        strings: &[StringMap],
+        strings: &[StringPackage],
         prompt: &str,
         value: &str,
         through: (VariableReach, VariableInterface),
@@ -609,7 +611,7 @@ mod tests {
     /// `writes`, which reach and are read as variables() of their reach and interface.
     fn set_through(
         root: &Rc<RefCell<IFROperation>>,
-        strings: &[StringMap],
+        strings: &[StringPackage],
         prompt: &str,
         value: &str,
         volatile: VolatileWrites,
@@ -621,7 +623,12 @@ mod tests {
         let selection = find_question_in(
             root,
             &BTreeSet::from([prompt]),
-            &mut FormSetWalk::new(strings, &mut reader, &values, IncludedStates::empty()),
+            &mut FormSetWalk::new(
+                &ListTexts::new(strings),
+                &mut reader,
+                &values,
+                IncludedStates::empty(),
+            ),
         );
         // set refuses a read-only question as it picks it, before it plans any write
         let options = SetOptions {
@@ -672,11 +679,11 @@ mod tests {
             var_store_efi(STORE, "Store", NV_BS_RT, 6),
             form(1, &[one_of]),
         ]);
-        let strings = vec![StringMap::from([
+        let strings = vec![en_us_package(StringMap::from([
             (FIRST_PROMPT, "Width".into()),
             (FIRST_PROMPT + 1, "Narrow".into()),
             (FIRST_PROMPT + 2, "Wide".into()),
-        ])];
+        ]))];
         let got = set_in(&root, &strings, "Width", "Narrow", EFIVARFS);
         assert_eq!(
             got,
@@ -779,10 +786,10 @@ mod tests {
             var_store_efi(STORE, "Store", NV_BS_RT, 6),
             form(1, &[password, around]),
         ]);
-        let strings = vec![StringMap::from([
+        let strings = vec![en_us_package(StringMap::from([
             (FIRST_PROMPT, "Around".into()),
             (FIRST_PROMPT + 1, "Password".into()),
-        ])];
+        ]))];
         let passwords = PasswordQuestions::of([&root]);
 
         for through in [EFIVARFS, VARIABLE_SERVICES, FIRMWARE_ENVIRONMENT] {
@@ -793,7 +800,12 @@ mod tests {
             let selection = find_question_in(
                 &root,
                 &BTreeSet::from(["Around"]),
-                &mut FormSetWalk::new(&strings, &mut reader, &values, IncludedStates::empty()),
+                &mut FormSetWalk::new(
+                    &ListTexts::new(&strings),
+                    &mut reader,
+                    &values,
+                    IncludedStates::empty(),
+                ),
             );
             let Selection::Picked {
                 picked: (descriptor, _),
@@ -903,10 +915,10 @@ mod tests {
             var_store_efi(OTHER, "Other", NV_BS_RT, 2),
             form(1, &[password, around]),
         ]);
-        let strings = vec![StringMap::from([
+        let strings = vec![en_us_package(StringMap::from([
             (FIRST_PROMPT, "Around".into()),
             (FIRST_PROMPT + 1, "Password".into()),
-        ])];
+        ]))];
         let passwords = PasswordQuestions::of([&root]);
         let mut reader = passwords
             .reader(Box::new(variables(through)))
@@ -915,7 +927,12 @@ mod tests {
         let selection = find_question_in(
             &root,
             &BTreeSet::from(["Around"]),
-            &mut FormSetWalk::new(&strings, &mut reader, &values, IncludedStates::empty()),
+            &mut FormSetWalk::new(
+                &ListTexts::new(&strings),
+                &mut reader,
+                &values,
+                IncludedStates::empty(),
+            ),
         );
         let Selection::Picked {
             picked: (descriptor, _),
@@ -1223,7 +1240,10 @@ mod tests {
         ]
         .concat();
         let roots = [list(1, Vec::new()), list(0, write)];
-        let strings = vec![StringMap::from([(FIRST_PROMPT, "Dup".into())])];
+        let strings = vec![en_us_package(StringMap::from([(
+            FIRST_PROMPT,
+            "Dup".into(),
+        )]))];
         let mut reader = EfivarReader::with_variables(Box::new(variables(EFIVARFS)));
         let mut selections = Vec::new();
         for root in &roots {
@@ -1231,7 +1251,12 @@ mod tests {
             selections.push(find_question_in(
                 root,
                 &BTreeSet::from(["Dup"]),
-                &mut FormSetWalk::new(&strings, &mut reader, &values, IncludedStates::empty()),
+                &mut FormSetWalk::new(
+                    &ListTexts::new(&strings),
+                    &mut reader,
+                    &values,
+                    IncludedStates::empty(),
+                ),
             ));
         }
         let selected: Vec<(&str, &QuestionDescriptor)> = ["list 1", "list 2"]
@@ -1296,7 +1321,10 @@ mod tests {
             var_store_efi(STORE, "Store", NV_BS_RT, 6),
             form(1, &[checkbox]),
         ]);
-        let strings = vec![StringMap::from([(FIRST_PROMPT, "Checkbox".into())])];
+        let strings = vec![en_us_package(StringMap::from([(
+            FIRST_PROMPT,
+            "Checkbox".into(),
+        )]))];
         for (value, want) in [("1", vec![1, 0xA1, 0]), ("0", vec![0, 0xA1, 1])] {
             assert_eq!(
                 set_in(&root, &strings, "Checkbox", value, EFIVARFS),

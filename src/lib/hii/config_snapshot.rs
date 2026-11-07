@@ -33,6 +33,7 @@ use crate::hii::forms::UnresolvedPassword;
 use crate::hii::package::DevicePath;
 use crate::hii::package::Guid;
 use crate::hii::package::ParsedPackageList;
+use crate::hii::strings::ListTexts;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::WithheldBytes;
@@ -253,23 +254,27 @@ impl SnapshotLookup {
     }
 
     /// Looks up the storages of `list` from now on: those of the driver at its device path, and
-    /// the labels that its strings give, as find_corresponding_string takes each string from the
-    /// first strings package that has it.
-    fn enter(&mut self, list: &ParsedPackageList) {
+    /// the labels that its strings give in `texts`, the texts that its questions show, as
+    /// edk2-stable202608 SetupBrowserDxe IfrParse.c takes a VarName through GetToken, as
+    /// DisplayEngineDxe FormDisplay.c takes a prompt.
+    fn enter(&mut self, list: &ParsedPackageList, texts: &ListTexts<'_>) {
         self.device_path = list.device_path.clone();
         let labels = self
             .device_path
             .as_ref()
             .map(|device_path| self.snapshot.labels(device_path))
             .unwrap_or_default();
-        let mut taken = BTreeSet::new();
-        self.labels = list
+        let ids: BTreeSet<u16> = list
             .strings
             .iter()
-            .flatten()
-            .filter(|(id, _)| taken.insert(**id))
-            .filter(|&(_, text)| labels.contains(&**text))
-            .map(|(id, text)| (*id, Rc::clone(text)))
+            .filter(|package| !package.language.is_configuration())
+            .flat_map(|package| package.strings.keys().copied())
+            .collect();
+        self.labels = ids
+            .into_iter()
+            .map(|id| (id, texts.display(id)))
+            .filter(|&(_, text)| labels.contains(text))
+            .map(|(id, text)| (id, Rc::from(text)))
             .collect();
     }
 
@@ -308,10 +313,10 @@ impl EfivarReader {
     }
 
     /// Takes snapshot values for the storages of `list` from now on, for the questions of its
-    /// forms.
-    pub(crate) fn enter_package_list(&mut self, list: &ParsedPackageList) {
+    /// forms, which show `texts`.
+    pub(crate) fn enter_package_list(&mut self, list: &ParsedPackageList, texts: &ListTexts<'_>) {
         if let Some(snapshot) = &mut self.snapshot {
-            snapshot.enter(list);
+            snapshot.enter(list, texts);
         }
     }
 }
@@ -322,6 +327,10 @@ pub(crate) mod tests {
     use std::sync::Once;
 
     use super::*;
+    use crate::hii::forms::ifr_fixtures::en_us_package;
+    use crate::hii::strings::Language;
+    use crate::hii::strings::StringMap;
+    use crate::hii::strings::StringPackage;
 
     /// PciRoot(0), then the End of Hardware Device Path node: the device path of the driver of
     /// the fixtures.
@@ -397,16 +406,31 @@ pub(crate) mod tests {
             strings: strings
                 .iter()
                 .map(|package| {
-                    package
-                        .iter()
-                        .map(|(id, text)| (*id, Rc::from(*text)))
-                        .collect()
+                    en_us_package(
+                        package
+                            .iter()
+                            .map(|(id, text)| (*id, Rc::from(*text)))
+                            .collect(),
+                    )
                 })
                 .collect(),
-            string_languages: Vec::new(),
             forms: Vec::new(),
             ignored_ifr: Vec::new(),
         }
+    }
+
+    /// A package list of the driver at DRIVER_PATH whose strings package of each language of
+    /// `packages`, in order, names string 1 by its label.
+    fn labelled_list(packages: &[(&[u8], &str)]) -> ParsedPackageList {
+        let mut list = package_list(Some(&DRIVER_PATH), &[]);
+        list.strings = packages
+            .iter()
+            .map(|(language, label)| StringPackage {
+                language: Language(language.to_vec()),
+                strings: StringMap::from([(1, Rc::from(*label))]),
+            })
+            .collect();
+        list
     }
 
     #[test]
@@ -647,7 +671,7 @@ pub(crate) mod tests {
                 None,
             ),
         ] {
-            lookup.enter(&list);
+            lookup.enter(&list, &list.texts());
 
             assert_eq!(lookup.buffer(&store, 0..1), want_buffer, "{case}: NStore");
             assert_eq!(
@@ -657,6 +681,25 @@ pub(crate) mod tests {
             );
             assert_eq!(lookup.number(guid, 2), None, "{case}: string 2");
         }
+    }
+
+    /// A name/value setting takes the label that its string shows among the texts of the package
+    /// list, never the keyword of an x- package before them.
+    #[test]
+    fn lookup_labels_settings_by_the_texts_shown() {
+        let text = format!("{}&Var0=07&Var1=08", config_hdr(N_GUID, "", &DRIVER_PATH));
+        let mut lookup =
+            SnapshotLookup::new(&ExportedConfig::new(text), &PasswordQuestions::default())
+                .expect("look up the snapshot");
+        let list = labelled_list(&[(b"x-UEFI-ns", "Var0"), (b"en-US", "Var1")]);
+
+        lookup.enter(&list, &list.texts());
+
+        assert_eq!(
+            lookup.number(Guid::from(N_GUID), 1).map(Number::as_bytes),
+            Some(&[8][..]),
+            "string 1"
+        );
     }
 
     thread_local! {

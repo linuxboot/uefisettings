@@ -401,6 +401,7 @@ mod tests {
     use crate::hii::forms::IgnoredIfr;
     use crate::hii::package::Guid;
     use crate::hii::strings::Language;
+    use crate::hii::strings::StringPackage;
 
     const PATH: &str = "01041400111111111111111111111111111111117fff0400";
     const OTHER_PATH: &str = "01041400222222222222222222222222222222227fff0400";
@@ -577,19 +578,17 @@ mod tests {
     /// A package list of the device path `path` that declares VarStore 1 and holds `ops`, whose
     /// x-UEFI-ns strings package names strings 3 and 5 KEYWORD and SECOND_KEYWORD.
     fn list(path: &str, ops: &[Vec<u8>]) -> ParsedPackageList {
-        let strings =
-            |first: &str, second: &str| BTreeMap::from([(3, first.into()), (5, second.into())]);
+        let strings = |language: &[u8], first: &str, second: &str| StringPackage {
+            language: Language(language.to_vec()),
+            strings: BTreeMap::from([(3, first.into()), (5, second.into())]),
+        };
         let device_path = path.parse::<KeywordPath>().expect("a device path");
         ParsedPackageList {
             guid: Guid::from([0x22; 16]),
             device_path: Some(device_path.as_ref().clone()),
             strings: vec![
-                strings("Keyword question", "Second question"),
-                strings(KEYWORD, SECOND_KEYWORD),
-            ],
-            string_languages: vec![
-                Language(b"en-US".to_vec()),
-                Language(NAMESPACE.as_bytes().to_vec()),
+                strings(b"en-US", "Keyword question", "Second question"),
+                strings(NAMESPACE.as_bytes(), KEYWORD, SECOND_KEYWORD),
             ],
             forms: vec![parse_form_set(
                 &[vec![var_store(1, STORE_GUID, "Store", 16)], ops.to_vec()].concat(),

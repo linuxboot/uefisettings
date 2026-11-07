@@ -648,12 +648,13 @@ impl HiiBackend {
                 continue;
             }
             writeln!(readable_representation, "Packagelist {}", list.guid)?;
-            reader.enter_package_list(&list);
-            for root in list.forms {
+            let texts = list.texts();
+            reader.enter_package_list(&list, &texts);
+            for root in &list.forms {
                 readable_representation.push_str(&forms::display(
-                    root,
+                    Rc::clone(root),
                     0,
-                    &list.strings,
+                    &texts,
                     &mut reader,
                 )?);
             }
@@ -672,23 +673,18 @@ impl HiiBackend {
         let parsed_db = package::read_db(db_bytes)?;
 
         for list in parsed_db {
-            let mut languages = list.string_languages.into_iter();
             for string_package in list.strings {
                 let mut p = HiiStringsPackage {
                     package_list: list.guid.to_string(),
-                    language: languages
-                        .next()
-                        .context("a strings package without its language")?
-                        .to_ascii_string()
-                        .with_context(|| {
-                            format!(
-                                "failed to list a strings package of package list {}",
-                                list.guid
-                            )
-                        })?,
+                    language: string_package.language.to_ascii_string().with_context(|| {
+                        format!(
+                            "failed to list a strings package of package list {}",
+                            list.guid
+                        )
+                    })?,
                     ..Default::default()
                 };
-                for (string_id, string) in string_package {
+                for (string_id, string) in string_package.strings {
                     p.string_package
                         .insert(i32::from(string_id), string.to_string());
                 }
@@ -774,14 +770,15 @@ impl HiiBackend {
         )?;
         for list in parsed_db {
             list.check_form_strings()?;
-            reader.enter_package_list(&list);
+            let texts = list.texts();
+            reader.enter_package_list(&list, &texts);
 
-            for root in list.forms {
+            for root in &list.forms {
                 //  TODO: show form name, package list guid in the final response as well
 
                 for (question_descriptor, state) in list_questions(
-                    root,
-                    &list.strings,
+                    Rc::clone(root),
+                    &texts,
                     include,
                     options.access_level,
                     &mut reader,
@@ -1022,12 +1019,13 @@ impl HiiBackend {
         let mut excluded = Exclusion::NONE;
         for list in parsed_db {
             list.check_form_strings()?;
-            reader.enter_package_list(&list);
+            let texts = list.texts();
+            reader.enter_package_list(&list, &texts);
 
-            for root in list.forms {
+            for root in &list.forms {
                 let selection = forms::find_question(
-                    root,
-                    &list.strings,
+                    Rc::clone(root),
+                    &texts,
                     &question_variations,
                     include,
                     options.access_level,
@@ -1169,11 +1167,12 @@ fn select_for_set(
     let mut selected = Vec::new();
     let mut excluded = Exclusion::NONE;
     for list in parsed_db {
+        let texts = list.texts();
         for root in &list.forms {
             // try to find the question
             let selection = forms::find_question(
                 Rc::clone(root),
-                &list.strings,
+                &texts,
                 question_variations,
                 options.include,
                 options.access_level,
@@ -1634,6 +1633,172 @@ mod tests {
             efivars: EfivarSource::Disabled,
         };
         HiiBackend::show_ifr_using(&hiidb, &ifr).expect("show the IFR");
+    }
+
+    /// Prompts come from the first strings package of a language that is no x- configuration
+    /// language, here after an x-UEFI-ns package, else from another such package that holds the
+    /// string, and never from an x- package: a string that only one holds shows as "".
+    #[test]
+    fn texts_never_come_from_a_configuration_language() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 3),
+                form(
+                    1,
+                    &[
+                        checkbox_at(1, 1, 1, 0),
+                        checkbox_at(2, 2, 1, 1),
+                        checkbox_at(3, 3, 1, 2),
+                    ],
+                ),
+            ]),
+            strings_package_of(
+                b"x-UEFI-ns",
+                &["BootEnable", "SecondKeyword", "ThirdKeyword"],
+            ),
+            strings_package_of(b"en-US", &["Boot"]),
+            strings_package_of(b"fr-FR", &["D\u{e9}marrage", "Seconde"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x66; 16], &packages.concat());
+
+        let names: Vec<String> = HiiBackend::list_questions_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            Box::new(MemoryVariables::default()),
+            None,
+        )
+        .expect("list the questions")
+        .into_iter()
+        .map(|question| question.name)
+        .collect();
+
+        assert_eq!(names, ["Boot", "Seconde", ""], "names of the questions");
+    }
+
+    /// A package list whose only strings package is of a configuration language names its
+    /// questions "": the texts of x- packages are never shown, even with no other package.
+    #[test]
+    fn a_list_of_configuration_texts_only_names_no_question() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                form(1, &[checkbox_at(1, 1, 1, 0)]),
+            ]),
+            strings_package_of(b"x-UEFI-ns", &["BootEnable"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x6D; 16], &packages.concat());
+
+        let names: Vec<String> = HiiBackend::list_questions_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            Box::new(MemoryVariables::default()),
+            None,
+        )
+        .expect("list the questions")
+        .into_iter()
+        .map(|question| question.name)
+        .collect();
+
+        assert_eq!(names, [""], "names of the questions");
+    }
+
+    /// get and set select no question by a QUESTION that only a package of a configuration
+    /// language holds as its prompt, and set writes nothing; a QUESTION of a display language
+    /// selects as before.
+    #[test]
+    fn questions_match_no_text_of_a_configuration_language() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                form(1, &[checkbox_at(1, 1, 1, 0), checkbox_at(2, 2, 1, 1)]),
+            ]),
+            strings_package_of(b"x-UEFI-ns", &["BootEnable", "SecondKeyword"]),
+            strings_package_of(b"en-US", &["Boot", "Second"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x6F; 16], &packages.concat());
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0, 0]);
+
+        let got = HiiBackend::get_in(
+            &hiidb,
+            "BootEnable",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+        )
+        .expect("get BootEnable");
+        let set = HiiBackend::set_in(
+            &hiidb,
+            "BootEnable",
+            "1",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+        );
+        let keyword_writes = variables.writes_to(&setup());
+        let boot = HiiBackend::set_in(
+            &hiidb,
+            "Boot",
+            "1",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+        )
+        .expect("set Boot 1");
+
+        assert_eq!(got.responses.len(), 0, "get BootEnable answers");
+        assert_eq!(
+            set.map(drop).map_err(|error| error.to_string()),
+            Err("no question \"BootEnable\" in the HiiDB".to_string()),
+            "set BootEnable 1"
+        );
+        assert_eq!(keyword_writes, [], "set BootEnable 1 writes");
+        let names: Vec<&str> = boot
+            .responses
+            .iter()
+            .map(|response| response.question.name.as_str())
+            .collect();
+        assert_eq!(names, ["Boot"], "set Boot 1");
+        assert_eq!(
+            variables.writes_to(&setup()),
+            [(0, vec![1])],
+            "set Boot 1 writes"
+        );
+    }
+
+    /// A package of a language whose "x-" is in upper case is a configuration language too: its
+    /// texts are never shown.
+    #[test]
+    fn an_upper_case_x_language_is_a_configuration_language() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                form(1, &[checkbox_at(1, 1, 1, 0), checkbox_at(2, 2, 1, 1)]),
+            ]),
+            strings_package_of(b"X-UEFI-ns", &["BootEnable", "SecondKeyword"]),
+            strings_package_of(b"en-US", &["Boot"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x6E; 16], &packages.concat());
+
+        let names: Vec<String> = HiiBackend::list_questions_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            Box::new(MemoryVariables::default()),
+            None,
+        )
+        .expect("list the questions")
+        .into_iter()
+        .map(|question| question.name)
+        .collect();
+
+        assert_eq!(names, ["Boot", ""], "names of the questions");
     }
 
     /// get, list-questions and show-ifr read question values from the source that their

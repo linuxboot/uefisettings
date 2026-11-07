@@ -37,7 +37,6 @@ use super::conditions::QuestionExpression;
 use super::conditions::VarStoreValues;
 use super::declared_var_store;
 use super::defaults::is_statement;
-use super::find_corresponding_string;
 use super::find_corresponding_varstore;
 use super::question_values::describe_question;
 use super::question_values::value_question;
@@ -72,7 +71,7 @@ use crate::hii::config_string::Namespace;
 use crate::hii::config_string::Usage;
 use crate::hii::package::ParsedPackageList;
 use crate::hii::strings::Language;
-use crate::hii::strings::StringMap;
+use crate::hii::strings::ListTexts;
 use crate::hii::variables::is_volatile;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarReader;
@@ -219,14 +218,19 @@ pub(crate) fn keyword_strings<'a: 'b, 'b>(
         PackageSearch::First => 1,
         PackageSearch::Every => usize::MAX,
     };
-    list.string_languages
+    list.strings
         .iter()
-        .zip(&list.strings)
-        .filter(move |(language, _)| language.0.starts_with(prefix.as_bytes()))
+        .filter(move |package| package.language.0.starts_with(prefix.as_bytes()))
         .take(packages)
-        .filter_map(move |(language, strings)| {
-            let (&id, _) = strings.iter().find(|(_, text)| ***text == *keyword)?;
-            Some(KeywordString { language, id })
+        .filter_map(move |package| {
+            let (&id, _) = package
+                .strings
+                .iter()
+                .find(|(_, text)| ***text == *keyword)?;
+            Some(KeywordString {
+                language: &package.language,
+                id,
+            })
         })
 }
 
@@ -248,7 +252,7 @@ pub(crate) struct KeywordQuestion<'a> {
     namespace: Namespace,
     /// The device path of the package list
     path: KeywordPath,
-    strings: &'a [StringMap],
+    texts: ListTexts<'a>,
     /// The roots of the form packages of the package list
     roots: &'a [Rc<RefCell<IFROperation>>],
     /// The root of the form package of the statement
@@ -357,7 +361,7 @@ impl<'a> KeywordQuestion<'a> {
             keyword: keyword.clone(),
             namespace,
             path,
-            strings: &list.strings,
+            texts: list.texts(),
             roots: &list.forms,
             root,
             op,
@@ -406,7 +410,7 @@ impl<'a> KeywordQuestion<'a> {
             }
             .into());
         };
-        let prompt = find_corresponding_string(header.prompt_string_id, self.strings);
+        let prompt = self.texts.display(header.prompt_string_id);
         let number = value_number(question, resp.value.as_bytes())
             .ok_or_else(|| self.value_refusal(resp, prompt, ValueRefusal::Width))?;
         let descriptor = self
@@ -585,7 +589,7 @@ impl<'a> KeywordQuestion<'a> {
     ) -> Result<QuestionDescriptor> {
         let selection = {
             let values = VarStoreValues::new(self.root, None);
-            let mut walk = FormSetWalk::new(self.strings, reader, &values, include);
+            let mut walk = FormSetWalk::new(&self.texts, reader, &values, include);
             let state = question_state(&self.op.borrow(), &mut walk.inputs);
             select(vec![(question, state)], include)
                 .map(|question| describe_question(&self.op, question, &mut walk))
@@ -608,7 +612,7 @@ impl<'a> KeywordQuestion<'a> {
     fn question_refusal(&self, header: &QuestionHeader, reason: QuestionRefusal) -> KeywordRefusal {
         KeywordRefusal::Question {
             keyword: self.keyword.to_string(),
-            question: find_corresponding_string(header.prompt_string_id, self.strings).to_owned(),
+            question: self.texts.display(header.prompt_string_id).to_owned(),
             reason,
         }
     }
@@ -814,6 +818,7 @@ mod tests {
     use crate::hii::config_string::MultiKeywordResp;
     use crate::hii::package::DevicePath;
     use crate::hii::package::Guid;
+    use crate::hii::strings::StringPackage;
     use crate::hii::variables::WithheldBytes;
 
     /// A vendor device path node of the GUID 11111111-1111-1111-1111-111111111111, then End.
@@ -871,17 +876,20 @@ mod tests {
     /// A package list of the device path `path` holding `ops` after VarStore 1, and the strings
     /// of PROMPT: QUESTION in en-US, then each (language, text) of `keywords`.
     fn list(path: &str, keywords: &[(&str, &str)], ops: Vec<u8>) -> ParsedPackageList {
-        let mut strings = vec![BTreeMap::from([(PROMPT, QUESTION.into())])];
-        let mut string_languages = vec![Language(b"en-US".to_vec())];
+        let mut strings = vec![StringPackage {
+            language: Language(b"en-US".to_vec()),
+            strings: BTreeMap::from([(PROMPT, QUESTION.into())]),
+        }];
         for (language, text) in keywords {
-            strings.push(BTreeMap::from([(PROMPT, (*text).into())]));
-            string_languages.push(Language(language.as_bytes().to_vec()));
+            strings.push(StringPackage {
+                language: Language(language.as_bytes().to_vec()),
+                strings: BTreeMap::from([(PROMPT, (*text).into())]),
+            });
         }
         ParsedPackageList {
             guid: Guid::from([0x22; 16]),
             device_path: Some(path_of(path).as_ref().clone()),
             strings,
-            string_languages,
             forms: vec![parse_form_set(&[
                 var_store(1, STORE_GUID, "Store", 16),
                 ops,

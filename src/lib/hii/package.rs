@@ -29,7 +29,7 @@ use serde::Serializer;
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
 use crate::hii::strings;
-use crate::hii::strings::StringMap;
+use crate::hii::strings::ListTexts;
 use crate::parse_error::ReadParsed;
 
 /// PACKAGE_LIST_HEADER_SIZE is the size of EFI_HII_PACKAGE_LIST_HEADER:
@@ -381,22 +381,25 @@ impl AsRef<[u8]> for DevicePath {
 
 type IFRNodeLink = Rc<RefCell<IFROperation>>;
 
-/// String map (string id -> string) and language per strings package and IFR root per FormSet
-/// of one package list.
+/// The strings packages and the IFR root of each FormSet of one package list.
 pub struct ParsedPackageList {
     pub guid: Guid,
     /// The device path of the driver handle that added the list, from its device path package
     /// (UEFI 2.10 §33.3.4), if it has one
     pub device_path: Option<DevicePath>,
-    pub strings: Vec<StringMap>,
-    /// The Language of each strings package's header, in the order of `strings`
-    pub string_languages: Vec<strings::Language>,
+    pub strings: Vec<strings::StringPackage>,
     pub forms: Vec<IFRNodeLink>,
     /// The IFR of its form packages that read_db ignores, whose PASSWORD questions are unknown
     pub ignored_ifr: Vec<forms::IgnoredIfr>,
 }
 
 impl ParsedPackageList {
+    /// The texts of the list's questions and other ops, as get, set, list-questions and show-ifr
+    /// show them.
+    pub(crate) fn texts(&self) -> ListTexts<'_> {
+        ListTexts::new(&self.strings)
+    }
+
     /// Fails if the list has forms but no strings packages.
     pub fn check_form_strings(&self) -> Result<()> {
         ensure!(
@@ -431,9 +434,7 @@ pub fn read_db(source: &[u8]) -> Result<Vec<ParsedPackageList>> {
 /// Parses the strings and form packages of a package list, keeps its device path package and
 /// skips the others.
 fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
-    // once filled this will have string maps from each string package in the package list.
-    let mut package_list_string_maps: Vec<StringMap> = Vec::new();
-    let mut string_languages = Vec::new();
+    let mut string_packages = Vec::new();
     let mut roots: Vec<IFRNodeLink> = Vec::new();
     let mut ignored_ifr = Vec::new();
     let mut device_path = None;
@@ -444,10 +445,10 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         match package.package_type {
             PackageType::Strings => {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
-                let string_package = strings::handle_string_package(&package.data)
-                    .context("failed to parse a strings package")?;
-                package_list_string_maps.push(string_package.strings);
-                string_languages.push(string_package.language);
+                string_packages.push(
+                    strings::handle_string_package(&package.data)
+                        .context("failed to parse a strings package")?,
+                );
             }
             PackageType::Form => {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
@@ -474,8 +475,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     Ok(ParsedPackageList {
         guid: package_list.guid,
         device_path,
-        strings: package_list_string_maps,
-        string_languages,
+        strings: string_packages,
         forms: roots,
         ignored_ifr,
     })
@@ -513,6 +513,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::scsu::tests::EDK2_LANGUAGE_WINDOW;
+    use crate::hii::strings::StringMap;
     use crate::parse_error::ParseError;
 
     /// OPAQUE_PACKAGE is a package with Length 6, that is, 2 bytes of data:
@@ -558,11 +559,19 @@ mod tests {
         encode_package_list([0x00; 16], length, &packages)
     }
 
+    /// The string maps of `packages`, in order.
+    fn maps_of(packages: &[strings::StringPackage]) -> Vec<StringMap> {
+        packages
+            .iter()
+            .map(|package| package.strings.clone())
+            .collect()
+    }
+
     /// Pairs each list's GUID with its string maps, in order.
     fn strings_of_lists(lists: Vec<ParsedPackageList>) -> Vec<(String, Vec<StringMap>)> {
         lists
             .into_iter()
-            .map(|list| (list.guid.to_string(), list.strings))
+            .map(|list| (list.guid.to_string(), maps_of(&list.strings)))
             .collect()
     }
 
@@ -1696,14 +1705,23 @@ mod tests {
         let [list] = lists.as_slice() else {
             panic!("{} package lists, not 1", lists.len());
         };
+        let languages: Vec<&strings::Language> = list
+            .strings
+            .iter()
+            .map(|package| &package.language)
+            .collect();
         assert_eq!(
-            list.string_languages,
-            ["x-UEFI-ns", "en-US"].map(|language| strings::Language(language.as_bytes().to_vec())),
+            languages,
+            ["x-UEFI-ns", "en-US"].map(language).each_ref(),
             "languages of the strings packages"
         );
         let want = ["iSCSIBootEnable", "My Keyword Namespace Test"]
             .map(|string| StringMap::from([(1, string.into())]));
-        assert_eq!(list.strings, want, "strings of the strings packages");
+        assert_eq!(
+            maps_of(&list.strings),
+            want,
+            "strings of the strings packages"
+        );
     }
 
     /// read_db reads a strings package whose Language is not ASCII, keeping its bytes and
@@ -1718,13 +1736,11 @@ mod tests {
         let [list] = lists.as_slice() else {
             panic!("{} package lists, not 1", lists.len());
         };
-        assert_eq!(
-            list.string_languages,
-            [strings::Language(b"en-\xe9".to_vec())],
-            "languages of the strings packages"
-        );
-        let want = [StringMap::from([(1, "A".into())])];
-        assert_eq!(list.strings, want, "strings of the strings packages");
+        let want = [strings::StringPackage {
+            language: strings::Language(b"en-\xe9".to_vec()),
+            strings: StringMap::from([(1, "A".into())]),
+        }];
+        assert_eq!(list.strings, want, "the strings packages");
     }
 
     /// STRING_A_BLOCKS are the string blocks of string ID 1, "A": EFI_HII_SIBT_STRING_UCS2, then
@@ -1752,15 +1768,9 @@ mod tests {
         let [list] = lists.as_slice() else {
             panic!("{} package lists, not 1", lists.len());
         };
-        assert_eq!(
-            list.string_languages.len(),
-            list.strings.len(),
-            "a Language per strings package"
-        );
-        list.string_languages
+        list.strings
             .iter()
-            .cloned()
-            .zip(list.strings.iter().cloned())
+            .map(|package| (package.language.clone(), package.strings.clone()))
             .collect()
     }
 
@@ -1771,10 +1781,7 @@ mod tests {
         match read_db(&hiidb) {
             Ok(lists) => panic!(
                 "read_db parsed it: {:?}",
-                lists
-                    .iter()
-                    .map(|list| (&list.string_languages, &list.strings))
-                    .collect::<Vec<_>>()
+                lists.iter().map(|list| &list.strings).collect::<Vec<_>>()
             ),
             Err(err) => format!("{err:#}"),
         }
@@ -2110,7 +2117,7 @@ mod tests {
 
         let got: Vec<(usize, Vec<StringMap>)> = lists
             .into_iter()
-            .map(|list| (list.forms.len(), list.strings))
+            .map(|list| (list.forms.len(), maps_of(&list.strings)))
             .collect();
         let want = vec![
             (1, vec![StringMap::from([(1, "A".into())])]),
@@ -2347,6 +2354,7 @@ mod tests {
                 .strings
                 .first()
                 .unwrap()
+                .strings
                 .get(&8)
                 .unwrap()
                 .as_ref(),
@@ -2359,6 +2367,7 @@ mod tests {
                 .strings
                 .first()
                 .unwrap()
+                .strings
                 .len(),
             5714
         );
@@ -2446,7 +2455,7 @@ mod tests {
 
         let got: Vec<_> = lists
             .iter()
-            .map(|list| (list.device_path.clone(), list.strings.clone()))
+            .map(|list| (list.device_path.clone(), maps_of(&list.strings)))
             .collect();
         assert_eq!(
             got,
@@ -2720,7 +2729,7 @@ mod tests {
                 lists
                     .iter()
                     .flat_map(|list| &list.strings)
-                    .map(StringMap::len)
+                    .map(|package| package.strings.len())
                     .sum::<usize>()
             ),
             Err(err) => assert_eq!(
@@ -2767,7 +2776,7 @@ mod tests {
                     lists
                         .iter()
                         .flat_map(|list| &list.strings)
-                        .map(StringMap::len)
+                        .map(|package| package.strings.len())
                         .sum::<usize>()
                 })
                 .map_err(|err| format!("{err:#}"));

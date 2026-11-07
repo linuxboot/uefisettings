@@ -753,9 +753,11 @@ mod get_and_set_tests {
     /// What answers add for the standard default that each CHECKBOX's Flags 0 give.
     const CHECKBOX_DEFAULT: &str = " <IFR default: 0>";
 
-    fn string_packages() -> Vec<StringMap> {
+    fn string_packages() -> Vec<StringPackage> {
         let prompts = QUESTIONS.iter().map(|(prompt, ..)| *prompt).chain([STORED]);
-        vec![(FIRST_PROMPT..).zip(prompts.map(Rc::from)).collect()]
+        vec![en_us_package(
+            (FIRST_PROMPT..).zip(prompts.map(Rc::from)).collect(),
+        )]
     }
 
     /// A FormSet holding a CHECKBOX without a VarStore for each of QUESTIONS, each READ and WRITE
@@ -844,7 +846,7 @@ mod get_and_set_tests {
             let mut reader = reader_reaching(reach);
             let listed: BTreeMap<String, String> = list_questions(
                 Rc::clone(&root),
-                &strings,
+                &ListTexts::new(&strings),
                 IncludedStates::empty(),
                 None,
                 &mut reader,
@@ -892,7 +894,12 @@ mod get_and_set_tests {
                 let selection = find_question_in(
                     &root,
                     &BTreeSet::from([prompt]),
-                    &mut FormSetWalk::new(&strings, &mut reader, &values, IncludedStates::empty()),
+                    &mut FormSetWalk::new(
+                        &ListTexts::new(&strings),
+                        &mut reader,
+                        &values,
+                        IncludedStates::empty(),
+                    ),
                 );
                 let Selection::Picked {
                     picked: (descriptor, _),
@@ -950,7 +957,7 @@ mod get_and_set_tests {
         let mut reader = reader_reaching(VariableReach::BootServices);
         let listed: BTreeMap<String, QuestionDescriptor> = list_questions(
             Rc::clone(&root),
-            &string_packages(),
+            &ListTexts::new(&string_packages()),
             IncludedStates::empty(),
             None,
             &mut reader,

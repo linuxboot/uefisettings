@@ -27,7 +27,6 @@ use super::conditions::skips_scope;
 use super::conditions::ExpressionInputs;
 use super::conditions::QuestionValues;
 use super::conditions::Truth;
-use super::find_corresponding_string;
 use super::is_bit_varstore_guid;
 use super::storage::ValueLocation;
 use super::walk_scopes;
@@ -43,7 +42,7 @@ use super::ParsedOperation;
 use super::Range;
 use super::TypeValue;
 use super::Walk;
-use crate::hii::strings::StringMap;
+use crate::hii::strings::ListTexts;
 
 // UEFI 2.10 §33.3.8.3.9, §33.3.8.3.51
 const EFI_IFR_CHECKBOX_DEFAULT: u8 = 0x01;
@@ -458,7 +457,7 @@ fn one_of_value(one_of: &OneOf, value: u64) -> Result<TypeValue, OptionValueErro
 pub(super) fn question_defaults<V: QuestionValues>(
     question: &IFROperation,
     stores: &DefaultStores,
-    string_packages: &[StringMap],
+    texts: &ListTexts<'_>,
     inputs: &mut ExpressionInputs<'_, V>,
     mut text: impl FnMut(u64, &mut ExpressionInputs<'_, V>) -> Result<String, DefaultError>,
 ) -> Vec<DeclaredDefault> {
@@ -486,7 +485,7 @@ pub(super) fn question_defaults<V: QuestionValues>(
                 store_name: stores
                     .0
                     .get(&default_id)
-                    .map(|&name| find_corresponding_string(name, string_packages).to_string()),
+                    .map(|&name| texts.display(name).to_string()),
                 value: DefaultValue(value),
             })
         })
@@ -603,7 +602,7 @@ pub(super) fn push_default(
 pub(super) fn option_text(
     question: &IFROperation,
     value: u64,
-    string_packages: &[StringMap],
+    texts: &ListTexts<'_>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> Result<Option<String>, DefaultError> {
     question_scope(question)
@@ -619,12 +618,10 @@ pub(super) fn option_text(
                 Ok(_) | Err(_) => return None,
             }
             match option_visibility(&op, inputs) {
-                OptionVisibility::Shown => Some(Ok(find_corresponding_string(
-                    option.option_string_id,
-                    string_packages,
-                )
-                .trim()
-                .to_string())),
+                OptionVisibility::Shown => Some(Ok(texts
+                    .display(option.option_string_id)
+                    .trim()
+                    .to_string())),
                 OptionVisibility::Suppressed => None,
                 OptionVisibility::Unknown(reason) => {
                     Some(Err(DefaultError::SuppressIfCondition(reason)))
@@ -968,7 +965,7 @@ mod tests {
         let efivars = Efivars::new();
         let listed = list_questions(
             Rc::clone(&root),
-            &strings(),
+            &ListTexts::new(&strings()),
             IncludedStates::empty(),
             None,
             &mut efivars.reader(),
@@ -977,7 +974,7 @@ mod tests {
             picked: (found, _), ..
         } = find_question(
             root,
-            &strings(),
+            &ListTexts::new(&strings()),
             &BTreeSet::from([PROMPT]),
             IncludedStates::empty(),
             None,
@@ -1009,7 +1006,7 @@ mod tests {
 
         let listed = list_questions(
             root,
-            &strings(),
+            &ListTexts::new(&strings()),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),
@@ -1052,7 +1049,7 @@ mod tests {
 
         let listed = list_questions(
             root,
-            &strings(),
+            &ListTexts::new(&strings()),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),
@@ -1095,7 +1092,7 @@ mod tests {
 
         let listed = list_questions(
             root,
-            &strings(),
+            &ListTexts::new(&strings()),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),

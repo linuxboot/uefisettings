@@ -4376,7 +4376,12 @@ mod tests {
         find_question_in(
             &root,
             &BTreeSet::from([PROMPT]),
-            &mut FormSetWalk::new(&strings(), &mut Efivars::new().reader(), &values(), include),
+            &mut FormSetWalk::new(
+                &ListTexts::new(&strings()),
+                &mut Efivars::new().reader(),
+                &values(),
+                include,
+            ),
         )
         .map(|question| {
             question_id_at(&root, question.location).expect("the QuestionId of the selected")
@@ -5071,7 +5076,7 @@ mod tests {
 
             let got: Vec<u16> = list_questions(
                 Rc::clone(&root),
-                &strings(),
+                &ListTexts::new(&strings()),
                 IncludedStates::empty(),
                 None,
                 &mut Efivars::new().reader(),

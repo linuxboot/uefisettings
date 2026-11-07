@@ -51,6 +51,9 @@ const MIN_HDR_SIZE: u32 = LANGUAGE_OFFSET + 1;
 /// DUPLICATE 48 characters, plus the 15 per byte that the other blocks leave unused.
 const MAX_CHARACTERS_PER_LENGTH_BYTE: u64 = 16;
 
+/// The prefix of a private-use language (Language::is_configuration).
+const PRIVATE_USE_PREFIX: &[u8] = b"x-";
+
 // UEFI 2.10 §33.3.6.1
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little)]
@@ -120,6 +123,7 @@ const EFI_HII_SIBT_FONT: u8 = 0x40;
 pub(crate) type StringMap = BTreeMap<u16, Rc<str>>;
 
 /// A strings package (UEFI 2.11 §33.3.6): the strings by id, in the language its header names.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringPackage {
     pub language: Language,
     pub strings: StringMap,
@@ -179,6 +183,66 @@ impl Language {
         );
         // each ASCII byte is its char
         Ok(self.0.iter().copied().map(char::from).collect())
+    }
+
+    /// Whether this is a private-use language, which UEFI 2.11 §33.2.6.1 has prefixed with "x"
+    /// and makes a configuration language, such as x-UEFI-ns: its strings are keywords
+    /// (§35.2.1.6), not texts to show.
+    pub fn is_configuration(&self) -> bool {
+        is_configuration_language(&self.0)
+    }
+}
+
+/// Whether `language` starts with "x-", that of Language::is_configuration, in either case:
+/// edk2-stable202211 HiiDatabaseDxe/String.c HiiCompareLanguage lowercases languages before it
+/// compares them.
+pub(crate) fn is_configuration_language(language: &[u8]) -> bool {
+    language
+        .get(..PRIVATE_USE_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PRIVATE_USE_PREFIX))
+}
+
+/// The texts of the strings packages of one package list, as get, set, list-questions and
+/// show-ifr show them; "the Forms Browser selects the actual text to display based on the
+/// current platform language setting" (UEFI 2.11 §33.2.6). No expression reads them, so the
+/// language they come in never changes a condition, READ or WRITE.
+pub(crate) struct ListTexts<'a> {
+    /// The package that texts come from first
+    chosen: Option<&'a StringPackage>,
+    /// The packages of no configuration language, in list order, which texts fall back on
+    shown: Vec<&'a StringPackage>,
+}
+
+impl<'a> ListTexts<'a> {
+    /// The texts of `packages`, those of one package list, from the first package of no
+    /// configuration language.
+    pub(crate) fn new(packages: &'a [StringPackage]) -> Self {
+        let shown: Vec<&StringPackage> = packages
+            .iter()
+            .filter(|package| !package.language.is_configuration())
+            .collect();
+        Self {
+            chosen: shown.first().copied(),
+            shown,
+        }
+    }
+
+    /// The text of the string `id`: the chosen package's, else that of the first package of no
+    /// configuration language that holds it, else "" (edk2-stable202608 SetupBrowserDxe
+    /// GetToken shows "!"), as a firmware may leave a string untranslated or out.
+    pub(crate) fn display(&self, id: u16) -> &'a str {
+        let text = self
+            .chosen
+            .into_iter()
+            .chain(self.shown.iter().copied())
+            .find_map(|package| package.strings.get(&id));
+        match text {
+            Some(text) => text,
+            None => {
+                debug!("string id: {id} not found");
+                ""
+            }
+        }
     }
 }
 
@@ -543,4 +607,41 @@ fn data_index(offset: u32) -> Result<usize> {
         .checked_sub(PACKAGE_HEADER_SIZE)
         .context("the offset is inside the package header")?;
     usize::try_from(index).context("failed to convert the offset into usize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A language is a configuration language if it starts with "x-" in either case, and only
+    /// then.
+    #[test]
+    fn configuration_languages_start_with_x_in_either_case() {
+        let cases = [
+            ("x-UEFI-ns", true),
+            ("X-UEFI-ns", true),
+            ("x-", true),
+            ("X-", true),
+            ("en-US", false),
+            ("x", false),
+            ("xx-UEFI", false),
+            ("-x-UEFI", false),
+            ("", false),
+        ];
+        for (language, want) in cases {
+            assert_eq!(
+                package(language).language.is_configuration(),
+                want,
+                "language {language:?}"
+            );
+        }
+    }
+
+    /// A strings package of `language` without strings.
+    fn package(language: &str) -> StringPackage {
+        StringPackage {
+            language: Language(language.as_bytes().to_vec()),
+            strings: BTreeMap::new(),
+        }
+    }
 }

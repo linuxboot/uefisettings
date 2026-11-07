@@ -45,7 +45,10 @@ use super::set::own_write;
 use super::set::NewValue;
 use super::storage::VariableStoreKind;
 use super::*;
-use crate::hii::strings::StringMap;
+pub(crate) use crate::hii::strings::Language;
+pub(crate) use crate::hii::strings::ListTexts;
+pub(crate) use crate::hii::strings::StringMap;
+pub(crate) use crate::hii::strings::StringPackage;
 #[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::variable_key;
 pub(crate) use crate::hii::variables::tests::MemoryVariables;
@@ -325,14 +328,22 @@ pub(super) fn unavailable() -> VarStoreFixture {
     }
 }
 
-pub(super) fn strings() -> Vec<StringMap> {
-    vec![StringMap::from([
+/// A strings package of en-US holding `strings`.
+pub(crate) fn en_us_package(strings: StringMap) -> StringPackage {
+    StringPackage {
+        language: Language(b"en-US".to_vec()),
+        strings,
+    }
+}
+
+pub(super) fn strings() -> Vec<StringPackage> {
+    vec![en_us_package(StringMap::from([
         (3, PROMPT.into()),
         (5, "Disabled".into()),
         (6, "Enabled".into()),
         (7, "AllOnes".into()),
         (PADDED_ENABLED, "Enabled ".into()),
-    ])]
+    ]))]
 }
 
 /// `depth` copies of the op `scope`, each in the scope of the one before, around `body`, with
@@ -861,8 +872,9 @@ pub(super) fn question_descriptor_with(
 ) -> QuestionDescriptor {
     let current = node.borrow();
     let strings = strings();
+    let texts = ListTexts::new(&strings);
     let mut reader = efivars.reader();
-    let walk = &mut FormSetWalk::new(&strings, &mut reader, values, IncludedStates::empty());
+    let walk = &mut FormSetWalk::new(&texts, &mut reader, values, IncludedStates::empty());
     let flags = value_question(&current)
         .expect("a question")
         .header()

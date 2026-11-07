@@ -32,7 +32,7 @@ use thiserror::Error;
 use crate::exports::SetOptions;
 use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
-use crate::hii::strings::StringMap;
+use crate::hii::strings::ListTexts;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::check_volatile_write;
@@ -2219,9 +2219,9 @@ impl QuestionDescriptor {
 // with their states, of the questions in a state that `include` may allow
 // node should be the root of a FormSet
 // conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value
-pub fn list_questions(
+pub(crate) fn list_questions(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &[StringMap],
+    texts: &ListTexts<'_>,
     include: IncludedStates,
     access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
@@ -2229,14 +2229,14 @@ pub fn list_questions(
     let values = VarStoreValues::new(&node, access_level);
     list_questions_in(
         &node,
-        &mut FormSetWalk::new(string_packages, reader, &values, include),
+        &mut FormSetWalk::new(texts, reader, &values, include),
     )
 }
 
 /// What walking the ops of a FormSet takes besides them.
 struct FormSetWalk<'a, V> {
-    /// The string packages of the FormSet's package list
-    string_packages: &'a [StringMap],
+    /// The texts of the FormSet's package list, which no expression reads
+    texts: &'a ListTexts<'a>,
     default_stores: FormSetDefaultStores,
     inputs: ExpressionInputs<'a, V>,
     include: IncludedStates,
@@ -2244,13 +2244,13 @@ struct FormSetWalk<'a, V> {
 
 impl<'a, V> FormSetWalk<'a, V> {
     fn new(
-        string_packages: &'a [StringMap],
+        texts: &'a ListTexts<'a>,
         reader: &'a mut EfivarReader,
         values: &'a V,
         include: IncludedStates,
     ) -> Self {
         Self {
-            string_packages,
+            texts,
             default_stores: FormSetDefaultStores::default(),
             inputs: ExpressionInputs { reader, values },
             include,
@@ -2290,14 +2290,14 @@ fn listed_question(
     Some((descriptor, state))
 }
 
-/// find_question accepts the root node, string_packages and possible_question_phrases.
+/// find_question accepts the root node, texts and possible_question_phrases.
 /// possible_question_phrases is a vector of strings which represent variations of the
 /// same question. So if a single phrase matches then we assume that we have the answer.
 /// Of the matching questions, it selects one as select does, with conditions reading
 /// `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value.
-pub fn find_question<T>(
+pub(crate) fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
-    string_packages: &[StringMap],
+    texts: &ListTexts<'_>,
     possible_question_phrases: &BTreeSet<T>,
     include: IncludedStates,
     access_level: Option<AccessLevel>,
@@ -2310,7 +2310,7 @@ where
     find_question_in(
         &node,
         possible_question_phrases,
-        &mut FormSetWalk::new(string_packages, reader, &values, include),
+        &mut FormSetWalk::new(texts, reader, &values, include),
     )
 }
 
@@ -2323,7 +2323,7 @@ fn find_question_in<T>(
 where
     T: AsRef<str>,
 {
-    let questions = questions_named(node, walk.string_packages, possible_question_phrases);
+    let questions = questions_named(node, walk.texts, possible_question_phrases);
     let ops: Vec<std::cell::Ref<IFROperation>> =
         questions.iter().map(|question| question.borrow()).collect();
     let matches = questions
@@ -2519,7 +2519,12 @@ mod choice_for_set_tests {
         let selection = find_question_in(
             root,
             &BTreeSet::from([PROMPT]),
-            &mut FormSetWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
+            &mut FormSetWalk::new(
+                &ListTexts::new(&strings()),
+                &mut reader,
+                &values,
+                IncludedStates::empty(),
+            ),
         );
         choice_for_set(
             selection,
@@ -3217,10 +3222,10 @@ mod choice_for_set_tests {
 // TODO: show the default of an unreadable OneOf, Numeric or CheckBox, as list_questions does.
 // TODO: show the state that the conditions give each question and option, as list-questions
 // does.
-pub fn display(
+pub(crate) fn display(
     node: Rc<RefCell<IFROperation>>,
     level: usize,
-    string_packages: &[StringMap],
+    texts: &ListTexts<'_>,
     reader: &mut EfivarReader,
 ) -> Result<String> {
     let mut result = String::new();
@@ -3230,7 +3235,7 @@ pub fn display(
         values: &values,
     };
     walk_scopes(std::slice::from_ref(&node), level, |node, &level| {
-        display_op(node, level, string_packages, &mut inputs, &mut result)
+        display_op(node, level, texts, &mut inputs, &mut result)
     });
     Ok(result)
 }
@@ -3240,7 +3245,7 @@ pub fn display(
 fn display_op(
     node: &Rc<RefCell<IFROperation>>,
     level: usize,
-    string_packages: &[StringMap],
+    texts: &ListTexts<'_>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
     result: &mut String,
 ) -> Walk<usize> {
@@ -3265,7 +3270,7 @@ fn display_op(
             format!(
                 "{extra_spaces}OpCode: {:?} - S: {}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.prompt_string_id, string_packages),
+                texts.display(parsed.prompt_string_id),
             )
             .as_str(),
         ),
@@ -3273,7 +3278,7 @@ fn display_op(
             format!(
                 "{extra_spaces}OpCode: {:?} - {} - GUID {}{}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.title_string_id, string_packages),
+                texts.display(parsed.title_string_id),
                 parsed.guid,
                 parsed
                     .class_guids
@@ -3302,7 +3307,7 @@ fn display_op(
             format!(
                 "{extra_spaces}OpCode: {:?} - S: {}\n{extra_spaces}-ValueType:{}\n{extra_spaces}-Value:{:?}\n",
                 current_node.op_code,
-                find_corresponding_string(parsed.option_string_id, string_packages),
+                texts.display(parsed.option_string_id),
                 parsed.value_type,
                 parsed.value
             )
@@ -3318,14 +3323,8 @@ fn display_op(
                 format!(
                     "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
                     current_node.op_code,
-                    find_corresponding_string(
-                        parsed.question_header().prompt_string_id,
-                        string_packages
-                    ),
-                    find_corresponding_string(
-                        parsed.question_header().help_string_id,
-                        string_packages
-                    ),
+                    texts.display(parsed.question_header().prompt_string_id),
+                    texts.display(parsed.question_header().help_string_id),
                     parsed.data
                 )
                 .as_str(),
@@ -3340,14 +3339,8 @@ fn display_op(
                 format!(
                     "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
                     current_node.op_code,
-                    find_corresponding_string(
-                        parsed.question_header().prompt_string_id,
-                        string_packages
-                    ),
-                    find_corresponding_string(
-                        parsed.question_header().help_string_id,
-                        string_packages
-                    ),
+                    texts.display(parsed.question_header().prompt_string_id),
+                    texts.display(parsed.question_header().help_string_id),
                     parsed.data
                 )
                 .as_str(),
@@ -3362,14 +3355,8 @@ fn display_op(
                 format!(
                     "{extra_spaces}OpCode: {:?} - Q: - {} - Help: - {}\n{extra_spaces}-Answer: {answer_disp}\n",
                     current_node.op_code,
-                    find_corresponding_string(
-                        parsed.question_header().prompt_string_id,
-                        string_packages
-                    ),
-                    find_corresponding_string(
-                        parsed.question_header().help_string_id,
-                        string_packages
-                    ),
+                    texts.display(parsed.question_header().prompt_string_id),
+                    texts.display(parsed.question_header().help_string_id),
                 )
                 .as_str(),
             );
@@ -3395,26 +3382,6 @@ fn display_answer(
         Err(reason) => reason.to_answer(),
         Ok(retrieved) => format!("{}{}", retrieved.value, retrieved.source.annotation()),
     }
-}
-
-fn find_corresponding_string(string_id: u16, string_packages: &[StringMap]) -> &str {
-    // TODO: accept language pack parameter later
-    // it defaults to the first language pack it can find and the first one is en-US
-
-    for package in string_packages {
-        if let Some(s) = package.get(&string_id) {
-            return s;
-        }
-    }
-
-    // in lots of language packs most strings are simply not present
-    // in some cases strings aren't there at all in any language
-
-    // cannot return an error here because its the firmware not following the spec
-
-    debug!("string id: {string_id} not found");
-
-    ""
 }
 
 /// find_corresponding_varstore bubble's up from current node till we find a FormSet.
@@ -3576,7 +3543,7 @@ mod tests {
 
             let listed = list_questions(
                 root,
-                &[],
+                &ListTexts::new(&[]),
                 IncludedStates::empty(),
                 None,
                 &mut Efivars::new().reader(),
@@ -3601,13 +3568,13 @@ mod tests {
     fn questions_are_found_by_their_listed_name() {
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
         let values = VarStoreValues::new(&root, None);
-        let prompted = |prompt: &str| vec![StringMap::from([(3, prompt.into())])];
+        let prompted = |prompt: &str| vec![en_us_package(StringMap::from([(3, prompt.into())]))];
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
                 &root,
                 &BTreeSet::from([phrase]),
                 &mut FormSetWalk::new(
-                    &prompted(prompt),
+                    &ListTexts::new(&prompted(prompt)),
                     &mut Efivars::new().reader(),
                     &values,
                     IncludedStates::empty(),
@@ -3617,7 +3584,7 @@ mod tests {
         };
         let listed = list_questions(
             Rc::clone(&root),
-            &prompted("  Prompt "),
+            &ListTexts::new(&prompted("  Prompt ")),
             IncludedStates::empty(),
             None,
             &mut Efivars::new().reader(),
@@ -4150,7 +4117,8 @@ mod tests {
     fn display_shows_only_the_root_as_root() {
         let root = parse_form_set(&[form(1, &[operation(DUMMY_OPCODE, false, &[])])]);
 
-        let shown = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+        let shown =
+            display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader()).expect("display");
 
         let roots: Vec<&str> = shown
             .lines()
@@ -4165,7 +4133,8 @@ mod tests {
         let skipped_scope = [operation(0x70, true, &[]), checkbox_op(2, 1), END.to_vec()].concat();
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0), skipped_scope])]);
 
-        let shown = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+        let shown =
+            display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader()).expect("display");
 
         let check_boxes = shown
             .lines()
@@ -4293,7 +4262,8 @@ mod tests {
             let root = handle_form_set(&mut Cursor::new(&data))
                 .unwrap_or_else(|error| panic!("parse Flags {flags:#04x}: {error:#}"));
 
-            let display = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+            let display = display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader())
+                .expect("display");
 
             let line = display
                 .lines()
@@ -4343,7 +4313,7 @@ mod tests {
 
             let listed = list_questions(
                 root,
-                &strings(),
+                &ListTexts::new(&strings()),
                 IncludedStates::empty(),
                 None,
                 &mut disabled_reader(),
@@ -4389,7 +4359,8 @@ mod tests {
             &[conditional(SUPPRESS_IF, condition, &[checkbox_op(1, 0)])],
         )]);
 
-        let display = display(root, 0, &strings(), &mut disabled_reader()).expect("display");
+        let display =
+            display(root, 0, &ListTexts::new(&strings()), &mut disabled_reader()).expect("display");
 
         let ops: Vec<&str> = display
             .lines()
@@ -4430,12 +4401,12 @@ mod nesting_tests {
     const DISPLAY_DEEP: usize = 2_000;
 
     /// The strings of deep_form_set.
-    fn deep_strings() -> Vec<StringMap> {
-        vec![StringMap::from([
+    fn deep_strings() -> Vec<StringPackage> {
+        vec![en_us_package(StringMap::from([
             (3, "Deep".into()),
             (4, "Help".into()),
             (5, "Hidden".into()),
-        ])]
+        ]))]
     }
 
     /// `op` opening a scope that holds `body`, with its End.
@@ -4593,7 +4564,7 @@ mod nesting_tests {
             ] {
                 let listed = list_questions(
                     parse_deep(DEEP, DEEP, false),
-                    &deep_strings(),
+                    &ListTexts::new(&deep_strings()),
                     include,
                     None,
                     &mut disabled_reader(),
@@ -4610,7 +4581,7 @@ mod nesting_tests {
             for (name, want) in [("Deep", true), ("Hidden", false)] {
                 let selection = find_question(
                     parse_deep(DEEP, DEEP, false),
-                    &deep_strings(),
+                    &ListTexts::new(&deep_strings()),
                     &BTreeSet::from([name]),
                     IncludedStates::GRAYED_OUT,
                     None,
@@ -4710,7 +4681,13 @@ mod nesting_tests {
 
         on_small_stack("display", || {
             let root = parse_deep(DISPLAY_DEEP, 1, false);
-            let shown = display(root, 0, &deep_strings(), &mut disabled_reader()).expect("display");
+            let shown = display(
+                root,
+                0,
+                &ListTexts::new(&deep_strings()),
+                &mut disabled_reader(),
+            )
+            .expect("display");
             // the root, the FormSet, the Form, then the Subtitles
             let want = format!(
                 "{}OpCode: CheckBox - Q: - Deep - Help: - Help",

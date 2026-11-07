@@ -31,7 +31,6 @@ use super::defaults::option_value;
 use super::defaults::push_default;
 use super::defaults::question_defaults;
 use super::defaults::question_scope;
-use super::find_corresponding_string;
 use super::find_corresponding_varstore;
 use super::numeric_format;
 use super::storage::RetrievedValue;
@@ -55,7 +54,7 @@ use super::QuestionHeader;
 use super::Range;
 use super::RangeType;
 use super::Walk;
-use crate::hii::strings::StringMap;
+use crate::hii::strings::ListTexts;
 
 /// A question whose value get reads and set writes.
 #[derive(Clone, Copy)]
@@ -115,7 +114,7 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
 /// prompt is one of `phrases`, ignoring ASCII case and surrounding whitespace.
 pub(super) fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
-    string_packages: &[StringMap],
+    texts: &ListTexts<'_>,
     phrases: &BTreeSet<T>,
 ) -> Vec<Rc<RefCell<IFROperation>>>
 where
@@ -127,7 +126,7 @@ where
         if skips_scope(&op) {
             return Walk::Skip;
         }
-        let prompt = prompt(&op, string_packages).trim();
+        let prompt = prompt(&op, texts).trim();
         // Only Numeric, OneOf and CheckBox are questions.
         if value_question(&op).is_some()
             && phrases
@@ -142,9 +141,9 @@ where
 }
 
 /// Returns the prompt of a ONE_OF, NUMERIC or CHECKBOX, empty for other ops.
-fn prompt<'a>(op: &IFROperation, string_packages: &'a [StringMap]) -> &'a str {
+fn prompt<'a>(op: &IFROperation, texts: &ListTexts<'a>) -> &'a str {
     value_question(op).map_or("", |question| {
-        find_corresponding_string(question.header().prompt_string_id, string_packages)
+        texts.display(question.header().prompt_string_id)
     })
 }
 
@@ -155,7 +154,7 @@ pub(super) fn describe_question(
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let header = value_question.header();
-    let prompt = find_corresponding_string(header.prompt_string_id, walk.string_packages);
+    let prompt = walk.texts.display(header.prompt_string_id);
     let flags = header.flags() | class_question_flags(&question.borrow());
     let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
     match value_question {
@@ -221,7 +220,7 @@ pub(super) fn handle_checkbox(
     let defaults = question_defaults(
         current_node,
         stores,
-        walk.string_packages,
+        walk.texts,
         &mut walk.inputs,
         |v, _| Ok(checkbox_text(v)),
     );
@@ -231,11 +230,10 @@ pub(super) fn handle_checkbox(
     let res = QuestionDescriptor {
         question: question.to_string(),
         value: answer,
-        help: find_corresponding_string(
-            parsed.question_header().help_string_id,
-            walk.string_packages,
-        )
-        .to_string(),
+        help: walk
+            .texts
+            .display(parsed.question_header().help_string_id)
+            .to_string(),
         possible_options: Vec::new(),
         varstore,
         location: parsed.location,
@@ -276,11 +274,11 @@ pub(super) fn handle_oneof(
     let defaults = question_defaults(
         current_node,
         stores,
-        walk.string_packages,
+        walk.texts,
         &mut walk.inputs,
         |v, inputs| {
             let format = format.clone()?;
-            option_text(current_node, format.cut(v), walk.string_packages, inputs)
+            option_text(current_node, format.cut(v), walk.texts, inputs)
                 .map(|option| one_of_text(v, format, option.as_deref()))
         },
     );
@@ -299,8 +297,7 @@ pub(super) fn handle_oneof(
             possible_options.push(AnswerOption {
                 raw_value,
                 source: ValueSource::since(taken, walk.inputs.reader),
-                value: find_corresponding_string(o.option_string_id, walk.string_packages)
-                    .to_string(),
+                value: walk.texts.display(o.option_string_id).to_string(),
                 state: option_state(&op, &mut walk.inputs),
             });
         }
@@ -329,11 +326,10 @@ pub(super) fn handle_oneof(
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
         value: answer,
-        help: find_corresponding_string(
-            parsed.question_header().help_string_id,
-            walk.string_packages,
-        )
-        .to_string(),
+        help: walk
+            .texts
+            .display(parsed.question_header().help_string_id)
+            .to_string(),
         possible_options,
         varstore,
         location: parsed.location,
@@ -417,7 +413,7 @@ pub(super) fn handle_numeric(
     let defaults = question_defaults(
         current_node,
         stores,
-        walk.string_packages,
+        walk.texts,
         &mut walk.inputs,
         |v, _| {
             Ok(numeric_format(parsed.location, parsed.flags, &parsed.data)?
@@ -431,11 +427,10 @@ pub(super) fn handle_numeric(
     let res = QuestionDescriptor {
         question: question.to_string(),
         value: answer,
-        help: find_corresponding_string(
-            parsed.question_header().help_string_id,
-            walk.string_packages,
-        )
-        .to_string(),
+        help: walk
+            .texts
+            .display(parsed.question_header().help_string_id)
+            .to_string(),
         possible_options: Vec::new(),
         varstore,
         location: parsed.location,
