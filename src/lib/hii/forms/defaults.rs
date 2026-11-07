@@ -28,6 +28,7 @@ use super::conditions::ExpressionInputs;
 use super::conditions::QuestionValues;
 use super::conditions::Truth;
 use super::find_corresponding_string;
+use super::is_bit_varstore_guid;
 use super::walk_scopes;
 use super::IFRDefault;
 use super::IFROpCode;
@@ -130,110 +131,127 @@ enum NestedScope {
 impl NestedScope {
     /// Classifies an op as edk2-stable202608 SetupBrowserDxe/IfrParse.c attaches the ops in its
     /// scope.
-    fn of(op_code: IFROpCode) -> Self {
-        match op_code {
-            IFROpCode::Default
-            | IFROpCode::Subtitle
-            | IFROpCode::Text
-            | IFROpCode::ResetButton
-            | IFROpCode::Ref
-            | IFROpCode::Action
-            | IFROpCode::Numeric
-            | IFROpCode::OrderedList
-            | IFROpCode::CheckBox
-            | IFROpCode::String
-            | IFROpCode::Password
-            | IFROpCode::Date
-            | IFROpCode::Time
-            | IFROpCode::Guid
-            | IFROpCode::OneOf => Self::Own,
-            IFROpCode::Form
-            | IFROpCode::Image
-            | IFROpCode::OneOfOption
-            | IFROpCode::SuppressIf
-            | IFROpCode::Locked
-            | IFROpCode::FormSet
-            | IFROpCode::NoSubmitIf
-            | IFROpCode::InconsistentIf
-            | IFROpCode::EqIdVal
-            | IFROpCode::EqIdId
-            | IFROpCode::EqIdValList
-            | IFROpCode::And
-            | IFROpCode::Or
-            | IFROpCode::Not
-            | IFROpCode::Rule
-            | IFROpCode::GrayOutIf
-            | IFROpCode::Refresh
-            | IFROpCode::DisableIf
-            | IFROpCode::Animation
-            | IFROpCode::ToLower
-            | IFROpCode::ToUpper
-            | IFROpCode::Map
-            | IFROpCode::VarStore
-            | IFROpCode::VarStoreNameValue
-            | IFROpCode::VarStoreEfi
-            | IFROpCode::VarStoreDevice
-            | IFROpCode::Version
-            | IFROpCode::End
-            | IFROpCode::Match
-            | IFROpCode::Get
-            | IFROpCode::Set
-            | IFROpCode::Read
-            | IFROpCode::Write
-            | IFROpCode::Equal
-            | IFROpCode::NotEqual
-            | IFROpCode::GreaterThan
-            | IFROpCode::GreaterEqual
-            | IFROpCode::LessThan
-            | IFROpCode::LessEqual
-            | IFROpCode::BitwiseAnd
-            | IFROpCode::BitwiseOr
-            | IFROpCode::BitwiseNot
-            | IFROpCode::ShiftLeft
-            | IFROpCode::ShiftRight
-            | IFROpCode::Add
-            | IFROpCode::Subtract
-            | IFROpCode::Multiply
-            | IFROpCode::Divide
-            | IFROpCode::Modulo
-            | IFROpCode::RuleRef
-            | IFROpCode::QuestionRef1
-            | IFROpCode::QuestionRef2
-            | IFROpCode::Uint8
-            | IFROpCode::Uint16
-            | IFROpCode::Uint32
-            | IFROpCode::Uint64
-            | IFROpCode::True
-            | IFROpCode::False
-            | IFROpCode::ToUint
-            | IFROpCode::ToString
-            | IFROpCode::ToBoolean
-            | IFROpCode::Mid
-            | IFROpCode::Find
-            | IFROpCode::Token
-            | IFROpCode::StringRef1
-            | IFROpCode::StringRef2
-            | IFROpCode::Conditional
-            | IFROpCode::QuestionRef3
-            | IFROpCode::Zero
-            | IFROpCode::One
-            | IFROpCode::Ones
-            | IFROpCode::Undefined
-            | IFROpCode::Length
-            | IFROpCode::Dup
-            | IFROpCode::This
-            | IFROpCode::Span
-            | IFROpCode::Value
-            | IFROpCode::DefaultStore
-            | IFROpCode::FormMap
-            | IFROpCode::Catenate
-            | IFROpCode::Security
-            | IFROpCode::ModalTag
-            | IFROpCode::RefreshId
-            | IFROpCode::WarningIf
-            | IFROpCode::Match2
-            | IFROpCode::Unknown(_) => Self::Question,
+    fn of(op: &IFROperation) -> Self {
+        match (op.op_code, is_parent_statement(op)) {
+            (IFROpCode::Default, _) | (_, true) => Self::Own,
+            (_, false) => Self::Question,
         }
+    }
+}
+
+/// Whether the ops in the scope of `op` are its own: edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes makes a statement with a scope their ParentStatement,
+/// but clears the Scope of the GUID op of an EDKII bit varstore field, so that the ops in it stay
+/// the enclosing statement's.
+pub(super) fn is_parent_statement(op: &IFROperation) -> bool {
+    is_statement(op.op_code) && !is_bit_varstore_guid(op)
+}
+
+/// Whether `op_code` is a statement's, as edk2-stable202608 SetupBrowserDxe/IfrParse.c
+/// IsStatementOpCode tells.
+fn is_statement(op_code: IFROpCode) -> bool {
+    match op_code {
+        IFROpCode::Subtitle
+        | IFROpCode::Text
+        | IFROpCode::ResetButton
+        | IFROpCode::Ref
+        | IFROpCode::Action
+        | IFROpCode::Numeric
+        | IFROpCode::OrderedList
+        | IFROpCode::CheckBox
+        | IFROpCode::String
+        | IFROpCode::Password
+        | IFROpCode::Date
+        | IFROpCode::Time
+        | IFROpCode::Guid
+        | IFROpCode::OneOf => true,
+        IFROpCode::Default
+        | IFROpCode::Form
+        | IFROpCode::Image
+        | IFROpCode::OneOfOption
+        | IFROpCode::SuppressIf
+        | IFROpCode::Locked
+        | IFROpCode::FormSet
+        | IFROpCode::NoSubmitIf
+        | IFROpCode::InconsistentIf
+        | IFROpCode::EqIdVal
+        | IFROpCode::EqIdId
+        | IFROpCode::EqIdValList
+        | IFROpCode::And
+        | IFROpCode::Or
+        | IFROpCode::Not
+        | IFROpCode::Rule
+        | IFROpCode::GrayOutIf
+        | IFROpCode::Refresh
+        | IFROpCode::DisableIf
+        | IFROpCode::Animation
+        | IFROpCode::ToLower
+        | IFROpCode::ToUpper
+        | IFROpCode::Map
+        | IFROpCode::VarStore
+        | IFROpCode::VarStoreNameValue
+        | IFROpCode::VarStoreEfi
+        | IFROpCode::VarStoreDevice
+        | IFROpCode::Version
+        | IFROpCode::End
+        | IFROpCode::Match
+        | IFROpCode::Get
+        | IFROpCode::Set
+        | IFROpCode::Read
+        | IFROpCode::Write
+        | IFROpCode::Equal
+        | IFROpCode::NotEqual
+        | IFROpCode::GreaterThan
+        | IFROpCode::GreaterEqual
+        | IFROpCode::LessThan
+        | IFROpCode::LessEqual
+        | IFROpCode::BitwiseAnd
+        | IFROpCode::BitwiseOr
+        | IFROpCode::BitwiseNot
+        | IFROpCode::ShiftLeft
+        | IFROpCode::ShiftRight
+        | IFROpCode::Add
+        | IFROpCode::Subtract
+        | IFROpCode::Multiply
+        | IFROpCode::Divide
+        | IFROpCode::Modulo
+        | IFROpCode::RuleRef
+        | IFROpCode::QuestionRef1
+        | IFROpCode::QuestionRef2
+        | IFROpCode::Uint8
+        | IFROpCode::Uint16
+        | IFROpCode::Uint32
+        | IFROpCode::Uint64
+        | IFROpCode::True
+        | IFROpCode::False
+        | IFROpCode::ToUint
+        | IFROpCode::ToString
+        | IFROpCode::ToBoolean
+        | IFROpCode::Mid
+        | IFROpCode::Find
+        | IFROpCode::Token
+        | IFROpCode::StringRef1
+        | IFROpCode::StringRef2
+        | IFROpCode::Conditional
+        | IFROpCode::QuestionRef3
+        | IFROpCode::Zero
+        | IFROpCode::One
+        | IFROpCode::Ones
+        | IFROpCode::Undefined
+        | IFROpCode::Length
+        | IFROpCode::Dup
+        | IFROpCode::This
+        | IFROpCode::Span
+        | IFROpCode::Value
+        | IFROpCode::DefaultStore
+        | IFROpCode::FormMap
+        | IFROpCode::Catenate
+        | IFROpCode::Security
+        | IFROpCode::ModalTag
+        | IFROpCode::RefreshId
+        | IFROpCode::WarningIf
+        | IFROpCode::Match2
+        | IFROpCode::Unknown(_) => false,
     }
 }
 
@@ -248,7 +266,7 @@ pub(super) fn question_scope(question: &IFROperation) -> Vec<Rc<RefCell<IFROpera
             return Walk::Skip;
         }
         scope.push(Rc::clone(child));
-        match NestedScope::of(child.borrow().op_code) {
+        match NestedScope::of(&child.borrow()) {
             NestedScope::Own => Walk::Skip,
             NestedScope::Question => Walk::Enter(()),
         }
@@ -616,6 +634,35 @@ mod tests {
                     CHECKBOX,
                     &checkbox(0, flags),
                     &children,
+                    unavailable()
+                ),
+                format!("{UNAVAILABLE}{suffix}"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A DEFAULT in an EDKII bit-varstore GUID in the question's scope is the question's, as
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes, which clears that GUID's Scope,
+    /// attaches it; one in another GUID statement is that statement's.
+    #[test]
+    fn default_in_a_bit_varstore_guid_in_scope_is_the_questions() {
+        for (name, guid, suffix) in [
+            ("bit-varstore GUID", BIT_VARSTORE_GUID, " <IFR default: 5>"),
+            ("other GUID", OTHER_GUID, ""),
+        ] {
+            let in_guid = [
+                operation(GUID, true, &guid),
+                ifr_default(0, 5),
+                END.to_vec(),
+            ]
+            .concat();
+            assert_eq!(
+                answer(
+                    &[],
+                    NUMERIC,
+                    &uint8_numeric(0x10, 0, 255),
+                    &[in_guid],
                     unavailable()
                 ),
                 format!("{UNAVAILABLE}{suffix}"),

@@ -26,6 +26,7 @@ use thiserror::Error;
 
 use super::ami_access_level::AMI_ACCESS_LEVEL;
 use super::declared_var_store;
+use super::defaults::is_parent_statement;
 use super::find_corresponding_varstore;
 use super::question_values::value_question;
 use super::question_values::ValueQuestion;
@@ -480,16 +481,19 @@ impl<T> Selection<T> {
 }
 
 /// Returns the states that the SUPPRESS_IF, GRAY_OUT_IF and DISABLE_IF scopes around
-/// `question` can give it: those of its form and FormSet too.
-// TODO: gray out a question in an EFI_IFR_LOCKED scope, as edk2-stable202608
-// SetupBrowserDxe/Presentation.c InitializeDisplayStatement does. Its FormDisplay.c
-// UiAddMenuOption grays out EFI_IFR_FLAG_READ_ONLY ones too where PcdBrowerGrayOutReadOnlyMenu
-// is set, a build setting that the OS cannot read.
+/// `question` can give it, those of its form and FormSet too, and GrayedOut if an EFI_IFR_LOCKED
+/// locks it.
+// edk2-stable202608 DisplayEngineDxe/FormDisplay.c UiAddMenuOption grays out
+// EFI_IFR_FLAG_READ_ONLY ones too where PcdBrowerGrayOutReadOnlyMenu is set, a build setting that
+// the OS cannot read.
 pub(crate) fn question_state(
     question: &IFROperation,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> StateEvaluation {
     let mut evaluation = StateEvaluation::selectable();
+    if locked(question) {
+        evaluation.add(QuestionState::GrayedOut, Truth::Known(true));
+    }
     let mut scope = question.parent.as_ref().and_then(Weak::upgrade);
     while let Some(op) = scope {
         let op = op.borrow();
@@ -499,6 +503,35 @@ pub(crate) fn question_state(
         scope = op.parent.as_ref().and_then(Weak::upgrade);
     }
     evaluation
+}
+
+/// Whether an EFI_IFR_LOCKED locks `question`, which edk2-stable202608 SetupBrowserDxe grays out
+/// (Presentation.c InitializeDisplayStatement, and for a locked form, DisplayEngineDxe/
+/// FormDisplay.c UiAddMenuOption). UEFI 2.11 §33.3.8.3.37 addresses LOCKED to Forms Editors,
+/// which change forms, not values; this follows edk2: IfrParse.c ParseOpCodes locks the FORM or
+/// FORM_MAP that holds a LOCKED right in its scope, with every statement in it, else the
+/// innermost statement around it whose scope holds its ops (is_parent_statement), so not a
+/// question around that statement, and skips the ops in the scope of an unknown op.
+fn locked(question: &IFROperation) -> bool {
+    let mut locked = false;
+    walk_scopes(&question.children, (), |op, ()| {
+        let op = op.borrow();
+        match (op.op_code, skips_scope(&op) || is_parent_statement(&op)) {
+            (IFROpCode::Locked, _) => {
+                locked = true;
+                Walk::Skip
+            }
+            (_, true) => Walk::Skip,
+            (_, false) => Walk::Enter(()),
+        }
+    });
+    locked
+        || enclosing_form(question).is_some_and(|form| {
+            form.borrow()
+                .children
+                .iter()
+                .any(|child| child.borrow().op_code == IFROpCode::Locked)
+        })
 }
 
 /// Returns the states that the SUPPRESS_IF scopes between `option` and its ONE_OF or
@@ -3042,6 +3075,155 @@ mod tests {
         StateEvaluation {
             known: state,
             unknown: Vec::new(),
+        }
+    }
+
+    /// The data of the CHECKBOX that locked_question_state finds.
+    fn locked_question_data() -> Vec<u8> {
+        [question_header_of(9, 0), vec![0x00]].concat()
+    }
+
+    /// A CHECKBOX with locked_question_data, holding `children` in its scope.
+    fn locked_question(children: &[Vec<u8>]) -> Vec<u8> {
+        [
+            operation(CHECKBOX, true, &locked_question_data()),
+            children.concat(),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// The state that question_state gives the CHECKBOX of locked_question in a FormSet holding
+    /// `body`.
+    fn locked_question_state(body: &[Vec<u8>]) -> StateEvaluation {
+        let root = parse_form_set(body);
+        let question = find_op(&root, &locked_question_data()).expect("find the CHECKBOX");
+        let question = question.borrow();
+        question_state(
+            &question,
+            &mut ExpressionInputs {
+                reader: &mut Efivars::new().reader(),
+                values: &values(),
+            },
+        )
+    }
+
+    /// An EFI_IFR_LOCKED grays out the question in whose scope it is, also inside an op that is
+    /// no statement or inside an EDKII bit-varstore GUID, whose Scope edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c ParseOpCodes clears, but not inside another nested statement
+    /// or an op that ParseOpCodes skips, and every question of a FORM or FORM_MAP
+    /// that holds it right in its scope, as SetupBrowserDxe/Presentation.c grays them out; a
+    /// question in the scope of a locked statement stays selectable (IfrParse.c ParseOpCodes locks
+    /// only the innermost statement around a LOCKED).
+    #[test]
+    fn locked_scope_grays_out_the_question_as_edk2_does() {
+        let in_scope = |op_code: u8, data: &[u8]| {
+            [operation(op_code, true, data), locked_op(), END.to_vec()].concat()
+        };
+        let form_map = |body: &[Vec<u8>]| {
+            // FormId 2, one method: MethodTitle 1, MethodIdentifier
+            let data = [&[0x02, 0x00, 0x01, 0x00][..], &[0x33; 16]].concat();
+            [
+                operation(FORM_MAP, true, &data),
+                body.concat(),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let suppressed_lock = || conditional(SUPPRESS_IF, ifr_false(), &[locked_op()]);
+        let cases: [(&str, Vec<Vec<u8>>, QuestionState); 13] = [
+            (
+                "no LOCKED",
+                vec![form(1, &[locked_question(&[])])],
+                QuestionState::Selectable,
+            ),
+            (
+                "LOCKED in its scope",
+                vec![form(1, &[locked_question(&[locked_op()])])],
+                QuestionState::GrayedOut,
+            ),
+            (
+                "LOCKED in a SUPPRESS_IF in its scope",
+                vec![form(1, &[locked_question(&[suppressed_lock()])])],
+                QuestionState::GrayedOut,
+            ),
+            (
+                "LOCKED in a DEFAULT in its scope",
+                vec![form(
+                    1,
+                    &[locked_question(&[in_scope(
+                        DEFAULT,
+                        &[0x00, 0x00, 0x00, 0x01],
+                    )])],
+                )],
+                QuestionState::GrayedOut,
+            ),
+            (
+                "LOCKED in a GUID statement in its scope",
+                vec![form(1, &[locked_question(&[in_scope(GUID, &[0x77; 16])])])],
+                QuestionState::Selectable,
+            ),
+            (
+                "LOCKED in an EDKII bit-varstore GUID in its scope",
+                vec![form(
+                    1,
+                    &[locked_question(&[in_scope(GUID, &BIT_VARSTORE_GUID)])],
+                )],
+                QuestionState::GrayedOut,
+            ),
+            (
+                "LOCKED in an unknown op in its scope",
+                vec![form(1, &[locked_question(&[in_scope(0x70, &[])])])],
+                QuestionState::Selectable,
+            ),
+            (
+                "in a SUBTITLE holding LOCKED",
+                vec![form(
+                    1,
+                    &[[
+                        subtitle_scope(2),
+                        locked_op(),
+                        locked_question(&[]),
+                        END.to_vec(),
+                    ]
+                    .concat()],
+                )],
+                QuestionState::Selectable,
+            ),
+            (
+                "in a FORM holding LOCKED",
+                vec![form(1, &[locked_op(), locked_question(&[])])],
+                QuestionState::GrayedOut,
+            ),
+            (
+                "before a LOCKED in its FORM",
+                vec![form(1, &[locked_question(&[]), locked_op()])],
+                QuestionState::GrayedOut,
+            ),
+            (
+                "in a SUBTITLE of a FORM holding LOCKED",
+                vec![form(
+                    1,
+                    &[
+                        locked_op(),
+                        [subtitle_scope(2), locked_question(&[]), END.to_vec()].concat(),
+                    ],
+                )],
+                QuestionState::GrayedOut,
+            ),
+            (
+                "in a FORM whose SUPPRESS_IF holds LOCKED",
+                vec![form(1, &[suppressed_lock(), locked_question(&[])])],
+                QuestionState::Selectable,
+            ),
+            (
+                "in a FORM_MAP holding LOCKED",
+                vec![form_map(&[locked_op(), locked_question(&[])])],
+                QuestionState::GrayedOut,
+            ),
+        ];
+        for (name, body, want) in cases {
+            assert_eq!(locked_question_state(&body), known(want), "{name}");
         }
     }
 

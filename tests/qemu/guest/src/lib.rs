@@ -148,8 +148,11 @@ pub mod driver_sample {
     /// library does not evaluate.
     pub const MATCH2_REASON: &str = "EFI_IFR_STRING_REF1 not evaluated";
     /// The flag that makes `get` and `set` select questions that a GRAY_OUT_IF may gray out
-    /// too, such as [`MATCH2`].
+    /// too, such as [`MATCH2`], and those that an EFI_IFR_LOCKED grays out, such as [`LOCKED`].
     pub const INCLUDE_GRAYED_OUT: [&str; 2] = ["--include", "grayed-out"];
+    /// A numeric question on DriverSample's name/value store whose scope holds an
+    /// EFI_IFR_LOCKED (`locked` in Vfr.vfr, edk2-stable202608), which grays it out.
+    pub const LOCKED: &str = "NameValueVar0";
 }
 
 /// How a `uefisettings` run exited, and what it printed.

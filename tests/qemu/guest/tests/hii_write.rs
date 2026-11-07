@@ -23,6 +23,7 @@ use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_SUPPRESSED;
+use uefisettings_qemu_guest::driver_sample::LOCKED;
 use uefisettings_qemu_guest::driver_sample::MATCH2;
 use uefisettings_qemu_guest::driver_sample::MATCH2_OFFSET;
 use uefisettings_qemu_guest::driver_sample::MATCH2_REASON;
@@ -264,18 +265,34 @@ fn set_of_an_unknown_question_is_refused() {
 #[test]
 fn set_of_a_question_without_a_varstore_is_refused() {
     let cases = [(
-        "NameValueVar0",
+        LOCKED,
         "1",
+        &INCLUDE_GRAYED_OUT[..],
         "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
     )];
-    for (question, answer, reason) in cases {
+    for (question, answer, flags, reason) in cases {
         for prefix in PREFIXES {
             assert_eq!(
-                refuse(prefix, question, answer, &[]).error_message,
+                refuse(prefix, question, answer, flags).error_message,
                 format!("cannot set question {question:?}: {reason}"),
                 "{prefix:?} {question}"
             );
         }
+    }
+}
+
+/// set refuses DriverSample's question in a LOCKED scope as grayed out, before it looks at its
+/// name/value store, and writes nothing.
+#[test]
+fn set_of_a_question_in_a_locked_scope_is_refused() {
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse(prefix, LOCKED, "1", &[]).error_message,
+            format!(
+                "question {LOCKED:?} is grayed-out; also include grayed-out questions to select it"
+            ),
+            "{prefix:?}"
+        );
     }
 }
 

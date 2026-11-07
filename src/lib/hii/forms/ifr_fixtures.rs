@@ -76,7 +76,7 @@ pub(super) const DISABLE_IF: u8 = 0x1E;
 
 pub(super) const FORM: u8 = 0x01;
 pub(crate) const SUBTITLE: u8 = 0x02;
-const LOCKED: u8 = 0x0B;
+pub(crate) const LOCKED: u8 = 0x0B;
 const ONE_OF_OPTION: u8 = 0x09;
 const FORM_SET: u8 = 0x0E;
 const EQ_ID_VAL: u8 = 0x12;
@@ -89,7 +89,7 @@ const ONES: u8 = 0x54;
 pub(super) const VALUE: u8 = 0x5A;
 pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
-pub(super) const FORM_MAP: u8 = 0x5D;
+pub(crate) const FORM_MAP: u8 = 0x5D;
 
 const VAR_STORE: u8 = 0x24;
 const VAR_STORE_EFI: u8 = 0x26;
@@ -102,7 +102,7 @@ pub(crate) const SYSTEM_ACCESS_GUID: [u8; 16] = [
     0x69, 0xBB, 0x70, 0xE7, 0xB4, 0xBC, 0x04, 0x4D, 0x9E, 0x97, 0x23, 0xFF, 0x94, 0x56, 0xFE, 0xAC,
 ];
 
-pub(super) const GUID: u8 = 0x5F;
+pub(crate) const GUID: u8 = 0x5F;
 
 /// EDKII_IFR_BIT_VARSTORE_GUID 82DDD68B-9163-4187-9B27-20A8FD60A71D as stored.
 pub(super) const BIT_VARSTORE_GUID: [u8; 16] = [
@@ -345,6 +345,11 @@ pub(crate) fn subtitle_scope(prompt: u16) -> Vec<u8> {
 /// A LOCKED op opening a scope.
 pub(super) fn locked_scope() -> Vec<u8> {
     operation(LOCKED, true, &[])
+}
+
+/// A LOCKED op.
+pub(crate) fn locked_op() -> Vec<u8> {
+    operation(LOCKED, false, &[])
 }
 
 pub(crate) fn operation(op_code: u8, open_scope: bool, data: &[u8]) -> Vec<u8> {

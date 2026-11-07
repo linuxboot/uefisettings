@@ -23,6 +23,7 @@ use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_SUPPRESSED;
+use uefisettings_qemu_guest::driver_sample::LOCKED;
 use uefisettings_qemu_guest::driver_sample::MATCH2;
 use uefisettings_qemu_guest::driver_sample::MATCH2_OFFSET;
 use uefisettings_qemu_guest::driver_sample::MATCH2_REASON;
@@ -99,8 +100,8 @@ const DEFAULTS: [DefaultQuestion; 4] = [
 ];
 
 /// Questions whose values the HII backend cannot read from Linux: on DriverSample's
-/// name/value store.
-const UNAVAILABLE_QUESTIONS: [&str; 1] = ["NameValueVar0"];
+/// name/value store, which INCLUDE_GRAYED_OUT selects.
+const UNAVAILABLE_QUESTIONS: [&str; 1] = [LOCKED];
 
 /// The answers of the questions on bit fields of DriverSample's EFI variable MyEfiBitVar,
 /// which lacks runtime access, each ending with the default of Vfr.vfr if it has one, and then
@@ -321,7 +322,13 @@ fn list_questions_lists_the_defaults() {
 
 #[test]
 fn list_questions_reports_unreadable_questions_as_unavailable() {
-    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
+    let questions: Vec<Question> = json(&[
+        "hii",
+        "list-questions",
+        "--json",
+        INCLUDE_GRAYED_OUT[0],
+        INCLUDE_GRAYED_OUT[1],
+    ]);
     for name in UNAVAILABLE_QUESTIONS {
         let listed: Vec<&Question> = questions
             .iter()
@@ -581,8 +588,49 @@ fn get_refuses_a_suppressed_question_by_default() {
 #[test]
 fn get_reports_unreadable_questions_as_unavailable() {
     for name in UNAVAILABLE_QUESTIONS {
-        let (got, _) = single_response(&["hii", "get", name, "--json"], BACKEND_HII);
+        let (got, _) = single_response(
+            &[&["hii", "get", name, "--json"][..], &INCLUDE_GRAYED_OUT].concat(),
+            BACKEND_HII,
+        );
         assert!(got.answer.starts_with(UNAVAILABLE), "{got:#?}");
+    }
+}
+
+/// get and list-questions leave out DriverSample's question in a LOCKED scope, as edk2's setup
+/// browser grays it out, unless --include selects grayed-out questions, and then show its state.
+#[test]
+fn get_and_list_questions_gray_out_a_question_in_a_locked_scope() {
+    let error = json_error(&["hii", "get", LOCKED, "--json"]);
+    assert_eq!(
+        error.error_message,
+        format!(
+            "question {LOCKED:?} is grayed-out; also include grayed-out questions to select it"
+        ),
+        "get {LOCKED}"
+    );
+    let (got, _) = single_response(
+        &[&["hii", "get", LOCKED, "--json"][..], &INCLUDE_GRAYED_OUT].concat(),
+        BACKEND_HII,
+    );
+    assert!(
+        got.answer.ends_with(" <grayed-out>"),
+        "get {LOCKED} {got:#?}"
+    );
+
+    for (flags, want) in [(&[][..], 0), (&INCLUDE_GRAYED_OUT[..], 1)] {
+        let questions: Vec<Question> =
+            json(&[&["hii", "list-questions", "--json"][..], flags].concat());
+        let listed: Vec<&Question> = questions
+            .iter()
+            .filter(|question| question.name == LOCKED)
+            .collect();
+        assert_eq!(listed.len(), want, "list-questions {flags:?}: {listed:#?}");
+        assert!(
+            listed
+                .iter()
+                .all(|question| question.answer.ends_with(" <grayed-out>")),
+            "list-questions {flags:?}: {listed:#?}"
+        );
     }
 }
 

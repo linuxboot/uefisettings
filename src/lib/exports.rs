@@ -881,6 +881,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::ifr_default;
+    use crate::hii::forms::ifr_fixtures::locked_op;
     use crate::hii::forms::ifr_fixtures::nested;
     use crate::hii::forms::ifr_fixtures::on_small_stack;
     use crate::hii::forms::ifr_fixtures::operation;
@@ -896,6 +897,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
+    use crate::hii::forms::ifr_fixtures::GUID;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::NV_BS;
@@ -1644,6 +1646,170 @@ mod tests {
                 .collect();
             assert_eq!(got, [defaults], "set {name}");
         }
+    }
+
+    /// A UINT8 NUMERIC from 0 to 255 of QuestionId and prompt string `id`, at byte `id - 1` of
+    /// VarStore 1, holding `children` in its scope.
+    fn numeric_holding(id: u16, children: &[Vec<u8>]) -> Vec<u8> {
+        let data = [
+            question_header_with(id, id, 1, id - 1, 0x00),
+            NUMERIC_0_TO_255.to_vec(),
+        ]
+        .concat();
+        [
+            operation(NUMERIC, true, &data),
+            children.concat(),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// The questions of locked_hiidb, each at the byte of its index of the EFI variable Setup,
+    /// and whether an EFI_IFR_LOCKED grays it out.
+    const LOCKED_QUESTIONS: [(&str, bool); 3] =
+        [("Open", false), ("Locked", true), ("In locked form", true)];
+
+    /// A HiiDB whose EFI variable Setup holds the UINT8 NUMERICs of LOCKED_QUESTIONS: Open,
+    /// Locked, which holds an EFI_IFR_LOCKED in its scope, and, in a FORM that holds one, In
+    /// locked form.
+    fn locked_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 3),
+                form(
+                    1,
+                    &[numeric_holding(1, &[]), numeric_holding(2, &[locked_op()])],
+                ),
+                form(2, &[locked_op(), numeric_holding(3, &[])]),
+            ]),
+            en_strings_package_of(&LOCKED_QUESTIONS.map(|(name, _)| name)),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// What set does: its result, the error as text, and its writes to Setup, by offset.
+    type SetOutcome = (Result<(), String>, Vec<(u16, Vec<u8>)>);
+
+    /// set of `question` to 9 in `hiidb`, selecting `include` too, with Setup of 3 bytes.
+    fn set_to_9(hiidb: &[u8], question: &str, include: IncludedStates) -> SetOutcome {
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(setup(), NV_BS_RT, &[0; 3]);
+        let variables = Rc::new(variables);
+        let got = HiiBackend::set_in(
+            hiidb,
+            question,
+            "9",
+            None,
+            &SetOptions {
+                include,
+                ..SetOptions::default()
+            },
+            shared(&variables),
+            &*variables,
+        );
+        (
+            got.map(drop).map_err(|error| error.to_string()),
+            variables.writes_to(&setup()),
+        )
+    }
+
+    /// set refuses a question that an EFI_IFR_LOCKED in its scope or in its FORM grays out, as
+    /// edk2-stable202608 SetupBrowserDxe does, before any write, unless --include selects
+    /// grayed-out questions, and writes the others.
+    #[test]
+    fn set_refuses_questions_that_a_locked_scope_grays_out() {
+        let hiidb = locked_hiidb();
+        for ((name, locked), offset) in LOCKED_QUESTIONS.into_iter().zip(0..) {
+            let written = (Ok(()), vec![(offset, vec![9])]);
+            let refused = (
+                Err(format!(
+                    "question {name:?} is grayed-out; also include grayed-out questions to \
+                     select it"
+                )),
+                vec![],
+            );
+            let want = if locked { refused } else { written.clone() };
+            assert_eq!(
+                set_to_9(&hiidb, name, IncludedStates::empty()),
+                want,
+                "set {name}"
+            );
+            assert_eq!(
+                set_to_9(&hiidb, name, IncludedStates::GRAYED_OUT),
+                written,
+                "set {name} with --include grayed-out"
+            );
+        }
+    }
+
+    /// list-questions leaves out a question that an EFI_IFR_LOCKED grays out, unless --include
+    /// selects grayed-out questions, and then shows its state.
+    #[test]
+    fn list_questions_grays_out_questions_in_a_locked_scope() {
+        let hiidb = locked_hiidb();
+        let list = |include| {
+            HiiBackend::list_questions_using(
+                &hiidb,
+                &ListQuestionsOptions {
+                    include,
+                    efivars: EfivarSource::Disabled,
+                    ..ListQuestionsOptions::default()
+                },
+            )
+            .expect("list questions")
+            .into_iter()
+            .map(|question| (question.name, question.answer))
+            .collect::<Vec<_>>()
+        };
+        let not_read = "<ValueUnavailable: EFI variables not read>";
+        let answer = |locked| match locked {
+            true => format!("{not_read} <grayed-out>"),
+            false => not_read.to_string(),
+        };
+
+        let selectable: Vec<(String, String)> = LOCKED_QUESTIONS
+            .iter()
+            .filter(|(_, locked)| !locked)
+            .map(|&(name, locked)| (name.to_string(), answer(locked)))
+            .collect();
+        assert_eq!(list(IncludedStates::empty()), selectable, "list-questions");
+        let all: Vec<(String, String)> = LOCKED_QUESTIONS
+            .iter()
+            .map(|&(name, locked)| (name.to_string(), answer(locked)))
+            .collect();
+        assert_eq!(
+            list(IncludedStates::GRAYED_OUT),
+            all,
+            "list-questions --include grayed-out"
+        );
+    }
+
+    /// An EFI_IFR_LOCKED in a statement nested in a question's scope locks that statement and
+    /// leaves the question writable (edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes).
+    #[test]
+    fn locked_in_a_nested_statement_leaves_the_question_writable() {
+        let guid = [
+            operation(GUID, true, &[0x77; 16]),
+            locked_op(),
+            END.to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 3),
+                form(1, &[numeric_holding(1, &[guid])]),
+            ]),
+            en_strings_package_of(&["N"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+
+        assert_eq!(
+            set_to_9(&hiidb, "N", IncludedStates::empty()),
+            (Ok(()), vec![(0, vec![9])]),
+            "set N"
+        );
     }
 
     /// set's response lists the flags of the question it wrote, and none for one without.

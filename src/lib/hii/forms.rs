@@ -1080,11 +1080,12 @@ fn refers_to_bit_field(question: &IFROperation) -> bool {
         .parent
         .as_ref()
         .and_then(Weak::upgrade)
-        .is_some_and(|parent| {
-            let parent = parent.borrow();
-            parent.op_code == IFROpCode::Guid
-                && parent.data.starts_with(&EDKII_IFR_BIT_VARSTORE_GUID)
-        })
+        .is_some_and(|parent| is_bit_varstore_guid(&parent.borrow()))
+}
+
+/// Whether `op` is the GUID op that marks an EDKII bit varstore field.
+fn is_bit_varstore_guid(op: &IFROperation) -> bool {
+    op.op_code == IFROpCode::Guid && op.data.starts_with(&EDKII_IFR_BIT_VARSTORE_GUID)
 }
 
 /// How a ONE_OF, NUMERIC or CHECKBOX stores its value, and a NUMERIC or ONE_OF its MinValue,
@@ -4000,9 +4001,11 @@ mod nesting_tests {
         });
 
         on_small_stack("list_questions", || {
+            // the LOCKED ops gray out Deep
             for (include, want) in [
                 (IncludedStates::all(), &["Deep", "Hidden"][..]),
-                (IncludedStates::empty(), &["Deep"][..]),
+                (IncludedStates::GRAYED_OUT, &["Deep"][..]),
+                (IncludedStates::empty(), &[][..]),
             ] {
                 let listed = list_questions(
                     parse_deep(DEEP, DEEP, false),
@@ -4025,7 +4028,7 @@ mod nesting_tests {
                     parse_deep(DEEP, DEEP, false),
                     &deep_strings(),
                     &BTreeSet::from([name]),
-                    IncludedStates::empty(),
+                    IncludedStates::GRAYED_OUT,
                     None,
                     &mut disabled_reader(),
                 );
