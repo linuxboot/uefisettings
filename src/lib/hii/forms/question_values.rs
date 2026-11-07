@@ -49,6 +49,7 @@ use super::walk_scopes;
 use super::AnswerOption;
 use super::CheckBox;
 use super::FormSetWalk;
+use super::IFROpCode;
 use super::IFROperation;
 use super::Numeric;
 use super::NumericFormat;
@@ -101,6 +102,144 @@ impl ValueQuestion<'_> {
             ValueQuestion::Numeric(question) => question.encoding,
             ValueQuestion::CheckBox(question) => question.encoding,
         }
+    }
+}
+
+/// The kind of a question by its op; ONE_OF, NUMERIC and CHECKBOX share one: set gives one value
+/// to questions of one kind only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QuestionKind {
+    /// An integer: a ONE_OF or NUMERIC (number) or a CHECKBOX (boolean)
+    Value,
+    String,
+    Password,
+    OrderedList,
+    Date,
+    Time,
+    Ref,
+    /// An action button, whose value is always Undefined
+    Action,
+}
+
+impl QuestionKind {
+    /// The kind of a question of `op_code`; None for an op that is no question.
+    pub(super) fn of(op_code: IFROpCode) -> Option<Self> {
+        match op_code {
+            IFROpCode::OneOf | IFROpCode::Numeric | IFROpCode::CheckBox => Some(Self::Value),
+            IFROpCode::String => Some(Self::String),
+            IFROpCode::Password => Some(Self::Password),
+            IFROpCode::OrderedList => Some(Self::OrderedList),
+            IFROpCode::Date => Some(Self::Date),
+            IFROpCode::Time => Some(Self::Time),
+            IFROpCode::Ref => Some(Self::Ref),
+            IFROpCode::Action => Some(Self::Action),
+            IFROpCode::Form
+            | IFROpCode::Subtitle
+            | IFROpCode::Text
+            | IFROpCode::Image
+            | IFROpCode::OneOfOption
+            | IFROpCode::SuppressIf
+            | IFROpCode::Locked
+            | IFROpCode::ResetButton
+            | IFROpCode::FormSet
+            | IFROpCode::NoSubmitIf
+            | IFROpCode::InconsistentIf
+            | IFROpCode::EqIdVal
+            | IFROpCode::EqIdId
+            | IFROpCode::EqIdValList
+            | IFROpCode::And
+            | IFROpCode::Or
+            | IFROpCode::Not
+            | IFROpCode::Rule
+            | IFROpCode::GrayOutIf
+            | IFROpCode::Refresh
+            | IFROpCode::DisableIf
+            | IFROpCode::Animation
+            | IFROpCode::ToLower
+            | IFROpCode::ToUpper
+            | IFROpCode::Map
+            | IFROpCode::VarStore
+            | IFROpCode::VarStoreNameValue
+            | IFROpCode::VarStoreEfi
+            | IFROpCode::VarStoreDevice
+            | IFROpCode::Version
+            | IFROpCode::End
+            | IFROpCode::Match
+            | IFROpCode::Get
+            | IFROpCode::Set
+            | IFROpCode::Read
+            | IFROpCode::Write
+            | IFROpCode::Equal
+            | IFROpCode::NotEqual
+            | IFROpCode::GreaterThan
+            | IFROpCode::GreaterEqual
+            | IFROpCode::LessThan
+            | IFROpCode::LessEqual
+            | IFROpCode::BitwiseAnd
+            | IFROpCode::BitwiseOr
+            | IFROpCode::BitwiseNot
+            | IFROpCode::ShiftLeft
+            | IFROpCode::ShiftRight
+            | IFROpCode::Add
+            | IFROpCode::Subtract
+            | IFROpCode::Multiply
+            | IFROpCode::Divide
+            | IFROpCode::Modulo
+            | IFROpCode::RuleRef
+            | IFROpCode::QuestionRef1
+            | IFROpCode::QuestionRef2
+            | IFROpCode::Uint8
+            | IFROpCode::Uint16
+            | IFROpCode::Uint32
+            | IFROpCode::Uint64
+            | IFROpCode::True
+            | IFROpCode::False
+            | IFROpCode::ToUint
+            | IFROpCode::ToString
+            | IFROpCode::ToBoolean
+            | IFROpCode::Mid
+            | IFROpCode::Find
+            | IFROpCode::Token
+            | IFROpCode::StringRef1
+            | IFROpCode::StringRef2
+            | IFROpCode::Conditional
+            | IFROpCode::QuestionRef3
+            | IFROpCode::Zero
+            | IFROpCode::One
+            | IFROpCode::Ones
+            | IFROpCode::Undefined
+            | IFROpCode::Length
+            | IFROpCode::Dup
+            | IFROpCode::This
+            | IFROpCode::Span
+            | IFROpCode::Value
+            | IFROpCode::Default
+            | IFROpCode::DefaultStore
+            | IFROpCode::FormMap
+            | IFROpCode::Catenate
+            | IFROpCode::Guid
+            | IFROpCode::Security
+            | IFROpCode::ModalTag
+            | IFROpCode::RefreshId
+            | IFROpCode::WarningIf
+            | IFROpCode::Match2
+            | IFROpCode::Unknown(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for QuestionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Value => "ONE_OF, NUMERIC or CHECKBOX",
+            Self::String => "STRING",
+            Self::Password => "PASSWORD",
+            Self::OrderedList => "ORDERED_LIST",
+            Self::Date => "DATE",
+            Self::Time => "TIME",
+            Self::Ref => "REF",
+            Self::Action => "ACTION",
+        })
     }
 }
 
@@ -926,6 +1065,31 @@ mod question_value_tests {
 
     /// EDKII_IFR_DISPLAY_UINT_DEC_BIT
     const UINT_DEC: u8 = 0x40;
+
+    /// Each question op of UEFI 2.11 §33.2.5.4 has a kind, ONE_OF, NUMERIC and CHECKBOX one,
+    /// and other ops none.
+    #[test]
+    fn each_question_op_has_its_kind() {
+        let cases = [
+            (IFROpCode::OneOf, Some(QuestionKind::Value)),
+            (IFROpCode::Numeric, Some(QuestionKind::Value)),
+            (IFROpCode::CheckBox, Some(QuestionKind::Value)),
+            (IFROpCode::String, Some(QuestionKind::String)),
+            (IFROpCode::Password, Some(QuestionKind::Password)),
+            (IFROpCode::OrderedList, Some(QuestionKind::OrderedList)),
+            (IFROpCode::Date, Some(QuestionKind::Date)),
+            (IFROpCode::Time, Some(QuestionKind::Time)),
+            (IFROpCode::Ref, Some(QuestionKind::Ref)),
+            (IFROpCode::Action, Some(QuestionKind::Action)),
+            (IFROpCode::OneOfOption, None),
+            (IFROpCode::Form, None),
+            (IFROpCode::Get, None),
+            (IFROpCode::Unknown(0xF0), None),
+        ];
+        for (op_code, want) in cases {
+            assert_eq!(QuestionKind::of(op_code), want, "{op_code:?}");
+        }
+    }
 
     #[test]
     fn readable_checkbox_shows_no_default() {

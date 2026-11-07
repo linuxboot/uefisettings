@@ -27,6 +27,7 @@ use super::conditions::IncludedStates;
 use super::conditions::ReadOnlyCause;
 use super::conditions::SelectionError;
 use super::defaults::OptionValueError;
+use super::question_values::QuestionKind;
 use super::storage::created_attributes;
 use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
@@ -414,7 +415,8 @@ pub(crate) struct WrittenQuestion<'a> {
 /// Sets each of the `selected` questions, by the selector of its package list, to `new_value`
 /// or to its option of one of `texts` that chosen_option picks with `include`, in `variables`,
 /// writing a volatile variable only if `volatile` allows it, and returns a WrittenQuestion per
-/// selected question, in its order; fails with SelectionError::NotFound when nothing is selected.
+/// selected question, in its order; fails with SelectionError::NotFound when nothing is selected,
+/// and with MixedKinds for questions of more than one QuestionKind.
 /// It builds the WritePlan of every question before the first write, reading with `reader`, whose
 /// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
 /// one question refuses leaves every variable unchanged; then it writes each variable once, with
@@ -444,6 +446,7 @@ pub(crate) fn set_questions<'a>(
         }
         .into());
     }
+    check_one_kind(question, selected)?;
     let (reach, interface) = (variables.reach(), variables.interface());
     let plans = selected
         .iter()
@@ -511,6 +514,50 @@ pub(crate) fn set_questions<'a>(
         .into());
     }
     Ok(written_questions)
+}
+
+/// Refuses `selected`, the questions that the text `question` selects, by selector, unless they
+/// are all of one QuestionKind: set gives one value to all of them.
+fn check_one_kind(question: &str, selected: &[(&str, &QuestionDescriptor)]) -> Result<()> {
+    let mut kinds: Vec<(QuestionKind, Vec<String>)> = Vec::new();
+    for &(selector, descriptor) in selected {
+        let kind = QuestionKind::of(descriptor.opcode)
+            .ok_or_else(|| anyhow!("{} is no question", descriptor.opcode.spec_name()))?;
+        match kinds.iter_mut().find(|(listed, _)| *listed == kind) {
+            Some((_, selectors)) => selectors.push(selector.to_owned()),
+            None => kinds.push((kind, vec![selector.to_owned()])),
+        }
+    }
+    match kinds.len() {
+        0 | 1 => Ok(()),
+        _ => Err(MixedKinds {
+            question: question.to_owned(),
+            kinds,
+        }
+        .into()),
+    }
+}
+
+/// set's error for a text that selects questions of more than one QuestionKind: each kind with
+/// its selectors, in the order of the matches.
+#[derive(Error, Debug)]
+#[error(
+    "question {question:?} selects questions of more than one kind: {}; set gives one value to \
+     questions of one kind",
+    kinds_text(.kinds)
+)]
+struct MixedKinds {
+    question: String,
+    kinds: Vec<(QuestionKind, Vec<String>)>,
+}
+
+/// The kinds of MixedKinds, each with its selectors.
+fn kinds_text(kinds: &[(QuestionKind, Vec<String>)]) -> String {
+    kinds
+        .iter()
+        .map(|(kind, selectors)| format!("{kind} (in {})", selectors.join(", ")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// set's error when one of several writes fails.
@@ -1118,6 +1165,90 @@ mod set_questions_tests {
                 [(0, want)],
                 "{size} bytes: writes"
             );
+        }
+    }
+
+    /// set writes a ONE_OF and a NUMERIC that one prompt selects, both integers, and refuses a
+    /// ONE_OF and a DATE before any write, naming both kinds and both selectors.
+    #[test]
+    fn questions_of_more_than_one_kind_are_refused_before_any_write() {
+        let variables = MemoryVariables::default();
+        let one_of = one_of_on_store(
+            flagged_option(6, 0x00, 1),
+            writable_var_store("A", &[0], &variables),
+        );
+        let numeric = numeric_on_store(200, writable_var_store("B", &[0], &variables));
+
+        assert_eq!(
+            set_options(
+                &variables,
+                &[("A", &one_of), ("B", &numeric)],
+                "1",
+                &["Enabled"]
+            ),
+            Ok(vec![Some("Enabled".to_string()), None]),
+            "ONE_OF and NUMERIC"
+        );
+        assert_eq!(
+            writes(&variables, "A"),
+            [(0, vec![1])],
+            "writes of the ONE_OF"
+        );
+        assert_eq!(
+            writes(&variables, "B"),
+            [(0, vec![1])],
+            "writes of the NUMERIC"
+        );
+
+        let variables = MemoryVariables::default();
+        let one_of = one_of_on_store(
+            flagged_option(6, 0x00, 1),
+            writable_var_store("A", &[0], &variables),
+        );
+        let mut date = one_of_on_store(
+            flagged_option(6, 0x00, 1),
+            writable_var_store("B", &[0], &variables),
+        );
+        date.opcode = IFROpCode::Date;
+
+        assert_eq!(
+            set_options(
+                &variables,
+                &[("A", &one_of), ("B", &date)],
+                "1",
+                &["Enabled"]
+            ),
+            Err(
+                "question \"Prompt\" selects questions of more than one kind: ONE_OF, NUMERIC \
+                 or CHECKBOX (in A), DATE (in B); set gives one value to questions of one kind"
+                    .to_string()
+            ),
+            "ONE_OF and DATE"
+        );
+        assert_eq!(writes(&variables, "A"), [], "writes of the ONE_OF");
+        assert_eq!(writes(&variables, "B"), [], "writes of the DATE");
+    }
+
+    /// Each kind names its selectors once, in the order of the matches.
+    #[test]
+    fn each_kind_names_its_selectors() {
+        let variables = MemoryVariables::default();
+        let [a, b, c] = ["A", "B", "C"]
+            .map(|name| checkbox_on_store(writable_var_store(name, &[0], &variables)));
+        let mut b = b;
+        b.opcode = IFROpCode::Time;
+
+        assert_eq!(
+            set(&variables, &[("A", &a), ("B", &b), ("C", &c)], "1"),
+            Err(
+                "question \"Prompt\" selects questions of more than one kind: ONE_OF, NUMERIC \
+                 or CHECKBOX (in A, C), TIME (in B); set gives one value to questions of one \
+                 kind"
+                    .to_string()
+            )
+        );
+        for name in ["A", "B", "C"] {
+            assert_eq!(writes(&variables, name), [], "writes of {name}");
         }
     }
 
