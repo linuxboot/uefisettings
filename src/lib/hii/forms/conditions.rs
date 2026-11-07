@@ -27,6 +27,7 @@ use thiserror::Error;
 use super::ami_access_level::AMI_ACCESS_LEVEL;
 use super::declared_var_store;
 use super::defaults::is_parent_statement;
+use super::defaults::question_scope;
 use super::find_corresponding_varstore;
 use super::question_values::value_question;
 use super::question_values::ValueQuestion;
@@ -47,6 +48,7 @@ use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
 use super::ParsedOperation;
+use super::QuestionFlags;
 use super::VarStoreOperand;
 use super::Walk;
 use super::EFI_IFR_TYPE_BOOLEAN;
@@ -92,23 +94,73 @@ impl fmt::Display for QuestionState {
     }
 }
 
+/// Why set refuses to write a question. edk2-stable202608 SetupBrowserDxe/Presentation.c
+/// InitializeDisplayStatement shows either as HII_DISPLAY_READONLY, which
+/// DisplayEngineDxe/FormDisplay.c IsSelectable refuses as it refuses a grayed-out question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ReadOnlyCause {
+    /// EFI_IFR_FLAG_READ_ONLY (UEFI 2.11 §33.3.8.2.2), which edk2-stable202608
+    /// HiiDatabaseDxe/ConfigKeywordHandler.c EfiConfigKeywordHandlerSetData, the write by name,
+    /// refuses with EFI_ACCESS_DENIED; set writes it with IncludedStates::READ_ONLY
+    Flag,
+    /// An EFI_IFR_VALUE, which gives the question its value (§33.3.8.3.88) and which
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue never writes; nor does set
+    ValueExpression,
+}
+
+impl ReadOnlyCause {
+    /// The states that set includes to write a question that this makes read-only, if any.
+    pub(crate) fn lifted_with(self) -> Option<IncludedStates> {
+        match self {
+            ReadOnlyCause::Flag => Some(IncludedStates::READ_ONLY),
+            ReadOnlyCause::ValueExpression => None,
+        }
+    }
+
+    /// Whether set writes a question that this makes read-only, with `include`.
+    pub(crate) fn lifted_by(self, include: IncludedStates) -> bool {
+        self.lifted_with()
+            .is_some_and(|states| include.contains(states))
+    }
+}
+
+impl fmt::Display for ReadOnlyCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ReadOnlyCause::Flag => {
+                "EFI_IFR_FLAG_READ_ONLY makes it read-only (UEFI 2.11 §33.3.8.2.2)"
+            }
+            ReadOnlyCause::ValueExpression => VALUE_MAKES_READ_ONLY,
+        })
+    }
+}
+
 bitflags::bitflags! {
     /// The states, besides selectable, of the questions and options that get, set and
-    /// list-questions select.
+    /// list-questions select, and READ_ONLY. IncludedStates::all() includes READ_ONLY, so set
+    /// with it writes EFI_IFR_FLAG_READ_ONLY questions too; CONDITIONS does not.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct IncludedStates: u64 {
         const GRAYED_OUT = 1;
         const SUPPRESSED = 1 << 1;
         const DISABLED = 1 << 2;
+        /// set writes the questions that EFI_IFR_FLAG_READ_ONLY makes read-only; get and
+        /// list-questions show read-only questions regardless
+        const READ_ONLY = 1 << 3;
     }
 }
 
 impl IncludedStates {
+    /// Every state that a condition gives.
+    pub const CONDITIONS: Self = Self::GRAYED_OUT
+        .union(Self::SUPPRESSED)
+        .union(Self::DISABLED);
+
     pub fn allows(self, state: QuestionState) -> bool {
         self.contains(state.into())
     }
 
-    /// The states, lowest priority first.
+    /// The condition states, lowest priority first.
     fn states(self) -> impl Iterator<Item = QuestionState> {
         [
             QuestionState::GrayedOut,
@@ -144,6 +196,9 @@ impl fmt::Display for IncludedStates {
         for state in self.states() {
             write!(f, "{separator}{state}")?;
             separator = ",";
+        }
+        if self.contains(IncludedStates::READ_ONLY) {
+            write!(f, "{separator}read-only")?;
         }
         Ok(())
     }
@@ -199,13 +254,30 @@ pub enum SelectionError {
     NotFound { question: String },
 }
 
-/// The states that the conditions around a question or option can give it.
+/// The states that the conditions around a question or option can give it, and why set refuses
+/// to write the question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StateEvaluation {
     /// The state that the true conditions give
     known: QuestionState,
     /// The conditions not evaluated: the state each gives if true, and why it is not evaluated
     unknown: Vec<(QuestionState, String)>,
+    /// Why the question is read-only, if it is; never for an option
+    read_only: Option<ReadOnlyCause>,
+}
+
+/// The order in which select prefers matches equally certain to be selected, lowest first: by
+/// why set refuses to write the match, then by its state; a match that `include` allows in every
+/// possible state comes before a likely one whatever their Ranks. A read-only match ranks after
+/// every writable one, whatever their states, as no --include of a condition state makes it
+/// writable; of read-only ones, a ReadOnlyCause::Flag one, which set writes with
+/// IncludedStates::READ_ONLY, ranks before a ReadOnlyCause::ValueExpression one. Rank does not
+/// ask whether set may write the efivar of a match, so a writable match whose efivar set refuses
+/// hides a read-only twin that set would write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    read_only: Option<ReadOnlyCause>,
+    state: QuestionState,
 }
 
 impl StateEvaluation {
@@ -213,6 +285,20 @@ impl StateEvaluation {
         StateEvaluation {
             known: QuestionState::Selectable,
             unknown: Vec::new(),
+            read_only: None,
+        }
+    }
+
+    /// Why the question is read-only, if it is.
+    pub(crate) fn read_only(&self) -> Option<ReadOnlyCause> {
+        self.read_only
+    }
+
+    /// The Rank of the match in `state`.
+    fn rank(&self, state: QuestionState) -> Rank {
+        Rank {
+            read_only: self.read_only,
+            state,
         }
     }
 
@@ -319,7 +405,11 @@ impl StateEvaluation {
 /// Which of the matches of a question to select.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Selection<T> {
-    Picked(T, StateEvaluation),
+    Picked {
+        picked: (T, StateEvaluation),
+        /// The states to include to select a match that ranks before it, as it is read-only
+        ranked_before: IncludedStates,
+    },
     /// No match is certainly in a state that `include` allows, but some may be
     Undetermined {
         /// The one that get shows regardless
@@ -328,15 +418,19 @@ pub(crate) enum Selection<T> {
         reasons: Vec<String>,
         /// The states to include to select one regardless
         states: IncludedStates,
+        /// The states to include to select a match that ranks before the likely one, as it is
+        /// read-only
+        ranked_before: IncludedStates,
     },
     /// Every match is in a state that `include` does not allow: the states to include
     Excluded(IncludedStates),
     NotFound,
 }
 
-/// Selects, of `matches` in IFR order, the one with the lowest worst-case state among those
-/// that `include` allows in every possible state, the first on a tie. Of those that it may
-/// allow, the likely one has the lowest possible state that it allows, the first on a tie.
+/// Selects, of `matches` in IFR order, the one with the lowest Rank of its worst-case state among
+/// those that `include` allows in every possible state, the first on a tie. Of those that it may
+/// allow, the likely one has the lowest Rank of the lowest possible state that it allows, the
+/// first on a tie.
 pub(crate) fn select<T>(
     matches: Vec<(T, StateEvaluation)>,
     include: IncludedStates,
@@ -352,10 +446,13 @@ pub(crate) fn select<T>(
 struct Selector<T> {
     include: IncludedStates,
     picked: Option<(T, StateEvaluation)>,
-    likely: Option<(T, StateEvaluation, QuestionState)>,
+    likely: Option<(T, StateEvaluation, Rank)>,
     reasons: Vec<String>,
     undetermined: IncludedStates,
     excluded: IncludedStates,
+    /// The states that `include` may not allow of the matches that it does not allow in every
+    /// possible state, by why each is read-only
+    unselected: BTreeMap<Option<ReadOnlyCause>, IncludedStates>,
 }
 
 impl<T> Selector<T> {
@@ -368,6 +465,7 @@ impl<T> Selector<T> {
             reasons: Vec::new(),
             undetermined: IncludedStates::empty(),
             excluded: IncludedStates::empty(),
+            unselected: BTreeMap::new(),
         }
     }
 
@@ -379,10 +477,9 @@ impl<T> Selector<T> {
             evaluation.lowest_allowed(self.include),
         ) {
             (true, _) => {
-                let better = self
-                    .picked
-                    .as_ref()
-                    .is_none_or(|(_, best)| evaluation.worst_case() < best.worst_case());
+                let better = self.picked.as_ref().is_none_or(|(_, best)| {
+                    evaluation.rank(evaluation.worst_case()) < best.rank(best.worst_case())
+                });
                 if better {
                     self.picked = Some((candidate, evaluation));
                 }
@@ -395,26 +492,50 @@ impl<T> Selector<T> {
                     .collect();
                 self.reasons.extend(new);
                 self.undetermined |= excluded_states;
-                if self
-                    .likely
-                    .as_ref()
-                    .is_none_or(|&(_, _, best)| lowest < best)
-                {
-                    self.likely = Some((candidate, evaluation, lowest));
+                *self.unselected.entry(evaluation.read_only).or_default() |= excluded_states;
+                let rank = evaluation.rank(lowest);
+                if self.likely.as_ref().is_none_or(|&(_, _, best)| rank < best) {
+                    self.likely = Some((candidate, evaluation, rank));
                 }
             }
-            (false, None) => self.excluded |= excluded_states,
+            (false, None) => {
+                self.excluded |= excluded_states;
+                *self.unselected.entry(evaluation.read_only).or_default() |= excluded_states;
+            }
         }
+    }
+
+    /// The states to include to select a match that ranks before one that `read_only` makes
+    /// read-only, of those taken in: the states of the matches with a lower read_only, with
+    /// those that make them writable, except the states that set includes.
+    fn ranked_before(&self, read_only: Option<ReadOnlyCause>) -> IncludedStates {
+        self.unselected
+            .range(..read_only)
+            .filter_map(|(&cause, &states)| match cause {
+                None => Some(states),
+                Some(cause) => cause.lifted_with().map(|lifted_with| states | lifted_with),
+            })
+            .fold(IncludedStates::empty(), |all, states| all | states)
+            .difference(self.include)
     }
 
     /// The selection of the matches taken in.
     fn finish(self) -> Selection<T> {
+        let chosen = match (&self.picked, &self.likely) {
+            (Some((_, evaluation)), _) | (None, Some((_, evaluation, _))) => evaluation.read_only,
+            (None, None) => None,
+        };
+        let ranked_before = self.ranked_before(chosen);
         match (self.picked, self.likely, self.excluded.is_empty()) {
-            (Some((candidate, evaluation)), _, _) => Selection::Picked(candidate, evaluation),
+            (Some(picked), _, _) => Selection::Picked {
+                picked,
+                ranked_before,
+            },
             (None, Some((candidate, evaluation, _)), _) => Selection::Undetermined {
                 likely: (candidate, evaluation),
                 reasons: self.reasons,
                 states: self.undetermined,
+                ranked_before,
             },
             (None, None, false) => Selection::Excluded(self.excluded),
             (None, None, true) => Selection::NotFound,
@@ -434,15 +555,23 @@ impl<T> Selection<T> {
     /// Maps the match.
     pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Selection<U> {
         match self {
-            Selection::Picked(candidate, evaluation) => Selection::Picked(f(candidate), evaluation),
+            Selection::Picked {
+                picked: (candidate, evaluation),
+                ranked_before,
+            } => Selection::Picked {
+                picked: (f(candidate), evaluation),
+                ranked_before,
+            },
             Selection::Undetermined {
                 likely: (candidate, evaluation),
                 reasons,
                 states,
+                ranked_before,
             } => Selection::Undetermined {
                 likely: (f(candidate), evaluation),
                 reasons,
                 states,
+                ranked_before,
             },
             Selection::Excluded(states) => Selection::Excluded(states),
             Selection::NotFound => Selection::NotFound,
@@ -452,7 +581,10 @@ impl<T> Selection<T> {
     /// set writes only a match that `include` certainly allows, and fails rather than guess.
     pub(crate) fn for_set(self, question: &str) -> Result<Choice<T>, SelectionError> {
         match self {
-            Selection::Picked(candidate, evaluation) => Ok(Choice::Chosen(candidate, evaluation)),
+            Selection::Picked {
+                picked: (candidate, evaluation),
+                ..
+            } => Ok(Choice::Chosen(candidate, evaluation)),
             Selection::Undetermined {
                 reasons, states, ..
             } => Err(SelectionError::Undetermined {
@@ -469,7 +601,10 @@ impl<T> Selection<T> {
     /// possible states.
     pub(crate) fn for_get(self) -> Choice<T> {
         match self {
-            Selection::Picked(candidate, evaluation)
+            Selection::Picked {
+                picked: (candidate, evaluation),
+                ..
+            }
             | Selection::Undetermined {
                 likely: (candidate, evaluation),
                 ..
@@ -482,7 +617,7 @@ impl<T> Selection<T> {
 
 /// Returns the states that the SUPPRESS_IF, GRAY_OUT_IF and DISABLE_IF scopes around
 /// `question` can give it, those of its form and FormSet too, and GrayedOut if an EFI_IFR_LOCKED
-/// locks it.
+/// locks it; and why set refuses to write it.
 // edk2-stable202608 DisplayEngineDxe/FormDisplay.c UiAddMenuOption grays out
 // EFI_IFR_FLAG_READ_ONLY ones too where PcdBrowerGrayOutReadOnlyMenu is set, a build setting that
 // the OS cannot read.
@@ -490,7 +625,10 @@ pub(crate) fn question_state(
     question: &IFROperation,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> StateEvaluation {
-    let mut evaluation = StateEvaluation::selectable();
+    let mut evaluation = StateEvaluation {
+        read_only: read_only(question),
+        ..StateEvaluation::selectable()
+    };
     if locked(question) {
         evaluation.add(QuestionState::GrayedOut, Truth::Known(true));
     }
@@ -503,6 +641,19 @@ pub(crate) fn question_state(
         scope = op.parent.as_ref().and_then(Weak::upgrade);
     }
     evaluation
+}
+
+/// Why set refuses to write `question`, if it does: an EFI_IFR_VALUE gives its value
+/// (question_value_expression), else EFI_IFR_FLAG_READ_ONLY.
+fn read_only(question: &IFROperation) -> Option<ReadOnlyCause> {
+    if question_value_expression(question).is_some() {
+        return Some(ReadOnlyCause::ValueExpression);
+    }
+    value_question(question)?
+        .header()
+        .flags()
+        .contains(QuestionFlags::READ_ONLY)
+        .then_some(ReadOnlyCause::Flag)
 }
 
 /// Whether an EFI_IFR_LOCKED locks `question`, which edk2-stable202608 SetupBrowserDxe grays out
@@ -775,7 +926,7 @@ pub(super) fn retrieve_question_value(
         .location()
         .check()
         .map_err(ValueUnavailable::BitField)?;
-    if let Some(value) = question_value_expression(question) {
+    if let Some(value) = question_value_expression(&op) {
         return evaluate_value(&value.borrow(), inputs)
             .map(|value| (location, value))
             .map_err(ValueUnavailable::ValueExpression);
@@ -1043,7 +1194,7 @@ pub(super) fn question_expression(
     // edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue takes the value of a question
     // with an EFI_IFR_VALUE from it, before any READ, and SetQuestionValue returns before WRITE:
     // the question is read-only (UEFI 2.11 §33.3.8.3.88)
-    if question_value_expression(question).is_some()
+    if question_value_expression(&question.borrow()).is_some()
         || !evaluates_read_and_write(&question.borrow())
     {
         return None;
@@ -1075,18 +1226,16 @@ pub(super) fn question_expression(
     found
 }
 
-/// The EFI_IFR_VALUE that gives the value of `question`: one in its own scope, never one in an
-/// EFI_IFR_DEFAULT, as edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes takes it for the
-/// question's ValueExpression.
+/// The EFI_IFR_VALUE that gives the value of `question`: the last in its scope (question_scope),
+/// never one in an EFI_IFR_DEFAULT or in a statement nested in it, as edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes makes each VALUE outside a DEFAULT the
+/// ValueExpression of its ParentStatement.
 pub(super) fn question_value_expression(
-    question: &Rc<RefCell<IFROperation>>,
+    question: &IFROperation,
 ) -> Option<Rc<RefCell<IFROperation>>> {
-    question
-        .borrow()
-        .children
-        .iter()
-        .find(|child| child.borrow().op_code == IFROpCode::Value)
-        .cloned()
+    question_scope(question)
+        .into_iter()
+        .rfind(|op| op.borrow().op_code == IFROpCode::Value)
 }
 
 /// Why set refuses a question with an EFI_IFR_VALUE.
@@ -3075,6 +3224,7 @@ mod tests {
         StateEvaluation {
             known: state,
             unknown: Vec::new(),
+            read_only: None,
         }
     }
 
@@ -3224,6 +3374,67 @@ mod tests {
         ];
         for (name, body, want) in cases {
             assert_eq!(locked_question_state(&body), known(want), "{name}");
+        }
+    }
+
+    /// question_value_expression takes the last EFI_IFR_VALUE in the scope of the question, also
+    /// one inside an op that is no statement or inside an EDKII bit-varstore GUID, as
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes makes each the ValueExpression of
+    /// its ParentStatement, but none inside an EFI_IFR_DEFAULT, another nested statement or an op
+    /// that ParseOpCodes skips.
+    #[test]
+    fn question_value_expression_is_the_last_value_in_the_question_scope() {
+        let value = |value: u8| value_of(uint8(value));
+        let in_scope = |op_code: u8, data: &[u8], body: Vec<u8>| {
+            [operation(op_code, true, data), body, END.to_vec()].concat()
+        };
+        let cases = [
+            ("no VALUE", vec![], None),
+            ("VALUE in its scope", vec![value(2)], Some(2)),
+            ("two VALUEs", vec![value(2), value(3)], Some(3)),
+            (
+                "VALUE in a SUPPRESS_IF in its scope",
+                vec![conditional(SUPPRESS_IF, ifr_false(), &[value(2)])],
+                Some(2),
+            ),
+            (
+                "VALUE in a DEFAULT in its scope",
+                vec![ifr_default_2(0, uint8(2))],
+                None,
+            ),
+            (
+                "VALUE in a GUID statement in its scope",
+                vec![in_scope(GUID, &[0x77; 16], value(2))],
+                None,
+            ),
+            (
+                "VALUE after a GUID statement in its scope",
+                vec![in_scope(GUID, &[0x77; 16], value(2)), value(3)],
+                Some(3),
+            ),
+            (
+                "VALUE in an EDKII bit-varstore GUID in its scope",
+                vec![in_scope(GUID, &BIT_VARSTORE_GUID, value(2))],
+                Some(2),
+            ),
+            (
+                "VALUE in an unknown op in its scope",
+                vec![in_scope(0x70, &[], value(2))],
+                None,
+            ),
+        ];
+        for (name, children, want) in cases {
+            let root = parse_form_set(&[form(1, &[locked_question(&children)])]);
+            let question = find_op(&root, &locked_question_data()).expect("find the CHECKBOX");
+            // the data of the expression op of the VALUE taken
+            let expression = question_value_expression(&question.borrow()).map(|value| {
+                value
+                    .borrow()
+                    .children
+                    .first()
+                    .map(|expression| expression.borrow().data.clone())
+            });
+            assert_eq!(expression, want.map(|value| Some(vec![value])), "{name}");
         }
     }
 
@@ -3412,6 +3623,7 @@ mod tests {
                     QuestionState::Suppressed,
                     "EFI_IFR_EQ_ID_VAL of question 0x0004: <ValueUnavailable: test>".to_string()
                 )],
+                read_only: None,
             },
             "grayed out, maybe suppressed"
         );
@@ -3424,6 +3636,7 @@ mod tests {
                 .iter()
                 .map(|&(state, reason)| (state, reason.to_string()))
                 .collect(),
+            read_only: None,
         }
     }
 
@@ -3512,7 +3725,15 @@ mod tests {
 
     /// Picks the match of index `index`; the test takes its evaluation from the matches.
     fn picked(index: usize) -> Selection<usize> {
-        Selection::Picked(index, StateEvaluation::selectable())
+        picked_as(index, StateEvaluation::selectable())
+    }
+
+    /// Picks `candidate`, in `evaluation`, with no match ranked before it.
+    fn picked_as<T>(candidate: T, evaluation: StateEvaluation) -> Selection<T> {
+        Selection::Picked {
+            picked: (candidate, evaluation),
+            ranked_before: IncludedStates::empty(),
+        }
     }
 
     /// Undetermined, likely the match of index `likely`; the test takes its evaluation from the
@@ -3522,6 +3743,7 @@ mod tests {
             likely: (likely, StateEvaluation::selectable()),
             reasons: reasons.iter().map(ToString::to_string).collect(),
             states,
+            ranked_before: IncludedStates::empty(),
         }
     }
 
@@ -3635,15 +3857,23 @@ mod tests {
         ];
         for (name, matches, include, want) in cases {
             let want = match want {
-                Selection::Picked(index, _) => Selection::Picked(index, matches[index].clone()),
+                Selection::Picked {
+                    picked: (index, _),
+                    ranked_before,
+                } => Selection::Picked {
+                    picked: (index, matches[index].clone()),
+                    ranked_before,
+                },
                 Selection::Undetermined {
                     likely: (index, _),
                     reasons,
                     states,
+                    ranked_before,
                 } => Selection::Undetermined {
                     likely: (index, matches[index].clone()),
                     reasons,
                     states,
+                    ranked_before,
                 },
                 want => want,
             };
@@ -3670,13 +3900,17 @@ mod tests {
             for second in &pool {
                 let matches = || vec![(0, first.clone()), (1, second.clone())];
                 for &smaller in &includes {
-                    let Selection::Picked(_, picked) = select(matches(), smaller) else {
+                    let Selection::Picked {
+                        picked: (_, picked),
+                        ..
+                    } = select(matches(), smaller)
+                    else {
                         continue;
                     };
                     for &larger in includes.iter().filter(|larger| larger.contains(smaller)) {
                         let selection = select(matches(), larger);
                         assert!(
-                            matches!(&selection, Selection::Picked(_, more) if more.worst_case() <= picked.worst_case()),
+                            matches!(&selection, Selection::Picked { picked: (_, more), .. } if more.worst_case() <= picked.worst_case()),
                             "{first:?}, {second:?}: {smaller} picks {picked:?}, {larger} {selection:?}"
                         );
                     }
@@ -3814,13 +4048,13 @@ mod tests {
                 "selectable after suppressed",
                 vec![suppressed(), checkbox_op(2, 1)],
                 IncludedStates::empty(),
-                Selection::Picked(2, selectable()),
+                picked_as(2, selectable()),
             ),
             (
                 "selectable after suppressed, suppressed included",
                 vec![suppressed(), checkbox_op(2, 1)],
                 include,
-                Selection::Picked(2, selectable()),
+                picked_as(2, selectable()),
             ),
             (
                 "suppressed",
@@ -3832,7 +4066,7 @@ mod tests {
                 "suppressed, included",
                 vec![suppressed()],
                 include,
-                Selection::Picked(1, known(QuestionState::Suppressed)),
+                picked_as(1, known(QuestionState::Suppressed)),
             ),
             (
                 "maybe suppressed",
@@ -3848,13 +4082,14 @@ mod tests {
                     ),
                     reasons: vec![reason.to_string()],
                     states: include,
+                    ranked_before: IncludedStates::empty(),
                 },
             ),
             (
                 "maybe suppressed, included",
                 vec![maybe_suppressed()],
                 include,
-                Selection::Picked(
+                picked_as(
                     1,
                     evaluation(
                         QuestionState::Selectable,
@@ -3866,7 +4101,7 @@ mod tests {
                 "selectable after maybe suppressed",
                 vec![maybe_suppressed(), checkbox_op(2, 1)],
                 IncludedStates::empty(),
-                Selection::Picked(2, selectable()),
+                picked_as(2, selectable()),
             ),
             (
                 "no question",
@@ -4414,7 +4649,7 @@ mod tests {
                 IncludedStates::empty(),
             );
             let want = if parsed {
-                Selection::Picked(1, StateEvaluation::selectable())
+                picked_as(1, StateEvaluation::selectable())
             } else {
                 Selection::NotFound
             };
@@ -4889,6 +5124,7 @@ mod tests {
         let undetermined = StateEvaluation {
             known: QuestionState::Selectable,
             unknown: vec![(QuestionState::GrayedOut, UNREAD.to_string())],
+            read_only: None,
         };
         let cases = [
             (
@@ -5107,6 +5343,7 @@ mod tests {
                 StateEvaluation {
                     known: QuestionState::Selectable,
                     unknown: Vec::new(),
+                    read_only: None,
                 },
                 "{level:?}"
             );

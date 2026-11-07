@@ -22,6 +22,7 @@ use uefisettings_qemu_guest::changed_bytes;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
+use uefisettings_qemu_guest::driver_sample::INCLUDE_READ_ONLY;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_SUPPRESSED;
 use uefisettings_qemu_guest::driver_sample::LOCKED;
 use uefisettings_qemu_guest::driver_sample::MATCH2;
@@ -31,6 +32,8 @@ use uefisettings_qemu_guest::driver_sample::NUMERIC;
 use uefisettings_qemu_guest::driver_sample::NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF;
 use uefisettings_qemu_guest::driver_sample::ONE_OF_OFFSET;
+use uefisettings_qemu_guest::driver_sample::READ_ONLY_NUMERIC;
+use uefisettings_qemu_guest::driver_sample::READ_ONLY_NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json_error;
@@ -292,6 +295,51 @@ fn set_of_a_question_in_a_locked_scope_is_refused() {
                 "question {LOCKED:?} is grayed-out; also include grayed-out questions to select it"
             ),
             "{prefix:?}"
+        );
+    }
+}
+
+/// set, through hii set and set, refuses DriverSample's numeric that EFI_IFR_FLAG_READ_ONLY makes
+/// read-only and writes nothing, and writes it with read-only included; get, which shows
+/// read-only questions regardless, answers the new value.
+#[test]
+fn set_read_only_numeric_is_refused_unless_read_only_is_included() {
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse(prefix, READ_ONLY_NUMERIC, "30", &[]).error_message,
+            format!(
+                "cannot set question {READ_ONLY_NUMERIC:?}: EFI_IFR_FLAG_READ_ONLY makes it \
+                 read-only (UEFI 2.11 §33.3.8.2.2); also include read-only questions to write it"
+            ),
+            "{prefix:?}"
+        );
+    }
+
+    for (prefix, answer) in PREFIXES.into_iter().zip(["30", "31"]) {
+        let before = driver_sample_data();
+        let (set, modified) = single_response(
+            &[
+                prefix,
+                &["set", READ_ONLY_NUMERIC, answer, "--json"],
+                &INCLUDE_READ_ONLY,
+            ]
+            .concat(),
+            BACKEND_HII,
+        );
+        assert_eq!((set.answer.as_str(), modified), (answer, true), "{set:#?}");
+        let (got, _) = single_response(
+            &[prefix, &["get", READ_ONLY_NUMERIC, "--json"]].concat(),
+            BACKEND_HII,
+        );
+        assert_eq!(got.answer, answer, "{prefix:?} get: {got:#?}");
+        let want = [(
+            READ_ONLY_NUMERIC_OFFSET,
+            answer.parse::<u8>().expect("an 8-bit answer"),
+        )];
+        assert_eq!(
+            changed_bytes(&before, &driver_sample_data()),
+            want,
+            "{prefix:?} {INCLUDE_READ_ONLY:?}"
         );
     }
 }

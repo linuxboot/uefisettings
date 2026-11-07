@@ -71,7 +71,7 @@ pub(super) const PASSWORD: u8 = 0x08;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
 pub(crate) const GRAY_OUT_IF: u8 = 0x19;
-pub(super) const DISABLE_IF: u8 = 0x1E;
+pub(crate) const DISABLE_IF: u8 = 0x1E;
 
 pub(super) const FORM: u8 = 0x01;
 pub(crate) const SUBTITLE: u8 = 0x02;
@@ -108,7 +108,7 @@ pub(super) const BIT_VARSTORE_GUID: [u8; 16] = [
     0x8B, 0xD6, 0xDD, 0x82, 0x63, 0x91, 0x87, 0x41, 0x9B, 0x27, 0x20, 0xA8, 0xFD, 0x60, 0xA7, 0x1D,
 ];
 /// An EFI_IFR_GUID Guid other than EDKII_IFR_BIT_VARSTORE_GUID.
-pub(super) const OTHER_GUID: [u8; 16] = [0x33; 16];
+pub(crate) const OTHER_GUID: [u8; 16] = [0x33; 16];
 
 /// The prompt of `question_header()`.
 pub(super) const PROMPT: &str = "Prompt";
@@ -384,7 +384,7 @@ pub(super) fn uint32_default(default_id: u16, value: u32) -> Vec<u8> {
 }
 
 /// An EFI_IFR_DEFAULT_2 whose EFI_IFR_VALUE holds `expression`.
-pub(super) fn ifr_default_2(default_id: u16, expression: Vec<u8>) -> Vec<u8> {
+pub(crate) fn ifr_default_2(default_id: u16, expression: Vec<u8>) -> Vec<u8> {
     let data = [&default_id.to_le_bytes()[..], &[0x08]].concat();
     [
         operation(DEFAULT, true, &data),
@@ -411,7 +411,7 @@ pub(crate) fn ifr_true() -> Vec<u8> {
     operation(TRUE, false, &[])
 }
 
-pub(super) fn ifr_false() -> Vec<u8> {
+pub(crate) fn ifr_false() -> Vec<u8> {
     operation(FALSE, false, &[])
 }
 
@@ -419,7 +419,7 @@ pub(super) fn ifr_ones() -> Vec<u8> {
     operation(ONES, false, &[])
 }
 
-pub(super) fn uint8(value: u8) -> Vec<u8> {
+pub(crate) fn uint8(value: u8) -> Vec<u8> {
     operation(UINT8, false, &[value])
 }
 
@@ -635,6 +635,28 @@ pub(super) fn uint8_numeric_on(question_id: u16, prompt: u16, var_store_id: u16)
     ]
     .concat();
     operation(NUMERIC, false, &data)
+}
+
+/// A UINT8 NUMERIC of QuestionId `question_id`, prompted string `prompt`, with the question Flags
+/// `flags`, from 0 to 255 at VarOffset `offset` of VarStore 1, with `body` in its scope.
+pub(crate) fn uint8_numeric_with(
+    question_id: u16,
+    prompt: u16,
+    offset: u16,
+    flags: u8,
+    body: &[Vec<u8>],
+) -> Vec<u8> {
+    let data = [
+        question_header_with(question_id, prompt, 1, offset, flags),
+        vec![0x10, 0, 255, 1], // Flags: UINT8 UINT_DEC; MinValue, MaxValue, Step
+    ]
+    .concat();
+    [operation(NUMERIC, true, &data), body.concat(), END.to_vec()].concat()
+}
+
+/// An EFI_IFR_VALUE whose scope holds `expression`.
+pub(crate) fn value_of(expression: Vec<u8>) -> Vec<u8> {
+    [operation(VALUE, true, &[]), expression, END.to_vec()].concat()
 }
 
 /// A VARSTORE of `id` named `name`, of the Guid stored as `guid`, of `size` bytes.

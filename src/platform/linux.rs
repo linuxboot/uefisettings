@@ -51,6 +51,7 @@ use crate::print_with_style;
 use crate::write_extracted_db;
 use crate::JsonArgs;
 use crate::SelectionArgs;
+use crate::SetIncludeState;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -262,7 +263,10 @@ impl SetupPasswordArgs {
     }
 }
 
-impl SelectionArgs {
+impl<S> SelectionArgs<S>
+where
+    S: clap::ValueEnum + Clone + Send + Sync + 'static,
+{
     /// Fails if any state is included or an access level stated: Ilo attributes have no IFR
     /// conditions.
     pub(super) fn refuse_on_ilo(&self) -> Result<()> {
@@ -322,7 +326,7 @@ pub(super) fn auto_set(
     question: &str,
     value: &str,
     json: bool,
-    selection: &SelectionArgs,
+    selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
 ) -> Result<()> {
     let machine = identify_machine();

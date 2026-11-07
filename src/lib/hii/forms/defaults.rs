@@ -886,14 +886,17 @@ mod tests {
             None,
             &mut efivars.reader(),
         );
-        let Selection::Picked(found, _) = find_question(
+        let Selection::Picked {
+            picked: (found, _), ..
+        } = find_question(
             root,
             &strings(),
             &BTreeSet::from([PROMPT]),
             IncludedStates::empty(),
             None,
             &mut efivars.reader(),
-        ) else {
+        )
+        else {
             panic!("find the question by its prompt");
         };
 

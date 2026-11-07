@@ -18,8 +18,12 @@ use std::io::Write;
 #[cfg(all(system_hiidb, hiidb_files))]
 use std::path::Path;
 use std::process::ExitCode;
+#[cfg(all(system_hiidb, system_variables))]
+use std::sync::LazyLock;
 
 use anyhow::Result;
+#[cfg(all(system_hiidb, system_variables))]
+use clap::builder::PossibleValue;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
@@ -111,7 +115,7 @@ enum Commands {
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
-        selection: SelectionArgs,
+        selection: SelectionArgs<SetIncludeState>,
         #[command(flatten)]
         setup_password: SetupPasswordArgs,
         #[command(flatten)]
@@ -167,7 +171,7 @@ enum HiiSubcommands {
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
-        selection: SelectionArgs,
+        selection: SelectionArgs<SetIncludeState>,
         #[command(flatten)]
         setup_password: SetupPasswordArgs,
         #[command(flatten)]
@@ -212,15 +216,20 @@ struct JsonArgs {
     json: bool,
 }
 
-/// Which questions and options get, set and list-questions select.
+/// Which questions and options get, set and list-questions select. `S` is the value of
+/// --include: set's (SetIncludeState) also takes read-only, which get and list-questions refuse,
+/// as they show read-only questions regardless.
 #[derive(Debug, Args)]
-struct SelectionArgs {
+struct SelectionArgs<S = IncludeState>
+where
+    S: clap::ValueEnum + Clone + Send + Sync + 'static,
+{
     /// Also select questions that conditions gray out, suppress or disable. The edk2 setup
     /// browser (edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList) ranks
     /// DisableIf > SuppressIf > GrayOutIf, so a question that is both grayed out and suppressed
     /// counts as suppressed.
     #[arg(long, value_enum, value_delimiter = ',')]
-    include: Vec<IncludeState>,
+    include: Vec<S>,
     /// Evaluate the conditions that read the AMI Setup access level (VarStore SystemAccess
     /// E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User) at this level instead of
     /// the stored value. This states a Setup privilege; it is no password and authenticates
@@ -229,7 +238,11 @@ struct SelectionArgs {
     access_level: Option<AccessLevelArg>,
 }
 
-impl SelectionArgs {
+impl<S> SelectionArgs<S>
+where
+    S: clap::ValueEnum + Copy + Send + Sync + 'static,
+    IncludedStates: From<S>,
+{
     fn states(&self) -> IncludedStates {
         self.include
             .iter()
@@ -253,8 +266,8 @@ impl From<&SelectionArgs> for GetOptions {
 }
 
 #[cfg(all(system_hiidb, system_variables))]
-impl From<&SelectionArgs> for SetOptions {
-    fn from(args: &SelectionArgs) -> Self {
+impl From<&SelectionArgs<SetIncludeState>> for SetOptions {
+    fn from(args: &SelectionArgs<SetIncludeState>) -> Self {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
@@ -274,7 +287,7 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
 /// The SetOptions of `selection`, `setup_password` and `volatile`.
 #[cfg(all(system_hiidb, system_variables))]
 fn set_options(
-    selection: &SelectionArgs,
+    selection: &SelectionArgs<SetIncludeState>,
     setup_password: &SetupPasswordArgs,
     volatile: &VolatileArgs,
 ) -> SetOptions {
@@ -330,6 +343,50 @@ impl From<IncludeState> for IncludedStates {
             IncludeState::GrayedOut => IncludedStates::GRAYED_OUT,
             IncludeState::Suppressed => IncludedStates::SUPPRESSED,
             IncludeState::Disabled => IncludedStates::DISABLED,
+        }
+    }
+}
+
+/// The values of set's --include: those of IncludeState, and read-only.
+#[cfg(all(system_hiidb, system_variables))]
+#[derive(Debug, Clone, Copy)]
+enum SetIncludeState {
+    Condition(IncludeState),
+    ReadOnly,
+}
+
+#[cfg(all(system_hiidb, system_variables))]
+impl clap::ValueEnum for SetIncludeState {
+    fn value_variants<'a>() -> &'a [Self] {
+        static VARIANTS: LazyLock<Vec<SetIncludeState>> = LazyLock::new(|| {
+            let conditions = IncludeState::value_variants().iter().copied();
+            conditions
+                .map(SetIncludeState::Condition)
+                .chain([SetIncludeState::ReadOnly])
+                .collect()
+        });
+        VARIANTS.as_slice()
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        match self {
+            SetIncludeState::Condition(state) => state.to_possible_value(),
+            SetIncludeState::ReadOnly => Some(PossibleValue::new("read-only").help(
+                "Also write questions that EFI_IFR_FLAG_READ_ONLY makes read-only (UEFI 2.11 \
+                 §33.3.8.2.2), never one that an EFI_IFR_VALUE makes read-only (§33.3.8.3.88). \
+                 Of questions with the same text, set picks a writable one first among matches \
+                 equally certain to be selected",
+            )),
+        }
+    }
+}
+
+#[cfg(all(system_hiidb, system_variables))]
+impl From<SetIncludeState> for IncludedStates {
+    fn from(state: SetIncludeState) -> Self {
+        match state {
+            SetIncludeState::Condition(state) => state.into(),
+            SetIncludeState::ReadOnly => IncludedStates::READ_ONLY,
         }
     }
 }
@@ -563,6 +620,17 @@ mod tests {
         selection
     }
 
+    /// The selection flags of `uefisettings hii set Q V` with `args` after it.
+    #[cfg(all(system_hiidb, system_variables))]
+    fn set_selection_of(args: &[&str]) -> SelectionArgs<SetIncludeState> {
+        let command = [&["set", "Q", "V"][..], args].concat();
+        let parsed = hii(&command).unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
+        let HiiSubcommands::Set { selection, .. } = parsed else {
+            panic!("{command:?} is no set: {parsed:?}");
+        };
+        selection
+    }
+
     #[test]
     fn include_maps_each_state_to_its_flag() {
         let cases = [
@@ -585,7 +653,7 @@ mod tests {
             (
                 "all three",
                 vec!["--include", "grayed-out,suppressed,disabled"],
-                IncludedStates::all(),
+                IncludedStates::CONDITIONS,
             ),
             (
                 "repeated",
@@ -598,7 +666,11 @@ mod tests {
             assert_eq!(selection.states(), states, "{name}");
             assert_eq!(GetOptions::from(&selection).include, states, "{name}: get");
             #[cfg(all(system_hiidb, system_variables))]
-            assert_eq!(SetOptions::from(&selection).include, states, "{name}: set");
+            assert_eq!(
+                SetOptions::from(&set_selection_of(&args)).include,
+                states,
+                "{name}: set"
+            );
             assert_eq!(
                 ListQuestionsOptions::from(&selection).include,
                 states,
@@ -631,7 +703,7 @@ mod tests {
             );
             #[cfg(all(system_hiidb, system_variables))]
             assert_eq!(
-                SetOptions::from(&selection).access_level,
+                SetOptions::from(&set_selection_of(&args)).access_level,
                 level,
                 "{name}: set"
             );
@@ -650,6 +722,49 @@ mod tests {
         .concat())
         .expect_err("parse --access-level 0");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "0");
+    }
+
+    /// set's --include takes read-only, which lifts EFI_IFR_FLAG_READ_ONLY; get and
+    /// list-questions refuse it as a value they do not take, as they show read-only questions
+    /// regardless.
+    #[test]
+    fn include_takes_read_only_only_on_set() {
+        let refusing: [&[&str]; 2] = [&["hii", "get", "Q"], &["hii", "list-questions"]];
+        let refusing = refusing.map(|command| [command, &OFFLINE_SOURCE].concat());
+        let commands = refusing.iter().map(|command| (&command[..], false));
+        #[cfg(all(system_hiidb, system_variables))]
+        let commands = commands.chain([
+            (&["get", "Q"][..], false),
+            (&["hii", "set", "Q", "V"], true),
+            (&["set", "Q", "V"], true),
+        ]);
+        for (command, takes) in commands {
+            let argv = [&["uefisettings"][..], command, &["--include", "read-only"]].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            match takes {
+                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
+                false => assert_eq!(
+                    parsed.err(),
+                    Some(clap::error::ErrorKind::InvalidValue),
+                    "{command:?}"
+                ),
+            }
+        }
+
+        #[cfg(all(system_hiidb, system_variables))]
+        for (args, states) in [
+            (&["--include", "read-only"][..], IncludedStates::READ_ONLY),
+            (
+                &["--include", "grayed-out,suppressed,disabled,read-only"],
+                IncludedStates::CONDITIONS | IncludedStates::READ_ONLY,
+            ),
+        ] {
+            assert_eq!(
+                SetOptions::from(&set_selection_of(args)).include,
+                states,
+                "set {args:?}"
+            );
+        }
     }
 
     /// --access-level comes with --include: on hii get, set and list-questions and on get and

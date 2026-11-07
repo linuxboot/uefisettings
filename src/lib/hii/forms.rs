@@ -30,6 +30,7 @@ use log::debug;
 use log::warn;
 use thiserror::Error;
 
+use crate::exports::SetOptions;
 use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
 use crate::hii::variables::check_runtime_writable;
@@ -44,7 +45,6 @@ use crate::hii::variables::VolatileWrites;
 use crate::parse_error::ParseError;
 use crate::parse_error::ReadParsed;
 use conditions::question_state;
-use conditions::question_value_expression;
 use conditions::retrieve_question_value;
 use conditions::select;
 use conditions::skips_scope;
@@ -1928,17 +1928,11 @@ pub struct AnswerOption {
 
 impl QuestionDescriptor {
     /// The VarStore of the question, or None for a question without one whose WRITE expression
-    /// alone takes the value, or why set, through variables of `reach`, cannot write it, as for a
-    /// question that an EFI_IFR_VALUE makes read-only.
+    /// alone takes the value, or why set, through variables of `reach`, cannot write it.
     fn store(
         &self,
         reach: VariableReach,
     ) -> std::result::Result<Option<&dyn VariableStore>, ChangeValueError> {
-        if question_value_expression(&self.node).is_some() {
-            return Err(ChangeValueError::ReadOnly {
-                question: self.question.clone(),
-            });
-        }
         let reason = match &self.varstore {
             Ok(store) => return Ok(Some(store.as_ref())),
             Err(reason) => reason,
@@ -2038,11 +2032,15 @@ impl QuestionDescriptor {
         };
         let question = self.question.clone();
         match select(matches, include) {
-            Selection::Picked(option, _) => Ok(Some(option)),
+            Selection::Picked {
+                picked: (option, _),
+                ..
+            } => Ok(Some(option)),
             Selection::Undetermined {
                 likely: (option, _),
                 reasons,
                 states,
+                ..
             } => Err(SelectionError::OptionUndetermined {
                 question,
                 option: option.value.clone(),
@@ -2184,28 +2182,47 @@ where
 }
 
 /// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
-/// match that set would write, or the likely match, has no VarStore, or its efivar is missing,
-/// unreadable, e.g. withheld, boot-service-only, volatile or authenticated, which --include
-/// cannot make writable: then ChangeValueError::NoVarStore, DeclaredBootServiceOnly,
-/// VariableNotExported or the read's error, as `reader` found it, BootServiceOnlyVariable,
-/// VolatileVariable or AuthenticatedVariable.
+/// match that set would write, or the likely match, is read-only, which only the
+/// `options.include` that lifts its ReadOnlyCause makes writable: then ChangeValueError::ReadOnly,
+/// before the efivar checks; or has no VarStore, or its efivar is missing, unreadable, e.g.
+/// withheld, boot-service-only, volatile or authenticated, which --include cannot make writable:
+/// then ChangeValueError::NoVarStore, DeclaredBootServiceOnly, VariableNotExported or the read's
+/// error, as `reader` found it, BootServiceOnlyVariable, VolatileVariable or
+/// AuthenticatedVariable.
 pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
+    options: &SetOptions,
     reader: &EfivarReader,
-    volatile: VolatileWrites,
 ) -> Result<Choice<QuestionDescriptor>> {
-    let descriptor = match &selection {
-        Selection::Picked(descriptor, _)
-        | Selection::Undetermined {
-            likely: (descriptor, _),
+    let ((descriptor, evaluation), undetermined, ranked_before) = match &selection {
+        Selection::Picked {
+            picked,
+            ranked_before,
+        } => (picked, IncludedStates::empty(), *ranked_before),
+        Selection::Undetermined {
+            likely,
+            states,
+            ranked_before,
             ..
-        } => descriptor,
+        } => (likely, *states, *ranked_before),
         Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
     };
+    if let Some(cause) = evaluation
+        .read_only()
+        .filter(|cause| !cause.lifted_by(options.include))
+    {
+        return Err(ChangeValueError::ReadOnly {
+            question: descriptor.question.clone(),
+            cause,
+            undetermined,
+            ranked_before,
+        }
+        .into());
+    }
     // the WRITE expression of a question without a VarStore names the stores that set writes
     if let Some(store) = descriptor.store(reader.reach())? {
-        check_writable(store, reader, volatile)?;
+        check_writable(store, reader, options.volatile)?;
     }
     Ok(selection.for_set(question)?)
 }
@@ -2341,7 +2358,7 @@ mod choice_for_set_tests {
             &BTreeSet::from([PROMPT]),
             &mut FormSetWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
         );
-        choice_for_set(selection, PROMPT, &reader, VolatileWrites::Refuse)
+        choice_for_set(selection, PROMPT, &SetOptions::default(), &reader)
     }
 
     /// set's choice for PROMPT in the FormSet of `undetermined_on(own)`.
@@ -3366,7 +3383,10 @@ mod tests {
         for (prompt, phrase) in cases {
             assert_eq!(
                 find(prompt, phrase),
-                Selection::Picked((), StateEvaluation::selectable()),
+                Selection::Picked {
+                    picked: ((), StateEvaluation::selectable()),
+                    ranked_before: IncludedStates::empty(),
+                },
                 "prompt {prompt:?}, phrase {phrase:?}"
             );
         }
@@ -4142,7 +4162,7 @@ mod nesting_tests {
         on_small_stack("list_questions", || {
             // the LOCKED ops gray out Deep
             for (include, want) in [
-                (IncludedStates::all(), &["Deep", "Hidden"][..]),
+                (IncludedStates::CONDITIONS, &["Deep", "Hidden"][..]),
                 (IncludedStates::GRAYED_OUT, &["Deep"][..]),
                 (IncludedStates::empty(), &[][..]),
             ] {
@@ -4172,7 +4192,7 @@ mod nesting_tests {
                     &mut disabled_reader(),
                 );
                 assert_eq!(
-                    matches!(selection, Selection::Picked(..)),
+                    matches!(selection, Selection::Picked { .. }),
                     want,
                     "{name} picked: {selection:?}"
                 );

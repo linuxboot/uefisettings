@@ -1639,7 +1639,7 @@ mod efivar_reader_tests {
                 ],
             ),
         ]);
-        list_questions(root, &strings(), IncludedStates::all(), None, reader)
+        list_questions(root, &strings(), IncludedStates::CONDITIONS, None, reader)
             .into_iter()
             .map(|(_, state)| state.annotation())
             .collect()

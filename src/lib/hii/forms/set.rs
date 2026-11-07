@@ -23,8 +23,8 @@ use thiserror::Error;
 use super::ami_access_level::AccessLevel;
 use super::conditions::ExpressionRefusal;
 use super::conditions::IncludedStates;
+use super::conditions::ReadOnlyCause;
 use super::conditions::SelectionError;
-use super::conditions::VALUE_MAKES_READ_ONLY;
 use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
@@ -47,7 +47,7 @@ use crate::hii::variables::WithholdingVariables;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 #[derive(Error, Debug)]
-pub enum ChangeValueError {
+pub(crate) enum ChangeValueError {
     #[error("provided value did not match any possible option")]
     InvalidOption,
     #[error("provided value exceeded max possible value")]
@@ -70,14 +70,53 @@ pub enum ChangeValueError {
         question: String,
         refusal: ExpressionRefusal,
     },
-    /// A question with an EFI_IFR_VALUE, whose value that expression gives
-    #[error("cannot set question {question:?}: {}", VALUE_MAKES_READ_ONLY)]
-    ReadOnly { question: String },
+    /// A question that `cause` makes read-only, which set writes only with the states that lift
+    /// `cause`, and `undetermined`, the states that it may be in where the selection is
+    /// undetermined; `ranked_before` selects a match that ranks before it
+    #[error(
+        "cannot set question {question:?}: {}",
+        read_only_refusal(*.cause, *.undetermined, *.ranked_before)
+    )]
+    ReadOnly {
+        question: String,
+        cause: ReadOnlyCause,
+        undetermined: IncludedStates,
+        ranked_before: IncludedStates,
+    },
     #[error(transparent)]
     Selection(#[from] SelectionError),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// Why set refuses a question that `cause` makes read-only, with the states to include to write
+/// it, if any: those that lift `cause`, then `undetermined`; or to select a match that ranks
+/// before it, `ranked_before`.
+fn read_only_refusal(
+    cause: ReadOnlyCause,
+    undetermined: IncludedStates,
+    ranked_before: IncludedStates,
+) -> String {
+    let to_write = cause
+        .lifted_with()
+        .map(|lifted_with| match undetermined.is_empty() {
+            true => lifted_with.to_string(),
+            false => format!("{lifted_with},{undetermined}"),
+        });
+    match (to_write, ranked_before.is_empty()) {
+        (Some(to_write), true) => {
+            format!("{cause}; also include {to_write} questions to write it")
+        }
+        (Some(to_write), false) => format!(
+            "{cause}; also include {to_write} questions to write it, or {ranked_before} \
+             questions to select a writable one"
+        ),
+        (None, true) => cause.to_string(),
+        (None, false) => {
+            format!("{cause}; also include {ranked_before} questions to select one that set writes")
+        }
+    }
 }
 
 /// set's write of the variable of `store`: `patches`, each little-endian bytes at a VarOffset,

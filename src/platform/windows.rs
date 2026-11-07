@@ -39,6 +39,7 @@ use crate::hii_set;
 use crate::print_line;
 use crate::write_extracted_db;
 use crate::SelectionArgs;
+use crate::SetIncludeState;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -162,7 +163,7 @@ pub(super) fn auto_set(
     question: &str,
     value: &str,
     json: bool,
-    _selection: &SelectionArgs,
+    _selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
 ) -> Result<()> {
     hii_set(question, value, options, json)

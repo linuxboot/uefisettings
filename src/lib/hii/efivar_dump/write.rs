@@ -90,7 +90,7 @@ fn decoded_bytes(
             list_questions(
                 root,
                 &list.strings,
-                IncludedStates::all(),
+                IncludedStates::CONDITIONS,
                 None,
                 &mut reader,
             );
@@ -284,6 +284,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::parse_form_set;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::DISABLE_IF;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
@@ -338,7 +339,7 @@ mod tests {
         list_questions(
             Rc::clone(root),
             &[BTreeMap::new()],
-            IncludedStates::all(),
+            IncludedStates::CONDITIONS,
             None,
             &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),
         )
@@ -899,6 +900,59 @@ mod tests {
         assert_eq!(
             answers(&root, &dir),
             ["1", "1 <suppressed>"],
+            "answers from the dump"
+        );
+        assert_eq!(
+            answers(&root, &dir),
+            answers(&root, live.path()),
+            "answers from the source"
+        );
+    }
+
+    /// A dump keeps the bytes of a question that a DISABLE_IF disables too, as get reads it with
+    /// disabled included.
+    #[test]
+    fn redacted_dump_keeps_the_bytes_of_disabled_questions() {
+        let root = parse_form_set(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 2),
+            var_store_efi(2, "Hidden", NV_BS_RT, 2),
+            form(
+                1,
+                &[
+                    checkbox_on(1, 3, 1),
+                    conditional(DISABLE_IF, ifr_true(), &[checkbox_on(2, 3, 2)]),
+                ],
+            ),
+        ]);
+        let live = efivars(&[
+            (&efivar("Setup"), &[7, 0, 0, 0, 1, 0xAA]),
+            (&efivar("Hidden"), &[7, 0, 0, 0, 1, 0xBB]),
+        ]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
+        let dump = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
+
+        assert_eq!(
+            dump.copied,
+            [efivar("Hidden").to_string(), efivar("Setup").to_string()],
+            "copied files"
+        );
+        assert_eq!(
+            fs::read(dir.join(efivar("Hidden"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 1, 0],
+            "dumped Hidden: the disabled question's byte only"
+        );
+        assert_eq!(
+            answers(&root, &dir),
+            ["1", "1 <disabled>"],
             "answers from the dump"
         );
         assert_eq!(

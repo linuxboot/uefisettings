@@ -539,13 +539,20 @@ mod tests {
             &BTreeSet::from([prompt]),
             &mut FormSetWalk::new(strings, &mut reader, &values, IncludedStates::empty()),
         );
-        let Selection::Picked(descriptor, _) = &selection else {
-            panic!("{prompt}: not picked");
+        // set refuses a read-only question as it picks it, before it plans any write
+        let options = SetOptions {
+            volatile,
+            ..SetOptions::default()
+        };
+        let descriptor = match choice_for_set(selection, prompt, &options, &reader) {
+            Ok(Choice::Chosen(descriptor, _)) => descriptor,
+            Ok(Choice::Skipped(states)) => panic!("{prompt}: not picked, {states}"),
+            Err(error) => return (Err(format!("{error:#}")), BTreeMap::new()),
         };
         let writes = variables(through);
         let outcome = set_questions(
             prompt,
-            &[("selector", descriptor)],
+            &[("selector", &descriptor)],
             value,
             &BTreeSet::from([value.to_string()]),
             IncludedStates::empty(),
@@ -844,7 +851,10 @@ mod tests {
             .into_iter()
             .zip(&selections)
             .map(|(selector, selection)| match selection {
-                Selection::Picked(descriptor, _) => (selector, descriptor),
+                Selection::Picked {
+                    picked: (descriptor, _),
+                    ..
+                } => (selector, descriptor),
                 _ => panic!("{selector}: not picked"),
             })
             .collect();

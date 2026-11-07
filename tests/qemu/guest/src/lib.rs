@@ -153,6 +153,14 @@ pub mod driver_sample {
     /// A numeric question on DriverSample's name/value store whose scope holds an
     /// EFI_IFR_LOCKED (`locked` in Vfr.vfr, edk2-stable202608), which grays it out.
     pub const LOCKED: &str = "NameValueVar0";
+    /// A numeric question from 0 to 240 that EFI_IFR_FLAG_READ_ONLY makes read-only
+    /// (`flags = READ_ONLY` in Vfr.vfr, edk2-stable202608).
+    pub const READ_ONLY_NUMERIC: &str = "How old are you?(Readonly)";
+    /// Offset of the 8-bit answer of [`READ_ONLY_NUMERIC`].
+    pub const READ_ONLY_NUMERIC_OFFSET: usize = 82;
+    /// The flag that makes `set` write questions that EFI_IFR_FLAG_READ_ONLY makes read-only,
+    /// such as [`READ_ONLY_NUMERIC`]; `get` shows them regardless.
+    pub const INCLUDE_READ_ONLY: [&str; 2] = ["--include", "read-only"];
 }
 
 /// How a `uefisettings` run exited, and what it printed.

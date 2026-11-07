@@ -50,7 +50,7 @@ impl StoragelessQuestion {
             read: question_expression(question, QuestionExpression::Read).is_some(),
             write: question_expression(question, QuestionExpression::Write).is_some(),
             callback: header.flags().contains(QuestionFlags::CALLBACK),
-            value: question_value_expression(question).is_some(),
+            value: question_value_expression(&question.borrow()).is_some(),
         })
     }
 
@@ -895,7 +895,11 @@ mod get_and_set_tests {
                     &BTreeSet::from([prompt]),
                     &mut FormSetWalk::new(&strings, &mut reader, &values, IncludedStates::empty()),
                 );
-                let Selection::Picked(descriptor, _) = &selection else {
+                let Selection::Picked {
+                    picked: (descriptor, _),
+                    ..
+                } = &selection
+                else {
                     panic!("{prompt}: not picked");
                 };
                 let variables = MemoryVariables::new(reach, reader.interface());
@@ -921,7 +925,7 @@ mod get_and_set_tests {
                     "{prompt}: set through {reach:?}"
                 );
                 assert_eq!(
-                    choice_for_set(selection, prompt, &reader, VolatileWrites::Refuse)
+                    choice_for_set(selection, prompt, &SetOptions::default(), &reader)
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
                     refusal.map_or(Ok(()), |refusal| {
