@@ -84,6 +84,9 @@ accepts firmware=secboot-user 'kernel= firmware=secboot-user arch=x86_64,i686,aa
 accepts arch=i686 'kernel= firmware=default arch=i686 devices= guest= params='
 accepts arch=aarch64,x86_64 'kernel= firmware=default arch=aarch64,x86_64 devices= guest= params='
 accepts devices=virtio-rng "kernel= $all devices=virtio-rng guest= params="
+accepts 'devices=esp-disk arch=i686' 'kernel= firmware=default arch=i686 devices=esp-disk guest= params='
+accepts 'arch=i686 devices=virtio-rng,esp-disk' \
+    'kernel= firmware=default arch=i686 devices=virtio-rng,esp-disk guest= params='
 accepts 'devices=virtio-rng firmware=secboot-user kernel=lockdown arch=x86_64,i686' \
     'kernel=lockdown firmware=secboot-user arch=x86_64,i686 devices=virtio-rng guest= params='
 accepts guest=unfixed "kernel= $all devices= guest=unfixed params="
@@ -130,9 +133,10 @@ refuses arch=riscv64 \
 refuses arch=x86 \
     'scenarios.tsv: test: unknown element x86 in arch=x86; the elements are x86_64 i686 aarch64'
 refuses devices=fat-disk \
-    'scenarios.tsv: test: unknown element fat-disk in devices=fat-disk; the elements are virtio-rng'
+    'scenarios.tsv: test: unknown element fat-disk in devices=fat-disk; the elements are virtio-rng esp-disk'
 refuses devices=virtio \
-    'scenarios.tsv: test: unknown element virtio in devices=virtio; the elements are virtio-rng'
+    'scenarios.tsv: test: unknown element virtio in devices=virtio; the elements are virtio-rng esp-disk'
+accepts devices=esp-disk "kernel= $all devices=esp-disk guest= params="
 refuses devices=virtio-rng,virtio-rng \
     'scenarios.tsv: test: repeated element virtio-rng in devices=virtio-rng,virtio-rng'
 refuses guest= 'scenarios.tsv: test: unknown value guest=; the values are unfixed unfixed-v5.8'

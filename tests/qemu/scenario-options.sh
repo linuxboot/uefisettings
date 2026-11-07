@@ -20,7 +20,8 @@
 #                                        default: default
 #   arch=ARCH[,ARCH]...                  the architectures, of x86_64, i686 and aarch64, that boot
 #                                        the scenario; default: all three
-#   devices=DEVICE[,DEVICE]...           QEMU devices to add, of virtio-rng; default: none
+#   devices=DEVICE[,DEVICE]...           QEMU devices to add, of virtio-rng and esp-disk (run.sh);
+#                                        default: none
 #   guest=unfixed|unfixed-v5.8           the guest of guest-packages-<arch>-unfixed, or of
 #                                        guest-packages-x86_64-unfixed-v5.8, which needs
 #                                        arch=x86_64: Linux without upstream 0e8d2444168d (run.sh);
@@ -82,7 +83,7 @@ scenario_options() {
             option_firmware=$value
             ;;
         arch) scenario_option_list "$name" "$key" "$value" option_arches x86_64 i686 aarch64 || return 1 ;;
-        devices) scenario_option_list "$name" "$key" "$value" option_devices virtio-rng || return 1 ;;
+        devices) scenario_option_list "$name" "$key" "$value" option_devices virtio-rng esp-disk || return 1 ;;
         guest)
             scenario_option_value "$name" "$key" "$value" unfixed unfixed-v5.8 || return 1
             option_guest=$value

@@ -2,6 +2,7 @@ binutils-aarch64-linux-gnu
 build-essential
 cpio
 curl
+fdisk
 gcc-aarch64-linux-gnu
 git
 jq

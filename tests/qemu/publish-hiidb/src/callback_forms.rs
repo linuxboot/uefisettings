@@ -19,7 +19,8 @@
 //! EFI_HII_CONFIG_ROUTING_PROTOCOL routes the form set's stores to the handle's
 //! EFI_HII_CONFIG_ACCESS_PROTOCOL (edk2-stable202608 HiiDatabaseDxe Database.c HiiNewPackageList,
 //! ConfigRouting.c HiiConfigRoutingExtractConfig).
-//! - [`FormSet::Plain`] declares no store; its question asks for a platform reset in CHANGED.
+//! - [`FormSet::Plain`] declares no store; its questions ask for a platform reset in CHANGED, or
+//!   reset the platform there, for the scenario `staged-set`.
 //! - [`FormSet::Stores`] declares an EFI variable store and a 5-byte Buffer store, kept in the
 //!   EFI variable of its name, whose byte 4 ExtractConfig() answers with the count of its
 //!   calls, as a driver answers with data that is no setting; its questions' Callback()s keep
@@ -57,6 +58,7 @@ use uefi::guid;
 use uefi::println;
 use uefi::proto::unsafe_protocol;
 use uefi::runtime;
+use uefi::runtime::ResetType;
 use uefi::runtime::VariableAttributes;
 use uefi::runtime::VariableVendor;
 use uefi::CStr16;
@@ -239,6 +241,8 @@ enum Behavior {
     Own,
     /// As Own, and CHANGED asks for EFI_BROWSER_ACTION_REQUEST_RESET
     OwnAskingReset,
+    /// As Own, and CHANGED then resets the platform, so that it never returns
+    OwnResetting,
     /// As Own, and CHANGED asks for EFI_BROWSER_ACTION_REQUEST_SUBMIT
     OwnAskingSave,
     /// As Own, and CHANGED asks for EFI_BROWSER_ACTION_REQUEST_RECONNECT
@@ -269,12 +273,18 @@ struct Question {
     behavior: Behavior,
 }
 
-const QUESTIONS: [Question; 15] = [
+const QUESTIONS: [Question; 16] = [
     Question {
         id: 0x0101,
         form_set: FormSet::Plain,
         prompt: "Callback value asking for a reset",
         behavior: Behavior::OwnAskingReset,
+    },
+    Question {
+        id: 0x0102,
+        form_set: FormSet::Plain,
+        prompt: "Callback value resetting the platform",
+        behavior: Behavior::OwnResetting,
     },
     Question {
         id: 0x0201,
@@ -953,6 +963,15 @@ fn respond(
                 }
                 Behavior::OwnAskingReset => {
                     (write_variable(&own, &[value]), BrowserActionRequest::RESET)
+                }
+                Behavior::OwnResetting => {
+                    let status = write_variable(&own, &[value]);
+                    println!(
+                        "callback-forms: Callback(CHANGED) question {:#06x} value {value:#x}: \
+                         {status:?}, resetting the platform",
+                        question.id
+                    );
+                    runtime::reset(ResetType::COLD, Status::SUCCESS, None)
                 }
                 Behavior::OwnAskingSave => {
                     (write_variable(&own, &[value]), BrowserActionRequest::SUBMIT)

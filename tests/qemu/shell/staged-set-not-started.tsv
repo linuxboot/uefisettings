@@ -1,0 +1,8 @@
+# The checks of shell/staged-set-not-started.nsh. See check-shell-log.sh.
+# the firmware fails to load the staged set's image and boots on, once
+firmware	line	^BdsDxe: failed to load Boot[0-9A-Fa-f]{4} "uefisettings: a set staged for this boot" from HD\(2,GPT,8C78A505-BAA0-4C4A-869F-000000001A10,0x800,0x14000\)/\\EFI\\uefisettings\\uefisettings\.efi: Not Found$
+firmware	none	^apply-staged:
+firmware	count	1 ^publish-hiidb: registered the callback forms Callbacks$
+# the value that the staged set held is not applied
+get-unapplied	status	0x0
+get-unapplied	json-line	.responses | length == 1 and (.[0].question.answer | startswith("On <"))

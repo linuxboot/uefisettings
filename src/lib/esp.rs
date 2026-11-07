@@ -656,6 +656,7 @@ mod tests {
     use super::sfdisk_images::GPT_4096;
     use super::sfdisk_images::GPT_512;
     use super::sfdisk_images::MBR_512;
+    use super::sfdisk_images::QEMU_ESP_DISK;
     use super::*;
 
     const LINUX_TYPE: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
@@ -925,6 +926,19 @@ mod tests {
                 signature: PartitionSignature::Gpt(guid("8C78A505-BAA0-4C4A-869F-000000001A0A")),
             }),
             "GPT_4096's ESP"
+        );
+
+        // the QEMU tests' disk, whose firmware starts a staged image by this node
+        let disk = DiskImage::from(&QEMU_ESP_DISK);
+        assert_eq!(
+            esp_of(&disk, extent(512, 2048, 81920)),
+            Ok(HardDrive {
+                partition_number: 2,
+                start: 2048,
+                size: 81920,
+                signature: PartitionSignature::Gpt(guid("8C78A505-BAA0-4C4A-869F-000000001A10")),
+            }),
+            "QEMU_ESP_DISK's ESP"
         );
     }
 

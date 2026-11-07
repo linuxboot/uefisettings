@@ -19,8 +19,11 @@
 # The script, tests/qemu/shell/NAME.nsh, runs with echo -off and echoes
 # "uefisettings-shell: start" first, "uefisettings-shell: step STEP %lasterror%" after each
 # step and "uefisettings-shell: done" last: the output of a step is the console lines after
-# the marker before it. EXPECTATIONS, tests/qemu/shell/NAME.tsv, holds the checks, one per
-# line, in tab-separated columns:
+# the marker before it. The console lines before the start are those of the step firmware,
+# which has no status: what the firmware and the boot options that it starts before the Shell
+# print, also in the boots that a reset ended, in a rebooting-shell: boot of run.sh.
+# EXPECTATIONS, tests/qemu/shell/NAME.tsv, holds the checks, one per line, in tab-separated
+# columns:
 #   step       the step that the check reads
 #   check      status: the step's %lasterror% is the argument; "aborted" stands for
 #                EFI_ABORTED, which the shell shows as 0x15, and as 0x80000015 on i686, and
@@ -38,6 +41,8 @@
 #              line: a line of the step's output matches the extended regular expression of
 #                the argument
 #              none: no line of the step's output matches that expression
+#              count: the argument is "N REGEX"; exactly N lines of the step's output match
+#                the extended regular expression REGEX
 #              same: the step's output is that of the step that the argument names
 #              variable: the argument is "NAME STEP"; the step's output, that of the shell's
 #                set, has the line "NAME = VALUE", and VALUE is the one line of STEP's output
@@ -58,8 +63,8 @@
 #                for unless-line, if none does, such as where the firmware lacks a protocol
 #                that dh lists
 #   argument   what the check takes
-# Every step of the log needs a status check, and every step that a check names must be in
-# the log once.
+# Every step of the log but firmware needs a status check, and every step that a check names
+# must be in the log once.
 
 set -euo pipefail
 shopt -s nullglob
@@ -86,8 +91,15 @@ steps=$(mktemp -d)
 trap 'rm -r "$steps"' EXIT
 # The console has CRLF line ends and control sequences.
 if ! tr -d '\r' <"$console" | LC_ALL=C sed "s|$control_sequence||g" | awk -v steps="$steps" '
-    $0 == "uefisettings-shell: start" { started = 1; output = ""; next }
-    !started { next }
+    BEGIN { seen["firmware"] = 1 }
+    !started && $0 == "uefisettings-shell: start" {
+        started = 1
+        printf "%s", output > (steps "/firmware.out")
+        close(steps "/firmware.out")
+        output = ""
+        next
+    }
+    !started { output = output $0 "\n"; next }
     $0 == "uefisettings-shell: done" { done = 1; exit }
     /^uefisettings-shell: step / {
         if (NF != 4 || $3 !~ /^[a-z0-9-]+$/ || ($3 in seen)) {
@@ -150,6 +162,10 @@ check_step() {
     case $check in
     status)
         status_checked[$step]=1
+        if [[ $step == firmware ]]; then
+            fail "$step" "no status: it is the console before the script's start"
+            continue
+        fi
         want=$argument
         [[ $want != aborted ]] || want=$aborted
         got=$(<"$steps/$step.status")
@@ -184,6 +200,11 @@ check_step() {
         ;;
     line) grep --quiet --extended-regexp -- "$argument" "$out" || fail "$step" "no line matches $argument" ;;
     none) ! grep --quiet --extended-regexp -- "$argument" "$out" || fail "$step" "a line matches $argument" ;;
+    count)
+        read -r want regex <<<"$argument"
+        got=$(grep --count --extended-regexp -- "$regex" "$out" || true)
+        [[ $got == "$want" ]] || fail "$step" "$got lines, not $want, match $regex"
+        ;;
     same)
         [[ -f $steps/$argument.out ]] && cmp --quiet "$steps/$argument.out" "$out" ||
             fail "$step" "output differs from that of $argument"
@@ -250,7 +271,8 @@ while IFS=$'\t' read -r step check argument || [[ -n $step ]]; do
 done <"$expectations"
 for out in "$steps"/*.out; do
     step=$(basename "$out" .out)
-    [[ -n ${status_checked[$step]:-} ]] || fail "$step" "no status check in $expectations"
+    [[ $step == firmware || -n ${status_checked[$step]:-} ]] ||
+        fail "$step" "no status check in $expectations"
 done
 if ((failures > 0)); then
     echo "check-shell-log: $failures checks FAILED"

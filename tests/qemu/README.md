@@ -53,7 +53,7 @@ tests/qemu/run.sh x86_64 boot-smoke   # the named scenarios
 ```
 
 Elsewhere, these tools must be on `PATH`: `qemu-system-x86_64`, `qemu-system-i386`,
-`qemu-system-aarch64`, `virt-fw-vars`, `jq`, `cpio`, `flock` and `openssl` for `run.sh`;
+`qemu-system-aarch64`, `virt-fw-vars`, `jq`, `cpio`, `flock`, `openssl` and `sfdisk` for `run.sh`;
 `curl`, `rpm2cpio`, `cpio`, `ar`, `tar`, `xz` and `zstd` for `fetch-packages.sh`; and,
 unless DriverSample.efi is already built, `gcc`, `g++`, `make`, `git`, `nasm`, `python3`
 and the libuuid headers for [`build-driver-sample.sh`](build-driver-sample.sh), which
@@ -456,6 +456,25 @@ and CapsuleMax and CapsuleLast. Each is non-volatile, CapsuleMax too, which edk2
 InitCapsuleMaxVariable()), as the variable store that seeds them holds no volatile variable.
 `shell-capsule-results` and `shell-capsule-results-i686` check that `uefisettings.efi` prints the
 same results in the UEFI Shell, and the table.
+
+## Staged sets
+
+The scenario `staged-set` stages a set for the next boot from Linux and has the firmware apply
+it, on each architecture. Its option `devices=esp-disk` has `run.sh` attach a writable 64 MiB
+disk image, which its boots share and `sfdisk` partitions as [`esp-disk.sfdisk`](esp-disk.sfdisk):
+the EFI system partition is GPT entry 2 but the first partition on the disk. `run.sh` also puts
+in the initramfs the modules that Linux needs to mount that partition, on x86_64 and aarch64
+only the FAT modules of `kernel-modules-core`, and the UEFI Shell's `uefisettings.efi`. The guest
+test [`staged_set`](guest/tests/staged_set.rs) formats that partition and stages questions of
+`publish-hiidb.efi callback-forms`, whose driver holds their value, with `set --image`.
+
+Its `rebooting-shell:` boots run QEMU without `-no-reboot`, so that a reset restarts the
+firmware. Before the UEFI Shell, the firmware starts the staged set's `Boot####` from
+`BootNext`; its `uefisettings.efi` applies the set, prints each result and the deletion of the
+`Boot####`, and resets the platform. In the other two boots, the firmware finds no image, as the
+test deleted it, or a question's `Callback(CHANGED)` resets the platform before any result.
+[`check-shell-log.sh`](check-shell-log.sh) reads what the firmware printed before the Shell,
+through every reset, as the step `firmware`.
 
 ## Secure Boot
 

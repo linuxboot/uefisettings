@@ -140,6 +140,10 @@ name = "secboot"
 required-features = ["test-vm"]
 
 [[test]]
+name = "staged_set"
+required-features = ["test-vm"]
+
+[[test]]
 name = "capsule"
 required-features = ["test-vm"]
 

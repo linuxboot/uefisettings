@@ -1,0 +1,18 @@
+# The checks of shell/staged-set-applied.nsh. See check-shell-log.sh.
+# the firmware starts the staged set's Boot#### by the Hard Drive node of the ESP, GPT entry 2,
+# the first partition on the disk; its uefisettings.efi applies the first request, its driver
+# refuses the second, it deletes the set's Boot####, and it resets the platform, after which the
+# firmware loads the drivers again
+firmware	line	^BdsDxe: starting Boot[0-9A-Fa-f]{4} "uefisettings: a set staged for this boot" from HD\(2,GPT,8C78A505-BAA0-4C4A-869F-000000001A10,0x800,0x14000\)/\\EFI\\uefisettings\\uefisettings\.efi$
+firmware	line	^callback-forms: Callback\(CHANGED\) question 0x0201 value 0x1: SUCCESS
+firmware	line	^apply-staged: question "Callback value beside stores", QuestionId 0x0201 of FormSet [0-9A-Fa-f-]+, to 1: applied: <applied
+firmware	line	^apply-staged: question "Callback value refused in CHANGING", QuestionId 0x0204 of FormSet [0-9A-Fa-f-]+, to 1: not applied: .*EFI_ACCESS_DENIED
+firmware	line	^apply-staged: deleted Boot[0-9A-Fa-f]{4}$
+firmware	none	^apply-staged: failed
+firmware	line	^apply-staged: resetting the platform$
+firmware	count	2 ^publish-hiidb: registered the callback forms Callbacks$
+# the driver keeps what the staged boot set
+get-applied	status	0x0
+get-applied	json-line	.responses | length == 1 and (.[0].question.answer | startswith("On <"))
+get-refused	status	0x0
+get-refused	json-line	.responses | length == 1 and (.[0].question.answer | startswith("Off <"))
