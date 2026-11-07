@@ -65,6 +65,10 @@ pub(crate) enum ChangeValueError {
     BelowMinValue,
     #[error("numeric question has an invalid range")]
     InvalidNumericRange,
+    #[error("hexadecimal value {value:?} has more bits than the {bits} of the question's value")]
+    HexTooWide { value: String, bits: u32 },
+    #[error("hexadecimal value {0:?} takes no sign")]
+    SignedHex(String),
     #[error("setting EDKII bit-field values is not supported")]
     UnsupportedBitField,
     #[error("cannot set question {question:?}: {reason}")]
@@ -1817,6 +1821,144 @@ mod write_validation_tests {
                 Err(ChangeValueError::InvalidNumericRange)
             ));
             assert!(writes(&variables).is_empty());
+        }
+    }
+
+    /// A NUMERIC takes hexadecimal after 0x or 0X on every EFI_IFR_DISPLAY (UEFI 2.11
+    /// §33.3.8.3.47: "Input is still allowed in any form"), decimal otherwise; malformed
+    /// hexadecimal writes nothing.
+    #[test]
+    fn numeric_takes_hexadecimal_after_0x_on_every_display() {
+        for (display, name) in [(0x00, "INT_DEC"), (0x10, "UINT_DEC"), (0x20, "UINT_HEX")] {
+            for input in ["30", "0x1E", "0X1e", "0x001E"] {
+                let (question, variables) = numeric_question(8, 0, 100, 1, display, 0);
+                change_value(&question, input, &variables)
+                    .unwrap_or_else(|error| panic!("{name}: set {input:?}: {error}"));
+                assert_eq!(writes(&variables), [(2, vec![30])], "{name}: set {input:?}");
+            }
+            for input in ["0x", "0x+1E", "0x-1", "0x1G", "0x 1E", "0x1E ", "x1E", "1E"] {
+                let (question, variables) = numeric_question(8, 0, 100, 1, display, 0);
+                let changed = change_value(&question, input, &variables);
+                assert!(changed.is_err(), "{name}: set {input:?}: {changed:?}");
+                assert_eq!(writes(&variables), [], "{name}: set {input:?}");
+            }
+        }
+    }
+
+    /// On EFI_IFR_DISPLAY_INT_DEC, 0x input is the stored bits: decoded signed, checked against
+    /// MinValue and MaxValue as signed, refused with more bits than the value holds or with a
+    /// sign.
+    #[test]
+    fn int_dec_hexadecimal_is_the_stored_bits() {
+        let minimum = (-128i64).cast_unsigned();
+        let cases = [
+            ("0xFF", Ok(vec![0xFF])),
+            ("0x80", Ok(vec![0x80])),
+            ("0x7F", Ok(vec![0x7F])),
+            ("0x00", Ok(vec![0x00])),
+            (
+                "0x100",
+                Err("hexadecimal value \"0x100\" has more bits than the 8 of the question's value"),
+            ),
+            ("-0x1", Err("hexadecimal value \"-0x1\" takes no sign")),
+            ("+0x1", Err("hexadecimal value \"+0x1\" takes no sign")),
+            ("-0X1", Err("hexadecimal value \"-0X1\" takes no sign")),
+        ];
+        for (input, want) in cases {
+            let (question, variables) = numeric_question(8, minimum, 127, 1, 0x00, 0);
+            let changed = change_value(&question, input, &variables).map_err(|e| e.to_string());
+            match want {
+                Ok(bytes) => {
+                    assert_eq!(changed, Ok(()), "set {input:?}");
+                    assert_eq!(writes(&variables), [(2, bytes)], "set {input:?}");
+                }
+                Err(error) => {
+                    assert_eq!(changed, Err(error.to_string()), "set {input:?}");
+                    assert_eq!(writes(&variables), [], "set {input:?}");
+                }
+            }
+        }
+    }
+
+    /// The number that hexadecimal input names is checked against MinValue and MaxValue at every
+    /// width, as a decimal one is.
+    #[test]
+    fn hexadecimal_input_is_checked_against_the_range() {
+        let cases = [
+            // UINT_HEX 0..=250
+            ("UINT_HEX 0xFA", (8, 0, 250, 0x20), "0xFA", Ok(vec![0xFA])),
+            ("UINT_HEX 0xFB", (8, 0, 250, 0x20), "0xFB", Err("above")),
+            // INT_DEC -10..=10
+            (
+                "INT_DEC 0xF6",
+                (8, (-10i64).cast_unsigned(), 10, 0x00),
+                "0xF6",
+                Ok(vec![0xF6]),
+            ),
+            (
+                "INT_DEC 0xF5",
+                (8, (-10i64).cast_unsigned(), 10, 0x00),
+                "0xF5",
+                Err("below"),
+            ),
+            (
+                "16-bit INT_DEC 0x8000",
+                (16, (-32768i64).cast_unsigned(), 32767, 0x00),
+                "0x8000",
+                Ok(vec![0x00, 0x80]),
+            ),
+            (
+                "64-bit UINT_HEX all ones",
+                (64, 0, u64::MAX, 0x20),
+                "0xFFFFFFFFFFFFFFFF",
+                Ok(vec![0xFF; 8]),
+            ),
+            (
+                "64-bit UINT_HEX over 64 bits",
+                (64, 0, u64::MAX, 0x20),
+                "0x10000000000000000",
+                Err("parse"),
+            ),
+        ];
+        for (name, (bits, minimum, maximum, display), input, want) in cases {
+            let (question, variables) = numeric_question(bits, minimum, maximum, 1, display, 0);
+            let changed = change_value(&question, input, &variables);
+            match want {
+                Ok(bytes) => {
+                    assert!(changed.is_ok(), "{name}: {changed:?}");
+                    assert_eq!(writes(&variables), [(2, bytes)], "{name}");
+                }
+                Err(kind) => {
+                    let refused = match kind {
+                        "above" => matches!(changed, Err(ChangeValueError::ExceededMaxValue)),
+                        "below" => matches!(changed, Err(ChangeValueError::BelowMinValue)),
+                        _ => matches!(changed, Err(ChangeValueError::Other(_))),
+                    };
+                    assert!(refused, "{name}: {changed:?}");
+                    assert_eq!(writes(&variables), [], "{name}");
+                }
+            }
+        }
+    }
+
+    /// A CHECKBOX keeps decimal input: 0x is for NUMERIC (UEFI 2.11 §33.3.8.3.47).
+    #[test]
+    fn checkbox_takes_no_hexadecimal() {
+        for (input, want) in [("1", vec![(0, vec![1])]), ("0x1", vec![])] {
+            let variables = MemoryVariables::default();
+            let (_root, node) = parse_question(&[], CHECKBOX, &checkbox(0, 0x00), &[]);
+            let question = question_descriptor(&node, writable_var_store("A", &[0], &variables));
+            let changed = change_value(&question, input, &variables);
+            assert_eq!(
+                changed.is_ok(),
+                !want.is_empty(),
+                "set {input:?}: {changed:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&variable_key("A")),
+                want,
+                "set {input:?}"
+            );
         }
     }
 

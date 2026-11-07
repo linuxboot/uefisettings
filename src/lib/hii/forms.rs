@@ -167,6 +167,9 @@ const EFI_IFR_NUMERIC_SIZE_4: u8 = 0x02;
 const EFI_IFR_NUMERIC_SIZE_8: u8 = 0x03;
 const EFI_IFR_DISPLAY: u8 = 0x30;
 const EFI_IFR_DISPLAY_INT_DEC: u8 = 0x00;
+/// The prefixes of a NUMERIC value in hexadecimal, which set takes whatever EFI_IFR_DISPLAY
+/// shows: "Input is still allowed in any form" (UEFI 2.11 §33.3.8.3.47)
+const HEX_PREFIXES: [&str; 2] = ["0x", "0X"];
 // UEFI 2.10 §33.3.8.3.51
 const EFI_IFR_TYPE_NUM_SIZE_8: u8 = 0x00;
 const EFI_IFR_TYPE_NUM_SIZE_16: u8 = 0x01;
@@ -1181,9 +1184,7 @@ impl NumericRange {
         if self.minimum > self.maximum {
             return Err(ChangeValueError::InvalidNumericRange);
         }
-        let value = value
-            .parse::<i128>()
-            .context("value should be a decimal integer")?;
+        let value = self.number(value)?;
         if value < self.minimum {
             return Err(ChangeValueError::BelowMinValue);
         }
@@ -1207,6 +1208,40 @@ impl NumericRange {
             64 => Ok(TypeValue::NumSize64(stored)),
             _ => Err(ChangeValueError::InvalidNumericRange),
         }
+    }
+
+    /// The number that `text` names: after 0x or 0X, the stored bits in hexadecimal, decoded as
+    /// get shows them; otherwise a decimal integer.
+    fn number(&self, text: &str) -> Result<i128, ChangeValueError> {
+        let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+        let Some(digits) = HEX_PREFIXES
+            .iter()
+            .find_map(|prefix| unsigned.strip_prefix(prefix))
+        else {
+            return Ok(text
+                .parse::<i128>()
+                .context("value should be a decimal integer, or hexadecimal after 0x")?);
+        };
+        if unsigned.len() != text.len() {
+            return Err(ChangeValueError::SignedHex(text.to_owned()));
+        }
+        // from_str_radix takes a sign too
+        if !digits.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "hexadecimal value {text:?} has a character after its prefix that is no \
+                 hexadecimal digit"
+            )
+            .into());
+        }
+        let bits = u64::from_str_radix(digits, 16)
+            .with_context(|| format!("failed to parse hexadecimal value {text:?}"))?;
+        if self.format.cut(bits) != bits {
+            return Err(ChangeValueError::HexTooWide {
+                value: text.to_owned(),
+                bits: self.format.bits,
+            });
+        }
+        Ok(self.format.decode(bits))
     }
 }
 

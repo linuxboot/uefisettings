@@ -158,6 +158,44 @@ fn set_question_on_a_runtime_variable_of_a_boot_service_only_form_is_stored() {
     );
 }
 
+/// set takes a numeric value in hexadecimal after 0x, whatever the question displays (UEFI 2.11
+/// §33.3.8.3.47), here on DriverSample's UINT_HEX question on MyEfiVar: 0x1E stores 30, as decimal
+/// 30 does, which get shows in decimal; 0xFB, above its maximum of 250, is refused. Each write is
+/// undone, so the question keeps the value that the other checks give it.
+#[test]
+fn set_numeric_in_hexadecimal_is_stored() {
+    let first_byte = || variable_data(MY_EFI_VAR).expect("MyEfiVar exists")[0];
+    let set_to = |answer: &str| {
+        let (set, modified) = single_response(
+            &["hii", "set", MY_EFI_VAR_QUESTION, answer, "--json"],
+            BACKEND_HII,
+        );
+        assert_eq!((set.answer.as_str(), modified), (answer, true), "{set:#?}");
+    };
+    let found = first_byte();
+
+    for answer in ["0x1E", "30"] {
+        set_to(answer);
+        let (got, _) = single_response(&["hii", "get", MY_EFI_VAR_QUESTION, "--json"], BACKEND_HII);
+        assert_eq!(got.answer, "30", "get after set {answer}: {got:#?}");
+        assert_eq!(first_byte(), 30, "{MY_EFI_VAR} after set {answer}");
+
+        set_to(&found.to_string());
+        assert_eq!(
+            first_byte(),
+            found,
+            "{MY_EFI_VAR} after the undo of {answer}"
+        );
+    }
+
+    let error = json_error(&["hii", "set", MY_EFI_VAR_QUESTION, "0xFB", "--json"]);
+    assert_eq!(
+        error.error_message, "provided value exceeded max possible value",
+        "set 0xFB"
+    );
+    assert_eq!(first_byte(), found, "{MY_EFI_VAR} after set 0xFB");
+}
+
 /// set refuses a question on MyEfiUnionVar, which DriverSample creates without runtime
 /// access, naming the boot-service-only declaration of its form, and writes nothing.
 #[test]

@@ -9125,6 +9125,81 @@ mod tests {
         assert_eq!(variables.writes_to(&n_store()), [], "writes");
     }
 
+    /// set's refusal of a question of NStore, whose variable only the snapshot holds.
+    const N_STORE_NOT_EXPOSED: &str = "no EFI variable \
+        NStore-8c78a505-baa0-4c4a-869f-000000001401: the firmware has not created it or does not \
+        expose it to the OS, so its questions cannot be set from Linux; change them in the \
+        firmware setup, or ask the board vendor for firmware that exposes it; see \
+        https://github.com/linuxboot/uefisettings/issues/2";
+
+    /// A HiiDB of the driver at DRIVER_PATH whose FormSet has `body` after the buffer VarStore
+    /// NStore of `size` bytes, of id 1; its strings are `strings`.
+    fn n_store_hiidb(size: u16, body: &[Vec<u8>], strings: &[&str]) -> Vec<u8> {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[var_store(1, N_GUID, "NStore", size), form(1, body)]),
+            en_strings_package_of(strings),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// The snapshot of the driver of n_store_hiidb, whose NStore holds `bytes`.
+    fn n_store_snapshot(bytes: &[u8]) -> String {
+        block_resp(&config_hdr(N_GUID, "NStore", &DRIVER_PATH), 0, bytes)
+    }
+
+    /// The error of set of `question` of `hiidb` to `value` through no variables, after
+    /// asserting that it wrote nothing.
+    #[track_caller]
+    fn set_error_without_variables(hiidb: &[u8], question: &str, value: &str) -> String {
+        let variables = no_variables();
+        let error = HiiBackend::set_in(
+            hiidb,
+            question,
+            value,
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        )
+        .expect_err(question);
+        assert_eq!(variables.writes_to(&n_store()), [], "{question}: writes");
+        format!("{error:#}")
+    }
+
+    /// A NUMERIC that displays hexadecimal shows its value from the snapshot in decimal, tagged,
+    /// as get shows any NUMERIC; set refuses a hexadecimal value of it as a decimal one, as it
+    /// never takes the snapshot.
+    #[test]
+    fn hexadecimal_numerics_show_snapshot_values_and_set_refuses_them() {
+        // a UINT16 NUMERIC at byte 1, EFI_IFR_DISPLAY_UINT_HEX, from 0 to 65535
+        let data = [
+            question_header_with(1, 1, 1, 1, 0x00),
+            vec![0x21, 0x00, 0x00, 0xFF, 0xFF, 0x01, 0x00],
+        ]
+        .concat();
+        let hiidb = n_store_hiidb(3, &[operation(NUMERIC, false, &data)], &["H"]);
+        let text = n_store_snapshot(&[0, 0x34, 0x12]);
+
+        let (got, listed, ifr, _) = answers_with_snapshot(&hiidb, &["H"], &no_variables(), &text);
+
+        assert_eq!(got, ["4660 <snapshot>"], "get");
+        assert_eq!(listed, ["4660 <snapshot>"], "list-questions");
+        assert!(
+            ifr.contains("-Answer: 4660 <snapshot>\n"),
+            "show-ifr: {ifr}"
+        );
+        for value in ["0x1E", "30"] {
+            assert_eq!(
+                set_error_without_variables(&hiidb, "H", value),
+                N_STORE_NOT_EXPOSED,
+                "set {value}"
+            );
+        }
+    }
+
     /// Reading a snapshot logs none of its bytes, at any level, also when it is no
     /// <MultiConfigAltResp> or holds a <ConfigAltResp> that does not parse.
     #[test]
