@@ -259,6 +259,7 @@ otherwise.
 | Operation | Commands | Build | Consequence |
 |---|---|---|---|
 | A write in a HiiDB that declares a setup password question | `set`, `hii set`, `hii keyword set` | UEFI Shell | No password is asked or checked, as the UEFI Shell runs no setup browser |
+| A set staged for the next boot in a HiiDB that declares a setup password question | `set`, `hii set`, which record the flag for `apply-staged` | Linux | The next boot applies it before the OS, where no setup browser asks for or checks the password |
 | A write of a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only | `set`, `hii set` | Linux, UEFI Shell, Windows | A value changes that the firmware declares read-only; the Keyword Handler refuses it as "a violation of system policy" (UEFI 2.11 §35.3.2) |
 | A signed write of a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware writes it without checking the signature (UEFI 2.11 §3.3, §32.3) |
 | A signed write of a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware may write it without checking the signature (UEFI 2.11 §32.6.3) |
@@ -869,7 +870,11 @@ A failing command returns EFI_ABORTED, which `%lasterror%` shows as 0x15 (0x8000
 
 The UEFI Shell runs no setup browser, so nothing there asks for or checks a setup password: in a
 HiiDB that declares a password question, `set` writes nothing unless
-`--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)).
+`--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)). A set
+staged for the next boot follows the same rule, as `apply-staged` applies it before the OS: on
+Linux, `set` stages a question whose value only its driver holds in such a HiiDB only with
+`--i-am-fine-to-brick-this-system`, which it records with the question and which `apply-staged`
+honours.
 
 `set` refuses a variable without EFI_VARIABLE_NON_VOLATILE unless `--allow-volatile` is given.
 The UEFI Shell runs before ExitBootServices, when SetVariable() still sets volatile variables

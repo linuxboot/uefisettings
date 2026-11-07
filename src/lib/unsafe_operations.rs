@@ -63,6 +63,9 @@ pub enum UnsafeOperation {
     /// A write, in the UEFI Shell, in a HiiDB that declares a setup password question, which no
     /// setup browser there asks for
     SetupPassword,
+    /// A set staged for the next boot in a HiiDB that declares a setup password question, which
+    /// uefisettings.efi applies before the OS, where no setup browser asks for it either
+    StagedSetupPassword,
     /// A write of `question`, which EFI_IFR_FLAG_READ_ONLY makes read-only; including the
     /// condition states `writable` selects a writable question of its text instead
     ReadOnlyQuestion {
@@ -100,6 +103,7 @@ impl UnsafeOperation {
     fn unlock(&self) -> &'static str {
         match self {
             Self::SetupPassword => "write without it",
+            Self::StagedSetupPassword => "stage it",
             Self::ReadOnlyQuestion { .. } => "write it",
             #[cfg(variable_data)]
             Self::SetupModePolicyWrite { .. } | Self::SetupModeDeviceDatabaseWrite { .. } => {
@@ -119,7 +123,9 @@ impl UnsafeOperation {
             Self::ReadOnlyQuestion { writable, .. } if !writable.is_empty() => {
                 format!(", or also include {writable} questions to select a writable one")
             }
-            Self::SetupPassword | Self::ReadOnlyQuestion { .. } => String::new(),
+            Self::SetupPassword | Self::StagedSetupPassword | Self::ReadOnlyQuestion { .. } => {
+                String::new()
+            }
             #[cfg(variable_data)]
             Self::SetupModePolicyWrite { .. }
             | Self::SetupModeDeviceDatabaseWrite { .. }
@@ -148,6 +154,10 @@ impl fmt::Display for UnsafeOperation {
             Self::SetupPassword => f.write_str(
                 "this HiiDB declares a setup password question, and the UEFI Shell runs no setup \
                  browser, so no password is asked or checked",
+            ),
+            Self::StagedSetupPassword => f.write_str(
+                "this HiiDB declares a setup password question, and a set staged for the next boot \
+                 is applied before the OS, where no setup browser asks for or checks the password",
             ),
             // the name as it is: a warning escapes it once, as TerminalText
             Self::ReadOnlyQuestion { question, .. } => write!(

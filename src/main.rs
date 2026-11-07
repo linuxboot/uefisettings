@@ -525,6 +525,13 @@ const READ_ONLY_WRITE: &str = "a write of a question that EFI_IFR_FLAG_READ_ONLY
                                picks a writable one first among matches equally certain to be \
                                selected";
 
+/// What set refuses without --i-am-fine-to-brick-this-system on the builds that stage a set for
+/// the next boot.
+#[cfg(all(system_hiidb, system_variables, target_os = "linux"))]
+const STAGED_SETUP_PASSWORD: &str = "a set staged for the next boot in a HiiDB that declares a \
+                                     setup password question, which the next boot applies before \
+                                     the OS, where no setup browser asks for or checks it";
+
 /// --i-am-fine-to-brick-this-system, which only the commands that have an unsafe operation take.
 #[cfg(system_variables)]
 #[derive(Debug, Args)]

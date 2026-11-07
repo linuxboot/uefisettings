@@ -1111,12 +1111,12 @@ impl HiiBackend {
         // From an OS, set stages a question that its driver holds for the next boot
         // (staged_set.rs); in the UEFI Shell, setup_password_bypass above took the setup password
         // in.
-        if writes.reach() == VariableReach::Runtime
+        let stages = writes.reach() == VariableReach::Runtime
             && selected
                 .iter()
-                .any(|selected| driver_of(held, &selected.descriptor).is_some())
-        {
-            passwords.check_staging()?;
+                .any(|selected| driver_of(held, &selected.descriptor).is_some());
+        if let Some(staged) = passwords.staged_setup_password().filter(|_| stages) {
+            unsafe_operations.add(staged);
         }
         let answer = match value {
             SetValue::Text(text) => forms::NewAnswer::Text {
@@ -1797,14 +1797,13 @@ impl DriverStore for DriverHeldSet<'_> {
 
 /// The question that apply-staged sets for `request` in `parsed_db`: the one whose driver holds its
 /// value as QuestionId `request.question_id` of the FormSet `request.form_set`, with its package
-/// list and how its driver holds it, and the unsafe operations that setting it lifts. Refused in a
-/// HiiDB that declares a setup password question, and unless exactly one question is that, the
-/// states of `request.include` cover each state it may be in, with conditions reading
-/// `request.access_level` if stated, as set's selection reads them with `reader`, it takes the
-/// request's value type, and no EFI_IFR_VALUE makes it read-only; one that EFI_IFR_FLAG_READ_ONLY
-/// makes read-only is an unsafe operation, checked against `request.unsafe_operations`, set's
-/// grant, as set checks it. Its texts show in the languages `requested` takes
-/// (ParsedPackageList::texts).
+/// list and how its driver holds it, and the unsafe operations that setting it lifts. Refused
+/// unless exactly one question is that, the states of `request.include` cover each state it may be
+/// in, with conditions reading `request.access_level` if stated, as set's selection reads them with
+/// `reader`, it takes the request's value type, and no EFI_IFR_VALUE makes it read-only. A HiiDB
+/// that declares a setup password question, and a question that EFI_IFR_FLAG_READ_ONLY makes
+/// read-only, are unsafe operations, checked against `request.unsafe_operations`, set's grant, as
+/// set checks them. Its texts show in the languages `requested` takes (ParsedPackageList::texts).
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
 fn staged_question<'a>(
     parsed_db: &'a [package::ParsedPackageList],
@@ -1817,7 +1816,10 @@ fn staged_question<'a>(
     DriverHeldQuestion,
     Vec<UnsafeOperation>,
 )> {
-    PasswordQuestions::of_lists(parsed_db).check_staging()?;
+    let mut unsafe_operations = PendingOperations::new(request.unsafe_operations);
+    if let Some(staged) = PasswordQuestions::of_lists(parsed_db).staged_setup_password() {
+        unsafe_operations.add(staged);
+    }
     forms::check_access_level(
         parsed_db.iter().flat_map(|list| &list.forms),
         request.access_level,
@@ -1888,7 +1890,6 @@ fn staged_question<'a>(
         }
         None => return Err(anyhow!("{named} has a VarStore now")),
     };
-    let mut unsafe_operations = PendingOperations::new(request.unsafe_operations);
     forms::check_staged_read_only(
         descriptor.question.clone(),
         state.read_only(),
@@ -1993,7 +1994,6 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::WRITE;
     #[cfg(variable_data)]
     use crate::hii::forms::IfrValueType;
-    use crate::hii::forms::StagingSetupPassword;
     use crate::hii::forms::StoragelessRefusal;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::package::hiidb_fixtures::device_path_package;
@@ -8276,6 +8276,14 @@ mod tests {
         }
     }
 
+    /// The refusal, without --i-am-fine-to-brick-this-system, of a set staged for the next boot
+    /// in a HiiDB that declares a setup password question.
+    const STAGED_PASSWORD_REFUSAL: &str = "this HiiDB declares a setup password question, and a \
+                                           set staged for the next boot is applied before the \
+                                           OS, where no setup browser asks for or checks the \
+                                           password; pass --i-am-fine-to-brick-this-system to \
+                                           stage it";
+
     /// apply-staged finds a staged request's question by its FormSet GUID and QuestionId among
     /// those that their driver holds, and refuses one that is gone, held twice, in a state that
     /// set did not include, or of another value type.
@@ -8444,7 +8452,7 @@ mod tests {
                 &[held([0x66; 16]), outside_password].concat(),
                 &request(7, IncludedStates::empty())
             ),
-            Err(StagingSetupPassword.to_string()),
+            Err(STAGED_PASSWORD_REFUSAL.to_owned()),
             "a HiiDB with a PASSWORD outside any FormSet"
         );
         assert_eq!(
@@ -8452,8 +8460,27 @@ mod tests {
                 &[held([0x66; 16]), password_hiidb()].concat(),
                 &request(7, IncludedStates::empty())
             ),
-            Err(StagingSetupPassword.to_string()),
+            Err(STAGED_PASSWORD_REFUSAL.to_owned()),
             "a HiiDB that declares a setup password question"
+        );
+        // staged with --i-am-fine-to-brick-this-system, which lifts the setup password
+        let password_db = [held([0x66; 16]), password_hiidb()].concat();
+        let parsed = package::read_db(&password_db).expect("the HiiDB");
+        let allowed = StagedRequest {
+            unsafe_operations: UnsafeOperations::Allow,
+            ..request(7, IncludedStates::empty())
+        };
+        let (list, descriptor, _, lifted) = staged_question(&parsed, &allowed, &[], &mut reader)
+            .expect("Q staged with --i-am-fine-to-brick-this-system");
+        assert_eq!(
+            (list.index, descriptor.question, lifted),
+            (
+                0,
+                "Q".to_owned(),
+                vec![UnsafeOperation::StagedSetupPassword]
+            ),
+            "a HiiDB that declares a setup password question, staged with \
+             --i-am-fine-to-brick-this-system"
         );
         assert_eq!(
             found(
@@ -9649,12 +9676,14 @@ mod tests {
         assert!(variables.writes_to(&setup()).is_empty(), "Setup unwritten");
     }
 
-    /// In a HiiDB that declares a setup password question, set from an OS stages no question that
-    /// its driver holds, also with --i-am-fine-to-brick-this-system, as the next boot would apply
-    /// it where no setup browser asks for the password; set of a stored one from an OS, and in the
-    /// UEFI Shell with --i-am-fine-to-brick-this-system, write as before.
+    /// In a HiiDB that declares a setup password question, set from an OS stages a question that
+    /// its driver holds only with --i-am-fine-to-brick-this-system, which lifts
+    /// UnsafeOperation::StagedSetupPassword, as the next boot applies it where no setup browser
+    /// asks for the password, and no other option lifts it; set of a stored one from an OS
+    /// writes as before, the flag lifting nothing, and in the UEFI Shell with the flag, lifting
+    /// UnsafeOperation::SetupPassword.
     #[test]
-    fn set_from_an_os_stages_nothing_beside_a_setup_password_question() {
+    fn set_from_an_os_stages_beside_a_setup_password_question_only_with_the_flag() {
         let callback = package_list_with_guid(
             [0x66; 16],
             &[
@@ -9664,50 +9693,76 @@ mod tests {
             ]
             .concat(),
         );
+        let through_driver = || {
+            vec![
+                "1 <set by the driver of QuestionId 7>".to_owned(),
+                "1".to_owned(),
+            ]
+        };
+        let granting = |unsafe_operations| SetOptions {
+            unsafe_operations,
+            ..SetOptions::default()
+        };
         let cases = [
             (
                 "from an OS",
                 [callback.clone(), password_hiidb()].concat(),
                 VariableReach::Runtime,
-                UnsafeOperations::Refuse,
-                Err(StagingSetupPassword.to_string()),
+                granting(UnsafeOperations::Refuse),
+                Err(STAGED_PASSWORD_REFUSAL.to_owned()),
+                Vec::new(),
+            ),
+            (
+                "from an OS, with every other option",
+                [callback.clone(), password_hiidb()].concat(),
+                VariableReach::Runtime,
+                // --access-level needs AMI's SystemAccess VarStore, which this HiiDB lacks
+                SetOptions {
+                    include: IncludedStates::all(),
+                    volatile: VolatileWrites::Allow,
+                    language: Some("en-US".to_owned()),
+                    staging_image: Some(PathBuf::from("uefisettings.efi")),
+                    ..granting(UnsafeOperations::Refuse)
+                },
+                Err(STAGED_PASSWORD_REFUSAL.to_owned()),
                 Vec::new(),
             ),
             (
                 "from an OS, allowed",
                 [callback.clone(), password_hiidb()].concat(),
                 VariableReach::Runtime,
-                UnsafeOperations::Allow,
-                Err(StagingSetupPassword.to_string()),
-                Vec::new(),
+                granting(UnsafeOperations::Allow),
+                Ok((through_driver(), vec![UnsafeOperation::StagedSetupPassword])),
+                vec![(7, 1)],
             ),
             (
                 "from an OS, without a question that its driver holds",
                 password_hiidb(),
                 VariableReach::Runtime,
-                UnsafeOperations::Refuse,
-                Ok(vec!["1".to_owned()]),
+                granting(UnsafeOperations::Refuse),
+                Ok((vec!["1".to_owned()], Vec::new())),
+                Vec::new(),
+            ),
+            (
+                "from an OS, allowed, without a question that its driver holds",
+                password_hiidb(),
+                VariableReach::Runtime,
+                granting(UnsafeOperations::Allow),
+                Ok((vec!["1".to_owned()], Vec::new())),
                 Vec::new(),
             ),
             (
                 "in the UEFI Shell, allowed",
                 [callback, password_hiidb()].concat(),
                 VariableReach::BootServices,
-                UnsafeOperations::Allow,
-                Ok(vec![
-                    "1 <set by the driver of QuestionId 7>".to_owned(),
-                    "1".to_owned(),
-                ]),
+                granting(UnsafeOperations::Allow),
+                Ok((through_driver(), vec![UnsafeOperation::SetupPassword])),
                 vec![(7, 1)],
             ),
         ];
-        for (case, hiidb, reach, unsafe_operations, want, sets) in cases {
+        for (case, hiidb, reach, options, want, sets) in cases {
             let driver = RecordingDriver::default();
             let variables = password_variables(reach, VariableInterface::VariableServices);
-            let options = SetOptions {
-                unsafe_operations,
-                ..SetOptions::default()
-            };
 
             let set = HiiBackend::set_in(
                 &hiidb,
@@ -9724,11 +9779,13 @@ mod tests {
             );
 
             assert_eq!(
-                set.map(|(set, _)| {
-                    set.responses
+                set.map(|(set, lifted)| {
+                    let answers = set
+                        .responses
                         .into_iter()
                         .map(|response| response.question.answer)
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (answers, lifted)
                 })
                 .map_err(|error| format!("{error:#}")),
                 want,

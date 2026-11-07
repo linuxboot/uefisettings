@@ -151,8 +151,6 @@ pub(crate) use set::set_questions;
 pub(crate) use set::DriverStore;
 pub(crate) use set::NewAnswer;
 pub(crate) use setup_password::PasswordQuestions;
-#[cfg(test)]
-pub(crate) use setup_password::StagingSetupPassword;
 pub(crate) use setup_password::UnresolvedPassword;
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
 pub(crate) use storage::DeclaredKind;

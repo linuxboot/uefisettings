@@ -686,7 +686,8 @@ mod tests {
 
     /// Staging refuses up front, with apply-staged's refusal, a set that apply-staged would refuse
     /// before the OS: in a HiiDB where IFR that uefisettings ignores may hold a PASSWORD question,
-    /// whose VarStore is then unknown, nothing is staged.
+    /// or with --i-am-fine-to-brick-this-system beside a PASSWORD outside any FormSet, whose
+    /// VarStore is then unknown, nothing is staged.
     #[test]
     fn staging_refuses_up_front_what_apply_staged_refuses() {
         let unresolved = "PASSWORD questions of package list 00000000-0000-0000-0000-000000000000 \
@@ -710,12 +711,37 @@ mod tests {
             disabled_forms: Vec::new(),
             first_var_stores: Vec::new(),
         };
-        let cases = [(
-            "IFR that uefisettings ignores",
-            ignored,
-            SetOptions::default(),
-            unresolved,
-        )];
+        let outside = read_db(&package_list_with_guid(
+            [0; 16],
+            &[
+                form_package_of(&password_on(0x10, 1, 1, 0)),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        ))
+        .expect("read_db")
+        .remove(0);
+        let allowed = SetOptions {
+            unsafe_operations: UnsafeOperations::Allow,
+            ..SetOptions::default()
+        };
+        let cases = [
+            (
+                "IFR that uefisettings ignores",
+                ignored,
+                SetOptions::default(),
+                unresolved,
+            ),
+            (
+                "a PASSWORD outside any FormSet, allowed",
+                outside,
+                allowed,
+                "PASSWORD op of package list 00000000-0000-0000-0000-000000000000 outside a \
+                 FormSet, at offset 0 of a form package, which no Forms Browser shows but edk2's \
+                 Config Keyword Handler finds; as the variable of that password is unknown, the \
+                 UEFI Shell build reads and writes no variable of this HiiDB",
+            ),
+        ];
         for (case, list, options, refusal) in cases {
             let (linux, esp) = FakeLinux::with_esp();
             let variables = booted_from(Some(gpt_512_esp()));

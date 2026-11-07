@@ -1191,6 +1191,15 @@ impl PasswordQuestions {
             (VariableReach::BootServices, false) | (VariableReach::Runtime, _) => None,
         }
     }
+
+    /// The unsafe operation of a set staged for the next boot in this HiiDB, both of staging it and
+    /// of applying it, if any: UnsafeOperation::StagedSetupPassword where the HiiDB declares a
+    /// PASSWORD question, as the next boot applies the set before the OS, where no setup browser
+    /// asks for the password either.
+    pub(crate) fn staged_setup_password(&self) -> Option<UnsafeOperation> {
+        self.declared
+            .then_some(UnsafeOperation::StagedSetupPassword)
+    }
 }
 
 /// The GUID of the FormSet that `op` opens, if it is a decoded FORM_SET op.
@@ -1227,16 +1236,6 @@ fn package_of(
 }
 
 impl PasswordQuestions {
-    /// Refuses a set staged for the next boot in a HiiDB that declares a PASSWORD question, both
-    /// staging it and applying it: the next boot applies it before the OS, where no setup browser
-    /// asks for the password either.
-    pub(crate) fn check_staging(&self) -> Result<(), StagingSetupPassword> {
-        match self.declared {
-            true => Err(StagingSetupPassword),
-            false => Ok(()),
-        }
-    }
-
     /// Refuses what withholding_of refuses through variables that reach `reach`.
     #[cfg_attr(
         not(target_os = "linux"),
@@ -1623,16 +1622,6 @@ pub(crate) enum WithholdingRefusal {
     #[error(transparent)]
     AnyVariable(AnyVariablePasswords),
 }
-
-/// The refusal to stage or apply a set for the next boot in a HiiDB that declares a setup password
-/// question.
-#[derive(Debug, Error)]
-#[error(
-    "this HiiDB declares a setup password question; a set staged for the next boot is applied \
-     before the OS, where no setup browser asks for or checks the password, so none is staged or \
-     applied"
-)]
-pub(crate) struct StagingSetupPassword;
 
 #[cfg(test)]
 mod tests {
@@ -2357,6 +2346,28 @@ mod tests {
                 "{reach:?}, declared: {}",
                 passwords.declared
             );
+        }
+    }
+
+    /// A set staged for the next boot in a HiiDB that declares a password question is an unsafe
+    /// operation, as an OS stages it and uefisettings.efi applies it; in a HiiDB without one it is
+    /// none.
+    #[test]
+    fn a_staged_set_beside_a_declared_password_is_unsafe() {
+        let cases = [
+            (
+                "declared",
+                password_questions(&[password_on(2, 3, 0, 0)]),
+                Some(UnsafeOperation::StagedSetupPassword),
+            ),
+            (
+                "undeclared",
+                password_questions(&[checkbox_on(1, 3, 1)]),
+                None,
+            ),
+        ];
+        for (case, passwords, want) in cases {
+            assert_eq!(passwords.staged_setup_password(), want, "{case}");
         }
     }
 

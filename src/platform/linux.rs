@@ -76,6 +76,7 @@ use crate::SelectionArgs;
 use crate::SetArgs;
 use crate::UnsafeArgs;
 use crate::READ_ONLY_WRITE;
+use crate::STAGED_SETUP_PASSWORD;
 use crate::UNSAFE_ARG;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
@@ -396,8 +397,13 @@ impl EfivarArgs {
 }
 
 /// The unsafe operations of set, which its long help lists: efivarfs writes from Linux, which
-/// no setup password gates, and the read of the HiiDB.
-pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE, FIRMWARE_RESERVED_READ];
+/// no setup password gates, a set staged for the next boot, which one does, and the read of the
+/// HiiDB.
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[
+    READ_ONLY_WRITE,
+    STAGED_SETUP_PASSWORD,
+    FIRMWARE_RESERVED_READ,
+];
 
 /// What set stages for the next boot.
 #[derive(Debug, Args)]
