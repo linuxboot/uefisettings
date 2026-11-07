@@ -28,8 +28,8 @@ Device memory as arm64 does. On Ubuntu 26.04 it also needs the packages of
 xargs --arg-file=tests/qemu/ubuntu-packages sudo apt-get install --yes
 ```
 
-The guest's kernel, firmware, UEFI Shell and busybox do not come from the host: they are the
-packages that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64),
+The guest's kernel and its FAT modules, firmware, UEFI Shell and busybox do not come from the
+host: they are the packages that `guest-packages-<arch>` ([x86_64](guest-packages-x86_64),
 [i686](guest-packages-i686) or [aarch64](guest-packages-aarch64)) pins, which
 [`fetch-packages.sh`](fetch-packages.sh) downloads. `run.sh` first runs
 [`fetch-packages-test.sh`](fetch-packages-test.sh), which checks on local fixtures how that
