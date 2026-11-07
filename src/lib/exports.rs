@@ -282,10 +282,10 @@ impl VariableBackend {
 
     /// Sets the global variable `name` to `value`, as set does, to make the Secure Boot mode
     /// transition `transition` of UEFI 2.11 §32.3, which only the UEFI Shell build makes, as
-    /// AuditMode "Always becomes read-only after ExitBootServices() is called" (§3.3). Refuses,
-    /// before it opens the variables, another variable or value and the builds that run after
-    /// ExitBootServices(), and, before any write, a transition that the current mode does not
-    /// allow; returns what it wrote and what SetVariable() returned.
+    /// AuditMode and DeployedMode each "Always becomes read-only after ExitBootServices() is
+    /// called" (§3.3). Refuses, before it opens the variables, another variable or value and the
+    /// builds that run after ExitBootServices(), and, before any write, a transition that the
+    /// current mode does not allow; returns what it wrote and what SetVariable() returned.
     pub fn set_mode(
         name: &str,
         value: &str,

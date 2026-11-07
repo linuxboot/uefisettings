@@ -12,7 +12,6 @@
 
 //! The variable command: this machine's EFI variables.
 
-#[cfg(not(all(variable_names, variable_storage_info)))]
 use anyhow::anyhow;
 use anyhow::Result;
 #[cfg(variable_data)]
@@ -82,7 +81,8 @@ enum VariableSubcommands {
     },
     /// Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout, BootOrder,
     /// DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications; or, in the UEFI Shell,
-    /// AuditMode with --enter-audit-mode-clearing-pk
+    /// AuditMode with --enter-audit-mode-clearing-pk and DeployedMode with
+    /// --enter-deployed-mode-irreversibly
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
     Set(SetArgs),
@@ -117,14 +117,21 @@ struct SetArgs {
     /// Its value as get shows it, the list comma-separated: seconds or "wait for user input"
     /// for Timeout, load options such as Boot0002,Boot0001 for the orders, one for BootNext,
     /// a code of PlatformLangCodes for PlatformLang, bits such as BOOT_TO_FW_UI, or none,
-    /// for OsIndications, which keeps its reserved bits; 1 for AuditMode
+    /// for OsIndications, which keeps its reserved bits; 1 for AuditMode and DeployedMode
     value: String,
     /// Set AuditMode to 1, in the UEFI Shell, from Setup Mode or User Mode, to enter Audit Mode,
     /// which clears PK and sets SetupMode to 1 and DeployedMode to 0 (UEFI 2.11 section 32.3.3);
     /// the firmware may queue it for the next reset (section 32.3); setting PK then enters
     /// Deployed Mode, not User Mode (UEFI 2.11 section 32.3.4)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "enter_deployed_mode_irreversibly")]
     enter_audit_mode_clearing_pk: bool,
+    /// Set DeployedMode to 1, in the UEFI Shell, from User Mode, to enter Deployed Mode
+    /// irreversibly: leaving it "requires a secure platform-specific method, or deleting the PK,
+    /// which is authenticated" (UEFI 2.11 section 32.3). From Audit Mode, where SetupMode is 1,
+    /// enrolling PK enters it instead, as `variable write-signed PK` does with its flag for Setup
+    /// Mode (section 32.3.4)
+    #[arg(long)]
+    enter_deployed_mode_irreversibly: bool,
 }
 
 #[cfg(variable_data)]
@@ -132,7 +139,7 @@ impl SetArgs {
     /// Sets the variable and prints what it wrote, as print_global prints it, and, for a Secure
     /// Boot mode transition, what SetVariable() returned.
     fn run(&self) -> Result<()> {
-        match self.transition() {
+        match self.transition()? {
             None => print_global_variable(&VariableBackend::set(&self.name, &self.value)?),
             Some(transition) => {
                 let write = VariableBackend::set_mode(&self.name, &self.value, transition)?;
@@ -142,10 +149,20 @@ impl SetArgs {
         }
     }
 
-    /// The Secure Boot mode transition that the flags ask for, if any.
-    fn transition(&self) -> Option<ModeTransition> {
-        self.enter_audit_mode_clearing_pk
-            .then_some(ModeTransition::EnterAuditModeClearingPk)
+    /// The Secure Boot mode transition that the flags ask for, if any; clap refuses both.
+    fn transition(&self) -> Result<Option<ModeTransition>> {
+        match (
+            self.enter_audit_mode_clearing_pk,
+            self.enter_deployed_mode_irreversibly,
+        ) {
+            (false, false) => Ok(None),
+            (true, false) => Ok(Some(ModeTransition::EnterAuditModeClearingPk)),
+            (false, true) => Ok(Some(ModeTransition::EnterDeployedModeIrreversibly)),
+            (true, true) => Err(anyhow!(
+                "--enter-audit-mode-clearing-pk and --enter-deployed-mode-irreversibly ask for \
+                 two transitions"
+            )),
+        }
     }
 }
 
@@ -464,7 +481,7 @@ mod tests {
         ];
         for (args, want) in cases {
             let asked = match variable(args) {
-                VariableSubcommands::Set(set) => set.transition(),
+                VariableSubcommands::Set(set) => set.transition().expect("one transition"),
                 #[cfg(variable_info)]
                 parsed @ VariableSubcommands::Info { .. } => {
                     panic!("{args:?} is no set: {parsed:?}")
@@ -479,6 +496,57 @@ mod tests {
 
             assert_eq!(asked, want, "{args:?}");
         }
+    }
+
+    /// set takes --enter-deployed-mode-irreversibly after its name and value, which asks for the
+    /// transition to Deployed Mode, and refuses it with --enter-audit-mode-clearing-pk.
+    #[cfg(variable_data)]
+    #[test]
+    fn set_takes_the_deployed_mode_flag() {
+        let deployed = ModeTransition::EnterDeployedModeIrreversibly;
+        let argv = [
+            "uefisettings",
+            "variable",
+            "set",
+            deployed.variable(),
+            "1",
+            deployed.flag(),
+        ];
+
+        let parsed = UefiSettingsToolArgs::try_parse_from(argv);
+
+        assert!(
+            matches!(
+                parsed.as_ref().map(|args| &args.command),
+                Ok(Commands::Variable(VariableCommand {
+                    command: VariableSubcommands::Set(_)
+                }))
+            ),
+            "{argv:?}: {parsed:?}"
+        );
+        let transition = match variable(&argv[2..]) {
+            VariableSubcommands::Set(set) => set.transition().expect("one transition"),
+            #[cfg(variable_info)]
+            parsed @ VariableSubcommands::Info { .. } => panic!("{argv:?} is no set: {parsed:?}"),
+            parsed @ (VariableSubcommands::List { .. }
+            | VariableSubcommands::Get { .. }
+            | VariableSubcommands::Storage { .. }
+            | VariableSubcommands::WriteSigned(_)) => panic!("{argv:?} is no set: {parsed:?}"),
+        };
+        assert_eq!(transition, Some(deployed), "{argv:?}");
+        let both = UefiSettingsToolArgs::try_parse_from(
+            [
+                &argv[..],
+                &[ModeTransition::EnterAuditModeClearingPk.flag()],
+            ]
+            .concat(),
+        )
+        .map_err(|error| error.kind());
+        assert_eq!(
+            both.err(),
+            Some(clap::error::ErrorKind::ArgumentConflict),
+            "both flags"
+        );
     }
 
     /// storage takes the attributes of non-volatile variables that the OS reaches unless

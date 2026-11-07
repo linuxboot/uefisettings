@@ -475,6 +475,22 @@ queued one refuses another with EFI_ALREADY_STARTED, which set reports as an err
 FS0:\> uefisettings.efi variable set AuditMode 1 --enter-audit-mode-clearing-pk
 ```
 
+`variable set DeployedMode 1 --enter-deployed-mode-irreversibly`, in the UEFI Shell, enters Deployed
+Mode from User Mode, which sets SetupMode to 0, and AuditMode to 0 and DeployedMode to 1, both made
+read-only (§32.3.4); leaving it "requires a secure platform-specific method, or deleting the PK,
+which is authenticated" (§32.3). Without the flag, set refuses DeployedMode. It checks the mode
+variables as for Audit Mode and refuses Deployed Mode from Setup Mode, which §32.3 lists no
+unauthenticated transition to it from, and from Audit Mode, where SetupMode is 1 and enrolling PK
+enters Deployed Mode instead, as `variable write-signed PK` does with
+`--allow-setup-mode-write-without-signature-check` (§32.3.4). Linux and Windows refuse it, as
+DeployedMode "Always becomes read-only after ExitBootServices() is called" (§3.3). It prints as for
+Audit Mode: §32.3 and §32.3.4 have this transition take effect immediately, so
+`EFI_WARN_RESET_REQUIRED` there is a firmware departure that set reports as returned.
+
+```plain
+FS0:\> uefisettings.efi variable set DeployedMode 1 --enter-deployed-mode-irreversibly
+```
+
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)
 tells of the storage of the variables of those attributes, by default the non-volatile ones that
 the OS reaches (`non-volatile,bootservice-access,runtime-access`), as a JSON object of its own:

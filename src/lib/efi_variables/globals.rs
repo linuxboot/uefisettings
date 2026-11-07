@@ -79,8 +79,6 @@ const WRITABLE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
 /// Why the OS does not write a variable, in the words of UEFI 2.11 §3.3: those of Table 3.1 for
 /// most of them, of the text after it for the others.
 const TREATED_AS_READ_ONLY: &str = "Should be treated as read-only.";
-const DEPLOYED_MODE_READ_ONLY: &str = "Should be treated as read-only when its value is 1. Always \
-                                       becomes read-only after ExitBootServices() is called.";
 const BOOT_CURRENT_READ_ONLY: &str =
     "The platform sets this variable before signaling EFI_EVENT_GROUP_READY_TO_BOOT.";
 const HW_ERR_REC_SUPPORT_READ_ONLY: &str =
@@ -115,7 +113,7 @@ const GLOBALS: [Global; 34] = [
     Global::read_only("dbrDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
     Global::read_only("dbtDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
     Global::read_only("dbxDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
-    Global::read_only("DeployedMode", Codec::Byte, DEPLOYED_MODE_READ_ONLY),
+    Global::mode_transition(ModeTransition::EnterDeployedModeIrreversibly),
     Global::read_only("devAuthBoot", Codec::Byte, TREATED_AS_READ_ONLY),
     Global::read_only("devdbDefault", Codec::SignatureLists, TREATED_AS_READ_ONLY),
     Global::writable("DriverOrder", Setter::Order(LoadOptionKind::Driver)),
@@ -1967,8 +1965,7 @@ pub(crate) mod tests {
                  JSON_CONFIG_DATA_REFRESH, comma-separated, or none, not \"{text}\""
             )
         };
-        let cases: Vec<(&str, &str, String)> =
-            vec![
+        let cases: Vec<(&str, &str, String)> = vec![
             (
                 "BootOrder",
                 "Boot0001,Boot0002,Boot0001",
@@ -2129,11 +2126,11 @@ pub(crate) mod tests {
             (
                 "DeployedMode",
                 "1",
-                read_only(
-                    "DeployedMode",
-                    "Should be treated as read-only when its value is 1. Always becomes \
-                     read-only after ExitBootServices() is called.",
-                ),
+                "variable set writes DeployedMode only with --enter-deployed-mode-irreversibly, in \
+                 the UEFI Shell: \"to move from Deployed Mode to any other mode requires a secure \
+                 platform-specific method, or deleting the PK, which is authenticated\" (UEFI \
+                 2.11 section 32.3)"
+                    .to_string(),
             ),
             (
                 "BootCurrent",

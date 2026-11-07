@@ -320,7 +320,7 @@ fn get_secboot_user() {
 fn set_mode_from_linux() {
     require_test_vm();
     let before = efivars();
-    let cases: [(&[&str], &str); 2] = [
+    let cases: [(&[&str], &str); 4] = [
         (
             &["variable", "set", "AuditMode", "1"],
             "variable set writes AuditMode only with --enter-audit-mode-clearing-pk, in the UEFI \
@@ -338,6 +338,25 @@ fn set_mode_from_linux() {
             "AuditMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
              2.11 section 3.3): run `uefisettings.efi variable set AuditMode 1 \
              --enter-audit-mode-clearing-pk` in the UEFI Shell",
+        ),
+        (
+            &["variable", "set", "DeployedMode", "1"],
+            "variable set writes DeployedMode only with --enter-deployed-mode-irreversibly, in the \
+             UEFI Shell: \"to move from Deployed Mode to any other mode requires a secure \
+             platform-specific method, or deleting the PK, which is authenticated\" (UEFI 2.11 \
+             section 32.3)",
+        ),
+        (
+            &[
+                "variable",
+                "set",
+                "DeployedMode",
+                "1",
+                "--enter-deployed-mode-irreversibly",
+            ],
+            "DeployedMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
+             2.11 section 3.3): run `uefisettings.efi variable set DeployedMode 1 \
+             --enter-deployed-mode-irreversibly` in the UEFI Shell",
         ),
     ];
     for (args, refusal) in cases {

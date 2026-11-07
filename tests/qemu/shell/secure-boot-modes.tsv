@@ -1,6 +1,7 @@
 # The checks of shell/secure-boot-modes.nsh, the boot of shell-secure-boot-modes-setup and
-# shell-secure-boot-modes-user: variable set refuses AuditMode without its flag, naming it, and
-# with it names the absent mode variables; PK and every other global variable stay as they were.
+# shell-secure-boot-modes-user: variable set refuses AuditMode and DeployedMode without their
+# flags, naming them, and with them names the absent mode variables; PK and every other global
+# variable stay as they were.
 # See check-shell-log.sh.
 before	status	any
 pk-before	status	any
@@ -8,6 +9,10 @@ audit-mode-unflagged	status	aborted
 audit-mode-unflagged	json	. == {"error_message": "variable set writes AuditMode only with --enter-audit-mode-clearing-pk, in the UEFI Shell: \"Entering Audit Mode has the side effect of changing SetupMode == 1, PK is cleared, and the new DeployedMode == 0\" (UEFI 2.11 section 32.3.3)"}
 audit-mode	status	aborted
 audit-mode	json	. == {"error_message": "AuditMode and DeployedMode are absent, which UEFI 2.11 sections 3.3 and 32.3 define for the Secure Boot modes, so the firmware tells no mode to check the transition against"}
+deployed-mode-unflagged	status	aborted
+deployed-mode-unflagged	json	. == {"error_message": "variable set writes DeployedMode only with --enter-deployed-mode-irreversibly, in the UEFI Shell: \"to move from Deployed Mode to any other mode requires a secure platform-specific method, or deleting the PK, which is authenticated\" (UEFI 2.11 section 32.3)"}
+deployed-mode	status	aborted
+deployed-mode	json	. == {"error_message": "AuditMode and DeployedMode are absent, which UEFI 2.11 sections 3.3 and 32.3 define for the Secure Boot modes, so the firmware tells no mode to check the transition against"}
 pk-after	status	any
 pk-after	same	pk-before
 after	status	any

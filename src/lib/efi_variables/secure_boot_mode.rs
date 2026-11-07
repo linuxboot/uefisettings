@@ -12,9 +12,11 @@
 
 //! The Secure Boot modes of UEFI 2.11 §32.3, which SetupMode, AuditMode and DeployedMode tell
 //! (§3.3), and the transitions between them that variable set makes, each behind its own flag.
-//! Firmware queues a transition to Audit Mode for the next reset if it cannot make it at once
+//! Firmware may queue a transition to Audit Mode for the next reset instead of making it at once
 //! (§32.3), which SetVariable() returns as EFI_WARN_RESET_REQUIRED, or EFI_ALREADY_STARTED while
-//! one is queued; set reports either as returned.
+//! one is queued; set reports either as returned. The transition to Deployed Mode takes effect
+//! immediately (§32.3, §32.3.4), so EFI_WARN_RESET_REQUIRED there is a firmware departure that set
+//! reports as returned too.
 
 use std::fmt;
 
@@ -52,6 +54,10 @@ pub enum ModeTransition {
     /// AuditMode set to 1: "Entering Audit Mode has the side effect of changing SetupMode == 1,
     /// PK is cleared, and the new DeployedMode == 0" (§32.3.3)
     EnterAuditModeClearingPk,
+    /// DeployedMode set to 1, from User Mode: "Entering Deployed Mode has the side effect of
+    /// changing SetupMode == 0, AuditMode == 0 and is made read-only, and DeployedMode == 1 and
+    /// is made read-only" (§32.3.4)
+    EnterDeployedModeIrreversibly,
 }
 
 impl ModeTransition {
@@ -59,6 +65,7 @@ impl ModeTransition {
     pub const fn variable(self) -> &'static str {
         match self {
             Self::EnterAuditModeClearingPk => AUDIT_MODE,
+            Self::EnterDeployedModeIrreversibly => DEPLOYED_MODE,
         }
     }
 
@@ -66,6 +73,7 @@ impl ModeTransition {
     pub const fn flag(self) -> &'static str {
         match self {
             Self::EnterAuditModeClearingPk => "--enter-audit-mode-clearing-pk",
+            Self::EnterDeployedModeIrreversibly => "--enter-deployed-mode-irreversibly",
         }
     }
 
@@ -75,6 +83,11 @@ impl ModeTransition {
             Self::EnterAuditModeClearingPk => {
                 "\"Entering Audit Mode has the side effect of changing SetupMode == 1, PK is \
                  cleared, and the new DeployedMode == 0\" (UEFI 2.11 section 32.3.3)"
+            }
+            Self::EnterDeployedModeIrreversibly => {
+                "\"to move from Deployed Mode to any other mode requires a secure \
+                 platform-specific method, or deleting the PK, which is authenticated\" (UEFI \
+                 2.11 section 32.3)"
             }
         }
     }
@@ -90,6 +103,16 @@ impl ModeTransition {
             }
             (Self::EnterAuditModeClearingPk, SecureBootMode::Deployed) => {
                 Err(ModeTransitionError::AuditModeInDeployedMode)
+            }
+            (Self::EnterDeployedModeIrreversibly, SecureBootMode::User) => Ok(()),
+            (Self::EnterDeployedModeIrreversibly, SecureBootMode::Setup) => {
+                Err(ModeTransitionError::DeployedModeInSetupMode)
+            }
+            (Self::EnterDeployedModeIrreversibly, SecureBootMode::Audit) => {
+                Err(ModeTransitionError::DeployedModeInAuditMode)
+            }
+            (Self::EnterDeployedModeIrreversibly, SecureBootMode::Deployed) => {
+                Err(ModeTransitionError::AlreadyIn(mode))
             }
         }
     }
@@ -287,6 +310,7 @@ impl ModeVariables {
     fn attributes(&self, transition: ModeTransition) -> VariableAttributes {
         match transition {
             ModeTransition::EnterAuditModeClearingPk => self.audit.0,
+            ModeTransition::EnterDeployedModeIrreversibly => self.deployed.0,
         }
     }
 }
@@ -387,6 +411,19 @@ enum ModeTransitionError {
     )]
     AuditModeInDeployedMode,
     #[error(
+        "the firmware is in Setup Mode, and \"both User Mode and Audit Mode support \
+         unauthenticated transitions to Deployed Mode\" (UEFI 2.11 section 32.3), not Setup Mode: \
+         enrolling PK enters User Mode first (section 32.3.1)"
+    )]
+    DeployedModeInSetupMode,
+    #[error(
+        "the firmware is in Audit Mode, where \"To enter Deployed Mode from Audit Mode, set the \
+         variable PK\" (UEFI 2.11 section 32.3.4): `uefisettings.efi variable write-signed PK \
+         8BE4DF61-93CA-11D2-AA0D-00E098032B8C` writes it, with \
+         --allow-setup-mode-write-without-signature-check while SetupMode is 1"
+    )]
+    DeployedModeInAuditMode,
+    #[error(
         "the firmware queued a Secure Boot Mode transition already, which a reset processes, so \
          it queued no other (EFI_ALREADY_STARTED, UEFI 2.11 section 32.3)"
     )]
@@ -414,6 +451,11 @@ mod tests {
     /// BS+RT: the attributes of SetupMode, AuditMode and DeployedMode in UEFI 2.11 §3.3.
     const BS_RT: VariableAttributes =
         VariableAttributes::BOOTSERVICE_ACCESS.union(VariableAttributes::RUNTIME_ACCESS);
+    /// NV+BS+RT: attributes that the mode variables lack in UEFI 2.11 §3.3, which a firmware may
+    /// give them anyway.
+    const NV_BS_RT: VariableAttributes = VariableAttributes::NON_VOLATILE
+        .union(VariableAttributes::BOOTSERVICE_ACCESS)
+        .union(VariableAttributes::RUNTIME_ACCESS);
     /// NV+BS+RT+AT: the attributes of PK in UEFI 2.11 §3.3.
     const NV_BS_RT_AT: VariableAttributes = VariableAttributes::NON_VOLATILE
         .union(VariableAttributes::BOOTSERVICE_ACCESS)
@@ -520,6 +562,14 @@ mod tests {
                     self.hold(AUDIT_MODE, BS_RT, &[1]);
                     self.hold(DEPLOYED_MODE, BS_RT, &[0]);
                     self.variables.borrow_mut().remove(&mode_key("PK"));
+                    Ok(())
+                }
+                // "To enter Deployed Mode from User Mode, set the variable DeployedMode to 1"
+                // (§32.3.4)
+                (DEPLOYED_MODE, false, false, false) => {
+                    self.hold(SETUP_MODE, BS_RT, &[0]);
+                    self.hold(AUDIT_MODE, BS_RT, &[0]);
+                    self.hold(DEPLOYED_MODE, BS_RT, &[1]);
                     Ok(())
                 }
                 _ => Err(anyhow!(
@@ -672,46 +722,139 @@ mod tests {
         }
     }
 
+    /// set_mode enters Deployed Mode from User Mode, writing DeployedMode alone: the firmware
+    /// sets SetupMode and AuditMode to 0 and keeps PK (UEFI 2.11 §32.3.4).
+    #[test]
+    fn set_mode_enters_deployed_mode_from_user_mode() {
+        let firmware = ModeFirmware::in_mode(SecureBootMode::User, Taking::AtOnce);
+
+        let write = request_and_set_mode(
+            &firmware,
+            VariableReach::BootServices,
+            DEPLOYED_MODE,
+            ENTER_TEXT,
+            ModeTransition::EnterDeployedModeIrreversibly,
+        )
+        .unwrap_or_else(|error| panic!("enter Deployed Mode from User Mode: {error:#}"));
+
+        assert_eq!(
+            write,
+            write_of(DEPLOYED_MODE, ModeTransitionStatus::Success),
+            "from User Mode"
+        );
+        assert_eq!(
+            firmware.written.borrow().as_slice(),
+            [mode_key(DEPLOYED_MODE)],
+            "DeployedMode alone is written"
+        );
+        assert_eq!(
+            firmware.state(),
+            ([Some(vec![0]), Some(vec![0]), Some(vec![1])], true),
+            "Deployed Mode, with PK"
+        );
+    }
+
+    /// set_mode refuses to enter Deployed Mode from Setup Mode, which UEFI 2.11 §32.3 lists no
+    /// unauthenticated transition to it from, from Audit Mode, where enrolling PK enters it
+    /// (§32.3.4), and from Deployed Mode, which it is in already.
+    #[test]
+    fn set_mode_refuses_deployed_mode_from_setup_audit_and_deployed_mode() {
+        let cases = [
+            (
+                SecureBootMode::Setup,
+                ModeTransitionError::DeployedModeInSetupMode,
+            ),
+            (
+                SecureBootMode::Audit,
+                ModeTransitionError::DeployedModeInAuditMode,
+            ),
+            (
+                SecureBootMode::Deployed,
+                ModeTransitionError::AlreadyIn(SecureBootMode::Deployed),
+            ),
+        ];
+        for (mode, expected) in cases {
+            let firmware = ModeFirmware::in_mode(mode, Taking::AtOnce);
+
+            let error: ModeTransitionError = refusal(
+                &firmware,
+                VariableReach::BootServices,
+                DEPLOYED_MODE,
+                ENTER_TEXT,
+                ModeTransition::EnterDeployedModeIrreversibly,
+            );
+
+            assert_eq!(error, expected, "from {mode}");
+        }
+    }
+
+    /// set_mode writes the variable of a transition with that variable's own attributes, as set
+    /// keeps those of an existing variable.
+    #[test]
+    fn set_mode_keeps_the_attributes_of_the_variable_it_sets() {
+        let cases = [
+            (ModeTransition::EnterAuditModeClearingPk, BS_RT),
+            (ModeTransition::EnterDeployedModeIrreversibly, NV_BS_RT),
+        ];
+        for (transition, attributes) in cases {
+            let firmware = ModeFirmware::in_mode(SecureBootMode::User, Taking::AtOnce);
+            firmware.hold(DEPLOYED_MODE, NV_BS_RT, &[0]);
+
+            let write = request_and_set_mode(
+                &firmware,
+                VariableReach::BootServices,
+                transition.variable(),
+                ENTER_TEXT,
+                transition,
+            )
+            .unwrap_or_else(|error| panic!("{transition:?}: {error:#}"));
+
+            assert_eq!(
+                write.written.contents.map(|contents| contents.attributes),
+                Some(attributes.bits()),
+                "{transition:?}"
+            );
+        }
+    }
+
     /// ModeRequest refuses any variable but the transition's, and any value but 1, so set_mode
     /// reads no variable.
     #[test]
     fn set_mode_refuses_other_variables_and_values() {
-        let transition = ModeTransition::EnterAuditModeClearingPk;
+        let audit = ModeTransition::EnterAuditModeClearingPk;
+        let deployed = ModeTransition::EnterDeployedModeIrreversibly;
+        let other_variable = |transition, name: &str| ModeTransitionError::OtherVariable {
+            transition,
+            name: name.to_owned(),
+        };
+        let other_value = |transition, text: &str| ModeTransitionError::OtherValue {
+            transition,
+            text: text.to_owned(),
+        };
         let cases = [
             (
+                audit,
                 DEPLOYED_MODE,
                 ENTER_TEXT,
-                ModeTransitionError::OtherVariable {
-                    transition,
-                    name: DEPLOYED_MODE.to_owned(),
-                },
+                other_variable(audit, DEPLOYED_MODE),
             ),
             (
+                audit,
                 "Timeout",
                 ENTER_TEXT,
-                ModeTransitionError::OtherVariable {
-                    transition,
-                    name: "Timeout".to_owned(),
-                },
+                other_variable(audit, "Timeout"),
             ),
+            (audit, AUDIT_MODE, "0", other_value(audit, "0")),
+            (audit, AUDIT_MODE, "01", other_value(audit, "01")),
             (
+                deployed,
                 AUDIT_MODE,
-                "0",
-                ModeTransitionError::OtherValue {
-                    transition,
-                    text: "0".to_owned(),
-                },
+                ENTER_TEXT,
+                other_variable(deployed, AUDIT_MODE),
             ),
-            (
-                AUDIT_MODE,
-                "01",
-                ModeTransitionError::OtherValue {
-                    transition,
-                    text: "01".to_owned(),
-                },
-            ),
+            (deployed, DEPLOYED_MODE, "0", other_value(deployed, "0")),
         ];
-        for (name, text, expected) in cases {
+        for (transition, name, text, expected) in cases {
             let firmware = ModeFirmware::in_mode(SecureBootMode::User, Taking::AtOnce);
 
             let error: ModeTransitionError = refusal(
@@ -722,11 +865,11 @@ mod tests {
                 transition,
             );
 
-            assert_eq!(error, expected, "{name} {text}");
+            assert_eq!(error, expected, "{transition:?} of {name} {text}");
             assert_eq!(
                 firmware.read.borrow().as_slice(),
                 [],
-                "{name} {text}: no read"
+                "{transition:?} of {name} {text}: no read"
             );
         }
     }
@@ -736,34 +879,43 @@ mod tests {
     /// ExitBootServices() is called" (UEFI 2.11 §3.3).
     #[test]
     fn set_mode_refuses_after_exit_boot_services() {
-        let transition = ModeTransition::EnterAuditModeClearingPk;
-        let firmware = ModeFirmware::in_mode(SecureBootMode::User, Taking::AtOnce);
+        let cases = [
+            (
+                ModeTransition::EnterAuditModeClearingPk,
+                "AuditMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
+                 2.11 section 3.3): run `uefisettings.efi variable set AuditMode 1 \
+                 --enter-audit-mode-clearing-pk` in the UEFI Shell",
+            ),
+            (
+                ModeTransition::EnterDeployedModeIrreversibly,
+                "DeployedMode \"Always becomes read-only after ExitBootServices() is called\" \
+                 (UEFI 2.11 section 3.3): run `uefisettings.efi variable set DeployedMode 1 \
+                 --enter-deployed-mode-irreversibly` in the UEFI Shell",
+            ),
+        ];
+        for (transition, text) in cases {
+            let firmware = ModeFirmware::in_mode(SecureBootMode::User, Taking::AtOnce);
 
-        let error: ModeTransitionError = refusal(
-            &firmware,
-            VariableReach::Runtime,
-            transition.variable(),
-            ENTER_TEXT,
-            transition,
-        );
+            let error: ModeTransitionError = refusal(
+                &firmware,
+                VariableReach::Runtime,
+                transition.variable(),
+                ENTER_TEXT,
+                transition,
+            );
 
-        assert_eq!(
-            error,
-            ModeTransitionError::AfterExitBootServices(transition),
-            "{transition:?}"
-        );
-        assert_eq!(
-            firmware.read.borrow().as_slice(),
-            [],
-            "{transition:?}: no read"
-        );
-        assert_eq!(
-            error.to_string(),
-            "AuditMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
-             2.11 section 3.3): run `uefisettings.efi variable set AuditMode 1 \
-             --enter-audit-mode-clearing-pk` in the UEFI Shell",
-            "{transition:?}"
-        );
+            assert_eq!(
+                error,
+                ModeTransitionError::AfterExitBootServices(transition),
+                "{transition:?}"
+            );
+            assert_eq!(
+                firmware.read.borrow().as_slice(),
+                [],
+                "{transition:?}: no read"
+            );
+            assert_eq!(error.to_string(), text, "{transition:?}");
+        }
     }
 
     /// set_mode refuses a firmware without SetupMode, AuditMode or DeployedMode, such as edk2,
@@ -783,21 +935,28 @@ mod tests {
             ([zero(), None, zero()], vec![AUDIT_MODE]),
             ([None, zero(), zero()], vec![SETUP_MODE]),
         ];
-        for (values, absent) in cases {
+        let transitions = [
+            ModeTransition::EnterAuditModeClearingPk,
+            ModeTransition::EnterDeployedModeIrreversibly,
+        ];
+        for ((values, absent), transition) in cases
+            .into_iter()
+            .flat_map(|case| transitions.map(|transition| (case.clone(), transition)))
+        {
             let firmware = ModeFirmware::with_mode_values(values.clone(), Taking::AtOnce);
 
             let error: ModeTransitionError = refusal(
                 &firmware,
                 VariableReach::BootServices,
-                AUDIT_MODE,
+                transition.variable(),
                 ENTER_TEXT,
-                ModeTransition::EnterAuditModeClearingPk,
+                transition,
             );
 
             assert_eq!(
                 error,
                 ModeTransitionError::Absent(absent),
-                "mode values {values:?}"
+                "{transition:?} with mode values {values:?}"
             );
         }
     }
@@ -977,6 +1136,39 @@ mod tests {
         );
     }
 
+    /// set_mode reports EFI_WARN_RESET_REQUIRED of the Deployed Mode transition as returned,
+    /// although UEFI 2.11 §32.3.4 says it "takes effect immediately with no reset required".
+    #[test]
+    fn set_mode_reports_a_queued_deployed_mode_transition_as_returned() {
+        let firmware = ModeFirmware::in_mode(SecureBootMode::User, Taking::Queued);
+        let state = firmware.state();
+
+        let queued = request_and_set_mode(
+            &firmware,
+            VariableReach::BootServices,
+            DEPLOYED_MODE,
+            ENTER_TEXT,
+            ModeTransition::EnterDeployedModeIrreversibly,
+        )
+        .expect("the queued transition");
+
+        assert_eq!(
+            queued,
+            write_of(DEPLOYED_MODE, ModeTransitionStatus::WarnResetRequired),
+            "the Deployed Mode transition"
+        );
+        assert_eq!(
+            firmware.written.borrow().as_slice(),
+            [mode_key(DEPLOYED_MODE)],
+            "DeployedMode alone is written"
+        );
+        assert_eq!(
+            firmware.state(),
+            state,
+            "the mode variables and PK as they were"
+        );
+    }
+
     /// What variable set prints of a transition: the variable as get prints it, then the status
     /// of SetVariable().
     #[test]
@@ -1055,6 +1247,30 @@ mod tests {
                 "\"The AuditMode variable is only writable before ExitBootServices() is called \
                  when the system is not in Deployed Mode\" (UEFI 2.11 section 32.3.3), and the \
                  firmware is in Deployed Mode",
+            ),
+            (
+                ModeTransitionError::OtherVariable {
+                    transition: ModeTransition::EnterDeployedModeIrreversibly,
+                    name: AUDIT_MODE.to_owned(),
+                },
+                "--enter-deployed-mode-irreversibly sets DeployedMode, not AuditMode",
+            ),
+            (
+                ModeTransitionError::AlreadyIn(SecureBootMode::Deployed),
+                "the firmware is in Deployed Mode already",
+            ),
+            (
+                ModeTransitionError::DeployedModeInSetupMode,
+                "the firmware is in Setup Mode, and \"both User Mode and Audit Mode support \
+                 unauthenticated transitions to Deployed Mode\" (UEFI 2.11 section 32.3), not \
+                 Setup Mode: enrolling PK enters User Mode first (section 32.3.1)",
+            ),
+            (
+                ModeTransitionError::DeployedModeInAuditMode,
+                "the firmware is in Audit Mode, where \"To enter Deployed Mode from Audit Mode, \
+                 set the variable PK\" (UEFI 2.11 section 32.3.4): `uefisettings.efi variable \
+                 write-signed PK 8BE4DF61-93CA-11D2-AA0D-00E098032B8C` writes it, with \
+                 --allow-setup-mode-write-without-signature-check while SetupMode is 1",
             ),
             (
                 ModeTransitionError::AlreadyStarted,
