@@ -36,6 +36,7 @@ use crate::hii::variables::check_non_volatile;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::EfivarReader;
+use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
@@ -2150,6 +2151,13 @@ fn unwritable(
     if let Some(declared) = store.explain_unread(reach, interface, error) {
         return declared.into();
     }
+    // set writes no authenticated variable, whether or not get decodes it
+    if let Some(refused) = error.downcast_ref::<EnhancedAuthenticatedVariable>() {
+        if let Err(authenticated) = check_unauthenticated(&store.variable_key(), refused.attributes)
+        {
+            return authenticated.into();
+        }
+    }
     match error.downcast_ref::<VariableNotFound>() {
         Some(missing) => VariableNotExported {
             missing: missing.clone(),
@@ -2166,6 +2174,7 @@ mod choice_for_set_tests {
     use super::ifr_fixtures::*;
     use super::storage::read_current_value_bytes;
     use super::*;
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
 
     /// The refusal of the efivar Present with the attributes NV_BS through variables that reach
     /// Runtime.
@@ -2844,22 +2853,41 @@ mod choice_for_set_tests {
     }
 
     /// set refuses a match on a variable with any authenticated access before any write: every
-    /// write of it needs a signed descriptor (UEFI 2.10 §8.2.3).
+    /// write of it needs a signed descriptor (UEFI 2.10 §8.2.3). With
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, it does so whether or not get accepts its
+    /// metadata.
     #[test]
     fn match_on_an_authenticated_efivar_is_refused() {
         let root = picked_one_of(&[var_store_efi(1, "Present", NV_BS_RT, 1)], 1);
+        let refusal = |attributes: u32| {
+            format!(
+                "EFI variable Present-00000000-0000-0000-0000-000000000000 has authenticated \
+                 access (attributes {attributes:#x}), which uefisettings does not write"
+            )
+        };
         for attributes in [NV_BS_RT | 0x10, NV_BS_RT | 0x20, NV_BS_RT | 0x80] {
             let signed = choice_attributed(&root, attributes);
 
             assert_eq!(
                 signed.map_err(|error| error.to_string()).err(),
-                Some(format!(
-                    "EFI variable Present-00000000-0000-0000-0000-000000000000 has authenticated \
-                     access (attributes {attributes:#x}), which uefisettings does not write"
-                )),
+                Some(refusal(attributes)),
                 "efivar file with attributes {attributes:#x}"
             );
         }
+        let efivars = Efivars::new();
+        efivars.write_attributed(
+            &efi_variable("Present", 1),
+            NV_BS_RT | 0x80,
+            &[&timestamp_metadata()[..], &[0]].concat(),
+        );
+
+        assert_eq!(
+            choice_with(&root, &efivars)
+                .map_err(|error| error.to_string())
+                .err(),
+            Some(refusal(NV_BS_RT | 0x80)),
+            "efivar file with attributes 0x87 and metadata"
+        );
     }
 
     /// set decides on a match on an NV|BS VARSTORE_EFI whose variable has

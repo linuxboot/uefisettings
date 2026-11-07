@@ -27,6 +27,7 @@ use crate::hii_package::end;
 use crate::hii_package::op;
 use crate::hii_package::package;
 use crate::hii_package::package_list;
+use crate::hii_package::question_header;
 use crate::hii_package::strings_package;
 use crate::hii_package::EFI_HII_PACKAGE_FORMS;
 use crate::hii_package::EFI_IFR_FORM_OP;
@@ -37,6 +38,7 @@ use crate::hii_package::EFI_IFR_ONE_OF_OPTION_OP;
 use crate::hii_package::EFI_IFR_PASSWORD_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_EFI_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_OP;
+use crate::hii_package::UINT8_DECIMAL;
 
 /// The GUID of the package list and of its form set.
 const FORM_SET: Guid = guid!("8c78a505-baa0-4c4a-869f-000000000100");
@@ -70,8 +72,6 @@ const STRINGS: [&str; 9] = [
 const AMITSE_SETUP: u16 = 1;
 const CON_OUT_DEV: u16 = 2;
 
-/// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.10 §33.3.8.3.47).
-const UINT8_DECIMAL: u8 = 0x10;
 /// EFI_IFR_TYPE_NUM_SIZE_8, the Type of a UINT8 EFI_IFR_ONE_OF_OPTION.
 const NUM_SIZE_8: u8 = 0x00;
 /// The MaxSize of each PASSWORD, in characters: its UCS-2 string takes 40 bytes.
@@ -120,7 +120,7 @@ fn form_package() -> Vec<u8> {
             EFI_IFR_ONE_OF_OP,
             true,
             &[
-                question_header(3, QUIET_BOOT, AMITSE_SETUP, 80),
+                question_header(QUIET_BOOT, HELP, 3, AMITSE_SETUP, 80),
                 // Flags, MinValue, MaxValue, Step
                 [UINT8_DECIMAL, 0, 1, 0].to_vec(),
             ]
@@ -136,7 +136,7 @@ fn form_package() -> Vec<u8> {
             EFI_IFR_NUMERIC_OP,
             true,
             &[
-                question_header(4, VOLATILE_SETTING, CON_OUT_DEV, 0),
+                question_header(VOLATILE_SETTING, HELP, 4, CON_OUT_DEV, 0),
                 // Flags, MinValue, MaxValue, Step
                 [UINT8_DECIMAL, 0, 255, 1].to_vec(),
             ]
@@ -162,24 +162,11 @@ fn form_package() -> Vec<u8> {
     package(EFI_HII_PACKAGE_FORMS, &body)
 }
 
-/// EFI_IFR_QUESTION_HEADER: Prompt, Help, QuestionId, VarStoreId, VarOffset and Flags.
-fn question_header(id: u16, prompt: u16, var_store: u16, offset: u16) -> Vec<u8> {
-    [
-        &prompt.to_le_bytes()[..],
-        &HELP.to_le_bytes(),
-        &id.to_le_bytes(),
-        &var_store.to_le_bytes(),
-        &offset.to_le_bytes(),
-        &[0],
-    ]
-    .concat()
-}
-
 /// The PASSWORD op of question `id` at byte `offset` of AMITSESetup (UEFI 2.10
 /// §33.3.8.3.54), out of scope.
 fn password(id: u16, prompt: u16, offset: u16) -> Vec<u8> {
     let data = [
-        question_header(id, prompt, AMITSE_SETUP, offset),
+        question_header(prompt, HELP, id, AMITSE_SETUP, offset),
         [1u16.to_le_bytes(), PASSWORD_MAX_SIZE.to_le_bytes()].concat(), // MinSize, MaxSize
     ]
     .concat();

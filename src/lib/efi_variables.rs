@@ -17,7 +17,8 @@
 //! §8.5.3) too: their bytes come from capsule.rs, and Linux's capsule loader
 //! (capsule_loader.rs) or the runtime services in the UEFI Shell (capsule_services.rs) take
 //! them. And the configuration data of the firmware's JSON configuration table (§23.5.2), which
-//! capsule.rs decodes from a VendorTable.
+//! capsule.rs decodes from a VendorTable. Every build reads the values of questions behind the
+//! metadata of enhanced authenticated variables (enhanced_authenticated.rs).
 
 #[cfg(variable_data)]
 pub(crate) mod authenticated;
@@ -25,11 +26,13 @@ pub(crate) mod authenticated;
 mod capsule;
 #[cfg(capsule_delivery)]
 mod capsule_delivery;
+pub(crate) mod enhanced_authenticated;
 
 #[cfg(all(variable_names, any(target_os = "uefi", test)))]
 use anyhow::anyhow;
 #[cfg(any(variable_names, variable_info))]
 use anyhow::Context;
+#[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
 use anyhow::Result;
 #[cfg(any(variable_info, variable_storage_info))]
 use serde::Serialize;
@@ -68,6 +71,18 @@ use crate::hii::VariableKey;
 
 #[cfg(variable_data)]
 pub(crate) mod globals;
+
+/// The size of EFI_TIME (UEFI 2.11 §8.3.1).
+const EFI_TIME_SIZE: usize = 16;
+
+/// Whether `time_stamp`, an EFI_TIME, is the TimeStamp of an authentication descriptor, which
+/// is in GMT: Pad1, Nanosecond, TimeZone, Daylight and Pad2 are 0 (UEFI 2.11 §8.2.3, §8.2.5).
+fn is_gmt_time_stamp(time_stamp: &[u8; EFI_TIME_SIZE]) -> bool {
+    // Year, Month, Day, Hour, Minute and Second, then Pad1, Nanosecond, TimeZone, Daylight and
+    // Pad2 (UEFI 2.11 §8.3.1)
+    let [_, _, _, _, _, _, _, gmt_fields @ ..] = *time_stamp;
+    gmt_fields.iter().all(|&byte| byte == 0)
+}
 
 /// GetNextVariableName() (UEFI 2.10 §8.2.2): the variables that a backend reaches, by name and
 /// vendor GUID.
@@ -311,7 +326,10 @@ pub(crate) fn parse_vendor(vendor: &str) -> Result<Guid> {
         .with_context(|| format!("vendor {vendor} is not a GUID"))
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(variable_names, variable_info, variable_storage_info, variable_data)
+))]
 mod tests {
     #[cfg(configuration_tables)]
     use super::capsule::fixture::config_data;

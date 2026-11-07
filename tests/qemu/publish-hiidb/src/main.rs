@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|enhanced-auth-forms|padded-strings|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -33,6 +33,7 @@
 //! that both Linux and `uefisettings.efi` in the UEFI Shell find it.
 //! `password-forms` publishes nothing: it registers the package list of [`password_forms`]
 //! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
+//! `enhanced-auth-forms` does the same with the package list of [`enhanced_auth_forms`].
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `acpi-table` sets no `HiiDB`: it installs the database as the body of a `QHII` ACPI table,
@@ -68,6 +69,7 @@
 extern crate alloc;
 
 mod auth_variables;
+mod enhanced_auth_forms;
 mod global_variable_forms;
 mod hii_package;
 mod padded_strings;
@@ -186,6 +188,11 @@ fn efi_main() -> Status {
             "registering the password forms",
         )
         .map(|()| println!("publish-hiidb: registered the password forms")),
+        Some(Task::RegisterEnhancedAuthForms) => register_package_list(
+            &enhanced_auth_forms::package_list_bytes(),
+            "registering the enhanced authenticated forms",
+        )
+        .map(|()| println!("publish-hiidb: registered the enhanced authenticated forms")),
         Some(Task::RegisterPaddedStrings) => register_package_list(
             &padded_strings::package_list_bytes(),
             "registering the padded strings",
@@ -215,8 +222,8 @@ fn efi_main() -> Status {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
-                 |rt-data-readwrite-forms|password-forms|padded-strings|acpi-table\
-                 |acpi-table-hiid|acpi-table-junk-qhii\
+                 |rt-data-readwrite-forms|password-forms|enhanced-auth-forms|padded-strings\
+                 |acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
                  |json-config-data-past-region|json-config-data-boot-services\
@@ -241,6 +248,8 @@ enum Task {
     Publish(MemoryType, Database),
     /// Register the package list of [`password_forms`] in the HII database.
     RegisterPasswordForms,
+    /// Register the package list of [`enhanced_auth_forms`] in the HII database.
+    RegisterEnhancedAuthForms,
     /// Register the package list of [`padded_strings`] in the HII database.
     RegisterPaddedStrings,
     /// Create the variable of [`readwrite_forms`] if missing, register its package list in the
@@ -287,6 +296,9 @@ fn load_option() -> Option<Task> {
             Some(Task::PublishReadWriteForms)
         }
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
+        Ok(option) if option == cstr16!("enhanced-auth-forms") => {
+            Some(Task::RegisterEnhancedAuthForms)
+        }
         Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
         Ok(option) if option == cstr16!("acpi-table") => {
             Some(Task::PublishAcpiTable(QHII_SIGNATURE))

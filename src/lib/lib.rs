@@ -27,13 +27,6 @@ mod capsule_loader;
 mod capsule_services;
 #[cfg(target_os = "linux")]
 mod chattr;
-#[cfg(any(
-    variable_names,
-    variable_info,
-    variable_storage_info,
-    capsule_delivery,
-    configuration_tables
-))]
 mod efi_variables;
 mod exit_status;
 pub mod exports;

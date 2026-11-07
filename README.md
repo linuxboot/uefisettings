@@ -288,9 +288,11 @@ Without `-f`, `--efivars` reads the HiiDB that the dump saved. A directory witho
 
 The dump keeps the HiiDB whole, whose strings can name the machine (a MAC address, for one), and
 of each EFI variable only the bytes that questions decode unless `--unredacted` is given; even those
-can be secrets, so share it only with people you trust. A redacted dump zeroes every other byte,
-so `--efivars` refuses it with another HiiDB (`-f`), whose questions would read those zeros as
-values; a later uefisettings that decodes more reads them as values too.
+can be secrets, so share it only with people you trust. A redacted dump also keeps, for variables
+with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, the EFI_VARIABLE_AUTHENTICATION_3 metadata that
+`get` accepts (time stamp or nonce, and certificate digest), which it needs to find their values.
+It zeroes every other byte, so `--efivars` refuses it with another HiiDB (`-f`), whose questions
+would read those zeros as values; a later uefisettings that decodes more reads them as values too.
 
 On a case-insensitive file system, such as APFS unless formatted case-sensitive, `--efivars`
 reads each efivar file by its exact name. Two files whose names differ only in case become one

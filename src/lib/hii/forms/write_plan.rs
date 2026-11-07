@@ -242,6 +242,7 @@ mod tests {
     use super::super::*;
     #[cfg(efivar_dumps)]
     use super::write_in_turn;
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::variables::WithholdingVariables;
 
     const AND: u8 = 0x15;
@@ -274,6 +275,12 @@ mod tests {
     const BOOT_ONLY: u16 = 4;
     /// A VARSTORE of 3 bytes on the variable of STORE.
     const SHORT: u16 = 5;
+    /// VARSTORE_EFIs whose variables have EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, with
+    /// metadata that get accepts and with none.
+    const ENHANCED: u16 = 6;
+    const BAD_METADATA: u16 = 7;
+    /// The attributes of the variables of ENHANCED and BAD_METADATA.
+    const NV_BS_RT_ENHANCED: u32 = NV_BS_RT | 0x80;
     /// The bytes of the variables of STORE, OTHER and BOOT_ONLY before set.
     const STORE_BYTES: [u8; 6] = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5];
     const OTHER_BYTES: [u8; 2] = [0xB0, 0xB1];
@@ -385,6 +392,18 @@ mod tests {
                 .concat(),
             ),
             ("Stored value", STORE, 1, value_of_1),
+            (
+                "Enhanced target",
+                STORE,
+                0,
+                write(&[op(THIS), set(ENHANCED, 0, EFI_IFR_TYPE_NUM_SIZE_8)]),
+            ),
+            (
+                "Bad metadata target",
+                STORE,
+                0,
+                write(&[op(THIS), set(BAD_METADATA, 0, EFI_IFR_TYPE_NUM_SIZE_8)]),
+            ),
         ]
     }
 
@@ -411,6 +430,8 @@ mod tests {
             var_store(ABSENT, [0; 16], "Absent", 1),
             var_store_efi(BOOT_ONLY, "BootOnly", NV_BS, 1),
             var_store(SHORT, [0; 16], "Store", 3),
+            var_store_efi(ENHANCED, "Enhanced", NV_BS_RT_ENHANCED, 1),
+            var_store_efi(BAD_METADATA, "BadMetadata", NV_BS_RT_ENHANCED, 1),
             form(1, &body),
         ])
     }
@@ -422,12 +443,19 @@ mod tests {
         }
     }
 
-    /// Variables of `(reach, interface)` holding STORE, OTHER and BOOT_ONLY as before set.
+    /// Variables of `(reach, interface)` holding STORE, OTHER, BOOT_ONLY, ENHANCED and
+    /// BAD_METADATA as before set.
     fn variables((reach, interface): (VariableReach, VariableInterface)) -> MemoryVariables {
         let variables = MemoryVariables::new(reach, interface);
         variables.insert(key("Store"), NV_BS_RT, &STORE_BYTES);
         variables.insert(key("Other"), NV_BS_RT, &OTHER_BYTES);
         variables.insert(key("BootOnly"), NV_BS, &BOOT_ONLY_BYTES);
+        variables.insert(
+            key("Enhanced"),
+            NV_BS_RT_ENHANCED,
+            &[&timestamp_metadata()[..], &[0xD0]].concat(),
+        );
+        variables.insert(key("BadMetadata"), NV_BS_RT_ENHANCED, &[0xE0]);
         variables
     }
 
@@ -482,11 +510,18 @@ mod tests {
         )
         .map(|_| ())
         .map_err(|error| format!("{error:#}"));
-        let written = ["Store", "Other", "BootOnly", "Absent"]
-            .into_iter()
-            .map(|name| (name, writes.writes_to(&key(name))))
-            .filter(|(_, writes)| !writes.is_empty())
-            .collect();
+        let written = [
+            "Store",
+            "Other",
+            "BootOnly",
+            "Absent",
+            "Enhanced",
+            "BadMetadata",
+        ]
+        .into_iter()
+        .map(|name| (name, writes.writes_to(&key(name))))
+        .filter(|(_, writes)| !writes.is_empty())
+        .collect();
         (outcome, written)
     }
 
@@ -591,7 +626,31 @@ mod tests {
                 )
             })
         });
-        for (through, prompt, want) in cases.into_iter().chain(read_only.into_iter().flatten()) {
+        // a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, whether or not get accepts
+        // its metadata
+        let authenticated = [
+            ("Enhanced target", ENHANCED, "Enhanced"),
+            ("Bad metadata target", BAD_METADATA, "BadMetadata"),
+        ]
+        .map(|(prompt, id, name)| {
+            [EFIVARFS, VARIABLE_SERVICES, FIRMWARE_ENVIRONMENT].map(|through| {
+                (
+                    through,
+                    prompt,
+                    format!(
+                        "cannot set question \"{prompt}\": its WRITE expression sets VarStore \
+                         {id:#06x} (EFI_IFR_VARSTORE_EFI \"{name}\"), which set may not write: {:#}",
+                        check_unauthenticated(&key(name), NV_BS_RT_ENHANCED)
+                            .expect_err("refuse a variable with authenticated access")
+                    ),
+                )
+            })
+        });
+        for (through, prompt, want) in cases
+            .into_iter()
+            .chain(read_only.into_iter().flatten())
+            .chain(authenticated.into_iter().flatten())
+        {
             assert_eq!(
                 set(prompt, "1", through),
                 (Err(want), BTreeMap::new()),

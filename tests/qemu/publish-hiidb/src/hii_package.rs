@@ -46,6 +46,8 @@ pub(crate) const EFI_IFR_UINT8_OP: u8 = 0x42;
 pub(crate) const EFI_IFR_UINT16_OP: u8 = 0x43;
 pub(crate) const EFI_IFR_TO_UINT_OP: u8 = 0x48;
 pub(crate) const EFI_IFR_THIS_OP: u8 = 0x58;
+/// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.10 §33.3.8.3.47).
+pub(crate) const UINT8_DECIMAL: u8 = 0x10;
 
 /// A package list of `guid`: EFI_HII_PACKAGE_LIST_HEADER (UEFI 2.10 §33.3.1.2), then
 /// `packages` and the End package.
@@ -104,6 +106,25 @@ pub(crate) fn op(op_code: u8, scope: bool, data: &[u8]) -> Vec<u8> {
         .expect("an IFR op fits its 7-bit Length");
     let scope = if scope { 0x80 } else { 0 };
     [&[op_code, scope | length][..], data].concat()
+}
+
+/// EFI_IFR_QUESTION_HEADER: Prompt, Help, QuestionId, VarStoreId, VarOffset and Flags 0.
+pub(crate) fn question_header(
+    prompt: u16,
+    help: u16,
+    id: u16,
+    var_store: u16,
+    offset: u16,
+) -> Vec<u8> {
+    [
+        &prompt.to_le_bytes()[..],
+        &help.to_le_bytes(),
+        &id.to_le_bytes(),
+        &var_store.to_le_bytes(),
+        &offset.to_le_bytes(),
+        &[0],
+    ]
+    .concat()
 }
 
 /// EFI_IFR_END, which closes a scope.

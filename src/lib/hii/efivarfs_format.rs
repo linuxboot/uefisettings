@@ -56,7 +56,6 @@ const PROC_SELF_FD: &str = "/proc/self/fd";
 /// The largest efivar file that read_efivar_file reads, far above EDK2's largest EFI variables:
 /// PcdMaxVariableSize is 0x400 by default (MdeModulePkg.dec) and 0x8400 in a 4 MiB OVMF
 /// (OvmfPkgX64.dsc), as of edk2-stable202508.
-#[cfg(any(target_os = "linux", test))]
 pub(super) const MAX_EFIVAR_FILE_SIZE: u64 = 16 * 1024 * 1024;
 /// What efivarfs, and so a copy of it, reaches.
 pub(super) const EFIVARFS_REACH: VariableReach = VariableReach::Runtime;
@@ -311,12 +310,17 @@ pub(super) fn read_efivar(dir: &Path, name: &EfivarFileName, size: u16) -> Resul
         .with_context(|| format!("failed to read efivar file '{}'", dir.join(name).display()))
 }
 
+/// Reads the whole efivar file `name` in `dir`, as read_efivar_file does.
+pub(super) fn read_whole_efivar(dir: &Path, name: &EfivarFileName) -> Result<Vec<u8>> {
+    let file = open_efivar(dir, name)?;
+    read_efivar_file_of(&file)
+        .with_context(|| format!("failed to read efivar file '{}'", dir.join(name).display()))
+}
+
 /// The bytes of the efivar `file`, of `size` bytes by its metadata, in one read() unless it grew
 /// since: each efivarfs read() reads the whole variable from the firmware (Linux v7.2
 /// fs/efivarfs/file.c efivarfs_file_read()). A file of more than MAX_EFIVAR_FILE_SIZE bytes, by
 /// its metadata or as read, is an error.
-// efivarfs writes and dump-efivars read whole files; the tests write dumps on any build
-#[cfg(any(target_os = "linux", test))]
 pub(super) fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8>> {
     if size > MAX_EFIVAR_FILE_SIZE {
         return Err(efivar_file_too_large());
@@ -346,13 +350,11 @@ pub(super) fn read_efivar_file<R: Read>(file: R, size: u64) -> io::Result<Vec<u8
 }
 
 /// The bytes of the efivar `file`, as read_efivar_file reads them at the size its metadata gives.
-#[cfg(any(target_os = "linux", test))]
 pub(super) fn read_efivar_file_of(file: &File) -> io::Result<Vec<u8>> {
     read_efivar_file(file, file.metadata()?.len())
 }
 
 /// read_efivar_file's error for a file of more than MAX_EFIVAR_FILE_SIZE bytes.
-#[cfg(any(target_os = "linux", test))]
 fn efivar_file_too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::FileTooLarge,
@@ -394,6 +396,13 @@ impl FirmwareVariables for EfivarCopy {
         let name = EfivarFileName::from(key);
         check_exact_name(&self.dir, &name)
             .and_then(|()| read_efivar(&self.dir, &name, size))
+            .map_err(|error| as_variable_not_found(key, error))
+    }
+
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        let name = EfivarFileName::from(key);
+        check_exact_name(&self.dir, &name)
+            .and_then(|()| read_whole_efivar(&self.dir, &name))
             .map_err(|error| as_variable_not_found(key, error))
     }
 
@@ -1051,14 +1060,14 @@ pub mod tests {
         }
     }
 
-    /// A copy of efivars reads the efivar file of each variable by its exact name: a
-    /// case-insensitive file system, such as APFS unless formatted case-sensitive, opens a name
-    /// that differs only in case, which is another variable's file.
+    /// A copy of efivars reads the efivar file of each variable by its exact name, in part or
+    /// whole: a case-insensitive file system, such as APFS unless formatted case-sensitive, opens
+    /// a name that differs only in case, which is another variable's file.
     #[test]
     fn exact_name_refuses_a_case_variant() {
         let dir = tempfile::tempdir().expect("create efivars directory");
         let setup = variable_key("Setup");
-        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[1]].concat();
+        let bytes = [&NV_BS_RT.to_ne_bytes()[..], &[1, 2]].concat();
         fs::write(dir.path().join(EfivarFileName::from(&setup)), &bytes)
             .expect("write the efivar file");
         let variables = EfivarSource::Directory(dir.path().to_path_buf())
@@ -1067,15 +1076,28 @@ pub mod tests {
 
         assert_eq!(
             variables.read(&setup, 1).expect("read Setup"),
-            bytes,
+            bytes[..EFIVARFS_HEADER_SIZE + 1],
             "Setup"
+        );
+        assert_eq!(
+            variables.read_whole(&setup).expect("read Setup whole"),
+            bytes,
+            "Setup whole"
         );
         let variant = variable_key("SETUP");
         let error = variables.read(&variant, 1).expect_err("read SETUP");
         assert_eq!(
             error.downcast_ref::<VariableNotFound>(),
-            Some(&VariableNotFound(variant)),
+            Some(&VariableNotFound(variant.clone())),
             "SETUP: {error:#}"
+        );
+        let error = variables
+            .read_whole(&variant)
+            .expect_err("read SETUP whole");
+        assert_eq!(
+            error.downcast_ref::<VariableNotFound>(),
+            Some(&VariableNotFound(variant)),
+            "SETUP whole: {error:#}"
         );
     }
 
@@ -1096,8 +1118,8 @@ pub mod tests {
         );
     }
 
-    /// A copy of efivars reads an efivar file only through a listing of its directory: one that
-    /// it cannot list fails the read, though the file would open.
+    /// A copy of efivars reads an efivar file, in part or whole, only through a listing of its
+    /// directory: one that it cannot list fails the read, though the file would open.
     #[test]
     fn copy_reads_only_listed_entries() {
         use std::os::unix::fs::PermissionsExt;
@@ -1112,28 +1134,38 @@ pub mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300))
             .expect("make the directory unlistable");
 
-        let unlisted = copy.read(&setup, 1);
+        let unlisted = [
+            ("read", copy.read(&setup, 1)),
+            ("read whole", copy.read_whole(&setup)),
+        ];
 
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
             .expect("make the directory listable");
-        let error = unlisted.expect_err("read through an unlistable directory");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "failed to list efivars directory '{}'",
-                dir.path().display()
-            ),
-            "unlistable: {error:#}"
-        );
-        assert_eq!(
-            error
-                .root_cause()
-                .downcast_ref::<io::Error>()
-                .map(io::Error::kind),
-            Some(io::ErrorKind::PermissionDenied),
-            "unlistable: cause"
-        );
+        for (case, unlisted) in unlisted {
+            let error = unlisted.expect_err("read through an unlistable directory");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "failed to list efivars directory '{}'",
+                    dir.path().display()
+                ),
+                "{case}, unlistable: {error:#}"
+            );
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<io::Error>()
+                    .map(io::Error::kind),
+                Some(io::ErrorKind::PermissionDenied),
+                "{case}, unlistable: cause"
+            );
+        }
         assert_eq!(copy.read(&setup, 1).expect("read Setup"), bytes, "listable");
+        assert_eq!(
+            copy.read_whole(&setup).expect("read Setup whole"),
+            bytes,
+            "listable, whole"
+        );
     }
 
     /// The variables of an EfivarSource::Directory read its efivar files and take no writes.

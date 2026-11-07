@@ -28,6 +28,7 @@ use crate::hii_package::end;
 use crate::hii_package::op;
 use crate::hii_package::package;
 use crate::hii_package::package_list;
+use crate::hii_package::question_header;
 use crate::hii_package::strings_package;
 use crate::hii_package::EFI_HII_PACKAGE_FORMS;
 use crate::hii_package::EFI_IFR_FORM_OP;
@@ -35,6 +36,7 @@ use crate::hii_package::EFI_IFR_FORM_SET_OP;
 use crate::hii_package::EFI_IFR_NUMERIC_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_EFI_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_OP;
+use crate::hii_package::UINT8_DECIMAL;
 
 /// The Attributes of every VARSTORE_EFI: non-volatile, boot service and runtime access.
 const NV_BS_RT: u32 = 0x07;
@@ -43,9 +45,6 @@ const NV_BS_RT: u32 = 0x07;
 const TITLE: u16 = 2;
 /// The string ID of the help of the form set and of each question; the prompts follow it.
 const HELP: u16 = 3;
-
-/// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.10 §33.3.8.3.47).
-const UINT8_DECIMAL: u8 = 0x10;
 
 /// The package lists, in the order of the database: a question in several lists has one
 /// copy in each.
@@ -266,15 +265,9 @@ impl Question {
     fn op(&self, id: u16) -> Vec<u8> {
         let prompt = HELP + id;
         let data = [
-            // EFI_IFR_QUESTION_HEADER: Prompt, Help, QuestionId, VarStoreId, VarOffset, Flags
-            &prompt.to_le_bytes()[..],
-            &HELP.to_le_bytes(),
-            &id.to_le_bytes(),
-            &id.to_le_bytes(),
-            &0u16.to_le_bytes(),
-            &[0],
+            question_header(prompt, HELP, id, id, 0),
             // Flags, MinValue, MaxValue, Step
-            &[UINT8_DECIMAL, 0, self.maximum, 1],
+            [UINT8_DECIMAL, 0, self.maximum, 1].to_vec(),
         ]
         .concat();
         [op(EFI_IFR_NUMERIC_OP, true, &data), end()].concat()

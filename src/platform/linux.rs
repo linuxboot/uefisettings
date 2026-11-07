@@ -381,8 +381,11 @@ fn dump_warning(dir: &Path, redaction: EfivarRedaction) -> String {
     match redaction {
         EfivarRedaction::DecodedBytes => format!(
             "warning: {} holds the HiiDB, whose strings can name the machine, and EFI variables \
-             redacted to the bytes that questions decode, whose values can still be secrets; \
-             share it only with people you trust",
+             redacted to the bytes that questions decode, whose values can still be secrets, and \
+             also, for variables with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, to the \
+             EFI_VARIABLE_AUTHENTICATION_3 metadata that get accepts (time stamp or nonce, and \
+             certificate digest), which it needs to find their values; share it only with people \
+             you trust",
             dir.display()
         ),
         EfivarRedaction::Unredacted => format!(
@@ -604,7 +607,11 @@ mod tests {
                 EfivarRedaction::DecodedBytes,
                 "warning: out holds the HiiDB, whose strings can name the machine, and EFI \
                  variables redacted to the bytes that questions decode, whose values can still \
-                 be secrets; share it only with people you trust",
+                 be secrets, and also, for variables with \
+                 EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, to the \
+                 EFI_VARIABLE_AUTHENTICATION_3 metadata that get accepts (time stamp or nonce, \
+                 and certificate digest), which it needs to find their values; share it only \
+                 with people you trust",
             ),
             (
                 "unredacted",

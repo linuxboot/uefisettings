@@ -60,6 +60,7 @@ use crate::hii::efivarfs_format::listed_names;
 use crate::hii::efivarfs_format::open_efivar;
 use crate::hii::efivarfs_format::read_efivar;
 use crate::hii::efivarfs_format::read_efivar_file_of;
+use crate::hii::efivarfs_format::read_whole_efivar;
 use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EfivarNotFound;
@@ -166,6 +167,11 @@ impl FirmwareVariables for EfivarFiles {
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
         read_efivar(&self.dir, &EfivarFileName::from(key), size)
+            .map_err(|error| as_variable_not_found(key, error))
+    }
+
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        read_whole_efivar(&self.dir, &EfivarFileName::from(key))
             .map_err(|error| as_variable_not_found(key, error))
     }
 
@@ -1441,6 +1447,35 @@ mod tests {
             missing.downcast_ref::<NotEfivarfs>(),
             Some(&NotEfivarfs(dir.path().to_path_buf())),
             "Missing: {missing:#}"
+        );
+    }
+
+    /// FirmwareVariables::read_whole of EfivarFiles gives the whole efivar file of a variable,
+    /// and VariableNotFound for a missing one.
+    #[test]
+    fn efivar_files_give_whole_efivar_files() {
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
+        fs::write(
+            dir.path()
+                .join(EfivarFileName::from(&variable_key("Setup"))),
+            SETUP,
+        )
+        .expect("write the efivar file");
+
+        assert_eq!(
+            files
+                .read_whole(&variable_key("Setup"))
+                .expect("read Setup whole"),
+            SETUP,
+            "Setup"
+        );
+        let error = files
+            .read_whole(&variable_key("Missing"))
+            .expect_err("read Missing whole");
+        assert_eq!(
+            error.downcast_ref::<VariableNotFound>(),
+            Some(&VariableNotFound(variable_key("Missing"))),
+            "Missing: {error:#}"
         );
     }
 

@@ -30,7 +30,6 @@ use super::NumericFormatError;
 use super::DECLARED_BOOT_SERVICE_ONLY;
 use super::EDKII_BIT_FIELD_VALUE_BITS;
 use crate::hii::package::Guid;
-use crate::hii::variables::check_decodable;
 use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarRange;
 use crate::hii::variables::EfivarReader;
@@ -176,6 +175,9 @@ mod non_efi_varstore_tests {
     use super::super::TypeValue;
     use super::super::DUMMY_OPCODE;
     use super::*;
+    use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata;
+    use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata_of;
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::efivarfs_format::EfivarFileName;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
     use crate::hii::variables::FirmwareVariables;
@@ -571,11 +573,11 @@ mod non_efi_varstore_tests {
         );
     }
 
-    /// get decodes no value from a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, whose
-    /// data starts with metadata (UEFI 2.10 §8.2.1). The other authenticated accesses put their
-    /// descriptors only into writes, so those variables decode as others do.
+    /// get decodes no value from a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS whose
+    /// data ends inside the metadata it starts with (UEFI 2.10 §8.2.1). The other authenticated
+    /// accesses put their descriptors only into writes, so those variables decode as others do.
     #[test]
-    fn enhanced_authenticated_variable_is_not_decoded() {
+    fn enhanced_authenticated_variable_without_metadata_is_not_decoded() {
         let store = || efi_variable("Signed", 1);
         let efivars = Efivars::new();
         efivars.write_attributed(&store(), NV_BS_RT | 0x80, &[1]);
@@ -584,8 +586,8 @@ mod non_efi_varstore_tests {
             read(store(), &efivars),
             Err(
                 "<ValueUnavailable: EFI variable Signed-00000000-0000-0000-0000-000000000000 \
-                 has enhanced authenticated access (attributes 0x87): its data starts with \
-                 metadata, which uefisettings does not decode>"
+                 has enhanced authenticated access (attributes 0x87), whose metadata \
+                 uefisettings refuses: its 1 bytes of data end inside its metadata>"
                     .to_string()
             ),
             "attributes 0x87"
@@ -604,6 +606,173 @@ mod non_efi_varstore_tests {
                 read(store(), &efivars),
                 Ok(efivar_file_bytes(attributes, &[1])),
                 "attributes {attributes:#x}"
+            );
+        }
+    }
+
+    /// `metadata` followed by a value byte.
+    fn with_value(metadata: Vec<u8>) -> Vec<u8> {
+        [metadata, vec![0x2A]].concat()
+    }
+
+    /// `metadata` with the byte at each offset of `bytes` replaced.
+    fn changed(mut metadata: Vec<u8>, bytes: &[(usize, u8)]) -> Vec<u8> {
+        for &(offset, byte) in bytes {
+            metadata[offset] = byte;
+        }
+        metadata
+    }
+
+    /// get decodes the value of a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS
+    /// behind its metadata of either Type, also where its NONCE needs padding before the 4-byte
+    /// aligned CERT_ID (UEFI 2.11 §2.3.1), and with the smallest NonceSize, 1 (§8.2.3), for
+    /// VarStores shorter and longer than EFI_VARIABLE_AUTHENTICATION_3.
+    #[test]
+    fn enhanced_authenticated_variable_decodes_behind_its_metadata() {
+        for (name, metadata) in [
+            ("timestamp", timestamp_metadata()),
+            ("nonce", nonce_metadata()),
+            (
+                "nonce of 5 bytes, padded",
+                nonce_metadata_of(&[0xA5; 5], &[0; 3], 64),
+            ),
+            (
+                "nonce of 1 byte, padded",
+                nonce_metadata_of(&[0xA5], &[0; 3], 60),
+            ),
+        ] {
+            for size in [1, 16] {
+                let store = || efi_variable("Signed", size);
+                let efivars = Efivars::new();
+                let value: Vec<u8> = (0x40..).take(size).collect();
+                efivars.write_attributed(
+                    &store(),
+                    NV_BS_RT | 0x80,
+                    &[&metadata[..], &value].concat(),
+                );
+
+                assert_eq!(
+                    read(store(), &efivars),
+                    Ok(efivar_file_bytes(NV_BS_RT | 0x80, &value)),
+                    "{name}, VarStore of {size} bytes"
+                );
+            }
+        }
+    }
+
+    /// get refuses the metadata of a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS,
+    /// naming the check it fails, and so decodes no value from it.
+    #[test]
+    fn enhanced_authenticated_variable_with_bad_metadata_is_not_decoded() {
+        // packed, without the padding of natural alignment: the Flags check refuses it, as it
+        // reads the Year of EFI_TIME into Flags (0x7ea0000), not a check of the layout
+        let packed = [
+            &[1, 1][..],
+            &63u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &[0xEA, 0x07, 11, 6, 12, 0, 0, 0],
+            &[0; 8],
+            &[1],
+            &32u32.to_le_bytes(),
+            &(0..32).collect::<Vec<u8>>(),
+        ]
+        .concat();
+        let cases = [
+            (
+                "Version",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(0, 2)])),
+                "EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1",
+            ),
+            (
+                "Type",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(1, 3)])),
+                "EFI_VARIABLE_AUTHENTICATION_3 Type 3, neither TIMESTAMP (1) nor NONCE (2)",
+            ),
+            (
+                "Flags",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(8, 1)])),
+                "EFI_VARIABLE_AUTHENTICATION_3 Flags 0x1: all flags are reserved on GetVariable()",
+            ),
+            (
+                "Nanosecond",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(20, 1)])),
+                "its TimeStamp has a nonzero Pad1, Nanosecond, TimeZone, Daylight or Pad2",
+            ),
+            (
+                "NonceSize",
+                NV_BS_RT | 0x80,
+                with_value(changed(nonce_metadata(), &[(12, 0)])),
+                "EFI_VARIABLE_AUTHENTICATION_3_NONCE NonceSize 0",
+            ),
+            (
+                "nonce of 5 bytes, unpadded",
+                NV_BS_RT | 0x80,
+                with_value(nonce_metadata_of(&[0xA5; 5], &[], 61)),
+                "nonzero padding between EFI_VARIABLE_AUTHENTICATION_3_NONCE and \
+                 EFI_VARIABLE_AUTHENTICATION_3_CERT_ID",
+            ),
+            (
+                "CERT_ID Type",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(28, 2)])),
+                "EFI_VARIABLE_AUTHENTICATION_3_CERT_ID Type 2, not CERT_ID_SHA256 (1)",
+            ),
+            (
+                "IdSize",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(32, 31)])),
+                "EFI_VARIABLE_AUTHENTICATION_3_CERT_ID IdSize 31, not 32",
+            ),
+            (
+                "MetadataSize",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(4, 67)])),
+                "MetadataSize 67, but its descriptors end at byte 68",
+            ),
+            (
+                "MetadataSize larger",
+                NV_BS_RT | 0x80,
+                with_value(changed(timestamp_metadata(), &[(4, 72)])),
+                "MetadataSize 72, but its descriptors end at byte 68",
+            ),
+            (
+                "packed",
+                NV_BS_RT | 0x80,
+                with_value(packed),
+                "EFI_VARIABLE_AUTHENTICATION_3 Flags 0x7ea0000: all flags are reserved on \
+                 GetVariable()",
+            ),
+            (
+                "truncated",
+                NV_BS_RT | 0x80,
+                timestamp_metadata()[..60].to_vec(),
+                "its 60 bytes of data end inside its metadata",
+            ),
+            (
+                "time-based too",
+                NV_BS_RT | 0xA0,
+                with_value(timestamp_metadata()),
+                "it also has EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which \
+                 SetVariable() refuses with it (UEFI 2.11 section 8.2.3)",
+            ),
+        ];
+        for (name, attributes, data, reason) in cases {
+            let store = || efi_variable("Signed", 1);
+            let efivars = Efivars::new();
+            efivars.write_attributed(&store(), attributes, &data);
+
+            assert_eq!(
+                read(store(), &efivars),
+                Err(format!(
+                    "<ValueUnavailable: EFI variable Signed-00000000-0000-0000-0000-000000000000 \
+                     has enhanced authenticated access (attributes {attributes:#x}), whose \
+                     metadata uefisettings refuses: {reason}>"
+                )),
+                "{name}"
             );
         }
     }
@@ -961,19 +1130,14 @@ pub(super) fn read_current_value_bytes<'a>(
     // firmware may give an NV|BS VarStore's variable runtime access, as firmware whose EDK2 gives
     // every non-volatile variable runtime access does. The declaration only explains a missing or
     // unread variable.
-    let bytes = reader
+    reader
         .read(EfivarRange::of(store.as_ref()), value)
         .map_err(
             |error| match store.explain_unread(reach, interface, error) {
                 Some(declared) => ValueUnavailable::DeclaredBootServiceOnly(declared),
                 None => ValueUnavailable::from_read_error(store.kind(), error),
             },
-        )?;
-    if let Some(attributes) = efivar_attributes(bytes) {
-        check_decodable(&store.variable_key(), attributes)
-            .map_err(ValueUnavailable::EnhancedAuthenticated)?;
-    }
-    Ok(bytes)
+        )
 }
 
 /// Why a question has no value. Display gives the reason, to_answer the text shown for the
@@ -1051,6 +1215,9 @@ impl ValueUnavailable {
         }
         if error.downcast_ref::<WithheldVariable>().is_some() {
             return Self::PasswordVarStore;
+        }
+        if let Some(refused) = error.downcast_ref::<EnhancedAuthenticatedVariable>() {
+            return Self::EnhancedAuthenticated(refused.clone());
         }
         let Some(missing) = error.downcast_ref::<VariableNotFound>() else {
             return Self::ReadError(format!("{error:#}"));

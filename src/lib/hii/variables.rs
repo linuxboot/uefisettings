@@ -26,6 +26,9 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
+use crate::efi_variables::enhanced_authenticated::has_metadata;
+use crate::efi_variables::enhanced_authenticated::metadata_end;
+use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
 #[cfg(all(efivar_dumps, not(system_variables)))]
 use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::package::Guid;
@@ -169,7 +172,6 @@ impl VariableInterface {
     }
 
     /// The error for variable bytes without their whole attributes word.
-    #[cfg(any(system_variables, test))]
     fn missing_attributes(self) -> &'static str {
         match self {
             Self::Efivarfs => "efivarfs file is missing its attributes header",
@@ -241,6 +243,8 @@ pub(crate) trait FirmwareVariables {
     fn interface(&self) -> VariableInterface;
     /// The attributes word and the first `size` data bytes of `key`, as an efivarfs file starts.
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>>;
+    /// The attributes word and all the data of `key`, as its efivarfs file holds them.
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>>;
     /// Writes `encoded` at data offset `offset` of `key`, whose VarStore has `size` bytes,
     /// keeping its attributes and other bytes.
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()>;
@@ -257,6 +261,10 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
         (**self).read(key, size)
+    }
+
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        (**self).read_whole(key)
     }
 
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
@@ -277,6 +285,10 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
         (**self).read(key, size)
     }
 
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        (**self).read_whole(key)
+    }
+
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
         (**self).write_at(key, size, offset, encoded)
     }
@@ -285,22 +297,20 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
 /// The attribute word of efivar file bytes, which Linux v7.2 fs/efivarfs/file.c
 /// efivarfs_file_read() copies as a native u32 before the payload; None for fewer bytes.
 pub(super) fn efivar_attributes(bytes: &[u8]) -> Option<u32> {
+    efivar_parts(bytes).map(|(attributes, _)| attributes)
+}
+
+/// The attribute word of efivar file bytes and the payload after it; None for fewer bytes than
+/// the word.
+pub(super) fn efivar_parts(bytes: &[u8]) -> Option<(u32, &[u8])> {
     bytes
-        .first_chunk::<EFIVARFS_HEADER_SIZE>()
-        .copied()
-        .map(u32::from_ne_bytes)
+        .split_first_chunk::<EFIVARFS_HEADER_SIZE>()
+        .map(|(attributes, data)| (u32::from_ne_bytes(*attributes), data))
 }
 
 /// What FirmwareVariables::read gives for the variable `key` whose GetVariable() returned
 /// `attributes` and `data`: the attributes word and the first `size` data bytes, as an efivarfs
 /// file starts.
-#[cfg_attr(
-    not(target_os = "uefi"),
-    allow(
-        dead_code,
-        reason = "efivarfs reads its files; the UEFI build and the tests' MemoryVariables call it"
-    )
-)]
 pub(super) fn attributes_and_data(
     key: &VariableKey,
     attributes: u32,
@@ -455,32 +465,54 @@ pub(super) struct AuthenticatedVariable {
     attributes: u32,
 }
 
-/// Refuses to decode an EFI variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, which its
-/// `attributes` word names: its data starts with metadata (UEFI 2.10 §8.2.1), where questions
-/// would decode their values.
-pub(super) fn check_decodable(
+/// The value of the variable `key` in `data`, its GetVariable() data: the bytes after the
+/// metadata that metadata_end finds by its `attributes`.
+fn value_of<'a>(
     key: &VariableKey,
     attributes: u32,
-) -> std::result::Result<(), EnhancedAuthenticatedVariable> {
-    if attributes & EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS != 0 {
-        return Err(EnhancedAuthenticatedVariable {
+    data: &'a [u8],
+) -> std::result::Result<&'a [u8], EnhancedAuthenticatedVariable> {
+    metadata_end(attributes, data)
+        .and_then(|end| data.get(end..).ok_or(MetadataRefusal::truncated(data)))
+        .map_err(|reason| EnhancedAuthenticatedVariable {
             key: key.clone(),
             attributes,
-        });
-    }
-    Ok(())
+            reason,
+        })
 }
 
-/// An EFI variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, which questions do not
-/// decode.
-#[derive(Error, Debug)]
+/// An EFI variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS whose metadata metadata_end
+/// refuses, so questions decode no value from it.
+#[derive(Error, Debug, Clone)]
 #[error(
-    "EFI variable {key} has enhanced authenticated access (attributes {attributes:#x}): its data \
-     starts with metadata, which uefisettings does not decode"
+    "EFI variable {key} has enhanced authenticated access (attributes {attributes:#x}), whose \
+     metadata uefisettings refuses: {reason}"
 )]
 pub(super) struct EnhancedAuthenticatedVariable {
     key: VariableKey,
-    attributes: u32,
+    pub(super) attributes: u32,
+    reason: MetadataRefusal,
+}
+
+/// FirmwareVariables::read of the attributes word and the first `size` bytes of the value of
+/// `key`: for a variable whose data has_metadata, those after its metadata (value_of), which it
+/// reads whole to find.
+fn read_value_bytes(
+    variables: &dyn FirmwareVariables,
+    key: &VariableKey,
+    size: u16,
+) -> Result<Vec<u8>> {
+    let bytes = variables.read(key, size)?;
+    match efivar_attributes(&bytes).map(has_metadata) {
+        Some(Ok(false)) | None => return Ok(bytes),
+        // value_of finds the metadata, or refuses it, in the whole variable
+        Some(Ok(true) | Err(_)) => {}
+    }
+    // attributes, metadata and value from one read
+    let whole = variables.read_whole(key)?;
+    let (attributes, data) =
+        efivar_parts(&whole).context(variables.interface().missing_attributes())?;
+    attributes_and_data(key, attributes, value_of(key, attributes, data)?, size)
 }
 
 /// A variable that FirmwareVariables does not hold.
@@ -588,6 +620,10 @@ impl FirmwareVariables for UnreadVariables {
         Err(EfivarsNotRead.into())
     }
 
+    fn read_whole(&self, _key: &VariableKey) -> Result<Vec<u8>> {
+        Err(EfivarsNotRead.into())
+    }
+
     fn write_at(
         &self,
         _key: &VariableKey,
@@ -658,10 +694,10 @@ impl EfivarReader {
         self.variables.interface()
     }
 
-    /// FirmwareVariables::read of `range`, read once.
+    /// read_value_bytes of `range`, read once.
     /// The caller decodes the payload bytes `value`, which this records in `decoded` with
-    /// `range.size` unless they end past the `range.size` bytes that FirmwareVariables::read
-    /// reads, where they never decode. The variable is recorded either way, so that a dump answers
+    /// `range.size` unless they end past the `range.size` bytes that read_value_bytes reads,
+    /// where they never decode. The variable is recorded either way, so that a dump answers
     /// as its source.
     pub(super) fn read(
         &mut self,
@@ -678,7 +714,9 @@ impl EfivarReader {
         let variables = &self.variables;
         self.outcomes
             .entry(range)
-            .or_insert_with_key(|range| variables.read(&range.key, range.size))
+            .or_insert_with_key(|range| {
+                read_value_bytes(variables.as_ref(), &range.key, range.size)
+            })
             .as_deref()
     }
 }
@@ -719,6 +757,11 @@ impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
         self.check(key)?;
         self.variables.read(key, size)
+    }
+
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        self.check(key)?;
+        self.variables.read_whole(key)
     }
 
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
@@ -865,6 +908,14 @@ pub(crate) mod tests {
             attributes_and_data(key, attributes, data, size)
         }
 
+        fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+            self.variables
+                .borrow()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| VariableNotFound(key.clone()).into())
+        }
+
         fn write_at(
             &self,
             key: &VariableKey,
@@ -909,6 +960,10 @@ pub(crate) mod tests {
 
         fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
             self.as_ref().read(key, size)
+        }
+
+        fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+            self.as_ref().read_whole(key)
         }
 
         fn write_at(
@@ -1118,6 +1173,30 @@ pub(crate) mod tests {
                 (variable_key("Setup"), 1)
             ],
             "reads: each range once, in order"
+        );
+    }
+
+    /// WithholdingVariables refuse to read a withheld variable whole, and pass the others
+    /// through.
+    #[test]
+    fn withheld_variable_is_not_read_whole() {
+        let variables = MemoryVariables::default();
+        variables.insert(variable_key("Passed"), NV_BS_RT, &[1, 2]);
+        variables.insert(variable_key("Withheld"), NV_BS_RT, &[0xAA]);
+        let withholding =
+            WithholdingVariables::new(&variables, BTreeSet::from([variable_key("Withheld")]));
+
+        assert_eq!(
+            withholding
+                .read_whole(&variable_key("Withheld"))
+                .map_err(|error| error.downcast_ref::<WithheldVariable>().cloned()),
+            Err(Some(WithheldVariable(variable_key("Withheld")))),
+            "read Withheld whole"
+        );
+        assert_eq!(
+            withholding.read_whole(&variable_key("Passed")).ok(),
+            Some([&NV_BS_RT.to_ne_bytes()[..], &[1, 2]].concat()),
+            "read Passed whole"
         );
     }
 

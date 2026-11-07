@@ -33,6 +33,7 @@ use super::DUMP_FILE_NOUN;
 use super::DUMP_FORMAT;
 use super::DUMP_HIIDB;
 use super::DUMP_MANIFEST;
+use crate::efi_variables::enhanced_authenticated::metadata_end;
 #[cfg(target_os = "linux")]
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::efivarfs_format::open_efivar;
@@ -44,6 +45,7 @@ use crate::hii::forms::IncludedStates;
 #[cfg(target_os = "linux")]
 use crate::hii::package::read_db;
 use crate::hii::package::ParsedPackageList;
+use crate::hii::variables::efivar_parts;
 use crate::hii::variables::DecodedValue;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EfivarSource;
@@ -151,16 +153,21 @@ pub(super) fn write_dump(
 }
 
 /// The efivar file `bytes` with each payload byte zeroed unless one of `values` decodes it from
-/// these bytes.
+/// these bytes, or it is metadata that the value follows.
 fn keep_decoded(bytes: &[u8], values: &[DecodedValue]) -> Vec<u8> {
     let mut kept = vec![0; bytes.len()];
+    // the metadata of EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS that get accepts stays, so that
+    // the dump decodes as its source does; behind metadata that it refuses, no value decodes
+    let (start, values) = match value_start(bytes) {
+        Some(start) => (start, values),
+        None => (EFIVARFS_HEADER_SIZE, &[][..]),
+    };
+    let value_len = bytes.get(start..).map_or(0, <[u8]>::len);
     let payload = values
         .iter()
-        .filter(|decoded| decoded.decodes_from(bytes.len()))
-        .map(|decoded| {
-            EFIVARFS_HEADER_SIZE + decoded.value.start..EFIVARFS_HEADER_SIZE + decoded.value.end
-        });
-    for range in std::iter::once(0..EFIVARFS_HEADER_SIZE).chain(payload) {
+        .filter(|decoded| decoded.decodes_from(value_len))
+        .map(|decoded| start + decoded.value.start..start + decoded.value.end);
+    for range in std::iter::once(0..start).chain(payload) {
         let end = range.end.min(bytes.len());
         let start = range.start.min(end);
         if let (Some(to), Some(from)) = (kept.get_mut(start..end), bytes.get(start..end)) {
@@ -170,11 +177,23 @@ fn keep_decoded(bytes: &[u8], values: &[DecodedValue]) -> Vec<u8> {
     kept
 }
 
+/// Where the value starts in the efivar file `bytes`: after the attributes word and the metadata
+/// that metadata_end accepts. None where it refuses that metadata, so get decodes nothing.
+fn value_start(bytes: &[u8]) -> Option<usize> {
+    let Some((attributes, data)) = efivar_parts(bytes) else {
+        return Some(EFIVARFS_HEADER_SIZE);
+    };
+    match metadata_end(attributes, data) {
+        Ok(end) => Some(EFIVARFS_HEADER_SIZE + end),
+        Err(_) => None,
+    }
+}
+
 impl DecodedValue {
-    /// Whether this value decodes from an efivar file of `len` bytes: read_efivar reads the
-    /// attributes field and `size` payload bytes, so it fails on a shorter file.
+    /// Whether this value decodes from a variable whose value, behind any metadata, has `len`
+    /// bytes: get reads `size` of them, so it fails on fewer.
     fn decodes_from(&self, len: usize) -> bool {
-        len >= EFIVARFS_HEADER_SIZE + usize::from(self.size)
+        len >= usize::from(self.size)
     }
 }
 
@@ -251,6 +270,7 @@ mod tests {
     use super::super::tests::first_bytes;
     use super::super::tests::HIIDB;
     use super::*;
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::efivarfs_format::tests::SETUP;
     use crate::hii::forms::handle_form_set;
     use crate::hii::forms::ifr_fixtures::checkbox;
@@ -374,6 +394,106 @@ mod tests {
             [7, 0, 0, 0, 0, 2, 3, 0, 0, 0, 7, 0, 0, 10],
             "attributes, payload offsets 1, 2, 6 and 9"
         );
+    }
+
+    /// A redacted dump keeps the metadata of EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS and the
+    /// decoded bytes behind it, so that it decodes as its source does, and none of a value
+    /// shorter than its VarStore, which get does not decode.
+    #[test]
+    fn redacted_dump_keeps_the_metadata_and_the_decoded_bytes_behind_it() {
+        let metadata = timestamp_metadata();
+        for (case, value, kept) in [
+            ("value of 4 bytes", &[9, 8, 7, 6][..], &[0, 8, 0, 0][..]),
+            ("value of 3 bytes", &[9, 8, 7][..], &[0, 0, 0][..]),
+        ] {
+            let attributes = 0x87u32.to_ne_bytes();
+            let file = [&attributes[..], &metadata, value].concat();
+            let live = efivars(&[(&efivar("Setup"), &file)]);
+            let (_parent, dir) = dump_dir();
+            let decoded = BTreeMap::from([(
+                efivar("Setup"),
+                vec![DecodedValue {
+                    size: 4,
+                    value: 1..2,
+                }],
+            )]);
+
+            write_dump(
+                HIIDB,
+                &decoded,
+                live.path(),
+                &dir,
+                EfivarRedaction::DecodedBytes,
+            )
+            .expect("dump efivars");
+
+            assert_eq!(
+                fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+                [&attributes[..], &metadata, kept].concat(),
+                "{case}: attributes, metadata, value offset 1 of a VarStore of 4 bytes"
+            );
+        }
+    }
+
+    /// A redacted dump keeps the EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable with
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS where get accepts it, and so decodes where its
+    /// source does, and keeps neither the metadata nor bytes behind it where get refuses it. A
+    /// variable with EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS alone has no metadata.
+    #[test]
+    fn redacted_dump_keeps_the_metadata_that_get_accepts() {
+        let bytes = form_set(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 4),
+            operation(CHECKBOX, false, &checkbox(1, 0x00)),
+            operation(CHECKBOX, false, &checkbox(3, 0x00)),
+        ]);
+        let root = handle_form_set(&mut Cursor::new(&bytes)).expect("parse the FormSet");
+        let mut version_2 = timestamp_metadata();
+        version_2[0] = 2;
+        for (case, attributes, metadata, accepted) in [
+            ("0x87", 0x87u32, timestamp_metadata(), true),
+            ("0xA7", 0xA7, timestamp_metadata(), false),
+            ("0x87 of Version 2", 0x87, version_2, false),
+            ("0x27", 0x27, Vec::new(), true),
+        ] {
+            let attributes = attributes.to_ne_bytes();
+            // 0 and 1, not the 1 and 0 at bytes 1 and 3 of the metadata, which a read that
+            // skips no metadata decodes
+            let file = [&attributes[..], &metadata, &[0xAA, 0, 0xBB, 1]].concat();
+            let live = efivars(&[(&efivar("Setup"), &file)]);
+            let (_parent, dir) = dump_dir();
+
+            let decoded = decoded_bytes(vec![package_list(&root)]).expect("find the decoded bytes");
+            write_dump(
+                HIIDB,
+                &decoded,
+                live.path(),
+                &dir,
+                EfivarRedaction::DecodedBytes,
+            )
+            .expect("dump efivars");
+
+            let kept = match accepted {
+                true => [&attributes[..], &metadata, &[0, 0, 0, 1]].concat(),
+                false => [&attributes[..], &vec![0; metadata.len() + 4]].concat(),
+            };
+            assert_eq!(
+                fs::read(dir.join(efivar("Setup"))).expect("read the dumped file"),
+                kept,
+                "{case}: dumped Setup"
+            );
+            assert_eq!(
+                answers(&root, live.path()) == ["0", "1"],
+                accepted,
+                "{case}: get decodes the source: {:?}",
+                answers(&root, live.path())
+            );
+            assert_eq!(
+                answers(&root, &dir) == ["0", "1"],
+                accepted,
+                "{case}: get decodes the dump: {:?}",
+                answers(&root, &dir)
+            );
+        }
     }
 
     #[test]

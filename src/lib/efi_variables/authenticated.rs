@@ -38,16 +38,15 @@ pub use self::signing::TimeStamp;
 pub use self::signing::TimeStampError;
 use super::globals::EFI_GLOBAL_VARIABLE;
 use super::globals::EFI_IMAGE_SECURITY_DATABASE;
+use super::is_gmt_time_stamp;
 use super::RuntimeAccessWithoutBootServiceAccess;
 use super::VariableContents;
 use super::VariableData;
+use super::EFI_TIME_SIZE;
 use crate::hii::package::Guid;
 use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 
-/// The size of EFI_TIME (UEFI 2.11 §8.3.1), the TimeStamp that starts an
-/// EFI_VARIABLE_AUTHENTICATION_2.
-const EFI_TIME_SIZE: usize = 16;
 /// The size of a WIN_CERTIFICATE_UEFI_GUID before its CertData: the dwLength, wRevision and
 /// wCertificateType of its Hdr, and its CertType (UEFI 2.11 §32.2.4.1, §32.2.4.3).
 const CERTIFICATE_HEADER_SIZE: usize = 24;
@@ -292,10 +291,7 @@ fn auth2_value(payload: &[u8]) -> std::result::Result<&[u8], SignedWriteRefusal>
             available: after_time_stamp.len(),
         });
     };
-    // Year, Month, Day, Hour, Minute and Second, then Pad1, Nanosecond, TimeZone, Daylight and
-    // Pad2 (UEFI 2.11 §8.3.1)
-    let [_, _, _, _, _, _, _, gmt_fields @ ..] = *time_stamp;
-    if gmt_fields.iter().any(|&byte| byte != 0) {
+    if !is_gmt_time_stamp(time_stamp) {
         return Err(SignedWriteRefusal::TimeStampNotGmt);
     }
     Ok(value)

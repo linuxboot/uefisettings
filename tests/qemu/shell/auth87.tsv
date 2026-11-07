@@ -1,0 +1,30 @@
+# The checks of shell/auth87.nsh, the boot of shell-auth87: EnhancedAuthData and
+# EnhancedAuthRefused have the attributes 0x87. See check-shell-log.sh.
+dmpstore-before	status	any
+# DmpStore names no flag for EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS; the data is the 68
+# bytes of EFI_VARIABLE_AUTHENTICATION_3, EFI_TIME and EFI_VARIABLE_AUTHENTICATION_3_CERT_ID,
+# then the 4 of the VarStore
+dmpstore-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000301:EnhancedAuthData' DataSize = 0x48$
+# get decodes the value behind that metadata (UEFI 2.11 §8.2.1); this firmware returns the
+# seeded bytes as they are
+get	status	0x0
+get	json	.responses | length == 1 and .[0].question.answer == "18"
+# set refuses to write it, with or without --bypass-setup-password, before SetVariable()
+set	status	aborted
+set	json	. == {"error_message": "EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301 has authenticated access (attributes 0x87), which uefisettings does not write"}
+top-set	status	aborted
+top-set	json	. == {"error_message": "EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301 has authenticated access (attributes 0x87), which uefisettings does not write"}
+set-bypass	status	aborted
+set-bypass	json	. == {"error_message": "EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301 has authenticated access (attributes 0x87), which uefisettings does not write"}
+# and the variable stays as it was
+dmpstore-after	status	any
+dmpstore-after	same	dmpstore-before
+# the firmware holds the attributes and size that the scenario seeds
+variable-info	status	0x0
+variable-info	json	. == {"variable": "EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301", "attributes": 135, "size": 72}
+# get names the check that refuses the metadata of Version 2
+get-refused	status	0x0
+get-refused	json	.responses | length == 1 and .[0].question.answer == "<ValueUnavailable: EFI variable EnhancedAuthRefused-8c78a505-baa0-4c4a-869f-000000000301 has enhanced authenticated access (attributes 0x87), whose metadata uefisettings refuses: EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1>"
+# set refuses it as authenticated first
+set-refused	status	aborted
+set-refused	json	. == {"error_message": "EFI variable EnhancedAuthRefused-8c78a505-baa0-4c4a-869f-000000000301 has authenticated access (attributes 0x87), which uefisettings does not write"}

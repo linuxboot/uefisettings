@@ -90,6 +90,11 @@ impl FirmwareVariables for VariableServices {
         attributes_and_data(key, attributes.bits(), &data, size)
     }
 
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        let (data, attributes) = get_variable(key)?;
+        Ok([&attributes.bits().to_ne_bytes()[..], &data].concat())
+    }
+
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
         let (data, attributes) = get_variable(key)?;
         let mut bytes = [&attributes.bits().to_ne_bytes()[..], &data].concat();

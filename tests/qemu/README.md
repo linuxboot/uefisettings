@@ -113,11 +113,9 @@ that commit.
 also creates its EFI variable `MyEfiVar` with runtime access, which its `Vfr.vfr` declares
 boot-service-only, as some vendors' firmware gives every non-volatile variable runtime
 access: in the scenario `hii`, `uefisettings` reads and writes it by its own attributes.
-[`vars/my-ifr-nv-data-auth27.json`](vars/my-ifr-nv-data-auth27.json) and
-[`vars/my-ifr-nv-data-authA7.json`](vars/my-ifr-nv-data-authA7.json) create it with the
-same data and authenticated access, the attributes 0x27 and 0xA7, for the UEFI Shell
-scenarios `shell-auth27` and `shell-authA7`: `uefisettings.efi` decodes the first but not
-the second, and writes neither.
+[`vars/my-ifr-nv-data-auth27.json`](vars/my-ifr-nv-data-auth27.json) creates it with
+authenticated access, the attributes 0x27, for the UEFI Shell scenario `shell-auth27`:
+`uefisettings.efi` decodes it, and does not write it.
 
 `publish-hiidb.efi rt-data-global-variable-forms` publishes, after the firmware's own
 package lists, those of
@@ -159,6 +157,16 @@ database, which `uefisettings.efi` exports in the UEFI Shell: PASSWORD questions
 layout of AMI firmware's `AMITSESetup`, which
 [`vars/amitse-setup.json`](vars/amitse-setup.json) creates, and a question on a volatile
 variable.
+
+`publish-hiidb.efi enhanced-auth-forms` registers the forms of
+[`publish-hiidb/src/enhanced_auth_forms.rs`](publish-hiidb/src/enhanced_auth_forms.rs) the
+same way, for the UEFI Shell scenario `shell-auth87`: questions on the variables that
+[`vars/enhanced-auth-87.json`](vars/enhanced-auth-87.json) creates with the attributes 0x87,
+among them EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, their values behind
+EFI_VARIABLE_AUTHENTICATION_3 metadata: `uefisettings.efi` decodes the value behind the
+metadata of `EnhancedAuthData`, refuses that of `EnhancedAuthRefused`, and writes neither.
+No edk2 firmware makes such variables, so the scenario checks only that `uefisettings.efi`
+decodes the bytes that GetVariable() returns as seeded.
 
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII

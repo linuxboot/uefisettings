@@ -184,6 +184,11 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
         attributes_and_data(key, attributes, &data, size)
     }
 
+    fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+        let (attributes, data) = self.read_all(key)?;
+        Ok([&attributes.to_ne_bytes()[..], &data].concat())
+    }
+
     fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
         // As VariableServices::write_at (variable_services.rs): read the whole variable,
         // modify its bytes, and write the whole data back with the same attributes.
