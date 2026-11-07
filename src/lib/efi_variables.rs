@@ -119,7 +119,13 @@ use crate::hii::VariableInterface;
 use crate::hii::VariableKey;
 
 #[cfg(variable_data)]
+pub(crate) mod boot_manager;
+#[cfg(variable_data)]
+pub(crate) mod device_path;
+#[cfg(variable_data)]
 pub(crate) mod globals;
+#[cfg(variable_data)]
+pub(crate) mod key_option;
 #[cfg(variable_data)]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "windows", test)),

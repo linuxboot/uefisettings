@@ -62,6 +62,9 @@
 #                output of the step OTHER matches the extended regular expression REGEX, or
 #                for unless-line, if none does, such as where the firmware lacks a protocol
 #                that dh lists
+#              firmware: the step's output is one line of JSON, and the jq filter of the
+#                argument finds it true with $firmware bound to the lines of the step
+#                firmware, such as its boot manager's "BdsDxe: loading Boot0002 ..."
 #   argument   what the check takes
 # Every step of the log but firmware needs a status check, and every step that a check names
 # must be in the log once.
@@ -253,6 +256,13 @@ check_step() {
         fi
         echo "check-shell-log: $step: $check $other $regex holds, so $inner $inner_argument"
         check_step "$step" "$inner" "$inner_argument"
+        ;;
+    firmware)
+        if (($(wc -l <"$out") != 1)) ||
+            ! jq --exit-status --rawfile firmware "$steps/firmware.out" \
+                "(\$firmware | split(\"\\n\")) as \$firmware | $argument" <"$out" >/dev/null 2>&1; then
+            fail "$step" "not one line of JSON for which $argument holds with the firmware's lines"
+        fi
         ;;
     *)
         echo "check-shell-log: unknown check $check of $step in $expectations" >&2

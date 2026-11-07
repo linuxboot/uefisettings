@@ -44,11 +44,12 @@ der = { version = "0.7", features = ["alloc", "pem", "std"] }
 rand_core = { version = "0.6", default-features = false }
 # The RNG of RSA blinding on every target, seeded once from the platform's source.
 rand_chacha = { version = "0.3", default-features = false }
+# BootOptionCrc, the CRC-32 of the Boot#### variable that a Key#### hot key starts, and the
+# CRC32s of the GPT on which the Linux and Windows builds find the ESP.
+crc32fast = "1.5.2"
 
-# The Linux and Windows builds find the ESP on a disk, whose GPT they check by its CRC32s, and
-# stage a set for the next boot under a random nonce.
+# The Linux and Windows builds stage a set for the next boot under a random nonce.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-crc32fast = "1.4"
 rand = { version = "0.8", features = ["small_rng"] }
 
 # Only the Linux build uses these: efivarfs, the HiiDB in sysfs, iLO through

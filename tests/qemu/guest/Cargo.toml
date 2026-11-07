@@ -28,6 +28,10 @@ test-vm = []
 test = false
 
 [[test]]
+name = "boot_manager"
+required-features = ["test-vm"]
+
+[[test]]
 name = "boot_smoke"
 required-features = ["test-vm"]
 

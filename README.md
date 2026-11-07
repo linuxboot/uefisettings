@@ -141,13 +141,16 @@ writes no variable of a HiiDB with such a password question or with IFR that it 
 ```plain
 Commands:
   get           Show the attributes and the decoded value of a global variable of UEFI 2.11 section
-                3.3, but its load options, hot keys and device paths, or of a signature database, or
-                that it is absent
+                3.3, its load options, hot keys and device paths as text among them, or of a
+                signature database, or that it is absent
   help          Print this message or the help of the given subcommand(s)
-  info          Show the attributes and the size of an EFI variable, never its data
+  info          Show the attributes and the size of an EFI variable, and the
+                EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access,
+                never its data
   list          List the name and vendor GUID of every EFI variable, never its data
   set           Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout,
-                BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications
+                BootOrder, DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications; or,
+                in the UEFI Shell, AuditMode and DeployedMode with --i-am-fine-to-brick-this-system
   storage       Show the storage space of the EFI variables of some attributes, and how much of it
                 is left
   write-signed  Write an EFI variable from a signed payload, or from new data that a key signs; the
@@ -646,8 +649,11 @@ and each reserved bit in hex; `SecureBoot`, `SetupMode`, `AuditMode`, `DeployedM
 `devAuthBoot` and `HwErrRecSupport` are their number; `BootOptionSupport` lists its flags and its
 key press `count`; `SignatureSupport` and `OsRecoveryOrder` list their GUIDs; `PK`, `KEK`, the
 signature databases and their `*Default` list their EFI_SIGNATURE_LISTs, each a `type` GUID and its
-`signatures`, each an `owner` GUID and the `sha256` of its data. The load options, hot keys and
-device paths of §3.3 are left to `variable info`.
+`signatures`, each an `owner` GUID and the `sha256` of its data. Boot####, Driver####, SysPrep####,
+PlatformRecovery#### and, of the GUID given, OsRecovery#### show `attributes`, `category`,
+`description`, `device_paths` as text and `optional_data` in hex; Key#### shows `revision`,
+`modifiers`, `keys`, `boot_option` and `crc_matches`; ConIn, ConOut, ErrOut and their *Dev show
+their device path as text.
 
 ```sh
 uefisettings variable get SecureBoot

@@ -237,20 +237,20 @@ fn end_node(sub_type: u8) -> [u8; NODE_HEADER_SIZE] {
 }
 
 /// A device path node as found: its Type, Sub-Type and data.
-struct RawNode<'a> {
-    node_type: u8,
-    sub_type: u8,
-    data: &'a [u8],
+pub(super) struct RawNode<'a> {
+    pub(super) node_type: u8,
+    pub(super) sub_type: u8,
+    pub(super) data: &'a [u8],
 }
 
 /// The nodes of packed device paths, each checked to lie within them.
-struct RawNodes<'a> {
+pub(super) struct RawNodes<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> RawNodes<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(super) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 }

@@ -491,6 +491,16 @@ test deleted it, or a question's `Callback(CHANGED)` resets the platform before 
 [`check-shell-log.sh`](check-shell-log.sh) reads what the firmware printed before the Shell,
 through every reset, as the step `firmware`.
 
+## Boot manager
+
+The scenario `boot-manager` reads and writes the boot manager's variables (UEFI 2.11 §3.1)
+from Linux and from the UEFI Shell. [`vars/boot-manager.json`](vars/boot-manager.json) seeds
+its variable store with `Boot0099`, a load option of a file that no ESP holds, with an
+undefined attribute bit and OptionalData, which `BootOrder` does not list, and `Key0099`, a hot
+key, CTRL-q, to `Boot0099`, whose `BootOptionCrc` is the CRC-32 of that `Boot0099`. The
+firmware's boot manager keeps both, as it keeps every load option that it did not create, and
+ignores a key whose CRC does not match.
+
 ## Secure Boot
 
 The scenarios with `firmware=secboot-setup` or `firmware=secboot-user` in their options boot

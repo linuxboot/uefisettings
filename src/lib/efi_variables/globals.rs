@@ -27,6 +27,11 @@ use sha2::Digest;
 use sha2::Sha256;
 use thiserror::Error;
 
+use crate::efi_variables::boot_manager;
+use crate::efi_variables::boot_manager::BootManagerVariable;
+use crate::efi_variables::boot_manager::DevicePathText;
+use crate::efi_variables::boot_manager::HotKey;
+use crate::efi_variables::boot_manager::LoadOptionData;
 use crate::efi_variables::enhanced_authenticated::metadata_end;
 use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
 use crate::efi_variables::secure_boot_mode::ModeTransition;
@@ -98,8 +103,9 @@ const DEVICE_SIGNATURE_DATABASE: Quote = Quote {
     section: "32.6.3",
 };
 
-/// The variables that variable get decodes: those of UEFI 2.11 Table 3.1 but the load options,
-/// hot keys and device paths, and the signature databases; and whether variable set writes them.
+/// The variables that variable get decodes here: those of UEFI 2.11 Table 3.1 but the load
+/// options, hot keys and device paths, which boot_manager.rs decodes, and the signature databases;
+/// and whether variable set writes them.
 const GLOBALS: [Global; 34] = [
     Global::mode_transition(ModeTransition::EnterAuditModeClearingPk),
     Global::read_only("BootCurrent", Codec::BootOption, BOOT_CURRENT_READ_ONLY),
@@ -213,6 +219,12 @@ pub enum GlobalValue {
     Guids(Vec<Guid>),
     /// PK, KEK, db, dbx, dbt, dbr and the defaults of the signature databases
     SignatureLists(Vec<SignatureList>),
+    /// Boot####, Driver####, SysPrep####, PlatformRecovery#### and OsRecovery####
+    LoadOptionData(LoadOptionData),
+    /// Key####
+    HotKey(HotKey),
+    /// ConIn, ConOut, ErrOut, ConInDev, ConOutDev and ErrOutDev
+    DevicePath(DevicePathText),
 }
 
 /// What Timeout tells: "the number of seconds that the firmware will wait before initiating the
@@ -262,7 +274,7 @@ pub enum LoadOptionKind {
 
 impl LoadOptionKind {
     /// The name of the variables of this kind before their option number.
-    fn prefix(self) -> &'static str {
+    pub(crate) fn prefix(self) -> &'static str {
         match self {
             Self::Boot => "Boot",
             Self::Driver => "Driver",
@@ -283,14 +295,7 @@ pub struct LoadOptionName {
 impl LoadOptionName {
     /// The load option of `kind` that `text` names as Display writes it, such as Boot0001.
     fn parse(kind: LoadOptionKind, text: &str) -> std::result::Result<Self, SetRefusal> {
-        text.strip_prefix(kind.prefix())
-            .filter(|digits| {
-                digits.len() == 4
-                    && digits
-                        .bytes()
-                        .all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'F'))
-            })
-            .and_then(|digits| u16::from_str_radix(digits, 16).ok())
+        boot_manager::option_number(text, kind.prefix())
             .map(|number| Self { kind, number })
             .ok_or_else(|| SetRefusal::OptionName {
                 kind,
@@ -412,6 +417,9 @@ pub(crate) fn read_global(
     name: &str,
     vendor: Option<Guid>,
 ) -> Result<GlobalVariable> {
+    if let Some(variable) = BootManagerVariable::parse(name) {
+        return boot_manager::read(variables, variable, vendor);
+    }
     let global = Global::named(name, vendor)?;
     let key = global.key();
     let contents = variables
@@ -574,9 +582,10 @@ impl Global {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 enum NoGlobal {
     #[error(
-        "variable get decodes {}, not {0}; `uefisettings variable info {0} GUID` shows the \
+        "variable get decodes {}, {}, not {0}; `uefisettings variable info {0} GUID` shows the \
          attributes and size of any EFI variable",
-        global_names()
+        global_names(),
+        boot_manager::variable_names()
     )]
     Unknown(String),
     #[error(
@@ -1203,7 +1212,7 @@ fn take<const N: usize>(data: &mut &[u8]) -> Option<[u8; N]> {
 }
 
 /// `names`, then each bit of `reserved` in hex, such as 0x100.
-fn serialize_bits<S: Serializer>(
+pub(super) fn serialize_bits<S: Serializer>(
     serializer: S,
     names: impl Iterator<Item = &'static str>,
     reserved: u64,
@@ -1226,8 +1235,12 @@ fn serialize_hex<S: Serializer>(
     bytes: &[u8; 32],
     serializer: S,
 ) -> std::result::Result<S::Ok, S::Error> {
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    serializer.serialize_str(&hex)
+    serializer.serialize_str(&lower_hex(bytes))
+}
+
+/// `bytes` in lowercase hex, two digits a byte.
+pub(super) fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -1777,7 +1790,7 @@ pub(crate) mod tests {
     #[test]
     fn read_global_refuses_other_variables_unread() {
         let variables = HeldVariables::default()
-            .with("Boot0001", EFI_GLOBAL_VARIABLE, &[1])
+            .with("Boot001", EFI_GLOBAL_VARIABLE, &[1])
             .with(
                 "Timeout",
                 vendor("A04A27F4-DF00-4D42-B552-39511302113D"),
@@ -1792,7 +1805,7 @@ pub(crate) mod tests {
         .expect_err("read the Timeout of another vendor");
         let foreign_devdb = read_global(&variables, "devdb", Some(EFI_IMAGE_SECURITY_DATABASE))
             .expect_err("read the devdb of EFI_IMAGE_SECURITY_DATABASE_GUID");
-        let unknown = read_global(&variables, "Boot0001", None).expect_err("read Boot0001");
+        let unknown = read_global(&variables, "Boot001", None).expect_err("read Boot001");
 
         assert_eq!(
             foreign.to_string(),
@@ -1813,8 +1826,10 @@ pub(crate) mod tests {
         assert!(
             unknown.starts_with("variable get decodes AuditMode, BootCurrent, BootNext, ")
                 && unknown.ends_with(
-                    ", dbr, devdb, not Boot0001; `uefisettings variable info Boot0001 GUID` shows \
-                     the attributes and size of any EFI variable"
+                    ", dbr, devdb, Boot####, Driver####, SysPrep####, PlatformRecovery####, \
+                     OsRecovery####, Key####, ConIn, ConOut, ErrOut, ConInDev, ConOutDev, \
+                     ErrOutDev, not Boot001; `uefisettings variable info Boot001 GUID` shows the \
+                     attributes and size of any EFI variable"
                 ),
             "unknown name: {unknown}"
         );
@@ -1822,7 +1837,7 @@ pub(crate) mod tests {
     }
 
     /// GLOBALS holds each name once, those of UEFI 2.11 Table 3.1 but its load options, hot keys
-    /// and device paths among them.
+    /// and device paths among them, and boot_manager.rs decodes the others.
     #[test]
     fn globals_are_table_3_1_but_load_options_hot_keys_and_device_paths() {
         let table_3_1 = [
@@ -1887,11 +1902,24 @@ pub(crate) mod tests {
             GLOBALS.len(),
             "unique names"
         );
+        let others: Vec<&str> = table_3_1
+            .into_iter()
+            .filter(|name| !globals.contains(name))
+            .collect();
+        assert!(
+            others
+                .iter()
+                .all(|name| BootManagerVariable::parse(&name.replace("####", "00A1")).is_some()),
+            "Table 3.1 names that boot_manager.rs decodes: {others:?}"
+        );
+        assert!(
+            globals
+                .iter()
+                .all(|name| BootManagerVariable::parse(name).is_none()),
+            "names that both decode: {globals:?}"
+        );
         assert_eq!(
-            table_3_1
-                .into_iter()
-                .filter(|name| !globals.contains(name))
-                .collect::<Vec<_>>(),
+            others,
             [
                 "Boot####",
                 "ConIn",
@@ -1905,7 +1933,7 @@ pub(crate) mod tests {
                 "PlatformRecovery####",
                 "SysPrep####",
             ],
-            "Table 3.1 names that variable get leaves to variable info"
+            "Table 3.1 names that GLOBALS leaves out"
         );
         assert!(
             globals.iter().all(|name| table_3_1.contains(name)),

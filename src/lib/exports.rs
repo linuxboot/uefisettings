@@ -55,6 +55,12 @@ use crate::efi_variables::authenticated::SignedWrite;
 pub use crate::efi_variables::authenticated::TimeStamp;
 #[cfg(variable_data)]
 pub use crate::efi_variables::authenticated::TimeStampError;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::DevicePathText;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::HotKey;
+#[cfg(variable_data)]
+pub use crate::efi_variables::boot_manager::LoadOptionData;
 #[cfg(capsule_delivery)]
 use crate::efi_variables::deliver_json_capsule;
 #[cfg(variable_data)]
@@ -89,6 +95,8 @@ pub use crate::efi_variables::globals::Signature;
 pub use crate::efi_variables::globals::SignatureList;
 #[cfg(variable_data)]
 pub use crate::efi_variables::globals::Timeout;
+#[cfg(variable_data)]
+pub use crate::efi_variables::key_option::InputKey;
 #[cfg(variable_names)]
 use crate::efi_variables::list_capsule_results;
 #[cfg(variable_names)]
@@ -330,7 +338,8 @@ impl VariableBackend {
 impl VariableBackend {
     /// The global variable `name` of UEFI 2.11 §3.3, or the signature database `name` of §32.7.1
     /// or §32.7.2, decoded, or that it is absent; of the vendor GUID `vendor`, such as
-    /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C", if given, which must be its own.
+    /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C", if given, which must be its own. An OsRecovery####
+    /// needs it, as each vendor has its own (§3.4.1).
     pub fn get(name: &str, vendor: Option<&str>) -> Result<GlobalVariable> {
         let vendor = vendor.map(parse_vendor).transpose()?;
         read_global(&Self::system_variable_data()?, name, vendor)

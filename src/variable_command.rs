@@ -75,17 +75,18 @@ enum VariableSubcommands {
         guid: String,
     },
     /// Show the attributes and the decoded value of a global variable of UEFI 2.11 section 3.3,
-    /// but its load options, hot keys and device paths, or of a signature database, or that it is
-    /// absent
+    /// its load options, hot keys and device paths as text among them, or of a signature database,
+    /// or that it is absent
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
     Get {
-        /// The variable, such as Timeout, BootOrder, SecureBoot, db or devdb
+        /// The variable, such as Timeout, BootOrder, Boot0001, Key0000, ConOut, SecureBoot, db
+        /// or devdb
         name: String,
         /// The vendor GUID of the variable, which must be its own:
         /// D719B2CB-3D3A-4596-A3BC-DAD00E67656F for db, dbx, dbt and dbr,
-        /// B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD for devdb, else
-        /// 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
+        /// B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD for devdb, that which OsRecoveryOrder lists for
+        /// OsRecovery####, else 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
         guid: Option<String>,
     },
     /// Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout, BootOrder,

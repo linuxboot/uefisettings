@@ -12,7 +12,8 @@
 
 //! `variable get` of the global variables (src/lib/efi_variables/globals.rs), which reads them
 //! through efivarfs: `get_default_firmware` in variable-get, on the default firmware, whose
-//! variable store holds no Secure Boot variables, and `get_secboot_setup` and `get_secboot_user`
+//! variable store holds no Secure Boot variables, and its load options, hot keys and ConOut
+//! (src/lib/efi_variables/boot_manager.rs), and `get_secboot_setup` and `get_secboot_user`
 //! in variable-get-secboot-setup and variable-get-secboot-user, on the secboot firmware in Setup
 //! Mode and, with run.sh's PK, KEK and db enrolled, in User Mode, and `get_devdb` in
 //! variable-get-devdb, on the default firmware with the devdb that tests/qemu/vars/devdb.json
@@ -238,13 +239,79 @@ fn get_default_firmware() {
         assert_absent_global(name, EFI_GLOBAL_VARIABLE);
     }
     assert_absent_global("db", EFI_IMAGE_SECURITY_DATABASE);
+    for option in boot_order() {
+        assert_load_option(&option);
+    }
+    for (name, key) in [("Key0000", "F2"), ("Key0001", "ESC")] {
+        assert_global(name, NV_BS_RT, |_| {
+            serde_json::json!({
+                "revision": 0,
+                "modifiers": [],
+                "keys": [key],
+                "boot_option": "Boot0000",
+                "crc_matches": true,
+            })
+        });
+    }
+    let con_out = get("ConOut").value.expect("ConOut is present");
+    assert!(
+        con_out
+            .as_str()
+            .is_some_and(|text| text.contains("/Uart(115200,8,N,1)/")),
+        "ConOut: {con_out}"
+    );
 
-    let error = json_error(&["variable", "get", "Boot0000"]);
+    let error = json_error(&["variable", "get", "Boot001"]);
 
     assert!(
-        error.error_message.contains("variable info Boot0000 GUID"),
-        "Boot0000: {error:?}"
+        error.error_message.contains("variable info Boot001 GUID"),
+        "Boot001: {error:?}"
     );
+}
+
+/// get shows the load option `name` as its EFI_LOAD_OPTION in efivarfs tells (UEFI 2.11
+/// §3.1.3): its Description and OptionalData, and each device path of its FilePathList as
+/// text; that of OVMF's UEFI Shell, as the FvFile of the Shell's FILE_GUID.
+#[track_caller]
+fn assert_load_option(name: &str) {
+    let (attributes, data) = efivar(name, EFI_GLOBAL_VARIABLE);
+    let (header, rest) = data.split_at(6);
+    let file_path_list_length = usize::from(uint16(&header[4..]));
+    let units: Vec<u16> = rest
+        .chunks_exact(2)
+        .map(uint16)
+        .take_while(|unit| *unit != 0)
+        .collect();
+    let description = String::from_utf16(&units).expect("a UCS-2 Description");
+    let optional_data: String = rest[(units.len() + 1) * 2 + file_path_list_length..]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let value = get(name)
+        .value
+        .unwrap_or_else(|| panic!("{name} is absent"));
+
+    assert_eq!(attributes, NV_BS_RT, "{name}: attributes in efivarfs");
+    assert_eq!(value["description"], description, "{name}: Description");
+    assert_eq!(
+        value["optional_data"], optional_data,
+        "{name}: OptionalData"
+    );
+    let paths = value["device_paths"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: {value}"));
+    assert!(
+        !paths.is_empty() && paths.iter().all(serde_json::Value::is_string),
+        "{name}: device paths of no text: {value}"
+    );
+    if description == "EFI Internal Shell" {
+        assert!(
+            paths[0]
+                .as_str()
+                .is_some_and(|text| text.ends_with("/FvFile(7C04A583-9E3E-4F1C-AD65-E05268D0B4D1)")),
+            "{name}: {value}"
+        );
+    }
 }
 
 /// get decodes devdb, the authenticated variable of EFI_DEVICE_SECURITY_DATABASE_GUID, refuses
