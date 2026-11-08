@@ -818,13 +818,18 @@ fn enclosing_question_id(op: &IFROperation) -> Option<u16> {
 
 /// Returns the QuestionId of a question op.
 fn question_id(op: &IFROperation) -> Option<u16> {
-    let OpRole::Question = OpRole::of(op.op_code) else {
+    if !is_question(op.op_code) {
         return None;
-    };
+    }
     // EFI_IFR_QUESTION_HEADER, after the Prompt and Help of its statement header
     op.data
         .first_chunk::<6>()
         .map(|&[_, _, _, _, low, high]| u16::from_le_bytes([low, high]))
+}
+
+/// Whether ops of `op_code` start with an EFI_IFR_QUESTION_HEADER.
+pub(super) fn is_question(op_code: IFROpCode) -> bool {
+    matches!(OpRole::of(op_code), OpRole::Question)
 }
 
 /// Reads the values of the questions that conditions refer to from their VarStores, as get

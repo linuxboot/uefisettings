@@ -78,16 +78,18 @@ pub(crate) enum ChangeValueError {
         question: String,
         refusal: WithheldPassword,
     },
-    /// A question that `cause` makes read-only, which set writes only with the states that lift
-    /// `cause`, and `undetermined`, the states that it may be in where the selection is
-    /// undetermined; `ranked_before` selects a match that ranks before it
+    /// A question that `cause` makes read-only, which set writes only with `lifted_with`, the
+    /// states that lift `cause` where its caller can include them, else never, and
+    /// `undetermined`, the states that it may be in where the selection is undetermined;
+    /// `ranked_before` selects a match that ranks before it
     #[error(
         "cannot set question {question:?}: {}",
-        read_only_refusal(*.cause, *.undetermined, *.ranked_before)
+        read_only_refusal(*.cause, *.lifted_with, *.undetermined, *.ranked_before)
     )]
     ReadOnly {
         question: String,
         cause: ReadOnlyCause,
+        lifted_with: Option<IncludedStates>,
         undetermined: IncludedStates,
         ranked_before: IncludedStates,
     },
@@ -116,19 +118,18 @@ pub(crate) enum ChangeValueError {
 }
 
 /// Why set refuses a question that `cause` makes read-only, with the states to include to write
-/// it, if any: those that lift `cause`, then `undetermined`; or to select a match that ranks
+/// it, if any: `lifted_with`, then `undetermined`; or to select a match that ranks
 /// before it, `ranked_before`.
 fn read_only_refusal(
     cause: ReadOnlyCause,
+    lifted_with: Option<IncludedStates>,
     undetermined: IncludedStates,
     ranked_before: IncludedStates,
 ) -> String {
-    let to_write = cause
-        .lifted_with()
-        .map(|lifted_with| match undetermined.is_empty() {
-            true => lifted_with.to_string(),
-            false => format!("{lifted_with},{undetermined}"),
-        });
+    let to_write = lifted_with.map(|lifted_with| match undetermined.is_empty() {
+        true => lifted_with.to_string(),
+        false => format!("{lifted_with},{undetermined}"),
+    });
     match (to_write, ranked_before.is_empty()) {
         (Some(to_write), true) => {
             format!("{cause}; also include {to_write} questions to write it")

@@ -554,11 +554,12 @@ mod tests {
             volatile,
             ..SetOptions::default()
         };
-        let descriptor = match choice_for_set(selection, prompt, &options, &reader) {
-            Ok(Choice::Chosen(descriptor, _)) => descriptor,
-            Ok(Choice::Skipped(states)) => panic!("{prompt}: not picked, {states}"),
-            Err(error) => return (Err(format!("{error:#}")), BTreeMap::new()),
-        };
+        let descriptor =
+            match choice_for_set(selection, prompt, &options, IncludedStates::all(), &reader) {
+                Ok(Choice::Chosen(descriptor, _)) => descriptor,
+                Ok(Choice::Skipped(states)) => panic!("{prompt}: not picked, {states}"),
+                Err(error) => return (Err(format!("{error:#}")), BTreeMap::new()),
+            };
         let writes = variables(through);
         let outcome = set_questions(
             prompt,

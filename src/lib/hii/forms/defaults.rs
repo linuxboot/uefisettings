@@ -171,8 +171,8 @@ pub(super) fn is_parent_statement(op: &IFROperation) -> bool {
 }
 
 /// Whether `op_code` is a statement's, as edk2-stable202608 SetupBrowserDxe/IfrParse.c
-/// IsStatementOpCode tells.
-fn is_statement(op_code: IFROpCode) -> bool {
+/// IsStatementOpCode tells, and HiiDatabaseDxe/ConfigKeywordHandler.c's of the same opcodes.
+pub(super) fn is_statement(op_code: IFROpCode) -> bool {
     match op_code {
         IFROpCode::Subtitle
         | IFROpCode::Text

@@ -924,9 +924,15 @@ mod get_and_set_tests {
                     "{prompt}: set through {reach:?}"
                 );
                 assert_eq!(
-                    choice_for_set(selection, prompt, &SetOptions::default(), &reader)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
+                    choice_for_set(
+                        selection,
+                        prompt,
+                        &SetOptions::default(),
+                        IncludedStates::all(),
+                        &reader,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
                     refusal.map_or(Ok(()), |refusal| {
                         Err(format!("cannot set question {prompt:?}: {refusal}"))
                     }),

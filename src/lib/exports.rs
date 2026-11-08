@@ -946,7 +946,14 @@ fn select_for_set(
                 options.access_level,
                 reader,
             );
-            match forms::choice_for_set(selection, question, options, reader)? {
+            // set may include every state, READ_ONLY too
+            match forms::choice_for_set(
+                selection,
+                question,
+                options,
+                IncludedStates::all(),
+                reader,
+            )? {
                 Choice::Chosen(question_descriptor, state) => {
                     selected.push((list.guid.to_string(), question_descriptor, state));
                 }

@@ -92,6 +92,15 @@ mod conditions;
 mod defaults;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
+#[cfg(any(target_os = "uefi", test))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no hii keyword command of the UEFI Shell build reads or writes keywords yet"
+    )
+)]
+pub(crate) mod keywords;
 mod question_values;
 mod set;
 mod setup_password;
@@ -2081,6 +2090,16 @@ impl QuestionDescriptor {
         } else {
             stored
         };
+        self.pick_option(candidates, include)
+    }
+
+    /// Returns the option of `candidates`, in IFR order, that select() picks with `include`, or
+    /// None if there are none.
+    fn pick_option<'a>(
+        &self,
+        candidates: Vec<&'a AnswerOption>,
+        include: IncludedStates,
+    ) -> std::result::Result<Option<&'a AnswerOption>, SelectionError> {
         let matches: Vec<(&AnswerOption, StateEvaluation)> = candidates
             .into_iter()
             .map(|option| (option, option.state.clone()))
@@ -2241,7 +2260,8 @@ where
 
 /// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
 /// match that set would write, or the likely match, is read-only, which only the
-/// `options.include` that lifts its ReadOnlyCause makes writable: then ChangeValueError::ReadOnly,
+/// `options.include` that lifts its ReadOnlyCause, within `liftable`, the states that the caller
+/// can include, makes writable: then ChangeValueError::ReadOnly,
 /// before the efivar checks; or has no VarStore, or its efivar is missing, unreadable, e.g.
 /// withheld, boot-service-only, volatile or authenticated, which --include cannot make writable:
 /// then ChangeValueError::NoVarStore, DeclaredBootServiceOnly, VariableNotExported or the read's
@@ -2251,6 +2271,7 @@ pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
     options: &SetOptions,
+    liftable: IncludedStates,
     reader: &EfivarReader,
 ) -> Result<Choice<QuestionDescriptor>> {
     let ((descriptor, evaluation), undetermined, ranked_before) = match &selection {
@@ -2268,11 +2289,14 @@ pub(crate) fn choice_for_set(
     };
     if let Some(cause) = evaluation
         .read_only()
-        .filter(|cause| !cause.lifted_by(options.include))
+        .filter(|cause| !cause.lifted_by(options.include & liftable))
     {
         return Err(ChangeValueError::ReadOnly {
             question: descriptor.question.clone(),
             cause,
+            lifted_with: cause
+                .lifted_with()
+                .filter(|states| liftable.contains(*states)),
             undetermined,
             ranked_before,
         }
@@ -2416,7 +2440,13 @@ mod choice_for_set_tests {
             &BTreeSet::from([PROMPT]),
             &mut FormSetWalk::new(&strings(), &mut reader, &values, IncludedStates::empty()),
         );
-        choice_for_set(selection, PROMPT, &SetOptions::default(), &reader)
+        choice_for_set(
+            selection,
+            PROMPT,
+            &SetOptions::default(),
+            IncludedStates::all(),
+            &reader,
+        )
     }
 
     /// set's choice for PROMPT in the FormSet of `undetermined_on(own)`.

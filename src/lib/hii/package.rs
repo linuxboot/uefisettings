@@ -388,7 +388,7 @@ pub struct ParsedPackageList {
     /// The device path of the driver handle that added the list, from its device path package
     /// (UEFI 2.10 §33.3.4), if it has one
     #[cfg_attr(
-        not(test),
+        not(any(test, target_os = "uefi")),
         expect(
             dead_code,
             reason = "no Config Routing caller routes to a package list's driver yet"
