@@ -17,7 +17,8 @@ mod boot_log;
     not(test),
     expect(
         dead_code,
-        reason = "no Config Routing or Keyword Handler caller builds or parses these strings yet"
+        reason = "no Config Routing caller builds or parses these strings yet, and only the UEFI \
+                  Shell build's Keyword Handler caller does some"
     )
 )]
 mod config_string;
@@ -45,6 +46,11 @@ mod hiidb_driver;
 // Linux's symbol table, which tells whether Linux keeps a read-only efivarfs read-only.
 #[cfg(target_os = "linux")]
 mod kallsyms;
+// Get and set by keyword, of the UEFI Shell build; the tests of every host build its logic.
+#[cfg(any(target_os = "uefi", test))]
+mod keyword_access;
+#[cfg(target_os = "uefi")]
+mod keyword_handler;
 #[cfg(target_os = "linux")]
 mod lockdown;
 #[cfg(target_os = "linux")]
@@ -95,6 +101,14 @@ pub(crate) use firmware_environment::RealFirmwareEnvironmentCalls;
 pub use firmware_memory::MemoryMapUnavailable;
 #[cfg(target_os = "windows")]
 pub(crate) use hiidb_driver::read_hiidb;
+#[cfg(target_os = "uefi")]
+pub(crate) use keyword_access::get_keyword;
+#[cfg(target_os = "uefi")]
+pub(crate) use keyword_access::set_keywords;
+#[cfg(target_os = "uefi")]
+pub use keyword_access::KeywordValues;
+#[cfg(target_os = "uefi")]
+pub(crate) use keyword_handler::FirmwareKeywordHandler;
 #[cfg(target_os = "linux")]
 pub use lockdown::LockdownMode;
 #[cfg(target_os = "linux")]
@@ -126,3 +140,4 @@ pub use variables::VariableKey;
 #[cfg(variable_data)]
 pub(crate) use variables::VariableReach;
 pub use variables::VolatileWrites;
+pub(crate) use variables::VOLATILE_ANNOTATION;

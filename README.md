@@ -667,6 +667,27 @@ variable that `set` writes is volatile, as read before the write, its answer end
 ExitBootServices, when SetVariable() sets no volatile variable (UEFI 2.11 §8.2.3), so they take
 no `--allow-volatile`.
 
+`hii keyword get` and `hii keyword set` read and write questions by the keywords of UEFI
+configuration languages such as `x-UEFI-ns`, through EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL (UEFI
+2.11 §35.3.1), which no OS reaches. `get` takes a `<KeywordRequest>` of an optional PATH, the hex
+digits of the device path of the keyword's package list, and a KEYWORD, and prints GetData()'s
+`<KeywordResp>`, one per package list without PATH. It reads the keyword's question whatever its
+conditions, as GetData() does, so it takes no `--include`, but not one whose bytes, as GetData()
+reads them, overlap a password's. `set` takes a `<MultiKeywordResp>`,
+refuses it if `set` would refuse a keyword's question or value, if SetData() would write one
+otherwise than `set` (edk2's evaluates no condition or expression, sends no Callback() and checks
+no option or range), or if two keywords write a byte of one variable, and else writes every
+keyword with one SetData() and prints what GetData() reads back, which must hold each VALUE
+written, as a number. It never writes a read-only question, which the Keyword Handler refuses, so
+its `--include` takes no `read-only`; else `--include`, `--bypass-setup-password` and
+`--allow-volatile` work as for `set`: the `<KeywordResp>` of a keyword whose variable is volatile
+ends with ` <volatile: lasts until the next reset or power cycle>`. `-j` prints JSON instead.
+
+```plain
+FS0:\> uefisettings.efi hii keyword get --namespace x-UEFI-ns KEYWORD=<keyword>
+FS0:\> uefisettings.efi hii keyword set "NAMESPACE=x-UEFI-ns&PATH=<hex digits>&KEYWORD=<keyword>&VALUE=<hex digits>"
+```
+
 With Secure Boot enabled, the firmware starts an image only if its signature database (db) holds
 the certificate of its signature or its hash, so sign `uefisettings.efi` with a key that the
 machine's db trusts.

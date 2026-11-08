@@ -166,6 +166,8 @@ use crate::hii::FirmwareVariables;
 /// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
 #[cfg(firmware_memory_maps)]
 pub use crate::hii::HiiExportError;
+#[cfg(target_os = "uefi")]
+pub use crate::hii::KeywordValues;
 #[cfg(target_os = "linux")]
 pub use crate::hii::LockdownMode;
 #[cfg(target_os = "linux")]
@@ -191,6 +193,7 @@ pub use crate::hii::SystemTableError;
 pub use crate::hii::VariableAttributes;
 #[cfg(any(variable_names, variable_info))]
 pub use crate::hii::VariableKey;
+use crate::hii::VOLATILE_ANNOTATION;
 #[cfg(variable_data)]
 use crate::secret_file::Secret;
 use crate::translation::get_qa_variations_hii;
@@ -203,9 +206,6 @@ pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
 pub use crate::hii::forms::SetupPasswordPolicy;
 pub use crate::hii::VolatileWrites;
-
-/// The suffix of set's answer for a question that wrote a volatile variable (UEFI 2.11 §8.2.3).
-const VOLATILE_ANNOTATION: &str = " <volatile: lasts until the next reset or power cycle>";
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -224,6 +224,8 @@ pub use linux::identify_machine;
 pub use linux::identify_machine_using;
 #[cfg(target_os = "linux")]
 pub use linux::IloBackend;
+#[cfg(target_os = "uefi")]
+pub use uefi::KeywordSetOptions;
 
 /// SettingsBackend is a trait which should be satisfied by all backends (like ilo, hii)
 pub trait SettingsBackend {

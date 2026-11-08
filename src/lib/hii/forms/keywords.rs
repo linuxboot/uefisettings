@@ -73,8 +73,10 @@ use crate::hii::config_string::Usage;
 use crate::hii::package::ParsedPackageList;
 use crate::hii::strings::Language;
 use crate::hii::strings::StringMap;
+use crate::hii::variables::is_volatile;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::VariableKey;
+use crate::hii::variables::VolatileWrites;
 use crate::parse_error::ReadParsed;
 
 /// The language prefix that GetStringIdFromRecord searches without a NameSpaceId: edk2's
@@ -143,6 +145,15 @@ pub(crate) enum KeywordRefusal {
         value: String,
         question: String,
         reason: ValueRefusal,
+    },
+    #[error(
+        "keywords {first} and {second} write overlapping bytes of EFI variable {variable}, which \
+         SetData() writes one after the other"
+    )]
+    Overlapping {
+        first: String,
+        second: String,
+        variable: String,
     },
 }
 
@@ -216,6 +227,17 @@ pub(crate) fn keyword_strings<'a: 'b, 'b>(
             let (&id, _) = strings.iter().find(|(_, text)| ***text == *keyword)?;
             Some(KeywordString { language, id })
         })
+}
+
+/// What SetData() of a keyword writes, as check_set found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeywordWrite {
+    /// The variable of the question's VarStore
+    pub(crate) variable: VariableKey,
+    /// The VarOffsets of the bytes written
+    pub(crate) bytes: Vec<Range<usize>>,
+    /// Whether the variable is volatile, as the reader read its attributes
+    pub(crate) volatile: bool,
 }
 
 /// The statement that a keyword prompts in its package list.
@@ -360,16 +382,17 @@ impl<'a> KeywordQuestion<'a> {
 
     /// Refuses a set of `resp`, the question's keyword, that SetData() would write otherwise than
     /// set: through no WRITE expression or Callback(); else takes it through set's own checks,
-    /// with `include` and the variables of `reader`: the question's state, whether it is
-    /// read-only, which no `include` lifts, its option of the VALUE or the VALUE's range, the
+    /// with `include`, `volatile` and the variables of `reader`: the question's state, whether it
+    /// is read-only, which no `include` lifts, its option of the VALUE or the VALUE's range, the
     /// variable's, and whether the bytes written overlap those that `reader` withholds, which
-    /// hold a password (ChangeValueError::PasswordBytes).
+    /// hold a password (ChangeValueError::PasswordBytes). Returns what SetData() writes.
     pub(crate) fn check_set(
         &self,
         resp: &KeywordResp,
         include: IncludedStates,
+        volatile: VolatileWrites,
         reader: &mut EfivarReader,
-    ) -> Result<()> {
+    ) -> Result<KeywordWrite> {
         let header = self.check_question(QuestionExpression::Write, reader)?;
         if resp.usage == Usage::ReadOnly {
             return Err(KeywordRefusal::ReadOnlyResp(self.keyword.to_string()).into());
@@ -386,7 +409,7 @@ impl<'a> KeywordQuestion<'a> {
         let number = value_number(question, resp.value.as_bytes())
             .ok_or_else(|| self.value_refusal(resp, prompt, ValueRefusal::Width))?;
         let descriptor = self
-            .chosen(question, prompt, include, reader)
+            .chosen(question, prompt, include, volatile, reader)
             .with_context(|| format!("keyword {}", self.keyword))?;
         let text;
         let new_value = match question {
@@ -411,21 +434,32 @@ impl<'a> KeywordQuestion<'a> {
                     self.keyword, resp.value
                 )
             })?;
-        // SetData() writes every byte of the question's storage, changed or not
-        if let Some(write) = &write {
-            let variable = write.store.variable_key();
-            for (offset, bytes) in &write.patches {
+        let write =
+            write.ok_or_else(|| self.question_refusal(&header, QuestionRefusal::Storageless))?;
+        let variable = write.store.variable_key();
+        let bytes: Vec<Range<usize>> = write
+            .patches
+            .iter()
+            .map(|(offset, bytes)| {
                 let start = usize::from(*offset);
-                reader
-                    .check_write(&variable, &(start..start + bytes.len()))
-                    .map_err(|refusal| ChangeValueError::PasswordBytes {
-                        question: prompt.to_owned(),
-                        refusal,
-                    })
-                    .with_context(|| format!("keyword {}", self.keyword))?;
-            }
+                start..start + bytes.len()
+            })
+            .collect();
+        // SetData() writes every byte of the question's storage, changed or not
+        for range in &bytes {
+            reader
+                .check_write(&variable, range)
+                .map_err(|refusal| ChangeValueError::PasswordBytes {
+                    question: prompt.to_owned(),
+                    refusal,
+                })
+                .with_context(|| format!("keyword {}", self.keyword))?;
         }
-        Ok(())
+        Ok(KeywordWrite {
+            variable,
+            bytes,
+            volatile: reader.attributes(write.store).is_some_and(is_volatile),
+        })
     }
 
     /// The question header of the question, refused unless GetData() (`Read`) or SetData()
@@ -533,14 +567,15 @@ impl<'a> KeywordQuestion<'a> {
             })
     }
 
-    /// The question, `question` prompted by `prompt`, as set chooses it with `include` and the
-    /// variables of `reader`: refused in a state that `include` does not allow, read-only, or in
-    /// a variable that set does not write.
+    /// The question, `question` prompted by `prompt`, as set chooses it with `include`, `volatile`
+    /// and the variables of `reader`: refused in a state that `include` does not allow, read-only,
+    /// or in a variable that set does not write.
     fn chosen(
         &self,
         question: ValueQuestion<'_>,
         prompt: &str,
         include: IncludedStates,
+        volatile: VolatileWrites,
         reader: &mut EfivarReader,
     ) -> Result<QuestionDescriptor> {
         let selection = {
@@ -552,6 +587,7 @@ impl<'a> KeywordQuestion<'a> {
         };
         let options = SetOptions {
             include,
+            volatile,
             ..SetOptions::default()
         };
         match choice_for_set(selection, prompt, &options, KEYWORD_SET_LIFTABLE, reader)? {
@@ -928,7 +964,14 @@ mod tests {
     /// check_set of `value` on the one question of KEYWORD in a list of `ops`, with `include`.
     fn check_set_of(ops: Vec<u8>, value: &str, include: IncludedStates) -> Result<()> {
         let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
-        question_of(&lists).check_set(&resp(value), include, &mut reader(1))
+        question_of(&lists)
+            .check_set(
+                &resp(value),
+                include,
+                VolatileWrites::Refuse,
+                &mut reader(1),
+            )
+            .map(|_write| ())
     }
 
     fn question_refusal(reason: QuestionRefusal) -> KeywordRefusal {
@@ -956,7 +999,7 @@ mod tests {
     }
 
     /// The KeywordRefusal of `result`, if it failed with one.
-    fn refusal_of(result: Result<()>) -> Option<KeywordRefusal> {
+    fn refusal_of<T>(result: Result<T>) -> Option<KeywordRefusal> {
         result
             .err()
             .and_then(|error| error.downcast_ref::<KeywordRefusal>().cloned())
@@ -1272,7 +1315,12 @@ mod tests {
         )));
 
         let error = question_of(&lists)
-            .check_set(&resp("03"), IncludedStates::empty(), &mut no_variables)
+            .check_set(
+                &resp("03"),
+                IncludedStates::empty(),
+                VolatileWrites::Refuse,
+                &mut no_variables,
+            )
             .expect_err("a missing variable");
 
         assert!(
@@ -1620,8 +1668,10 @@ mod tests {
                 .check_set(
                     &resp("03"),
                     IncludedStates::empty(),
+                    VolatileWrites::Refuse,
                     &mut withholding(password),
                 )
+                .map(|write| write.bytes)
                 .map_err(|error| format!("{error:#}"))
         };
 
@@ -1633,7 +1683,8 @@ mod tests {
                 store_key()
             ))
         );
-        assert_eq!(set(OFFSET + 1..OFFSET + 3), Ok(()));
+        let question_byte = OFFSET..OFFSET + 1;
+        assert_eq!(set(OFFSET + 1..OFFSET + 3), Ok(vec![question_byte]));
     }
 
     /// The Keyword Handler takes a question's VarStore from the first declaration of its
@@ -1686,7 +1737,12 @@ mod tests {
             let question = question_of(&lists);
 
             let get = question.check_get(&reader(1));
-            let set = question.check_set(&resp("03"), IncludedStates::empty(), &mut reader(1));
+            let set = question.check_set(
+                &resp("03"),
+                IncludedStates::empty(),
+                VolatileWrites::Refuse,
+                &mut reader(1),
+            );
 
             assert_eq!(
                 (

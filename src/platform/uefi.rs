@@ -47,6 +47,8 @@ use uefi_raw::table::system::SystemTable;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
+use uefisettings::exports::KeywordSetOptions;
+use uefisettings::exports::KeywordValues;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetupPasswordPolicy;
 use uefisettings::exports::VolatileWrites;
@@ -62,8 +64,11 @@ use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii_get;
 use crate::hii_set;
+use crate::print_line;
 use crate::variable_command::print_info;
 use crate::HiiSourceArgs;
+use crate::IncludeArgs;
+use crate::JsonArgs;
 use crate::SelectionArgs;
 use crate::SetIncludeState;
 
@@ -94,8 +99,8 @@ impl PlatformCommands {
     }
 }
 
-/// variable-info, which variable info is too; extract-db and dump-efivars write files, which
-/// this build does not.
+/// variable-info, which variable info is too, and keyword; extract-db and dump-efivars write
+/// files, which this build does not.
 #[derive(Debug, Subcommand)]
 pub(super) enum HiiPlatformCommands {
     /// Show the attributes and the size of an EFI variable, never its data
@@ -105,14 +110,93 @@ pub(super) enum HiiPlatformCommands {
         /// The vendor GUID of the variable, such as 8C78A505-BAA0-4C4A-869F-000000000101
         guid: String,
     },
+    /// Get and set the keywords of UEFI configuration languages, such as x-UEFI-ns, through EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL
+    #[command(subcommand, next_display_order = None)]
+    Keyword(KeywordCommands),
 }
 
 impl HiiPlatformCommands {
     pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
         match self {
             Self::VariableInfo { name, guid } => print_info(name, guid),
+            Self::Keyword(command) => command.run(),
         }
     }
+}
+
+/// GetData() and SetData() of EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL (UEFI 2.11 §35.3.1), after the
+/// checks of get and set.
+#[derive(Debug, Subcommand)]
+pub(super) enum KeywordCommands {
+    /// Get the value of a keyword, as GetData() returns it: a KeywordResp per package list
+    #[command(next_display_order = None)]
+    Get {
+        // a doc comment would make rustdoc take the placeholders for HTML tags
+        #[arg(
+            help = "A KeywordRequest, [PATH=<hex digits>&]KEYWORD=<keyword>: an optional PATH, the device path of the keyword's package list, and the KEYWORD"
+        )]
+        request: String,
+        /// The configuration language of the keyword, such as x-UEFI-ns; else one of the prefix x-UEFI
+        #[arg(long)]
+        namespace: Option<String>,
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+    /// Set keywords with one SetData(), unless set would refuse a keyword's question or value, and get them back; never a read-only question, which the Keyword Handler refuses
+    #[command(next_display_order = None)]
+    Set {
+        #[arg(
+            help = "A MultiKeywordResp, NAMESPACE=<language>&PATH=<hex digits>&KEYWORD=<keyword>&VALUE=<hex digits> per keyword, joined by &"
+        )]
+        keywords: String,
+        #[command(flatten)]
+        include: IncludeArgs,
+        #[command(flatten)]
+        setup_password: SetupPasswordArgs,
+        #[command(flatten)]
+        volatile: VolatileArgs,
+        #[command(flatten)]
+        output: JsonArgs,
+    },
+}
+
+impl KeywordCommands {
+    fn run(&self) -> Result<()> {
+        let (values, output) = match self {
+            Self::Get {
+                request,
+                namespace,
+                output,
+            } => (
+                HiiBackend::keyword_get(request, namespace.as_deref())?,
+                output,
+            ),
+            Self::Set {
+                keywords,
+                include,
+                setup_password,
+                volatile,
+                output,
+            } => {
+                let mut options = KeywordSetOptions::default();
+                options.include = include.states();
+                options.setup_password = setup_password.policy();
+                options.volatile = volatile.policy();
+                (HiiBackend::keyword_set(keywords, &options)?, output)
+            }
+        };
+        print_keyword_values(&values, output.json)
+    }
+}
+
+/// Prints `values` as their `<MultiKeywordResp>`, or as JSON if `json`, an object per keyword,
+/// outside the thrift IDL that the other hii commands print.
+fn print_keyword_values(values: &KeywordValues, json: bool) -> Result<()> {
+    match json {
+        true => print_line(format_args!("{}", serde_json::to_string(values)?))?,
+        false => print_line(format_args!("{values}"))?,
+    }
+    Ok(())
 }
 
 /// Where list-strings, which takes no --no-efivars, reads the HiiDB: as the other hii commands

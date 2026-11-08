@@ -100,3 +100,55 @@ hii-get-help	line	--no-efivars
 hii-get-help	none	--efivars|--filename
 hii-set-help	status	0x0
 hii-set-help	line	--bypass-setup-password
+# get and set by keyword through EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL (UEFI 2.11 §35.3.1):
+# DriverSample's "My Keyword Namespace Test" has the x-UEFI-ns keyword iSCSIBootEnable, the byte at
+# 0x5B, with the options 0, 1 and 3; PATH is the vendor device path of DriverSample's main form set
+hii-help	line	^  keyword +Get and set the keywords of UEFI configuration languages
+hii-help	line	EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL
+keyword-get	status	0x0
+keyword-get	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01$
+# DriverSample's inventory list holds the keyword's string too, but none of its questions
+keyword-get-no-path	status	0x0
+keyword-get-no-path	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01$
+keyword-dmpstore-before	status	any
+keyword-dmpstore-before	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. .. 01 00 
+# SetData() would store 2, which no option holds: uefisettings refuses before it calls SetData()
+keyword-set-no-option	status	aborted
+keyword-set-no-option	json	. == {"error_message": "keyword iSCSIBootEnable: VALUE=02 is no option of question \"My Keyword Namespace Test\""}
+keyword-dmpstore-refused	status	any
+keyword-dmpstore-refused	same	keyword-dmpstore-before
+# the x-UEFI-ns keyword xUefiHiiOption (Vfr.vfr's QuestionXUefiKeywordRestStyle) has the options
+# 0, 1 and 3 too: its VALUE of no option leaves iSCSIBootEnable's 3, before it, unwritten
+keyword-set-second-no-option	status	aborted
+keyword-set-second-no-option	json	. == {"error_message": "keyword xUefiHiiOption: VALUE=02 is no option of question \"x-UEFI HII Option\""}
+keyword-dmpstore-second-refused	status	any
+keyword-dmpstore-second-refused	same	keyword-dmpstore-before
+keyword-set	status	0x0
+keyword-set	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=03$
+keyword-get-after	status	0x0
+keyword-get-after	json	. == [{"namespace": "x-UEFI-ns", "path": "01041400f4274aa000df424db55239511302113d7fff0400", "keyword": "iSCSIBootEnable", "value": "03", "read_only": false}]
+keyword-question-after	status	0x0
+keyword-question-after	json	.responses | length == 1 and .[0].question.answer == "My one-of text #3"
+keyword-dmpstore-after	status	any
+keyword-dmpstore-after	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. .. 03 00 
+# SetData() would write iSCSIBootEnable's byte twice, one <ConfigResp> after the other:
+# uefisettings refuses before it calls SetData()
+keyword-set-twice	status	aborted
+keyword-set-twice	json	. == {"error_message": "keywords iSCSIBootEnable and iSCSIBootEnable write overlapping bytes of EFI variable MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d, which SetData() writes one after the other"}
+keyword-dmpstore-twice-refused	status	any
+keyword-dmpstore-twice-refused	same	keyword-dmpstore-after
+# DriverSample declares no volatile VarStore: --allow-volatile writes MyIfrNVData, which is
+# non-volatile, and its <KeywordResp> names no volatility
+keyword-set-allow-volatile	status	0x0
+keyword-set-allow-volatile	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01$
+keyword-dmpstore-allow-volatile	status	any
+keyword-dmpstore-allow-volatile	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. .. 01 00 
+# the placeholders of the help texts, each check up to a space, where clap may wrap the line
+keyword-get-help	status	0x0
+keyword-get-help	line	\[PATH=<hex( |$)
+keyword-get-help	line	(^| )digits>&\]KEYWORD=<keyword>:
+keyword-set-help	status	0x0
+keyword-set-help	line	NAMESPACE=<language>&PATH=<hex( |$)
+keyword-set-help	line	(^| )digits>&KEYWORD=<keyword>&VALUE=<hex( |$)
+keyword-set-help	line	--allow-volatile
+keyword-set-help	line	(^| )read-only( |$)

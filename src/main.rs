@@ -252,11 +252,11 @@ struct JsonArgs {
     json: bool,
 }
 
-/// Which questions and options get, set and list-questions select. `S` is the value of
-/// --include: set's (SetIncludeState) also takes read-only, which get and list-questions refuse,
-/// as they show read-only questions regardless.
+/// The states of the questions and options that get, set, list-questions and the UEFI Shell
+/// build's hii keyword set select too, `S` as SelectionArgs takes it: keyword set takes
+/// IncludeState, as the Keyword Handler writes no read-only question.
 #[derive(Debug, Args)]
-struct SelectionArgs<S = IncludeState>
+struct IncludeArgs<S = IncludeState>
 where
     S: clap::ValueEnum + Clone + Send + Sync + 'static,
 {
@@ -266,6 +266,32 @@ where
     /// counts as suppressed.
     #[arg(long, value_enum, value_delimiter = ',')]
     include: Vec<S>,
+}
+
+impl<S> IncludeArgs<S>
+where
+    S: clap::ValueEnum + Copy + Send + Sync + 'static,
+    IncludedStates: From<S>,
+{
+    fn states(&self) -> IncludedStates {
+        self.include
+            .iter()
+            .copied()
+            .map(IncludedStates::from)
+            .collect()
+    }
+}
+
+/// Which questions and options get, set and list-questions select. `S` is the value of
+/// --include: set's (SetIncludeState) also takes read-only, which get and list-questions refuse,
+/// as they show read-only questions regardless.
+#[derive(Debug, Args)]
+struct SelectionArgs<S = IncludeState>
+where
+    S: clap::ValueEnum + Clone + Send + Sync + 'static,
+{
+    #[command(flatten)]
+    include: IncludeArgs<S>,
     /// Evaluate the conditions that read the AMI Setup access level (VarStore SystemAccess
     /// E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User) at this level instead of
     /// the stored value. This states a Setup privilege; it is no password and authenticates
@@ -280,11 +306,7 @@ where
     IncludedStates: From<S>,
 {
     fn states(&self) -> IncludedStates {
-        self.include
-            .iter()
-            .copied()
-            .map(IncludedStates::from)
-            .collect()
+        self.include.states()
     }
 
     fn access_level(&self) -> Option<AccessLevel> {

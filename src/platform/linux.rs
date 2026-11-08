@@ -307,7 +307,7 @@ where
     /// Fails if any state is included or an access level stated: Ilo attributes have no IFR
     /// conditions.
     pub(super) fn refuse_on_ilo(&self) -> Result<()> {
-        match (self.include.as_slice(), self.access_level) {
+        match (self.include.include.as_slice(), self.access_level) {
             ([], None) => Ok(()),
             ([_, ..], None) => Err(anyhow!(
                 "--include applies to the HII backend, not to the Ilo backend of this machine"

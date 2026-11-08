@@ -163,6 +163,10 @@ pub enum VolatileWrites {
     Allow,
 }
 
+/// The suffix of set's answer for a question that wrote a volatile variable (UEFI 2.11 §8.2.3).
+pub(crate) const VOLATILE_ANNOTATION: &str =
+    " <volatile: lasts until the next reset or power cycle>";
+
 /// The interface through which FirmwareVariables read and write variables, which their error
 /// texts name; it decides no runtime access, which VariableReach does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -22,7 +22,10 @@ use anyhow::Result;
 
 use super::CapsuleBackend;
 use super::HiiBackend;
+use super::IncludedStates;
+use super::SetupPasswordPolicy;
 use super::VariableBackend;
+use super::VolatileWrites;
 use crate::capsule_services::RuntimeCapsuleServices;
 use crate::efi_variables::CapsuleDelivery;
 use crate::efi_variables::UpdateCapsuleDelivery;
@@ -36,7 +39,12 @@ use crate::efi_variables::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
 use crate::efi_variables::EFI_JSON_CONFIG_DATA_TABLE_GUID;
 use crate::firmware_width::FirmwareWidth;
 use crate::hii::export_package_lists;
+use crate::hii::get_keyword;
+use crate::hii::package;
+use crate::hii::set_keywords;
+use crate::hii::FirmwareKeywordHandler;
 use crate::hii::FirmwareVariables;
+use crate::hii::KeywordValues;
 use crate::hii::VariableReach;
 use crate::hii::VariableServices;
 use crate::uefi_config_table::SystemConfigurationTable;
@@ -117,4 +125,50 @@ impl HiiBackend {
     pub fn variable_info(name: &str, vendor: &str) -> Result<VariableInfo> {
         VariableBackend::info(name, vendor)
     }
+
+    /// What GetData() (UEFI 2.11 §35.3.3) of EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL reads of
+    /// `request`, a `<KeywordRequest>` of an optional PATH and a KEYWORD, in `namespace`, such as
+    /// "x-UEFI-ns", else in a language of the prefix "x-UEFI": a `<KeywordResp>` per package list
+    /// of this firmware's HiiDB whose question of the keyword get would read as GetData() does.
+    pub fn keyword_get(request: &str, namespace: Option<&str>) -> Result<KeywordValues> {
+        let lists = package::read_db(&Self::export_hiidb()?)?;
+        get_keyword(
+            &lists,
+            request,
+            namespace,
+            Box::new(VariableServices),
+            &FirmwareKeywordHandler,
+        )
+    }
+
+    /// Writes `keywords`, a `<MultiKeywordResp>`, with one SetData() (UEFI 2.11 §35.3.2) of
+    /// EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL, unless set, with `options`, would refuse a keyword's
+    /// question or value in this firmware's HiiDB and variables; then returns what GetData() reads
+    /// back, which must hold each VALUE written, as a number.
+    pub fn keyword_set(keywords: &str, options: &KeywordSetOptions) -> Result<KeywordValues> {
+        let lists = package::read_db(&Self::export_hiidb()?)?;
+        set_keywords(
+            &lists,
+            keywords,
+            options.include,
+            options.setup_password,
+            options.volatile,
+            Box::new(VariableServices),
+            &FirmwareKeywordHandler,
+        )
+    }
+}
+
+/// The options of HiiBackend::keyword_set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct KeywordSetOptions {
+    /// The states of the questions and options to select too, as set selects them, but
+    /// READ_ONLY: the Keyword Handler writes no read-only question
+    pub include: IncludedStates,
+    /// Whether to write in a HiiDB that declares a setup password question
+    pub setup_password: SetupPasswordPolicy,
+    /// Whether to write a keyword whose question keeps its value in a volatile variable, as
+    /// SetOptions::volatile
+    pub volatile: VolatileWrites,
 }

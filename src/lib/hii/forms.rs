@@ -93,13 +93,6 @@ mod defaults;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
 #[cfg(any(target_os = "uefi", test))]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no hii keyword command of the UEFI Shell build reads or writes keywords yet"
-    )
-)]
 pub(crate) mod keywords;
 mod question_values;
 mod set;
