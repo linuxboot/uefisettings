@@ -247,3 +247,12 @@ handles of EFI_RNG_PROTOCOL first, and expects the refusal to sign where `dh` li
 write, and writes it with `--allow-setup-mode-write-without-signature-check`, then PK, signed with
 its own key, after which the firmware is in User Mode; `sign-setup` then checks that it refuses a
 KEK append signed with a foreign key, with the flag too.
+
+`shell-devdb-setup` checks, in Setup Mode, that `uefisettings.efi` refuses an append to devdb, the
+device signature database of UEFI 2.11 §32.6.3, signed with PK's key, before any write, and
+appends with `--allow-setup-mode-write-without-signature-check`, which creates devdb; that the
+firmware then refuses an append signed with KEK's key, as edk2 takes devdb's updates only from the
+signer that created it, and takes one signed with PK's; and, in its Linux boot, that `variable
+write-signed` refuses another append without the flag. `variable-get-devdb` and
+`shell-variable-get-devdb` read, on the default firmware, the devdb that
+[`vars/devdb.json`](vars/devdb.json) seeds, and check that `variable set` refuses to write it.

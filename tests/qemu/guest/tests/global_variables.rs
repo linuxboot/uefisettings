@@ -14,8 +14,10 @@
 //! through efivarfs: `get_default_firmware` in variable-get, on the default firmware, whose
 //! variable store holds no Secure Boot variables, and `get_secboot_setup` and `get_secboot_user`
 //! in variable-get-secboot-setup and variable-get-secboot-user, on the secboot firmware in Setup
-//! Mode and, with run.sh's PK, KEK and db enrolled, in User Mode. Each test records what get
-//! prints of each variable. `variable set` of those that the OS may write: in global-variables,
+//! Mode and, with run.sh's PK, KEK and db enrolled, in User Mode, and `get_devdb` in
+//! variable-get-devdb, on the default firmware with the devdb that tests/qemu/vars/devdb.json
+//! seeds. Each test records what get prints of each variable. `variable set` of those that the OS
+//! may write: in global-variables,
 //! `set_before_reboot` checks that each refusal leaves every efivar file as it was and sets
 //! Timeout, BootOrder, SysPrepOrder, PlatformLang and OsIndications, and `after_reboot`, the next
 //! boot, reads what outlasted the reset.
@@ -40,6 +42,8 @@ use uefisettings_qemu_guest::EFIVARS;
 const EFI_GLOBAL_VARIABLE: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 /// EFI_IMAGE_SECURITY_DATABASE_GUID, the vendor GUID of db.
 const EFI_IMAGE_SECURITY_DATABASE: &str = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
+/// EFI_DEVICE_SECURITY_DATABASE_GUID, the vendor GUID of devdb (UEFI 2.11 §32.7.2).
+const EFI_DEVICE_SECURITY_DATABASE: &str = "b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad";
 /// NV+BS+RT, the attributes of Timeout and BootOrder in UEFI 2.11 Table 3.1.
 const NV_BS_RT: u32 = 0x07;
 /// BS+RT, the attributes of SetupMode and SecureBoot in UEFI 2.11 Table 3.1.
@@ -50,6 +54,10 @@ const NV_BS_RT_AT: u32 = 0x27;
 const EFI_CERT_X509: &str = "A5C059A1-94E4-4AA7-87B5-AB155C2BF072";
 /// The SignatureOwner of the certificates that run.sh enrolls (secboot_owner).
 const SECBOOT_OWNER: &str = "DE145B29-C3CD-455F-91DE-A76237B67C52";
+/// The SignatureOwner of the certificate that tests/qemu/vars/devdb.json seeds in devdb.
+const DEVDB_OWNER: &str = "8C78A505-BAA0-4C4A-869F-000000000400";
+/// A vendor GUID of no variable that variable get decodes.
+const FOREIGN_VENDOR: &str = "8C78A505-BAA0-4C4A-869F-000000000401";
 /// The Timeout that the firmware writes at every boot without `-boot menu=on`:
 /// PcdPlatformBootTimeOut, 0 in OvmfPkg's PcdsDynamicDefault, 5 in ArmVirtQemu's PcdsDynamicHii,
 /// which reads Timeout itself (edk2-stable202508 OvmfPkg/OvmfPkgX64.dsc:716,
@@ -187,7 +195,14 @@ fn assert_mode(name: &str, value: u8) {
 /// certificate that run.sh enrolled, with its SHA-256.
 #[track_caller]
 fn assert_enrolled(name: &str, vendor: &str) {
-    let (attributes, data) = efivar(name, vendor);
+    assert_certificate(name, vendor, SECBOOT_OWNER, NV_BS_RT_AT);
+}
+
+/// get shows the signature database `name` of `vendor`, of `attributes`, as one EFI_SIGNATURE_LIST
+/// of an X.509 certificate of `owner`, with its SHA-256.
+#[track_caller]
+fn assert_certificate(name: &str, vendor: &str, owner: &str, attributes: u32) {
+    let (held, data) = efivar(name, vendor);
     // SignatureType, SignatureListSize, SignatureHeaderSize 0, SignatureSize, then one
     // EFI_SIGNATURE_DATA: SignatureOwner and the certificate (UEFI 2.11 §32.4.1)
     let certificate = data.get(28 + 16..).expect("an EFI_SIGNATURE_LIST");
@@ -199,16 +214,16 @@ fn assert_enrolled(name: &str, vendor: &str) {
         get(name),
         Global {
             variable: format!("{name}-{vendor}"),
-            attributes: Some(attributes),
+            attributes: Some(held),
             value: Some(serde_json::json!([{
                 "type": EFI_CERT_X509,
-                "signatures": [{ "owner": SECBOOT_OWNER, "sha256": sha256 }],
+                "signatures": [{ "owner": owner, "sha256": sha256 }],
             }])),
             absent: false,
         },
         "{name}"
     );
-    assert_eq!(attributes, NV_BS_RT_AT, "{name}: attributes in efivarfs");
+    assert_eq!(held, attributes, "{name}: attributes in efivarfs");
 }
 
 #[test]
@@ -225,6 +240,51 @@ fn get_default_firmware() {
     assert!(
         error.error_message.contains("variable info Boot0000 GUID"),
         "Boot0000: {error:?}"
+    );
+}
+
+/// get decodes devdb, the authenticated variable of EFI_DEVICE_SECURITY_DATABASE_GUID, refuses
+/// the devdb of another vendor, and set refuses to write devdb, which it leaves as it was.
+#[test]
+fn get_devdb() {
+    require_test_vm();
+    assert_certificate(
+        "devdb",
+        EFI_DEVICE_SECURITY_DATABASE,
+        DEVDB_OWNER,
+        NV_BS_RT_AT,
+    );
+    let before = efivar("devdb", EFI_DEVICE_SECURITY_DATABASE);
+
+    for vendor in [
+        EFI_IMAGE_SECURITY_DATABASE.to_uppercase().as_str(),
+        FOREIGN_VENDOR,
+    ] {
+        let error = json_error(&["variable", "get", "devdb", vendor]);
+
+        assert_eq!(
+            error.error_message,
+            format!(
+                "devdb of vendor {vendor} is not the devdb that variable get decodes, of vendor \
+                 {}; `uefisettings variable info devdb {vendor}` shows its attributes and size",
+                EFI_DEVICE_SECURITY_DATABASE.to_uppercase()
+            ),
+            "devdb of {vendor}"
+        );
+    }
+    let error = json_error(&["variable", "set", "devdb", "x"]);
+
+    assert_eq!(
+        error.error_message,
+        "variable set does not write devdb: \"The Authorized device signature databases are \
+         stored as UEFI authenticated variables (see Variable Services) for the GUID \
+         EFI_DEVICE_SECURITY_DATABASE_GUID.\" (UEFI 2.11 section 32.6.3)",
+        "set devdb"
+    );
+    assert_eq!(
+        efivar("devdb", EFI_DEVICE_SECURITY_DATABASE),
+        before,
+        "devdb after set"
     );
 }
 

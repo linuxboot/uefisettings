@@ -404,22 +404,22 @@ GetFirmwareEnvironmentVariableExW, which tells the size no other way, and prints
 FS0:\> uefisettings.efi variable info AMITSESetup C811FA38-42C8-4579-A9BB-60E94EDDFB34
 ```
 
-`variable get NAME [GUID]` prints a global variable of UEFI 2.11 §3.3, or the signature database
-db, dbx, dbt or dbr, decoded, as a JSON object of its own, with no `-j`: `variable`, its efivar
-name, `attributes`, its bitmask, and `value`, or `"absent": true` if the firmware has not created
-it. GUID, if given, must be the variable's own, which it defaults to:
-`D719B2CB-3D3A-4596-A3BC-DAD00E67656F` for the signature databases, else
-`8BE4DF61-93CA-11D2-AA0D-00E098032B8C`. `Timeout` is its seconds, or `"wait for user input"` for
-0xFFFF; `BootOrder`, `DriverOrder` and `SysPrepOrder` list their load options, such as `"Boot0001"`,
-and `BootNext` and `BootCurrent` name one; `PlatformLang` and `PlatformLangCodes` are their text;
-`OsIndications` and `OsIndicationsSupported` list their bits, as `BOOT_TO_FW_UI` for
-`EFI_OS_INDICATIONS_BOOT_TO_FW_UI`, and each reserved bit in hex; `SecureBoot`, `SetupMode`,
-`AuditMode`, `DeployedMode`, `VendorKeys`, `devAuthBoot` and `HwErrRecSupport` are their number;
-`BootOptionSupport` lists its flags and its key press `count`; `SignatureSupport` and
-`OsRecoveryOrder` list their GUIDs; `PK`, `KEK`, the signature databases and their `*Default`
-list their EFI_SIGNATURE_LISTs, each a `type` GUID and its `signatures`, each an `owner` GUID and
-the `sha256` of its data. The load options, hot keys and device paths of §3.3 are left to
-`variable info`.
+`variable get NAME [GUID]` prints a global variable of UEFI 2.11 §3.3, or the signature database db,
+dbx, dbt, dbr (§32.7.1) or devdb (§32.7.2), decoded, as a JSON object of its own, with no `-j`:
+`variable`, its efivar name, `attributes`, its bitmask, and `value`, or `"absent": true` if the
+firmware has not created it. GUID, if given, must be the variable's own, which it defaults to:
+`D719B2CB-3D3A-4596-A3BC-DAD00E67656F` for db, dbx, dbt and dbr,
+`B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD` for devdb, else `8BE4DF61-93CA-11D2-AA0D-00E098032B8C`.
+`Timeout` is its seconds, or `"wait for user input"` for 0xFFFF; `BootOrder`, `DriverOrder` and
+`SysPrepOrder` list their load options, such as `"Boot0001"`, and `BootNext` and `BootCurrent` name
+one; `PlatformLang` and `PlatformLangCodes` are their text; `OsIndications` and
+`OsIndicationsSupported` list their bits, as `BOOT_TO_FW_UI` for `EFI_OS_INDICATIONS_BOOT_TO_FW_UI`,
+and each reserved bit in hex; `SecureBoot`, `SetupMode`, `AuditMode`, `DeployedMode`, `VendorKeys`,
+`devAuthBoot` and `HwErrRecSupport` are their number; `BootOptionSupport` lists its flags and its
+key press `count`; `SignatureSupport` and `OsRecoveryOrder` list their GUIDs; `PK`, `KEK`, the
+signature databases and their `*Default` list their EFI_SIGNATURE_LISTs, each a `type` GUID and its
+`signatures`, each an `owner` GUID and the `sha256` of its data. The load options, hot keys and
+device paths of §3.3 are left to `variable info`.
 
 ```sh
 uefisettings variable get SecureBoot
@@ -458,10 +458,17 @@ EFI_VARIABLE_APPEND_WRITE. The firmware verifies the signature, which covers the
 vendor GUID, the attributes and the time stamp that the payload was made for. Before any write,
 uefisettings refuses a payload without a complete descriptor, one without data unless `--append`
 is given, and attributes without bootservice-access or runtime-access, either of which would
-delete the variable, and a Secure Boot policy variable (PK, KEK, OsRecoveryOrder,
-OsRecovery####, and every variable of EFI_IMAGE_SECURITY_DATABASE_GUID, such as db, dbx, dbt and
-dbr; §3.3) while SetupMode is 1, when the firmware writes them without checking the signature,
-unless `--allow-setup-mode-write-without-signature-check` is given.
+delete the variable, and, while SetupMode is 1, a Secure Boot policy variable (PK, KEK,
+OsRecoveryOrder, OsRecovery####, and every variable of EFI_IMAGE_SECURITY_DATABASE_GUID, such as
+db, dbx, dbt and dbr; §3.3), which the firmware writes then without checking the signature, or a
+device signature database (every variable of EFI_DEVICE_SECURITY_DATABASE_GUID, such as devdb),
+which the firmware may write then without checking the signature (§32.6.3), unless
+`--allow-setup-mode-write-without-signature-check` is given. In User Mode, a KEK or PK signs db,
+dbx, dbt and dbr (§32.5.3), and only PK signs devdb (§32.6.2, §32.6.3). edk2-stable202608 departs
+from that for devdb: it verifies devdb as any other time-based authenticated variable, in Setup
+Mode too, and then takes updates only from its first signer (SecurityPkg AuthVariableLib's
+AuthVariableLibProcessVariable routes devdb to ProcessVariable, and AuthService.c's
+VerifyTimeBasedPayload checks it in its AuthVarTypePriv branch).
 It prints nothing when the firmware accepts the payload. On Linux it checks first, as `set`
 does, that the write cannot crash Linux, then writes the variable's efivar file;
 `uefisettings.efi` calls SetVariable() and names the status that it returns, such as
@@ -487,12 +494,13 @@ hardening, and uefisettings runs as the advisory's workaround allows: local use 
 non-compromised computer. uefisettings reads KEY as a secret; KEY and CERTIFICATES hold at most
 64 KiB each.
 
-`--allow-setup-mode-write-without-signature-check` has either form write a Secure Boot policy
-variable while SetupMode is 1, when the firmware checks no signature (§3.3, §32.3), as to enroll
-KEK and then PK; the payload is still an EFI_VARIABLE_AUTHENTICATION_2, and a write without data
-and without `--append` stays refused, as edk2 deletes the variable then. Writing PK moves Setup
-Mode to User Mode, and Audit Mode to Deployed Mode (§32.3.1, §32.3.4). PK may have to be signed
-with its own key (§32.3.1).
+`--allow-setup-mode-write-without-signature-check` has either form write, while SetupMode is 1, a
+Secure Boot policy variable, which the firmware writes then without checking the signature (§3.3,
+§32.3), as to enroll KEK and then PK, or a device signature database, which the firmware may write
+then without checking the signature (§32.6.3); the payload is still an
+EFI_VARIABLE_AUTHENTICATION_2, and a write without data and without `--append` stays refused, as
+edk2 deletes the variable then. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed
+Mode (§32.3.1, §32.3.4). PK may have to be signed with its own key (§32.3.1).
 
 ```sh
 uefisettings variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E67656F --attributes non-volatile,bootservice-access,runtime-access --append --data-file db.esl --signing-key-file kek.key --signing-certificate-file kek.pem

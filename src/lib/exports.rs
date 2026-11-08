@@ -208,8 +208,8 @@ impl VariableBackend {
 
 #[cfg(variable_data)]
 impl VariableBackend {
-    /// The global variable `name` of UEFI 2.11 §3.3, or the signature database `name` of §32.7.1,
-    /// decoded, or that it is absent; of the vendor GUID `vendor`, such as
+    /// The global variable `name` of UEFI 2.11 §3.3, or the signature database `name` of §32.7.1
+    /// or §32.7.2, decoded, or that it is absent; of the vendor GUID `vendor`, such as
     /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C", if given, which must be its own.
     pub fn get(name: &str, vendor: Option<&str>) -> Result<GlobalVariable> {
         let vendor = vendor.map(parse_vendor).transpose()?;
@@ -228,7 +228,8 @@ impl VariableBackend {
     /// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS; the firmware verifies its signature.
     /// Refuses, before any write, other attributes, a payload without a complete descriptor,
     /// attributes without access or a payload that would delete the variable, and, unless
-    /// `setup_mode` allows it, a Secure Boot Policy Variable in Setup Mode.
+    /// `setup_mode` allows it, a Secure Boot Policy Variable or a device signature database (any
+    /// variable of EFI_DEVICE_SECURITY_DATABASE_GUID) in Setup Mode.
     pub fn write_signed(
         name: &str,
         vendor: &str,
@@ -295,7 +296,8 @@ pub struct SignedVariableWrite<'a> {
     pub timestamp: TimeStamp,
     /// The digest of the signature
     pub digest: SignatureDigest,
-    /// Whether a Secure Boot Policy Variable is written while SetupMode is 1
+    /// Whether a Secure Boot Policy Variable or a device signature database (any variable of
+    /// EFI_DEVICE_SECURITY_DATABASE_GUID) is written while SetupMode is 1
     pub setup_mode: SetupModeWrite,
 }
 

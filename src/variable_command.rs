@@ -68,10 +68,11 @@ enum VariableSubcommands {
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
     Get {
-        /// The variable, such as Timeout, BootOrder, SecureBoot or db
+        /// The variable, such as Timeout, BootOrder, SecureBoot, db or devdb
         name: String,
         /// The vendor GUID of the variable, which must be its own:
-        /// D719B2CB-3D3A-4596-A3BC-DAD00E67656F for db, dbx, dbt and dbr, else
+        /// D719B2CB-3D3A-4596-A3BC-DAD00E67656F for db, dbx, dbt and dbr,
+        /// B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD for devdb, else
         /// 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
         guid: Option<String>,
     },

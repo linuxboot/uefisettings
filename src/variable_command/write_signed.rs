@@ -65,7 +65,7 @@ pub(super) struct WriteSignedArgs {
     /// The TimeStamp to sign, a GMT time such as 2026-11-07T00:00:00Z, later than the variable's unless --append; by default the current second of the system clock, but in the UEFI Shell, which reads none, --append signs the all-zero TimeStamp of UEFI 2.11 section 8.2.6
     #[arg(long, requires = "data_file")]
     timestamp: Option<TimeStamp>,
-    /// Write a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, any OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID such as db, dbx, dbt and dbr) while SetupMode is 1, when the firmware checks no signature (UEFI 2.11 sections 3.3 and 32.3); the payload is still an EFI_VARIABLE_AUTHENTICATION_2. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed Mode (sections 32.3.1 and 32.3.4). PK may have to be signed with its own key (section 32.3.1)
+    /// Write a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, any OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID such as db, dbx, dbt and dbr) while SetupMode is 1, when the firmware checks no signature (UEFI 2.11 sections 3.3 and 32.3), or a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID such as devdb), which the firmware may then write without checking the signature (section 32.6.3); the payload is still an EFI_VARIABLE_AUTHENTICATION_2. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed Mode (sections 32.3.1 and 32.3.4). PK may have to be signed with its own key (section 32.3.1)
     #[arg(long)]
     allow_setup_mode_write_without_signature_check: bool,
 }
@@ -147,7 +147,8 @@ impl WriteSignedArgs {
         )
     }
 
-    /// What a write of a Secure Boot policy variable does while SetupMode is 1.
+    /// What a write of a Secure Boot policy variable or a device signature database (any
+    /// variable of EFI_DEVICE_SECURITY_DATABASE_GUID) does while SetupMode is 1.
     fn setup_mode(&self) -> SetupModeWrite {
         match self.allow_setup_mode_write_without_signature_check {
             true => SetupModeWrite::WithoutSignatureCheck,

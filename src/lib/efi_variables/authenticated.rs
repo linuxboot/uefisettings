@@ -16,8 +16,8 @@
 //! covers the name, vendor GUID, attributes and time stamp that it was made for; new data that a
 //! caller's key signs (signing.rs) goes after the descriptor that uefisettings makes.
 //! uefisettings checks that a payload's descriptor is complete and refuses, before any write, a
-//! write that would delete the variable and one that the firmware would make without checking
-//! the signature.
+//! write that would delete the variable and one that the firmware may make without checking the
+//! signature.
 //! The backends' VariableData does the I/O: efivarfs on Linux (hii/efivarfs.rs), SetVariable() in
 //! the UEFI Shell (hii/variable_services.rs), and SetFirmwareEnvironmentVariableExW on Windows
 //! (hii/firmware_environment.rs), whose dwAttributes carries
@@ -36,6 +36,7 @@ pub use self::signing::SignatureDigest;
 use self::signing::Signer;
 pub use self::signing::TimeStamp;
 pub use self::signing::TimeStampError;
+use super::globals::EFI_DEVICE_SECURITY_DATABASE;
 use super::globals::EFI_GLOBAL_VARIABLE;
 use super::globals::EFI_IMAGE_SECURITY_DATABASE;
 use super::is_gmt_time_stamp;
@@ -79,7 +80,8 @@ const SIGNED_WRITE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLA
     .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
 
 /// Whether a signed write of a Secure Boot Policy Variable goes ahead while SetupMode is 1, when
-/// the firmware writes it without checking its signature (UEFI 2.11 §8.2.6, §32.3).
+/// the firmware writes it without checking its signature (UEFI 2.11 §8.2.6, §32.3), and of a
+/// device signature database, which it may write so (§32.6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SetupModeWrite {
     Refuse,
@@ -91,7 +93,7 @@ pub enum SetupModeWrite {
 /// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS. Before any write, it refuses other
 /// attributes, attributes without access, a payload without a complete descriptor, one without
 /// data unless it appends, either of which would delete the variable, and, unless `setup_mode`
-/// allows it, a Secure Boot Policy Variable while SetupMode is 1.
+/// allows it, a Secure Boot Policy Variable or a device signature database while SetupMode is 1.
 pub(crate) fn write_signed(
     variables: &impl VariableData,
     key: &VariableKey,
@@ -150,7 +152,8 @@ pub(crate) fn sign_and_write(
 /// Refuses a write of `value`, the new data of `key`, with `attributes`, that would delete the
 /// variable, as no data without APPEND_WRITE does (UEFI 2.11 §8.2.3), and, unless `setup_mode`
 /// allows it, one of a Secure Boot Policy Variable while SetupMode is 1, which the firmware makes
-/// without checking the signature.
+/// without checking the signature, or of a device signature database, any variable of
+/// EFI_DEVICE_SECURITY_DATABASE_GUID, which it may make so (§32.6.3).
 fn refuse_deletion_and_setup_mode(
     variables: &impl VariableData,
     key: &VariableKey,
@@ -161,12 +164,17 @@ fn refuse_deletion_and_setup_mode(
     if value.is_empty() && !attributes.contains(VariableAttributes::APPEND_WRITE) {
         return Err(SignedWriteRefusal::Delete(key.clone()).into());
     }
-    let refused = match setup_mode {
-        SetupModeWrite::Refuse => is_secure_boot_policy_variable(key) && in_setup_mode(variables)?,
-        SetupModeWrite::WithoutSignatureCheck => false,
+    let refusal = match setup_mode {
+        SetupModeWrite::Refuse if is_secure_boot_policy_variable(key) => {
+            SignedWriteRefusal::SetupModePolicyWrite(key.clone())
+        }
+        SetupModeWrite::Refuse if key.guid == EFI_DEVICE_SECURITY_DATABASE => {
+            SignedWriteRefusal::SetupModeDeviceDatabaseWrite(key.clone())
+        }
+        SetupModeWrite::Refuse | SetupModeWrite::WithoutSignatureCheck => return Ok(()),
     };
-    if refused {
-        return Err(SignedWriteRefusal::SetupModePolicyWrite(key.clone()).into());
+    if in_setup_mode(variables)? {
+        return Err(refusal.into());
     }
     Ok(())
 }
@@ -225,6 +233,11 @@ enum SignedWriteRefusal {
          8.2.6)"
     )]
     SetupModePolicyWrite(VariableKey),
+    #[error(
+        "EFI variable {0} is a device signature database and SetupMode is 1, so the firmware may \
+         write it without checking the payload's signature (UEFI 2.11 section 32.6.3)"
+    )]
+    SetupModeDeviceDatabaseWrite(VariableKey),
     #[error("SetupMode holds {0} bytes, not the 1 of a UINT8 (UEFI 2.11 section 3.3)")]
     SetupModeSize(usize),
     #[error("SetupMode is {0}, neither 0 nor 1 (UEFI 2.11 section 3.3)")]
@@ -344,6 +357,7 @@ mod tests {
     use super::*;
     use crate::efi_variables::globals::tests::key;
     use crate::efi_variables::globals::tests::HeldVariables;
+    use crate::efi_variables::globals::tests::DEVDB_VENDOR;
     use crate::efi_variables::globals::tests::NV_BS_RT;
 
     /// A stand-in for the DER of a PKCS #7 SignedData, which uefisettings does not parse.
@@ -639,8 +653,9 @@ mod tests {
     }
 
     /// write_signed refuses each Secure Boot Policy Variable (UEFI 2.11 §3.3) while SetupMode is
-    /// 1, and writes it when SetupMode is 0 or absent; it writes any other variable whatever
-    /// SetupMode is, without reading it.
+    /// 1, an OsRecovery#### of EFI_DEVICE_SECURITY_DATABASE_GUID as one too, and writes it when
+    /// SetupMode is 0 or absent; it writes any other variable whatever SetupMode is, without
+    /// reading it.
     #[test]
     fn write_signed_refuses_policy_variables_in_setup_mode() {
         let policy = [
@@ -650,6 +665,7 @@ mod tests {
             key("OsRecovery0000", VENDOR),
             key("OsRecovery09AF", EFI_GLOBAL_VARIABLE),
             key("OsRecoveryFFFF", VENDOR),
+            key("OsRecovery0000", DEVDB_VENDOR),
             key("db", EFI_IMAGE_SECURITY_DATABASE),
             key("dbx", EFI_IMAGE_SECURITY_DATABASE),
             key("dbt", EFI_IMAGE_SECURITY_DATABASE),
@@ -661,6 +677,8 @@ mod tests {
             key("KEK", VENDOR),
             key("OsRecoveryOrder", VENDOR),
             key("db", EFI_GLOBAL_VARIABLE),
+            key("devdb", EFI_GLOBAL_VARIABLE),
+            key("devdb", VENDOR),
             key("PKDefault", EFI_GLOBAL_VARIABLE),
             key("SecureBoot", EFI_GLOBAL_VARIABLE),
             key("OsRecovery09af", VENDOR),
@@ -732,12 +750,71 @@ mod tests {
         }
     }
 
+    /// write_signed refuses each variable of EFI_DEVICE_SECURITY_DATABASE_GUID while SetupMode is
+    /// 1, when the firmware may write it "without a signature validation" (UEFI 2.11 §32.6.3),
+    /// and writes it when SetupMode is 0 or absent, or when allowed.
+    #[test]
+    fn write_signed_refuses_device_signature_databases_in_setup_mode() {
+        let databases = [key("devdb", DEVDB_VENDOR), key("Other", DEVDB_VENDOR)];
+        let attributes = NV_BS_RT | VariableAttributes::APPEND_WRITE;
+        let payload = auth2(VALUE);
+
+        for key in &databases {
+            let variables = firmware(Some(&[1]));
+
+            let error = write_signed(
+                &variables,
+                key,
+                attributes,
+                &payload,
+                SetupModeWrite::Refuse,
+            )
+            .expect_err(&key.to_string());
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "EFI variable {key} is a device signature database and SetupMode is 1, so \
+                     the firmware may write it without checking the payload's signature (UEFI \
+                     2.11 section 32.6.3)"
+                ),
+                "{key}"
+            );
+            assert_eq!(*variables.set.borrow(), [], "{key}: writes");
+        }
+        for (setup_mode, allowed, case) in [
+            (Some(&[0][..]), SetupModeWrite::Refuse, "SetupMode 0"),
+            (None, SetupModeWrite::Refuse, "no SetupMode"),
+            (
+                Some(&[1][..]),
+                SetupModeWrite::WithoutSignatureCheck,
+                "SetupMode 1, allowed",
+            ),
+        ] {
+            for key in &databases {
+                let variables = firmware(setup_mode);
+
+                write_signed(&variables, key, attributes, &payload, allowed)
+                    .unwrap_or_else(|error| panic!("{key}, {case}: {error:#}"));
+
+                assert_eq!(
+                    held(&variables, key),
+                    written(0x67, &payload),
+                    "{key}, {case}"
+                );
+            }
+        }
+    }
+
     /// write_signed refuses a SetupMode other than a UINT8 of 0 or 1 when it writes a Secure Boot
-    /// Policy Variable, and writes nothing then.
+    /// Policy Variable or a device signature database, and writes nothing then.
     #[test]
     fn write_signed_refuses_a_malformed_setup_mode() {
-        let db = key("db", EFI_IMAGE_SECURITY_DATABASE);
-        for (setup_mode, refusal) in [
+        let keys = [
+            key("db", EFI_IMAGE_SECURITY_DATABASE),
+            key("devdb", DEVDB_VENDOR),
+        ];
+        let cases = [
             (
                 &[1, 0][..],
                 "SetupMode holds 2 bytes, not the 1 of a UINT8 (UEFI 2.11 section 3.3)",
@@ -746,23 +823,30 @@ mod tests {
                 &[2],
                 "SetupMode is 2, neither 0 nor 1 (UEFI 2.11 section 3.3)",
             ),
-        ] {
+        ];
+        for (key, (setup_mode, refusal)) in
+            keys.iter().flat_map(|key| cases.map(|case| (key, case)))
+        {
             let variables = firmware(Some(setup_mode));
 
             let error = write_signed(
                 &variables,
-                &db,
+                key,
                 NV_BS_RT | VariableAttributes::APPEND_WRITE,
                 &auth2(VALUE),
                 SetupModeWrite::Refuse,
             )
             .expect_err("write with a malformed SetupMode");
 
-            assert_eq!(error.to_string(), refusal, "SetupMode {setup_mode:?}");
+            assert_eq!(
+                error.to_string(),
+                refusal,
+                "{key}, SetupMode {setup_mode:?}"
+            );
             assert_eq!(
                 *variables.set.borrow(),
                 [],
-                "SetupMode {setup_mode:?}: writes"
+                "{key}, SetupMode {setup_mode:?}: writes"
             );
         }
     }
@@ -847,51 +931,59 @@ mod tests {
         }
     }
 
-    /// write_signed refuses a Secure Boot Policy Variable when SetupMode cannot be read, and
-    /// writes nothing then.
+    /// write_signed refuses a Secure Boot Policy Variable or a device signature database when
+    /// SetupMode cannot be read, and writes nothing then.
     #[test]
-    fn write_signed_refuses_a_policy_variable_when_setup_mode_is_unreadable() {
-        let variables = UnreadableVariables(HeldVariables::default());
-        let db = key("db", EFI_IMAGE_SECURITY_DATABASE);
+    fn write_signed_refuses_policy_variables_and_devdb_when_setup_mode_is_unreadable() {
+        for key in [
+            key("db", EFI_IMAGE_SECURITY_DATABASE),
+            key("devdb", DEVDB_VENDOR),
+        ] {
+            let variables = UnreadableVariables(HeldVariables::default());
 
-        let error = write_signed(
-            &variables,
-            &db,
-            NV_BS_RT | VariableAttributes::APPEND_WRITE,
-            &auth2(VALUE),
-            SetupModeWrite::Refuse,
-        )
-        .expect_err("write db with an unreadable SetupMode");
+            let error = write_signed(
+                &variables,
+                &key,
+                NV_BS_RT | VariableAttributes::APPEND_WRITE,
+                &auth2(VALUE),
+                SetupModeWrite::Refuse,
+            )
+            .expect_err("write with an unreadable SetupMode");
 
-        assert_eq!(
-            error.to_string(),
-            "cannot read EFI variable SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c",
-            "refusal"
-        );
-        assert_eq!(*variables.0.set.borrow(), [], "writes");
+            assert_eq!(
+                error.to_string(),
+                "cannot read EFI variable SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                "{key}: refusal"
+            );
+            assert_eq!(*variables.0.set.borrow(), [], "{key}: writes");
+        }
     }
 
     /// With SetupModeWrite::WithoutSignatureCheck, write_signed writes a Secure Boot Policy
-    /// Variable while SetupMode is 1 without reading SetupMode, and still refuses a payload
-    /// that is no EFI_VARIABLE_AUTHENTICATION_2, and one without data and without APPEND_WRITE,
-    /// which edk2 takes as a deletion in Setup Mode (edk2-stable202608 AuthService.c:725-727).
+    /// Variable or a device signature database while SetupMode is 1 without reading SetupMode,
+    /// and still refuses a payload that is no EFI_VARIABLE_AUTHENTICATION_2, and one without
+    /// data and without APPEND_WRITE, which edk2 takes as a deletion in Setup Mode
+    /// (edk2-stable202608 AuthService.c:725-727).
     #[test]
-    fn write_signed_writes_policy_variables_in_setup_mode_when_allowed() {
+    fn write_signed_writes_policy_variables_and_devdb_in_setup_mode_when_allowed() {
         let kek = key("KEK", EFI_GLOBAL_VARIABLE);
         let attributes = NV_BS_RT | VariableAttributes::APPEND_WRITE;
+        for key in [&kek, &key("devdb", DEVDB_VENDOR)] {
+            let variables = firmware(Some(&[1]));
+
+            write_signed(
+                &variables,
+                key,
+                attributes,
+                &auth2(VALUE),
+                SetupModeWrite::WithoutSignatureCheck,
+            )
+            .expect("write in Setup Mode with the flag");
+
+            assert_eq!(held(&variables, key), written(0x67, &auth2(VALUE)), "{key}");
+            assert_eq!(*variables.read.borrow(), [], "{key}: reads");
+        }
         let variables = firmware(Some(&[1]));
-
-        write_signed(
-            &variables,
-            &kek,
-            attributes,
-            &auth2(VALUE),
-            SetupModeWrite::WithoutSignatureCheck,
-        )
-        .expect("write KEK in Setup Mode with the flag");
-
-        assert_eq!(held(&variables, &kek), written(0x67, &auth2(VALUE)), "KEK");
-        assert_eq!(*variables.read.borrow(), [], "reads");
         let error = write_signed(
             &variables,
             &kek,
@@ -957,6 +1049,61 @@ mod tests {
         let allowed = firmware(Some(&[1]));
         write(&allowed, SetupModeWrite::WithoutSignatureCheck).expect("KEK with the flag");
         assert!(held(&allowed, &kek).is_some(), "KEK written with the flag");
+    }
+
+    /// sign_and_write refuses a signed devdb while SetupMode is 1 unless allowed, as write_signed
+    /// does: the firmware may not check the signature (UEFI 2.11 §32.6.3). Allowed, it writes
+    /// what the key signs without reading SetupMode.
+    #[test]
+    fn sign_and_write_refuses_devdb_in_setup_mode_unless_allowed() {
+        let devdb = key("devdb", DEVDB_VENDOR);
+        let signer = signing::tests::test_signer();
+        let timestamp = signing::tests::TIME.parse().expect("the test TimeStamp");
+        let write = |variables: &HeldVariables, setup_mode| {
+            sign_and_write(
+                variables,
+                &SignedWrite {
+                    key: &devdb,
+                    attributes: NV_BS_RT | VariableAttributes::APPEND_WRITE,
+                    data: VALUE,
+                    timestamp,
+                    setup_mode,
+                },
+                &signer,
+                &mut signing::tests::FakeSeed(Some(1)),
+            )
+        };
+
+        let refused = firmware(Some(&[1]));
+        let error = write(&refused, SetupModeWrite::Refuse).expect_err("devdb in Setup Mode");
+        assert_eq!(
+            error.to_string(),
+            "EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad is a device signature \
+             database and SetupMode is 1, so the firmware may write it without checking the \
+             payload's signature (UEFI 2.11 section 32.6.3)",
+            "refusal"
+        );
+        assert_eq!(*refused.set.borrow(), [], "writes without the flag");
+
+        let allowed = firmware(Some(&[1]));
+        write(&allowed, SetupModeWrite::WithoutSignatureCheck).expect("devdb with the flag");
+        let expected = signer
+            .authentication_2(
+                &AuthenticatedWrite {
+                    key: &devdb,
+                    attributes: signing::tests::append_attributes(),
+                    timestamp,
+                    data: VALUE,
+                },
+                &mut rand_chacha::ChaCha20Rng::seed_from_u64(0),
+            )
+            .expect("sign");
+        assert_eq!(
+            held(&allowed, &devdb),
+            written(0x67, &expected),
+            "devdb written with the flag"
+        );
+        assert_eq!(*allowed.read.borrow(), [], "reads with the flag");
     }
 
     /// sign_and_write writes the descriptor that the key signs, then the data, with the

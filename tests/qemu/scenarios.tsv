@@ -55,6 +55,8 @@ variable-get-secboot-user	-	-	global_variables/get_secboot_user	firmware=secboot
 shell-variable-get	-	-	shell:variable-get	-
 shell-variable-get-secboot-setup	-	-	shell:variable-get-secboot-setup	firmware=secboot-setup
 shell-variable-get-secboot-user	-	-	shell:variable-get-secboot-user	firmware=secboot-user
+variable-get-devdb	-	devdb.json	global_variables/get_devdb	-
+shell-variable-get-devdb	-	devdb.json	shell:variable-get-devdb	-
 global-variables	-	boot-options.json	global_variables/set_before_reboot,global_variables/after_reboot	-
 shell-global-variables	-	-	shell:global-variables,shell:global-variables-reboot	-
 secboot-setup	-	-	secboot/setup_mode	firmware=secboot-setup
@@ -97,3 +99,4 @@ shell-sign-user	-	-	shell:sign-user	firmware=secboot-user devices=virtio-rng
 shell-sign-no-rng	-	-	shell:sign-no-rng	firmware=secboot-user
 sign-setup	-	-	write_signed/signing_in_setup	firmware=secboot-setup
 shell-sign-setup	-	-	shell:sign-setup	firmware=secboot-setup devices=virtio-rng
+shell-devdb-setup	-	-	shell:devdb-setup,write_signed/devdb_appended_by_the_shell	firmware=secboot-setup devices=virtio-rng

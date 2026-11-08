@@ -11,8 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The global variables of UEFI 2.11 §3.3 but its load options, hot keys and device paths, and
-//! the signature databases of §32.7.1, decoded as variable get prints them, and those that the OS
-//! may write, as variable set writes them.
+//! the signature databases of §32.7.1 and §32.7.2, decoded as variable get prints them, and those
+//! that the OS may write, as variable set writes them.
 
 use std::fmt;
 
@@ -26,6 +26,8 @@ use sha2::Digest;
 use sha2::Sha256;
 use thiserror::Error;
 
+use crate::efi_variables::enhanced_authenticated::metadata_end;
+use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
 use crate::efi_variables::VariableContents;
 use crate::efi_variables::VariableData;
 use crate::hii::package::Guid;
@@ -45,6 +47,13 @@ pub(super) const EFI_IMAGE_SECURITY_DATABASE: Guid = Guid {
     data2: 0x3D3A,
     data3: 0x4596,
     data4: [0xA3, 0xBC, 0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F],
+};
+/// EFI_DEVICE_SECURITY_DATABASE_GUID, the vendor GUID of devdb (UEFI 2.11 §32.7.2).
+pub(super) const EFI_DEVICE_SECURITY_DATABASE: Guid = Guid {
+    data1: 0xB9C2_B4F4,
+    data2: 0xBF5F,
+    data3: 0x462D,
+    data4: [0x8A, 0xDF, 0xC5, 0xC7, 0x0A, 0xC3, 0x5D, 0xAD],
 };
 /// The size of an EFI_GUID, such as SignatureOwner, which starts each EFI_SIGNATURE_DATA.
 const GUID_SIZE: usize = 16;
@@ -82,10 +91,18 @@ const OS_INDICATIONS_SUPPORTED_READ_ONLY: &str =
 const PLATFORM_LANG_CODES_READ_ONLY: &str = "This value is considered read-only.";
 const SECURE_BOOT_POLICY_VARIABLE: &str = "Secure Boot Policy Variables must be created using the \
                                            EFI_VARIABLE_AUTHENTICATION_2 structure.";
+/// The section of UEFI 2.11 that tells which global variables the OS writes.
+const GLOBAL_VARIABLES_SECTION: &str = "3.3";
+/// Why the OS does not write devdb, which §3.3 does not name, in the words of UEFI 2.11 §32.6.3.
+const DEVICE_SIGNATURE_DATABASE: Quote = Quote {
+    words: "The Authorized device signature databases are stored as UEFI authenticated variables \
+            (see Variable Services) for the GUID EFI_DEVICE_SECURITY_DATABASE_GUID.",
+    section: "32.6.3",
+};
 
 /// The variables that variable get decodes: those of UEFI 2.11 Table 3.1 but the load options,
 /// hot keys and device paths, and the signature databases; and whether variable set writes them.
-const GLOBALS: [Global; 33] = [
+const GLOBALS: [Global; 34] = [
     Global::read_only("AuditMode", Codec::Byte, AUDIT_MODE_READ_ONLY),
     Global::read_only("BootCurrent", Codec::BootOption, BOOT_CURRENT_READ_ONLY),
     Global::writable("BootNext", Setter::BootNext),
@@ -131,6 +148,7 @@ const GLOBALS: [Global; 33] = [
     Global::image_security("dbx"),
     Global::image_security("dbt"),
     Global::image_security("dbr"),
+    Global::device_security("devdb"),
 ];
 
 /// What variable get tells of a variable that it decodes: its name as an efivar file, and its
@@ -389,7 +407,8 @@ pub struct Signature {
 }
 
 /// The variable `name` that `variables` hold, of the vendor GUID `vendor` if given, which must be
-/// its own, decoded.
+/// its own, decoded: the bytes after the metadata that metadata_end finds by its attributes (UEFI
+/// 2.11 §8.2.1).
 pub(crate) fn read_global(
     variables: &impl VariableData,
     name: &str,
@@ -400,9 +419,11 @@ pub(crate) fn read_global(
     let contents = variables
         .variable_data(&key)?
         .map(|contents| {
-            let value = global
-                .codec
-                .decode(contents.data())
+            let data = contents.data();
+            let value = metadata_end(contents.attributes().bits(), data)
+                .and_then(|end| data.get(end..).ok_or(MetadataRefusal::truncated(data)))
+                .map_err(anyhow::Error::from)
+                .and_then(|value| global.codec.decode(value).map_err(anyhow::Error::from))
                 .with_context(|| format!("EFI variable {key} is malformed"))?;
             anyhow::Ok(GlobalContents {
                 attributes: contents.attributes().bits(),
@@ -462,13 +483,17 @@ impl Global {
         }
     }
 
-    /// The global variable `name` (UEFI 2.11 §3.3), which the OS does not write, for `reason`.
+    /// The global variable `name` (UEFI 2.11 §3.3), which the OS does not write, for `reason`,
+    /// words of §3.3.
     const fn read_only(name: &'static str, codec: Codec, reason: &'static str) -> Self {
         Self {
             name,
             vendor: EFI_GLOBAL_VARIABLE,
             codec,
-            access: Access::ReadOnly(reason),
+            access: Access::ReadOnly(Quote {
+                words: reason,
+                section: GLOBAL_VARIABLES_SECTION,
+            }),
         }
     }
 
@@ -478,7 +503,21 @@ impl Global {
             name,
             vendor: EFI_IMAGE_SECURITY_DATABASE,
             codec: Codec::SignatureLists,
-            access: Access::ReadOnly(SECURE_BOOT_POLICY_VARIABLE),
+            access: Access::ReadOnly(Quote {
+                words: SECURE_BOOT_POLICY_VARIABLE,
+                section: GLOBAL_VARIABLES_SECTION,
+            }),
+        }
+    }
+
+    /// The device signature database `name` (UEFI 2.11 §32.7.2), an authenticated variable
+    /// (§32.6.3).
+    const fn device_security(name: &'static str) -> Self {
+        Self {
+            name,
+            vendor: EFI_DEVICE_SECURITY_DATABASE,
+            codec: Codec::SignatureLists,
+            access: Access::ReadOnly(DEVICE_SIGNATURE_DATABASE),
         }
     }
 
@@ -562,8 +601,21 @@ enum Access {
     /// The OS may write it: "By using the SetVariable() function the data that contain these
     /// environment variables can be modified" (UEFI 2.11 §3.1.1)
     Writable(Setter),
-    /// The OS does not write it, for these words of UEFI 2.11 §3.3
-    ReadOnly(&'static str),
+    /// The OS does not write it, for these words of UEFI 2.11
+    ReadOnly(Quote),
+}
+
+/// Words of UEFI 2.11 and the section that holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Quote {
+    words: &'static str,
+    section: &'static str,
+}
+
+impl fmt::Display for Quote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\" (UEFI 2.11 section {})", self.words, self.section)
+    }
 }
 
 /// How variable set takes and checks the value of a variable that the OS may write.
@@ -744,11 +796,8 @@ fn check_present(
 enum SetRefusal {
     #[error("variable set writes {}, not {0}", writable_names())]
     NotWritable(String),
-    #[error("variable set does not write {name}: \"{reason}\" (UEFI 2.11 section 3.3)")]
-    ReadOnly {
-        name: &'static str,
-        reason: &'static str,
-    },
+    #[error("variable set does not write {name}: {reason}")]
+    ReadOnly { name: &'static str, reason: Quote },
     #[error(
         "Timeout takes seconds from 0 to 65535, or \"{}\", not \"{0}\"",
         WAIT_FOR_USER_INPUT_TEXT
@@ -1083,6 +1132,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::efi_variables::VariableContents;
     use crate::hii::VariableAttributes;
 
@@ -1108,6 +1158,13 @@ pub(crate) mod tests {
     pub(crate) const NV_BS_RT: VariableAttributes = VariableAttributes::NON_VOLATILE
         .union(VariableAttributes::BOOTSERVICE_ACCESS)
         .union(VariableAttributes::RUNTIME_ACCESS);
+    /// EFI_DEVICE_SECURITY_DATABASE_GUID as UEFI 2.11 §32.7.2 spells it, the vendor of devdb.
+    pub(crate) const DEVDB_VENDOR: Guid = Guid {
+        data1: 0xB9C2_B4F4,
+        data2: 0xBF5F,
+        data3: 0x462D,
+        data4: [0x8A, 0xDF, 0xC5, 0xC7, 0x0A, 0xC3, 0x5D, 0xAD],
+    };
 
     /// VariableData that hold `variables` and record each key read and set.
     #[derive(Default)]
@@ -1315,6 +1372,7 @@ pub(crate) mod tests {
             ("dbx", databases.clone(), databases_json.clone()),
             ("dbt", databases.clone(), databases_json.clone()),
             ("dbr", databases.clone(), databases_json.clone()),
+            ("devdb", databases.clone(), databases_json.clone()),
             ("dbDefault", databases.clone(), databases_json.clone()),
             ("devdbDefault", databases, databases_json),
             (
@@ -1474,14 +1532,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// db, dbx, dbt and dbr are variables of EFI_IMAGE_SECURITY_DATABASE_GUID, and the others
-    /// of EFI_GLOBAL_VARIABLE, unless a vendor GUID names their own.
+    /// db, dbx, dbt and dbr are variables of EFI_IMAGE_SECURITY_DATABASE_GUID, devdb of
+    /// EFI_DEVICE_SECURITY_DATABASE_GUID, and the others of EFI_GLOBAL_VARIABLE, unless a vendor
+    /// GUID names their own.
     #[test]
     fn read_global_reads_each_variable_of_its_own_vendor() {
         let list = signature_list(EFI_CERT_X509, &[], 3, &[b"abc"]);
         let variables = HeldVariables::default()
             .with("db", EFI_IMAGE_SECURITY_DATABASE, &list)
             .with("db", EFI_GLOBAL_VARIABLE, &[0])
+            .with("devdb", DEVDB_VENDOR, &list)
+            .with("devdb", EFI_IMAGE_SECURITY_DATABASE, &[0])
             .with("Timeout", EFI_GLOBAL_VARIABLE, &[3, 0]);
         let cases = [
             ("db", None, "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f"),
@@ -1489,6 +1550,12 @@ pub(crate) mod tests {
                 "db",
                 Some(EFI_IMAGE_SECURITY_DATABASE),
                 "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f",
+            ),
+            ("devdb", None, "devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad"),
+            (
+                "devdb",
+                Some(DEVDB_VENDOR),
+                "devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad",
             ),
             (
                 "Timeout",
@@ -1513,10 +1580,48 @@ pub(crate) mod tests {
             [
                 key("db", EFI_IMAGE_SECURITY_DATABASE),
                 key("db", EFI_IMAGE_SECURITY_DATABASE),
+                key("devdb", DEVDB_VENDOR),
+                key("devdb", DEVDB_VENDOR),
                 key("Timeout", EFI_GLOBAL_VARIABLE),
                 key("Timeout", EFI_GLOBAL_VARIABLE),
             ],
             "keys read"
+        );
+    }
+
+    /// read_global decodes the value after the EFI_VARIABLE_AUTHENTICATION_3 metadata that
+    /// GetVariable() returns first for a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS
+    /// (UEFI 2.11 §8.2.1), as it decodes that value alone, and refuses data that ends inside the
+    /// metadata.
+    #[test]
+    fn read_global_decodes_the_value_after_enhanced_authenticated_metadata() {
+        let list = signature_list(EFI_CERT_X509, &[], 3, &[b"abc"]);
+        let enhanced = NV_BS_RT | VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS;
+        let read = |attributes, data: &[u8]| {
+            let variables =
+                HeldVariables::default().with_attributes("devdb", DEVDB_VENDOR, attributes, data);
+            read_global(&variables, "devdb", None).map_err(|error| format!("{error:#}"))
+        };
+        let alone = read(NV_BS_RT, &list)
+            .expect("read devdb")
+            .contents
+            .expect("devdb held");
+
+        let after_metadata = read(enhanced, &[timestamp_metadata(), list.clone()].concat())
+            .expect("read devdb after its metadata")
+            .contents
+            .expect("devdb held");
+
+        assert_eq!(after_metadata.value, alone.value, "value");
+        assert_eq!(after_metadata.attributes, enhanced.bits(), "attributes");
+        assert_eq!(
+            read(enhanced, &timestamp_metadata()[..10]),
+            Err(
+                "EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad is malformed: its 10 \
+                 bytes of data end inside its metadata"
+                    .to_string()
+            ),
+            "data ending inside the metadata"
         );
     }
 
@@ -1538,6 +1643,8 @@ pub(crate) mod tests {
             Some(vendor("a04a27f4-df00-4d42-b552-39511302113d")),
         )
         .expect_err("read the Timeout of another vendor");
+        let foreign_devdb = read_global(&variables, "devdb", Some(EFI_IMAGE_SECURITY_DATABASE))
+            .expect_err("read the devdb of EFI_IMAGE_SECURITY_DATABASE_GUID");
         let unknown = read_global(&variables, "Boot0001", None).expect_err("read Boot0001");
 
         assert_eq!(
@@ -1548,12 +1655,19 @@ pub(crate) mod tests {
              and size",
             "foreign vendor"
         );
+        assert_eq!(
+            foreign_devdb.to_string(),
+            "devdb of vendor D719B2CB-3D3A-4596-A3BC-DAD00E67656F is not the devdb that variable \
+             get decodes, of vendor B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD; `uefisettings variable \
+             info devdb D719B2CB-3D3A-4596-A3BC-DAD00E67656F` shows its attributes and size",
+            "devdb of a foreign vendor"
+        );
         let unknown = unknown.to_string();
         assert!(
             unknown.starts_with("variable get decodes AuditMode, BootCurrent, BootNext, ")
                 && unknown.ends_with(
-                    ", dbr, not Boot0001; `uefisettings variable info Boot0001 GUID` shows the \
-                     attributes and size of any EFI variable"
+                    ", dbr, devdb, not Boot0001; `uefisettings variable info Boot0001 GUID` shows \
+                     the attributes and size of any EFI variable"
                 ),
             "unknown name: {unknown}"
         );
@@ -1611,10 +1725,10 @@ pub(crate) mod tests {
             .filter(|global| global.vendor == EFI_GLOBAL_VARIABLE)
             .map(|global| global.name)
             .collect();
-        let databases: Vec<&str> = GLOBALS
+        let databases: Vec<(&str, Guid)> = GLOBALS
             .iter()
-            .filter(|global| global.vendor == EFI_IMAGE_SECURITY_DATABASE)
-            .map(|global| global.name)
+            .filter(|global| global.vendor != EFI_GLOBAL_VARIABLE)
+            .map(|global| (global.name, global.vendor))
             .collect();
 
         assert_eq!(
@@ -1652,7 +1766,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             databases,
-            ["db", "dbx", "dbt", "dbr"],
+            [
+                ("db", EFI_IMAGE_SECURITY_DATABASE),
+                ("dbx", EFI_IMAGE_SECURITY_DATABASE),
+                ("dbt", EFI_IMAGE_SECURITY_DATABASE),
+                ("dbr", EFI_IMAGE_SECURITY_DATABASE),
+                ("devdb", DEVDB_VENDOR),
+            ],
             "signature databases"
         );
     }
@@ -1950,6 +2070,14 @@ pub(crate) mod tests {
                     "Secure Boot Policy Variables must be created using the \
                      EFI_VARIABLE_AUTHENTICATION_2 structure.",
                 ),
+            ),
+            (
+                "devdb",
+                "",
+                "variable set does not write devdb: \"The Authorized device signature databases \
+                 are stored as UEFI authenticated variables (see Variable Services) for the GUID \
+                 EFI_DEVICE_SECURITY_DATABASE_GUID.\" (UEFI 2.11 section 32.6.3)"
+                    .to_string(),
             ),
             (
                 "KEK",

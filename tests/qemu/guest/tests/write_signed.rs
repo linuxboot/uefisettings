@@ -29,7 +29,10 @@
 //! sign-setup, whose variable store is a template copy, where uefisettings refuses KEK, signed
 //! with PK's key, before any write, writes it with
 //! --allow-setup-mode-write-without-signature-check, then PK, signed with its own key, after which
-//! the firmware is in User Mode and verifies KEK appends against PK, with the flag too.
+//! the firmware is in User Mode and verifies KEK appends against PK, with the flag too;
+//! `devdb_appended_by_the_shell` in shell-devdb-setup, after its UEFI Shell boot appended to
+//! devdb, still in Setup Mode, where uefisettings refuses another append before any write. No
+//! test's name holds another's, as libtest runs every test whose name holds a scenario's filter.
 
 use std::fs;
 use std::io;
@@ -38,6 +41,7 @@ use uefisettings_qemu_guest::assert_absent;
 use uefisettings_qemu_guest::auth2_data;
 use uefisettings_qemu_guest::db_path;
 use uefisettings_qemu_guest::global_variable;
+use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::security_violation_errno;
@@ -82,6 +86,13 @@ const EFI_CERT_X509_GUID: [u8; 16] = [
 /// OWNER as an EFI_GUID's bytes.
 const OWNER_BYTES: [u8; 16] = [
     0x29, 0x5b, 0x14, 0xde, 0xcd, 0xc3, 0x5f, 0x45, 0x91, 0xde, 0xa7, 0x62, 0x37, 0xb6, 0x7c, 0x52,
+];
+/// EFI_DEVICE_SECURITY_DATABASE_GUID, the vendor GUID of devdb (UEFI 2.11 §32.7.2).
+const EFI_DEVICE_SECURITY_DATABASE: &str = "b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad";
+/// The owner of the signature lists that run.sh makes for devdb (devdb_owner),
+/// 8c78a505-baa0-4c4a-869f-000000000400, as an EFI_GUID's bytes.
+const DEVDB_OWNER_BYTES: [u8; 16] = [
+    0x05, 0xa5, 0x78, 0x8c, 0xa0, 0xba, 0x4a, 0x4c, 0x86, 0x9f, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
 ];
 /// The size of an EFI_SIGNATURE_LIST before its signatures: SignatureType, SignatureListSize,
 /// SignatureHeaderSize and SignatureSize (UEFI 2.11 §32.4.1).
@@ -180,8 +191,8 @@ fn security_violation() -> String {
 }
 
 /// The EFI_SIGNATURE_LISTs of `data`, the data of a signature database, each checked to hold one
-/// X.509 certificate of OWNER, as run.sh enrolls and auth-payload.sh x509-esl appends them.
-fn x509_signature_lists(data: &[u8]) -> Vec<&[u8]> {
+/// X.509 certificate of `owner`, as run.sh enrolls and auth-payload.sh x509-esl appends them.
+fn x509_signature_lists(data: &[u8], owner: [u8; 16]) -> Vec<&[u8]> {
     let mut lists = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
@@ -207,7 +218,7 @@ fn x509_signature_lists(data: &[u8]) -> Vec<&[u8]> {
         );
         assert_eq!(
             &list[SIGNATURE_LIST_HEADER_SIZE..SIGNATURE_LIST_HEADER_SIZE + 16],
-            OWNER_BYTES,
+            owner,
             "SignatureOwner"
         );
         lists.push(list);
@@ -336,7 +347,7 @@ fn after_shell() {
     require_test_vm();
     let db = variable_data(&db_path()).expect("db is missing");
 
-    let lists = x509_signature_lists(&db);
+    let lists = x509_signature_lists(&db, OWNER_BYTES);
 
     assert_eq!(lists.len(), 2, "the signature lists of db: {lists:02x?}");
     assert!(
@@ -561,5 +572,57 @@ fn signing_in_setup() {
         variable_bytes(&kek),
         Some([&PROBE_ATTRIBUTES.to_ne_bytes()[..], &kek_lists].concat()),
         "KEK after the appends: the refused ones left it, PK's added its list"
+    );
+}
+
+#[test]
+fn devdb_appended_by_the_shell() {
+    require_test_vm();
+    assert_eq!(global_variable("SetupMode"), Some(vec![1]), "SetupMode");
+    let devdb = format!("{EFIVARS}/devdb-{EFI_DEVICE_SECURITY_DATABASE}");
+    let before = variable_bytes(&devdb).expect("devdb is missing");
+    let data = variable_data(&devdb).expect("devdb is missing");
+
+    let lists = x509_signature_lists(&data, DEVDB_OWNER_BYTES);
+
+    assert_eq!(lists.len(), 2, "the signature lists of devdb: {lists:02x?}");
+    assert!(
+        holds(lists[0], b"uefisettings test devdb")
+            && !holds(lists[0], b"uefisettings test devdb2"),
+        "the first list holds the certificate of the Shell boot's first append"
+    );
+    assert!(
+        holds(lists[1], b"uefisettings test devdb2"),
+        "the second list holds the certificate of its PK-signed append"
+    );
+    let got: serde_json::Value = json(&["variable", "get", "devdb"]);
+    assert_eq!(
+        got["value"].as_array().map(Vec::len),
+        Some(2),
+        "variable get devdb: {got}"
+    );
+
+    let error = json_error(&strs(&sign_args(
+        "devdb",
+        EFI_DEVICE_SECURITY_DATABASE,
+        Write::Append,
+        "devdb2.esl",
+        ["PK.key", "PK.crt"],
+        "sha256",
+    )));
+
+    assert_eq!(
+        error.error_message,
+        format!(
+            "EFI variable devdb-{EFI_DEVICE_SECURITY_DATABASE} is a device signature database and \
+             SetupMode is 1, so the firmware may write it without checking the payload's \
+             signature (UEFI 2.11 section 32.6.3)"
+        ),
+        "the devdb append without the flag"
+    );
+    assert_eq!(
+        variable_bytes(&devdb),
+        Some(before),
+        "devdb after the refused append"
     );
 }

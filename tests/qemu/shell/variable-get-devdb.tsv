@@ -1,0 +1,14 @@
+# The checks of shell/variable-get-devdb.nsh, the boot of shell-variable-get-devdb: get decodes
+# devdb, of EFI_DEVICE_SECURITY_DATABASE_GUID (UEFI 2.11 section 32.7.2), as the one X.509
+# EFI_SIGNATURE_LIST of the authenticated devdb that vars/devdb.json seeds, refuses another
+# vendor's devdb, and set refuses to write it. See check-shell-log.sh.
+devdb	status	0x0
+devdb	json	. == {"variable": "devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad", "attributes": 39, "value": [{"type": "A5C059A1-94E4-4AA7-87B5-AB155C2BF072", "signatures": [{"owner": "8C78A505-BAA0-4C4A-869F-000000000400", "sha256": "dc76e49b10bfeec5d60660c0a95ff58c805d7528156a1607bf0d8384c25ebba6"}]}]}
+image-security-vendor	status	aborted
+image-security-vendor	json	. == {"error_message": "devdb of vendor D719B2CB-3D3A-4596-A3BC-DAD00E67656F is not the devdb that variable get decodes, of vendor B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD; `uefisettings variable info devdb D719B2CB-3D3A-4596-A3BC-DAD00E67656F` shows its attributes and size"}
+foreign-vendor	status	aborted
+foreign-vendor	json	. == {"error_message": "devdb of vendor 8C78A505-BAA0-4C4A-869F-000000000401 is not the devdb that variable get decodes, of vendor B9C2B4F4-BF5F-462D-8ADF-C5C70AC35DAD; `uefisettings variable info devdb 8C78A505-BAA0-4C4A-869F-000000000401` shows its attributes and size"}
+set-refused	status	aborted
+set-refused	json	. == {"error_message": "variable set does not write devdb: \"The Authorized device signature databases are stored as UEFI authenticated variables (see Variable Services) for the GUID EFI_DEVICE_SECURITY_DATABASE_GUID.\" (UEFI 2.11 section 32.6.3)"}
+devdb-after-set	status	0x0
+devdb-after-set	same	devdb

@@ -309,6 +309,8 @@ fi
 secboot_owner=de145b29-c3cd-455f-91de-a76237b67c52
 # EFI_IMAGE_SECURITY_DATABASE_GUID, the vendor GUID of db
 db_guid=d719b2cb-3d3a-4596-a3bc-dad00e67656f
+# The owner of the signature lists that the scenarios write to devdb, a fixture GUID.
+devdb_owner=8c78a505-baa0-4c4a-869f-000000000400
 
 # Generates the keys and payloads of a Secure Boot scenario in the new directory $1: PK, KEK and
 # db to enroll, a foreign key that none of them holds, and for its Shell boots (shell/) and Linux
@@ -322,13 +324,14 @@ db_guid=d719b2cb-3d3a-4596-a3bc-dad00e67656f
 # KEK's certificates, PK.esl and KEK.esl; ca.key and ca.crt, of a CA that KEK issues,
 # and leaf.key and leaf.crt, of a certificate that the CA issues, with chain.pem, the leaf's
 # certificate then the CA's; an EFI_SIGNATURE_LIST of a certificate of its own for each db
-# append, sha256.esl, sha384.esl, sha512.esl, chain.esl and refused.esl; and two texts of a
-# private authenticated variable, probe.data and update.data.
+# append, sha256.esl, sha384.esl, sha512.esl, chain.esl and refused.esl; the EFI_SIGNATURE_LISTs
+# of two certificates of their own, of devdb_owner, for devdb, devdb.esl and devdb2.esl; and two
+# texts of a private authenticated variable, probe.data and update.data.
 secboot_files() {
     local keys=$1 each file size byte
     mkdir "$keys"
     for each in PK KEK db foreign shell-db linux-db sign-sha256 sign-sha384 sign-sha512 \
-        sign-chain sign-refused; do
+        sign-chain sign-refused devdb devdb2; do
         openssl req -x509 -newkey rsa:2048 -noenc -days 2 -sha256 \
             -subj "/CN=uefisettings test $each" -keyout "$keys/$each.key" \
             -out "$keys/$each.crt" 2>>"$keys/openssl.log"
@@ -350,6 +353,9 @@ secboot_files() {
     for each in sha256 sha384 sha512 chain refused; do
         "$here/auth-payload.sh" x509-esl "$secboot_owner" "$keys/sign-$each.crt" \
             "$keys/sign/$each.esl"
+    done
+    for each in devdb devdb2; do
+        "$here/auth-payload.sh" x509-esl "$devdb_owner" "$keys/$each.crt" "$keys/sign/$each.esl"
     done
     printf 'uefisettings test private probe' >"$keys/sign/probe.data"
     printf 'uefisettings test private probe update' >"$keys/sign/update.data"
