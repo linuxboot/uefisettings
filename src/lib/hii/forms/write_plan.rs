@@ -107,7 +107,9 @@ impl<'a> WritePlan<'a> {
 
     /// The plan's writes, one per variable, in the order in which the plan first changes each,
     /// each of its patches in order. Refuses a SET of a VarStore whose variable set may not
-    /// write, through what `reader` read of it, under `volatile`.
+    /// write, through what `reader` read of it, under `volatile`, and a write whose span overlaps
+    /// the bytes of a password that `reader` withholds, so that set writes no variable of the
+    /// plan.
     pub(super) fn variable_writes(
         &self,
         reader: &mut EfivarReader,
@@ -149,10 +151,21 @@ impl<'a> WritePlan<'a> {
                 None => variables.push((key, vec![patch])),
             }
         }
-        variables
+        let writes = variables
             .into_iter()
             .map(|(_, patches)| merged_write(&patches))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        for write in &writes {
+            if let Some((start, end)) = write.changed() {
+                reader
+                    .check_write(&write.store.variable_key(), &(usize::from(start)..end))
+                    .map_err(|refusal| ChangeValueError::PasswordBytes {
+                        question: self.question.question.clone(),
+                        refusal,
+                    })?;
+            }
+        }
+        Ok(writes)
     }
 }
 
@@ -246,6 +259,7 @@ mod tests {
     use super::write_in_turn;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::variables::check_non_volatile;
+    use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
 
     const AND: u8 = 0x15;
@@ -555,7 +569,7 @@ mod tests {
             &mut reader,
             None,
             volatile,
-            &WithholdingVariables::new(&writes, BTreeSet::new()),
+            &WithholdingVariables::new(&writes, WithheldBytes::default()),
         )
         .map(|written| written.iter().map(|question| question.volatile).collect())
         .map_err(|error| format!("{error:#}"));
@@ -653,6 +667,257 @@ mod tests {
                     set(prompt, value, through),
                     (Ok(()), want.iter().cloned().collect()),
                     "{prompt} = {value} through {through:?}"
+                );
+            }
+        }
+    }
+
+    /// Before a WRITE that writes the bytes on both sides of a password in one write, set refuses
+    /// it through variables of every backend, writing nothing: that write would carry the
+    /// password's bytes, which questions read as zero, back into the variable.
+    #[test]
+    fn a_write_across_a_password_writes_nothing() {
+        let op = |op_code| operation(op_code, false, &[]);
+        let set_op = |id: u16, offset: u16| {
+            let data = [
+                &id.to_le_bytes()[..],
+                &offset.to_le_bytes(),
+                &[EFI_IFR_TYPE_NUM_SIZE_8],
+            ]
+            .concat();
+            operation(SET, false, &data)
+        };
+        // a PASSWORD of MaxSize 1 at byte 1 of Store: bytes 1..3
+        let password = operation(
+            PASSWORD,
+            false,
+            &[
+                question_header_with(2, FIRST_PROMPT + 1, STORE, 1, 0),
+                vec![1, 0, 1, 0],
+            ]
+            .concat(),
+        );
+        // a UINT8 NUMERIC at byte 0 whose WRITE also sets byte 4
+        let around = [
+            operation(
+                NUMERIC,
+                true,
+                &[
+                    question_header_with(1, FIRST_PROMPT, STORE, 0, 0),
+                    vec![0x10, 0, 255, 1],
+                ]
+                .concat(),
+            ),
+            op(WRITE),
+            scoped_expression(&[op(THIS), set_op(STORE, 4)], 0),
+            END.to_vec(),
+        ]
+        .concat();
+        let root = parse_form_set(&[
+            var_store_efi(STORE, "Store", NV_BS_RT, 6),
+            form(1, &[password, around]),
+        ]);
+        let strings = vec![StringMap::from([
+            (FIRST_PROMPT, "Around".into()),
+            (FIRST_PROMPT + 1, "Password".into()),
+        ])];
+        let passwords = PasswordQuestions::of([&root]);
+
+        for through in [EFIVARFS, VARIABLE_SERVICES, FIRMWARE_ENVIRONMENT] {
+            let mut reader = passwords
+                .reader(Box::new(variables(through)))
+                .expect("resolve the VarStore of the PASSWORD question");
+            let values = VarStoreValues::new(&root, None);
+            let selection = find_question_in(
+                &root,
+                &BTreeSet::from(["Around"]),
+                &mut FormSetWalk::new(&strings, &mut reader, &values, IncludedStates::empty()),
+            );
+            let Selection::Picked {
+                picked: (descriptor, _),
+                ..
+            } = &selection
+            else {
+                panic!("Around: not picked through {through:?}");
+            };
+            let writes = variables(through);
+            let outcome = set_questions(
+                "Around",
+                &[("selector", descriptor)],
+                "5",
+                &BTreeSet::from(["5".to_string()]),
+                IncludedStates::empty(),
+                &mut reader,
+                None,
+                VolatileWrites::Refuse,
+                &passwords
+                    .withholding(&writes)
+                    .expect("resolve the VarStore of the PASSWORD question"),
+            )
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"));
+
+            assert!(
+                outcome.as_ref().is_err_and(|error| error
+                    .contains("holds a password at bytes 1..3, which set never writes")),
+                "through {through:?}: {outcome:?}"
+            );
+            assert_eq!(
+                writes.writes_to(&key("Store")),
+                [],
+                "writes through {through:?}"
+            );
+        }
+    }
+
+    /// set of the UINT8 NUMERIC Around, at byte `own` of Store, to 5 through variables of
+    /// `through`, beside a PASSWORD of MaxSize 1 at bytes 1..3 of Store: its WRITE expression sets
+    /// Other's UINT16 at 0, then Store's `set_type` at `set_at`. The outcome as the CLI prints an
+    /// error, and the writes to Other and Store.
+    fn set_around_a_password(
+        own: u16,
+        set_at: u16,
+        set_type: u8,
+        through: (VariableReach, VariableInterface),
+    ) -> (Result<(), String>, Written) {
+        let op = |op_code| operation(op_code, false, &[]);
+        let set_op = |id: u16, offset: u16, value_type: u8| {
+            let data = [&id.to_le_bytes()[..], &offset.to_le_bytes(), &[value_type]].concat();
+            operation(SET, false, &data)
+        };
+        let password = operation(
+            PASSWORD,
+            false,
+            &[
+                question_header_with(2, FIRST_PROMPT + 1, STORE, 1, 0),
+                vec![1, 0, 1, 0],
+            ]
+            .concat(),
+        );
+        let around = [
+            operation(
+                NUMERIC,
+                true,
+                &[
+                    question_header_with(1, FIRST_PROMPT, STORE, own, 0),
+                    vec![0x10, 0, 255, 1],
+                ]
+                .concat(),
+            ),
+            op(WRITE),
+            scoped_expression(
+                &[
+                    op(THIS),
+                    set_op(OTHER, 0, EFI_IFR_TYPE_NUM_SIZE_16),
+                    op(THIS),
+                    set_op(STORE, set_at, set_type),
+                    op(AND),
+                ],
+                0,
+            ),
+            END.to_vec(),
+        ]
+        .concat();
+        let root = parse_form_set(&[
+            var_store_efi(STORE, "Store", NV_BS_RT, 6),
+            var_store_efi(OTHER, "Other", NV_BS_RT, 2),
+            form(1, &[password, around]),
+        ]);
+        let strings = vec![StringMap::from([
+            (FIRST_PROMPT, "Around".into()),
+            (FIRST_PROMPT + 1, "Password".into()),
+        ])];
+        let passwords = PasswordQuestions::of([&root]);
+        let mut reader = passwords
+            .reader(Box::new(variables(through)))
+            .expect("resolve the VarStore of the PASSWORD question");
+        let values = VarStoreValues::new(&root, None);
+        let selection = find_question_in(
+            &root,
+            &BTreeSet::from(["Around"]),
+            &mut FormSetWalk::new(&strings, &mut reader, &values, IncludedStates::empty()),
+        );
+        let Selection::Picked {
+            picked: (descriptor, _),
+            ..
+        } = &selection
+        else {
+            panic!("Around: not picked through {through:?}");
+        };
+        let writes = variables(through);
+        let outcome = set_questions(
+            "Around",
+            &[("selector", descriptor)],
+            "5",
+            &BTreeSet::from(["5".to_string()]),
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            VolatileWrites::Refuse,
+            &passwords
+                .withholding(&writes)
+                .expect("resolve the VarStore of the PASSWORD question"),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"));
+        let written = ["Other", "Store"]
+            .into_iter()
+            .map(|name| (name, writes.writes_to(&key(name))))
+            .collect();
+        (outcome, written)
+    }
+
+    /// A WRITE expression whose first SET changes Other, and whose bytes in Store, with the
+    /// question's own, span a password, across it or by its first or last byte only: set refuses
+    /// before any write, Other's too, naming the question. A span beside the password writes both.
+    #[test]
+    fn a_write_plan_across_a_password_writes_no_other_variable() {
+        let refused = || {
+            (
+                Err("cannot set question \"Around\": EFI variable \
+                     Store-00000000-0000-0000-0000-000000000000 holds a password at bytes 1..3, \
+                     which set never writes"
+                    .to_string()),
+                BTreeMap::from([("Other", vec![]), ("Store", vec![])]),
+            )
+        };
+        // the span in Store, the question's own byte, and the offset and type of its SET of Store
+        let cases = [
+            ("0..5, across", 0, 4, EFI_IFR_TYPE_NUM_SIZE_8, refused()),
+            (
+                "0..2, its last byte",
+                0,
+                0,
+                EFI_IFR_TYPE_NUM_SIZE_16,
+                refused(),
+            ),
+            (
+                "2..5, its first byte",
+                4,
+                2,
+                EFI_IFR_TYPE_NUM_SIZE_8,
+                refused(),
+            ),
+            (
+                "3..5, beside it",
+                4,
+                3,
+                EFI_IFR_TYPE_NUM_SIZE_8,
+                (
+                    Ok(()),
+                    BTreeMap::from([
+                        ("Other", vec![(0, vec![5, 0])]),
+                        ("Store", vec![(3, vec![5, 5])]),
+                    ]),
+                ),
+            ),
+        ];
+        for (span, own, set_at, set_type, want) in cases {
+            for through in [EFIVARFS, VARIABLE_SERVICES, FIRMWARE_ENVIRONMENT] {
+                assert_eq!(
+                    set_around_a_password(own, set_at, set_type, through),
+                    want,
+                    "Store span {span} through {through:?}"
                 );
             }
         }
@@ -899,7 +1164,7 @@ mod tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
-            &WithholdingVariables::new(&writes, BTreeSet::new()),
+            &WithholdingVariables::new(&writes, WithheldBytes::default()),
         )
         .expect("set both questions");
 

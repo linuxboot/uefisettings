@@ -5822,17 +5822,15 @@ mod store_expression_tests {
         );
     }
 
-    /// A GET of the VarStore of a PASSWORD question reads no byte of it through variables that
-    /// reach BootServices, which setup_password withholds it from, as the UEFI Shell build's do;
-    /// through variables that reach Runtime the same GET reads it, and a GET of another VarStore
-    /// reads it either way.
+    /// A GET reads no byte of the password of a PASSWORD question, through variables of either
+    /// reach; a GET of the other bytes of its VarStore, or of another VarStore, reads them.
     #[test]
-    fn get_of_a_password_var_store_reads_no_byte_where_it_is_withheld() {
+    fn get_reads_no_byte_of_a_password() {
         let value_through = |expression: Vec<u8>, (reach, interface)| {
             let declarations = declarations();
             let root = parse_form_set(&[
                 declarations.concat(),
-                password_on(9, 3, STORE, 0),
+                password_on(9, 3, STORE, 1),
                 operation(VALUE, true, &[]),
                 expression,
                 END.to_vec(),
@@ -5840,8 +5838,8 @@ mod store_expression_tests {
             let variables = MemoryVariables::new(reach, interface);
             variables.insert(variable_key("Store"), NV_BS_RT, &[7, 0, 0, 0, 0]);
             variables.insert(variable_key("Buffer"), NV_BS_RT, &[5, 0]);
-            let withholding = PasswordQuestions::of([&root])
-                .withholding(variables)
+            let mut reader = PasswordQuestions::of([&root])
+                .reader(Box::new(variables))
                 .expect("resolve the VarStore of the PASSWORD question");
             let form_set = Rc::clone(&root.borrow().children[0]);
             let scope = Rc::clone(&form_set.borrow().children[declarations.len() + 1]);
@@ -5849,7 +5847,7 @@ mod store_expression_tests {
             evaluate_value(
                 &scope,
                 &mut ExpressionInputs {
-                    reader: &mut EfivarReader::with_variables(Box::new(withholding)),
+                    reader: &mut reader,
                     values: &no_values(),
                 },
             )
@@ -5859,27 +5857,32 @@ mod store_expression_tests {
             VariableInterface::VariableServices,
         );
         let linux = (VariableReach::Runtime, VariableInterface::Efivarfs);
-        let of_store = || scoped_expression(&[get(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8)], 0);
-        let of_buffer = || scoped_expression(&[get(BUFFER, 0, EFI_IFR_TYPE_NUM_SIZE_8)], 0);
-        assert_eq!(
-            value_through(of_store(), shell),
-            Err(
-                "EFI_IFR_GET of VarStore 0x0002 (EFI_IFR_VARSTORE_EFI \"Store\"), which cannot be \
-                 read: VarStore holds a password"
-                    .to_string()
-            ),
-            "the password VarStore through BootServices"
-        );
-        assert_eq!(
-            value_through(of_buffer(), shell),
-            Ok(5),
-            "another VarStore through BootServices"
-        );
-        assert_eq!(
-            value_through(of_store(), linux),
-            Ok(7),
-            "the password VarStore through Runtime"
-        );
+        let of_store =
+            |offset| scoped_expression(&[get(STORE, offset, EFI_IFR_TYPE_NUM_SIZE_8)], 0);
+        for (name, through) in [("Runtime", linux), ("BootServices", shell)] {
+            assert_eq!(
+                value_through(of_store(1), through),
+                Err(
+                    "EFI_IFR_GET of VarStore 0x0002 (EFI_IFR_VARSTORE_EFI \"Store\"), which cannot \
+                     be read: its bytes hold a password"
+                        .to_string()
+                ),
+                "{name}: a byte of the password"
+            );
+            assert_eq!(
+                value_through(of_store(0), through),
+                Ok(7),
+                "{name}: a byte before the password"
+            );
+            assert_eq!(
+                value_through(
+                    scoped_expression(&[get(BUFFER, 0, EFI_IFR_TYPE_NUM_SIZE_8)], 0),
+                    through
+                ),
+                Ok(5),
+                "{name}: another VarStore"
+            );
+        }
     }
 
     /// edk2 fails the FormSet of a GET of an undeclared VarStore or of a type that names no

@@ -45,8 +45,6 @@ use super::set::own_write;
 use super::set::NewValue;
 use super::storage::VariableStoreKind;
 use super::*;
-#[cfg(efivar_dumps)]
-use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::strings::StringMap;
 #[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::variable_key;
@@ -57,6 +55,8 @@ pub(crate) use crate::hii::variables::tests::BS_RT;
 pub(crate) use crate::hii::variables::tests::NIL_GUID;
 pub(crate) use crate::hii::variables::tests::NV_BS;
 pub(crate) use crate::hii::variables::tests::NV_BS_RT;
+#[cfg(efivar_dumps)]
+use crate::hii::variables::EfivarFileName;
 #[cfg(efivar_dumps)]
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;

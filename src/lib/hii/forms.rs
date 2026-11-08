@@ -3313,7 +3313,7 @@ mod tests {
     use super::*;
     use crate::hii::efivarfs_format::open_efivar;
     use crate::hii::efivarfs_format::read_efivarfs_bytes;
-    use crate::hii::efivarfs_format::EfivarFileName;
+    use crate::hii::variables::EfivarFileName;
     use crate::hii::variables::FirmwareVariables;
     use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 

@@ -43,6 +43,7 @@ use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::VolatileWritingVariables;
+use crate::hii::variables::WithheldPassword;
 use crate::hii::variables::WithholdingVariables;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
@@ -69,6 +70,12 @@ pub(crate) enum ChangeValueError {
     Expression {
         question: String,
         refusal: ExpressionRefusal,
+    },
+    /// A question one of whose writes overlaps the bytes of a password
+    #[error("cannot set question {question:?}: {refusal}")]
+    PasswordBytes {
+        question: String,
+        refusal: WithheldPassword,
     },
     /// A question that `cause` makes read-only, which set writes only with the states that lift
     /// `cause`, and `undetermined`, the states that it may be in where the selection is
@@ -219,24 +226,27 @@ impl<'a> VarStoreWrite<'a> {
             })
     }
 
-    /// The first VarOffset that the patches change, and the bytes from there to the last that
-    /// they change: those of more than one patch with the bytes between them as `variables`
-    /// hold them now, after the writes before this one.
-    fn span(&self, variables: &dyn FirmwareVariables) -> Result<(u16, Vec<u8>)> {
-        let Some((first, rest)) = self.patches.split_first() else {
-            return Err(anyhow!("a variable write without bytes"));
-        };
-        if rest.is_empty() {
-            return Ok(first.clone());
-        }
-        let start = rest
-            .iter()
-            .fold(first.0, |start, (offset, _)| start.min(*offset));
+    /// The first VarOffset that the patches change and the end of the last bytes that they
+    /// change, which span writes; None without patches.
+    pub(super) fn changed(&self) -> Option<(u16, usize)> {
+        let start = self.patches.iter().map(|(offset, _)| *offset).min()?;
         let end = self
             .patches
             .iter()
             .map(|(offset, bytes)| usize::from(*offset) + bytes.len())
-            .fold(0, usize::max);
+            .max()?;
+        Some((start, end))
+    }
+
+    /// The first VarOffset that the patches change, and the bytes from there to the last that
+    /// they change: those of more than one patch with the bytes between them as `variables`
+    /// hold them now, after the writes before this one.
+    fn span(&self, variables: &dyn FirmwareVariables) -> Result<(u16, Vec<u8>)> {
+        let (start, end) = match (self.patches.as_slice(), self.changed()) {
+            ([only], _) => return Ok(only.clone()),
+            (_, Some(changed)) => changed,
+            (_, None) => return Err(anyhow!("a variable write without bytes")),
+        };
         let key = self.store.variable_key();
         let held = variables.read(&key, self.store.size())?;
         let mut span = held
@@ -509,6 +519,7 @@ mod set_questions_tests {
     use super::super::EFI_IFR_TYPE_NUM_SIZE_64;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_8;
     use super::*;
+    use crate::hii::variables::WithheldBytes;
 
     const WRITE_ERROR: WriteError = WriteError {
         cause: "write failed",
@@ -603,7 +614,7 @@ mod set_questions_tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
-            &WithholdingVariables::new(variables, BTreeSet::new()),
+            &WithholdingVariables::new(variables, WithheldBytes::default()),
         )
         .map(|written| {
             written

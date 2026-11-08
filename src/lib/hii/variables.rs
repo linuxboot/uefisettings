@@ -16,9 +16,9 @@
 //! (firmware_environment.rs).
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
+use std::path::Path;
 
 #[cfg(any(system_variables, test))]
 use anyhow::anyhow;
@@ -107,6 +107,29 @@ impl fmt::Display for VariableKey {
             self.name.replace('/', "!"),
             self.guid.to_string().to_ascii_lowercase()
         )
+    }
+}
+
+/// The name of the efivar file of a variable, as VariableKey displays it: always exactly one path
+/// component.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct EfivarFileName(String);
+
+impl From<&VariableKey> for EfivarFileName {
+    fn from(key: &VariableKey) -> Self {
+        Self(key.to_string())
+    }
+}
+
+impl AsRef<Path> for EfivarFileName {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl fmt::Display for EfivarFileName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -728,29 +751,55 @@ pub(crate) struct EfivarReader {
     pub(super) outcomes: BTreeMap<EfivarRange, Result<Vec<u8>>>,
     /// The payload bytes that the callers of read decode, by variable
     pub(super) decoded: BTreeMap<VariableKey, Vec<DecodedValue>>,
+    /// The bytes that `variables` withhold, which no value decodes
+    withheld: WithheldBytes,
 }
 
 impl EfivarReader {
-    /// Reads the variables of `source`, which EfivarSource::validate accepts.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            dead_code,
-            reason = "the exports withhold password VarStores from a source's variables; only \
-                      the Linux build's dump-efivars and the tests read a source as it is"
-        )
-    )]
+    /// Reads the variables of `source`, which EfivarSource::validate accepts, withholding none:
+    /// outside the tests, PasswordQuestions::reader reads a source.
+    #[cfg(test)]
     pub(crate) fn new(source: EfivarSource) -> Result<Self> {
         Ok(Self::with_variables(source.into_variables()?))
     }
 
-    /// Reads `variables`.
+    /// Reads `variables`, withholding none: outside the tests, PasswordQuestions::reader reads
+    /// variables.
+    #[cfg(test)]
     pub(crate) fn with_variables(variables: Box<dyn FirmwareVariables>) -> Self {
+        Self::withholding(variables, WithheldBytes::default())
+    }
+
+    /// Reads `variables` but their `withheld` bytes, which read as zero and which no value
+    /// decodes.
+    pub(crate) fn withholding(
+        variables: Box<dyn FirmwareVariables>,
+        withheld: WithheldBytes,
+    ) -> Self {
         Self {
-            variables,
+            variables: Box::new(WithholdingVariables::new(variables, withheld.clone())),
             outcomes: BTreeMap::new(),
             decoded: BTreeMap::new(),
+            withheld,
         }
+    }
+
+    /// The withheld bytes of `key` that the payload bytes `value` overlap, if any.
+    pub(super) fn withheld_overlap(
+        &self,
+        key: &VariableKey,
+        value: &Range<usize>,
+    ) -> Option<Range<usize>> {
+        self.withheld.overlap(key, value)
+    }
+
+    /// Refuses a write of the value bytes `bytes` of `key` that overlaps its withheld bytes.
+    pub(super) fn check_write(
+        &self,
+        key: &VariableKey,
+        bytes: &Range<usize>,
+    ) -> std::result::Result<(), WithheldPassword> {
+        self.withheld.check_write(key, bytes)
     }
 
     /// Which variables this reader reaches.
@@ -790,27 +839,95 @@ impl EfivarReader {
     }
 }
 
-/// `variables` without the `withheld` ones, the VarStores that PASSWORD questions name: each read
-/// or write of one fails with WithheldVariable, before `variables` see it.
+/// The bytes of variables in which PASSWORD questions keep their passwords (UEFI 2.11
+/// §33.3.8.3.54), by efivar file, counted from the start of its value: after its metadata, if any
+/// (value_of). Variable names that differ only in '/' and '!' name one efivar file, so they share
+/// withheld bytes; where they name two variables, as they do outside efivarfs, both are withheld,
+/// which fails safe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WithheldBytes(BTreeMap<EfivarFileName, Vec<Range<usize>>>);
+
+impl WithheldBytes {
+    /// Withholds the value bytes `bytes` of `key` too; an empty range withholds none.
+    pub(super) fn insert(&mut self, key: VariableKey, bytes: Range<usize>) {
+        if !bytes.is_empty() {
+            self.0
+                .entry(EfivarFileName::from(&key))
+                .or_default()
+                .push(bytes);
+        }
+    }
+
+    /// The first withheld bytes of `key` that `bytes` overlap, if any.
+    fn overlap(&self, key: &VariableKey, bytes: &Range<usize>) -> Option<Range<usize>> {
+        self.0
+            .get(&EfivarFileName::from(key))?
+            .iter()
+            .find(|withheld| withheld.start < bytes.end && bytes.start < withheld.end)
+            .cloned()
+    }
+
+    /// Refuses a write of the value bytes `bytes` of `key` that overlaps withheld bytes.
+    fn check_write(
+        &self,
+        key: &VariableKey,
+        bytes: &Range<usize>,
+    ) -> std::result::Result<(), WithheldPassword> {
+        match self.overlap(key, bytes) {
+            Some(withheld) => Err(WithheldPassword {
+                key: key.clone(),
+                bytes: withheld,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Zeroes the withheld bytes of `key` in `value`, the start of its value.
+    fn zero(&self, key: &VariableKey, value: &mut [u8]) {
+        let len = value.len();
+        for withheld in self.0.get(&EfivarFileName::from(key)).into_iter().flatten() {
+            if let Some(password) = value.get_mut(withheld.start.min(len)..withheld.end.min(len)) {
+                password.fill(0);
+            }
+        }
+    }
+}
+
+/// `variables` without their `withheld` bytes, those of PASSWORD questions: they read as zero,
+/// where the value of their variable holds them, and a write that overlaps them fails with
+/// WithheldPassword before `variables` see it, so that no password byte is shown or written back.
 pub(crate) struct WithholdingVariables<V> {
     variables: V,
-    withheld: BTreeSet<VariableKey>,
+    withheld: WithheldBytes,
 }
 
 impl<V> WithholdingVariables<V> {
-    pub(super) fn new(variables: V, withheld: BTreeSet<VariableKey>) -> Self {
+    pub(super) fn new(variables: V, withheld: WithheldBytes) -> Self {
         Self {
             variables,
             withheld,
         }
     }
 
-    /// Refuses the variable `key` if it is withheld.
-    fn check(&self, key: &VariableKey) -> std::result::Result<(), WithheldVariable> {
-        match self.withheld.contains(key) {
-            true => Err(WithheldVariable(key.clone())),
-            false => Ok(()),
+    /// Zeroes the withheld bytes of `key` in `bytes`, its attributes word and data as read and
+    /// read_whole give them, where its value holds them: after its metadata (value_of), whose
+    /// refusal this returns.
+    fn zero_withheld(
+        &self,
+        key: &VariableKey,
+        bytes: &mut [u8],
+    ) -> std::result::Result<(), EnhancedAuthenticatedVariable> {
+        if !self.withheld.0.contains_key(&EfivarFileName::from(key)) {
+            return Ok(());
         }
+        let Some((attributes, data)) = efivar_parts(bytes) else {
+            return Ok(());
+        };
+        let start = EFIVARFS_HEADER_SIZE + data.len() - value_of(key, attributes, data)?.len();
+        if let Some(value) = bytes.get_mut(start..) {
+            self.withheld.zero(key, value);
+        }
+        Ok(())
     }
 }
 
@@ -824,13 +941,22 @@ impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
-        self.check(key)?;
-        self.variables.read(key, size)
+        let mut bytes = self.variables.read(key, size)?;
+        // the first `size` data bytes may end inside metadata, which then hides where the value
+        // starts: they read as zero, as read_value_bytes takes only the attributes word from them
+        // and the value from read_whole
+        if self.zero_withheld(key, &mut bytes).is_err() {
+            if let Some(data) = bytes.get_mut(EFIVARFS_HEADER_SIZE..) {
+                data.fill(0);
+            }
+        }
+        Ok(bytes)
     }
 
     fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
-        self.check(key)?;
-        self.variables.read_whole(key)
+        let mut bytes = self.variables.read_whole(key)?;
+        self.zero_withheld(key, &mut bytes)?;
+        Ok(bytes)
     }
 
     fn write_at_with(
@@ -841,7 +967,12 @@ impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
         encoded: &[u8],
         volatile: VolatileWrites,
     ) -> Result<()> {
-        self.check(key)?;
+        // a data offset is a value offset: set writes no variable with metadata
+        // (check_unauthenticated)
+        self.withheld.check_write(
+            key,
+            &(usize::from(offset)..usize::from(offset) + encoded.len()),
+        )?;
         self.variables
             .write_at_with(key, size, offset, encoded, volatile)
     }
@@ -894,11 +1025,17 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
     }
 }
 
-/// The outcome of every read and write of a variable that WithholdingVariables withhold: a
-/// password VarStore.
+/// A write that WithholdingVariables refuse: it overlaps the bytes of a password.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("EFI variable {0} holds a password, which the UEFI Shell build never reads or writes")]
-pub(super) struct WithheldVariable(pub(super) VariableKey);
+#[error(
+    "EFI variable {key} holds a password at bytes {}..{}, which set never writes",
+    .bytes.start,
+    .bytes.end
+)]
+pub(super) struct WithheldPassword {
+    key: VariableKey,
+    bytes: Range<usize>,
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -908,6 +1045,7 @@ pub(crate) mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
 
     /// EFI variable Attributes: non-volatile, boot service and runtime access.
     pub(crate) const NV_BS_RT: u32 = 0x07;
@@ -1315,80 +1453,139 @@ pub(crate) mod tests {
         );
     }
 
-    /// WithholdingVariables refuse to read a withheld variable whole, and pass the others
-    /// through.
+    /// WithholdingVariables read each withheld range of a variable as zero and its other bytes as
+    /// they are; they refuse a write that overlaps a range before their variables see it, and
+    /// pass the other writes through, which keep the withheld bytes as they are.
     #[test]
-    fn withheld_variable_is_not_read_whole() {
-        let variables = MemoryVariables::default();
-        variables.insert(variable_key("Passed"), NV_BS_RT, &[1, 2]);
-        variables.insert(variable_key("Withheld"), NV_BS_RT, &[0xAA]);
-        let withholding =
-            WithholdingVariables::new(&variables, BTreeSet::from([variable_key("Withheld")]));
-
-        assert_eq!(
-            withholding
-                .read_whole(&variable_key("Withheld"))
-                .map_err(|error| error.downcast_ref::<WithheldVariable>().cloned()),
-            Err(Some(WithheldVariable(variable_key("Withheld")))),
-            "read Withheld whole"
-        );
-        assert_eq!(
-            withholding.read_whole(&variable_key("Passed")).ok(),
-            Some([&NV_BS_RT.to_ne_bytes()[..], &[1, 2]].concat()),
-            "read Passed whole"
-        );
-    }
-
-    /// WithholdingVariables refuse to read or write a withheld variable before their variables
-    /// see it, and pass the others through.
-    #[test]
-    fn withheld_variable_is_neither_read_nor_written() {
+    fn withheld_bytes_are_neither_read_nor_written() {
         let variables = MemoryVariables::new(
             VariableReach::BootServices,
             VariableInterface::VariableServices,
         );
         variables.insert(variable_key("Setup"), NV_BS_RT, &[1]);
-        variables.insert(variable_key("AMITSESetup"), NV_BS_RT, &[0xAA]);
-        let withholding =
-            WithholdingVariables::new(&variables, BTreeSet::from([variable_key("AMITSESetup")]));
-        let withheld = |error: anyhow::Error| error.downcast_ref::<WithheldVariable>().cloned();
+        // two passwords, at bytes 1..3 and 3..5, as AMI firmware keeps two, then a setting
+        variables.insert(
+            variable_key("AMITSESetup"),
+            NV_BS_RT,
+            &[0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 1],
+        );
+        let mut withheld = WithheldBytes::default();
+        withheld.insert(variable_key("AMITSESetup"), 1..3);
+        withheld.insert(variable_key("AMITSESetup"), 3..5);
+        let withholding = WithholdingVariables::new(&variables, withheld);
+        let attributes = NV_BS_RT.to_ne_bytes();
 
         assert_eq!(
-            withholding
-                .read(&variable_key("AMITSESetup"), 1)
-                .map_err(withheld),
-            Err(Some(WithheldVariable(variable_key("AMITSESetup")))),
+            withholding.read(&variable_key("AMITSESetup"), 6).ok(),
+            Some([&attributes[..], &[0xAA, 0, 0, 0, 0, 1]].concat()),
             "read AMITSESetup"
         );
         assert_eq!(
-            withholding
-                .write_at(&variable_key("AMITSESetup"), 1, 0, &[0])
-                .map_err(withheld),
-            Err(Some(WithheldVariable(variable_key("AMITSESetup")))),
-            "write AMITSESetup"
+            withholding.read(&variable_key("AMITSESetup"), 2).ok(),
+            Some([&attributes[..], &[0xAA, 0]].concat()),
+            "read 2 bytes of AMITSESetup, which end inside the first password"
         );
         assert_eq!(
-            withholding.read(&variable_key("Setup"), 1).ok(),
-            Some([&NV_BS_RT.to_ne_bytes()[..], &[1]].concat()),
-            "read Setup"
+            withholding.read_whole(&variable_key("AMITSESetup")).ok(),
+            Some([&attributes[..], &[0xAA, 0, 0, 0, 0, 1]].concat()),
+            "read AMITSESetup whole"
         );
+        for (offset, encoded, password) in [
+            (2, &[0][..], "1..3"),
+            (0, &[0, 0][..], "1..3"),
+            (4, &[0, 0][..], "3..5"),
+            (0, &[0; 6][..], "1..3"),
+        ] {
+            assert_eq!(
+                withholding
+                    .write_at(&variable_key("AMITSESetup"), 6, offset, encoded)
+                    .map_err(|error| error.to_string()),
+                Err(format!(
+                    "EFI variable AMITSESetup-00000000-0000-0000-0000-000000000000 holds a \
+                     password at bytes {password}, which set never writes"
+                )),
+                "write {encoded:?} at {offset}"
+            );
+        }
+        withholding
+            .write_at(&variable_key("AMITSESetup"), 6, 5, &[0])
+            .expect("write after the passwords");
+        withholding
+            .write_at(&variable_key("AMITSESetup"), 6, 0, &[0])
+            .expect("write before the passwords");
         withholding
             .write_at(&variable_key("Setup"), 1, 0, &[2])
             .expect("write Setup");
         assert_eq!(
-            variables.reads(),
-            [(variable_key("Setup"), 1)],
-            "reads: Setup only"
+            variables.writes_to(&variable_key("AMITSESetup")),
+            [(5, vec![0]), (0, vec![0])],
+            "writes to AMITSESetup"
         );
         assert_eq!(
-            variables.writes_to(&variable_key("AMITSESetup")),
-            [],
-            "writes to AMITSESetup"
+            variables.bytes(&variable_key("AMITSESetup")),
+            Some([&attributes[..], &[0, 0xAA, 0xAA, 0xAA, 0xAA, 0]].concat()),
+            "AMITSESetup keeps the passwords' bytes"
+        );
+        assert_eq!(
+            withholding.read(&variable_key("Setup"), 1).ok(),
+            Some([&attributes[..], &[2]].concat()),
+            "read Setup"
         );
         assert_eq!(
             variables.writes_to(&variable_key("Setup")),
             [(0, vec![2])],
             "writes to Setup"
+        );
+    }
+
+    /// WithholdingVariables zero the withheld bytes of a variable with
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS where its value holds them, after its metadata
+    /// (UEFI 2.11 §8.2.1), which they keep; read gives no data byte where those end inside the
+    /// metadata, and read_whole refuses metadata that hides where the value starts, as get does.
+    #[test]
+    fn withheld_bytes_after_metadata_read_as_zero() {
+        let enhanced = NV_BS_RT | EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS;
+        let metadata = timestamp_metadata();
+        let variables = MemoryVariables::default();
+        variables.insert(
+            variable_key("Enhanced"),
+            enhanced,
+            &[&metadata[..], &[0xAA, 0xAA, 0xAA, 1]].concat(),
+        );
+        variables.insert(variable_key("BadMetadata"), enhanced, &[2, 0xAA, 0xAA]);
+        let mut withheld = WithheldBytes::default();
+        withheld.insert(variable_key("Enhanced"), 1..3);
+        withheld.insert(variable_key("BadMetadata"), 1..3);
+        let withholding = WithholdingVariables::new(&variables, withheld);
+        let attributes = enhanced.to_ne_bytes();
+        let size = u16::try_from(metadata.len() + 4).expect("the size of Enhanced");
+
+        assert_eq!(
+            withholding.read_whole(&variable_key("Enhanced")).ok(),
+            Some([&attributes[..], &metadata, &[0xAA, 0, 0, 1]].concat()),
+            "read Enhanced whole"
+        );
+        assert_eq!(
+            withholding.read(&variable_key("Enhanced"), size).ok(),
+            Some([&attributes[..], &metadata, &[0xAA, 0, 0, 1]].concat()),
+            "read Enhanced, its metadata and its value"
+        );
+        assert_eq!(
+            withholding.read(&variable_key("Enhanced"), 4).ok(),
+            Some([&attributes[..], &[0; 4]].concat()),
+            "read 4 bytes of Enhanced, inside its metadata"
+        );
+        assert_eq!(
+            withholding
+                .read_whole(&variable_key("BadMetadata"))
+                .map_err(|error| error.to_string()),
+            Err(
+                "EFI variable BadMetadata-00000000-0000-0000-0000-000000000000 has enhanced \
+                 authenticated access (attributes 0x87), whose metadata uefisettings refuses: \
+                 EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1"
+                    .to_string()
+            ),
+            "read BadMetadata whole"
         );
     }
 
@@ -1847,12 +2044,12 @@ pub(crate) mod tests {
                     let got = match stack {
                         Stack::WithholdingOverDecorator => write(&WithholdingVariables::new(
                             VolatileWritingVariables::new(&variables, bound),
-                            BTreeSet::new(),
+                            WithheldBytes::default(),
                         )),
                         Stack::DecoratorOverWithholdingOverBox => {
                             let boxed: Box<dyn FirmwareVariables + '_> = Box::new(&variables);
                             write(&VolatileWritingVariables::new(
-                                &WithholdingVariables::new(boxed, BTreeSet::new()),
+                                &WithholdingVariables::new(boxed, WithheldBytes::default()),
                                 bound,
                             ))
                         }

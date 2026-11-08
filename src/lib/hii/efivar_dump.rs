@@ -185,9 +185,9 @@ mod tests {
     use super::*;
     use crate::hii::efivarfs_format::tests::FIRST_STEP;
     use crate::hii::efivarfs_format::tests::SETUP;
-    use crate::hii::efivarfs_format::EfivarFileName;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::variables::DecodedValue;
+    use crate::hii::variables::EfivarFileName;
 
     /// The HiiDB that write_dump saves; it does not parse it.
     pub(super) const HIIDB: &[u8] = b"a HiiDB";

@@ -87,6 +87,13 @@ Commands:
   show-ifr        Show a human readable representation of the Hii Forms
 ```
 
+Questions never read or write the bytes of a password question that uefisettings finds: a
+question whose bytes overlap a password's shows `<ValueUnavailable: its bytes hold a password>`,
+and `set` refuses it; the other questions of its VarStore read and write. Outside the UEFI Shell, a
+password question in IFR that uefisettings ignores, or whose VarStore it cannot find, withholds no
+bytes from `get`, `set` or the redacted `dump-efivars`, which warn of it. The UEFI Shell build reads
+and writes no variable of a HiiDB with such a password question or with IFR that it ignores.
+
 `variable`:
 
 ```plain
@@ -617,10 +624,9 @@ FS0:\> uefisettings.efi capsule results
 
 A failing command returns EFI_ABORTED, which `%lasterror%` shows as 0x15 (0x80000015 on i686).
 
-Questions never read a VarStore that a password question names: they show
-`<ValueUnavailable: VarStore holds a password>`, and `set` refuses them. The UEFI Shell runs no
-setup browser, so nothing there asks for or checks a setup password: in a HiiDB that declares a
-password question, `set` writes nothing unless `--bypass-setup-password` is given.
+The UEFI Shell runs no setup browser, so nothing there asks for or checks a setup password: in a
+HiiDB that declares a password question, `set` writes nothing unless `--bypass-setup-password` is
+given.
 
 `set` refuses a variable without EFI_VARIABLE_NON_VOLATILE unless `--allow-volatile` is given.
 The UEFI Shell runs before ExitBootServices, when SetVariable() still sets volatile variables

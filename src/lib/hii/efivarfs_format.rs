@@ -15,7 +15,6 @@
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -43,6 +42,7 @@ use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use thiserror::Error;
 
+use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
@@ -66,29 +66,6 @@ pub(super) const EFIVARFS_INTERFACE: VariableInterface = VariableInterface::Efiv
 /// EFI_VARIABLE_GUID_LEN).
 #[cfg(target_os = "linux")]
 const EFI_VARIABLE_GUID_LEN: usize = 36;
-
-/// The name of the efivar file of a variable, as VariableKey displays it: always exactly one path
-/// component.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) struct EfivarFileName(String);
-
-impl From<&VariableKey> for EfivarFileName {
-    fn from(key: &VariableKey) -> Self {
-        Self(key.to_string())
-    }
-}
-
-impl AsRef<Path> for EfivarFileName {
-    fn as_ref(&self) -> &Path {
-        Path::new(&self.0)
-    }
-}
-
-impl fmt::Display for EfivarFileName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 #[cfg(target_os = "linux")]
 impl VariableKey {

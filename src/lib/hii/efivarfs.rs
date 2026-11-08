@@ -62,7 +62,6 @@ use crate::hii::efivarfs_format::read_efivar;
 use crate::hii::efivarfs_format::read_efivar_file_of;
 use crate::hii::efivarfs_format::read_whole_efivar;
 use crate::hii::efivarfs_format::EfivarCopy;
-use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EfivarNotFound;
 use crate::hii::efivarfs_format::EFIVARFS_INTERFACE;
 use crate::hii::efivarfs_format::EFIVARFS_REACH;
@@ -98,6 +97,7 @@ use crate::hii::system_table::PointerSpace;
 #[cfg(firmware_memory_maps)]
 use crate::hii::system_table::SystemTableFiles;
 use crate::hii::variables::modify_variable_bytes;
+use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;

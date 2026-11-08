@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|enhanced-auth-forms|dropped-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -31,8 +31,11 @@
 //! `rt-data-readwrite-forms` is `rt-data`, after it creates the variable of
 //! [`readwrite_forms`] if it is missing and registers its package list in the HII database, so
 //! that both Linux and `uefisettings.efi` in the UEFI Shell find it.
-//! `password-forms` publishes nothing: it registers the package list of [`password_forms`]
-//! in the HII database, for `uefisettings.efi` in the UEFI Shell, which exports the database.
+//! `password-forms` publishes nothing: it creates the variable of [`plaintext_password_forms`]
+//! if it is missing and registers the package lists of [`password_forms`] and
+//! [`plaintext_password_forms`] in the HII database, for `uefisettings.efi` in the UEFI Shell,
+//! which exports the database. `rt-data-password-forms` is `rt-data`, after it does the same,
+//! so that Linux finds them too.
 //! `enhanced-auth-forms` does the same with the package list of [`enhanced_auth_forms`].
 //! `dropped-password-forms` does the same with the package list of [`dropped_password_forms`].
 //! `padded-strings` publishes nothing either: it registers the package list of
@@ -82,6 +85,7 @@ mod global_variable_forms;
 mod hii_package;
 mod padded_strings;
 mod password_forms;
+mod plaintext_password_forms;
 mod readwrite_forms;
 mod string_blocks;
 
@@ -208,11 +212,15 @@ fn efi_main() -> Status {
                 println!("publish-hiidb: {length} bytes at {address:#x}, type {memory_type:?}");
             })
         }
-        Some(Task::RegisterPasswordForms) => register_package_list(
-            &password_forms::package_list_bytes(),
-            "registering the password forms",
-        )
-        .map(|()| println!("publish-hiidb: registered the password forms")),
+        Some(Task::RegisterPasswordForms) => register_password_forms()
+            .map(|()| println!("publish-hiidb: registered the password forms")),
+        Some(Task::PublishPasswordForms) => register_password_forms()
+            .and_then(|()| publish(MemoryType::RUNTIME_SERVICES_DATA, Database::Exported))
+            .map(|(address, length)| {
+                println!(
+                    "publish-hiidb: password forms registered; {length} bytes at {address:#x}"
+                );
+            }),
         Some(Task::RegisterEnhancedAuthForms) => register_package_list(
             &enhanced_auth_forms::package_list_bytes(),
             "registering the enhanced authenticated forms",
@@ -258,8 +266,8 @@ fn efi_main() -> Status {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
-                 |rt-data-readwrite-forms|password-forms|enhanced-auth-forms\
-                 |dropped-password-forms|padded-strings\
+                 |rt-data-readwrite-forms|password-forms|rt-data-password-forms\
+                 |enhanced-auth-forms|dropped-password-forms|padded-strings\
                  |string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
@@ -283,8 +291,11 @@ fn efi_main() -> Status {
 enum Task {
     /// Publish the database in pages of the memory type.
     Publish(MemoryType, Database),
-    /// Register the package list of [`password_forms`] in the HII database.
+    /// Create the variable of [`plaintext_password_forms`] if missing and register the package
+    /// lists of [`password_forms`] and [`plaintext_password_forms`] in the HII database.
     RegisterPasswordForms,
+    /// Do what RegisterPasswordForms does, then publish the database in runtime-data pages.
+    PublishPasswordForms,
     /// Register the package list of [`enhanced_auth_forms`] in the HII database.
     RegisterEnhancedAuthForms,
     /// Register the package list of [`dropped_password_forms`] in the HII database.
@@ -339,6 +350,9 @@ fn load_option() -> Option<Task> {
             Some(Task::PublishReadWriteForms)
         }
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
+        Ok(option) if option == cstr16!("rt-data-password-forms") => {
+            Some(Task::PublishPasswordForms)
+        }
         Ok(option) if option == cstr16!("enhanced-auth-forms") => {
             Some(Task::RegisterEnhancedAuthForms)
         }
@@ -429,29 +443,65 @@ fn register_package_list(list: &[u8], step: &'static str) -> Result<(), Failure>
     status.to_result().map_err(|error| (step, error.status()))
 }
 
-/// Creates the variable of [`readwrite_forms`] unless it exists, as a driver creates its
-/// storage, registers the package list of [`readwrite_forms`], then publishes the database in
-/// runtime-data pages. Returns the address and length of the copy.
-fn publish_readwrite_forms() -> Result<(u64, u32), Failure> {
-    let vendor = VariableVendor(readwrite_forms::STORE_VENDOR);
-    match runtime::get_variable(readwrite_forms::STORE_NAME, &vendor, &mut []) {
-        Err(error) if error.status() == Status::NOT_FOUND => runtime::set_variable(
-            readwrite_forms::STORE_NAME,
-            &vendor,
-            readwrite_forms::STORE_ATTRIBUTES,
-            &readwrite_forms::STORE_DATA,
-        )
-        .map_err(|error| ("creating the ReadWriteData variable", error.status()))?,
-        // it exists, with data
-        Err(error) if error.status() == Status::BUFFER_TOO_SMALL => {}
-        Err(error) => return Err(("reading the ReadWriteData variable", error.status())),
-        Ok(_) => {
-            return Err((
-                "reading the ReadWriteData variable",
-                Status::BAD_BUFFER_SIZE,
-            ))
+/// Creates the variable `name` of `vendor` with `attributes` and `data` unless it exists, as a
+/// driver creates its storage. A failure names the step `reading` or `creating`.
+fn create_missing_variable(
+    name: &CStr16,
+    vendor: Guid,
+    attributes: VariableAttributes,
+    data: &[u8],
+    (reading, creating): (&'static str, &'static str),
+) -> Result<(), Failure> {
+    let vendor = VariableVendor(vendor);
+    match runtime::get_variable(name, &vendor, &mut []) {
+        Err(error) if error.status() == Status::NOT_FOUND => {
+            runtime::set_variable(name, &vendor, attributes, data)
+                .map_err(|error| (creating, error.status()))
         }
+        // it exists, with data
+        Err(error) if error.status() == Status::BUFFER_TOO_SMALL => Ok(()),
+        Err(error) => Err((reading, error.status())),
+        Ok(_) => Err((reading, Status::BAD_BUFFER_SIZE)),
     }
+}
+
+/// Creates the variable of [`plaintext_password_forms`] unless it exists, then registers the
+/// package lists of [`password_forms`] and [`plaintext_password_forms`].
+fn register_password_forms() -> Result<(), Failure> {
+    create_missing_variable(
+        plaintext_password_forms::STORE_NAME,
+        plaintext_password_forms::STORE_VENDOR,
+        plaintext_password_forms::STORE_ATTRIBUTES,
+        &plaintext_password_forms::STORE_DATA,
+        (
+            "reading the PlaintextPassword variable",
+            "creating the PlaintextPassword variable",
+        ),
+    )?;
+    register_package_list(
+        &password_forms::package_list_bytes(),
+        "registering the password forms",
+    )?;
+    register_package_list(
+        &plaintext_password_forms::package_list_bytes(),
+        "registering the plaintext password forms",
+    )
+}
+
+/// Creates the variable of [`readwrite_forms`] unless it exists, registers the package list of
+/// [`readwrite_forms`], then publishes the database in runtime-data pages. Returns the address
+/// and length of the copy.
+fn publish_readwrite_forms() -> Result<(u64, u32), Failure> {
+    create_missing_variable(
+        readwrite_forms::STORE_NAME,
+        readwrite_forms::STORE_VENDOR,
+        readwrite_forms::STORE_ATTRIBUTES,
+        &readwrite_forms::STORE_DATA,
+        (
+            "reading the ReadWriteData variable",
+            "creating the ReadWriteData variable",
+        ),
+    )?;
     register_package_list(
         &readwrite_forms::package_list_bytes(),
         "registering the read/write forms",

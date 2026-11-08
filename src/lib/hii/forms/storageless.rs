@@ -733,6 +733,7 @@ mod get_and_set_tests {
 
     use super::super::ifr_fixtures::*;
     use super::super::*;
+    use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
 
     /// Each storage-less CHECKBOX of storageless_form_set(): its prompt, then whether it has
@@ -910,7 +911,7 @@ mod get_and_set_tests {
                     &mut reader,
                     None,
                     VolatileWrites::Refuse,
-                    &WithholdingVariables::new(&variables, BTreeSet::new()),
+                    &WithholdingVariables::new(&variables, WithheldBytes::default()),
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string());

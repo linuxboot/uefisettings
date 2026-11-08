@@ -38,16 +38,16 @@ use crate::efi_variables::enhanced_authenticated::metadata_end;
 use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
 use crate::hii::efivarfs_format::open_efivar;
 use crate::hii::efivarfs_format::read_efivar_file_of;
-use crate::hii::efivarfs_format::EfivarFileName;
 use crate::hii::efivarfs_format::EfivarNotFound;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::IncludedStates;
+use crate::hii::forms::PasswordQuestions;
 #[cfg(target_os = "linux")]
 use crate::hii::package::read_db;
 use crate::hii::package::ParsedPackageList;
 use crate::hii::variables::efivar_parts;
 use crate::hii::variables::DecodedValue;
-use crate::hii::variables::EfivarReader;
+use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
@@ -79,11 +79,14 @@ pub(crate) fn dump_efivars(
 }
 
 /// The payload bytes that the questions of `package_lists`, in any state, decode, by efivar
-/// file, found without reading any.
+/// file, found without reading any; none that a PASSWORD question that uefisettings finds holds.
+/// One in IFR that read_db ignores, or whose VarStore is unknown, withholds no bytes: of_lists
+/// warns of each.
 fn decoded_bytes(
     package_lists: Vec<ParsedPackageList>,
 ) -> Result<BTreeMap<EfivarFileName, Vec<DecodedValue>>> {
-    let mut reader = EfivarReader::new(EfivarSource::Disabled)?;
+    let mut reader = PasswordQuestions::of_lists(&package_lists)
+        .reader(EfivarSource::Disabled.into_variables()?)?;
     for list in package_lists {
         list.check_form_strings()?;
         for root in list.forms {
@@ -282,10 +285,14 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::ifr_true;
     use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::parse_form_set;
+    use crate::hii::forms::ifr_fixtures::password_on;
+    use crate::hii::forms::ifr_fixtures::question_header_with;
+    use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::DISABLE_IF;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
+    use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::IFROperation;
@@ -296,6 +303,119 @@ mod tests {
     use crate::hii::package::read_db;
     use crate::hii::strings::Language;
     use crate::hii::variables::tests::NV_BS;
+    use crate::hii::variables::EfivarReader;
+
+    /// The redacted dump of a HiiDB with a UINT64 NUMERIC over bytes 0..8 of a PASSWORD's 40
+    /// bytes keeps no byte of the password, and the CHECKBOX beside it: decoded_bytes never
+    /// records a value over one.
+    #[test]
+    fn redacted_dump_keeps_no_password_byte() {
+        let numeric = [
+            question_header_with(4, 4, 2, 0, 0x00),
+            vec![0x23], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_HEX
+            0u64.to_le_bytes().to_vec(),
+            u64::MAX.to_le_bytes().to_vec(),
+            1u64.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(
+                    1,
+                    &[
+                        password_on(3, 3, 2, 0),
+                        operation(NUMERIC, false, &numeric),
+                        checkbox_at(5, 5, 2, 80),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "N0", "O"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let mut password: Vec<u8> = "hunter2secret"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        password.resize(40, 0);
+        let file = [&NV_BS_RT.to_ne_bytes()[..], &password, &[0xAA; 40], &[1]].concat();
+
+        let decoded = decoded_bytes(read_db(&hiidb).expect("read the HiiDB")).expect("decode");
+        let values: Vec<DecodedValue> = decoded
+            .iter()
+            .filter(|(name, _)| name.to_string().starts_with("AMITSESetup-"))
+            .flat_map(|(_, values)| values.iter().cloned())
+            .collect();
+        let kept = keep_decoded(&file, &values);
+
+        assert_eq!(
+            kept.get(EFIVARFS_HEADER_SIZE..EFIVARFS_HEADER_SIZE + 40),
+            Some(&[0; 40][..]),
+            "the password's bytes in the dump"
+        );
+        assert_eq!(
+            kept.get(EFIVARFS_HEADER_SIZE + 80),
+            Some(&1),
+            "the CHECKBOX's byte in the dump"
+        );
+    }
+
+    /// The redacted dump keeps no byte of a PASSWORD on "A/B" that the NUMERIC N0 on "A!B", the
+    /// same efivar file, would decode, and keeps the CHECKBOX O on "A!B" beside it.
+    #[test]
+    fn redacted_dump_keeps_no_password_byte_under_an_aliased_name() {
+        let numeric = [
+            question_header_with(4, 4, 3, 0, 0x00),
+            vec![0x23], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_HEX
+            0u64.to_le_bytes().to_vec(),
+            u64::MAX.to_le_bytes().to_vec(),
+            1u64.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[
+                var_store(2, [0x44; 16], "A/B", 81),
+                var_store(3, [0x44; 16], "A!B", 81),
+                form(
+                    1,
+                    &[
+                        password_on(3, 3, 2, 0),
+                        operation(NUMERIC, false, &numeric),
+                        checkbox_at(5, 5, 3, 80),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "N0", "O"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let mut password: Vec<u8> = "hunter2secret"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        password.resize(40, 0);
+        let file = [&NV_BS_RT.to_ne_bytes()[..], &password, &[0xAA; 40], &[1]].concat();
+
+        let decoded = decoded_bytes(read_db(&hiidb).expect("read the HiiDB")).expect("decode");
+        let values: Vec<DecodedValue> = decoded
+            .iter()
+            .filter(|(name, _)| name.to_string().starts_with("A!B-"))
+            .flat_map(|(_, values)| values.iter().cloned())
+            .collect();
+        let kept = keep_decoded(&file, &values);
+
+        assert_eq!(
+            kept.get(EFIVARFS_HEADER_SIZE..EFIVARFS_HEADER_SIZE + 40),
+            Some(&[0; 40][..]),
+            "the password's bytes in the dump"
+        );
+        assert_eq!(
+            kept.get(EFIVARFS_HEADER_SIZE + 80),
+            Some(&1),
+            "the CHECKBOX's byte in the dump"
+        );
+    }
 
     /// The directory of the fixtures of tests/offline_golden.rs.
     const OFFLINE_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/offline");

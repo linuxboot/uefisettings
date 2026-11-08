@@ -185,7 +185,15 @@ bounds the reads of firmware memory: both methods refuse, naming the missing FDT
 database, which `uefisettings.efi` exports in the UEFI Shell: PASSWORD questions in the
 layout of AMI firmware's `AMITSESetup`, which
 [`vars/amitse-setup.json`](vars/amitse-setup.json) creates, and a question on a volatile
-variable.
+variable. It also creates the variable `PlaintextPassword` unless it exists and registers the
+forms of
+[`publish-hiidb/src/plaintext_password_forms.rs`](publish-hiidb/src/plaintext_password_forms.rs):
+a PASSWORD question whose password `PlaintextPassword` keeps as plaintext, a NUMERIC over its
+bytes and one beside it. `publish-hiidb.efi rt-data-password-forms` does the same, then
+publishes the database as `rt-data` does. The scenarios `shell-password` and `hii-password`
+check, in the UEFI Shell and from Linux, that a question whose bytes overlap a password's
+shows no byte of it and that `set` refuses it, while the questions beside the passwords read
+and write.
 
 `publish-hiidb.efi enhanced-auth-forms` registers the forms of
 [`publish-hiidb/src/enhanced_auth_forms.rs`](publish-hiidb/src/enhanced_auth_forms.rs) the

@@ -651,10 +651,10 @@ impl HiiBackend {
     }
 
     /// set in the HiiDB `db_bytes` with `options`, selecting by the values of `reads`, which it
-    /// reads before the first write, and writing through `writes`, neither of them withheld
-    /// variables (PasswordQuestions::withholding): fails with SelectionError::NotFound when no
-    /// question has the text, and unless every selected match is written, also after writing the
-    /// others.
+    /// reads before the first write, and writing through `writes`, neither of them the bytes of
+    /// password questions (PasswordQuestions::reader and withholding): fails with
+    /// SelectionError::NotFound when no question has the text, and unless every selected match
+    /// is written, also after writing the others.
     #[cfg_attr(
         not(system_variables),
         allow(
@@ -678,7 +678,7 @@ impl HiiBackend {
 
         let parsed_db = package::read_db(db_bytes)?;
         let passwords = PasswordQuestions::of_lists(&parsed_db);
-        let mut reader = EfivarReader::with_variables(Box::new(passwords.withholding(reads)?));
+        let mut reader = passwords.reader(reads)?;
         let writes = passwords.withholding(writes)?;
         passwords.check_set(writes.reach(), options.setup_password)?;
 
@@ -874,15 +874,15 @@ impl HiiBackend {
     }
 }
 
-/// The package lists of the HiiDB `db_bytes`, and a reader of `variables` without the variables
-/// that its password questions name, as their reach withholds (PasswordQuestions::withholding).
+/// The package lists of the HiiDB `db_bytes`, and a reader of `variables` without the bytes of
+/// its password questions (PasswordQuestions::reader).
 fn read_db_withholding(
     db_bytes: &[u8],
     variables: Box<dyn FirmwareVariables>,
 ) -> Result<(Vec<package::ParsedPackageList>, EfivarReader)> {
     let parsed_db = package::read_db(db_bytes)?;
     let passwords = PasswordQuestions::of_lists(&parsed_db);
-    let reader = EfivarReader::with_variables(Box::new(passwords.withholding(variables)?));
+    let reader = passwords.reader(variables)?;
     Ok((parsed_db, reader))
 }
 
@@ -975,6 +975,7 @@ mod tests {
 
     use fbthrift::simplejson_protocol;
 
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::forms::ifr_fixtures::checkbox_at;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
     use crate::hii::forms::ifr_fixtures::conditional;
@@ -1030,6 +1031,7 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::strings_package_of;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::Guid;
+    use crate::hii::VariableAttributes;
 
     use super::*;
 
@@ -2485,29 +2487,17 @@ mod tests {
         }
     }
 
-    /// Through variables that reach BootServices, get, list-questions and show-ifr read no data
-    /// of a VarStore that a password question names, whose questions show why; through those
-    /// that reach Runtime they read it, as before.
+    /// Through variables of either reach, get, list-questions and show-ifr read the questions
+    /// beside a password in its VarStore: P at byte 80 of AMITSESetup.
     #[test]
-    fn password_var_stores_are_read_only_through_runtime_variables() {
-        let cases = [
-            (
-                VariableReach::Runtime,
-                VariableInterface::Efivarfs,
-                "1",
-                "1",
-                vec![81],
-            ),
+    fn questions_beside_passwords_are_read_through_either_reach() {
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
             (
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
-                "<ValueUnavailable: VarStore holds a password> <IFR default: 0>",
-                "<ValueUnavailable: VarStore holds a password>",
-                vec![],
             ),
-        ];
-
-        for (reach, interface, want, want_shown, want_reads) in cases {
+        ] {
             let variables = password_variables(reach, interface);
             let got = HiiBackend::get_in(
                 &password_hiidb(),
@@ -2532,36 +2522,31 @@ mod tests {
                 .iter()
                 .map(|response| response.question.answer.as_str())
                 .collect();
-            assert_eq!(answers, [want], "{reach:?}: get");
+            assert_eq!(answers, ["1"], "{reach:?}: get");
             let answers: Vec<&str> = listed
                 .iter()
                 .filter(|question| question.name == "P")
                 .map(|question| question.answer.as_str())
                 .collect();
-            assert_eq!(answers, [want], "{reach:?}: list-questions");
-            assert!(
-                ifr.contains(&format!("-Answer: {want_shown}\n")),
-                "{reach:?}: show-ifr {ifr:?}"
-            );
+            assert_eq!(answers, ["1"], "{reach:?}: list-questions");
+            assert!(ifr.contains("-Answer: 1\n"), "{reach:?}: show-ifr {ifr:?}");
             assert_eq!(
                 variables.reads_of(&amitse_setup()),
-                want_reads.repeat(3),
+                [81].repeat(3),
                 "{reach:?}: reads of AMITSESetup"
             );
         }
     }
 
     /// set through variables that reach BootServices, in a HiiDB that declares a password
-    /// question, refuses unless the caller bypasses, and never reads or writes a VarStore that a
-    /// password question names; set through those that reach Runtime writes either, as before;
-    /// whatever their interface and whether volatile writes are allowed.
+    /// question, refuses unless the caller bypasses; set through those that reach Runtime writes,
+    /// as before; whatever their interface and whether volatile writes are allowed. Either writes
+    /// P, beside the password.
     #[test]
     fn set_follows_the_setup_password_policy() {
         let refusal = "this HiiDB declares a setup password question; the UEFI Shell runs no \
                        setup browser, so no password is asked or checked; pass \
                        --bypass-setup-password to write anyway";
-        let withheld = "EFI variable AMITSESetup-44444444-4444-4444-4444-444444444444 holds a \
-                        password, which the UEFI Shell build never reads or writes";
         let cases = [
             (
                 VariableReach::Runtime,
@@ -2613,9 +2598,9 @@ mod tests {
                 VariableInterface::VariableServices,
                 "P",
                 SetupPasswordPolicy::Bypass,
-                Err(withheld),
+                Ok(()),
                 vec![],
-                vec![],
+                vec![(80, vec![0])],
             ),
             (
                 VariableReach::BootServices,
@@ -2631,9 +2616,9 @@ mod tests {
                 VariableInterface::Efivarfs,
                 "P",
                 SetupPasswordPolicy::Bypass,
-                Err(withheld),
+                Ok(()),
                 vec![],
-                vec![],
+                vec![(80, vec![0])],
             ),
             (
                 VariableReach::Runtime,
@@ -2687,13 +2672,539 @@ mod tests {
                 want_amitse_setup,
                 "{case}: AMITSESetup"
             );
-            if reach == VariableReach::BootServices {
+        }
+    }
+
+    /// password_hiidb with the CHECKBOX O at byte 10 of AMITSESetup too, inside the PASSWORD's 40
+    /// bytes.
+    fn overlapping_password_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(
+                    1,
+                    &[
+                        checkbox_on(1, 1, 1),
+                        password_on(3, 3, 2, 0),
+                        checkbox_at(2, 2, 2, 80),
+                        checkbox_at(4, 4, 2, 10),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "O"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// The answers of `question` that get gives in the HiiDB `hiidb` through `variables`.
+    fn answers_of(hiidb: &[u8], question: &str, variables: &Rc<MemoryVariables>) -> Vec<String> {
+        HiiBackend::get_in(
+            hiidb,
+            question,
+            None,
+            &GetOptions::default(),
+            shared(variables),
+        )
+        .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
+        .responses
+        .into_iter()
+        .map(|response| response.question.answer)
+        .collect()
+    }
+
+    /// set of `question` to `value` in the HiiDB `hiidb` through `variables` with
+    /// --bypass-setup-password, as the CLI prints an error.
+    fn set_bypassing(
+        hiidb: &[u8],
+        question: &str,
+        value: &str,
+        variables: &Rc<MemoryVariables>,
+    ) -> Result<(), String> {
+        let options = SetOptions {
+            setup_password: SetupPasswordPolicy::Bypass,
+            ..SetOptions::default()
+        };
+        HiiBackend::set_in(
+            hiidb,
+            question,
+            value,
+            None,
+            &options,
+            shared(variables),
+            &**variables,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    /// The answer of a value whose bytes overlap a password's.
+    const PASSWORD_BYTES: &str = "<ValueUnavailable: its bytes hold a password>";
+
+    /// Whatever their reach, get and list-questions read a question of a VarStore that a password
+    /// question names, P at byte 80, and set writes it, keeping the password's bytes; a question
+    /// whose bytes overlap the password's, O at byte 10, is neither read nor written.
+    #[test]
+    fn only_the_bytes_of_password_questions_are_withheld() {
+        let hiidb = overlapping_password_hiidb();
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = password_variables(reach, interface);
+            let listed: BTreeMap<String, String> = HiiBackend::list_questions_in(
+                &hiidb,
+                &ListQuestionsOptions::default(),
+                shared(&variables),
+            )
+            .expect("list questions")
+            .into_iter()
+            .map(|question| (question.name, question.answer))
+            .collect();
+
+            assert_eq!(
+                answers_of(&hiidb, "P", &variables),
+                ["1"],
+                "{reach:?}: get P"
+            );
+            assert_eq!(
+                answers_of(&hiidb, "O", &variables),
+                [format!("{PASSWORD_BYTES} <IFR default: 0>")],
+                "{reach:?}: get O"
+            );
+            assert_eq!(
+                listed.get("P").map(String::as_str),
+                Some("1"),
+                "{reach:?}: list-questions P"
+            );
+            assert_eq!(
+                listed.get("O"),
+                Some(&format!("{PASSWORD_BYTES} <IFR default: 0>")),
+                "{reach:?}: list-questions O"
+            );
+
+            assert_eq!(
+                set_bypassing(&hiidb, "P", "0", &variables),
+                Ok(()),
+                "{reach:?}: set P"
+            );
+            let set = set_bypassing(&hiidb, "O", "0", &variables);
+            assert!(
+                set.as_ref().is_err_and(|error| error
+                    .contains("holds a password at bytes 0..40, which set never writes")),
+                "{reach:?}: set O: {set:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&amitse_setup()),
+                [(80, vec![0])],
+                "{reach:?}: writes to AMITSESetup"
+            );
+            assert_eq!(
+                variables.bytes(&amitse_setup()),
+                Some([&NV_BS_RT.to_ne_bytes()[..], &[0xAA; 80], &[0]].concat()),
+                "{reach:?}: AMITSESetup keeps its password bytes"
+            );
+        }
+    }
+
+    /// The UCS-2 password "hunter2secret", NUL-padded to the 40 bytes of a PASSWORD of MaxSize 20.
+    fn plaintext_password() -> Vec<u8> {
+        let mut bytes: Vec<u8> = "hunter2secret"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        bytes.resize(40, 0);
+        bytes
+    }
+
+    /// password_hiidb with the UINT64 NUMERICs N0, N8 and N16, shown in hex, at bytes 0, 8 and 16
+    /// of AMITSESetup, inside the PASSWORD's 40 bytes.
+    fn numerics_over_password_hiidb() -> Vec<u8> {
+        let numeric = |id: u16, offset: u16| {
+            let data = [
+                question_header_with(id, id, 2, offset, 0x00),
+                vec![0x23], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_HEX
+                0u64.to_le_bytes().to_vec(),
+                u64::MAX.to_le_bytes().to_vec(),
+                1u64.to_le_bytes().to_vec(),
+            ]
+            .concat();
+            operation(NUMERIC, false, &data)
+        };
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(
+                    1,
+                    &[
+                        checkbox_on(1, 1, 1),
+                        password_on(3, 3, 2, 0),
+                        checkbox_at(2, 2, 2, 80),
+                        numeric(4, 0),
+                        numeric(5, 8),
+                        numeric(6, 16),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "N0", "N8", "N16"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// Through variables of either reach, get, list-questions and show-ifr show no byte of a
+    /// password through the NUMERICs over it, each of which answers that its bytes hold one.
+    #[test]
+    fn numerics_over_a_password_show_no_byte_of_it() {
+        let password = plaintext_password();
+        let groups: Vec<(usize, u64)> = [0, 8, 16]
+            .into_iter()
+            .map(|offset| {
+                let mut group = [0; 8];
+                group.copy_from_slice(&password[offset..offset + 8]);
+                (offset, u64::from_le_bytes(group))
+            })
+            .collect();
+        let hiidb = numerics_over_password_hiidb();
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(setup(), NV_BS_RT, &[0]);
+            variables.insert(
+                amitse_setup(),
+                NV_BS_RT,
+                &[password.as_slice(), &[0xAA; 40], &[1]].concat(),
+            );
+            let variables = Rc::new(variables);
+            let answers: Vec<String> = ["N0", "N8", "N16"]
+                .into_iter()
+                .flat_map(|name| answers_of(&hiidb, name, &variables))
+                .collect();
+            let listed: Vec<String> = HiiBackend::list_questions_in(
+                &hiidb,
+                &ListQuestionsOptions::default(),
+                shared(&variables),
+            )
+            .expect("list questions")
+            .into_iter()
+            .filter(|question| question.name.starts_with('N'))
+            .map(|question| question.answer)
+            .collect();
+            let ifr = HiiBackend::show_ifr_in(&hiidb, shared(&variables))
+                .expect("show the IFR")
+                .readable_representation;
+
+            let shown = format!("{answers:?} {listed:?} {ifr}").to_lowercase();
+            let leaked: Vec<String> = groups
+                .iter()
+                .filter(|(_, value)| {
+                    shown.contains(&format!("{value:x}")) || shown.contains(&value.to_string())
+                })
+                .map(|(offset, value)| {
+                    let units: Vec<u16> = value
+                        .to_le_bytes()
+                        .chunks(2)
+                        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                        .collect();
+                    format!(
+                        "bytes {offset}..{}: {:?}",
+                        offset + 8,
+                        String::from_utf16_lossy(&units)
+                    )
+                })
+                .collect();
+            assert_eq!(
+                leaked,
+                Vec::<String>::new(),
+                "{reach:?}: answers that show password bytes"
+            );
+            assert_eq!(answers, [PASSWORD_BYTES; 3], "{reach:?}: get");
+            assert_eq!(listed, [PASSWORD_BYTES; 3], "{reach:?}: list-questions");
+            assert_eq!(
+                ifr.matches(&format!("-Answer: {PASSWORD_BYTES}\n")).count(),
+                3,
+                "{reach:?}: show-ifr {ifr:?}"
+            );
+        }
+    }
+
+    /// A HiiDB whose AMITSESetup has a PASSWORD at bytes 40..80, the UINT16 NUMERIC S at bytes
+    /// 39..41, across its start, and the UINT16 NUMERIC E at bytes 79..81, across its end.
+    fn straddling_password_hiidb() -> Vec<u8> {
+        let uint16 = |id: u16, offset: u16| {
+            let data = [
+                question_header_with(id, id, 1, offset, 0x00),
+                vec![0x11], // EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC
+                0u16.to_le_bytes().to_vec(),
+                u16::MAX.to_le_bytes().to_vec(),
+                1u16.to_le_bytes().to_vec(),
+            ]
+            .concat();
+            operation(NUMERIC, false, &data)
+        };
+        let packages = [
+            form_package(&[
+                var_store(1, [0x44; 16], "AMITSESetup", 81),
+                form(1, &[password_on(3, 3, 1, 40), uint16(1, 39), uint16(2, 79)]),
+            ]),
+            en_strings_package_of(&["S", "E", "Password"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// Through variables of either reach, a value across the start or the end of a password's
+    /// bytes is neither read nor written: get answers that its bytes hold a password, and set
+    /// refuses it with nothing written.
+    #[test]
+    fn values_across_the_edges_of_a_password_are_neither_read_nor_written() {
+        let hiidb = straddling_password_hiidb();
+        let stored = [&[0x11; 40][..], &plaintext_password(), &[1]].concat();
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(amitse_setup(), NV_BS_RT, &stored);
+            let variables = Rc::new(variables);
+
+            for question in ["S", "E"] {
                 assert_eq!(
-                    variables.reads_of(&amitse_setup()),
-                    Vec::<u16>::new(),
-                    "{case}: reads of AMITSESetup"
+                    answers_of(&hiidb, question, &variables),
+                    [PASSWORD_BYTES],
+                    "{reach:?}: get {question}"
+                );
+                let set = set_bypassing(&hiidb, question, "1", &variables);
+                assert!(
+                    set.as_ref().is_err_and(|error| error
+                        .contains("holds a password at bytes 40..80, which set never writes")),
+                    "{reach:?}: set {question}: {set:?}"
                 );
             }
+            assert_eq!(
+                variables.writes_to(&amitse_setup()),
+                [],
+                "{reach:?}: writes to AMITSESetup"
+            );
+            assert_eq!(
+                variables.bytes(&amitse_setup()),
+                Some([&NV_BS_RT.to_ne_bytes()[..], &stored].concat()),
+                "{reach:?}: AMITSESetup"
+            );
+        }
+    }
+
+    /// set of the NUMERIC W, at byte 0 of the EFI variable Setup, whose WRITE expression sets Setup
+    /// and then byte 10 of AMITSESetup, inside the PASSWORD's 40 bytes, refuses before any write
+    /// through variables of each interface: neither Setup nor AMITSESetup is written.
+    #[test]
+    fn a_plan_over_two_variables_writes_nothing() {
+        const AND: u8 = 0x15;
+        const SET: u8 = 0x2C;
+        const THIS: u8 = 0x58;
+        const WRITE: u8 = 0x2E;
+        // a SET of a UINT8 (EFI_IFR_TYPE_NUM_SIZE_8)
+        let set = |var_store_id: u16, offset: u16| {
+            let data = [
+                &var_store_id.to_le_bytes()[..],
+                &offset.to_le_bytes(),
+                &[0x00],
+            ]
+            .concat();
+            operation(SET, false, &data)
+        };
+        let numeric = [
+            operation(
+                NUMERIC,
+                true,
+                &[
+                    question_header_with(4, 4, 1, 0, 0x00),
+                    // EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC, from 0 to 255, step 1
+                    vec![0x10, 0, 255, 1],
+                ]
+                .concat(),
+            ),
+            operation(WRITE, false, &[]),
+            operation(THIS, true, &[]),
+            set(1, 0),
+            operation(THIS, false, &[]),
+            set(2, 10),
+            operation(AND, false, &[]),
+            END.to_vec(),
+            END.to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(1, &[password_on(3, 3, 2, 0), numeric]),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "W"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+            ),
+        ] {
+            let variables = password_variables(reach, interface);
+
+            let set = set_bypassing(&hiidb, "W", "5", &variables);
+
+            assert_eq!(
+                set,
+                Err("cannot set question \"W\": EFI variable \
+                     AMITSESetup-44444444-4444-4444-4444-444444444444 holds a password at bytes \
+                     0..40, which set never writes"
+                    .to_string()),
+                "{interface:?}: set W"
+            );
+            assert_eq!(
+                variables.writes_to(&setup()),
+                [],
+                "{interface:?}: writes to Setup"
+            );
+            assert_eq!(
+                variables.writes_to(&amitse_setup()),
+                [],
+                "{interface:?}: writes to AMITSESetup"
+            );
+        }
+    }
+
+    /// The VarStores "A/B" and "A!B" of one GUID are one efivar file: efivarfs names a variable's
+    /// file with '!' for each '/' (Linux v7.2 fs/efivarfs/vars.c efivar_get_utf8name()). get and
+    /// list-questions show no byte of a PASSWORD on "A/B" through the NUMERIC N0 on "A!B" over
+    /// it, and show the CHECKBOX O on "A!B" beside it.
+    #[cfg(efivar_dumps)]
+    #[test]
+    fn a_password_under_an_aliased_var_store_name_is_withheld() {
+        let numeric = [
+            question_header_with(4, 4, 2, 0, 0x00),
+            vec![0x23], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_HEX
+            0u64.to_le_bytes().to_vec(),
+            u64::MAX.to_le_bytes().to_vec(),
+            1u64.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[
+                var_store(1, [0x44; 16], "A/B", 81),
+                var_store(2, [0x44; 16], "A!B", 81),
+                form(
+                    1,
+                    &[
+                        password_on(3, 3, 1, 0),
+                        operation(NUMERIC, false, &numeric),
+                        checkbox_at(5, 5, 2, 80),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "N0", "O"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let dir = tempfile::tempdir().expect("create efivars directory");
+        let key = VariableKey {
+            name: "A/B".to_string(),
+            guid: amitse_setup().guid,
+        };
+        std::fs::write(
+            dir.path().join(key.to_string()),
+            [
+                &NV_BS_RT.to_ne_bytes()[..],
+                &plaintext_password(),
+                &[0xAA; 40],
+                &[1],
+            ]
+            .concat(),
+        )
+        .expect("write the efivar file");
+        let variables = || {
+            EfivarSource::Directory(dir.path().to_path_buf())
+                .into_variables()
+                .expect("variables of the directory")
+        };
+
+        for (question, want) in [("N0", PASSWORD_BYTES), ("O", "1")] {
+            let got: Vec<String> =
+                HiiBackend::get_in(&hiidb, question, None, &GetOptions::default(), variables())
+                    .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
+                    .responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect();
+            let listed: Vec<String> = HiiBackend::list_questions_in(
+                &hiidb,
+                &ListQuestionsOptions::default(),
+                variables(),
+            )
+            .expect("list questions")
+            .into_iter()
+            .filter(|listed| listed.name == question)
+            .map(|listed| listed.answer)
+            .collect();
+
+            assert_eq!(got, [want], "get {question}");
+            assert_eq!(listed, [want], "list-questions {question}");
+        }
+    }
+
+    /// Through variables of either reach, a password in a variable with
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS is withheld where its value starts, after the
+    /// metadata (UEFI 2.11 §8.2.1): O, over the password, answers that its bytes hold one, and P,
+    /// beside it, shows its value.
+    #[test]
+    fn a_password_behind_metadata_is_withheld_where_the_value_starts() {
+        let hiidb = overlapping_password_hiidb();
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(setup(), NV_BS_RT, &[0]);
+            variables.insert(
+                amitse_setup(),
+                NV_BS_RT | VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS.bits(),
+                &[&timestamp_metadata()[..], &[0xAA; 80], &[1]].concat(),
+            );
+            let variables = Rc::new(variables);
+
+            assert_eq!(
+                answers_of(&hiidb, "P", &variables),
+                ["1"],
+                "{reach:?}: get P"
+            );
+            assert_eq!(
+                answers_of(&hiidb, "O", &variables),
+                [format!("{PASSWORD_BYTES} <IFR default: 0>")],
+                "{reach:?}: get O"
+            );
         }
     }
 
@@ -3147,7 +3658,7 @@ mod tests {
     /// uefisettings ignores, a FormSet that does not parse or nests too deep, the ops after one
     /// where its walk for FormSets ends or a FormSet without its Scope bit, whose second form edk2
     /// parses into it, has get and set read and write no variable: a PASSWORD question in it
-    /// could name any variable. A HiiDB without that IFR withholds the PASSWORD's variable as
+    /// could name any variable. A HiiDB without that IFR withholds the PASSWORD's bytes as
     /// before, and through variables that reach Runtime each reads as before.
     #[test]
     fn ignored_ifr_closes_every_variable_to_boot_services() {
@@ -3292,9 +3803,7 @@ mod tests {
                 &variables
             )
             .map_err(|error| error.to_string()),
-            Ok(vec![
-                "<ValueUnavailable: VarStore holds a password> <IFR default: 0>".to_string()
-            ]),
+            Ok(vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]),
             "no drop: BootServices: get"
         );
         assert_eq!(variables.reads(), [], "no drop: BootServices: reads");

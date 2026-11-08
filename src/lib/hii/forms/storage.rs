@@ -39,7 +39,6 @@ use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
-use crate::hii::variables::WithheldVariable;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use crate::hii::variables::EFI_VARIABLE_RUNTIME_ACCESS;
 
@@ -178,8 +177,8 @@ mod non_efi_varstore_tests {
     use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata;
     use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata_of;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
-    use crate::hii::efivarfs_format::EfivarFileName;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
+    use crate::hii::variables::EfivarFileName;
     use crate::hii::variables::FirmwareVariables;
     use crate::hii::variables::UnreadVariables;
     use crate::hii::variables::VolatileVariable;
@@ -1124,6 +1123,12 @@ pub(super) fn read_current_value_bytes<'a>(
             )
         }
     };
+    if reader
+        .withheld_overlap(&store.variable_key(), &value)
+        .is_some()
+    {
+        return Err(ValueUnavailable::PasswordBytes);
+    }
     let interface = reader.interface();
 
     // A variable that the read finds is read whatever runtime access its VARSTORE_EFI declares:
@@ -1173,9 +1178,9 @@ pub(super) enum ValueUnavailable {
     DeclaredBootServiceOnly(DeclaredBootServiceOnly),
     #[error("{0}")]
     EnhancedAuthenticated(EnhancedAuthenticatedVariable),
-    /// The read of a VarStore that a PASSWORD question names, which the reader withholds
-    #[error("VarStore holds a password")]
-    PasswordVarStore,
+    /// Payload bytes that overlap those of a PASSWORD question, which the reader withholds
+    #[error("its bytes hold a password")]
+    PasswordBytes,
     #[error("{0}")]
     NotRead(EfivarsNotRead),
     #[error("{0}")]
@@ -1213,9 +1218,6 @@ impl ValueUnavailable {
         if let Some(&not_read) = error.downcast_ref::<EfivarsNotRead>() {
             return Self::NotRead(not_read);
         }
-        if error.downcast_ref::<WithheldVariable>().is_some() {
-            return Self::PasswordVarStore;
-        }
         if let Some(refused) = error.downcast_ref::<EnhancedAuthenticatedVariable>() {
             return Self::EnhancedAuthenticated(refused.clone());
         }
@@ -1249,7 +1251,7 @@ impl ValueUnavailable {
             | Self::ValueExpression(_)
             | Self::DeclaredBootServiceOnly(_)
             | Self::EnhancedAuthenticated(_)
-            | Self::PasswordVarStore
+            | Self::PasswordBytes
             | Self::NotRead(_)
             | Self::Missing(_)
             | Self::MissingBuffer(_)
