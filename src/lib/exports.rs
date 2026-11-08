@@ -16,6 +16,9 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(firmware_memory_maps)]
+use log::debug;
+use log::warn;
 
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::GetResponse;
@@ -142,6 +145,8 @@ pub use crate::efi_variables::Undecoded;
 use crate::efi_variables::VariableInfoSource;
 #[cfg(variable_storage_info)]
 pub use crate::efi_variables::VariableStorage;
+use crate::hii::config_snapshot::ExportedConfig;
+use crate::hii::config_snapshot::SnapshotLookup;
 #[cfg(target_os = "linux")]
 pub use crate::hii::extract::EfivarMemory;
 #[cfg(target_os = "linux")]
@@ -160,6 +165,7 @@ use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::DeclaredDefault;
+use crate::hii::forms::Exclusion;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::forms::QuestionFlags;
 use crate::hii::package;
@@ -173,6 +179,9 @@ use crate::hii::EfivarReader;
 #[cfg(target_os = "linux")]
 pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use crate::hii::ExportedConfigError;
 use crate::hii::FirmwareVariables;
 /// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
 #[cfg(firmware_memory_maps)]
@@ -599,26 +608,38 @@ pub struct DumpEfivarsOptions {
 
 impl HiiBackend {
     /// show_ifr returns a human readable representation of the forms in Hii
+    ///
+    /// It reads values as `EfivarSource::System` does, so on Linux also from the ExportConfig
+    /// snapshot in physical memory.
     pub fn show_ifr(db_bytes: &[u8]) -> Result<HiiShowIfrResponse> {
         Self::show_ifr_using(db_bytes, &ShowIfrOptions::default())
     }
 
     /// show_ifr with `options`
+    ///
+    /// Under `EfivarSource::System`, on Linux it also reads the ExportConfig snapshot from
+    /// physical memory.
     pub fn show_ifr_using(db_bytes: &[u8], options: &ShowIfrOptions) -> Result<HiiShowIfrResponse> {
-        Self::show_ifr_in(db_bytes, options.efivars.clone().into_variables()?)
+        Self::show_ifr_in(
+            db_bytes,
+            options.efivars.clone().into_variables()?,
+            system_snapshot(&options.efivars),
+        )
     }
 
-    /// show_ifr, reading question values from `variables`
+    /// show_ifr, reading question values from `variables`, or from the snapshot `exported`
+    /// where they miss a variable
     fn show_ifr_in(
         db_bytes: &[u8],
         variables: Box<dyn FirmwareVariables>,
+        exported: Option<ExportedConfig>,
     ) -> Result<HiiShowIfrResponse> {
         // We depend on the caller to provide us with the hiidb instead of calling extract here
         // because they might want to provide a file instead.
 
         let mut readable_representation = String::new();
 
-        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables)?;
+        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables, exported)?;
 
         for list in parsed_db {
             list.check_form_strings()?;
@@ -627,6 +648,7 @@ impl HiiBackend {
                 continue;
             }
             writeln!(readable_representation, "Packagelist {}", list.guid)?;
+            reader.enter_package_list(&list);
             for root in list.forms {
                 readable_representation.push_str(&forms::display(
                     root,
@@ -677,6 +699,8 @@ impl HiiBackend {
         Ok(resp)
     }
 
+    /// list_questions with the default options, which read values as `EfivarSource::System`
+    /// does, so on Linux also from the ExportConfig snapshot in physical memory
     pub fn list_questions(db_bytes: &[u8]) -> Result<Vec<Question>> {
         Self::list_questions_using(db_bytes, &ListQuestionsOptions::default())
     }
@@ -691,11 +715,19 @@ impl HiiBackend {
     }
 
     /// list_questions with `options`
+    ///
+    /// Under `EfivarSource::System`, on Linux it also reads the ExportConfig snapshot from
+    /// physical memory.
     pub fn list_questions_using(
         db_bytes: &[u8],
         options: &ListQuestionsOptions,
     ) -> Result<Vec<Question>> {
-        Self::list_questions_in(db_bytes, options, options.efivars.clone().into_variables()?)
+        Self::list_questions_in(
+            db_bytes,
+            options,
+            options.efivars.clone().into_variables()?,
+            system_snapshot(&options.efivars),
+        )
     }
 
     /// list_questions_using, and ignored_ifr of the same parse of the HiiDB
@@ -707,16 +739,19 @@ impl HiiBackend {
             db_bytes,
             options,
             options.efivars.clone().into_variables()?,
+            system_snapshot(&options.efivars),
         )
     }
 
-    /// list_questions with `options`, reading question values from `variables`
+    /// list_questions with `options`, reading question values from `variables`, or from the
+    /// snapshot `exported` where they miss a variable
     fn list_questions_in(
         db_bytes: &[u8],
         options: &ListQuestionsOptions,
         variables: Box<dyn FirmwareVariables>,
+        exported: Option<ExportedConfig>,
     ) -> Result<Vec<Question>> {
-        Ok(Self::list_questions_and_ignored_ifr_in(db_bytes, options, variables)?.0)
+        Ok(Self::list_questions_and_ignored_ifr_in(db_bytes, options, variables, exported)?.0)
     }
 
     /// list_questions_in, and the IFR that uefisettings ignores in the HiiDB
@@ -724,10 +759,11 @@ impl HiiBackend {
         db_bytes: &[u8],
         options: &ListQuestionsOptions,
         variables: Box<dyn FirmwareVariables>,
+        exported: Option<ExportedConfig>,
     ) -> Result<(Vec<Question>, Vec<IgnoredIfr>)> {
         let include = options.include;
         let mut res = Vec::new();
-        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables)?;
+        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables, exported)?;
         let ignored_ifr = parsed_db
             .iter()
             .flat_map(|list| list.ignored_ifr.iter().cloned())
@@ -738,6 +774,7 @@ impl HiiBackend {
         )?;
         for list in parsed_db {
             list.check_form_strings()?;
+            reader.enter_package_list(&list);
 
             for root in list.forms {
                 //  TODO: show form name, package list guid in the final response as well
@@ -753,6 +790,7 @@ impl HiiBackend {
                         options: question_descriptor.listed_options(include),
                         name: question_descriptor.question,
                         answer: question_descriptor.value
+                            + question_descriptor.value_source.annotation()
                             + &question_descriptor.value_state.option_annotation()
                             + &state.annotation(),
                         help: question_descriptor.help,
@@ -926,6 +964,9 @@ impl HiiBackend {
     }
 
     /// get from the HiiDB `db_bytes`, with `options`
+    ///
+    /// Under `EfivarSource::System`, on Linux it also reads the ExportConfig snapshot from
+    /// physical memory.
     pub fn get_using(
         db_bytes: &[u8],
         question: &str,
@@ -938,16 +979,19 @@ impl HiiBackend {
             selector,
             options,
             options.efivars.clone().into_variables()?,
+            system_snapshot(&options.efivars),
         )
     }
 
-    /// get with `options`, reading question values from `variables`
+    /// get with `options`, reading question values from `variables`, or from the snapshot
+    /// `exported` where they miss a variable
     fn get_in(
         db_bytes: &[u8],
         question: &str,
         _selector: Option<&str>,
         options: &GetOptions,
         variables: Box<dyn FirmwareVariables>,
+        exported: Option<ExportedConfig>,
     ) -> Result<GetResponseList> {
         // TODO: use selector to only get questions which match question + selector
         // TODO: take a form@packagelist selector to pick one of the FormSets that select
@@ -968,16 +1012,17 @@ impl HiiBackend {
             } => (question_variations, false),
         };
 
-        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables)?;
+        let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables, exported)?;
         forms::check_access_level(
             parsed_db.iter().flat_map(|list| &list.forms),
             options.access_level,
         )?;
         let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
 
-        let mut excluded = IncludedStates::empty();
+        let mut excluded = Exclusion::NONE;
         for list in parsed_db {
             list.check_form_strings()?;
+            reader.enter_package_list(&list);
 
             for root in list.forms {
                 let selection = forms::find_question(
@@ -990,8 +1035,8 @@ impl HiiBackend {
                 );
                 let (question_descriptor, state) = match selection.for_get() {
                     Choice::Chosen(question_descriptor, state) => (question_descriptor, state),
-                    Choice::Skipped(states) => {
-                        excluded |= states;
+                    Choice::Skipped(exclusion) => {
+                        excluded |= exclusion;
                         continue;
                     }
                 };
@@ -1017,6 +1062,7 @@ impl HiiBackend {
                         translate_response(question, &get_resp.question.answer, Backend::Hii);
                 }
                 // after translate_response, which matches whole answers
+                get_resp.question.answer += question_descriptor.value_source.annotation();
                 get_resp.question.answer += &question_descriptor.value_state.option_annotation();
                 get_resp.question.answer += &state.annotation();
 
@@ -1024,11 +1070,7 @@ impl HiiBackend {
             }
         }
         if resp.is_empty() && !excluded.is_empty() {
-            return Err(SelectionError::Excluded {
-                question: question.to_owned(),
-                states: excluded,
-            }
-            .into());
+            return Err(excluded.question_error(question).into());
         }
 
         Ok(GetResponseList {
@@ -1039,15 +1081,65 @@ impl HiiBackend {
     }
 }
 
+/// The ExportConfig snapshot of this machine's firmware (UEFI 2.11 §33.2.11.1), from which get,
+/// list-questions and show-ifr take the values of the variables that `efivars`, if this
+/// machine's, miss; none of other sources, or where it cannot be read, which the debug log says.
+fn system_snapshot(efivars: &EfivarSource) -> Option<ExportedConfig> {
+    match efivars {
+        #[cfg(system_variables)]
+        EfivarSource::System => read_system_snapshot(),
+        #[cfg(efivar_dumps)]
+        EfivarSource::Directory(_) => None,
+        EfivarSource::Disabled => None,
+    }
+}
+
+/// The ExportConfig snapshot that this machine's configuration table lists, if it can be read.
+#[cfg(firmware_memory_maps)]
+fn read_system_snapshot() -> Option<ExportedConfig> {
+    match crate::hii::exported_config() {
+        Ok(Some(exported)) => Some(exported),
+        Ok(None) => {
+            debug!("no ExportConfig snapshot: the configuration table lists none");
+            None
+        }
+        Err(error) => {
+            debug!("no ExportConfig snapshot: {error:#}");
+            None
+        }
+    }
+}
+
+/// No ExportConfig snapshot on the builds that read no configuration table from the OS: Windows
+/// reads no physical memory, Linux reads it on x86 and arm64 only, and the UEFI Shell can ask
+/// EFI_HII_CONFIG_ROUTING_PROTOCOL for current values instead.
+#[cfg(all(system_variables, not(firmware_memory_maps)))]
+fn read_system_snapshot() -> Option<ExportedConfig> {
+    None
+}
+
 /// The package lists of the HiiDB `db_bytes`, and a reader of `variables` without the bytes of
-/// its password questions (PasswordQuestions::reader).
+/// its password questions (PasswordQuestions::reader). It takes the values of the variables that
+/// they miss from the snapshot `exported`, without the bytes of password questions either
+/// (SnapshotLookup::new), unless it cannot, which the warning log says.
 fn read_db_withholding(
     db_bytes: &[u8],
     variables: Box<dyn FirmwareVariables>,
+    exported: Option<ExportedConfig>,
 ) -> Result<(Vec<package::ParsedPackageList>, EfivarReader)> {
     let parsed_db = package::read_db(db_bytes)?;
     let passwords = PasswordQuestions::of_lists(&parsed_db);
     let reader = passwords.reader(variables)?;
+    let Some(exported) = exported else {
+        return Ok((parsed_db, reader));
+    };
+    let reader = match SnapshotLookup::new(&exported, &passwords) {
+        Ok(snapshot) => reader.with_snapshot(snapshot),
+        Err(refusal) => {
+            warn!("{refusal}");
+            reader
+        }
+    };
     Ok((parsed_db, reader))
 }
 
@@ -1075,7 +1167,7 @@ fn select_for_set(
     // Every FormSet selects its question and option before the first write, so that a
     // selection error leaves every variable unchanged.
     let mut selected = Vec::new();
-    let mut excluded = IncludedStates::empty();
+    let mut excluded = Exclusion::NONE;
     for list in parsed_db {
         for root in &list.forms {
             // try to find the question
@@ -1100,16 +1192,12 @@ fn select_for_set(
                 }
                 // question not found in this FormSet
                 // or only in states that `include` does not allow
-                Choice::Skipped(states) => excluded |= states,
+                Choice::Skipped(exclusion) => excluded |= exclusion,
             }
         }
     }
     if selected.is_empty() && !excluded.is_empty() {
-        return Err(SelectionError::Excluded {
-            question: question.to_owned(),
-            states: excluded,
-        }
-        .into());
+        return Err(excluded.question_error(question).into());
     }
     let mut ignored = parsed_db
         .iter()
@@ -1183,6 +1271,9 @@ mod tests {
     #[cfg(variable_data)]
     use crate::efi_variables::authenticated::signing::tests::test_pems;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
+    use crate::hii::config_snapshot::tests::block_resp;
+    use crate::hii::config_snapshot::tests::config_hdr;
+    use crate::hii::config_snapshot::tests::logged_by;
     use crate::hii::forms::ifr_fixtures::checkbox_at;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
     use crate::hii::forms::ifr_fixtures::conditional;
@@ -1199,6 +1290,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::nested;
     use crate::hii::forms::ifr_fixtures::on_small_stack;
     use crate::hii::forms::ifr_fixtures::operation;
+    use crate::hii::forms::ifr_fixtures::other_option;
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
     use crate::hii::forms::ifr_fixtures::scopeless_form_set;
@@ -1209,12 +1301,14 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::var_store_efi_of;
+    use crate::hii::forms::ifr_fixtures::var_store_name_value;
     use crate::hii::forms::ifr_fixtures::MemoryVariables;
     use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
     use crate::hii::forms::ifr_fixtures::VariableReach;
     use crate::hii::forms::ifr_fixtures::BS_RT;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::DISABLE_IF;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
     use crate::hii::forms::ifr_fixtures::GUID;
@@ -1224,10 +1318,15 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
     use crate::hii::forms::ifr_fixtures::OTHER_GUID;
+    use crate::hii::forms::ifr_fixtures::QUESTION_REF1;
+    use crate::hii::forms::ifr_fixtures::READ;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
+    use crate::hii::forms::ifr_fixtures::THIS;
+    use crate::hii::forms::ifr_fixtures::VALUE;
     use crate::hii::forms::ifr_fixtures::VAR_STORE;
     use crate::hii::forms::MAX_SCOPE_NESTING;
+    use crate::hii::package::hiidb_fixtures::device_path_package;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::en_strings_package;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
@@ -1955,6 +2054,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&variables),
+                None,
             )
             .expect("get");
             let answers: Vec<&str> = got
@@ -2001,6 +2101,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
         )
         .expect("get T");
         let answers: Vec<Option<&str>> = got
@@ -2077,6 +2178,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&Rc::new(variables)),
+            None,
         )
         .expect("get T");
         let answers: Vec<&str> = got
@@ -2783,15 +2885,17 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&variables),
+                None,
             )
             .expect("get");
             let listed = HiiBackend::list_questions_in(
                 &password_hiidb(),
                 &ListQuestionsOptions::default(),
                 shared(&variables),
+                None,
             )
             .expect("list questions");
-            let ifr = HiiBackend::show_ifr_in(&password_hiidb(), shared(&variables))
+            let ifr = HiiBackend::show_ifr_in(&password_hiidb(), shared(&variables), None)
                 .expect("show the IFR")
                 .readable_representation;
 
@@ -2984,6 +3088,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(variables),
+            None,
         )
         .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
         .responses
@@ -3038,6 +3143,7 @@ mod tests {
                 &hiidb,
                 &ListQuestionsOptions::default(),
                 shared(&variables),
+                None,
             )
             .expect("list questions")
             .into_iter()
@@ -3172,13 +3278,14 @@ mod tests {
                 &hiidb,
                 &ListQuestionsOptions::default(),
                 shared(&variables),
+                None,
             )
             .expect("list questions")
             .into_iter()
             .filter(|question| question.name.starts_with('N'))
             .map(|question| question.answer)
             .collect();
-            let ifr = HiiBackend::show_ifr_in(&hiidb, shared(&variables))
+            let ifr = HiiBackend::show_ifr_in(&hiidb, shared(&variables), None)
                 .expect("show the IFR")
                 .readable_representation;
 
@@ -3427,17 +3534,24 @@ mod tests {
         };
 
         for (question, want) in [("N0", PASSWORD_BYTES), ("O", "1")] {
-            let got: Vec<String> =
-                HiiBackend::get_in(&hiidb, question, None, &GetOptions::default(), variables())
-                    .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
-                    .responses
-                    .into_iter()
-                    .map(|response| response.question.answer)
-                    .collect();
+            let got: Vec<String> = HiiBackend::get_in(
+                &hiidb,
+                question,
+                None,
+                &GetOptions::default(),
+                variables(),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
+            .responses
+            .into_iter()
+            .map(|response| response.question.answer)
+            .collect();
             let listed: Vec<String> = HiiBackend::list_questions_in(
                 &hiidb,
                 &ListQuestionsOptions::default(),
                 variables(),
+                None,
             )
             .expect("list questions")
             .into_iter()
@@ -3813,13 +3927,15 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
         );
         let listed = HiiBackend::list_questions_in(
             &hiidb,
             &ListQuestionsOptions::default(),
             shared(&variables),
+            None,
         );
-        let shown = HiiBackend::show_ifr_in(&hiidb, shared(&variables));
+        let shown = HiiBackend::show_ifr_in(&hiidb, shared(&variables), None);
         assert_eq!(
             got.map(drop).map_err(|error| error.to_string()),
             Err(closed.to_string()),
@@ -3855,6 +3971,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(&variables),
+            None,
         )
         .expect("get through Runtime");
         let answers: Vec<&str> = got
@@ -4000,14 +4117,20 @@ mod tests {
             ),
         ];
         let get = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
-            HiiBackend::get_in(hiidb, "Q", None, &GetOptions::default(), shared(variables)).map(
-                |got| {
-                    got.responses
-                        .iter()
-                        .map(|response| response.question.answer.clone())
-                        .collect::<Vec<_>>()
-                },
+            HiiBackend::get_in(
+                hiidb,
+                "Q",
+                None,
+                &GetOptions::default(),
+                shared(variables),
+                None,
             )
+            .map(|got| {
+                got.responses
+                    .iter()
+                    .map(|response| response.question.answer.clone())
+                    .collect::<Vec<_>>()
+            })
         };
         let set = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
             HiiBackend::set_in(
@@ -4110,6 +4233,7 @@ mod tests {
             None,
             &GetOptions::default(),
             shared(variables),
+            None,
         )
         .map(|got| {
             got.responses
@@ -4595,6 +4719,7 @@ mod tests {
                 None,
                 &GetOptions::default(),
                 shared(&variables()),
+                None,
             )
             .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
         };
@@ -5124,5 +5249,888 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The device path of the driver of snapshot_hiidb.
+    const DRIVER_PATH: [u8; 16] = crate::hii::config_snapshot::tests::DRIVER_PATH;
+    /// The GUIDs, as stored, of NStore and AMITSESetup.
+    const N_GUID: [u8; 16] = crate::hii::config_snapshot::tests::N_GUID;
+    const P_GUID: [u8; 16] = crate::hii::config_snapshot::tests::P_GUID;
+    /// The answer of N of snapshot_hiidb without a variable or snapshot value.
+    const MISSING_N_STORE: &str = "<ValueUnavailable: no EFI variable \
+        NStore-8c78a505-baa0-4c4a-869f-000000001401; HII buffer varstore requires \
+        EFI_HII_CONFIG_ACCESS_PROTOCOL> <IFR default: 0>";
+    /// The answer of X of snapshot_hiidb, over the password's bytes; the NUMERIC declares no
+    /// default.
+    const WITHHELD: &str = "<ValueUnavailable: its bytes hold a password>";
+
+    /// A UINT16 NUMERIC of QuestionId `question_id`, prompted string `prompt`, from 0 to 65535,
+    /// at VarOffset, or VarName, `info` of VarStore `var_store_id`.
+    fn uint16_numeric(question_id: u16, prompt: u16, var_store_id: u16, info: u16) -> Vec<u8> {
+        let data = [
+            question_header_with(question_id, prompt, var_store_id, info, 0x00),
+            // Flags EFI_IFR_NUMERIC_SIZE_2, MinValue, MaxValue, Step
+            vec![0x01, 0x00, 0x00, 0xFF, 0xFF, 0x01, 0x00],
+        ]
+        .concat();
+        operation(NUMERIC, false, &data)
+    }
+
+    /// A UINT8 ONE_OF of QuestionId `question_id`, prompted string `prompt`, at VarOffset
+    /// `offset` of VarStore `var_store_id`, with `options`.
+    fn uint8_one_of(
+        question_id: u16,
+        prompt: u16,
+        var_store_id: u16,
+        offset: u16,
+        options: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let data = [
+            question_header_with(question_id, prompt, var_store_id, offset, 0x00),
+            // Flags EFI_IFR_NUMERIC_SIZE_1, MinValue, MaxValue, Step
+            vec![0x00, 0x00, 0xFF, 0x01],
+        ]
+        .concat();
+        [
+            operation(ONE_OF, true, &data),
+            options.concat(),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// The variable of NStore.
+    fn n_store() -> VariableKey {
+        VariableKey {
+            name: "NStore".to_owned(),
+            guid: Guid::from(N_GUID),
+        }
+    }
+
+    /// A HiiDB of the driver at DRIVER_PATH, whose FormSet has the CHECKBOX N at byte 0, the
+    /// UINT16 NUMERIC W at byte 1 and the ONE_OF O of "Off" 0 and "On" 1 at byte 0 of the buffer
+    /// VarStore NStore, then, on the buffer VarStore AMITSESetup of AMI's layout, `password`, the
+    /// CHECKBOX P at byte 80, and the UINT16 NUMERICs S at byte 40 and X at byte 38.
+    fn snapshot_hiidb_with(password: Vec<u8>) -> Vec<u8> {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                var_store(1, N_GUID, "NStore", 3),
+                var_store(2, P_GUID, "AMITSESetup", 81),
+                form(
+                    1,
+                    &[
+                        checkbox_on(1, 1, 1),
+                        uint16_numeric(2, 2, 1, 1),
+                        uint8_one_of(
+                            5,
+                            5,
+                            1,
+                            0,
+                            &[flagged_option(6, 0x00, 0), flagged_option(7, 0x00, 1)],
+                        ),
+                        password,
+                        checkbox_at(4, 3, 2, 80),
+                        uint16_numeric(8, 8, 2, 40),
+                        uint16_numeric(9, 9, 2, 38),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["N", "W", "P", "Password", "O", "Off", "On", "S", "X"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// snapshot_hiidb_with a PASSWORD of 20 CHAR16s at byte 0 of AMITSESetup: X's bytes end in
+    /// its last 2, and S's follow them.
+    fn snapshot_hiidb() -> Vec<u8> {
+        snapshot_hiidb_with(password_on(3, 4, 2, 0))
+    }
+
+    /// The snapshot of snapshot_hiidb's driver: NStore holds 1, then 0x1234; AMITSESetup 40
+    /// bytes of 0xA5 for the password, then S's 0x5678, zeros, and P's 1.
+    fn snapshot_text() -> String {
+        let mut amitse_setup = [0; 81];
+        amitse_setup[..40].fill(0xA5);
+        amitse_setup[40..42].copy_from_slice(&[0x78, 0x56]);
+        amitse_setup[80] = 1;
+        [
+            block_resp(
+                &config_hdr(N_GUID, "NStore", &DRIVER_PATH),
+                0,
+                &[1, 0x34, 0x12],
+            ),
+            block_resp(
+                &config_hdr(P_GUID, "AMITSESetup", &DRIVER_PATH),
+                0,
+                &amitse_setup,
+            ),
+        ]
+        .join("&")
+    }
+
+    /// Variables that reach Runtime through efivarfs and hold none of snapshot_hiidb's.
+    fn no_variables() -> Rc<MemoryVariables> {
+        Rc::new(MemoryVariables::new(
+            VariableReach::Runtime,
+            VariableInterface::Efivarfs,
+        ))
+    }
+
+    /// The answers that get and list-questions give for each question of `names` of `hiidb`
+    /// through `variables` with the snapshot `text`, and what show-ifr shows; each response as
+    /// text and as JSON, after them.
+    fn answers_with_snapshot(
+        hiidb: &[u8],
+        names: &[&str],
+        variables: &Rc<MemoryVariables>,
+        text: &str,
+    ) -> (Vec<String>, Vec<String>, String, Vec<String>) {
+        let exported = || Some(ExportedConfig::new(text.to_owned()));
+        let mut outputs = Vec::new();
+        let mut got = Vec::new();
+        for name in names {
+            let response = HiiBackend::get_in(
+                hiidb,
+                name,
+                None,
+                &GetOptions::default(),
+                shared(variables),
+                exported(),
+            )
+            .unwrap_or_else(|error| panic!("get {name}: {error:#}"));
+            got.extend(
+                response
+                    .responses
+                    .iter()
+                    .map(|response| response.question.answer.clone()),
+            );
+            outputs.push(format!("{response:#?}"));
+            outputs
+                .push(String::from_utf8_lossy(&simplejson_protocol::serialize(&response)).into());
+        }
+        let questions = HiiBackend::list_questions_in(
+            hiidb,
+            &ListQuestionsOptions::default(),
+            shared(variables),
+            exported(),
+        )
+        .expect("list questions");
+        let listed = names
+            .iter()
+            .flat_map(|name| {
+                questions
+                    .iter()
+                    .filter(move |question| question.name == *name)
+                    .map(|question| question.answer.clone())
+            })
+            .collect();
+        for question in &questions {
+            outputs.push(format!("{question:#?}"));
+            outputs.push(String::from_utf8_lossy(&simplejson_protocol::serialize(question)).into());
+        }
+        let ifr =
+            HiiBackend::show_ifr_in(hiidb, shared(variables), exported()).expect("show the IFR");
+        outputs.push(format!("{ifr:#?}"));
+        outputs.push(String::from_utf8_lossy(&simplejson_protocol::serialize(&ifr)).into());
+        (got, listed, ifr.readable_representation, outputs)
+    }
+
+    /// Asserts that no output of `outputs` shows a byte of the 0xA5 of a password.
+    #[track_caller]
+    fn assert_no_password_byte(outputs: &[String]) {
+        for output in outputs {
+            for needle in ["a5a5", "A5A5", "165"] {
+                assert!(!output.contains(needle), "{needle} in {output}");
+            }
+        }
+    }
+
+    /// get, list-questions and show-ifr, as text and as JSON, take the values of questions whose
+    /// variable is missing from the ExportConfig snapshot, tagged, also of those beside a password
+    /// in its VarStore, but show a question over the password's bytes withheld, and never those
+    /// bytes.
+    #[test]
+    fn missing_variables_show_snapshot_values_but_password_bytes_stay_withheld() {
+        let (got, listed, ifr, outputs) = answers_with_snapshot(
+            &snapshot_hiidb(),
+            &["N", "W", "O", "P", "S", "X"],
+            &no_variables(),
+            &snapshot_text(),
+        );
+
+        let want = [
+            "1 <snapshot>",
+            "4660 <snapshot>",
+            "On <snapshot>",
+            "1 <snapshot>",
+            "22136 <snapshot>",
+            WITHHELD,
+        ];
+        assert_eq!(got, want, "get");
+        assert_eq!(listed, want, "list-questions");
+        for shown in [
+            "1 <snapshot>",
+            "4660 <snapshot>",
+            "22136 <snapshot>",
+            WITHHELD,
+        ] {
+            assert!(
+                ifr.contains(&format!("-Answer: {shown}\n")),
+                "show-ifr lacks {shown:?}: {ifr}"
+            );
+        }
+        assert_no_password_byte(&outputs);
+    }
+
+    /// The snapshot fills in only missing variables of the package list's driver, and none in a
+    /// HiiDB with a PASSWORD op whose VarStore is unknown, which could be any, or with IFR that the
+    /// parser drops, which could hold one: the warning says that the password cannot be withheld.
+    #[test]
+    fn snapshot_values_show_only_for_missing_variables_of_their_driver() {
+        const REFUSED: &str = "; as the VarStore of that password is unknown, uefisettings \
+            cannot withhold its bytes, so no value is shown from the ExportConfig snapshot";
+        let with_n_store = no_variables();
+        with_n_store.insert(n_store(), NV_BS_RT, &[0, 0, 0]);
+        let short_n_store = no_variables();
+        short_n_store.insert(n_store(), NV_BS_RT, &[0]);
+        let without_path = {
+            let packages = [
+                form_package(&[
+                    var_store(1, N_GUID, "NStore", 3),
+                    form(1, &[checkbox_on(1, 1, 1)]),
+                ]),
+                en_strings_package_of(&["N"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid([0x55; 16], &packages.concat())
+        };
+        let other_driver = snapshot_text().replace(
+            &config_hdr(N_GUID, "NStore", &DRIVER_PATH),
+            &config_hdr(N_GUID, "NStore", &[0x7F, 0xFF, 0x04, 0x00]),
+        );
+        let dropped_form_set = {
+            // a VARSTORE op that ends after 4 of the 20 bytes before its Name
+            let malformed = operation(VAR_STORE, false, &[0x00; 4]);
+            let packages = [
+                device_path_package(&DRIVER_PATH),
+                form_package_of(
+                    &[
+                        form_set(&[
+                            var_store(1, N_GUID, "NStore", 3),
+                            form(1, &[checkbox_on(1, 1, 1)]),
+                        ]),
+                        form_set(&dropped_password_second_ops(malformed)),
+                    ]
+                    .concat(),
+                ),
+                en_strings_package_of(&["N", "Password"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid([0x55; 16], &packages.concat())
+        };
+        for (case, hiidb, variables, text, want, refused) in [
+            (
+                "a variable that exists",
+                snapshot_hiidb(),
+                with_n_store,
+                snapshot_text(),
+                "0",
+                false,
+            ),
+            (
+                "a variable shorter than its VarStore",
+                snapshot_hiidb(),
+                short_n_store,
+                snapshot_text(),
+                "<VStoreError: EFI variable NStore-8c78a505-baa0-4c4a-869f-000000001401 \
+                 holds 1 data bytes, fewer than the 3 of its VarStore> <IFR default: 0>",
+                false,
+            ),
+            (
+                "a list without a device path package",
+                without_path,
+                no_variables(),
+                snapshot_text(),
+                MISSING_N_STORE,
+                false,
+            ),
+            (
+                "another driver's NStore",
+                snapshot_hiidb(),
+                no_variables(),
+                other_driver,
+                MISSING_N_STORE,
+                false,
+            ),
+            (
+                "a PASSWORD op on VarStore 9, which the FormSet does not declare",
+                snapshot_hiidb_with(password_on(3, 4, 9, 0)),
+                no_variables(),
+                snapshot_text(),
+                MISSING_N_STORE,
+                true,
+            ),
+            (
+                "a FormSet that the parser drops, whose PASSWORD ops are unknown",
+                dropped_form_set,
+                no_variables(),
+                snapshot_text(),
+                MISSING_N_STORE,
+                true,
+            ),
+        ] {
+            let mut answers = None;
+            let logged = logged_by(|| {
+                answers = Some(answers_with_snapshot(&hiidb, &["N"], &variables, &text));
+            });
+            let (got, listed, _, outputs) = answers.expect("the answers");
+
+            assert_eq!(got, [want], "{case}: get");
+            assert_eq!(listed, [want], "{case}: list-questions");
+            assert_no_password_byte(&outputs);
+            assert_eq!(
+                logged.iter().any(|message| message.ends_with(REFUSED)),
+                refused,
+                "{case}: the refusal in {logged:?}"
+            );
+        }
+    }
+
+    /// The questions of a VARSTORE_EFI without runtime access, whose variable Linux does not
+    /// see, take their values from the snapshot.
+    #[test]
+    fn boot_service_only_efi_variables_show_snapshot_values() {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS, 1),
+                form(1, &[checkbox_on(1, 1, 1)]),
+            ]),
+            en_strings_package_of(&["Q"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let text = block_resp(&config_hdr([0; 16], "Setup", &DRIVER_PATH), 0, &[1]);
+
+        let (got, listed, ifr, _) = answers_with_snapshot(&hiidb, &["Q"], &no_variables(), &text);
+
+        assert_eq!(got, ["1 <snapshot>"], "get");
+        assert_eq!(listed, ["1 <snapshot>"], "list-questions");
+        assert!(ifr.contains("-Answer: 1 <snapshot>\n"), "show-ifr: {ifr}");
+    }
+
+    /// A value that an EFI_IFR_VALUE or READ expression gives is tagged when the snapshot gave
+    /// THIS or a value that the expression took, and only then.
+    #[test]
+    fn expression_values_show_whether_the_snapshot_gave_them() {
+        const LIVE: u16 = 2;
+        let live = VariableKey {
+            name: "Live".to_owned(),
+            guid: Guid::from(N_GUID),
+        };
+        let variables = no_variables();
+        variables.insert(live, NV_BS_RT, &[0; 4]);
+        // a UINT8 NUMERIC of QuestionId and prompt `id` at VarOffset `offset` of `var_store_id`,
+        // whose `expression` op holds `ops`
+        let numeric = |id: u16, var_store_id: u16, offset: u16, expression: u8, ops: Vec<u8>| {
+            let data = [
+                question_header_with(id, id, var_store_id, offset, 0x00),
+                vec![0x00, 0, 255, 1], // Flags, MinValue, MaxValue, Step
+            ]
+            .concat();
+            [
+                operation(NUMERIC, true, &data),
+                operation(expression, true, &[]),
+                ops,
+                END.to_vec(),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let n = || operation(QUESTION_REF1, false, &1u16.to_le_bytes());
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                var_store(1, N_GUID, "NStore", 3),
+                var_store(LIVE, N_GUID, "Live", 4),
+                form(
+                    1,
+                    &[
+                        checkbox_on(1, 1, 1),
+                        numeric(2, LIVE, 0, VALUE, n()),
+                        numeric(3, LIVE, 1, VALUE, uint8(7)),
+                        numeric(4, LIVE, 2, READ, n()),
+                        numeric(5, LIVE, 3, READ, uint8(5)),
+                        numeric(6, 1, 1, READ, operation(THIS, false, &[])),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["N", "VN", "VC", "RN", "RC", "RT"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+
+        let (got, listed, ifr, _) = answers_with_snapshot(
+            &hiidb,
+            &["N", "VN", "VC", "RN", "RC", "RT"],
+            &variables,
+            &snapshot_text(),
+        );
+
+        let want = [
+            "1 <snapshot>",
+            "1 <snapshot>",
+            "7",
+            "1 <snapshot>",
+            "5",
+            "52 <snapshot>",
+        ];
+        assert_eq!(got, want, "get");
+        assert_eq!(listed, want, "list-questions");
+        for shown in want {
+            assert!(
+                ifr.contains(&format!("-Answer: {shown}\n")),
+                "show-ifr lacks {shown:?}: {ifr}"
+            );
+        }
+    }
+
+    /// The questions of name/value storage take their numbers from the snapshot by the labels
+    /// that their VarName strings give, unless a number does not fit the question; zeros before
+    /// its digits do.
+    #[test]
+    fn name_value_questions_show_snapshot_numbers() {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                var_store_name_value(3, N_GUID),
+                form(
+                    1,
+                    &[
+                        checkbox_at(1, 1, 3, 5),
+                        uint16_numeric(2, 2, 3, 6),
+                        checkbox_at(3, 3, 3, 7),
+                        checkbox_at(4, 4, 3, 8),
+                        checkbox_at(5, 9, 3, 10),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&[
+                "C", "V", "X", "U", "Flag", "Word", "Wide", "Unset", "Z", "Padded",
+            ]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let text = format!(
+            "{}&Flag=01&Word=1234&Wide=0102&Padded=0001",
+            config_hdr(N_GUID, "", &DRIVER_PATH)
+        );
+
+        let (got, listed, ifr, _) =
+            answers_with_snapshot(&hiidb, &["C", "V", "X", "U", "Z"], &no_variables(), &text);
+
+        let want = [
+            "1 <snapshot>",
+            "4660 <snapshot>",
+            "<ValueUnavailable: its number in the ExportConfig snapshot does not fit in 8 bits> \
+             <IFR default: 0>",
+            "<ValueUnavailable: HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL> \
+             <IFR default: 0>",
+            "1 <snapshot>",
+        ];
+        assert_eq!(got, want, "get");
+        assert_eq!(listed, want, "list-questions");
+        for shown in ["1 <snapshot>", "4660 <snapshot>"] {
+            assert!(
+                ifr.contains(&format!("-Answer: {shown}\n")),
+                "show-ifr lacks {shown:?}: {ifr}"
+            );
+        }
+    }
+
+    /// A storage's later <BlockConfig> past the end of the bytes so far, as ExportConfig() gives
+    /// a buffer of one block per question, extends it.
+    #[test]
+    fn snapshot_blocks_past_the_end_extend_their_storage() {
+        let hdr = config_hdr(N_GUID, "NStore", &DRIVER_PATH);
+        let text = format!("{}&OFFSET=1&WIDTH=2&VALUE=1234", block_resp(&hdr, 0, &[1]));
+
+        let (got, listed, ifr, _) =
+            answers_with_snapshot(&snapshot_hiidb(), &["N", "W"], &no_variables(), &text);
+
+        let want = ["1 <snapshot>", "4660 <snapshot>"];
+        assert_eq!(got, want, "get");
+        assert_eq!(listed, want, "list-questions");
+        assert!(
+            ifr.contains("-Answer: 4660 <snapshot>\n"),
+            "show-ifr: {ifr}"
+        );
+    }
+
+    /// A HiiDB of the driver at DRIVER_PATH whose FormSet has the CHECKBOX P on the VarStore
+    /// `p_store`, of id 1, and `question`, prompted string 2, on the VARSTORE_EFI Other of id 2,
+    /// whose variable holds 0; its strings are P, Q, Off and On.
+    fn condition_hiidb(p_store: Vec<u8>, question: Vec<u8>) -> Vec<u8> {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                p_store,
+                var_store_efi_of(2, N_GUID, "Other", NV_BS_RT, 1),
+                form(1, &[checkbox_on(1, 1, 1), question]),
+            ]),
+            en_strings_package_of(&["P", "Q", "Off", "On"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// Variables that hold condition_hiidb's Other, 0, and none of its P.
+    fn other_variables() -> Rc<MemoryVariables> {
+        other_variables_holding(0)
+    }
+
+    /// Variables that hold condition_hiidb's Other, `value`, and none of its P.
+    fn other_variables_holding(value: u8) -> Rc<MemoryVariables> {
+        let variables = no_variables();
+        let other = VariableKey {
+            name: "Other".to_owned(),
+            guid: Guid::from(N_GUID),
+        };
+        variables.insert(other, NV_BS_RT, &[value]);
+        variables
+    }
+
+    /// What get of question Q of `hiidb` gives with `include` through `variables` and the
+    /// snapshot `text`, if any, and the answers that list-questions gives for it.
+    fn condition_answers(
+        hiidb: &[u8],
+        include: IncludedStates,
+        variables: &Rc<MemoryVariables>,
+        text: Option<&str>,
+    ) -> (Result<Vec<String>, String>, Vec<String>) {
+        let exported = || text.map(|text| ExportedConfig::new(text.to_owned()));
+        let got = HiiBackend::get_in(
+            hiidb,
+            "Q",
+            None,
+            &GetOptions {
+                include,
+                ..GetOptions::default()
+            },
+            shared(variables),
+            exported(),
+        )
+        .map(|got| {
+            got.responses
+                .iter()
+                .map(|response| response.question.answer.clone())
+                .collect()
+        })
+        .map_err(|error| format!("{error:#}"));
+        let listed = HiiBackend::list_questions_in(
+            hiidb,
+            &ListQuestionsOptions {
+                include,
+                ..ListQuestionsOptions::default()
+            },
+            shared(variables),
+            exported(),
+        )
+        .expect("list questions")
+        .into_iter()
+        .filter(|question| question.name == "Q")
+        .map(|question| question.answer)
+        .collect();
+        (got, listed)
+    }
+
+    /// A state that a condition decides from a value of the snapshot is tagged, as values are:
+    /// get's refusal names the snapshot, and so do the answers of get and list-questions that
+    /// include the state. Without the snapshot, the condition cannot be evaluated.
+    #[test]
+    fn states_that_snapshot_values_decide_are_tagged() {
+        let variables = other_variables();
+        let setup = block_resp(&config_hdr([0; 16], "Setup", &DRIVER_PATH), 0, &[1]);
+        for (case, p_store, text) in [
+            (
+                "a missing variable",
+                var_store(1, N_GUID, "NStore", 3),
+                snapshot_text(),
+            ),
+            (
+                "a variable without runtime access",
+                var_store_efi(1, "Setup", NV_BS, 1),
+                setup,
+            ),
+        ] {
+            // the CHECKBOX Q on Other under GRAY_OUT_IF P == 1, where only the snapshot holds
+            // P, 1
+            let hiidb = condition_hiidb(
+                p_store,
+                conditional(GRAY_OUT_IF, eq_id_val_of(1, 1), &[checkbox_on(2, 2, 2)]),
+            );
+
+            let (got, listed) =
+                condition_answers(&hiidb, IncludedStates::empty(), &variables, Some(&text));
+            assert_eq!(
+                got,
+                Err(
+                    "question \"Q\" is grayed-out by a value of the ExportConfig snapshot; also \
+                     include grayed-out questions to select it"
+                        .to_owned()
+                ),
+                "{case}: get"
+            );
+            assert_eq!(listed, Vec::<String>::new(), "{case}: list-questions");
+
+            let (got, listed) =
+                condition_answers(&hiidb, IncludedStates::GRAYED_OUT, &variables, Some(&text));
+            let want = ["0 <grayed-out> <snapshot>"];
+            assert_eq!(
+                got,
+                Ok(want.map(str::to_owned).to_vec()),
+                "{case}: get, grayed-out"
+            );
+            assert_eq!(listed, want, "{case}: list-questions, grayed-out");
+
+            for include in [IncludedStates::empty(), IncludedStates::GRAYED_OUT] {
+                let (got, listed) = condition_answers(&hiidb, include, &variables, None);
+                let got = got.unwrap_or_else(|error| panic!("{case}: get without it: {error}"));
+                for answers in [got, listed] {
+                    let [answer] = answers.as_slice() else {
+                        panic!("{case}: {include:?} without the snapshot: {answers:?}");
+                    };
+                    assert!(
+                        answer.starts_with(
+                            "0 <selectable or grayed-out: EFI_IFR_EQ_ID_VAL of question 0x0001: \
+                             <ValueUnavailable: "
+                        ) && !answer.contains("snapshot"),
+                        "{case}: {include:?} without the snapshot: {answer}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The snapshot tags just the states that its values decide: a false condition on one leaves
+    /// the question selectable by the snapshot, a condition on one under a true DISABLE_IF
+    /// decides nothing, and the stored option of a ONE_OF under a SUPPRESS_IF on one is tagged
+    /// as its question is.
+    #[test]
+    fn snapshot_tags_just_the_states_that_its_values_decide() {
+        let variables = other_variables();
+        let check_box = || checkbox_on(2, 2, 2);
+        let one_of = uint8_one_of(
+            2,
+            2,
+            2,
+            0,
+            &[
+                conditional(
+                    SUPPRESS_IF,
+                    eq_id_val_of(1, 1),
+                    &[flagged_option(3, 0x00, 0)],
+                ),
+                flagged_option(4, 0x00, 1),
+            ],
+        );
+        for (case, question, include, want) in [
+            (
+                "a false condition",
+                conditional(GRAY_OUT_IF, eq_id_val_of(1, 0), &[check_box()]),
+                IncludedStates::empty(),
+                "0 <selectable> <snapshot>",
+            ),
+            (
+                "a condition under a true DISABLE_IF",
+                conditional(
+                    DISABLE_IF,
+                    ifr_true(),
+                    &[conditional(GRAY_OUT_IF, eq_id_val_of(1, 1), &[check_box()])],
+                ),
+                IncludedStates::GRAYED_OUT | IncludedStates::DISABLED,
+                "0 <disabled>",
+            ),
+            (
+                "the stored option under a SUPPRESS_IF",
+                one_of,
+                IncludedStates::empty(),
+                "Off <option suppressed> <snapshot>",
+            ),
+        ] {
+            let hiidb = condition_hiidb(var_store(1, N_GUID, "NStore", 3), question);
+
+            let (got, listed) =
+                condition_answers(&hiidb, include, &variables, Some(&snapshot_text()));
+
+            assert_eq!(got, Ok(vec![want.to_owned()]), "{case}: get");
+            assert_eq!(listed, [want], "{case}: list-questions");
+        }
+    }
+
+    /// show-ifr shows the condition ops of a question by their OpCode, untagged, beside the values
+    /// that it tags: P's from the snapshot, and that of Q, under a GRAY_OUT_IF on P, from its
+    /// variable.
+    #[test]
+    fn show_ifr_tags_snapshot_values_beside_condition_ops() {
+        let hiidb = condition_hiidb(
+            var_store(1, N_GUID, "NStore", 3),
+            conditional(GRAY_OUT_IF, eq_id_val_of(1, 1), &[checkbox_on(2, 2, 2)]),
+        );
+
+        let (_, _, ifr, _) =
+            answers_with_snapshot(&hiidb, &[], &other_variables(), &snapshot_text());
+
+        let shown: Vec<&str> = ifr
+            .lines()
+            .map(str::trim_start)
+            .skip_while(|line| *line != "OpCode: Form")
+            .map(|line| line.split(" - ").next().unwrap_or(line))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "OpCode: Form",
+                "OpCode: CheckBox",
+                "-Answer: 1 <snapshot>",
+                "OpCode: GrayOutIf",
+                "OpCode: EqIdVal",
+                "OpCode: CheckBox",
+                "-Answer: 0",
+            ],
+            "{ifr}"
+        );
+    }
+
+    /// The option that a ONE_OF answers is tagged when values that options of Type OTHER took
+    /// from the snapshot decide it: the option took its value from there, or one before it that
+    /// did would show if it matched, or none shows; one after it decides nothing. A stored value
+    /// from the snapshot tags an OTHER option of a constant VALUE as it tags any option.
+    #[test]
+    fn options_whose_values_the_snapshot_gives_tag_the_one_of_answer() {
+        // EFI_IFR_QUESTION_REF1 of P, which only the snapshot holds: 1
+        let p = || vec![operation(QUESTION_REF1, false, &1u16.to_le_bytes())];
+        let off = || flagged_option(3, 0x00, 0);
+        let on_p = || other_option(4, 0x00, &p());
+        for (case, var_store_id, stored, options, want) in [
+            (
+                "the shown option's VALUE takes P",
+                2,
+                1,
+                [off(), on_p()],
+                "On <snapshot>",
+            ),
+            (
+                "an option before the shown one takes P",
+                2,
+                0,
+                [on_p(), off()],
+                "Off <snapshot>",
+            ),
+            (
+                "an option after the shown one takes P",
+                2,
+                0,
+                [off(), on_p()],
+                "Off",
+            ),
+            (
+                "no option shows, one takes P",
+                2,
+                2,
+                [off(), on_p()],
+                "2 (no matching option) <snapshot>",
+            ),
+            (
+                "a stored value from the snapshot, an OTHER option of VALUE 1",
+                1,
+                0,
+                [off(), other_option(4, 0x00, &[uint8(1)])],
+                "On <snapshot>",
+            ),
+        ] {
+            let hiidb = condition_hiidb(
+                var_store(1, N_GUID, "NStore", 3),
+                uint8_one_of(2, 2, var_store_id, 0, &options),
+            );
+
+            let (got, listed) = condition_answers(
+                &hiidb,
+                IncludedStates::empty(),
+                &other_variables_holding(stored),
+                Some(&snapshot_text()),
+            );
+
+            assert_eq!(got, Ok(vec![want.to_owned()]), "{case}: get");
+            assert_eq!(listed, [want], "{case}: list-questions");
+        }
+    }
+
+    /// set never takes a value from the snapshot: on a question whose value only the snapshot
+    /// holds, it refuses as without one, and writes nothing.
+    #[test]
+    fn set_refuses_a_question_whose_value_only_the_snapshot_holds() {
+        let variables = no_variables();
+        let (got, _, _, _) =
+            answers_with_snapshot(&snapshot_hiidb(), &["N"], &variables, &snapshot_text());
+        assert_eq!(got, ["1 <snapshot>"], "get");
+
+        let error = HiiBackend::set_in(
+            &snapshot_hiidb(),
+            "N",
+            "0",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+        )
+        .expect_err("set N");
+
+        assert_eq!(
+            format!("{error:#}"),
+            "no EFI variable NStore-8c78a505-baa0-4c4a-869f-000000001401: the firmware has not \
+             created it or does not expose it to the OS, so its questions cannot be set from \
+             Linux; change them in the firmware setup, or ask the board vendor for firmware that \
+             exposes it; see https://github.com/linuxboot/uefisettings/issues/2",
+            "set N"
+        );
+        assert_eq!(variables.writes_to(&n_store()), [], "writes");
+    }
+
+    /// Reading a snapshot logs none of its bytes, at any level, also when it is no
+    /// <MultiConfigAltResp> or holds a <ConfigAltResp> that does not parse.
+    #[test]
+    fn snapshot_bytes_are_never_logged() {
+        let malformed = format!(
+            "{}&OFFSET=0&VALUE={}",
+            config_hdr(P_GUID, "AMITSESetup", &DRIVER_PATH),
+            "a5".repeat(81)
+        );
+        let partly_malformed = format!("{}&{malformed}", snapshot_text());
+
+        let logged = logged_by(|| {
+            for text in [snapshot_text(), malformed, partly_malformed] {
+                answers_with_snapshot(&snapshot_hiidb(), &["N", "P"], &no_variables(), &text);
+            }
+        });
+
+        for (what, logs) in [
+            (
+                "the refusal of the malformed snapshot",
+                "not a <MultiConfigAltResp>",
+            ),
+            (
+                "the storage that does not parse",
+                "1 of the 3 <ConfigAltResp>s",
+            ),
+        ] {
+            assert!(
+                logged.iter().any(|message| message.contains(logs)),
+                "{what} is not logged: {logged:?}"
+            );
+        }
+        assert_no_password_byte(&logged);
     }
 }

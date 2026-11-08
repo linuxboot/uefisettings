@@ -35,9 +35,10 @@ use super::question_values::ValueQuestion;
 use super::storage::read_current_value_bytes;
 use super::storage::read_question_value;
 use super::storage::stored_value;
-use super::storage::ReadableLocation;
+use super::storage::RetrievedValue;
 use super::storage::ShortVarStoreEfi;
 use super::storage::ValueLocation;
+use super::storage::ValueSource;
 use super::storage::ValueUnavailable;
 use super::storage::VariableStore;
 use super::storage::VariableStoreKind;
@@ -219,6 +220,16 @@ pub enum SelectionError {
         question: String,
         states: IncludedStates,
     },
+    /// Excluded, in states that values of the ExportConfig snapshot decide
+    #[error(
+        "question {question:?} is {} by a value of the ExportConfig snapshot; also include \
+         {states} questions to select it",
+        .states.alternatives()
+    )]
+    SnapshotExcluded {
+        question: String,
+        states: IncludedStates,
+    },
     #[error(
         "cannot tell whether question {question:?} is {}: {}; also include {states} questions \
          to select it regardless",
@@ -236,6 +247,17 @@ pub enum SelectionError {
         .states.alternatives()
     )]
     OptionExcluded {
+        question: String,
+        option: String,
+        states: IncludedStates,
+    },
+    /// OptionExcluded, in states that values of the ExportConfig snapshot decide
+    #[error(
+        "option {option:?} of question {question:?} is {} by a value of the ExportConfig \
+         snapshot; also include {states} questions to select it",
+        .states.alternatives()
+    )]
+    SnapshotOptionExcluded {
         question: String,
         option: String,
         states: IncludedStates,
@@ -271,10 +293,14 @@ pub enum SelectionError {
 /// to write the question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StateEvaluation {
-    /// The state that the true conditions give
-    known: QuestionState,
+    /// The state that the true conditions give, of those that took no value of the ExportConfig
+    /// snapshot
+    current: QuestionState,
     /// The conditions not evaluated: the state each gives if true, and why it is not evaluated
     unknown: Vec<(QuestionState, String)>,
+    /// The conditions evaluated from values of the ExportConfig snapshot: the state each gives if
+    /// true, and whether it is
+    from_snapshot: Vec<(QuestionState, bool)>,
     /// Why the question is read-only, if it is; never for an option
     read_only: Option<ReadOnlyCause>,
 }
@@ -296,8 +322,9 @@ struct Rank {
 impl StateEvaluation {
     pub(crate) fn selectable() -> Self {
         StateEvaluation {
-            known: QuestionState::Selectable,
+            current: QuestionState::Selectable,
             unknown: Vec::new(),
+            from_snapshot: Vec::new(),
             read_only: None,
         }
     }
@@ -315,20 +342,43 @@ impl StateEvaluation {
         }
     }
 
-    /// Takes in a condition that gives `state` when true.
-    fn add(&mut self, state: QuestionState, truth: Truth) {
-        match truth {
-            Truth::Known(true) => self.known = self.known.max(state),
-            Truth::Known(false) => {}
-            Truth::Unknown(reason) => self.unknown.push((state, reason)),
+    /// Takes in a condition that gives `state` when true, evaluated from values of `source`.
+    fn add(&mut self, state: QuestionState, truth: Truth, source: ValueSource) {
+        match (truth, source) {
+            (Truth::Known(true), ValueSource::Current) => self.current = self.current.max(state),
+            (Truth::Known(false), ValueSource::Current) => {}
+            (Truth::Known(truth), ValueSource::Snapshot) => self.from_snapshot.push((state, truth)),
+            (Truth::Unknown(reason), ValueSource::Current | ValueSource::Snapshot) => {
+                self.unknown.push((state, reason));
+            }
         }
+    }
+
+    /// Takes in the condition of the SUPPRESS_IF, GRAY_OUT_IF or DISABLE_IF `scope`, which gives
+    /// `state` when true, with where the values that it takes come from.
+    fn evaluate(
+        &mut self,
+        state: QuestionState,
+        scope: &IFROperation,
+        inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+    ) {
+        let taken = inputs.reader.snapshot_values_taken();
+        let truth = evaluate_condition(scope, inputs);
+        self.add(state, truth, ValueSource::since(taken, inputs.reader));
+    }
+
+    /// The state that the true conditions give.
+    fn known(&self) -> QuestionState {
+        self.from_snapshot
+            .iter()
+            .filter(|&&(_, truth)| truth)
+            .fold(self.current, |known, &(state, _)| known.max(state))
     }
 
     /// The conditions not evaluated that would give a state above the known one.
     fn deciding(&self) -> impl Iterator<Item = &(QuestionState, String)> {
-        self.unknown
-            .iter()
-            .filter(move |(state, _)| *state > self.known)
+        let known = self.known();
+        self.unknown.iter().filter(move |(state, _)| *state > known)
     }
 
     /// Why the conditions that decide between the possible states are not evaluated, each
@@ -342,16 +392,31 @@ impl StateEvaluation {
 
     /// The states that the question or option can be in.
     fn possible_states(&self) -> BTreeSet<QuestionState> {
-        std::iter::once(self.known)
-            .chain(self.deciding().map(|&(state, _)| state))
-            .collect()
+        possible_states_of(self.known(), self.unknown.iter().map(|&(state, _)| state))
+    }
+
+    /// Snapshot if the values of the ExportConfig snapshot that conditions took decide the
+    /// possible states: without them, those conditions would not be evaluated, and the states
+    /// would differ.
+    pub(crate) fn source(&self) -> ValueSource {
+        let without = possible_states_of(
+            self.current,
+            self.unknown
+                .iter()
+                .map(|&(state, _)| state)
+                .chain(self.from_snapshot.iter().map(|&(state, _)| state)),
+        );
+        match without == self.possible_states() {
+            true => ValueSource::Current,
+            false => ValueSource::Snapshot,
+        }
     }
 
     /// The highest of possible_states.
     fn worst_case(&self) -> QuestionState {
         self.deciding()
             .map(|&(state, _)| state)
-            .fold(self.known, QuestionState::max)
+            .fold(self.known(), QuestionState::max)
     }
 
     /// The possible states that `include` does not allow.
@@ -381,7 +446,8 @@ impl StateEvaluation {
     }
 
     /// The suffix that get, set and list-questions add to the answer: the possible states,
-    /// unless just selectable, with why the conditions are not evaluated if more than one.
+    /// unless just selectable, with why the conditions are not evaluated if more than one, then
+    /// the tag of source(), after which a selectable state shows too.
     pub(crate) fn annotation(&self) -> String {
         self.annotated("")
     }
@@ -393,6 +459,7 @@ impl StateEvaluation {
 
     /// The annotation, with `subject` before the states.
     fn annotated(&self, subject: &str) -> String {
+        let source = self.source();
         let reasons: Vec<&str> = self.reasons().collect();
         if !reasons.is_empty() {
             let states: Vec<String> = self
@@ -401,18 +468,33 @@ impl StateEvaluation {
                 .map(ToString::to_string)
                 .collect();
             return format!(
-                " <{subject}{}: {}>",
+                " <{subject}{}: {}>{}",
                 states.join(" or "),
-                reasons.join("; ")
+                reasons.join("; "),
+                source.annotation()
             );
         }
-        match self.known {
-            QuestionState::Selectable => String::new(),
-            QuestionState::GrayedOut | QuestionState::Suppressed | QuestionState::Disabled => {
-                format!(" <{subject}{}>", self.known)
-            }
+        let known = self.known();
+        let shown = match known {
+            QuestionState::Selectable => matches!(source, ValueSource::Snapshot),
+            QuestionState::GrayedOut | QuestionState::Suppressed | QuestionState::Disabled => true,
+        };
+        match shown {
+            true => format!(" <{subject}{known}>{}", source.annotation()),
+            false => String::new(),
         }
     }
+}
+
+/// The states that a question or option can be in when its true conditions give `known` and
+/// those not evaluated may give `unknown`.
+fn possible_states_of(
+    known: QuestionState,
+    unknown: impl Iterator<Item = QuestionState>,
+) -> BTreeSet<QuestionState> {
+    std::iter::once(known)
+        .chain(unknown.filter(|&state| state > known))
+        .collect()
 }
 
 /// Which of the matches of a question to select.
@@ -435,8 +517,8 @@ pub(crate) enum Selection<T> {
         /// read-only
         ranked_before: IncludedStates,
     },
-    /// Every match is in a state that `include` does not allow: the states to include
-    Excluded(IncludedStates),
+    /// Every match is in a state that `include` does not allow
+    Excluded(Exclusion),
     NotFound,
 }
 
@@ -462,7 +544,7 @@ struct Selector<T> {
     likely: Option<(T, StateEvaluation, Rank)>,
     reasons: Vec<String>,
     undetermined: IncludedStates,
-    excluded: IncludedStates,
+    excluded: Exclusion,
     /// The states that `include` may not allow of the matches that it does not allow in every
     /// possible state, by why each is read-only
     unselected: BTreeMap<Option<ReadOnlyCause>, IncludedStates>,
@@ -477,7 +559,7 @@ impl<T> Selector<T> {
             likely: None,
             reasons: Vec::new(),
             undetermined: IncludedStates::empty(),
-            excluded: IncludedStates::empty(),
+            excluded: Exclusion::NONE,
             unselected: BTreeMap::new(),
         }
     }
@@ -512,7 +594,10 @@ impl<T> Selector<T> {
                 }
             }
             (false, None) => {
-                self.excluded |= excluded_states;
+                self.excluded |= Exclusion {
+                    states: excluded_states,
+                    source: evaluation.source(),
+                };
                 *self.unselected.entry(evaluation.read_only).or_default() |= excluded_states;
             }
         }
@@ -560,8 +645,63 @@ impl<T> Selector<T> {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Choice<T> {
     Chosen(T, StateEvaluation),
-    /// No match: the states that excluded matches are in, none if no question matches
-    Skipped(IncludedStates),
+    /// No match: what excluded the matches, none if no question matches
+    Skipped(Exclusion),
+}
+
+/// The states that exclude every match of a question or option, which `include` does not allow,
+/// and whether values of the ExportConfig snapshot decide them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Exclusion {
+    pub(crate) states: IncludedStates,
+    pub(crate) source: ValueSource,
+}
+
+impl Exclusion {
+    /// Of no match.
+    pub(crate) const NONE: Self = Exclusion {
+        states: IncludedStates::empty(),
+        source: ValueSource::Current,
+    };
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.states.is_empty()
+    }
+
+    /// The refusal of `question`, whose every match this excludes.
+    pub(crate) fn question_error(self, question: &str) -> SelectionError {
+        let question = question.to_owned();
+        let states = self.states;
+        match self.source {
+            ValueSource::Current => SelectionError::Excluded { question, states },
+            ValueSource::Snapshot => SelectionError::SnapshotExcluded { question, states },
+        }
+    }
+
+    /// The refusal of option `option` of `question`, whose every match this excludes.
+    pub(crate) fn option_error(self, question: String, option: String) -> SelectionError {
+        let states = self.states;
+        match self.source {
+            ValueSource::Current => SelectionError::OptionExcluded {
+                question,
+                option,
+                states,
+            },
+            ValueSource::Snapshot => SelectionError::SnapshotOptionExcluded {
+                question,
+                option,
+                states,
+            },
+        }
+    }
+}
+
+impl std::ops::BitOrAssign for Exclusion {
+    /// Adds the states of `other`, and the snapshot if it decides them.
+    fn bitor_assign(&mut self, other: Self) {
+        self.states |= other.states;
+        self.source = self.source.or(other.source);
+    }
 }
 
 impl<T> Selection<T> {
@@ -586,7 +726,7 @@ impl<T> Selection<T> {
                 states,
                 ranked_before,
             },
-            Selection::Excluded(states) => Selection::Excluded(states),
+            Selection::Excluded(exclusion) => Selection::Excluded(exclusion),
             Selection::NotFound => Selection::NotFound,
         }
     }
@@ -605,8 +745,8 @@ impl<T> Selection<T> {
                 states,
                 reasons,
             }),
-            Selection::Excluded(states) => Ok(Choice::Skipped(states)),
-            Selection::NotFound => Ok(Choice::Skipped(IncludedStates::empty())),
+            Selection::Excluded(exclusion) => Ok(Choice::Skipped(exclusion)),
+            Selection::NotFound => Ok(Choice::Skipped(Exclusion::NONE)),
         }
     }
 
@@ -622,8 +762,8 @@ impl<T> Selection<T> {
                 likely: (candidate, evaluation),
                 ..
             } => Choice::Chosen(candidate, evaluation),
-            Selection::Excluded(states) => Choice::Skipped(states),
-            Selection::NotFound => Choice::Skipped(IncludedStates::empty()),
+            Selection::Excluded(exclusion) => Choice::Skipped(exclusion),
+            Selection::NotFound => Choice::Skipped(Exclusion::NONE),
         }
     }
 }
@@ -643,13 +783,17 @@ pub(crate) fn question_state(
         ..StateEvaluation::selectable()
     };
     if locked(question) {
-        evaluation.add(QuestionState::GrayedOut, Truth::Known(true));
+        evaluation.add(
+            QuestionState::GrayedOut,
+            Truth::Known(true),
+            ValueSource::Current,
+        );
     }
     let mut scope = question.parent.as_ref().and_then(Weak::upgrade);
     while let Some(op) = scope {
         let op = op.borrow();
         if let OpRole::Scope(state) = OpRole::of(op.op_code) {
-            evaluation.add(state, evaluate_condition(&op, inputs));
+            evaluation.evaluate(state, &op, inputs);
         }
         scope = op.parent.as_ref().and_then(Weak::upgrade);
     }
@@ -712,7 +856,7 @@ pub(crate) fn option_state(
         match OpRole::of(op.op_code) {
             OpRole::Question => break,
             OpRole::Scope(state @ QuestionState::Suppressed) => {
-                evaluation.add(state, evaluate_condition(&op, inputs));
+                evaluation.evaluate(state, &op, inputs);
             }
             OpRole::Scope(
                 QuestionState::Selectable | QuestionState::GrayedOut | QuestionState::Disabled,
@@ -930,12 +1074,14 @@ fn value_kind(value_question: ValueQuestion) -> ValueKind {
 /// if any, replaces; or why it has none. A READ that gives UNDEFINED or fails leaves the stored
 /// value, as edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue reads storage then; a
 /// question without a VarStore has none then. A question with an EFI_IFR_VALUE has the value of
-/// its expression instead, which GetQuestionValue takes before any READ or storage.
+/// its expression instead, which GetQuestionValue takes before any READ or storage. The value of
+/// an EFI_IFR_VALUE or READ expression comes from the snapshot if THIS or a value that the
+/// expression took does.
 pub(super) fn retrieve_question_value(
     question: &Rc<RefCell<IFROperation>>,
     varstore: &Result<Box<dyn VariableStore>>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-) -> std::result::Result<(ReadableLocation, u64), ValueUnavailable> {
+) -> std::result::Result<RetrievedValue, ValueUnavailable> {
     let op = question.borrow();
     let Some(value_question) = value_question(&op) else {
         return Err(ValueUnavailable::NotDecoded(op.op_code));
@@ -944,9 +1090,14 @@ pub(super) fn retrieve_question_value(
         .location()
         .check()
         .map_err(ValueUnavailable::BitField)?;
+    let taken = inputs.reader.snapshot_values_taken();
     if let Some(value) = question_value_expression(&op) {
         return evaluate_value(&value.borrow(), inputs)
-            .map(|value| (location, value))
+            .map(|value| RetrievedValue {
+                location,
+                value,
+                source: ValueSource::since(taken, inputs.reader),
+            })
             .map_err(ValueUnavailable::ValueExpression);
     }
     let stored = read_question_value(&op, varstore, inputs.reader);
@@ -967,8 +1118,8 @@ pub(super) fn retrieve_question_value(
         reason: reason.to_answer(),
     };
     let this = match &stored {
-        Ok((_, value)) => {
-            typed_value(value_question, *value).unwrap_or_else(|reason| unreadable(&reason))
+        Ok(stored) => {
+            typed_value(value_question, stored.value).unwrap_or_else(|reason| unreadable(&reason))
         }
         Err(reason) => unreadable(reason),
     };
@@ -980,7 +1131,11 @@ pub(super) fn retrieve_question_value(
             )),
             None => stored,
         },
-        ReadOutcome::Value(value) => Ok((location, value.as_u64())),
+        ReadOutcome::Value(value) => Ok(RetrievedValue {
+            location,
+            value: value.as_u64(),
+            source: ValueSource::since(taken, inputs.reader),
+        }),
         ReadOutcome::Refused(refusal) => Err(ValueUnavailable::Expression(refusal)),
     }
 }
@@ -1005,7 +1160,7 @@ fn question_value(
         // around a REF, which either stated level suppresses
         (true, Some(level)) => Ok(u64::from(u8::from(level))),
         (true, None) | (false, Some(_) | None) => {
-            retrieve_question_value(question, varstore, inputs).map(|(_, value)| value)
+            retrieve_question_value(question, varstore, inputs).map(|retrieved| retrieved.value)
         }
     };
     let reason = match value.and_then(|value| typed_value(value_question, value)) {
@@ -1546,7 +1701,7 @@ fn variable_store(
 ) -> Result<Box<dyn VariableStore>, (&'static str, &'static str)> {
     match declared {
         DeclaredStore::Variable(store) => Ok(store),
-        DeclaredStore::NameValue => Err((NAME_VALUE_STORE, NAME_VALUE_REACH)),
+        DeclaredStore::NameValue(_) => Err((NAME_VALUE_STORE, NAME_VALUE_REACH)),
         DeclaredStore::ShortEfi => Err((ShortVarStoreEfi::LABEL, ShortVarStoreEfi::UNREAD)),
     }
 }
@@ -3268,9 +3423,10 @@ mod tests {
 
     fn known(state: QuestionState) -> StateEvaluation {
         StateEvaluation {
-            known: state,
+            current: state,
             unknown: Vec::new(),
             read_only: None,
+            from_snapshot: Vec::new(),
         }
     }
 
@@ -3674,12 +3830,13 @@ mod tests {
         assert_eq!(
             got,
             StateEvaluation {
-                known: QuestionState::GrayedOut,
+                current: QuestionState::GrayedOut,
                 unknown: vec![(
                     QuestionState::Suppressed,
                     "EFI_IFR_EQ_ID_VAL of question 0x0004: <ValueUnavailable: test>".to_string()
                 )],
                 read_only: None,
+                from_snapshot: Vec::new(),
             },
             "grayed out, maybe suppressed"
         );
@@ -3687,12 +3844,162 @@ mod tests {
 
     fn evaluation(known: QuestionState, unknown: &[(QuestionState, &str)]) -> StateEvaluation {
         StateEvaluation {
-            known,
+            current: known,
             unknown: unknown
                 .iter()
                 .map(|&(state, reason)| (state, reason.to_string()))
                 .collect(),
             read_only: None,
+            from_snapshot: Vec::new(),
+        }
+    }
+
+    /// The exclusion in `states` that current values decide.
+    fn exclusion(states: IncludedStates) -> Exclusion {
+        Exclusion {
+            states,
+            source: ValueSource::Current,
+        }
+    }
+
+    /// The tag of a state goes with the values of the ExportConfig snapshot that decide it, and
+    /// only with them: a condition on one decides nothing when a state above its own is known
+    /// already, or when another condition would give that state anyway.
+    #[test]
+    fn states_name_the_snapshot_only_where_it_decides_them() {
+        use QuestionState::*;
+        // name, current, unknown, from_snapshot, annotation
+        type Case<'a> = (
+            &'a str,
+            QuestionState,
+            &'a [(QuestionState, &'a str)],
+            &'a [(QuestionState, bool)],
+            &'a str,
+        );
+        let cases: [Case; 7] = [
+            (
+                "true",
+                Selectable,
+                &[],
+                &[(GrayedOut, true)],
+                " <grayed-out> <snapshot>",
+            ),
+            (
+                "false",
+                Selectable,
+                &[],
+                &[(GrayedOut, false)],
+                " <selectable> <snapshot>",
+            ),
+            (
+                "under a known higher state",
+                Disabled,
+                &[],
+                &[(GrayedOut, true)],
+                " <disabled>",
+            ),
+            (
+                "beside the same known state",
+                GrayedOut,
+                &[],
+                &[(GrayedOut, true)],
+                " <grayed-out>",
+            ),
+            (
+                "over a condition not evaluated",
+                Selectable,
+                &[(GrayedOut, "r")],
+                &[(GrayedOut, true)],
+                " <grayed-out> <snapshot>",
+            ),
+            (
+                "under a condition not evaluated",
+                Selectable,
+                &[(Suppressed, "r")],
+                &[(GrayedOut, true)],
+                " <grayed-out or suppressed: r> <snapshot>",
+            ),
+            (
+                "none",
+                GrayedOut,
+                &[(Suppressed, "r")],
+                &[],
+                " <grayed-out or suppressed: r>",
+            ),
+        ];
+        for (case, current, unknown, from_snapshot, want) in cases {
+            let evaluation = StateEvaluation {
+                from_snapshot: from_snapshot.to_vec(),
+                ..evaluation(current, unknown)
+            };
+
+            assert_eq!(evaluation.annotation(), want, "{case}");
+            assert_eq!(
+                evaluation.option_annotation(),
+                want.replacen(" <", " <option ", 1),
+                "{case}: option"
+            );
+        }
+    }
+
+    /// get's refusals name the snapshot when its values decide the states that exclude a
+    /// question or option, also among other exclusions.
+    #[test]
+    fn exclusions_name_the_snapshot_that_decides_them() {
+        let snapshot = Exclusion {
+            states: IncludedStates::SUPPRESSED,
+            source: ValueSource::Snapshot,
+        };
+        let mut merged = snapshot;
+        merged |= exclusion(IncludedStates::GRAYED_OUT);
+
+        for (case, exclusion, question_want, option_want) in [
+            (
+                "current values",
+                exclusion(IncludedStates::SUPPRESSED),
+                SelectionError::Excluded {
+                    question: "Q".to_string(),
+                    states: IncludedStates::SUPPRESSED,
+                },
+                SelectionError::OptionExcluded {
+                    question: "Q".to_string(),
+                    option: "O".to_string(),
+                    states: IncludedStates::SUPPRESSED,
+                },
+            ),
+            (
+                "snapshot values",
+                snapshot,
+                SelectionError::SnapshotExcluded {
+                    question: "Q".to_string(),
+                    states: IncludedStates::SUPPRESSED,
+                },
+                SelectionError::SnapshotOptionExcluded {
+                    question: "Q".to_string(),
+                    option: "O".to_string(),
+                    states: IncludedStates::SUPPRESSED,
+                },
+            ),
+            (
+                "snapshot values and current ones",
+                merged,
+                SelectionError::SnapshotExcluded {
+                    question: "Q".to_string(),
+                    states: IncludedStates::GRAYED_OUT | IncludedStates::SUPPRESSED,
+                },
+                SelectionError::SnapshotOptionExcluded {
+                    question: "Q".to_string(),
+                    option: "O".to_string(),
+                    states: IncludedStates::GRAYED_OUT | IncludedStates::SUPPRESSED,
+                },
+            ),
+        ] {
+            assert_eq!(exclusion.question_error("Q"), question_want, "{case}");
+            assert_eq!(
+                exclusion.option_error("Q".to_string(), "O".to_string()),
+                option_want,
+                "{case}: option"
+            );
         }
     }
 
@@ -3822,7 +4129,7 @@ mod tests {
                 "grayed out",
                 vec![evaluation(GrayedOut, &[])],
                 none,
-                Selection::Excluded(grayed_out),
+                Selection::Excluded(exclusion(grayed_out)),
             ),
             (
                 "grayed out, included",
@@ -3888,7 +4195,7 @@ mod tests {
                 "excluded states add up",
                 vec![evaluation(Suppressed, &[]), evaluation(Disabled, &[])],
                 none,
-                Selection::Excluded(suppressed | disabled),
+                Selection::Excluded(exclusion(suppressed | disabled)),
             ),
             (
                 "undetermined states and reasons add up, once each",
@@ -4116,7 +4423,7 @@ mod tests {
                 "suppressed",
                 vec![suppressed()],
                 IncludedStates::empty(),
-                Selection::Excluded(include),
+                Selection::Excluded(exclusion(include)),
             ),
             (
                 "suppressed, included",
@@ -4183,6 +4490,14 @@ mod tests {
                  questions to select it",
             ),
             (
+                SelectionError::SnapshotExcluded {
+                    question: "Q".to_string(),
+                    states: IncludedStates::GRAYED_OUT,
+                },
+                "question \"Q\" is grayed-out by a value of the ExportConfig snapshot; also \
+                 include grayed-out questions to select it",
+            ),
+            (
                 SelectionError::Undetermined {
                     question: "Q".to_string(),
                     states: IncludedStates::GRAYED_OUT | IncludedStates::SUPPRESSED,
@@ -4199,6 +4514,15 @@ mod tests {
                 },
                 "option \"O\" of question \"Q\" is suppressed or disabled; also include \
                  suppressed,disabled questions to select it",
+            ),
+            (
+                SelectionError::SnapshotOptionExcluded {
+                    question: "Q".to_string(),
+                    option: "O".to_string(),
+                    states: IncludedStates::SUPPRESSED,
+                },
+                "option \"O\" of question \"Q\" is suppressed by a value of the ExportConfig \
+                 snapshot; also include suppressed questions to select it",
             ),
             (
                 SelectionError::OptionUndetermined {
@@ -5178,9 +5502,10 @@ mod tests {
             )
         };
         let undetermined = StateEvaluation {
-            known: QuestionState::Selectable,
+            current: QuestionState::Selectable,
             unknown: vec![(QuestionState::GrayedOut, UNREAD.to_string())],
             read_only: None,
+            from_snapshot: Vec::new(),
         };
         let cases = [
             (
@@ -5397,9 +5722,10 @@ mod tests {
                     },
                 ),
                 StateEvaluation {
-                    known: QuestionState::Selectable,
+                    current: QuestionState::Selectable,
                     unknown: Vec::new(),
                     read_only: None,
+                    from_snapshot: Vec::new(),
                 },
                 "{level:?}"
             );
@@ -5551,7 +5877,6 @@ mod store_expression_tests {
     const ZERO: u8 = 0x52;
     const ONE: u8 = 0x53;
     const UNDEFINED: u8 = 0x55;
-    const THIS: u8 = 0x58;
     const VALUE: u8 = 0x5A;
 
     /// The VARSTORE_EFI of the tests, of 5 bytes.

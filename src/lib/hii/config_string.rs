@@ -18,6 +18,7 @@
 use std::fmt;
 use std::iter::Peekable;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::str::FromStr;
 use std::str::Split;
 
@@ -282,6 +283,11 @@ impl BlockConfig {
         &self.value
     }
 
+    /// The bytes of the buffer that the block covers, which end at most at MAX_BLOCK_END.
+    pub(crate) fn range(&self) -> Range<usize> {
+        self.offset..self.offset + self.value.len()
+    }
+
     /// Copies the block into `buffer`, as ConfigToBlock does (UEFI 2.10 §35.4.6).
     pub(crate) fn write_to(&self, buffer: &mut [u8]) -> Result<(), ConfigStringError> {
         let outside = ConfigStringError::OutsideBuffer {
@@ -368,6 +374,12 @@ impl NvConfig {
     /// The value's hex digits, in lowercase.
     pub(crate) fn value(&self) -> &str {
         &self.value
+    }
+
+    /// The value as a `<Number>`, least significant byte first, as EDK2's SetupBrowserDxe
+    /// BufferToValue reads that of a question that holds no string: None if it is empty.
+    pub(crate) fn number(&self) -> Option<Number> {
+        hex_number(&self.value).map(Number)
     }
 }
 
@@ -480,6 +492,21 @@ impl MultiConfigAltResp {
     pub(crate) fn as_slice(&self) -> &[ConfigAltResp] {
         &self.0
     }
+
+    /// Each `<ConfigAltResp>` of `text`, or why it does not parse, in order: one that does not
+    /// parse ends at the next `<ConfigHdr>`, and the `<AltResp>`s that follow it are its own, so
+    /// it hides none of the others.
+    pub(crate) fn parse_each(text: &str) -> Vec<Result<ConfigAltResp, ConfigStringError>> {
+        let mut elements = Elements::new(text);
+        let mut resps = Vec::new();
+        while elements.peek().is_some() {
+            if let Err(error) = parse_next_resp(&mut elements, &mut resps) {
+                while elements.next_unless_header().is_some() {}
+                resps.push(Err(error));
+            }
+        }
+        resps
+    }
 }
 
 impl FromStr for MultiConfigAltResp {
@@ -489,10 +516,9 @@ impl FromStr for MultiConfigAltResp {
         let mut elements = Elements::new(text);
         let mut resps: Vec<ConfigAltResp> = Vec::new();
         loop {
-            let header = ConfigHdr::parse(&mut elements)?;
-            match elements.optional_value("ALTCFG=") {
-                Some(digits) => {
-                    let alt_cfg_id = DefaultId(parse_alt_cfg_id(digits)?);
+            let (header, alt_cfg_id) = parse_resp_start(&mut elements)?;
+            match alt_cfg_id {
+                Some(alt_cfg_id) => {
                     let resp = resps.last_mut().ok_or(ConfigStringError::AltRespFirst)?;
                     if header != resp.resp.header {
                         return Err(ConfigStringError::AltRespHeader);
@@ -515,6 +541,49 @@ impl FromStr for MultiConfigAltResp {
             }
         }
     }
+}
+
+/// The `<ConfigHdr>` that starts the next `<ConfigResp>` or `<AltResp>` of `elements`, and the
+/// ALTCFG of an `<AltResp>`.
+fn parse_resp_start(
+    elements: &mut Elements<'_>,
+) -> Result<(ConfigHdr, Option<DefaultId>), ConfigStringError> {
+    let header = ConfigHdr::parse(elements)?;
+    let alt_cfg_id = elements
+        .optional_value("ALTCFG=")
+        .map(|digits| parse_alt_cfg_id(digits).map(DefaultId))
+        .transpose()?;
+    Ok((header, alt_cfg_id))
+}
+
+/// Parses the next `<ConfigResp>` of `elements` into `resps`, or the next `<AltResp>` into the
+/// last of them; one of a `<ConfigAltResp>` that does not parse is taken and dropped.
+fn parse_next_resp(
+    elements: &mut Elements<'_>,
+    resps: &mut Vec<Result<ConfigAltResp, ConfigStringError>>,
+) -> Result<(), ConfigStringError> {
+    let (header, alt_cfg_id) = parse_resp_start(elements)?;
+    match (alt_cfg_id, resps.last_mut()) {
+        (None, _) => {
+            let body = parse_body(elements)?;
+            resps.push(Ok(ConfigAltResp {
+                resp: ConfigResp { header, body },
+                alternates: Vec::new(),
+            }));
+        }
+        (Some(_), None) => return Err(ConfigStringError::AltRespFirst),
+        (Some(_), Some(Err(_))) => {
+            parse_body(elements)?;
+        }
+        (Some(alt_cfg_id), Some(Ok(resp))) => {
+            if header != resp.resp.header {
+                return Err(ConfigStringError::AltRespHeader);
+            }
+            let body = parse_body(elements)?;
+            resp.alternates.push(AltResp { alt_cfg_id, body });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for MultiConfigAltResp {
@@ -1800,6 +1869,51 @@ mod tests {
         ];
         for (text, error) in cases {
             assert_eq!(text.parse::<MultiConfigAltResp>(), Err(error), "{text:?}");
+        }
+    }
+
+    /// parse_each gives each <ConfigAltResp> as the strict parse gives it alone, and for one that
+    /// does not parse its error, in order: it ends at the next <ConfigHdr>, and an <AltResp> after
+    /// it is its own, while one before any <ConfigResp> or of another storage fails alone.
+    #[test]
+    fn parse_each_parses_each_config_alt_resp_on_its_own() {
+        let header = setup_header_text();
+        let other_header = format!("GUID={GLOBAL_VARIABLE_HEX}&NAME=0058&PATH=7fff0400");
+        let first = format!("{header}&OFFSET=0&WIDTH=1&VALUE=01&{header}&ALTCFG=0000&fred=01");
+        let unparsed = format!("{other_header}&OFFSET=0&WIDTH=1g&VALUE=02");
+        let its_alternate = format!("{other_header}&ALTCFG=0001&OFFSET=0&WIDTH=1&VALUE=03");
+        let last = format!("{header}&OFFSET=1&WIDTH=1&VALUE=04");
+        let alone = |text: &str| {
+            text.parse::<MultiConfigAltResp>()
+                .map(|multi| multi.as_slice().to_vec())
+                .expect("parse alone")
+        };
+        let cases = [
+            (
+                [first.as_str(), &unparsed, &its_alternate, &last].join("&"),
+                vec![
+                    Ok(alone(&first).remove(0)),
+                    Err(invalid_value("WIDTH", "1g", SIZE_NUMBER)),
+                    Ok(alone(&last).remove(0)),
+                ],
+            ),
+            (
+                format!("{its_alternate}&{last}"),
+                vec![
+                    Err(ConfigStringError::AltRespFirst),
+                    Ok(alone(&last).remove(0)),
+                ],
+            ),
+            (
+                format!("{last}&{its_alternate}"),
+                vec![
+                    Ok(alone(&last).remove(0)),
+                    Err(ConfigStringError::AltRespHeader),
+                ],
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(MultiConfigAltResp::parse_each(&text), want, "{text:?}");
         }
     }
 

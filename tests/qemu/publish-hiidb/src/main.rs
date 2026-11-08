@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -53,6 +53,10 @@
 //! edk2's HiiDatabaseDxe does when PcdHiiOsRuntimeSupport is TRUE (UEFI 2.11 §33.2.11.1), and
 //! puts its length and address in the volatile `HiiDBConfigTable` variable, in `HiiDB`'s
 //! layout, for the tests.
+//! `export-config` installs ExportConfig()'s results as edk2 does with PcdHiiOsRuntimeSupport
+//! (UEFI 2.11 §33.2.11.1), after it registers the package list of [`password_forms`] for a
+//! handle with a device path and appends a `<ConfigResp>` of marker bytes for its password
+//! VarStore: [`exported_config`]. A later `publish-hiidb.efi rt-data` publishes that list too.
 //! `rt-properties-no-set-variable` publishes nothing: it installs an EFI_RT_PROPERTIES_TABLE
 //! (UEFI 2.11 §4.6.2) whose RuntimeServicesSupported lists every runtime service but
 //! SetVariable(), as firmware that cannot write variables at runtime publishes, and
@@ -83,6 +87,7 @@ extern crate alloc;
 mod auth_variables;
 mod dropped_password_forms;
 mod enhanced_auth_forms;
+mod exported_config;
 mod formset_skip_forms;
 mod global_variable_forms;
 mod hii_package;
@@ -115,6 +120,7 @@ use uefi::runtime::VariableAttributes;
 use uefi::runtime::VariableVendor;
 use uefi::CStr16;
 use uefi::Guid;
+use uefi::Handle;
 use uefi::Status;
 use uefi::StatusExt;
 use uefi_raw::protocol::hii::database::HiiDatabaseProtocol;
@@ -262,6 +268,7 @@ fn efi_main() -> Status {
             })
         }
         Some(Task::InstallConfigTables) => install_config_tables(),
+        Some(Task::ExportConfig) => exported_config::export_config(),
         Some(Task::InstallRtProperties(version, supported)) => {
             install_rt_properties(version, supported)
         }
@@ -276,7 +283,8 @@ fn efi_main() -> Status {
                  |rt-data-readwrite-forms|password-forms|rt-data-password-forms\
                  |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
                  |padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
-                 |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
+                 |install-config-tables|export-config|rt-properties-no-set-variable\
+                 |rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
                  |json-config-data-past-region|json-config-data-boot-services\
                  |json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]"
@@ -322,6 +330,9 @@ enum Task {
     PublishJunkAcpiTable([u8; 4]),
     /// Install a copy of the database as the HII database protocol's configuration table.
     InstallConfigTables,
+    /// Install ExportConfig()'s results, with a block of the password forms' VarStore, as the
+    /// HII Configuration Routing Protocol's configuration table.
+    ExportConfig,
     /// Install an EFI_RT_PROPERTIES_TABLE of this Version and RuntimeServicesSupported.
     InstallRtProperties(u16, u32),
     /// Install this JSON configuration table.
@@ -383,6 +394,7 @@ fn load_option() -> Option<Task> {
             Some(Task::PublishJunkAcpiTable(QHII_SIGNATURE))
         }
         Ok(option) if option == cstr16!("install-config-tables") => Some(Task::InstallConfigTables),
+        Ok(option) if option == cstr16!("export-config") => Some(Task::ExportConfig),
         Ok(option) if option == cstr16!("rt-properties-no-set-variable") => {
             Some(Task::InstallRtProperties(
                 RT_PROPERTIES_TABLE_VERSION,
@@ -431,6 +443,16 @@ struct RawHiiDatabase(HiiDatabaseProtocol);
 /// Registers the package list `list` in the HII database, for no driver, until the reset: the
 /// UEFI Shell or a later publish-hiidb exports the database. A failure names `step`.
 fn register_package_list(list: &[u8], step: &'static str) -> Result<(), Failure> {
+    register_package_list_for(list, None, step)
+}
+
+/// register_package_list for the driver handle `driver`, if any, whose device path the database
+/// adds to the list as its device path package.
+fn register_package_list_for(
+    list: &[u8],
+    driver: Option<Handle>,
+    step: &'static str,
+) -> Result<(), Failure> {
     let database = boot::get_handle_for_protocol::<RawHiiDatabase>()
         .and_then(boot::open_protocol_exclusive::<RawHiiDatabase>)
         .map_err(|error| ("opening the HII database", error.status()))?;
@@ -448,7 +470,7 @@ fn register_package_list(list: &[u8], step: &'static str) -> Result<(), Failure>
         (database.0.new_package_list)(
             &database.0,
             list.as_ptr().cast(),
-            ptr::null_mut(),
+            driver.map_or(ptr::null_mut(), |driver| driver.as_ptr()),
             &mut handle,
         )
     };

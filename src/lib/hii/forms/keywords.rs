@@ -548,7 +548,7 @@ impl<'a> KeywordQuestion<'a> {
                     DeclaredStore::Variable(store) => {
                         Some(format!("EFI variable {}", store.variable_key()))
                     }
-                    DeclaredStore::NameValue => Some("a VARSTORE_NAME_VALUE".to_owned()),
+                    DeclaredStore::NameValue(_) => Some("a VARSTORE_NAME_VALUE".to_owned()),
                     DeclaredStore::ShortEfi => Some(format!("an {}", ShortVarStoreEfi::LABEL)),
                 },
             )
@@ -597,15 +597,11 @@ impl<'a> KeywordQuestion<'a> {
         };
         match choice_for_set(selection, prompt, &options, KEYWORD_SET_LIFTABLE, reader)? {
             Choice::Chosen(descriptor, _) => Ok(descriptor),
-            Choice::Skipped(states) if states.is_empty() => Err(SelectionError::NotFound {
+            Choice::Skipped(exclusion) if exclusion.is_empty() => Err(SelectionError::NotFound {
                 question: prompt.to_owned(),
             }
             .into()),
-            Choice::Skipped(states) => Err(SelectionError::Excluded {
-                question: prompt.to_owned(),
-                states,
-            }
-            .into()),
+            Choice::Skipped(exclusion) => Err(exclusion.question_error(prompt).into()),
         }
     }
 

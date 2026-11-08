@@ -230,6 +230,21 @@ set to FALSE. The scenario `hii-systab` and, on aarch64 with `kernel=vamap`, `hi
 check that the Linux build reads it with `--hii-source systab` and in the automatic order, where
 the vendor ACPI tables and the `HiiDB` variable report their sources absent.
 
+`publish-hiidb.efi export-config` installs the current configuration that EDK2 exports with
+`PcdHiiOsRuntimeSupport` too (UEFI 2.11 §33.2.11.1): `ExportConfig()`'s results, in a zeroed
+runtime pool a quarter larger, as the EFI configuration table of the HII Configuration Routing
+Protocol's GUID. Before that, it registers the forms of
+[`publish-hiidb/src/password_forms.rs`](publish-hiidb/src/password_forms.rs) for a handle
+with a device path of its own, as a driver does, and after the results it appends a
+`<ConfigResp>` that fills the bytes of their PASSWORD questions in `AMITSESetup` with 0xA5
+and sets the ONE_OF after them to 1, as that driver's `ExtractConfig()` would export it. In
+the scenario `hii-snapshot`,
+[`vars/my-ifr-nv-data-boot-services.json`](vars/my-ifr-nv-data-boot-services.json) creates
+DriverSample's variable without runtime access and with values other than its defaults, so
+Linux does not see it: `uefisettings` shows the values of its questions and of that ONE_OF
+from the snapshot, prints and logs no byte of the passwords, and `set` refuses DriverSample's
+questions as without the snapshot.
+
 `publish-hiidb.efi rt-properties-no-set-variable` publishes nothing: it installs an
 `EFI_RT_PROPERTIES_TABLE` that lists every runtime service but `SetVariable()`, as firmware
 that cannot write variables at runtime publishes, and `publish-hiidb.efi rt-properties-all` one

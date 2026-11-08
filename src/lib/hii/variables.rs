@@ -29,6 +29,7 @@ use thiserror::Error;
 use crate::efi_variables::enhanced_authenticated::has_metadata;
 use crate::efi_variables::enhanced_authenticated::metadata_end;
 use crate::efi_variables::enhanced_authenticated::MetadataRefusal;
+use crate::hii::config_snapshot::SnapshotLookup;
 #[cfg(all(efivar_dumps, not(system_variables)))]
 use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::package::Guid;
@@ -636,7 +637,10 @@ pub enum EfivarSource {
     /// This machine's variables: its efivarfs on Linux, GetVariable() in the UEFI Shell,
     /// GetFirmwareEnvironmentVariableExW on Windows, where opening them enables the
     /// SeSystemEnvironmentPrivilege, so that a process that is not elevated fails there before
-    /// any read, even for a HiiDB whose questions read no variable.
+    /// any read, even for a HiiDB whose questions read no variable. On Linux on x86 and arm64,
+    /// get, list-questions and show-ifr also take the values of the variables that it lacks
+    /// from the ExportConfig snapshot that the configuration table lists (UEFI 2.11 §33.2.11.1),
+    /// read from physical memory.
     #[cfg(system_variables)]
     #[default]
     System,
@@ -766,6 +770,9 @@ pub(crate) struct EfivarReader {
     pub(super) decoded: BTreeMap<VariableKey, Vec<DecodedValue>>,
     /// The bytes that `variables` withhold, which no value decodes
     withheld: WithheldBytes,
+    /// Where get, list-questions and show-ifr take the values of missing variables from, if
+    /// anywhere
+    pub(super) snapshot: Option<SnapshotLookup>,
 }
 
 impl EfivarReader {
@@ -794,6 +801,7 @@ impl EfivarReader {
             outcomes: BTreeMap::new(),
             decoded: BTreeMap::new(),
             withheld,
+            snapshot: None,
         }
     }
 
@@ -872,10 +880,16 @@ impl WithheldBytes {
         }
     }
 
+    /// The withheld bytes of `key`.
+    pub(super) fn of(&self, key: &VariableKey) -> &[Range<usize>] {
+        self.0
+            .get(&EfivarFileName::from(key))
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The first withheld bytes of `key` that `bytes` overlap, if any.
     fn overlap(&self, key: &VariableKey, bytes: &Range<usize>) -> Option<Range<usize>> {
-        self.0
-            .get(&EfivarFileName::from(key))?
+        self.of(key)
             .iter()
             .find(|withheld| withheld.start < bytes.end && bytes.start < withheld.end)
             .cloned()
@@ -911,7 +925,7 @@ impl WithheldBytes {
     /// Zeroes the withheld bytes of `key` in `value`, the start of its value.
     fn zero(&self, key: &VariableKey, value: &mut [u8]) {
         let len = value.len();
-        for withheld in self.0.get(&EfivarFileName::from(key)).into_iter().flatten() {
+        for withheld in self.of(key) {
             if let Some(password) = value.get_mut(withheld.start.min(len)..withheld.end.min(len)) {
                 password.fill(0);
             }

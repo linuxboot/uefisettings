@@ -64,6 +64,10 @@ name = "hii_no_runtime_access"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_snapshot"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_persistence"
 required-features = ["test-vm"]
 

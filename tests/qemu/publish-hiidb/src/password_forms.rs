@@ -43,7 +43,13 @@ use crate::hii_package::UINT8_DECIMAL;
 /// The GUID of the package list and of its form set.
 const FORM_SET: Guid = guid!("8c78a505-baa0-4c4a-869f-000000000100");
 /// The vendor GUID of AMITSESetup, which tests/qemu/vars/amitse-setup.json creates.
-const AMITSE_SETUP_VENDOR: Guid = guid!("8c78a505-baa0-4c4a-869f-000000000101");
+pub(crate) const AMITSE_SETUP_VENDOR: Guid = guid!("8c78a505-baa0-4c4a-869f-000000000101");
+/// The name of the buffer VarStore AMITSESetup.
+pub(crate) const AMITSE_SETUP_NAME: &str = "AMITSESetup";
+/// The Size of AMITSESetup: the two passwords, then the byte of the ONE_OF.
+pub(crate) const AMITSE_SETUP_SIZE: u16 = 81;
+/// The byte of AMITSESetup that the ONE_OF keeps, after the two passwords.
+pub(crate) const QUIET_BOOT_OFFSET: u16 = 80;
 /// The Attributes of the VARSTORE_EFI: non-volatile, boot service and runtime access.
 const NV_BS_RT: u32 = 0x07;
 
@@ -98,8 +104,9 @@ fn form_package() -> Vec<u8> {
         &[
             &AMITSE_SETUP_VENDOR.to_bytes()[..],
             &AMITSE_SETUP.to_le_bytes(),
-            &81u16.to_le_bytes(), // Size
-            b"AMITSESetup\0",
+            &AMITSE_SETUP_SIZE.to_le_bytes(),
+            AMITSE_SETUP_NAME.as_bytes(),
+            &[0],
         ]
         .concat(),
     );
@@ -120,7 +127,7 @@ fn form_package() -> Vec<u8> {
             EFI_IFR_ONE_OF_OP,
             true,
             &[
-                question_header(QUIET_BOOT, HELP, 3, AMITSE_SETUP, 80),
+                question_header(QUIET_BOOT, HELP, 3, AMITSE_SETUP, QUIET_BOOT_OFFSET),
                 // Flags, MinValue, MaxValue, Step
                 [UINT8_DECIMAL, 0, 1, 0].to_vec(),
             ]

@@ -59,9 +59,11 @@ use question_values::questions_named;
 use question_values::value_question;
 use set::ChangeValueError;
 use storage::storage_width;
+use storage::NameValueStore;
 use storage::ReadableLocation;
 use storage::ShortVarStoreEfi;
 use storage::ValueLocation;
+use storage::ValueSource;
 use storage::VarStore;
 use storage::VarStoreEfi;
 use storage::VarStoreNameValue;
@@ -80,12 +82,14 @@ pub use setup_password::SetupPasswordPolicy;
 
 pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
+pub(crate) use conditions::Exclusion;
 pub(crate) use conditions::Selection;
 pub(crate) use conditions::StateEvaluation;
 pub(crate) use defaults::DeclaredDefault;
 pub(crate) use defaults::DefaultId;
 pub(crate) use set::set_questions;
 pub(crate) use setup_password::PasswordQuestions;
+pub(crate) use setup_password::UnresolvedPassword;
 
 mod ami_access_level;
 mod conditions;
@@ -2032,6 +2036,8 @@ pub struct QuestionDescriptor {
     location: ValueLocation,
     /// The state of the option that `value` names: selectable if none does
     pub(crate) value_state: StateEvaluation,
+    /// Where `value` comes from
+    pub(crate) value_source: ValueSource,
     /// The question's op, whose WRITE expression set evaluates
     node: Rc<RefCell<IFROperation>>,
 }
@@ -2051,6 +2057,8 @@ pub struct AnswerOption {
     pub value: String,
     /// The option's value, or why it is not known
     raw_value: Result<TypeValue, OptionValueError>,
+    /// Snapshot if the EFI_IFR_VALUE of an option of Type OTHER took a value from there
+    source: ValueSource,
     pub(crate) state: StateEvaluation,
 }
 
@@ -2199,11 +2207,9 @@ impl QuestionDescriptor {
                 states,
                 reasons,
             }),
-            Selection::Excluded(states) => Err(SelectionError::OptionExcluded {
-                question,
-                option: first.value.clone(),
-                states,
-            }),
+            Selection::Excluded(exclusion) => {
+                Err(exclusion.option_error(question, first.value.clone()))
+            }
             Selection::NotFound => Ok(None),
         }
     }
@@ -2646,7 +2652,10 @@ mod choice_for_set_tests {
         );
         let user = choice_reading(&root, &efivars, Some(AccessLevel::User));
         assert!(
-            matches!(user, Ok(Choice::Skipped(states)) if states == IncludedStates::GRAYED_OUT),
+            matches!(
+                user,
+                Ok(Choice::Skipped(exclusion)) if exclusion.states == IncludedStates::GRAYED_OUT
+            ),
             "User: {user:?}"
         );
     }
@@ -3375,7 +3384,8 @@ fn display_op(
     Walk::Enter(level + 1)
 }
 
-/// Returns the answer that show-ifr shows: the question's value, or why it cannot be read.
+/// Returns the answer that show-ifr shows: the question's value, tagged with where it comes
+/// from, or why it cannot be read.
 fn display_answer(
     question: &Rc<RefCell<IFROperation>>,
     varstore: &Result<Box<dyn VariableStore>>,
@@ -3383,7 +3393,7 @@ fn display_answer(
 ) -> String {
     match retrieve_question_value(question, varstore, inputs) {
         Err(reason) => reason.to_answer(),
-        Ok((_, value)) => value.to_string(),
+        Ok(retrieved) => format!("{}{}", retrieved.value, retrieved.source.annotation()),
     }
 }
 
@@ -3446,9 +3456,7 @@ fn find_corresponding_varstore(
 fn form_set_varstore(form_set: &IFROperation, var_store_id: u16) -> Result<Box<dyn VariableStore>> {
     match declared_var_store(form_set, var_store_id) {
         Some(DeclaredStore::Variable(store)) => Ok(store),
-        Some(DeclaredStore::NameValue) => Err(anyhow!(
-            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
-        )),
+        Some(DeclaredStore::NameValue(guid)) => Err(NameValueStore { guid }.into()),
         Some(DeclaredStore::ShortEfi) => Err(anyhow!(
             "VarStore {var_store_id:#06x} ({}), {}",
             ShortVarStoreEfi::LABEL,
@@ -3466,8 +3474,9 @@ enum DeclaredStore {
     /// A VARSTORE or VARSTORE_EFI, which an EFI variable of its Name and Guid holds; UEFI 2.11
     /// §33.2.5.6 makes the EFI variable a specialized form of Buffer Storage
     Variable(Box<dyn VariableStore>),
-    /// A VARSTORE_NAME_VALUE, whose values only the driver's EFI_HII_CONFIG_ACCESS_PROTOCOL reaches
-    NameValue,
+    /// A VARSTORE_NAME_VALUE of the Guid, whose values only the driver's
+    /// EFI_HII_CONFIG_ACCESS_PROTOCOL reaches
+    NameValue(Guid),
     /// A VARSTORE_EFI of the form before UEFI 2.3.1, which names no EFI variable
     ShortEfi,
 }
@@ -3486,7 +3495,7 @@ fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Option<Decl
                 Some(DeclaredStore::Variable(Box::new(store.clone())))
             }
             ParsedOperation::VarStoreNameValue(store) if store.var_store_id == var_store_id => {
-                Some(DeclaredStore::NameValue)
+                Some(DeclaredStore::NameValue(store.guid))
             }
             ParsedOperation::ShortVarStoreEfi(store) if store.var_store_id == var_store_id => {
                 Some(DeclaredStore::ShortEfi)

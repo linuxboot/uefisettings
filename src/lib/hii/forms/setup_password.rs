@@ -145,12 +145,28 @@ impl PasswordQuestions {
                 Err(UnresolvedPasswords(self.unresolved.clone()))
             }
             (VariableReach::Runtime, _) | (VariableReach::BootServices, []) => {
-                let mut withheld = WithheldBytes::default();
-                for question in &self.questions {
-                    withheld.insert(question.key.clone(), question.bytes());
-                }
-                Ok(withheld)
+                Ok(self.password_bytes())
             }
+        }
+    }
+
+    /// The bytes of every PASSWORD question with a VarStore.
+    fn password_bytes(&self) -> WithheldBytes {
+        let mut withheld = WithheldBytes::default();
+        for question in &self.questions {
+            withheld.insert(question.key.clone(), question.bytes());
+        }
+        withheld
+    }
+
+    /// The bytes of every PASSWORD question with a VarStore, which a ConfigSnapshot drops
+    /// whatever the reach: ExportConfig() exports their storage though Linux, which reaches
+    /// Runtime, may see none of them. Err holds the PASSWORD ops whose VarStore is unknown, which
+    /// could keep their passwords in any bytes.
+    pub(crate) fn withheld_from_snapshot(&self) -> Result<WithheldBytes, &[UnresolvedPassword]> {
+        match self.unresolved.as_slice() {
+            [] => Ok(self.password_bytes()),
+            unresolved => Err(unresolved),
         }
     }
 

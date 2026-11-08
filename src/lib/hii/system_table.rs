@@ -20,10 +20,6 @@
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
 pub(super) mod boot_params;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no caller reads the configuration export yet")
-)]
 mod exported_config;
 mod hii_export;
 
@@ -64,15 +60,7 @@ use crate::hii::lockdown::LOCKDOWN_PATH;
 use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::package::Guid;
 use crate::memory_map::efi_memory_map::EfiMemoryMap;
-#[expect(
-    unused_imports,
-    reason = "no caller reads the configuration export yet"
-)]
 pub(in crate::hii) use exported_config::read_exported_config;
-#[expect(
-    unused_imports,
-    reason = "no caller reads the configuration export yet"
-)]
 pub use exported_config::ExportedConfigError;
 pub(in crate::hii) use hii_export::read_hii_export;
 pub use hii_export::HiiExportError;

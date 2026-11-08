@@ -22,6 +22,7 @@ use super::conditions::ExpressionRefusal;
 use super::conditions::QuestionExpression;
 use super::conditions::MAX_READ_DEPTH;
 use super::question_values::value_question;
+use super::question_values::ValueQuestion;
 use super::storageless::NoVarStore;
 use super::storageless::StoragelessRefusal;
 use super::IFROpCode;
@@ -29,6 +30,7 @@ use super::IFROperation;
 use super::NumericFormatError;
 use super::DECLARED_BOOT_SERVICE_ONLY;
 use super::EDKII_BIT_FIELD_VALUE_BITS;
+use crate::hii::config_string::Number;
 use crate::hii::package::Guid;
 use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarRange;
@@ -1047,6 +1049,7 @@ mod non_efi_varstore_tests {
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 raw_value: Ok(TypeValue::NumSize8(1)),
+                source: ValueSource::Current,
                 state: StateEvaluation::selectable(),
             }],
             varstore: Ok(Box::new(TestVariableStore {
@@ -1054,6 +1057,7 @@ mod non_efi_varstore_tests {
             })),
             location: ValueLocation::Bytes { offset: 0, size: 1 },
             value_state: StateEvaluation::selectable(),
+            value_source: ValueSource::Current,
             node: Rc::new(RefCell::new(IFROperation {
                 op_code: IFROpCode::OneOf,
                 length: 0,
@@ -1202,6 +1206,9 @@ pub(super) enum ValueUnavailable {
     },
     #[error("CHECKBOX value {0} over a byte")]
     CheckboxOverByte(u64),
+    /// The number of a name/value setting in the ExportConfig snapshot, wider than the question
+    #[error("its number in the ExportConfig snapshot does not fit in {bits} bits")]
+    SnapshotNumber { bits: usize },
     /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
     /// level replaces it only in conditions
     #[error(
@@ -1257,7 +1264,8 @@ impl ValueUnavailable {
             | Self::MissingBuffer(_)
             | Self::BitField(_)
             | Self::NotDecoded(_)
-            | Self::CheckboxOverByte(_) => "ValueUnavailable",
+            | Self::CheckboxOverByte(_)
+            | Self::SnapshotNumber { .. } => "ValueUnavailable",
         }
     }
 }
@@ -1332,12 +1340,78 @@ fn value_bytes(question: &IFROperation) -> Option<std::ops::Range<usize>> {
     Some(value_question(question)?.location().bytes())
 }
 
-/// Returns where the question keeps its value and the value, or why it cannot be read.
+/// Where the value of a question comes from, which get, list-questions and show-ifr tag, or
+/// the values that decide its state, which get and list-questions tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValueSource {
+    /// Its variable, or an expression, now
+    Current,
+    /// The ExportConfig snapshot that the firmware took before the OS ran (UEFI 2.11
+    /// §33.2.11.1), in place of a missing variable
+    Snapshot,
+}
+
+impl ValueSource {
+    /// What get, list-questions and show-ifr show after a value from here.
+    pub(crate) fn annotation(self) -> &'static str {
+        match self {
+            Self::Current => "",
+            Self::Snapshot => " <snapshot>",
+        }
+    }
+
+    /// Snapshot if either is.
+    pub(crate) fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Current, Self::Current) => Self::Current,
+            (Self::Snapshot, Self::Current | Self::Snapshot) | (Self::Current, Self::Snapshot) => {
+                Self::Snapshot
+            }
+        }
+    }
+
+    /// Snapshot if questions have taken values from the snapshot of `reader` since it counted
+    /// `taken` (EfivarReader::snapshot_values_taken), else Current.
+    pub(super) fn since(taken: usize, reader: &EfivarReader) -> Self {
+        match reader.snapshot_values_taken() > taken {
+            true => Self::Snapshot,
+            false => Self::Current,
+        }
+    }
+}
+
+/// The value of a question, where the question keeps it, and where it comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RetrievedValue {
+    pub(super) location: ReadableLocation,
+    pub(super) value: u64,
+    pub(super) source: ValueSource,
+}
+
+/// A VARSTORE_NAME_VALUE of `guid`, whose values only the driver's
+/// EFI_HII_CONFIG_ACCESS_PROTOCOL reaches, and the ExportConfig snapshot shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NameValueStore {
+    pub(super) guid: Guid,
+}
+
+// thiserror 1.0.56's derive leaves `guid` unread, which unused_assignments refuses
+impl std::fmt::Display for NameValueStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL")
+    }
+}
+
+impl std::error::Error for NameValueStore {}
+
+/// Returns where the question keeps its value and the value, or why it cannot be read: from the
+/// ExportConfig snapshot of `reader`, if any, where the question's variable is missing or its
+/// storage is name/value (snapshot_bytes).
 pub(super) fn read_question_value(
     question: &IFROperation,
     varstore: &Result<Box<dyn VariableStore>>,
     reader: &mut EfivarReader,
-) -> std::result::Result<(ReadableLocation, u64), ValueUnavailable> {
+) -> std::result::Result<RetrievedValue, ValueUnavailable> {
     let Some(value_question) = value_question(question) else {
         return Err(ValueUnavailable::NotDecoded(question.op_code));
     };
@@ -1347,8 +1421,77 @@ pub(super) fn read_question_value(
         .location()
         .check()
         .map_err(ValueUnavailable::BitField)?;
-    let bytes = read_question_bytes(question, varstore, reader)?;
-    Ok((location, location.read(bytes)))
+    let unread = match read_question_bytes(question, varstore, reader) {
+        Ok(bytes) => {
+            return Ok(RetrievedValue {
+                location,
+                value: location.read(bytes),
+                source: ValueSource::Current,
+            })
+        }
+        Err(unread) => unread,
+    };
+    let bytes = snapshot_bytes(value_question, location, varstore, reader, unread)?;
+    if let Some(snapshot) = reader.snapshot.as_mut() {
+        snapshot.count_taken();
+    }
+    Ok(RetrievedValue {
+        location,
+        value: location.read(&bytes),
+        source: ValueSource::Snapshot,
+    })
+}
+
+/// The bytes of `question`'s value at `location` in the ExportConfig snapshot of `reader`, if
+/// its variable is missing or its storage is name/value, or `unread`, why the question has no
+/// value otherwise: the snapshot holds no byte of a PASSWORD question (ConfigSnapshot::parse),
+/// so a value over one gives `unread`, PasswordBytes (read_current_value_bytes).
+fn snapshot_bytes(
+    question: ValueQuestion<'_>,
+    location: ReadableLocation,
+    varstore: &Result<Box<dyn VariableStore>>,
+    reader: &EfivarReader,
+    unread: ValueUnavailable,
+) -> std::result::Result<Vec<u8>, ValueUnavailable> {
+    let Some(snapshot) = &reader.snapshot else {
+        return Err(unread);
+    };
+    let value = location.0.bytes();
+    match varstore {
+        Ok(store) => {
+            let missing = reader
+                .read_error(store.as_ref())
+                .is_some_and(|error| error.is::<VariableNotFound>());
+            if !missing {
+                return Err(unread);
+            }
+            snapshot.buffer(&store.variable_key(), value).ok_or(unread)
+        }
+        Err(error) => {
+            let Some(NameValueStore { guid }) = error.downcast_ref() else {
+                return Err(unread);
+            };
+            let number = snapshot
+                .number(*guid, question.header().var_store_info)
+                .ok_or(unread)?;
+            number_bytes(number, value.len())
+        }
+    }
+}
+
+/// The `size` bytes of `number`, least significant first, as EDK2's SetupBrowserDxe
+/// BufferToValue takes them, or why they cannot hold it: where it drops the more significant
+/// digits, this refuses those that are not zero.
+fn number_bytes(number: &Number, size: usize) -> std::result::Result<Vec<u8>, ValueUnavailable> {
+    let bytes = number.as_bytes();
+    if bytes.iter().skip(size).any(|byte| *byte != 0) {
+        return Err(ValueUnavailable::SnapshotNumber {
+            bits: size.saturating_mul(8),
+        });
+    }
+    let mut bytes = bytes.to_vec();
+    bytes.resize(size, 0);
+    Ok(bytes)
 }
 
 /// Returns the value_bytes of the question, or why its value cannot be read.

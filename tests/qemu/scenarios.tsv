@@ -33,6 +33,7 @@ hii-reserved	/DriverSample.efi;/publish-hiidb.efi reserved	my-ifr-nv-data.json	h
 hii-acpi-nvs	/publish-hiidb.efi acpi-nvs	-	hii_strict_devmem	arch=x86_64,i686
 hii-lockdown-acpi	/publish-hiidb.efi acpi-table	-	hii_lockdown/acpi::	kernel=lockdown
 hii-lockdown-efivar	/publish-hiidb.efi rt-data	-	hii_lockdown/efivar::	kernel=lockdown
+hii-snapshot	/DriverSample.efi;/publish-hiidb.efi export-config;/publish-hiidb.efi rt-data	my-ifr-nv-data-boot-services.json	hii_snapshot	-
 hii-global-variables	/publish-hiidb.efi padded-strings;/publish-hiidb.efi string-blocks;/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables	-
 hii-readwrite	/DriverSample.efi;/publish-hiidb.efi rt-data-readwrite-forms	my-ifr-nv-data.json	hii_readwrite	-
 hii-password	/publish-hiidb.efi rt-data-password-forms	amitse-setup.json	hii_password	-

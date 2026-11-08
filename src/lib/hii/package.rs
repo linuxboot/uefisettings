@@ -358,7 +358,7 @@ impl From<[u8; 16]> for Guid {
 
 /// The bytes of an EFI_DEVICE_PATH_PROTOCOL instance, as a device path package (UEFI 2.10
 /// §33.3.4) and a configuration string's PATH carry them.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DevicePath(Vec<u8>);
 
 impl From<Vec<u8>> for DevicePath {
@@ -387,13 +387,6 @@ pub struct ParsedPackageList {
     pub guid: Guid,
     /// The device path of the driver handle that added the list, from its device path package
     /// (UEFI 2.10 §33.3.4), if it has one
-    #[cfg_attr(
-        not(any(test, target_os = "uefi")),
-        expect(
-            dead_code,
-            reason = "no Config Routing caller routes to a package list's driver yet"
-        )
-    )]
     pub device_path: Option<DevicePath>,
     pub strings: Vec<StringMap>,
     /// The Language of each strings package's header, in the order of `strings`

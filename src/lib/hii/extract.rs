@@ -32,6 +32,8 @@ use log::debug;
 use thiserror::Error;
 
 #[cfg(firmware_memory_maps)]
+use crate::hii::config_snapshot::ExportedConfig;
+#[cfg(firmware_memory_maps)]
 use crate::hii::firmware_memory::runtime_memory::DevMem;
 #[cfg(firmware_memory_maps)]
 use crate::hii::firmware_memory::runtime_memory::PhysicalMemory;
@@ -53,6 +55,8 @@ use crate::hii::package;
 use crate::hii::package::db_file::read_db_bytes;
 use crate::hii::package::db_file::DbFileTooBig;
 use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::read_exported_config;
 #[cfg(firmware_memory_maps)]
 use crate::hii::system_table::read_hii_export;
 #[cfg(firmware_memory_maps)]
@@ -324,6 +328,14 @@ fn extract_db_systab(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
 #[cfg(not(firmware_memory_maps))]
 fn extract_db_systab(_: &HiiSourcePaths) -> Result<Vec<u8>> {
     Err(MemoryMapUnavailable::NoMapReader.into())
+}
+
+/// ExportConfig()'s results that the configuration table of this machine's System Table lists
+/// (UEFI 2.11 §33.2.11.1), read from /dev/mem; None where it lists none.
+#[cfg(firmware_memory_maps)]
+pub(crate) fn exported_config() -> Result<Option<ExportedConfig>> {
+    let paths = HiiSourcePaths::default();
+    Ok(read_exported_config(&paths.system_table_files(), DevMem::open)?.map(ExportedConfig::new))
 }
 
 /// Whether `error` says only that a file does not exist.

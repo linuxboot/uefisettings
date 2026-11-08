@@ -631,7 +631,9 @@ mod tests {
         let descriptor =
             match choice_for_set(selection, prompt, &options, IncludedStates::all(), &reader) {
                 Ok(Choice::Chosen(descriptor, _)) => descriptor,
-                Ok(Choice::Skipped(states)) => panic!("{prompt}: not picked, {states}"),
+                Ok(Choice::Skipped(exclusion)) => {
+                    panic!("{prompt}: not picked, {}", exclusion.states)
+                }
                 Err(error) => return Err(format!("{error:#}")),
             };
         set_questions(

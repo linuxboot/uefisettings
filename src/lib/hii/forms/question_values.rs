@@ -34,7 +34,9 @@ use super::defaults::question_scope;
 use super::find_corresponding_string;
 use super::find_corresponding_varstore;
 use super::numeric_format;
+use super::storage::RetrievedValue;
 use super::storage::ValueLocation;
+use super::storage::ValueSource;
 use super::storage::VariableStore;
 use super::walk_scopes;
 use super::AnswerOption;
@@ -205,14 +207,14 @@ pub(super) fn handle_checkbox(
 ) -> QuestionDescriptor {
     let current_node = &node.borrow();
     let mut answer = String::new();
-    let available = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
+    let source = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
         Err(reason) => {
             answer.push_str(&reason.to_answer());
-            false
+            None
         }
-        Ok((_, value)) => {
-            answer.push_str(&checkbox_text(value));
-            true
+        Ok(retrieved) => {
+            answer.push_str(&checkbox_text(retrieved.value));
+            Some(retrieved.source)
         }
     };
     let stores = walk.default_stores.of(current_node, &mut walk.inputs);
@@ -223,7 +225,7 @@ pub(super) fn handle_checkbox(
         &mut walk.inputs,
         |v, _| Ok(checkbox_text(v)),
     );
-    if !available {
+    if source.is_none() {
         push_default(&mut answer, &defaults, stores);
     }
     let res = QuestionDescriptor {
@@ -243,6 +245,7 @@ pub(super) fn handle_checkbox(
         flags,
         defaults,
         value_state: StateEvaluation::selectable(),
+        value_source: source.unwrap_or(ValueSource::Current),
         node: Rc::clone(node),
     };
     res
@@ -291,25 +294,24 @@ pub(super) fn handle_oneof(
     for op in question_scope(current_node) {
         let op = op.borrow();
         if let ParsedOperation::OneOfOption(o) = &op.parsed_data {
+            let taken = walk.inputs.reader.snapshot_values_taken();
+            let raw_value = option_value(current_node, &op, o, &mut walk.inputs);
             possible_options.push(AnswerOption {
-                raw_value: option_value(current_node, &op, o, &mut walk.inputs),
+                raw_value,
+                source: ValueSource::since(taken, walk.inputs.reader),
                 value: find_corresponding_string(o.option_string_id, walk.string_packages)
                     .to_string(),
                 state: option_state(&op, &mut walk.inputs),
             });
         }
     }
-    let chosen: Vec<&AnswerOption> = possible_options
-        .iter()
-        .filter(|opt| chosen_value.is_some_and(|(_, value)| opt.as_u64() == Some(value)))
-        .collect();
-    // the first that may be shown, as edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption
-    // finds it, else the first, which a SUPPRESS_IF hides
-    let option = chosen
-        .iter()
-        .find(|opt| opt.state.may_be_allowed(IncludedStates::empty()))
-        .or(chosen.first());
-    if let Some((location, value)) = chosen_value {
+    let option = chosen_value
+        .and_then(|chosen| shown_option(&possible_options, chosen.value, None))
+        .and_then(|index| possible_options.get(index));
+    if let Some(RetrievedValue {
+        location, value, ..
+    }) = chosen_value
+    {
         let format = NumericFormat::from_location(location, parsed.flags, &parsed.data);
         answer.push_str(&one_of_text(
             value,
@@ -318,6 +320,11 @@ pub(super) fn handle_oneof(
         ));
     }
     let value_state = option.map_or_else(StateEvaluation::selectable, |opt| opt.state.clone());
+    let value_source = chosen_value.map_or(ValueSource::Current, |chosen| {
+        chosen
+            .source
+            .or(shown_option_source(&possible_options, chosen.value))
+    });
 
     let res = QuestionDescriptor {
         question: question.trim().to_string(),
@@ -341,9 +348,46 @@ pub(super) fn handle_oneof(
         flags,
         defaults,
         value_state,
+        value_source,
         node: Rc::clone(node),
     };
     res
+}
+
+/// The index of the option of `options` that shows for the stored `value`, with the option at
+/// `also_matching`, if any, matching too: the first match that may be shown, as
+/// edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption finds it, else the first, which a
+/// SUPPRESS_IF hides.
+fn shown_option(
+    options: &[AnswerOption],
+    value: u64,
+    also_matching: Option<usize>,
+) -> Option<usize> {
+    let matching: Vec<(usize, &AnswerOption)> = options
+        .iter()
+        .enumerate()
+        .filter(|&(index, option)| option.as_u64() == Some(value) || also_matching == Some(index))
+        .collect();
+    matching
+        .iter()
+        .find(|(_, option)| option.state.may_be_allowed(IncludedStates::empty()))
+        .or(matching.first())
+        .map(|&(index, _)| index)
+}
+
+/// Snapshot if values that options of `options` took from the snapshot decide which one shows
+/// for the stored `value`: the one shown took its value from there, or one that did would show
+/// if it matched.
+fn shown_option_source(options: &[AnswerOption], value: u64) -> ValueSource {
+    let shown = shown_option(options, value, None);
+    let decided = options.iter().enumerate().any(|(index, option)| {
+        matches!(option.source, ValueSource::Snapshot)
+            && (shown == Some(index) || shown_option(options, value, Some(index)) != shown)
+    });
+    match decided {
+        true => ValueSource::Snapshot,
+        false => ValueSource::Current,
+    }
 }
 
 pub(super) fn handle_numeric(
@@ -357,15 +401,16 @@ pub(super) fn handle_numeric(
     let current_node = &node.borrow();
     let mut answer = String::new();
 
-    let available = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
+    let source = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
         Err(reason) => {
             answer.push_str(&reason.to_answer());
-            false
+            None
         }
-        Ok((location, value)) => {
-            let format = NumericFormat::from_location(location, parsed.flags, &parsed.data);
-            answer.push_str(&format.decode(value).to_string());
-            true
+        Ok(retrieved) => {
+            let format =
+                NumericFormat::from_location(retrieved.location, parsed.flags, &parsed.data);
+            answer.push_str(&format.decode(retrieved.value).to_string());
+            Some(retrieved.source)
         }
     };
     let stores = walk.default_stores.of(current_node, &mut walk.inputs);
@@ -380,7 +425,7 @@ pub(super) fn handle_numeric(
                 .to_string())
         },
     );
-    if !available {
+    if source.is_none() {
         push_default(&mut answer, &defaults, stores);
     }
     let res = QuestionDescriptor {
@@ -409,6 +454,7 @@ pub(super) fn handle_numeric(
         flags,
         defaults,
         value_state: StateEvaluation::selectable(),
+        value_source: source.unwrap_or(ValueSource::Current),
         node: Rc::clone(node),
     };
     res

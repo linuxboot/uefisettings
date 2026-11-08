@@ -83,20 +83,22 @@ const FORM_SET: u8 = 0x0E;
 const EQ_ID_VAL: u8 = 0x12;
 pub(super) const NOT: u8 = 0x17;
 pub(super) const EQUAL: u8 = 0x2F;
-pub(super) const QUESTION_REF1: u8 = 0x40;
+pub(crate) const QUESTION_REF1: u8 = 0x40;
 const UINT8: u8 = 0x42;
 pub(super) const TRUE: u8 = 0x46;
 pub(super) const FALSE: u8 = 0x47;
 pub(super) const STRING_REF1: u8 = 0x4E;
+pub(crate) const THIS: u8 = 0x58;
 const ONES: u8 = 0x54;
-pub(super) const VALUE: u8 = 0x5A;
+pub(crate) const VALUE: u8 = 0x5A;
 pub(super) const DEFAULT: u8 = 0x5B;
 const DEFAULT_STORE: u8 = 0x5C;
 pub(crate) const FORM_MAP: u8 = 0x5D;
 
 pub(crate) const VAR_STORE: u8 = 0x24;
+const VAR_STORE_NAME_VALUE: u8 = 0x25;
 pub(super) const VAR_STORE_EFI: u8 = 0x26;
-pub(super) const READ: u8 = 0x2D;
+pub(crate) const READ: u8 = 0x2D;
 pub(super) const WRITE: u8 = 0x2E;
 
 /// The Guid E770BB69-BCB4-4D04-9E97-23FF9456FEAC of AMI firmware's VarStore SystemAccess, as
@@ -371,7 +373,7 @@ pub(super) fn one_of_option(string_id: u16, value_type: u8, value: &[u8]) -> Vec
 
 /// An EFI_IFR_ONE_OF_OPTION of Type EFI_IFR_TYPE_OTHER with `flags`, holding an EFI_IFR_VALUE of
 /// `expression`, or none if `expression` is empty.
-pub(super) fn other_option(string_id: u16, flags: u8, expression: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn other_option(string_id: u16, flags: u8, expression: &[Vec<u8>]) -> Vec<u8> {
     let data = [&string_id.to_le_bytes()[..], &[flags, EFI_IFR_TYPE_OTHER]].concat();
     if expression.is_empty() {
         return operation(ONE_OF_OPTION, false, &data);
@@ -710,6 +712,12 @@ pub(crate) fn var_store(id: u16, guid: [u8; 16], name: &str, size: u16) -> Vec<u
     ]
     .concat();
     operation(VAR_STORE, false, &data)
+}
+
+/// A VARSTORE_NAME_VALUE of `id`, of the Guid stored as `guid`.
+pub(crate) fn var_store_name_value(id: u16, guid: [u8; 16]) -> Vec<u8> {
+    let data = [&id.to_le_bytes()[..], &guid].concat();
+    operation(VAR_STORE_NAME_VALUE, false, &data)
 }
 
 /// A VARSTORE_EFI of `id` named `name`, of NIL_GUID, with `attributes`, of `size` bytes.

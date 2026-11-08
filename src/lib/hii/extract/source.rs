@@ -193,11 +193,11 @@ pub(super) fn read_through(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::sync::Once;
 
     use anyhow::anyhow;
 
     use super::*;
+    use crate::hii::config_snapshot::tests::leveled_by;
     use crate::hii::lockdown::LockdownMode;
     use crate::hii::memory_access_denied::DenialCause;
     use crate::hii::memory_access_denied::MemoryDevice;
@@ -264,41 +264,16 @@ mod tests {
         }
     }
 
-    thread_local! {
-        /// The records that this thread logs while `captured` runs, as "LEVEL message".
-        static CAPTURED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-    }
-
-    /// Keeps each record in CAPTURED of the thread that logs it, as each test runs in a thread of
-    /// its own.
-    struct CaptureLogger;
-
-    impl log::Log for CaptureLogger {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            CAPTURED.with_borrow_mut(|captured| {
-                if let Some(records) = captured {
-                    records.push(format!("{} {}", record.level(), record.args()));
-                }
-            });
-        }
-
-        fn flush(&self) {}
-    }
-
-    /// What `f` gives, and the records that it logs at debug level and above.
+    /// What `f` gives, and the records that it logs at debug level and above, as "LEVEL message",
+    /// through the crate's one test logger (leveled_by).
     fn captured<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        static LOGGER: Once = Once::new();
-        LOGGER.call_once(|| {
-            log::set_logger(&CaptureLogger).expect("set the test logger");
-            log::set_max_level(log::LevelFilter::Debug);
-        });
-        CAPTURED.set(Some(Vec::new()));
-        let got = f();
-        (got, CAPTURED.take().unwrap_or_default())
+        let mut got = None;
+        let records = leveled_by(|| got = Some(f()))
+            .into_iter()
+            .filter(|(level, _)| *level <= log::Level::Debug)
+            .map(|(level, message)| format!("{level} {message}"))
+            .collect();
+        (got.expect("captured runs f"), records)
     }
 
     /// Where the automatic order reads the database past a method that failed, it warns of that

@@ -13,6 +13,7 @@
 // Linux's boot log, which tells whether Linux applied an EFI_RT_PROPERTIES_TABLE.
 #[cfg(target_os = "linux")]
 mod boot_log;
+pub(crate) mod config_snapshot;
 #[cfg_attr(
     not(test),
     expect(
@@ -93,6 +94,8 @@ pub(crate) use efivar_dump::SavedDump;
 pub(crate) use efivarfs::EfivarFiles;
 #[cfg(target_os = "linux")]
 pub(crate) use efivarfs_format::EFIVARFS_REACH;
+#[cfg(firmware_memory_maps)]
+pub(crate) use extract::exported_config;
 #[cfg(target_os = "windows")]
 pub(crate) use firmware_environment::FirmwareEnvironment;
 #[cfg(target_os = "windows")]
@@ -123,6 +126,8 @@ pub use memory_access_denied::MemoryDevice;
 pub use memory_access_denied::MemoryOperation;
 #[cfg(firmware_memory_maps)]
 pub(crate) use system_table::system_vendor_table;
+#[cfg(firmware_memory_maps)]
+pub use system_table::ExportedConfigError;
 #[cfg(firmware_memory_maps)]
 pub use system_table::HiiExportError;
 #[cfg(firmware_memory_maps)]
