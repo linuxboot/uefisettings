@@ -868,6 +868,11 @@ fn dumped_efivars_answer_as_efivarfs() {
             .starts_with("failed to parse the package list"),
         "--efivars of a dump with a garbage hiidb.bin: {error:?}"
     );
+    // binrw's frames are shown on one line, without the Rust source locations of its derive
+    assert!(
+        !error.error_message.contains('\n') && !error.error_message.contains("src/"),
+        "--efivars of a dump with a garbage hiidb.bin, on one line: {error:?}"
+    );
     fs::remove_file("/tmp/efivars-whole/uefisettings-dump.json")
         .expect("cannot remove the manifest");
     let plain = uefisettings(&[&list[..], &["--efivars", "/tmp/efivars-whole"]].concat());

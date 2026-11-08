@@ -20,11 +20,11 @@ use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
-use binrw::BinReaderExt;
 use log::debug;
 use log::warn;
 
 use super::package::PACKAGE_HEADER_SIZE;
+use crate::parse_error::ReadParsed;
 
 /// LANGUAGE_OFFSET is the offset of Language in a strings package: the package header, HdrSize
 /// and StringInfoOffset (a u32 each), LanguageWindow (16 CHAR16) and LanguageName precede it
@@ -121,7 +121,7 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
         hdr_size,
         string_info_offset,
     } = Cursor::new(data)
-        .read_ne()
+        .parse_ne()
         .context("failed to parse string package header")?;
     let length = u64::try_from(data.len())
         .context("failed to convert the package size into u64")?
@@ -192,7 +192,7 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
         // We can also break because if there is an error here we loose track of string_id_current
         // and want to immediately stop parsing this string package anything beyond this wont be useful.
         let block_type: StringBlockType = blocks_cursor
-            .read_ne()
+            .parse_ne()
             .context("failed to read a string block type")?;
         debug!("Blocktype is {:?}", block_type);
 
@@ -200,7 +200,7 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
             StringBlockType::StringUcs2 => {
                 // Or we can break;
                 let null_str: binrw::NullWideString = blocks_cursor
-                    .read_ne()
+                    .parse_ne()
                     .context("failed to read a null-terminated 16-bit string")?;
                 debug!(
                     "Null-terminated 16-bit string is {:?} and its id is {}",
@@ -215,7 +215,7 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
             StringBlockType::Skip2 => {
                 // Or we can break;
                 let skip_count: u16 = blocks_cursor
-                    .read_ne()
+                    .parse_ne()
                     .context("failed to read a Skip2 count")?;
                 string_id_current = string_id_current
                     .checked_add(i32::from(skip_count))
@@ -225,7 +225,7 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
             StringBlockType::Skip1 => {
                 // Or we can break;
                 let skip_count: u8 = blocks_cursor
-                    .read_ne()
+                    .parse_ne()
                     .context("failed to read a Skip1 count")?;
                 string_id_current = string_id_current
                     .checked_add(i32::from(skip_count))

@@ -17,6 +17,27 @@ disallowed-types = [
 # library/std/src/sys/pal/uefi/mod.rs init, cleanup). The Linux build has no uefi crate, hence
 # allow-invalid.
 disallowed-methods = [
+    # binrw::Error's Display prints a backtrace frame per field being parsed, with the Rust
+    # source location of its derive, on lines of their own (binrw 0.13.3
+    # src/error/backtrace.rs); ParseError shows it on one line.
+    { path = "binrw::BinReaderExt::read_ne", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinReaderExt::read_le", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinReaderExt::read_be", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinReaderExt::read_type", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinReaderExt::read_ne_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinReaderExt::read_le_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinReaderExt::read_be_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinReaderExt::read_type_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    # BinRead's own reads fail the same way. Its read_options stays allowed: every
+    # #[derive(BinRead)] calls it.
+    { path = "binrw::BinRead::read", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinRead::read_be", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinRead::read_le", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinRead::read_ne", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinRead::read_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinRead::read_be_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinRead::read_le_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
+    { path = "binrw::BinRead::read_ne_args", reason = "fails with binrw::Error, whose Display prints multi-line backtrace frames", replacement = "crate::parse_error::ReadParsed" },
     { path = "std::process::exit", reason = "main returns its ExitCode, which the UEFI Shell build's entry point turns into EFI_ABORTED" },
     { path = "uefi::boot::exit", reason = "exits the image before std closes its ExitBootServices event, whose notify function then runs in freed memory", allow-invalid = true },
     # read_physical_memory_at reads any range of /dev/mem. The efivar source

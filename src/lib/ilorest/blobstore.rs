@@ -21,7 +21,6 @@ use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
-use binrw::BinReaderExt;
 use log::debug;
 use rand::distributions::Alphanumeric;
 use rand::thread_rng;
@@ -29,6 +28,7 @@ use rand::Rng;
 
 use crate::ilorest::chif::IloRestChif;
 use crate::ilorest::chif::IloRestChifInterface;
+use crate::parse_error::ReadParsed;
 
 enum BlobStoreReturnCode {
     Success = 0,
@@ -53,6 +53,9 @@ enum ResponseReceiveMode {
 /// #     pub mod chif {
 /// #         include!("chif.rs");
 /// #     }
+/// # }
+/// # mod parse_error {
+/// #     pub use uefisettings::parse_error::ReadParsed;
 /// # }
 /// # use ilorest::blobstore::Transport;
 /// # use ilorest::chif::get_lib;
@@ -119,7 +122,7 @@ impl<'a> Transport<'a> {
         };
 
         let mut rest_resp_cursor = Cursor::new(&rest_resp);
-        let parsed_rest_resp: IloFixedResponse = rest_resp_cursor.read_le()?;
+        let parsed_rest_resp: IloFixedResponse = rest_resp_cursor.parse_le()?;
 
         if parsed_rest_resp.receive_mode == ResponseReceiveMode::FragmentedResponse as u32 {
             debug!("Receive Mode is 1 - FragmentedResponse");
@@ -206,7 +209,7 @@ impl<'a> Transport<'a> {
 
             let mut fragment_bytes_cursor = Cursor::new(&fragment_bytes);
             fragment_bytes_cursor.seek(SeekFrom::Start(response_header_blob_size.into()))?;
-            let fragment_bytes_read: u32 = fragment_bytes_cursor.read_le()?;
+            let fragment_bytes_read: u32 = fragment_bytes_cursor.parse_le()?;
 
             read_data_buffer.extend_from_slice(
                 &fragment_bytes
@@ -231,7 +234,7 @@ impl<'a> Transport<'a> {
 
         let mut response_cursor =
             Cursor::new(&blob_info_bytes[self.ilo.get_response_header_blob_size() as usize..]);
-        let blobsize: u32 = response_cursor.read_le()?;
+        let blobsize: u32 = response_cursor.parse_le()?;
 
         Ok(blobsize)
     }
@@ -333,12 +336,12 @@ impl<'a> Transport<'a> {
     fn exchange_packet(&self, send_buf: &[u8]) -> Result<Vec<u8>> {
         let mut send_buf_cursor = Cursor::new(send_buf);
         send_buf_cursor.seek(SeekFrom::Start(2))?;
-        let sequence_number: u16 = send_buf_cursor.read_le()?;
+        let sequence_number: u16 = send_buf_cursor.parse_le()?;
 
         match self.ilo.exchange_packet(send_buf) {
             Ok(recv_buf) => {
                 let mut recv_buf_cursor = Cursor::new(&recv_buf);
-                let packet_exchange_resp: PacketExchangeResponse = recv_buf_cursor.read_le()?;
+                let packet_exchange_resp: PacketExchangeResponse = recv_buf_cursor.parse_le()?;
 
                 if packet_exchange_resp.sequence_number != sequence_number {
                     return Err(anyhow!(

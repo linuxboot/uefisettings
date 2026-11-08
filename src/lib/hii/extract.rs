@@ -24,7 +24,6 @@ use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
-use binrw::BinReaderExt;
 use log::debug;
 use thiserror::Error;
 
@@ -49,6 +48,7 @@ use crate::hii::package;
 use crate::hii::package::db_file::read_db_bytes;
 use crate::hii::package::db_file::DbFileTooBig;
 use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
+use crate::parse_error::ReadParsed;
 
 // TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
 // open_efivar, so efivarfs paths and missing-variable errors have one source.
@@ -266,7 +266,7 @@ impl HiiDBEFIVar {
         match contents.len() {
             HiiDBEFIVar32::SIZE => {
                 let mut cursor = Cursor::new(contents);
-                let var: HiiDBEFIVar32 = cursor.read_ne()?;
+                let var: HiiDBEFIVar32 = cursor.parse_ne()?;
 
                 Ok(Self {
                     flags: var.flags,
@@ -276,7 +276,7 @@ impl HiiDBEFIVar {
             }
             HiiDBEFIVar64::SIZE => {
                 let mut cursor = Cursor::new(contents);
-                let var: HiiDBEFIVar64 = cursor.read_ne()?;
+                let var: HiiDBEFIVar64 = cursor.parse_ne()?;
 
                 Ok(Self {
                     flags: var.flags,

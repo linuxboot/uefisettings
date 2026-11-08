@@ -23,7 +23,6 @@ use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::io::SeekFrom;
 use binrw::BinRead;
-use binrw::BinReaderExt;
 use log::debug;
 use serde::Serialize;
 use serde::Serializer;
@@ -31,6 +30,7 @@ use serde::Serializer;
 use crate::hii::forms;
 use crate::hii::forms::IFROperation;
 use crate::hii::strings;
+use crate::parse_error::ReadParsed;
 
 /// PACKAGE_LIST_HEADER_SIZE is the size of EFI_HII_PACKAGE_LIST_HEADER:
 /// PackageListGuid (16 bytes) + PackageLength (4 bytes).
@@ -76,7 +76,7 @@ pub(crate) struct AvailableBytes(u64);
 /// `available`.
 ///
 /// Example: get_package_lists reads each package list with
-/// `db_cursor.read_ne_args::<PackageList>(AvailableBytes(db_size - used_bytes))`.
+/// `db_cursor.parse_ne_args::<PackageList>(AvailableBytes(db_size - used_bytes))`.
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little, import_raw(available: AvailableBytes))]
 pub(crate) struct PackageList {
@@ -103,7 +103,7 @@ pub(crate) struct PackageList {
 /// `available`.
 ///
 /// Example: get_packages reads each package with
-/// `pl_cursor.read_ne_args::<Package>(AvailableBytes(pl_size - pl_cursor.position()))`.
+/// `pl_cursor.parse_ne_args::<Package>(AvailableBytes(pl_size - pl_cursor.position()))`.
 #[derive(BinRead, Debug, PartialEq)]
 #[br(little, import_raw(available: AvailableBytes))]
 struct Package {
@@ -195,7 +195,7 @@ pub(crate) fn get_package_lists(source: &[u8]) -> Result<Vec<PackageList>> {
         // Fail: returning the lists parsed so far would give the caller
         // `Ok` without the unparsable list or any list after it.
         let package_list: PackageList = db_cursor
-            .read_ne_args(AvailableBytes(available))
+            .parse_ne_args(AvailableBytes(available))
             .with_context(|| {
                 format!("failed to parse the package list at offset {used_bytes:#x}")
             })?;
@@ -265,7 +265,7 @@ fn get_packages(package_list: &PackageList) -> Result<Vec<Package>> {
         // Fail: returning the packages parsed so far would give the
         // caller `Ok` without the unparsable package or any package
         // after it.
-        let package: Package = pl_cursor.read_ne_args(AvailableBytes(available))?;
+        let package: Package = pl_cursor.parse_ne_args(AvailableBytes(available))?;
 
         debug!(
             "Package List {}. This package type is {:?}",
@@ -510,6 +510,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::MAX_SCOPE_NESTING;
+    use crate::parse_error::ParseError;
 
     /// OPAQUE_PACKAGE is a package with Length 6, that is, 2 bytes of data:
     /// 0xAA 0xBB. Its Type 0xE0 is in the range that UEFI Spec v2.10 §33.3.1.1
@@ -1118,8 +1119,8 @@ mod tests {
             };
 
             assert!(
-                err.downcast_ref::<binrw::Error>()
-                    .is_some_and(binrw::Error::is_eof),
+                err.downcast_ref::<ParseError>()
+                    .is_some_and(ParseError::is_eof),
                 "{} header bytes: {:#}",
                 partial,
                 err
@@ -1253,7 +1254,9 @@ mod tests {
             let err = get_package_lists(&hiidb).unwrap_err();
 
             assert!(
-                err.downcast_ref::<binrw::Error>().unwrap().is_eof(),
+                err.downcast_ref::<ParseError>()
+                    .expect("a ParseError")
+                    .is_eof(),
                 "tail {:02x?}: {}",
                 tail,
                 err
@@ -1751,7 +1754,7 @@ mod tests {
                     failed to parse a strings package: failed to parse string package header: ";
         assert!(msg.starts_with(want), "{msg}");
         assert!(
-            err.chain().any(|cause| cause.is::<binrw::Error>()),
+            err.chain().any(|cause| cause.is::<ParseError>()),
             "the cause is kept: {msg}"
         );
     }
@@ -1921,7 +1924,7 @@ mod tests {
             );
             assert!(msg.starts_with(&want), "blocks {blocks:02x?}: {msg}");
             assert!(
-                err.chain().any(|cause| cause.is::<binrw::Error>()),
+                err.chain().any(|cause| cause.is::<ParseError>()),
                 "blocks {blocks:02x?} keep the cause: {msg}"
             );
         }
@@ -2024,7 +2027,7 @@ mod tests {
             "error names the list and package: {msg}"
         );
         assert!(
-            err.chain().any(|cause| cause.is::<binrw::Error>()),
+            err.chain().any(|cause| cause.is::<ParseError>()),
             "error keeps its cause: {msg}"
         );
     }

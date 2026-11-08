@@ -41,6 +41,7 @@ mod ilorest;
     all(target_os = "linux", test)
 ))]
 mod memory_map;
+pub mod parse_error;
 pub mod secret_file;
 mod translation;
 #[cfg(target_os = "uefi")]

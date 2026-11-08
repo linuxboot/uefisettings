@@ -2962,6 +2962,36 @@ mod tests {
         operation(0x70, true, &[])
     }
 
+    /// Every command refuses a HiiDB whose VarStore op ends inside its Guid with an error that
+    /// main prints on one line: the fields being parsed, without the Rust source locations of
+    /// binrw's backtrace frames.
+    #[test]
+    fn commands_refuse_a_truncated_var_store_on_one_line() {
+        // EFI_IFR_VARSTORE, whose 5 bytes end in the Data2 of its Guid
+        let var_store = operation(0x24, false, &[0x11; 5]);
+        let packages = [
+            en_strings_package_of(&["FormSet"]),
+            form_package(&[var_store]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let want = "failed to parse package list 55555555-5555-5555-5555-555555555555: failed to \
+                    parse a form package: failed to parse op_code VarStore properly: failed to \
+                    parse VarStore's data: failed to fill whole buffer (While parsing field \
+                    'data2' in Guid; While parsing field 'guid' in VarStore)";
+        for (name, command) in commands() {
+            let Err(error) = command(&hiidb) else {
+                panic!("{name}: parsed a truncated VarStore");
+            };
+            let rendered = format!("{error:#}");
+            assert!(
+                !rendered.contains('\n') && !rendered.contains("src/"),
+                "{name}: {rendered:?}"
+            );
+            assert_eq!(rendered, want, "{name}");
+        }
+    }
+
     /// A command of the tests below: what it prints of a HiiDB, line by line.
     type Command = fn(&[u8]) -> Result<Vec<String>>;
 

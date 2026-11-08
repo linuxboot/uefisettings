@@ -25,7 +25,6 @@ use anyhow::Context;
 use anyhow::Result;
 use binrw::io::Cursor;
 use binrw::BinRead;
-use binrw::BinReaderExt;
 use binrw::BinResult;
 use log::debug;
 use log::warn;
@@ -42,6 +41,8 @@ use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
+use crate::parse_error::ParseError;
+use crate::parse_error::ReadParsed;
 use conditions::question_state;
 use conditions::question_value_expression;
 use conditions::retrieve_question_value;
@@ -1135,19 +1136,22 @@ impl ValueEncoding {
     }
 }
 
+/// The MinValue, MaxValue and Step of a NUMERIC or ONE_OF of `flags` in `encoding`.
 fn range_parser<R: Read + Seek>(
     reader: &mut R,
-    _endian: binrw::Endian,
+    endian: binrw::Endian,
     (flags, encoding): (u8, ValueEncoding),
 ) -> BinResult<Range> {
     match encoding {
-        ValueEncoding::EdkiiBitField => Ok(Range::Range32(reader.read_ne()?)),
+        ValueEncoding::EdkiiBitField => {
+            BinRead::read_options(reader, endian, ()).map(Range::Range32)
+        }
         ValueEncoding::NumericSize => match flags & EFI_IFR_NUMERIC_SIZE {
-            EFI_IFR_NUMERIC_SIZE_1 => Ok(Range::Range8(reader.read_ne()?)),
-            EFI_IFR_NUMERIC_SIZE_2 => Ok(Range::Range16(reader.read_ne()?)),
-            EFI_IFR_NUMERIC_SIZE_4 => Ok(Range::Range32(reader.read_ne()?)),
+            EFI_IFR_NUMERIC_SIZE_1 => BinRead::read_options(reader, endian, ()).map(Range::Range8),
+            EFI_IFR_NUMERIC_SIZE_2 => BinRead::read_options(reader, endian, ()).map(Range::Range16),
+            EFI_IFR_NUMERIC_SIZE_4 => BinRead::read_options(reader, endian, ()).map(Range::Range32),
             // EFI_IFR_NUMERIC_SIZE_8, the only value left
-            _ => Ok(Range::Range64(reader.read_ne()?)),
+            _ => BinRead::read_options(reader, endian, ()).map(Range::Range64),
         },
     }
 }
@@ -1326,8 +1330,8 @@ impl FormMap {
         let (form_id, methods) = data.split_first_chunk::<2>()?;
         let methods = methods
             .chunks_exact(EFI_IFR_FORM_MAP_METHOD_SIZE)
-            .map(|method| Cursor::new(method).read_le())
-            .collect::<BinResult<Vec<FormMapMethod>>>()
+            .map(|method| Cursor::new(method).parse_le())
+            .collect::<Result<Vec<FormMapMethod>, ParseError>>()
             .ok()?;
         Some(Self {
             form_id: u16::from_le_bytes(*form_id),
@@ -1418,30 +1422,31 @@ impl TypeValue {
     }
 }
 
+/// A value of the type `args.0`, read in the endian that its derive passes.
 fn type_value_parser<R: Read + Seek>(
     reader: &mut R,
-    _endian: binrw::Endian,
+    endian: binrw::Endian,
     args: (u8,),
 ) -> BinResult<TypeValue> {
     match args.0 {
         EFI_IFR_TYPE_NUM_SIZE_8 => {
-            let r: u8 = reader.read_ne()?;
+            let r: u8 = BinRead::read_options(reader, endian, ())?;
             Ok(TypeValue::NumSize8(r))
         }
         EFI_IFR_TYPE_NUM_SIZE_16 => {
-            let r: u16 = reader.read_ne()?;
+            let r: u16 = BinRead::read_options(reader, endian, ())?;
             Ok(TypeValue::NumSize16(r))
         }
         EFI_IFR_TYPE_NUM_SIZE_32 => {
-            let r: u32 = reader.read_ne()?;
+            let r: u32 = BinRead::read_options(reader, endian, ())?;
             Ok(TypeValue::NumSize32(r))
         }
         EFI_IFR_TYPE_NUM_SIZE_64 => {
-            let r: u64 = reader.read_ne()?;
+            let r: u64 = BinRead::read_options(reader, endian, ())?;
             Ok(TypeValue::NumSize64(r))
         }
         EFI_IFR_TYPE_BOOLEAN => {
-            let r: u8 = reader.read_ne()?;
+            let r: u8 = BinRead::read_options(reader, endian, ())?;
             if r != 0 {
                 return Ok(TypeValue::Boolean(true));
             }
@@ -1449,7 +1454,7 @@ fn type_value_parser<R: Read + Seek>(
         }
         // TODO: handle other types like Date, Time & Ref. We have already made structs for them.
         _ => {
-            let r: u8 = reader.read_ne()?;
+            let r: u8 = BinRead::read_options(reader, endian, ())?;
             Ok(TypeValue::Unknown(r))
         }
     }
@@ -1480,7 +1485,7 @@ pub(super) fn parse_form_sets(
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
         let offset = package_cursor.position();
-        let op: IFROperation = match package_cursor.read_ne() {
+        let op: IFROperation = match package_cursor.parse_ne() {
             Ok(op) => op,
             Err(error) if roots.is_empty() => {
                 return Err(error).context("failed to parse IFR operation")
@@ -1560,7 +1565,7 @@ pub(super) fn parse_form_sets(
                 }
             }
             Err(error)
-                if !roots.is_empty() && error.chain().any(|cause| cause.is::<binrw::Error>()) =>
+                if !roots.is_empty() && error.chain().any(|cause| cause.is::<ParseError>()) =>
             {
                 warn!(
                     "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
@@ -1608,10 +1613,10 @@ pub struct IgnoredIfr {
 
 /// Moves `package_cursor` from the op at its position past the End that closes that op's scope,
 /// reading the ops in between undecoded, as GetIfrBinaryData's walk steps over them.
-fn skip_scope(package_cursor: &mut Cursor<&Vec<u8>>) -> binrw::BinResult<()> {
+fn skip_scope(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<(), ParseError> {
     let mut depth: usize = 0;
     loop {
-        let op: IFROperation = package_cursor.read_ne()?;
+        let op: IFROperation = package_cursor.parse_ne()?;
         match (&op.op_code, op.open_scope) {
             (IFROpCode::End, _) => depth = depth.saturating_sub(1),
             (_, true) => depth = depth.saturating_add(1),
@@ -1658,7 +1663,7 @@ fn handle_form_set_within(
     loop {
         let offset = package_cursor.position();
         let node: IFROperation = package_cursor
-            .read_ne()
+            .parse_ne()
             .context("failed to parse IFR operation")?;
 
         let current_node = Rc::new(RefCell::new(node));
@@ -1739,7 +1744,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
     match node.op_code {
         IFROpCode::FormSet => {
             let parsed: FormSet = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse FormSet's data")?;
             debug!("FormSet is {:?}", parsed);
             node.parsed_data = ParsedOperation::FormSet(parsed);
@@ -1747,28 +1752,28 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
         IFROpCode::OneOf => {
             let parsed: OneOf = data_cursor
-                .read_ne_args((ValueEncoding::from_question(&node),))
+                .parse_ne_args((ValueEncoding::from_question(&node),))
                 .context("failed to parse OneOf's data")?;
             debug!("OneOf is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOf(parsed);
         }
         IFROpCode::CheckBox => {
             let parsed: CheckBox = data_cursor
-                .read_ne_args((ValueEncoding::from_question(&node),))
+                .parse_ne_args((ValueEncoding::from_question(&node),))
                 .context("failed to parse CheckBox's data")?;
             debug!("CheckBox is {:?}", parsed);
             node.parsed_data = ParsedOperation::CheckBox(parsed);
         }
         IFROpCode::OneOfOption => {
             let parsed: OneOfOption = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse OneOfOption's data")?;
             debug!("OneOfOption is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOfOption(parsed);
         }
         IFROpCode::VarStore => {
             let parsed: VarStore = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse VarStore's data")?;
 
             debug!("VarStore is {:?}", &parsed);
@@ -1777,7 +1782,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         }
         IFROpCode::VarStoreNameValue => {
             let parsed: VarStoreNameValue = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse VarStoreNameValue's data")?;
             debug!("VarStoreNameValue is {:?}", parsed);
             node.parsed_data = ParsedOperation::VarStoreNameValue(parsed);
@@ -1786,77 +1791,77 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
             // this is implemented in hiilib and the docs for this are relatively clear
             // so I implemented this but I haven't seen it being used anywhere in the dbdumps I have
             let parsed: VarStoreEfi = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse VarStoreEfi's data")?;
             debug!("VarStoreEfi is {:?}", parsed);
             node.parsed_data = ParsedOperation::VarStoreEfi(parsed);
         }
         IFROpCode::DefaultStore => {
             let parsed: DefaultStore = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse DefaultStore's data")?;
             debug!("DefaultStore is {:?}", parsed);
             node.parsed_data = ParsedOperation::DefaultStore(parsed);
         }
         IFROpCode::Default => {
             let parsed: IFRDefault = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse Default's data")?;
             debug!("Default is {:?}", parsed);
             node.parsed_data = ParsedOperation::IFRDefault(parsed);
         }
         IFROpCode::Form => {
             let parsed: Form = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse Form's data")?;
             debug!("Form is {:?}", parsed);
             node.parsed_data = ParsedOperation::Form(parsed);
         }
         IFROpCode::Text => {
             let parsed: Text = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse Text's data")?;
             debug!("Text is {:?}", parsed);
             node.parsed_data = ParsedOperation::Text(parsed);
         }
         IFROpCode::Subtitle => {
             let parsed: Subtitle = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse Subtitle's data")?;
             debug!("Subtitle is {:?}", parsed);
             node.parsed_data = ParsedOperation::Subtitle(parsed);
         }
         IFROpCode::Numeric => {
             let parsed: Numeric = data_cursor
-                .read_ne_args((ValueEncoding::from_question(&node),))
+                .parse_ne_args((ValueEncoding::from_question(&node),))
                 .context("failed to parse Numeric's data")?;
             debug!("Numeric is {:?}", parsed);
             node.parsed_data = ParsedOperation::Numeric(parsed);
         }
         IFROpCode::QuestionRef1 => {
             let parsed: QuestionRef1 = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse QuestionRef1's data")?;
             debug!("QuestionRef1 is {:?}", parsed);
             node.parsed_data = ParsedOperation::QuestionRef1(parsed);
         }
         IFROpCode::EqIdVal => {
             let parsed: EqIdVal = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse EqIdVal's data")?;
             debug!("EqIdVal is {:?}", parsed);
             node.parsed_data = ParsedOperation::EqIdVal(parsed);
         }
         IFROpCode::EqIdId => {
             let parsed: EqIdId = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse EqIdId's data")?;
             debug!("EqIdId is {:?}", parsed);
             node.parsed_data = ParsedOperation::EqIdId(parsed);
         }
         IFROpCode::EqIdValList => {
             let parsed: EqIdValList = data_cursor
-                .read_ne()
+                .parse_ne()
                 .context("failed to parse EqIdValList's data")?;
             debug!("EqIdValList is {:?}", parsed);
             node.parsed_data = ParsedOperation::EqIdValList(parsed);
@@ -1864,11 +1869,11 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         // An undecoded GET, SET or FORM_MAP keeps the FormSet, whose other questions get and set
         // still reach: an evaluation refuses an undecoded GET or SET, and an undecoded FORM_MAP is
         // no standard map form.
-        IFROpCode::Get => match data_cursor.read_ne() {
+        IFROpCode::Get => match data_cursor.parse_ne() {
             Ok(parsed) => node.parsed_data = ParsedOperation::Get(parsed),
             Err(error) => debug!("leaving a Get undecoded: {error}"),
         },
-        IFROpCode::Set => match data_cursor.read_ne() {
+        IFROpCode::Set => match data_cursor.parse_ne() {
             Ok(parsed) => node.parsed_data = ParsedOperation::Set(parsed),
             Err(error) => debug!("leaving a Set undecoded: {error}"),
         },
@@ -3744,6 +3749,24 @@ mod tests {
             Some(std::io::ErrorKind::NotADirectory),
             "root cause of the open failure below a file"
         );
+    }
+
+    /// type_value_parser reads a value in the endian that its derive passes, as a parse_with
+    /// function takes it.
+    #[test]
+    fn type_value_parser_reads_in_the_endian_it_is_given() {
+        for (endian, want) in [
+            (binrw::Endian::Little, 0x0201),
+            (binrw::Endian::Big, 0x0102),
+        ] {
+            let got = type_value_parser(
+                &mut Cursor::new([0x01, 0x02]),
+                endian,
+                (EFI_IFR_TYPE_NUM_SIZE_16,),
+            )
+            .unwrap_or_else(|error| panic!("{endian:?}: {error}"));
+            assert_eq!(got, TypeValue::NumSize16(want), "{endian:?}");
+        }
     }
 
     /// An IFR operation Length below the header size is rejected as an

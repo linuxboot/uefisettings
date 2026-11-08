@@ -18,7 +18,6 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use binrw::io::Cursor;
-use binrw::BinReaderExt;
 use log::warn;
 use thiserror::Error;
 
@@ -35,6 +34,7 @@ use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::WithholdingVariables;
+use crate::parse_error::ReadParsed;
 
 /// The PASSWORD questions of a HiiDB (UEFI 2.10 §33.3.8.3.54): whether it declares any, the
 /// variables of the VarStores that they name, and the ops whose VarStore is unknown.
@@ -150,7 +150,7 @@ fn password_var_store(
 ) -> Result<Option<VariableKey>, UnresolvedPassword> {
     let header: QuestionHeader =
         Cursor::new(&op.data)
-            .read_ne()
+            .parse_ne()
             .map_err(|error| UnresolvedPassword::NoHeader {
                 form_set,
                 reason: error.to_string(),
@@ -382,6 +382,21 @@ mod tests {
             ),
             "headless: {:?}",
             headless.unresolved
+        );
+    }
+
+    /// A PASSWORD op whose question header does not parse gives its reason on one line: the
+    /// fields being parsed, without the Rust source locations of binrw's backtrace frames.
+    #[test]
+    fn a_headless_password_gives_its_reason_on_one_line() {
+        let headless = password_questions(&[operation(PASSWORD, false, &[3, 0, 4, 0])]);
+        let [UnresolvedPassword::NoHeader { reason, .. }] = headless.unresolved.as_slice() else {
+            panic!("headless: {:?}", headless.unresolved);
+        };
+        assert_eq!(
+            reason,
+            "failed to fill whole buffer (While parsing field 'question_id' in QuestionHeader)",
+            "headless"
         );
     }
 
