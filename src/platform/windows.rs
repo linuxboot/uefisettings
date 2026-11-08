@@ -26,6 +26,7 @@ use clap::Subcommand;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
+use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetupPasswordPolicy;
 use uefisettings::exports::VolatileWrites;
@@ -40,6 +41,7 @@ use crate::hii_set;
 use crate::print_line;
 use crate::write_extracted_db;
 use crate::HiiSourceArgs;
+use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetIncludeState;
 
@@ -146,14 +148,14 @@ impl SetupPasswordArgs {
 
 /// get, in this machine's HiiDB.
 pub(super) fn auto_get(
-    question: &str,
+    question: &QuestionArgs,
     json: bool,
     selection: &SelectionArgs,
     _source: &HiiSourceArgs,
 ) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
-        question,
+        question.selector()?,
         &GetOptions::from(selection),
         json,
     )
@@ -175,19 +177,19 @@ impl VolatileArgs {
 
 /// set, in this machine's HiiDB.
 pub(super) fn auto_set(
-    question: &str,
+    question: &QuestionArgs,
     value: &str,
     json: bool,
     _selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {
-    hii_set(question, value, options, json, source)
+    hii_set(question.selector()?, value, options, json, source)
 }
 
 /// HiiBackend::set_using, whatever `_source` names.
 pub(super) fn set_using(
-    question: &str,
+    question: QuestionSelector,
     value: &str,
     options: &SetOptions,
     _source: &HiiSourceArgs,

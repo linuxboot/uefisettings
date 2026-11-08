@@ -49,6 +49,7 @@ use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::KeywordSetOptions;
 use uefisettings::exports::KeywordValues;
+use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetupPasswordPolicy;
 use uefisettings::exports::VolatileWrites;
@@ -69,6 +70,7 @@ use crate::variable_command::print_info;
 use crate::HiiSourceArgs;
 use crate::IncludeArgs;
 use crate::JsonArgs;
+use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetIncludeState;
 
@@ -274,14 +276,14 @@ impl VolatileArgs {
 
 /// get, in this firmware's HII database.
 pub(super) fn auto_get(
-    question: &str,
+    question: &QuestionArgs,
     json: bool,
     selection: &SelectionArgs,
     _source: &HiiSourceArgs,
 ) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
-        question,
+        question.selector()?,
         &GetOptions::from(selection),
         json,
     )
@@ -289,19 +291,19 @@ pub(super) fn auto_get(
 
 /// set, in this firmware's HII database.
 pub(super) fn auto_set(
-    question: &str,
+    question: &QuestionArgs,
     value: &str,
     json: bool,
     _selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {
-    hii_set(question, value, options, json, source)
+    hii_set(question.selector()?, value, options, json, source)
 }
 
 /// HiiBackend::set_using, whatever `_source` names.
 pub(super) fn set_using(
-    question: &str,
+    question: QuestionSelector,
     value: &str,
     options: &SetOptions,
     _source: &HiiSourceArgs,

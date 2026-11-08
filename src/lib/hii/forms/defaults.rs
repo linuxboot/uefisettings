@@ -647,6 +647,7 @@ mod tests {
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
     use super::super::IncludedStates;
+    use super::super::QuestionMatch;
     use super::super::Selection;
     use super::DeclaredDefault;
     use super::DefaultError;
@@ -975,7 +976,7 @@ mod tests {
         } = find_question(
             root,
             &ListTexts::new(&strings(), &[]),
-            &BTreeSet::from([PROMPT]),
+            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
             IncludedStates::empty(),
             None,
             &mut efivars.reader(),

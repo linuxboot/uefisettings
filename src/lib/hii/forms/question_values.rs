@@ -16,9 +16,13 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::IntErrorKind;
+use std::num::NonZeroU16;
 use std::rc::Rc;
+use std::str::FromStr;
 
 use anyhow::Result;
+use thiserror::Error;
 
 use super::conditions::enclosing_form_set;
 use super::conditions::option_state;
@@ -34,6 +38,8 @@ use super::defaults::question_defaults;
 use super::defaults::question_scope;
 use super::find_corresponding_varstore;
 use super::keywords::keyword_of;
+use super::keywords::KeywordStatement;
+use super::keywords::UEFI_CONFIG_LANG;
 use super::numeric_format;
 use super::storage::RetrievedValue;
 use super::storage::ValueLocation;
@@ -56,7 +62,10 @@ use super::QuestionHeader;
 use super::Range;
 use super::RangeType;
 use super::Walk;
+use crate::hii::config_string;
+use crate::hii::config_string::Namespace;
 use crate::hii::package::Guid;
+use crate::hii::strings::is_configuration_language;
 use crate::hii::strings::ListTexts;
 
 /// A question whose value get reads and set writes.
@@ -132,20 +141,7 @@ where
     T: AsRef<str>,
 {
     let mut found = Vec::new();
-    walk_scopes(std::slice::from_ref(node), None, |node, &form_set| {
-        let op = node.borrow();
-        if skips_scope(&op) {
-            return Walk::Skip;
-        }
-        let form_set = match &op.parsed_data {
-            ParsedOperation::FormSet(parsed) => Some(parsed.guid),
-            _ => form_set,
-        };
-        // Only Numeric, OneOf and CheckBox are questions.
-        let Some(question) = value_question(&op) else {
-            return Walk::Enter(form_set);
-        };
-        let header = question.header();
+    visit_value_questions(node, |node, form_set, header| {
         let languages: Vec<String> = texts
             .matching(header.prompt_string_id)
             .filter(|(_, prompt)| {
@@ -165,9 +161,298 @@ where
                 },
             });
         }
-        Walk::Enter(form_set)
     });
     found
+}
+
+/// Calls `visit` with each ONE_OF, NUMERIC and CHECKBOX under `node`, in IFR order, the GUID of
+/// its FormSet and its header.
+fn visit_value_questions(
+    node: &Rc<RefCell<IFROperation>>,
+    mut visit: impl FnMut(&Rc<RefCell<IFROperation>>, Option<Guid>, QuestionHeader),
+) {
+    walk_scopes(std::slice::from_ref(node), None, |node, &form_set| {
+        let op = node.borrow();
+        if skips_scope(&op) {
+            return Walk::Skip;
+        }
+        let form_set = match &op.parsed_data {
+            ParsedOperation::FormSet(parsed) => Some(parsed.guid),
+            _ => form_set,
+        };
+        // Only Numeric, OneOf and CheckBox are questions.
+        if let Some(question) = value_question(&op) {
+            visit(node, form_set, question.header());
+        }
+        Walk::Enter(form_set)
+    });
+}
+
+/// What find_question selects questions by, in one FormSet.
+pub(crate) enum QuestionMatch<'a, T> {
+    /// The questions whose prompt is one of these phrases, as questions_named finds them
+    Prompt(&'a BTreeSet<T>),
+    /// The question of this address
+    Address(&'a QuestionAddress),
+    /// The questions of these statements of a keyword, those of the FormSet
+    Keyword(&'a [KeywordStatement<'a>]),
+}
+
+/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, that
+/// `matching` selects, of texts `texts`.
+pub(super) fn questions_matching<T>(
+    node: &Rc<RefCell<IFROperation>>,
+    texts: &ListTexts<'_>,
+    matching: &QuestionMatch<'_, T>,
+) -> Vec<Rc<RefCell<IFROperation>>>
+where
+    T: AsRef<str>,
+{
+    match *matching {
+        QuestionMatch::Prompt(phrases) => questions_named(node, texts, phrases)
+            .into_iter()
+            .map(|named| named.node)
+            .collect(),
+        QuestionMatch::Address(address) => questions_addressed(node, address),
+        QuestionMatch::Keyword(statements) => statements
+            .iter()
+            .filter(|statement| Rc::ptr_eq(statement.root(), node))
+            .map(KeywordStatement::op)
+            .filter(|op| value_question(&op.borrow()).is_some())
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, of the address
+/// `address`: two or more only where QuestionIds repeat in a FormSet.
+pub(super) fn questions_addressed(
+    node: &Rc<RefCell<IFROperation>>,
+    address: &QuestionAddress,
+) -> Vec<Rc<RefCell<IFROperation>>> {
+    let mut found = Vec::new();
+    visit_value_questions(node, |node, form_set, header| {
+        if form_set == Some(address.form_set) && header.question_id == address.question_id.get() {
+            found.push(Rc::clone(node));
+        }
+    });
+    found
+}
+
+/// Where --keyword searches: the strings packages whose language starts with this NAMESPACE,
+/// itself a configuration language (Language::is_configuration), as NamespaceId is "the platform
+/// configuration language to search through" (UEFI 2.11 §35.3.3). It parses from such a
+/// language only, so that a keyword never matches a prompt of a display language.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeywordNamespace(Namespace);
+
+impl KeywordNamespace {
+    pub(crate) fn namespace(&self) -> &Namespace {
+        &self.0
+    }
+}
+
+impl FromStr for KeywordNamespace {
+    type Err = KeywordError;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        let namespace =
+            Namespace::try_from(text).map_err(|error| KeywordError::Syntax(error.to_string()))?;
+        match is_configuration_language(text.as_bytes()) {
+            true => Ok(Self(namespace)),
+            false => Err(KeywordError::NotConfiguration(text.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for KeywordNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// What --keyword selects by: a `<Keyword>`'s keyword of the UEFI Configuration Namespace
+/// Registry, with any ':' and 1 to 4 digits of its instance (UEFI 2.11 §35.2.1.6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeywordName(config_string::Keyword);
+
+impl KeywordName {
+    pub(crate) fn keyword(&self) -> &config_string::Keyword {
+        &self.0
+    }
+}
+
+impl FromStr for KeywordName {
+    type Err = KeywordError;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        config_string::Keyword::try_from(text)
+            .map(Self)
+            .map_err(|error| KeywordError::Syntax(error.to_string()))
+    }
+}
+
+impl fmt::Display for KeywordName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Why a text is no KeywordNamespace or KeywordName.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+#[non_exhaustive]
+pub enum KeywordError {
+    /// The text breaks the syntax of `<NameSpaceId>` or `<Keyword>`, as the error says
+    #[error("{0}")]
+    Syntax(String),
+    #[error(
+        "{0:?} is no configuration language: it does not start with \"x-\" (UEFI 2.11 §33.2.6.1)"
+    )]
+    NotConfiguration(String),
+}
+
+/// A question by its FormSet's GUID and its QuestionId (UEFI 2.11 §33.3.8.2.2), which
+/// list-questions shows as form_set_guid and question_id; it parses from "GUID:ID", ID in
+/// decimal or 0x hex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuestionAddress {
+    pub form_set: Guid,
+    /// "The value of zero is reserved" (UEFI 2.11 §33.3.8.2.2)
+    pub question_id: NonZeroU16,
+}
+
+impl FromStr for QuestionAddress {
+    type Err = QuestionAddressError;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        let (guid, id) = text
+            .rsplit_once(':')
+            .ok_or_else(|| QuestionAddressError::NoColon(text.to_owned()))?;
+        let form_set = guid
+            .parse()
+            .map_err(|_| QuestionAddressError::Guid(guid.to_owned()))?;
+        let (digits, radix) = match id.strip_prefix("0x").or_else(|| id.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None => (id, 10),
+        };
+        // from_str_radix also takes a leading '+', which "decimal or 0x hex" does not have
+        if !digits.starts_with(|digit: char| digit.is_digit(radix)) {
+            return Err(QuestionAddressError::Id(id.to_owned()));
+        }
+        let number = u16::from_str_radix(digits, radix).map_err(|error| match error.kind() {
+            IntErrorKind::PosOverflow => QuestionAddressError::Above16Bits(id.to_owned()),
+            _ => QuestionAddressError::Id(id.to_owned()),
+        })?;
+        let question_id = NonZeroU16::new(number).ok_or(QuestionAddressError::Reserved)?;
+        Ok(Self {
+            form_set,
+            question_id,
+        })
+    }
+}
+
+/// "GUID:ID", as from_str takes it, ID in decimal as list-questions shows it.
+impl fmt::Display for QuestionAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.form_set, self.question_id)
+    }
+}
+
+/// Why a text is no QuestionAddress.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Error)]
+#[non_exhaustive]
+pub enum QuestionAddressError {
+    #[error("{0:?} is not GUID:ID: it has no ':'")]
+    NoColon(String),
+    #[error("{0:?} is not a GUID")]
+    Guid(String),
+    #[error("{0:?} is not a number in decimal or 0x hex")]
+    Id(String),
+    #[error("QuestionId 0 is reserved (UEFI 2.11 §33.3.8.2.2)")]
+    Reserved,
+    #[error("QuestionId {0} is above 0xFFFF")]
+    Above16Bits(String),
+}
+
+/// The questions that get and set select, one in each FormSet.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum QuestionSelector {
+    /// The questions whose prompt, in a language of no configuration language, is this text,
+    /// ignoring ASCII case and surrounding whitespace, or one of its spellings
+    Prompt(String),
+    /// The question of this address, in every package list that holds its FormSet
+    Address(QuestionAddress),
+    /// The questions of the statements that the Keyword Handler takes for `keyword` in
+    /// `namespace`, else in a language of the prefix "x-UEFI", in each package list
+    /// (KeywordStatement::resolve_offline): the keyword strings (UEFI 2.11 §35.2.1.6) of KEYWORD
+    /// `keyword`, any `:<DecCh>(1/4)` instance suffix included, whose NAMESPACE starts so
+    Keyword {
+        keyword: KeywordName,
+        namespace: Option<KeywordNamespace>,
+    },
+}
+
+impl QuestionSelector {
+    /// What find_question selects by: by Prompt, any of `variations`, the spellings of its text;
+    /// by Keyword, `statements`, its statements in the HiiDB.
+    pub(crate) fn matching<'a, T>(
+        &'a self,
+        variations: &'a BTreeSet<T>,
+        statements: &'a [KeywordStatement<'a>],
+    ) -> QuestionMatch<'a, T> {
+        match self {
+            Self::Prompt(_) => QuestionMatch::Prompt(variations),
+            Self::Address(address) => QuestionMatch::Address(address),
+            Self::Keyword { .. } => QuestionMatch::Keyword(statements),
+        }
+    }
+}
+
+impl From<&str> for QuestionSelector {
+    fn from(question: &str) -> Self {
+        Self::Prompt(question.to_owned())
+    }
+}
+
+impl From<String> for QuestionSelector {
+    fn from(question: String) -> Self {
+        Self::Prompt(question)
+    }
+}
+
+impl From<&String> for QuestionSelector {
+    fn from(question: &String) -> Self {
+        Self::Prompt(question.clone())
+    }
+}
+
+/// How errors name the questions: by the prompt's text, else by QuestionId or keyword.
+impl fmt::Display for QuestionSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prompt(text) => f.write_str(text),
+            Self::Address(address) => write!(
+                f,
+                "QuestionId {:#06X} of FormSet {}",
+                address.question_id, address.form_set
+            ),
+            Self::Keyword {
+                keyword,
+                namespace: Some(namespace),
+            } => write!(
+                f,
+                "keyword {keyword} of a namespace starting with {namespace}"
+            ),
+            Self::Keyword {
+                keyword,
+                namespace: None,
+            } => write!(
+                f,
+                "keyword {keyword} of a namespace starting with {UEFI_CONFIG_LANG}"
+            ),
+        }
+    }
 }
 
 /// A question that a QUESTION of get or set names, and the languages in which it is its prompt.
@@ -177,7 +462,8 @@ pub struct PromptMatch {
     pub question_id: u16,
     /// The GUID of the question's FormSet
     pub form_set: Option<Guid>,
-    /// The languages, of no configuration language, whose text of the prompt is the QUESTION
+    /// The languages, of no configuration language, whose text of the prompt is the QUESTION;
+    /// for --keyword, the NAMESPACE of the keyword's strings package
     pub languages: Vec<String>,
 }
 
@@ -267,14 +553,9 @@ pub(crate) struct Keyword {
 impl QuestionIdentity {
     /// The identity of the question `op`, of header `header`, whose keywords `texts` hold.
     fn of(op: &IFROperation, header: &QuestionHeader, texts: &ListTexts<'_>) -> Self {
-        let form_set =
-            enclosing_form_set(op).and_then(|form_set| match &form_set.borrow().parsed_data {
-                ParsedOperation::FormSet(parsed) => Some(parsed.guid),
-                _ => None,
-            });
         Self {
             question_id: header.question_id,
-            form_set,
+            form_set: form_set_guid(op),
             keywords: texts
                 .keywords(header.prompt_string_id)
                 .filter_map(|(language, text)| keyword_of(language, text))
@@ -285,6 +566,14 @@ impl QuestionIdentity {
                 .collect(),
         }
     }
+}
+
+/// The GUID of the FormSet that holds `op`.
+pub(super) fn form_set_guid(op: &IFROperation) -> Option<Guid> {
+    enclosing_form_set(op).and_then(|form_set| match &form_set.borrow().parsed_data {
+        ParsedOperation::FormSet(parsed) => Some(parsed.guid),
+        _ => None,
+    })
 }
 
 /// Returns the QuestionDescriptor of `question`, whose op is `value_question`.
@@ -1757,5 +2046,156 @@ mod question_value_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod question_address_tests {
+    use super::*;
+    use crate::hii::config_string::ConfigStringError;
+
+    const FORM_SET: &str = "8C78A505-BAA0-4C4A-869F-000000000800";
+
+    /// GUID:ID takes ID in decimal or 0x hex, from 1 to 0xFFFF, digits only, and names what it
+    /// refuses.
+    #[test]
+    fn question_address_takes_an_id_from_1_to_0xffff() {
+        let id = |id: &str| format!("{FORM_SET}:{id}");
+        for (text, want) in [
+            (id("0x8001"), Ok(id("32769"))),
+            (id("0X8001"), Ok(id("32769"))),
+            (id("32769"), Ok(id("32769"))),
+            (id("1"), Ok(id("1"))),
+            (id("0xFFFF"), Ok(id("65535"))),
+            (id("65535"), Ok(id("65535"))),
+            (id("0"), Err(QuestionAddressError::Reserved)),
+            (id("0x0"), Err(QuestionAddressError::Reserved)),
+            (
+                id("0x10000"),
+                Err(QuestionAddressError::Above16Bits("0x10000".to_owned())),
+            ),
+            (
+                id("65536"),
+                Err(QuestionAddressError::Above16Bits("65536".to_owned())),
+            ),
+            (id("-1"), Err(QuestionAddressError::Id("-1".to_owned()))),
+            (id("0x"), Err(QuestionAddressError::Id("0x".to_owned()))),
+            (id("1h"), Err(QuestionAddressError::Id("1h".to_owned()))),
+            (id("+1"), Err(QuestionAddressError::Id("+1".to_owned()))),
+            (id("0x+1"), Err(QuestionAddressError::Id("0x+1".to_owned()))),
+            (id(""), Err(QuestionAddressError::Id(String::new()))),
+            (
+                FORM_SET.to_owned(),
+                Err(QuestionAddressError::NoColon(FORM_SET.to_owned())),
+            ),
+            (
+                "8C78A505:1".to_owned(),
+                Err(QuestionAddressError::Guid("8C78A505".to_owned())),
+            ),
+        ] {
+            assert_eq!(
+                text.parse::<QuestionAddress>()
+                    .map(|address| address.to_string()),
+                want,
+                "{text}"
+            );
+        }
+    }
+
+    /// Errors name a question that get or set selects by its prompt, by its QuestionId in hex
+    /// and its FormSet's GUID, or by its keyword and namespace.
+    #[test]
+    fn question_selector_names_what_it_selects_by() {
+        let address = format!("{FORM_SET}:1").parse().expect("parse the address");
+        for (selector, want) in [
+            (QuestionSelector::from("Boot Mode"), "Boot Mode".to_owned()),
+            (
+                QuestionSelector::Address(address),
+                format!("QuestionId 0x0001 of FormSet {FORM_SET}"),
+            ),
+            (
+                QuestionSelector::Keyword {
+                    keyword: "Keyword:5".parse().expect("parse the keyword"),
+                    namespace: None,
+                },
+                "keyword Keyword:5 of a namespace starting with x-UEFI".to_owned(),
+            ),
+            (
+                QuestionSelector::Keyword {
+                    keyword: "Keyword:5".parse().expect("parse the keyword"),
+                    namespace: Some("x-i-UEFI".parse().expect("parse the namespace")),
+                },
+                "keyword Keyword:5 of a namespace starting with x-i-UEFI".to_owned(),
+            ),
+        ] {
+            assert_eq!(selector.to_string(), want, "{selector:?}");
+        }
+    }
+
+    /// A keyword's namespace parses from a NAMESPACE that is a configuration language only, its
+    /// "x-" in either case, so that no keyword selects by a prompt of a display language.
+    #[test]
+    fn keyword_namespace_is_a_configuration_language() {
+        let syntax = |text: &str| {
+            KeywordError::Syntax(ConfigStringError::InvalidNamespace(text.to_owned()).to_string())
+        };
+        for (text, want) in [
+            ("x-UEFI", Ok(())),
+            ("x-UEFI-ns", Ok(())),
+            ("x-i-UEFI", Ok(())),
+            ("X-UEFI-ns", Ok(())),
+            ("", Err(syntax(""))),
+            ("x-UEFI=ns", Err(syntax("x-UEFI=ns"))),
+            ("x-UEFI ns", Err(syntax("x-UEFI ns"))),
+            ("en", Err(KeywordError::NotConfiguration("en".to_owned()))),
+            (
+                "en-US",
+                Err(KeywordError::NotConfiguration("en-US".to_owned())),
+            ),
+            ("x", Err(KeywordError::NotConfiguration("x".to_owned()))),
+        ] {
+            assert_eq!(
+                text.parse::<KeywordNamespace>()
+                    .map(|namespace| namespace.to_string()),
+                want.map(|()| text.to_owned()),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// --keyword parses as a <Keyword>: text without '&', '=' or control characters, any ':'
+    /// followed by 1 to 4 digits only.
+    #[test]
+    fn keyword_name_is_a_keyword() {
+        let syntax = |text: &str| {
+            KeywordError::Syntax(ConfigStringError::InvalidKeyword(text.to_owned()).to_string())
+        };
+        for (text, want) in [
+            ("BIOSVendor", Ok(())),
+            ("ChipsetSATAPortEnable:5", Ok(())),
+            ("Keyword:1234", Ok(())),
+            ("", Err(syntax(""))),
+            ("Key&word", Err(syntax("Key&word"))),
+            ("Key=word", Err(syntax("Key=word"))),
+            ("Keyword:12345", Err(syntax("Keyword:12345"))),
+            ("Keyword:five", Err(syntax("Keyword:five"))),
+        ] {
+            assert_eq!(
+                text.parse::<KeywordName>()
+                    .map(|keyword| keyword.to_string()),
+                want.map(|()| text.to_owned()),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// The library's get and set take a prompt as a &str, a String and a &String.
+    #[test]
+    fn question_selector_converts_from_each_string_type() {
+        let text = String::from("Boot Mode");
+        let want = QuestionSelector::Prompt(text.clone());
+        let selectors: [QuestionSelector; 3] =
+            [text.as_str().into(), (&text).into(), text.clone().into()];
+        assert_eq!(selectors, [want.clone(), want.clone(), want], "prompts");
     }
 }

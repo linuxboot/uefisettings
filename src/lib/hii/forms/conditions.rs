@@ -290,7 +290,8 @@ pub enum SelectionError {
         ignored: Vec<IgnoredIfr>,
     },
     /// get's and set's refusal of a QUESTION that names questions through the prompts of
-    /// different languages
+    /// different languages, and of a --keyword that names them through those of different
+    /// namespaces
     #[error(
         "{question:?} is the prompt {}: no one language holds it as the prompt of every question \
          it names",
@@ -308,6 +309,19 @@ pub enum SelectionError {
     AmbiguousOption {
         question: String,
         matches: Vec<OptionMatch>,
+    },
+    /// get's and set's refusal of a --question-id that questions of one FormSet share, of which
+    /// select would pick one, though a QuestionId is "The unique value that identifies the
+    /// particular question" (UEFI 2.11 §33.3.8.2.2)
+    #[error(
+        "{question} is that of the questions {}: a QuestionId identifies one question of its \
+         FormSet",
+        .prompts.iter().map(|prompt| format!("{prompt:?}")).collect::<Vec<_>>().join(" and ")
+    )]
+    SharedQuestionId {
+        question: String,
+        /// The prompts of the questions, in IFR order
+        prompts: Vec<String>,
     },
 }
 
@@ -2722,6 +2736,7 @@ mod tests {
     use super::super::Cursor;
     use super::super::FormSetWalk;
     use super::super::QuestionDescriptor;
+    use super::super::QuestionMatch;
     use super::*;
 
     const EQ_ID_ID: u8 = 0x13;
@@ -4397,7 +4412,7 @@ mod tests {
         let root = parse_form_set(forms);
         find_question_in(
             &root,
-            &BTreeSet::from([PROMPT]),
+            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings(), &[]),
                 &mut Efivars::new().reader(),

@@ -396,6 +396,40 @@ uefisettings hii list-questions --language en-US --json
 </details>
 
 <details>
+<summary>Selecting a question by QuestionId or keyword</summary>
+
+`get`, `set`, `hii get` and `hii set` select by one of QUESTION, `--question-id` and `--keyword`;
+the Ilo backend selects only by QUESTION.
+
+`--question-id GUID:ID` selects the question of QuestionId ID (UEFI 2.11 §33.3.8.2.2) in the
+FormSet of GUID, in every package list that holds that FormSet. ID is decimal or 0x hex, 1 to
+0xFFFF, as `hii list-questions --json` shows `form_set_guid` and `question_id`. It selects
+questions whose prompt is empty or shared with others.
+
+`--keyword KEYWORD` selects the questions of the statements that KEYWORD names as edk2's Keyword
+Handler finds them without PATH (edk2-stable202608 ConfigKeywordHandler.c), in the strings
+packages whose language starts with `x-UEFI` (its UEFI_CONFIG_LANG, where §35.3.3 says `x-UEFI-`),
+or with LANGUAGE under `--keyword-namespace LANGUAGE`: in each package list, the first such
+strings package (GetStringIdFromRecord), there the lowest string ID whose text is KEYWORD, exactly
+and with its case (GetStringIdFromString), and the statement that this string prompts
+(FindQuestionFromStringId). KEYWORD is the KEYWORD of a keyword string (§35.2.1.6), a `<Keyword>`
+with any instance suffix, such as `ChipsetSATAPortEnable:5`, the spec's example of a setting with
+several instances, and `hii list-questions --json` shows each question's in `keywords`.
+uefisettings reads the keywords from the HiiDB, as it reads prompts; it does not call
+`EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL`, and it selects in a package list without a device path too,
+which no `<KeywordResp>` could name. LANGUAGE must be a `<NameSpaceId>` that is a configuration
+language, one that starts with `x-`, as NamespaceId is "the platform configuration language to
+search through" (§35.3.3), so that KEYWORD never matches a prompt of a display language.
+
+`get` and `set` refuse a KEYWORD that another strings package of the namespace in its package list
+holds too, or that prompts more than one statement of its list, which firmware may take instead,
+and a KEYWORD that names questions of more than one namespace, and a `--question-id` that two
+questions of one FormSet hold, naming each match, and write nothing. `set` takes VALUE literally with `--question-id` and `--keyword`: the spellings database,
+which lets VALUE take other spellings by QUESTION, keys them by prompt.
+
+</details>
+
+<details>
 <summary>Questions with READ and WRITE expressions, and without a VarStore</summary>
 
 A question can take its value through a READ expression and keep it through a WRITE expression

@@ -37,6 +37,7 @@ use uefisettings::exports::HiiMethod;
 use uefisettings::exports::HiiSource;
 use uefisettings::exports::HiiSourceOptions;
 use uefisettings::exports::IloBackend;
+use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SettingsBackend;
 use uefisettings::exports::SetupPasswordPolicy;
@@ -58,6 +59,7 @@ use crate::EfivarMemoryArg;
 use crate::HiiSourceArg;
 use crate::HiiSourceArgs;
 use crate::JsonArgs;
+use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetIncludeState;
 
@@ -300,35 +302,42 @@ impl SetupPasswordArgs {
     }
 }
 
-impl<S> SelectionArgs<S>
+/// The QUESTION of `question` for the Ilo backend; fails if a flag of the HII backend is given:
+/// Ilo attributes have no QuestionId, no keywords, no IFR conditions and no HII strings.
+fn refuse_on_ilo<'a, S>(question: &'a QuestionArgs, selection: &SelectionArgs<S>) -> Result<&'a str>
 where
     S: clap::ValueEnum + Clone + Send + Sync + 'static,
 {
-    /// Fails if any state is included, or an access level or a language stated: Ilo attributes
-    /// have no IFR conditions and no HII strings.
-    pub(super) fn refuse_on_ilo(&self) -> Result<()> {
-        let stated: Vec<&str> = [
-            ("--include", !self.include.include.is_empty()),
-            ("--access-level", self.access_level.is_some()),
-            ("--language", self.language.language.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(flag, stated)| stated.then_some(flag))
-        .collect();
-        let flags = match stated.as_slice() {
-            [] => return Ok(()),
-            [flag] => format!("{flag} applies"),
-            [first @ .., last] => format!("{} and {last} apply", first.join(", ")),
-        };
-        Err(anyhow!(
-            "{flags} to the HII backend, not to the Ilo backend of this machine"
-        ))
-    }
+    let stated: Vec<&str> = [
+        ("--question-id", question.selector.question_id.is_some()),
+        ("--keyword", question.selector.keyword.is_some()),
+        ("--keyword-namespace", question.keyword_namespace.is_some()),
+        ("--include", !selection.include.include.is_empty()),
+        ("--access-level", selection.access_level.is_some()),
+        ("--language", selection.language.language.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, stated)| stated.then_some(flag))
+    .collect();
+    let flags = match stated.as_slice() {
+        [] => {
+            return question
+                .selector
+                .question
+                .as_deref()
+                .ok_or_else(|| anyhow!("the Ilo backend selects only by QUESTION"))
+        }
+        [flag] => format!("{flag} applies"),
+        [first @ .., last] => format!("{} and {last} apply", first.join(", ")),
+    };
+    Err(anyhow!(
+        "{flags} to the HII backend, not to the Ilo backend of this machine"
+    ))
 }
 
 /// get, on this machine's backend, whose HiiDB it reads as `source` says.
 pub(super) fn auto_get(
-    question: &str,
+    question: &QuestionArgs,
     json: bool,
     selection: &SelectionArgs,
     source: &HiiSourceArgs,
@@ -339,13 +348,12 @@ pub(super) fn auto_get(
         return Err(anyhow!("unknown backend"));
     }
     if prioritize_backend(&machine, json)? == Backend::Ilo {
-        selection.refuse_on_ilo()?;
-        let res = IloBackend::get(question, None)?;
+        let res = IloBackend::get(refuse_on_ilo(question, selection)?, None)?;
         print_with_style(res, json)?;
     } else {
         hii_get(
             &HiiBackend::read_hiidb_from(None, &EfivarSource::System, &options)?,
-            question,
+            question.selector()?,
             &GetOptions::from(selection),
             json,
         )?;
@@ -369,7 +377,7 @@ impl VolatileArgs {
 
 /// set, on this machine's backend, whose HiiDB it reads as `source` says.
 pub(super) fn auto_set(
-    question: &str,
+    question: &QuestionArgs,
     value: &str,
     json: bool,
     selection: &SelectionArgs<SetIncludeState>,
@@ -381,18 +389,17 @@ pub(super) fn auto_set(
         return Err(anyhow!("unknown backend"));
     }
     if prioritize_backend(&machine, json)? == Backend::Ilo {
-        selection.refuse_on_ilo()?;
-        let res = IloBackend::set(question, value, None)?;
+        let res = IloBackend::set(refuse_on_ilo(question, selection)?, value, None)?;
         print_with_style(res, json)?;
     } else {
-        hii_set(question, value, options, json, source)?;
+        hii_set(question.selector()?, value, options, json, source)?;
     }
     Ok(())
 }
 
 /// HiiBackend::set_using, in this machine's HiiDB read as `source` says.
 pub(super) fn set_using(
-    question: &str,
+    question: QuestionSelector,
     value: &str,
     options: &SetOptions,
     source: &HiiSourceArgs,
@@ -483,8 +490,8 @@ fn dump_warning(dir: &Path, redaction: EfivarRedaction) -> String {
 mod tests {
     use super::*;
     use crate::tests::hii;
-    use crate::tests::selection_of;
     use crate::tests::READING_COMMANDS;
+    use crate::Commands;
     use crate::HiiSubcommands;
     use crate::UefiSettingsToolArgs;
 
@@ -533,12 +540,51 @@ mod tests {
         }
     }
 
+    /// refuse_on_ilo of `uefisettings get Q` with the flags `args`, or of `uefisettings get` with
+    /// `args` if they select by --question-id or --keyword.
+    fn refused_on_ilo(args: &[&str]) -> Result<String, String> {
+        let selects = args
+            .iter()
+            .any(|arg| matches!(*arg, "--question-id" | "--keyword"));
+        let question: &[&str] = if selects { &[] } else { &["Q"] };
+        let argv = [&["uefisettings", "get"][..], question, args].concat();
+        let parsed = UefiSettingsToolArgs::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("parse get {args:?}: {error}"));
+        let Commands::Get {
+            question,
+            selection,
+            ..
+        } = parsed.command
+        else {
+            panic!("not get: {args:?}");
+        };
+        refuse_on_ilo(&question, &selection)
+            .map(str::to_owned)
+            .map_err(|error| error.to_string())
+    }
+
     /// refuse_on_ilo names the flags that apply to the HII backend only, of which Ilo attributes
-    /// take none, and passes no flag.
+    /// take none, and passes QUESTION without them.
     #[test]
     fn refuse_on_ilo_names_the_flags_of_the_hii_backend() {
         let cases = [
-            ("no flag", vec![], Ok(())),
+            ("no flag", vec![], Ok("Q")),
+            (
+                "--question-id",
+                vec!["--question-id", "8C78A505-BAA0-4C4A-869F-000000000800:1"],
+                Err(
+                    "--question-id applies to the HII backend, not to the Ilo backend of this \
+                     machine",
+                ),
+            ),
+            (
+                "--keyword and --keyword-namespace",
+                vec!["--keyword", "K", "--keyword-namespace", "x-i-UEFI"],
+                Err(
+                    "--keyword and --keyword-namespace apply to the HII backend, not to the Ilo \
+                     backend of this machine",
+                ),
+            ),
             (
                 "--include",
                 vec!["--include", "grayed-out"],
@@ -585,10 +631,8 @@ mod tests {
         ];
         for (case, args, want) in cases {
             assert_eq!(
-                selection_of(&args)
-                    .refuse_on_ilo()
-                    .map_err(|error| error.to_string()),
-                want.map_err(str::to_string),
+                refused_on_ilo(&args),
+                want.map(str::to_string).map_err(str::to_string),
                 "{case}"
             );
         }

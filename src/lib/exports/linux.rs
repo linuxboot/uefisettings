@@ -36,6 +36,7 @@ use uefisettings_backend_thrift::SetResponseList;
 use super::CapsuleBackend;
 use super::DumpEfivarsOptions;
 use super::HiiBackend;
+use super::QuestionSelector;
 use super::SetOptions;
 use super::SettingsBackend;
 use super::VariableBackend;
@@ -180,7 +181,7 @@ impl HiiBackend {
 
     /// set_using, in this machine's HiiDB read as `source` says.
     pub fn set_from(
-        question: &str,
+        question: impl Into<QuestionSelector>,
         new_value: &str,
         selector: Option<&str>,
         options: &SetOptions,

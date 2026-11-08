@@ -633,7 +633,7 @@ impl fmt::Display for Number {
 /// Plain text, although the BNF has a `<String>`: EDK2's Keyword Handler reads and writes it so
 /// (ExtractNameSpace, GenerateKeywordResp), as the §35.2.1.6 examples do, and converts it to
 /// ASCII (UnicodeStrToAsciiStrS).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Namespace(String);
 
 impl TryFrom<&str> for Namespace {
@@ -661,7 +661,7 @@ impl fmt::Display for Namespace {
 ///
 /// Plain text, as for Namespace: EDK2's ExtractKeyword and GenerateKeywordResp, and the
 /// §35.2.1.6 examples.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Keyword(String);
 
 impl TryFrom<&str> for Keyword {

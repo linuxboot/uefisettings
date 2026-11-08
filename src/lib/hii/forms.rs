@@ -55,14 +55,25 @@ use conditions::QuestionValues;
 use conditions::VarStoreValues;
 use defaults::FormSetDefaultStores;
 use defaults::OptionValueError;
+use keywords::KeywordStatement;
 use question_values::describe_question;
+use question_values::form_set_guid;
+use question_values::questions_addressed;
+use question_values::questions_matching;
 use question_values::questions_named;
 use question_values::share_a_language;
 use question_values::value_question;
 pub(crate) use question_values::Keyword;
+pub use question_values::KeywordError;
+pub use question_values::KeywordName;
+pub use question_values::KeywordNamespace;
 pub use question_values::OptionMatch;
 pub use question_values::PromptMatch;
+pub use question_values::QuestionAddress;
+pub use question_values::QuestionAddressError;
 pub(crate) use question_values::QuestionIdentity;
+pub(crate) use question_values::QuestionMatch;
+pub use question_values::QuestionSelector;
 use set::ChangeValueError;
 use storage::storage_width;
 use storage::NameValueStore;
@@ -107,7 +118,8 @@ pub(crate) mod ifr_fixtures;
     expect(
         dead_code,
         reason = "only the UEFI Shell build's Keyword Handler resolves keywords for GetData() and \
-                  SetData() and checks them; list-questions takes keyword_of on every build"
+                  SetData() and checks them; get, set and list-questions take resolve_offline \
+                  and keyword_of on every build"
     )
 )]
 pub(crate) mod keywords;
@@ -2334,15 +2346,15 @@ fn listed_question(
     Some((descriptor, state))
 }
 
-/// find_question accepts the root node, texts and possible_question_phrases.
-/// possible_question_phrases is a vector of strings which represent variations of the
-/// same question. So if a single phrase matches then we assume that we have the answer.
+/// find_question accepts the root node, texts and what to match questions by: by prompt, a set
+/// of strings which represent variations of the same question, so if a single phrase matches
+/// then we assume that we have the answer; or by QuestionId or keyword (QuestionMatch).
 /// Of the matching questions, it selects one as select does, with conditions reading
 /// `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value.
 pub(crate) fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
-    possible_question_phrases: &BTreeSet<T>,
+    matching: &QuestionMatch<'_, T>,
     include: IncludedStates,
     access_level: Option<AccessLevel>,
     reader: &mut EfivarReader,
@@ -2353,7 +2365,7 @@ where
     let values = VarStoreValues::new(&node, access_level);
     find_question_in(
         &node,
-        possible_question_phrases,
+        matching,
         &mut FormSetWalk::new(texts, reader, &values, include),
     )
 }
@@ -2361,17 +2373,13 @@ where
 /// Finds a question as find_question does, with `walk`.
 fn find_question_in<T>(
     node: &Rc<RefCell<IFROperation>>,
-    possible_question_phrases: &BTreeSet<T>,
+    matching: &QuestionMatch<'_, T>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Selection<QuestionDescriptor>
 where
     T: AsRef<str>,
 {
-    let questions: Vec<Rc<RefCell<IFROperation>>> =
-        questions_named(node, walk.texts, possible_question_phrases)
-            .into_iter()
-            .map(|named| named.node)
-            .collect();
+    let questions = questions_matching(node, walk.texts, matching);
     let ops: Vec<std::cell::Ref<IFROperation>> =
         questions.iter().map(|question| question.borrow()).collect();
     let matches = questions
@@ -2402,6 +2410,61 @@ where
         .into_iter()
         .map(|named| named.prompt)
         .collect()
+}
+
+/// Refuses with SelectionError::Ambiguous the `statements` of the keyword `question` whose
+/// ONE_OF, NUMERIC and CHECKBOX questions are of more than one NAMESPACE, naming each: a
+/// NAMESPACE "is equivalent to the platform configuration language being used for the keyword
+/// definition" (UEFI 2.11 §35.2.1.6), so they would be settings of different definitions.
+pub(crate) fn check_keyword_namespace(
+    question: &str,
+    statements: &[KeywordStatement<'_>],
+) -> std::result::Result<(), SelectionError> {
+    let matches: Vec<PromptMatch> = statements
+        .iter()
+        .filter_map(|statement| {
+            let op = statement.op().borrow();
+            let header = value_question(&op)?.header();
+            Some(PromptMatch {
+                question_id: header.question_id,
+                form_set: form_set_guid(&op),
+                languages: vec![statement.namespace().to_string()],
+            })
+        })
+        .collect();
+    let first = matches.first().map(|named| &named.languages);
+    match matches.iter().all(|named| Some(&named.languages) == first) {
+        true => Ok(()),
+        false => Err(SelectionError::Ambiguous {
+            question: question.to_owned(),
+            matches,
+        }),
+    }
+}
+
+/// Refuses `address` with SelectionError::SharedQuestionId if two or more questions under the
+/// root `node` of a FormSet hold it, naming them by their prompts in `texts`: find_question
+/// would select one of them.
+pub(crate) fn check_address_unique(
+    node: &Rc<RefCell<IFROperation>>,
+    texts: &ListTexts<'_>,
+    address: &QuestionAddress,
+) -> std::result::Result<(), SelectionError> {
+    let questions = questions_addressed(node, address);
+    if questions.len() < 2 {
+        return Ok(());
+    }
+    Err(SelectionError::SharedQuestionId {
+        question: QuestionSelector::Address(*address).to_string(),
+        prompts: questions
+            .iter()
+            .filter_map(|question| {
+                let op = question.borrow();
+                value_question(&op).map(|value| texts.display(value.header().prompt_string_id))
+            })
+            .map(str::to_owned)
+            .collect(),
+    })
 }
 
 /// Refuses `question` with SelectionError::Ambiguous unless one language holds it as the prompt
@@ -2604,7 +2667,7 @@ mod choice_for_set_tests {
         let values = VarStoreValues::new(root, access_level);
         let selection = find_question_in(
             root,
-            &BTreeSet::from([PROMPT]),
+            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings(), &[]),
                 &mut reader,
@@ -3658,7 +3721,7 @@ mod tests {
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
                 &root,
-                &BTreeSet::from([phrase]),
+                &QuestionMatch::Prompt(&BTreeSet::from([phrase])),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&prompted(prompt), &[]),
                     &mut Efivars::new().reader(),
@@ -4688,7 +4751,7 @@ mod nesting_tests {
                 let selection = find_question(
                     parse_deep(DEEP, DEEP, false),
                     &ListTexts::new(&deep_strings(), &[]),
-                    &BTreeSet::from([name]),
+                    &QuestionMatch::Prompt(&BTreeSet::from([name])),
                     IncludedStates::GRAYED_OUT,
                     None,
                     &mut disabled_reader(),

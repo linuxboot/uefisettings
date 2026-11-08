@@ -163,6 +163,8 @@ pub use crate::hii::extract::HiiSourceOptions;
 #[cfg(target_os = "linux")]
 pub use crate::hii::extract::NoHiiDatabase;
 use crate::hii::forms;
+use crate::hii::forms::keywords::KeywordRefusal;
+use crate::hii::forms::keywords::KeywordStatement;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
 use crate::hii::forms::DeclaredDefault;
@@ -224,8 +226,14 @@ use crate::translation::HiiTranslation;
 pub use crate::hii::forms::AccessLevel;
 pub use crate::hii::forms::IgnoredIfr;
 pub use crate::hii::forms::IncludedStates;
+pub use crate::hii::forms::KeywordError;
+pub use crate::hii::forms::KeywordName;
+pub use crate::hii::forms::KeywordNamespace;
 pub use crate::hii::forms::OptionMatch;
 pub use crate::hii::forms::PromptMatch;
+pub use crate::hii::forms::QuestionAddress;
+pub use crate::hii::forms::QuestionAddressError;
+pub use crate::hii::forms::QuestionSelector;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
 pub use crate::hii::forms::SetupPasswordPolicy;
@@ -852,7 +860,7 @@ impl HiiBackend {
     /// set with `options`, in this machine's HiiDB and variables, as set_in does.
     #[cfg(all(system_hiidb, system_variables))]
     pub fn set_using(
-        question: &str,
+        question: impl Into<QuestionSelector>,
         new_value: &str,
         selector: Option<&str>,
         options: &SetOptions,
@@ -869,11 +877,12 @@ impl HiiBackend {
         )
     }
 
-    /// set in the HiiDB `db_bytes` with `options`, selecting by the values of `reads`, which it
-    /// reads before the first write, and writing through `writes`, neither of them the bytes of
-    /// password questions (PasswordQuestions::reader and withholding), on a platform of
-    /// PlatformLang `platform_lang`, if any: fails with SelectionError::NotFound when no question
-    /// has the text, and unless every selected match is written, also after writing the others.
+    /// set of the questions that `question` selects in the HiiDB `db_bytes` with `options`,
+    /// selecting by the values of `reads`, which it reads before the first write, and writing
+    /// through `writes`, neither of them the bytes of password questions
+    /// (PasswordQuestions::reader and withholding), on a platform of PlatformLang
+    /// `platform_lang`, if any: fails with SelectionError::NotFound when it selects none, and
+    /// unless every selected match is written, also after writing the others.
     #[cfg_attr(
         not(system_variables),
         allow(
@@ -888,7 +897,7 @@ impl HiiBackend {
     )]
     fn set_in(
         db_bytes: &[u8],
-        question: &str,
+        question: impl Into<QuestionSelector>,
         new_value: &str,
         _selector: Option<&str>,
         options: &SetOptions,
@@ -908,21 +917,14 @@ impl HiiBackend {
         let writes = passwords.withholding(writes)?;
         passwords.check_set(writes.reach(), options.setup_password)?;
 
-        let hii_translation = get_qa_variations_hii(question, new_value);
-        let (question_variations, new_value_variations, is_translated) = match hii_translation {
-            HiiTranslation::Translated {
-                question_variations,
-                answer_variations,
-            } => (question_variations, answer_variations, true),
-            HiiTranslation::NotTranslated {
-                question_variations,
-                answer_variations,
-            } => (question_variations, answer_variations, false),
-        };
+        let question = question.into();
+        let name = question.to_string();
+        let (question_variations, new_value_variations, is_translated) =
+            spellings(&question, new_value);
 
         let selected = select_for_set(
             &parsed_db,
-            question,
+            &question,
             &question_variations,
             options,
             &text_languages(options.language.as_deref(), platform_lang),
@@ -930,7 +932,7 @@ impl HiiBackend {
         )?;
 
         let annotations: Vec<(String, bool)> = forms::set_questions(
-            question,
+            &name,
             &selected
                 .iter()
                 .map(|(guid, question_descriptor, _)| (guid.as_str(), question_descriptor))
@@ -991,7 +993,7 @@ impl HiiBackend {
     /// physical memory.
     pub fn get_using(
         db_bytes: &[u8],
-        question: &str,
+        question: impl Into<QuestionSelector>,
         selector: Option<&str>,
         options: &GetOptions,
     ) -> Result<GetResponseList> {
@@ -1011,7 +1013,7 @@ impl HiiBackend {
     /// any
     fn get_in(
         db_bytes: &[u8],
-        question: &str,
+        question: impl Into<QuestionSelector>,
         _selector: Option<&str>,
         options: &GetOptions,
         variables: Box<dyn FirmwareVariables>,
@@ -1025,17 +1027,9 @@ impl HiiBackend {
 
         let mut resp = Vec::new();
 
-        let hii_translation = get_qa_variations_hii(question, "");
-        let (question_variations, is_translated) = match hii_translation {
-            HiiTranslation::Translated {
-                question_variations,
-                ..
-            } => (question_variations, true),
-            HiiTranslation::NotTranslated {
-                question_variations,
-                ..
-            } => (question_variations, false),
-        };
+        let question = question.into();
+        let name = question.to_string();
+        let (question_variations, _, is_translated) = spellings(&question, "");
 
         let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables, exported)?;
         forms::check_access_level(
@@ -1043,20 +1037,21 @@ impl HiiBackend {
             options.access_level,
         )?;
         let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
-        check_question_languages(&parsed_db, question, &question_variations)?;
+        check_unambiguous(&parsed_db, &question, &question_variations)?;
+        let statements = keyword_statements(&parsed_db, &question)?;
 
         let requested = text_languages(options.language.as_deref(), platform_lang);
         let mut excluded = Exclusion::NONE;
-        for list in parsed_db {
+        for list in &parsed_db {
             list.check_form_strings()?;
             let texts = list.texts(&requested);
-            reader.enter_package_list(&list, &texts);
+            reader.enter_package_list(list, &texts);
 
             for root in &list.forms {
                 let selection = forms::find_question(
                     Rc::clone(root),
                     &texts,
-                    &question_variations,
+                    &question.matching(&question_variations, &statements),
                     include,
                     options.access_level,
                     &mut reader,
@@ -1080,7 +1075,7 @@ impl HiiBackend {
 
                 if is_translated {
                     get_resp.question.answer =
-                        translate_response(question, &get_resp.question.answer, Backend::Hii);
+                        translate_response(&name, &get_resp.question.answer, Backend::Hii);
                 }
                 // after translate_response, which matches whole answers
                 get_resp.question.answer += source_annotation;
@@ -1091,7 +1086,7 @@ impl HiiBackend {
             }
         }
         if resp.is_empty() && !excluded.is_empty() {
-            return Err(excluded.question_error(question).into());
+            return Err(excluded.question_error(&name).into());
         }
 
         Ok(GetResponseList {
@@ -1170,11 +1165,35 @@ fn text_languages<'a>(stated: Option<&'a str>, platform: Option<&'a str>) -> Vec
     [stated, platform].into_iter().flatten().collect()
 }
 
-/// Refuses `question` unless one language holds it as the prompt of every question that its
-/// `variations` name in `parsed_db` (forms::check_prompt_language).
-fn check_question_languages(
+/// The spellings of `question`'s prompt and of `value` that the spellings database holds,
+/// themselves if it holds none, and whether it holds any. A question selected by QuestionId or
+/// keyword has no prompt to spell, and its value no spellings.
+fn spellings(
+    question: &QuestionSelector,
+    value: &str,
+) -> (BTreeSet<String>, BTreeSet<String>, bool) {
+    let QuestionSelector::Prompt(text) = question else {
+        return (BTreeSet::new(), BTreeSet::from([value.to_owned()]), false);
+    };
+    match get_qa_variations_hii(text, value) {
+        HiiTranslation::Translated {
+            question_variations,
+            answer_variations,
+        } => (question_variations, answer_variations, true),
+        HiiTranslation::NotTranslated {
+            question_variations,
+            answer_variations,
+        } => (question_variations, answer_variations, false),
+    }
+}
+
+/// Refuses a `question` that names questions ambiguously in `parsed_db`: by prompt, unless one
+/// language holds it as the prompt of every question that its `variations` name
+/// (forms::check_prompt_language); by address, if two questions of one FormSet hold it
+/// (forms::check_address_unique). keyword_statements refuses a keyword's.
+fn check_unambiguous(
     parsed_db: &[package::ParsedPackageList],
-    question: &str,
+    question: &QuestionSelector,
     variations: &BTreeSet<String>,
 ) -> Result<()> {
     let mut matches = Vec::new();
@@ -1182,23 +1201,58 @@ fn check_question_languages(
         // whichever language texts show in, QUESTION matches those of every language
         let texts = list.texts(&[]);
         for root in &list.forms {
-            matches.extend(forms::prompt_matches(root, &texts, variations));
+            match question {
+                QuestionSelector::Prompt(_) => {
+                    matches.extend(forms::prompt_matches(root, &texts, variations));
+                }
+                QuestionSelector::Address(address) => {
+                    forms::check_address_unique(root, &texts, address)?;
+                }
+                QuestionSelector::Keyword { .. } => {}
+            }
         }
     }
-    forms::check_prompt_language(question, matches)?;
+    forms::check_prompt_language(&question.to_string(), matches)?;
     Ok(())
 }
 
+/// The statements that the keyword of `question` names in `parsed_db`, as the Keyword Handler
+/// finds them (KeywordStatement::resolve_offline), none for another selector or a keyword that
+/// names none; refuses statements whose questions are of more than one NAMESPACE
+/// (forms::check_keyword_namespace).
+fn keyword_statements<'a>(
+    parsed_db: &'a [package::ParsedPackageList],
+    question: &QuestionSelector,
+) -> Result<Vec<KeywordStatement<'a>>> {
+    let QuestionSelector::Keyword { keyword, namespace } = question else {
+        return Ok(Vec::new());
+    };
+    let statements = match KeywordStatement::resolve_offline(
+        parsed_db,
+        namespace.as_ref().map(KeywordNamespace::namespace),
+        keyword.keyword(),
+    ) {
+        Ok(statements) => statements,
+        // a keyword that names no statement selects none, as a QUESTION that no prompt is
+        Err(KeywordRefusal::NotFound { .. } | KeywordRefusal::NoStatement(_)) => Vec::new(),
+        Err(refusal) => return Err(refusal.into()),
+    };
+    forms::check_keyword_namespace(&question.to_string(), &statements)?;
+    Ok(statements)
+}
+
 /// set's phase before its first write, so that no error follows a write: checks every package
-/// list of `parsed_db`, the stated access level and the languages of `question`'s prompt, then
-/// selects, in each FormSet, the question of `question_variations` that set writes, its texts
-/// shown in the languages `requested` takes (ParsedPackageList::texts), reading each range once
-/// with `reader`; returns them with the GUID of their package list, or SelectionError::Excluded
-/// for `question` if each FormSet skips it for its states, or else MaybeInIgnoredIfr if none
-/// holds it and read_db ignores IFR of `parsed_db`.
+/// list of `parsed_db`, the stated access level and that `question` is unambiguous
+/// (check_unambiguous), then
+/// selects, in each FormSet, the question of `question` that set writes, by prompt any of
+/// `question_variations`, its texts shown in the languages `requested` takes
+/// (ParsedPackageList::texts), reading each range once with `reader`; returns them with the
+/// GUID of their package list, or SelectionError::Excluded for `question` if each FormSet skips
+/// it for its states, or else MaybeInIgnoredIfr if none holds it and read_db ignores IFR of
+/// `parsed_db`.
 fn select_for_set(
     parsed_db: &[package::ParsedPackageList],
-    question: &str,
+    question: &QuestionSelector,
     question_variations: &BTreeSet<String>,
     options: &SetOptions,
     requested: &[&str],
@@ -1211,7 +1265,8 @@ fn select_for_set(
     parsed_db
         .iter()
         .try_for_each(package::ParsedPackageList::check_form_strings)?;
-    check_question_languages(parsed_db, question, question_variations)?;
+    check_unambiguous(parsed_db, question, question_variations)?;
+    let statements = keyword_statements(parsed_db, question)?;
 
     // Every FormSet selects its question and option before the first write, so that a
     // selection error leaves every variable unchanged.
@@ -1224,7 +1279,7 @@ fn select_for_set(
             let selection = forms::find_question(
                 Rc::clone(root),
                 &texts,
-                question_variations,
+                &question.matching(question_variations, &statements),
                 options.include,
                 options.access_level,
                 reader,
@@ -1232,7 +1287,7 @@ fn select_for_set(
             // set may include every state, READ_ONLY too
             match forms::choice_for_set(
                 selection,
-                question,
+                &question.to_string(),
                 options,
                 IncludedStates::all(),
                 reader,
@@ -1247,7 +1302,7 @@ fn select_for_set(
         }
     }
     if selected.is_empty() && !excluded.is_empty() {
-        return Err(excluded.question_error(question).into());
+        return Err(excluded.question_error(&question.to_string()).into());
     }
     let mut ignored = parsed_db
         .iter()
@@ -1255,7 +1310,7 @@ fn select_for_set(
         .peekable();
     if selected.is_empty() && ignored.peek().is_some() {
         return Err(SelectionError::MaybeInIgnoredIfr {
-            question: question.to_owned(),
+            question: question.to_string(),
             ignored: ignored.cloned().collect(),
         }
         .into());
@@ -2258,10 +2313,10 @@ mod tests {
         text.parse::<Guid>().expect("parse the GUID").into()
     }
 
-    /// A HiiDB whose FormSet of Guid KEYED_FORM_SET holds the CHECKBOX "Keyed" of QuestionId
-    /// 0x8001, whose prompt x-UEFI-ns and x-i-UEFI translate, and the CHECKBOX "Plain", whose
-    /// prompt no package of a configuration language holds.
-    fn keyed_hiidb() -> Vec<u8> {
+    /// A HiiDB whose FormSet of Guid KEYED_FORM_SET holds the CHECKBOX of QuestionId 0x8001
+    /// and en-US prompt `keyed`, which x-UEFI-ns and x-i-UEFI translate, and the CHECKBOX
+    /// "Plain", whose prompt no package of a configuration language holds.
+    fn keyed_hiidb(keyed: &str) -> Vec<u8> {
         let packages = [
             form_package_with_guid(
                 guid_bytes(KEYED_FORM_SET),
@@ -2271,7 +2326,7 @@ mod tests {
                 ],
             ),
             strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
-            strings_package_of(b"en-US", &["Title", "Help", "Keyed", "Help text", "Plain"]),
+            strings_package_of(b"en-US", &["Title", "Help", keyed, "Help text", "Plain"]),
             strings_package_of(b"x-i-UEFI", &["", "", "Other"]),
             END_PACKAGE.to_vec(),
         ];
@@ -2302,7 +2357,7 @@ mod tests {
         variables.insert(setup(), 7, &[0, 0]);
 
         let listed = HiiBackend::list_questions_in(
-            &keyed_hiidb(),
+            &keyed_hiidb("Keyed"),
             &ListQuestionsOptions::default(),
             shared(&variables),
             None,
@@ -2310,7 +2365,7 @@ mod tests {
         )
         .expect("list the questions");
         let got = HiiBackend::get_in(
-            &keyed_hiidb(),
+            &keyed_hiidb("Keyed"),
             "Keyed",
             None,
             &GetOptions::default(),
@@ -2320,7 +2375,7 @@ mod tests {
         )
         .expect("get Keyed");
         let set = HiiBackend::set_in(
-            &keyed_hiidb(),
+            &keyed_hiidb("Keyed"),
             "Keyed",
             "1",
             None,
@@ -2398,6 +2453,592 @@ mod tests {
             ]))],
             "keywords of Keyed"
         );
+    }
+
+    /// What get and set of a question select, by name and QuestionId.
+    #[derive(Debug, PartialEq)]
+    struct Selected {
+        got: Vec<(String, Option<i32>)>,
+        /// set's error if it fails
+        set: std::result::Result<Vec<(String, Option<i32>)>, String>,
+        writes: Vec<(u16, Vec<u8>)>,
+    }
+
+    /// What get of `question`, and set of `question` to 1, select in keyed_hiidb of a nameless
+    /// question 0x8001.
+    fn selected_in_keyed_hiidb(question: &QuestionSelector) -> Selected {
+        let identified = |question: &Question| (question.name.clone(), question.question_id);
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0, 0]);
+
+        let got = HiiBackend::get_in(
+            &keyed_hiidb(""),
+            question.clone(),
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("get {question}: {error}"));
+        let set = HiiBackend::set_in(
+            &keyed_hiidb(""),
+            question.clone(),
+            "1",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        );
+
+        Selected {
+            got: got
+                .responses
+                .iter()
+                .map(|response| identified(&response.question))
+                .collect(),
+            set: set
+                .map(|set| {
+                    set.responses
+                        .iter()
+                        .map(|response| identified(&response.question))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            writes: variables.writes_to(&setup()),
+        }
+    }
+
+    fn by_address(text: &str) -> QuestionSelector {
+        QuestionSelector::Address(text.parse().expect("parse the address"))
+    }
+
+    fn by_keyword(keyword: &str, namespace: Option<&str>) -> QuestionSelector {
+        QuestionSelector::Keyword {
+            keyword: keyword.parse().expect("parse the keyword"),
+            namespace: namespace.map(|text| text.parse().expect("parse the namespace")),
+        }
+    }
+
+    /// get and set select a question, a nameless one too, by its FormSet's GUID and its
+    /// QuestionId, in decimal or 0x hex, and by its prompt in a strings package whose language
+    /// starts with the namespace.
+    #[test]
+    fn questions_select_by_question_id_or_keyword() {
+        let nameless = vec![(String::new(), Some(0x8001))];
+        for question in [
+            by_address(&format!("{KEYED_FORM_SET}:0x8001")),
+            by_address(&format!("{KEYED_FORM_SET}:32769")),
+            by_keyword("Keyword:5", None),
+            by_keyword("Other", Some("x-i-UEFI")),
+        ] {
+            assert_eq!(
+                selected_in_keyed_hiidb(&question),
+                Selected {
+                    got: nameless.clone(),
+                    set: Ok(nameless.clone()),
+                    writes: vec![(0, vec![1])],
+                },
+                "{question:?}"
+            );
+        }
+    }
+
+    /// get and set select no question by its keyword in another case or without its instance
+    /// suffix, by its keyword under a namespace that does not hold it, by a prompt of a display
+    /// language, nor by its QuestionId in another FormSet; set writes nothing.
+    #[test]
+    fn questions_select_by_question_id_or_keyword_only_exactly() {
+        for question in [
+            by_keyword("keyword:5", None),
+            by_keyword("Keyword", None),
+            by_keyword("Keyword:5", Some("x-i-UEFI")),
+            by_keyword("Plain", None),
+            by_address("8C78A505-BAA0-4C4A-869F-000000000802:0x8001"),
+            by_address(&format!("{KEYED_FORM_SET}:0x8002")),
+        ] {
+            let not_found = format!("no question {:?} in the HiiDB", question.to_string());
+            assert_eq!(
+                selected_in_keyed_hiidb(&question),
+                Selected {
+                    got: vec![],
+                    set: Err(not_found),
+                    writes: vec![],
+                },
+                "{question:?}"
+            );
+        }
+    }
+
+    /// A HiiDB whose FormSet holds the CHECKBOXes 0xA at byte 0 and 0x14 at byte 1 of Setup,
+    /// prompted "First" and "Second" in en-US, of which x-UEFI-ns names 0xA "Foo" and x-UEFI-AMI
+    /// names 0x14 "Foo".
+    fn crossed_keywords_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                form(1, &[checkbox_at(0xA, 1, 1, 0), checkbox_at(0x14, 2, 1, 1)]),
+            ]),
+            strings_package_of(b"en-US", &["First", "Second"]),
+            strings_package_of(b"x-UEFI-ns", &["Foo", ""]),
+            strings_package_of(b"x-UEFI-AMI", &["", "Foo"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x6A; 16], &packages.concat())
+    }
+
+    /// A HiiDB of two package lists, whose FormSets of GUIDs KEYED_FORM_SET and
+    /// 8C78A505-BAA0-4C4A-869F-000000000803 hold the CHECKBOX 0xA, at byte 0 and byte 1 of
+    /// Setup, prompted "First" and "Second" in en-US, and named "Foo" in the configuration
+    /// languages `first` and `second`.
+    fn keyword_in_two_lists_hiidb(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let list = |form_set: &str, offset: u16, prompt: &str, namespace: &[u8], guid: u8| {
+            let packages = [
+                form_package_with_guid(
+                    guid_bytes(form_set),
+                    &[
+                        var_store_efi(1, "Setup", NV_BS_RT, 2),
+                        form(1, &[checkbox_at(0xA, 1, 1, offset)]),
+                    ],
+                ),
+                strings_package_of(b"en-US", &[prompt]),
+                strings_package_of(namespace, &["Foo"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid([guid; 16], &packages.concat())
+        };
+        [
+            list(KEYED_FORM_SET, 0, "First", first, 0x6B),
+            list(
+                "8C78A505-BAA0-4C4A-869F-000000000803",
+                1,
+                "Second",
+                second,
+                0x6C,
+            ),
+        ]
+        .concat()
+    }
+
+    /// What get of `question`, and set of `question` to 1, select in `hiidb`, by name and
+    /// QuestionId, and set's writes to Setup.
+    fn selected_in(hiidb: &[u8], question: &QuestionSelector) -> Selected {
+        let identified = |question: &Question| (question.name.clone(), question.question_id);
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0, 0]);
+
+        let got = HiiBackend::get_in(
+            hiidb,
+            question.clone(),
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        );
+        let set = HiiBackend::set_in(
+            hiidb,
+            question.clone(),
+            "1",
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        );
+
+        Selected {
+            got: match got {
+                Ok(got) => got
+                    .responses
+                    .iter()
+                    .map(|response| identified(&response.question))
+                    .collect(),
+                Err(error) => vec![(error.to_string(), None)],
+            },
+            set: set
+                .map(|set| {
+                    set.responses
+                        .iter()
+                        .map(|response| identified(&response.question))
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            writes: variables.writes_to(&setup()),
+        }
+    }
+
+    /// The Selected of get and set failing with `error`, without a write.
+    fn refused(error: &str) -> Selected {
+        Selected {
+            got: vec![(error.to_owned(), None)],
+            set: Err(error.to_owned()),
+            writes: vec![],
+        }
+    }
+
+    /// get and set refuse a --keyword that strings packages of two namespaces hold in one package
+    /// list, as the Keyword Handler does, and one that names questions of two namespaces in two
+    /// package lists, naming each; set writes nothing. Under a namespace that holds one of them,
+    /// or with every match in one namespace, it selects as before, in one write of their variable.
+    #[test]
+    fn get_and_set_refuse_a_keyword_of_questions_in_different_namespaces() {
+        let other = "8C78A505-BAA0-4C4A-869F-000000000803";
+        let ambiguous = |matches: String| {
+            refused(&format!(
+                "\"keyword Foo of a namespace starting with x-UEFI\" is the prompt {matches}: no \
+                 one language holds it as the prompt of every question it names"
+            ))
+        };
+        let selected = |question: (&str, i32), writes: Vec<(u16, Vec<u8>)>| {
+            let question = vec![(question.0.to_owned(), Some(question.1))];
+            Selected {
+                got: question.clone(),
+                set: Ok(question),
+                writes,
+            }
+        };
+        let both = vec![
+            ("First".to_owned(), Some(0xA)),
+            ("Second".to_owned(), Some(0xA)),
+        ];
+        let cases = [
+            (
+                "one package list",
+                crossed_keywords_hiidb(),
+                None,
+                refused(
+                    "keyword Foo: strings packages of the languages [\"x-UEFI-ns\", \
+                     \"x-UEFI-AMI\"] of one package list hold it, which firmware may search in \
+                     another order",
+                ),
+            ),
+            (
+                "one package list, x-UEFI-AMI",
+                crossed_keywords_hiidb(),
+                Some("x-UEFI-AMI"),
+                selected(("Second", 0x14), vec![(1, vec![1])]),
+            ),
+            (
+                "two lists",
+                keyword_in_two_lists_hiidb(b"x-UEFI-ns", b"x-UEFI-AMI"),
+                None,
+                ambiguous(format!(
+                    "of QuestionId 0x000A of FormSet {KEYED_FORM_SET} in x-UEFI-ns and of \
+                     QuestionId 0x000A of FormSet {other} in x-UEFI-AMI"
+                )),
+            ),
+            (
+                "two lists, x-UEFI-ns",
+                keyword_in_two_lists_hiidb(b"x-UEFI-ns", b"x-UEFI-AMI"),
+                Some("x-UEFI-ns"),
+                selected(("First", 0xA), vec![(0, vec![1])]),
+            ),
+            (
+                "two lists, one namespace",
+                keyword_in_two_lists_hiidb(b"x-UEFI-ns", b"x-UEFI-ns"),
+                None,
+                Selected {
+                    got: both.clone(),
+                    set: Ok(both),
+                    writes: vec![(0, vec![1, 1])],
+                },
+            ),
+        ];
+        for (case, hiidb, namespace, want) in cases {
+            assert_eq!(
+                selected_in(&hiidb, &by_keyword("Foo", namespace)),
+                want,
+                "{case}"
+            );
+        }
+    }
+
+    /// get and set refuse a --keyword that prompts two statements of its package list, as the
+    /// Keyword Handler does (KeywordRefusal::AmbiguousStatements); set writes nothing.
+    #[test]
+    fn get_and_set_refuse_a_keyword_of_two_statements() {
+        let packages = [
+            form_package_with_guid(
+                guid_bytes(KEYED_FORM_SET),
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, 2),
+                    form(
+                        1,
+                        &[checkbox_at(0x8001, 3, 1, 0), checkbox_at(0x8002, 3, 1, 1)],
+                    ),
+                ],
+            ),
+            strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
+            strings_package_of(b"en-US", &["Title", "Help", "Keyed"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat());
+
+        assert_eq!(
+            selected_in(&hiidb, &by_keyword("Keyword:5", None)),
+            refused(
+                "keyword Keyword:5: it prompts 2 statements of its package list, of which \
+                 firmware may take another than the first"
+            ),
+            "Keyword:5 of two statements"
+        );
+    }
+
+    /// No selector, QUESTION, --question-id or --keyword, reaches a CHECKBOX in the scope of an
+    /// unknown opcode, which the walk skips, and set writes nothing; each selects the same
+    /// CHECKBOX outside that scope.
+    #[test]
+    fn selectors_skip_a_question_in_ignored_ifr() {
+        let checkbox = checkbox_at(0x8001, 3, 1, 0);
+        let ignored = [unknown_scope(), checkbox.clone(), END.to_vec()].concat();
+        for (case, statements, reached) in [
+            ("in ignored IFR", ignored, false),
+            ("outside", checkbox, true),
+        ] {
+            let packages = [
+                form_package_with_guid(
+                    guid_bytes(KEYED_FORM_SET),
+                    &[
+                        var_store_efi(1, "Setup", NV_BS_RT, 2),
+                        form(1, &[statements]),
+                    ],
+                ),
+                strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
+                strings_package_of(b"en-US", &["Title", "Help", "Keyed"]),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat());
+            let selectors = [
+                ("prompt", QuestionSelector::Prompt("Keyed".to_owned())),
+                ("address", by_address(&format!("{KEYED_FORM_SET}:0x8001"))),
+                ("keyword", by_keyword("Keyword:5", None)),
+            ];
+            for (name, selector) in selectors {
+                let selected = selected_in(&hiidb, &selector);
+
+                let got_it = selected.got.iter().any(|(_, id)| *id == Some(0x8001));
+                assert_eq!(got_it, reached, "{case}, {name}: get {selected:?}");
+                let set_it = selected
+                    .set
+                    .as_ref()
+                    .is_ok_and(|set| set.iter().any(|(_, id)| *id == Some(0x8001)));
+                assert_eq!(set_it, reached, "{case}, {name}: set {selected:?}");
+                assert_eq!(
+                    !selected.writes.is_empty(),
+                    reached,
+                    "{case}, {name}: writes {selected:?}"
+                );
+            }
+        }
+    }
+
+    /// A HiiDB whose FormSet of GUID KEYED_FORM_SET holds the CHECKBOXes "First" and "Second" of
+    /// QuestionId 7, at bytes 0 and 1 of Setup, and "Third" of QuestionId 8, at byte 1 too.
+    fn shared_question_id_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package_with_guid(
+                guid_bytes(KEYED_FORM_SET),
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, 2),
+                    form(
+                        1,
+                        &[
+                            checkbox_at(7, 1, 1, 0),
+                            checkbox_at(7, 2, 1, 1),
+                            checkbox_at(8, 3, 1, 1),
+                        ],
+                    ),
+                ],
+            ),
+            strings_package_of(b"en-US", &["First", "Second", "Third"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat())
+    }
+
+    /// get and set refuse a --question-id that two questions of one FormSet hold, naming them,
+    /// and set writes nothing; the QuestionId of one question selects it.
+    #[test]
+    fn get_and_set_refuse_a_question_id_of_two_questions() {
+        let shared = selected_in(
+            &shared_question_id_hiidb(),
+            &by_address(&format!("{KEYED_FORM_SET}:7")),
+        );
+        let unique = selected_in(
+            &shared_question_id_hiidb(),
+            &by_address(&format!("{KEYED_FORM_SET}:8")),
+        );
+
+        assert_eq!(
+            shared,
+            refused(&format!(
+                "QuestionId 0x0007 of FormSet {KEYED_FORM_SET} is that of the questions \"First\" \
+                 and \"Second\": a QuestionId identifies one question of its FormSet"
+            )),
+            "QuestionId 7"
+        );
+        let third = vec![("Third".to_owned(), Some(8))];
+        assert_eq!(
+            unique,
+            Selected {
+                got: third.clone(),
+                set: Ok(third),
+                writes: vec![(1, vec![1])],
+            },
+            "QuestionId 8"
+        );
+    }
+
+    /// A HiiDB whose FormSet of GUID KEYED_FORM_SET holds, at byte 0 of Setup, the CHECKBOX of
+    /// QuestionId 0x8001 that a SUPPRESS_IF TRUE suppresses, which x-UEFI-ns names "Hidden", and,
+    /// at byte 1, that of QuestionId 0x8003 that a GRAY_OUT_IF TRUE grays out, named "Grayed".
+    fn conditioned_keyed_hiidb() -> Vec<u8> {
+        let packages = [
+            form_package_with_guid(
+                guid_bytes(KEYED_FORM_SET),
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, 2),
+                    form(
+                        1,
+                        &[
+                            conditional(SUPPRESS_IF, ifr_true(), &[checkbox_at(0x8001, 1, 1, 0)]),
+                            conditional(GRAY_OUT_IF, ifr_true(), &[checkbox_at(0x8003, 2, 1, 1)]),
+                        ],
+                    ),
+                ],
+            ),
+            strings_package_of(b"en-US", &["Suppressed", "Grayed out"]),
+            strings_package_of(b"x-UEFI-ns", &["Hidden", "Grayed"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat())
+    }
+
+    /// The names of the questions that get or set selects, or the SelectionError that it fails
+    /// with, if any.
+    type Outcome = std::result::Result<Vec<String>, Option<SelectionError>>;
+
+    /// What get and set select in conditioned_keyed_hiidb by `question` with `include`, set
+    /// setting it to 1, and set's writes to Setup.
+    fn selected_including(
+        question: &QuestionSelector,
+        include: IncludedStates,
+    ) -> ([Outcome; 2], Vec<(u16, Vec<u8>)>) {
+        let selection_error = |error: anyhow::Error| error.downcast::<SelectionError>().ok();
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[0, 0]);
+
+        let got = HiiBackend::get_in(
+            &conditioned_keyed_hiidb(),
+            question.clone(),
+            None,
+            &GetOptions {
+                include,
+                ..GetOptions::default()
+            },
+            shared(&variables),
+            None,
+            None,
+        );
+        let set = HiiBackend::set_in(
+            &conditioned_keyed_hiidb(),
+            question.clone(),
+            "1",
+            None,
+            &SetOptions {
+                include,
+                ..SetOptions::default()
+            },
+            shared(&variables),
+            &*variables,
+            None,
+        );
+
+        let got = got
+            .map(|got| {
+                got.responses
+                    .into_iter()
+                    .map(|response| response.question.name)
+                    .collect()
+            })
+            .map_err(selection_error);
+        let set = set
+            .map(|set| {
+                set.responses
+                    .into_iter()
+                    .map(|response| response.question.name)
+                    .collect()
+            })
+            .map_err(selection_error);
+        ([got, set], variables.writes_to(&setup()))
+    }
+
+    /// get and set by --question-id and by --keyword refuse a suppressed or grayed-out question
+    /// unless --include names its state, and set writes nothing; with its state included they
+    /// select it, and set writes it.
+    #[test]
+    fn selectors_select_a_question_in_a_state_only_if_included() {
+        let cases = [
+            (
+                "Suppressed",
+                0x8001,
+                "Hidden",
+                0,
+                IncludedStates::SUPPRESSED,
+            ),
+            (
+                "Grayed out",
+                0x8003,
+                "Grayed",
+                1,
+                IncludedStates::GRAYED_OUT,
+            ),
+        ];
+        for (prompt, question_id, keyword, offset, state) in cases {
+            for question in [
+                by_address(&format!("{KEYED_FORM_SET}:{question_id}")),
+                by_keyword(keyword, None),
+            ] {
+                let excluded = Err(Some(SelectionError::Excluded {
+                    question: question.to_string(),
+                    states: state,
+                }));
+                let names = Ok(vec![prompt.to_owned()]);
+
+                assert_eq!(
+                    selected_including(&question, IncludedStates::empty()),
+                    ([excluded.clone(), excluded], vec![]),
+                    "{question:?} without --include"
+                );
+                assert_eq!(
+                    selected_including(&question, state),
+                    ([names.clone(), names], vec![(offset, vec![1])]),
+                    "{question:?} with {state:?}"
+                );
+            }
+        }
+    }
+
+    /// get takes a QUESTION as a &String, as it did before it took a QuestionSelector.
+    #[test]
+    fn get_takes_a_question_as_a_string_reference() {
+        let question = String::from("Plain");
+        let options = GetOptions {
+            efivars: EfivarSource::Disabled,
+            ..GetOptions::default()
+        };
+
+        let got = HiiBackend::get_using(&keyed_hiidb("Keyed"), &question, None, &options)
+            .expect("get Plain");
+
+        let names: Vec<&str> = got
+            .responses
+            .iter()
+            .map(|response| response.question.name.as_str())
+            .collect();
+        assert_eq!(names, ["Plain"], "get Plain");
     }
 
     /// get, list-questions and show-ifr read question values from the source that their
@@ -5652,7 +6293,7 @@ mod tests {
             };
             select_for_set(
                 &package::read_db(hiidb).expect("parse the HiiDB"),
-                "Q",
+                &QuestionSelector::from("Q"),
                 &BTreeSet::from(["Q".to_string()]),
                 &options,
                 &[],
@@ -6221,7 +6862,7 @@ mod tests {
         for name in names {
             let response = HiiBackend::get_in(
                 hiidb,
-                name,
+                *name,
                 None,
                 &GetOptions::default(),
                 shared(variables),

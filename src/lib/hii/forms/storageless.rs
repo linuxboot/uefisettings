@@ -893,7 +893,7 @@ mod get_and_set_tests {
                 let values = VarStoreValues::new(&root, None);
                 let selection = find_question_in(
                     &root,
-                    &BTreeSet::from([prompt]),
+                    &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
                     &mut FormSetWalk::new(
                         &ListTexts::new(&strings, &[]),
                         &mut reader,

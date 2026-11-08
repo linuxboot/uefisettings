@@ -21,6 +21,7 @@ use std::process::ExitCode;
 #[cfg(all(system_hiidb, system_variables))]
 use std::sync::LazyLock;
 
+use anyhow::anyhow;
 use anyhow::Result;
 #[cfg(all(system_hiidb, system_variables))]
 use clap::builder::PossibleValue;
@@ -35,7 +36,11 @@ use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IncludedStates;
+use uefisettings::exports::KeywordName;
+use uefisettings::exports::KeywordNamespace;
 use uefisettings::exports::ListQuestionsOptions;
+use uefisettings::exports::QuestionAddress;
+use uefisettings::exports::QuestionSelector;
 #[cfg(all(system_hiidb, system_variables))]
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::ShowIfrOptions;
@@ -122,6 +127,13 @@ enum EfivarMemoryArg {
 }
 
 #[derive(Debug, Subcommand)]
+#[cfg_attr(
+    target_os = "macos",
+    expect(
+        clippy::large_enum_variant,
+        reason = "parsed once per run; without get and set, no other variant is as large as hii"
+    )
+)]
 enum Commands {
     // The platform word hii: the macOS build reads HiiDB files and efivars dumps only.
     #[command(about = platform::HII_ABOUT)]
@@ -134,18 +146,20 @@ enum Commands {
     #[cfg(all(system_hiidb, system_variables))]
     #[command(about = platform::GET_ABOUT, next_display_order = None)]
     Get {
-        #[arg(allow_negative_numbers = true)]
-        question: String,
+        #[command(flatten)]
+        question: QuestionArgs,
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
         selection: SelectionArgs,
     },
+    // clap takes an optional QUESTION before the required VALUE with allow_missing_positional: a
+    // lone positional is VALUE, so `set QUESTION` fails for its missing selector.
     #[cfg(all(system_hiidb, system_variables))]
-    #[command(about = platform::SET_ABOUT, next_display_order = None)]
+    #[command(about = platform::SET_ABOUT, next_display_order = None, allow_missing_positional = true)]
     Set {
-        #[arg(allow_negative_numbers = true)]
-        question: String,
+        #[command(flatten)]
+        question: QuestionArgs,
         #[arg(allow_negative_numbers = true)]
         value: String,
         #[command(flatten)]
@@ -185,8 +199,8 @@ enum HiiSubcommands {
     /// Get the current value of a question
     #[command(next_display_order = None)]
     Get {
-        #[arg(allow_negative_numbers = true)]
-        question: String,
+        #[command(flatten)]
+        question: QuestionArgs,
         #[command(flatten)]
         hiidb: HiiDbArgs,
         #[command(flatten)]
@@ -198,10 +212,10 @@ enum HiiSubcommands {
     },
     /// Set/change the value of a question
     #[cfg(all(system_hiidb, system_variables))]
-    #[command(next_display_order = None)]
+    #[command(next_display_order = None, allow_missing_positional = true)]
     Set {
-        #[arg(allow_negative_numbers = true)]
-        question: String,
+        #[command(flatten)]
+        question: QuestionArgs,
         #[arg(allow_negative_numbers = true)]
         value: String,
         #[command(flatten)]
@@ -252,6 +266,71 @@ enum HiiSubcommands {
 struct JsonArgs {
     #[arg(short = 'j', long = "json", overrides_with = "json")]
     json: bool,
+}
+
+/// Which questions get and set select: by QUESTION, --question-id or --keyword.
+#[derive(Debug, Args)]
+struct QuestionArgs {
+    #[command(flatten)]
+    selector: QuestionSelectorArgs,
+    /// Search --keyword in strings packages whose language starts with LANGUAGE instead of
+    /// "x-UEFI", as edk2's Keyword Handler does without a NamespaceId (UEFI 2.11 §35.3.3),
+    /// LANGUAGE a configuration language: one that starts with "x-"; requires --keyword
+    // clap lets a `requires` go unmet where its target conflicts with a given argument, as
+    // --keyword does with the rest of its group, so those conflict here too.
+    #[arg(
+        long,
+        value_name = "LANGUAGE",
+        requires = "keyword",
+        conflicts_with_all = ["question", "question_id"]
+    )]
+    keyword_namespace: Option<KeywordNamespace>,
+}
+
+/// The one of QUESTION, --question-id and --keyword that get and set take.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct QuestionSelectorArgs {
+    /// one of QUESTION, --question-id and --keyword is required
+    #[arg(allow_negative_numbers = true)]
+    question: Option<String>,
+    /// Select the question of QuestionId ID in the FormSet of GUID, in every package list that
+    /// holds that FormSet, instead of by QUESTION; ID in decimal or 0x hex, 1 to 0xFFFF (0 is
+    /// reserved), as list-questions shows question_id and form_set_guid
+    #[arg(long, value_name = "GUID:ID")]
+    question_id: Option<QuestionAddress>,
+    /// Select the question whose prompt is KEYWORD, exactly and with its case, any ":<digits>"
+    /// instance suffix included, in the first strings package of a configuration language of
+    /// each package list, as the Keyword Handler finds it, instead of by QUESTION
+    #[allow(
+        rustdoc::invalid_html_tags,
+        reason = "clap prints this doc comment as the help of --keyword, where <digits> is text"
+    )]
+    #[arg(long, value_name = "KEYWORD")]
+    keyword: Option<KeywordName>,
+}
+
+impl QuestionArgs {
+    /// The questions that these flags select.
+    fn selector(&self) -> Result<QuestionSelector> {
+        let QuestionSelectorArgs {
+            question,
+            question_id,
+            keyword,
+        } = &self.selector;
+        match (question, question_id, keyword) {
+            (Some(question), None, None) => Ok(QuestionSelector::Prompt(question.clone())),
+            (None, Some(address), None) => Ok(QuestionSelector::Address(*address)),
+            (None, None, Some(keyword)) => Ok(QuestionSelector::Keyword {
+                keyword: keyword.clone(),
+                namespace: self.keyword_namespace.clone(),
+            }),
+            // QuestionSelectorArgs's group lets clap parse none of these
+            _ => Err(anyhow!(
+                "exactly one of QUESTION, --question-id and --keyword is required"
+            )),
+        }
+    }
 }
 
 /// The states of the questions and options that get, set, list-questions and the UEFI Shell
@@ -375,7 +454,12 @@ fn set_options(
 }
 
 /// get of `question` in the HiiDB `db_bytes` with `options`, printed as JSON if `json`.
-fn hii_get(db_bytes: &[u8], question: &str, options: &GetOptions, json: bool) -> Result<()> {
+fn hii_get(
+    db_bytes: &[u8],
+    question: QuestionSelector,
+    options: &GetOptions,
+    json: bool,
+) -> Result<()> {
     let res = HiiBackend::get_using(db_bytes, question, None, options)?;
     print_with_style(res, json)?;
     Ok(())
@@ -385,7 +469,7 @@ fn hii_get(db_bytes: &[u8], question: &str, options: &GetOptions, json: bool) ->
 /// and variables, printed as JSON if `json`.
 #[cfg(all(system_hiidb, system_variables))]
 fn hii_set(
-    question: &str,
+    question: QuestionSelector,
     value: &str,
     options: &SetOptions,
     json: bool,
@@ -547,7 +631,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 options.efivars.validate()?;
                 hii_get(
                     &hiidb.read(&options.efivars, source)?,
-                    question,
+                    question.selector()?,
                     &options,
                     output.json,
                 )?;
@@ -562,7 +646,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 volatile,
             } => {
                 let options = set_options(selection, setup_password, volatile);
-                hii_set(question, value, &options, output.json, source)?
+                hii_set(question.selector()?, value, &options, output.json, source)?
             }
             HiiSubcommands::ShowIFR {
                 hiidb,
@@ -1374,6 +1458,157 @@ mod tests {
                 Err(clap::error::ErrorKind::MissingRequiredArgument),
                 "{args:?}"
             );
+        }
+    }
+
+    /// The questions that the get or set command `args`, after `uefisettings`, selects, and
+    /// set's VALUE.
+    fn selected_by(
+        args: &[&str],
+    ) -> Result<(QuestionSelector, Option<String>), clap::error::ErrorKind> {
+        let argv = [&["uefisettings"][..], args].concat();
+        let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind())?;
+        let (question, value) = match parsed.command {
+            Commands::Hii(HiiCommand {
+                command: HiiSubcommands::Get { question, .. },
+            }) => (question, None),
+            #[cfg(all(system_hiidb, system_variables))]
+            Commands::Hii(HiiCommand {
+                command:
+                    HiiSubcommands::Set {
+                        question, value, ..
+                    },
+            }) => (question, Some(value)),
+            #[cfg(all(system_hiidb, system_variables))]
+            Commands::Get { question, .. } => (question, None),
+            #[cfg(all(system_hiidb, system_variables))]
+            Commands::Set {
+                question, value, ..
+            } => (question, Some(value)),
+            other => panic!("{args:?} is no get or set: {other:?}"),
+        };
+        let selector = question
+            .selector()
+            .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+        Ok((selector, value))
+    }
+
+    /// get and set take exactly one of QUESTION, --question-id and --keyword, and
+    /// --keyword-namespace only with --keyword and only a configuration language; set takes
+    /// VALUE with each, and refuses QUESTION alone. --question-id takes digits after the ':'
+    /// and after its "0x", not a sign.
+    #[test]
+    fn get_and_set_select_by_question_question_id_or_keyword() {
+        use clap::error::ErrorKind::ArgumentConflict;
+        use clap::error::ErrorKind::MissingRequiredArgument;
+        use clap::error::ErrorKind::ValueValidation;
+
+        const ADDRESS: &str = "8C78A505-BAA0-4C4A-869F-000000000800:0x8001";
+        let address = QuestionSelector::Address(ADDRESS.parse().expect("parse the address"));
+        let keyword = |namespace: Option<&str>| QuestionSelector::Keyword {
+            keyword: "K:5".parse().expect("parse the keyword"),
+            namespace: namespace.map(|text| text.parse().expect("parse the namespace")),
+        };
+        let cases: [(&[&str], Result<QuestionSelector, clap::error::ErrorKind>); 21] = [
+            (&["Q"], Ok(QuestionSelector::from("Q"))),
+            (&["--question-id", ADDRESS], Ok(address.clone())),
+            (&["--keyword", "K:5"], Ok(keyword(None))),
+            (
+                &["--keyword", "K:5", "--keyword-namespace", "x-i-UEFI"],
+                Ok(keyword(Some("x-i-UEFI"))),
+            ),
+            (
+                &["--keyword", "K:5", "--keyword-namespace", "X-UEFI-ns"],
+                Ok(keyword(Some("X-UEFI-ns"))),
+            ),
+            (&["--keyword", "K&V"], Err(ValueValidation)),
+            (&["--keyword", "K:12345"], Err(ValueValidation)),
+            (
+                &["--keyword", "K", "--keyword-namespace", "x-UEFI=ns"],
+                Err(ValueValidation),
+            ),
+            (
+                &["--keyword", "K", "--keyword-namespace", ""],
+                Err(ValueValidation),
+            ),
+            (
+                &["--keyword", "K", "--keyword-namespace", "en"],
+                Err(ValueValidation),
+            ),
+            (
+                &["--keyword", "K", "--keyword-namespace", "en-US"],
+                Err(ValueValidation),
+            ),
+            (&[], Err(MissingRequiredArgument)),
+            (&["Q", "--keyword", "K"], Err(ArgumentConflict)),
+            (
+                &["--question-id", ADDRESS, "--keyword", "K"],
+                Err(ArgumentConflict),
+            ),
+            (
+                &["Q", "--keyword-namespace", "x-i-UEFI"],
+                Err(ArgumentConflict),
+            ),
+            (
+                &["--question-id", ADDRESS, "--keyword-namespace", "x-i-UEFI"],
+                Err(ArgumentConflict),
+            ),
+            (
+                &["--keyword-namespace", "x-i-UEFI"],
+                Err(MissingRequiredArgument),
+            ),
+            (
+                &["--question-id", "8C78A505-BAA0-4C4A-869F-000000000800:0"],
+                Err(ValueValidation),
+            ),
+            (
+                &[
+                    "--question-id",
+                    "8C78A505-BAA0-4C4A-869F-000000000800:0x10000",
+                ],
+                Err(ValueValidation),
+            ),
+            (
+                &["--question-id", "8C78A505-BAA0-4C4A-869F-000000000800:+1"],
+                Err(ValueValidation),
+            ),
+            (
+                &["--question-id", "8C78A505-BAA0-4C4A-869F-000000000800:0x+1"],
+                Err(ValueValidation),
+            ),
+        ];
+        let hii_get = [&["hii", "get"][..], &OFFLINE_SOURCE].concat();
+        let gets: [&[&str]; 1] = [&hii_get];
+        #[cfg(all(system_hiidb, system_variables))]
+        let gets = gets.into_iter().chain([&["get"][..]]);
+        for command in gets {
+            for (flags, want) in &cases {
+                let args = [command, *flags].concat();
+                assert_eq!(
+                    selected_by(&args),
+                    want.clone().map(|selector| (selector, None)),
+                    "{args:?}"
+                );
+            }
+        }
+
+        #[cfg(all(system_hiidb, system_variables))]
+        for command in [&["hii", "set"][..], &["set"]] {
+            let sets: [(&[&str], Result<QuestionSelector, clap::error::ErrorKind>); 5] = [
+                (&["Q", "1"], Ok(QuestionSelector::from("Q"))),
+                (&["--question-id", ADDRESS, "1"], Ok(address.clone())),
+                (&["--keyword", "K:5", "1"], Ok(keyword(None))),
+                (&["Q"], Err(MissingRequiredArgument)),
+                (&["Q", "1", "--keyword", "K"], Err(ArgumentConflict)),
+            ];
+            for (flags, want) in sets {
+                let args = [command, flags].concat();
+                assert_eq!(
+                    selected_by(&args),
+                    want.map(|selector| (selector, Some("1".to_owned()))),
+                    "{args:?}"
+                );
+            }
         }
     }
 

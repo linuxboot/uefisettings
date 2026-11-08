@@ -622,7 +622,7 @@ mod tests {
         let values = VarStoreValues::new(root, None);
         let selection = find_question_in(
             root,
-            &BTreeSet::from([prompt]),
+            &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
             &mut FormSetWalk::new(
                 &ListTexts::new(strings, &[]),
                 &mut reader,
@@ -799,7 +799,7 @@ mod tests {
             let values = VarStoreValues::new(&root, None);
             let selection = find_question_in(
                 &root,
-                &BTreeSet::from(["Around"]),
+                &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&strings, &[]),
                     &mut reader,
@@ -926,7 +926,7 @@ mod tests {
         let values = VarStoreValues::new(&root, None);
         let selection = find_question_in(
             &root,
-            &BTreeSet::from(["Around"]),
+            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings, &[]),
                 &mut reader,
@@ -1250,7 +1250,7 @@ mod tests {
             let values = VarStoreValues::new(root, None);
             selections.push(find_question_in(
                 root,
-                &BTreeSet::from(["Dup"]),
+                &QuestionMatch::Prompt(&BTreeSet::from(["Dup"])),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&strings, &[]),
                     &mut reader,

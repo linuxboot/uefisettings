@@ -540,6 +540,40 @@ fn questions_show_their_question_id_form_set_guid_and_keywords() {
     );
 }
 
+/// get selects the question of a keyword, and that of a FormSet GUID and QuestionId as
+/// list-questions shows them, as by its prompt.
+#[test]
+fn get_selects_by_keyword_or_question_id_as_by_prompt() {
+    let by_prompt = uefisettings(&["hii", "get", ONE_OF, "--json"]);
+    assert_eq!(by_prompt.code, Some(0), "{by_prompt:#?}");
+    let questions: Vec<serde_json::Value> = json(&["hii", "list-questions", "--json"]);
+    let addresses: Vec<String> = questions
+        .iter()
+        .filter(|question| question["name"] == ONE_OF)
+        .map(|question| {
+            format!(
+                "{}:{}",
+                question["form_set_guid"].as_str().unwrap_or_default(),
+                question["question_id"]
+            )
+        })
+        .collect();
+    let [address] = <[String; 1]>::try_from(addresses)
+        .unwrap_or_else(|addresses| panic!("{ONE_OF:?} listed as {addresses:?}"));
+
+    for args in [
+        ["hii", "get", "--keyword", "iSCSIBootEnable", "--json"],
+        ["hii", "get", "--question-id", &address, "--json"],
+    ] {
+        let output = uefisettings(&args);
+        assert_eq!(
+            (output.code, &output.stdout),
+            (Some(0), &by_prompt.stdout),
+            "{args:?}: {output:#?}"
+        );
+    }
+}
+
 #[test]
 fn show_ifr_shows_the_formsets() {
     let output = uefisettings(&["hii", "show-ifr"]);

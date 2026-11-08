@@ -11,15 +11,18 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The first boot of the UEFI Shell scenario shell-parity: prints the questions that
-//! `hii list-questions --json` lists here, the variables of DriverSample that `variable list`
-//! lists and what `variable info` tells of MyIfrNVData, for `tests/qemu/check-shell-log.sh` to
+//! `hii list-questions --json` lists here, the question that `hii get --keyword` selects, the
+//! variables of DriverSample that `variable list` lists and what `variable info` tells of
+//! MyIfrNVData, for `tests/qemu/check-shell-log.sh` to
 //! compare with what `uefisettings.efi` prints in the UEFI Shell, the next boot, on the same
 //! variables. Both list the questions in every state, as the shell can evaluate conditions that
 //! Linux cannot.
 
+use uefisettings_qemu_guest::driver_sample::ONE_OF;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::write_for_the_shell;
 use uefisettings_qemu_guest::Question;
+use uefisettings_qemu_guest::Responses;
 use uefisettings_qemu_guest::Variable;
 
 /// The flags of shell/list-questions.nsh, which list every question.
@@ -35,6 +38,19 @@ fn list_questions_for_the_shell() {
     assert!(!questions.is_empty(), "no questions: {output:#?}");
 
     write_for_the_shell("list-questions", &output);
+}
+
+#[test]
+fn get_keyword_for_the_shell() {
+    let output = uefisettings(&["hii", "get", "--json", "--keyword", "iSCSIBootEnable"]);
+    let Responses { responses } = output.json(0);
+    let names: Vec<&str> = responses
+        .iter()
+        .map(|response| response.question.name.as_str())
+        .collect();
+    assert_eq!(names, [ONE_OF], "{output:#?}");
+
+    write_for_the_shell("get-keyword", &output);
 }
 
 #[test]

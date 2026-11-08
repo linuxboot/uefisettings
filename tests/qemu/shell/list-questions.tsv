@@ -1,6 +1,9 @@
 # The checks of shell/list-questions.nsh. See check-shell-log.sh.
 list-questions	status	0x0
 list-questions	parity	boot1.test.log
+# hii get --keyword selects here the question that it selects on Linux, by its x-UEFI-ns prompt
+get-keyword	status	0x0
+get-keyword	linux	boot1.test.log get-keyword (.responses | map(.question | {name, question_id, form_set_guid, keywords})) as $here | $here == ($linux.responses | map(.question | {name, question_id, form_set_guid, keywords})) and $here[0].keywords == [{"namespace_id": "x-UEFI-ns", "keyword": "iSCSIBootEnable"}] and ($here | length) == 1
 # every variable that Linux lists is listed here too, where the boot-service-only MyEfiVar,
 # which Linux cannot reach (UEFI 2.10 §8.2.2), is listed besides
 variable-list	status	0x0

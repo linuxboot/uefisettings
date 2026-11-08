@@ -82,7 +82,7 @@ use crate::parse_error::ReadParsed;
 
 /// The language prefix that GetStringIdFromRecord searches without a NameSpaceId: edk2's
 /// UEFI_CONFIG_LANG (ConfigKeywordHandler.c:1383), where UEFI 2.11 §35.3.3 says "x-UEFI-".
-const UEFI_CONFIG_LANG: &str = "x-UEFI";
+pub(crate) const UEFI_CONFIG_LANG: &str = "x-UEFI";
 
 /// The states that keyword set may include: not READ_ONLY, as EfiConfigKeywordHandlerSetData
 /// refuses every EFI_IFR_FLAG_READ_ONLY question (ConfigKeywordHandler.c:3033-3047).
@@ -246,13 +246,14 @@ pub(crate) struct KeywordWrite {
     pub(crate) volatile: bool,
 }
 
-/// The statement that a keyword prompts in its package list.
-pub(crate) struct KeywordQuestion<'a> {
+/// The statement that a keyword prompts in its package list, and `path`, what the search takes of
+/// that list besides: its device path, for the Keyword Handler (resolve), or nothing, for get
+/// and set, which select offline (KeywordStatement).
+pub(crate) struct KeywordQuestion<'a, P = KeywordPath> {
     keyword: Keyword,
     /// The language of the strings package that holds the keyword
     namespace: Namespace,
-    /// The device path of the package list
-    path: KeywordPath,
+    path: P,
     texts: ListTexts<'a>,
     /// The roots of the form packages of the package list
     roots: &'a [Rc<RefCell<IFROperation>>],
@@ -261,7 +262,11 @@ pub(crate) struct KeywordQuestion<'a> {
     op: Rc<RefCell<IFROperation>>,
 }
 
-impl<'a> KeywordQuestion<'a> {
+/// A statement that a keyword prompts, found without PATH in a package list with or without a
+/// device path: get and set select it offline, where no `<KeywordResp>` names its list.
+pub(crate) type KeywordStatement<'a> = KeywordQuestion<'a, ()>;
+
+impl<'a, P> KeywordQuestion<'a, P> {
     /// The statements that the Keyword Handler takes for `keyword`, in `namespace`, else in a
     /// language of the prefix "x-UEFI": in the package list of the device path `path`
     /// (GetRecordFromDevicePath), else in each list, in database order
@@ -269,12 +274,14 @@ impl<'a> KeywordQuestion<'a> {
     /// keyword (GetStringIdFromRecord) and whose statements it prompts; there the first
     /// statement, in IFR order, that the keyword's string prompts (FindQuestionFromStringId,
     /// IsStatementOpCode). Refuses a keyword that other strings packages of the list hold too,
-    /// or that prompts other statements too, which firmware may take instead.
-    pub(crate) fn resolve(
+    /// or that prompts other statements too, which firmware may take instead, and a list that
+    /// `list_path`, given the list and the keyword, refuses before its statements are searched.
+    fn find(
         lists: &'a [ParsedPackageList],
         namespace: Option<&Namespace>,
         path: Option<&KeywordPath>,
         keyword: &Keyword,
+        list_path: impl Fn(&ParsedPackageList, &str) -> Result<P, KeywordRefusal>,
     ) -> Result<Vec<Self>, KeywordRefusal> {
         let prefix = namespace.map_or_else(|| UEFI_CONFIG_LANG.to_owned(), ToString::to_string);
         let candidates: Vec<&ParsedPackageList> = match path {
@@ -292,7 +299,10 @@ impl<'a> KeywordQuestion<'a> {
             else {
                 continue;
             };
-            match (Self::in_list(list, string, &prefix, path, keyword), path) {
+            match (
+                Self::in_list(list, string, &prefix, keyword, &list_path),
+                path,
+            ) {
                 (Ok(question), _) => questions.push(question),
                 // a driver may add one strings package to lists whose forms differ
                 (Err(KeywordRefusal::NoStatement(_)), None) => unprompted = true,
@@ -310,13 +320,14 @@ impl<'a> KeywordQuestion<'a> {
     }
 
     /// The statement that the keyword `string` of `list` prompts, refused unless `string` is the
-    /// only one of the keyword under `prefix` and prompts that statement alone.
+    /// only one of the keyword under `prefix` and prompts that statement alone, or if
+    /// `list_path` refuses `list`.
     fn in_list(
         list: &'a ParsedPackageList,
         string: KeywordString<'_>,
         prefix: &str,
-        path: Option<&KeywordPath>,
         keyword: &Keyword,
+        list_path: &impl Fn(&ParsedPackageList, &str) -> Result<P, KeywordRefusal>,
     ) -> Result<Self, KeywordRefusal> {
         let text = keyword.to_string();
         let holders: Vec<KeywordString<'_>> =
@@ -334,18 +345,7 @@ impl<'a> KeywordQuestion<'a> {
             keyword: text.clone(),
             language: string.language.0.escape_ascii().to_string(),
         })?;
-        let path = match (path, &list.device_path) {
-            (Some(path), _) => path.clone(),
-            (None, Some(device_path)) => {
-                KeywordPath::try_from(device_path.clone()).map_err(|error| {
-                    KeywordRefusal::DevicePath {
-                        keyword: text.clone(),
-                        reason: error.to_string(),
-                    }
-                })?
-            }
-            (None, None) => return Err(KeywordRefusal::NoDevicePath(text)),
-        };
+        let path = list_path(list, &text)?;
         let Statement { root, op } = match <[_; 1]>::try_from(statements(list, string.id)) {
             Ok([statement]) => statement,
             Err(statements) if statements.is_empty() => {
@@ -371,6 +371,55 @@ impl<'a> KeywordQuestion<'a> {
 
     pub(crate) fn namespace(&self) -> &Namespace {
         &self.namespace
+    }
+}
+
+impl<'a> KeywordStatement<'a> {
+    /// The statements of find for `keyword` in `namespace`, else in a language of the prefix
+    /// "x-UEFI", in every list of `lists` that holds it, with or without a device path.
+    pub(crate) fn resolve_offline(
+        lists: &'a [ParsedPackageList],
+        namespace: Option<&Namespace>,
+        keyword: &Keyword,
+    ) -> Result<Vec<Self>, KeywordRefusal> {
+        Self::find(lists, namespace, None, keyword, |_, _| Ok(()))
+    }
+
+    /// The root of the form package of the statement
+    pub(crate) fn root(&self) -> &'a Rc<RefCell<IFROperation>> {
+        self.root
+    }
+
+    pub(crate) fn op(&self) -> &Rc<RefCell<IFROperation>> {
+        &self.op
+    }
+}
+
+impl<'a> KeywordQuestion<'a> {
+    /// The statements of find, for the Keyword Handler, each with the device path of its package
+    /// list: `path`, else the list's. Refuses a list without a device path, or with one that is no
+    /// KeywordPath, as a `<KeywordResp>` names it (edk2-stable202608 GetStringIdFromDatabase
+    /// asserts on such a list, ConfigKeywordHandler.c:2411).
+    pub(crate) fn resolve(
+        lists: &'a [ParsedPackageList],
+        namespace: Option<&Namespace>,
+        path: Option<&KeywordPath>,
+        keyword: &Keyword,
+    ) -> Result<Vec<Self>, KeywordRefusal> {
+        Self::find(lists, namespace, path, keyword, |list, text| {
+            match (path, &list.device_path) {
+                (Some(path), _) => Ok(path.clone()),
+                (None, Some(device_path)) => {
+                    KeywordPath::try_from(device_path.clone()).map_err(|error| {
+                        KeywordRefusal::DevicePath {
+                            keyword: text.to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })
+                }
+                (None, None) => Err(KeywordRefusal::NoDevicePath(text.to_owned())),
+            }
+        })
     }
 
     pub(crate) fn path(&self) -> &KeywordPath {
@@ -1139,6 +1188,53 @@ mod tests {
                 Some(KeywordRefusal::DevicePath { keyword, .. }) if keyword == KEYWORD
             ),
             "a device path shorter than an End node"
+        );
+    }
+
+    /// Offline, a keyword names its statement in a package list without a device path, or with
+    /// one that is no KeywordPath, too, as no <KeywordResp> names the list; the other refusals
+    /// stand.
+    #[test]
+    fn resolve_offline_takes_a_list_without_a_device_path() {
+        let mut no_path = list(PATH, &[(NAMESPACE, KEYWORD)], one_of(1, 0));
+        no_path.device_path = None;
+        let mut short_path = list(PATH, &[(NAMESPACE, KEYWORD)], one_of(1, 0));
+        short_path.device_path = Some(DevicePath::from(vec![0x7f, 0xff, 0x04]));
+        let mut two_ns = list(
+            PATH,
+            &[(NAMESPACE, KEYWORD), ("x-UEFI-ns-v2", KEYWORD)],
+            one_of(1, 0),
+        );
+        two_ns.device_path = None;
+        let offline = |list: ParsedPackageList| {
+            let lists = [list];
+            KeywordStatement::resolve_offline(&lists, None, &keyword(KEYWORD)).map(|statements| {
+                statements
+                    .iter()
+                    .map(|statement| {
+                        (
+                            statement.namespace().to_string(),
+                            statement.op().borrow().op_code.spec_name(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        for (case, list) in [("no device path", no_path), ("short", short_path)] {
+            assert_eq!(
+                offline(list),
+                Ok(vec![(NAMESPACE.to_owned(), "EFI_IFR_ONE_OF")]),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            offline(two_ns),
+            Err(KeywordRefusal::AmbiguousPackages {
+                keyword: KEYWORD.to_owned(),
+                languages: vec![NAMESPACE.to_owned(), "x-UEFI-ns-v2".to_owned()],
+            }),
+            "two strings packages under x-UEFI"
         );
     }
 
