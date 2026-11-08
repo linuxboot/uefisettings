@@ -53,6 +53,7 @@ const DATA_FILTER: &str =
     "<DataFilter>: Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time";
 const NUMERIC_TYPE: &str = "Numeric[:1|:2|:4|:8]";
 const KEYWORD_RESP_END: &str = "the next <KeywordResp> or the end";
+const KEYWORD_REQUEST_END: &str = "the end of a <KeywordRequest> of PATH= and KEYWORD= alone";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ConfigStringError {
@@ -762,6 +763,15 @@ impl TryFrom<DevicePath> for KeywordPath {
     }
 }
 
+/// PATH='s hex digits, as a `<KeywordPath>`.
+impl FromStr for KeywordPath {
+    type Err = ConfigStringError;
+
+    fn from_str(digits: &str) -> Result<Self, Self::Err> {
+        Self::try_from(parse_device_path(digits)?)
+    }
+}
+
 impl AsRef<DevicePath> for KeywordPath {
     fn as_ref(&self) -> &DevicePath {
         &self.0
@@ -801,6 +811,34 @@ impl fmt::Display for KeywordRequest {
             write!(f, "&{data}")?;
         }
         Ok(())
+    }
+}
+
+/// A `<KeywordRequest>` of an optional PATH and a KEYWORD; KEYWORDINFO and the filters are
+/// refused.
+impl FromStr for KeywordRequest {
+    type Err = ConfigStringError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut elements = Elements::new(text);
+        let device_path = elements
+            .optional_value("PATH=")
+            .map(str::parse::<KeywordPath>)
+            .transpose()?;
+        let keyword = Keyword::try_from(elements.required_value("KEYWORD=")?)?;
+        if let Some(found) = elements.next() {
+            return Err(ConfigStringError::Unexpected {
+                expected: KEYWORD_REQUEST_END,
+                found: found.to_owned(),
+            });
+        }
+        Ok(Self {
+            device_path,
+            keyword,
+            info: None,
+            usage: None,
+            data: None,
+        })
     }
 }
 
@@ -1882,6 +1920,73 @@ mod tests {
              &KEYWORDINFO=DataTypeDefault&ReadOnly&Numeric:1",
             "every optional part"
         );
+    }
+
+    #[test]
+    fn keyword_request_of_path_and_keyword_parses() {
+        let with_path = KeywordRequest {
+            device_path: Some(end_keyword_path()),
+            ..keyword_request("ChipsetSATAPortEnable:5")
+        };
+        let cases = [
+            ("KEYWORD=BIOSVendor", Ok(keyword_request("BIOSVendor"))),
+            (
+                "PATH=7fff0400&KEYWORD=ChipsetSATAPortEnable:5",
+                Ok(with_path),
+            ),
+            (
+                "KEYWORD=BIOSVendor&KEYWORDINFO=All",
+                Err(unexpected(KEYWORD_REQUEST_END, "KEYWORDINFO=All")),
+            ),
+            (
+                "KEYWORD=BIOSVendor&ReadOnly",
+                Err(unexpected(KEYWORD_REQUEST_END, "ReadOnly")),
+            ),
+            (
+                "PATH=7fff04&KEYWORD=BIOSVendor",
+                Err(ConfigStringError::ShortKeywordPath(3)),
+            ),
+            ("BIOSVendor", Err(unexpected("KEYWORD=", "BIOSVendor"))),
+            (
+                "PATH=7fff0400",
+                Err(ConfigStringError::Truncated {
+                    expected: "KEYWORD=",
+                }),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(text.parse::<KeywordRequest>(), expected, "{text:?}");
+        }
+    }
+
+    /// What a `<KeywordRequest>` of PATH and KEYWORD writes, it parses back.
+    #[test]
+    fn keyword_request_of_path_and_keyword_reads_back() {
+        let request = KeywordRequest {
+            device_path: Some(end_keyword_path()),
+            ..keyword_request("iSCSIBootEnable")
+        };
+
+        assert_eq!(
+            request.to_string().parse::<KeywordRequest>(),
+            Ok(request),
+            "PATH and KEYWORD"
+        );
+    }
+
+    #[test]
+    fn keyword_path_parses_from_hex_digits() {
+        let cases = [
+            ("7fff0400", Ok(end_keyword_path())),
+            ("7fff04", Err(ConfigStringError::ShortKeywordPath(3))),
+            (
+                "7fff04zz",
+                Err(invalid_value("PATH", "7fff04zz", DEVICE_PATH)),
+            ),
+        ];
+        for (digits, expected) in cases {
+            assert_eq!(digits.parse::<KeywordPath>(), expected, "{digits:?}");
+        }
     }
 
     #[test]
