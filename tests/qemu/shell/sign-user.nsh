@@ -6,7 +6,10 @@ echo -off
 # carries the CA that KEK issued; the firmware refuses the appends that db's key, the foreign key
 # and the leaf key without its CA sign. It refuses a write without --append or --timestamp, as
 # it reads no clock, then creates PrivateProbe, a private authenticated variable, with the
-# foreign key, after which the firmware takes a later write by that key only.
+# foreign key, after which the firmware takes a later write by that key only. The firmware
+# refuses EnhancedProbe's writes with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: run.sh's
+# pre-signed one in \auth, and those that uefisettings signs at a TimeStamp, with a nonce and
+# with a NewCert.
 # shell/sign-user.tsv holds the checks of its steps.
 fs0:
 echo uefisettings-shell: start
@@ -44,5 +47,15 @@ uefisettings.efi variable write-signed PrivateProbe DE145B29-C3CD-455F-91DE-A762
 echo uefisettings-shell: step private-other-key %lasterror%
 uefisettings.efi variable info PrivateProbe DE145B29-C3CD-455F-91DE-A76237B67C52
 echo uefisettings-shell: step private-info-after %lasterror%
+uefisettings.efi variable write-signed EnhancedProbe DE145B29-C3CD-455F-91DE-A76237B67C52 --attributes non-volatile,bootservice-access,runtime-access,enhanced-authenticated-access --payload-file \auth\enhanced.auth
+echo uefisettings-shell: step enhanced-payload %lasterror%
+uefisettings.efi variable write-signed EnhancedProbe DE145B29-C3CD-455F-91DE-A76237B67C52 --attributes non-volatile,bootservice-access,runtime-access,enhanced-authenticated-access --data-file \sign\probe.data --signing-key-file \sign\KEK.key --signing-certificate-file \sign\KEK.crt --timestamp 2026-01-01T00:00:00Z
+echo uefisettings-shell: step enhanced-timestamp %lasterror%
+uefisettings.efi variable write-signed EnhancedProbe DE145B29-C3CD-455F-91DE-A76237B67C52 --attributes non-volatile,bootservice-access,runtime-access,enhanced-authenticated-access --data-file \sign\probe.data --signing-key-file \sign\KEK.key --signing-certificate-file \sign\KEK.crt --nonce 0123456789abcdef
+echo uefisettings-shell: step enhanced-nonce %lasterror%
+uefisettings.efi variable write-signed EnhancedProbe DE145B29-C3CD-455F-91DE-A76237B67C52 --attributes non-volatile,bootservice-access,runtime-access,enhanced-authenticated-access --data-file \sign\probe.data --signing-key-file \sign\KEK.key --signing-certificate-file \sign\KEK.crt --nonce 0123456789abcdef --new-signing-key-file \sign\db.key --new-signing-certificate-file \sign\db.crt
+echo uefisettings-shell: step enhanced-new-cert %lasterror%
+dmpstore EnhancedProbe -guid DE145B29-C3CD-455F-91DE-A76237B67C52
+echo uefisettings-shell: step enhanced-dmpstore %lasterror%
 echo uefisettings-shell: done
 reset -s

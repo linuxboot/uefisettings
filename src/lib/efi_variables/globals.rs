@@ -1154,6 +1154,7 @@ pub(crate) mod tests {
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::efi_variables::VariableContents;
     use crate::hii::VariableAttributes;
+    use crate::hii::VariableInterface;
 
     /// EFI_CERT_SHA256_GUID (UEFI 2.11 §32.4.1) as its bytes.
     const EFI_CERT_SHA256: [u8; 16] = [
@@ -1185,15 +1186,32 @@ pub(crate) mod tests {
         data4: [0x8A, 0xDF, 0xC5, 0xC7, 0x0A, 0xC3, 0x5D, 0xAD],
     };
 
-    /// VariableData that hold `variables` and record each key read and set.
-    #[derive(Default)]
+    /// VariableData that hold `variables` and record each key read and set, as `interface`
+    /// reaches them: through GetVariable() and SetVariable() unless `through` says otherwise.
     pub(crate) struct HeldVariables {
         pub(crate) variables: RefCell<BTreeMap<VariableKey, VariableContents>>,
         pub(crate) read: RefCell<Vec<VariableKey>>,
         pub(crate) set: RefCell<Vec<VariableKey>>,
+        interface: VariableInterface,
+    }
+
+    impl Default for HeldVariables {
+        fn default() -> Self {
+            Self {
+                variables: RefCell::default(),
+                read: RefCell::default(),
+                set: RefCell::default(),
+                interface: VariableInterface::VariableServices,
+            }
+        }
     }
 
     impl HeldVariables {
+        /// These variables, as `interface` reaches them.
+        pub(crate) fn through(self, interface: VariableInterface) -> Self {
+            Self { interface, ..self }
+        }
+
         /// Holds `data` with NV+BS+RT as the variable `name` of `vendor`.
         pub(crate) fn with(self, name: &str, vendor: Guid, data: &[u8]) -> Self {
             self.with_attributes(name, vendor, NV_BS_RT, data)
@@ -1224,6 +1242,10 @@ pub(crate) mod tests {
     }
 
     impl VariableData for HeldVariables {
+        fn interface(&self) -> VariableInterface {
+            self.interface
+        }
+
         fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
             self.read.borrow_mut().push(key.clone());
             Ok(self.variables.borrow().get(key).cloned())

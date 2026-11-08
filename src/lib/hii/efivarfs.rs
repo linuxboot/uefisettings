@@ -904,6 +904,10 @@ fn efivar_info(key: &VariableKey, bytes: &[u8]) -> Result<VariableInfo> {
 }
 
 impl VariableData for EfivarFiles {
+    fn interface(&self) -> VariableInterface {
+        EFIVARFS_INTERFACE
+    }
+
     /// The contents of `key` from its efivar file, which read_efivar_file_of reads whole.
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
         let name = EfivarFileName::from(key);

@@ -24,6 +24,9 @@ use std::str::Split;
 use bitflags::bitflags;
 use thiserror::Error;
 
+use crate::hex_digits::hex_byte;
+use crate::hex_digits::hex_bytes;
+use crate::hex_digits::hex_digit;
 use crate::hii::forms::DefaultId;
 use crate::hii::package::DevicePath;
 use crate::hii::package::Guid;
@@ -1194,37 +1197,10 @@ fn hex_number(digits: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The bytes of `digits`, two hex digits per byte in order, as `<Guid>` and `<PathHdr>` list them.
-fn hex_bytes<B: FromIterator<u8>>(digits: &str) -> Option<B> {
-    digits
-        .as_bytes()
-        .chunks(2)
-        .map(|pair| match pair {
-            [high, low] => hex_byte(*high, *low),
-            _ => None,
-        })
-        .collect()
-}
-
 /// The CHAR16 of 4 hex digits, most significant first.
 fn hex_unit(digits: &[u8]) -> Option<u16> {
     match digits {
         [a, b, c, d] => Some(u16::from_be_bytes([hex_byte(*a, *b)?, hex_byte(*c, *d)?])),
-        _ => None,
-    }
-}
-
-fn hex_byte(high: u8, low: u8) -> Option<u8> {
-    Some((hex_digit(high)? << 4) | hex_digit(low)?)
-}
-
-/// The value of a hex digit of either case: `<HexCh>` is lowercase, but EDK2's StrHexToUint64
-/// reads both and §35.4.6's example has "AA55".
-fn hex_digit(digit: u8) -> Option<u8> {
-    match digit {
-        b'0'..=b'9' => Some(digit - b'0'),
-        b'a'..=b'f' => Some(digit - b'a' + 10),
-        b'A'..=b'F' => Some(digit - b'A' + 10),
         _ => None,
     }
 }

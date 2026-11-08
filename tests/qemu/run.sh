@@ -319,7 +319,9 @@ devdb_owner=8c78a505-baa0-4c4a-869f-000000000400
 # and the same append signed with db's key, which KEK lacks, as db-unauthorized.auth, and with
 # the foreign key, as db-foreign.auth; and a write of a text of its own to WriteSignedProbe, a
 # new variable of the tests' vendor GUID, without EFI_VARIABLE_APPEND_WRITE and signed with KEK,
-# as probe-write.auth. In sign/, for uefisettings to sign with in both kinds of boots: the keys
+# as probe-write.auth, and to EnhancedProbe with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, in
+# an EFI_VARIABLE_AUTHENTICATION_3 signed with KEK, as enhanced.auth.
+# In sign/, for uefisettings to sign with in both kinds of boots: the keys
 # and certificates of PK, KEK, db and the foreign key, and the EFI_SIGNATURE_LISTs of PK's and
 # KEK's certificates, PK.esl and KEK.esl; ca.key and ca.crt, of a CA that KEK issues,
 # and leaf.key and leaf.crt, of a certificate that the CA issues, with chain.pem, the leaf's
@@ -371,6 +373,8 @@ secboot_files() {
         printf 'uefisettings test %s probe' "$each" >"$keys/$each-probe.data"
         "$here/auth-payload.sh" sign WriteSignedProbe "$secboot_owner" 0x27 \
             "$keys/$each-probe.data" "$keys/KEK.crt" "$keys/KEK.key" "$keys/$each/probe-write.auth"
+        "$here/auth-payload.sh" auth3 EnhancedProbe "$secboot_owner" 0x87 \
+            "$keys/$each-probe.data" "$keys/KEK.crt" "$keys/KEK.key" "$keys/$each/enhanced.auth"
         file=$keys/$each/db-tampered.auth
         cp "$keys/$each/db-append.auth" "$file"
         size=$(stat --format=%s "$file")

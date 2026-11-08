@@ -447,6 +447,7 @@ mod tests {
     use anyhow::anyhow;
 
     use super::*;
+    use crate::hii::VariableInterface;
 
     /// BS+RT: the attributes of SetupMode, AuditMode and DeployedMode in UEFI 2.11 §3.3.
     const BS_RT: VariableAttributes =
@@ -580,6 +581,10 @@ mod tests {
     }
 
     impl VariableData for ModeFirmware {
+        fn interface(&self) -> VariableInterface {
+            VariableInterface::VariableServices
+        }
+
         fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
             self.read.borrow_mut().push(key.clone());
             Ok(self.variables.borrow().get(key).cloned())

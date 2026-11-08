@@ -30,11 +30,15 @@ use uefisettings_backend_thrift::SetResponseList;
 #[cfg(variable_data)]
 use crate::efi_variables::authenticated::sign_and_write;
 #[cfg(variable_data)]
+use crate::efi_variables::authenticated::sign_and_write_enhanced;
+#[cfg(variable_data)]
 use crate::efi_variables::authenticated::signing::PlatformSeed;
 #[cfg(variable_data)]
 use crate::efi_variables::authenticated::signing::Signer;
 #[cfg(variable_data)]
 use crate::efi_variables::authenticated::write_signed;
+#[cfg(variable_data)]
+use crate::efi_variables::authenticated::EnhancedSignedWrite;
 #[cfg(variable_data)]
 pub use crate::efi_variables::authenticated::SetupModeWrite;
 #[cfg(variable_data)]
@@ -47,6 +51,12 @@ pub use crate::efi_variables::authenticated::TimeStamp;
 pub use crate::efi_variables::authenticated::TimeStampError;
 #[cfg(capsule_delivery)]
 use crate::efi_variables::deliver_json_capsule;
+#[cfg(variable_data)]
+pub use crate::efi_variables::enhanced_authenticated::Freshness;
+#[cfg(variable_data)]
+pub use crate::efi_variables::enhanced_authenticated::Nonce;
+#[cfg(variable_data)]
+pub use crate::efi_variables::enhanced_authenticated::NonceError;
 #[cfg(variable_data)]
 use crate::efi_variables::globals::read_global;
 #[cfg(variable_data)]
@@ -353,6 +363,94 @@ impl VariableBackend {
             &mut PlatformSeed::default(),
         )
     }
+
+    /// Signs `write` with the PEM RSA key `signing_key` into an EFI_VARIABLE_AUTHENTICATION_3
+    /// (UEFI 2.11 §8.2.5) whose SigningCert carries `certificates`, a PEM bundle of the key's
+    /// certificate, then any others, and whose NewCert, if `write` names a new authority, hands
+    /// the variable to it, blinded as sign_and_write blinds, and writes it, then the data, with
+    /// the attributes and EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS. Refuses before it signs a
+    /// Secure Boot Policy Variable, a write that would delete the variable, a device signature
+    /// database while SetupMode is 1 unless `write` allows it, and, on Linux, every such write,
+    /// which efivarfs cannot make.
+    pub fn sign_and_write_enhanced(
+        write: &EnhancedVariableWrite<'_>,
+        signing_key: &Secret,
+        certificates: &[u8],
+    ) -> Result<()> {
+        let key = VariableKey {
+            name: write.name.to_owned(),
+            guid: parse_vendor(write.vendor)?,
+        };
+        let (signer, new_authority) = enhanced_signers(write, signing_key, certificates)?;
+        sign_and_write_enhanced(
+            &Self::system_variable_data()?,
+            &EnhancedSignedWrite {
+                key: &key,
+                attributes: write.attributes,
+                data: write.data,
+                freshness: write.freshness,
+                setup_mode: write.setup_mode,
+            },
+            &signer,
+            new_authority.as_ref(),
+            &mut PlatformSeed::default(),
+        )
+    }
+}
+
+/// The Signers of the EFI_VARIABLE_AUTHENTICATION_3 that VariableBackend::sign_and_write_enhanced
+/// writes: of `signing_key` with `certificates`, for the SigningCert, and of the new authority of
+/// `write`, if any, for the NewCert, whose refusals name that authority's flags.
+#[cfg(variable_data)]
+fn enhanced_signers(
+    write: &EnhancedVariableWrite<'_>,
+    signing_key: &Secret,
+    certificates: &[u8],
+) -> Result<(Signer, Option<Signer>)> {
+    let signer = Signer::from_pem(signing_key, certificates, write.digest)?;
+    let new_authority = write
+        .new_authority
+        .map(|authority| {
+            Signer::from_pem(authority.key, authority.certificates, write.digest).context(
+                "the new authority of the NewCert, --new-signing-key-file and \
+                 --new-signing-certificate-file",
+            )
+        })
+        .transpose()?;
+    Ok((signer, new_authority))
+}
+
+/// A write that VariableBackend::sign_and_write_enhanced signs.
+#[cfg(variable_data)]
+#[derive(Debug, Clone, Copy)]
+pub struct EnhancedVariableWrite<'a> {
+    /// The EFI variable
+    pub name: &'a str,
+    /// Its vendor GUID, such as "8BE4DF61-93CA-11D2-AA0D-00E098032B8C"
+    pub vendor: &'a str,
+    /// The attributes, to which the write adds EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS
+    pub attributes: VariableAttributes,
+    /// The new data of the variable
+    pub data: &'a [u8],
+    /// The Type of the EFI_VARIABLE_AUTHENTICATION_3 and its Secondary Descriptor
+    pub freshness: &'a Freshness,
+    /// The digest of the signatures
+    pub digest: SignatureDigest,
+    /// The authority that a NewCert hands the variable to, if any
+    pub new_authority: Option<NewAuthority<'a>>,
+    /// Whether a device signature database is written while SetupMode is 1
+    pub setup_mode: SetupModeWrite,
+}
+
+/// The authority that the NewCert of an EFI_VARIABLE_AUTHENTICATION_3 hands a variable to (UEFI
+/// 2.11 §8.2.5).
+#[cfg(variable_data)]
+#[derive(Debug, Clone, Copy)]
+pub struct NewAuthority<'a> {
+    /// Its PEM RSA private key, which signs its certificate's tbsCertificate
+    pub key: &'a Secret,
+    /// A PEM bundle of its certificate, then any others
+    pub certificates: &'a [u8],
 }
 
 /// A write that VariableBackend::sign_and_write signs.
@@ -1009,6 +1107,10 @@ mod tests {
 
     use fbthrift::simplejson_protocol;
 
+    #[cfg(variable_data)]
+    use crate::efi_variables::authenticated::signing::tests::other_pems;
+    #[cfg(variable_data)]
+    use crate::efi_variables::authenticated::signing::tests::test_pems;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::forms::ifr_fixtures::checkbox_at;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
@@ -1066,8 +1168,79 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::Guid;
     use crate::hii::VariableAttributes;
+    #[cfg(variable_data)]
+    use crate::secret_file::read_secret_file;
+    #[cfg(variable_data)]
+    use crate::secret_file::MAX_SECRET_LEN;
 
     use super::*;
+
+    /// The refusal of enhanced_signers for the Signers of `write`, of `key` and `certificates`.
+    #[cfg(variable_data)]
+    fn signers_refusal(
+        write: &EnhancedVariableWrite<'_>,
+        key: &Secret,
+        certificates: &[u8],
+    ) -> String {
+        match enhanced_signers(write, key, certificates) {
+            Ok(_) => panic!("Signers of {}", write.name),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    /// enhanced_signers refuses a new authority whose key is no PEM RSA private key, or whose
+    /// certificate holds another key, naming the NewCert's flags, so that the refusal differs
+    /// from the same one of the signing key.
+    #[cfg(variable_data)]
+    #[test]
+    fn enhanced_signers_name_a_broken_new_authority() {
+        let (key, certificates) = test_pems();
+        let not_a_key = read_secret_file(&b"not a key"[..], MAX_SECRET_LEN).expect("a secret");
+        let freshness = Freshness::Nonce {
+            nonce: "01".parse().expect("a nonce"),
+            current: None,
+        };
+        let write = |new_authority| EnhancedVariableWrite {
+            name: "Example",
+            vendor: "DE145B29-C3CD-455F-91DE-A76237B67C52",
+            attributes: VariableAttributes::NON_VOLATILE,
+            data: b"data",
+            freshness: &freshness,
+            digest: SignatureDigest::Sha256,
+            new_authority,
+            setup_mode: SetupModeWrite::Refuse,
+        };
+        for (new_key, refused) in [
+            (
+                &not_a_key,
+                "the signing key is neither a PEM PKCS #8 nor a PEM PKCS #1 RSA private key",
+            ),
+            (
+                &other_pems().0,
+                "the first certificate of the bundle does not hold the public key of the signing key",
+            ),
+        ] {
+            let new_authority = NewAuthority {
+                key: new_key,
+                certificates: certificates.as_bytes(),
+            };
+
+            let as_new_authority =
+                signers_refusal(&write(Some(new_authority)), key, certificates.as_bytes());
+            let as_signing_key = signers_refusal(&write(None), new_key, certificates.as_bytes());
+
+            assert_eq!(
+                as_new_authority,
+                format!(
+                    "the new authority of the NewCert, --new-signing-key-file and \
+                     --new-signing-certificate-file: {refused}"
+                ),
+                "new authority"
+            );
+            assert_eq!(as_signing_key, refused, "signing key");
+            assert_ne!(as_new_authority, as_signing_key, "{refused}");
+        }
+    }
 
     /// A package list with GUID `guid` holding a FormSet titled by the
     /// one-character string `title` of its own strings package.

@@ -245,6 +245,10 @@ impl<C: FirmwareEnvironmentCalls> VariableInfoSource for FirmwareEnvironment<C> 
 
 #[cfg(variable_data)]
 impl<C: FirmwareEnvironmentCalls> VariableData for FirmwareEnvironment<C> {
+    fn interface(&self) -> VariableInterface {
+        Self::INTERFACE
+    }
+
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
         let (attributes, data) = match self.read_all(key) {
             Err(error) if error.is::<VariableNotFound>() => return Ok(None),

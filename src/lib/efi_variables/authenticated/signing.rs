@@ -12,7 +12,8 @@
 
 //! EFI_VARIABLE_AUTHENTICATION_2 descriptors that a caller's RSA key signs (UEFI 2.11 §8.2.6): a
 //! PKCS #7 SignedData without signed attributes over the serialization of the write, of SHA-256,
-//! SHA-384 or SHA-512. RSA signs only blinded, over a ChaCha20Rng seeded once from the
+//! SHA-384 or SHA-512; and the NewCert and SigningCert of an EFI_VARIABLE_AUTHENTICATION_3
+//! (§8.2.5), SignedData of the same form. RSA signs only blinded, over a ChaCha20Rng seeded once from the
 //! platform's source, and clippy.toml bans rsa's unblinded signing entry points. rsa has no
 //! release that fixes RUSTSEC-2023-0071's timing leak; blinding is partial hardening, and
 //! uefisettings runs as the advisory's workaround allows: local use on a non-compromised
@@ -46,6 +47,7 @@ use der::Any;
 use der::DateTime;
 use der::Encode;
 use der::EncodeValue;
+use der::Tag;
 use rand_chacha::ChaCha20Rng;
 use rand_core::CryptoRngCore;
 use rand_core::SeedableRng;
@@ -69,7 +71,11 @@ use zeroize::Zeroizing;
 use super::CERTIFICATE_HEADER_SIZE;
 use super::EFI_CERT_TYPE_PKCS7_GUID;
 use super::EFI_TIME_SIZE;
+use super::WIN_CERT_REVISION;
 use super::WIN_CERT_TYPE_EFI_GUID;
+use crate::efi_variables::enhanced_authenticated::authentication_3_payload;
+use crate::efi_variables::enhanced_authenticated::Freshness;
+use crate::efi_variables::enhanced_authenticated::MetadataTooLarge;
 use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 use crate::secret_file::Secret;
@@ -78,8 +84,6 @@ use crate::secret_file::Secret;
 const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 /// rsaEncryption, the digestEncryptionAlgorithm of PKCS #1 v1.5 (RFC 8017 Appendix A.1).
 const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-/// WIN_CERTIFICATE.wRevision (UEFI 2.11 §32.2.4.1).
-const WIN_CERT_REVISION: u16 = 0x0200;
 /// The RSA key sizes that signing takes.
 const KEY_BITS: std::ops::RangeInclusive<usize> = 2048..=4096;
 /// The seed of ChaCha20Rng.
@@ -120,6 +124,11 @@ impl TimeStamp {
                 time.seconds(),
             ],
         ))
+    }
+
+    /// The EFI_TIME.
+    pub(crate) fn as_bytes(&self) -> &[u8; EFI_TIME_SIZE] {
+        &self.0
     }
 
     /// The EFI_TIME of `year` and its month, day, hour, minute and second, in GMT.
@@ -223,6 +232,17 @@ pub(crate) struct AuthenticatedWrite<'a> {
     pub(crate) data: &'a [u8],
 }
 
+/// One SetVariable() call with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, before its
+/// descriptors: what the SigningCert's signature covers (UEFI 2.11 §8.2.5 step 3).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EnhancedWrite<'a> {
+    pub(crate) key: &'a VariableKey,
+    /// The Attributes of the call, ENHANCED_AUTHENTICATED_ACCESS and APPEND_WRITE included.
+    pub(crate) attributes: VariableAttributes,
+    pub(crate) freshness: &'a Freshness,
+    pub(crate) data: &'a [u8],
+}
+
 /// Why no descriptor was signed.
 #[derive(Debug, Error)]
 pub(crate) enum SigningRefusal {
@@ -261,6 +281,13 @@ pub(crate) enum SigningRefusal {
          write"
     )]
     TooLarge(usize),
+    #[error(
+        "the SignedData takes {0} bytes, more than the dwLength of a WIN_CERTIFICATE_UEFI_GUID, \
+         a UINT32, counts with its header"
+    )]
+    CertificateLength(usize),
+    #[error(transparent)]
+    Metadata(#[from] MetadataTooLarge),
 }
 
 /// The signing key, for the digest of the SignedData.
@@ -310,6 +337,9 @@ pub(crate) struct Signer {
     key: DigestKey,
     /// Of the signer's certificate.
     signer: IssuerAndSerialNumber,
+    /// The DER of the signer's certificate's tbsCertificate, which its NewCert signs (UEFI 2.11
+    /// §8.2.5).
+    tbs_certificate: Vec<u8>,
     certificates: CertificateSet,
 }
 
@@ -354,6 +384,7 @@ impl Signer {
         if public.as_bytes() != certified.as_slice() {
             return Err(SigningRefusal::KeyMismatch);
         }
+        let tbs_certificate = signer.to_der().map_err(SigningRefusal::Encode)?;
         let signer = IssuerAndSerialNumber {
             issuer: signer.issuer.clone(),
             serial_number: signer.serial_number.clone(),
@@ -373,6 +404,7 @@ impl Signer {
         Ok(Self {
             key: DigestKey::new(key, digest),
             signer,
+            tbs_certificate,
             certificates,
         })
     }
@@ -385,7 +417,7 @@ impl Signer {
         rng: &mut impl CryptoRngCore,
     ) -> Result<Vec<u8>, SigningRefusal> {
         let signature = self.key.sign(rng, &digest_input(write)?)?;
-        let signed_data = self.signed_data(signature)?;
+        let signed_data = self.signed_data(signature, None)?;
         let content = signed_data
             .value_len()
             .and_then(usize::try_from)
@@ -393,27 +425,56 @@ impl Signer {
         if content > TWO_BYTE_LENGTH_MAX {
             return Err(SigningRefusal::TooLarge(content));
         }
-        let cert_data = signed_data.to_der().map_err(SigningRefusal::Encode)?;
-        let length = CERTIFICATE_HEADER_SIZE
-            .checked_add(cert_data.len())
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or(SigningRefusal::TooLarge(content))?;
         Ok([
             &write.timestamp.0[..],
-            &length.to_le_bytes(),
-            &WIN_CERT_REVISION.to_le_bytes(),
-            &WIN_CERT_TYPE_EFI_GUID.to_le_bytes(),
-            &<[u8; 16]>::from(EFI_CERT_TYPE_PKCS7_GUID),
-            &cert_data,
+            &win_certificate(&signed_data)?,
             write.data,
         ]
         .concat())
     }
 
-    /// The SignedData of UEFI 2.11 §8.2.6 steps a-g: version 1, the digest, id-data without
-    /// content, the certificates, and one SignerInfo of version 1 by issuer and serial number,
-    /// without authenticated or unauthenticated attributes.
-    fn signed_data(&self, signature: Vec<u8>) -> Result<SignedData, SigningRefusal> {
+    /// The SetVariable() Data of `write`: its EFI_VARIABLE_AUTHENTICATION_3 and Secondary
+    /// Descriptor, the NewCert of `new_authority` if given, which hands the variable to its key,
+    /// the SigningCert that this signer signs, both blinded over `rng`, then the new data (UEFI
+    /// 2.11 §8.2.5). The firmware alone checks the SignedData's size.
+    pub(crate) fn authentication_3(
+        &self,
+        write: &EnhancedWrite<'_>,
+        new_authority: Option<&Signer>,
+        rng: &mut impl CryptoRngCore,
+    ) -> Result<Vec<u8>, SigningRefusal> {
+        let new_cert = new_authority
+            .map(|authority| authority.new_cert(rng))
+            .transpose()?;
+        let signature = self
+            .key
+            .sign(rng, &digest_input_3(write, new_cert.as_deref())?)?;
+        let signing_cert = win_certificate(&self.signed_data(signature, None)?)?;
+        Ok(authentication_3_payload(
+            write.freshness,
+            new_cert.as_deref(),
+            &signing_cert,
+            write.data,
+        )?)
+    }
+
+    /// The NewCert of this signer's certificate (UEFI 2.11 §8.2.5): a WIN_CERTIFICATE_UEFI_GUID
+    /// whose SignedData carries the certificate's tbsCertificate as its content, which this
+    /// signer's key signs.
+    fn new_cert(&self, rng: &mut impl CryptoRngCore) -> Result<Vec<u8>, SigningRefusal> {
+        let signature = self.key.sign(rng, &self.tbs_certificate)?;
+        win_certificate(&self.signed_data(signature, Some(&self.tbs_certificate))?)
+    }
+
+    /// The SignedData of UEFI 2.11 §8.2.6 steps a-g and §8.2.5 step 3: version 1, the digest,
+    /// id-data with `content` or, for the signature of a write, without any, the certificates,
+    /// and one SignerInfo of version 1 by issuer and serial number, without authenticated or
+    /// unauthenticated attributes.
+    fn signed_data(
+        &self,
+        signature: Vec<u8>,
+        content: Option<&[u8]>,
+    ) -> Result<SignedData, SigningRefusal> {
         let digest = AlgorithmIdentifierOwned {
             oid: self.key.digest_oid(),
             parameters: None,
@@ -435,7 +496,11 @@ impl Signer {
             digest_algorithms: SetOfVec::try_from(vec![digest]).map_err(SigningRefusal::Encode)?,
             encap_content_info: EncapsulatedContentInfo {
                 econtent_type: ID_DATA,
-                econtent: None,
+                // Data ::= OCTET STRING, the content of id-data (RFC 2315 §8)
+                econtent: content
+                    .map(|content| Any::new(Tag::OctetString, content))
+                    .transpose()
+                    .map_err(SigningRefusal::Encode)?,
             },
             certificates: Some(self.certificates.clone()),
             crls: None,
@@ -444,6 +509,24 @@ impl Signer {
             ),
         })
     }
+}
+
+/// The WIN_CERTIFICATE_UEFI_GUID of `signed_data` (UEFI 2.11 §32.2.4.3): dwLength, wRevision
+/// 0x0200, WIN_CERT_TYPE_EFI_GUID, EFI_CERT_TYPE_PKCS7_GUID, then the SignedData's DER as CertData.
+fn win_certificate(signed_data: &SignedData) -> Result<Vec<u8>, SigningRefusal> {
+    let cert_data = signed_data.to_der().map_err(SigningRefusal::Encode)?;
+    let length = CERTIFICATE_HEADER_SIZE
+        .checked_add(cert_data.len())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or(SigningRefusal::CertificateLength(cert_data.len()))?;
+    Ok([
+        &length.to_le_bytes()[..],
+        &WIN_CERT_REVISION.to_le_bytes(),
+        &WIN_CERT_TYPE_EFI_GUID.to_le_bytes(),
+        &<[u8; 16]>::from(EFI_CERT_TYPE_PKCS7_GUID),
+        &cert_data,
+    ]
+    .concat())
 }
 
 /// Refuses an RSA key of `bits` outside KEY_BITS.
@@ -469,24 +552,49 @@ fn pem_certificates(pem: &[u8]) -> Result<Vec<Certificate>, SigningRefusal> {
 /// What UEFI 2.11 §8.2.6 hashes: VariableName without its terminating NUL, VendorGuid,
 /// Attributes, TimeStamp, then the new data.
 pub(crate) fn digest_input(write: &AuthenticatedWrite<'_>) -> Result<Vec<u8>, SigningRefusal> {
-    let name = write
-        .key
-        .name
-        .encode_utf16()
-        // A surrogate half belongs to a character outside UCS-2.
-        .map(|unit| match unit {
-            0xD800..=0xDFFF => Err(SigningRefusal::NameNotUcs2(write.key.clone())),
-            unit => Ok(unit.to_le_bytes()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     Ok([
-        name.as_flattened(),
+        &ucs2_name(write.key)?[..],
         &<[u8; 16]>::from(write.key.guid),
         &write.attributes.bits().to_le_bytes(),
         &write.timestamp.0,
         write.data,
     ]
     .concat())
+}
+
+/// What UEFI 2.11 §8.2.5 step 3 hashes: VariableName, VendorGuid, Attributes and the Secondary
+/// Descriptor; the new data; the current nonce of an update or deletion of a variable of
+/// EFI_VARIABLE_AUTHENTICATION_3_NONCE_TYPE; then the whole NewCert, if given. §8.2.5 does not
+/// say whether VariableName ends with its NUL; this takes it without, as §8.2.6 does.
+pub(crate) fn digest_input_3(
+    write: &EnhancedWrite<'_>,
+    new_cert: Option<&[u8]>,
+) -> Result<Vec<u8>, SigningRefusal> {
+    Ok([
+        &ucs2_name(write.key)?[..],
+        &<[u8; 16]>::from(write.key.guid),
+        &write.attributes.bits().to_le_bytes(),
+        &write.freshness.secondary_descriptor(),
+        write.data,
+        write.freshness.current_nonce().unwrap_or_default(),
+        new_cert.unwrap_or_default(),
+    ]
+    .concat())
+}
+
+/// The VariableName of `key` as SetVariable() takes it, in UCS-2 little-endian, without its
+/// terminating NUL.
+fn ucs2_name(key: &VariableKey) -> Result<Vec<u8>, SigningRefusal> {
+    let name = key
+        .name
+        .encode_utf16()
+        // A surrogate half belongs to a character outside UCS-2.
+        .map(|unit| match unit {
+            0xD800..=0xDFFF => Err(SigningRefusal::NameNotUcs2(key.clone())),
+            unit => Ok(unit.to_le_bytes()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(name.as_flattened().to_vec())
 }
 
 /// The source that seeds the RNG of RSA blinding once.
@@ -562,6 +670,7 @@ pub(crate) mod tests {
     use der::Decode;
     use der::DecodePem;
     use der::EncodePem;
+    use der::Tagged;
     use rand_core::CryptoRng;
     use rand_core::RngCore;
     use rsa::pkcs1v15::Signature;
@@ -579,7 +688,9 @@ pub(crate) mod tests {
     use x509_cert::Version;
 
     use super::*;
+    use crate::efi_variables::enhanced_authenticated::Nonce;
     use crate::efi_variables::globals::EFI_IMAGE_SECURITY_DATABASE;
+    use crate::hii::package::Guid;
     use crate::secret_file::read_secret_file;
     use crate::secret_file::MAX_SECRET_LEN;
 
@@ -608,7 +719,7 @@ pub(crate) mod tests {
     }
 
     /// key_and_certificate(5), another key, made once.
-    fn other_pems() -> &'static (Secret, Secret) {
+    pub(crate) fn other_pems() -> &'static (Secret, Secret) {
         static PEMS: OnceLock<(Secret, Secret)> = OnceLock::new();
         PEMS.get_or_init(|| key_and_certificate(5))
     }
@@ -751,7 +862,12 @@ pub(crate) mod tests {
 
     /// Whether `signature`, by the test key over `digest`, verifies over `input`.
     fn verifies(digest: SignatureDigest, input: &[u8], signature: &[u8]) -> bool {
-        let key = std::str::from_utf8(test_pems().0.as_bytes()).expect("PEM text");
+        verifies_by(&test_pems().0, digest, input, signature)
+    }
+
+    /// Whether `signature`, by the PEM PKCS #8 key `key` over `digest`, verifies over `input`.
+    fn verifies_by(key: &Secret, digest: SignatureDigest, input: &[u8], signature: &[u8]) -> bool {
+        let key = std::str::from_utf8(key.as_bytes()).expect("PEM text");
         let public = RsaPrivateKey::from_pkcs8_pem(key)
             .expect("decode the test key")
             .to_public_key();
@@ -915,6 +1031,385 @@ pub(crate) mod tests {
                 Err(SigningRefusal::NameNotUcs2(_))
             ),
             "a name outside UCS-2 is refused"
+        );
+    }
+
+    /// A vendor GUID of no Secure Boot Policy Variable: DE145B29-C3CD-455F-91DE-A76237B67C52.
+    const VENDOR: Guid = Guid {
+        data1: 0xDE14_5B29,
+        data2: 0xC3CD,
+        data3: 0x455F,
+        data4: [0x91, 0xDE, 0xA7, 0x62, 0x37, 0xB6, 0x7C, 0x52],
+    };
+    /// VENDOR in EFI_GUID byte order, written out from UEFI 2.11 §2.3.1 Table 2.3: a UINT32, two
+    /// UINT16s, little-endian, and 8 bytes.
+    const VENDOR_BYTES: [u8; 16] = [
+        0x29, 0x5B, 0x14, 0xDE, 0xCD, 0xC3, 0x5F, 0x45, 0x91, 0xDE, 0xA7, 0x62, 0x37, 0xB6, 0x7C,
+        0x52,
+    ];
+    /// The EFI_TIME of TIME, 2026-11-07T00:00:00Z (UEFI 2.11 §8.3.1).
+    const TIME_BYTES: [u8; 16] = [0xEA, 0x07, 11, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    /// The variable Enh of VENDOR.
+    fn enhanced_key() -> VariableKey {
+        VariableKey {
+            name: "Enh".to_owned(),
+            guid: VENDOR,
+        }
+    }
+
+    /// NON_VOLATILE, BOOTSERVICE_ACCESS, RUNTIME_ACCESS and ENHANCED_AUTHENTICATED_ACCESS: 0x87.
+    fn enhanced_attributes() -> VariableAttributes {
+        VariableAttributes::from_bits_retain(0x87)
+    }
+
+    fn enhanced_write<'a>(
+        key: &'a VariableKey,
+        freshness: &'a Freshness,
+        data: &'a [u8],
+    ) -> EnhancedWrite<'a> {
+        EnhancedWrite {
+            key,
+            attributes: enhanced_attributes(),
+            freshness,
+            data,
+        }
+    }
+
+    /// A nonce-type Freshness of NonceSize 5, as the update of a variable whose nonce is
+    /// `current` if given.
+    fn nonce_freshness(current: Option<&[u8]>) -> Freshness {
+        Freshness::Nonce {
+            nonce: Nonce::new(vec![9; 5]).expect("the nonce"),
+            current: current.map(|current| Nonce::new(current.to_vec()).expect("current nonce")),
+        }
+    }
+
+    /// The Secondary Descriptor of nonce_freshness: NonceSize 5 and the Nonce.
+    const NONCE_DESCRIPTOR: [u8; 9] = [5, 0, 0, 0, 9, 9, 9, 9, 9];
+
+    /// What UEFI 2.11 §8.2.5 step 3 hashes, written out from the spec's list, not through
+    /// digest_input_3: "Enh" in UCS-2 without its NUL, VENDOR_BYTES, Attributes 0x87,
+    /// `descriptor`, `data`, then each of `tail`, the current nonce and the NewCert.
+    fn spec_serialization(descriptor: &[u8], data: &[u8], tail: &[&[u8]]) -> Vec<u8> {
+        [
+            &b"E\0n\0h\0"[..],
+            &VENDOR_BYTES,
+            &0x87u32.to_le_bytes(),
+            descriptor,
+            data,
+            &tail.concat(),
+        ]
+        .concat()
+    }
+
+    /// The WIN_CERTIFICATE_UEFI_GUID at `at` of `payload`, checked as authentication_3 makes it:
+    /// its dwLength and SignedData.
+    fn certificate_at(payload: &[u8], at: usize) -> (usize, SignedData) {
+        let length = u32::from_le_bytes(payload[at..at + 4].try_into().expect("dwLength"));
+        let length = usize::try_from(length).expect("dwLength fits usize");
+        assert_eq!(
+            payload[at + 4..at + 8],
+            [0x00, 0x02, 0xF1, 0x0E],
+            "wRevision 0x0200 and WIN_CERT_TYPE_EFI_GUID at {at}"
+        );
+        assert_eq!(
+            payload[at + 8..at + 24],
+            <[u8; 16]>::from(EFI_CERT_TYPE_PKCS7_GUID),
+            "CertType at {at}"
+        );
+        let signed = SignedData::from_der(&payload[at + 24..at + length])
+            .unwrap_or_else(|error| panic!("CertData at {at} is no SignedData: {error}"));
+        (length, signed)
+    }
+
+    /// The signature of the one SignerInfo of `signed`, after checking it as UEFI 2.11 §8.2.5
+    /// step 3 has it: version 1, the digest of `oid`, no authenticated or unauthenticated
+    /// attributes, and SignedData version 1 with `oid` as its one digest algorithm.
+    fn signer_signature<'a>(signed: &'a SignedData, oid: [u8; 9], case: &str) -> &'a [u8] {
+        assert_eq!(signed.version, CmsVersion::V1, "{case}: SignedData.version");
+        let algorithms = signed.digest_algorithms.as_slice();
+        assert_eq!(
+            algorithms
+                .iter()
+                .map(|algorithm| algorithm.oid.as_bytes())
+                .collect::<Vec<_>>(),
+            [oid],
+            "{case}: digestAlgorithms"
+        );
+        assert_eq!(
+            signed.encap_content_info.econtent_type, ID_DATA,
+            "{case}: contentType id-data"
+        );
+        let [info] = signed.signer_infos.0.as_slice() else {
+            panic!("{case}: not one SignerInfo");
+        };
+        assert_eq!(info.version, CmsVersion::V1, "{case}: SignerInfo.version");
+        assert_eq!(
+            info.digest_alg.oid.as_bytes(),
+            oid,
+            "{case}: SignerInfo.digestAlgorithm"
+        );
+        assert!(
+            info.signed_attrs.is_none() && info.unsigned_attrs.is_none(),
+            "{case}: no authenticated or unauthenticated attributes"
+        );
+        info.signature.as_bytes()
+    }
+
+    /// digest_input_3 serializes VariableName without its NUL, VendorGuid, Attributes and the
+    /// Secondary Descriptor, the data, the current nonce of a nonce-type update, then the whole
+    /// NewCert, and refuses a name outside UCS-2.
+    #[test]
+    fn digest_input_3_serializes_the_write() {
+        let key = enhanced_key();
+        let timestamp = Freshness::TimeStamp(TIME.parse().expect("the test TimeStamp"));
+        let create = nonce_freshness(None);
+        let update = nonce_freshness(Some(&[7; 3]));
+        let new_cert = b"a whole NewCert".as_slice();
+        let cases = [
+            (
+                "timestamp",
+                &timestamp,
+                None,
+                spec_serialization(&TIME_BYTES, b"v", &[]),
+            ),
+            (
+                "timestamp with a NewCert",
+                &timestamp,
+                Some(new_cert),
+                spec_serialization(&TIME_BYTES, b"v", &[new_cert]),
+            ),
+            (
+                "nonce create",
+                &create,
+                None,
+                spec_serialization(&NONCE_DESCRIPTOR, b"v", &[]),
+            ),
+            (
+                "nonce update",
+                &update,
+                None,
+                spec_serialization(&NONCE_DESCRIPTOR, b"v", &[&[7; 3]]),
+            ),
+            (
+                "nonce update with a NewCert",
+                &update,
+                Some(new_cert),
+                spec_serialization(&NONCE_DESCRIPTOR, b"v", &[&[7; 3], new_cert]),
+            ),
+        ];
+        for (case, freshness, new_cert, want) in cases {
+            assert_eq!(
+                digest_input_3(&enhanced_write(&key, freshness, b"v"), new_cert)
+                    .expect("serialize"),
+                want,
+                "{case}"
+            );
+        }
+        let outside = VariableKey {
+            name: "Enh\u{1F600}".to_owned(),
+            ..enhanced_key()
+        };
+        assert!(
+            matches!(
+                digest_input_3(&enhanced_write(&outside, &timestamp, b""), None),
+                Err(SigningRefusal::NameNotUcs2(_))
+            ),
+            "a name outside UCS-2 is refused"
+        );
+    }
+
+    /// authentication_3 over `digest` lays out a timestamp-type payload, the EFI_TIME at 12 and
+    /// the SigningCert at 28, whose SignedData carries no content, and whose signature verifies
+    /// over the serialization of §8.2.5 step 3 and fails over it with a flipped data byte.
+    fn assert_authentication_3_verifies(digest: SignatureDigest, oid: [u8; 9]) {
+        let (key_pem, certificate) = test_pems();
+        let signer = Signer::from_pem(key_pem, certificate.as_bytes(), digest).expect("signer");
+        let key = enhanced_key();
+        let freshness = Freshness::TimeStamp(TIME.parse().expect("the test TimeStamp"));
+        let data = b"enhanced data";
+
+        let payload = signer
+            .authentication_3(
+                &enhanced_write(&key, &freshness, data),
+                None,
+                &mut ChaCha20Rng::seed_from_u64(3),
+            )
+            .expect("sign");
+
+        assert_eq!(
+            payload[..4],
+            [1, 1, 0, 0],
+            "{digest:?}: Version, Type, padding"
+        );
+        assert_eq!(payload[8..12], [0; 4], "{digest:?}: Flags");
+        assert_eq!(payload[12..28], TIME_BYTES, "{digest:?}: EFI_TIME");
+        let (length, signed) = certificate_at(&payload, 28);
+        let metadata_size = u32::from_le_bytes(payload[4..8].try_into().expect("MetadataSize"));
+        assert_eq!(
+            usize::try_from(metadata_size).expect("MetadataSize fits usize"),
+            28 + length,
+            "{digest:?}: MetadataSize"
+        );
+        assert_eq!(&payload[28 + length..], data, "{digest:?}: the data");
+        assert!(
+            signed.encap_content_info.econtent.is_none(),
+            "{digest:?}: no content"
+        );
+        let signature = signer_signature(&signed, oid, &format!("{digest:?}"));
+        let input = spec_serialization(&TIME_BYTES, data, &[]);
+        assert!(
+            verifies(digest, &input, signature),
+            "{digest:?}: the signature verifies over the serialization"
+        );
+        let mut flipped = input.clone();
+        *flipped.last_mut().expect("a data byte") ^= 1;
+        assert!(
+            !verifies(digest, &flipped, signature),
+            "{digest:?}: a flipped data byte fails"
+        );
+    }
+
+    #[test]
+    fn authentication_3_signs_with_sha256() {
+        assert_authentication_3_verifies(SignatureDigest::Sha256, EDK2_SHA256_OID);
+    }
+
+    #[test]
+    fn authentication_3_signs_with_sha384() {
+        assert_authentication_3_verifies(SignatureDigest::Sha384, EDK2_SHA384_OID);
+    }
+
+    #[test]
+    fn authentication_3_signs_with_sha512() {
+        assert_authentication_3_verifies(SignatureDigest::Sha512, EDK2_SHA512_OID);
+    }
+
+    /// The new authority of the NewCert tests, the other key, over `digest`.
+    fn new_authority(digest: SignatureDigest) -> Signer {
+        let (key, certificate) = other_pems();
+        Signer::from_pem(key, certificate.as_bytes(), digest).expect("the new authority")
+    }
+
+    /// The payload of a nonce-type update of `data` with the NewCert of new_authority(SHA-256),
+    /// signed by the test key, and the offsets of its NewCert and SigningCert.
+    fn new_cert_payload(data: &[u8]) -> (Vec<u8>, usize, usize) {
+        let key = enhanced_key();
+        let freshness = nonce_freshness(Some(&[7; 3]));
+        let payload = test_signer()
+            .authentication_3(
+                &enhanced_write(&key, &freshness, data),
+                Some(&new_authority(SignatureDigest::Sha256)),
+                &mut ChaCha20Rng::seed_from_u64(4),
+            )
+            .expect("sign");
+        // The descriptor ends at 12 + 4 + 5 = 21, so the NewCert starts at 24.
+        let (new_length, _) = certificate_at(&payload, 24);
+        (payload, 24, (24 + new_length).next_multiple_of(4))
+    }
+
+    /// With a new authority, Flags has UPDATE_CERT, the NewCert at 24 carries the new
+    /// certificate's tbsCertificate as content, which the new key signs and the test key does
+    /// not, and the certificate itself; the SigningCert follows it on a 4-byte boundary after
+    /// any zero bytes, its content absent; nonce_payload_pads_each_certificate_to_4 covers a
+    /// NewCert that needs them.
+    #[test]
+    fn new_cert_self_signs_its_tbs_certificate() {
+        let (payload, new_at, signing_at) = new_cert_payload(b"v3");
+        assert_eq!(payload[..4], [1, 2, 0, 0], "Version, Type, padding");
+        assert_eq!(payload[8..12], 1u32.to_le_bytes(), "Flags UPDATE_CERT");
+        let (new_length, new_signed) = certificate_at(&payload, new_at);
+        assert!(
+            payload[new_at + new_length..signing_at]
+                .iter()
+                .all(|&byte| byte == 0),
+            "zero padding after the NewCert"
+        );
+
+        let certificate =
+            Certificate::from_pem(other_pems().1.as_bytes()).expect("the new certificate");
+        let tbs = certificate
+            .tbs_certificate
+            .to_der()
+            .expect("encode the new tbsCertificate");
+        let content = new_signed
+            .encap_content_info
+            .econtent
+            .as_ref()
+            .expect("the NewCert carries content");
+        assert_eq!(
+            (content.tag(), content.value()),
+            (Tag::OctetString, tbs.as_slice()),
+            "content: the tbsCertificate as id-data's OCTET STRING"
+        );
+        let carried = new_signed
+            .certificates
+            .as_ref()
+            .expect("the NewCert carries certificates")
+            .0
+            .iter()
+            .any(|choice| *choice == CertificateChoices::Certificate(certificate.clone()));
+        assert!(carried, "the NewCert carries the new certificate");
+        let signature = signer_signature(&new_signed, EDK2_SHA256_OID, "NewCert");
+        assert!(
+            verifies_by(&other_pems().0, SignatureDigest::Sha256, &tbs, signature),
+            "the new key signs the tbsCertificate"
+        );
+        assert!(
+            !verifies(SignatureDigest::Sha256, &tbs, signature),
+            "the test key does not"
+        );
+
+        let (_, signing) = certificate_at(&payload, signing_at);
+        assert!(
+            signing.encap_content_info.econtent.is_none(),
+            "the SigningCert carries no content"
+        );
+    }
+
+    /// An update of a nonce-type variable that also hands it to a new authority signs the
+    /// current nonce after the data, then the whole NewCert (UEFI 2.11 §8.2.5 step 3, c then d),
+    /// not the other way round.
+    #[test]
+    fn current_nonce_precedes_new_cert() {
+        let (payload, new_at, signing_at) = new_cert_payload(b"v3");
+        let (new_length, _) = certificate_at(&payload, new_at);
+        let new_cert = &payload[new_at..new_at + new_length];
+        let (_, signing) = certificate_at(&payload, signing_at);
+        let signature = signer_signature(&signing, EDK2_SHA256_OID, "SigningCert");
+
+        assert!(
+            verifies(
+                SignatureDigest::Sha256,
+                &spec_serialization(&NONCE_DESCRIPTOR, b"v3", &[&[7; 3], new_cert]),
+                signature
+            ),
+            "the current nonce, then the NewCert"
+        );
+        assert!(
+            !verifies(
+                SignatureDigest::Sha256,
+                &spec_serialization(&NONCE_DESCRIPTOR, b"v3", &[new_cert, &[7; 3]]),
+                signature
+            ),
+            "not the NewCert, then the current nonce"
+        );
+    }
+
+    /// A certificate-only update, of empty data with a NewCert, ends at MetadataSize, and
+    /// authentication_3_value takes it.
+    #[test]
+    fn certificate_only_update_has_no_data() {
+        let (payload, _, signing_at) = new_cert_payload(b"");
+        let (signing_length, _) = certificate_at(&payload, signing_at);
+
+        assert_eq!(payload.len(), signing_at + signing_length, "no data");
+        assert_eq!(
+            crate::efi_variables::enhanced_authenticated::authentication_3_value(&payload)
+                .map(|value| (value.new_cert, value.data.len())),
+            Ok((true, 0)),
+            "authentication_3_value"
         );
     }
 

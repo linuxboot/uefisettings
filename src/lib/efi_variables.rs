@@ -108,6 +108,8 @@ use crate::firmware_width::FirmwareWidth;
 use crate::hii::package::Guid;
 #[cfg(any(variable_storage_info, variable_data))]
 use crate::hii::VariableAttributes;
+#[cfg(variable_data)]
+use crate::hii::VariableInterface;
 #[cfg(any(variable_names, variable_info, variable_data))]
 use crate::hii::VariableKey;
 
@@ -256,6 +258,9 @@ pub struct VariableInfo {
 /// backend reaches, whole.
 #[cfg(variable_data)]
 pub(crate) trait VariableData {
+    /// The interface through which the backend reads and writes variables, which decides what
+    /// it can write.
+    fn interface(&self) -> VariableInterface;
     /// The attributes and data of `key`, or None if the backend reaches no such variable.
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>>;
     /// Sets `key` to `contents`, creating it if missing.

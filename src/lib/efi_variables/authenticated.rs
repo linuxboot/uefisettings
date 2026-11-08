@@ -17,7 +17,9 @@
 //! caller's key signs (signing.rs) goes after the descriptor that uefisettings makes.
 //! uefisettings checks that a payload's descriptor is complete and refuses, before any write, a
 //! write that would delete the variable and one that the firmware may make without checking the
-//! signature.
+//! signature. With EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, the same for an
+//! EFI_VARIABLE_AUTHENTICATION_3 and its descriptors (§8.2.5, enhanced_authenticated.rs), which
+//! no Secure Boot policy variable takes and Linux's efivarfs cannot write.
 //! The backends' VariableData does the I/O: efivarfs on Linux (hii/efivarfs.rs), SetVariable() in
 //! the UEFI Shell (hii/variable_services.rs), and SetFirmwareEnvironmentVariableExW on Windows
 //! (hii/firmware_environment.rs), whose dwAttributes carries
@@ -31,11 +33,14 @@ use thiserror::Error;
 
 use self::signing::seeded_rng;
 use self::signing::AuthenticatedWrite;
+use self::signing::EnhancedWrite;
 use self::signing::SeedSource;
 pub use self::signing::SignatureDigest;
 use self::signing::Signer;
 pub use self::signing::TimeStamp;
 pub use self::signing::TimeStampError;
+use super::enhanced_authenticated::authentication_3_value;
+use super::enhanced_authenticated::Freshness;
 use super::globals::EFI_DEVICE_SECURITY_DATABASE;
 use super::globals::EFI_GLOBAL_VARIABLE;
 use super::globals::EFI_IMAGE_SECURITY_DATABASE;
@@ -48,16 +53,20 @@ use super::VariableData;
 use super::EFI_TIME_SIZE;
 use crate::hii::package::Guid;
 use crate::hii::VariableAttributes;
+use crate::hii::VariableInterface;
 use crate::hii::VariableKey;
 
 /// The size of a WIN_CERTIFICATE_UEFI_GUID before its CertData: the dwLength, wRevision and
 /// wCertificateType of its Hdr, and its CertType (UEFI 2.11 §32.2.4.1, §32.2.4.3).
-const CERTIFICATE_HEADER_SIZE: usize = 24;
+pub(super) const CERTIFICATE_HEADER_SIZE: usize = 24;
+/// WIN_CERTIFICATE.wRevision (UEFI 2.11 §32.2.4.1).
+pub(super) const WIN_CERT_REVISION: u16 = 0x0200;
 /// WIN_CERT_TYPE_EFI_GUID (UEFI 2.11 §32.2.4.1).
-const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
+pub(super) const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 /// EFI_CERT_TYPE_PKCS7_GUID (UEFI 2.11 §32.2.4.3), the only CertType that an
-/// EFI_VARIABLE_AUTHENTICATION_2 takes (§8.2.3).
-const EFI_CERT_TYPE_PKCS7_GUID: Guid = Guid {
+/// EFI_VARIABLE_AUTHENTICATION_2 takes (§8.2.3), and that an EFI_VARIABLE_AUTHENTICATION_3's
+/// certificates take (§8.2.5).
+pub(super) const EFI_CERT_TYPE_PKCS7_GUID: Guid = Guid {
     data1: 0x4AAF_D29D,
     data2: 0x68DF,
     data3: 0x49EE,
@@ -76,7 +85,8 @@ const SIGNED_WRITE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLA
     .union(VariableAttributes::BOOTSERVICE_ACCESS)
     .union(VariableAttributes::RUNTIME_ACCESS)
     .union(VariableAttributes::APPEND_WRITE)
-    .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
+    .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
+    .union(VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS);
 
 /// Whether a signed write of a Secure Boot Policy Variable goes ahead while SetupMode is 1, when
 /// the firmware writes it without checking its signature (UEFI 2.11 §8.2.6, §32.3), and of a
@@ -93,6 +103,9 @@ pub enum SetupModeWrite {
 /// attributes, attributes without access, a payload without a complete descriptor, one without
 /// data unless it appends, either of which would delete the variable, and, unless `setup_mode`
 /// allows it, a Secure Boot Policy Variable or a device signature database while SetupMode is 1.
+/// With EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS in `attributes`, `payload` is an
+/// EFI_VARIABLE_AUTHENTICATION_3 and its descriptors, then the new data (§8.2.5), written with
+/// `attributes` alone, as write_enhanced refuses.
 pub(crate) fn write_signed(
     variables: &impl VariableData,
     key: &VariableKey,
@@ -101,6 +114,9 @@ pub(crate) fn write_signed(
     setup_mode: SetupModeWrite,
 ) -> Result<()> {
     let attributes = signed_write_attributes(attributes)?;
+    if attributes.contains(VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS) {
+        return write_enhanced(variables, key, attributes, payload, setup_mode);
+    }
     let value = auth2_value(payload)?;
     refuse_deletion_and_setup_mode(variables, key, attributes, value, setup_mode)?;
     variables.set_variable(key, &VariableContents::new(attributes, payload.to_vec())?)
@@ -148,6 +164,97 @@ pub(crate) fn sign_and_write(
     variables.set_variable(write.key, &VariableContents::new(attributes, payload)?)
 }
 
+/// Writes `payload`, an EFI_VARIABLE_AUTHENTICATION_3 of the variable `key` with its descriptors
+/// and new data (UEFI 2.11 §8.2.5), through `variables` with `attributes`, which hold
+/// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS. Before any write, it refuses what
+/// refuse_enhanced_write refuses, a payload whose descriptors are malformed, one without data
+/// and without a NewCert, which would delete the variable, and, unless `setup_mode` allows it, a
+/// device signature database while SetupMode is 1.
+fn write_enhanced(
+    variables: &impl VariableData,
+    key: &VariableKey,
+    attributes: VariableAttributes,
+    payload: &[u8],
+    setup_mode: SetupModeWrite,
+) -> Result<()> {
+    refuse_enhanced_write(variables, key)?;
+    let value = authentication_3_value(payload)?;
+    refuse_enhanced_deletion(key, value.data, value.new_cert)?;
+    refuse_setup_mode_write(variables, key, setup_mode)?;
+    variables.set_variable(key, &VariableContents::new(attributes, payload.to_vec())?)
+}
+
+/// A write that sign_and_write_enhanced signs: `data`, the new data of the variable `key`, with
+/// `attributes`, to which it adds EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, and `freshness`,
+/// and whether it goes ahead in Setup Mode.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EnhancedSignedWrite<'a> {
+    pub(crate) key: &'a VariableKey,
+    pub(crate) attributes: VariableAttributes,
+    pub(crate) data: &'a [u8],
+    pub(crate) freshness: &'a Freshness,
+    pub(crate) setup_mode: SetupModeWrite,
+}
+
+/// Signs `write` with `signer` into an EFI_VARIABLE_AUTHENTICATION_3 (UEFI 2.11 §8.2.5) that
+/// carries the NewCert of `new_authority` if given, blinded over a ChaCha20Rng that `seed` seeds,
+/// and writes it, then the data. It refuses what write_enhanced refuses before it seeds, and a
+/// failing seed source refuses before any write.
+pub(crate) fn sign_and_write_enhanced(
+    variables: &impl VariableData,
+    write: &EnhancedSignedWrite<'_>,
+    signer: &Signer,
+    new_authority: Option<&Signer>,
+    seed: &mut impl SeedSource,
+) -> Result<()> {
+    let attributes = signed_write_attributes(
+        write
+            .attributes
+            .union(VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS),
+    )?;
+    refuse_enhanced_write(variables, write.key)?;
+    refuse_enhanced_deletion(write.key, write.data, new_authority.is_some())?;
+    refuse_setup_mode_write(variables, write.key, write.setup_mode)?;
+    let mut rng = seeded_rng(seed)?;
+    let payload = signer.authentication_3(
+        &EnhancedWrite {
+            key: write.key,
+            attributes,
+            freshness: write.freshness,
+            data: write.data,
+        },
+        new_authority,
+        &mut rng,
+    )?;
+    variables.set_variable(write.key, &VariableContents::new(attributes, payload)?)
+}
+
+/// Refuses an EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS write of `key` through Linux's
+/// efivarfs, which refuses the attribute before the firmware sees it, and one of a Secure Boot
+/// Policy Variable, which takes only an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 §3.3, §8.2.3).
+fn refuse_enhanced_write(variables: &impl VariableData, key: &VariableKey) -> Result<()> {
+    match variables.interface() {
+        VariableInterface::Efivarfs => {
+            return Err(SignedWriteRefusal::EnhancedThroughEfivarfs(key.clone()).into())
+        }
+        VariableInterface::VariableServices | VariableInterface::FirmwareEnvironment => {}
+    }
+    if is_secure_boot_policy_variable(key) {
+        return Err(SignedWriteRefusal::EnhancedPolicyVariable(key.clone()).into());
+    }
+    Ok(())
+}
+
+/// Refuses an EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS write of `key` whose new data `data` is
+/// empty while it carries no NewCert, as `new_cert` tells: it would delete the variable (UEFI
+/// 2.11 §8.2.3). Empty data with a NewCert updates the certificate alone.
+fn refuse_enhanced_deletion(key: &VariableKey, data: &[u8], new_cert: bool) -> Result<()> {
+    match (data.is_empty(), new_cert) {
+        (true, false) => Err(SignedWriteRefusal::EnhancedDelete(key.clone()).into()),
+        (true, true) | (false, _) => Ok(()),
+    }
+}
+
 /// Refuses a write of `value`, the new data of `key`, with `attributes`, that would delete the
 /// variable, as no data without APPEND_WRITE does (UEFI 2.11 §8.2.3), and, unless `setup_mode`
 /// allows it, one of a Secure Boot Policy Variable while SetupMode is 1, which the firmware makes
@@ -163,6 +270,18 @@ fn refuse_deletion_and_setup_mode(
     if value.is_empty() && !attributes.contains(VariableAttributes::APPEND_WRITE) {
         return Err(SignedWriteRefusal::Delete(key.clone()).into());
     }
+    refuse_setup_mode_write(variables, key, setup_mode)
+}
+
+/// The Setup Mode refusal of refuse_deletion_and_setup_mode, which the
+/// EFI_VARIABLE_AUTHENTICATION_3 writes share: a device signature database takes that
+/// descriptor in Setup Mode too (UEFI 2.11 §32.6.3), and refuse_enhanced_write refuses every
+/// Secure Boot Policy Variable first.
+fn refuse_setup_mode_write(
+    variables: &impl VariableData,
+    key: &VariableKey,
+    setup_mode: SetupModeWrite,
+) -> Result<()> {
     let refusal = match setup_mode {
         SetupModeWrite::Refuse if is_secure_boot_policy_variable(key) => {
             SignedWriteRefusal::SetupModePolicyWrite(key.clone())
@@ -184,10 +303,36 @@ fn refuse_deletion_and_setup_mode(
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 enum SignedWriteRefusal {
     #[error(
-        "{0}: a signed write takes only NON_VOLATILE, BOOTSERVICE_ACCESS, RUNTIME_ACCESS and \
-         APPEND_WRITE, and adds TIME_BASED_AUTHENTICATED_WRITE_ACCESS"
+        "{0}: a signed write takes only NON_VOLATILE, BOOTSERVICE_ACCESS, RUNTIME_ACCESS, \
+         APPEND_WRITE and ENHANCED_AUTHENTICATED_ACCESS, and adds \
+         TIME_BASED_AUTHENTICATED_WRITE_ACCESS without ENHANCED_AUTHENTICATED_ACCESS"
     )]
     Attributes(VariableAttributes),
+    #[error(
+        "{0}: SetVariable() returns EFI_INVALID_PARAMETER for both \
+         TIME_BASED_AUTHENTICATED_WRITE_ACCESS and ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 \
+         section 8.2.3)"
+    )]
+    TimeBasedAndEnhanced(VariableAttributes),
+    #[error(
+        "Linux's efivarfs cannot write EFI variable {0} with ENHANCED_AUTHENTICATED_ACCESS: its \
+         EFI_VARIABLE_MASK (include/linux/efi.h) lacks the attribute, so efivarfs_file_write() \
+         (fs/efivarfs/file.c) refuses the write with EINVAL; write it with uefisettings.efi in \
+         the UEFI Shell"
+    )]
+    EnhancedThroughEfivarfs(VariableKey),
+    #[error(
+        "EFI variable {0} is a Secure Boot policy variable, which takes only an \
+         EFI_VARIABLE_AUTHENTICATION_2 with TIME_BASED_AUTHENTICATED_WRITE_ACCESS (UEFI 2.11 \
+         sections 3.3 and 8.2.3)"
+    )]
+    EnhancedPolicyVariable(VariableKey),
+    #[error(
+        "the write holds no data after its EFI_VARIABLE_AUTHENTICATION_3 descriptors and no \
+         NewCert, so it would delete EFI variable {0} (UEFI 2.11 section 8.2.3), which a signed \
+         write does not do"
+    )]
+    EnhancedDelete(VariableKey),
     #[error(
         "the payload holds {0} bytes, fewer than the {} of the TimeStamp and the AuthInfo header \
          of an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 section 8.2.3)",
@@ -245,9 +390,11 @@ enum SignedWriteRefusal {
     NoAccess(VariableAttributes),
 }
 
-/// `attributes` and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, unless they hold an
-/// attribute that a signed write does not take, runtime access without boot service access, or
-/// no access attribute, with which a write deletes the variable (UEFI 2.11 §8.2.3).
+/// `attributes` and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, or `attributes` alone
+/// with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, unless they hold an attribute that a signed
+/// write does not take, runtime access without boot service access, no access attribute, with
+/// which a write deletes the variable, or both authentication attributes, which SetVariable()
+/// refuses (UEFI 2.11 §8.2.3).
 fn signed_write_attributes(attributes: VariableAttributes) -> Result<VariableAttributes> {
     let refused = attributes.difference(SIGNED_WRITE_ATTRIBUTES);
     if !refused.is_empty() {
@@ -263,7 +410,16 @@ fn signed_write_attributes(attributes: VariableAttributes) -> Result<VariableAtt
     {
         return Err(SignedWriteRefusal::NoAccess(attributes).into());
     }
-    Ok(attributes.union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS))
+    match (
+        attributes.contains(VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS),
+        attributes.contains(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS),
+    ) {
+        (true, true) => Err(SignedWriteRefusal::TimeBasedAndEnhanced(attributes).into()),
+        (true, false) => Ok(attributes),
+        (false, _) => {
+            Ok(attributes.union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS))
+        }
+    }
 }
 
 /// The new data of the variable in `payload`, after its EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11
@@ -339,6 +495,9 @@ mod tests {
     use rand_core::SeedableRng;
 
     use super::*;
+    use crate::efi_variables::enhanced_authenticated::authentication_3_payload;
+    use crate::efi_variables::enhanced_authenticated::fixture::win_certificate_of;
+    use crate::efi_variables::enhanced_authenticated::Nonce;
     use crate::efi_variables::globals::tests::key;
     use crate::efi_variables::globals::tests::HeldVariables;
     use crate::efi_variables::globals::tests::DEVDB_VENDOR;
@@ -844,26 +1003,30 @@ mod tests {
             (
                 VariableAttributes::HARDWARE_ERROR_RECORD | NV_BS_RT,
                 "HARDWARE_ERROR_RECORD: a signed write takes only NON_VOLATILE, \
-                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS and APPEND_WRITE, and adds \
-                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS",
+                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS, APPEND_WRITE and \
+                 ENHANCED_AUTHENTICATED_ACCESS, and adds TIME_BASED_AUTHENTICATED_WRITE_ACCESS \
+                 without ENHANCED_AUTHENTICATED_ACCESS",
             ),
             (
                 VariableAttributes::AUTHENTICATED_WRITE_ACCESS | NV_BS_RT,
                 "AUTHENTICATED_WRITE_ACCESS: a signed write takes only NON_VOLATILE, \
-                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS and APPEND_WRITE, and adds \
-                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS",
+                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS, APPEND_WRITE and \
+                 ENHANCED_AUTHENTICATED_ACCESS, and adds TIME_BASED_AUTHENTICATED_WRITE_ACCESS \
+                 without ENHANCED_AUTHENTICATED_ACCESS",
             ),
             (
                 VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS
                     | VariableAttributes::HARDWARE_ERROR_RECORD,
-                "HARDWARE_ERROR_RECORD | ENHANCED_AUTHENTICATED_ACCESS: a signed write takes \
-                 only NON_VOLATILE, BOOTSERVICE_ACCESS, RUNTIME_ACCESS and APPEND_WRITE, and adds \
-                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS",
+                "HARDWARE_ERROR_RECORD: a signed write takes only NON_VOLATILE, \
+                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS, APPEND_WRITE and \
+                 ENHANCED_AUTHENTICATED_ACCESS, and adds TIME_BASED_AUTHENTICATED_WRITE_ACCESS \
+                 without ENHANCED_AUTHENTICATED_ACCESS",
             ),
             (
                 VariableAttributes::from_bits_retain(0x100) | NV_BS_RT,
                 "0x100: a signed write takes only NON_VOLATILE, BOOTSERVICE_ACCESS, \
-                 RUNTIME_ACCESS and APPEND_WRITE, and adds TIME_BASED_AUTHENTICATED_WRITE_ACCESS",
+                 RUNTIME_ACCESS, APPEND_WRITE and ENHANCED_AUTHENTICATED_ACCESS, and adds \
+                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS without ENHANCED_AUTHENTICATED_ACCESS",
             ),
             (
                 VariableAttributes::NON_VOLATILE | VariableAttributes::RUNTIME_ACCESS,
@@ -906,6 +1069,10 @@ mod tests {
     struct UnreadableVariables(HeldVariables);
 
     impl VariableData for UnreadableVariables {
+        fn interface(&self) -> VariableInterface {
+            self.0.interface()
+        }
+
         fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
             Err(anyhow::anyhow!("cannot read EFI variable {key}"))
         }
@@ -1157,8 +1324,9 @@ mod tests {
                 VariableAttributes::HARDWARE_ERROR_RECORD | NV_BS_RT,
                 VALUE,
                 "HARDWARE_ERROR_RECORD: a signed write takes only NON_VOLATILE, \
-                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS and APPEND_WRITE, and adds \
-                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS"
+                 BOOTSERVICE_ACCESS, RUNTIME_ACCESS, APPEND_WRITE and \
+                 ENHANCED_AUTHENTICATED_ACCESS, and adds TIME_BASED_AUTHENTICATED_WRITE_ACCESS \
+                 without ENHANCED_AUTHENTICATED_ACCESS"
                     .to_owned(),
             ),
             (
@@ -1205,6 +1373,463 @@ mod tests {
 
             assert_eq!(format!("{error:#}"), refusal, "{case}");
             assert_eq!(*variables.set.borrow(), [], "{case}: writes");
+        }
+    }
+
+    /// NV+BS+RT and ENHANCED_AUTHENTICATED_ACCESS.
+    const NV_BS_RT_ENHANCED: VariableAttributes =
+        NV_BS_RT.union(VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS);
+
+    /// A timestamp-type EFI_VARIABLE_AUTHENTICATION_3 payload of `data`, with a NewCert if
+    /// `new_cert`, whose certificates carry CERT_DATA.
+    fn auth3(data: &[u8], new_cert: bool) -> Vec<u8> {
+        let freshness =
+            Freshness::TimeStamp(signing::tests::TIME.parse().expect("the test TimeStamp"));
+        let new_cert = new_cert.then(|| win_certificate_of(CERT_DATA));
+        authentication_3_payload(
+            &freshness,
+            new_cert.as_deref(),
+            &win_certificate_of(CERT_DATA),
+            data,
+        )
+        .expect("a payload")
+    }
+
+    /// write_signed passes a pre-signed EFI_VARIABLE_AUTHENTICATION_3 payload with
+    /// ENHANCED_AUTHENTICATED_ACCESS to SetVariable() unchanged, adding no
+    /// TIME_BASED_AUTHENTICATED_WRITE_ACCESS, and that of a certificate-only update too: empty
+    /// data with a NewCert.
+    #[test]
+    fn write_signed_writes_enhanced_authenticated_payloads_unchanged() {
+        let signed = key("Signed", VENDOR);
+        for (case, payload) in [
+            ("data", auth3(VALUE, false)),
+            ("data and a NewCert", auth3(VALUE, true)),
+            ("a certificate-only update", auth3(&[], true)),
+        ] {
+            let variables = firmware(Some(&[0]));
+
+            write_signed(
+                &variables,
+                &signed,
+                NV_BS_RT_ENHANCED,
+                &payload,
+                SetupModeWrite::Refuse,
+            )
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+            assert_eq!(held(&variables, &signed), written(0x87, &payload), "{case}");
+            assert_eq!(
+                *variables.set.borrow(),
+                std::slice::from_ref(&signed),
+                "{case}: writes"
+            );
+        }
+    }
+
+    /// write_signed refuses, writing nothing, both authentication attributes, an enhanced write
+    /// through efivarfs, of a Secure Boot policy variable, without data or a NewCert, which would
+    /// delete the variable, and with a broken descriptor.
+    #[test]
+    fn write_signed_refuses_enhanced_authenticated_payloads_before_any_write() {
+        let signed = key("Signed", VENDOR);
+        let db = key("db", EFI_IMAGE_SECURITY_DATABASE);
+        let mut broken = auth3(VALUE, false);
+        broken[0] = 2;
+        let cases = [
+            (
+                &signed,
+                NV_BS_RT_ENHANCED | VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+                VariableInterface::VariableServices,
+                auth3(VALUE, false),
+                "NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | \
+                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS | ENHANCED_AUTHENTICATED_ACCESS: \
+                 SetVariable() returns EFI_INVALID_PARAMETER for both \
+                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS and ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 \
+                 section 8.2.3)"
+                    .to_owned(),
+            ),
+            (
+                &signed,
+                NV_BS_RT_ENHANCED,
+                VariableInterface::Efivarfs,
+                auth3(VALUE, false),
+                format!(
+                    "Linux's efivarfs cannot write EFI variable {signed} with \
+                     ENHANCED_AUTHENTICATED_ACCESS: its EFI_VARIABLE_MASK (include/linux/efi.h) \
+                     lacks the attribute, so efivarfs_file_write() (fs/efivarfs/file.c) refuses \
+                     the write with EINVAL; write it with uefisettings.efi in the UEFI Shell"
+                ),
+            ),
+            (
+                &db,
+                NV_BS_RT_ENHANCED,
+                VariableInterface::VariableServices,
+                auth3(VALUE, false),
+                format!(
+                    "EFI variable {db} is a Secure Boot policy variable, which takes only an \
+                     EFI_VARIABLE_AUTHENTICATION_2 with TIME_BASED_AUTHENTICATED_WRITE_ACCESS \
+                     (UEFI 2.11 sections 3.3 and 8.2.3)"
+                ),
+            ),
+            (
+                &signed,
+                NV_BS_RT_ENHANCED,
+                VariableInterface::VariableServices,
+                auth3(&[], false),
+                format!(
+                    "the write holds no data after its EFI_VARIABLE_AUTHENTICATION_3 descriptors \
+                     and no NewCert, so it would delete EFI variable {signed} (UEFI 2.11 section \
+                     8.2.3), which a signed write does not do"
+                ),
+            ),
+            (
+                &signed,
+                NV_BS_RT_ENHANCED,
+                VariableInterface::VariableServices,
+                broken,
+                "the payload's EFI_VARIABLE_AUTHENTICATION_3 Version is 2, not 1 (UEFI 2.11 \
+                 section 8.2.3)"
+                    .to_owned(),
+            ),
+        ];
+        for (key, attributes, interface, payload, refusal) in cases {
+            let variables = firmware(Some(&[0])).through(interface);
+
+            let error = write_signed(
+                &variables,
+                key,
+                attributes,
+                &payload,
+                SetupModeWrite::Refuse,
+            )
+            .expect_err(&refusal);
+
+            assert_eq!(
+                error.to_string(),
+                refusal,
+                "{key} {attributes} {interface:?}"
+            );
+            assert_eq!(
+                *variables.set.borrow(),
+                [],
+                "{key} {attributes} {interface:?}: writes"
+            );
+        }
+    }
+
+    /// The EFI_VARIABLE_AUTHENTICATION_3 path refuses every Secure Boot policy variable (UEFI
+    /// 2.11 §3.3), of EFI_GLOBAL_VARIABLE, any vendor's OsRecovery#### and every variable of
+    /// EFI_IMAGE_SECURITY_DATABASE_GUID, before it reads the payload, writing nothing.
+    #[test]
+    fn enhanced_refuses_every_policy_variable() {
+        for key in [
+            key("PK", EFI_GLOBAL_VARIABLE),
+            key("KEK", EFI_GLOBAL_VARIABLE),
+            key("OsRecoveryOrder", EFI_GLOBAL_VARIABLE),
+            key("OsRecovery0001", VENDOR),
+            key("db", EFI_IMAGE_SECURITY_DATABASE),
+            key("dbx", EFI_IMAGE_SECURITY_DATABASE),
+        ] {
+            let variables = firmware(Some(&[0]));
+
+            let error = write_signed(
+                &variables,
+                &key,
+                NV_BS_RT_ENHANCED,
+                &[0; 64],
+                SetupModeWrite::WithoutSignatureCheck,
+            )
+            .expect_err("a policy variable");
+
+            assert_eq!(
+                error.downcast_ref::<SignedWriteRefusal>(),
+                Some(&SignedWriteRefusal::EnhancedPolicyVariable(key.clone())),
+                "{key}: {error}"
+            );
+            assert_eq!(*variables.set.borrow(), [], "{key}: writes");
+        }
+    }
+
+    /// A write that sign_and_write_enhanced signs at the test TimeStamp, or as a nonce-type
+    /// update.
+    fn enhanced_signed_write<'a>(
+        key: &'a VariableKey,
+        attributes: VariableAttributes,
+        data: &'a [u8],
+        freshness: &'a Freshness,
+    ) -> EnhancedSignedWrite<'a> {
+        EnhancedSignedWrite {
+            key,
+            attributes,
+            data,
+            freshness,
+            setup_mode: SetupModeWrite::Refuse,
+        }
+    }
+
+    /// sign_and_write_enhanced writes, with ENHANCED_AUTHENTICATED_ACCESS added, the
+    /// EFI_VARIABLE_AUTHENTICATION_3 that the key signs, with the NewCert of a new authority if
+    /// given, and then the data, which a certificate-only update leaves empty.
+    #[test]
+    fn sign_and_write_enhanced_writes_what_the_key_signs() {
+        let signed = key("Signed", VENDOR);
+        let timestamp =
+            Freshness::TimeStamp(signing::tests::TIME.parse().expect("the test TimeStamp"));
+        let update = Freshness::Nonce {
+            nonce: Nonce::new(vec![9; 5]).expect("the nonce"),
+            current: Some(Nonce::new(vec![7; 3]).expect("the current nonce")),
+        };
+        let signer = signing::tests::test_signer();
+        let (authority_key, authority_certificate) = signing::tests::other_pems();
+        let authority = Signer::from_pem(
+            authority_key,
+            authority_certificate.as_bytes(),
+            SignatureDigest::Sha256,
+        )
+        .expect("the new authority");
+        let cases = [
+            ("timestamp", &timestamp, VALUE, None),
+            ("nonce update", &update, VALUE, None),
+            ("new authority", &update, VALUE, Some(&authority)),
+            ("certificate only", &update, &[][..], Some(&authority)),
+        ];
+        for (case, freshness, data, new_authority) in cases {
+            let variables = firmware(Some(&[0]));
+
+            sign_and_write_enhanced(
+                &variables,
+                &enhanced_signed_write(&signed, NV_BS_RT, data, freshness),
+                &signer,
+                new_authority,
+                &mut signing::tests::FakeSeed(Some(1)),
+            )
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+            let expected = signer
+                .authentication_3(
+                    &EnhancedWrite {
+                        key: &signed,
+                        attributes: NV_BS_RT_ENHANCED,
+                        freshness,
+                        data,
+                    },
+                    new_authority,
+                    &mut rand_chacha::ChaCha20Rng::seed_from_u64(0),
+                )
+                .expect("sign");
+            assert_eq!(
+                held(&variables, &signed),
+                written(0x87, &expected),
+                "{case}"
+            );
+        }
+    }
+
+    /// sign_and_write_enhanced refuses both authentication attributes, a write through
+    /// efivarfs, a Secure Boot policy variable and a write without data or a NewCert before it
+    /// seeds: without a seed source, the refusal is these, and nothing is written; a write that
+    /// it takes then fails at the seed.
+    #[test]
+    fn sign_and_write_enhanced_refuses_before_seeding() {
+        let signed = key("Signed", VENDOR);
+        let kek = key("KEK", EFI_GLOBAL_VARIABLE);
+        let freshness =
+            Freshness::TimeStamp(signing::tests::TIME.parse().expect("the test TimeStamp"));
+        let cases = [
+            (
+                "both authentications",
+                &signed,
+                NV_BS_RT | VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+                VALUE,
+                VariableInterface::VariableServices,
+                "NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | \
+                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS | ENHANCED_AUTHENTICATED_ACCESS: \
+                 SetVariable() returns EFI_INVALID_PARAMETER for both \
+                 TIME_BASED_AUTHENTICATED_WRITE_ACCESS and ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 \
+                 section 8.2.3)"
+                    .to_owned(),
+            ),
+            (
+                "efivarfs",
+                &signed,
+                NV_BS_RT,
+                VALUE,
+                VariableInterface::Efivarfs,
+                format!(
+                    "Linux's efivarfs cannot write EFI variable {signed} with \
+                     ENHANCED_AUTHENTICATED_ACCESS: its EFI_VARIABLE_MASK (include/linux/efi.h) \
+                     lacks the attribute, so efivarfs_file_write() (fs/efivarfs/file.c) refuses \
+                     the write with EINVAL; write it with uefisettings.efi in the UEFI Shell"
+                ),
+            ),
+            (
+                "a policy variable",
+                &kek,
+                NV_BS_RT,
+                VALUE,
+                VariableInterface::VariableServices,
+                format!(
+                    "EFI variable {kek} is a Secure Boot policy variable, which takes only an \
+                     EFI_VARIABLE_AUTHENTICATION_2 with TIME_BASED_AUTHENTICATED_WRITE_ACCESS \
+                     (UEFI 2.11 sections 3.3 and 8.2.3)"
+                ),
+            ),
+            (
+                "no data",
+                &signed,
+                NV_BS_RT,
+                &[][..],
+                VariableInterface::VariableServices,
+                format!(
+                    "the write holds no data after its EFI_VARIABLE_AUTHENTICATION_3 descriptors \
+                     and no NewCert, so it would delete EFI variable {signed} (UEFI 2.11 section \
+                     8.2.3), which a signed write does not do"
+                ),
+            ),
+            (
+                "a write that it takes",
+                &signed,
+                NV_BS_RT,
+                VALUE,
+                VariableInterface::VariableServices,
+                "cannot seed RSA blinding from EFI_RNG_PROTOCOL: no handle has it: NOT_FOUND"
+                    .to_owned(),
+            ),
+        ];
+        let signer = signing::tests::test_signer();
+        for (case, key, attributes, data, interface, refusal) in cases {
+            let variables = firmware(Some(&[0])).through(interface);
+
+            let error = sign_and_write_enhanced(
+                &variables,
+                &enhanced_signed_write(key, attributes, data, &freshness),
+                &signer,
+                None,
+                &mut signing::tests::FakeSeed(None),
+            )
+            .expect_err(case);
+
+            assert_eq!(format!("{error:#}"), refusal, "{case}");
+            assert_eq!(*variables.set.borrow(), [], "{case}: writes");
+        }
+    }
+
+    /// The refusal of a write of `key`, a device signature database, while SetupMode is 1.
+    fn device_database_refusal(key: &VariableKey) -> String {
+        format!(
+            "EFI variable {key} is a device signature database and SetupMode is 1, so the \
+             firmware may write it without checking the payload's signature (UEFI 2.11 section \
+             32.6.3)"
+        )
+    }
+
+    /// write_signed refuses an EFI_VARIABLE_AUTHENTICATION_3 write of each variable of
+    /// EFI_DEVICE_SECURITY_DATABASE_GUID while SetupMode is 1 (UEFI 2.11 §32.6.3), as for an
+    /// EFI_VARIABLE_AUTHENTICATION_2, and writes it when SetupMode is 0 or absent, or when
+    /// allowed.
+    #[test]
+    fn write_signed_refuses_enhanced_device_signature_databases_in_setup_mode() {
+        let databases = [key("devdb", DEVDB_VENDOR), key("Other", DEVDB_VENDOR)];
+        let payload = auth3(VALUE, false);
+
+        for key in &databases {
+            let variables = firmware(Some(&[1]));
+
+            let error = write_signed(
+                &variables,
+                key,
+                NV_BS_RT_ENHANCED,
+                &payload,
+                SetupModeWrite::Refuse,
+            )
+            .map_err(|error| error.to_string());
+
+            assert_eq!(error, Err(device_database_refusal(key)), "{key}");
+            assert_eq!(*variables.set.borrow(), [], "{key}: writes");
+        }
+        for (setup_mode, allowed, case) in [
+            (Some(&[0][..]), SetupModeWrite::Refuse, "SetupMode 0"),
+            (None, SetupModeWrite::Refuse, "no SetupMode"),
+            (
+                Some(&[1][..]),
+                SetupModeWrite::WithoutSignatureCheck,
+                "SetupMode 1, allowed",
+            ),
+        ] {
+            for key in &databases {
+                let variables = firmware(setup_mode);
+
+                write_signed(&variables, key, NV_BS_RT_ENHANCED, &payload, allowed)
+                    .unwrap_or_else(|error| panic!("{key}, {case}: {error:#}"));
+
+                assert_eq!(
+                    held(&variables, key),
+                    written(0x87, &payload),
+                    "{key}, {case}"
+                );
+            }
+        }
+    }
+
+    /// sign_and_write_enhanced refuses devdb while SetupMode is 1 unless allowed, before it
+    /// seeds, as write_signed does: the firmware may not check the signature (UEFI 2.11
+    /// §32.6.3). It writes devdb when SetupMode is 0 or absent, or when allowed.
+    #[test]
+    fn sign_and_write_enhanced_refuses_devdb_in_setup_mode_unless_allowed() {
+        let devdb = key("devdb", DEVDB_VENDOR);
+        let freshness =
+            Freshness::TimeStamp(signing::tests::TIME.parse().expect("the test TimeStamp"));
+        let signer = signing::tests::test_signer();
+        let write = |variables: &HeldVariables, setup_mode, seed| {
+            sign_and_write_enhanced(
+                variables,
+                &EnhancedSignedWrite {
+                    setup_mode,
+                    ..enhanced_signed_write(&devdb, NV_BS_RT, VALUE, &freshness)
+                },
+                &signer,
+                None,
+                &mut signing::tests::FakeSeed(seed),
+            )
+        };
+
+        let refused = firmware(Some(&[1]));
+        let error =
+            write(&refused, SetupModeWrite::Refuse, None).map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            error,
+            Err(device_database_refusal(&devdb)),
+            "the refusal, before the seed"
+        );
+        assert_eq!(*refused.set.borrow(), [], "writes without the flag");
+
+        let expected = signer
+            .authentication_3(
+                &EnhancedWrite {
+                    key: &devdb,
+                    attributes: NV_BS_RT_ENHANCED,
+                    freshness: &freshness,
+                    data: VALUE,
+                },
+                None,
+                &mut rand_chacha::ChaCha20Rng::seed_from_u64(0),
+            )
+            .expect("sign");
+        for (setup_mode, allowed, case) in [
+            (Some(&[0][..]), SetupModeWrite::Refuse, "SetupMode 0"),
+            (None, SetupModeWrite::Refuse, "no SetupMode"),
+            (
+                Some(&[1][..]),
+                SetupModeWrite::WithoutSignatureCheck,
+                "SetupMode 1, allowed",
+            ),
+        ] {
+            let variables = firmware(setup_mode);
+
+            write(&variables, allowed, Some(1)).unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+            assert_eq!(held(&variables, &devdb), written(0x87, &expected), "{case}");
         }
     }
 }

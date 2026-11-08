@@ -202,6 +202,10 @@ impl VariableInfoSource for VariableServices {
 }
 
 impl VariableData for VariableServices {
+    fn interface(&self) -> VariableInterface {
+        Self::INTERFACE
+    }
+
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
         let (data, attributes) = match get_variable(key) {
             Err(error) if error.is::<VariableNotFound>() => return Ok(None),

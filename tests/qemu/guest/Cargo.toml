@@ -48,6 +48,10 @@ name = "hii_acpi"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_auth87"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_devmem_guard"
 required-features = ["test-vm"]
 

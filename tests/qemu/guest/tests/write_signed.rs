@@ -79,6 +79,15 @@ const SIGN: &str = "/sign";
 const CLOCK_PROBE: &str = "ClockProbe";
 /// A TimeStamp before any that the system clock gives.
 const EARLIER: &str = "2000-01-01T00:00:00Z";
+/// A variable of OWNER that no Secure Boot policy names, which a write with
+/// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS would create.
+const ENHANCED_PROBE: &str = "EnhancedProbe";
+/// A write of a text to ENHANCED_PROBE in an EFI_VARIABLE_AUTHENTICATION_3 signed with KEK (run.sh
+/// secboot_files).
+const ENHANCED_WRITE: &str = "/auth/enhanced.auth";
+/// ATTRIBUTES and EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, those of ENHANCED_WRITE.
+const ENHANCED_ATTRIBUTES: &str =
+    "non-volatile,bootservice-access,runtime-access,enhanced-authenticated-access";
 /// EFI_CERT_X509_GUID, a5c059a1-94e4-4aa7-87b5-ab155c2bf072, as an EFI_GUID's bytes.
 const EFI_CERT_X509_GUID: [u8; 16] = [
     0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a, 0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
@@ -467,6 +476,78 @@ fn signing_in_user() {
         Some([&PROBE_ATTRIBUTES.to_ne_bytes()[..], &data].concat()),
         "{CLOCK_PROBE} after the write at {EARLIER}"
     );
+}
+
+#[test]
+fn signing_in_user_refuses_enhanced_authenticated_access() {
+    require_test_vm();
+    let probe = format!("{EFIVARS}/{ENHANCED_PROBE}-{OWNER}");
+    assert_absent(&probe);
+    let write = [
+        "variable",
+        "write-signed",
+        ENHANCED_PROBE,
+        OWNER,
+        "--attributes",
+        ENHANCED_ATTRIBUTES,
+    ]
+    .map(str::to_owned);
+    let signed = [
+        &write[..],
+        &[
+            "--data-file".to_owned(),
+            format!("{SIGN}/probe.data"),
+            "--signing-key-file".to_owned(),
+            format!("{SIGN}/KEK.key"),
+            "--signing-certificate-file".to_owned(),
+            format!("{SIGN}/KEK.crt"),
+        ],
+    ]
+    .concat();
+    let nonce = ["--nonce", "0123456789abcdef"].map(str::to_owned);
+    let new_cert = [
+        "--new-signing-key-file".to_owned(),
+        format!("{SIGN}/db.key"),
+        "--new-signing-certificate-file".to_owned(),
+        format!("{SIGN}/db.crt"),
+    ];
+
+    for (args, what) in [
+        (
+            [
+                &write[..],
+                &["--payload-file".to_owned(), ENHANCED_WRITE.to_owned()],
+            ]
+            .concat(),
+            "the pre-signed write",
+        ),
+        (
+            [&signed[..], &["--timestamp".to_owned(), EARLIER.to_owned()]].concat(),
+            "the write signed at a TimeStamp",
+        ),
+        (
+            [&signed[..], &nonce].concat(),
+            "the write signed with a nonce",
+        ),
+        (
+            [&signed[..], &nonce, &new_cert].concat(),
+            "the write signed with a NewCert",
+        ),
+    ] {
+        let error = json_error(&strs(&args));
+
+        assert_eq!(
+            error.error_message,
+            format!(
+                "Linux's efivarfs cannot write EFI variable {ENHANCED_PROBE}-{OWNER} with \
+                 ENHANCED_AUTHENTICATED_ACCESS: its EFI_VARIABLE_MASK (include/linux/efi.h) lacks \
+                 the attribute, so efivarfs_file_write() (fs/efivarfs/file.c) refuses the write \
+                 with EINVAL; write it with uefisettings.efi in the UEFI Shell"
+            ),
+            "{what}"
+        );
+        assert_absent(&probe);
+    }
 }
 
 #[test]

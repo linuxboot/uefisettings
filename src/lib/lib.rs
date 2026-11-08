@@ -34,6 +34,7 @@ pub mod exports;
 mod file_lock;
 #[cfg(variable_data)]
 mod firmware_width;
+mod hex_digits;
 mod hii;
 #[cfg(target_os = "linux")]
 mod ilorest;

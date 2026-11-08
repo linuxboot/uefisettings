@@ -45,3 +45,18 @@ private-other-key	status	aborted
 private-other-key	json	. == {"error_message": "SetVariable() of EFI variable PrivateProbe-de145b29-c3cd-455f-91de-a76237b67c52: SECURITY_VIOLATION"}
 private-info-after	status	0x0
 private-info-after	json	. == {"variable": "PrivateProbe-de145b29-c3cd-455f-91de-a76237b67c52", "attributes": 39, "size": 38}
+# the firmware lacks EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: SetVariable() returns
+# EFI_INVALID_PARAMETER for an attribute outside its EFI_VARIABLE_ATTRIBUTES_MASK (edk2's
+# VariableServiceSetVariable()), for run.sh's EFI_VARIABLE_AUTHENTICATION_3 and those that
+# uefisettings signs, and EnhancedProbe stays absent
+enhanced-payload	status	aborted
+enhanced-payload	json	. == {"error_message": "SetVariable() of EFI variable EnhancedProbe-de145b29-c3cd-455f-91de-a76237b67c52: INVALID_PARAMETER"}
+enhanced-timestamp	status	aborted
+enhanced-timestamp	json	. == {"error_message": "SetVariable() of EFI variable EnhancedProbe-de145b29-c3cd-455f-91de-a76237b67c52: INVALID_PARAMETER"}
+enhanced-nonce	status	aborted
+enhanced-nonce	json	. == {"error_message": "SetVariable() of EFI variable EnhancedProbe-de145b29-c3cd-455f-91de-a76237b67c52: INVALID_PARAMETER"}
+enhanced-new-cert	status	aborted
+enhanced-new-cert	json	. == {"error_message": "SetVariable() of EFI variable EnhancedProbe-de145b29-c3cd-455f-91de-a76237b67c52: INVALID_PARAMETER"}
+enhanced-dmpstore	status	any
+enhanced-dmpstore	line	No matching variables found
+enhanced-dmpstore	none	^Variable

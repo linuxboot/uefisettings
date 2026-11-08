@@ -549,13 +549,40 @@ non-compromised computer. uefisettings reads KEY as a secret; KEY and CERTIFICAT
 `--allow-setup-mode-write-without-signature-check` has either form write, while SetupMode is 1, a
 Secure Boot policy variable, which the firmware writes then without checking the signature (§3.3,
 §32.3), as to enroll KEK and then PK, or a device signature database, which the firmware may write
-then without checking the signature (§32.6.3); the payload is still an
-EFI_VARIABLE_AUTHENTICATION_2, and a write without data and without `--append` stays refused, as
-edk2 deletes the variable then. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed
-Mode (§32.3.1, §32.3.4). PK may have to be signed with its own key (§32.3.1).
+then without checking the signature (§32.6.3). The payload of a Secure Boot policy variable is
+still an EFI_VARIABLE_AUTHENTICATION_2; that of a device signature database may be either
+descriptor: an EFI_VARIABLE_AUTHENTICATION_3 with `enhanced-authenticated-access`, as §32.6.3
+formats a Setup Mode write, or an EFI_VARIABLE_AUTHENTICATION_2, which edk2 takes. A write without
+data and without `--append` stays refused, as edk2 deletes the variable then. Writing PK moves
+Setup Mode to User Mode, and Audit Mode to Deployed Mode (§32.3.1, §32.3.4). PK may have to be
+signed with its own key (§32.3.1).
 
 ```sh
 uefisettings variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E67656F --attributes non-volatile,bootservice-access,runtime-access --append --data-file db.esl --signing-key-file kek.key --signing-certificate-file kek.pem
+```
+
+With `enhanced-authenticated-access` in ATTRIBUTES, both forms write a variable of
+EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, whose descriptor is an EFI_VARIABLE_AUTHENTICATION_3
+(§8.2.5), without EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS. uefisettings checks the
+payload of `--payload-file` before it writes it unchanged: the 12-byte
+EFI_VARIABLE_AUTHENTICATION_3 of Version 1, its EFI_TIME or EFI_VARIABLE_AUTHENTICATION_3_NONCE, a
+NewCert if Flags has EFI_VARIABLE_ENHANCED_AUTH_FLAG_UPDATE_CERT, then the SigningCert, each
+certificate a WIN_CERTIFICATE_UEFI_GUID of PKCS #7 on a 4-byte boundary after zero bytes, as C lays
+the structures out, and MetadataSize their size, then the data. With `--data-file`, KEY signs over
+SHA-256 or the `--digest`, as above, and `--timestamp TIME` or `--nonce HEX` gives the Type; the
+firmware takes only a TimeStamp later than the variable's, or a nonce other than its own, and makes
+one for an all-zero nonce where it can. `--current-nonce HEX`, the variable's nonce, is required to
+update a NONCE variable, and `--new-signing-key-file KEY2 --new-signing-certificate-file
+CERTIFICATES2` adds a NewCert, which KEY2 signs over the same digest and which hands the variable
+to KEY2; with it, the data may be empty, to change the certificate alone. uefisettings does not
+compare these with the stored variable: the firmware does. Before it seeds or writes, it refuses a
+write without data or NewCert, which would delete the variable, a Secure Boot policy variable,
+which takes only an EFI_VARIABLE_AUTHENTICATION_2, a device signature database while SetupMode is
+1, as above, and on Linux every such write, as efivarfs lacks the attribute (EFI_VARIABLE_MASK in
+include/linux/efi.h); `uefisettings.efi` writes them in the UEFI Shell.
+
+```plain
+FS0:\> uefisettings.efi variable write-signed Example DE145B29-C3CD-455F-91DE-A76237B67C52 --attributes non-volatile,bootservice-access,runtime-access,enhanced-authenticated-access --data-file example.bin --signing-key-file owner.key --signing-certificate-file owner.pem --nonce 00000000000000000000000000000000
 ```
 
 </details>

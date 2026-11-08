@@ -197,13 +197,14 @@ and write.
 
 `publish-hiidb.efi enhanced-auth-forms` registers the forms of
 [`publish-hiidb/src/enhanced_auth_forms.rs`](publish-hiidb/src/enhanced_auth_forms.rs) the
-same way, for the UEFI Shell scenario `shell-auth87`: questions on the variables that
+same way, for the UEFI Shell scenario `shell-auth87` and, with `publish-hiidb.efi rt-data`
+after it, the Linux scenario `hii-auth87`: questions on the variables that
 [`vars/enhanced-auth-87.json`](vars/enhanced-auth-87.json) creates with the attributes 0x87,
 among them EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, their values behind
-EFI_VARIABLE_AUTHENTICATION_3 metadata: `uefisettings.efi` decodes the value behind the
-metadata of `EnhancedAuthData`, refuses that of `EnhancedAuthRefused`, and writes neither.
-No edk2 firmware makes such variables, so the scenario checks only that `uefisettings.efi`
-decodes the bytes that GetVariable() returns as seeded.
+EFI_VARIABLE_AUTHENTICATION_3 metadata: `uefisettings.efi` and `uefisettings` decode the value
+behind the metadata of `EnhancedAuthData`, refuse that of `EnhancedAuthRefused`, and write
+neither. No edk2 firmware makes such variables, so the scenarios check only that they decode
+the bytes that GetVariable() and efivarfs return as seeded.
 
 `publish-hiidb.efi dropped-password-forms` registers those of
 [`publish-hiidb/src/dropped_password_forms.rs`](publish-hiidb/src/dropped_password_forms.rs):
@@ -307,6 +308,12 @@ handles of EFI_RNG_PROTOCOL first, and expects the refusal to sign where `dh` li
 write, and writes it with `--allow-setup-mode-write-without-signature-check`, then PK, signed with
 its own key, after which the firmware is in User Mode; `sign-setup` then checks that it refuses a
 KEK append signed with a foreign key, with the flag too.
+`sign-user` and `shell-sign-user` also write `EnhancedProbe` with
+EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: the payload that `auth-payload.sh auth3` signs, and
+those that `variable write-signed` signs at a TimeStamp, with a nonce and with a NewCert. Linux
+refuses them before any write, as its efivarfs lacks the attribute, and the firmware with
+EFI_INVALID_PARAMETER, as EDK2's variable driver takes no such attribute; the variable stays
+absent.
 
 `shell-devdb-setup` checks, in Setup Mode, that `uefisettings.efi` refuses an append to devdb, the
 device signature database of UEFI 2.11 §32.6.3, signed with PK's key, before any write, and

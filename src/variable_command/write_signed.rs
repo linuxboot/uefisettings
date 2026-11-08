@@ -12,8 +12,9 @@
 
 //! variable write-signed: writes to an EFI variable a payload that the caller signed, or new data
 //! that it signs with the caller's key, and the firmware verifies the signature (UEFI 2.11
-//! §8.2.6).
+//! §8.2.6, and §8.2.5 with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS).
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -21,6 +22,10 @@ use anyhow::bail;
 use anyhow::Result;
 use clap::Args;
 use clap::ValueEnum;
+use uefisettings::exports::EnhancedVariableWrite;
+use uefisettings::exports::Freshness;
+use uefisettings::exports::NewAuthority;
+use uefisettings::exports::Nonce;
 use uefisettings::exports::SetupModeWrite;
 use uefisettings::exports::SignatureDigest;
 use uefisettings::exports::SignedVariableWrite;
@@ -37,20 +42,20 @@ pub(super) struct WriteSignedArgs {
     name: String,
     /// The vendor GUID of the variable, such as D719B2CB-3D3A-4596-A3BC-DAD00E67656F
     guid: String,
-    /// The attributes of the write, which the signature covers, but EFI_VARIABLE_APPEND_WRITE, which --append names, and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which uefisettings adds
+    /// The attributes of the write, which the signature covers, but EFI_VARIABLE_APPEND_WRITE, which --append names, and EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, which uefisettings adds unless enhanced-authenticated-access names an EFI_VARIABLE_AUTHENTICATION_3 (UEFI 2.11 section 8.2.5)
     #[arg(long, value_enum, value_delimiter = ',', required = true)]
     attributes: Vec<SignedAttributeArg>,
     /// Append the new data to the variable (EFI_VARIABLE_APPEND_WRITE), which the signature covers too
     #[arg(long)]
     append: bool,
-    /// The payload: an EFI_VARIABLE_AUTHENTICATION_2 descriptor and then the new data of the variable (UEFI 2.11 section 8.2.6), which uefisettings writes unchanged
+    /// The payload: an EFI_VARIABLE_AUTHENTICATION_2 descriptor (UEFI 2.11 section 8.2.6), or with enhanced-authenticated-access an EFI_VARIABLE_AUTHENTICATION_3 and its descriptors (section 8.2.5), and then the new data of the variable, which uefisettings writes unchanged
     #[arg(
         long,
         required_unless_present = "data_file",
         conflicts_with = "data_file"
     )]
     payload_file: Option<PathBuf>,
-    /// The new data of the variable, which uefisettings signs with --signing-key-file into an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 section 8.2.6) and writes after it
+    /// The new data of the variable, which uefisettings signs with --signing-key-file into an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 section 8.2.6), or with enhanced-authenticated-access an EFI_VARIABLE_AUTHENTICATION_3 (section 8.2.5), and writes after it
     #[arg(long, requires_all = ["signing_key_file", "signing_certificate_file"])]
     data_file: Option<PathBuf>,
     /// The unencrypted PEM RSA private key, PKCS #8 or PKCS #1 of 2048 to 4096 bits, that signs --data-file; read as a secret of at most 64 KiB
@@ -59,13 +64,27 @@ pub(super) struct WriteSignedArgs {
     /// The PEM X.509 certificates that the signature carries: the one of --signing-key-file's public key, then any others, such as intermediate CAs; DER sorts them (X.690 section 11.6); a file of at most 64 KiB
     #[arg(long, requires = "data_file")]
     signing_certificate_file: Option<PathBuf>,
-    /// The digest of the signature (UEFI 2.11 section 8.2.6)
+    /// The digest of the signatures (UEFI 2.11 sections 8.2.6 and 8.2.5)
     #[arg(long, value_enum, default_value_t = DigestArg::Sha256, requires = "data_file")]
     digest: DigestArg,
-    /// The TimeStamp to sign, a GMT time such as 2026-11-07T00:00:00Z, later than the variable's unless --append; by default the current second of the system clock, but in the UEFI Shell, which reads none, --append signs the all-zero TimeStamp of UEFI 2.11 section 8.2.6
+    /// The TimeStamp to sign, a GMT time such as 2026-11-07T00:00:00Z. In an EFI_VARIABLE_AUTHENTICATION_2, later than the variable's unless --append; by default the current second of the system clock, but in the UEFI Shell, which reads none, --append signs the all-zero TimeStamp of UEFI 2.11 section 8.2.6. With enhanced-authenticated-access, it makes a TIMESTAMP_TYPE EFI_VARIABLE_AUTHENTICATION_3, whose TimeStamp is always later than the variable's (section 8.2.5); that needs this or --nonce
     #[arg(long, requires = "data_file")]
     timestamp: Option<TimeStamp>,
-    /// Write a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, any OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID such as db, dbx, dbt and dbr) while SetupMode is 1, when the firmware checks no signature (UEFI 2.11 sections 3.3 and 32.3), or a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID such as devdb), which the firmware may then write without checking the signature (section 32.6.3); the payload is still an EFI_VARIABLE_AUTHENTICATION_2. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed Mode (sections 32.3.1 and 32.3.4). PK may have to be signed with its own key (section 32.3.1)
+    /// With enhanced-authenticated-access, sign a NONCE_TYPE EFI_VARIABLE_AUTHENTICATION_3 of this nonce, two hex digits per byte, other than the variable's; all zero asks the firmware to make one of that size (UEFI 2.11 section 8.2.5)
+    #[arg(long, requires = "data_file", conflicts_with = "timestamp")]
+    nonce: Option<Nonce>,
+    /// The nonce that the variable holds, two hex digits per byte, which UEFI 2.11 section 8.2.5 signs after the data: required to update an existing NONCE_TYPE variable (deleting one, which section 8.2.3 defines, write-signed refuses), and omitted only to create one
+    // clap waives `requires` for an argument that conflicts with a given one, as --nonce with
+    // --timestamp, hence the conflict.
+    #[arg(long, requires = "nonce", conflicts_with = "timestamp")]
+    current_nonce: Option<Nonce>,
+    /// With enhanced-authenticated-access, hand the variable to this unencrypted PEM RSA private key, PKCS #8 or PKCS #1 of 2048 to 4096 bits, in a NewCert that it signs over --digest (UEFI 2.11 section 8.2.5); read as a secret of at most 64 KiB
+    #[arg(long, requires_all = ["data_file", "new_signing_certificate_file"])]
+    new_signing_key_file: Option<PathBuf>,
+    /// The PEM X.509 certificates of --new-signing-key-file: the one of its public key, whose tbsCertificate the NewCert signs, then any others; a file of at most 64 KiB
+    #[arg(long, requires = "new_signing_key_file")]
+    new_signing_certificate_file: Option<PathBuf>,
+    /// Write a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, any OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID such as db, dbx, dbt and dbr) while SetupMode is 1, when the firmware checks no signature (UEFI 2.11 sections 3.3 and 32.3), or a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID such as devdb), which the firmware may then write without checking the signature (section 32.6.3). The payload of a Secure Boot policy variable is still an EFI_VARIABLE_AUTHENTICATION_2; that of a device signature database may be either descriptor: an EFI_VARIABLE_AUTHENTICATION_3 with enhanced-authenticated-access, as section 32.6.3 formats a Setup Mode write, or an EFI_VARIABLE_AUTHENTICATION_2, which edk2 takes. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed Mode (sections 32.3.1 and 32.3.4). PK may have to be signed with its own key (section 32.3.1)
     #[arg(long)]
     allow_setup_mode_write_without_signature_check: bool,
 }
@@ -76,6 +95,7 @@ enum SignedAttributeArg {
     NonVolatile,
     BootserviceAccess,
     RuntimeAccess,
+    EnhancedAuthenticatedAccess,
 }
 
 impl From<SignedAttributeArg> for VariableAttributes {
@@ -84,6 +104,7 @@ impl From<SignedAttributeArg> for VariableAttributes {
             SignedAttributeArg::NonVolatile => Self::NON_VOLATILE,
             SignedAttributeArg::BootserviceAccess => Self::BOOTSERVICE_ACCESS,
             SignedAttributeArg::RuntimeAccess => Self::RUNTIME_ACCESS,
+            SignedAttributeArg::EnhancedAuthenticatedAccess => Self::ENHANCED_AUTHENTICATED_ACCESS,
         }
     }
 }
@@ -104,6 +125,27 @@ impl From<DigestArg> for SignatureDigest {
             DigestArg::Sha512 => Self::Sha512,
         }
     }
+}
+
+/// What a signed write of the data file signs it into, as the flags name it, before any file is
+/// read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Signing<'a> {
+    /// An EFI_VARIABLE_AUTHENTICATION_2 at this TimeStamp (UEFI 2.11 §8.2.6)
+    Authentication2(TimeStamp),
+    /// An EFI_VARIABLE_AUTHENTICATION_3 of this Freshness, whose NewCert, if given, hands the
+    /// variable to the authority of these key and certificate files (§8.2.5)
+    Authentication3 {
+        freshness: Freshness,
+        new_authority: Option<NewAuthorityFiles<'a>>,
+    },
+}
+
+/// The key and certificate files of the authority that a NewCert hands a variable to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NewAuthorityFiles<'a> {
+    key: &'a Path,
+    certificates: &'a Path,
 }
 
 impl WriteSignedArgs {
@@ -128,23 +170,109 @@ impl WriteSignedArgs {
                 setup_mode,
             );
         };
-        let timestamp = signed_time_stamp(self.timestamp, self.append, platform::signing_clock())?;
+        let signing = self.signing(platform::signing_clock())?;
         let data = platform::read_payload(data_file)?;
         let signing_key = platform::read_secret_file(key_file, "signing key")?;
         let certificates = platform::read_secret_file(certificate_file, "certificate bundle")?;
-        VariableBackend::sign_and_write(
-            &SignedVariableWrite {
+        let (freshness, new_authority) = match signing {
+            Signing::Authentication2(timestamp) => {
+                return VariableBackend::sign_and_write(
+                    &SignedVariableWrite {
+                        name: &self.name,
+                        vendor: &self.guid,
+                        attributes: self.attributes(),
+                        data: &data,
+                        timestamp,
+                        digest: self.digest.into(),
+                        setup_mode,
+                    },
+                    &signing_key,
+                    certificates.as_bytes(),
+                )
+            }
+            Signing::Authentication3 {
+                freshness,
+                new_authority,
+            } => (freshness, new_authority),
+        };
+        let new_authority = new_authority
+            .map(|files| -> Result<_> {
+                Ok((
+                    platform::read_secret_file(files.key, "new signing key")?,
+                    platform::read_secret_file(files.certificates, "new certificate bundle")?,
+                ))
+            })
+            .transpose()?;
+        VariableBackend::sign_and_write_enhanced(
+            &EnhancedVariableWrite {
                 name: &self.name,
                 vendor: &self.guid,
                 attributes: self.attributes(),
                 data: &data,
-                timestamp,
+                freshness: &freshness,
                 digest: self.digest.into(),
+                new_authority: new_authority
+                    .as_ref()
+                    .map(|(key, certificates)| NewAuthority {
+                        key,
+                        certificates: certificates.as_bytes(),
+                    }),
                 setup_mode,
             },
             &signing_key,
             certificates.as_bytes(),
         )
+    }
+
+    /// What the data file is signed into: with enhanced-authenticated-access, an
+    /// EFI_VARIABLE_AUTHENTICATION_3 of --timestamp or of --nonce and --current-nonce, with the
+    /// NewCert of --new-signing-key-file and --new-signing-certificate-file if given; else an
+    /// EFI_VARIABLE_AUTHENTICATION_2 at signed_time_stamp's TimeStamp, from `clock`. Refuses an
+    /// EFI_VARIABLE_AUTHENTICATION_3 of no Type, and the flags of one beside an
+    /// EFI_VARIABLE_AUTHENTICATION_2.
+    fn signing(&self, clock: Option<SystemTime>) -> Result<Signing<'_>> {
+        let new_authority = self
+            .new_signing_key_file
+            .as_deref()
+            .zip(self.new_signing_certificate_file.as_deref())
+            .map(|(key, certificates)| NewAuthorityFiles { key, certificates });
+        if self
+            .attributes
+            .contains(&SignedAttributeArg::EnhancedAuthenticatedAccess)
+        {
+            let freshness = match (self.timestamp, &self.nonce) {
+                (Some(timestamp), None) => Freshness::TimeStamp(timestamp),
+                (None, Some(nonce)) => Freshness::Nonce {
+                    nonce: nonce.clone(),
+                    current: self.current_nonce.clone(),
+                },
+                (None, None) | (Some(_), Some(_)) => bail!(
+                    "--attributes enhanced-authenticated-access with --data-file takes one of \
+                     --timestamp and --nonce, the Type of its EFI_VARIABLE_AUTHENTICATION_3 (UEFI \
+                     2.11 section 8.2.5)"
+                ),
+            };
+            return Ok(Signing::Authentication3 {
+                freshness,
+                new_authority,
+            });
+        }
+        let enhanced_only = [
+            ("--nonce", self.nonce.is_some()),
+            ("--current-nonce", self.current_nonce.is_some()),
+            ("--new-signing-key-file", new_authority.is_some()),
+        ];
+        if let Some((flag, _)) = enhanced_only.iter().find(|(_, given)| *given) {
+            bail!(
+                "{flag} takes --attributes enhanced-authenticated-access, which signs an \
+                 EFI_VARIABLE_AUTHENTICATION_3 (UEFI 2.11 section 8.2.5)"
+            );
+        }
+        Ok(Signing::Authentication2(signed_time_stamp(
+            self.timestamp,
+            self.append,
+            clock,
+        )?))
     }
 
     /// What a write of a Secure Boot policy variable or a device signature database (any
@@ -209,7 +337,7 @@ mod tests {
             .command;
         match command {
             Commands::Variable(variable) => match variable.command {
-                VariableSubcommands::WriteSigned(args) => Ok(args),
+                VariableSubcommands::WriteSigned(args) => Ok(*args),
                 #[cfg(variable_info)]
                 parsed @ VariableSubcommands::Info { .. } => {
                     panic!("{argv:?} is no write-signed: {parsed:?}")
@@ -233,7 +361,7 @@ mod tests {
         let nv_bs_rt = VariableAttributes::NON_VOLATILE
             | VariableAttributes::BOOTSERVICE_ACCESS
             | VariableAttributes::RUNTIME_ACCESS;
-        let cases: [(&[&str], VariableAttributes); 3] = [
+        let cases: [(&[&str], VariableAttributes); 4] = [
             (
                 &[
                     "db",
@@ -269,6 +397,18 @@ mod tests {
                     "db.auth",
                 ],
                 VariableAttributes::BOOTSERVICE_ACCESS,
+            ),
+            (
+                &[
+                    "db",
+                    db,
+                    "--attributes",
+                    "bootservice-access,enhanced-authenticated-access",
+                    "--payload-file",
+                    "db.auth",
+                ],
+                VariableAttributes::BOOTSERVICE_ACCESS
+                    | VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS,
             ),
         ];
 
@@ -407,6 +547,238 @@ mod tests {
         ];
         for (args, want) in cases {
             assert_eq!(write_signed(&args).err(), Some(want), "{args:?}");
+        }
+    }
+
+    /// The arguments of a write-signed of the data file to sign, with `attributes`; no file
+    /// that they name exists.
+    fn data_write(attributes: &str) -> Vec<&str> {
+        vec![
+            "Signed",
+            "DE145B29-C3CD-455F-91DE-A76237B67C52",
+            "--attributes",
+            attributes,
+            "--data-file",
+            "missing.data",
+            "--signing-key-file",
+            "missing.key",
+            "--signing-certificate-file",
+            "missing.crt",
+        ]
+    }
+
+    /// With enhanced-authenticated-access.
+    const ENHANCED: &str = "non-volatile,bootservice-access,enhanced-authenticated-access";
+    /// Without it.
+    const PLAIN: &str = "non-volatile,bootservice-access";
+
+    /// write-signed maps each of --timestamp, --nonce, --current-nonce, --new-signing-key-file
+    /// and --new-signing-certificate-file into its own part of what it signs the data file into,
+    /// and an EFI_VARIABLE_AUTHENTICATION_2 into its TimeStamp, given or from the clock.
+    #[test]
+    fn write_signed_maps_each_signing_flag() {
+        let time: TimeStamp = "2026-11-07T00:00:00Z".parse().expect("the test TimeStamp");
+        let clock = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_794_013_323);
+        let nonce = |digits: &str| digits.parse::<Nonce>().expect("a test nonce");
+        let cases: [(&str, &str, &[&str], Signing<'_>); 6] = [
+            (
+                "--timestamp",
+                ENHANCED,
+                &["--timestamp", "2026-11-07T00:00:00Z"],
+                Signing::Authentication3 {
+                    freshness: Freshness::TimeStamp(time),
+                    new_authority: None,
+                },
+            ),
+            (
+                "--nonce",
+                ENHANCED,
+                &["--nonce", "a5A5"],
+                Signing::Authentication3 {
+                    freshness: Freshness::Nonce {
+                        nonce: nonce("a5a5"),
+                        current: None,
+                    },
+                    new_authority: None,
+                },
+            ),
+            (
+                "--current-nonce",
+                ENHANCED,
+                &["--nonce", "a5a5", "--current-nonce", "5a5a5a"],
+                Signing::Authentication3 {
+                    freshness: Freshness::Nonce {
+                        nonce: nonce("a5a5"),
+                        current: Some(nonce("5a5a5a")),
+                    },
+                    new_authority: None,
+                },
+            ),
+            (
+                "--new-signing-key-file and --new-signing-certificate-file",
+                ENHANCED,
+                &[
+                    "--timestamp",
+                    "2026-11-07T00:00:00Z",
+                    "--new-signing-key-file",
+                    "new.key",
+                    "--new-signing-certificate-file",
+                    "new.crt",
+                ],
+                Signing::Authentication3 {
+                    freshness: Freshness::TimeStamp(time),
+                    new_authority: Some(NewAuthorityFiles {
+                        key: Path::new("new.key"),
+                        certificates: Path::new("new.crt"),
+                    }),
+                },
+            ),
+            (
+                "EFI_VARIABLE_AUTHENTICATION_2 at --timestamp",
+                PLAIN,
+                &["--timestamp", "2026-11-07T00:00:00Z"],
+                Signing::Authentication2(time),
+            ),
+            (
+                "EFI_VARIABLE_AUTHENTICATION_2 at the clock's second",
+                PLAIN,
+                &[],
+                Signing::Authentication2("2026-11-07T01:02:03Z".parse().expect("a TimeStamp")),
+            ),
+        ];
+
+        for (case, attributes, flags, want) in cases {
+            let args = [&data_write(attributes)[..], flags].concat();
+            let parsed = write_signed(&args).unwrap_or_else(|kind| panic!("parse {case}: {kind}"));
+
+            assert_eq!(
+                parsed
+                    .signing(Some(clock))
+                    .map_err(|error| error.to_string()),
+                Ok(want),
+                "{case}"
+            );
+        }
+    }
+
+    /// write-signed refuses --nonce beside --timestamp, a nonce that is no hex digits,
+    /// --current-nonce beside --timestamp, which a timestamp-type write cannot sign, or without
+    /// --nonce, and --new-signing-key-file without its certificate, or either without
+    /// --data-file.
+    #[test]
+    fn write_signed_refuses_enhanced_flags_that_do_not_fit() {
+        use clap::error::ErrorKind::ArgumentConflict;
+        use clap::error::ErrorKind::MissingRequiredArgument;
+        use clap::error::ErrorKind::ValueValidation;
+
+        let payload = [
+            "Signed",
+            "DE145B29-C3CD-455F-91DE-A76237B67C52",
+            "--attributes",
+            ENHANCED,
+            "--payload-file",
+            "signed.auth",
+        ];
+        let cases: [(&[&str], &[&str], clap::error::ErrorKind); 9] = [
+            (
+                &data_write(ENHANCED),
+                &["--nonce", "a5", "--timestamp", "2026-11-07T00:00:00Z"],
+                ArgumentConflict,
+            ),
+            (&data_write(ENHANCED), &["--nonce", "a5a"], ValueValidation),
+            (&data_write(ENHANCED), &["--nonce", ""], ValueValidation),
+            (
+                &data_write(ENHANCED),
+                &[
+                    "--timestamp",
+                    "2026-11-07T00:00:00Z",
+                    "--current-nonce",
+                    "a5",
+                ],
+                ArgumentConflict,
+            ),
+            (
+                &data_write(ENHANCED),
+                &["--current-nonce", "a5"],
+                MissingRequiredArgument,
+            ),
+            (
+                &data_write(ENHANCED),
+                &["--new-signing-key-file", "new.key"],
+                MissingRequiredArgument,
+            ),
+            (
+                &data_write(ENHANCED),
+                &["--new-signing-certificate-file", "new.crt"],
+                MissingRequiredArgument,
+            ),
+            (&payload, &["--nonce", "a5"], MissingRequiredArgument),
+            (
+                &payload,
+                &[
+                    "--new-signing-key-file",
+                    "new.key",
+                    "--new-signing-certificate-file",
+                    "new.crt",
+                ],
+                MissingRequiredArgument,
+            ),
+        ];
+
+        for (args, flags, want) in cases {
+            let args = [args, flags].concat();
+            assert_eq!(write_signed(&args).err(), Some(want), "{args:?}");
+        }
+    }
+
+    /// write-signed refuses, before it reads any file, an EFI_VARIABLE_AUTHENTICATION_3 of no
+    /// Type, and --nonce, --current-nonce or --new-signing-key-file without
+    /// enhanced-authenticated-access.
+    #[test]
+    fn write_signed_refuses_enhanced_flags_without_enhanced_access_before_any_read() {
+        let flag_refusal = |flag: &str| {
+            format!(
+                "{flag} takes --attributes enhanced-authenticated-access, which signs an \
+                 EFI_VARIABLE_AUTHENTICATION_3 (UEFI 2.11 section 8.2.5)"
+            )
+        };
+        let cases: [(&str, &[&str], String); 4] = [
+            (
+                ENHANCED,
+                &[],
+                "--attributes enhanced-authenticated-access with --data-file takes one of \
+                 --timestamp and --nonce, the Type of its EFI_VARIABLE_AUTHENTICATION_3 (UEFI \
+                 2.11 section 8.2.5)"
+                    .to_owned(),
+            ),
+            (PLAIN, &["--nonce", "a5"], flag_refusal("--nonce")),
+            (
+                PLAIN,
+                &["--nonce", "a5", "--current-nonce", "5a"],
+                flag_refusal("--nonce"),
+            ),
+            (
+                PLAIN,
+                &[
+                    "--new-signing-key-file",
+                    "new.key",
+                    "--new-signing-certificate-file",
+                    "new.crt",
+                ],
+                flag_refusal("--new-signing-key-file"),
+            ),
+        ];
+
+        for (attributes, flags, want) in cases {
+            let args = [&data_write(attributes)[..], flags].concat();
+            let parsed =
+                write_signed(&args).unwrap_or_else(|kind| panic!("parse {args:?}: {kind}"));
+
+            assert_eq!(
+                parsed.run().map_err(|error| error.to_string()),
+                Err(want),
+                "{args:?}"
+            );
         }
     }
 

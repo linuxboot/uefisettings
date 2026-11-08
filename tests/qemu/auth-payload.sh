@@ -20,9 +20,14 @@
 #   signed attributes and without the content, as edk2's AuthVariableLib verifies it. ATTRIBUTES
 #   are those of the SetVariable() call, EFI_VARIABLE_APPEND_WRITE included. TimeStamp is the
 #   current UTC second.
+# - auth3: sign's EFI_TIME, certificate and DATA after an EFI_VARIABLE_AUTHENTICATION_3 of
+#   EFI_VARIABLE_AUTHENTICATION_3_TIMESTAMP_TYPE without a NewCert (§8.2.5): Version 1, Type 1,
+#   the 2 zero bytes before MetadataSize of its naturally aligned C layout, MetadataSize, the
+#   size of all but DATA, and Flags 0. §8.2.5's digest input then equals sign's, as it adds a
+#   nonce and a NewCert only for writes that have them.
 # - x509-esl: the EFI_SIGNATURE_LIST of one X.509 certificate (§32.4.1), the data of a db append.
 #
-# Usage: tests/qemu/auth-payload.sh sign NAME GUID ATTRIBUTES DATA SIGNER_CERT SIGNER_KEY OUT
+# Usage: tests/qemu/auth-payload.sh sign|auth3 NAME GUID ATTRIBUTES DATA SIGNER_CERT SIGNER_KEY OUT
 #        tests/qemu/auth-payload.sh x509-esl OWNER CERT OUT
 # NAME is printable ASCII; GUID and OWNER are in registry format; ATTRIBUTES is a hexadecimal
 # number such as 0x67; SIGNER_CERT and SIGNER_KEY are PEM files; CERT is a PEM certificate.
@@ -32,7 +37,7 @@ set -euo pipefail
 export LC_ALL=C
 
 usage() {
-    echo "usage: $0 sign NAME GUID ATTRIBUTES DATA SIGNER_CERT SIGNER_KEY OUT" >&2
+    echo "usage: $0 sign|auth3 NAME GUID ATTRIBUTES DATA SIGNER_CERT SIGNER_KEY OUT" >&2
     echo "       $0 x509-esl OWNER CERT OUT" >&2
     exit 2
 }
@@ -91,7 +96,7 @@ x509-esl)
     } >"$4"
     exit 0
     ;;
-sign) (($# == 8)) || usage ;;
+sign | auth3) (($# == 8)) || usage ;;
 *) usage ;;
 esac
 
@@ -134,6 +139,11 @@ openssl cms -sign -binary -noattr -outform DER -md sha256 -signer "$cert" -inkey
     -in "$work/digest-input" -out "$work/signature"
 size=$(stat --format=%s "$work/signature")
 {
+    if [[ $1 == auth3 ]]; then
+        hex 01010000
+        le $((12 + 16 + 8 + 16 + size)) 4
+        le 0 4
+    fi
     cat "$work/time"
     # WIN_CERTIFICATE: dwLength, of the header, CertType and CertData; wRevision 0x0200;
     # wCertificateType WIN_CERT_TYPE_EFI_GUID. Then CertType EFI_CERT_TYPE_PKCS7_GUID.
