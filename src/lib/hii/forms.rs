@@ -104,6 +104,13 @@ const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
 const DECLARED_BOOT_SERVICE_ONLY: &str = "boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)";
 // UEFI 2.11 §33.3.8.3.26: "Bits 0:1 = number of members in ClassGuid"
 const EFI_IFR_FORM_SET_CLASS_GUID_COUNT: u8 = 0x03;
+// UEFI 2.11 §35.6.2
+const EFI_HII_REST_STYLE_FORMSET_GUID: Guid = Guid {
+    data1: 0x7902_17BD,
+    data2: 0xBECF,
+    data3: 0x485B,
+    data4: [0x91, 0x70, 0x5F, 0xF7, 0x11, 0x31, 0x8B, 0x27],
+};
 // UEFI 2.10 §33.3.8.3.47
 const EFI_IFR_NUMERIC_SIZE: u8 = 0x03;
 const EFI_IFR_NUMERIC_SIZE_1: u8 = 0x00;
@@ -786,6 +793,19 @@ pub struct FormSet {
     /// As many as bits 0:1 of Flags count; bits 2:7 are reserved (UEFI 2.11 §33.3.8.3.26)
     #[br(count = usize::from(flags & EFI_IFR_FORM_SET_CLASS_GUID_COUNT))]
     pub class_guids: Vec<Guid>,
+}
+
+impl FormSet {
+    /// The question Flags that the FormSet's class gives each of its questions: REST_STYLE,
+    /// which "can be omitted if the formset class guid already contains
+    /// EFI_HII_REST_STYLE_FORMSET_GUID" (UEFI 2.11 §33.3.8.2.2).
+    fn class_question_flags(&self) -> QuestionFlags {
+        if self.class_guids.contains(&EFI_HII_REST_STYLE_FORMSET_GUID) {
+            QuestionFlags::REST_STYLE
+        } else {
+            QuestionFlags::empty()
+        }
+    }
 }
 
 pub trait Question {
@@ -3411,6 +3431,55 @@ mod tests {
         }
     }
 
+    /// A question lists REST_STYLE when its FormSet's ClassGuids hold
+    /// EFI_HII_REST_STYLE_FORMSET_GUID, wherever among them, as its Flags can then omit it
+    /// (UEFI 2.11 §33.3.8.2.2); other classes add no flag.
+    #[test]
+    fn question_lists_rest_style_of_its_form_set_class() {
+        // EFI_HII_REST_STYLE_FORMSET_GUID (UEFI 2.11 §35.6.2) as stored
+        let rest_style = [
+            0xBD, 0x17, 0x02, 0x79, 0xCF, 0xBE, 0x5B, 0x48, 0x91, 0x70, 0x5F, 0xF7, 0x11, 0x31,
+            0x8B, 0x27,
+        ];
+        let classes = [[0x22; 16], [0x33; 16], rest_style];
+        let cases = [
+            (&classes[2..], 0x00, &["REST_STYLE"][..]),
+            (&classes[..], 0x10, &["RESET_REQUIRED", "REST_STYLE"][..]),
+            (&classes[2..], 0x20, &["REST_STYLE"][..]),
+            (&classes[..2], 0x00, &[][..]),
+            (&classes[..2], 0x20, &["REST_STYLE"][..]),
+            (&classes[..0], 0x00, &[][..]),
+        ];
+        for (class_guids, question_flags, want) in cases {
+            let count = u8::try_from(class_guids.len()).expect("a ClassGuid count");
+            let question = [question_header_with(1, 3, 1, 0, question_flags), vec![0x00]].concat();
+            let data = form_set_with_class_guids(
+                count,
+                class_guids,
+                &[form(1, &[operation(CHECKBOX, false, &question)])],
+            );
+            let root = handle_form_set(&mut Cursor::new(&data)).expect("parse the FormSet");
+
+            let listed = list_questions(
+                root,
+                &[],
+                IncludedStates::empty(),
+                None,
+                &mut Efivars::new().reader(),
+            );
+
+            let names: Vec<Vec<&str>> = listed
+                .iter()
+                .map(|(question, _)| question.flags.iter_names().map(|(name, _)| name).collect())
+                .collect();
+            assert_eq!(
+                names,
+                [want],
+                "ClassGuids {class_guids:02x?}, Flags {question_flags:#04x}"
+            );
+        }
+    }
+
     /// find_question_in finds a question by the name that list_questions prints, whose leading
     /// and trailing whitespace the prompt string keeps, and by that name with other surrounding
     /// whitespace or ASCII case.
@@ -4106,7 +4175,7 @@ mod tests {
             (0x07, &guids[..], &three[..]),
         ];
         for (flags, class_guids, shown) in cases {
-            let data = form_set_with_class_guids(flags, class_guids);
+            let data = form_set_with_class_guids(flags, class_guids, &[]);
             let root = handle_form_set(&mut Cursor::new(&data))
                 .unwrap_or_else(|error| panic!("parse Flags {flags:#04x}: {error:#}"));
 
@@ -4125,7 +4194,7 @@ mod tests {
     /// §33.2.5.10.1).
     #[test]
     fn form_set_short_of_its_class_guid_count_does_not_parse() {
-        let data = form_set_with_class_guids(0x03, &[[0x22; 16]]);
+        let data = form_set_with_class_guids(0x03, &[[0x22; 16]], &[]);
 
         let error = handle_form_set(&mut Cursor::new(&data)).expect_err("3 counted, 1 held");
 

@@ -15,11 +15,11 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
-use std::rc::Weak;
 
 use binrw::BinRead;
 use thiserror::Error;
 
+use super::conditions::enclosing_form_set;
 use super::conditions::evaluate_condition;
 use super::conditions::evaluate_value;
 use super::conditions::option_state;
@@ -335,7 +335,7 @@ impl FormSetDefaultStores {
         question: &IFROperation,
         inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
     ) -> &DefaultStores {
-        let Some(form_set) = form_set_of(question) else {
+        let Some(form_set) = enclosing_form_set(question) else {
             return &NO_DEFAULT_STORES;
         };
         let entry = match self.0.take() {
@@ -347,18 +347,6 @@ impl FormSetDefaultStores {
         };
         &self.0.insert(entry).1
     }
-}
-
-/// Returns the innermost FormSet around `op`.
-fn form_set_of(op: &IFROperation) -> Option<Rc<RefCell<IFROperation>>> {
-    let mut scope = op.parent.as_ref().and_then(Weak::upgrade);
-    while let Some(op) = scope {
-        if op.borrow().op_code == IFROpCode::FormSet {
-            return Some(op);
-        }
-        scope = op.borrow().parent.as_ref().and_then(Weak::upgrade);
-    }
-    None
 }
 
 /// Returns the DEFAULTSTOREs in `form_set`.

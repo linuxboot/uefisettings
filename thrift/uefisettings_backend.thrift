@@ -68,6 +68,8 @@ struct Question {
   // hii - the question's Flags (UEFI 2.11 §33.3.8.2.2) that are set, by their names there
   // without the EFI_IFR_FLAG_ prefix, in bit order: READ_ONLY, CALLBACK, RESET_REQUIRED,
   // REST_STYLE, RECONNECT_REQUIRED, OPTIONS_ONLY; reserved bits are left out. Unset if none is.
+  // REST_STYLE also when the FormSet's ClassGuids hold EFI_HII_REST_STYLE_FORMSET_GUID, which
+  // lets the Flags omit it.
   5: optional list<string> flags;
   // hii - the defaults that the IFR declares for the question, by default_id ascending. Unset if
   // it declares none.

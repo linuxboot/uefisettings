@@ -504,10 +504,15 @@ fn form_set_data_with(flags: u8, class_guids: &[[u8; 16]]) -> Vec<u8> {
     .concat()
 }
 
-/// An empty EFI_IFR_FORM_SET with `flags` and `class_guids`.
-pub(super) fn form_set_with_class_guids(flags: u8, class_guids: &[[u8; 16]]) -> Vec<u8> {
+/// An EFI_IFR_FORM_SET with `flags` and `class_guids` holding `children`.
+pub(super) fn form_set_with_class_guids(
+    flags: u8,
+    class_guids: &[[u8; 16]],
+    children: &[Vec<u8>],
+) -> Vec<u8> {
     [
         operation(FORM_SET, true, &form_set_data_with(flags, class_guids)),
+        children.concat(),
         END.to_vec(),
     ]
     .concat()

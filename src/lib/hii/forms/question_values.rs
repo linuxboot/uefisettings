@@ -19,6 +19,7 @@ use std::rc::Rc;
 
 use anyhow::Result;
 
+use super::conditions::enclosing_form_set;
 use super::conditions::option_state;
 use super::conditions::retrieve_question_value;
 use super::conditions::skips_scope;
@@ -153,7 +154,7 @@ pub(super) fn describe_question(
 ) -> QuestionDescriptor {
     let header = value_question.header();
     let prompt = find_corresponding_string(header.prompt_string_id, walk.string_packages);
-    let flags = header.flags();
+    let flags = header.flags() | class_question_flags(&question.borrow());
     let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
     match value_question {
         ValueQuestion::OneOf(parsed) => {
@@ -166,6 +167,16 @@ pub(super) fn describe_question(
             handle_checkbox(varstore, parsed, prompt, flags, question, walk)
         }
     }
+}
+
+/// Returns the question Flags that the class of the FormSet around `question` gives it.
+fn class_question_flags(question: &IFROperation) -> QuestionFlags {
+    enclosing_form_set(question).map_or(QuestionFlags::empty(), |form_set| {
+        match &form_set.borrow().parsed_data {
+            ParsedOperation::FormSet(parsed) => parsed.class_question_flags(),
+            _ => QuestionFlags::empty(),
+        }
+    })
 }
 
 /// Returns `value`, a current value or IFR default of a CHECKBOX, as list-questions and get show

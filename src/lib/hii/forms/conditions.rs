@@ -793,7 +793,7 @@ fn enclosing_form(op: &IFROperation) -> Option<Rc<RefCell<IFROperation>>> {
 }
 
 /// Returns the FORM_SET that holds `op`.
-fn enclosing_form_set(op: &IFROperation) -> Option<Rc<RefCell<IFROperation>>> {
+pub(super) fn enclosing_form_set(op: &IFROperation) -> Option<Rc<RefCell<IFROperation>>> {
     let mut parent = op.parent.as_ref().and_then(Weak::upgrade);
     while let Some(op) = parent {
         if op.borrow().op_code == IFROpCode::FormSet {
