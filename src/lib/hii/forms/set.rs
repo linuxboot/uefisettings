@@ -1533,6 +1533,7 @@ mod write_validation_tests {
     use super::super::Range32;
     use super::super::Range64;
     use super::super::Range8;
+    use super::super::ValueEncoding;
     use super::*;
 
     /// The buffer VarStore NumericTest of 42 bytes, whose efivar file holds `payload`, and
@@ -1612,6 +1613,7 @@ mod write_validation_tests {
                 offset: 2,
                 size: range.size(),
             },
+            encoding: ValueEncoding::NumericSize,
             data: range,
         };
         let node = Rc::new(RefCell::new(IFROperation {

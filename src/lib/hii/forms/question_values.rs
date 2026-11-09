@@ -61,6 +61,7 @@ use super::QuestionFlags;
 use super::QuestionHeader;
 use super::Range;
 use super::RangeType;
+use super::ValueEncoding;
 use super::Walk;
 use crate::hii::config_string;
 use crate::hii::config_string::Namespace;
@@ -90,6 +91,15 @@ impl ValueQuestion<'_> {
             ValueQuestion::OneOf(question) => question.location,
             ValueQuestion::Numeric(question) => question.location,
             ValueQuestion::CheckBox(question) => question.location,
+        }
+    }
+
+    /// How the question was parsed to store its value.
+    pub(super) fn encoding(self) -> ValueEncoding {
+        match self {
+            ValueQuestion::OneOf(question) => question.encoding,
+            ValueQuestion::Numeric(question) => question.encoding,
+            ValueQuestion::CheckBox(question) => question.encoding,
         }
     }
 }

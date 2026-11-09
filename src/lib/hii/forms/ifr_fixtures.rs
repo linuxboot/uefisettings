@@ -113,8 +113,12 @@ pub(crate) const SYSTEM_ACCESS_GUID: [u8; 16] = [
 pub(crate) const GUID: u8 = 0x5F;
 
 /// EDKII_IFR_BIT_VARSTORE_GUID 82DDD68B-9163-4187-9B27-20A8FD60A71D as stored.
-pub(super) const BIT_VARSTORE_GUID: [u8; 16] = [
+pub(crate) const BIT_VARSTORE_GUID: [u8; 16] = [
     0x8B, 0xD6, 0xDD, 0x82, 0x63, 0x91, 0x87, 0x41, 0x9B, 0x27, 0x20, 0xA8, 0xFD, 0x60, 0xA7, 0x1D,
+];
+/// The fixture Guid 8C78A505-BAA0-4C4A-869F-000000000B01 of short_var_store_efi, as stored.
+pub(crate) const SHORT_VAR_STORE_GUID: [u8; 16] = [
+    0x05, 0xA5, 0x78, 0x8C, 0xA0, 0xBA, 0x4A, 0x4C, 0x86, 0x9F, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x01,
 ];
 /// An EFI_IFR_GUID Guid other than EDKII_IFR_BIT_VARSTORE_GUID.
 pub(crate) const OTHER_GUID: [u8; 16] = [0x33; 16];
@@ -792,10 +796,15 @@ pub(crate) fn var_store_efi_of(
     operation(VAR_STORE_EFI, false, &data)
 }
 
-/// A VARSTORE_EFI of `id` of the form before UEFI 2.3.1, which ends at Attributes: of NIL_GUID,
-/// with NV_BS_RT, of 24 bytes.
+/// A VARSTORE_EFI of `id` of the form before UEFI 2.3.1, which ends at Attributes: of
+/// SHORT_VAR_STORE_GUID, with NV_BS_RT, of 24 bytes.
 pub(super) fn short_var_store_efi(id: u16) -> Vec<u8> {
-    let data = [&id.to_le_bytes()[..], &[0; 16], &NV_BS_RT.to_le_bytes()].concat();
+    short_var_store_efi_of(id, SHORT_VAR_STORE_GUID, NV_BS_RT)
+}
+
+/// short_var_store_efi of the Guid stored as `guid`, with `attributes`.
+pub(crate) fn short_var_store_efi_of(id: u16, guid: [u8; 16], attributes: u32) -> Vec<u8> {
+    let data = [&id.to_le_bytes()[..], &guid, &attributes.to_le_bytes()].concat();
     operation(VAR_STORE_EFI, false, &data)
 }
 

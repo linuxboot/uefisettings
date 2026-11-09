@@ -1431,6 +1431,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
     use crate::hii::forms::ifr_fixtures::scopeless_form_set;
+    use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::uint8;
     use crate::hii::forms::ifr_fixtures::uint8_numeric_with;
@@ -1443,6 +1444,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
     use crate::hii::forms::ifr_fixtures::VariableReach;
+    use crate::hii::forms::ifr_fixtures::BIT_VARSTORE_GUID;
     use crate::hii::forms::ifr_fixtures::BS_RT;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::DISABLE_IF;
@@ -1457,6 +1459,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::OTHER_GUID;
     use crate::hii::forms::ifr_fixtures::QUESTION_REF1;
     use crate::hii::forms::ifr_fixtures::READ;
+    use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
     use crate::hii::forms::ifr_fixtures::THIS;
@@ -7710,5 +7713,686 @@ mod tests {
             );
         }
         assert_no_password_byte(&logged);
+    }
+
+    /// The strings of short_store_hiidb from ID 1: the prompts of the questions A to F, the
+    /// VarNames of A to E, and the texts of the options of C.
+    const SHORT_STRINGS: [&str; 13] = [
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+        "F",
+        "ShortVarA",
+        "ShortVarB",
+        "ShortVarC",
+        "ShortVarD",
+        "ShortVarE",
+        "Off",
+        "On",
+    ];
+    /// The VarNames of the questions A to E of short_store_hiidb.
+    const SHORT_VAR_NAMES: [&str; 5] = [
+        "ShortVarA",
+        "ShortVarB",
+        "ShortVarC",
+        "ShortVarD",
+        "ShortVarE",
+    ];
+
+    /// A NUMERIC of QuestionId `question_id`, prompted string `prompt`, on VarStore 1 with VarName
+    /// `var_name`, of Flags `flags` and the MinValue, MaxValue and Step `range`.
+    fn short_numeric(
+        question_id: u16,
+        prompt: u16,
+        var_name: u16,
+        flags: u8,
+        range: &[u8],
+    ) -> Vec<u8> {
+        let data = [
+            question_header_with(question_id, prompt, 1, var_name, 0x00),
+            vec![flags],
+            range.to_vec(),
+        ]
+        .concat();
+        operation(NUMERIC, false, &data)
+    }
+
+    /// The UINT8 NUMERIC A, from 0 to 255, on VarName 7, ShortVarA.
+    fn short_numeric_a() -> Vec<u8> {
+        // EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC
+        short_numeric(1, 1, 7, 0x10, &[0, 255, 1])
+    }
+
+    /// The questions A to E of short_store_hiidb, each on the VarName that SHORT_VAR_NAMES names
+    /// in its place: the NUMERIC A, the CHECKBOX B, the ONE_OF C of Off (0) and On (1), the
+    /// UINT16 NUMERIC D and the UINT32 NUMERIC E.
+    fn short_questions() -> Vec<Vec<u8>> {
+        let one_of = [question_header_with(3, 3, 1, 9, 0x00), vec![0x10, 0, 1, 1]].concat();
+        let uint16_range = [0, u16::MAX, 1].map(u16::to_le_bytes).concat();
+        let uint32_range = [0, u32::MAX, 1].map(u32::to_le_bytes).concat();
+        vec![
+            short_numeric_a(),
+            checkbox_at(2, 2, 1, 8),
+            [
+                operation(ONE_OF, true, &one_of),
+                flagged_option(12, 0x00, 0),
+                flagged_option(13, 0x00, 1),
+                END.to_vec(),
+            ]
+            .concat(),
+            // EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC
+            short_numeric(4, 4, 10, 0x11, &uint16_range),
+            // EFI_IFR_NUMERIC_SIZE_4 | EFI_IFR_DISPLAY_UINT_DEC
+            short_numeric(5, 5, 11, 0x12, &uint32_range),
+        ]
+    }
+
+    /// A package list holding a FormSet of `children` and the strings packages `strings`.
+    fn short_store_list(children: &[Vec<u8>], strings: &[Vec<u8>]) -> Vec<u8> {
+        let packages = [
+            form_package(children),
+            strings.concat(),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// A HiiDB whose FormSet declares the VARSTORE_EFI before UEFI 2.3.1 of VarStoreId 1,
+    /// SHORT_VAR_STORE_GUID and `attributes`, then holds `questions` in a form, with the strings
+    /// SHORT_STRINGS.
+    fn short_store_hiidb(attributes: u32, questions: &[Vec<u8>]) -> Vec<u8> {
+        short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, attributes),
+                form(1, questions),
+            ],
+            &[en_strings_package_of(&SHORT_STRINGS)],
+        )
+    }
+
+    /// The EFI variable `name` of SHORT_VAR_STORE_GUID.
+    fn short_key(name: &str) -> VariableKey {
+        VariableKey {
+            name: name.to_string(),
+            guid: Guid::from(SHORT_VAR_STORE_GUID),
+        }
+    }
+
+    /// The variables of the questions A to E of short_store_hiidb, each NV|BS|RT, which reach
+    /// `reach` through `interface`: A holds 5, B 1, C 0, D 0x1234 and E 0x12345678.
+    fn short_variables(reach: VariableReach, interface: VariableInterface) -> Rc<MemoryVariables> {
+        let variables = MemoryVariables::new(reach, interface);
+        let values = [
+            vec![5],
+            vec![1],
+            vec![0],
+            0x1234u16.to_le_bytes().to_vec(),
+            0x1234_5678u32.to_le_bytes().to_vec(),
+        ];
+        for (name, value) in SHORT_VAR_NAMES.into_iter().zip(values) {
+            variables.insert(short_key(name), NV_BS_RT, &value);
+        }
+        Rc::new(variables)
+    }
+
+    /// short_variables through efivarfs.
+    fn short_efivarfs_variables() -> Rc<MemoryVariables> {
+        short_variables(VariableReach::Runtime, VariableInterface::Efivarfs)
+    }
+
+    /// set of `question` to `value` in the HiiDB `hiidb` through `variables`, as the CLI prints an
+    /// error.
+    fn set_of(
+        hiidb: &[u8],
+        question: &str,
+        value: &str,
+        variables: &Rc<MemoryVariables>,
+    ) -> Result<(), String> {
+        HiiBackend::set_in(
+            hiidb,
+            question,
+            value,
+            None,
+            &SetOptions::default(),
+            shared(variables),
+            &**variables,
+            None,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Each ONE_OF, NUMERIC and CHECKBOX on a VARSTORE_EFI before UEFI 2.3.1 reads and sets the
+    /// EFI variable that its VarName names, of the store's Guid, from byte 0 as wide as its value,
+    /// as edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue and SetQuestionValue do; set
+    /// writes no other variable.
+    #[test]
+    fn questions_of_a_short_var_store_read_and_set_the_variables_of_their_var_names() {
+        let hiidb = short_store_hiidb(NV_BS_RT, &short_questions());
+        let cases = [
+            ("A", "5", "9", vec![9]),
+            ("B", "1", "0", vec![0]),
+            ("C", "Off", "On", vec![1]),
+            ("D", "4660", "513", vec![0x01, 0x02]),
+            ("E", "305419896", "70000", 70_000u32.to_le_bytes().to_vec()),
+        ];
+        for ((question, value, new_value, written), name) in cases.into_iter().zip(SHORT_VAR_NAMES)
+        {
+            let variables = short_efivarfs_variables();
+
+            assert_eq!(
+                answers_of(&hiidb, question, &variables),
+                [value],
+                "get {question}"
+            );
+            assert_eq!(
+                set_of(&hiidb, question, new_value, &variables),
+                Ok(()),
+                "set {question}"
+            );
+
+            for other in SHORT_VAR_NAMES {
+                let want = match other == name {
+                    true => vec![(0, written.clone())],
+                    false => vec![],
+                };
+                assert_eq!(
+                    variables.writes_to(&short_key(other)),
+                    want,
+                    "set {question}: writes of {other}"
+                );
+            }
+            assert_eq!(
+                answers_of(&hiidb, question, &variables),
+                [new_value],
+                "get {question} after set"
+            );
+        }
+    }
+
+    /// A question on a VARSTORE_EFI before UEFI 2.3.1 whose VarName no string holds names no
+    /// variable, where edk2-stable202608 SetupBrowserDxe/Setup.c GetToken takes the unknown string
+    /// "!": get shows why and set refuses it, while the question beside it reads.
+    #[test]
+    fn a_short_var_store_question_without_a_var_name_string_is_refused() {
+        let hiidb = short_store_hiidb(
+            NV_BS_RT,
+            &[
+                short_numeric_a(),
+                short_numeric(6, 6, 99, 0x10, &[0, 255, 1]),
+            ],
+        );
+        let variables = short_efivarfs_variables();
+        let why =
+            "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): no string 0x0063 holds \
+                   its VarName";
+
+        assert_eq!(
+            answers_of(&hiidb, "F", &variables),
+            [format!("<ValueUnavailable: {why}>")],
+            "get F"
+        );
+        assert_eq!(
+            set_of(&hiidb, "F", "1", &variables),
+            Err(format!("cannot set question \"F\": {why}")),
+            "set F"
+        );
+        assert_eq!(answers_of(&hiidb, "A", &variables), ["5"], "get A");
+        assert_eq!(
+            variables.writes_to(&short_key("ShortVarA")),
+            vec![],
+            "writes of ShortVarA"
+        );
+    }
+
+    /// A question on a VARSTORE_EFI before UEFI 2.3.1 is shown and selected as any question:
+    /// list-questions shows its QuestionId, its FormSet's GUID and its keyword, show-ifr its
+    /// FormSet's GUID and its answer, and get and set select it by QuestionId and by keyword, and
+    /// read and set its variable. Here the NUMERIC A, of QuestionId 1 in form_package's FormSet,
+    /// whose prompt x-UEFI-ns names "ShortKeyA", on ShortVarA, which holds 5.
+    #[test]
+    fn short_var_store_questions_show_their_identity_and_select_by_question_id_or_keyword() {
+        let hiidb = short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, &[short_numeric_a()]),
+            ],
+            &[
+                en_strings_package_of(&SHORT_STRINGS),
+                strings_package_of(b"x-UEFI-ns", &["ShortKeyA"]),
+            ],
+        );
+        let form_set = Guid::from([0x11; 16]).to_string();
+        let variables = short_efivarfs_variables();
+
+        let listed = HiiBackend::list_questions_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        )
+        .expect("list the questions");
+        let ifr = HiiBackend::show_ifr_in(
+            &hiidb,
+            &ShowIfrOptions::default(),
+            shared(&variables),
+            None,
+            None,
+        )
+        .expect("show the IFR")
+        .readable_representation;
+
+        let listed: Vec<(&str, &str, [Option<serde_json::Value>; 3])> = listed
+            .iter()
+            .map(|question| {
+                (
+                    question.name.as_str(),
+                    question.answer.as_str(),
+                    identity_json(question),
+                )
+            })
+            .collect();
+        let identity = [
+            Some(serde_json::json!(1)),
+            Some(serde_json::json!(form_set)),
+            Some(serde_json::json!([{"namespace_id": "x-UEFI-ns", "keyword": "ShortKeyA"}])),
+        ];
+        assert_eq!(listed, [("A", "5", identity)], "list-questions");
+        assert!(
+            ifr.contains(&format!("GUID {form_set}")) && ifr.contains("Q: A - Help:"),
+            "show-ifr: {ifr}"
+        );
+        assert!(ifr.contains("-Answer: 5\n"), "show-ifr: {ifr}");
+        for (question, value) in [
+            (by_address(&format!("{form_set}:1")), 9),
+            (by_keyword("ShortKeyA", None), 10),
+        ] {
+            let variables = short_efivarfs_variables();
+
+            let got = HiiBackend::get_in(
+                &hiidb,
+                question.clone(),
+                None,
+                &GetOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("get {question}: {error:#}"));
+            let set = HiiBackend::set_in(
+                &hiidb,
+                question.clone(),
+                &value.to_string(),
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+
+            let got: Vec<&str> = got
+                .responses
+                .iter()
+                .map(|response| response.question.answer.as_str())
+                .collect();
+            assert_eq!(got, ["5"], "get {question}");
+            assert_eq!(set, Ok(()), "set {question} {value}");
+            assert_eq!(
+                variables.writes_to(&short_key("ShortVarA")),
+                [(0, vec![value])],
+                "set {question} {value}: writes of ShortVarA"
+            );
+        }
+    }
+
+    /// A question on a VARSTORE_EFI before UEFI 2.3.1 takes no value from the ExportConfig
+    /// snapshot, as edk2-stable202608 ExportConfig() asks a driver's ExtractConfig() only for the
+    /// storages that HiiDatabaseDxe/ConfigRouting.c ParseIfrData finds, which skips the short op
+    /// (:2485): no <ConfigResp> holds the variable of a VarName, and one under the VarName's name
+    /// and the store's Guid is another storage. get, list-questions and show-ifr show the
+    /// variable, or why it has no value, untagged, here beside such a <ConfigResp> of 7.
+    #[test]
+    fn short_var_store_questions_take_no_snapshot_value() {
+        let key = "ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01";
+        let text = block_resp(
+            &config_hdr(SHORT_VAR_STORE_GUID, "ShortVarA", &DRIVER_PATH),
+            0,
+            &[7],
+        );
+        let cases = [
+            (
+                NV_BS_RT,
+                None,
+                format!("<ValueUnavailable: no EFI variable {key}>"),
+            ),
+            (
+                NV_BS,
+                None,
+                format!(
+                    "<ValueUnavailable: EFI variable {key} is not present at OS runtime: efivarfs \
+                     does not list it, and its form declares it boot-service-only (no \
+                     EFI_VARIABLE_RUNTIME_ACCESS)>"
+                ),
+            ),
+            (NV_BS_RT, Some(5), "5".to_string()),
+        ];
+        for (attributes, held, want) in cases {
+            let packages = [
+                device_path_package(&DRIVER_PATH),
+                form_package(&[
+                    short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, attributes),
+                    form(1, &[short_numeric_a()]),
+                ]),
+                en_strings_package_of(&SHORT_STRINGS),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+            let variables = no_variables();
+            if let Some(value) = held {
+                variables.insert(short_key("ShortVarA"), attributes, &[value]);
+            }
+
+            let (got, listed, ifr, _) = answers_with_snapshot(&hiidb, &["A"], &variables, &text);
+
+            let case = format!("attributes {attributes:#x}, ShortVarA {held:?}");
+            assert_eq!(got, [want], "get, {case}");
+            assert_eq!(listed, got, "list-questions, {case}");
+            assert!(!ifr.contains("<snapshot>"), "show-ifr, {case}: {ifr}");
+        }
+    }
+
+    /// get shows a missing per-question variable as missing, through variables that reach Runtime
+    /// in the words of the runtime access that its VARSTORE_EFI declares: one declared without
+    /// EFI_VARIABLE_RUNTIME_ACCESS is not present at OS runtime. set refuses both.
+    #[test]
+    fn a_missing_per_question_variable_is_shown_as_its_var_store_declares_it() {
+        let key = "ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01";
+        let boot_service_only = format!(
+            "EFI variable {key} is not present at OS runtime: efivarfs does not list it, and its \
+             form declares it boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)"
+        );
+        let cases = [
+            (
+                NV_BS_RT,
+                format!("no EFI variable {key}"),
+                format!(
+                    "no EFI variable {key}: the firmware has not created it or does not expose it \
+                     to the OS, so its questions cannot be set from Linux; change them in the \
+                     firmware setup, or ask the board vendor for firmware that exposes it; see \
+                     https://github.com/linuxboot/uefisettings/issues/2"
+                ),
+            ),
+            (NV_BS, boot_service_only.clone(), boot_service_only),
+        ];
+        for (attributes, why, refusal) in cases {
+            let hiidb = short_store_hiidb(attributes, &[short_numeric_a()]);
+            let variables = Rc::new(MemoryVariables::default());
+
+            assert_eq!(
+                answers_of(&hiidb, "A", &variables),
+                [format!("<ValueUnavailable: {why}>")],
+                "get, attributes {attributes:#x}"
+            );
+            assert_eq!(
+                set_of(&hiidb, "A", "9", &variables),
+                Err(refusal),
+                "set, attributes {attributes:#x}"
+            );
+        }
+    }
+
+    /// get and set refuse a per-question variable whose data is not exactly as wide as its
+    /// question's value, naming both sizes, where edk2-stable202608 SetupBrowserDxe/Setup.c
+    /// GetQuestionValue would show a value that it did not read, or a part of one, and
+    /// SetQuestionValue would change the variable's size; set writes nothing.
+    #[test]
+    fn a_per_question_variable_of_another_size_is_refused() {
+        let hiidb = short_store_hiidb(NV_BS_RT, &short_questions());
+        let cases: [(&str, &[u8], usize, u8); 3] =
+            [("A", &[5, 0], 2, 1), ("A", &[], 0, 1), ("D", &[0x34], 1, 2)];
+        for (question, data, held, width) in cases {
+            let name = format!("ShortVar{question}");
+            let variables = Rc::new(MemoryVariables::default());
+            variables.insert(short_key(&name), NV_BS_RT, data);
+            let case = format!("{question} on {held} bytes");
+            let why = format!(
+                "EFI variable {name}-8c78a505-baa0-4c4a-869f-000000000b01 holds {held} bytes; the \
+                 question takes {width}"
+            );
+
+            assert_eq!(
+                answers_of(&hiidb, question, &variables),
+                [format!("<ValueUnavailable: {why}>")],
+                "{case}: get"
+            );
+            assert_eq!(
+                set_of(&hiidb, question, "1", &variables),
+                Err(why),
+                "{case}: set"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key(&name)),
+                vec![],
+                "{case}: writes"
+            );
+        }
+    }
+
+    /// A question in a FormSet's own scope, outside any form, reads its value from a VARSTORE_EFI
+    /// before UEFI 2.3.1 and from one of UEFI 2.3.1 alike, without a panic, and one there whose
+    /// VarStore no op declares has no value.
+    #[test]
+    fn a_question_outside_a_form_reads_its_var_store() {
+        let variables = short_efivarfs_variables();
+        let long = VariableKey {
+            name: "Long".to_string(),
+            guid: NIL_GUID,
+        };
+        variables.insert(long, NV_BS_RT, &[7]);
+        let on_var_store_9 = [
+            question_header_with(1, 1, 9, 7, 0x00),
+            vec![0x10, 0, 255, 1],
+        ]
+        .concat();
+        let cases = [
+            (
+                "before UEFI 2.3.1",
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                short_numeric_a(),
+                "5",
+            ),
+            (
+                "UEFI 2.3.1",
+                var_store_efi(1, "Long", NV_BS_RT, 1),
+                short_numeric(1, 1, 0, 0x10, &[0, 255, 1]),
+                "7",
+            ),
+            (
+                "undeclared",
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                operation(NUMERIC, false, &on_var_store_9),
+                "<ValueUnavailable: no supported varstore with matching id 0x0009 found>",
+            ),
+        ];
+        for (case, store, question, value) in cases {
+            let hiidb =
+                short_store_list(&[store, question], &[en_strings_package_of(&SHORT_STRINGS)]);
+
+            assert_eq!(answers_of(&hiidb, "A", &variables), [value], "{case}");
+        }
+    }
+
+    /// A VarName whose strings differ between the strings packages of its package list names no
+    /// variable, as edk2-stable202608 SetupBrowserDxe/Setup.c GetToken takes the string in the
+    /// platform language, which uefisettings does not know: its question refuses, naming the
+    /// VarName and the languages. One that every package holding it agrees on names its variable,
+    /// also when a package, as an x-UEFI-ns one, lacks it.
+    #[test]
+    fn strings_packages_that_differ_on_a_var_name_refuse_its_question() {
+        let mut french = SHORT_STRINGS;
+        french[6] = "VarCourteA";
+        let hiidb = short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, &short_questions()[..2]),
+            ],
+            &[
+                strings_package_of(b"en", &SHORT_STRINGS),
+                strings_package_of(b"fr", &french),
+                strings_package_of(b"x-UEFI-ns", &SHORT_STRINGS[..6]),
+            ],
+        );
+        let variables = short_efivarfs_variables();
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): the strings packages \
+                   differ on its VarName 0x0007: \"ShortVarA\" in en, \"VarCourteA\" in fr";
+
+        assert_eq!(
+            answers_of(&hiidb, "A", &variables),
+            [format!("<ValueUnavailable: {why}>")],
+            "get A"
+        );
+        assert_eq!(
+            set_of(&hiidb, "A", "9", &variables),
+            Err(format!("cannot set question \"A\": {why}")),
+            "set A"
+        );
+        assert_eq!(answers_of(&hiidb, "B", &variables), ["1"], "get B");
+    }
+
+    /// A question in the scope of the GUID op of an EDKII bit varstore field, on a VARSTORE_EFI
+    /// before UEFI 2.3.1, is refused by name: there its VarStoreInfo is a VarName, not the bit
+    /// offset that the field takes it for.
+    #[test]
+    fn an_edkii_bit_field_on_a_short_var_store_is_refused() {
+        let uint32_range = [0, u32::MAX, 1].map(u32::to_le_bytes).concat();
+        let bit_field = [
+            operation(GUID, true, &BIT_VARSTORE_GUID),
+            // a field of 8 bits
+            short_numeric(1, 1, 7, 0x08, &uint32_range),
+            END.to_vec(),
+        ]
+        .concat();
+        let hiidb = short_store_hiidb(NV_BS_RT, &[bit_field]);
+        let variables = short_efivarfs_variables();
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): the question is an \
+                   EDKII bit varstore field, whose VarStoreInfo is a bit offset, not a VarName";
+
+        assert_eq!(
+            answers_of(&hiidb, "A", &variables),
+            [format!("<ValueUnavailable: {why}>")],
+            "get A"
+        );
+        assert_eq!(
+            set_of(&hiidb, "A", "9", &variables),
+            Err(format!("cannot set question \"A\": {why}")),
+            "set A"
+        );
+        assert_eq!(
+            variables.writes_to(&short_key("ShortVarA")),
+            vec![],
+            "writes of ShortVarA"
+        );
+    }
+
+    /// A question that precedes the VARSTORE_EFI before UEFI 2.3.1 that it names is refused by
+    /// name: it took its VarStoreInfo for a VarOffset, as its VarStoreId names a previously
+    /// declared variable store (UEFI 2.11 §33.3.8.2.2 EFI_IFR_QUESTION_HEADER).
+    #[test]
+    fn a_question_before_its_short_var_store_is_refused() {
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): declared after the \
+                   question, which took its VarStoreInfo for a VarOffset; a question names a \
+                   previously declared VarStore (UEFI 2.11 §33.3.8.2.2 EFI_IFR_QUESTION_HEADER)";
+        // VarStoreInfo 7 and 0, which the question takes for VarOffsets
+        for var_store_info in [7, 0] {
+            let hiidb = short_store_list(
+                &[
+                    form(
+                        1,
+                        &[short_numeric(1, 1, var_store_info, 0x10, &[0, 255, 1])],
+                    ),
+                    short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                ],
+                &[en_strings_package_of(&SHORT_STRINGS)],
+            );
+            let variables = short_efivarfs_variables();
+
+            assert_eq!(
+                answers_of(&hiidb, "A", &variables),
+                [format!("<ValueUnavailable: {why}>")],
+                "VarStoreInfo {var_store_info}: get A"
+            );
+            assert_eq!(
+                set_of(&hiidb, "A", "9", &variables),
+                Err(format!("cannot set question \"A\": {why}")),
+                "VarStoreInfo {var_store_info}: set A"
+            );
+        }
+    }
+
+    /// Two VARSTORE_EFIs before UEFI 2.3.1 of two Guids each take the VarNames of their questions
+    /// from the strings of the package list: the NUMERIC A, inside a SUPPRESS_IF and a
+    /// GRAY_OUT_IF, reads and sets ShortVarA of the first store's Guid, the CHECKBOX B ShortVarB
+    /// of the second's, and set writes no variable of the other Guid.
+    #[test]
+    fn two_short_var_stores_set_the_variables_of_their_own_guids() {
+        let nested_a = conditional(
+            SUPPRESS_IF,
+            ifr_false(),
+            &[conditional(GRAY_OUT_IF, ifr_false(), &[short_numeric_a()])],
+        );
+        let hiidb = short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                short_var_store_efi_of(2, OTHER_GUID, NV_BS_RT),
+                form(1, &[nested_a, checkbox_at(2, 2, 2, 8)]),
+            ],
+            &[en_strings_package_of(&SHORT_STRINGS)],
+        );
+        let other = |name: &str| VariableKey {
+            name: name.to_string(),
+            guid: Guid::from(OTHER_GUID),
+        };
+        let variables = short_efivarfs_variables();
+        variables.insert(other("ShortVarB"), NV_BS_RT, &[0]);
+
+        assert_eq!(answers_of(&hiidb, "A", &variables), ["5"], "get A");
+        assert_eq!(answers_of(&hiidb, "B", &variables), ["0"], "get B");
+        assert_eq!(set_of(&hiidb, "A", "9", &variables), Ok(()), "set A");
+        assert_eq!(set_of(&hiidb, "B", "1", &variables), Ok(()), "set B");
+        let writes = [
+            (short_key("ShortVarA"), vec![(0, vec![9])]),
+            (other("ShortVarA"), vec![]),
+            (other("ShortVarB"), vec![(0, vec![1])]),
+            (short_key("ShortVarB"), vec![]),
+        ];
+        for (key, want) in writes {
+            assert_eq!(variables.writes_to(&key), want, "writes of {key}");
+        }
+    }
+
+    /// set writes an existing per-question variable at its question's width with the variable's
+    /// own attributes, not those that the VARSTORE_EFI declares: "If a preexisting variable is
+    /// rewritten with different attributes, SetVariable() shall not modify the variable" (UEFI
+    /// 2.11 §8.2.3 SetVariable).
+    #[test]
+    fn set_keeps_the_attributes_of_a_per_question_variable() {
+        let hiidb = short_store_hiidb(NV_BS_RT, &[short_numeric_a()]);
+        let variables = Rc::new(MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        ));
+        variables.insert(short_key("ShortVarA"), NV_BS, &[5]);
+
+        assert_eq!(set_of(&hiidb, "A", "9", &variables), Ok(()), "set A");
+        assert_eq!(
+            variables.bytes(&short_key("ShortVarA")),
+            Some([&NV_BS.to_ne_bytes()[..], &[9]].concat()),
+            "ShortVarA"
+        );
     }
 }

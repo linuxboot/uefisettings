@@ -22,6 +22,7 @@ use std::rc::Rc;
 use std::rc::Weak;
 
 use anyhow::Result;
+use binrw::io::Cursor;
 use thiserror::Error;
 
 use super::ami_access_level::AMI_ACCESS_LEVEL;
@@ -55,6 +56,7 @@ use super::IFROperation;
 use super::IgnoredIfr;
 use super::ParsedOperation;
 use super::QuestionFlags;
+use super::QuestionHeader;
 use super::VarStoreOperand;
 use super::Walk;
 use super::EFI_IFR_TYPE_BOOLEAN;
@@ -67,6 +69,7 @@ use super::EFI_IFR_TYPE_REF;
 use super::EFI_IFR_TYPE_STRING;
 use super::EFI_IFR_TYPE_TIME;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
+use crate::parse_error::ReadParsed;
 
 /// The opcode of IFROpCode::Match2, the highest that edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c IsUnKnownOpCode knows.
@@ -1008,6 +1011,14 @@ fn enclosing_question_id(op: &IFROperation) -> Option<u16> {
     None
 }
 
+/// Returns the EFI_IFR_QUESTION_HEADER of a question op.
+pub(super) fn parse_question_header(op: &IFROperation) -> Option<QuestionHeader> {
+    let OpRole::Question = OpRole::of(op.op_code) else {
+        return None;
+    };
+    Cursor::new(&op.data).parse_ne().ok()
+}
+
 /// Returns the QuestionId of a question op.
 fn question_id(op: &IFROperation) -> Option<u16> {
     if !is_question(op.op_code) {
@@ -1738,7 +1749,7 @@ fn variable_store(
     match declared {
         DeclaredStore::Variable(store) => Ok(store),
         DeclaredStore::NameValue(_) => Err((NAME_VALUE_STORE, NAME_VALUE_REACH)),
-        DeclaredStore::ShortEfi => Err((ShortVarStoreEfi::LABEL, ShortVarStoreEfi::UNREAD)),
+        DeclaredStore::ShortEfi(_) => Err((ShortVarStoreEfi::LABEL, ShortVarStoreEfi::UNREAD)),
     }
 }
 

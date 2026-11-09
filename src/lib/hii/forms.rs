@@ -34,17 +34,21 @@ use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
 use crate::hii::strings::Language;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::StringPackage;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::check_volatile_write;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::VariableInterface;
+use crate::hii::variables::VariableLayout;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
 use crate::parse_error::ParseError;
 use crate::parse_error::ReadParsed;
+use conditions::enclosing_form_set;
+use conditions::parse_question_header;
 use conditions::question_state;
 use conditions::retrieve_question_value;
 use conditions::select;
@@ -78,9 +82,14 @@ use set::ChangeValueError;
 use storage::storage_width;
 use storage::NameValueStore;
 use storage::ReadableLocation;
+use storage::ShortEfiReason;
+use storage::ShortEfiRefusal;
+use storage::ShortEfiVariable;
 use storage::ShortVarStoreEfi;
+use storage::UnresolvedVarName;
 use storage::ValueLocation;
 use storage::ValueSource;
+use storage::VarNames;
 use storage::VarStore;
 use storage::VarStoreEfi;
 use storage::VarStoreNameValue;
@@ -888,6 +897,8 @@ pub struct OneOf {
     pub data: Range,
     #[br(calc = encoding.numeric_location(question_header.var_store_info, flags, &data))]
     location: ValueLocation,
+    #[br(calc = encoding)]
+    encoding: ValueEncoding,
 }
 
 impl Question for OneOf {
@@ -905,6 +916,8 @@ pub struct Numeric {
     pub data: Range,
     #[br(calc = encoding.numeric_location(question_header.var_store_info, flags, &data))]
     location: ValueLocation,
+    #[br(calc = encoding)]
+    encoding: ValueEncoding,
 }
 
 impl Question for Numeric {
@@ -1156,6 +1169,17 @@ fn is_bit_varstore_guid(op: &IFROperation) -> bool {
     op.op_code == IFROpCode::Guid && op.data.starts_with(&EDKII_IFR_BIT_VARSTORE_GUID)
 }
 
+/// Whether VarStore `var_store_id` of `op` is a VARSTORE_EFI of the form before UEFI 2.3.1 that
+/// its FormSet declares: before `op`, while the FormSet is parsed.
+fn names_short_var_store(op: &IFROperation, var_store_id: u16) -> bool {
+    enclosing_form_set(op).is_some_and(|form_set| {
+        matches!(
+            declared_var_store(&form_set.borrow(), var_store_id),
+            Some(DeclaredStore::ShortEfi(_))
+        )
+    })
+}
+
 /// How a ONE_OF, NUMERIC or CHECKBOX stores its value, and a NUMERIC or ONE_OF its MinValue,
 /// MaxValue and Step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1165,37 +1189,59 @@ pub enum ValueEncoding {
     /// As UINT32, as edk2-stable202608 VfrSyntax.g stores them for an EDKII bit varstore field,
     /// whose Flags hold its width in bits; the value in that width, a CHECKBOX value in 1 bit.
     EdkiiBitField,
+    /// As NumericSize, from byte 0 of the EFI variable that its VarName names, on a VARSTORE_EFI
+    /// of the form before UEFI 2.3.1.
+    VarName,
 }
 
 impl ValueEncoding {
     fn from_question(question: &IFROperation) -> Self {
-        if refers_to_bit_field(question) {
-            Self::EdkiiBitField
-        } else {
-            Self::NumericSize
+        match (
+            refers_to_bit_field(question),
+            parse_question_header(question)
+                .is_some_and(|header| names_short_var_store(question, header.var_store_id)),
+        ) {
+            (true, _) => Self::EdkiiBitField,
+            (false, true) => Self::VarName,
+            (false, false) => Self::NumericSize,
         }
     }
 
-    /// Where a ONE_OF or NUMERIC with `flags` and `range` keeps its value, VarOffset `offset`.
-    fn numeric_location(self, offset: u16, flags: u8, range: &Range) -> ValueLocation {
+    /// Where a ONE_OF or NUMERIC with `flags` and `range` keeps its value, VarStoreInfo
+    /// `var_store_info`.
+    fn numeric_location(self, var_store_info: u16, flags: u8, range: &Range) -> ValueLocation {
         match self {
             Self::NumericSize => ValueLocation::Bytes {
-                offset,
+                offset: var_store_info,
                 size: range.size(),
             },
             Self::EdkiiBitField => ValueLocation::Bits {
-                offset,
+                offset: var_store_info,
                 width: flags & EDKII_IFR_NUMERIC_SIZE_BIT,
+            },
+            Self::VarName => ValueLocation::Bytes {
+                offset: VariableLayout::OneValue.offset(var_store_info),
+                size: range.size(),
             },
         }
     }
 
-    /// Where a CHECKBOX keeps its value, VarOffset `offset`: in a byte, or in the 1 bit that
-    /// edk2-stable202608 IfrParse.c gives a bit-field CHECKBOX.
-    fn checkbox_location(self, offset: u16) -> ValueLocation {
+    /// Where a CHECKBOX keeps its value, VarStoreInfo `var_store_info`: in a byte, or in the 1 bit
+    /// that edk2-stable202608 IfrParse.c gives a bit-field CHECKBOX.
+    fn checkbox_location(self, var_store_info: u16) -> ValueLocation {
         match self {
-            Self::NumericSize => ValueLocation::Bytes { offset, size: 1 },
-            Self::EdkiiBitField => ValueLocation::Bits { offset, width: 1 },
+            Self::NumericSize => ValueLocation::Bytes {
+                offset: var_store_info,
+                size: 1,
+            },
+            Self::EdkiiBitField => ValueLocation::Bits {
+                offset: var_store_info,
+                width: 1,
+            },
+            Self::VarName => ValueLocation::Bytes {
+                offset: VariableLayout::OneValue.offset(var_store_info),
+                size: 1,
+            },
         }
     }
 }
@@ -1210,7 +1256,7 @@ fn range_parser<R: Read + Seek>(
         ValueEncoding::EdkiiBitField => {
             BinRead::read_options(reader, endian, ()).map(Range::Range32)
         }
-        ValueEncoding::NumericSize => match flags & EFI_IFR_NUMERIC_SIZE {
+        ValueEncoding::NumericSize | ValueEncoding::VarName => match flags & EFI_IFR_NUMERIC_SIZE {
             EFI_IFR_NUMERIC_SIZE_1 => BinRead::read_options(reader, endian, ()).map(Range::Range8),
             EFI_IFR_NUMERIC_SIZE_2 => BinRead::read_options(reader, endian, ()).map(Range::Range16),
             EFI_IFR_NUMERIC_SIZE_4 => BinRead::read_options(reader, endian, ()).map(Range::Range32),
@@ -1229,6 +1275,8 @@ pub struct CheckBox {
     pub flags: u8,
     #[br(calc = encoding.checkbox_location(question_header.var_store_info))]
     location: ValueLocation,
+    #[br(calc = encoding)]
+    encoding: ValueEncoding,
 }
 
 impl Question for CheckBox {
@@ -2886,8 +2934,8 @@ mod choice_for_set_tests {
         );
     }
 
-    /// set refuses a question on a VARSTORE_EFI of the form before UEFI 2.3.1, whose EFI
-    /// variable its VarName names, with why.
+    /// set refuses a question on a VARSTORE_EFI of the form before UEFI 2.3.1 whose VarName no
+    /// string holds, with why.
     #[test]
     fn match_on_a_var_store_efi_before_uefi_2_3_1_is_refused() {
         let choice = choice_in(&parse_form_set(&[
@@ -2898,8 +2946,7 @@ mod choice_for_set_tests {
             choice.map_err(|error| error.to_string()).err().as_deref(),
             Some(
                 "cannot set question \"Prompt\": VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before \
-                 UEFI 2.3.1), whose EFI variables are named by VarNames, which uefisettings does \
-                 not resolve"
+                 UEFI 2.3.1): no string 0x0000 holds its VarName"
             ),
             "question 1 on VarStore 7"
         );
@@ -3549,12 +3596,13 @@ fn find_corresponding_varstore(
         });
     }
 
+    let question = Rc::clone(&node);
     let mut node = node;
     loop {
         let parent = {
             let current_node = node.borrow();
             if current_node.op_code == IFROpCode::FormSet {
-                return form_set_varstore(&current_node, var_store_id);
+                return form_set_varstore(&current_node, var_store_id, &question.borrow());
             }
             match current_node.parent.as_ref() {
                 Some(parent_ref) => match parent_ref.upgrade() {
@@ -3568,21 +3616,51 @@ fn find_corresponding_varstore(
     }
 }
 
-/// Returns the varstore of `var_store_id` among the children of `form_set`.
-fn form_set_varstore(form_set: &IFROperation, var_store_id: u16) -> Result<Box<dyn VariableStore>> {
+/// Returns the varstore of `var_store_id` among the children of `form_set`, as `question` reads
+/// it: of a VARSTORE_EFI before UEFI 2.3.1, the EFI variable of its VarName.
+fn form_set_varstore(
+    form_set: &IFROperation,
+    var_store_id: u16,
+    question: &IFROperation,
+) -> Result<Box<dyn VariableStore>> {
     match declared_var_store(form_set, var_store_id) {
         Some(DeclaredStore::Variable(store)) => Ok(store),
         Some(DeclaredStore::NameValue(guid)) => Err(NameValueStore { guid }.into()),
-        Some(DeclaredStore::ShortEfi) => Err(anyhow!(
-            "VarStore {var_store_id:#06x} ({}), {}",
-            ShortVarStoreEfi::LABEL,
-            ShortVarStoreEfi::UNREAD
-        )),
+        Some(DeclaredStore::ShortEfi(store)) => Ok(Box::new(short_efi_variable(&store, question)?)),
         None => Err(anyhow!(
             "no supported varstore with matching id {:#06x} found",
             var_store_id
         )),
     }
+}
+
+/// The EFI variable of `question` on the VARSTORE_EFI before UEFI 2.3.1 `store`: of a ONE_OF,
+/// NUMERIC or CHECKBOX, whose value ValueEncoding::VarName places at byte 0, as wide as the value.
+fn short_efi_variable(
+    store: &ShortVarStoreEfi,
+    question: &IFROperation,
+) -> Result<ShortEfiVariable, ShortEfiRefusal> {
+    let id = store.var_store_id;
+    let Some(value_question) = value_question(question) else {
+        return Err(ShortEfiRefusal::new(
+            id,
+            ShortEfiReason::NotRead(question.op_code.spec_name()),
+        ));
+    };
+    let size = match (value_question.encoding(), value_question.location()) {
+        (ValueEncoding::VarName, ValueLocation::Bytes { size, .. }) => size,
+        (ValueEncoding::EdkiiBitField, _)
+        | (ValueEncoding::VarName, ValueLocation::Bits { .. }) => {
+            return Err(ShortEfiRefusal::new(id, ShortEfiReason::BitField))
+        }
+        // the store was not declared yet when the question was parsed
+        (ValueEncoding::NumericSize, _) => {
+            return Err(ShortEfiRefusal::new(id, ShortEfiReason::DeclaredAfter))
+        }
+    };
+    store
+        .variable(value_question.header().var_store_info, u16::from(size))
+        .map_err(|unresolved| ShortEfiRefusal::new(id, unresolved.into()))
 }
 
 /// A VarStore that a FormSet declares.
@@ -3593,31 +3671,114 @@ enum DeclaredStore {
     /// A VARSTORE_NAME_VALUE of the Guid, whose values only the driver's
     /// EFI_HII_CONFIG_ACCESS_PROTOCOL reaches
     NameValue(Guid),
-    /// A VARSTORE_EFI of the form before UEFI 2.3.1, which names no EFI variable
-    ShortEfi,
+    /// A VARSTORE_EFI of the form before UEFI 2.3.1, whose ops each name an EFI variable by their
+    /// VarName
+    ShortEfi(ShortVarStoreEfi),
 }
 
 /// Returns the VarStore of `var_store_id` that `form_set` declares, if any: the first among its
 /// children.
 fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Option<DeclaredStore> {
-    form_set
-        .children
+    form_set.children.iter().find_map(|child| {
+        let (declared, store) = declared_store(&child.borrow())?;
+        (declared == var_store_id).then_some(store)
+    })
+}
+
+/// The VarStoreId that `op` declares and its VarStore, if `op` declares one.
+fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
+    match &op.parsed_data {
+        ParsedOperation::VarStore(store) => Some((
+            store.var_store_id,
+            DeclaredStore::Variable(Box::new(store.clone())),
+        )),
+        ParsedOperation::VarStoreEfi(store) => Some((
+            store.var_store_id,
+            DeclaredStore::Variable(Box::new(store.clone())),
+        )),
+        ParsedOperation::VarStoreNameValue(store) => {
+            Some((store.var_store_id, DeclaredStore::NameValue(store.guid)))
+        }
+        ParsedOperation::ShortVarStoreEfi(store) => {
+            Some((store.var_store_id, DeclaredStore::ShortEfi(store.clone())))
+        }
+        ParsedOperation::FormSet(_)
+        | ParsedOperation::OneOf(_)
+        | ParsedOperation::OneOfOption(_)
+        | ParsedOperation::Numeric(_)
+        | ParsedOperation::CheckBox(_)
+        | ParsedOperation::DefaultStore(_)
+        | ParsedOperation::IFRDefault(_)
+        | ParsedOperation::Form(_)
+        | ParsedOperation::Text(_)
+        | ParsedOperation::Subtitle(_)
+        | ParsedOperation::QuestionRef1(_)
+        | ParsedOperation::EqIdVal(_)
+        | ParsedOperation::EqIdId(_)
+        | ParsedOperation::EqIdValList(_)
+        | ParsedOperation::Get(_)
+        | ParsedOperation::Set(_)
+        | ParsedOperation::FormMap(_)
+        | ParsedOperation::Placeholder => None,
+    }
+}
+
+/// Fills the VarName strings of the VARSTORE_EFIs before UEFI 2.3.1 of the FormSets of `roots`,
+/// one package list's, from `string_packages`, its strings packages, as edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c takes the string of each VarName (GetToken): for each op with a
+/// question header on such a store, in any scope, the string that every strings package holding
+/// its VarName gives, or the strings that they differ on. The strings are the list's, so every
+/// such store shares one map of them, filled after the walk, which borrows the ops that it visits.
+pub(super) fn resolve_short_var_names(
+    roots: &[Rc<RefCell<IFROperation>>],
+    string_packages: &[StringPackage],
+) {
+    let mut stores = Vec::new();
+    let mut names = VarNames::new();
+    walk_scopes(roots, (), |node, ()| {
+        let op = node.borrow();
+        if let ParsedOperation::ShortVarStoreEfi(_) = op.parsed_data {
+            stores.push(Rc::clone(node));
+        }
+        let var_name = parse_question_header(&op)
+            .filter(|header| names_short_var_store(&op, header.var_store_id))
+            .map(|header| header.var_store_info);
+        let string = var_name
+            .and_then(|var_name| Some((var_name, var_name_string(var_name, string_packages)?)));
+        if let Some((var_name, string)) = string {
+            names.insert(var_name, string);
+        }
+        Walk::Enter(())
+    });
+    let names = Rc::new(names);
+    for store in stores {
+        if let ParsedOperation::ShortVarStoreEfi(store) = &mut store.borrow_mut().parsed_data {
+            store.var_names = Rc::clone(&names);
+        }
+    }
+}
+
+/// Returns the string of VarName `var_name` in the `string_packages` that hold it, or, where they
+/// differ, each with its language; None if none holds it.
+fn var_name_string(
+    var_name: u16,
+    string_packages: &[StringPackage],
+) -> Option<std::result::Result<Rc<str>, UnresolvedVarName>> {
+    let held: Vec<(&Language, &Rc<str>)> = string_packages
         .iter()
-        .find_map(|child| match &child.borrow().parsed_data {
-            ParsedOperation::VarStore(store) if store.var_store_id == var_store_id => {
-                Some(DeclaredStore::Variable(Box::new(store.clone())))
-            }
-            ParsedOperation::VarStoreEfi(store) if store.var_store_id == var_store_id => {
-                Some(DeclaredStore::Variable(Box::new(store.clone())))
-            }
-            ParsedOperation::VarStoreNameValue(store) if store.var_store_id == var_store_id => {
-                Some(DeclaredStore::NameValue(store.guid))
-            }
-            ParsedOperation::ShortVarStoreEfi(store) if store.var_store_id == var_store_id => {
-                Some(DeclaredStore::ShortEfi)
-            }
-            _ => None,
-        })
+        .filter_map(|package| Some((&package.language, package.strings.get(&var_name)?)))
+        .collect();
+    let &(_, first) = held.first()?;
+    if held.iter().all(|&(_, string)| string == first) {
+        return Some(Ok(Rc::clone(first)));
+    }
+    Some(Err(UnresolvedVarName::Disagreeing {
+        var_name,
+        strings: held
+            .into_iter()
+            .map(|(language, string)| (language.0.escape_ascii().to_string(), string.to_string()))
+            .collect(),
+    }))
 }
 
 #[cfg(test)]
@@ -4466,8 +4627,7 @@ mod tests {
             handle_form_set(&mut Cursor::new(&data))
         };
         let unread = "<ValueUnavailable: VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI \
-                      2.3.1), whose EFI variables are named by VarNames, which uefisettings does \
-                      not resolve> <IFR default: 0>";
+                      2.3.1): no string 0x0000 holds its VarName> <IFR default: 0>";
 
         for tail in [&[][..], &[0x05], &[0x05, 0x00]] {
             let data = [fields, tail].concat();

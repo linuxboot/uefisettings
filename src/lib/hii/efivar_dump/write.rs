@@ -50,6 +50,7 @@ use crate::hii::variables::efivar_parts;
 use crate::hii::variables::DecodedValue;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarSource;
+use crate::hii::variables::VariableLayout;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 /// The efivar files that a dump copied, and those that its questions read but do not exist.
@@ -115,7 +116,9 @@ fn decoded_bytes(
 
 /// Copies the efivar files that `decoded` names from `efivars` into the new directory `dir`,
 /// keeping, as `redaction` says, only their `decoded` payload bytes, and saves `hiidb`, which
-/// `decoded` comes from, as DUMP_HIIDB and then the DUMP_MANIFEST.
+/// `decoded` comes from, as DUMP_HIIDB and then the DUMP_MANIFEST. A file that `efivars` lacks,
+/// or whose name the file system refuses as too long, as the VarName string of a VARSTORE_EFI
+/// before UEFI 2.3.1 may make it, is missing.
 pub(super) fn write_dump(
     hiidb: &[u8],
     decoded: &BTreeMap<EfivarFileName, Vec<DecodedValue>>,
@@ -128,7 +131,7 @@ pub(super) fn write_dump(
     for (name, values) in decoded {
         let file = match open_efivar(efivars, name) {
             Ok(file) => file,
-            Err(error) if error.is::<EfivarNotFound>() => {
+            Err(error) if error.is::<EfivarNotFound>() || names_too_long(&error) => {
                 dump.missing.push(name.to_string());
                 continue;
             }
@@ -156,6 +159,13 @@ pub(super) fn write_dump(
     partial.write(DUMP_MANIFEST, &serde_json::to_vec_pretty(&manifest)?)?;
     partial.commit();
     Ok(dump)
+}
+
+/// Whether `error` is ENAMETOOLONG, of a file name longer than the file system takes.
+fn names_too_long(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
 }
 
 /// The efivar file `bytes` with each payload byte zeroed unless one of `values` decodes it from
@@ -197,9 +207,13 @@ fn value_start(bytes: &[u8]) -> Option<usize> {
 
 impl DecodedValue {
     /// Whether this value decodes from a variable whose value, behind any metadata, has `len`
-    /// bytes: get reads `size` of them, so it fails on fewer.
+    /// bytes: get reads `size` of them, so it fails on fewer, and under VariableLayout::OneValue
+    /// on any other number (VariableSizeMismatch).
     fn decodes_from(&self, len: usize) -> bool {
-        len >= usize::from(self.size)
+        match self.layout {
+            VariableLayout::Offsets => len >= usize::from(self.size),
+            VariableLayout::OneValue => len == usize::from(self.size),
+        }
     }
 }
 
@@ -290,6 +304,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::parse_form_set;
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
+    use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
@@ -297,6 +312,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+    use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::IFROperation;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
@@ -304,6 +320,7 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::read_db;
+    use crate::hii::package::Guid;
     use crate::hii::strings::Language;
     use crate::hii::strings::ListTexts;
     use crate::hii::strings::StringPackage;
@@ -495,7 +512,11 @@ mod tests {
     fn redacted_dump_keeps_the_decoded_bytes() {
         let live = efivars(&[(&efivar("Setup"), &SETUP)]);
         let (_parent, dir) = dump_dir();
-        let decoded = |value| DecodedValue { size: 10, value };
+        let decoded = |value| DecodedValue {
+            size: 10,
+            layout: VariableLayout::Offsets,
+            value,
+        };
         let decoded = BTreeMap::from([(
             efivar("Setup"),
             vec![decoded(1..3), decoded(6..7), decoded(9..10)],
@@ -543,6 +564,7 @@ mod tests {
                 efivar("Setup"),
                 vec![DecodedValue {
                     size: 4,
+                    layout: VariableLayout::Offsets,
                     value: 1..2,
                 }],
             )]);
@@ -945,6 +967,187 @@ mod tests {
             answers_in(&dir),
             answers_in(live.path()),
             "answers from the dump and from the source"
+        );
+    }
+
+    /// The dump copies the per-question variables that the questions of a VARSTORE_EFI before
+    /// UEFI 2.3.1 read, each by the string of its VarName, and the redacted one keeps their bytes
+    /// 0..width, the value: it answers as its source does.
+    #[test]
+    fn dump_copies_the_per_question_variables_of_a_short_var_store() {
+        let uint16_numeric = [
+            question_header_with(2, 2, 1, 4, 0x00),
+            vec![0x11], // EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC
+            [0, u16::MAX, 1].map(u16::to_le_bytes).concat(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(
+                    1,
+                    &[
+                        checkbox_at(1, 1, 1, 3),
+                        operation(NUMERIC, false, &uint16_numeric),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["A", "D", "ShortVarA", "ShortVarD"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let short = |name| EfivarFileName::new(name, Guid::from(SHORT_VAR_STORE_GUID));
+        let live = efivars(&[
+            (&short("ShortVarA"), &[7, 0, 0, 0, 1]),
+            (&short("ShortVarD"), &[7, 0, 0, 0, 0x34, 0x12]),
+            (&efivar("Other"), &[7, 0, 0, 0, 0xAA]),
+        ]);
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+        let root = Rc::clone(&lists[0].forms[0]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded = decoded_bytes(lists).expect("find the decoded bytes");
+        let dump = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
+
+        let width = |size: u16| {
+            vec![DecodedValue {
+                size,
+                layout: VariableLayout::OneValue,
+                value: 0..usize::from(size),
+            }]
+        };
+        assert_eq!(
+            decoded,
+            BTreeMap::from([
+                (short("ShortVarA"), width(1)),
+                (short("ShortVarD"), width(2))
+            ]),
+            "decoded bytes"
+        );
+        assert_eq!(
+            dump.copied,
+            [
+                "ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01",
+                "ShortVarD-8c78a505-baa0-4c4a-869f-000000000b01"
+            ],
+            "copied"
+        );
+        assert_eq!(
+            fs::read(dir.join(short("ShortVarD"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 0x34, 0x12],
+            "dumped ShortVarD"
+        );
+        assert_eq!(answers(&root, &dir), ["1", "4660"], "answers from the dump");
+        assert_eq!(
+            answers(&root, &dir),
+            answers(&root, live.path()),
+            "answers from the source"
+        );
+    }
+
+    /// A package list of a VARSTORE_EFI before UEFI 2.3.1, VarStore 1 of SHORT_VAR_STORE_GUID,
+    /// then a form of `questions`, with the strings `strings` from ID 1.
+    fn short_store_hiidb(questions: &[Vec<u8>], strings: &[&str]) -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, questions),
+            ]),
+            en_strings_package_of(strings),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// A UINT16 NUMERIC of QuestionId `question_id`, prompted by string 1, on VarStore 1 at
+    /// VarName `var_name`.
+    fn uint16_numeric_on(question_id: u16, var_name: u16) -> Vec<u8> {
+        let data = [
+            question_header_with(question_id, 1, 1, var_name, 0x00),
+            vec![0x11], // EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC
+            [0, u16::MAX, 1].map(u16::to_le_bytes).concat(),
+        ]
+        .concat();
+        operation(NUMERIC, false, &data)
+    }
+
+    /// The efivar file name of the variable `name` of SHORT_VAR_STORE_GUID.
+    fn short_efivar(name: &str) -> EfivarFileName {
+        EfivarFileName::new(name, Guid::from(SHORT_VAR_STORE_GUID))
+    }
+
+    /// The redacted dump keeps no payload byte of a per-question variable that get refuses as of
+    /// another size: of 3 bytes under a UINT16 question, only the attributes word stays.
+    #[test]
+    fn redacted_dump_keeps_no_byte_of_a_per_question_variable_of_another_size() {
+        let hiidb = short_store_hiidb(&[uint16_numeric_on(2, 2)], &["D", "ShortVarD"]);
+        let live = efivars(&[(&short_efivar("ShortVarD"), &[7, 0, 0, 0, 0x34, 0x12, 0x56])]);
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+        let root = Rc::clone(&lists[0].forms[0]);
+        let (_parent, dir) = dump_dir();
+
+        let decoded = decoded_bytes(lists).expect("find the decoded bytes");
+        write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .expect("dump efivars");
+
+        assert_eq!(
+            answers(&root, live.path()),
+            [
+                "<ValueUnavailable: EFI variable ShortVarD-8c78a505-baa0-4c4a-869f-000000000b01 \
+              holds 3 bytes; the question takes 2>"
+            ],
+            "answers from the source"
+        );
+        assert_eq!(
+            fs::read(dir.join(short_efivar("ShortVarD"))).expect("read the dumped file"),
+            [7, 0, 0, 0, 0, 0, 0],
+            "dumped ShortVarD"
+        );
+    }
+
+    /// A VarName whose string makes an efivar file name longer than the file system takes fails
+    /// no dump: its variable is missing, and the others are copied.
+    #[test]
+    fn dump_takes_a_var_name_past_the_file_name_limit_for_missing() {
+        let long = "L".repeat(300);
+        let hiidb = short_store_hiidb(
+            &[uint16_numeric_on(2, 2), uint16_numeric_on(4, 3)],
+            &["D", &long, "ShortVarD"],
+        );
+        let live = efivars(&[(&short_efivar("ShortVarD"), &[7, 0, 0, 0, 0x34, 0x12])]);
+        let lists = read_db(&hiidb).expect("read the HiiDB");
+        let (_parent, dir) = dump_dir();
+
+        let decoded = decoded_bytes(lists).expect("find the decoded bytes");
+        let dump = write_dump(
+            HIIDB,
+            &decoded,
+            live.path(),
+            &dir,
+            EfivarRedaction::DecodedBytes,
+        )
+        .map_err(|error| format!("{error:#}"));
+
+        assert_eq!(
+            dump,
+            Ok(EfivarDump {
+                copied: vec![short_efivar("ShortVarD").to_string()],
+                missing: vec![short_efivar(&long).to_string()],
+            }),
+            "dump with a VarName of 300 characters"
         );
     }
 

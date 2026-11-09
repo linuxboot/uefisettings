@@ -188,6 +188,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::variables::DecodedValue;
     use crate::hii::variables::EfivarFileName;
+    use crate::hii::variables::VariableLayout;
 
     /// The HiiDB that write_dump saves; it does not parse it.
     pub(super) const HIIDB: &[u8] = b"a HiiDB";
@@ -224,6 +225,7 @@ mod tests {
                     name.clone(),
                     vec![DecodedValue {
                         size: 1,
+                        layout: VariableLayout::Offsets,
                         value: 0..1,
                     }],
                 )

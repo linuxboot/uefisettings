@@ -666,10 +666,9 @@ mod tests {
                 .map_err(|error| error.to_string()),
             Err(
                 "PASSWORD question 0x0002 in FormSet 11111111-1111-1111-1111-111111111111: \
-                 VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1), whose EFI variables \
-                 are named by VarNames, which uefisettings does not resolve; as the variable of \
-                 that password is unknown, the UEFI Shell build reads and writes no variable of \
-                 this HiiDB"
+                 VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): uefisettings reads \
+                 no EFI_IFR_PASSWORD on it; as the variable of that password is unknown, the \
+                 UEFI Shell build reads and writes no variable of this HiiDB"
                     .to_string()
             ),
             "BootServices"

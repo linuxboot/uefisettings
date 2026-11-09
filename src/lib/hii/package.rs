@@ -473,6 +473,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         }
     }
 
+    forms::resolve_short_var_names(&roots, &string_packages);
     Ok(ParsedPackageList {
         guid: package_list.guid,
         device_path,

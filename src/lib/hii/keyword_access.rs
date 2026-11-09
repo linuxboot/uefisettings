@@ -389,6 +389,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::parse_form_set;
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
+    use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::MemoryVariables;
     use crate::hii::forms::ifr_fixtures::VariableInterface;
@@ -397,7 +398,9 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
+    use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::keywords::KeywordRefusal;
+    use crate::hii::forms::resolve_short_var_names;
     use crate::hii::forms::IgnoredIfr;
     use crate::hii::package::Guid;
     use crate::hii::strings::Language;
@@ -655,6 +658,45 @@ mod tests {
             variables(),
             handler,
         )
+    }
+
+    /// get and set by KEYWORD of a ONE_OF on a VARSTORE_EFI before UEFI 2.3.1, on VarName 7
+    /// "ShortVarK", are refused before any GetData() or SetData(): the Keyword Handler would take
+    /// the VarName for a VarOffset in a request to the driver (edk2-stable202608
+    /// ConfigKeywordHandler.c :2114, :2219; ConfigRouting.c GetVarStoreType :1902).
+    #[test]
+    fn get_and_set_by_keyword_call_no_handler_for_a_short_var_store() {
+        const REFUSAL: &str = "is on an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1, whose VarName the \
+            Keyword Handler takes for a VarOffset in a request to its driver";
+        let mut lists = [list(
+            PATH,
+            &[
+                short_var_store_efi_of(2, SHORT_VAR_STORE_GUID, ATTRIBUTES),
+                one_of(3, 7, 2),
+            ],
+        )];
+        lists[0].strings[0].strings.insert(7, "ShortVarK".into());
+        resolve_short_var_names(&lists[0].forms, &lists[0].strings);
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+
+        let get = get(&lists, &handler)
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+        let set = set(
+            &lists,
+            &resp(PATH, KEYWORD, "03"),
+            SetupPasswordPolicy::Refuse,
+            &handler,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+
+        assert!(
+            get.as_ref().is_err_and(|error| error.contains(REFUSAL))
+                && set.as_ref().is_err_and(|error| error.contains(REFUSAL)),
+            "get {get:?}, set {set:?}"
+        );
+        assert_eq!(handler.calls(), vec![], "no GetData() or SetData()");
     }
 
     /// GetData() reads the question that check_get passed: by the NAMESPACE of its strings

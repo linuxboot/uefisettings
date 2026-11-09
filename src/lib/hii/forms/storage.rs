@@ -13,6 +13,9 @@
 //! The VarStores that IFR questions keep their values in, and the reads of those values from
 //! the EFI variables behind them.
 
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
 use anyhow::Result;
 use binrw::BinRead;
 use thiserror::Error;
@@ -39,8 +42,10 @@ use crate::hii::variables::EfivarsNotRead;
 use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
+use crate::hii::variables::VariableLayout;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
+use crate::hii::variables::VariableSizeMismatch;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use crate::hii::variables::EFI_VARIABLE_RUNTIME_ACCESS;
 
@@ -50,6 +55,11 @@ pub(super) trait VariableStore {
     fn size(&self) -> u16;
     fn kind(&self) -> VariableStoreKind;
     fn is_runtime_accessible(&self) -> bool;
+
+    /// How its variable holds the values of its questions.
+    fn layout(&self) -> VariableLayout {
+        VariableLayout::Offsets
+    }
 
     /// The variable that holds the values of this VarStore.
     fn variable_key(&self) -> VariableKey {
@@ -1094,6 +1104,7 @@ impl EfivarRange {
         Self {
             key: store.variable_key(),
             size: store.size(),
+            layout: store.layout(),
         }
     }
 }
@@ -1196,6 +1207,8 @@ pub(super) enum ValueUnavailable {
     NotRead(EfivarsNotRead),
     #[error("{0}")]
     Missing(VariableNotFound),
+    #[error("{0}")]
+    Size(VariableSizeMismatch),
     #[error("{0}; HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL")]
     MissingBuffer(VariableNotFound),
     /// The cause chain of a read error that the EfivarReader keeps, as `{:#}` shows it
@@ -1235,6 +1248,9 @@ impl ValueUnavailable {
         if let Some(refused) = error.downcast_ref::<EnhancedAuthenticatedVariable>() {
             return Self::EnhancedAuthenticated(refused.clone());
         }
+        if let Some(mismatch) = error.downcast_ref::<VariableSizeMismatch>() {
+            return Self::Size(mismatch.clone());
+        }
         let Some(missing) = error.downcast_ref::<VariableNotFound>() else {
             return Self::ReadError(format!("{error:#}"));
         };
@@ -1268,6 +1284,7 @@ impl ValueUnavailable {
             | Self::PasswordBytes
             | Self::NotRead(_)
             | Self::Missing(_)
+            | Self::Size(_)
             | Self::MissingBuffer(_)
             | Self::BitField(_)
             | Self::NotDecoded(_)
@@ -1451,8 +1468,9 @@ pub(super) fn read_question_value(
 
 /// The bytes of `question`'s value at `location` in the ExportConfig snapshot of `reader`, if
 /// its variable is missing or its storage is name/value, or `unread`, why the question has no
-/// value otherwise: the snapshot holds no byte of a PASSWORD question (ConfigSnapshot::parse),
-/// so a value over one gives `unread`, PasswordBytes (read_current_value_bytes).
+/// value otherwise, as of a variable of a VarName: the snapshot holds no byte of a PASSWORD
+/// question (ConfigSnapshot::parse), so a value over one gives `unread`, PasswordBytes
+/// (read_current_value_bytes).
 fn snapshot_bytes(
     question: ValueQuestion<'_>,
     location: ReadableLocation,
@@ -1466,6 +1484,13 @@ fn snapshot_bytes(
     let value = location.0.bytes();
     match varstore {
         Ok(store) => {
+            // edk2-stable202608 ExportConfig() asks a driver only for the storages that
+            // HiiDatabaseDxe/ConfigRouting.c ParseIfrData finds, which skips a VARSTORE_EFI before
+            // UEFI 2.3.1 (:2485): no <ConfigResp> holds the variable of a VarName
+            match store.layout() {
+                VariableLayout::Offsets => {}
+                VariableLayout::OneValue => return Err(unread),
+            }
             let missing = reader
                 .read_error(store.as_ref())
                 .is_some_and(|error| error.is::<VariableNotFound>());
@@ -2063,6 +2088,7 @@ mod efivar_reader_tests {
                     efi_variable("Bits", 4).variable_key(),
                     vec![DecodedValue {
                         size: 4,
+                        layout: VariableLayout::Offsets,
                         value: 1..2
                     }]
                 ),
@@ -2070,6 +2096,7 @@ mod efivar_reader_tests {
                     efi_variable("Hidden", 4).variable_key(),
                     vec![DecodedValue {
                         size: 4,
+                        layout: VariableLayout::Offsets,
                         value: 3..4
                     }]
                 ),
@@ -2077,6 +2104,7 @@ mod efivar_reader_tests {
                     efi_variable("Setup", 4).variable_key(),
                     vec![DecodedValue {
                         size: 4,
+                        layout: VariableLayout::Offsets,
                         value: 3..4
                     }]
                 ),
@@ -2189,11 +2217,130 @@ pub struct ShortVarStoreEfi {
     pub var_store_id: u16,
     pub guid: Guid,
     pub attributes: u32,
+    /// What resolve_short_var_names finds in the strings of its package list
+    #[br(default)]
+    pub(super) var_names: Rc<VarNames>,
 }
+
+/// The EFI variable names of the VarNames of the ops on a ShortVarStoreEfi, by string ID, or the
+/// strings that they differ on.
+pub(super) type VarNames = BTreeMap<u16, Result<Rc<str>, UnresolvedVarName>>;
 impl ShortVarStoreEfi {
     /// Its label in refusals.
     pub(super) const LABEL: &'static str = "EFI_IFR_VARSTORE_EFI before UEFI 2.3.1";
-    /// Why its values are not read, after the VarStore.
+    /// Why a GET or SET does not read its values, after the VarStore.
     pub(super) const UNREAD: &'static str =
         "whose EFI variables are named by VarNames, which uefisettings does not resolve";
+
+    /// The EFI variable of `size` bytes that VarName `var_name` names, or why it names none.
+    pub(super) fn variable(
+        &self,
+        var_name: u16,
+        size: u16,
+    ) -> Result<ShortEfiVariable, UnresolvedVarName> {
+        let name = self
+            .var_names
+            .get(&var_name)
+            .cloned()
+            .unwrap_or(Err(UnresolvedVarName::NoString(var_name)))?;
+        Ok(ShortEfiVariable {
+            name,
+            guid: self.guid,
+            attributes: self.attributes,
+            size,
+        })
+    }
+}
+
+/// Why the VarName of an op on a ShortVarStoreEfi names no EFI variable.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(super) enum UnresolvedVarName {
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c GetToken takes the unknown string "!" then
+    #[error("no string {0:#06x} holds its VarName")]
+    NoString(u16),
+    /// Strings of the VarName that differ between the strings packages, each with the Language of
+    /// its package: GetToken takes the one of the platform language, which uefisettings does not
+    /// know
+    #[error(
+        "the strings packages differ on its VarName {var_name:#06x}: {}",
+        .strings
+            .iter()
+            .map(|(language, string)| format!("{string:?} in {language}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    Disagreeing {
+        var_name: u16,
+        strings: Vec<(String, String)>,
+    },
+}
+
+/// The EFI variable of one op on a ShortVarStoreEfi, which holds its value alone: of the string of
+/// its VarName and the store's Guid, of the `size` bytes of the value (edk2-stable202608
+/// SetupBrowserDxe/Setup.c GetQuestionValue, SetQuestionValue).
+pub(super) struct ShortEfiVariable {
+    name: Rc<str>,
+    guid: Guid,
+    attributes: u32,
+    size: u16,
+}
+
+impl VariableStore for ShortEfiVariable {
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+    fn guid(&self) -> Guid {
+        self.guid
+    }
+    fn size(&self) -> u16 {
+        self.size
+    }
+    fn kind(&self) -> VariableStoreKind {
+        VariableStoreKind::EfiVariable
+    }
+    /// Whether the form declares EFI_VARIABLE_RUNTIME_ACCESS; the variable's own attributes may
+    /// differ.
+    fn is_runtime_accessible(&self) -> bool {
+        (self.attributes & EFI_VARIABLE_RUNTIME_ACCESS) != 0
+    }
+    fn layout(&self) -> VariableLayout {
+        VariableLayout::OneValue
+    }
+}
+
+/// Why a ShortVarStoreEfi names no EFI variable for an op on it.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("VarStore {var_store_id:#06x} ({}): {reason}", ShortVarStoreEfi::LABEL)]
+pub(super) struct ShortEfiRefusal {
+    pub(super) var_store_id: u16,
+    pub(super) reason: ShortEfiReason,
+}
+
+impl ShortEfiRefusal {
+    pub(super) fn new(var_store_id: u16, reason: ShortEfiReason) -> Self {
+        Self {
+            var_store_id,
+            reason,
+        }
+    }
+}
+
+/// The reason of a ShortEfiRefusal.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(super) enum ShortEfiReason {
+    #[error(transparent)]
+    VarName(#[from] UnresolvedVarName),
+    #[error(
+        "the question is an EDKII bit varstore field, whose VarStoreInfo is a bit offset, not a \
+         VarName"
+    )]
+    BitField,
+    #[error(
+        "declared after the question, which took its VarStoreInfo for a VarOffset; a question \
+         names a previously declared VarStore (UEFI 2.11 §33.3.8.2.2 EFI_IFR_QUESTION_HEADER)"
+    )]
+    DeclaredAfter,
+    /// An op whose value uefisettings does not read, named by its spec name
+    #[error("uefisettings reads no {0} on it")]
+    NotRead(&'static str),
 }

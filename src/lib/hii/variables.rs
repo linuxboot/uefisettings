@@ -601,13 +601,33 @@ pub(super) struct EnhancedAuthenticatedVariable {
 }
 
 /// FirmwareVariables::read of the attributes word and the first `size` bytes of the value of
-/// `key`: for a variable whose data has_metadata, those after its metadata (value_of), which it
-/// reads whole to find.
+/// `key`, or under VariableLayout::OneValue its whole value, which must be `size` bytes: for a
+/// variable whose data has_metadata, those after its metadata (value_of), which it reads whole to
+/// find.
 fn read_value_bytes(
     variables: &dyn FirmwareVariables,
     key: &VariableKey,
     size: u16,
+    layout: VariableLayout,
 ) -> Result<Vec<u8>> {
+    match layout {
+        VariableLayout::Offsets => {}
+        VariableLayout::OneValue => {
+            let whole = variables.read_whole(key)?;
+            let (attributes, data) =
+                efivar_parts(&whole).context(variables.interface().missing_attributes())?;
+            let value = value_of(key, attributes, data)?;
+            if value.len() != usize::from(size) {
+                return Err(VariableSizeMismatch {
+                    key: key.clone(),
+                    held: value.len(),
+                    width: size,
+                }
+                .into());
+            }
+            return Ok([&attributes.to_ne_bytes()[..], value].concat());
+        }
+    }
     let bytes = variables.read(key, size)?;
     match efivar_attributes(&bytes).map(has_metadata) {
         Some(Ok(false)) | None => return Ok(bytes),
@@ -625,6 +645,16 @@ fn read_value_bytes(
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("no EFI variable {0}")]
 pub(super) struct VariableNotFound(pub(super) VariableKey);
+
+/// A variable of VariableLayout::OneValue whose value is not as wide as its question's, which get
+/// and set refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("EFI variable {key} holds {held} bytes; the question takes {width}")]
+pub(super) struct VariableSizeMismatch {
+    key: VariableKey,
+    held: usize,
+    width: u16,
+}
 
 /// Where question values are read: the variables of this machine, a directory of efivar files,
 /// or none.
@@ -749,18 +779,42 @@ impl FirmwareVariables for UnreadVariables {
     }
 }
 
-/// The arguments of FirmwareVariables::read, which an EfivarReader reads once.
+/// The arguments of read_value_bytes, which an EfivarReader reads once.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct EfivarRange {
     pub(super) key: VariableKey,
     pub(super) size: u16,
+    pub(super) layout: VariableLayout,
 }
 
-/// The payload bytes `value` that a question decodes from a variable, of which
+/// How the variable of a VarStore holds the values of its questions, which decides what of it
+/// read_value_bytes reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum VariableLayout {
+    /// Each at its VarOffset, in a value at least as large as the VarStore
+    Offsets,
+    /// The value of one question, alone and whole: the variable of a VarName on a VARSTORE_EFI
+    /// before UEFI 2.3.1
+    OneValue,
+}
+
+impl VariableLayout {
+    /// Where a value of VarStoreInfo `var_store_info` starts in the variable: at that VarOffset,
+    /// or at byte 0 of the variable of a VarName.
+    pub(super) fn offset(self, var_store_info: u16) -> u16 {
+        match self {
+            Self::Offsets => var_store_info,
+            Self::OneValue => 0,
+        }
+    }
+}
+
+/// The payload bytes `value` that a question decodes from a variable of `layout`, of which
 /// FirmwareVariables::read reads `size` payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DecodedValue {
     pub(super) size: u16,
+    pub(super) layout: VariableLayout,
     pub(super) value: Range<usize>,
 }
 
@@ -853,6 +907,7 @@ impl EfivarReader {
         if value.end <= usize::from(range.size) {
             decoded.push(DecodedValue {
                 size: range.size,
+                layout: range.layout,
                 value,
             });
         }
@@ -860,7 +915,7 @@ impl EfivarReader {
         self.outcomes
             .entry(range)
             .or_insert_with_key(|range| {
-                read_value_bytes(variables.as_ref(), &range.key, range.size)
+                read_value_bytes(variables.as_ref(), &range.key, range.size, range.layout)
             })
             .as_deref()
     }
@@ -1488,6 +1543,7 @@ pub(crate) mod tests {
         let range = |name: &str, size| EfivarRange {
             key: variable_key(name),
             size,
+            layout: VariableLayout::Offsets,
         };
         let mut reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
 
@@ -1747,6 +1803,7 @@ pub(crate) mod tests {
         let range = EfivarRange {
             key: variable_key("Setup"),
             size: 1,
+            layout: VariableLayout::Offsets,
         };
 
         let error = reader.read(range, 0..1).expect_err("read without efivars");
@@ -1809,12 +1866,17 @@ pub(crate) mod tests {
             (&other, 2, 1..3), // ends one byte past Size
             (&past, 2, 3..5),
         ];
-        let decoded = |size, value| DecodedValue { size, value };
+        let decoded = |size, value| DecodedValue {
+            size,
+            layout: VariableLayout::Offsets,
+            value,
+        };
 
         for (key, size, value) in reads {
             let range = EfivarRange {
                 key: key.clone(),
                 size,
+                layout: VariableLayout::Offsets,
             };
             reader.read(range, value).expect_err("read without efivars");
         }

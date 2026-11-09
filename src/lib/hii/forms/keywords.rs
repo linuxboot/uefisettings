@@ -77,6 +77,7 @@ use crate::hii::variables::is_volatile;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::VariableKey;
+use crate::hii::variables::VariableLayout;
 use crate::hii::variables::VolatileWrites;
 use crate::parse_error::ReadParsed;
 
@@ -175,6 +176,12 @@ pub(crate) enum QuestionRefusal {
     BitField,
     #[error("has no VarStore that uefisettings reads: {0}")]
     UnreadVarStore(String),
+    #[error(
+        "is on an {}, whose VarName the Keyword Handler takes for a VarOffset in a request to \
+         its driver, not for the EFI variable that get and set reach",
+        ShortVarStoreEfi::LABEL
+    )]
+    ShortVarStore,
     #[error("spans bytes that hold a password, which uefisettings neither reads nor writes")]
     PasswordBytes,
     #[error("has VarStoreId {0}, which another FormSet of its package list declares for {1}")]
@@ -568,6 +575,16 @@ impl<'a> KeywordQuestion<'a> {
                 )
             },
         )?;
+        // edk2-stable202608 ConfigKeywordHandler.c ExtractConfigRequest and ExtractConfigResp
+        // (:2114, :2219) put its VarName in OFFSET=, and ConfigRouting.c GetVarStoreType (:1902)
+        // sends a request on a VARSTORE_EFI before UEFI 2.3.1 to the driver's ExtractConfig and
+        // RouteConfig
+        match store.layout() {
+            VariableLayout::Offsets => {}
+            VariableLayout::OneValue => {
+                return Err(self.question_refusal(&header, QuestionRefusal::ShortVarStore))
+            }
+        }
         // GetData() answers with the question's bytes; check_set refuses a SetData() of them
         if access == QuestionExpression::Read
             && reader
@@ -603,7 +620,7 @@ impl<'a> KeywordQuestion<'a> {
                         Some(format!("EFI variable {}", store.variable_key()))
                     }
                     DeclaredStore::NameValue(_) => Some("a VARSTORE_NAME_VALUE".to_owned()),
-                    DeclaredStore::ShortEfi => Some(format!("an {}", ShortVarStoreEfi::LABEL)),
+                    DeclaredStore::ShortEfi(_) => Some(format!("an {}", ShortVarStoreEfi::LABEL)),
                 },
             )
     }
@@ -875,9 +892,11 @@ mod tests {
     use super::super::ifr_fixtures::NUMERIC;
     use super::super::ifr_fixtures::ONE_OF;
     use super::super::ifr_fixtures::READ;
+    use super::super::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use super::super::ifr_fixtures::SUPPRESS_IF;
     use super::super::ifr_fixtures::VALUE;
     use super::super::ifr_fixtures::WRITE;
+    use super::super::resolve_short_var_names;
     use super::super::storage::VariableNotExported;
     use super::super::ChangeValueError;
     use super::*;
@@ -1875,6 +1894,94 @@ mod tests {
                 "VarStore 1 of {name} in FormSet {at} of the list"
             );
         }
+    }
+
+    /// The Keyword Handler sends a question on a VARSTORE_EFI of the form before UEFI 2.3.1 to its
+    /// driver with its VarName as a VarOffset (edk2-stable202608 ConfigKeywordHandler.c
+    /// ExtractConfigRequest :2114, ExtractConfigResp :2219; ConfigRouting.c GetVarStoreType
+    /// :1902), never to the EFI variable that its VarName names, so check_get and check_set of a
+    /// ONE_OF on one refuse it, naming the store, before they look at the bytes of that variable,
+    /// which here hold a password.
+    #[test]
+    fn check_get_and_set_refuse_a_question_on_a_short_var_store() {
+        let ops = [short_var_store_efi(2), one_of(2, 0)].concat();
+        let mut lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
+        // VarName 5, the question's VarStoreInfo, names the variable ShortVar
+        lists[0].strings[0].strings.insert(5, "ShortVar".into());
+        resolve_short_var_names(&lists[0].forms, &lists[0].strings);
+        let question = question_of(&lists);
+        let refusal = format!(
+            "keyword {KEYWORD}: question {QUESTION:?} is on an EFI_IFR_VARSTORE_EFI before UEFI \
+             2.3.1, whose VarName the Keyword Handler takes for a VarOffset in a request to its \
+             driver, not for the EFI variable that get and set reach"
+        );
+        let short_var = VariableKey {
+            name: "ShortVar".to_owned(),
+            guid: Guid::from(SHORT_VAR_STORE_GUID),
+        };
+        let withholding = || {
+            let mut withheld = WithheldBytes::default();
+            withheld.insert(short_var.clone(), 0..OFFSET + 1);
+            EfivarReader::withholding(Box::new(variables(1)), withheld)
+        };
+
+        let get = question.check_get(&withholding());
+        let set = question.check_set(
+            &resp("03"),
+            IncludedStates::empty(),
+            VolatileWrites::Refuse,
+            &mut withholding(),
+        );
+
+        assert_eq!(
+            (
+                get.err().map(|error| error.to_string()),
+                set.err().map(|error| error.to_string())
+            ),
+            (Some(refusal.clone()), Some(refusal)),
+            "get and set"
+        );
+    }
+
+    /// check_get and check_set refuse a ONE_OF on a VARSTORE_EFI before UEFI 2.3.1 whose VarName
+    /// names an existing variable, which get and set read and write: GetData() and SetData() take
+    /// that VarName for a VarOffset in a request to the driver.
+    #[test]
+    fn check_get_and_set_refuse_a_question_on_a_var_store_efi_before_uefi_2_3_1() {
+        let ops = [short_var_store_efi(2), one_of(2, 0)].concat();
+        let mut lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
+        lists[0].strings[0].strings.insert(5, "ShortVar".into());
+        resolve_short_var_names(&lists[0].forms, &lists[0].strings);
+        let question = question_of(&lists);
+        let variables = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let short = VariableKey {
+            name: "ShortVar".to_owned(),
+            guid: Guid::from(SHORT_VAR_STORE_GUID),
+        };
+        variables.insert(short, ATTRIBUTES, &[1]);
+        let mut reader = EfivarReader::with_variables(Box::new(variables));
+
+        let get = question.check_get(&reader);
+        let set = question.check_set(
+            &resp("03"),
+            IncludedStates::empty(),
+            VolatileWrites::Refuse,
+            &mut reader,
+        );
+
+        assert_eq!(
+            get.err(),
+            Some(question_refusal(QuestionRefusal::ShortVarStore)),
+            "check_get, short store"
+        );
+        assert_eq!(
+            refusal_of(set),
+            Some(question_refusal(QuestionRefusal::ShortVarStore)),
+            "check_set, short store"
+        );
     }
 
     /// A UINT16 VALUE holds the question's two bytes, the first in memory last.
