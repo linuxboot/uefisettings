@@ -6,6 +6,12 @@
       "guid": "8c78a505-baa0-4c4a-869f-000000001203",
       "attr": 7,
       "data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0103"
+    },
+    {
+      "name": "UefisettingsFirstFormSetSkip",
+      "guid": "8c78a505-baa0-4c4a-869f-000000001213",
+      "attr": 7,
+      "data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA04"
     }
   ]
 }

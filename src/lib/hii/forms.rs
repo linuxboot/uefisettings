@@ -1504,20 +1504,20 @@ fn type_value_parser<R: Read + Seek>(
 /// handle_form_set_within parses it, the walk going on after its End. A package without one has
 /// no root.
 /// That walk ends at an op whose Length runs past the package; here it also ends at one below the
-/// header size, which that walk loops on (Length 0) or steps into (Length 1). A later FormSet
-/// whose bytes do not parse, or whose scopes nest deeper than MAX_SCOPE_NESTING, is ignored, as
-/// UEFI 2.11 §33.2.5.10.1 ignores only a malformed forms set, and the walk goes on from the op
-/// after its FORM_SET op, as that walk does, so a FORM_SET op in it becomes a root, as that walk
-/// finds it, though that section ignores the entire forms set. A FORM_SET op without Scope that a
-/// failed parse reads outside every scope that it opened is ignored with that parse's failure,
-/// unparsed: the parse from it reads the same ops and fails at the same one. So each op is parsed
-/// at most twice per scope open around it, which a parse that reaches it opens no more than
-/// MAX_SCOPE_NESTING of: from the FORM_SET op that opens that scope and from one without Scope
-/// directly in it; then once from one without Scope outside them, and once by the walk.
-/// None of them fails the package after the first FormSet: edk2 reads past it only for such a
-/// walk. Before it, they fail the package as they fail the first FormSet.
+/// header size, which that walk loops on (Length 0) or steps into (Length 1). A FormSet whose
+/// bytes do not parse, or whose scopes nest deeper than MAX_SCOPE_NESTING, the first one too, is
+/// ignored, as UEFI 2.11 §33.2.5.10.1 ignores a malformed forms set wherever it is, and the walk
+/// goes on from the op after its FORM_SET op, as that walk does, so a FORM_SET op in it becomes a
+/// root, as that walk finds it, though that section ignores the entire forms set. A FORM_SET op
+/// without Scope that a failed parse reads outside every scope that it opened is ignored with that
+/// parse's failure, unparsed: the parse from it reads the same ops and fails at the same one. So
+/// each op is parsed at most twice per scope open around it, which a parse that reaches it opens
+/// no more than MAX_SCOPE_NESTING of: from the FORM_SET op that opens that scope and from one
+/// without Scope directly in it; then once from one without Scope outside them, and once by the
+/// walk.
+/// An op where the walk ends fails the package unless the walk has read a FORM_SET op before it.
 /// The IFR that the walk leaves unread is returned too, as PASSWORD questions in it are unknown:
-/// such a later FormSet, and the bytes after an op where the walk ends, unless they are padding.
+/// such a FormSet, and the bytes after an op where the walk ends, unless they are padding.
 /// So is each FormSet, first or later, whose FORM_SET op opens no scope and that parses: edk2
 /// parses its ops on to the end of the package, past the End where handle_form_set_within ends
 /// it.
@@ -1527,6 +1527,7 @@ pub(super) fn parse_form_sets(
 ) -> Result<FormSets> {
     let mut roots = Vec::new();
     let mut ignored = Vec::new();
+    let mut form_set_read = false;
     // FORM_SET ops without Scope, by offset, that a failed parse read outside every scope that it
     // opened, with its failure, which the parse from each gives too
     let mut failing_alike: BTreeMap<u64, Rc<FormSetFailure>> = BTreeMap::new();
@@ -1536,7 +1537,7 @@ pub(super) fn parse_form_sets(
         let offset = package_cursor.position();
         let op: IFROperation = match package_cursor.parse_ne() {
             Ok(op) => op,
-            Err(error) if roots.is_empty() => {
+            Err(error) if !form_set_read => {
                 return Err(error).context("failed to parse IFR operation")
             }
             Err(error)
@@ -1570,6 +1571,7 @@ pub(super) fn parse_form_sets(
             );
             continue;
         }
+        form_set_read = true;
         let failure = match failing_alike.remove(&offset) {
             Some(failure) => failure,
             None => {
@@ -1583,7 +1585,6 @@ pub(super) fn parse_form_sets(
                         roots.push(root);
                         continue;
                     }
-                    Err(error) if roots.is_empty() => return Err(error),
                     Err(error) => {
                         let failure = Rc::new(FormSetFailure::of(error)?);
                         failing_alike.extend(alike.into_iter().map(|at| (at, Rc::clone(&failure))));

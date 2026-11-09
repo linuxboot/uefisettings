@@ -4381,6 +4381,77 @@ mod tests {
         }
     }
 
+    /// A first FormSet that does not parse or nests too deep is ignored like a later one: through
+    /// variables that reach Runtime the FormSet after it reads, and through variables that reach
+    /// BootServices a PASSWORD in it still closes get and set, bypassed or not, with no variable
+    /// read or written.
+    #[test]
+    fn a_malformed_first_form_set_is_ignored_like_a_later_one() {
+        // the FormSet's own scope and these
+        let too_deep = nested(&subtitle_scope(5), MAX_SCOPE_NESTING, &[]);
+        let q3 = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(3, 3, 1)]),
+        ]);
+        let cases = [
+            (
+                "a first FormSet that does not parse",
+                form_set(&[
+                    dropped_password_var_store(),
+                    form(1, &[password_on(2, 2, 1, 0)]),
+                    short_var_store(),
+                ]),
+            ),
+            (
+                "a first FormSet nested too deep",
+                form_set(&[
+                    dropped_password_var_store(),
+                    form(1, &[password_on(2, 2, 1, 0)]),
+                    too_deep,
+                ]),
+            ),
+        ];
+        let refused = format!("{}0 of a form package: ", three_questions_refusal());
+        let variables_of = |reach, interface| {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+            Rc::new(variables)
+        };
+        for (name, first) in cases {
+            let hiidb = three_questions_hiidb(&[first, q3.clone()].concat());
+
+            let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
+            assert_eq!(
+                answers_or_error_of(&hiidb, "Q3", &runtime),
+                Ok(vec!["1".to_string()]),
+                "{name}: Runtime: get Q3"
+            );
+
+            let boot_services = variables_of(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            );
+            let got = answers_or_error_of(&hiidb, "Q3", &boot_services);
+            assert!(
+                got.as_ref().is_err_and(|error| error.starts_with(&refused)),
+                "{name}: BootServices: get Q3: {got:?}"
+            );
+            for policy in [SetupPasswordPolicy::Refuse, SetupPasswordPolicy::Bypass] {
+                let got = set_count_of(&hiidb, "Q3", policy, &boot_services);
+                assert!(
+                    got.as_ref().is_err_and(|error| error.starts_with(&refused)),
+                    "{name}: BootServices: set Q3 {policy:?}: {got:?}"
+                );
+            }
+            assert_eq!(boot_services.reads(), [], "{name}: BootServices: reads");
+            assert_eq!(
+                boot_services.writes_to(&dropped_password_store()),
+                [],
+                "{name}: BootServices: writes"
+            );
+        }
+    }
+
     /// The offsets of the records of IFR that uefisettings ignores that `error` names, in order.
     fn offsets_named(error: &str) -> Vec<String> {
         error
@@ -4874,11 +4945,12 @@ mod tests {
         operation(0x70, true, &[])
     }
 
-    /// Every command refuses a HiiDB whose VarStore op ends inside its Guid with an error that
-    /// main prints on one line: the fields being parsed, without the Rust source locations of
+    /// Every command ignores the FormSet of a HiiDB whose VarStore op ends inside its Guid, and
+    /// the record of that FormSet, which list-questions prints on stderr and refusals name, gives
+    /// the error on one line: the fields being parsed, without the Rust source locations of
     /// binrw's backtrace frames.
     #[test]
-    fn commands_refuse_a_truncated_var_store_on_one_line() {
+    fn commands_ignore_a_truncated_var_store_and_name_it_on_one_line() {
         // EFI_IFR_VARSTORE, whose 5 bytes end in the Data2 of its Guid
         let var_store = operation(0x24, false, &[0x11; 5]);
         let packages = [
@@ -4887,21 +4959,35 @@ mod tests {
             END_PACKAGE.to_vec(),
         ];
         let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
-        let want = "failed to parse package list 55555555-5555-5555-5555-555555555555: failed to \
-                    parse a form package: failed to parse op_code VarStore properly: failed to \
-                    parse VarStore's data: failed to fill whole buffer (While parsing field \
-                    'data2' in Guid; While parsing field 'guid' in VarStore)";
+        let want = format!(
+            "the IFR that uefisettings ignores at offset 0 of a form package of package list \
+             55555555-5555-5555-5555-555555555555: the FormSet {}, which does not parse; \
+             uefisettings ignores it, where UEFI 2.11 §33.2.5.10.1 disables only the form of a \
+             malformed op and ignores only a malformed forms set: failed to parse op_code \
+             VarStore properly: failed to parse VarStore's data: failed to fill whole buffer \
+             (While parsing field 'data2' in Guid; While parsing field 'guid' in VarStore)",
+            Guid::from([0x11; 16])
+        );
         for (name, command) in commands() {
-            let Err(error) = command(&hiidb) else {
-                panic!("{name}: parsed a truncated VarStore");
+            let got = command(&hiidb).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let want: &[&str] = match name {
+                "list-strings" => &["FormSet"],
+                _ => &[],
             };
-            let rendered = format!("{error:#}");
-            assert!(
-                !rendered.contains('\n') && !rendered.contains("src/"),
-                "{name}: {rendered:?}"
-            );
-            assert_eq!(rendered, want, "{name}");
+            assert_eq!(got, want, "{name}");
         }
+        let records: Vec<String> = HiiBackend::ignored_ifr(&hiidb)
+            .unwrap_or_else(|error| panic!("ignored_ifr: {error:#}"))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for record in &records {
+            assert!(
+                !record.contains('\n') && !record.contains("src/"),
+                "{record:?}"
+            );
+        }
+        assert_eq!(records, [want], "ignored_ifr");
     }
 
     /// A command of the tests below: what it prints of a HiiDB, line by line.
@@ -4979,10 +5065,13 @@ mod tests {
         }
     }
 
-    /// Every command refuses a HiiDB whose IFR scopes nest deeper than MAX_SCOPE_NESTING, unknown
-    /// ones counted, by one or by 20000 Subtitles, naming the op past the limit, on SMALL_STACK.
+    /// Every command reads a HiiDB whose only FormSet nests IFR scopes deeper than
+    /// MAX_SCOPE_NESTING, unknown ones counted, by one or by 20000 Subtitles, on SMALL_STACK, and
+    /// ignores that FormSet, as a later one: it shows no question, and names the FormSet and the
+    /// op past the limit as the IFR that it ignores at offset 0. Through variables that reach
+    /// BootServices, get refuses the HiiDB.
     #[test]
-    fn commands_refuse_scopes_nested_past_the_limit_on_a_small_stack() {
+    fn commands_ignore_a_form_set_nested_past_the_limit_on_a_small_stack() {
         let form_set_op = form_set(&[]).len() - END.len();
         let form_op = form(1, &[]).len() - END.len();
         let subtitle_op = subtitle_scope(2).len();
@@ -4992,22 +5081,47 @@ mod tests {
                 + form_op
                 + usize::from(in_unknown_scope) * unknown_scope().len()
                 + (MAX_SCOPE_NESTING - outer) * subtitle_op;
-            let want = format!(
-                "failed to parse package list 55555555-5555-5555-5555-555555555555: failed to \
-                 parse a form package: IFR scopes nest deeper than {MAX_SCOPE_NESTING} at offset \
-                 {past_limit} of a form package"
+            let ignored = format!(
+                "the FormSet {}, which nests too deep: IFR scopes nest deeper than \
+                 {MAX_SCOPE_NESTING} at offset {past_limit} of a form package",
+                Guid::from([0x11; 16])
             );
             for subtitles in [MAX_SCOPE_NESTING - outer + 1, 20_000] {
                 let hiidb = nested_subtitles_hiidb(subtitles, in_unknown_scope);
+                let case =
+                    format!("{subtitles} Subtitles, in an unknown scope: {in_unknown_scope}");
                 for (name, command) in commands() {
-                    let case = format!(
-                        "{name}, {subtitles} Subtitles, in an unknown scope: {in_unknown_scope}"
-                    );
-                    let Err(error) = on_small_stack(name, || command(&hiidb)) else {
-                        panic!("{case}: read past the limit");
+                    let got = on_small_stack(name, || command(&hiidb))
+                        .unwrap_or_else(|error| panic!("{name}, {case}: {error:#}"));
+                    let want: &[&str] = match name {
+                        "list-strings" => &["FormSet", "Deep"],
+                        _ => &[],
                     };
-                    assert_eq!(format!("{error:#}"), want, "{case}");
+                    assert_eq!(got, want, "{name}, {case}");
                 }
+
+                let records: Vec<(u64, String)> =
+                    on_small_stack("ignored_ifr", || HiiBackend::ignored_ifr(&hiidb))
+                        .unwrap_or_else(|error| panic!("ignored_ifr, {case}: {error:#}"))
+                        .into_iter()
+                        .map(|ignored| (ignored.offset, ignored.reason))
+                        .collect();
+                assert_eq!(records, [(0, ignored.clone())], "ignored_ifr, {case}");
+
+                let variables = Rc::new(MemoryVariables::new(
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                ));
+                assert_eq!(
+                    answers_or_error_of(&hiidb, "Deep", &variables),
+                    Err(format!(
+                        "PASSWORD questions of package list 55555555-5555-5555-5555-555555555555 \
+                         may be in the IFR that uefisettings ignores at offset 0 of a form \
+                         package: {ignored}; as the variable of that password is unknown, the \
+                         UEFI Shell build reads and writes no variable of this HiiDB"
+                    )),
+                    "BootServices: get, {case}"
+                );
             }
         }
     }

@@ -761,8 +761,8 @@ mod tests {
 
     /// read_db keeps each FormSet of a form package as a root of its own. The walk for FormSets
     /// after the first skips other ops and ends, without failing the package, at an op that does
-    /// not fit it, and goes on after a later FormSet whose bytes do not parse or whose scopes nest
-    /// deeper than MAX_SCOPE_NESTING; a malformed first FormSet still fails it.
+    /// not fit it, and goes on after a FormSet whose bytes do not parse or whose scopes nest deeper
+    /// than MAX_SCOPE_NESTING, the first one too, which it lists as the later ones.
     #[test]
     fn test_read_db_ends_the_form_set_walk_at_an_op_that_does_not_fit() {
         let read = |ifr| {
@@ -830,27 +830,57 @@ mod tests {
             );
         }
 
-        let error =
-            read(form_set_of_guid(0xA0, &short_checkbox)).expect_err("a malformed first FormSet");
-        assert!(
-            format!("{error:#}").contains("failed to parse CheckBox's data"),
-            "a malformed first FormSet: {error:#}"
-        );
-        let error =
-            read(form_set_of_guid(0xA0, &too_deep)).expect_err("a first FormSet nested too deep");
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.is::<forms::ScopesTooDeep>()),
-            "a first FormSet nested too deep: {error:#}"
-        );
+        let a0 = format!("the FormSet {}", Guid::from([0xA0; 16]));
+        let first_cases = [
+            (
+                "a malformed first FormSet",
+                form_set_of_guid(0xA0, &short_checkbox),
+                format!(
+                    "{a0}, which does not parse; uefisettings ignores it, where UEFI 2.11 \
+                     §33.2.5.10.1 disables only the form of a malformed op and ignores only a \
+                     malformed forms set: failed to parse op_code CheckBox properly: failed to \
+                     parse CheckBox's data: "
+                ),
+            ),
+            (
+                "a first FormSet nested too deep",
+                form_set_of_guid(0xA0, &too_deep),
+                format!(
+                    "{a0}, which nests too deep: IFR scopes nest deeper than {MAX_SCOPE_NESTING} \
+                     at offset "
+                ),
+            ),
+        ];
+        for (name, first, reason) in first_cases {
+            let got = read([first.clone(), form_set_of_guid(0xB0, &[])].concat())
+                .unwrap_or_else(|error| panic!("read_db after {name}: {error:#}"));
+            assert_eq!(
+                got,
+                [0xB0],
+                "FormSets, by the last byte of their GUID, after {name}"
+            );
+            let list = read_form_package(&first)
+                .unwrap_or_else(|error| panic!("read_db of {name}: {error:#}"));
+            let ignored: Vec<(u64, bool)> = list
+                .ignored_ifr
+                .iter()
+                .map(|ignored| (ignored.offset, ignored.reason.starts_with(&reason)))
+                .collect();
+            assert_eq!(
+                (list.forms.len(), ignored),
+                (0, vec![(0, true)]),
+                "roots and IFR ignored (offset, reason as expected) of {name}: {:?}",
+                list.ignored_ifr
+            );
+        }
     }
 
     /// read_db reads the FormSets after one that it ignores, as GetIfrBinaryData's walk finds
     /// them op by op (UEFI 2.11 §33.2.5.10.1 ignores only a malformed forms set), a FormSet in an
     /// ignored one too, with or without its Scope bit, and lists each ignored FormSet at its
     /// offset; past an op whose Length is below the header size, which that walk loops on or
-    /// steps into, it reads nothing more.
+    /// steps into, or runs past the package, it reads nothing more, and lists that op, in an
+    /// ignored first FormSet too, where neither the package nor the HiiDB fails.
     #[test]
     fn test_read_db_reads_the_form_sets_after_one_that_it_ignores() {
         // the FormSet's own scope and these
@@ -880,10 +910,15 @@ mod tests {
         let not_fit = "an op that does not fit the form package, and the bytes after it: invalid \
                        IFR operation length 1"
             .to_string();
+        let runs_past =
+            "an op that does not fit the form package, and the bytes after it: ".to_string();
+        let first_length_1 = form_set_of_guid(0xB0, &[0x29, 0x01]);
+        // a Subtitle whose Length runs past the package, 3 of its 7 bytes
+        let runs_past_end = [form_set_op, &[0x02, 0x07, 0x05]].concat();
         // a name, a form package, its FormSets by the last byte of their GUID, and its ignored
         // IFR by offset and the start of its reason
         type Case<'a> = (&'a str, Vec<u8>, &'a [u8], Vec<(u64, String)>);
-        let cases: [Case<'_>; 7] = [
+        let cases: [Case<'_>; 9] = [
             (
                 "a malformed FormSet, then a FormSet",
                 [&first[..], &malformed(0xB0), &form_set_of_guid(0xC0, &[])].concat(),
@@ -970,8 +1005,20 @@ mod tests {
                 &[0xA0],
                 vec![
                     (at(&[&first]), does_not_parse(0xB0)),
-                    (at(&[&first, form_set_op]), not_fit),
+                    (at(&[&first, form_set_op]), not_fit.clone()),
                 ],
+            ),
+            (
+                "a first FormSet holding an op of Length 1, then a FormSet",
+                [&first_length_1[..], &form_set_of_guid(0xC0, &[])].concat(),
+                &[],
+                vec![(0, does_not_parse(0xB0)), (at(&[form_set_op]), not_fit)],
+            ),
+            (
+                "a first FormSet whose last op runs past the package",
+                runs_past_end,
+                &[],
+                vec![(0, does_not_parse(0xA0)), (at(&[form_set_op]), runs_past)],
             ),
         ];
         for (name, ifr, want_roots, want_ignored) in cases {
@@ -1003,6 +1050,30 @@ mod tests {
                 list.ignored_ifr
             );
         }
+
+        // another package list after one whose form package is first_length_1
+        let hiidb = [
+            package_list_with_guid(
+                [0x22; 16],
+                &[form_package_of(&first_length_1), END_PACKAGE.to_vec()].concat(),
+            ),
+            package_list_with_guid(
+                [0x33; 16],
+                &[form_package_of(&first), END_PACKAGE.to_vec()].concat(),
+            ),
+        ]
+        .concat();
+        let lists =
+            read_db(&hiidb).unwrap_or_else(|error| panic!("read_db of 2 package lists: {error:#}"));
+        let got: Vec<(usize, usize)> = lists
+            .iter()
+            .map(|list| (list.forms.len(), list.ignored_ifr.len()))
+            .collect();
+        assert_eq!(
+            got,
+            [(0, 2), (1, 0)],
+            "roots and IFR ignored of each package list"
+        );
     }
 
     /// read_db parses the ops of a run of FORM_SET ops without their Scope bit, which no End
@@ -1085,14 +1156,24 @@ mod tests {
         }
     }
 
-    /// read_db fails at an op that does not fit the walk for FormSets before the first FormSet,
-    /// as it fails at one in that FormSet.
+    /// read_db fails at an op that does not fit the walk for FormSets before the walk reads a
+    /// FORM_SET op.
     #[test]
     fn test_read_db_fails_at_an_op_that_does_not_fit_before_the_first_form_set() {
-        let cases: [(&str, Vec<u8>, &str); 3] = [
+        let cases: [(&str, Vec<u8>, &str); 4] = [
             (
                 "Length 1, then a FormSet",
                 [&[0x02, 0x01][..], &form_set_of_guid(0xB0, &[])].concat(),
+                "invalid IFR operation length 1",
+            ),
+            (
+                "a Subtitle, then Length 1, then a FormSet",
+                [
+                    &[0x02, 0x07, 0x05, 0x00, 0x06, 0x00, 0x00][..],
+                    &[0x02, 0x01],
+                    &form_set_of_guid(0xB0, &[]),
+                ]
+                .concat(),
                 "invalid IFR operation length 1",
             ),
             (
@@ -2158,8 +2239,8 @@ mod tests {
         }
     }
 
-    /// The contexts that read_db gives a form package's parse error are lowercase, for each op
-    /// that handle_opcode parses.
+    /// The contexts that read_db gives the IFR that it ignores in a form package, a FormSet that
+    /// does not parse, are lowercase, for each op that handle_opcode parses.
     #[test]
     fn test_read_db_form_error_contexts_are_lowercase() {
         let ops = [
@@ -2186,19 +2267,20 @@ mod tests {
             let form_package = form_package(&[vec![op_code, 0x02]]);
             let hiidb = package_list_with_guid([0x22; 16], &form_package);
 
-            let Err(err) = read_db(&hiidb) else {
-                panic!("read_db parsed a {name} op without data");
-            };
+            let lists = read_db(&hiidb)
+                .unwrap_or_else(|error| panic!("read_db of a {name} op without data: {error:#}"));
 
-            let msg = format!("{err:#}");
-            let want = format!(
-                "failed to parse package list 22222222-2222-2222-2222-222222222222: \
-                 failed to parse a form package: failed to parse op_code {name} properly: \
-                 failed to parse {name}'s data: "
-            );
+            // the record of the FormSet, at offset 0, that the op makes fail
+            let want =
+                format!("failed to parse op_code {name} properly: failed to parse {name}'s data: ");
+            let first = lists
+                .iter()
+                .flat_map(|list| &list.ignored_ifr)
+                .next()
+                .map(|ignored| (ignored.offset, ignored.reason.as_str()));
             assert!(
-                msg.starts_with(&want),
-                "{name}: lowercase contexts up to {name}'s data: {msg}"
+                first.is_some_and(|(offset, reason)| offset == 0 && reason.contains(&want)),
+                "{name}: lowercase contexts up to {name}'s data: {first:?}"
             );
         }
     }

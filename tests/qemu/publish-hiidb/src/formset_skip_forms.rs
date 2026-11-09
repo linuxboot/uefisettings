@@ -10,13 +10,15 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The HII package list that `formset-skip-forms` registers in the HII database, for the
-//! scenarios `hii-formset-skip` and `shell-formset-skip` of `tests/qemu/scenarios.tsv`, holding a
-//! form set that `uefisettings` ignores: one with a PASSWORD at bytes 0 to 19 of the list's
-//! variable, then, outside its form, a VARSTORE op shorter than its minimum, which UEFI 2.11
-//! §33.2.5.10.1 calls malformed. Three form sets on one variable: the first keeps a UINT8 NUMERIC
-//! at byte 20 of it, the second is the ignored one, and the third keeps a UINT8 NUMERIC at byte
-//! 21, which `uefisettings` reads past the second.
+//! The HII package lists that `formset-skip-forms` registers in the HII database, for the
+//! scenarios `hii-formset-skip` and `shell-formset-skip` of `tests/qemu/scenarios.tsv`, each
+//! holding a form set that `uefisettings` ignores: one with a PASSWORD at bytes 0 to 19 of its
+//! list's variable, then, outside its form, a VARSTORE op shorter than its minimum, which UEFI
+//! 2.11 §33.2.5.10.1 calls malformed. In the first list, three form sets on one variable: the
+//! first keeps a UINT8 NUMERIC at byte 20 of it, the second is the ignored one, and the third
+//! keeps a UINT8 NUMERIC at byte 21, which `uefisettings` reads past the second. In the second
+//! list, two form sets on another variable: the ignored one first, then one that keeps a UINT8
+//! NUMERIC at byte 20.
 
 use alloc::vec::Vec;
 
@@ -38,23 +40,36 @@ use crate::hii_package::EFI_IFR_VARSTORE_EFI_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_OP;
 use crate::hii_package::UINT8_DECIMAL;
 
-/// The GUID of the package list and of its first form set.
+/// The GUID of the first package list and of its first form set.
 const FIRST_FORM_SET: Guid = guid!("8c78a505-baa0-4c4a-869f-000000001200");
-/// The GUID of the second form set, which `uefisettings` ignores.
+/// The GUID of the second form set of the first list, which `uefisettings` ignores.
 const IGNORED_FORM_SET: Guid = guid!("8c78a505-baa0-4c4a-869f-000000001201");
-/// The GUID of the third form set.
+/// The GUID of the third form set of the first list.
 const THIRD_FORM_SET: Guid = guid!("8c78a505-baa0-4c4a-869f-000000001202");
-/// The variable of the list, which tests/qemu/vars/formset-skip.json creates: the
+/// The variable of the first list, which tests/qemu/vars/formset-skip.json creates: the
 /// password, then the two settings.
 const STORE: VarStoreEfi = VarStoreEfi {
     vendor: guid!("8c78a505-baa0-4c4a-869f-000000001203"),
     name: b"UefisettingsFormSetSkip\0",
     size: 22,
 };
-/// The Attributes of the VARSTORE_EFI: non-volatile, boot service and runtime access.
+/// The GUID of the second package list.
+const SECOND_LIST: Guid = guid!("8c78a505-baa0-4c4a-869f-000000001210");
+/// The GUID of the first form set of the second list, which `uefisettings` ignores.
+const IGNORED_FIRST_FORM_SET: Guid = guid!("8c78a505-baa0-4c4a-869f-000000001211");
+/// The GUID of the second form set of the second list.
+const AFTER_IGNORED_FIRST: Guid = guid!("8c78a505-baa0-4c4a-869f-000000001212");
+/// The variable of the second list, which tests/qemu/vars/formset-skip.json creates: the
+/// password, then the setting.
+const SECOND_STORE: VarStoreEfi = VarStoreEfi {
+    vendor: guid!("8c78a505-baa0-4c4a-869f-000000001213"),
+    name: b"UefisettingsFirstFormSetSkip\0",
+    size: 21,
+};
+/// The Attributes of each VARSTORE_EFI: non-volatile, boot service and runtime access.
 const NV_BS_RT: u32 = 0x07;
 
-// The strings, from string ID 2, after the language name.
+// The strings of each list, from string ID 2, after the language name.
 const TITLE: u16 = 2;
 const HELP: u16 = 3;
 const FIRST_SETTING: u16 = 4;
@@ -67,6 +82,14 @@ const STRINGS: [&str; 6] = [
     "First setting",
     "Password",
     "Third setting",
+];
+const FOURTH_SETTING: u16 = 4;
+const SECOND_STRINGS: [&str; 5] = [
+    "English",
+    "uefisettings QEMU formset skip forms, first ignored",
+    "A form set after a first one that uefisettings ignores",
+    "Fourth setting",
+    "Password",
 ];
 
 /// The VarStoreId of the variable in each form set.
@@ -86,22 +109,42 @@ struct VarStoreEfi {
 }
 
 /// The package lists, as NewPackageList() takes them, in the order to register them.
-pub(crate) fn package_lists() -> [Vec<u8>; 1] {
-    [package_list(
-        FIRST_FORM_SET,
-        &[
-            strings_package(STRINGS),
-            package(
-                EFI_HII_PACKAGE_FORMS,
-                &[
-                    form_set(FIRST_FORM_SET, &STORE, &uint8_numeric(FIRST_SETTING, 1, 20)),
-                    ignored_form_set(IGNORED_FORM_SET, &STORE),
-                    form_set(THIRD_FORM_SET, &STORE, &uint8_numeric(THIRD_SETTING, 3, 21)),
-                ]
-                .concat(),
-            ),
-        ],
-    )]
+pub(crate) fn package_lists() -> [Vec<u8>; 2] {
+    [
+        package_list(
+            FIRST_FORM_SET,
+            &[
+                strings_package(STRINGS),
+                package(
+                    EFI_HII_PACKAGE_FORMS,
+                    &[
+                        form_set(FIRST_FORM_SET, &STORE, &uint8_numeric(FIRST_SETTING, 1, 20)),
+                        ignored_form_set(IGNORED_FORM_SET, &STORE),
+                        form_set(THIRD_FORM_SET, &STORE, &uint8_numeric(THIRD_SETTING, 3, 21)),
+                    ]
+                    .concat(),
+                ),
+            ],
+        ),
+        package_list(
+            SECOND_LIST,
+            &[
+                strings_package(SECOND_STRINGS),
+                package(
+                    EFI_HII_PACKAGE_FORMS,
+                    &[
+                        ignored_form_set(IGNORED_FIRST_FORM_SET, &SECOND_STORE),
+                        form_set(
+                            AFTER_IGNORED_FIRST,
+                            &SECOND_STORE,
+                            &uint8_numeric(FOURTH_SETTING, 1, 20),
+                        ),
+                    ]
+                    .concat(),
+                ),
+            ],
+        ),
+    ]
 }
 
 /// A form set of `guid` on `store` whose form holds a PASSWORD at bytes 0 to 19, followed,
