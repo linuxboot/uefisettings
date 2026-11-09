@@ -96,6 +96,10 @@ name = "hii_formset_skip"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_short_var_store"
+required-features = ["test-vm"]
+
+[[test]]
 name = "secboot"
 required-features = ["test-vm"]
 

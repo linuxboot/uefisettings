@@ -1,0 +1,53 @@
+# The checks of shell/short-var-store.nsh. See check-shell-log.sh.
+# Each question reads the EFI variable of its VarName, of the store's Guid, and nothing shows a
+# byte of the password in ShortVarPw
+get-numeric	status	0x0
+get-numeric	json	.responses | length == 1 and .[0].selector == "8C78A505-BAA0-4C4A-869F-000000000B00" and .[0].question.answer == "5"
+get-one-of	status	0x0
+get-one-of	json	.responses | length == 1 and .[0].question.answer == "Disabled"
+list-questions	status	0x0
+list-questions	json	any(.[]; .name == "Short numeric" and .answer == "5") and any(.[]; .name == "Short one-of" and .answer == "Disabled")
+list-questions	none	aa aa|AA AA|aaaa|AAAA|170, 170
+show-ifr	status	0x0
+show-ifr	none	aa aa|AA AA|aaaa|AAAA|170, 170
+dmpstore-a-before	status	any
+dmpstore-a-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarA' DataSize = 0x01$
+dmpstore-a-before	line	^  00000000: 05 
+dmpstore-pw-before	status	any
+dmpstore-pw-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarPw' DataSize = 0x14$
+# set refuses to write in a HiiDB that declares a password question
+set-refused	status	aborted
+set-refused	json	. == {"error_message": "this HiiDB declares a setup password question; the UEFI Shell runs no setup browser, so no password is asked or checked; pass --bypass-setup-password to write anyway"}
+dmpstore-a-refused	status	any
+dmpstore-a-refused	same	dmpstore-a-before
+# unless --bypass-setup-password is given; the GET of its SUPPRESS_IF reads 5 from ShortVarA, which
+# hides the CHECKBOX until ShortVarA holds 9
+set-suppressed	status	aborted
+set-suppressed	json	. == {"error_message": "question \"Short checkbox\" is suppressed; also include suppressed questions to select it"}
+set-numeric	status	0x0
+set-numeric	json	.responses | length == 1 and .[0].question.answer == "9" and .[0].modified == true
+dmpstore-a-after	status	any
+dmpstore-a-after	line	^  00000000: 09 
+# the CHECKBOX writes ShortVarC, and the SET of its WRITE ShortVarB, which the ONE_OF answers
+set-checkbox	status	0x0
+set-checkbox	json	.responses | length == 1 and .[0].question.answer == "1" and .[0].modified == true
+get-one-of-after	status	0x0
+get-one-of-after	json	.responses | length == 1 and .[0].question.answer == "Enabled"
+dmpstore-b-after	status	any
+dmpstore-b-after	line	^  00000000: 01 
+dmpstore-c-after	status	any
+dmpstore-c-after	line	^  00000000: 01 
+# ShortVarPw keeps its 20 bytes of 0xAA
+dmpstore-pw-after	status	any
+dmpstore-pw-after	same	dmpstore-pw-before
+# set creates the missing ShortVarD of the UINT16 NUMERIC with the store's Attributes; dmpstore
+# finds no ShortVarD before (EFI_NOT_FOUND)
+dmpstore-d-before	status	0xE
+dmpstore-d-before	none	ShortVarD' DataSize
+set-created	status	0x0
+set-created	json	.responses | length == 1 and .[0].question.answer == "513" and .[0].modified == true
+dmpstore-d-after	status	any
+dmpstore-d-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarD' DataSize = 0x02$
+dmpstore-d-after	line	^  00000000: 01 02 
+get-created	status	0x0
+get-created	json	.responses | length == 1 and .[0].question.answer == "513"

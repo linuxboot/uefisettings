@@ -1,0 +1,29 @@
+{
+  "version": 2,
+  "variables": [
+    {
+      "name": "ShortVarA",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "05"
+    },
+    {
+      "name": "ShortVarB",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "00"
+    },
+    {
+      "name": "ShortVarC",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "00"
+    },
+    {
+      "name": "ShortVarPw",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  ]
+}

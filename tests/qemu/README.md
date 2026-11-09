@@ -225,6 +225,18 @@ which edk2's walk for form sets finds after them: in the scenario `hii-formset-s
 the form sets that it reads and names those that it ignores, while in `shell-formset-skip`
 `uefisettings.efi` reads and writes no variable.
 
+`publish-hiidb.efi short-var-store-forms` registers those of
+[`publish-hiidb/src/short_var_store_forms.rs`](publish-hiidb/src/short_var_store_forms.rs):
+questions on a VARSTORE_EFI of the form before UEFI 2.3.1, each on the EFI variable of its
+VarName, which [`vars/short-var-store.json`](vars/short-var-store.json) creates, among them a
+CHECKBOX that a SUPPRESS_IF with a GET hides and whose WRITE expression holds a SET, and a
+PASSWORD; it does not create ShortVarD, the variable of a UINT16 NUMERIC.
+`publish-hiidb.efi rt-data-short-var-store-forms` does the same, then publishes the database as
+`rt-data` does. The scenarios `shell-short-var-store` and `short-var-store` check, in the UEFI
+Shell and from Linux, that `get` and `set` read and write the variable of each question's
+VarName, and the GET and the SET those of theirs, while no byte of the password's variable is
+read or written, and that `set` creates ShortVarD with the store's Attributes.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
