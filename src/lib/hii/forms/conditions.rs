@@ -29,6 +29,7 @@ use super::declared_var_store;
 use super::defaults::is_parent_statement;
 use super::defaults::question_scope;
 use super::find_corresponding_varstore;
+use super::named_records;
 use super::question_values::value_question;
 use super::question_values::ValueQuestion;
 use super::storage::read_current_value_bytes;
@@ -48,6 +49,7 @@ use super::DeclaredStore;
 use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
+use super::IgnoredIfr;
 use super::ParsedOperation;
 use super::QuestionFlags;
 use super::VarStoreOperand;
@@ -253,6 +255,16 @@ pub enum SelectionError {
     /// set's error when no question has the text; get answers no question instead
     #[error("no question {question:?} in the HiiDB")]
     NotFound { question: String },
+    /// NotFound in a HiiDB with IFR that uefisettings ignores, which may hold the question; get
+    /// lists that IFR in its answer instead
+    #[error(
+        "no question {question:?} in the HiiDB, but it may be in {}",
+        named_records(.ignored)
+    )]
+    MaybeInIgnoredIfr {
+        question: String,
+        ignored: Vec<IgnoredIfr>,
+    },
 }
 
 /// The states that the conditions around a question or option can give it, and why set refuses

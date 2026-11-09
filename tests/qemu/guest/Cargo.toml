@@ -84,6 +84,10 @@ name = "hii_password"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_formset_skip"
+required-features = ["test-vm"]
+
+[[test]]
 name = "secboot"
 required-features = ["test-vm"]
 

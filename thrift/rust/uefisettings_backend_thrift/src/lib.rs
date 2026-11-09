@@ -73,9 +73,23 @@ pub struct SetResponse {
     pub _dot_dot_Default_default: self::dot_dot::OtherFields,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HiiIgnoredIfr {
+    pub package_list: ::std::string::String,
+    pub offset: ::std::primitive::i64,
+    pub reason: ::std::string::String,
+    // This field forces `..Default::default()` when instantiating this
+    // struct, to make code future-proof against new fields added later to
+    // the definition in Thrift. If you don't want this, add the annotation
+    // `(rust.exhaustive)` to the Thrift struct to eliminate this field.
+    #[doc(hidden)]
+    pub _dot_dot_Default_default: self::dot_dot::OtherFields,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct SetResponseList {
     pub responses: ::std::vec::Vec<crate::types::SetResponse>,
+    pub ignored_ifr: ::std::option::Option<::std::vec::Vec<crate::types::HiiIgnoredIfr>>,
     // This field forces `..Default::default()` when instantiating this
     // struct, to make code future-proof against new fields added later to
     // the definition in Thrift. If you don't want this, add the annotation
@@ -101,6 +115,7 @@ pub struct GetResponse {
 #[derive(Clone, PartialEq)]
 pub struct GetResponseList {
     pub responses: ::std::vec::Vec<crate::types::GetResponse>,
+    pub ignored_ifr: ::std::option::Option<::std::vec::Vec<crate::types::HiiIgnoredIfr>>,
     // This field forces `..Default::default()` when instantiating this
     // struct, to make code future-proof against new fields added later to
     // the definition in Thrift. If you don't want this, add the annotation
@@ -1058,10 +1073,126 @@ impl ::fbthrift::metadata::ThriftAnnotations for SetResponse {
 
 
 #[allow(clippy::derivable_impls)]
+impl ::std::default::Default for self::HiiIgnoredIfr {
+    fn default() -> Self {
+        Self {
+            package_list: ::std::default::Default::default(),
+            offset: ::std::default::Default::default(),
+            reason: ::std::default::Default::default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        }
+    }
+}
+
+impl ::std::fmt::Debug for self::HiiIgnoredIfr {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("HiiIgnoredIfr")
+            .field("package_list", &self.package_list)
+            .field("offset", &self.offset)
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+unsafe impl ::std::marker::Send for self::HiiIgnoredIfr {}
+unsafe impl ::std::marker::Sync for self::HiiIgnoredIfr {}
+impl ::std::marker::Unpin for self::HiiIgnoredIfr {}
+
+impl ::fbthrift::GetTType for self::HiiIgnoredIfr {
+    const TTYPE: ::fbthrift::TType = ::fbthrift::TType::Struct;
+}
+
+impl<P> ::fbthrift::Serialize<P> for self::HiiIgnoredIfr
+where
+    P: ::fbthrift::ProtocolWriter,
+{
+    fn write(&self, p: &mut P) {
+        p.write_struct_begin("HiiIgnoredIfr");
+        p.write_field_begin("package_list", ::fbthrift::TType::String, 1);
+        ::fbthrift::Serialize::write(&self.package_list, p);
+        p.write_field_end();
+        p.write_field_begin("offset", ::fbthrift::TType::I64, 2);
+        ::fbthrift::Serialize::write(&self.offset, p);
+        p.write_field_end();
+        p.write_field_begin("reason", ::fbthrift::TType::String, 3);
+        ::fbthrift::Serialize::write(&self.reason, p);
+        p.write_field_end();
+        p.write_field_stop();
+        p.write_struct_end();
+    }
+}
+
+impl<P> ::fbthrift::Deserialize<P> for self::HiiIgnoredIfr
+where
+    P: ::fbthrift::ProtocolReader,
+{
+    fn read(p: &mut P) -> ::anyhow::Result<Self> {
+        static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("offset", ::fbthrift::TType::I64, 2),
+            ::fbthrift::Field::new("package_list", ::fbthrift::TType::String, 1),
+            ::fbthrift::Field::new("reason", ::fbthrift::TType::String, 3),
+        ];
+        let mut field_package_list = ::std::option::Option::None;
+        let mut field_offset = ::std::option::Option::None;
+        let mut field_reason = ::std::option::Option::None;
+        let _ = p.read_struct_begin(|_| ())?;
+        loop {
+            let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
+            match (fty, fid as ::std::primitive::i32) {
+                (::fbthrift::TType::Stop, _) => break,
+                (::fbthrift::TType::String, 1) => field_package_list = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::I64, 2) => field_offset = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::String, 3) => field_reason = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (fty, _) => p.skip(fty)?,
+            }
+            p.read_field_end()?;
+        }
+        p.read_struct_end()?;
+        ::std::result::Result::Ok(Self {
+            package_list: field_package_list.unwrap_or_default(),
+            offset: field_offset.unwrap_or_default(),
+            reason: field_reason.unwrap_or_default(),
+            _dot_dot_Default_default: self::dot_dot::OtherFields(()),
+        })
+    }
+}
+
+
+impl ::fbthrift::metadata::ThriftAnnotations for HiiIgnoredIfr {
+    fn get_structured_annotation<T: Sized + 'static>() -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        None
+    }
+
+    fn get_field_structured_annotation<T: Sized + 'static>(field_id: i16) -> ::std::option::Option<T> {
+        #[allow(unused_variables)]
+        let type_id = ::std::any::TypeId::of::<T>();
+
+        #[allow(clippy::match_single_binding)]
+        match field_id {
+            1 => {
+            },
+            2 => {
+            },
+            3 => {
+            },
+            _ => {}
+        }
+
+        None
+    }
+}
+
+
+#[allow(clippy::derivable_impls)]
 impl ::std::default::Default for self::SetResponseList {
     fn default() -> Self {
         Self {
             responses: ::std::default::Default::default(),
+            ignored_ifr: ::std::option::Option::None,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         }
     }
@@ -1072,6 +1203,7 @@ impl ::std::fmt::Debug for self::SetResponseList {
         formatter
             .debug_struct("SetResponseList")
             .field("responses", &self.responses)
+            .field("ignored_ifr", &self.ignored_ifr)
             .finish()
     }
 }
@@ -1093,6 +1225,11 @@ where
         p.write_field_begin("responses", ::fbthrift::TType::List, 1);
         ::fbthrift::Serialize::write(&self.responses, p);
         p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.ignored_ifr {
+            p.write_field_begin("ignored_ifr", ::fbthrift::TType::List, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
         p.write_field_stop();
         p.write_struct_end();
     }
@@ -1104,15 +1241,18 @@ where
 {
     fn read(p: &mut P) -> ::anyhow::Result<Self> {
         static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("ignored_ifr", ::fbthrift::TType::List, 2),
             ::fbthrift::Field::new("responses", ::fbthrift::TType::List, 1),
         ];
         let mut field_responses = ::std::option::Option::None;
+        let mut field_ignored_ifr = ::std::option::Option::None;
         let _ = p.read_struct_begin(|_| ())?;
         loop {
             let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
             match (fty, fid as ::std::primitive::i32) {
                 (::fbthrift::TType::Stop, _) => break,
                 (::fbthrift::TType::List, 1) => field_responses = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 2) => field_ignored_ifr = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (fty, _) => p.skip(fty)?,
             }
             p.read_field_end()?;
@@ -1120,6 +1260,7 @@ where
         p.read_struct_end()?;
         ::std::result::Result::Ok(Self {
             responses: field_responses.unwrap_or_default(),
+            ignored_ifr: field_ignored_ifr,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         })
     }
@@ -1141,6 +1282,8 @@ impl ::fbthrift::metadata::ThriftAnnotations for SetResponseList {
         #[allow(clippy::match_single_binding)]
         match field_id {
             1 => {
+            },
+            2 => {
             },
             _ => {}
         }
@@ -1281,6 +1424,7 @@ impl ::std::default::Default for self::GetResponseList {
     fn default() -> Self {
         Self {
             responses: ::std::default::Default::default(),
+            ignored_ifr: ::std::option::Option::None,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         }
     }
@@ -1291,6 +1435,7 @@ impl ::std::fmt::Debug for self::GetResponseList {
         formatter
             .debug_struct("GetResponseList")
             .field("responses", &self.responses)
+            .field("ignored_ifr", &self.ignored_ifr)
             .finish()
     }
 }
@@ -1312,6 +1457,11 @@ where
         p.write_field_begin("responses", ::fbthrift::TType::List, 1);
         ::fbthrift::Serialize::write(&self.responses, p);
         p.write_field_end();
+        if let ::std::option::Option::Some(some) = &self.ignored_ifr {
+            p.write_field_begin("ignored_ifr", ::fbthrift::TType::List, 2);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
         p.write_field_stop();
         p.write_struct_end();
     }
@@ -1323,15 +1473,18 @@ where
 {
     fn read(p: &mut P) -> ::anyhow::Result<Self> {
         static FIELDS: &[::fbthrift::Field] = &[
+            ::fbthrift::Field::new("ignored_ifr", ::fbthrift::TType::List, 2),
             ::fbthrift::Field::new("responses", ::fbthrift::TType::List, 1),
         ];
         let mut field_responses = ::std::option::Option::None;
+        let mut field_ignored_ifr = ::std::option::Option::None;
         let _ = p.read_struct_begin(|_| ())?;
         loop {
             let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
             match (fty, fid as ::std::primitive::i32) {
                 (::fbthrift::TType::Stop, _) => break,
                 (::fbthrift::TType::List, 1) => field_responses = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 2) => field_ignored_ifr = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (fty, _) => p.skip(fty)?,
             }
             p.read_field_end()?;
@@ -1339,6 +1492,7 @@ where
         p.read_struct_end()?;
         ::std::result::Result::Ok(Self {
             responses: field_responses.unwrap_or_default(),
+            ignored_ifr: field_ignored_ifr,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         })
     }
@@ -1360,6 +1514,8 @@ impl ::fbthrift::metadata::ThriftAnnotations for GetResponseList {
         #[allow(clippy::match_single_binding)]
         match field_id {
             1 => {
+            },
+            2 => {
             },
             _ => {}
         }

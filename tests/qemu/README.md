@@ -213,6 +213,15 @@ creates, the second with a PASSWORD and an op shorter than its minimum, which UE
 §33.2.5.10.1 calls malformed. `uefisettings` ignores that form set, so in the scenario
 `shell-dropped-password` `uefisettings.efi` reads and writes no variable.
 
+`publish-hiidb.efi formset-skip-forms` registers those of
+[`publish-hiidb/src/formset_skip_forms.rs`](publish-hiidb/src/formset_skip_forms.rs): three form
+sets on the variable that [`vars/formset-skip.json`](vars/formset-skip.json) creates, the second
+with a PASSWORD and an op shorter than its minimum. `uefisettings` ignores that form set and reads
+the third, which edk2's walk for form sets finds after it: in the scenario `hii-formset-skip`,
+whose later `publish-hiidb.efi rt-data` exports the database, `uefisettings` reads and writes the
+questions of the first and the third form set and names the second, while in
+`shell-formset-skip` `uefisettings.efi` reads and writes no variable.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt

@@ -23,6 +23,7 @@ use log::warn;
 use thiserror::Error;
 
 use super::find_corresponding_varstore;
+use super::named_records;
 use super::walk_scopes;
 use super::IFROpCode;
 use super::IFROperation;
@@ -98,16 +99,14 @@ impl PasswordQuestions {
     /// so each counts as one whose VarStore is unknown.
     pub(crate) fn of_lists(lists: &[ParsedPackageList]) -> Self {
         let mut found = Self::of(lists.iter().flat_map(|list| &list.forms));
-        for list in lists {
-            for ignored in &list.ignored_ifr {
-                let unresolved = UnresolvedPassword::InIgnoredIfr {
-                    package_list: list.guid,
-                    offset: ignored.offset,
-                    reason: ignored.reason.clone(),
-                };
-                warn!("{unresolved}");
-                found.unresolved.push(unresolved);
-            }
+        for ignored in lists.iter().flat_map(|list| &list.ignored_ifr) {
+            let unresolved = UnresolvedPassword::InIgnoredIfr {
+                package_list: ignored.package_list,
+                offset: ignored.offset,
+                reason: ignored.reason.clone(),
+            };
+            warn!("{unresolved}");
+            found.unresolved.push(unresolved);
         }
         found
     }
@@ -278,7 +277,7 @@ impl std::fmt::Display for FormSetName {
 #[error(
     "{}; as the variable of that password is unknown, the UEFI Shell build reads and writes no \
      variable of this HiiDB",
-    .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+    named_records(.0)
 )]
 pub(crate) struct UnresolvedPasswords(Vec<UnresolvedPassword>);
 

@@ -11,6 +11,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt;
@@ -26,7 +27,6 @@ use binrw::io::Cursor;
 use binrw::BinRead;
 use binrw::BinResult;
 use log::debug;
-use log::warn;
 use thiserror::Error;
 
 use crate::exports::SetOptions;
@@ -1501,24 +1501,35 @@ fn type_value_parser<R: Read + Seek>(
 /// Parses a form package into one root per FORM_SET op, outside another FormSet, that
 /// edk2-stable202608 SetupBrowserDxe/Setup.c GetIfrBinaryData reaches when it looks for a FormSet
 /// by GUID, walking the package op by op, scopes unread, e.g. into an unknown op's scope; each as
-/// handle_form_set parses it, the walk going on after its End. A package without one has no root.
+/// handle_form_set_within parses it, the walk going on after its End. A package without one has
+/// no root.
 /// That walk ends at an op whose Length runs past the package; here it also ends at one below the
-/// header size, which that walk loops on (Length 0) or steps into (Length 1), and at a later
-/// FormSet whose bytes do not parse. A later FormSet whose scopes nest deeper than
-/// MAX_SCOPE_NESTING is skipped to its End, as that walk steps over it.
+/// header size, which that walk loops on (Length 0) or steps into (Length 1). A later FormSet
+/// whose bytes do not parse, or whose scopes nest deeper than MAX_SCOPE_NESTING, is ignored, as
+/// UEFI 2.11 §33.2.5.10.1 ignores only a malformed forms set, and the walk goes on from the op
+/// after its FORM_SET op, as that walk does, so a FORM_SET op in it becomes a root, as that walk
+/// finds it, though that section ignores the entire forms set. A FORM_SET op without Scope that a
+/// failed parse reads outside every scope that it opened is ignored with that parse's failure,
+/// unparsed: the parse from it reads the same ops and fails at the same one. So each op is parsed
+/// at most twice per scope open around it, which a parse that reaches it opens no more than
+/// MAX_SCOPE_NESTING of: from the FORM_SET op that opens that scope and from one without Scope
+/// directly in it; then once from one without Scope outside them, and once by the walk.
 /// None of them fails the package after the first FormSet: edk2 reads past it only for such a
 /// walk. Before it, they fail the package as they fail the first FormSet.
 /// The IFR that the walk leaves unread is returned too, as PASSWORD questions in it are unknown:
-/// such a later FormSet, with the ops after it if it does not parse or the package ends inside
-/// it, and the bytes after an op where the walk ends, unless they are padding. So is each
-/// FormSet, first or later, whose FORM_SET op opens no scope: edk2 parses its ops on to the end
-/// of the package, past the End where handle_form_set ends it.
+/// such a later FormSet, and the bytes after an op where the walk ends, unless they are padding.
+/// So is each FormSet, first or later, whose FORM_SET op opens no scope and that parses: edk2
+/// parses its ops on to the end of the package, past the End where handle_form_set_within ends
+/// it.
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
     package_list_guid: Guid,
 ) -> Result<FormSets> {
     let mut roots = Vec::new();
     let mut ignored = Vec::new();
+    // FORM_SET ops without Scope, by offset, that a failed parse read outside every scope that it
+    // opened, with its failure, which the parse from each gives too
+    let mut failing_alike: BTreeMap<u64, Rc<FormSetFailure>> = BTreeMap::new();
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
@@ -1538,6 +1549,7 @@ pub(super) fn parse_form_sets(
                     .and_then(|offset| package_cursor.get_ref().get(offset..));
                 if !unread.is_some_and(is_padding) {
                     ignored.push(IgnoredIfr {
+                        package_list: package_list_guid,
                         offset,
                         reason: format!(
                             "an op that does not fit the form package, and the bytes after it: \
@@ -1549,6 +1561,8 @@ pub(super) fn parse_form_sets(
             }
             Err(error) => return Err(error).context("failed to parse IFR operation"),
         };
+        // where GetIfrBinaryData's walk goes on past a FormSet that this one ignores
+        let after_op = package_cursor.position();
         if op.op_code != IFROpCode::FormSet {
             debug!(
                 "skipping {:?} outside a FormSet at offset {offset}",
@@ -1556,74 +1570,113 @@ pub(super) fn parse_form_sets(
             );
             continue;
         }
-        if !op.open_scope {
-            let reason = format!(
-                "{} opens no scope, so edk2 parses its ops on to the end of the form package, past \
-                 the End where uefisettings ends it (edk2-stable202211 SetupBrowserDxe IfrParse.c \
-                 ParseOpCodes pushes a scope only for Scope != 0, and ends a FormSet only at the \
-                 End of a FORM_SET scope)",
-                form_set_name(&op)
-            );
-            warn!(
-                "package list {package_list_guid}: at offset {offset} of a form package, {reason}"
-            );
-            ignored.push(IgnoredIfr { offset, reason });
-        }
-        package_cursor.set_position(offset);
-        match handle_form_set(package_cursor) {
-            Ok(root) => roots.push(root),
-            Err(error)
-                if !roots.is_empty() && error.chain().any(|cause| cause.is::<ScopesTooDeep>()) =>
-            {
-                warn!(
-                    "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
-                     a form package: {error:#}"
-                );
-                let name = form_set_name(&op);
+        let failure = match failing_alike.remove(&offset) {
+            Some(failure) => failure,
+            None => {
                 package_cursor.set_position(offset);
-                match skip_scope(package_cursor) {
-                    Ok(()) => ignored.push(IgnoredIfr {
-                        offset,
-                        reason: format!("{name}, which nests too deep: {error:#}"),
-                    }),
-                    Err(skip_error) => {
-                        debug!(
-                            "ending the FormSet walk in the FormSet at offset {offset}: \
-                             {skip_error}"
-                        );
-                        ignored.push(IgnoredIfr {
-                            offset,
-                            reason: format!(
-                                "{name}, which nests too deep; uefisettings ignores it and the \
-                                 ops after it, as the form package ends inside it: {error:#}"
-                            ),
-                        });
-                        break;
+                let mut alike = Vec::new();
+                match handle_form_set_within(package_cursor, MAX_SCOPE_NESTING, &mut alike) {
+                    Ok(root) => {
+                        if !op.open_scope {
+                            ignored.push(opens_no_scope(&op, package_list_guid, offset));
+                        }
+                        roots.push(root);
+                        continue;
+                    }
+                    Err(error) if roots.is_empty() => return Err(error),
+                    Err(error) => {
+                        let failure = Rc::new(FormSetFailure::of(error)?);
+                        failing_alike.extend(alike.into_iter().map(|at| (at, Rc::clone(&failure))));
+                        failure
                     }
                 }
             }
-            Err(error)
-                if !roots.is_empty() && error.chain().any(|cause| cause.is::<ParseError>()) =>
-            {
-                warn!(
-                    "package list {package_list_guid}: ignoring the FormSet at offset {offset} of \
-                     a form package and the ops after it: {error:#}"
-                );
-                ignored.push(IgnoredIfr {
-                    offset,
-                    reason: format!(
-                        "{}, which does not parse; uefisettings ignores it and the ops after it, \
-                         where UEFI 2.11 §33.2.5.10.1 disables only the form of a malformed op \
-                         and ignores only a malformed forms set: {error:#}",
-                        form_set_name(&op)
-                    ),
-                });
-                break;
-            }
-            Err(error) => return Err(error),
-        }
+        };
+        debug!(
+            "package list {package_list_guid}: ignoring the FormSet at offset {offset} of a form \
+             package: {}",
+            failure.error
+        );
+        ignored.push(IgnoredIfr {
+            package_list: package_list_guid,
+            offset,
+            reason: failure.reason(&form_set_name(&op)),
+        });
+        package_cursor.set_position(after_op);
     }
     Ok(FormSets { roots, ignored })
+}
+
+/// The record of the FormSet that parses from the FORM_SET op `op` without Scope, at offset
+/// `offset` of a form package of the package list `package_list`.
+fn opens_no_scope(op: &IFROperation, package_list: Guid, offset: u64) -> IgnoredIfr {
+    let reason = format!(
+        "{} opens no scope, so edk2 parses its ops on to the end of the form package, past the End \
+         where uefisettings ends it (edk2-stable202211 SetupBrowserDxe IfrParse.c ParseOpCodes \
+         pushes a scope only for Scope != 0, and ends a FormSet only at the End of a FORM_SET \
+         scope)",
+        form_set_name(op)
+    );
+    debug!("package list {package_list}: at offset {offset} of a form package, {reason}");
+    IgnoredIfr {
+        package_list,
+        offset,
+        reason,
+    }
+}
+
+/// The records that an error names before it counts the rest.
+const NAMED_RECORDS: usize = 16;
+
+/// `records` joined by "; ": the first NAMED_RECORDS of them, then the count of the rest.
+pub(crate) fn named_records(records: &[impl fmt::Display]) -> String {
+    let mut named: Vec<String> = records
+        .iter()
+        .take(NAMED_RECORDS)
+        .map(ToString::to_string)
+        .collect();
+    let rest = records.len().saturating_sub(NAMED_RECORDS);
+    if rest > 0 {
+        named.push(format!("and {rest} more"));
+    }
+    named.join("; ")
+}
+
+/// Why a FormSet that parse_form_sets ignores does not parse: the error of its parse, and whether
+/// its scopes nest too deep.
+struct FormSetFailure {
+    too_deep: bool,
+    error: String,
+}
+
+impl FormSetFailure {
+    /// That of the error `error` of handle_form_set_within, which ignores the FormSet if it nests
+    /// too deep or does not parse; `error` for any other.
+    fn of(error: anyhow::Error) -> Result<Self> {
+        let too_deep = error.chain().any(|cause| cause.is::<ScopesTooDeep>());
+        let malformed = error.chain().any(|cause| cause.is::<ParseError>());
+        if !too_deep && !malformed {
+            return Err(error);
+        }
+        Ok(Self {
+            too_deep,
+            error: format!("{error:#}"),
+        })
+    }
+
+    /// The reason of the record of the FormSet `name` that fails so.
+    fn reason(&self, name: &str) -> String {
+        let error = &self.error;
+        if self.too_deep {
+            format!("{name}, which nests too deep: {error}")
+        } else {
+            format!(
+                "{name}, which does not parse; uefisettings ignores it, where UEFI 2.11 \
+                 §33.2.5.10.1 disables only the form of a malformed op and ignores only a \
+                 malformed forms set: {error}"
+            )
+        }
+    }
 }
 
 /// The FormSet that the FORM_SET op `op` opens, named by its GUID, or "a FormSet" if its data is
@@ -1642,40 +1695,63 @@ pub(super) struct FormSets {
     pub(super) ignored: Vec<IgnoredIfr>,
 }
 
-/// IFR of a form package that parse_form_sets ignores, from `offset` on, and what it is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// IFR of a form package of the package list `package_list` that parse_form_sets ignores, from
+/// `offset` on, and what it is. Only parse_form_sets makes one:
+///
+/// ```compile_fail
+/// use uefisettings::exports::IgnoredIfr;
+///
+/// fn at_offset_0(ignored: &IgnoredIfr) -> IgnoredIfr {
+///     IgnoredIfr {
+///         offset: 0,
+///         ..ignored.clone()
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct IgnoredIfr {
+    pub package_list: Guid,
     pub offset: u64,
     pub reason: String,
 }
 
-/// Moves `package_cursor` from the op at its position past the End that closes that op's scope,
-/// reading the ops in between undecoded, as GetIfrBinaryData's walk steps over them.
-fn skip_scope(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<(), ParseError> {
-    let mut depth: usize = 0;
-    loop {
-        let op: IFROperation = package_cursor.parse_ne()?;
-        match (&op.op_code, op.open_scope) {
-            (IFROpCode::End, _) => depth = depth.saturating_sub(1),
-            (_, true) => depth = depth.saturating_add(1),
-            (_, false) => {}
-        }
-        if depth == 0 {
-            return Ok(());
-        }
+impl fmt::Display for IgnoredIfr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the IFR that uefisettings ignores at offset {} of a form package of package list {}: \
+             {}",
+            self.offset, self.package_list, self.reason
+        )
     }
 }
 
-pub fn handle_form_set(package_cursor: &mut Cursor<&Vec<u8>>) -> Result<Rc<RefCell<IFROperation>>> {
-    handle_form_set_within(package_cursor, MAX_SCOPE_NESTING)
+#[cfg(test)]
+thread_local! {
+    /// The ops that handle_form_set_within has parsed on this thread, which tests of the bound on
+    /// parse_form_sets' parses count.
+    pub(crate) static OPS_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// handle_form_set_within for the tests, at MAX_SCOPE_NESTING
+#[cfg(test)]
+pub(crate) fn handle_form_set(
+    package_cursor: &mut Cursor<&Vec<u8>>,
+) -> Result<Rc<RefCell<IFROperation>>> {
+    handle_form_set_within(package_cursor, MAX_SCOPE_NESTING, &mut Vec::new())
 }
 
 /// handle_form_set, failing with ScopesTooDeep at an op that opens more than `limit` scopes at
-/// once.
+/// once, adding to `alike` the offset of each FORM_SET op without Scope after its first op that it
+/// reads outside every scope that it opened: the parse from such an op reads the ops after it as
+/// this one does, so it fails where this one fails.
 fn handle_form_set_within(
     package_cursor: &mut Cursor<&Vec<u8>>,
     limit: usize,
+    alike: &mut Vec<u64>,
 ) -> Result<Rc<RefCell<IFROperation>>> {
+    let start = package_cursor.position();
     // this is the root element so all the values like op_code, length, etc are dummy
     debug!("new FormSet");
     let root = Rc::new(RefCell::new(IFROperation {
@@ -1703,6 +1779,11 @@ fn handle_form_set_within(
         let node: IFROperation = package_cursor
             .parse_ne()
             .context("failed to parse IFR operation")?;
+        #[cfg(test)]
+        OPS_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
+        if depth == 0 && offset != start && node.op_code == IFROpCode::FormSet && !node.open_scope {
+            alike.push(offset);
+        }
 
         let current_node = Rc::new(RefCell::new(node));
 
@@ -4385,7 +4466,8 @@ mod nesting_tests {
     /// The root of deep_form_set, parsed past MAX_SCOPE_NESTING.
     fn parse_deep(depth: usize, nots: usize, password: bool) -> Rc<RefCell<IFROperation>> {
         let ifr = deep_form_set(depth, nots, password);
-        handle_form_set_within(&mut Cursor::new(&ifr), usize::MAX).expect("parse the FormSet")
+        handle_form_set_within(&mut Cursor::new(&ifr), usize::MAX, &mut Vec::new())
+            .expect("parse the FormSet")
     }
 
     /// The op of the tree of `root` whose data is that of the op `op`.

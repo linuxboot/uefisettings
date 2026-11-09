@@ -92,8 +92,19 @@ struct SetResponse {
   8: optional FirmwareAttributeSetResult firmware_attribute_set_result;
 }
 
+// hii - IFR of a form package, from offset on, that uefisettings ignores in whole or in part,
+// and why: get, set and list-questions may miss questions in it.
+struct HiiIgnoredIfr {
+  1: string package_list;
+  2: i64 offset;
+  3: string reason;
+}
+
 struct SetResponseList {
   1: list<SetResponse> responses;
+  // hii - the IFR that uefisettings ignores in the HiiDB, which may hold more questions; unset if
+  // there is none
+  2: optional list<HiiIgnoredIfr> ignored_ifr;
 }
 
 struct GetResponse {
@@ -105,6 +116,9 @@ struct GetResponse {
 
 struct GetResponseList {
   1: list<GetResponse> responses;
+  // hii - the IFR that uefisettings ignores in the HiiDB, which may hold more questions; unset if
+  // there is none
+  2: optional list<HiiIgnoredIfr> ignored_ifr;
 }
 
 // The CLI's error object: error_message is for people and may change; kind

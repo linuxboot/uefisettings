@@ -568,11 +568,15 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 options.efivars = efivars.source()?;
                 // before the HiiDB is read
                 options.efivars.validate()?;
-                let res = HiiBackend::list_questions_using(
+                let (res, ignored_ifr) = HiiBackend::list_questions_and_ignored_ifr_using(
                     &hiidb.read(&options.efivars, source)?,
                     &options,
                 )?;
                 print_with_style(res, output.json)?;
+                // the questions' list keeps its form, so the IFR that may hold more goes to stderr
+                for ignored in ignored_ifr {
+                    print_warning(format_args!("questions may be in {ignored}"))?;
+                }
             }
             HiiSubcommands::Platform(command) => command.run(source)?,
         },
@@ -610,6 +614,12 @@ fn print_line(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     writeln!(output, "{}", arguments)
+}
+
+fn print_warning(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
+    writeln!(output, "warning: {}", arguments)
 }
 
 // print_with_style either prints as json or with rust's debug pretty-printer

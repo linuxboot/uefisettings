@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -38,6 +38,8 @@
 //! so that Linux finds them too.
 //! `enhanced-auth-forms` does the same with the package list of [`enhanced_auth_forms`].
 //! `dropped-password-forms` does the same with the package list of [`dropped_password_forms`].
+//! `formset-skip-forms` registers the package lists of [`formset_skip_forms`] too, which a later
+//! `publish-hiidb.efi rt-data` exports with the database for Linux.
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `string-blocks` does the same with the package list of [`string_blocks`].
@@ -81,6 +83,7 @@ extern crate alloc;
 mod auth_variables;
 mod dropped_password_forms;
 mod enhanced_auth_forms;
+mod formset_skip_forms;
 mod global_variable_forms;
 mod hii_package;
 mod padded_strings;
@@ -231,6 +234,10 @@ fn efi_main() -> Status {
             "registering the dropped password forms",
         )
         .map(|()| println!("publish-hiidb: registered the dropped password forms")),
+        Some(Task::RegisterFormSetSkipForms) => formset_skip_forms::package_lists()
+            .iter()
+            .try_for_each(|list| register_package_list(list, "registering the formset skip forms"))
+            .map(|()| println!("publish-hiidb: registered the formset skip forms")),
         Some(Task::RegisterPaddedStrings) => register_package_list(
             &padded_strings::package_list_bytes(),
             "registering the padded strings",
@@ -267,8 +274,8 @@ fn efi_main() -> Status {
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
                  |rt-data-readwrite-forms|password-forms|rt-data-password-forms\
-                 |enhanced-auth-forms|dropped-password-forms|padded-strings\
-                 |string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
+                 |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
+                 |padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|rt-properties-no-set-variable|rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
                  |json-config-data-past-region|json-config-data-boot-services\
@@ -300,6 +307,8 @@ enum Task {
     RegisterEnhancedAuthForms,
     /// Register the package list of [`dropped_password_forms`] in the HII database.
     RegisterDroppedPasswordForms,
+    /// Register the package lists of [`formset_skip_forms`] in the HII database.
+    RegisterFormSetSkipForms,
     /// Register the package list of [`padded_strings`] in the HII database.
     RegisterPaddedStrings,
     /// Create the variable of [`readwrite_forms`] if missing, register its package list in the
@@ -358,6 +367,9 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("dropped-password-forms") => {
             Some(Task::RegisterDroppedPasswordForms)
+        }
+        Ok(option) if option == cstr16!("formset-skip-forms") => {
+            Some(Task::RegisterFormSetSkipForms)
         }
         Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
         Ok(option) if option == cstr16!("string-blocks") => Some(Task::RegisterStringBlocks),

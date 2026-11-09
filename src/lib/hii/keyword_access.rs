@@ -1177,6 +1177,7 @@ mod tests {
     fn get_and_set_fail_closed_on_ifr_that_the_parser_ignores() {
         let mut dropped = list(PATH, &questions());
         dropped.ignored_ifr = vec![IgnoredIfr {
+            package_list: dropped.guid,
             offset: 0x40,
             reason: "a FormSet that does not parse".to_owned(),
         }];

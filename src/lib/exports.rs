@@ -20,6 +20,7 @@ use anyhow::Result;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::GetResponse;
 use uefisettings_backend_thrift::GetResponseList;
+use uefisettings_backend_thrift::HiiIgnoredIfr;
 use uefisettings_backend_thrift::HiiShowIfrResponse;
 use uefisettings_backend_thrift::HiiStringsPackage;
 use uefisettings_backend_thrift::Question;
@@ -211,6 +212,7 @@ use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
 
 pub use crate::hii::forms::AccessLevel;
+pub use crate::hii::forms::IgnoredIfr;
 pub use crate::hii::forms::IncludedStates;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
@@ -679,6 +681,15 @@ impl HiiBackend {
         Self::list_questions_using(db_bytes, &ListQuestionsOptions::default())
     }
 
+    /// The IFR that uefisettings ignores in the HiiDB `db_bytes`, which may hold questions that
+    /// list_questions does not list.
+    pub fn ignored_ifr(db_bytes: &[u8]) -> Result<Vec<IgnoredIfr>> {
+        Ok(package::read_db(db_bytes)?
+            .into_iter()
+            .flat_map(|list| list.ignored_ifr)
+            .collect())
+    }
+
     /// list_questions with `options`
     pub fn list_questions_using(
         db_bytes: &[u8],
@@ -687,15 +698,40 @@ impl HiiBackend {
         Self::list_questions_in(db_bytes, options, options.efivars.clone().into_variables()?)
     }
 
+    /// list_questions_using, and ignored_ifr of the same parse of the HiiDB
+    pub fn list_questions_and_ignored_ifr_using(
+        db_bytes: &[u8],
+        options: &ListQuestionsOptions,
+    ) -> Result<(Vec<Question>, Vec<IgnoredIfr>)> {
+        Self::list_questions_and_ignored_ifr_in(
+            db_bytes,
+            options,
+            options.efivars.clone().into_variables()?,
+        )
+    }
+
     /// list_questions with `options`, reading question values from `variables`
     fn list_questions_in(
         db_bytes: &[u8],
         options: &ListQuestionsOptions,
         variables: Box<dyn FirmwareVariables>,
     ) -> Result<Vec<Question>> {
+        Ok(Self::list_questions_and_ignored_ifr_in(db_bytes, options, variables)?.0)
+    }
+
+    /// list_questions_in, and the IFR that uefisettings ignores in the HiiDB
+    fn list_questions_and_ignored_ifr_in(
+        db_bytes: &[u8],
+        options: &ListQuestionsOptions,
+        variables: Box<dyn FirmwareVariables>,
+    ) -> Result<(Vec<Question>, Vec<IgnoredIfr>)> {
         let include = options.include;
         let mut res = Vec::new();
         let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables)?;
+        let ignored_ifr = parsed_db
+            .iter()
+            .flat_map(|list| list.ignored_ifr.iter().cloned())
+            .collect();
         forms::check_access_level(
             parsed_db.iter().flat_map(|list| &list.forms),
             options.access_level,
@@ -735,7 +771,7 @@ impl HiiBackend {
                 }
             }
         }
-        Ok(res)
+        Ok((res, ignored_ifr))
     }
 }
 
@@ -802,6 +838,7 @@ impl HiiBackend {
         let mut resp = Vec::new();
 
         let parsed_db = package::read_db(db_bytes)?;
+        let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
         let passwords = PasswordQuestions::of_lists(&parsed_db);
         let mut reader = passwords.reader(reads)?;
         let writes = passwords.withholding(writes)?;
@@ -883,6 +920,7 @@ impl HiiBackend {
 
         Ok(SetResponseList {
             responses: resp,
+            ignored_ifr,
             ..Default::default()
         })
     }
@@ -935,6 +973,7 @@ impl HiiBackend {
             parsed_db.iter().flat_map(|list| &list.forms),
             options.access_level,
         )?;
+        let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
 
         let mut excluded = IncludedStates::empty();
         for list in parsed_db {
@@ -994,6 +1033,7 @@ impl HiiBackend {
 
         Ok(GetResponseList {
             responses: resp,
+            ignored_ifr,
             ..Default::default()
         })
     }
@@ -1015,7 +1055,8 @@ fn read_db_withholding(
 /// list of `parsed_db` and the stated access level, then selects, in each FormSet, the question
 /// of `question_variations` that set writes, reading each range once with `reader`; returns them
 /// with the GUID of their package list, or SelectionError::Excluded for `question` if each
-/// FormSet skips it for its states.
+/// FormSet skips it for its states, or else MaybeInIgnoredIfr if none holds it and read_db
+/// ignores IFR of `parsed_db`.
 fn select_for_set(
     parsed_db: &[package::ParsedPackageList],
     question: &str,
@@ -1070,6 +1111,17 @@ fn select_for_set(
         }
         .into());
     }
+    let mut ignored = parsed_db
+        .iter()
+        .flat_map(|list| &list.ignored_ifr)
+        .peekable();
+    if selected.is_empty() && ignored.peek().is_some() {
+        return Err(SelectionError::MaybeInIgnoredIfr {
+            question: question.to_owned(),
+            ignored: ignored.cloned().collect(),
+        }
+        .into());
+    }
     Ok(selected)
 }
 
@@ -1081,6 +1133,25 @@ fn listed_flags(flags: QuestionFlags) -> Option<Vec<String>> {
             .map(|(name, _)| name.to_owned())
             .collect()
     })
+}
+
+/// The IFR that read_db ignores in `lists`, as GetResponseList and SetResponseList list it: None,
+/// which --json leaves out, for none.
+fn listed_ignored_ifr(lists: &[package::ParsedPackageList]) -> Result<Option<Vec<HiiIgnoredIfr>>> {
+    let listed = lists
+        .iter()
+        .flat_map(|list| &list.ignored_ifr)
+        .map(|ignored| {
+            Ok(HiiIgnoredIfr {
+                package_list: ignored.package_list.to_string(),
+                offset: i64::try_from(ignored.offset)
+                    .context("the offset of ignored IFR does not fit an i64")?,
+                reason: ignored.reason.clone(),
+                ..Default::default()
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((!listed.is_empty()).then_some(listed))
 }
 
 /// `defaults` as Question lists them: None, which --json leaves out, for none.
@@ -3892,10 +3963,10 @@ mod tests {
                 Vec::new(),
                 form_set(&dropped_password_second_ops(malformed)),
                 format!(
-                    "{ignored}{second}, which does not parse; uefisettings ignores it and the ops \
-                     after it, where UEFI 2.11 §33.2.5.10.1 disables only the form of a malformed \
-                     op and ignores only a malformed forms set: failed to parse op_code VarStore \
-                     properly: failed to parse VarStore's data: "
+                    "{ignored}{second}, which does not parse; uefisettings ignores it, where UEFI \
+                     2.11 §33.2.5.10.1 disables only the form of a malformed op and ignores only \
+                     a malformed forms set: failed to parse op_code VarStore properly: failed to \
+                     parse VarStore's data: "
                 ),
             ),
             (
@@ -4014,6 +4085,510 @@ mod tests {
             "no drop: BootServices: get"
         );
         assert_eq!(variables.reads(), [], "no drop: BootServices: reads");
+    }
+
+    /// A HiiDB of one package list, of DROPPED_PASSWORD_LIST_GUID, holding a form package of
+    /// `ifr` and the strings Q1, Password and Q3 of string IDs 1 to 3.
+    fn three_questions_hiidb(ifr: &[u8]) -> Vec<u8> {
+        let packages = [
+            form_package_of(ifr),
+            en_strings_package_of(&["Q1", "Password", "Q3"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(DROPPED_PASSWORD_LIST_GUID, &packages.concat())
+    }
+
+    /// The answers of get of `question` in `hiidb`, reading `variables`, or its error.
+    fn answers_or_error_of(
+        hiidb: &[u8],
+        question: &str,
+        variables: &Rc<MemoryVariables>,
+    ) -> Result<Vec<String>, String> {
+        HiiBackend::get_in(
+            hiidb,
+            question,
+            None,
+            &GetOptions::default(),
+            shared(variables),
+        )
+        .map(|got| {
+            got.responses
+                .iter()
+                .map(|response| response.question.answer.clone())
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// The number of questions that set of `question` to "0" in `hiidb` under `policy` sets,
+    /// reading and writing `variables`, or its error.
+    fn set_count_of(
+        hiidb: &[u8],
+        question: &str,
+        policy: SetupPasswordPolicy,
+        variables: &Rc<MemoryVariables>,
+    ) -> Result<usize, String> {
+        let options = SetOptions {
+            setup_password: policy,
+            ..SetOptions::default()
+        };
+        HiiBackend::set_in(
+            hiidb,
+            question,
+            "0",
+            None,
+            &options,
+            shared(variables),
+            &**variables,
+        )
+        .map(|got| got.responses.len())
+        .map_err(|error| error.to_string())
+    }
+
+    /// A VARSTORE op that ends after 4 of the 20 bytes before its Name: UEFI 2.11 §33.2.5.10.1
+    /// calls it malformed.
+    fn short_var_store() -> Vec<u8> {
+        operation(VAR_STORE, false, &[0x00; 4])
+    }
+
+    /// The prefix of the refusal, through variables that reach BootServices, of a HiiDB of
+    /// three_questions_hiidb with IFR that uefisettings ignores.
+    fn three_questions_refusal() -> String {
+        format!(
+            "PASSWORD questions of package list {} may be in the IFR that uefisettings ignores at \
+             offset ",
+            Guid::from(DROPPED_PASSWORD_LIST_GUID)
+        )
+    }
+
+    /// Through variables that reach Runtime, get reads the questions of a FormSet after one that
+    /// uefisettings ignores, as edk2-stable202608 GetIfrBinaryData finds it, and those before;
+    /// through variables that reach BootServices, the PASSWORD of the ignored FormSet still closes
+    /// every variable of the HiiDB.
+    #[test]
+    fn form_sets_after_an_ignored_one_are_read() {
+        let ifr = [
+            form_set(&[
+                dropped_password_var_store(),
+                form(1, &[checkbox_on(1, 1, 1)]),
+            ]),
+            form_set(&[
+                dropped_password_var_store(),
+                form(1, &[password_on(2, 2, 1, 0)]),
+                short_var_store(),
+            ]),
+            form_set(&[
+                dropped_password_var_store(),
+                form(1, &[checkbox_on(3, 3, 1)]),
+            ]),
+        ]
+        .concat();
+        let hiidb = three_questions_hiidb(&ifr);
+        let variables_of = |reach, interface| {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+            Rc::new(variables)
+        };
+
+        let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
+        for question in ["Q1", "Q3"] {
+            assert_eq!(
+                answers_or_error_of(&hiidb, question, &runtime),
+                Ok(vec!["1".to_string()]),
+                "Runtime: get {question}"
+            );
+        }
+
+        let boot_services = variables_of(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        for question in ["Q1", "Q3"] {
+            let got = answers_or_error_of(&hiidb, question, &boot_services);
+            assert!(
+                got.as_ref()
+                    .is_err_and(|error| error.starts_with(&three_questions_refusal())),
+                "BootServices: get {question}: {got:?}"
+            );
+        }
+        assert_eq!(boot_services.reads(), [], "BootServices: reads");
+    }
+
+    /// Through variables that reach BootServices, get and set, with and without the setup
+    /// password bypass, refuse and touch no variable when a PASSWORD may sit in IFR that the
+    /// parser does not read: a FormSet that it ignores, a FormSet after one, and a FormSet in one
+    /// that has its End, which edk2's walk for FormSets finds. Through variables that reach
+    /// Runtime, the questions around that IFR read. Without IFR that it ignores, the PASSWORD that
+    /// it reads leaves get and the bypassed set open.
+    #[test]
+    fn unread_password_regions_close_boot_services() {
+        const PASSWORD_STORE_GUID: [u8; 16] = [0x5A; 16];
+        let password_key = VariableKey {
+            name: "UefisettingsPw".to_string(),
+            guid: Guid::from(PASSWORD_STORE_GUID),
+        };
+        let password_store =
+            || var_store_efi_of(2, PASSWORD_STORE_GUID, "UefisettingsPw", NV_BS_RT, 20);
+        let q1 = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(1, 1, 1)]),
+        ]);
+        let q3 = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(3, 3, 1)]),
+        ]);
+        // Q3 and a PASSWORD on the variable of password_key
+        let q3_and_password = || {
+            form_set(&[
+                dropped_password_var_store(),
+                password_store(),
+                form(1, &[checkbox_on(3, 3, 1), password_on(2, 2, 2, 0)]),
+            ])
+        };
+        let cases: [(&str, Vec<u8>); 4] = [
+            (
+                "a PASSWORD in an ignored FormSet",
+                [
+                    q1.clone(),
+                    form_set(&[
+                        dropped_password_var_store(),
+                        form(1, &[password_on(2, 2, 1, 0)]),
+                        short_var_store(),
+                    ]),
+                    q3,
+                ]
+                .concat(),
+            ),
+            (
+                "a PASSWORD in a FormSet after an ignored one",
+                [
+                    q1.clone(),
+                    form_set(&[dropped_password_var_store(), short_var_store()]),
+                    q3_and_password(),
+                ]
+                .concat(),
+            ),
+            (
+                "a PASSWORD in a FormSet in an ignored one that has its End",
+                [
+                    q1.clone(),
+                    form_set(&[
+                        dropped_password_var_store(),
+                        short_var_store(),
+                        q3_and_password(),
+                    ]),
+                ]
+                .concat(),
+            ),
+            (
+                "control: a PASSWORD in a FormSet after a FormSet that parses",
+                [
+                    q1,
+                    form_set(&[dropped_password_var_store()]),
+                    q3_and_password(),
+                ]
+                .concat(),
+            ),
+        ];
+        let variables_of = |reach, interface| {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+            variables.insert(password_key.clone(), NV_BS_RT, &[0x00; 20]);
+            Rc::new(variables)
+        };
+        let refused = three_questions_refusal();
+        for (name, ifr) in cases {
+            let hiidb = three_questions_hiidb(&ifr);
+
+            let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
+            for question in ["Q1", "Q3"] {
+                assert_eq!(
+                    answers_or_error_of(&hiidb, question, &runtime),
+                    Ok(vec!["1".to_string()]),
+                    "{name}: Runtime: get {question}"
+                );
+            }
+
+            let control = name.starts_with("control");
+            for question in ["Q1", "Q3"] {
+                // each question on its own variables: a bypassed set writes byte 0, which both
+                // CHECKBOXes read
+                let boot_services = variables_of(
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                );
+                let got = answers_or_error_of(&hiidb, question, &boot_services);
+                match control {
+                    false => assert!(
+                        got.as_ref().is_err_and(|error| error.starts_with(&refused)),
+                        "{name}: BootServices: get {question}: {got:?}"
+                    ),
+                    true => assert_eq!(
+                        got,
+                        Ok(vec!["1".to_string()]),
+                        "{name}: BootServices: get {question}"
+                    ),
+                }
+                for policy in [SetupPasswordPolicy::Refuse, SetupPasswordPolicy::Bypass] {
+                    let got = set_count_of(&hiidb, question, policy, &boot_services);
+                    match (control, policy) {
+                        (false, _) => assert!(
+                            got.as_ref().is_err_and(|error| error.starts_with(&refused)),
+                            "{name}: BootServices: set {question} {policy:?}: {got:?}"
+                        ),
+                        (true, SetupPasswordPolicy::Refuse) => assert!(
+                            got.as_ref().is_err_and(|error| error
+                                .starts_with("this HiiDB declares a setup password question")),
+                            "{name}: BootServices: set {question} {policy:?}: {got:?}"
+                        ),
+                        (true, _) => assert_eq!(
+                            got,
+                            Ok(1),
+                            "{name}: BootServices: set {question} {policy:?}"
+                        ),
+                    }
+                }
+                match control {
+                    false => {
+                        assert_eq!(
+                            boot_services.reads(),
+                            [],
+                            "{name}: BootServices: {question}: reads"
+                        );
+                        assert_eq!(
+                            boot_services.writes_to(&dropped_password_store()),
+                            [],
+                            "{name}: BootServices: {question}: writes"
+                        );
+                    }
+                    true => assert_eq!(
+                        boot_services.writes_to(&dropped_password_store()),
+                        [(0, vec![0])],
+                        "{name}: BootServices: {question}: the bypassed set writes"
+                    ),
+                }
+                assert_eq!(
+                    boot_services.reads_of(&password_key),
+                    Vec::<u16>::new(),
+                    "{name}: BootServices: {question}: the PASSWORD's variable stays unread"
+                );
+                assert_eq!(
+                    boot_services.writes_to(&password_key),
+                    [],
+                    "{name}: BootServices: {question}: no PASSWORD write"
+                );
+            }
+        }
+    }
+
+    /// The offsets of the records of IFR that uefisettings ignores that `error` names, in order.
+    fn offsets_named(error: &str) -> Vec<String> {
+        error
+            .split("uefisettings ignores at offset ")
+            .skip(1)
+            .map(|rest| rest.split(' ').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Through variables that reach BootServices, get's refusal names each FormSet that
+    /// uefisettings ignores, at its offset.
+    #[test]
+    fn the_refusal_names_every_ignored_form_set() {
+        let q1 = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(1, 1, 1)]),
+        ]);
+        let ignored = form_set(&[dropped_password_var_store(), short_var_store()]);
+        let hiidb = three_questions_hiidb(&[q1.clone(), ignored.clone(), ignored.clone()].concat());
+        let variables = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+        let error = answers_or_error_of(&hiidb, "Q1", &Rc::new(variables))
+            .expect_err("BootServices: get Q1");
+        let want = [q1.len(), q1.len() + ignored.len()].map(|offset| offset.to_string());
+        assert_eq!(offsets_named(&error), want, "{error}");
+    }
+
+    /// The refusals that name the IFR that uefisettings ignores name its first 16 records and
+    /// count the rest: get's through variables that reach BootServices, and set's of a question
+    /// that no FormSet that it reads holds, through variables that reach Runtime.
+    #[test]
+    fn refusals_name_16_ignored_form_sets_and_count_the_rest() {
+        let q1 = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(1, 1, 1)]),
+        ]);
+        let ignored = form_set(&[dropped_password_var_store(), short_var_store()]);
+        let hiidb = three_questions_hiidb(&[q1.clone(), ignored.repeat(17)].concat());
+        let want: Vec<String> = (0..16)
+            .map(|index| (q1.len() + index * ignored.len()).to_string())
+            .collect();
+        let variables_of = |reach, interface| {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+            Rc::new(variables)
+        };
+
+        let boot_services = variables_of(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let error =
+            answers_or_error_of(&hiidb, "Q1", &boot_services).expect_err("BootServices: get Q1");
+        assert_eq!(offsets_named(&error), want, "BootServices: get Q1: {error}");
+        assert!(
+            error.contains("; and 1 more; as the variable of that password is unknown"),
+            "BootServices: get Q1: {error}"
+        );
+
+        let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
+        let error = set_count_of(&hiidb, "Q2", SetupPasswordPolicy::Refuse, &runtime)
+            .expect_err("Runtime: set Q2");
+        assert_eq!(offsets_named(&error), want, "Runtime: set Q2: {error}");
+        assert!(error.ends_with("; and 1 more"), "Runtime: set Q2: {error}");
+    }
+
+    /// get and set name the IFR that uefisettings ignores in a HiiDB, through variables that
+    /// reach Runtime too, where it closes nothing: get and set list it in the ignored_ifr of their
+    /// answer, a question in it or not, and set's refusal of a question that no FormSet it reads
+    /// holds names it. Without such IFR, neither answer has an ignored_ifr and the refusal names
+    /// the question alone.
+    #[test]
+    fn get_and_set_name_the_ifr_that_uefisettings_ignores() {
+        let q1 = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(1, 1, 1)]),
+        ]);
+        // a FormSet that uefisettings ignores, with the CHECKBOX Q2 of string ID 2
+        let ignored = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(2, 2, 1)]),
+            short_var_store(),
+        ]);
+        let q3 = form_set(&[
+            dropped_password_var_store(),
+            form(1, &[checkbox_on(3, 3, 1)]),
+        ]);
+        let hiidb = three_questions_hiidb(&[q1.clone(), ignored, q3.clone()].concat());
+        let without = three_questions_hiidb(&[q1.clone(), q3].concat());
+        let list = Guid::from(DROPPED_PASSWORD_LIST_GUID).to_string();
+        let reason = format!(
+            "the FormSet {}, which does not parse; uefisettings ignores it, where UEFI 2.11 \
+             §33.2.5.10.1 disables only the form of a malformed op and ignores only a malformed \
+             forms set: failed to parse op_code VarStore properly: failed to parse VarStore's \
+             data: ",
+            Guid::from([0x11; 16])
+        );
+        let offset = q1.len();
+        let variables = || {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+            Rc::new(variables)
+        };
+        // the ignored_ifr of the JSON of `answer`: (package list, offset, whether the reason is
+        // `reason`), None if unset
+        let ignored_ifr_of = |answer: Vec<u8>| -> Option<Vec<(String, u64, bool)>> {
+            let answer: serde_json::Value =
+                serde_json::from_slice(&answer).expect("parse the JSON of an answer");
+            let records = answer.get("ignored_ifr")?.as_array()?;
+            Some(
+                records
+                    .iter()
+                    .map(|record| {
+                        (
+                            record["package_list"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                            record["offset"].as_u64().unwrap_or(u64::MAX),
+                            record["reason"]
+                                .as_str()
+                                .is_some_and(|got| got.starts_with(&reason)),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let want = Some(vec![(
+            list.clone(),
+            u64::try_from(offset).expect("offset"),
+            true,
+        )]);
+        let get = |hiidb: &[u8], question: &str| {
+            HiiBackend::get_in(
+                hiidb,
+                question,
+                None,
+                &GetOptions::default(),
+                shared(&variables()),
+            )
+            .unwrap_or_else(|error| panic!("get {question}: {error:#}"))
+        };
+        let set = |hiidb: &[u8], question: &str| {
+            let variables = variables();
+            HiiBackend::set_in(
+                hiidb,
+                question,
+                "0",
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+            )
+            .map_err(|error| error.to_string())
+        };
+
+        for (question, answers) in [("Q3", vec!["1"]), ("Q2", vec![])] {
+            let got = get(&hiidb, question);
+            let got_answers: Vec<&str> = got
+                .responses
+                .iter()
+                .map(|response| response.question.answer.as_str())
+                .collect();
+            assert_eq!(got_answers, answers, "get {question}: answers");
+            assert_eq!(
+                ignored_ifr_of(simplejson_protocol::serialize(&got).to_vec()),
+                want,
+                "get {question}: ignored_ifr"
+            );
+        }
+        assert_eq!(
+            ignored_ifr_of(simplejson_protocol::serialize(get(&without, "Q3")).to_vec()),
+            None,
+            "get Q3 without ignored IFR: ignored_ifr"
+        );
+
+        let set_q3 = set(&hiidb, "Q3").unwrap_or_else(|error| panic!("set Q3: {error}"));
+        assert_eq!(set_q3.responses.len(), 1, "set Q3: responses");
+        assert_eq!(
+            ignored_ifr_of(simplejson_protocol::serialize(&set_q3).to_vec()),
+            want,
+            "set Q3: ignored_ifr"
+        );
+        let set_q3 = set(&without, "Q3").unwrap_or_else(|error| panic!("set Q3: {error}"));
+        assert_eq!(
+            ignored_ifr_of(simplejson_protocol::serialize(&set_q3).to_vec()),
+            None,
+            "set Q3 without ignored IFR: ignored_ifr"
+        );
+
+        let got = set(&hiidb, "Q2");
+        let refusal = format!(
+            "no question \"Q2\" in the HiiDB, but it may be in the IFR that uefisettings ignores \
+             at offset {offset} of a form package of package list {list}: {reason}"
+        );
+        assert!(
+            got.as_ref().is_err_and(|error| error.starts_with(&refusal)),
+            "set Q2: {got:?}"
+        );
+        assert_eq!(
+            set(&without, "Q2").map(drop),
+            Err("no question \"Q2\" in the HiiDB".to_string()),
+            "set Q2 without ignored IFR"
+        );
     }
 
     /// A HiiDB of two package lists: one whose FormSet declares no VarStore, then one whose
