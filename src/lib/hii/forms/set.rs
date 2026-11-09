@@ -38,6 +38,7 @@ use super::QuestionDescriptor;
 use super::RangeType;
 use super::TypeValue;
 use crate::hii::variables::is_volatile;
+use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
@@ -46,7 +47,6 @@ use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::VolatileWritingVariables;
 use crate::hii::variables::WithheldPassword;
 use crate::hii::variables::WithholdingVariables;
-use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 #[derive(Error, Debug)]
 pub(crate) enum ChangeValueError {
@@ -221,10 +221,17 @@ impl<'a> VarStoreWrite<'a> {
     /// variables that they read. Firmware refuses such a write if the variable changed since that
     /// read (edk2-stable202608 VariableServiceSetVariable, EFI_WRITE_PROTECTED).
     pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<()> {
-        self.span(variables)
-            .and_then(|(offset, span)| {
-                variables.write_at(&self.store.variable_key(), self.store.size(), offset, &span)
-            })
+        if self.patches.is_empty() {
+            return Err(anyhow!("a variable write without bytes"));
+        }
+        let patches = self.data_patches().collect::<Vec<_>>();
+        variables
+            .write_patches(
+                &self.store.variable_key(),
+                self.store.size(),
+                &patches,
+                VolatileWrites::Refuse,
+            )
             .map_err(|error| {
                 VariableNotExported::explain(
                     error,
@@ -235,48 +242,12 @@ impl<'a> VarStoreWrite<'a> {
             })
     }
 
-    /// The first VarOffset that the patches change and the end of the last bytes that they
-    /// change, which span writes; None without patches.
-    pub(super) fn changed(&self) -> Option<(u16, usize)> {
-        let start = self.patches.iter().map(|(offset, _)| *offset).min()?;
-        let end = self
-            .patches
-            .iter()
-            .map(|(offset, bytes)| usize::from(*offset) + bytes.len())
-            .max()?;
-        Some((start, end))
-    }
-
-    /// The first VarOffset that the patches change, and the bytes from there to the last that
-    /// they change: those of more than one patch with the bytes between them as `variables`
-    /// hold them now, after the writes before this one.
-    fn span(&self, variables: &dyn FirmwareVariables) -> Result<(u16, Vec<u8>)> {
-        let (start, end) = match (self.patches.as_slice(), self.changed()) {
-            ([only], _) => return Ok(only.clone()),
-            (_, Some(changed)) => changed,
-            (_, None) => return Err(anyhow!("a variable write without bytes")),
-        };
-        let key = self.store.variable_key();
-        let held = variables.read(&key, self.store.size())?;
-        let mut span = held
-            .get(EFIVARFS_HEADER_SIZE..)
-            .and_then(|payload| payload.get(usize::from(start)..end))
-            .ok_or_else(|| {
-                anyhow!(
-                    "EFI variable {key} holds {} bytes, short of the {end} that set writes",
-                    held.len().saturating_sub(EFIVARFS_HEADER_SIZE)
-                )
-            })?
-            .to_vec();
-        for (offset, bytes) in &self.patches {
-            offset
-                .checked_sub(start)
-                .map(usize::from)
-                .and_then(|at| span.get_mut(at..at + bytes.len()))
-                .ok_or_else(|| anyhow!("bytes at VarOffset {offset} outside their span"))?
-                .copy_from_slice(bytes);
-        }
-        Ok((start, span))
+    /// The patches, in order.
+    pub(super) fn data_patches(&self) -> impl Iterator<Item = DataPatch<'_>> {
+        self.patches.iter().map(|(offset, bytes)| DataPatch {
+            offset: *offset,
+            bytes,
+        })
     }
 }
 
@@ -543,7 +514,9 @@ mod set_questions_tests {
     use super::super::EFI_IFR_TYPE_NUM_SIZE_64;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_8;
     use super::*;
+    use crate::hii::variables::VariableKey;
     use crate::hii::variables::WithheldBytes;
+    use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
     const WRITE_ERROR: WriteError = WriteError {
         cause: "write failed",
@@ -1031,6 +1004,144 @@ mod set_questions_tests {
                 "{size} bytes: writes"
             );
         }
+    }
+
+    /// `variables` read as a withholding of a PASSWORD question's bytes that reads them as 0
+    /// would read them: the data byte at `offset` of `key` reads 0; writes pass through.
+    struct ZeroingByte<'v> {
+        variables: &'v MemoryVariables,
+        key: VariableKey,
+        offset: u16,
+    }
+
+    impl ZeroingByte<'_> {
+        /// `bytes` of the variable `key`, an efivarfs file's, with the byte at `offset` 0.
+        fn zeroed(&self, key: &VariableKey, mut bytes: Vec<u8>) -> Vec<u8> {
+            if *key == self.key {
+                if let Some(byte) = bytes.get_mut(EFIVARFS_HEADER_SIZE + usize::from(self.offset)) {
+                    *byte = 0;
+                }
+            }
+            bytes
+        }
+    }
+
+    impl FirmwareVariables for ZeroingByte<'_> {
+        fn reach(&self) -> VariableReach {
+            self.variables.reach()
+        }
+
+        fn interface(&self) -> VariableInterface {
+            self.variables.interface()
+        }
+
+        fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
+            Ok(self.zeroed(key, self.variables.read(key, size)?))
+        }
+
+        fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+            Ok(self.zeroed(key, self.variables.read_whole(key)?))
+        }
+
+        fn write_patches(
+            &self,
+            key: &VariableKey,
+            size: u16,
+            patches: &[DataPatch<'_>],
+            volatile: VolatileWrites,
+        ) -> Result<()> {
+            self.variables.write_patches(key, size, patches, volatile)
+        }
+    }
+
+    /// set refuses, before any write, a question one of whose patches overlaps a password's
+    /// bytes, naming the question, through variables of every interface: the question before it
+    /// writes nothing either, and the password's bytes stay as they are, byte for byte.
+    #[test]
+    fn a_patch_over_a_password_refuses_set_before_any_write() {
+        // a password at byte 1 of B, between two settings
+        const HELD: [u8; 3] = [0, 0xA7, 0];
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            let a = checkbox_on_store(writable_var_store("A", &[0], &variables));
+            let mut b = checkbox_at(1, writable_var_store("B", &HELD, &variables));
+            // as a FormSet walk names it; the fixtures leave it empty
+            b.question = PROMPT.to_string();
+            let mut withheld = WithheldBytes::default();
+            withheld.insert(variable_key("B"), 1..2);
+            let mut reader = EfivarReader::withholding(
+                Box::new(MemoryVariables::new(reach, interface)),
+                withheld.clone(),
+            );
+
+            let got = set_questions(
+                PROMPT,
+                &[("A", &a), ("B", &b)],
+                "1",
+                &BTreeSet::new(),
+                IncludedStates::empty(),
+                &mut reader,
+                None,
+                VolatileWrites::Refuse,
+                &WithholdingVariables::new(&variables, withheld),
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+
+            assert_eq!(
+                got,
+                Err(format!(
+                    "cannot set question \"{PROMPT}\": EFI variable {} holds a password at \
+                     bytes 1..2, which set never writes",
+                    variable_key("B")
+                )),
+                "{interface:?}"
+            );
+            assert_eq!(writes(&variables, "A"), [], "{interface:?}: writes of A");
+            assert_eq!(writes(&variables, "B"), [], "{interface:?}: writes of B");
+            assert_eq!(
+                variables.bytes(&variable_key("B")),
+                Some(efivarfs_bytes(&HELD)),
+                "{interface:?}: B"
+            );
+        }
+    }
+
+    /// A write of two patches of one variable keeps the byte between them that a withholding
+    /// reads as 0 as the variable holds it: the backend's read-modify-write reads the variable
+    /// itself, not the view that withholds the byte.
+    #[test]
+    fn a_write_of_two_patches_keeps_a_withheld_byte_between_them() {
+        let variables = MemoryVariables::default();
+        let fixture = writable_var_store("A", &[0, 0xAA, 0], &variables);
+        let store = fixture.store.as_deref().expect("VarStore A");
+        let write = VarStoreWrite {
+            store,
+            patches: vec![(0, vec![1]), (2, vec![1])],
+        };
+        let zeroing = ZeroingByte {
+            variables: &variables,
+            key: variable_key("A"),
+            offset: 1,
+        };
+
+        write.write(&zeroing).expect("write A");
+
+        assert_eq!(
+            variables.bytes(&variable_key("A")),
+            Some(efivarfs_bytes(&[1, 0xAA, 1])),
+            "A keeps 0xAA"
+        );
     }
 
     #[test]

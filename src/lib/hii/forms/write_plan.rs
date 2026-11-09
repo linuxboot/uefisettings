@@ -107,9 +107,9 @@ impl<'a> WritePlan<'a> {
 
     /// The plan's writes, one per variable, in the order in which the plan first changes each,
     /// each of its patches in order. Refuses a SET of a VarStore whose variable set may not
-    /// write, through what `reader` read of it, under `volatile`, and a write whose span overlaps
-    /// the bytes of a password that `reader` withholds, so that set writes no variable of the
-    /// plan.
+    /// write, through what `reader` read of it, under `volatile`, and a write one of whose patches
+    /// overlaps the bytes of a password that `reader` withholds, so that set writes no variable of
+    /// the plan.
     pub(super) fn variable_writes(
         &self,
         reader: &mut EfivarReader,
@@ -155,15 +155,15 @@ impl<'a> WritePlan<'a> {
             .into_iter()
             .map(|(_, patches)| merged_write(&patches))
             .collect::<Result<Vec<_>, _>>()?;
+        // each backend applies the patches to its own read of the variable, so the bytes
+        // between them keep what it holds
         for write in &writes {
-            if let Some((start, end)) = write.changed() {
-                reader
-                    .check_write(&write.store.variable_key(), &(usize::from(start)..end))
-                    .map_err(|refusal| ChangeValueError::PasswordBytes {
-                        question: self.question.question.clone(),
-                        refusal,
-                    })?;
-            }
+            reader
+                .check_patches(&write.store.variable_key(), write.data_patches())
+                .map_err(|refusal| ChangeValueError::PasswordBytes {
+                    question: self.question.question.clone(),
+                    refusal,
+                })?;
         }
         Ok(writes)
     }
@@ -673,11 +673,11 @@ mod tests {
         }
     }
 
-    /// Before a WRITE that writes the bytes on both sides of a password in one write, set refuses
-    /// it through variables of every backend, writing nothing: that write would carry the
-    /// password's bytes, which questions read as zero, back into the variable.
+    /// A WRITE that writes the bytes on both sides of a password in one write keeps the password's
+    /// bytes as the variable holds them, byte for byte, through variables of every backend: each
+    /// backend patches its own read of the variable, where questions read those bytes as zero.
     #[test]
-    fn a_write_across_a_password_writes_nothing() {
+    fn a_write_on_both_sides_of_a_password_keeps_its_bytes() {
         let op = |op_code| operation(op_code, false, &[]);
         let set_op = |id: u16, offset: u16| {
             let data = [
@@ -742,6 +742,18 @@ mod tests {
                 panic!("Around: not picked through {through:?}");
             };
             let writes = variables(through);
+            // the password's bytes 1..3 of Store
+            let password = |writes: &MemoryVariables| {
+                writes.bytes(&key("Store")).and_then(|bytes| {
+                    bytes
+                        .get(
+                            crate::hii::variables::EFIVARFS_HEADER_SIZE + 1
+                                ..crate::hii::variables::EFIVARFS_HEADER_SIZE + 3,
+                        )
+                        .map(<[u8]>::to_vec)
+                })
+            };
+            let before = password(&writes);
             let outcome = set_questions(
                 "Around",
                 &[("selector", descriptor)],
@@ -758,15 +770,21 @@ mod tests {
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
 
-            assert!(
-                outcome.as_ref().is_err_and(|error| error
-                    .contains("holds a password at bytes 1..3, which set never writes")),
-                "through {through:?}: {outcome:?}"
-            );
+            assert_eq!(outcome, Ok(()), "through {through:?}");
             assert_eq!(
                 writes.writes_to(&key("Store")),
-                [],
+                [(0, vec![5, 0xA1, 0xA2, 0xA3, 5])],
                 "writes through {through:?}"
+            );
+            assert_eq!(
+                before,
+                Some(vec![0xA1, 0xA2]),
+                "the password's bytes before, through {through:?}"
+            );
+            assert_eq!(
+                password(&writes),
+                before,
+                "the password's bytes after, through {through:?}"
             );
         }
     }
@@ -869,8 +887,9 @@ mod tests {
     }
 
     /// A WRITE expression whose first SET changes Other, and whose bytes in Store, with the
-    /// question's own, span a password, across it or by its first or last byte only: set refuses
-    /// before any write, Other's too, naming the question. A span beside the password writes both.
+    /// question's own, overlap a password by its first or last byte: set refuses before any write,
+    /// Other's too, naming the question. Bytes on both sides of the password, keeping its bytes,
+    /// or beside it write both.
     #[test]
     fn a_write_plan_across_a_password_writes_no_other_variable() {
         let refused = || {
@@ -884,7 +903,19 @@ mod tests {
         };
         // the span in Store, the question's own byte, and the offset and type of its SET of Store
         let cases = [
-            ("0..5, across", 0, 4, EFI_IFR_TYPE_NUM_SIZE_8, refused()),
+            (
+                "0..5, on both sides",
+                0,
+                4,
+                EFI_IFR_TYPE_NUM_SIZE_8,
+                (
+                    Ok(()),
+                    BTreeMap::from([
+                        ("Other", vec![(0, vec![5, 0])]),
+                        ("Store", vec![(0, vec![5, 0xA1, 0xA2, 0xA3, 5])]),
+                    ]),
+                ),
+            ),
             (
                 "0..2, its last byte",
                 0,

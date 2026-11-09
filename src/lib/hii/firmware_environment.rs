@@ -30,6 +30,7 @@ use crate::efi_variables::VariableInfo;
 use crate::efi_variables::VariableInfoSource;
 use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
+use crate::hii::variables::DataPatch;
 use crate::hii::variables::FirmwareVariables;
 #[cfg(variable_data)]
 use crate::hii::variables::VariableAttributes;
@@ -193,21 +194,20 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
         Ok([&attributes.to_ne_bytes()[..], &data].concat())
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
     ) -> Result<()> {
-        // As VariableServices::write_at_with (variable_services.rs): read the whole variable,
+        // As VariableServices::write_patches (variable_services.rs): read the whole variable,
         // modify its bytes, and write the whole data back with the same attributes.
         let name = variable_name(key)?;
         let guid = variable_guid(key)?;
         let (attributes, data) = self.read_all(key)?;
         let mut bytes = [&attributes.to_ne_bytes()[..], &data].concat();
-        modify_variable_bytes(self, key, volatile, &mut bytes, size, offset, encoded)?;
+        modify_variable_bytes(self, key, volatile, &mut bytes, size, patches)?;
         let data = bytes
             .get(EFIVARFS_HEADER_SIZE..)
             .context("data after the attributes word")?;
@@ -340,7 +340,9 @@ mod tests {
 
     use super::*;
     use crate::hii::variables::tests::variable_key;
+    use crate::hii::variables::tests::WriteAt;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
+    use crate::hii::variables::tests::NV_BS;
     use crate::hii::variables::tests::NV_BS_RT;
     use crate::hii::variables::VolatileVariable;
 
@@ -865,6 +867,44 @@ mod tests {
                 NV_BS_RT
             )],
             "failing set: the write attempted"
+        );
+    }
+
+    /// Two patches of one variable take one SetFirmwareEnvironmentVariableExW, with the
+    /// variable's own attributes, here not NV_BS_RT.
+    #[test]
+    fn write_patches_writes_two_patches_in_one_call_with_the_variables_attributes() {
+        let calls = FakeFirmwareEnvironmentCalls::new();
+        calls.queue_get(got(NV_BS, &[1, 2, 3, 4]));
+        // what a read-modify-write of each patch in turn would read second, so that it fails at
+        // the count of calls
+        calls.queue_get(got(NV_BS, &[9, 2, 3, 4]));
+        let environment = fake_environment(&calls);
+
+        environment
+            .write_patches(
+                &variable_key("Setup"),
+                4,
+                &[
+                    DataPatch {
+                        offset: 0,
+                        bytes: &[9],
+                    },
+                    DataPatch {
+                        offset: 3,
+                        bytes: &[8],
+                    },
+                ],
+                VolatileWrites::Refuse,
+            )
+            .expect("write two patches");
+
+        let sets = calls.sets();
+        assert_eq!(sets.len(), 1, "one call for two patches");
+        assert_eq!(
+            sets.first().map(|set| (set.2.clone(), set.3)),
+            Some((vec![9, 2, 3, 8], NV_BS)),
+            "data and attributes of the call"
         );
     }
 

@@ -38,6 +38,7 @@ use crate::efi_variables::VariableStorageInfo;
 use crate::hii::package::Guid;
 use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
+use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::UnreadVariables;
@@ -97,17 +98,16 @@ impl FirmwareVariables for VariableServices {
         Ok([&attributes.bits().to_ne_bytes()[..], &data].concat())
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
     ) -> Result<()> {
         let (data, attributes) = get_variable(key)?;
         let mut bytes = [&attributes.bits().to_ne_bytes()[..], &data].concat();
-        modify_variable_bytes(self, key, volatile, &mut bytes, size, offset, encoded)?;
+        modify_variable_bytes(self, key, volatile, &mut bytes, size, patches)?;
         let data = bytes
             .get(EFIVARFS_HEADER_SIZE..)
             .context("data after the attributes word")?;

@@ -42,6 +42,7 @@ use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use thiserror::Error;
 
+use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
@@ -384,12 +385,11 @@ impl FirmwareVariables for EfivarCopy {
             .map_err(|error| as_variable_not_found(key, error))
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         _key: &VariableKey,
         _size: u16,
-        _offset: u16,
-        _encoded: &[u8],
+        _patches: &[DataPatch<'_>],
         _volatile: VolatileWrites,
     ) -> Result<()> {
         Err(CopyOfEfivars.into())
@@ -452,6 +452,7 @@ pub mod tests {
     use crate::hii::efivarfs::EFIVARS_MOUNT_POINT;
     use crate::hii::package::Guid;
     use crate::hii::variables::tests::variable_key;
+    use crate::hii::variables::tests::WriteAt;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
     use crate::hii::variables::tests::NV_BS_RT;
     use crate::hii::variables::EfivarSource;

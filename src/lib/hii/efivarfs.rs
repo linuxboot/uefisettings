@@ -97,6 +97,7 @@ use crate::hii::system_table::PointerSpace;
 #[cfg(firmware_memory_maps)]
 use crate::hii::system_table::SystemTableFiles;
 use crate::hii::variables::modify_variable_bytes;
+use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
@@ -153,11 +154,11 @@ impl EfivarSource {
 /// The efivar files in `dir` as FirmwareVariables: this machine's efivarfs.
 pub(crate) struct EfivarFiles {
     dir: PathBuf,
-    /// The file that write_at locks while it remounts `dir` read-write.
+    /// The file that write_patches locks while it remounts `dir` read-write.
     remount_lock: PathBuf,
     /// What tells whether an efivarfs write crashes this Linux.
     evidence: Box<dyn WriteSafetyEvidence>,
-    /// Set by the first write_at that finds that writes cannot crash this Linux.
+    /// Set by the first write_patches that finds that writes cannot crash this Linux.
     survives: OnceLock<KernelSurvivesWrites>,
 }
 
@@ -202,17 +203,16 @@ impl FirmwareVariables for EfivarFiles {
             .map_err(|error| as_variable_not_found(key, error))
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
     ) -> Result<()> {
         // Steps:
         // * Read bytes
-        // * Seek to 4 + offset
+        // * Seek to 4 + the offset of each patch
         // * If checks pass, write your answer
 
         // We have three layers of checks so as to not accidentally corrupt EFI vars.
@@ -233,15 +233,7 @@ impl FirmwareVariables for EfivarFiles {
         let mut file_contents = read_efivar_file_of(&file_ro)
             .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
 
-        modify_variable_bytes(
-            self,
-            key,
-            volatile,
-            &mut file_contents,
-            size,
-            offset,
-            encoded,
-        )?;
+        modify_variable_bytes(self, key, volatile, &mut file_contents, size, patches)?;
 
         let survives = self.survives()?;
         let _efifs = EfivarsMountGuard::new(&self.dir, survives)
@@ -928,8 +920,8 @@ impl VariableData for EfivarFiles {
         efivar_contents(key, &bytes)
     }
 
-    /// Writes the attributes and data of `contents` to the efivar file of `key` as write_at
-    /// writes, which creates the variable if the file is missing.
+    /// Writes the attributes and data of `contents` to the efivar file of `key` as
+    /// write_patches writes, which creates the variable if the file is missing.
     fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
         let mut lock = FileLock::new(&self.remount_lock);
         lock.lock()?;
@@ -952,7 +944,7 @@ impl VariableData for EfivarFiles {
             .context("Failed to create efivars fs mount guard")?;
 
         // efivarfs makes the file of a variable that Linux does not know immutable, as for
-        // write_at.
+        // write_patches.
         let _immutability_attribute_guard = exists
             .then(|| EfivarsImmutabilityGuard::new(&path))
             .transpose()
@@ -1089,6 +1081,7 @@ mod tests {
     use crate::hii::kallsyms::fixture::FIXED_KALLSYMS;
     use crate::hii::kallsyms::fixture::UNFIXED_KALLSYMS;
     use crate::hii::variables::tests::variable_key;
+    use crate::hii::variables::tests::WriteAt;
     use crate::hii::variables::tests::BS_RT;
     use crate::hii::variables::tests::EFI_GLOBAL_VARIABLE;
     use crate::hii::variables::tests::NV_BS_RT;

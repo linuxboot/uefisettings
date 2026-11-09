@@ -74,6 +74,7 @@ use crate::hii::package::ParsedPackageList;
 use crate::hii::strings::Language;
 use crate::hii::strings::StringMap;
 use crate::hii::variables::is_volatile;
+use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VolatileWrites;
@@ -446,15 +447,19 @@ impl<'a> KeywordQuestion<'a> {
             })
             .collect();
         // SetData() writes every byte of the question's storage, changed or not
-        for range in &bytes {
-            reader
-                .check_write(&variable, range)
-                .map_err(|refusal| ChangeValueError::PasswordBytes {
-                    question: prompt.to_owned(),
-                    refusal,
-                })
-                .with_context(|| format!("keyword {}", self.keyword))?;
-        }
+        reader
+            .check_patches(
+                &variable,
+                write.patches.iter().map(|(offset, bytes)| DataPatch {
+                    offset: *offset,
+                    bytes,
+                }),
+            )
+            .map_err(|refusal| ChangeValueError::PasswordBytes {
+                question: prompt.to_owned(),
+                refusal,
+            })
+            .with_context(|| format!("keyword {}", self.keyword))?;
         Ok(KeywordWrite {
             variable,
             bytes,

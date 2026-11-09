@@ -308,6 +308,7 @@ mod tests {
     use super::super::QuestionFlags;
     use super::*;
     use crate::hii::package::Guid;
+    use crate::hii::variables::tests::WriteAt;
     use crate::hii::variables::VolatileWrites;
     use crate::hii::variables::VolatileWritingVariables;
     use crate::hii::variables::WithheldPassword;
@@ -582,7 +583,7 @@ mod tests {
         );
     }
 
-    /// set's VolatileWritingVariables, which write through write_at_with, over the withholding
+    /// set's VolatileWritingVariables, which write through write_patches, over the withholding
     /// variables write no byte of a password whatever the volatile policy, and write the bytes
     /// beside it.
     #[test]

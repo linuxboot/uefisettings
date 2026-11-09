@@ -287,20 +287,31 @@ pub(crate) trait FirmwareVariables {
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>>;
     /// The attributes word and all the data of `key`, as its efivarfs file holds them.
     fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>>;
-    /// Writes `encoded` at data offset `offset` of `key`, whose VarStore has `size` bytes,
-    /// keeping its attributes and other bytes; a volatile `key` only as `volatile` allows
+    /// Writes `patches`, in order, at their data offsets of `key`, whose VarStore has `size`
+    /// bytes, in one write of the variable, keeping its attributes and the bytes that no patch
+    /// changes as the variable holds them, a SetVariable() of a non-volatile variable saving all of
+    /// its data or none (UEFI 2.11 §8.2.3); a volatile `key` only as `volatile` allows
     /// (check_volatile_write).
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
     ) -> Result<()>;
-    /// write_at_with under Refuse; a VolatileWritingVariables writes under its own policy instead.
-    fn write_at(&self, key: &VariableKey, size: u16, offset: u16, encoded: &[u8]) -> Result<()> {
-        self.write_at_with(key, size, offset, encoded, VolatileWrites::Refuse)
+}
+
+/// `bytes` that a write puts at data offset `offset` of a variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataPatch<'a> {
+    pub(crate) offset: u16,
+    pub(crate) bytes: &'a [u8],
+}
+
+impl DataPatch<'_> {
+    /// The data bytes that the patch changes.
+    pub(crate) fn range(&self) -> Range<usize> {
+        usize::from(self.offset)..usize::from(self.offset) + self.bytes.len()
     }
 }
 
@@ -321,15 +332,14 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
         (**self).read_whole(key)
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
     ) -> Result<()> {
-        (**self).write_at_with(key, size, offset, encoded, volatile)
+        (**self).write_patches(key, size, patches, volatile)
     }
 }
 
@@ -350,15 +360,14 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
         (**self).read_whole(key)
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
     ) -> Result<()> {
-        (**self).write_at_with(key, size, offset, encoded, volatile)
+        (**self).write_patches(key, size, patches, volatile)
     }
 }
 
@@ -394,10 +403,10 @@ pub(super) fn attributes_and_data(
     Ok([&attributes.to_ne_bytes()[..], data].concat())
 }
 
-/// The read-modify-write of FirmwareVariables::write_at_with on `bytes`, the attributes word and
+/// The read-modify-write of FirmwareVariables::write_patches on `bytes`, the attributes word and
 /// all the data of variable `key`, which `variables` hold: refuses an authenticated variable, and
-/// a volatile one unless `volatile` allows it (check_volatile_write), then writes `encoded` at data
-/// offset `offset` as update_efivarfs_bytes does.
+/// a volatile one unless `volatile` allows it (check_volatile_write), then writes each of
+/// `patches`, in order, as update_efivarfs_bytes does.
 // set writes this machine's variables; the tests' MemoryVariables write on any build
 #[cfg(any(system_variables, test))]
 pub(super) fn modify_variable_bytes(
@@ -406,14 +415,15 @@ pub(super) fn modify_variable_bytes(
     volatile: VolatileWrites,
     bytes: &mut [u8],
     size: u16,
-    offset: u16,
-    encoded: &[u8],
+    patches: &[DataPatch<'_>],
 ) -> Result<()> {
     let interface = variables.interface();
     let attributes = efivar_attributes(bytes).context(interface.missing_attributes())?;
     check_volatile_write(key, interface, variables.reach(), volatile, attributes)?;
     check_unauthenticated(key, attributes)?;
-    update_efivarfs_bytes(interface, bytes, size, offset, encoded)
+    patches.iter().try_for_each(|patch| {
+        update_efivarfs_bytes(interface, bytes, size, patch.offset, patch.bytes)
+    })
 }
 
 /// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
@@ -719,12 +729,11 @@ impl FirmwareVariables for UnreadVariables {
         Err(EfivarsNotRead.into())
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         _key: &VariableKey,
         _size: u16,
-        _offset: u16,
-        _encoded: &[u8],
+        _patches: &[DataPatch<'_>],
         _volatile: VolatileWrites,
     ) -> Result<()> {
         Err(EfivarsNotRead.into())
@@ -797,13 +806,14 @@ impl EfivarReader {
         self.withheld.overlap(key, value)
     }
 
-    /// Refuses a write of the value bytes `bytes` of `key` that overlaps its withheld bytes.
-    pub(super) fn check_write(
+    /// Refuses a write of `patches` of `key`, at value offsets, one of which overlaps its
+    /// withheld bytes.
+    pub(super) fn check_patches<'p>(
         &self,
         key: &VariableKey,
-        bytes: &Range<usize>,
+        patches: impl IntoIterator<Item = DataPatch<'p>>,
     ) -> std::result::Result<(), WithheldPassword> {
-        self.withheld.check_write(key, bytes)
+        self.withheld.check_patches(key, patches)
     }
 
     /// Which variables this reader reaches.
@@ -886,6 +896,18 @@ impl WithheldBytes {
         }
     }
 
+    /// Refuses a write of `patches` of `key`, at value offsets, one of which overlaps withheld
+    /// bytes.
+    fn check_patches<'p>(
+        &self,
+        key: &VariableKey,
+        patches: impl IntoIterator<Item = DataPatch<'p>>,
+    ) -> std::result::Result<(), WithheldPassword> {
+        patches
+            .into_iter()
+            .try_for_each(|patch| self.check_write(key, &patch.range()))
+    }
+
     /// Zeroes the withheld bytes of `key` in `value`, the start of its value.
     fn zero(&self, key: &VariableKey, value: &mut [u8]) {
         let len = value.len();
@@ -963,27 +985,22 @@ impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
         Ok(bytes)
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
     ) -> Result<()> {
         // a data offset is a value offset: set writes no variable with metadata
         // (check_unauthenticated)
-        self.withheld.check_write(
-            key,
-            &(usize::from(offset)..usize::from(offset) + encoded.len()),
-        )?;
-        self.variables
-            .write_at_with(key, size, offset, encoded, volatile)
+        self.withheld.check_patches(key, patches.iter().copied())?;
+        self.variables.write_patches(key, size, patches, volatile)
     }
 }
 
-/// `variables` whose write_at and write_at_with write a volatile variable as `volatile` says,
-/// whatever a caller passes, the policy of one set: the policy reaches the check of each backend's
+/// `variables` whose write_patches writes a volatile variable as `volatile` says, whatever a
+/// caller passes, the policy of one set: the policy reaches the check of each backend's
 /// read-modify-write (modify_variable_bytes).
 pub(crate) struct VolatileWritingVariables<V> {
     variables: V,
@@ -1016,16 +1033,15 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
         self.variables.read_whole(key)
     }
 
-    fn write_at_with(
+    fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
-        offset: u16,
-        encoded: &[u8],
+        patches: &[DataPatch<'_>],
         _: VolatileWrites,
     ) -> Result<()> {
         self.variables
-            .write_at_with(key, size, offset, encoded, self.volatile)
+            .write_patches(key, size, patches, self.volatile)
     }
 }
 
@@ -1143,7 +1159,8 @@ pub(crate) mod tests {
             self.reads.borrow().clone()
         }
 
-        /// The data offsets and values of the writes to `key` that succeeded, in order.
+        /// The writes to `key` that succeeded, in order: each the lowest data offset of its
+        /// patches, and the bytes from there to the end of the patch that ends last, as written.
         pub(crate) fn writes_to(&self, key: &VariableKey) -> Vec<(u16, Vec<u8>)> {
             self.writes
                 .borrow()
@@ -1182,12 +1199,11 @@ pub(crate) mod tests {
                 .ok_or_else(|| VariableNotFound(key.clone()).into())
         }
 
-        fn write_at_with(
+        fn write_patches(
             &self,
             key: &VariableKey,
             size: u16,
-            offset: u16,
-            encoded: &[u8],
+            patches: &[DataPatch<'_>],
             volatile: VolatileWrites,
         ) -> Result<()> {
             match self.failures.get(key) {
@@ -1206,11 +1222,19 @@ pub(crate) mod tests {
                 .get_mut(key)
                 .ok_or_else(|| VariableNotFound(key.clone()))?;
             let mut modified = bytes.clone();
-            modify_variable_bytes(self, key, volatile, &mut modified, size, offset, encoded)?;
+            modify_variable_bytes(self, key, volatile, &mut modified, size, patches)?;
+            let start = patches.iter().map(|patch| patch.offset).min().unwrap_or(0);
+            let end = patches
+                .iter()
+                .map(|patch| usize::from(patch.offset) + patch.bytes.len())
+                .max()
+                .unwrap_or(0);
+            let written = modified
+                .get(EFIVARFS_HEADER_SIZE + usize::from(start)..EFIVARFS_HEADER_SIZE + end)
+                .context("the written bytes")?
+                .to_vec();
             *bytes = modified;
-            self.writes
-                .borrow_mut()
-                .push((key.clone(), offset, encoded.to_vec()));
+            self.writes.borrow_mut().push((key.clone(), start, written));
             Ok(())
         }
     }
@@ -1233,17 +1257,37 @@ pub(crate) mod tests {
             self.as_ref().read_whole(key)
         }
 
-        fn write_at_with(
+        fn write_patches(
+            &self,
+            key: &VariableKey,
+            size: u16,
+            patches: &[DataPatch<'_>],
+            volatile: VolatileWrites,
+        ) -> Result<()> {
+            self.as_ref().write_patches(key, size, patches, volatile)
+        }
+    }
+
+    /// The write of one patch, under VolatileWrites::Refuse, that most tests make.
+    pub(crate) trait WriteAt: FirmwareVariables {
+        /// write_patches of `encoded` at data offset `offset` of `key`, whose VarStore has
+        /// `size` bytes, under VolatileWrites::Refuse.
+        fn write_at(
             &self,
             key: &VariableKey,
             size: u16,
             offset: u16,
             encoded: &[u8],
-            volatile: VolatileWrites,
         ) -> Result<()> {
-            self.as_ref()
-                .write_at_with(key, size, offset, encoded, volatile)
+            self.write_patches(key, size, &[patch(offset, encoded)], VolatileWrites::Refuse)
         }
+    }
+
+    impl<T: FirmwareVariables + ?Sized> WriteAt for T {}
+
+    /// `bytes` at data offset `offset`.
+    pub(crate) fn patch(offset: u16, bytes: &[u8]) -> DataPatch<'_> {
+        DataPatch { offset, bytes }
     }
 
     /// No variables, reaching what variables of `interface` reach, through it.
@@ -1540,6 +1584,90 @@ pub(crate) mod tests {
             [(0, vec![2])],
             "writes to Setup"
         );
+    }
+
+    /// WithholdingVariables refuse a write of several patches if any of them overlaps withheld
+    /// bytes, the last one too, before their variables see it, through variables of every
+    /// interface; patches on both sides of withheld bytes write in one write that keeps those bytes
+    /// as they are, byte for byte.
+    #[test]
+    fn withheld_bytes_are_not_written_by_any_patch() {
+        // a password at bytes 1..3, between two settings
+        const HELD: [u8; 5] = [0x11, 0xA7, 0x3C, 0x22, 1];
+        let password = |variables: &MemoryVariables| {
+            variables
+                .bytes(&variable_key("AMITSESetup"))
+                .and_then(|bytes| {
+                    bytes
+                        .get(EFIVARFS_HEADER_SIZE + 1..EFIVARFS_HEADER_SIZE + 3)
+                        .map(<[u8]>::to_vec)
+                })
+        };
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(variable_key("AMITSESetup"), NV_BS_RT, &HELD);
+            let mut withheld = WithheldBytes::default();
+            withheld.insert(variable_key("AMITSESetup"), 1..3);
+            let withholding = WithholdingVariables::new(&variables, withheld);
+
+            for patches in [
+                [patch(4, &[0]), patch(2, &[0])],
+                [patch(0, &[0, 0]), patch(4, &[0])],
+            ] {
+                assert_eq!(
+                    withholding
+                        .write_patches(
+                            &variable_key("AMITSESetup"),
+                            5,
+                            &patches,
+                            VolatileWrites::Refuse,
+                        )
+                        .map_err(|error| error.to_string()),
+                    Err(
+                        "EFI variable AMITSESetup-00000000-0000-0000-0000-000000000000 holds a \
+                         password at bytes 1..3, which set never writes"
+                            .to_string()
+                    ),
+                    "{interface:?}: write {patches:?}"
+                );
+            }
+            assert_eq!(
+                variables.writes_to(&variable_key("AMITSESetup")),
+                [],
+                "{interface:?}: writes of a patch over the password"
+            );
+
+            withholding
+                .write_patches(
+                    &variable_key("AMITSESetup"),
+                    5,
+                    &[patch(0, &[0]), patch(3, &[0, 0])],
+                    VolatileWrites::Refuse,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{interface:?}: write on both sides of the password: {error:#}")
+                });
+            assert_eq!(
+                variables.writes_to(&variable_key("AMITSESetup")),
+                [(0, vec![0, 0xA7, 0x3C, 0, 0])],
+                "{interface:?}: writes on both sides of the password"
+            );
+            assert_eq!(
+                password(&variables),
+                HELD.get(1..3).map(<[u8]>::to_vec),
+                "{interface:?}: the password's bytes"
+            );
+        }
     }
 
     /// WithholdingVariables zero the withheld bytes of a variable with
@@ -1924,8 +2052,7 @@ pub(crate) mod tests {
                 VolatileWrites::Refuse,
                 &mut bytes,
                 1,
-                0,
-                &[0x2A],
+                &[patch(0, &[0x2A])],
             )
             .expect_err("modify a volatile variable");
 
@@ -1947,8 +2074,7 @@ pub(crate) mod tests {
             VolatileWrites::Allow,
             &mut bytes,
             1,
-            0,
-            &[0x2A],
+            &[patch(0, &[0x2A])],
         );
 
         assert_eq!(got.map_err(|error| error.to_string()), Ok(()), "write");
@@ -1993,8 +2119,7 @@ pub(crate) mod tests {
                 volatile,
                 &mut bytes,
                 1,
-                0,
-                &[0x2A],
+                &[patch(0, &[0x2A])],
             );
 
             let case = format!("{reach:?}, {interface:?}, {volatile:?}");
@@ -2010,10 +2135,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// set's stacks write a volatile variable as the bound policy says, by write_at and by
-    /// write_at_with whatever policy it passes: WithholdingVariables over VolatileWritingVariables,
-    /// and set_questions's VolatileWritingVariables over WithholdingVariables, here over a boxed
-    /// backend.
+    /// set's stacks write a volatile variable as the bound policy says, by write_patches whatever
+    /// policy it passes: WithholdingVariables over VolatileWritingVariables, and set_questions's
+    /// VolatileWritingVariables over WithholdingVariables, here over a boxed backend.
     #[test]
     fn set_stack_writes_a_volatile_variable_by_its_bound_policy_alone() {
         #[derive(Debug, Clone, Copy)]
@@ -2030,19 +2154,14 @@ pub(crate) mod tests {
             Stack::DecoratorOverWithholdingOverBox,
         ] {
             for bound in [VolatileWrites::Refuse, VolatileWrites::Allow] {
-                for passed in [
-                    None,
-                    Some(VolatileWrites::Refuse),
-                    Some(VolatileWrites::Allow),
-                ] {
+                for passed in [VolatileWrites::Refuse, VolatileWrites::Allow] {
                     let variables = MemoryVariables::new(
                         VariableReach::BootServices,
                         VariableInterface::VariableServices,
                     );
                     variables.insert(key.clone(), BS_RT, &[1]);
-                    let write = |stack: &dyn FirmwareVariables| match passed {
-                        None => stack.write_at(&key, 1, 0, &[0x2A]),
-                        Some(passed) => stack.write_at_with(&key, 1, 0, &[0x2A], passed),
+                    let write = |stack: &dyn FirmwareVariables| {
+                        stack.write_patches(&key, 1, &[patch(0, &[0x2A])], passed)
                     };
 
                     let got = match stack {
@@ -2131,8 +2250,7 @@ pub(crate) mod tests {
                     VolatileWrites::Allow,
                     &mut bytes,
                     1,
-                    0,
-                    &[0x2A],
+                    &[patch(0, &[0x2A])],
                 )
                 .expect_err("modify an authenticated variable");
 
@@ -2167,8 +2285,7 @@ pub(crate) mod tests {
             VolatileWrites::Refuse,
             &mut bytes,
             4,
-            0,
-            &[0x2A],
+            &[patch(0, &[0x2A])],
         )
         .expect_err("modify a variable shorter than its VarStore");
 
@@ -2194,8 +2311,7 @@ pub(crate) mod tests {
             VolatileWrites::Refuse,
             &mut bytes,
             0,
-            0,
-            &[],
+            &[patch(0, &[])],
         )
         .expect_err("modify a variable without its attributes word");
 
