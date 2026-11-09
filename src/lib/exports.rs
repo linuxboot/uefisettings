@@ -1430,6 +1430,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::other_option;
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
+    use crate::hii::forms::ifr_fixtures::scoped_expression;
     use crate::hii::forms::ifr_fixtures::scopeless_form_set;
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
@@ -8463,6 +8464,126 @@ mod tests {
             ),
             "set A without --bypass-setup-password"
         );
+    }
+
+    /// A GET and a SET of the VARSTORE_EFI before UEFI 2.3.1 reach the EFI variables of their
+    /// VarNames through set, through variables of either reach: set refuses the CHECKBOX F, which
+    /// a SUPPRESS_IF hides while the GET of ShortVarA gives 5, and sets it once set of A wrote 9
+    /// there; that set writes ShortVarD by the SET of A's WRITE expression, then ShortVarA, and,
+    /// without ShortVarD, only ShortVarA, creating no variable.
+    #[test]
+    fn get_and_set_of_a_short_var_store_reach_the_variables_of_their_var_names() {
+        const GET: u8 = 0x2B;
+        const SET: u8 = 0x2C;
+        const WRITE: u8 = 0x2E;
+        const EQUAL: u8 = 0x2F;
+        const THIS: u8 = 0x58;
+        // a GET or SET of VarStore 1 at VarName `var_name`, of VarStoreType `value_type`
+        let store_op = |op_code: u8, var_name: u16, value_type: u8| {
+            let data = [
+                &1u16.to_le_bytes()[..],
+                &var_name.to_le_bytes(),
+                &[value_type],
+            ]
+            .concat();
+            operation(op_code, false, &data)
+        };
+        // the UINT8 NUMERIC A on ShortVarA, whose WRITE sets ShortVarD, a UINT16
+        // (EFI_IFR_TYPE_NUM_SIZE_16), to its value
+        let numeric_a = [
+            operation(
+                NUMERIC,
+                true,
+                &[
+                    question_header_with(1, 1, 1, 7, 0x00),
+                    // EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC, from 0 to 255, step 1
+                    vec![0x10, 0, 255, 1],
+                ]
+                .concat(),
+            ),
+            operation(WRITE, false, &[]),
+            scoped_expression(&[operation(THIS, false, &[]), store_op(SET, 10, 0x01)], 0),
+            END.to_vec(),
+        ]
+        .concat();
+        // the CHECKBOX F on ShortVarC, suppressed where ShortVarA holds the UINT8
+        // (EFI_IFR_TYPE_NUM_SIZE_8) 5
+        let hidden_f = conditional(
+            SUPPRESS_IF,
+            scoped_expression(
+                &[
+                    store_op(GET, 7, 0x00),
+                    uint8(5),
+                    operation(EQUAL, false, &[]),
+                ],
+                0,
+            ),
+            &[checkbox_at(6, 6, 1, 9)],
+        );
+        let hiidb = short_store_hiidb(NV_BS_RT, &[numeric_a, hidden_f]);
+        let reaches = [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ];
+        for (reach, interface) in reaches {
+            let variables = short_variables(reach, interface);
+
+            assert_eq!(
+                set_of(&hiidb, "F", "1", &variables),
+                Err(
+                    "question \"F\" is suppressed; also include suppressed questions to select it"
+                        .to_string()
+                ),
+                "{reach:?}: set F while ShortVarA holds 5"
+            );
+            assert_eq!(
+                set_of(&hiidb, "A", "9", &variables),
+                Ok(()),
+                "{reach:?}: set A"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key("ShortVarD")),
+                [(0, vec![9, 0])],
+                "{reach:?}: set A: writes of ShortVarD"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key("ShortVarA")),
+                [(0, vec![9])],
+                "{reach:?}: set A: writes of ShortVarA"
+            );
+            assert_eq!(
+                set_of(&hiidb, "F", "1", &variables),
+                Ok(()),
+                "{reach:?}: set F once ShortVarA holds 9"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key("ShortVarC")),
+                [(0, vec![1])],
+                "{reach:?}: set F: writes of ShortVarC"
+            );
+
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(short_key("ShortVarA"), NV_BS_RT, &[5]);
+            let variables = Rc::new(variables);
+            assert_eq!(
+                set_of(&hiidb, "A", "9", &variables),
+                Ok(()),
+                "{reach:?}: set A without ShortVarD"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key("ShortVarA")),
+                [(0, vec![9])],
+                "{reach:?}: set A without ShortVarD: writes of ShortVarA"
+            );
+            assert_eq!(
+                variables.bytes(&short_key("ShortVarD")),
+                None,
+                "{reach:?}: set A without ShortVarD: ShortVarD"
+            );
+        }
     }
 
     /// set writes an existing per-question variable at its question's width with the variable's

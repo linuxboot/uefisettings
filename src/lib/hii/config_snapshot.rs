@@ -737,6 +737,17 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// The warnings and errors that `run` logs on this thread.
+    // the tests that check warnings read efivar dumps
+    #[cfg(efivar_dumps)]
+    pub(crate) fn warned_by(run: impl FnOnce()) -> Vec<String> {
+        leveled_by(run)
+            .into_iter()
+            .filter(|(level, _)| *level <= log::Level::Warn)
+            .map(|(_, message)| message)
+            .collect()
+    }
+
     /// The messages that `run` logs on this thread, with their levels. The one test logger of the
     /// crate: log takes a single logger per process, and every test runs in it.
     pub(crate) fn leveled_by(run: impl FnOnce()) -> Vec<(log::Level, String)> {

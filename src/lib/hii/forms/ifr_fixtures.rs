@@ -501,7 +501,7 @@ pub(crate) fn eq_id_val_of(question_id: u16, value: u16) -> Vec<u8> {
 
 /// The ops of an expression with the Scope bit on the op at `scope_at`, and an End after the
 /// last: edk2-stable202608 VfrCompile sets the bit on the first op, AMI firmware on a later one.
-pub(super) fn scoped_expression(ops: &[Vec<u8>], scope_at: usize) -> Vec<u8> {
+pub(crate) fn scoped_expression(ops: &[Vec<u8>], scope_at: usize) -> Vec<u8> {
     let mut ops = ops.to_vec();
     ops[scope_at][1] |= 0x80;
     [ops.concat(), END.to_vec()].concat()

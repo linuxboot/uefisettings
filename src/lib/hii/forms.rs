@@ -3741,9 +3741,10 @@ fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
 /// Fills the VarName strings of the VARSTORE_EFIs before UEFI 2.3.1 of the FormSets of `roots`,
 /// one package list's, from `string_packages`, its strings packages, as edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c takes the string of each VarName (GetToken): for each op with a
-/// question header on such a store, in any scope, the string that every strings package holding
-/// its VarName gives, or the strings that they differ on. The strings are the list's, so every
-/// such store shares one map of them, filled after the walk, which borrows the ops that it visits.
+/// question header, GET and SET on such a store, in any scope, the string that every strings
+/// package holding its VarName gives, or the strings that they differ on. The strings are the
+/// list's, so every such store shares one map of them, filled after the walk, which borrows the
+/// ops that it visits.
 pub(super) fn resolve_short_var_names(
     roots: &[Rc<RefCell<IFROperation>>],
     string_packages: &[StringPackage],
@@ -3755,9 +3756,9 @@ pub(super) fn resolve_short_var_names(
         if let ParsedOperation::ShortVarStoreEfi(_) = op.parsed_data {
             stores.push(Rc::clone(node));
         }
-        let var_name = parse_question_header(&op)
-            .filter(|header| names_short_var_store(&op, header.var_store_id))
-            .map(|header| header.var_store_info);
+        let var_name = var_store_reference(&op)
+            .filter(|&(var_store_id, _)| names_short_var_store(&op, var_store_id))
+            .map(|(_, var_name)| var_name);
         let string = var_name
             .and_then(|var_name| Some((var_name, var_name_string(var_name, string_packages)?)));
         if let Some((var_name, string)) = string {
@@ -3771,6 +3772,15 @@ pub(super) fn resolve_short_var_names(
             store.var_names = Rc::clone(&names);
         }
     }
+}
+
+/// Returns the VarStoreId and VarStoreInfo that `op` names: those of its question header, or of
+/// its operand, of a GET or SET.
+fn var_store_reference(op: &IFROperation) -> Option<(u16, u16)> {
+    if let ParsedOperation::Get(operand) | ParsedOperation::Set(operand) = &op.parsed_data {
+        return Some((operand.var_store_id, operand.var_store_info));
+    }
+    parse_question_header(op).map(|header| (header.var_store_id, header.var_store_info))
 }
 
 /// Returns the string of VarName `var_name` in the `string_packages` that hold it, or, where they

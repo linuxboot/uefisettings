@@ -651,9 +651,9 @@ pub(super) struct VariableNotFound(pub(super) VariableKey);
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("EFI variable {key} holds {held} bytes; the question takes {width}")]
 pub(super) struct VariableSizeMismatch {
-    key: VariableKey,
-    held: usize,
-    width: u16,
+    pub(super) key: VariableKey,
+    pub(super) held: usize,
+    pub(super) width: u16,
 }
 
 /// Where question values are read: the variables of this machine, a directory of efivar files,

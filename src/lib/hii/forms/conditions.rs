@@ -23,6 +23,7 @@ use std::rc::Weak;
 
 use anyhow::Result;
 use binrw::io::Cursor;
+use log::warn;
 use thiserror::Error;
 
 use super::ami_access_level::AMI_ACCESS_LEVEL;
@@ -37,6 +38,7 @@ use super::question_values::PromptMatch;
 use super::question_values::ValueQuestion;
 use super::storage::read_current_value_bytes;
 use super::storage::read_question_value;
+use super::storage::read_stored_bytes;
 use super::storage::stored_value;
 use super::storage::RetrievedValue;
 use super::storage::ShortVarStoreEfi;
@@ -68,6 +70,7 @@ use super::EFI_IFR_TYPE_NUM_SIZE_8;
 use super::EFI_IFR_TYPE_REF;
 use super::EFI_IFR_TYPE_STRING;
 use super::EFI_IFR_TYPE_TIME;
+use crate::hii::variables::VariableLayout;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use crate::parse_error::ReadParsed;
 
@@ -1741,27 +1744,59 @@ fn operand_store(op: &IFROperation, operand: &VarStoreOperand) -> Result<Declare
         })
 }
 
-/// Returns `declared` as an EFI variable VarStore, or, of one that a GET or SET does not reach,
-/// its label and why, after the VarStore.
+/// Returns `declared` as the EFI variable that the GET or SET `operand` of `kind` reads or
+/// writes: on a VARSTORE_EFI before UEFI 2.3.1, that of its VarName, as wide as `kind`
+/// (edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes takes its ValueName by GetToken).
+/// Of a VarStore that a GET or SET does not reach, returns its label and why, after the VarStore.
 fn variable_store(
     declared: DeclaredStore,
-) -> Result<Box<dyn VariableStore>, (&'static str, &'static str)> {
+    operand: &VarStoreOperand,
+    kind: OperandKind,
+) -> Result<Box<dyn VariableStore>, (&'static str, String)> {
     match declared {
         DeclaredStore::Variable(store) => Ok(store),
-        DeclaredStore::NameValue(_) => Err((NAME_VALUE_STORE, NAME_VALUE_REACH)),
-        DeclaredStore::ShortEfi(_) => Err((ShortVarStoreEfi::LABEL, ShortVarStoreEfi::UNREAD)),
+        DeclaredStore::NameValue(_) => Err((NAME_VALUE_STORE, NAME_VALUE_REACH.to_string())),
+        DeclaredStore::ShortEfi(store) => {
+            match store.variable(operand.var_store_info, u16::from(kind.width())) {
+                Ok(variable) => Ok(Box::new(variable)),
+                Err(unresolved) => Err((ShortVarStoreEfi::LABEL, format!("as {unresolved}"))),
+            }
+        }
     }
 }
 
-/// Returns the payload bytes of `store` that the GET or SET `op` of `kind` reads or writes: its
-/// VarOffset in a VARSTORE or VARSTORE_EFI, all within the Size of the VarStore.
+/// Returns the VarOffset of `store` at which the GET or SET `operand` reads or writes: its
+/// VarStoreInfo in a VARSTORE or VARSTORE_EFI, 0 in the variable of a VarName, which holds the
+/// value alone.
+fn operand_offset(operand: &VarStoreOperand, store: &dyn VariableStore) -> u16 {
+    store.layout().offset(operand.var_store_info)
+}
+
+/// The FALSE that the SET `op` of VarStore `id`, `store`, pushes where set does not write its
+/// variable, as `why` says, which it warns of: nothing else tells that the SET stored nothing.
+fn unstored(
+    op: &IFROperation,
+    id: u16,
+    store: &dyn VariableStore,
+    why: impl fmt::Display,
+) -> Operand {
+    warn!(
+        "{} of VarStore {id:#06x} ({}) pushes FALSE and writes nothing: {why}",
+        op.op_code.spec_name(),
+        store_label(store)
+    );
+    Operand::Boolean(Some(0))
+}
+
+/// Returns the payload bytes of `store` that the GET or SET `op` of `kind` reads or writes, from
+/// its operand_offset, all within the Size of the VarStore.
 fn operand_range(
     op: &IFROperation,
     operand: &VarStoreOperand,
     kind: OperandKind,
     store: &dyn VariableStore,
 ) -> Result<std::ops::Range<usize>, Abort> {
-    let start = usize::from(operand.var_store_info);
+    let start = usize::from(operand_offset(operand, store));
     let end = start + usize::from(kind.width());
     if end > usize::from(store.size()) {
         return Err(Abort::Malformed(format!(
@@ -1774,13 +1809,22 @@ fn operand_range(
     Ok(start..end)
 }
 
-/// The label of `store` in refusals: the op that declares it, and its Name.
+/// The label of `store` in refusals: the op that declares it, and its Name, or the name of the
+/// variable of a VarName.
 fn store_label(store: &dyn VariableStore) -> String {
-    let op = match store.kind() {
-        VariableStoreKind::Buffer => "EFI_IFR_VARSTORE",
-        VariableStoreKind::EfiVariable => "EFI_IFR_VARSTORE_EFI",
-    };
-    format!("{op} {:?}", store.name())
+    match (store.kind(), store.layout()) {
+        (VariableStoreKind::Buffer, _) => format!("EFI_IFR_VARSTORE {:?}", store.name()),
+        (VariableStoreKind::EfiVariable, VariableLayout::Offsets) => {
+            format!("EFI_IFR_VARSTORE_EFI {:?}", store.name())
+        }
+        (VariableStoreKind::EfiVariable, VariableLayout::OneValue) => {
+            format!(
+                "{}, EFI variable {:?}",
+                ShortVarStoreEfi::LABEL,
+                store.name()
+            )
+        }
+    }
 }
 
 /// Why an evaluation ended before its last op.
@@ -2417,27 +2461,24 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
 
     /// Returns the value that the GET `op` reads from its VarStore (edk2-stable202608
     /// SetupBrowserDxe/Expression.c EvaluateExpression); one that this backend cannot read is
-    /// unknown.
+    /// unknown. A missing variable of a VarName, or one of another size, gives UNDEFINED, as a
+    /// value that could not be retrieved (UEFI 2.11 §33.3.8.3.27): edk2 gives it where
+    /// GetVariable fails, and reads a smaller variable zero-extended.
     fn get(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
         let ParsedOperation::Get(operand) = &op.parsed_data else {
             return Err(not_decoded(op));
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
-        let store = match variable_store(operand_store(op, operand)?) {
+        let store = match variable_store(operand_store(op, operand)?, operand, kind) {
             Ok(store) => store,
             Err((store, reach)) => {
-                self.unreached(
-                    op,
-                    StoreAccess::Reads,
-                    id,
-                    store.to_string(),
-                    reach.to_string(),
-                );
+                self.unreached(op, StoreAccess::Reads, id, store.to_string(), reach);
                 return Ok(kind.unknown());
             }
         };
         let label = store_label(store.as_ref());
+        let layout = store.layout();
         let range = operand_range(op, operand, kind, store.as_ref())?;
         let offset = range.start;
         let varstore = Ok(store);
@@ -2452,9 +2493,13 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                         len: bytes.len(),
                     })
             });
-        match read {
-            Ok(bytes) => Ok(kind.operand(&bytes)),
-            Err(reason) => {
+        match (read, layout) {
+            (Ok(bytes), _) => Ok(kind.operand(&bytes)),
+            (
+                Err(ValueUnavailable::Missing(_) | ValueUnavailable::Size(_)),
+                VariableLayout::OneValue,
+            ) => Err(Abort::Undefined),
+            (Err(reason), _) => {
                 self.unreached(
                     op,
                     StoreAccess::Reads,
@@ -2469,8 +2514,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
 
     /// Plans the SET `op` of a WRITE expression, and pushes TRUE, as edk2-stable202608
     /// SetupBrowserDxe/Expression.c EvaluateExpression does once it copies the value into the edit
-    /// buffer of a Buffer or EFI variable VarStore. Elsewhere a SET, which changes a stored value,
-    /// is not evaluated.
+    /// buffer of a Buffer or EFI variable VarStore, or SetVariable stores it in the variable of a
+    /// VarName. Where set does not write the variable of a VarName, as it is missing or of another
+    /// size, the SET pushes FALSE, as it does where its value cannot be stored (UEFI 2.11
+    /// §33.3.8.3.66). Elsewhere a SET, which changes a stored value, is not evaluated.
     fn set(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
         let ParsedOperation::Set(operand) = &op.parsed_data else {
             return Err(not_decoded(op));
@@ -2484,16 +2531,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
-        let store = match variable_store(operand_store(op, operand)?) {
+        let store = match variable_store(operand_store(op, operand)?, operand, kind) {
             Ok(store) => store,
             Err((store, reach)) => {
-                let why = self.unreached(
-                    op,
-                    StoreAccess::Sets,
-                    id,
-                    store.to_string(),
-                    reach.to_string(),
-                );
+                let why = self.unreached(op, StoreAccess::Sets, id, store.to_string(), reach);
                 return Err(Abort::NotEvaluated(why));
             }
         };
@@ -2504,6 +2545,35 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 op.op_code.spec_name()
             )));
         };
+        match store.layout() {
+            VariableLayout::Offsets => {}
+            VariableLayout::OneValue => {
+                match read_stored_bytes(store.as_ref(), range.clone(), self.reader) {
+                    Ok(_) => {}
+                    Err(ValueUnavailable::Missing(missing)) => {
+                        return Ok(unstored(op, id, store.as_ref(), missing))
+                    }
+                    Err(ValueUnavailable::Size(mismatch)) => {
+                        let why = format!(
+                            "EFI variable {} holds {} bytes, not {}",
+                            mismatch.key, mismatch.held, mismatch.width
+                        );
+                        return Ok(unstored(op, id, store.as_ref(), why));
+                    }
+                    Err(reason) => {
+                        let why = self.unreached(
+                            op,
+                            StoreAccess::Sets,
+                            id,
+                            store_label(store.as_ref()),
+                            format!("which cannot be read: {reason}"),
+                        );
+                        return Err(Abort::NotEvaluated(why));
+                    }
+                }
+            }
+        }
+        let offset = operand_offset(operand, store.as_ref());
         let bytes = value
             .to_le_bytes()
             .get(..range.len())
@@ -2515,7 +2585,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             sets.push(PlannedSet {
                 var_store_id: id,
                 store,
-                offset: operand.var_store_info,
+                offset,
                 bytes,
             });
         }
@@ -5910,9 +5980,14 @@ mod store_expression_tests {
 
     use super::super::display_answer;
     use super::super::ifr_fixtures::*;
+    use super::super::resolve_short_var_names;
     use super::super::setup_password::PasswordQuestions;
     use super::super::MAX_SCOPE_NESTING;
     use super::*;
+    use crate::hii::config_snapshot::tests::warned_by;
+    use crate::hii::package::Guid;
+    use crate::hii::strings::StringMap;
+    use crate::hii::variables::VariableKey;
 
     const MAP: u8 = 0x22;
     const VAR_STORE_NAME_VALUE: u8 = 0x25;
@@ -6759,69 +6834,315 @@ mod store_expression_tests {
         );
     }
 
-    /// A GET or SET of a VARSTORE_EFI of the form before UEFI 2.3.1, whose EFI variable its
-    /// VarName names (UEFI 2.11 §33.3.8.3.27 and §33.3.8.3.66 VarStoreInfo), is not evaluated: a
-    /// GET pushes a value that cannot be read, and a WRITE that holds a SET is refused.
-    #[test]
-    fn get_and_set_of_a_var_store_efi_before_uefi_2_3_1_are_not_evaluated() {
-        let get_short = scoped_expression(
+    /// The VarNames of the per-question variables of the VARSTORE_EFI before UEFI 2.3.1
+    /// SHORT_EFI in the tests below, by string ID; VarName 12 has no string.
+    const SHORT_VAR_NAMES: [(u16, &str); 5] = [
+        (7, "ShortVarA"),
+        (8, "ShortVarB"),
+        (9, "ShortVarFlag"),
+        (10, "ShortVarMissing"),
+        (11, "ShortVarPw"),
+    ];
+
+    /// The root of a FormSet that declares SHORT_EFI, of SHORT_VAR_STORE_GUID and `attributes`,
+    /// then holds `body`, with the strings of SHORT_VAR_NAMES in English.
+    fn short_store_root(attributes: u32, body: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
+        let root = parse_form_set(
             &[
-                get(SHORT_EFI, 0, EFI_IFR_TYPE_NUM_SIZE_8),
-                uint8(1),
-                op(EQUAL),
-            ],
-            0,
+                &[short_var_store_efi_of(
+                    SHORT_EFI,
+                    SHORT_VAR_STORE_GUID,
+                    attributes,
+                )],
+                body,
+            ]
+            .concat(),
         );
-        let set_short =
-            scoped_expression(&[op(THIS), set(SHORT_EFI, 0, EFI_IFR_TYPE_NUM_SIZE_8)], 0);
-        let question = [
-            operation(ONE_OF, true, &storage_less_one_of()),
-            conditional(
-                SUPPRESS_IF,
-                get_short,
-                &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[0])],
+        let strings: StringMap = SHORT_VAR_NAMES
+            .into_iter()
+            .map(|(id, name)| (id, Rc::from(name)))
+            .collect();
+        resolve_short_var_names(&[Rc::clone(&root)], &[en_us_package(strings)]);
+        root
+    }
+
+    /// The EFI variable `name` of SHORT_VAR_STORE_GUID.
+    fn short_key(name: &str) -> VariableKey {
+        VariableKey {
+            name: name.to_string(),
+            guid: Guid::from(SHORT_VAR_STORE_GUID),
+        }
+    }
+
+    /// Variables that reach `reach` through `interface`, each NV|BS|RT: ShortVarA holds 0x11,
+    /// ShortVarB the UINT16 0x1234, ShortVarFlag the BOOLEAN 1 and ShortVarPw the 40 bytes of a
+    /// password; ShortVarMissing is missing.
+    fn short_variables(reach: VariableReach, interface: VariableInterface) -> MemoryVariables {
+        let variables = MemoryVariables::new(reach, interface);
+        for (name, value) in [
+            ("ShortVarA", vec![0x11]),
+            ("ShortVarB", vec![0x34, 0x12]),
+            ("ShortVarFlag", vec![1]),
+            ("ShortVarPw", vec![0x41; 40]),
+        ] {
+            variables.insert(short_key(name), NV_BS_RT, &value);
+        }
+        variables
+    }
+
+    /// The reaches of the tests below: through efivarfs and through Variable Services.
+    const SHORT_REACHES: [(&str, (VariableReach, VariableInterface)); 2] = [
+        (
+            "Runtime",
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+        ),
+        (
+            "BootServices",
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
             ),
-            op(WRITE),
-            set_short,
-            END.to_vec(),
-        ]
-        .concat();
-        let root = parse_form_set(&[short_var_store_efi(SHORT_EFI), form(1, &[question])]);
-        let form_set = Rc::clone(&root.borrow().children[0]);
-        let form = Rc::clone(&form_set.borrow().children[1]);
-        let question = Rc::clone(&form.borrow().children[0]);
-        let missing = Efivars::new();
-        let short = "VarStore 0x0005 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1), whose EFI \
-                     variables are named by VarNames, which uefisettings does not resolve";
+        ),
+    ];
 
-        let scope = Rc::clone(&question.borrow().children[0]);
-        let truth = evaluate_condition(
-            &scope.borrow(),
-            &mut ExpressionInputs {
-                reader: &mut missing.reader(),
-                values: &no_values(),
-            },
-        );
-        assert_eq!(
-            truth,
-            Truth::Unknown(format!("EFI_IFR_GET of {short}")),
-            "GET"
-        );
-
-        let Err(refusal) = evaluate_write(
-            &question,
-            QuestionValue::Uint(3),
-            &mut ExpressionInputs {
-                reader: &mut missing.reader(),
-                values: &no_values(),
-            },
-        ) else {
-            panic!("a SET of a VARSTORE_EFI before UEFI 2.3.1 was planned");
+    /// A GET of a VARSTORE_EFI before UEFI 2.3.1 reads the whole EFI variable that its VarName
+    /// names, of the store's Guid, as wide as its VarStoreType, through variables of either reach
+    /// (edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression); a missing variable, or
+    /// one of another size, gives UNDEFINED, as a value that could not be retrieved (UEFI 2.11
+    /// §33.3.8.3.27). A VarName without a string, the bytes of a password, and at OS runtime a
+    /// missing variable that the store declares boot-service-only give a value that cannot be
+    /// read.
+    #[test]
+    fn get_of_a_short_var_store_reads_the_variable_of_its_var_name() {
+        let value_through = |attributes, expression, (reach, interface)| {
+            let root = short_store_root(
+                attributes,
+                &[
+                    password_on(9, 3, SHORT_EFI, 11),
+                    operation(VALUE, true, &[]),
+                    expression,
+                    END.to_vec(),
+                ],
+            );
+            let mut reader = PasswordQuestions::of([&root])
+                .reader(Box::new(short_variables(reach, interface)))
+                .expect("resolve the variable of the PASSWORD question");
+            let form_set = Rc::clone(&root.borrow().children[0]);
+            let scope = Rc::clone(&form_set.borrow().children[2]);
+            let scope = scope.borrow();
+            evaluate_value(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut reader,
+                    values: &no_values(),
+                },
+            )
         };
+        let of =
+            |var_name, value_type| scoped_expression(&[get(SHORT_EFI, var_name, value_type)], 0);
+        let store = "VarStore 0x0005 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1";
+        let undefined = Err("UNDEFINED result".to_string());
+        for (reach_name, through) in SHORT_REACHES {
+            let cases = [
+                ("UINT8 ShortVarA", of(7, EFI_IFR_TYPE_NUM_SIZE_8), Ok(0x11)),
+                (
+                    "UINT16 ShortVarB",
+                    of(8, EFI_IFR_TYPE_NUM_SIZE_16),
+                    Ok(0x1234),
+                ),
+                ("BOOLEAN ShortVarFlag", of(9, EFI_IFR_TYPE_BOOLEAN), Ok(1)),
+                (
+                    "ShortVarA as a UINT16",
+                    of(7, EFI_IFR_TYPE_NUM_SIZE_16),
+                    undefined.clone(),
+                ),
+                (
+                    "ShortVarB as a UINT8",
+                    of(8, EFI_IFR_TYPE_NUM_SIZE_8),
+                    undefined.clone(),
+                ),
+                (
+                    "ShortVarMissing",
+                    of(10, EFI_IFR_TYPE_NUM_SIZE_8),
+                    undefined.clone(),
+                ),
+                (
+                    "a VarName without a string",
+                    of(12, EFI_IFR_TYPE_NUM_SIZE_8),
+                    Err(format!(
+                        "EFI_IFR_GET of {store}), as no string 0x000c holds its VarName"
+                    )),
+                ),
+                (
+                    "a byte of the password",
+                    of(11, EFI_IFR_TYPE_NUM_SIZE_8),
+                    Err(format!(
+                        "EFI_IFR_GET of {store}, EFI variable \"ShortVarPw\"), which cannot be \
+                         read: its bytes hold a password"
+                    )),
+                ),
+            ];
+            for (name, expression, want) in cases {
+                assert_eq!(
+                    value_through(NV_BS_RT, expression, through),
+                    want,
+                    "{reach_name}: {name}"
+                );
+            }
+        }
+
+        let (_, linux) = SHORT_REACHES[0];
+        let got = value_through(NV_BS, of(10, EFI_IFR_TYPE_NUM_SIZE_8), linux);
+        assert!(
+            got.as_ref()
+                .is_err_and(|reason| reason.starts_with(&format!(
+                "EFI_IFR_GET of {store}, EFI variable \"ShortVarMissing\"), which cannot be read: \
+                 EFI variable ShortVarMissing-8c78a505-baa0-4c4a-869f-000000000b01 is not present \
+                 at OS runtime: "
+            ))),
+            "Runtime: ShortVarMissing of an NV|BS store: {got:?}"
+        );
+        let (_, shell) = SHORT_REACHES[1];
         assert_eq!(
-            refusal.to_string(),
-            format!("its WRITE expression sets {short}"),
-            "SET"
+            value_through(NV_BS, of(10, EFI_IFR_TYPE_NUM_SIZE_8), shell),
+            undefined,
+            "BootServices: ShortVarMissing of an NV|BS store"
+        );
+    }
+
+    /// What `run` returns, and the warnings that it logs on this thread (warned_by).
+    fn warnings_of<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let mut returned = None;
+        let warned = warned_by(|| returned = Some(run()));
+        (returned.expect("the value that run returns"), warned)
+    }
+
+    /// A SET of a VARSTORE_EFI before UEFI 2.3.1 in a WRITE plans its value, as wide as its
+    /// VarStoreType, at byte 0 of the EFI variable that its VarName names, and pushes TRUE, where
+    /// that variable holds a value of that width, through variables of either reach. Where the
+    /// variable is missing or of another size, which set does not write, it plans nothing and
+    /// pushes FALSE, as a SET that cannot store its value does (UEFI 2.11 §33.3.8.3.66), and warns
+    /// why. A VarName without a string, and at OS runtime a missing variable that the store
+    /// declares boot-service-only, refuse the WRITE.
+    #[test]
+    fn set_of_a_short_var_store_plans_the_variable_of_its_var_name() {
+        // the SET's result goes to ShortVarFlag, a BOOLEAN
+        let writes_through = |attributes, set_op, (reach, interface)| {
+            let write = scoped_expression(
+                &[op(THIS), set_op, set(SHORT_EFI, 9, EFI_IFR_TYPE_BOOLEAN)],
+                0,
+            );
+            let question = [
+                operation(ONE_OF, true, &storage_less_one_of()),
+                op(WRITE),
+                write,
+                END.to_vec(),
+            ]
+            .concat();
+            let root = short_store_root(attributes, &[form(1, &[question])]);
+            let form_set = Rc::clone(&root.borrow().children[0]);
+            let form = Rc::clone(&form_set.borrow().children[1]);
+            let question = Rc::clone(&form.borrow().children[0]);
+            let mut reader = PasswordQuestions::of([&root])
+                .reader(Box::new(short_variables(reach, interface)))
+                .expect("read the HiiDB without PASSWORD questions");
+            let sets = evaluate_write(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut reader,
+                    values: &no_values(),
+                },
+            )
+            .map_err(|refusal| refusal.to_string())?;
+            Ok::<_, String>(sets.map(|sets| {
+                sets.into_iter()
+                    .map(|set| (set.var_store_id, set.store.name(), set.offset, set.bytes))
+                    .collect::<Vec<_>>()
+            }))
+        };
+        let flag = |value| (SHORT_EFI, "ShortVarFlag".to_string(), 0, vec![value]);
+        let store = "VarStore 0x0005 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1";
+        let unstored = |name: &str, why: &str| {
+            vec![format!(
+                "EFI_IFR_SET of {store}, EFI variable {name:?}) pushes FALSE and writes nothing: \
+                 {why}"
+            )]
+        };
+        for (reach_name, through) in SHORT_REACHES {
+            let cases = [
+                (
+                    "UINT16 ShortVarB",
+                    set(SHORT_EFI, 8, EFI_IFR_TYPE_NUM_SIZE_16),
+                    Ok(Some(vec![
+                        (SHORT_EFI, "ShortVarB".to_string(), 0, vec![3, 0]),
+                        flag(1),
+                    ])),
+                    vec![],
+                ),
+                (
+                    "UINT8 ShortVarA",
+                    set(SHORT_EFI, 7, EFI_IFR_TYPE_NUM_SIZE_8),
+                    Ok(Some(vec![
+                        (SHORT_EFI, "ShortVarA".to_string(), 0, vec![3]),
+                        flag(1),
+                    ])),
+                    vec![],
+                ),
+                (
+                    "ShortVarA as a UINT16",
+                    set(SHORT_EFI, 7, EFI_IFR_TYPE_NUM_SIZE_16),
+                    Ok(Some(vec![flag(0)])),
+                    unstored(
+                        "ShortVarA",
+                        "EFI variable ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01 holds 1 \
+                         bytes, not 2",
+                    ),
+                ),
+                (
+                    "ShortVarMissing",
+                    set(SHORT_EFI, 10, EFI_IFR_TYPE_NUM_SIZE_8),
+                    Ok(Some(vec![flag(0)])),
+                    unstored(
+                        "ShortVarMissing",
+                        "no EFI variable ShortVarMissing-8c78a505-baa0-4c4a-869f-000000000b01",
+                    ),
+                ),
+                (
+                    "a VarName without a string",
+                    set(SHORT_EFI, 12, EFI_IFR_TYPE_NUM_SIZE_8),
+                    Err(format!(
+                        "its WRITE expression sets {store}), as no string 0x000c holds its VarName"
+                    )),
+                    vec![],
+                ),
+            ];
+            for (name, set_op, want, warned) in cases {
+                assert_eq!(
+                    warnings_of(|| writes_through(NV_BS_RT, set_op, through)),
+                    (want, warned),
+                    "{reach_name}: {name}"
+                );
+            }
+        }
+
+        let (_, linux) = SHORT_REACHES[0];
+        let got = writes_through(NV_BS, set(SHORT_EFI, 10, EFI_IFR_TYPE_NUM_SIZE_8), linux);
+        assert!(
+            got.as_ref()
+                .is_err_and(|refusal| refusal.starts_with(&format!(
+                    "its WRITE expression sets {store}, EFI variable \"ShortVarMissing\"), which \
+                 cannot be read: EFI variable \
+                 ShortVarMissing-8c78a505-baa0-4c4a-869f-000000000b01 is not present at OS \
+                 runtime: "
+                ))),
+            "Runtime: ShortVarMissing of an NV|BS store: {got:?}"
+        );
+        let (_, shell) = SHORT_REACHES[1];
+        assert_eq!(
+            writes_through(NV_BS, set(SHORT_EFI, 10, EFI_IFR_TYPE_NUM_SIZE_8), shell),
+            Ok(Some(vec![flag(0)])),
+            "BootServices: ShortVarMissing of an NV|BS store"
         );
     }
 

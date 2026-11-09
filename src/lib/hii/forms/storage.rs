@@ -1151,20 +1151,26 @@ pub(super) fn read_current_value_bytes<'a>(
     {
         return Err(ValueUnavailable::PasswordBytes);
     }
-    let interface = reader.interface();
+    read_stored_bytes(store.as_ref(), value, reader)
+}
 
+/// Reads `value` of `store` through `reader`, password bytes too, or returns why it reads none.
+pub(super) fn read_stored_bytes<'a>(
+    store: &dyn VariableStore,
+    value: std::ops::Range<usize>,
+    reader: &'a mut EfivarReader,
+) -> std::result::Result<&'a [u8], ValueUnavailable> {
+    let (reach, interface) = (reader.reach(), reader.interface());
     // A variable that the read finds is read whatever runtime access its VARSTORE_EFI declares:
     // firmware may give an NV|BS VarStore's variable runtime access, as firmware whose EDK2 gives
     // every non-volatile variable runtime access does. The declaration only explains a missing or
     // unread variable.
-    reader
-        .read(EfivarRange::of(store.as_ref()), value)
-        .map_err(
-            |error| match store.explain_unread(reach, interface, error) {
-                Some(declared) => ValueUnavailable::DeclaredBootServiceOnly(declared),
-                None => ValueUnavailable::from_read_error(store.kind(), error),
-            },
-        )
+    reader.read(EfivarRange::of(store), value).map_err(|error| {
+        match store.explain_unread(reach, interface, error) {
+            Some(declared) => ValueUnavailable::DeclaredBootServiceOnly(declared),
+            None => ValueUnavailable::from_read_error(store.kind(), error),
+        }
+    })
 }
 
 /// Why a question has no value. Display gives the reason, to_answer the text shown for the
@@ -2228,9 +2234,6 @@ pub(super) type VarNames = BTreeMap<u16, Result<Rc<str>, UnresolvedVarName>>;
 impl ShortVarStoreEfi {
     /// Its label in refusals.
     pub(super) const LABEL: &'static str = "EFI_IFR_VARSTORE_EFI before UEFI 2.3.1";
-    /// Why a GET or SET does not read its values, after the VarStore.
-    pub(super) const UNREAD: &'static str =
-        "whose EFI variables are named by VarNames, which uefisettings does not resolve";
 
     /// The EFI variable of `size` bytes that VarName `var_name` names, or why it names none.
     pub(super) fn variable(
