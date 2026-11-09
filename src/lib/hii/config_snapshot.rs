@@ -141,7 +141,7 @@ impl ConfigSnapshot {
                 name,
                 guid: resp.header.guid,
             };
-            let passwords = withheld.of(&variable);
+            let passwords: Vec<Range<usize>> = withheld.of(&variable).cloned().collect();
             let key = StorageKey {
                 device_path: resp.header.device_path.clone(),
                 variable,
@@ -149,7 +149,7 @@ impl ConfigSnapshot {
             let values = snapshot.storages.entry(key).or_default();
             for element in &resp.body {
                 match element {
-                    ConfigElement::Block(block) => values.buffer.write(block, passwords),
+                    ConfigElement::Block(block) => values.buffer.write(block, &passwords),
                     ConfigElement::Nv(setting) => {
                         let label = setting.label().to_string();
                         match setting.number() {
@@ -416,6 +416,8 @@ pub(crate) mod tests {
                 .collect(),
             forms: Vec::new(),
             ignored_ifr: Vec::new(),
+            outside_ifr: Vec::new(),
+            malformed_outside_stores: Vec::new(),
         }
     }
 

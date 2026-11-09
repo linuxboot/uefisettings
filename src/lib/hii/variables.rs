@@ -996,32 +996,106 @@ impl EfivarReader {
 /// §33.3.8.3.54), by efivar file, counted from the start of its value: after its metadata, if any
 /// (value_of). Variable names that differ only in '/' and '!' name one efivar file, so they share
 /// withheld bytes; where they name two variables, as they do outside efivarfs, both are withheld,
-/// which fails safe.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct WithheldBytes(BTreeMap<EfivarFileName, Vec<Range<usize>>>);
+/// which fails safe. Bytes that many files withhold are recorded once, in a shared set.
+#[derive(Clone, Default)]
+pub(crate) struct WithheldBytes {
+    files: BTreeMap<EfivarFileName, FileBytes>,
+    shared: Vec<Vec<Range<usize>>>,
+}
+
+/// The bytes that an efivar file withholds: its own, and the sets of WithheldBytes::shared at
+/// these indexes.
+#[derive(Clone, Default)]
+struct FileBytes {
+    own: Vec<Range<usize>>,
+    shared: Vec<Range<usize>>,
+}
 
 impl WithheldBytes {
     /// Withholds the value bytes `bytes` of `key` too; an empty range withholds none.
     pub(super) fn insert(&mut self, key: VariableKey, bytes: Range<usize>) {
         if !bytes.is_empty() {
-            self.0
+            self.files
                 .entry(EfivarFileName::from(&key))
                 .or_default()
+                .own
                 .push(bytes);
         }
     }
 
+    /// Records `sets` of value bytes, which withhold_shared shares, and returns their indexes;
+    /// their empty ranges withhold none.
+    pub(super) fn share(
+        &mut self,
+        sets: impl IntoIterator<Item = Vec<Range<usize>>>,
+    ) -> Range<usize> {
+        let start = self.shared.len();
+        self.shared.extend(sets.into_iter().map(|mut set| {
+            set.retain(|bytes| !bytes.is_empty());
+            set
+        }));
+        start..self.shared.len()
+    }
+
+    /// Withholds the shared sets at the indexes `sets`, from share, in `key` too.
+    pub(super) fn withhold_shared(&mut self, key: &VariableKey, sets: Range<usize>) {
+        self.files
+            .entry(EfivarFileName::from(key))
+            .or_default()
+            .shared
+            .push(sets);
+    }
+
     /// The withheld bytes of `key`.
-    pub(super) fn of(&self, key: &VariableKey) -> &[Range<usize>] {
-        self.0
-            .get(&EfivarFileName::from(key))
-            .map_or(&[], Vec::as_slice)
+    pub(super) fn of<'a>(&'a self, key: &VariableKey) -> impl Iterator<Item = &'a Range<usize>> {
+        self.of_file(&EfivarFileName::from(key))
+    }
+
+    /// The withheld bytes of the efivar file `file`.
+    fn of_file<'a>(&'a self, file: &EfivarFileName) -> impl Iterator<Item = &'a Range<usize>> {
+        self.files.get(file).into_iter().flat_map(|bytes| {
+            bytes.own.iter().chain(
+                bytes
+                    .shared
+                    .iter()
+                    .flat_map(|sets| self.shared[sets.clone()].iter().flatten()),
+            )
+        })
+    }
+
+    /// Whether `key` withholds any byte.
+    fn withholds(&self, key: &VariableKey) -> bool {
+        self.of(key).next().is_some()
+    }
+
+    /// The withheld bytes of each efivar file that withholds any, sorted, whichever records hold
+    /// them.
+    fn by_file(&self) -> BTreeMap<&EfivarFileName, Vec<Range<usize>>> {
+        self.files
+            .keys()
+            .filter_map(|file| {
+                let mut bytes: Vec<Range<usize>> = self.of_file(file).cloned().collect();
+                bytes.sort_by_key(|bytes| (bytes.start, bytes.end));
+                (!bytes.is_empty()).then_some((file, bytes))
+            })
+            .collect()
+    }
+
+    /// The ranges and the links to shared sets that this records, which tests of the bound on
+    /// PasswordQuestions' records count.
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> usize {
+        let files: usize = self
+            .files
+            .values()
+            .map(|bytes| bytes.own.len() + bytes.shared.len())
+            .sum();
+        files + self.shared.iter().map(Vec::len).sum::<usize>()
     }
 
     /// The first withheld bytes of `key` that `bytes` overlap, if any.
     fn overlap(&self, key: &VariableKey, bytes: &Range<usize>) -> Option<Range<usize>> {
         self.of(key)
-            .iter()
             .find(|withheld| withheld.start < bytes.end && bytes.start < withheld.end)
             .cloned()
     }
@@ -1064,6 +1138,20 @@ impl WithheldBytes {
     }
 }
 
+impl PartialEq for WithheldBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.by_file() == other.by_file()
+    }
+}
+
+impl Eq for WithheldBytes {}
+
+impl fmt::Debug for WithheldBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.by_file()).finish()
+    }
+}
+
 /// `variables` without their `withheld` bytes, those of PASSWORD questions: they read as zero,
 /// where the value of their variable holds them, and a write that overlaps them fails with
 /// WithheldPassword before `variables` see it, so that no password byte is shown or written back.
@@ -1088,7 +1176,7 @@ impl<V> WithholdingVariables<V> {
         key: &VariableKey,
         bytes: &mut [u8],
     ) -> std::result::Result<(), EnhancedAuthenticatedVariable> {
-        if !self.withheld.0.contains_key(&EfivarFileName::from(key)) {
+        if !self.withheld.withholds(key) {
             return Ok(());
         }
         let Some((attributes, data)) = efivar_parts(bytes) else {

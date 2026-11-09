@@ -2275,21 +2275,28 @@ impl ShortVarStoreEfi {
     /// The EFI variables that VarName `var_name` may name where it names none: of each string
     /// that the strings packages differ on, or of UNKNOWN_STRING where none holds it.
     pub(super) fn candidate_variables(&self, var_name: u16) -> Vec<VariableKey> {
-        let names = match self.var_names.get(&var_name) {
-            Some(Ok(name)) => vec![name.to_string()],
-            Some(Err(UnresolvedVarName::Disagreeing { strings, .. })) => {
-                strings.iter().map(|(_, string)| string.clone()).collect()
-            }
-            Some(Err(UnresolvedVarName::NoString(_))) | None => vec![UNKNOWN_STRING.to_owned()],
-        };
-        names
-            .into_iter()
-            .map(|name| VariableKey {
-                name,
-                guid: self.guid,
-            })
-            .collect()
+        var_name_variables(self.guid, self.var_names.get(&var_name))
     }
+}
+
+/// The EFI variables of Guid `guid` that a VarName may name, given the string that its strings
+/// packages give it, `string`: of that string, of each string that they differ on, or of
+/// UNKNOWN_STRING where none holds it.
+pub(super) fn var_name_variables(
+    guid: Guid,
+    string: Option<&Result<Rc<str>, UnresolvedVarName>>,
+) -> Vec<VariableKey> {
+    let names = match string {
+        Some(Ok(name)) => vec![name.to_string()],
+        Some(Err(UnresolvedVarName::Disagreeing { strings, .. })) => {
+            strings.iter().map(|(_, string)| string.clone()).collect()
+        }
+        Some(Err(UnresolvedVarName::NoString(_))) | None => vec![UNKNOWN_STRING.to_owned()],
+    };
+    names
+        .into_iter()
+        .map(|name| VariableKey { name, guid })
+        .collect()
 }
 
 /// The string that edk2-stable202608 SetupBrowserDxe/Setup.c GetToken takes for a string ID that

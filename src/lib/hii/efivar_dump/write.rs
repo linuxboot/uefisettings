@@ -475,6 +475,8 @@ mod tests {
             }],
             forms: vec![Rc::clone(root)],
             ignored_ifr: Vec::new(),
+            outside_ifr: Vec::new(),
+            malformed_outside_stores: Vec::new(),
         }
     }
 

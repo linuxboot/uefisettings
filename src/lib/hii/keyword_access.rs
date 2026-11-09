@@ -385,6 +385,7 @@ mod tests {
 
     use super::*;
     use crate::hii::forms::ifr_fixtures::flagged_option;
+    use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::parse_form_set;
     use crate::hii::forms::ifr_fixtures::password_on;
@@ -402,6 +403,10 @@ mod tests {
     use crate::hii::forms::keywords::KeywordRefusal;
     use crate::hii::forms::resolve_short_var_names;
     use crate::hii::forms::IgnoredIfr;
+    use crate::hii::package::hiidb_fixtures::form_package_of;
+    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::read_db;
     use crate::hii::package::Guid;
     use crate::hii::strings::Language;
     use crate::hii::strings::StringPackage;
@@ -597,6 +602,8 @@ mod tests {
                 &[vec![var_store(1, STORE_GUID, "Store", 16)], ops.to_vec()].concat(),
             )],
             ignored_ifr: Vec::new(),
+            outside_ifr: Vec::new(),
+            malformed_outside_stores: Vec::new(),
         }
     }
 
@@ -1238,6 +1245,99 @@ mod tests {
             (got.is_err(), written.is_err(), handler.calls()),
             (true, true, vec![]),
             "fail closed: get {got:?}, set {written:?}"
+        );
+    }
+
+    /// list(path, ops), as read_db reads it from a form package whose ops `outside`, outside any
+    /// FormSet, come before its FormSet.
+    fn list_with_outside(path: &str, outside: &[Vec<u8>], ops: &[Vec<u8>]) -> ParsedPackageList {
+        let ifr = [
+            outside.concat(),
+            form_set(&[var_store(1, STORE_GUID, "Store", 16), ops.concat()]),
+        ]
+        .concat();
+        let read = read_db(&package_list_with_guid(
+            [0x22; 16],
+            &[form_package_of(&ifr), END_PACKAGE.to_vec()].concat(),
+        ))
+        .expect("read_db")
+        .remove(0);
+        let list = list(path, &[]);
+        ParsedPackageList {
+            guid: list.guid,
+            device_path: list.device_path,
+            strings: list.strings,
+            ..read
+        }
+    }
+
+    /// A PASSWORD outside any FormSet, which edk2-stable202608 ConfigKeywordHandler.c
+    /// FindQuestionFromStringId finds, of VarStoreId 1 from VarOffset 6, keeps its password in
+    /// Store as FindStorageFromVarId takes it: get and set by keyword fail closed before any call
+    /// through variables that reach BootServices, and through those that reach Runtime neither
+    /// read nor write its bytes, as get and set do (PasswordQuestions::of_lists).
+    #[test]
+    fn get_and_set_withhold_a_password_outside_a_form_set() {
+        let lists = [list_with_outside(
+            PATH,
+            &[password_on(9, 9, 1, 6)],
+            &questions(),
+        )];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+        let got = get(&lists, &handler).map(|values| values.to_string());
+        let written = set(
+            &lists,
+            &resp(PATH, KEYWORD, "03"),
+            SetupPasswordPolicy::Bypass,
+            &handler,
+        )
+        .map(|values| values.to_string());
+        assert_eq!(
+            (got.is_err(), written.is_err(), handler.calls()),
+            (true, true, vec![]),
+            "fail closed: get {got:?}, set {written:?}"
+        );
+
+        let runtime = || {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            let key = VariableKey {
+                name: "Store".to_owned(),
+                guid: Guid::from(STORE_GUID),
+            };
+            variables.insert(
+                key,
+                ATTRIBUTES,
+                &[0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            );
+            Box::new(variables) as Box<dyn FirmwareVariables>
+        };
+        let handler =
+            MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (PATH, SECOND_KEYWORD, "01")]);
+        let get_of = |keyword: &str| {
+            get_keyword(
+                &lists,
+                &format!("KEYWORD={keyword}"),
+                None,
+                runtime(),
+                &handler,
+            )
+            .map(|values| values.to_string())
+            .map_err(|error| format!("{error:#}"))
+        };
+        assert_eq!(
+            get_of(SECOND_KEYWORD),
+            Err(
+                "keyword SecondKeyword: question \"Second question\" spans bytes that hold a \
+                 password, which uefisettings neither reads nor writes"
+                    .to_owned()
+            ),
+            "get over the password through Runtime"
+        );
+        assert_eq!(
+            get_of(KEYWORD),
+            Ok(resp(PATH, KEYWORD, "01")),
+            "get beside the password through Runtime"
         );
     }
 

@@ -42,6 +42,7 @@ use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::VariableInterface;
+use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableLayout;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
@@ -84,6 +85,7 @@ use setup_password::password_storage_width;
 use setup_password::PasswordOp;
 use storage::created_attributes;
 use storage::storage_width;
+use storage::var_name_variables;
 use storage::NameValueStore;
 use storage::ReadableLocation;
 use storage::ShortEfiReason;
@@ -1606,6 +1608,13 @@ fn type_value_parser<R: Read + Seek>(
 /// So is each FormSet, first or later, whose FORM_SET op opens no scope and that parses: edk2
 /// parses its ops on to the end of the package, past the End where handle_form_set_within ends
 /// it.
+/// The VarStores and PASSWORDs that the walk steps over outside a FormSet are returned as well:
+/// UEFI 2.11 §33.2.5.1 declares variable stores within a form set, and SetupBrowserDxe parses
+/// none outside one, but edk2-stable202608 ConfigKeywordHandler.c FindQuestionFromStringId and
+/// FindStorageFromVarId walk the whole form package. PASSWORDs are returned undecoded; a VarStore
+/// that does not parse, which hides only its VarStoreId, is returned apart. In a FormSet that the
+/// walk steps into as it ignores it, and after a FORM_SET op that opens no scope, whose ignored
+/// IFR already holds the PASSWORDs and malformed ops there, only the VarStores that parse are.
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
     package_list_guid: Guid,
@@ -1616,6 +1625,14 @@ pub(super) fn parse_form_sets(
     // FORM_SET ops without Scope, by offset, that a failed parse read outside every scope that it
     // opened, with its failure, which the parse from each gives too
     let mut failing_alike: BTreeMap<u64, Rc<FormSetFailure>> = BTreeMap::new();
+    let mut outside = Vec::new();
+    let mut malformed_stores = Vec::new();
+    // set once a FORM_SET op without its Scope bit makes the rest of the package ignored IFR,
+    // which already counts the PASSWORDs and malformed ops in it
+    let mut rest_ignored = false;
+    // the scopes open in the ignored FormSets that the walk is in, whose ignored IFR counts them
+    // likewise
+    let mut ignored_depth: usize = 0;
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
@@ -1654,9 +1671,28 @@ pub(super) fn parse_form_sets(
                 "skipping {:?} outside a FormSet at offset {offset}",
                 op.op_code
             );
+            let in_ignored_ifr = rest_ignored || ignored_depth > 0;
+            if ignored_depth > 0 {
+                match (op.op_code, op.open_scope) {
+                    (IFROpCode::End, _) => ignored_depth -= 1,
+                    (_, true) => ignored_depth += 1,
+                    (_, false) => {}
+                }
+            }
+            record_outside_op(
+                op,
+                offset,
+                package_list_guid,
+                in_ignored_ifr,
+                &mut outside,
+                &mut malformed_stores,
+            );
             continue;
         }
         form_set_read = true;
+        if !op.open_scope {
+            rest_ignored = true;
+        }
         let failure = match failing_alike.remove(&offset) {
             Some(failure) => failure,
             None => {
@@ -1688,9 +1724,53 @@ pub(super) fn parse_form_sets(
             offset,
             reason: failure.reason(&form_set_name(&op)),
         });
+        if op.open_scope {
+            ignored_depth += 1;
+        }
         package_cursor.set_position(after_op);
     }
-    Ok(FormSets { roots, ignored })
+    Ok(FormSets {
+        roots,
+        ignored,
+        outside,
+        malformed_stores,
+    })
+}
+
+/// Records the op `op` at `offset` of a form package of the package list `package_list`, outside
+/// any FormSet, in `outside` if it is a VarStore that parses or, unless it is in ignored IFR
+/// (`in_ignored_ifr`), a PASSWORD, and in `malformed_stores` if it is a VarStore that does not
+/// parse.
+fn record_outside_op(
+    mut op: IFROperation,
+    offset: u64,
+    package_list: Guid,
+    in_ignored_ifr: bool,
+    outside: &mut Vec<OutsideOp>,
+    malformed_stores: &mut Vec<IgnoredIfr>,
+) {
+    match op.op_code {
+        IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue => {
+            match handle_opcode(&mut op) {
+                Ok(()) => outside.push(OutsideOp { offset, op }),
+                Err(error) if in_ignored_ifr => debug!(
+                    "a malformed {} outside a FormSet, in ignored IFR: {error:#}",
+                    op.op_code.spec_name()
+                ),
+                Err(error) => malformed_stores.push(IgnoredIfr {
+                    package_list,
+                    offset,
+                    reason: format!(
+                        "a malformed {} outside a FormSet: {error:#}",
+                        op.op_code.spec_name()
+                    ),
+                }),
+            }
+        }
+        // PasswordQuestions decodes its question header
+        IFROpCode::Password if !in_ignored_ifr => outside.push(OutsideOp { offset, op }),
+        _ => {}
+    }
 }
 
 /// The record of the FormSet that parses from the FORM_SET op `op` without Scope, at offset
@@ -1774,11 +1854,22 @@ fn form_set_name(op: &IFROperation) -> String {
     }
 }
 
-/// The FormSets of a form package: a root for each that parse_form_sets parses, and the IFR that
-/// it ignores.
+/// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
+/// ignores, and the VarStores and PASSWORDs outside the FormSets that it parses, malformed
+/// VarStores apart.
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
+    pub(super) outside: Vec<OutsideOp>,
+    pub(super) malformed_stores: Vec<IgnoredIfr>,
+}
+
+/// A VarStore or PASSWORD op of a form package outside the FormSets that parse_form_sets parses,
+/// at `offset`.
+#[derive(Debug)]
+pub struct OutsideOp {
+    pub offset: u64,
+    pub op: IFROperation,
 }
 
 /// IFR of a form package of the package list `package_list` that parse_form_sets ignores, from
@@ -1917,7 +2008,8 @@ fn handle_form_set_within(
         current_node.borrow_mut().parent = Some(Rc::downgrade(&current_scope));
 
         if skipped_depth == 0 {
-            handle_opcode(Rc::clone(&current_node)).context(format!(
+            let decoded = handle_opcode(&mut current_node.borrow_mut());
+            decoded.context(format!(
                 "failed to parse op_code {:?} properly",
                 &current_node.borrow().op_code,
             ))?;
@@ -1940,8 +2032,7 @@ fn handle_form_set_within(
     Ok(root)
 }
 
-fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
-    let mut node = node.borrow_mut();
+fn handle_opcode(node: &mut IFROperation) -> Result<()> {
     let mut data_cursor = Cursor::new(&node.data);
 
     // debug!("Handling OpCode {:?}", current_node.borrow().op_code);
@@ -1957,14 +2048,14 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
 
         IFROpCode::OneOf => {
             let parsed: OneOf = data_cursor
-                .parse_ne_args((ValueEncoding::from_question(&node),))
+                .parse_ne_args((ValueEncoding::from_question(node),))
                 .context("failed to parse OneOf's data")?;
             debug!("OneOf is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOf(parsed);
         }
         IFROpCode::CheckBox => {
             let parsed: CheckBox = data_cursor
-                .parse_ne_args((ValueEncoding::from_question(&node),))
+                .parse_ne_args((ValueEncoding::from_question(node),))
                 .context("failed to parse CheckBox's data")?;
             debug!("CheckBox is {:?}", parsed);
             node.parsed_data = ParsedOperation::CheckBox(parsed);
@@ -2045,7 +2136,7 @@ fn handle_opcode(node: Rc<RefCell<IFROperation>>) -> Result<()> {
         }
         IFROpCode::Numeric => {
             let parsed: Numeric = data_cursor
-                .parse_ne_args((ValueEncoding::from_question(&node),))
+                .parse_ne_args((ValueEncoding::from_question(node),))
                 .context("failed to parse Numeric's data")?;
             debug!("Numeric is {:?}", parsed);
             node.parsed_data = ParsedOperation::Numeric(parsed);
@@ -3701,7 +3792,7 @@ fn short_efi_variable(
         .map_err(|unresolved| ShortEfiRefusal::new(id, unresolved.into()))
 }
 
-/// A VarStore that a FormSet declares.
+/// A VarStore that a FormSet, or an op outside any, declares.
 enum DeclaredStore {
     /// A VARSTORE or VARSTORE_EFI, which an EFI variable of its Name and Guid holds; UEFI 2.11
     /// §33.2.5.6 makes the EFI variable a specialized form of Buffer Storage
@@ -3723,8 +3814,17 @@ fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Option<Decl
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The calls of declared_store on this thread, which tests of the bound on PasswordQuestions'
+    /// reads of VarStores count.
+    pub(crate) static DECLARATIONS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The VarStoreId that `op` declares and its VarStore, if `op` declares one.
 fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
+    #[cfg(test)]
+    DECLARATIONS_READ.with(|read| read.set(read.get() + 1));
     match &op.parsed_data {
         ParsedOperation::VarStore(store) => Some((
             store.var_store_id,
@@ -3804,6 +3904,16 @@ fn var_store_reference(op: &IFROperation) -> Option<(u16, u16)> {
         return Some((operand.var_store_id, operand.var_store_info));
     }
     parse_question_header(op).map(|header| (header.var_store_id, header.var_store_info))
+}
+
+/// The EFI variables of Guid `guid` that VarName `var_name` may name on a VARSTORE_EFI before UEFI
+/// 2.3.1, by the strings of `string_packages` (var_name_string, var_name_variables).
+fn var_name_candidates(
+    guid: Guid,
+    var_name: u16,
+    string_packages: &[StringPackage],
+) -> Vec<VariableKey> {
+    var_name_variables(guid, var_name_string(var_name, string_packages).as_ref())
 }
 
 /// Returns the string of VarName `var_name` in the `string_packages` that hold it, or, where they

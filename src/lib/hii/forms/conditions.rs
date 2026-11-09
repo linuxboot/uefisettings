@@ -5999,7 +5999,6 @@ mod store_expression_tests {
     use crate::hii::variables::VariableKey;
 
     const MAP: u8 = 0x22;
-    const VAR_STORE_NAME_VALUE: u8 = 0x25;
     const GET: u8 = 0x2B;
     const SET: u8 = 0x2C;
     const AND: u8 = 0x15;
@@ -6060,11 +6059,7 @@ mod store_expression_tests {
     fn declarations() -> Vec<Vec<u8>> {
         vec![
             var_store_efi(STORE, "Store", NV_BS_RT, 5),
-            operation(
-                VAR_STORE_NAME_VALUE,
-                false,
-                &[&NAME_VALUE.to_le_bytes()[..], &[0x44; 16]].concat(),
-            ),
+            var_store_name_value(NAME_VALUE, [0x44; 16]),
             var_store(BUFFER, [0; 16], "Buffer", 2),
         ]
     }

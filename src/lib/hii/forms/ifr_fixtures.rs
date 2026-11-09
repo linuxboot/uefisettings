@@ -798,7 +798,7 @@ pub(crate) fn var_store_efi_of(
 
 /// A VARSTORE_EFI of `id` of the form before UEFI 2.3.1, which ends at Attributes: of
 /// SHORT_VAR_STORE_GUID, with NV_BS_RT, of 24 bytes.
-pub(super) fn short_var_store_efi(id: u16) -> Vec<u8> {
+pub(crate) fn short_var_store_efi(id: u16) -> Vec<u8> {
     short_var_store_efi_of(id, SHORT_VAR_STORE_GUID, NV_BS_RT)
 }
 

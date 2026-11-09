@@ -1432,6 +1432,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::question_header_with;
     use crate::hii::forms::ifr_fixtures::scoped_expression;
     use crate::hii::forms::ifr_fixtures::scopeless_form_set;
+    use crate::hii::forms::ifr_fixtures::short_var_store_efi;
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::uint8;
@@ -4763,6 +4764,252 @@ mod tests {
         }
     }
 
+    /// A VARSTORE_NAME_VALUE, or a VARSTORE_EFI before UEFI 2.3.1, of VarStoreId 2 outside any
+    /// FormSet, before them, names no variable that edk2-stable202608 ConfigKeywordHandler.c
+    /// FindStorageFromVarId, which takes the first VarStore of the id in the form package, would
+    /// read a PASSWORD of that id from. The PASSWORD's FormSet declares AMITSESetup at its top,
+    /// and the UINT64 NUMERIC N0 of a FormSet before it is over bytes 0..8 of that password: get
+    /// N0 answers that its bytes hold a password through variables that reach Runtime, and fails
+    /// closed through those that reach BootServices.
+    #[test]
+    fn an_outside_var_store_of_a_password_s_id_without_a_variable_shows_no_password_byte() {
+        let numeric = [
+            question_header_with(4, 4, 2, 0, 0x00),
+            vec![0x23], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_HEX
+            0u64.to_le_bytes().to_vec(),
+            u64::MAX.to_le_bytes().to_vec(),
+            1u64.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        for (case, outside) in [
+            ("a VARSTORE_NAME_VALUE", var_store_name_value(2, [0x66; 16])),
+            (
+                "an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1",
+                short_var_store_efi(2),
+            ),
+        ] {
+            let packages = [
+                form_package_of(
+                    &[
+                        outside,
+                        form_set(&[
+                            var_store(2, [0x44; 16], "AMITSESetup", 81),
+                            form(1, &[operation(NUMERIC, false, &numeric)]),
+                        ]),
+                        form_set(&[
+                            var_store(2, [0x44; 16], "AMITSESetup", 81),
+                            form(1, &[password_on(3, 3, 2, 0)]),
+                        ]),
+                    ]
+                    .concat(),
+                ),
+                en_strings_package_of(&["Q", "P", "Password", "N0"]),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+            for (reach, interface) in [
+                (VariableReach::Runtime, VariableInterface::Efivarfs),
+                (
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                ),
+            ] {
+                let variables = MemoryVariables::new(reach, interface);
+                variables.insert(
+                    amitse_setup(),
+                    NV_BS_RT,
+                    &[plaintext_password().as_slice(), &[0xAA; 40], &[1]].concat(),
+                );
+
+                let got = answers_or_error_of(&hiidb, "N0", &Rc::new(variables));
+
+                match reach {
+                    VariableReach::Runtime => assert_eq!(
+                        got,
+                        Ok(vec![PASSWORD_BYTES.to_string()]),
+                        "{case}: {reach:?}"
+                    ),
+                    VariableReach::BootServices => assert!(
+                        got.as_ref().is_err_and(|error| error.contains(&format!(
+                            "{case} outside a FormSet, at offset 0 of a form package, declares \
+                             its VarStoreId"
+                        ))),
+                        "{case}: {reach:?}: {got:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A question selected by its FormSet's GUID and QuestionId, the UINT64 NUMERIC N0 over bytes
+    /// 0..8 of AMITSESetup, keeps the bytes of a PASSWORD outside any FormSet of its VarStoreId
+    /// withheld: through variables that reach Runtime get answers that its bytes hold a password
+    /// and set refuses it; through those that reach BootServices both fail closed; set writes
+    /// nothing.
+    #[test]
+    fn a_question_selected_by_question_id_keeps_an_outside_password_withheld() {
+        let numeric = [
+            question_header_with(4, 4, 2, 0, 0x00),
+            vec![0x23], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_HEX
+            0u64.to_le_bytes().to_vec(),
+            u64::MAX.to_le_bytes().to_vec(),
+            1u64.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package_of(
+                &[
+                    password_on(3, 3, 2, 0),
+                    form_set(&[
+                        var_store(2, [0x44; 16], "AMITSESetup", 81),
+                        form(1, &[operation(NUMERIC, false, &numeric)]),
+                    ]),
+                ]
+                .concat(),
+            ),
+            en_strings_package_of(&["Q", "P", "Password", "N0"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let question = by_address("11111111-1111-1111-1111-111111111111:4");
+        let stored = [plaintext_password().as_slice(), &[0xAA; 40], &[1]].concat();
+        let options = SetOptions {
+            setup_password: SetupPasswordPolicy::Bypass,
+            ..SetOptions::default()
+        };
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(amitse_setup(), NV_BS_RT, &stored);
+            let variables = Rc::new(variables);
+
+            let got = HiiBackend::get_in(
+                &hiidb,
+                question.clone(),
+                None,
+                &GetOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .map(|got| {
+                got.responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| format!("{error:#}"));
+            let set = HiiBackend::set_in(
+                &hiidb,
+                question.clone(),
+                "1",
+                None,
+                &options,
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"));
+
+            let (got_refusal, set_refusal) = match reach {
+                VariableReach::Runtime => {
+                    assert_eq!(got, Ok(vec![PASSWORD_BYTES.to_string()]), "{reach:?}: get");
+                    (
+                        None,
+                        "holds a password at bytes 0..40, which set never writes",
+                    )
+                }
+                VariableReach::BootServices => {
+                    let outside = "outside a FormSet, at offset 0 of a form package";
+                    (Some(outside), outside)
+                }
+            };
+            if let Some(refusal) = got_refusal {
+                assert!(
+                    got.as_ref().is_err_and(|error| error.contains(refusal)),
+                    "{reach:?}: get: {got:?}"
+                );
+            }
+            assert!(
+                set.as_ref().is_err_and(|error| error.contains(set_refusal)),
+                "{reach:?}: set: {set:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&amitse_setup()),
+                [],
+                "{reach:?}: writes to AMITSESetup"
+            );
+        }
+    }
+
+    /// A PASSWORD outside any FormSet whose VarStoreId names a VARSTORE_EFI before UEFI 2.3.1 of a
+    /// FormSet, VarStoreInfo 5, keeps the variable that string 5 names as a VarName withheld: the
+    /// CHECKBOX C of that VarName, at byte 0 of ShortVarPw of the store's Guid, answers that its
+    /// bytes hold a password through variables that reach Runtime, and set refuses it; through
+    /// those that reach BootServices both fail closed; set writes nothing.
+    #[test]
+    fn a_password_outside_a_form_set_keeps_the_variable_of_its_var_name_withheld() {
+        let ifr = [
+            password_on(9, 3, 7, 5),
+            form_set(&[short_var_store_efi(7), form(1, &[checkbox_at(4, 4, 7, 5)])]),
+        ];
+        let packages = [
+            form_package_of(&ifr.concat()),
+            en_strings_package_of(&["Q", "P", "Password", "C", "ShortVarPw"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(short_key("ShortVarPw"), NV_BS_RT, &plaintext_password());
+            let variables = Rc::new(variables);
+
+            let got = answers_or_error_of(&hiidb, "C", &variables);
+            let set = set_bypassing(&hiidb, "C", "0", &variables);
+
+            let (got_ok, refusal) = match reach {
+                VariableReach::Runtime => (true, "holds a password at bytes 0..40"),
+                VariableReach::BootServices => {
+                    (false, "outside a FormSet, at offset 0 of a form package")
+                }
+            };
+            if got_ok {
+                assert!(
+                    got.as_ref().is_ok_and(
+                        |answers| answers.len() == 1 && answers[0].starts_with(PASSWORD_BYTES)
+                    ),
+                    "{reach:?}: get: {got:?}"
+                );
+            } else {
+                assert!(
+                    got.as_ref().is_err_and(|error| error.contains(refusal)),
+                    "{reach:?}: get: {got:?}"
+                );
+            }
+            assert!(
+                set.as_ref().is_err_and(|error| error.contains(refusal)),
+                "{reach:?}: set: {set:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key("ShortVarPw")),
+                [],
+                "{reach:?}: writes to ShortVarPw"
+            );
+        }
+    }
+
     /// A HiiDB whose AMITSESetup has a PASSWORD at bytes 40..80, the UINT16 NUMERIC S at bytes
     /// 39..41, across its start, and the UINT16 NUMERIC E at bytes 79..81, across its end.
     fn straddling_password_hiidb() -> Vec<u8> {
@@ -7070,6 +7317,102 @@ mod tests {
 
             assert_eq!(got, [want], "{case}: get");
             assert_eq!(listed, [want], "{case}: list-questions");
+            assert_no_password_byte(&outputs);
+            assert_eq!(
+                logged.iter().any(|message| message.ends_with(REFUSED)),
+                refused,
+                "{case}: the refusal in {logged:?}"
+            );
+        }
+    }
+
+    /// The snapshot drops the passwords of IFR outside any FormSet as get withholds them
+    /// (PasswordQuestions::of_lists). The FormSet of snapshot_hiidb's N and its PASSWORD on
+    /// AMITSESetup, VarStoreId 2, follows `outside`, then a FormSet whose UINT16 NUMERIC T is at
+    /// byte 0 of Shadow, whose 40 snapshot bytes are 0xA5 too:
+    /// - a VARSTORE outside any FormSet of VarStoreId 2 for Shadow keeps the password there too, so
+    ///   T shows withheld while N shows its snapshot value;
+    /// - a PASSWORD outside any FormSet, or a VARSTORE_NAME_VALUE there of VarStoreId 2, leaves
+    ///   the password's bytes unknown, so the snapshot shows nothing, which the warning says.
+    #[test]
+    fn the_snapshot_drops_the_passwords_of_ifr_outside_any_form_set() {
+        const REFUSED: &str = "; as the VarStore of that password is unknown, uefisettings \
+            cannot withhold its bytes, so no value is shown from the ExportConfig snapshot";
+        let hiidb = |outside: Vec<u8>| {
+            let packages = [
+                device_path_package(&DRIVER_PATH),
+                form_package_of(
+                    &[
+                        outside,
+                        form_set(&[
+                            var_store(1, N_GUID, "NStore", 3),
+                            var_store(2, P_GUID, "AMITSESetup", 81),
+                            form(1, &[checkbox_on(1, 1, 1), password_on(3, 4, 2, 0)]),
+                        ]),
+                        form_set(&[
+                            var_store(7, OTHER_GUID, "Shadow", 81),
+                            form(2, &[uint16_numeric(8, 8, 7, 0)]),
+                        ]),
+                    ]
+                    .concat(),
+                ),
+                en_strings_package_of(&["N", "W", "P", "Password", "O", "Off", "On", "T"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid([0x55; 16], &packages.concat())
+        };
+        let text = [
+            snapshot_text(),
+            block_resp(
+                &config_hdr(OTHER_GUID, "Shadow", &DRIVER_PATH),
+                0,
+                &[[0xA5; 40].as_slice(), &[0; 41]].concat(),
+            ),
+        ]
+        .join("&");
+        for (case, outside, want, refused) in [
+            (
+                "a VARSTORE of VarStoreId 2 for Shadow",
+                var_store(2, OTHER_GUID, "Shadow", 81),
+                ["1 <snapshot>", WITHHELD],
+                false,
+            ),
+            (
+                "a PASSWORD",
+                password_on(9, 4, 2, 0),
+                [
+                    MISSING_N_STORE,
+                    "<ValueUnavailable: no EFI variable \
+                  Shadow-33333333-3333-3333-3333-333333333333; HII buffer varstore requires \
+                  EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+                ],
+                true,
+            ),
+            (
+                "a VARSTORE_NAME_VALUE of VarStoreId 2",
+                var_store_name_value(2, OTHER_GUID),
+                [
+                    MISSING_N_STORE,
+                    "<ValueUnavailable: no EFI variable \
+                  Shadow-33333333-3333-3333-3333-333333333333; HII buffer varstore requires \
+                  EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+                ],
+                true,
+            ),
+        ] {
+            let mut answers = None;
+            let logged = logged_by(|| {
+                answers = Some(answers_with_snapshot(
+                    &hiidb(outside),
+                    &["N", "T"],
+                    &no_variables(),
+                    &text,
+                ));
+            });
+            let (got, listed, _, outputs) = answers.expect("the answers");
+
+            assert_eq!(got, want, "{case}: get");
+            assert_eq!(listed, want, "{case}: list-questions");
             assert_no_password_byte(&outputs);
             assert_eq!(
                 logged.iter().any(|message| message.ends_with(REFUSED)),

@@ -391,6 +391,11 @@ pub struct ParsedPackageList {
     pub forms: Vec<IFRNodeLink>,
     /// The IFR of its form packages that read_db ignores, whose PASSWORD questions are unknown
     pub ignored_ifr: Vec<forms::IgnoredIfr>,
+    /// The VarStores and PASSWORDs of its form packages outside the FormSets that read_db parses
+    pub outside_ifr: Vec<forms::OutsideOp>,
+    /// The VarStores of its form packages outside the FormSets that read_db parses that do not
+    /// parse, whose VarStoreIds are unknown
+    pub malformed_outside_stores: Vec<forms::IgnoredIfr>,
 }
 
 impl ParsedPackageList {
@@ -438,6 +443,8 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     let mut string_packages = Vec::new();
     let mut roots: Vec<IFRNodeLink> = Vec::new();
     let mut ignored_ifr = Vec::new();
+    let mut outside_ifr = Vec::new();
+    let mut malformed_outside_stores = Vec::new();
     let mut device_path = None;
 
     for package in get_packages(package_list)? {
@@ -457,6 +464,8 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                     .context("failed to parse a form package")?;
                 roots.extend(form_sets.roots);
                 ignored_ifr.extend(form_sets.ignored);
+                outside_ifr.extend(form_sets.outside);
+                malformed_outside_stores.extend(form_sets.malformed_stores);
             }
             // NewPackageList creates the one device path package of a list (UEFI 2.10 §33.3.4)
             PackageType::DevicePath => {
@@ -480,6 +489,8 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         strings: string_packages,
         forms: roots,
         ignored_ifr,
+        outside_ifr,
+        malformed_outside_stores,
     })
 }
 
