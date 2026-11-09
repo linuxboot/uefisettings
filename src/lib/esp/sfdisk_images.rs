@@ -22,6 +22,17 @@ pub(super) struct SfdiskImage {
     pub(super) runs: &'static [(usize, &'static [u8])],
 }
 
+impl SfdiskImage {
+    /// The bytes of the image.
+    pub(super) fn bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0; self.length];
+        for (offset, run) in self.runs {
+            bytes[*offset..offset + run.len()].copy_from_slice(run);
+        }
+        bytes
+    }
+}
+
 /// The first 17408 bytes of a disk image that `sfdisk` (util-linux 2.41.6) partitioned
 /// with this script:
 ///

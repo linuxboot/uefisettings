@@ -399,6 +399,32 @@ impl EfivarArgs {
 /// no setup password gates, and the read of the HiiDB.
 pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE, FIRMWARE_RESERVED_READ];
 
+/// What set stages for the next boot.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct StagingArgs {
+    /// The uefisettings.efi that set copies to the EFI system partition when it stages a question whose value only its driver holds, which the next boot applies. Under Secure Boot, it must be signed for db.
+    #[arg(long, value_name = "UEFISETTINGS_EFI")]
+    image: Option<PathBuf>,
+}
+
+impl StagingArgs {
+    pub(super) fn image(&self) -> Option<PathBuf> {
+        self.image.clone()
+    }
+
+    /// Fails if --image is given: Ilo attributes have no driver that holds their value.
+    pub(super) fn refuse_on_ilo(&self) -> Result<()> {
+        match self.image {
+            None => Ok(()),
+            Some(_) => Err(anyhow!(
+                "--image applies to the HII backend, not to the Ilo backend of this machine"
+            )),
+        }
+    }
+}
+
 /// The QUESTION of `question` for the Ilo backend; fails if a flag of the HII backend is given:
 /// Ilo attributes have no QuestionId, no keywords, no IFR conditions and no HII strings.
 fn refuse_on_ilo<'a>(question: &'a QuestionArgs, selection: &SelectionArgs) -> Result<&'a str> {
@@ -482,6 +508,7 @@ pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
     selection: &SelectionArgs,
+    staging: &StagingArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {
@@ -497,7 +524,9 @@ pub(super) fn auto_set(
                  takes VALUE"
             ));
         };
-        let res = IloBackend::set(refuse_on_ilo(&target.question, selection)?, &value, None)?;
+        let question = refuse_on_ilo(&target.question, selection)?;
+        staging.refuse_on_ilo()?;
+        let res = IloBackend::set(question, &value, None)?;
         print_with_style(res, json)?;
     } else {
         hii_set(selector, &value, options, json, source)?;
@@ -889,6 +918,29 @@ mod tests {
             assert_eq!(
                 refused_on_ilo(&args),
                 want.map(str::to_string).map_err(str::to_string),
+                "{case}"
+            );
+        }
+    }
+
+    /// StagingArgs::refuse_on_ilo refuses --image, which Ilo attributes take no use of, and
+    /// passes its absence.
+    #[test]
+    fn staging_refuse_on_ilo_names_image() {
+        let cases = [
+            ("no --image", None, Ok(())),
+            (
+                "--image",
+                Some(PathBuf::from("uefisettings.efi")),
+                Err("--image applies to the HII backend, not to the Ilo backend of this machine"),
+            ),
+        ];
+        for (case, image, want) in cases {
+            assert_eq!(
+                StagingArgs { image }
+                    .refuse_on_ilo()
+                    .map_err(|error| error.to_string()),
+                want.map_err(str::to_string),
                 "{case}"
             );
         }

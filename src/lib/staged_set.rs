@@ -20,22 +20,33 @@
 use std::fmt;
 use std::str::FromStr;
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use log::warn;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use thiserror::Error;
 
 use crate::efi_variables::globals::bit_names;
 use crate::efi_variables::globals::boot_next;
+use crate::efi_variables::globals::boot_option_support;
+use crate::efi_variables::globals::boot_order;
 use crate::efi_variables::globals::read_os_indications;
+use crate::efi_variables::globals::BootOptionFlags;
 use crate::efi_variables::globals::LoadOptionKind;
 use crate::efi_variables::globals::LoadOptionName;
 use crate::efi_variables::globals::OsIndications;
 use crate::efi_variables::globals::EFI_GLOBAL_VARIABLE;
+use crate::efi_variables::globals::WRITABLE_ATTRIBUTES;
+use crate::efi_variables::load_option::DevicePathNode;
+use crate::efi_variables::load_option::FilePathList;
+use crate::efi_variables::load_option::HardDrive;
 use crate::efi_variables::load_option::LoadOption;
+use crate::efi_variables::load_option::LoadOptionAttributes;
 use crate::efi_variables::load_option::LoadOptionError;
 use crate::efi_variables::load_option::Ucs2String;
 use crate::efi_variables::VariableContents;
@@ -49,6 +60,9 @@ use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 use crate::unsafe_operations::UnsafeOperations;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+
 /// The variables of UEFISETTINGS_VENDOR_GUID that hold the staged set, and the outcome of the
 /// last staged set's boot
 const STAGED_SET: &str = "UefisettingsStagedSet";
@@ -59,6 +73,23 @@ const RECORD_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
     .union(VariableAttributes::RUNTIME_ACCESS);
 /// The command line of a staged set's Boot#### before its nonce: the image, then its command
 const APPLY_STAGED: &str = "uefisettings.efi apply-staged";
+/// uefisettings' directory on the EFI system partition, and the path of a staged set's image in
+/// it, as File Path nodes name them
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux build reaches the ESP yet")
+)]
+pub(crate) const IMAGE_DIRECTORY: &str = "\\EFI\\uefisettings";
+pub(crate) const IMAGE_PATH: &str = "\\EFI\\uefisettings\\uefisettings.efi";
+/// The directory of capsules on disk, which the firmware processes at the next boot when
+/// OsIndications has FILE_CAPSULE_DELIVERY_SUPPORTED, letter case ignored (UEFI 2.11 §8.5.5)
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux build reaches the ESP yet")
+)]
+pub(crate) const CAPSULE_DIRECTORY: &str = "\\EFI\\UpdateCapsule";
+/// The Description of a staged set's Boot####
+const DESCRIPTION: &str = "uefisettings: a set staged for this boot";
 /// The OsIndications that keep the boot manager from starting BootNext's option unattended: it
 /// stops at a firmware user interface, or skips to recovery (UEFI 2.11 §8.5.4). With
 /// FILE_CAPSULE_DELIVERY_SUPPORTED, capsules on disk do too (StageRefusal::CapsulesOnDisk).
@@ -298,6 +329,11 @@ pub(crate) trait StagedFiles {
 
     /// Deletes the file at `path`, then uefisettings' directory if it is empty.
     fn delete(&self, path: &str) -> Result<()>;
+
+    /// Writes `image` to a new file at `path`, creating uefisettings' directory if missing, and
+    /// reads it back: the SHA-256 of what it read. Fails if `path` exists, and leaves no file if
+    /// it fails.
+    fn place(&self, path: &str, image: &[u8]) -> Result<Sha256Digest>;
 }
 
 /// What settle leaves.
@@ -324,6 +360,14 @@ pub(crate) fn settle(variables: &impl VariableData, files: &impl StagedFiles) ->
     remove_image(files, &set.image)?;
     variables.delete_variable(&record_key(STAGED_SET))?;
     Ok(Settled::Idle(Some(outcome)))
+}
+
+/// The Boot#### of `number`.
+fn boot_option_name(number: u16) -> LoadOptionName {
+    LoadOptionName {
+        kind: LoadOptionKind::Boot,
+        number,
+    }
 }
 
 /// Deletes the Boot#### of `set` if it holds the set's command line, after BootNext if that
@@ -428,6 +472,124 @@ pub(crate) fn plan_stage(
 /// Records `set` as the staged set.
 pub(crate) fn record_set(variables: &impl VariableData, set: &StagedSet) -> Result<()> {
     write_record(variables, STAGED_SET, set)
+}
+
+/// Stages `request` in a new set of `nonce`, for StagePlan::New: writes `image` to IMAGE_PATH
+/// and reads it back, records the set, writes its Boot####, the lowest free one, which starts the
+/// image on the partition of `hard_drive` with the set's command line, then BootNext. A step that
+/// fails undoes the steps before it; an image file that exists already fails it before any write,
+/// and stays, as a set staged at the same time may have placed it.
+pub(crate) fn stage_new(
+    variables: &impl VariableData,
+    files: &impl StagedFiles,
+    hard_drive: HardDrive,
+    request: StagedRequest,
+    image: &[u8],
+    nonce: Nonce,
+) -> Result<StagedSet> {
+    let sha256 = Sha256Digest(Sha256::digest(image).into());
+    let set = StagedSet {
+        nonce,
+        boot_option: free_boot_option(variables)?,
+        image: StagedImage {
+            path: IMAGE_PATH.to_owned(),
+            sha256,
+        },
+        requests: vec![request],
+    };
+    let load_option = LoadOption {
+        attributes: LoadOptionAttributes::ACTIVE
+            | LoadOptionAttributes::HIDDEN
+            | category(variables)?,
+        description: Ucs2String::try_from(DESCRIPTION)?,
+        file_paths: FilePathList::of(&[
+            DevicePathNode::HardDrive(hard_drive),
+            DevicePathNode::FilePath(Ucs2String::try_from(IMAGE_PATH)?),
+        ])?,
+        optional_data: optional_data(nonce)?,
+    };
+
+    let read_back = files.place(&set.image.path, image)?;
+    match write_new_set(variables, files, &set, &load_option, read_back) {
+        Ok(()) => Ok(set),
+        // nothing of a set that failed to stage stays
+        Err(error) => Err(match undo_new_set(variables, files, &set) {
+            Ok(()) => error,
+            Err(undo) => anyhow!("{error:#}; undoing the staging failed too: {undo:#}"),
+        }),
+    }
+}
+
+/// The steps of stage_new after it placed the image, which read back as `read_back`.
+fn write_new_set(
+    variables: &impl VariableData,
+    files: &impl StagedFiles,
+    set: &StagedSet,
+    load_option: &LoadOption,
+    read_back: Sha256Digest,
+) -> Result<()> {
+    if read_back != set.image.sha256 {
+        files.delete(&set.image.path)?;
+        return Err(anyhow!(
+            "{} reads back with SHA-256 {read_back}, not the image's {}",
+            set.image.path,
+            set.image.sha256
+        ));
+    }
+    record_set(variables, set)?;
+    variables.set_variable(
+        &boot_option_name(set.boot_option).key(),
+        &VariableContents::new(WRITABLE_ATTRIBUTES, load_option.encode())?,
+    )?;
+    variables.set_variable(
+        &boot_next_key(),
+        &VariableContents::new(WRITABLE_ATTRIBUTES, set.boot_option.to_le_bytes().to_vec())?,
+    )
+}
+
+/// Undoes the steps of stage_new that wrote, as settle does.
+fn undo_new_set(
+    variables: &impl VariableData,
+    files: &impl StagedFiles,
+    set: &StagedSet,
+) -> Result<()> {
+    remove_boot_option(variables, set)?;
+    if variables.variable_data(&record_key(STAGED_SET))?.is_some() {
+        variables.delete_variable(&record_key(STAGED_SET))?;
+    }
+    remove_image(files, &set.image)
+}
+
+/// The LOAD_OPTION_CATEGORY of a staged set's Boot####: LOAD_OPTION_CATEGORY_APP if
+/// BootOptionSupport has EFI_BOOT_OPTION_SUPPORT_APP, else LOAD_OPTION_CATEGORY_BOOT (UEFI 2.11
+/// §3.1.4).
+fn category(variables: &impl VariableData) -> Result<LoadOptionAttributes> {
+    let supports_apps = boot_option_support(variables)?
+        .is_some_and(|support| support.flags.contains(BootOptionFlags::APP));
+    Ok(match supports_apps {
+        true => LoadOptionAttributes::CATEGORY_APP,
+        false => LoadOptionAttributes::empty(),
+    })
+}
+
+/// The number of the lowest Boot#### that `variables` lack and that neither BootOrder lists, so
+/// that no boot starts it unattended, nor BootNext names, as edk2-stable202608
+/// UefiBootManagerLib BmGetFreeOptionNumber() skips both (BmLoadOption.c).
+fn free_boot_option(variables: &impl VariableData) -> Result<u16> {
+    let taken: Vec<LoadOptionName> = boot_order(variables)?
+        .into_iter()
+        .flatten()
+        .chain(boot_next(variables)?)
+        .collect();
+    for number in 0..=u16::MAX {
+        let option = boot_option_name(number);
+        if !taken.contains(&option) && variables.variable_data(&option.key())?.is_none() {
+            return Ok(number);
+        }
+    }
+    Err(anyhow!(
+        "every Boot#### from Boot0000 to BootFFFF exists or BootOrder or BootNext holds it"
+    ))
 }
 
 fn record_key(name: &str) -> VariableKey {
@@ -660,6 +822,7 @@ pub(crate) enum RecordError {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::btree_map::Entry;
     use std::collections::BTreeMap;
 
     use super::*;
@@ -668,6 +831,7 @@ mod tests {
     use crate::efi_variables::load_option::DevicePathNode;
     use crate::efi_variables::load_option::FilePathList;
     use crate::efi_variables::load_option::LoadOptionAttributes;
+    use crate::hii::VariableInterface;
 
     const NONCE: Nonce = Nonce([
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
@@ -794,10 +958,12 @@ mod tests {
     }
 
     /// Files of staged images in memory, by path, each with its SHA-256; records each deletion.
+    /// A placed image reads back as `read_back` if given.
     #[derive(Default)]
     struct HeldFiles {
         files: RefCell<BTreeMap<String, Sha256Digest>>,
         deleted: RefCell<Vec<String>>,
+        read_back: Option<Sha256Digest>,
         capsules: Vec<String>,
     }
 
@@ -826,6 +992,73 @@ mod tests {
             self.files.borrow_mut().remove(path);
             Ok(())
         }
+
+        fn place(&self, path: &str, image: &[u8]) -> Result<Sha256Digest> {
+            let digest = self
+                .read_back
+                .unwrap_or_else(|| Sha256Digest(Sha256::digest(image).into()));
+            match self.files.borrow_mut().entry(path.to_owned()) {
+                Entry::Occupied(_) => Err(anyhow!("{path} exists")),
+                Entry::Vacant(entry) => Ok(*entry.insert(digest)),
+            }
+        }
+    }
+
+    /// VariableData that fail to set `failing`, else are `held`.
+    struct FailingSet<'a> {
+        held: &'a HeldVariables,
+        failing: VariableKey,
+    }
+
+    impl VariableData for FailingSet<'_> {
+        fn interface(&self) -> VariableInterface {
+            self.held.interface()
+        }
+
+        fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
+            self.held.variable_data(key)
+        }
+
+        fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
+            match *key == self.failing {
+                true => Err(anyhow!("no space for {key}")),
+                false => self.held.set_variable(key, contents),
+            }
+        }
+
+        fn delete_variable(&self, key: &VariableKey) -> Result<()> {
+            self.held.delete_variable(key)
+        }
+    }
+
+    /// The image that stage_new stages here.
+    const IMAGE_BYTES: &[u8] = b"MZ an image";
+
+    /// The Hard Drive node that stage_new names the image's partition by here.
+    fn hard_drive() -> HardDrive {
+        HardDrive {
+            partition_number: 1,
+            start: 2048,
+            size: 2048,
+            signature: crate::efi_variables::load_option::PartitionSignature::Gpt(
+                "8C78A505-BAA0-4C4A-869F-000000001A0E"
+                    .parse()
+                    .expect("a GUID"),
+            ),
+        }
+    }
+
+    /// The data and attributes of the variable `name` of `vendor`, if held.
+    fn data(
+        variables: &HeldVariables,
+        name: &str,
+        vendor: Guid,
+    ) -> Option<(Vec<u8>, VariableAttributes)> {
+        variables
+            .variables
+            .borrow()
+            .get(&key(name, vendor))
+            .map(|contents| (contents.data().to_vec(), contents.attributes()))
     }
 
     #[test]
@@ -1320,6 +1553,241 @@ mod tests {
             );
             assert!(variables.set.borrow().is_empty(), "{case}: nothing written");
         }
+    }
+
+    #[test]
+    fn a_new_set_writes_its_image_then_its_record_boot_option_and_boot_next() {
+        let image_digest = Sha256Digest(Sha256::digest(IMAGE_BYTES).into());
+        let support = |flags: u32| {
+            HeldVariables::default()
+                .with("Boot0000", EFI_GLOBAL_VARIABLE, &boot_option(OTHER_NONCE))
+                .with("Boot0001", EFI_GLOBAL_VARIABLE, &boot_option(OTHER_NONCE))
+                .with(
+                    "BootOptionSupport",
+                    EFI_GLOBAL_VARIABLE,
+                    &flags.to_le_bytes(),
+                )
+        };
+        let cases = [
+            (
+                "BootOptionSupport with EFI_BOOT_OPTION_SUPPORT_APP",
+                support(0x0000_0103),
+                LoadOptionAttributes::CATEGORY_APP,
+            ),
+            (
+                "BootOptionSupport without it",
+                support(0x0000_0001),
+                LoadOptionAttributes::empty(),
+            ),
+            (
+                "no BootOptionSupport",
+                HeldVariables::default()
+                    .with("Boot0000", EFI_GLOBAL_VARIABLE, &boot_option(OTHER_NONCE))
+                    .with("Boot0001", EFI_GLOBAL_VARIABLE, &boot_option(OTHER_NONCE)),
+                LoadOptionAttributes::empty(),
+            ),
+        ];
+        for (case, variables, category) in cases {
+            let files = HeldFiles::default();
+
+            let set = stage_new(
+                &variables,
+                &files,
+                hard_drive(),
+                request(1),
+                IMAGE_BYTES,
+                NONCE,
+            )
+            .expect("stage a new set");
+
+            let want = StagedSet {
+                nonce: NONCE,
+                boot_option: 0x0002,
+                image: StagedImage {
+                    path: IMAGE.to_owned(),
+                    sha256: image_digest,
+                },
+                requests: vec![request(1)],
+            };
+            assert_eq!(set, want, "{case}: the set");
+            assert_eq!(
+                files.files.borrow().get(IMAGE),
+                Some(&image_digest),
+                "{case}: the image"
+            );
+            assert_eq!(
+                record(&variables, STAGED_SET),
+                Some(want),
+                "{case}: the record"
+            );
+            let load_option = LoadOption {
+                attributes: LoadOptionAttributes::ACTIVE | LoadOptionAttributes::HIDDEN | category,
+                description: Ucs2String::try_from("uefisettings: a set staged for this boot")
+                    .expect("a description"),
+                file_paths: FilePathList::of(&[
+                    DevicePathNode::HardDrive(hard_drive()),
+                    DevicePathNode::FilePath(Ucs2String::try_from(IMAGE).expect("IMAGE")),
+                ])
+                .expect("a FilePathList"),
+                optional_data: optional_data(NONCE).expect("the command line"),
+            };
+            let nv_bs_rt = VariableAttributes::NON_VOLATILE
+                | VariableAttributes::BOOTSERVICE_ACCESS
+                | VariableAttributes::RUNTIME_ACCESS;
+            assert_eq!(
+                data(&variables, "Boot0002", EFI_GLOBAL_VARIABLE),
+                Some((load_option.encode(), nv_bs_rt)),
+                "{case}: Boot0002"
+            );
+            assert_eq!(
+                data(&variables, "BootNext", EFI_GLOBAL_VARIABLE),
+                Some((vec![0x02, 0x00], nv_bs_rt)),
+                "{case}: BootNext"
+            );
+            assert_eq!(
+                *variables.set.borrow(),
+                [
+                    key(STAGED_SET, UEFISETTINGS_VENDOR_GUID),
+                    key("Boot0002", EFI_GLOBAL_VARIABLE),
+                    key("BootNext", EFI_GLOBAL_VARIABLE),
+                ],
+                "{case}: the writes, in order"
+            );
+            assert_eq!(
+                StagedState::read(&variables).expect("the state"),
+                StagedState::Pending(set),
+                "{case}: the state"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_set_that_fails_to_stage_leaves_nothing_of_it() {
+        for failing in [
+            key(STAGED_SET, UEFISETTINGS_VENDOR_GUID),
+            key("Boot0000", EFI_GLOBAL_VARIABLE),
+            key("BootNext", EFI_GLOBAL_VARIABLE),
+        ] {
+            let held = HeldVariables::default();
+            let variables = FailingSet {
+                held: &held,
+                failing: failing.clone(),
+            };
+            let files = HeldFiles::default();
+
+            let got = stage_new(
+                &variables,
+                &files,
+                hard_drive(),
+                request(1),
+                IMAGE_BYTES,
+                NONCE,
+            )
+            .map_err(|err| format!("{err:#}"));
+
+            assert_eq!(got, Err(format!("no space for {failing}")), "{failing}");
+            assert!(
+                held.variables.borrow().is_empty(),
+                "{failing}: no variable stays"
+            );
+            assert!(files.files.borrow().is_empty(), "{failing}: no image stays");
+        }
+
+        // the image reads back as other bytes
+        let variables = HeldVariables::default();
+        let files = HeldFiles {
+            read_back: Some(DIGEST),
+            ..HeldFiles::default()
+        };
+        let got = stage_new(
+            &variables,
+            &files,
+            hard_drive(),
+            request(1),
+            IMAGE_BYTES,
+            NONCE,
+        )
+        .map_err(|err| format!("{err:#}"));
+        assert_eq!(
+            got,
+            Err(format!(
+                "\\EFI\\uefisettings\\uefisettings.efi reads back with SHA-256 {DIGEST}, not the \
+                 image's {}",
+                Sha256Digest(Sha256::digest(IMAGE_BYTES).into())
+            )),
+            "a changed read-back"
+        );
+        assert!(
+            variables.variables.borrow().is_empty(),
+            "read back: no variable"
+        );
+        assert_eq!(
+            *files.deleted.borrow(),
+            [IMAGE],
+            "read back: the image deleted"
+        );
+    }
+
+    /// A new set takes the lowest Boot#### that no load option, BootOrder entry or BootNext
+    /// holds, so that no BootOrder entry boots it unattended.
+    #[test]
+    fn a_new_set_takes_a_number_that_neither_boot_order_nor_boot_next_holds() {
+        // Boot0001 is gone, but BootOrder still lists it; BootNext names Boot0002, gone too
+        let variables = HeldVariables::default()
+            .with("Boot0000", EFI_GLOBAL_VARIABLE, &boot_option(OTHER_NONCE))
+            .with("BootOrder", EFI_GLOBAL_VARIABLE, &[0x01, 0x00, 0x00, 0x00])
+            .with("BootNext", EFI_GLOBAL_VARIABLE, &[0x02, 0x00]);
+
+        let set = stage_new(
+            &variables,
+            &HeldFiles::default(),
+            hard_drive(),
+            request(1),
+            IMAGE_BYTES,
+            NONCE,
+        )
+        .expect("stage a new set");
+
+        assert_eq!(set.boot_option, 0x0003, "the set's Boot####");
+        assert!(
+            held(&variables, "Boot0003", EFI_GLOBAL_VARIABLE),
+            "Boot0003 written"
+        );
+        assert!(
+            !held(&variables, "Boot0001", EFI_GLOBAL_VARIABLE),
+            "no Boot0001, which BootOrder lists"
+        );
+    }
+
+    /// A new set whose image file exists, as a set staged at the same time may have placed it,
+    /// fails and keeps that file: its undoing deletes only an image that it placed.
+    #[test]
+    fn a_new_set_over_an_existing_image_fails_and_keeps_it() {
+        let image_digest = Sha256Digest(Sha256::digest(IMAGE_BYTES).into());
+        let variables = HeldVariables::default();
+        let files = HeldFiles::default().with(IMAGE, image_digest);
+
+        let got = stage_new(
+            &variables,
+            &files,
+            hard_drive(),
+            request(1),
+            IMAGE_BYTES,
+            NONCE,
+        )
+        .map_err(|err| format!("{err:#}"));
+
+        assert_eq!(got, Err(format!("{IMAGE} exists")), "the refusal");
+        assert_eq!(
+            files.files.borrow().get(IMAGE),
+            Some(&image_digest),
+            "the image stays"
+        );
+        assert!(files.deleted.borrow().is_empty(), "nothing deleted");
+        assert!(
+            variables.variables.borrow().is_empty(),
+            "no variable written"
+        );
     }
 
     #[test]

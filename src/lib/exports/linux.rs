@@ -62,6 +62,7 @@ use crate::firmware_width::FirmwareWidth;
 use crate::firmware_width::FW_PLATFORM_SIZE_PATH;
 use crate::hii::extract;
 use crate::hii::extract::HiiSourceOptions;
+use crate::hii::package;
 #[cfg(configuration_tables)]
 use crate::hii::system_vendor_table;
 use crate::hii::EfivarDump;
@@ -78,6 +79,7 @@ use crate::ilorest::requests;
 use crate::ilorest::requests::Ilo5Dev;
 use crate::ilorest::requests::IloDevice;
 use crate::ilorest::requests::RedfishAttributes;
+use crate::staged_set::linux::NextBootStaging;
 use crate::translation::ilo::get_qa_variations_ilo;
 use crate::translation::ilo::IloTranslation;
 use crate::translation::translate_response;
@@ -583,12 +585,21 @@ fn compare_redfish_attributes(
     map
 }
 
-/// What get and set do with a question whose driver holds its value: no driver is reached here.
+/// What get and set do with a question whose driver holds its value: get reaches no driver here,
+/// and set stages it for the next boot.
 impl HiiBackend {
     pub(super) fn driver_held_values(
         _hiidb: &[u8],
         _efivars: &EfivarSource,
     ) -> Option<Box<dyn DriverHeldValues>> {
         None
+    }
+
+    pub(super) fn driver_held_setter(
+        hiidb: &[u8],
+        options: &SetOptions,
+    ) -> Result<Option<Box<dyn DriverHeldValues>>> {
+        let lists = package::read_db(hiidb)?;
+        Ok(Some(Box::new(NextBootStaging::of(options, &lists))))
     }
 }

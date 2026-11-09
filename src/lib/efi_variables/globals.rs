@@ -74,7 +74,7 @@ const NO_OS_INDICATIONS: &str = "none";
 const BOOT_OPTION_SUPPORT_COUNT: u32 = 0x0000_0300;
 /// NV, BS, RT: the attributes of each variable of UEFI 2.11 Table 3.1 that the OS may write, which
 /// variable set creates a missing one with.
-const WRITABLE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
+pub(crate) const WRITABLE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
     .union(VariableAttributes::BOOTSERVICE_ACCESS)
     .union(VariableAttributes::RUNTIME_ACCESS);
 /// Why the OS does not write a variable, in the words of UEFI 2.11 §3.3: those of Table 3.1 for
@@ -775,9 +775,59 @@ impl Setter {
     }
 }
 
+/// The Boot#### that BootCurrent names, if present.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only the Linux build stages a set for the next boot yet"
+    )
+)]
+pub(crate) fn boot_current(variables: &impl VariableData) -> Result<Option<LoadOptionName>> {
+    read_decoded(variables, "BootCurrent", boot_option)
+}
+
+/// What BootOptionSupport tells, if present.
+pub(crate) fn boot_option_support(
+    variables: &impl VariableData,
+) -> Result<Option<BootOptionSupport>> {
+    read_decoded(variables, "BootOptionSupport", |data| {
+        Ok(u32::from_le_bytes(exact(data, "a UINT32")?).into())
+    })
+}
+
+/// SecureBoot, 1 while the platform firmware operates in Secure Boot mode (UEFI 2.11 §3.3), if
+/// present.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only the Linux build stages a set for the next boot yet"
+    )
+)]
+pub(crate) fn secure_boot(variables: &impl VariableData) -> Result<Option<u8>> {
+    read_decoded(variables, "SecureBoot", |data| {
+        Ok(u8::from_le_bytes(exact(data, "a UINT8")?))
+    })
+}
+
 /// The Boot#### that BootNext names, if present.
 pub(crate) fn boot_next(variables: &impl VariableData) -> Result<Option<LoadOptionName>> {
     read_decoded(variables, "BootNext", boot_option)
+}
+
+/// The Boot#### options that BootOrder lists, in its order, if present.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only the Linux build stages a set for the next boot yet"
+    )
+)]
+pub(crate) fn boot_order(variables: &impl VariableData) -> Result<Option<Vec<LoadOptionName>>> {
+    read_decoded(variables, "BootOrder", |data| {
+        load_options(LoadOptionKind::Boot, data)
+    })
 }
 
 /// The bits of OsIndications, if present.
@@ -934,14 +984,7 @@ impl Codec {
             Self::Timeout => {
                 GlobalValue::Timeout(u16::from_le_bytes(exact(data, "a UINT16")?).into())
             }
-            Self::Order(kind) => GlobalValue::LoadOptions(
-                items::<2>(data, "UINT16")?
-                    .map(|number| LoadOptionName {
-                        kind,
-                        number: u16::from_le_bytes(number),
-                    })
-                    .collect(),
-            ),
+            Self::Order(kind) => GlobalValue::LoadOptions(load_options(kind, data)?),
             Self::BootOption => GlobalValue::LoadOption(boot_option(data)?),
             Self::Ascii => GlobalValue::Ascii(ascii(data)?),
             Self::OsIndications => GlobalValue::OsIndications(os_indications(data)?),
@@ -1037,6 +1080,19 @@ fn items<'a, const N: usize>(
             what,
         }),
     }
+}
+
+/// The load options of `kind` that `data`, an array of UINT16 (UEFI 2.11 §3.3), lists.
+fn load_options(
+    kind: LoadOptionKind,
+    data: &[u8],
+) -> std::result::Result<Vec<LoadOptionName>, MalformedData> {
+    Ok(items::<2>(data, "UINT16")?
+        .map(|number| LoadOptionName {
+            kind,
+            number: u16::from_le_bytes(number),
+        })
+        .collect())
 }
 
 /// The Boot#### that `data`, "a single UINT16" (UEFI 2.11 §3.3), names.

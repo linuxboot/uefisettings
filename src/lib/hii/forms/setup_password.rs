@@ -1043,23 +1043,46 @@ impl PasswordQuestions {
         &self,
         variables: &dyn FirmwareVariables,
     ) -> Result<WithheldBytes, WithholdingRefusal> {
-        match (variables.reach(), self.unresolved.as_slice()) {
+        match (
+            self.withheld_reaching(variables.reach()),
+            variables.reads_nothing(),
+        ) {
+            (Err(WithholdingRefusal::AnyVariable(_)), true) => {
+                Ok(self.password_and_candidate_bytes())
+            }
+            (Ok(withheld), _) => Ok(withheld),
+            (
+                Err(
+                    refusal @ (WithholdingRefusal::BootServices(_)
+                    | WithholdingRefusal::AnyVariable(_)),
+                ),
+                _,
+            ) => Err(refusal),
+        }
+    }
+
+    /// withheld, of variables that reach `reach` and read something.
+    fn withheld_reaching(&self, reach: VariableReach) -> Result<WithheldBytes, WithholdingRefusal> {
+        match (reach, self.unresolved.as_slice()) {
             (VariableReach::BootServices, [_, ..]) => Err(WithholdingRefusal::BootServices(
                 UnresolvedPasswords(self.unresolved.clone()),
             )),
             (VariableReach::Runtime, _) | (VariableReach::BootServices, []) => {
-                match (self.check_bounded(), variables.reads_nothing()) {
-                    (Err(refusal), false) => Err(WithholdingRefusal::AnyVariable(refusal)),
-                    (Ok(()), _) | (Err(_), true) => {
-                        let mut withheld = self.password_bytes();
-                        for candidate in &self.candidates {
-                            withheld.insert(candidate.key.clone(), candidate.bytes());
-                        }
-                        Ok(withheld)
-                    }
-                }
+                self.check_bounded()
+                    .map_err(WithholdingRefusal::AnyVariable)?;
+                Ok(self.password_and_candidate_bytes())
             }
         }
+    }
+
+    /// The bytes of password_bytes, and those of the variables that may hold the password of a
+    /// PASSWORD op whose VarStore is unknown.
+    fn password_and_candidate_bytes(&self) -> WithheldBytes {
+        let mut withheld = self.password_bytes();
+        for candidate in &self.candidates {
+            withheld.insert(candidate.key.clone(), candidate.bytes());
+        }
+        withheld
     }
 
     /// Refuses a HiiDB with IFR past an op where the walk for FormSets ends, whose PASSWORD ops,
@@ -1126,6 +1149,24 @@ impl PasswordQuestions {
         variables: V,
     ) -> Result<WithholdingVariables<V>, WithholdingRefusal> {
         let withheld = self.withheld(&variables)?;
+        Ok(WithholdingVariables::new(variables, withheld))
+    }
+
+    /// `variables`, which reach `reach` and read something, without the bytes that questions set
+    /// through them withhold, as withholding gives them.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "only the Linux build stages a set for the next boot yet"
+        )
+    )]
+    pub(crate) fn withholding_of<V>(
+        &self,
+        variables: V,
+        reach: VariableReach,
+    ) -> Result<WithholdingVariables<V>, WithholdingRefusal> {
+        let withheld = self.withheld_reaching(reach)?;
         Ok(WithholdingVariables::new(variables, withheld))
     }
 

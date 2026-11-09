@@ -117,8 +117,11 @@ use crate::hii::VariableKey;
 pub(crate) mod globals;
 #[cfg(variable_data)]
 #[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "nothing stages a set in a load option yet")
+    not(any(target_os = "linux", test)),
+    allow(
+        dead_code,
+        reason = "only the Linux build stages a set in a load option yet"
+    )
 )]
 pub(crate) mod load_option;
 #[cfg(variable_data)]

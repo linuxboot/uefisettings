@@ -20,6 +20,7 @@ use anyhow::Result;
 use super::CapsuleBackend;
 use super::DriverHeldValues;
 use super::HiiBackend;
+use super::SetOptions;
 use super::VariableBackend;
 use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfoSource;
@@ -100,5 +101,12 @@ impl HiiBackend {
         _efivars: &EfivarSource,
     ) -> Option<Box<dyn DriverHeldValues>> {
         None
+    }
+
+    pub(super) fn driver_held_setter(
+        _hiidb: &[u8],
+        _options: &SetOptions,
+    ) -> Result<Option<Box<dyn DriverHeldValues>>> {
+        Ok(None)
     }
 }

@@ -60,6 +60,10 @@ const DRIVER_HELD: &str = "question has no VarStore; its driver keeps the value,
      EFI_HII_CONFIG_ACCESS_PROTOCOL.CallBack() reaches (UEFI 2.11 §33.2.5.6), and after \
      ExitBootServices() no EFI device-handle-based protocol may be used (UEFI 2.11 §7.4.6); use \
      uefisettings.efi in the UEFI Shell";
+/// set stages a question that its driver holds for the next boot, on the ESP, which no boot here
+/// mounts
+const NO_MOUNTED_ESP: &str =
+    "no mounted vfat volume is an EFI system partition; mount it. Mounted: none";
 const NO_VALUE_SOURCE: &str = "question has no VarStore, READ or WRITE expression, or \
      EFI_IFR_FLAG_CALLBACK, one of which UEFI 2.11 §33.2.5.6 requires";
 const NO_READ: &str = "question has no VarStore, READ expression or EFI_IFR_FLAG_CALLBACK, so it \
@@ -306,14 +310,20 @@ fn set_of_a_write_into_a_store_without_its_variable_is_refused() {
     assert_eq!(variable_data(ABSENT_BUFFER), None, "AbsentBuffer created");
 }
 
-/// get and set say what each question without a VarStore lacks, or that its driver keeps its
-/// value, which nothing reaches from Linux.
+/// get and set say what each question without a VarStore lacks; get says that its driver keeps
+/// its value, which nothing reaches from Linux, and set, which stages it for the next boot, that no
+/// ESP is mounted.
 #[test]
 fn get_and_set_of_storageless_questions_say_why_they_are_refused() {
     // (question, answer for set, refusal of get, refusal of set): None where the other test
     // checks that it succeeds
     let cases = [
-        ("Driver held", "First", Some(DRIVER_HELD), Some(DRIVER_HELD)),
+        (
+            "Driver held",
+            "First",
+            Some(DRIVER_HELD),
+            Some(NO_MOUNTED_ESP),
+        ),
         (
             "No value source",
             "1",

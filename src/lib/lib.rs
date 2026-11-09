@@ -31,7 +31,10 @@ mod chattr;
 mod efi_status;
 mod efi_variables;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-#[cfg_attr(not(test), allow(dead_code, reason = "nothing locates the ESP yet"))]
+#[cfg_attr(
+    target_os = "windows",
+    allow(dead_code, reason = "the Windows build locates no ESP yet")
+)]
 mod esp;
 mod exit_status;
 pub mod exports;
@@ -55,8 +58,11 @@ mod runtime_time_services;
 pub mod secret_file;
 #[cfg(variable_data)]
 #[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "nothing stages a set for the next boot yet")
+    not(any(target_os = "linux", test)),
+    allow(
+        dead_code,
+        reason = "only the Linux build stages a set for the next boot yet"
+    )
 )]
 mod staged_set;
 pub mod terminal_text;

@@ -31,6 +31,7 @@ use super::EfivarSource;
 use super::HiiBackend;
 use super::IncludedStates;
 use super::QuestionList;
+use super::SetOptions;
 use super::UnsafeOperation;
 use super::UnsafeOperations;
 use super::VariableBackend;
@@ -232,6 +233,14 @@ impl HiiBackend {
             EfivarSource::System => Some(Box::new(DriverCallbacks { hiidb })),
             EfivarSource::Disabled => None,
         }
+    }
+
+    /// set calls the driver's Callback()s, as get does.
+    pub(super) fn driver_held_setter<'a>(
+        hiidb: &'a [u8],
+        _options: &SetOptions,
+    ) -> Result<Option<Box<dyn DriverHeldValues + 'a>>> {
+        Ok(Self::driver_held_values(hiidb, &EfivarSource::System))
     }
 }
 

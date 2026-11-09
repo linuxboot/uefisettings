@@ -159,6 +159,18 @@ impl EfivarArgs {
 /// gates them, as on Linux.
 pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE];
 
+/// None: the Windows build does not stage a set for the next boot yet.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct StagingArgs {}
+
+impl StagingArgs {
+    pub(super) fn image(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
 /// get, in this machine's HiiDB.
 pub(super) fn auto_get(
     question: &QuestionArgs,
@@ -194,6 +206,7 @@ pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
     _selection: &SelectionArgs,
+    _staging: &StagingArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {

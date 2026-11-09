@@ -68,6 +68,8 @@ use platform::HiiSourceUnsafeArgs;
 use platform::ListStringsHiiDbArgs;
 use platform::PlatformCommands;
 #[cfg(all(system_hiidb, system_variables))]
+use platform::StagingArgs;
+#[cfg(all(system_hiidb, system_variables))]
 use platform::VolatileArgs;
 #[cfg(system_variables)]
 use variable_command::VariableCommand;
@@ -191,6 +193,8 @@ enum Commands {
         unsafe_operations: UnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
+        #[command(flatten)]
+        staging: StagingArgs,
     },
     /// Show the translation/spellings database for questions and answers
     #[command(next_display_order = None)]
@@ -254,6 +258,8 @@ enum HiiSubcommands {
         unsafe_operations: UnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
+        #[command(flatten)]
+        staging: StagingArgs,
     },
     /// Show a human readable representation of the Hii Forms
     #[command(next_display_order = None)]
@@ -549,16 +555,18 @@ fn unsafe_long_help(arg: clap::Arg, operations: &[&str]) -> clap::Arg {
     ))
 }
 
-/// The SetOptions of `selection`, `unsafe_operations` and `volatile`.
+/// The SetOptions of `selection`, `unsafe_operations`, `volatile` and `staging`.
 #[cfg(all(system_hiidb, system_variables))]
 fn set_options(
     selection: &SelectionArgs,
     unsafe_operations: &UnsafeArgs,
     volatile: &VolatileArgs,
+    staging: &StagingArgs,
 ) -> SetOptions {
     let mut options = SetOptions::from(selection);
     options.unsafe_operations = unsafe_operations.operations();
     options.volatile = volatile.policy();
+    options.staging_image = staging.image();
     options
 }
 
@@ -715,9 +723,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 selection,
                 unsafe_operations,
                 volatile,
+                staging,
             } => {
                 let (question, value) = target.target()?;
-                let options = set_options(selection, unsafe_operations, volatile);
+                let options = set_options(selection, unsafe_operations, volatile, staging);
                 hii_set(question, &value, &options, output.json, source)?
             }
             HiiSubcommands::ShowIFR {
@@ -776,9 +785,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             selection,
             unsafe_operations,
             volatile,
+            staging,
         } => {
-            let options = set_options(selection, unsafe_operations, volatile);
-            platform::auto_set(target, output.json, selection, &options, source)?
+            let options = set_options(selection, unsafe_operations, volatile, staging);
+            platform::auto_set(target, output.json, selection, staging, &options, source)?
         }
         Commands::ShowTranslations { output } => {
             print_with_style(&*translation_db, output.json)?;
@@ -1621,6 +1631,36 @@ mod tests {
                 clap::error::ErrorKind::UnknownArgument,
                 "{flags:?}"
             );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn set_takes_the_image_that_it_stages() {
+        let image = "/boot/uefisettings.efi";
+        let cases: [(&[&str], Option<std::path::PathBuf>); 2] = [
+            (&["set", "Question", "Value"], None),
+            (
+                &["set", "Question", "Value", "--image", image],
+                Some(image.into()),
+            ),
+        ];
+        for (args, want) in cases {
+            let parsed = hii(args).unwrap_or_else(|error| panic!("parse {args:?}: {error}"));
+            let HiiSubcommands::Set {
+                selection,
+                unsafe_operations,
+                volatile,
+                staging,
+                ..
+            } = parsed
+            else {
+                panic!("{args:?} is no set: {parsed:?}");
+            };
+
+            let options = set_options(&selection, &unsafe_operations, &volatile, &staging);
+
+            assert_eq!(options.staging_image, want, "{args:?}");
         }
     }
 

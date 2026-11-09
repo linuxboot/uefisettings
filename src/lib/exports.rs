@@ -11,6 +11,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::anyhow;
@@ -629,6 +630,9 @@ pub struct SetOptions {
     pub volatile: VolatileWrites,
     /// The language to show texts in instead of the platform language (PlatformLang), if stated
     pub language: Option<String>,
+    /// On Linux, the uefisettings.efi that set copies to the EFI system partition when it stages
+    /// a question that its driver holds for the next boot
+    pub staging_image: Option<PathBuf>,
 }
 
 /// The options of HiiBackend::list_questions_using.
@@ -735,10 +739,11 @@ pub(crate) trait DriverHeldValues {
 
 /// The refusal of set of `question` for `reason`.
 #[cfg_attr(
-    not(target_os = "uefi"),
+    not(any(target_os = "uefi", target_os = "linux")),
     allow(
         dead_code,
-        reason = "only the UEFI Shell build reaches a question's driver yet"
+        reason = "only the UEFI Shell build reaches a question's driver, and only the Linux build \
+                  stages a set for it yet"
     )
 )]
 pub(crate) fn set_refusal(question: &str, reason: impl std::fmt::Display) -> anyhow::Error {
@@ -1018,7 +1023,7 @@ impl HiiBackend {
         selector: Option<&str>,
         options: &SetOptions,
     ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
-        let held = Self::driver_held_values(db_bytes, &EfivarSource::System);
+        let held = Self::driver_held_setter(db_bytes, options)?;
         Self::set_in(
             db_bytes,
             question,
@@ -9090,6 +9095,47 @@ mod tests {
             *driver.sets.borrow(),
             [(8, 1), (7, 1), (9, 1)],
             "the drivers asked, in order"
+        );
+    }
+
+    /// set names a question that it stages for the next boot, in its errors, by its package list
+    /// followed by `(staged for the next boot)`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_staged_question_s_store_is_named_staged_for_the_next_boot() {
+        let parsed = package::read_db(&storageless_checkbox_list([0x77; 16], 7, 0x04))
+            .expect("parse the HiiDB");
+        let staging =
+            crate::staged_set::linux::NextBootStaging::of(&SetOptions::default(), &parsed);
+        let selected = select_for_set(
+            &parsed,
+            &QuestionSelector::from("Q"),
+            &BTreeSet::from(["Q".to_string()]),
+            &SetOptions::default(),
+            &[],
+            &mut PendingOperations::new(UnsafeOperations::Refuse),
+            &mut EfivarReader::with_variables(Box::new(MemoryVariables::default())),
+            Some(&staging),
+        )
+        .expect("select Q");
+        let [question] = selected.as_slice() else {
+            panic!("one match of Q, not {}", selected.len());
+        };
+        let driver_held = question
+            .descriptor
+            .driver_held()
+            .expect("held by its driver");
+        let store = DriverHeldSet {
+            selected: question,
+            held: &staging,
+            driver_held,
+            value: 1,
+        };
+
+        assert_eq!(
+            store.label(),
+            format!("{} (staged for the next boot)", question.guid),
+            "the label of Q's store"
         );
     }
 

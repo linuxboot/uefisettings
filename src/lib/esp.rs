@@ -22,6 +22,8 @@ use crate::efi_variables::load_option::HardDrive;
 use crate::efi_variables::load_option::PartitionSignature;
 use crate::hii::package::Guid;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 #[cfg(test)]
 mod sfdisk_images;
 
@@ -692,13 +694,9 @@ mod tests {
 
     impl From<&SfdiskImage> for DiskImage {
         fn from(image: &SfdiskImage) -> Self {
-            let mut bytes = vec![0; image.length];
-            for (offset, run) in image.runs {
-                bytes[*offset..offset + run.len()].copy_from_slice(run);
-            }
             Self {
                 block_size: image.block_size,
-                bytes,
+                bytes: image.bytes(),
             }
         }
     }

@@ -17,6 +17,7 @@
 use std::fmt::Debug;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 use std::ptr;
 use std::ptr::NonNull;
 use std::time::SystemTime;
@@ -313,6 +314,18 @@ impl VolatileArgs {
     }
 }
 
+/// None: set applies a question that its driver holds at once here, and stages nothing.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct StagingArgs {}
+
+impl StagingArgs {
+    pub(super) fn image(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
 /// get, in this firmware's HII database.
 pub(super) fn auto_get(
     question: &QuestionArgs,
@@ -334,6 +347,7 @@ pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
     _selection: &SelectionArgs,
+    _staging: &StagingArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {

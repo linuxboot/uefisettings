@@ -329,6 +329,24 @@ impl QuestionDescriptor {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+impl DriverHeldQuestion {
+    /// A CHECKBOX whose driver holds its value: QuestionId `question_id` of the FormSet
+    /// `form_set`, which declares no store.
+    pub(crate) fn checkbox(form_set: Guid, question_id: u16) -> Self {
+        Self {
+            form_set,
+            question_id,
+            value_type: IfrValueType::Boolean,
+            initial: 0,
+            stores: Vec::new(),
+            read_expression: false,
+            write_expression: false,
+            display: ValueDisplay::CheckBox,
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg(efivar_dumps)]
 mod tests {
