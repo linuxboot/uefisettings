@@ -399,8 +399,8 @@ pub struct ParsedPackageList {
     /// The forms that read_db drops from `forms`, whose PASSWORD ops are kept and resolved where
     /// they parse
     pub disabled_forms: Vec<forms::DisabledForm>,
-    /// The FormSets and disabled forms of each of its form packages and the first VarStores that
-    /// those FormSets declare
+    /// The FormSets of each of its form packages, which hold their disabled forms too
+    /// (DisabledForm::root_index), and the first VarStores that those FormSets declare
     pub(crate) first_var_stores: Vec<forms::FirstVarStores>,
 }
 
@@ -481,17 +481,21 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
                 let form_sets = forms::parse_form_sets(&mut package_cursor, package_list.guid)
                     .context("failed to parse a form package")?;
+                let roots_before = roots.len();
                 first_var_stores.push(forms::FirstVarStores {
-                    form_sets: roots.len()..roots.len() + form_sets.roots.len(),
-                    disabled_forms: disabled_forms.len()
-                        ..disabled_forms.len() + form_sets.disabled_forms.len(),
+                    form_sets: roots_before..roots_before + form_sets.roots.len(),
                     declared_by: form_sets.first_var_stores,
                 });
                 roots.extend(form_sets.roots);
                 ignored_ifr.extend(form_sets.ignored);
                 outside_ifr.extend(form_sets.outside);
                 malformed_outside_stores.extend(form_sets.malformed_stores);
-                disabled_forms.extend(form_sets.disabled_forms);
+                disabled_forms.extend(
+                    form_sets
+                        .disabled_forms
+                        .into_iter()
+                        .map(|disabled| disabled.after_roots(roots_before)),
+                );
             }
             // NewPackageList creates the one device path package of a list (UEFI 2.10 §33.3.4)
             PackageType::DevicePath => {

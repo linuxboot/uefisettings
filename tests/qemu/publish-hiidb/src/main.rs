@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -43,6 +43,10 @@
 //! [`plaintext_password_forms`] in the HII database, for `uefisettings.efi` in the UEFI Shell,
 //! which exports the database. `rt-data-password-forms` is `rt-data`, after it does the same,
 //! so that Linux finds them too.
+//! `nested-password-forms` publishes nothing: it creates the variables of
+//! [`nested_password_forms`] if they are missing and registers its package list in the HII
+//! database, for `uefisettings.efi` in the UEFI Shell. `rt-data-nested-password-forms` is
+//! `rt-data`, after it does the same, so that Linux finds it too.
 //! `enhanced-auth-forms` does the same with the package list of [`enhanced_auth_forms`].
 //! `dropped-password-forms` does the same with the package list of [`dropped_password_forms`].
 //! `formset-skip-forms` registers the package lists of [`formset_skip_forms`] too, which a later
@@ -112,6 +116,7 @@ mod first_store_password_forms;
 mod formset_skip_forms;
 mod global_variable_forms;
 mod hii_package;
+mod nested_password_forms;
 mod outside_form_set_password_forms;
 mod padded_strings;
 mod password_forms;
@@ -259,6 +264,16 @@ fn efi_main() -> Status {
                     "publish-hiidb: password forms registered; {length} bytes at {address:#x}"
                 );
             }),
+        Some(Task::RegisterNestedPasswordForms) => register_nested_password_forms()
+            .map(|()| println!("publish-hiidb: registered the nested password forms")),
+        Some(Task::PublishNestedPasswordForms) => register_nested_password_forms()
+            .and_then(|()| publish(MemoryType::RUNTIME_SERVICES_DATA, Database::Exported))
+            .map(|(address, length)| {
+                println!(
+                    "publish-hiidb: nested password forms registered; {length} bytes at \
+                     {address:#x}"
+                );
+            }),
         Some(Task::RegisterEnhancedAuthForms) => register_package_list(
             &enhanced_auth_forms::package_list_bytes(),
             "registering the enhanced authenticated forms",
@@ -357,7 +372,7 @@ fn efi_main() -> Status {
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
                  |rt-data-readwrite-forms|wakeup-time-forms|password-forms\
-                 |rt-data-password-forms\
+                 |rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms\
                  |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
                  |disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms\
                  |outside-form-set-password-forms|rt-data-outside-form-set-password-forms\
@@ -391,6 +406,12 @@ enum Task {
     RegisterPasswordForms,
     /// Do what RegisterPasswordForms does, then publish the database in runtime-data pages.
     PublishPasswordForms,
+    /// Create the variables of [`nested_password_forms`] if missing and register its package
+    /// list in the HII database.
+    RegisterNestedPasswordForms,
+    /// Do what RegisterNestedPasswordForms does, then publish the database in runtime-data
+    /// pages.
+    PublishNestedPasswordForms,
     /// Register the package list of [`enhanced_auth_forms`] in the HII database.
     RegisterEnhancedAuthForms,
     /// Register the package list of [`dropped_password_forms`] in the HII database.
@@ -476,6 +497,12 @@ fn load_option() -> Option<Task> {
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
         Ok(option) if option == cstr16!("rt-data-password-forms") => {
             Some(Task::PublishPasswordForms)
+        }
+        Ok(option) if option == cstr16!("nested-password-forms") => {
+            Some(Task::RegisterNestedPasswordForms)
+        }
+        Ok(option) if option == cstr16!("rt-data-nested-password-forms") => {
+            Some(Task::PublishNestedPasswordForms)
         }
         Ok(option) if option == cstr16!("enhanced-auth-forms") => {
             Some(Task::RegisterEnhancedAuthForms)
@@ -700,6 +727,35 @@ fn register_first_store_password_forms() -> Result<(), Failure> {
     register_package_list(
         &first_store_password_forms::package_list_bytes(),
         "registering the first store password forms",
+    )
+}
+
+/// Creates the variables of [`nested_password_forms`] unless they exist, then registers its
+/// package list.
+fn register_nested_password_forms() -> Result<(), Failure> {
+    create_missing_variable(
+        nested_password_forms::PASSWORD_STORE_NAME,
+        nested_password_forms::VENDOR,
+        nested_password_forms::ATTRIBUTES,
+        &nested_password_forms::PASSWORD_STORE_DATA,
+        (
+            "reading the NestedPassword variable",
+            "creating the NestedPassword variable",
+        ),
+    )?;
+    create_missing_variable(
+        nested_password_forms::CHOICE_STORE_NAME,
+        nested_password_forms::VENDOR,
+        nested_password_forms::ATTRIBUTES,
+        &nested_password_forms::CHOICE_STORE_DATA,
+        (
+            "reading the NestedChoice variable",
+            "creating the NestedChoice variable",
+        ),
+    )?;
+    register_package_list(
+        &nested_password_forms::package_list_bytes(),
+        "registering the nested password forms",
     )
 }
 

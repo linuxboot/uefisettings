@@ -51,6 +51,7 @@ use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
 use crate::parse_error::ParseError;
 use crate::parse_error::ReadParsed;
+use conditions::constant_condition;
 use conditions::enclosing_form_set;
 use conditions::parse_question_header;
 use conditions::question_state;
@@ -60,6 +61,7 @@ use conditions::skips_scope;
 use conditions::ExpressionInputs;
 use conditions::QuestionExpression;
 use conditions::QuestionValues;
+use conditions::Truth;
 use conditions::VarStoreValues;
 use cross_reference::display_ref_answer;
 use cross_reference::CrossReference;
@@ -1028,6 +1030,15 @@ pub struct FormSet {
     /// As many as bits 0:1 of Flags count; bits 2:7 are reserved (UEFI 2.11 §33.3.8.3.26)
     #[br(count = usize::from(flags & EFI_IFR_FORM_SET_CLASS_GUID_COUNT))]
     pub class_guids: Vec<Guid>,
+    /// The VarStoreIds of the VarStore ops in the scopes of its FORMs and FORM_MAPs, which
+    /// handle_form_set records as it parses them, so that declared_var_store walks those forms only
+    /// for such an id
+    #[br(default)]
+    pub(super) var_stores_in_forms: BTreeSet<u16>,
+    /// Those of the forms that handle_form_set disables, which leave the tree, so that
+    /// declared_var_store refuses a lookup of such an id
+    #[br(default)]
+    pub(super) var_stores_in_disabled_forms: BTreeSet<u16>,
 }
 
 impl FormSet {
@@ -1405,9 +1416,10 @@ fn names_short_var_store(op: &IFROperation, var_store_id: u16) -> bool {
 /// VarStore `var_store_id` of `op`, if its FormSet declares it as a VARSTORE_EFI of the form
 /// before UEFI 2.3.1.
 fn short_var_store_of(op: &IFROperation, var_store_id: u16) -> Option<ShortVarStoreEfi> {
-    match declared_var_store(&enclosing_form_set(op)?.borrow(), var_store_id)? {
-        DeclaredStore::ShortEfi(store) => Some(store),
-        DeclaredStore::Variable(_) | DeclaredStore::NameValue(_) => None,
+    match declared_var_store(&enclosing_form_set(op)?.borrow(), var_store_id) {
+        Ok(Some(DeclaredStore::ShortEfi(store))) => Some(store),
+        // a lookup that fails refuses the question as form_set_varstore reads it
+        Ok(Some(DeclaredStore::Variable(_) | DeclaredStore::NameValue(_)) | None) | Err(_) => None,
     }
 }
 
@@ -2032,8 +2044,14 @@ pub(super) fn parse_form_sets(
                             open_past_end = Some(offset);
                         }
                         var_stores.extend(parsed.var_stores);
+                        let roots_before = roots.len();
                         roots.push(parsed.root);
-                        disabled_forms.extend(parsed.disabled_forms);
+                        disabled_forms.extend(
+                            parsed
+                                .disabled_forms
+                                .into_iter()
+                                .map(|disabled| disabled.after_roots(roots_before)),
+                        );
                         for store in parsed.unknown_scope_stores {
                             let op = op_at(package_cursor.get_ref(), store)?;
                             walked.push((store, op, OutsidePlace::UnknownScope));
@@ -2125,12 +2143,12 @@ fn first_var_stores(
     let mut outside = outside.iter().peekable();
     for (offset, store) in var_stores {
         while let Some(op) = outside.next_if(|op| op.offset < *offset) {
-            if let Some((var_store_id, _)) = declared_store(&op.op) {
+            if let Some((var_store_id, _)) = declared_store(&op.op.parsed_data) {
                 first.entry(var_store_id).or_insert(None);
             }
         }
         let op = store.borrow();
-        if let Some((var_store_id, _)) = declared_store(&op) {
+        if let Some((var_store_id, _)) = declared_store(&op.parsed_data) {
             first.entry(var_store_id).or_insert_with(|| {
                 let form_set = enclosing_form_set(&op)?;
                 Some(FirstVarStore {
@@ -2327,6 +2345,31 @@ impl DeclaredStorage {
     /// :156, Setup.c GetToken :1069-1072, GetQuestionValue :1772-1774), any string for a question
     /// that is not read.
     fn declare(&mut self, op: &IFROperation, package: &[u8], offset: u64) {
+        self.declare_with(op, |guid_offset| guid_at(package, offset, guid_offset));
+    }
+
+    /// Adds what the op `op` of the tree of a FormSet declares, as declare does, from its op
+    /// alone: its GUID is unknown where it runs past its Length, as the bytes after the op are
+    /// not in the tree.
+    pub(crate) fn declare_in_tree(&mut self, op: &IFROperation) {
+        self.declare_with(op, |guid_offset| {
+            let start = guid_offset.checked_sub(u64::from(IFR_OPERATION_HEADER_SIZE))?;
+            let start = usize::try_from(start).ok()?;
+            let bytes: [u8; 16] = op
+                .data
+                .get(start..start.checked_add(16)?)?
+                .try_into()
+                .ok()?;
+            Some(Guid::from(bytes))
+        });
+    }
+
+    /// declare, with the GUID at each offset from the start of `op` from `guid_at_offset`.
+    fn declare_with(
+        &mut self,
+        op: &IFROperation,
+        guid_at_offset: impl FnOnce(u64) -> Option<Guid>,
+    ) {
         let mut data = Cursor::new(&op.data);
         let (variable, guid_offset) = match op.op_code {
             IFROpCode::VarStore => (
@@ -2348,7 +2391,7 @@ impl DeclaredStorage {
             Some(variable) => {
                 self.variables.insert(variable);
             }
-            None => self.guids.insert(guid_at(package, offset, guid_offset)),
+            None => self.guids.insert(guid_at_offset(guid_offset)),
         }
     }
 
@@ -2504,15 +2547,14 @@ pub(super) struct FormSets {
     pub(super) first_var_stores: BTreeMap<u16, FirstVarStore>,
 }
 
-/// The FormSets of a form package of a package list, by index in its forms, the forms that read_db
-/// disables in them, by index in its disabled_forms, and the first VarStore of each VarStoreId of
-/// the package where a FormSet declares it, by that id: the VarStore that edk2-stable202608
-/// ConfigKeywordHandler.c FindStorageFromVarId (:1520) takes for every question of the id in the
-/// package (first_var_stores).
+/// The FormSets of a form package of a package list, by index in its forms, which the forms that
+/// read_db disables in them name too (DisabledForm::root_index), and the first VarStore of each
+/// VarStoreId of the package where a FormSet declares it, by that id: the VarStore that
+/// edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId (:1520) takes for every question
+/// of the id in the package (first_var_stores).
 #[derive(Debug, Clone)]
 pub(crate) struct FirstVarStores {
     pub(crate) form_sets: std::ops::Range<usize>,
-    pub(crate) disabled_forms: std::ops::Range<usize>,
     pub(crate) declared_by: BTreeMap<u16, FirstVarStore>,
 }
 
@@ -2570,9 +2612,23 @@ pub struct DisabledForm {
     /// Its FORM or FORM_MAP op, with its parent in the tree, holding its ops, undecoded from the
     /// op that disables it on
     pub form: Rc<RefCell<IFROperation>>,
+    /// The index of the root of its FormSet among the roots that its parse returns: in the forms
+    /// of its package list (ParsedPackageList::forms) for read_db
+    pub root_index: usize,
 }
 
 impl DisabledForm {
+    /// Itself in a parse that returns `roots_before` roots before those of the parse that
+    /// returned it, as parse_form_sets and read_package_list collect the roots in order.
+    pub(super) fn after_roots(self, roots_before: usize) -> Self {
+        #[cfg(test)]
+        ROOT_INDICES_SHIFTED.with(|shifted| shifted.set(shifted.get() + 1));
+        Self {
+            root_index: self.root_index + roots_before,
+            ..self
+        }
+    }
+
     /// Its record, as a form of a form package of the package list `package_list`.
     pub fn record(&self, package_list: Guid) -> IgnoredIfr {
         IgnoredIfr {
@@ -2642,6 +2698,11 @@ thread_local! {
     /// The ops that handle_form_set_within has parsed on this thread, which tests of the bound on
     /// parse_form_sets' parses count.
     pub(crate) static OPS_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The calls of DisabledForm::after_roots on this thread, which shifts the root index of a
+    /// disabled form as each parse collects it, which tests of the bound on grouping disabled
+    /// forms by FormSet count.
+    pub(crate) static ROOT_INDICES_SHIFTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// The root of handle_form_set_within, for the tests, at MAX_SCOPE_NESTING
@@ -2771,6 +2832,7 @@ fn handle_form_set_within(
                     }
                 }
                 drop(parent);
+                record_disabled_var_stores(&disabled.form);
                 disabled_forms.push(disabled);
             }
 
@@ -2835,6 +2897,8 @@ fn handle_form_set_within(
                     offset: form_offset,
                     reason,
                     form,
+                    // the one root that this parse returns
+                    root_index: 0,
                 };
                 debug!(
                     "disabling, at offset {}, {}",
@@ -2855,6 +2919,9 @@ fn handle_form_set_within(
             .push(Rc::clone(&current_node));
         if is_var_store {
             var_stores.push((offset, Rc::clone(&current_node)));
+        }
+        if skipped_depth == 0 {
+            record_var_store_in_form(&current_node.borrow());
         }
 
         if open_scope {
@@ -3148,6 +3215,58 @@ struct UndecodedOp {
     detail: String,
 }
 
+/// Records the VarStoreId of `op`, if it is a VarStore op in the scope of a FORM or FORM_MAP, in
+/// the FormSet that holds that FORM (FormSet::var_stores_in_forms).
+fn record_var_store_in_form(op: &IFROperation) {
+    if !matches!(
+        op.op_code,
+        IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue
+    ) {
+        return;
+    }
+    let (Some((var_store_id, _)), Some(form_set)) =
+        (declared_store(&op.parsed_data), form_set_of_form(op))
+    else {
+        return;
+    };
+    let mut form_set = form_set.borrow_mut();
+    if let ParsedOperation::FormSet(form_set) = &mut form_set.parsed_data {
+        form_set.var_stores_in_forms.insert(var_store_id);
+    }
+}
+
+/// Records the VarStoreId of each VarStore op of the disabled form `form` in the FormSet that
+/// holds it (FormSet::var_stores_in_disabled_forms).
+fn record_disabled_var_stores(form: &Rc<RefCell<IFROperation>>) {
+    walk_scopes(std::slice::from_ref(form), (), |node, ()| {
+        let op = node.borrow();
+        if let (Some((var_store_id, _)), Some(form_set)) =
+            (declared_store(&op.parsed_data), form_set_of_form(&op))
+        {
+            if let ParsedOperation::FormSet(form_set) = &mut form_set.borrow_mut().parsed_data {
+                form_set.var_stores_in_disabled_forms.insert(var_store_id);
+            }
+        }
+        Walk::Enter(())
+    });
+}
+
+/// The FormSet that holds `op` if a FORM or FORM_MAP of that FormSet holds `op`.
+fn form_set_of_form(op: &IFROperation) -> Option<Rc<RefCell<IFROperation>>> {
+    let mut in_form = false;
+    let mut parent = op.parent.as_ref().and_then(Weak::upgrade);
+    while let Some(node) = parent {
+        let op_code = node.borrow().op_code;
+        match op_code {
+            IFROpCode::Form | IFROpCode::FormMap => in_form = true,
+            IFROpCode::FormSet => return in_form.then_some(node),
+            _ => {}
+        }
+        parent = node.borrow().parent.as_ref().and_then(Weak::upgrade);
+    }
+    None
+}
+
 fn handle_opcode(node: &mut IFROperation) -> Result<()> {
     let mut data_cursor = Cursor::new(&node.data);
 
@@ -3183,37 +3302,11 @@ fn handle_opcode(node: &mut IFROperation) -> Result<()> {
             debug!("OneOfOption is {:?}", parsed);
             node.parsed_data = ParsedOperation::OneOfOption(parsed);
         }
-        IFROpCode::VarStore => {
-            let parsed: VarStore = data_cursor
-                .parse_ne()
-                .context("failed to parse VarStore's data")?;
-
-            debug!("VarStore is {:?}", &parsed);
-
-            node.parsed_data = ParsedOperation::VarStore(parsed);
-        }
-        IFROpCode::VarStoreNameValue => {
-            let parsed: VarStoreNameValue = data_cursor
-                .parse_ne()
-                .context("failed to parse VarStoreNameValue's data")?;
-            debug!("VarStoreNameValue is {:?}", parsed);
-            node.parsed_data = ParsedOperation::VarStoreNameValue(parsed);
-        }
-        IFROpCode::VarStoreEfi if node.length < VAR_STORE_EFI_SIZE => {
-            let parsed: ShortVarStoreEfi = data_cursor
-                .parse_ne()
-                .context("failed to parse VarStoreEfi's data")?;
-            debug!("ShortVarStoreEfi is {:?}", parsed);
-            node.parsed_data = ParsedOperation::ShortVarStoreEfi(parsed);
-        }
-        IFROpCode::VarStoreEfi => {
-            // this is implemented in hiilib and the docs for this are relatively clear
-            // so I implemented this but I haven't seen it being used anywhere in the dbdumps I have
-            let parsed: VarStoreEfi = data_cursor
-                .parse_ne()
-                .context("failed to parse VarStoreEfi's data")?;
-            debug!("VarStoreEfi is {:?}", parsed);
-            node.parsed_data = ParsedOperation::VarStoreEfi(parsed);
+        IFROpCode::VarStore | IFROpCode::VarStoreNameValue | IFROpCode::VarStoreEfi => {
+            if let Some(parsed) = decode_var_store(node)? {
+                debug!("VarStore op is {:?}", parsed);
+                node.parsed_data = parsed;
+            }
         }
         IFROpCode::DefaultStore => {
             let parsed: DefaultStore = data_cursor
@@ -4943,7 +5036,7 @@ fn display_answer(
 }
 
 /// find_corresponding_varstore bubble's up from current node till we find a FormSet.
-/// then it looks for varstores which will be FormSet's children
+/// then it looks for varstores that the FormSet declares (form_set_varstore)
 fn find_corresponding_varstore(
     node: Rc<RefCell<IFROperation>>,
     var_store_id: u16,
@@ -4982,22 +5075,24 @@ fn find_corresponding_varstore(
     }
 }
 
-/// Returns the varstore of `var_store_id` among the children of `form_set`, as `question` reads
-/// it: of a VARSTORE_EFI before UEFI 2.3.1, the EFI variable of its VarName.
+/// Returns the varstore of `var_store_id` that `form_set` declares (declared_var_store), as
+/// `question` reads it: of a VARSTORE_EFI before UEFI 2.3.1, the EFI variable of its VarName.
 fn form_set_varstore(
     form_set: &IFROperation,
     var_store_id: u16,
     question: &IFROperation,
 ) -> Result<Box<dyn VariableStore>> {
-    match declared_var_store(form_set, var_store_id) {
+    match declared_var_store(form_set, var_store_id)? {
         Some(DeclaredStore::Variable(store)) => Ok(store),
         Some(DeclaredStore::NameValue(guid)) => Err(NameValueStore { guid }.into()),
         Some(DeclaredStore::ShortEfi(store)) => Ok(Box::new(short_efi_variable(&store, question)?)),
-        None => Err(anyhow!(
-            "no supported varstore with matching id {:#06x} found",
-            var_store_id
-        )),
+        None => Err(undeclared_var_store(var_store_id)),
     }
+}
+
+/// Why a question of `var_store_id` has no store.
+fn undeclared_var_store(var_store_id: u16) -> anyhow::Error {
+    anyhow!("no supported varstore with matching id {var_store_id:#06x} found")
 }
 
 /// The EFI variable of `question` on the VARSTORE_EFI before UEFI 2.3.1 `store`: of a ONE_OF,
@@ -5052,13 +5147,81 @@ enum DeclaredStore {
     ShortEfi(ShortVarStoreEfi),
 }
 
-/// Returns the VarStore of `var_store_id` that `form_set` declares, if any: the first among its
-/// children.
-fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Option<DeclaredStore> {
-    form_set.children.iter().find_map(|child| {
-        let (declared, store) = declared_store(&child.borrow())?;
-        (declared == var_store_id).then_some(store)
-    })
+/// Returns the VarStore of `var_store_id` that `form_set` declares where edk2 creates it, if any:
+/// the first of the id that form_set_list_var_stores meets. Why not, if that one may not be
+/// created, or if a VarStore op of the id in a FORM or FORM_MAP of the FormSet comes before it,
+/// or is in a form that handle_form_set disables, whose place it does not keep:
+/// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes creates that one too (:1873-1884,
+/// :477), and CreateQuestion binds a question to the first of the id (:136-145).
+fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Result<Option<DeclaredStore>> {
+    let found = form_set_list_var_stores(form_set, |op, creation, forms_before| {
+        let (id, store) = declared_store(&op.parsed_data)?;
+        (id == var_store_id).then(|| (creation.clone(), store, forms_before.to_vec()))
+    });
+    let Some((creation, store, forms_before)) = found else {
+        return Ok(None);
+    };
+    let form_first = match &form_set.parsed_data {
+        ParsedOperation::FormSet(form_set)
+            if !form_set.var_stores_in_forms.contains(&var_store_id) =>
+        {
+            None
+        }
+        _ => forms_before
+            .iter()
+            .find_map(|form| declares_in_scope(form, var_store_id)),
+    };
+    if let Some(form) = form_first {
+        return Err(anyhow!(
+            "VarStore {var_store_id:#06x} is declared in an {form} of its FormSet before the one \
+             of its form-set-list: edk2 creates both and binds a question to the first \
+             (SetupBrowserDxe/IfrParse.c:1873-1884, :136-145)"
+        ));
+    }
+    if let ParsedOperation::FormSet(form_set) = &form_set.parsed_data {
+        if form_set
+            .var_stores_in_disabled_forms
+            .contains(&var_store_id)
+        {
+            return Err(anyhow!(
+                "VarStore {var_store_id:#06x} is declared in a form of its FormSet that \
+                 uefisettings disables, before or after the one of its form-set-list: edk2 creates \
+                 both and binds a question to the first (SetupBrowserDxe/IfrParse.c:1873-1884, \
+                 :136-145)"
+            ));
+        }
+    }
+    match creation {
+        Creation::Created => Ok(Some(store)),
+        Creation::Undetermined(Undetermined::DisableIf(reason)) => Err(anyhow!(
+            "VarStore {var_store_id:#06x} is declared in the scope of a DISABLE_IF of its FormSet \
+             whose condition is not known: {reason}"
+        )),
+        Creation::Undetermined(Undetermined::Hiding(hiding)) => Err(anyhow!(
+            "VarStore {var_store_id:#06x} follows an {} in the scope of a DISABLE_IF of its \
+             FormSet, whose condition is {}: edk2-stable202608 SetupBrowserDxe/IfrParse.c takes \
+             that condition for the DISABLE_IF's, which may skip the rest of its scope \
+             (:1690-1704, :3045-3059), where UEFI 2.11 §33.3.8.3.75 has it only hide",
+            hiding.op,
+            hiding.condition()
+        )),
+    }
+}
+
+/// The spec name of the FORM or FORM_MAP `form` if a VarStore op of `var_store_id` is in its
+/// scope, which edk2 parses whatever the ops around it there, but those of unknown ops.
+fn declares_in_scope(form: &Rc<RefCell<IFROperation>>, var_store_id: u16) -> Option<&'static str> {
+    let declared = try_walk_scopes(&form.borrow().children, (), |node, ()| {
+        let op = node.borrow();
+        if skips_scope(&op) {
+            return Ok(Walk::Skip);
+        }
+        match declared_store(&op.parsed_data) {
+            Some((id, _)) if id == var_store_id => Err(()),
+            Some(_) | None => Ok(Walk::Enter(())),
+        }
+    });
+    declared.is_err().then(|| form.borrow().op_code.spec_name())
 }
 
 #[cfg(test)]
@@ -5068,11 +5231,11 @@ thread_local! {
     pub(crate) static DECLARATIONS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The VarStoreId that `op` declares and its VarStore, if `op` declares one.
-fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
+/// The VarStoreId that the op of `parsed` declares and its VarStore, if it declares one.
+fn declared_store(parsed: &ParsedOperation) -> Option<(u16, DeclaredStore)> {
     #[cfg(test)]
     DECLARATIONS_READ.with(|read| read.set(read.get() + 1));
-    match &op.parsed_data {
+    match parsed {
         ParsedOperation::VarStore(store) => Some((
             store.var_store_id,
             DeclaredStore::Variable(Box::new(store.clone())),
@@ -5112,27 +5275,204 @@ fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
     }
 }
 
+/// The VARSTORE, VARSTORE_NAME_VALUE or VARSTORE_EFI `op`, decoded from its data; None for another
+/// op.
+fn decode_var_store(op: &IFROperation) -> Result<Option<ParsedOperation>> {
+    let mut data_cursor = Cursor::new(&op.data);
+    let parsed = match op.op_code {
+        IFROpCode::VarStore => ParsedOperation::VarStore(
+            data_cursor
+                .parse_ne()
+                .context("failed to parse VarStore's data")?,
+        ),
+        IFROpCode::VarStoreNameValue => ParsedOperation::VarStoreNameValue(
+            data_cursor
+                .parse_ne()
+                .context("failed to parse VarStoreNameValue's data")?,
+        ),
+        IFROpCode::VarStoreEfi if op.length < VAR_STORE_EFI_SIZE => {
+            ParsedOperation::ShortVarStoreEfi(
+                data_cursor
+                    .parse_ne()
+                    .context("failed to parse VarStoreEfi's data")?,
+            )
+        }
+        // this is implemented in hiilib and the docs for this are relatively clear
+        // so I implemented this but I haven't seen it being used anywhere in the dbdumps I have
+        IFROpCode::VarStoreEfi => ParsedOperation::VarStoreEfi(
+            data_cursor
+                .parse_ne()
+                .context("failed to parse VarStoreEfi's data")?,
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(parsed))
+}
+
+/// declared_store of `op`, decoded from its data where handle_form_set leaves it undecoded, in the
+/// scope of an unknown op.
+fn decoded_store(op: &IFROperation) -> Result<Option<(u16, DeclaredStore)>> {
+    if !matches!(op.parsed_data, ParsedOperation::Placeholder) {
+        return Ok(declared_store(&op.parsed_data));
+    }
+    Ok(decode_var_store(op)?.and_then(|parsed| declared_store(&parsed)))
+}
+
+/// Whether edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes creates the store of a
+/// VarStore op of a form-set-list (CreateStorage, :1873-1913); form_set_list_var_stores never meets
+/// one that it skips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Creation {
+    Created,
+    Undetermined(Undetermined),
+}
+
+/// Why ParseOpCodes may skip a VarStore op of a form-set-list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Undetermined {
+    /// In the scope of a DISABLE_IF whose condition is not known: why
+    DisableIf(Rc<str>),
+    /// After a SUPPRESS_IF or GRAY_OUT_IF in the scope of a DISABLE_IF, whose condition is TRUE or
+    /// not known
+    Hiding(Hiding),
+}
+
+/// A SUPPRESS_IF or GRAY_OUT_IF of a form-set-list in the scope of a DISABLE_IF, whose condition
+/// ParseOpCodes takes for the DISABLE_IF's (:1690-1704, :3045-3059): TRUE skips the rest of that
+/// DISABLE_IF's scope (:1390-1413).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hiding {
+    /// Its spec name
+    op: &'static str,
+    /// Why its condition is not known; None if it is TRUE
+    unknown: Option<Rc<str>>,
+}
+
+impl Hiding {
+    /// Its condition, as text.
+    fn condition(&self) -> String {
+        match &self.unknown {
+            Some(reason) => format!("not known: {reason}"),
+            None => "TRUE".to_owned(),
+        }
+    }
+}
+
+/// The scopes around an op of a form-set-list, as form_set_list_var_stores walks them.
+#[derive(Clone, Default)]
+struct ListScopes {
+    /// Why the first DISABLE_IF around, outermost first, whose condition is not known, may skip it
+    unknown_disable_if: Option<Rc<str>>,
+    /// In the scope of a DISABLE_IF: the first SUPPRESS_IF or GRAY_OUT_IF met so far in the scope
+    /// of the outermost one whose condition is TRUE or not known, shared by every op in that scope
+    hiding: Option<Rc<RefCell<Option<Hiding>>>>,
+}
+
+impl ListScopes {
+    /// Whether ParseOpCodes creates the store of a VarStore op in these scopes: the DISABLE_IFs
+    /// first, then the SUPPRESS_IFs and GRAY_OUT_IFs.
+    fn creation(&self) -> Creation {
+        let hiding = self
+            .hiding
+            .as_ref()
+            .and_then(|hiding| hiding.borrow().clone());
+        match (&self.unknown_disable_if, hiding) {
+            (Some(reason), _) => Creation::Undetermined(Undetermined::DisableIf(Rc::clone(reason))),
+            (None, Some(hiding)) => Creation::Undetermined(Undetermined::Hiding(hiding)),
+            (None, None) => Creation::Created,
+        }
+    }
+}
+
+/// Visits the VarStore ops in the form-set-list of `form_set` (UEFI 2.11 §33.2.5.1), where
+/// VfrCompile declares VarStores, in IFR order, each with whether edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes creates its store and the FORMs and FORM_MAPs before
+/// it, until `visit` gives Some. It meets none in the scope of a FORM or FORM_MAP, outside the
+/// form-set-list, nor of an unknown op (IsUnKnownOpCode), nor of a DISABLE_IF whose condition is
+/// TRUE, which ParseOpCodes skips whatever DISABLE_IFs it nests (:1390-1413). It evaluates each
+/// DISABLE_IF, SUPPRESS_IF and GRAY_OUT_IF of the form-set-list once, the latter only in the scope
+/// of a DISABLE_IF.
+fn form_set_list_var_stores<T>(
+    form_set: &IFROperation,
+    mut visit: impl FnMut(&IFROperation, &Creation, &[Rc<RefCell<IFROperation>>]) -> Option<T>,
+) -> Option<T> {
+    let mut forms = Vec::new();
+    let walked = try_walk_scopes(&form_set.children, ListScopes::default(), |node, scopes| {
+        let op = node.borrow();
+        if skips_scope(&op) {
+            return Ok(Walk::Skip);
+        }
+        match op.op_code {
+            IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue => {
+                match visit(&op, &scopes.creation(), &forms) {
+                    Some(found) => Err(found),
+                    None => Ok(Walk::Enter(scopes.clone())),
+                }
+            }
+            IFROpCode::Form | IFROpCode::FormMap => {
+                forms.push(Rc::clone(node));
+                Ok(Walk::Skip)
+            }
+            IFROpCode::DisableIf => {
+                let mut inner = scopes.clone();
+                inner.hiding.get_or_insert_with(Rc::default);
+                match constant_condition(&op) {
+                    Truth::Known(true) => return Ok(Walk::Skip),
+                    Truth::Known(false) => {}
+                    Truth::Unknown(reason) => {
+                        inner.unknown_disable_if.get_or_insert(reason.into());
+                    }
+                }
+                Ok(Walk::Enter(inner))
+            }
+            IFROpCode::SuppressIf | IFROpCode::GrayOutIf => {
+                if let Some(hiding) = &scopes.hiding {
+                    let unknown = match constant_condition(&op) {
+                        Truth::Known(true) => Some(None),
+                        Truth::Known(false) => None,
+                        Truth::Unknown(reason) => Some(Some(reason.into())),
+                    };
+                    if let Some(unknown) = unknown {
+                        hiding.borrow_mut().get_or_insert(Hiding {
+                            op: op.op_code.spec_name(),
+                            unknown,
+                        });
+                    }
+                }
+                Ok(Walk::Enter(scopes.clone()))
+            }
+            _ => Ok(Walk::Enter(scopes.clone())),
+        }
+    });
+    walked.err()
+}
+
 /// Fills the VarName strings of the VARSTORE_EFIs before UEFI 2.3.1 of the FormSets of `roots`,
 /// one package list's, from `string_packages`, its strings packages, as edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c takes the string of each VarName (GetToken): for each op with a
-/// question header, GET and SET on such a store, in any scope, the string that every strings
-/// package holding its VarName gives, or the strings that they differ on. The strings are the
-/// list's, so every such store shares one map of them, filled after the walk, which borrows the
-/// ops that it visits.
+/// question header, GET and SET of the VarStoreId of such a store, in any scope, the string that
+/// every strings package holding its VarName gives, or the strings that they differ on. The
+/// strings are the list's, so every such store shares one map of them, filled after the walk,
+/// which borrows the ops that it visits.
 /// `roots` may hold the forms that their parse disables too, whose ops name VarNames as well.
 pub(super) fn resolve_short_var_names(
     roots: &[Rc<RefCell<IFROperation>>],
     string_packages: &[StringPackage],
 ) {
     let mut stores = Vec::new();
+    let mut short_ids = BTreeSet::new();
+    walk_scopes(roots, (), |node, ()| {
+        if let ParsedOperation::ShortVarStoreEfi(store) = &node.borrow().parsed_data {
+            short_ids.insert(store.var_store_id);
+            stores.push(Rc::clone(node));
+        }
+        Walk::Enter(())
+    });
     let mut names = VarNames::new();
     walk_scopes(roots, (), |node, ()| {
         let op = node.borrow();
-        if let ParsedOperation::ShortVarStoreEfi(_) = op.parsed_data {
-            stores.push(Rc::clone(node));
-        }
         let var_name = var_store_reference(&op)
-            .filter(|&(var_store_id, _)| names_short_var_store(&op, var_store_id))
+            .filter(|(var_store_id, _)| short_ids.contains(var_store_id))
             .map(|(_, var_name)| var_name);
         let string = var_name
             .and_then(|var_name| Some((var_name, var_name_string(var_name, string_packages)?)));

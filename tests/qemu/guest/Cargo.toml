@@ -100,6 +100,10 @@ name = "hii_first_store_password"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_nested_password"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_password"
 required-features = ["test-vm"]
 

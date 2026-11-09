@@ -18,7 +18,9 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
+use super::form_set_list_var_stores;
 use super::storage::VarStoreVariable;
+use super::Creation;
 use super::Guid;
 use super::IFROpCode;
 use super::IFROperation;
@@ -74,15 +76,15 @@ pub(crate) fn check_access_level<'a>(
 }
 
 /// Whether a FormSet of `root` declares AMI_ACCESS_LEVEL among the VarStores where
-/// find_corresponding_varstore finds those of its questions.
+/// find_corresponding_varstore finds those of its questions: those that edk2 creates.
 fn form_set_declares_ami_access_level(root: &Rc<RefCell<IFROperation>>) -> bool {
     root.borrow().children.iter().any(|form_set| {
         let form_set = form_set.borrow();
         form_set.op_code == IFROpCode::FormSet
-            && form_set
-                .children
-                .iter()
-                .any(|op| declares_ami_access_level(&op.borrow()))
+            && form_set_list_var_stores(&form_set, |op, creation, _| {
+                (declares_ami_access_level(op) && *creation == Creation::Created).then_some(())
+            })
+            .is_some()
     })
 }
 
@@ -178,6 +180,41 @@ mod tests {
                 check_access_level([&without, &with], None).is_ok(),
                 "{name}, no level"
             );
+        }
+    }
+
+    /// check_access_level takes SystemAccess where edk2 creates it: under a SUPPRESS_IF of the
+    /// FormSet, or a DISABLE_IF of it whose constant condition is FALSE; not under one whose
+    /// condition is TRUE or not constant.
+    #[test]
+    fn a_system_access_var_store_counts_where_edk2_creates_it() {
+        let system_access = || var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1);
+        let cases = [
+            (
+                "SUPPRESS_IF TRUE",
+                conditional(SUPPRESS_IF, ifr_true(), &[system_access()]),
+                true,
+            ),
+            (
+                "DISABLE_IF FALSE",
+                conditional(DISABLE_IF, ifr_false(), &[system_access()]),
+                true,
+            ),
+            (
+                "DISABLE_IF TRUE",
+                conditional(DISABLE_IF, ifr_true(), &[system_access()]),
+                false,
+            ),
+            (
+                "DISABLE_IF not constant",
+                conditional(DISABLE_IF, eq_id_val_of(1, 0), &[system_access()]),
+                false,
+            ),
+        ];
+        for (name, declaration, declares) in cases {
+            let root = parse_form_set(&[declaration]);
+            let checked = check_access_level([&root], Some(AccessLevel::User)).is_ok();
+            assert_eq!(checked, declares, "{name}");
         }
     }
 }

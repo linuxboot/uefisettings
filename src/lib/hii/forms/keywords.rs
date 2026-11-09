@@ -40,7 +40,7 @@ use super::conditions::QuestionValues;
 use super::conditions::VarStoreValues;
 use super::date_time::DateTimeStorage;
 use super::declared_store;
-use super::declared_var_store;
+use super::decoded_store;
 use super::defaults::is_ordered_list_default;
 use super::defaults::is_statement;
 use super::defaults::option_value;
@@ -60,10 +60,12 @@ use super::refers_to_bit_field;
 use super::set::own_write;
 use super::set::ChangeValueError;
 use super::set::NewValue;
+use super::try_walk_scopes;
 use super::walk_scopes;
 use super::AnswerOption;
 use super::Choice;
 use super::DeclaredStore;
+use super::DisabledForm;
 use super::FormSetWalk;
 use super::IFROpCode;
 use super::IFROperation;
@@ -233,8 +235,13 @@ pub(crate) enum QuestionRefusal {
     ShortVarStore,
     #[error("spans bytes that hold a password, which uefisettings neither reads nor writes")]
     PasswordBytes,
-    #[error("has VarStoreId {0}, which another FormSet of its package list declares for {1}")]
+    #[error("has VarStoreId {0}, which its package list also declares for {1}")]
     RedeclaredVarStore(u16, String),
+    #[error(
+        "may have the VarStoreId of a VarStore op of a FormSet of its package list that does not \
+         decode: {0}"
+    )]
+    UndecodedVarStore(String),
     #[error("has VarStoreId {0}, which a VarStore {1} of its package list declares for {2}")]
     OutsideVarStore(u16, OutsidePlace, String),
     /// One outside a FormSet or in the scope of an unknown opcode
@@ -507,6 +514,8 @@ pub(crate) struct KeywordQuestion<'a, P = KeywordPath> {
     texts: ListTexts<'a>,
     /// The roots of the form packages of the package list
     roots: &'a [Rc<RefCell<IFROperation>>],
+    /// The forms that read_db drops from them, which hold their VarStore ops
+    disabled_forms: &'a [DisabledForm],
     /// The VarStores and statements of the form packages of the package list outside any FormSet,
     /// and the VarStores in the scope of an unknown opcode in one
     outside: &'a [OutsideOp],
@@ -630,6 +639,7 @@ impl<'a, P> KeywordQuestion<'a, P> {
             path,
             texts: list.texts(requested),
             roots: &list.forms,
+            disabled_forms: &list.disabled_forms,
             outside: &list.outside_ifr,
             malformed_stores: &list.malformed_outside_stores,
             root,
@@ -1152,10 +1162,7 @@ impl<'a> KeywordQuestion<'a> {
             return Err(self.question_refusal(&header, QuestionRefusal::PasswordBytes));
         }
         if let Some(other) = self.other_declaration(header.var_store_id, &store.variable_key()) {
-            return Err(self.question_refusal(
-                &header,
-                QuestionRefusal::RedeclaredVarStore(header.var_store_id, other),
-            ));
+            return Err(self.question_refusal(&header, other));
         }
         if let Some((place, other)) =
             self.outside_declaration(header.var_store_id, &store.variable_key())
@@ -1175,18 +1182,24 @@ impl<'a> KeywordQuestion<'a> {
         Ok(header)
     }
 
-    /// The store, as text, that another FormSet of the package list declares for VarStoreId `id`,
-    /// unless it is the EFI variable `variable` too: UEFI 2.11 §33.3.8.3.89 EFI_IFR_VARSTORE makes
-    /// a VarStoreId unique only within its FormSet, and edk2-stable202608 FindStorageFromVarId
-    /// (ConfigKeywordHandler.c:1520), from GetData() and SetData() (:2108, :2213), takes the
-    /// first VarStore of the id in the form package, which other firmware may take otherwise.
-    fn other_declaration(&self, id: u16, variable: &VariableKey) -> Option<String> {
-        self.roots
-            .iter()
-            .filter(|root| !Rc::ptr_eq(root, self.root))
-            .flat_map(|root| root.borrow().children.clone())
-            .filter(|op| op.borrow().op_code == IFROpCode::FormSet)
-            .find_map(|form_set| other_store(declared_var_store(&form_set.borrow(), id)?, variable))
+    /// The refusal of a VarStore op of VarStoreId `id` in a FormSet of the package list, its own
+    /// included, whatever the ops around it, in forms, the forms that read_db disables and unknown
+    /// ops too, that is not of the EFI variable `variable`, or that does not decode, so that its
+    /// VarStoreId is unknown: UEFI 2.11 §33.3.8.3.89 EFI_IFR_VARSTORE makes a VarStoreId unique
+    /// only within its FormSet, and edk2-stable202608 FindStorageFromVarId
+    /// (ConfigKeywordHandler.c:1519-1570), from GetData() and SetData() (:2108, :2213), takes the
+    /// first VarStore op of the id in the form package, whatever its scope, which may not be the
+    /// one that find_corresponding_varstore takes, and other firmware may take another.
+    /// outside_declaration refuses those outside any FormSet, and those in the scope of an unknown
+    /// opcode that decode (declaration_refusal).
+    fn other_declaration(&self, id: u16, variable: &VariableKey) -> Option<QuestionRefusal> {
+        let disabled = self.disabled_forms.iter().map(|disabled| &disabled.form);
+        self.roots.iter().chain(disabled).find_map(|tree| {
+            try_walk_scopes(std::slice::from_ref(tree), (), |node, ()| {
+                declaration_refusal(&node.borrow(), id, variable)
+            })
+            .err()
+        })
     }
 
     /// The store, as text, that a VarStore outside any FormSet of the package list, or in the
@@ -1200,7 +1213,7 @@ impl<'a> KeywordQuestion<'a> {
     ) -> Option<(OutsidePlace, String)> {
         self.outside
             .iter()
-            .filter_map(|outside| Some((outside.place, declared_store(&outside.op)?)))
+            .filter_map(|outside| Some((outside.place, declared_store(&outside.op.parsed_data)?)))
             .filter(|&(_, (declared, _))| declared == id)
             .find_map(|(place, (_, store))| Some((place, other_store(store, variable)?)))
     }
@@ -1307,6 +1320,28 @@ pub(crate) fn keyword_of(language: &Language, text: &str) -> Option<(Namespace, 
             debug!("{namespace} string {text:?} is no keyword: {error}");
             None
         }
+    }
+}
+
+/// Walk::Enter past the op `op` unless it is a VarStore op of VarStoreId `id` that is not of the
+/// EFI variable `variable`, or one that does not decode, whose VarStoreId is unknown:
+/// other_declaration's refusal then. A VarStore op that the parse left undecoded, in the scope of
+/// an unknown opcode, and that decodes here is one of the package list's `outside` ops too, which
+/// outside_declaration refuses, naming that place.
+fn declaration_refusal(
+    op: &IFROperation,
+    id: u16,
+    variable: &VariableKey,
+) -> Result<Walk<()>, QuestionRefusal> {
+    let in_unknown_scope = matches!(op.parsed_data, ParsedOperation::Placeholder);
+    match decoded_store(op) {
+        Ok(Some(_)) if in_unknown_scope => Ok(Walk::Enter(())),
+        Ok(Some((declared, store))) if declared == id => match other_store(store, variable) {
+            Some(other) => Err(QuestionRefusal::RedeclaredVarStore(id, other)),
+            None => Ok(Walk::Enter(())),
+        },
+        Ok(Some(_) | None) => Ok(Walk::Enter(())),
+        Err(error) => Err(QuestionRefusal::UndecodedVarStore(format!("{error:#}"))),
     }
 }
 
@@ -1511,15 +1546,18 @@ mod tests {
     use super::super::ifr_fixtures::flagged_option;
     use super::super::ifr_fixtures::form;
     use super::super::ifr_fixtures::form_set;
+    use super::super::ifr_fixtures::form_set_with_guid;
     use super::super::ifr_fixtures::ifr_default;
     use super::super::ifr_fixtures::ifr_false;
     use super::super::ifr_fixtures::ifr_true;
     use super::super::ifr_fixtures::in_unknown_scope;
     use super::super::ifr_fixtures::locked_op;
+    use super::super::ifr_fixtures::nested;
     use super::super::ifr_fixtures::one_of_at;
     use super::super::ifr_fixtures::one_of_option;
     use super::super::ifr_fixtures::operation;
     use super::super::ifr_fixtures::parse_form_set;
+    use super::super::ifr_fixtures::parse_form_set_dropping;
     use super::super::ifr_fixtures::password_on;
     use super::super::ifr_fixtures::question_header_with;
     use super::super::ifr_fixtures::short_var_store_efi;
@@ -1548,6 +1586,7 @@ mod tests {
     use super::super::resolve_short_var_names;
     use super::super::storage::VariableNotExported;
     use super::super::ChangeValueError;
+    use super::super::PasswordQuestions;
     use super::*;
     use crate::hii::config_string::MultiKeywordResp;
     use crate::hii::package::hiidb_fixtures::form_package_of;
@@ -2576,8 +2615,8 @@ mod tests {
     fn check_get_and_set_refuse_a_var_store_id_that_another_form_set_declares() {
         let refusal = |store: &str| {
             format!(
-                "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which another \
-                 FormSet of its package list declares for {store}"
+                "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which its \
+                 package list also declares for {store}"
             )
         };
         let name_value = operation(
@@ -2632,6 +2671,249 @@ mod tests {
                 ),
                 (want.clone(), want),
                 "VarStore 1 of {name} in FormSet {at} of the list"
+            );
+        }
+    }
+
+    /// GetData() and SetData() take the VarStore of FindStorageFromVarId, the first VarStore op of
+    /// the id in the form package whatever its scope: check_get and check_set refuse a question on
+    /// VarStore 2, the variable Other, where VarStore 2 is also declared as Store, which holds a
+    /// password at the question's bytes, under a DISABLE_IF TRUE or in a FORM, which
+    /// find_corresponding_varstore passes over, whether Other is declared directly or under a
+    /// DISABLE_IF FALSE. A FORM that declares Store before Other refuses the lookup of the
+    /// question's VarStore itself (declared_var_store), and one after it refuses as one under a
+    /// DISABLE_IF TRUE does.
+    #[test]
+    fn check_get_and_set_refuse_a_var_store_id_that_the_question_s_form_set_also_declares() {
+        let store = || var_store(2, STORE_GUID, "Store", 16);
+        let other = || var_store(2, [0x44; 16], "Other", 16);
+        let other_false = || conditional(DISABLE_IF, ifr_false(), &[other()]);
+        let store_true = || conditional(DISABLE_IF, ifr_true(), &[store()]);
+        let redeclared = "keyword Keyword: question \"Keyword question\" has VarStoreId 2, which \
+                          its package list also declares for EFI variable \
+                          Store-33333333-3333-3333-3333-333333333333";
+        let form_first = "keyword Keyword: question \"Keyword question\" has no VarStore that \
+                          uefisettings reads: VarStore 0x0002 is declared in an EFI_IFR_FORM of \
+                          its FormSet before the one of its form-set-list";
+        let cases = [
+            (
+                "Store under DISABLE_IF TRUE, then Other directly",
+                vec![store_true(), other()],
+                redeclared,
+            ),
+            (
+                "Store under DISABLE_IF TRUE, then Other under DISABLE_IF FALSE",
+                vec![store_true(), other_false()],
+                redeclared,
+            ),
+            (
+                "Store in a FORM, then Other directly",
+                vec![form(5, &[store()]), other()],
+                form_first,
+            ),
+            (
+                "Store in a FORM, then Other under DISABLE_IF FALSE",
+                vec![form(5, &[store()]), other_false()],
+                form_first,
+            ),
+            (
+                "Other directly, then Store in a FORM",
+                vec![other(), form(5, &[store()])],
+                redeclared,
+            ),
+            (
+                "Other under DISABLE_IF FALSE, then Store in a FORM",
+                vec![other_false(), form(5, &[store()])],
+                redeclared,
+            ),
+        ];
+        for (case, declarations, want) in cases {
+            let ops = [
+                declarations.concat(),
+                password_on(
+                    7,
+                    9,
+                    1,
+                    u16::try_from(OFFSET).expect("OFFSET fits a VarOffset"),
+                ),
+                one_of(2, 0),
+            ]
+            .concat();
+            let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
+            let question = question_of(&lists);
+            let passwords = PasswordQuestions::of_lists(&lists);
+            let read = || passwords.reader(Box::new(variables(1))).expect("a reader");
+
+            let get = question.check_get(&read());
+            let set = question.check_set(
+                &resp("03"),
+                IncludedStates::empty(),
+                VolatileWrites::Refuse,
+                &mut read(),
+            );
+
+            let refusals = [
+                ("get", get.err().map(|error| error.to_string())),
+                ("set", set.err().map(|error| error.to_string())),
+            ];
+            for (name, refusal) in refusals {
+                assert!(
+                    refusal
+                        .as_deref()
+                        .is_some_and(|refusal| refusal.starts_with(want)),
+                    "{case}: {name}: {refusal:?}"
+                );
+            }
+        }
+    }
+
+    /// edk2-stable202608 FindStorageFromVarId (ConfigKeywordHandler.c:1520-1567) takes the first
+    /// VarStore op of the id in the form package, in a FormSet around the question's too: where a
+    /// FormSet declares Pw for VarStoreId 1, holds a PASSWORD of id 1 at VarOffset 5, and then
+    /// nests the keyword's FormSet, which declares Store for id 1, GetData() and SetData() of the
+    /// keyword's ONE_OF at VarOffset 5 take byte 5 of Pw, a byte of the password. check_get and
+    /// check_set refuse it, naming Pw, through variables of either reach, and take it where the
+    /// FormSet around declares no Pw. Their readers withhold nothing, so that the refusal is
+    /// other_declaration's: get_keyword's reader withholds the password's bytes in Store too, as a
+    /// VarStore of its id in its root (PasswordQuestions), which refuses a get first.
+    #[test]
+    fn check_get_and_set_refuse_a_var_store_id_that_a_form_set_around_the_question_s_declares() {
+        let keyword_form_set = form_set(&[var_store(1, STORE_GUID, "Store", 16), one_of(1, 0)]);
+        let offset = u16::try_from(OFFSET).expect("OFFSET fits a VarOffset");
+        let password = password_on(9, 9, 1, offset);
+        let pw = var_store(1, [0x44; 16], "Pw", 16);
+        let refusal = "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which its \
+                       package list also declares for EFI variable \
+                       Pw-44444444-4444-4444-4444-444444444444";
+        for (case, around, want) in [
+            (
+                "Pw declared first",
+                vec![pw, password.clone(), keyword_form_set.clone()],
+                Some(refusal.to_owned()),
+            ),
+            ("no Pw", vec![password, keyword_form_set], None),
+        ] {
+            let lists = [list_read(form_set_with_guid([0x66; 16], &around))];
+            let question = question_of(&lists);
+            for (reach, interface) in [
+                (
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                ),
+                (VariableReach::Runtime, VariableInterface::Efivarfs),
+            ] {
+                let reader = || {
+                    let variables = MemoryVariables::new(reach, interface);
+                    let mut data = [0; 16];
+                    data[OFFSET] = 1;
+                    variables.insert(store_key(), ATTRIBUTES, &data);
+                    EfivarReader::with_variables(Box::new(variables))
+                };
+
+                let get = question.check_get(&reader());
+                let set = question.check_set(
+                    &resp("03"),
+                    IncludedStates::empty(),
+                    VolatileWrites::Refuse,
+                    &mut reader(),
+                );
+
+                assert_eq!(
+                    (
+                        get.err().map(|error| error.to_string()),
+                        set.err().map(|error| error.to_string())
+                    ),
+                    (want.clone(), want.clone()),
+                    "{case}: {reach:?}"
+                );
+            }
+        }
+    }
+
+    /// check_get and check_set refuse a question when a VarStore op of a FormSet of its package
+    /// list does not decode, as it may have the question's VarStoreId: here in the scope of an
+    /// unknown op, which read_db leaves undecoded.
+    #[test]
+    fn check_get_and_set_refuse_a_var_store_id_that_an_undecoded_var_store_may_declare() {
+        let undecoded = nested(
+            &operation(0x70, true, &[]),
+            1,
+            &[operation(VAR_STORE, false, &[0x00; 3])],
+        );
+        let lists = [list(
+            PATH,
+            &[(NAMESPACE, KEYWORD)],
+            [undecoded, one_of(1, 0)].concat(),
+        )];
+        let question = question_of(&lists);
+
+        let get = question.check_get(&reader(1));
+        let set = question.check_set(
+            &resp("03"),
+            IncludedStates::empty(),
+            VolatileWrites::Refuse,
+            &mut reader(1),
+        );
+
+        let refusals = [
+            ("get", get.err().map(|error| error.to_string())),
+            ("set", set.err().map(|error| error.to_string())),
+        ];
+        for (name, refusal) in refusals {
+            assert!(
+                refusal.as_deref().is_some_and(|refusal| refusal.contains(
+                    "may have the VarStoreId of a VarStore op of a FormSet of its package list \
+                     that does not decode: failed to parse VarStore's data"
+                )),
+                "{name}: {refusal:?}"
+            );
+        }
+    }
+
+    /// check_get and check_set refuse a question when a form that read_db disables, of another
+    /// FormSet of its package list, declares its VarStoreId for another variable before the op
+    /// that disables it: edk2, which disables no form, keeps that VarStore op, which
+    /// FindStorageFromVarId may take first.
+    #[test]
+    fn check_get_and_set_refuse_a_var_store_id_that_a_disabled_form_declares() {
+        let (root, disabled) = parse_form_set_dropping(&[form(
+            5,
+            &[
+                var_store(1, [0x44; 16], "Other", 16),
+                operation(CHECKBOX, false, &[0x00]),
+            ],
+        )]);
+        assert_eq!(disabled.len(), 1, "form 5 disabled");
+        let mut lists = [list(PATH, &[(NAMESPACE, KEYWORD)], one_of(1, 0))];
+        let roots_before = lists[0].forms.len();
+        lists[0].forms.push(root);
+        lists[0].disabled_forms = disabled
+            .into_iter()
+            .map(|disabled| disabled.after_roots(roots_before))
+            .collect();
+        let question = question_of(&lists);
+
+        let get = question.check_get(&reader(1));
+        let set = question.check_set(
+            &resp("03"),
+            IncludedStates::empty(),
+            VolatileWrites::Refuse,
+            &mut reader(1),
+        );
+
+        let want = "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which its \
+                    package list also declares for EFI variable \
+                    Other-44444444-4444-4444-4444-444444444444";
+        let refusals = [
+            ("get", get.err().map(|error| error.to_string())),
+            ("set", set.err().map(|error| error.to_string())),
+        ];
+        for (name, refusal) in refusals {
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|refusal| refusal.starts_with(want)),
+                "{name}: {refusal:?}"
             );
         }
     }

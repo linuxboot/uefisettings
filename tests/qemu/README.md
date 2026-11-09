@@ -216,6 +216,18 @@ check, in the UEFI Shell and from Linux, that a question whose bytes overlap a p
 shows no byte of it and that `set` refuses it, while the questions beside the passwords read
 and write.
 
+`publish-hiidb.efi nested-password-forms` creates the variables `NestedPassword` and
+`NestedChoice` unless they exist and registers the forms of
+[`publish-hiidb/src/nested_password_forms.rs`](publish-hiidb/src/nested_password_forms.rs),
+whose VarStores sit in the scopes of FormSet-level conditions, as UEFI 2.11 §33.2.5.1 admits:
+`NestedPassword` under a SUPPRESS_IF, with a PASSWORD question, a NUMERIC over the password's
+bytes and a CHECKBOX beside it, and two VarStores of one id, under a DISABLE_IF whose condition
+is TRUE and one whose condition is FALSE, with a CHECKBOX on `NestedChoice`, the second.
+`publish-hiidb.efi rt-data-nested-password-forms` does the same, then publishes the database as
+`rt-data` does. The scenarios `shell-nested-password` and `hii-nested-password` check, in the
+UEFI Shell and from Linux, that the question over the password shows no byte of it, while the
+CHECKBOXes read and write their variables.
+
 `publish-hiidb.efi enhanced-auth-forms` registers the forms of
 [`publish-hiidb/src/enhanced_auth_forms.rs`](publish-hiidb/src/enhanced_auth_forms.rs) the
 same way, for the UEFI Shell scenario `shell-auth87` and, with `publish-hiidb.efi rt-data`

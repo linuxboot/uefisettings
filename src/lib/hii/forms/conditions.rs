@@ -79,7 +79,11 @@ use super::EFI_IFR_TYPE_NUM_SIZE_8;
 use super::EFI_IFR_TYPE_REF;
 use super::EFI_IFR_TYPE_STRING;
 use super::EFI_IFR_TYPE_TIME;
+use crate::hii::variables::UnreadVariables;
+use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableLayout;
+use crate::hii::variables::VariableReach;
+use crate::hii::variables::WithheldBytes;
 use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 use crate::parse_error::ReadParsed;
 
@@ -1352,6 +1356,75 @@ pub(crate) fn evaluate_condition(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The calls of constant_condition on this thread, which tests of the bound on the lookups of
+    /// VarStores count.
+    pub(crate) static CONSTANT_CONDITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns the truth of the condition of `scope`, a DISABLE_IF outside forms, which UEFI 2.11
+/// §33.3.8.3.14 EFI_IFR_DISABLE_IF allows to rely on constants only, or a SUPPRESS_IF or
+/// GRAY_OUT_IF outside forms in the scope of one, whose condition edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes takes for the DISABLE_IF's: ParseOpCodes evaluates it
+/// as it parses the FormSet (:1690-1704, :3045-3059), before it reads any value. Not known if it
+/// relies on a question or a VarStore.
+pub(crate) fn constant_condition(scope: &IFROperation) -> Truth {
+    #[cfg(test)]
+    CONSTANT_CONDITIONS.with(|evaluated| evaluated.set(evaluated.get() + 1));
+    // GET and SET must stay listed: evaluating one asks declared_var_store of this FormSet, which
+    // evaluates this DISABLE_IF again, without end
+    let mut reads = None;
+    walk_scopes(&leading_expression(&scope.children), (), |op, ()| {
+        let op = op.borrow();
+        if let OpRole::Expression(
+            ExpressionOp::EqIdVal
+            | ExpressionOp::EqIdId
+            | ExpressionOp::EqIdValList
+            | ExpressionOp::QuestionRef1
+            | ExpressionOp::This
+            | ExpressionOp::Get
+            | ExpressionOp::Set,
+        ) = OpRole::of(op.op_code)
+        {
+            reads.get_or_insert(op.op_code.spec_name());
+        }
+        Walk::Enter(())
+    });
+    if let Some(name) = reads {
+        return Truth::Unknown(format!(
+            "it relies on {name}, where a DISABLE_IF outside forms must only rely on constants \
+             (UEFI 2.11 §33.3.8.3.14)"
+        ));
+    }
+    // UnreadVariables read nothing, so they hold no password byte to withhold
+    let variables = UnreadVariables {
+        reach: VariableReach::Runtime,
+        interface: VariableInterface::Efivarfs,
+    };
+    evaluate_condition(
+        scope,
+        &mut ExpressionInputs {
+            reader: &mut EfivarReader::withholding(Box::new(variables), WithheldBytes::default()),
+            values: &NoQuestions,
+        },
+    )
+}
+
+/// The question values of an expression that refers to no question.
+struct NoQuestions;
+
+impl QuestionValues for NoQuestions {
+    fn value(
+        &self,
+        _referrer: &IFROperation,
+        _id: u16,
+        _reader: &mut EfivarReader,
+    ) -> Option<QuestionValue> {
+        None
+    }
+}
+
 /// Returns the value of the expression of the EFI_IFR_VALUE `scope` as a UINT64, or why it
 /// is not known.
 pub(crate) fn evaluate_value(
@@ -1859,14 +1932,17 @@ fn operand_store(op: &IFROperation, operand: &VarStoreOperand) -> Result<Declare
             op.op_code.spec_name()
         )));
     }
-    enclosing_form_set(op)
-        .and_then(|form_set| declared_var_store(&form_set.borrow(), id))
-        .ok_or_else(|| {
-            Abort::Malformed(format!(
-                "{} of undeclared VarStore {id:#06x}",
-                op.op_code.spec_name()
-            ))
-        })
+    let declared = enclosing_form_set(op)
+        .map(|form_set| declared_var_store(&form_set.borrow(), id))
+        .transpose()
+        .map_err(|error| Abort::NotEvaluated(format!("{error:#}")))?
+        .flatten();
+    declared.ok_or_else(|| {
+        Abort::Malformed(format!(
+            "{} of undeclared VarStore {id:#06x}",
+            op.op_code.spec_name()
+        ))
+    })
 }
 
 /// Returns `declared` as the EFI variable that the GET or SET `operand` of `kind` reads or
@@ -7679,6 +7755,119 @@ mod store_expression_tests {
                 )
             ),
             "Windows: ShortVarMissing"
+        );
+    }
+
+    /// A READ whose GET names a VarStore that a DISABLE_IF of the FormSet declares, whose condition
+    /// relies on EFI_IFR_EQ_ID_VAL where UEFI 2.11 §33.3.8.3.14 allows only constants, is refused
+    /// with that reason: edk2 may or may not create that store, so the question shows neither the
+    /// value of the GET nor its stored one.
+    #[test]
+    fn a_read_of_a_var_store_under_a_form_set_disable_if_that_is_not_constant_is_refused() {
+        let question = [
+            operation(ONE_OF, true, &storage_less_one_of()),
+            op(READ),
+            get(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+            END.to_vec(),
+        ]
+        .concat();
+        let root = parse_form_set(&[
+            conditional(
+                DISABLE_IF,
+                eq_id_val_of(1, 0),
+                &[var_store_efi(STORE, "Store", NV_BS_RT, 5)],
+            ),
+            form(1, &[question]),
+        ]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let form = Rc::clone(&form_set.borrow().children[1]);
+        let question = Rc::clone(&form.borrow().children[0]);
+
+        let read = evaluate_read(
+            &question,
+            QuestionValue::Uint(4),
+            &mut ExpressionInputs {
+                reader: &mut store_holding(&[7, 0, 0, 0, 0]).reader(),
+                values: &no_values(),
+            },
+        );
+
+        let ReadOutcome::Refused(refusal) = read else {
+            panic!("a READ of an undetermined VarStore gave {read:?}");
+        };
+        assert!(
+            refusal
+                .to_string()
+                .contains("it relies on EFI_IFR_EQ_ID_VAL"),
+            "{refusal}"
+        );
+    }
+
+    /// A GET or SET finds its VarStore where a SUPPRESS_IF of the FormSet declares it, which UEFI
+    /// 2.11 §33.2.5.1's form-set-list admits and edk2's ParseOpCodes creates: a GET reads its EFI
+    /// variable, and a WRITE that holds a SET writes it.
+    #[test]
+    fn get_and_set_find_a_var_store_under_a_form_set_suppress_if() {
+        let get_store = scoped_expression(
+            &[get(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8), uint8(7), op(EQUAL)],
+            0,
+        );
+        let set_store = scoped_expression(&[op(THIS), set(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8)], 0);
+        let question = [
+            operation(ONE_OF, true, &storage_less_one_of()),
+            conditional(
+                SUPPRESS_IF,
+                get_store,
+                &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[0])],
+            ),
+            op(WRITE),
+            set_store,
+            END.to_vec(),
+        ]
+        .concat();
+        let root = parse_form_set(&[
+            conditional(
+                SUPPRESS_IF,
+                ifr_true(),
+                &[var_store_efi(STORE, "Store", NV_BS_RT, 5)],
+            ),
+            form(1, &[question]),
+        ]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let form = Rc::clone(&form_set.borrow().children[1]);
+        let question = Rc::clone(&form.borrow().children[0]);
+        let efivars = store_holding(&[7, 0, 0, 0, 0]);
+
+        let scope = Rc::clone(&question.borrow().children[0]);
+        let truth = evaluate_condition(
+            &scope.borrow(),
+            &mut ExpressionInputs {
+                reader: &mut efivars.reader(),
+                values: &no_values(),
+            },
+        );
+        assert_eq!(truth, Truth::Known(true), "GET");
+
+        let sets = evaluate_write(
+            &question,
+            QuestionValue::Uint(3),
+            &mut ExpressionInputs {
+                reader: &mut efivars.reader(),
+                values: &no_values(),
+            },
+        )
+        .map(|sets| {
+            sets.map(|sets| {
+                sets.var_store
+                    .into_iter()
+                    .map(|set| (set.var_store_id, set.store.name(), set.offset, set.bytes))
+                    .collect::<Vec<ComparedSet>>()
+            })
+        });
+        assert_eq!(
+            sets,
+            Ok(Some(vec![(STORE, "Store".to_string(), 1, vec![3])])),
+            "SET"
         );
     }
 

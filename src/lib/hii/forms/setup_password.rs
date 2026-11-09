@@ -28,9 +28,12 @@ use thiserror::Error;
 
 use super::conditions::enclosing_form_set;
 use super::declared_store;
-use super::find_corresponding_varstore;
+use super::decoded_store;
 use super::named_records;
-use super::short_var_store_of;
+use super::short_efi_variable;
+use super::storage::NameValueStore;
+use super::storage::VariableStore;
+use super::undeclared_var_store;
 use super::var_name_candidates;
 use super::walk_scopes;
 use super::DeclaredStorage;
@@ -64,17 +67,18 @@ const CHAR16_SIZE: usize = std::mem::size_of::<u16>();
 
 /// The PASSWORD questions of a HiiDB (UEFI 2.10 §33.3.8.3.54): whether it declares any, those
 /// with a VarStore, the ops whose VarStore is unknown, and the variables that may hold their
-/// passwords where they are known (candidate_questions).
+/// passwords where they are known (password_questions).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PasswordQuestions {
     declared: bool,
     questions: Vec<PasswordQuestion>,
-    /// Those that VarStores outside their FormSet hold, by VarStoreId of a package list
+    /// Those that more than one variable holds, by VarStoreId of a package list
     shared: Vec<SharedPasswords>,
     unresolved: Vec<UnresolvedPassword>,
     candidates: Vec<PasswordQuestion>,
     /// The storage that IFR that read_db ignores, or a VarStore outside any FormSet that does not
-    /// parse, may keep a password in anywhere (IgnoredPasswords::Declared), withheld whole
+    /// parse, may keep a password in anywhere (IgnoredPasswords::Declared), and that VarStore ops
+    /// of the FormSet of a PASSWORD that do not decode may (UndecodedStores), withheld whole
     storage: DeclaredStorage,
 }
 
@@ -185,10 +189,8 @@ impl PasswordFields {
     /// The value bytes that hold its password at its VarOffset in each VARSTORE and VARSTORE_EFI
     /// that holds it.
     fn bytes(&self) -> Range<usize> {
-        password_bytes(
-            self.question.var_store_info,
-            self.max_size.as_ref().ok().copied(),
-        )
+        let offset = VariableLayout::Offsets.offset(self.question.var_store_info);
+        password_bytes(offset, self.max_size.as_ref().ok().copied())
     }
 
     /// Its questions on the variables that its VarName may name on the VARSTORE_EFIs before UEFI
@@ -224,17 +226,19 @@ fn password_bytes(offset: u16, max_size: Option<u16>) -> Range<usize> {
     }
 }
 
-/// The PASSWORD questions of one VarStoreId of a package list that VarStores outside their
-/// FormSet hold, with the variables of the VARSTOREs and VARSTORE_EFIs of that id: each password
-/// is recorded once, not once for each variable that holds it.
+/// The PASSWORD questions of one VarStoreId of a package list that more than one variable holds,
+/// with the variables of the VARSTOREs and VARSTORE_EFIs of that id: each password is recorded
+/// once, not once for each variable that holds it.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SharedPasswords {
-    /// Those in FormSets, which hold the passwords of the PASSWORDs outside any FormSet
-    in_form_sets: Vec<VariableKey>,
+    /// Those in FormSets, by the index of the root of their FormSet in the package list
+    /// (DisabledForm::root_index in a disabled form), which hold the passwords of the PASSWORDs of
+    /// their FormSet and those outside any FormSet
+    in_form_sets: BTreeMap<usize, Vec<VariableKey>>,
     /// Those outside any FormSet, which hold every password here
     outside: Vec<VariableKey>,
-    /// The passwords of the PASSWORDs in FormSets, each with the VarStore of its FormSet, if any
-    form_set_passwords: Vec<(Option<VariableKey>, Range<usize>)>,
+    /// The passwords of the PASSWORDs in FormSets, by the index of the root of their FormSet
+    form_set_passwords: BTreeMap<usize, Vec<Range<usize>>>,
     /// The passwords of the PASSWORDs outside any FormSet
     outside_passwords: Vec<Range<usize>>,
 }
@@ -247,29 +251,35 @@ impl SharedPasswords {
         passwords && variables
     }
 
-    /// Withholds each password here once in `withheld`, in shared sets: one for each VarStore of
-    /// a FormSet that the PASSWORDs in FormSets name, one for those that name none, and one for
-    /// the PASSWORDs outside any FormSet, which the VarStores in FormSets withhold too. The
-    /// VarStores outside any FormSet withhold every set.
+    /// Whether `key` is the variable of a VarStore of the FormSet of root `root` or of one outside
+    /// any FormSet, which hold the passwords of that FormSet's PASSWORDs.
+    fn holds_form_set_passwords(&self, root: usize, key: &VariableKey) -> bool {
+        let in_form_set = self.in_form_sets.get(&root).into_iter().flatten();
+        in_form_set.chain(&self.outside).any(|held| held == key)
+    }
+
+    /// Withholds each password here once in `withheld`, in shared sets: one for the PASSWORDs of
+    /// each FormSet, which its VarStores withhold, and one for the PASSWORDs outside any FormSet,
+    /// which the VarStores in FormSets withhold too. The VarStores outside any FormSet withhold
+    /// every set, so a variable that one of them declares takes no set as one of a FormSet too,
+    /// as a VarStore in the scope of an unknown opcode of a FormSet is both.
     fn withhold(&self, withheld: &mut WithheldBytes) {
-        let mut own: BTreeMap<&VariableKey, Vec<Range<usize>>> = BTreeMap::new();
-        let mut storeless = Vec::new();
-        for (key, bytes) in &self.form_set_passwords {
-            match key {
-                Some(key) => own.entry(key).or_default().push(bytes.clone()),
-                None => storeless.push(bytes.clone()),
+        let sets = withheld.share(
+            self.form_set_passwords
+                .values()
+                .cloned()
+                .chain([self.outside_passwords.clone()]),
+        );
+        let outside: BTreeSet<&VariableKey> = self.outside.iter().collect();
+        for (set, root) in sets.clone().zip(self.form_set_passwords.keys()) {
+            let in_form_set = self.in_form_sets.get(root).into_iter().flatten();
+            for key in in_form_set.filter(|key| !outside.contains(key)) {
+                withheld.withhold_shared(key, set..set + 1);
             }
         }
-        let keys: Vec<&VariableKey> = own.keys().copied().collect();
-        let sets = withheld.share(
-            own.into_values()
-                .chain([storeless, self.outside_passwords.clone()]),
-        );
-        for (set, key) in sets.clone().zip(keys) {
-            withheld.withhold_shared(key, set..set + 1);
-        }
         if !self.outside_passwords.is_empty() {
-            for key in &self.in_form_sets {
+            let in_form_sets = self.in_form_sets.values().flatten();
+            for key in in_form_sets.filter(|key| !outside.contains(key)) {
                 withheld.withhold_shared(key, sets.end - 1..sets.end);
             }
         }
@@ -282,17 +292,34 @@ impl SharedPasswords {
     /// count.
     #[cfg(test)]
     fn entries(&self) -> usize {
-        self.in_form_sets.len()
+        self.in_form_sets.values().map(Vec::len).sum::<usize>()
             + self.outside.len()
-            + self.form_set_passwords.len()
+            + self
+                .form_set_passwords
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
             + self.outside_passwords.len()
     }
 }
 
 /// The VarStores of each VarStoreId of a package list, read once for all its PASSWORDs, with the
-/// passwords that they share.
+/// passwords that they share, and the VarStore ops of each FormSet that do not decode, whose
+/// VarStoreIds are unknown, by the index of its root in the package list.
 #[derive(Default)]
-struct VarStoreIds(BTreeMap<u16, IdStores>);
+struct VarStoreIds {
+    ids: BTreeMap<u16, IdStores>,
+    undecoded: BTreeMap<usize, UndecodedStores>,
+}
+
+/// The VarStore ops of a FormSet that do not decode: the first, and the storage that they may
+/// declare (DeclaredStorage::declare_in_tree), where a PASSWORD of the FormSet of any VarStoreId
+/// may keep its password, as find_corresponding_varstore takes a VarStore of the PASSWORD's
+/// FormSet, and FindStorageFromVarId the first VarStore op of the id whatever its scope.
+struct UndecodedStores {
+    first: UnknownStore,
+    storage: DeclaredStorage,
+}
 
 /// The VarStores of one VarStoreId of a package list.
 #[derive(Default)]
@@ -306,6 +333,28 @@ struct IdStores {
     short_in_form_sets: BTreeSet<Guid>,
     /// Those outside any FormSet
     short_outside: BTreeSet<Guid>,
+    /// Those of each FormSet that name no variable of their own, by the index of its root
+    form_sets: BTreeMap<usize, FormSetStores>,
+}
+
+/// The VarStores of one VarStoreId in one FormSet, whatever the ops around them, that name no
+/// variable of their own: edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId
+/// (:1519-1570) takes the first VarStore op of the id in the form package, whatever its scope,
+/// so each may hold what a question of the id writes.
+#[derive(Default)]
+struct FormSetStores {
+    /// Its VARSTORE_EFIs before UEFI 2.3.1, each at its position in the walk of its FormSet
+    short: Vec<(usize, ShortVarStoreEfi)>,
+    /// The first VARSTORE_NAME_VALUE, whose values only its driver holds
+    name_value: Option<UnknownStore>,
+}
+
+/// A VarStore op of a FormSet whose variable is unknown, at its position in the walk of its
+/// FormSet, and why.
+#[derive(Clone)]
+struct UnknownStore {
+    at: usize,
+    reason: String,
 }
 
 /// A VarStore that names no variable.
@@ -364,24 +413,20 @@ impl StoreVariable {
 }
 
 impl VarStoreIds {
-    /// Those of `list`, in its FormSets, the forms that read_db disables among them too, and
-    /// outside any, but for those in the IFR that IgnoredPasswords::Declared covers, whose storage
-    /// PasswordQuestions withholds whole.
+    /// Those of `list`, in its FormSets and the forms that read_db disables among them
+    /// (in_form_sets), and outside any, but for those in the IFR that IgnoredPasswords::Declared
+    /// covers, whose storage PasswordQuestions withholds whole.
     fn of(list: &ParsedPackageList) -> Self {
-        let mut ids = Self::default();
-        ids.add_in_form_sets(&list.forms);
-        for disabled in &list.disabled_forms {
-            ids.add_in_form_sets(std::slice::from_ref(&disabled.form));
-        }
+        let mut ids = Self::in_form_sets(&list.forms, &list.disabled_forms);
         for outside in list
             .outside_ifr
             .iter()
             .filter(|outside| !outside.in_ignored_ifr)
         {
-            let Some((var_store_id, store)) = declared_store(&outside.op) else {
+            let Some((var_store_id, store)) = declared_store(&outside.op.parsed_data) else {
                 continue;
             };
-            let stores = ids.0.entry(var_store_id).or_default();
+            let stores = ids.ids.entry(var_store_id).or_default();
             let nameless = match store {
                 DeclaredStore::Variable(store) => {
                     stores.shared.outside.push(store.variable_key());
@@ -400,34 +445,87 @@ impl VarStoreIds {
         ids
     }
 
-    /// Adds those of the FormSets of `roots`, or of the forms that it holds.
-    fn add_in_form_sets(&mut self, roots: &[Rc<RefCell<IFROperation>>]) {
-        walk_scopes(roots, (), |node, ()| {
-            if let Some((var_store_id, store)) = declared_store(&node.borrow()) {
-                let stores = self.0.entry(var_store_id).or_default();
-                match store {
-                    DeclaredStore::Variable(store) => {
-                        stores.shared.in_form_sets.push(store.variable_key());
-                    }
-                    DeclaredStore::ShortEfi(store) => {
-                        stores.short_in_form_sets.insert(store.guid);
-                    }
-                    DeclaredStore::NameValue(_) => {}
+    /// Those of the FormSets of `roots`, one package list's, and of the forms `disabled` that
+    /// their parse drops from them, each in the FormSet of its root (DisabledForm::root_index), in
+    /// any scope: in forms and unknown ops too, whose VarStore ops decoded_store decodes.
+    fn in_form_sets(roots: &[Rc<RefCell<IFROperation>>], disabled: &[DisabledForm]) -> Self {
+        let mut ids = Self::default();
+        let trees = roots.iter().enumerate().chain(
+            disabled
+                .iter()
+                .map(|disabled| (disabled.root_index, &disabled.form)),
+        );
+        // one count for every walk: it orders the VarStores of a FormSet alone
+        let mut at = 0;
+        for (root, tree) in trees {
+            walk_scopes(std::slice::from_ref(tree), (), |node, ()| {
+                at += 1;
+                match decoded_store(&node.borrow()) {
+                    Ok(Some((var_store_id, store))) => ids.add(var_store_id, store, root, at),
+                    Ok(None) => {}
+                    Err(error) => ids.add_undecoded(&node.borrow(), &error, root, at),
                 }
+                Walk::Enter(())
+            });
+        }
+        ids
+    }
+
+    /// Adds `store` of `var_store_id`, at `at` in the walk of the FormSet of root `root`.
+    fn add(&mut self, var_store_id: u16, store: DeclaredStore, root: usize, at: usize) {
+        let stores = self.ids.entry(var_store_id).or_default();
+        match store {
+            DeclaredStore::Variable(store) => stores
+                .shared
+                .in_form_sets
+                .entry(root)
+                .or_default()
+                .push(store.variable_key()),
+            DeclaredStore::ShortEfi(store) => {
+                stores.short_in_form_sets.insert(store.guid);
+                stores
+                    .form_sets
+                    .entry(root)
+                    .or_default()
+                    .short
+                    .push((at, store));
             }
-            Walk::Enter(())
-        });
+            DeclaredStore::NameValue(guid) => {
+                let form_set = stores.form_sets.entry(root).or_default();
+                form_set.name_value.get_or_insert(UnknownStore {
+                    at,
+                    reason: NameValueStore { guid }.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Adds the VarStore op `op`, which does not decode for `error`, at `at` in the walk of the
+    /// FormSet of root `root`.
+    fn add_undecoded(&mut self, op: &IFROperation, error: &anyhow::Error, root: usize, at: usize) {
+        let undecoded = self
+            .undecoded
+            .entry(root)
+            .or_insert_with(|| UndecodedStores {
+                first: UnknownStore {
+                    at,
+                    reason: format!("{error:#}"),
+                },
+                storage: DeclaredStorage::default(),
+            });
+        undecoded.storage.declare_in_tree(op);
     }
 
     /// The storage of every VARSTORE and VARSTORE_EFI here: the variables that they name, and
     /// the Guids of those before UEFI 2.3.1, any variable of which a VarName may name.
     fn storage(&self) -> DeclaredStorage {
         let mut storage = DeclaredStorage::default();
-        for stores in self.0.values() {
+        for stores in self.ids.values() {
             let shared = &stores.shared;
+            let in_form_sets = shared.in_form_sets.values().flatten();
             storage
                 .variables
-                .extend(shared.in_form_sets.iter().chain(&shared.outside).cloned());
+                .extend(in_form_sets.chain(&shared.outside).cloned());
             for &guid in stores.short_in_form_sets.union(&stores.short_outside) {
                 storage.guids.insert(Some(guid));
             }
@@ -437,19 +535,22 @@ impl VarStoreIds {
 
     /// The SharedPasswords of each VarStoreId whose variables hold a password.
     fn into_shared(self) -> impl Iterator<Item = SharedPasswords> {
-        self.0
+        self.ids
             .into_values()
             .map(|stores| stores.shared)
             .filter(SharedPasswords::holds_any)
     }
 }
 
-/// A PASSWORD in a FormSet with a VarStoreId, and the variable of the VarStore of that id that its
-/// FormSet declares, with its layout, if any, and that of the first VarStore of the id in its form
-/// package, where another FormSet declares it (password_questions).
+/// A PASSWORD in a FormSet with a VarStoreId, with its questions on the VARSTORE_EFIs before UEFI
+/// 2.3.1 of that id in its FormSet whose variable its VarName names, and the variables that it may
+/// name on those whose variable it does not (ShortVarStoreEfi::candidate_variables), each from
+/// byte 0, and the variable of the first VarStore of the id in its form package, where another
+/// FormSet declares it (password_questions).
 struct FormSetPassword {
     password: PasswordFields,
-    store: Option<(VariableKey, VariableLayout)>,
+    short: Vec<PasswordQuestion>,
+    candidates: Vec<PasswordQuestion>,
     first: Option<StoreVariable>,
 }
 
@@ -458,12 +559,8 @@ impl PasswordQuestions {
     /// VarStores and PASSWORDs outside any FormSet.
     #[cfg(test)]
     pub(crate) fn of<'a>(roots: impl IntoIterator<Item = &'a Rc<RefCell<IFROperation>>>) -> Self {
-        let mut found = Self::default();
-        let mut ids = VarStoreIds::default();
-        for root in roots {
-            found.add(root, None, None, &mut ids, &[]);
-        }
-        found
+        let roots: Vec<Rc<RefCell<IFROperation>>> = roots.into_iter().map(Rc::clone).collect();
+        Self::of_forms(&roots, &[])
     }
 
     /// Those of the package lists `lists`, the forms that read_db disables too, as their ops are
@@ -548,14 +645,17 @@ impl PasswordQuestions {
     #[cfg(test)]
     fn of_forms(roots: &[Rc<RefCell<IFROperation>>], disabled: &[DisabledForm]) -> Self {
         let mut found = Self::default();
-        found.add_forms(roots, disabled, &[], &mut VarStoreIds::default(), &[]);
+        let mut ids = VarStoreIds::in_form_sets(roots, disabled);
+        found.add_forms(roots, disabled, &[], &mut ids, &[]);
+        found.shared.extend(ids.into_shared());
         found
     }
 
     /// Adds those of the FormSets of `roots` and of the forms `disabled` that their parse drops
-    /// from them, as their ops are read, with the FirstVarStores of their form packages,
-    /// `packages`, the VarStores of each VarStoreId of their package list, `ids`, and its strings
-    /// packages, `strings`.
+    /// from them, each in the FormSet of its root (DisabledForm::root_index), as their ops are
+    /// read, with the FirstVarStores of their form packages, `packages`, which hold their roots,
+    /// the VarStores of each VarStoreId of their package list, `ids`, and its strings packages,
+    /// `strings`.
     fn add_forms(
         &mut self,
         roots: &[Rc<RefCell<IFROperation>>],
@@ -564,25 +664,34 @@ impl PasswordQuestions {
         ids: &mut VarStoreIds,
         strings: &[StringPackage],
     ) {
-        for (index, root) in roots.iter().enumerate() {
-            let package = package_of(packages, index, |package| &package.form_sets);
-            self.add(root, None, package, ids, strings);
+        for (root, tree) in roots.iter().enumerate() {
+            let package = package_of(packages, root);
+            self.add(tree, None, root, package, ids, strings);
         }
-        for (index, disabled) in disabled.iter().enumerate() {
+        for disabled in disabled {
             let form_set = enclosing_form_set(&disabled.form.borrow())
                 .and_then(|form_set| form_set_guid(&form_set.borrow()));
-            let package = package_of(packages, index, |package| &package.disabled_forms);
-            self.add(&disabled.form, form_set, package, ids, strings);
+            let package = package_of(packages, disabled.root_index);
+            self.add(
+                &disabled.form,
+                form_set,
+                disabled.root_index,
+                package,
+                ids,
+                strings,
+            );
         }
     }
 
-    /// Adds those of `node`, in the FormSet `form_set` if any, and the ops in its scope, with the
-    /// FirstVarStores of their form package, `package`, the VarStores of each VarStoreId of their
-    /// package list, `ids`, and its strings packages, `strings`.
+    /// Adds those of `node`, in the FormSet `form_set` if any, of the root of index `root` in its
+    /// package list, and the ops in its scope, with the FirstVarStores of their form package,
+    /// `package`, the VarStores of each VarStoreId of their package list, `ids`, and its strings
+    /// packages, `strings`.
     fn add(
         &mut self,
         node: &Rc<RefCell<IFROperation>>,
         form_set: Option<Guid>,
+        root: usize,
         package: Option<&FirstVarStores>,
         ids: &mut VarStoreIds,
         strings: &[StringPackage],
@@ -591,30 +700,31 @@ impl PasswordQuestions {
             let op = node.borrow();
             let form_set = form_set_guid(&op).or(form_set);
             if op.op_code == IFROpCode::Password {
-                self.add_form_set_password(node, &op, form_set, package, ids, strings);
+                self.add_form_set_password(&op, form_set, root, package, ids, strings);
             }
             Walk::Enter(form_set)
         });
     }
 
-    /// Adds the PASSWORD `op` at `node`, of the FormSet `form_set`, with the FirstVarStores of its
-    /// form package, `package`, the VarStores of each VarStoreId of its package list, `ids`, and
-    /// its strings packages, `strings`. One whose
-    /// question header lies past its op is found by the Forms Browser in the VarStore of its id
-    /// that its FormSet declares, and by the Config Keyword Handler in the first VarStore of that
-    /// id in the form package (edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId,
-    /// :1520), so it is added as one outside any FormSet is (add_in_package_list) and is
-    /// unresolved; one whose header runs past the form package names no VarStore, so every
-    /// variable of each VarStore of its package list is withheld whole. Either way, what is
-    /// withheld covers the first VarStore of its id in its form package, which password_questions
-    /// adds for one whose header is in its op: each VARSTORE and VARSTORE_EFI of the id in the
-    /// package list keeps the password from its VarOffset on, and the variables of the VarNames on
-    /// those before UEFI 2.3.1 are withheld.
+    /// Adds the PASSWORD `op`, of the FormSet `form_set`, of the root of index `root` in its
+    /// package list, with the FirstVarStores of its form package, `package`, the VarStores of each
+    /// VarStoreId of that list, `ids`, and its strings packages, `strings`. One whose question
+    /// header lies past its op is found by the Forms Browser in the VarStore of its id that its
+    /// FormSet declares, and by the Config Keyword Handler in the first VarStore of that id in the
+    /// form package (edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId, :1520), so it
+    /// is added as one outside any FormSet is (add_in_package_list) and is unresolved; one whose
+    /// header runs past the form package names no VarStore, so every variable of each VarStore of
+    /// its package list is withheld whole. Either way, what is withheld covers the first VarStore
+    /// of its id in its form package, which password_questions adds for one whose header is in its
+    /// op: each VARSTORE and VARSTORE_EFI of the id in the package list keeps the password from its
+    /// VarOffset on, and the variables of the VarNames on those before UEFI 2.3.1 are withheld.
+    /// Only one that passes those checks is added in the FormSet of its root (password_questions),
+    /// with the storage of its VarStore ops that do not decode (withhold_undecoded).
     fn add_form_set_password(
         &mut self,
-        node: &Rc<RefCell<IFROperation>>,
         op: &IFROperation,
         form_set: Option<Guid>,
+        root: usize,
         package: Option<&FirstVarStores>,
         ids: &mut VarStoreIds,
         strings: &[StringPackage],
@@ -637,38 +747,61 @@ impl PasswordQuestions {
             });
             return;
         }
-        let (password, unresolved) = password_questions(node, password, form_set, package, ids);
+        self.withhold_undecoded(&password, root, ids);
+        let (password, unresolved) = password_questions(op, password, form_set, root, package, ids);
         if let Some(password) = password {
-            self.add_in_form_set(password, ids, strings);
+            self.add_in_form_set(password, root, ids, strings);
         }
         if let Some(unresolved) = unresolved {
             self.add_unresolved(unresolved);
-            self.candidates.extend(candidate_questions(op));
         }
     }
 
-    /// Adds `password`, of a FormSet: on the VarStore of its FormSet alone, if it has one, unless
-    /// `ids` has VarStores of its VarStoreId outside any FormSet, which hold it too: a VARSTORE or
-    /// VARSTORE_EFI at its VarOffset, and through Runtime, as its password is unresolved then
-    /// (password_questions), a VARSTORE_EFI before UEFI 2.3.1 in each variable that its VarName
-    /// may name in the package list of the strings packages `strings`. The first VarStore of
-    /// that id in its form package, where another FormSet declares it, holds it likewise.
+    /// Withholds whole, for the PASSWORD `password` of the FormSet of root `root`, the storage that
+    /// the VarStore ops of that FormSet that do not decode may declare (UndecodedStores), once for
+    /// all its PASSWORDs, unless `password` names VarStoreId 0, which names no VarStore.
+    fn withhold_undecoded(
+        &mut self,
+        password: &PasswordFields,
+        root: usize,
+        ids: &mut VarStoreIds,
+    ) {
+        if password.question.var_store_id == 0 {
+            return;
+        }
+        if let Some(undecoded) = ids.undecoded.get_mut(&root) {
+            self.storage.extend(&std::mem::take(&mut undecoded.storage));
+        }
+    }
+
+    /// Adds `password`, of the FormSet of root `root`: at its VarOffset in each VARSTORE and
+    /// VARSTORE_EFI of its VarStoreId in its FormSet, whatever the ops around it, and in each
+    /// outside any FormSet, which `ids` holds; as its question if one variable holds it, else once
+    /// in their SharedPasswords. Through Runtime, as its password is unresolved then
+    /// (password_questions), also in each variable that its VarName may name on a VARSTORE_EFI
+    /// before UEFI 2.3.1 of that id outside any FormSet, in the package list of the strings
+    /// packages `strings`. The first VarStore of that id in its form package, where another
+    /// FormSet declares it, holds it likewise, unless its variable is one of those.
     fn add_in_form_set(
         &mut self,
         FormSetPassword {
             password,
-            store,
+            short,
+            candidates,
             first,
         }: FormSetPassword,
+        root: usize,
         ids: &mut VarStoreIds,
         strings: &[StringPackage],
     ) {
+        self.questions.extend(short);
+        self.candidates.extend(candidates);
+        let stores = ids.ids.get_mut(&password.question.var_store_id);
         match first {
-            // the variable of its own VarStore, which holds it there already
-            Some(StoreVariable::Named(key, layout))
-                if store
+            Some(StoreVariable::Named(key, VariableLayout::Offsets))
+                if stores
                     .as_ref()
-                    .is_some_and(|(own, own_layout)| *own == key && *own_layout == layout) => {}
+                    .is_some_and(|stores| stores.shared.holds_form_set_passwords(root, &key)) => {}
             Some(StoreVariable::Named(key, layout)) => {
                 self.questions.push(password.on(key, layout))
             }
@@ -677,30 +810,26 @@ impl PasswordQuestions {
                 .extend(password.on_var_names([&guid], strings)),
             Some(StoreVariable::NameValue) | None => {}
         }
-        let Some(stores) = ids.0.get_mut(&password.question.var_store_id) else {
-            self.questions
-                .extend(store.map(|(key, layout)| password.on(key, layout)));
+        let Some(stores) = stores else {
             return;
         };
         self.candidates
             .extend(password.on_var_names(&stores.short_outside, strings));
-        match (store, stores.shared.outside.is_empty()) {
-            (Some((key, VariableLayout::Offsets)), false) => stores
+        let in_form_set = stores.shared.in_form_sets.get(&root);
+        match (
+            in_form_set.map_or(&[][..], Vec::as_slice),
+            stores.shared.outside.is_empty(),
+        ) {
+            ([], true) => {}
+            ([key], true) => self
+                .questions
+                .push(password.on(key.clone(), VariableLayout::Offsets)),
+            (_, _) => stores
                 .shared
                 .form_set_passwords
-                .push((Some(key), password.bytes())),
-            // no VarStore of its FormSet, or one that holds it from byte 0 of a VarName's variable
-            (store, false) => {
-                stores
-                    .shared
-                    .form_set_passwords
-                    .push((None, password.bytes()));
-                self.questions
-                    .extend(store.map(|(key, layout)| password.on(key, layout)));
-            }
-            (store, true) => self
-                .questions
-                .extend(store.map(|(key, layout)| password.on(key, layout))),
+                .entry(root)
+                .or_default()
+                .push(password.bytes()),
         }
     }
 
@@ -755,7 +884,7 @@ impl PasswordQuestions {
         strings: &[StringPackage],
     ) {
         let id = password.question.var_store_id;
-        let Some(stores) = ids.0.get_mut(&id).filter(|_| id != 0) else {
+        let Some(stores) = ids.ids.get_mut(&id).filter(|_| id != 0) else {
             return;
         };
         stores.shared.outside_passwords.push(password.bytes());
@@ -911,46 +1040,46 @@ thread_local! {
     static PACKAGES_COMPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The FirstVarStores of `packages` whose `range` holds `index`, the packages in the order of
-/// their ranges.
-fn package_of(
-    packages: &[FirstVarStores],
-    index: usize,
-    range: impl Fn(&FirstVarStores) -> &Range<usize>,
-) -> Option<&FirstVarStores> {
+/// The FirstVarStores of `packages` whose FormSets hold the root of index `root`, the packages in
+/// the order of their FormSets.
+fn package_of(packages: &[FirstVarStores], root: usize) -> Option<&FirstVarStores> {
     let package = packages.partition_point(|package| {
         #[cfg(test)]
         PACKAGES_COMPARED.with(|compared| compared.set(compared.get() + 1));
-        range(package).end <= index
+        package.form_sets.end <= root
     });
     packages
         .get(package)
-        .filter(|package| range(package).contains(&index))
+        .filter(|package| package.form_sets.contains(&root))
 }
 
-/// The PASSWORD of the `op` at `node`, of the FormSet `form_set`, with the variable of the VarStore
-/// of its VarStoreId that its FormSet declares and its layout, if any: each VarStore of that id
-/// outside any
-/// FormSet of its package list, in `ids`, which edk2-stable202608 ConfigKeywordHandler.c
-/// FindStorageFromVarId may take first, holds its password too, at the same VarOffset and MaxSize.
-/// With it, never instead of it, the first reason that its password may be in a variable that they
-/// do not name. None for VarStoreId 0, which names no VarStore (UEFI 2.10 §33.3.8.2.2): its driver
-/// keeps such a question's value through callbacks or READ/WRITE ops (§33.2.5.6), in no variable
-/// that the IFR names. A FormSet without a VarStore of that id that names a variable leaves the
-/// password unresolved, as does an outside VARSTORE_NAME_VALUE or VARSTORE_EFI before UEFI 2.3.1 of
-/// that id, which names none. Its fields `password` are read from its op: one that ends before
-/// MaxSize still names its VarStore and VarOffset, so its question takes every byte from there on,
-/// and it is unresolved too.
+/// The PASSWORD `op`, of the FormSet `form_set`, of the root `root` of its package list, whose
+/// VarStores of each VarStoreId `ids` holds: every VARSTORE and VARSTORE_EFI of its VarStoreId in
+/// its FormSet, whatever the ops around it, in the forms that read_db disables too, holds its
+/// password at its VarOffset, and each outside any FormSet or in the scope of an unknown opcode
+/// too, as edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId may take any of them
+/// first (add_in_form_set). Each VARSTORE_EFI before UEFI 2.3.1 of that id in its FormSet holds it
+/// from byte 0 of the variable that its VarName names, as form_set_varstore takes it.
+/// With them, never instead of them, the first reason that its password may be in a variable that
+/// they do not name: in its FormSet, a VarStore op that does not decode, a VARSTORE_NAME_VALUE of
+/// that id or such a VARSTORE_EFI whose VarName names no variable, or no VarStore of that id at
+/// all; outside any FormSet or in the scope of an unknown opcode, a VARSTORE_NAME_VALUE or
+/// VARSTORE_EFI before UEFI 2.3.1 of that id, which names none. None for VarStoreId 0, which
+/// names no VarStore (UEFI 2.10 §33.3.8.2.2): its driver keeps such a question's value through
+/// callbacks or READ/WRITE ops (§33.2.5.6), in no variable that the IFR names. Its fields
+/// `password` are read from its op: one that ends before MaxSize still names its VarStore and
+/// VarOffset, so its questions take every byte from there on, and it is unresolved too.
 /// The first VarStore of that id in its form package, which FindStorageFromVarId takes
 /// (ConfigKeywordHandler.c:1520-1567), in `package`, holds the password too where a FormSet other
 /// than the nearest around the PASSWORD declares it, a FormSet nested in that one or around it
 /// among them: a VARSTORE or VARSTORE_EFI at its VarOffset, while a VARSTORE_NAME_VALUE or
 /// VARSTORE_EFI before UEFI 2.3.1 leaves it unresolved. Only the first: a later FormSet's VarStore
-/// of the id holds none of it.
+/// of the id holds none of it, unless that FormSet is in the PASSWORD's root.
 fn password_questions(
-    node: &Rc<RefCell<IFROperation>>,
+    op: &IFROperation,
     password: PasswordFields,
     form_set: Option<Guid>,
+    root: usize,
     package: Option<&FirstVarStores>,
     ids: &VarStoreIds,
 ) -> (Option<FormSetPassword>, Option<UnresolvedPassword>) {
@@ -967,24 +1096,55 @@ fn password_questions(
     if header.var_store_id == 0 {
         return (None, no_max_size);
     }
-    let (store, mut unresolved) =
-        match find_corresponding_varstore(Rc::clone(node), header.var_store_id) {
-            Ok(store) => (Some((store.variable_key(), store.layout())), no_max_size),
-            Err(error) => (
-                None,
-                Some(UnresolvedPassword::NoVarStore {
-                    form_set,
-                    question_id: header.question_id,
-                    reason: error.to_string(),
-                }),
-            ),
-        };
-    let nameless = ids
-        .0
-        .get(&header.var_store_id)
-        .and_then(|stores| stores.nameless);
-    if let Some((nameless, offset, place)) = nameless {
-        let question_id = header.question_id;
+    let stores = ids.ids.get(&header.var_store_id);
+    let in_form_set = stores.and_then(|stores| stores.form_sets.get(&root));
+    let mut unknown = ids
+        .undecoded
+        .get(&root)
+        .map(|undecoded| undecoded.first.clone());
+    let mut short = Vec::new();
+    let mut candidates = Vec::new();
+    for (at, store) in in_form_set.into_iter().flat_map(|stores| &stores.short) {
+        match short_efi_variable(store, op) {
+            Ok(variable) => short.push(password.on(variable.variable_key(), variable.layout())),
+            Err(refusal) => {
+                unknown = first_unknown(
+                    unknown,
+                    UnknownStore {
+                        at: *at,
+                        reason: refusal.to_string(),
+                    },
+                );
+                candidates.extend(
+                    store
+                        .candidate_variables(header.var_store_info)
+                        .into_iter()
+                        .map(|key| password.on(key, VariableLayout::OneValue)),
+                );
+            }
+        }
+    }
+    if let Some(name_value) = in_form_set.and_then(|stores| stores.name_value.clone()) {
+        unknown = first_unknown(unknown, name_value);
+    }
+    let variables = stores.is_some_and(|stores| stores.shared.in_form_sets.contains_key(&root));
+    let reason = match unknown {
+        Some(unknown) => Some(unknown.reason),
+        None if !variables && short.is_empty() => {
+            Some(undeclared_var_store(header.var_store_id).to_string())
+        }
+        None => None,
+    };
+    let question_id = header.question_id;
+    let mut unresolved = match reason {
+        Some(reason) => Some(UnresolvedPassword::NoVarStore {
+            form_set,
+            question_id,
+            reason,
+        }),
+        None => no_max_size,
+    };
+    if let Some((nameless, offset, place)) = stores.and_then(|stores| stores.nameless) {
         unresolved.get_or_insert(match nameless {
             NamelessStore::NameValue => UnresolvedPassword::NameValueOutsideFormSet {
                 form_set,
@@ -1000,7 +1160,7 @@ fn password_questions(
             },
         });
     }
-    let own_form_set = enclosing_form_set(&node.borrow());
+    let own_form_set = enclosing_form_set(op);
     let first = package
         .and_then(|package| package.declared_by.get(&header.var_store_id))
         .filter(|first| {
@@ -1009,7 +1169,7 @@ fn password_questions(
                 .is_some_and(|own| Rc::ptr_eq(own, &first.form_set))
         })
         .and_then(|first| {
-            let (_, store) = declared_store(&first.store.borrow())?;
+            let (_, store) = declared_store(&first.store.borrow().parsed_data)?;
             Some((
                 StoreVariable::of(&store),
                 form_set_guid(&first.form_set.borrow()),
@@ -1021,32 +1181,21 @@ fn password_questions(
         unresolved.get_or_insert(reason);
     }
     let first = first.map(|(variable, _)| variable);
-    (
-        Some(FormSetPassword {
-            password,
-            store,
-            first,
-        }),
-        unresolved,
-    )
+    let password = FormSetPassword {
+        password,
+        short,
+        candidates,
+        first,
+    };
+    (Some(password), unresolved)
 }
 
-/// The variables that may hold the password of the PASSWORD `op`, whose VarStore is unknown: on
-/// a VARSTORE_EFI before UEFI 2.3.1, those that its VarName may name
-/// (ShortVarStoreEfi::candidate_variables), each from byte 0, all of it where the op ends before
-/// MaxSize.
-fn candidate_questions(op: &IFROperation) -> Vec<PasswordQuestion> {
-    let Ok(password) = PasswordFields::of(op) else {
-        return Vec::new();
-    };
-    let Some(store) = short_var_store_of(op, password.question.var_store_id) else {
-        return Vec::new();
-    };
-    store
-        .candidate_variables(password.question.var_store_info)
-        .into_iter()
-        .map(|key| password.on(key, VariableLayout::OneValue))
-        .collect()
+/// Of `unknown`, if any, and `other`, the one that comes first in the walk of their FormSet.
+fn first_unknown(unknown: Option<UnknownStore>, other: UnknownStore) -> Option<UnknownStore> {
+    Some(match unknown {
+        Some(unknown) if unknown.at <= other.at => unknown,
+        Some(_) | None => other,
+    })
 }
 
 /// A PASSWORD op whose VarStore is unknown.
@@ -1244,9 +1393,13 @@ pub(crate) struct SetupPasswordDeclared;
 mod tests {
     use std::cell::Cell;
 
+    use super::super::conditions::CONSTANT_CONDITIONS;
+    use super::super::find_corresponding_varstore;
     use super::super::ifr_fixtures::*;
     use super::super::QuestionFlags;
     use super::super::DECLARATIONS_READ;
+    use super::super::EFI_IFR_TYPE_NUM_SIZE_8;
+    use super::super::ROOT_INDICES_SHIFTED;
     use super::*;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
     use crate::hii::package::hiidb_fixtures::form_package;
@@ -2667,8 +2820,8 @@ mod tests {
         form_set_guid(&first.form_set.borrow())
     }
 
-    /// read_db records, for each form package, its FormSets by index in the list's forms, its
-    /// disabled forms by index in the list's disabled_forms, and the first VarStore of each
+    /// read_db records, for each form package, its FormSets by index in the list's forms, which its
+    /// disabled forms name by the index of their roots, and the first VarStore of each
     /// VarStoreId that a FormSet declares, with that FormSet, in IFR order, ops outside any FormSet
     /// and disabled forms included: in the first package, a VarStore outside any FormSet declares
     /// VarStoreId 3 first, and VarStoreId 5 only follows the FormSets; in the second, the form that
@@ -2708,7 +2861,7 @@ mod tests {
                     .declared_by
                     .iter()
                     .map(|(&var_store_id, first)| {
-                        let name = match declared_store(&first.store.borrow()) {
+                        let name = match declared_store(&first.store.borrow().parsed_data) {
                             Some((_, DeclaredStore::Variable(store))) => store.variable_key().name,
                             _ => String::new(),
                         };
@@ -2721,11 +2874,13 @@ mod tests {
                         (var_store_id, (name, form_set))
                     })
                     .collect();
-                (
-                    package.form_sets.clone(),
-                    package.disabled_forms.clone(),
-                    declared_by,
-                )
+                let disabled_roots: Vec<usize> = list
+                    .disabled_forms
+                    .iter()
+                    .map(|disabled| disabled.root_index)
+                    .filter(|root| package.form_sets.contains(root))
+                    .collect();
+                (package.form_sets.clone(), disabled_roots, declared_by)
             })
             .collect();
         let named = |name: &str, form_set: usize| (name.to_string(), Some(form_set));
@@ -2736,12 +2891,12 @@ mod tests {
             [
                 (
                     0..2,
-                    0..0,
+                    vec![],
                     BTreeMap::from([(2, named("S2", 0)), (4, named("S4", 1))])
                 ),
                 (
                     2..3,
-                    0..1,
+                    vec![2],
                     BTreeMap::from([(6, named("S6", 2)), (7, named("S7", 2))])
                 ),
             ]
@@ -2798,7 +2953,7 @@ mod tests {
         }
     }
 
-    /// A disabled form finds its form package by its index among the list's disabled forms: where
+    /// A disabled form finds its form package by its root's index in the list's forms: where
     /// each of two form packages holds a form that a short NUMERIC disables, and the second
     /// package's FormSet declares Shadow, the first VarStore of id 2, before a later FormSet whose
     /// PASSWORD of id 2 at VarOffset 5 is in the list's second disabled form, Shadow keeps the
@@ -2862,20 +3017,53 @@ mod tests {
         }
     }
 
+    /// Where another FormSet's first VarStore of a PASSWORD's VarStoreId names the variable of a
+    /// VarStore of the id outside any FormSet, which holds the password at that VarOffset already,
+    /// its bytes there are withheld once: of a FormSet that declares Shadow for VarStoreId 2, the
+    /// VARSTORE Shadow of id 2 outside any FormSet and the PASSWORD's FormSet, Shadow's FormSet
+    /// declares the first VarStore of id 2, and both reaches withhold AMITSESetup and Shadow at
+    /// 5..45, each once.
+    #[test]
+    fn a_first_var_store_of_an_outside_var_store_s_variable_withholds_its_bytes_once() {
+        let list = list_of_packages(&[vec![
+            first_form_set(var_store(2, OTHER_GUID, "Shadow", 81)),
+            var_store(2, OTHER_GUID, "Shadow", 81),
+            form_set_with(&[password_on(2, 3, 2, 5)]),
+        ]]);
+        let mut want = WithheldBytes::default();
+        want.insert(amitse_setup(), 5..45);
+        want.insert(shadow(), 5..45);
+
+        assert_eq!(
+            first_store_form_set(&list, 2),
+            Some(Guid::from(FIRST_FORM_SET)),
+            "the FormSet of the first VarStore of id 2"
+        );
+        for reach in [VariableReach::BootServices, VariableReach::Runtime] {
+            assert_eq!(
+                PasswordQuestions::of_lists(std::slice::from_ref(&list))
+                    .withheld(&reaching(reach))
+                    .map_err(|error| error.to_string()),
+                Ok(want.clone()),
+                "{reach:?}"
+            );
+        }
+    }
+
     /// FindStorageFromVarId walks the form package op by op, FORM_SET ops or not, so a FormSet
     /// nested in another is another FormSet either way round: where a FormSet declares Shadow for
     /// VarStoreId 2 and then nests the PASSWORD's FormSet, and where the PASSWORD's FormSet nests
     /// one that declares Shadow before its own AMITSESetup, Shadow keeps the password at its
     /// VarOffset, through variables of either reach and from a ConfigSnapshot. Where the nested
     /// PASSWORD's FormSet declares its AMITSESetup before the Shadow of the FormSet around it, its
-    /// own is the first.
+    /// own is the first, and Shadow keeps the password too, as a VarStore of its id in the
+    /// PASSWORD's root (password_questions).
     #[test]
     fn the_first_var_store_of_a_form_set_nesting_or_nested_in_the_password_s_is_withheld() {
         let shadow_store = var_store(2, OTHER_GUID, "Shadow", 81);
         let password_form_set = form_set_with(&[password_on(2, 3, 2, 5)]);
-        let mut own = WithheldBytes::default();
-        own.insert(amitse_setup(), 5..45);
-        let mut both = own.clone();
+        let mut both = WithheldBytes::default();
+        both.insert(amitse_setup(), 5..45);
         both.insert(shadow(), 5..45);
         for (case, ifr, want) in [
             (
@@ -2896,12 +3084,12 @@ mod tests {
                         form(1, &[password_on(2, 3, 2, 5)]),
                     ],
                 ),
-                both,
+                both.clone(),
             ),
             (
                 "the PASSWORD's FormSet nested before Shadow",
                 form_set_with_guid(FIRST_FORM_SET, &[password_form_set, shadow_store]),
-                own,
+                both,
             ),
         ] {
             let ifr = [ifr];
@@ -3908,11 +4096,39 @@ mod tests {
         }
     }
 
+    /// A VarStore in the scope of an unknown opcode of a PASSWORD's own FormSet is a VarStore of
+    /// that FormSet and one of those outside any FormSet at once: the PASSWORD resolves, and its
+    /// bytes at its VarOffset are withheld there once, beside those in the other VarStore of its
+    /// id in its FormSet, through variables of either reach.
+    #[test]
+    fn a_var_store_in_an_unknown_scope_of_its_form_set_withholds_a_password_once() {
+        let passwords = passwords_of(&[form_set(&[
+            var_store(2, TSE_GUID, "AMITSESetup", 81),
+            in_unknown_scope(&var_store(2, OTHER_GUID, "Shadow", 81)),
+            form(1, &[password_on(2, 3, 2, 0)]),
+        ])]);
+        let mut want = WithheldBytes::default();
+        want.insert(amitse_setup(), 0..40);
+        want.insert(shadow(), 0..40);
+
+        assert_eq!(passwords.unresolved, vec![], "unresolved");
+        for reach in [VariableReach::BootServices, VariableReach::Runtime] {
+            assert_eq!(
+                passwords
+                    .withheld(&reaching(reach))
+                    .map_err(|error| error.to_string()),
+                Ok(want.clone()),
+                "{reach:?}"
+            );
+        }
+    }
+
     /// A VarStore in the scope of an unknown opcode that does not parse may declare the
     /// VarStoreId of any PASSWORD, as one outside any FormSet may: through variables that reach
     /// Runtime every variable of the Guid that it holds is withheld whole, beside the bytes of
     /// the PASSWORD in its FormSet's store; through those that reach BootServices it fails
-    /// closed.
+    /// closed. The PASSWORD of its FormSet is unresolved for it too, as an undecoded VarStore op
+    /// of its FormSet (UndecodedStores).
     #[test]
     fn a_malformed_var_store_in_an_unknown_scope_withholds_every_variable_of_its_guid() {
         // its Guid, VarStoreId 7 and Size, and no Name
@@ -3934,8 +4150,11 @@ mod tests {
         assert!(
             matches!(
                 passwords.unresolved.as_slice(),
-                [UnresolvedPassword::MalformedVarStoreOutsideFormSet { reason, .. }]
-                    if reason.starts_with("a malformed EFI_IFR_VARSTORE in the scope of an unknown opcode: ")
+                [
+                    UnresolvedPassword::NoVarStore { reason: undecoded, .. },
+                    UnresolvedPassword::MalformedVarStoreOutsideFormSet { reason, .. },
+                ] if undecoded.starts_with("failed to parse VarStore's data: ")
+                    && reason.starts_with("a malformed EFI_IFR_VARSTORE in the scope of an unknown opcode: ")
             ),
             "{:?}",
             passwords.unresolved
@@ -4098,6 +4317,975 @@ mod tests {
                 bytes.contains(&&(0..usize::MAX)),
                 "{} withheld whole: {bytes:?}",
                 key.name
+            );
+        }
+    }
+
+    /// A password_on question of `key` at byte 0: MaxSize 20.
+    fn password_at_0(key: VariableKey) -> PasswordQuestion {
+        PasswordQuestion {
+            key,
+            offset: 0,
+            max_size: Some(20),
+        }
+    }
+
+    /// `body` in the scope of an op above EFI_IFR_MATCH2_OP, which edk2's ParseOpCodes skips
+    /// (IsUnKnownOpCode).
+    fn in_unknown_op(body: &[u8]) -> Vec<u8> {
+        nested(&operation(0x70, true, &[]), 1, &[body.to_vec()])
+    }
+
+    /// The variable that find_corresponding_varstore finds for a CHECKBOX of VarStoreId 2 in the
+    /// form of a FormSet whose `declarations` come before that form, or why it finds none.
+    fn checkbox_store(declarations: &[Vec<u8>]) -> Result<VariableKey, String> {
+        let root = parse_form_set(&[declarations.concat(), form(1, &[checkbox_on(1, 3, 2)])]);
+        let mut checkbox = None;
+        walk_scopes(std::slice::from_ref(&root), (), |node, ()| {
+            if node.borrow().op_code == IFROpCode::CheckBox {
+                checkbox = Some(Rc::clone(node));
+            }
+            Walk::Enter(())
+        });
+        find_corresponding_varstore(checkbox.expect("the CHECKBOX"), 2)
+            .map(|store| store.variable_key())
+            .map_err(|error| error.to_string())
+    }
+
+    /// A VarStore under a SUPPRESS_IF of the FormSet, or a DISABLE_IF of it whose constant
+    /// condition is FALSE, declares its VarStoreId: UEFI 2.11 §33.2.5.1's form-set-list admits
+    /// both, and edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes creates such a store
+    /// (CreateStorage).
+    #[test]
+    fn a_question_finds_its_var_store_under_a_form_set_suppress_if_or_false_disable_if() {
+        let amitse = var_store(2, TSE_GUID, "AMITSESetup", 81);
+        for (case, declarations) in [
+            (
+                "SUPPRESS_IF TRUE",
+                vec![conditional(
+                    SUPPRESS_IF,
+                    ifr_true(),
+                    std::slice::from_ref(&amitse),
+                )],
+            ),
+            (
+                "DISABLE_IF FALSE",
+                vec![conditional(
+                    DISABLE_IF,
+                    ifr_false(),
+                    std::slice::from_ref(&amitse),
+                )],
+            ),
+            (
+                "DISABLE_IF FALSE in a SUPPRESS_IF",
+                vec![conditional(
+                    SUPPRESS_IF,
+                    ifr_false(),
+                    &[conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        std::slice::from_ref(&amitse),
+                    )],
+                )],
+            ),
+        ] {
+            assert_eq!(checkbox_store(&declarations), Ok(amitse_setup()), "{case}");
+        }
+    }
+
+    /// A VarStore in a form is outside the form-set-list where UEFI 2.11 §33.2.5.1 and VfrCompile
+    /// declare VarStores: no store of its questions, though edk2's ParseOpCodes creates one there.
+    /// Nor is one in the scope of an unknown op, which ParseOpCodes skips (IsUnKnownOpCode).
+    #[test]
+    fn a_var_store_in_a_form_or_an_unknown_op_is_no_store() {
+        let amitse = var_store(2, TSE_GUID, "AMITSESetup", 81);
+        for (case, declaration) in [
+            ("a form", form(2, std::slice::from_ref(&amitse))),
+            (
+                "a form map",
+                form_map(&[(1, STANDARD_FORM_GUID)], std::slice::from_ref(&amitse)),
+            ),
+            ("an unknown op", in_unknown_op(&amitse)),
+        ] {
+            assert_eq!(
+                checkbox_store(&[declaration]),
+                Err("no supported varstore with matching id 0x0002 found".to_owned()),
+                "{case}"
+            );
+        }
+    }
+
+    /// Of two declarations of a VarStoreId under DISABLE_IFs of the FormSet, a question takes the
+    /// one that edk2 creates, whose constant condition is FALSE: ParseOpCodes skips the scope of
+    /// one whose condition is TRUE (IfrParse.c:1392, :3045-3059).
+    #[test]
+    fn a_form_set_disable_if_picks_the_var_store_that_edk2_creates() {
+        let variants = [
+            conditional(
+                DISABLE_IF,
+                ifr_true(),
+                &[var_store(2, OTHER_GUID, "Shadow", 81)],
+            ),
+            conditional(
+                DISABLE_IF,
+                ifr_false(),
+                &[var_store(2, TSE_GUID, "AMITSESetup", 81)],
+            ),
+        ];
+        assert_eq!(checkbox_store(&variants), Ok(amitse_setup()));
+    }
+
+    /// A VarStore only under a DISABLE_IF of the FormSet whose constant condition is TRUE is no
+    /// store of its questions, as edk2 creates none.
+    #[test]
+    fn a_var_store_under_a_true_form_set_disable_if_is_no_store() {
+        let refusal = checkbox_store(&[conditional(
+            DISABLE_IF,
+            ifr_true(),
+            &[var_store(2, TSE_GUID, "AMITSESetup", 81)],
+        )]);
+        assert_eq!(
+            refusal,
+            Err("no supported varstore with matching id 0x0002 found".to_owned())
+        );
+    }
+
+    /// A GET or SET of the UINT8 at VarOffset 0 of VarStore `id`.
+    fn store_op(op_code: u8, id: u16) -> Vec<u8> {
+        let data = [
+            &id.to_le_bytes()[..],
+            &0u16.to_le_bytes(),
+            &[EFI_IFR_TYPE_NUM_SIZE_8],
+        ]
+        .concat();
+        operation(op_code, false, &data)
+    }
+
+    /// A DISABLE_IF of the FormSet whose condition relies on a question or a VarStore, where UEFI
+    /// 2.11 §33.3.8.3.14 allows only constants, leaves a VarStore under it undetermined, whichever
+    /// op it relies on: no store, with that reason. The GET and SET are of the VarStore Shadow.
+    #[test]
+    fn a_var_store_under_a_form_set_disable_if_that_is_not_constant_is_undetermined() {
+        const EQ_ID_ID: u8 = 0x13;
+        const EQ_ID_VAL_LIST: u8 = 0x14;
+        const GET: u8 = 0x2B;
+        const SET: u8 = 0x2C;
+        const THIS: u8 = 0x58;
+        let cases = [
+            ("EQ_ID_VAL", "EQ_ID_VAL", eq_id_val_of(1, 0)),
+            (
+                "EQ_ID_ID",
+                "EQ_ID_ID",
+                operation(EQ_ID_ID, false, &[1, 0, 1, 0]),
+            ),
+            (
+                "EQ_ID_VAL_LIST",
+                "EQ_ID_VAL_LIST",
+                operation(EQ_ID_VAL_LIST, false, &[1, 0, 1, 0, 0, 0]),
+            ),
+            (
+                "QUESTION_REF1",
+                "QUESTION_REF1",
+                operation(QUESTION_REF1, false, &[1, 0]),
+            ),
+            ("THIS", "THIS", operation(THIS, false, &[])),
+            ("GET", "GET", store_op(GET, 5)),
+            ("SET", "SET", [uint8(1), store_op(SET, 5)].concat()),
+            (
+                "GET in the scope of the expression's first op",
+                "GET",
+                scoped_expression(
+                    &[uint8(1), store_op(GET, 5), operation(EQUAL, false, &[])],
+                    0,
+                ),
+            ),
+        ];
+        for (case, name, condition) in cases {
+            let refusal = checkbox_store(&[
+                var_store(5, OTHER_GUID, "Shadow", 81),
+                conditional(
+                    DISABLE_IF,
+                    condition,
+                    &[var_store(2, TSE_GUID, "AMITSESetup", 81)],
+                ),
+            ]);
+            let want = format!(
+                "it relies on EFI_IFR_{name}, where a DISABLE_IF outside forms must only rely on \
+                 constants"
+            );
+            assert!(
+                matches!(&refusal, Err(reason) if reason.contains(&want)),
+                "{case}: {refusal:?}"
+            );
+        }
+    }
+
+    /// A DISABLE_IF of the FormSet whose condition is TRUE hides the VarStores in its scope
+    /// whatever the conditions of the DISABLE_IFs inside it, which edk2's ParseOpCodes never
+    /// evaluates (IfrParse.c:1390-1413), and whatever those around it: a question takes the
+    /// VarStore of its id under the DISABLE_IF FALSE after it.
+    #[test]
+    fn a_true_form_set_disable_if_hides_its_var_stores_whatever_the_other_conditions() {
+        let hidden = [var_store(2, OTHER_GUID, "Shadow", 81)];
+        let cases = [
+            (
+                "TRUE around one not known",
+                conditional(
+                    DISABLE_IF,
+                    ifr_true(),
+                    &[conditional(DISABLE_IF, eq_id_val_of(1, 0), &hidden)],
+                ),
+            ),
+            (
+                "one not known around TRUE",
+                conditional(
+                    DISABLE_IF,
+                    eq_id_val_of(1, 0),
+                    &[conditional(DISABLE_IF, ifr_true(), &hidden)],
+                ),
+            ),
+        ];
+        for (case, declaration) in cases {
+            let store = checkbox_store(&[
+                declaration,
+                conditional(
+                    DISABLE_IF,
+                    ifr_false(),
+                    &[var_store(2, TSE_GUID, "AMITSESetup", 81)],
+                ),
+            ]);
+            assert_eq!(store, Ok(amitse_setup()), "{case}");
+        }
+    }
+
+    /// A PASSWORD whose VarStore a SUPPRESS_IF of the FormSet declares withholds its bytes there,
+    /// instead of failing closed for the whole HiiDB.
+    #[test]
+    fn a_password_on_a_var_store_under_a_form_set_suppress_if_is_withheld() {
+        let found = PasswordQuestions::of([&parse_form_set(&[
+            conditional(
+                SUPPRESS_IF,
+                ifr_true(),
+                &[var_store(2, TSE_GUID, "AMITSESetup", 81)],
+            ),
+            form(1, &[password_on(2, 3, 2, 0)]),
+        ])]);
+        assert_eq!(
+            (found.questions, found.unresolved),
+            (vec![password_at_0(amitse_setup())], vec![])
+        );
+    }
+
+    /// A PASSWORD withholds its bytes in every VarStore of its VarStoreId in its FormSet, under
+    /// DISABLE_IFs whatever their conditions, TRUE, FALSE or not known, in a form or an unknown op:
+    /// edk2's Config Keyword Handler takes the first VarStore of the id in the form package
+    /// (ConfigKeywordHandler.c FindStorageFromVarId), whatever the scopes around it, so a
+    /// condition never opens one.
+    #[test]
+    fn a_password_withholds_every_var_store_of_its_id_whatever_the_scopes() {
+        let amitse = var_store(2, TSE_GUID, "AMITSESetup", 81);
+        let shadow_store = var_store(2, OTHER_GUID, "Shadow", 81);
+        for (case, declarations, want) in [
+            (
+                "TRUE",
+                vec![conditional(
+                    DISABLE_IF,
+                    ifr_true(),
+                    std::slice::from_ref(&amitse),
+                )],
+                vec![amitse_setup()],
+            ),
+            (
+                "not constant",
+                vec![conditional(
+                    DISABLE_IF,
+                    eq_id_val_of(1, 0),
+                    std::slice::from_ref(&amitse),
+                )],
+                vec![amitse_setup()],
+            ),
+            (
+                "TRUE then FALSE",
+                vec![
+                    conditional(DISABLE_IF, ifr_true(), std::slice::from_ref(&shadow_store)),
+                    conditional(DISABLE_IF, ifr_false(), std::slice::from_ref(&amitse)),
+                ],
+                vec![shadow(), amitse_setup()],
+            ),
+            (
+                "in a form",
+                vec![form(2, std::slice::from_ref(&amitse))],
+                vec![amitse_setup()],
+            ),
+            (
+                "in an unknown op, then created",
+                vec![in_unknown_op(&shadow_store), amitse.clone()],
+                vec![shadow(), amitse_setup()],
+            ),
+        ] {
+            let found = PasswordQuestions::of([&parse_form_set(&[
+                declarations.concat(),
+                form(1, &[password_on(2, 3, 2, 0)]),
+            ])]);
+            let mut withheld = WithheldBytes::default();
+            for key in want {
+                withheld.insert(key, 0..40);
+            }
+            assert_eq!(found.unresolved, vec![], "{case}: unresolved");
+            assert_eq!(
+                found
+                    .withheld(&reaching(VariableReach::BootServices))
+                    .map_err(|error| error.to_string()),
+                Ok(withheld),
+                "{case}: withheld"
+            );
+        }
+    }
+
+    /// A VarStore op in the scope of an unknown op that does not decode may be of a PASSWORD's
+    /// VarStoreId, so the PASSWORD is unresolved, whatever other VarStore of its id it has.
+    #[test]
+    fn an_undecoded_var_store_in_an_unknown_op_leaves_a_password_unresolved() {
+        let found = PasswordQuestions::of([&parse_form_set(&[
+            in_unknown_op(&operation(VAR_STORE, false, &[0x00; 3])),
+            var_store(2, TSE_GUID, "AMITSESetup", 81),
+            form(1, &[password_on(2, 3, 2, 0)]),
+        ])]);
+        assert_eq!(found.questions, vec![password_at_0(amitse_setup())]);
+        assert!(
+            matches!(
+                found.unresolved.as_slice(),
+                [UnresolvedPassword::NoVarStore { question_id: 2, reason, .. }]
+                    if reason.contains("VarStore's data")
+            ),
+            "{:?}",
+            found.unresolved
+        );
+    }
+
+    /// A VarStore of a PASSWORD's VarStoreId whose EFI variable uefisettings does not know, a
+    /// short VARSTORE_EFI or a VARSTORE_NAME_VALUE, leaves the PASSWORD unresolved wherever it
+    /// sits, here under a DISABLE_IF TRUE, without dropping the VarStore of the id under a
+    /// DISABLE_IF FALSE: a CHECKBOX takes that one, and every reach withholds it. Through
+    /// BootServices, the HiiDB of this legal VFR variant is refused.
+    #[test]
+    fn a_store_of_an_unknown_variable_leaves_a_password_unresolved_beside_a_known_one() {
+        let cases = [
+            (
+                "short VARSTORE_EFI",
+                short_var_store_efi(2),
+                "VarStore 0x0002 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): no string 0x0000 \
+                 holds its VarName",
+                vec![short_variable("!")],
+            ),
+            (
+                "VARSTORE_NAME_VALUE",
+                var_store_name_value(2, [0x66; 16]),
+                "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
+                vec![],
+            ),
+        ];
+        for (case, unknown, reason, candidates) in cases {
+            let declarations = [
+                conditional(DISABLE_IF, ifr_true(), &[unknown]),
+                conditional(
+                    DISABLE_IF,
+                    ifr_false(),
+                    &[var_store(2, TSE_GUID, "AMITSESetup", 81)],
+                ),
+            ];
+            assert_eq!(
+                checkbox_store(&declarations),
+                Ok(amitse_setup()),
+                "{case}: CHECKBOX"
+            );
+
+            let found = PasswordQuestions::of([&parse_form_set(&[
+                declarations.concat(),
+                form(1, &[password_on(2, 3, 2, 0)]),
+            ])]);
+
+            assert_eq!(
+                found.questions,
+                vec![password_at_0(amitse_setup())],
+                "{case}: questions"
+            );
+            assert!(
+                matches!(
+                    found.unresolved.as_slice(),
+                    [UnresolvedPassword::NoVarStore { question_id: 2, reason: got, .. }]
+                        if got.contains(reason)
+                ),
+                "{case}: {:?}",
+                found.unresolved
+            );
+            assert!(
+                found
+                    .withheld(&reaching(VariableReach::BootServices))
+                    .is_err(),
+                "{case}: BootServices"
+            );
+            let mut known = WithheldBytes::default();
+            known.insert(amitse_setup(), 0..40);
+            for candidate in candidates {
+                known.insert(candidate, 0..40);
+            }
+            assert_eq!(
+                found
+                    .withheld(&reaching(VariableReach::Runtime))
+                    .map_err(|error| error.to_string()),
+                Ok(known),
+                "{case}: Runtime"
+            );
+        }
+    }
+
+    /// edk2's ParseOpCodes creates a VarStore in a FORM or FORM_MAP too (IfrParse.c:1873-1884,
+    /// :477), and CreateQuestion binds a question to the first store of its id (:136-145): a
+    /// VarStore of the id in a FORM or FORM_MAP before the one of the form-set-list refuses the
+    /// lookup, and one after it leaves the question on the one of the form-set-list.
+    #[test]
+    fn a_var_store_in_a_form_before_the_form_set_list_one_refuses_the_lookup() {
+        let shadow_store = || var_store(2, OTHER_GUID, "Shadow", 81);
+        let amitse = || var_store(2, TSE_GUID, "AMITSESetup", 81);
+        for (op, form_op) in [
+            ("EFI_IFR_FORM", form(2, &[shadow_store()])),
+            (
+                "EFI_IFR_FORM_MAP",
+                form_map(&[(1, STANDARD_FORM_GUID)], &[shadow_store()]),
+            ),
+        ] {
+            let refusal = checkbox_store(&[form_op.clone(), amitse()]);
+            let want = format!(
+                "VarStore 0x0002 is declared in an {op} of its FormSet before the one of its \
+                 form-set-list"
+            );
+            assert!(
+                matches!(&refusal, Err(reason) if reason.contains(&want)),
+                "{op} first: {refusal:?}"
+            );
+            assert_eq!(
+                checkbox_store(&[amitse(), form_op]),
+                Ok(amitse_setup()),
+                "{op} after"
+            );
+        }
+    }
+
+    /// A question takes the first VarStore of its id in IFR order that edk2 creates: a TRUE
+    /// DISABLE_IF hides its scope inside a FALSE one; of two created, the first; an undetermined
+    /// one before the created one refuses the lookup, after it changes nothing; and of nested
+    /// DISABLE_IFs whose conditions are not known, the outermost gives the reason.
+    #[test]
+    fn a_question_takes_the_first_var_store_of_its_id_that_edk2_creates() {
+        let shadow_store = || var_store(2, OTHER_GUID, "Shadow", 81);
+        let amitse = || var_store(2, TSE_GUID, "AMITSESetup", 81);
+        let eq_id_val_reason = "it relies on EFI_IFR_EQ_ID_VAL";
+        let cases = [
+            (
+                "DISABLE_IF FALSE around DISABLE_IF TRUE, then created",
+                vec![
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[conditional(DISABLE_IF, ifr_true(), &[shadow_store()])],
+                    ),
+                    amitse(),
+                ],
+                Ok(amitse_setup()),
+            ),
+            (
+                "two created",
+                vec![amitse(), shadow_store()],
+                Ok(amitse_setup()),
+            ),
+            (
+                "not known, then DISABLE_IF FALSE",
+                vec![
+                    conditional(DISABLE_IF, eq_id_val_of(1, 0), &[shadow_store()]),
+                    conditional(DISABLE_IF, ifr_false(), &[amitse()]),
+                ],
+                Err(eq_id_val_reason),
+            ),
+            (
+                "created, then not known",
+                vec![
+                    amitse(),
+                    conditional(DISABLE_IF, eq_id_val_of(1, 0), &[shadow_store()]),
+                ],
+                Ok(amitse_setup()),
+            ),
+            (
+                "EQ_ID_VAL around QUESTION_REF1",
+                vec![conditional(
+                    DISABLE_IF,
+                    eq_id_val_of(1, 0),
+                    &[conditional(
+                        DISABLE_IF,
+                        operation(QUESTION_REF1, false, &[1, 0]),
+                        &[shadow_store()],
+                    )],
+                )],
+                Err(eq_id_val_reason),
+            ),
+        ];
+        for (case, declarations, want) in cases {
+            let store = checkbox_store(&declarations);
+            match want {
+                Ok(key) => assert_eq!(store, Ok(key), "{case}"),
+                Err(reason) => assert!(
+                    matches!(&store, Err(got) if got.contains(reason)),
+                    "{case}: {store:?}"
+                ),
+            }
+        }
+    }
+
+    /// edk2's ParseOpCodes takes the condition of a SUPPRESS_IF or GRAY_OUT_IF of the
+    /// form-set-list in the scope of a DISABLE_IF for that DISABLE_IF's (IfrParse.c:1690-1704,
+    /// :3045-3059), so a TRUE one skips the rest of the DISABLE_IF's scope (:1390-1413), where UEFI
+    /// 2.11 §33.3.8.3.75 has it only hide: a VarStore after one whose condition is TRUE or not
+    /// known, around it or before it in that scope, is refused, and one after a FALSE one, or
+    /// under a SUPPRESS_IF outside any DISABLE_IF, is taken. Each PASSWORD of the id withholds its
+    /// bytes in every VarStore of the id all the same.
+    #[test]
+    fn a_form_set_suppress_if_in_a_disable_if_leaves_the_var_stores_after_it_undetermined() {
+        let shadow_store = || var_store(2, OTHER_GUID, "Shadow", 81);
+        let in_disable_if = |body: &[Vec<u8>]| conditional(DISABLE_IF, ifr_false(), body);
+        let suppressed =
+            |condition: Vec<u8>| conditional(SUPPRESS_IF, condition, &[shadow_store()]);
+        let after_true = "follows an EFI_IFR_SUPPRESS_IF in the scope of a DISABLE_IF of its \
+                          FormSet, whose condition is TRUE";
+        let cases = [
+            (
+                "DISABLE_IF FALSE { SUPPRESS_IF TRUE { Shadow } }",
+                in_disable_if(&[suppressed(ifr_true())]),
+                Err(after_true),
+            ),
+            (
+                "DISABLE_IF FALSE { SUPPRESS_IF TRUE {} Shadow }",
+                in_disable_if(&[conditional(SUPPRESS_IF, ifr_true(), &[]), shadow_store()]),
+                Err(after_true),
+            ),
+            (
+                "DISABLE_IF FALSE { SUPPRESS_IF eq_id_val { Shadow } }",
+                in_disable_if(&[suppressed(eq_id_val_of(1, 0))]),
+                Err("whose condition is not known: it relies on EFI_IFR_EQ_ID_VAL"),
+            ),
+            (
+                "DISABLE_IF FALSE { GRAY_OUT_IF TRUE { Shadow } }",
+                in_disable_if(&[conditional(GRAY_OUT_IF, ifr_true(), &[shadow_store()])]),
+                Err("follows an EFI_IFR_GRAY_OUT_IF in the scope of a DISABLE_IF"),
+            ),
+            (
+                "DISABLE_IF FALSE { SUPPRESS_IF FALSE { Shadow } }",
+                in_disable_if(&[suppressed(ifr_false())]),
+                Ok(shadow()),
+            ),
+            (
+                "SUPPRESS_IF TRUE { Shadow }",
+                suppressed(ifr_true()),
+                Ok(shadow()),
+            ),
+            (
+                "SUPPRESS_IF TRUE { DISABLE_IF FALSE { Shadow } }",
+                conditional(SUPPRESS_IF, ifr_true(), &[in_disable_if(&[shadow_store()])]),
+                Ok(shadow()),
+            ),
+        ];
+        for (case, declaration, want) in cases {
+            let declarations = [declaration, var_store(2, TSE_GUID, "AMITSESetup", 81)];
+            let store = checkbox_store(&declarations);
+            match want {
+                Ok(key) => assert_eq!(store, Ok(key), "{case}"),
+                Err(reason) => assert!(
+                    matches!(&store, Err(got) if got.contains(reason)),
+                    "{case}: {store:?}"
+                ),
+            }
+
+            let found = PasswordQuestions::of([&parse_form_set(&[
+                declarations.concat(),
+                form(1, &[password_on(2, 3, 2, 0)]),
+            ])]);
+            let mut withheld = WithheldBytes::default();
+            withheld.insert(shadow(), 0..40);
+            withheld.insert(amitse_setup(), 0..40);
+            assert_eq!(
+                found
+                    .withheld(&reaching(VariableReach::BootServices))
+                    .map_err(|error| error.to_string()),
+                Ok(withheld),
+                "{case}: withheld"
+            );
+        }
+    }
+
+    /// A PASSWORD on a VARSTORE_EFI before UEFI 2.3.1 that a SUPPRESS_IF of its FormSet declares
+    /// keeps its password from byte 0 of the variable that its VarStoreInfo names as a VarName, as
+    /// form_set_varstore takes it: bytes 0..40 of it are withheld, through variables of either
+    /// reach, whatever the string ID of its VarName.
+    #[test]
+    fn a_password_on_a_short_var_store_under_a_form_set_suppress_if_withholds_its_var_name() {
+        for (var_name, name) in [(5, "ShortVarPw"), (1, "Q")] {
+            let ifr = [form_set(&[
+                conditional(SUPPRESS_IF, ifr_true(), &[short_var_store_efi(7)]),
+                form(1, &[password_on(2, 3, 7, var_name)]),
+            ])];
+            let passwords =
+                PasswordQuestions::of_lists(&[list_with_strings(&ifr, &VAR_NAME_STRINGS)]);
+            let mut want = WithheldBytes::default();
+            want.insert(short_variable(name), 0..40);
+
+            for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+                assert_eq!(
+                    passwords
+                        .withheld(&reaching(reach))
+                        .map_err(|error| error.to_string()),
+                    Ok(want.clone()),
+                    "VarName {var_name}, {reach:?}"
+                );
+            }
+        }
+    }
+
+    /// A PASSWORD on the VarStoreId of a VARSTORE_EFI before UEFI 2.3.1 that edk2 does not
+    /// create, under a DISABLE_IF TRUE, beside a VARSTORE of that id that a question takes, keeps
+    /// its password from byte 0 of the variable that its VarName names on the first, which
+    /// FindStorageFromVarId may take, and at its VarOffset in the second: both are withheld,
+    /// through variables of either reach.
+    #[test]
+    fn a_password_on_the_id_of_a_short_var_store_that_edk2_skips_withholds_its_var_name() {
+        let ifr = [form_set(&[
+            conditional(DISABLE_IF, ifr_true(), &[short_var_store_efi(7)]),
+            var_store(7, OTHER_GUID, "Shadow", 81),
+            form(1, &[password_on(2, 3, 7, 5)]),
+        ])];
+        let passwords = PasswordQuestions::of_lists(&[list_with_strings(&ifr, &VAR_NAME_STRINGS)]);
+        let mut want = WithheldBytes::default();
+        want.insert(short_variable("ShortVarPw"), 0..40);
+        want.insert(shadow(), 5..45);
+
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            assert_eq!(
+                passwords
+                    .withheld(&reaching(reach))
+                    .map_err(|error| error.to_string()),
+                Ok(want.clone()),
+                "{reach:?}"
+            );
+        }
+    }
+
+    /// A PASSWORD whose VarStore a SUPPRESS_IF of its FormSet declares, of a VarStoreId that a
+    /// VARSTORE outside any FormSet declares too, withholds its bytes in both, through variables of
+    /// either reach; beside a VARSTORE_NAME_VALUE of the id outside any FormSet instead, it is
+    /// unresolved, and through Runtime it still withholds them in the VarStore of its FormSet.
+    #[test]
+    fn a_password_on_a_var_store_under_a_suppress_if_keeps_the_stores_outside_any_form_set() {
+        let suppressed_store = || {
+            form_set(&[
+                conditional(
+                    SUPPRESS_IF,
+                    ifr_true(),
+                    &[var_store(2, TSE_GUID, "AMITSESetup", 81)],
+                ),
+                form(1, &[password_on(2, 3, 2, 0)]),
+            ])
+        };
+        let mut both = WithheldBytes::default();
+        both.insert(shadow(), 0..40);
+        both.insert(amitse_setup(), 0..40);
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            assert_eq!(
+                withheld_of(
+                    &[var_store(2, OTHER_GUID, "Shadow", 81), suppressed_store()],
+                    reach
+                ),
+                Ok(both.clone()),
+                "an outside VARSTORE, {reach:?}"
+            );
+        }
+
+        let ifr = [var_store_name_value(2, OTHER_GUID), suppressed_store()];
+        let mut form_set_store = WithheldBytes::default();
+        form_set_store.insert(amitse_setup(), 0..40);
+        assert_eq!(
+            withheld_of(&ifr, VariableReach::Runtime),
+            Ok(form_set_store),
+            "an outside VARSTORE_NAME_VALUE, Runtime"
+        );
+        assert!(
+            withheld_of(&ifr, VariableReach::BootServices).is_err(),
+            "an outside VARSTORE_NAME_VALUE, BootServices"
+        );
+    }
+
+    /// The lookup of a VarStore evaluates each DISABLE_IF of the form-set-list once, and none in
+    /// the scope of a TRUE one: 250 nested DISABLE_IF FALSE holding 400 DISABLE_IF TRUE, each
+    /// around a VarStore of the id, then a created one, cost 650 evaluations, not one for each
+    /// DISABLE_IF around each VarStore of the id.
+    #[test]
+    fn a_var_store_lookup_evaluates_each_form_set_condition_once() {
+        let mut body = [
+            vec![
+                conditional(
+                    DISABLE_IF,
+                    ifr_true(),
+                    &[var_store(2, OTHER_GUID, "Shadow", 81)]
+                );
+                400
+            ],
+            vec![var_store(2, TSE_GUID, "AMITSESetup", 81)],
+        ]
+        .concat()
+        .concat();
+        for _ in 0..250 {
+            body = conditional(DISABLE_IF, ifr_false(), &[body]);
+        }
+        let root = parse_form_set(&[body, form(1, &[checkbox_on(1, 3, 2)])]);
+        let mut checkbox = None;
+        walk_scopes(std::slice::from_ref(&root), (), |node, ()| {
+            if node.borrow().op_code == IFROpCode::CheckBox {
+                checkbox = Some(Rc::clone(node));
+            }
+            Walk::Enter(())
+        });
+
+        let before = CONSTANT_CONDITIONS.with(Cell::get);
+        let store = find_corresponding_varstore(checkbox.expect("the CHECKBOX"), 2)
+            .map(|store| store.variable_key());
+        let evaluated = CONSTANT_CONDITIONS.with(Cell::get) - before;
+
+        assert_eq!(store.map_err(|error| error.to_string()), Ok(amitse_setup()));
+        assert!(evaluated <= 650, "conditions evaluated: {evaluated}");
+    }
+
+    /// A CHECKBOX that a malformed op after it disables its form (UEFI 2.11 §33.2.5.10.1).
+    fn short_checkbox() -> Vec<u8> {
+        operation(CHECKBOX, false, &[0x00])
+    }
+
+    /// A VarStore op of the id in a form that read_db disables leaves the tree, so its place among
+    /// the others is unknown, and edk2-stable202608 SetupBrowserDxe/IfrParse.c, which disables no
+    /// form, creates it all the same: the lookup is refused, the form before or after the
+    /// form-set-list store. A disabled form without a VarStore of the id changes nothing.
+    #[test]
+    fn a_var_store_in_a_disabled_form_refuses_the_lookup() {
+        let disabled_with = |store: Vec<u8>| form(2, &[store, short_checkbox()]);
+        let amitse = var_store(2, TSE_GUID, "AMITSESetup", 81);
+        let disabled = disabled_with(var_store(2, OTHER_GUID, "Shadow", 81));
+        let refused = "VarStore 0x0002 is declared in a form of its FormSet that uefisettings \
+                       disables, before or after the one of its form-set-list";
+        for (case, declarations) in [
+            (
+                "disabled form first",
+                vec![disabled.clone(), amitse.clone()],
+            ),
+            (
+                "disabled form after",
+                vec![amitse.clone(), disabled.clone()],
+            ),
+        ] {
+            let store = checkbox_store(&declarations);
+            assert!(
+                matches!(&store, Err(reason) if reason.starts_with(refused)),
+                "{case}: {store:?}"
+            );
+        }
+        let other_id = disabled_with(var_store(3, OTHER_GUID, "Shadow", 81));
+        assert_eq!(
+            checkbox_store(&[other_id, amitse]),
+            Ok(amitse_setup()),
+            "a disabled form of another id"
+        );
+    }
+
+    /// A PASSWORD whose VarStoreId only a form that read_db disables declares, before the op that
+    /// disables it, keeps its password there: edk2, which disables no form, creates that store and
+    /// binds the PASSWORD to it, so it is withheld through variables of either reach, the
+    /// PASSWORD resolved.
+    #[test]
+    fn a_password_on_a_var_store_of_a_disabled_form_is_withheld_there() {
+        let (root, disabled) = parse_form_set_dropping(&[
+            form(
+                2,
+                &[var_store(2, OTHER_GUID, "Shadow", 81), short_checkbox()],
+            ),
+            form(1, &[password_on(2, 3, 2, 0)]),
+        ]);
+        assert_eq!(disabled.len(), 1, "form 2 disabled");
+        let found = PasswordQuestions::of_forms(std::slice::from_ref(&root), &disabled);
+
+        let mut want = WithheldBytes::default();
+        want.insert(shadow(), 0..40);
+        assert_eq!(found.unresolved, vec![], "unresolved");
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            assert_eq!(
+                found
+                    .withheld(&reaching(reach))
+                    .map_err(|error| error.to_string()),
+                Ok(want.clone()),
+                "{reach:?}"
+            );
+        }
+    }
+
+    /// A VarStore op in the scope of an unknown op that does not decode may be the VarStore of a
+    /// PASSWORD of its FormSet of any VarStoreId, so every variable of its Guid, read from its op,
+    /// is withheld whole, as for a VarStore of ignored IFR (DeclaredStorage), and every variable
+    /// where its Guid runs past its Length; a PASSWORD of VarStoreId 0, which names no VarStore,
+    /// withholds none of it.
+    #[test]
+    fn an_undecoded_var_store_in_an_unknown_op_withholds_its_guid_whole() {
+        let guid_only = [&TSE_GUID[..], &2u16.to_le_bytes()].concat();
+        let mut every = VariableGuids::default();
+        every.insert(None);
+        let mut tse = VariableGuids::default();
+        tse.insert(Some(Guid::from(TSE_GUID)));
+        let cases = [
+            ("a Guid past its Length", vec![0x00; 3], 2, every),
+            ("its Guid alone", guid_only, 2, tse),
+            (
+                "a PASSWORD of VarStoreId 0",
+                vec![0x00; 3],
+                0,
+                VariableGuids::default(),
+            ),
+        ];
+        for (case, data, var_store_id, guids) in cases {
+            let found = PasswordQuestions::of([&parse_form_set(&[
+                in_unknown_op(&operation(VAR_STORE, false, &data)),
+                form(1, &[password_on(2, 3, var_store_id, 0)]),
+            ])]);
+            assert_eq!(
+                found.storage,
+                DeclaredStorage {
+                    variables: BTreeSet::new(),
+                    guids,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    /// A VarStore of a PASSWORD's VarStoreId in another FormSet of its package list is none of
+    /// that PASSWORD's stores: a PASSWORD whose FormSet declares none of its id stays unresolved,
+    /// so BootServices fails closed, and one whose FormSet declares one resolves.
+    #[test]
+    fn a_var_store_of_another_form_set_resolves_no_password() {
+        let other = form_set_with_guid(
+            [0x12; 16],
+            &[var_store(2, OTHER_GUID, "Shadow", 81), form(1, &[])],
+        );
+        for (case, own, resolved) in [
+            ("no VarStore of the id in its FormSet", vec![], false),
+            (
+                "its FormSet's VarStore of the id",
+                vec![var_store(2, TSE_GUID, "AMITSESetup", 81)],
+                true,
+            ),
+        ] {
+            let password_form_set = form_set(&[own.concat(), form(1, &[password_on(2, 3, 2, 0)])]);
+            let passwords = passwords_of(&[other.clone(), password_form_set]);
+
+            assert_eq!(
+                passwords.unresolved.is_empty(),
+                resolved,
+                "{case}: unresolved {:?}",
+                passwords.unresolved
+            );
+            assert_eq!(
+                passwords
+                    .withheld(&reaching(VariableReach::BootServices))
+                    .is_ok(),
+                resolved,
+                "{case}: BootServices"
+            );
+        }
+    }
+
+    /// read_db records with each form that it disables the index of the root of its FormSet, so
+    /// that grouping them by FormSet searches no roots: over n FormSets in two form packages, each
+    /// with a disabled form, that takes at most one step per disabled form in each of the two
+    /// parses that collect it, each index names the root that holds its form, and each PASSWORD
+    /// is withheld in the VarStore of its own FormSet, whether the disabled form holds the
+    /// PASSWORD or the VarStore, and in the first VarStore of its id in its form package where
+    /// another FormSet declares it (password_questions).
+    #[test]
+    fn disabled_forms_are_grouped_by_the_root_index_of_their_parse() {
+        let name = |index: u16| format!("V{index}");
+        for count in [2_000_u16, 16_000] {
+            let form_sets: Vec<Vec<u8>> = (0..count)
+                .map(|index| {
+                    let store = var_store(2, OTHER_GUID, &name(index), 81);
+                    let password = password_on(2, 3, 2, 0);
+                    match index % 2 {
+                        0 => form_set(&[store, form(1, &[password, short_checkbox()])]),
+                        _ => form_set(&[form(2, &[store, short_checkbox()]), form(1, &[password])]),
+                    }
+                })
+                .collect();
+            let (first, second) = form_sets.split_at(usize::from(count / 2));
+            let hiidb = package_list_with_guid(
+                [0x22; 16],
+                &[
+                    form_package_of(&first.concat()),
+                    form_package_of(&second.concat()),
+                    END_PACKAGE.to_vec(),
+                ]
+                .concat(),
+            );
+
+            let before = ROOT_INDICES_SHIFTED.with(Cell::get);
+            let list = read_db(&hiidb).expect("read_db").remove(0);
+            let shifted = ROOT_INDICES_SHIFTED.with(Cell::get) - before;
+
+            let disabled = list.disabled_forms.len();
+            assert_eq!(disabled, usize::from(count), "{count}: disabled forms");
+            assert!(
+                shifted <= 2 * disabled,
+                "{count}: root-index steps {shifted}, of {disabled} disabled forms"
+            );
+            for form in &list.disabled_forms {
+                let top = std::iter::successors(Some(Rc::clone(&form.form)), |node| {
+                    node.borrow()
+                        .parent
+                        .as_ref()
+                        .and_then(std::rc::Weak::upgrade)
+                })
+                .last()
+                .expect("the top of the form's tree");
+                assert!(
+                    list.forms
+                        .get(form.root_index)
+                        .is_some_and(|root| Rc::ptr_eq(root, &top)),
+                    "{count}: the form at offset {} of root index {}",
+                    form.offset,
+                    form.root_index
+                );
+            }
+            let passwords = PasswordQuestions::of_lists(std::slice::from_ref(&list));
+            let key = |index: u16| VariableKey {
+                name: name(index),
+                guid: Guid::from(OTHER_GUID),
+            };
+            let mut want = WithheldBytes::default();
+            for index in 0..count {
+                want.insert(key(index), 0..40);
+                // the first FormSet of each form package declares its first VarStore of id 2
+                let first = if index < count / 2 { 0 } else { count / 2 };
+                if index != first {
+                    want.insert(key(first), 0..40);
+                }
+            }
+            assert_eq!(passwords.unresolved, vec![], "{count}: unresolved");
+            assert_eq!(
+                passwords
+                    .withheld(&reaching(VariableReach::BootServices))
+                    .map_err(|error| error.to_string()),
+                Ok(want),
+                "{count}: withheld"
             );
         }
     }

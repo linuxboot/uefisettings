@@ -49,6 +49,8 @@ hii-acpi-two-tables	/DriverSample.efi;/publish-hiidb.efi acpi-table-junk-qhii;/p
 shell-driver-sample	/DriverSample.efi	-	shell:driver-sample,shell:driver-sample-reboot,shell:then-linux	-
 shell-parity	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data.json	hii_shell_parity,shell:list-questions	-
 shell-password	/DriverSample.efi;/publish-hiidb.efi password-forms	amitse-setup.json	shell:password	-
+hii-nested-password	/publish-hiidb.efi rt-data-nested-password-forms	-	hii_nested_password	arch=x86_64
+shell-nested-password	/publish-hiidb.efi nested-password-forms	-	shell:nested-password	-
 shell-readwrite	/DriverSample.efi;/publish-hiidb.efi rt-data-readwrite-forms	-	shell:readwrite	-
 shell-dropped-password	/publish-hiidb.efi dropped-password-forms	dropped-password.json	shell:dropped-password	-
 shell-formset-skip	/publish-hiidb.efi formset-skip-forms	formset-skip.json	shell:formset-skip	-

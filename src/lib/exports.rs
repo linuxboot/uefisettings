@@ -11711,4 +11711,140 @@ mod tests {
             "ShortVarA"
         );
     }
+
+    /// Two FormSets that declare AMITSESetup: the first at its top, with the UINT64 NUMERIC N0
+    /// over bytes 0..8, shown in hex; the second after `declarations`, with a PASSWORD at bytes
+    /// 0..40.
+    fn password_after_hiidb(declarations: &[Vec<u8>]) -> Vec<u8> {
+        let numeric = [
+            question_header_with(4, 4, 2, 0, 0x00),
+            vec![0x23], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_HEX
+            0u64.to_le_bytes().to_vec(),
+            u64::MAX.to_le_bytes().to_vec(),
+            1u64.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package_of(
+                &[
+                    form_set(&[
+                        var_store(2, [0x44; 16], "AMITSESetup", 81),
+                        form(1, &[operation(NUMERIC, false, &numeric)]),
+                    ]),
+                    form_set(&[declarations.concat(), form(1, &[password_on(3, 3, 2, 0)])]),
+                ]
+                .concat(),
+            ),
+            en_strings_package_of(&["Q", "P", "Password", "N0"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// get of N0 in `hiidb` through variables of `reach`, AMITSESetup holding a password in its
+    /// bytes 0..40: its answers, or why it refuses.
+    fn get_over_password(hiidb: &[u8], reach: VariableReach) -> Result<Vec<String>, String> {
+        let interface = match reach {
+            VariableReach::Runtime => VariableInterface::Efivarfs,
+            VariableReach::BootServices => VariableInterface::VariableServices,
+        };
+        let variables = MemoryVariables::new(reach, interface);
+        variables.insert(
+            amitse_setup(),
+            NV_BS_RT,
+            &[plaintext_password().as_slice(), &[0xAA; 40], &[1]].concat(),
+        );
+        HiiBackend::get_in(
+            hiidb,
+            "N0",
+            None,
+            &GetOptions::default(),
+            shared(&Rc::new(variables)),
+            None,
+            None,
+        )
+        .map(|got| {
+            got.responses
+                .iter()
+                .map(|response| response.question.answer.clone())
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// Through variables of either reach, a NUMERIC over a password whose VarStore a SUPPRESS_IF
+    /// of its FormSet declares shows none of its bytes: get answers that they hold a password.
+    #[test]
+    fn a_password_on_a_var_store_under_a_suppress_if_withholds_its_bytes() {
+        let hiidb = password_after_hiidb(&[conditional(
+            SUPPRESS_IF,
+            ifr_true(),
+            &[var_store(2, [0x44; 16], "AMITSESetup", 81)],
+        )]);
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            assert_eq!(
+                get_over_password(&hiidb, reach),
+                Ok(vec![PASSWORD_BYTES.to_string()]),
+                "{reach:?}"
+            );
+        }
+    }
+
+    /// A VarStore of a PASSWORD's VarStoreId whose EFI variable is unknown never drops the known
+    /// VarStore of the id beside it: through Runtime, a NUMERIC over the password shows none of
+    /// its bytes; through BootServices, get refuses the HiiDB as the password is unresolved.
+    #[test]
+    fn a_store_of_an_unknown_variable_keeps_a_password_withheld_through_runtime() {
+        let amitse = || var_store(2, [0x44; 16], "AMITSESetup", 81);
+        let cases = [
+            (
+                "a VarStore op that does not decode, in an unknown op",
+                vec![
+                    nested(
+                        &operation(0x70, true, &[]),
+                        1,
+                        &[operation(VAR_STORE, false, &[0x00; 3])],
+                    ),
+                    amitse(),
+                ],
+            ),
+            (
+                "a VARSTORE_NAME_VALUE in a form",
+                vec![amitse(), form(7, &[var_store_name_value(2, [0x66; 16])])],
+            ),
+            (
+                "a VARSTORE_NAME_VALUE under DISABLE_IF TRUE",
+                vec![
+                    conditional(
+                        DISABLE_IF,
+                        ifr_true(),
+                        &[var_store_name_value(2, [0x66; 16])],
+                    ),
+                    conditional(DISABLE_IF, ifr_false(), &[amitse()]),
+                ],
+            ),
+            (
+                "a short VARSTORE_EFI under DISABLE_IF TRUE",
+                vec![
+                    conditional(DISABLE_IF, ifr_true(), &[short_var_store_efi(2)]),
+                    conditional(DISABLE_IF, ifr_false(), &[amitse()]),
+                ],
+            ),
+        ];
+        for (case, declarations) in cases {
+            let hiidb = password_after_hiidb(&declarations);
+            assert_eq!(
+                get_over_password(&hiidb, VariableReach::Runtime),
+                Ok(vec![PASSWORD_BYTES.to_string()]),
+                "{case}: Runtime"
+            );
+            let refusal = get_over_password(&hiidb, VariableReach::BootServices);
+            assert!(
+                matches!(&refusal, Err(reason) if reason.contains(
+                    "the UEFI Shell build reads and writes no variable of this HiiDB"
+                )),
+                "{case}: BootServices: {refusal:?}"
+            );
+        }
+    }
 }
