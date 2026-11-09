@@ -17,6 +17,7 @@
 //! and refuse each question without a VarStore that neither reaches, saying why, and a WRITE
 //! expression that sets a VarStore without its variable, before any write. A question with an
 //! EFI_IFR_VALUE shows the value of that expression, and set refuses it (UEFI 2.11 §33.3.8.3.88).
+//! set writes an option of a narrower type than its question in all the question's bytes.
 
 use uefisettings_qemu_guest::changed_bytes;
 use uefisettings_qemu_guest::json;
@@ -35,7 +36,9 @@ const READ_WRITE_DATA: &str =
 const ABSENT_BUFFER: &str =
     "/sys/firmware/efi/efivars/AbsentBuffer-8c78a505-baa0-4c4a-869f-000000000201";
 /// The bytes that publish-hiidb creates ReadWriteData with (`readwrite_forms::STORE_DATA`).
-const STORE_DATA: [u8; 9] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE, 0x11];
+const STORE_DATA: [u8; 11] = [
+    0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE, 0x11, 0x07, 0xA5,
+];
 /// The NUMERIC at byte 7 of ReadWriteData whose READ gives the stored byte plus 1.
 const READ_TRANSFORMED: &str = "Read transformed";
 const READ_TRANSFORMED_OFFSET: usize = 7;
@@ -223,9 +226,28 @@ fn get_and_set_take_values_through_read_and_write_expressions() {
         "{READ_TRANSFORMED} after"
     );
 
+    // the UINT16 "Option width" holds 0xA507, which no option has; set writes its UINT8 option
+    // "Narrow" zero-extended in both bytes, as edk2-stable202608 SetupBrowserDxe/Setup.c:2108
+    // writes the StorageWidth bytes
+    assert_eq!(
+        get(&["hii"], "Option width"),
+        "42247 (no matching option)",
+        "Option width before"
+    );
+    assert_eq!(
+        set("Option width", "Narrow"),
+        [(9, 5), (10, 0)],
+        "Option width"
+    );
+    assert_eq!(
+        get(&["hii"], "Option width"),
+        "Narrow",
+        "Option width after"
+    );
+
     assert_eq!(
         read_write_data(),
-        [0x02, 0x05, 0x05, 0x00, 0x05, 0x01, 0x09, 0x64, 0x11],
+        [0x02, 0x05, 0x05, 0x00, 0x05, 0x01, 0x09, 0x64, 0x11, 0x05, 0x00],
         "after"
     );
 }

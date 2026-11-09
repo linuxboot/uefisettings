@@ -141,7 +141,9 @@ expressions give and keep (UEFI 2.11 §33.2.5.4.1), over `ReadWriteData` and ove
 VarStore `AbsentBuffer`, which has no variable, and questions without a VarStore that
 `uefisettings` refuses, each for its own reason. "Computed value", on `ReadWriteData` too, has
 an EFI_IFR_VALUE instead, which gives it the value of "Linked value" plus 0x10, never its stored
-byte, and makes it read-only (UEFI 2.11 §33.3.8.3.88). The scenarios `hii-readwrite` and
+byte, and makes it read-only (UEFI 2.11 §33.3.8.3.88). "Option width", a UINT16 ONE_OF on
+`ReadWriteData`, has the UINT8 option "Narrow", which `set` writes zero-extended in both bytes
+of the question. The scenarios `hii-readwrite` and
 `shell-readwrite` get and set them from Linux and from the UEFI Shell, and DriverSample's
 "Serial port number", whose WRITE sets three more fields.
 

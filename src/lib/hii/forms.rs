@@ -105,6 +105,7 @@ const EFI_IFR_NUMERIC_SIZE: u8 = 0x03;
 const EFI_IFR_NUMERIC_SIZE_1: u8 = 0x00;
 const EFI_IFR_NUMERIC_SIZE_2: u8 = 0x01;
 const EFI_IFR_NUMERIC_SIZE_4: u8 = 0x02;
+const EFI_IFR_NUMERIC_SIZE_8: u8 = 0x03;
 const EFI_IFR_DISPLAY: u8 = 0x30;
 const EFI_IFR_DISPLAY_INT_DEC: u8 = 0x00;
 // UEFI 2.10 §33.3.8.3.51
@@ -1151,7 +1152,9 @@ fn range_parser<R: Read + Seek>(
             EFI_IFR_NUMERIC_SIZE_2 => BinRead::read_options(reader, endian, ()).map(Range::Range16),
             EFI_IFR_NUMERIC_SIZE_4 => BinRead::read_options(reader, endian, ()).map(Range::Range32),
             // EFI_IFR_NUMERIC_SIZE_8, the only value left
-            _ => BinRead::read_options(reader, endian, ()).map(Range::Range64),
+            EFI_IFR_NUMERIC_SIZE_8.. => {
+                BinRead::read_options(reader, endian, ()).map(Range::Range64)
+            }
         },
     }
 }
@@ -3481,6 +3484,7 @@ mod tests {
             let write = VarStoreWrite::new(
                 &store,
                 u16::try_from(offset).expect("offset fits u16"),
+                u8::try_from(encoded.len()).expect("width fits u8"),
                 data,
                 variables.interface(),
             )
@@ -3513,7 +3517,7 @@ mod tests {
         let store = efi_variable("Short", 4);
         let variables = MemoryVariables::default();
         variables.insert(store.variable_key(), NV_BS_RT, &[0; 2]);
-        let write = VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), variables.interface())
+        let write = VarStoreWrite::new(&store, 0, 1, TypeValue::NumSize8(1), variables.interface())
             .expect("write 1");
 
         let error = write
@@ -3535,6 +3539,7 @@ mod tests {
         let write = VarStoreWrite::new(
             &store,
             0,
+            1,
             TypeValue::NumSize8(1),
             VariableInterface::Efivarfs,
         )
@@ -3557,12 +3562,13 @@ mod tests {
             (42, 41, TypeValue::NumSize16(1), 2),
             (42, 39, TypeValue::NumSize32(1), 4),
             (42, 35, TypeValue::NumSize64(1), 8),
+            (42, 41, TypeValue::NumSize8(1), 2),
             (0, 0, TypeValue::NumSize8(1), 1),
             (42, u16::MAX, TypeValue::NumSize64(1), 8),
         ] {
             let store = efi_variable("Test", size);
             assert_eq!(
-                VarStoreWrite::new(&store, offset, data, VariableInterface::Efivarfs)
+                VarStoreWrite::new(&store, offset, width, data, VariableInterface::Efivarfs)
                     .map(drop)
                     .map_err(|error| error.to_string()),
                 Err(format!(
@@ -3573,12 +3579,40 @@ mod tests {
         }
     }
 
+    /// VarStoreWrite::new refuses a question's storage of no byte, whose write would change
+    /// nothing, or of more bytes than a UINT64, and takes the widths between, such as a TIME's 3.
+    #[test]
+    fn refuses_storage_widths_outside_1_to_8() {
+        let write = |width| {
+            VarStoreWrite::new(
+                &efi_variable("Test", 42),
+                0,
+                width,
+                TypeValue::NumSize8(0),
+                VariableInterface::Efivarfs,
+            )
+            .map(drop)
+            .map_err(|error| error.to_string())
+        };
+        for width in [0, 9] {
+            assert_eq!(
+                write(width),
+                Err(format!("a question's storage of {width} bytes, not 1 to 8")),
+                "{width} bytes"
+            );
+        }
+        for width in 1..=8 {
+            assert_eq!(write(width), Ok(()), "{width} bytes");
+        }
+    }
+
     #[test]
     fn rejects_unsupported_value_instead_of_silent_noop() {
         assert_eq!(
             VarStoreWrite::new(
                 &efi_variable("Test", 42),
                 0,
+                1,
                 TypeValue::Boolean(true),
                 VariableInterface::Efivarfs
             )
@@ -3621,8 +3655,8 @@ mod tests {
         for (reach, interface, want) in cases {
             let variables = MemoryVariables::new(reach, interface);
             let store = efi_variable("Setup", 1);
-            let write =
-                VarStoreWrite::new(&store, 0, TypeValue::NumSize8(1), interface).expect("write 1");
+            let write = VarStoreWrite::new(&store, 0, 1, TypeValue::NumSize8(1), interface)
+                .expect("write 1");
 
             let error = write
                 .write(&variables)
@@ -3650,6 +3684,7 @@ mod tests {
                 VarStoreWrite::new(
                     &efi_variable("Test", 42),
                     0,
+                    1,
                     TypeValue::Boolean(true),
                     interface
                 )

@@ -17,7 +17,8 @@
 //! VARSTORE_EFI ReadWriteData, which the driver creates when it is missing, and questions without
 //! a VarStore that get and set refuse, each for its own reason. One more question over
 //! ReadWriteData takes its value from an EFI_IFR_VALUE expression instead, which makes it
-//! read-only (UEFI 2.11 §33.3.8.3.88). The VARSTORE AbsentBuffer has no variable.
+//! read-only (UEFI 2.11 §33.3.8.3.88), and a UINT16 ONE_OF over it has an option of type UINT8,
+//! which set writes in both bytes of its storage. The VARSTORE AbsentBuffer has no variable.
 
 use alloc::vec::Vec;
 
@@ -67,9 +68,12 @@ pub(crate) const STORE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_
 /// The bytes that the driver creates ReadWriteData with: byte 0, which "Mapped choice" keeps,
 /// holds no option; "Linked value" holds 4 at byte 1, which its WRITE copies to byte 2 and, plus
 /// 0x100, to bytes 4 and 5; "Absent target" holds 0 at byte 3; byte 6 is what "Write only" sets,
-/// "Read transformed" holds 0xEE at byte 7, which its READ shows plus 1, and "Computed value"
-/// holds 0x11 at byte 8, which its VALUE hides.
-pub(crate) const STORE_DATA: [u8; 9] = [0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE, 0x11];
+/// "Read transformed" holds 0xEE at byte 7, which its READ shows plus 1, "Computed value"
+/// holds 0x11 at byte 8, which its VALUE hides, and "Option width" holds 0xA507 at bytes 9 and
+/// 10, which no option has.
+pub(crate) const STORE_DATA: [u8; 11] = [
+    0x00, 0x04, 0x04, 0x00, 0x04, 0x01, 0x00, 0xEE, 0x11, 0x07, 0xA5,
+];
 
 // The strings, from string ID 2, after the language name.
 const TITLE: u16 = 2;
@@ -87,7 +91,9 @@ const SECOND: u16 = 13;
 const THIRD: u16 = 14;
 const READ_TRANSFORMED: u16 = 15;
 const COMPUTED_VALUE: u16 = 16;
-const STRINGS: [&str; 16] = [
+const OPTION_WIDTH: u16 = 17;
+const NARROW: u16 = 18;
+const STRINGS: [&str; 18] = [
     "English",
     "uefisettings QEMU read/write forms",
     "Questions that READ and WRITE expressions give and keep the values of",
@@ -104,6 +110,8 @@ const STRINGS: [&str; 16] = [
     "Third",
     "Read transformed",
     "Computed value",
+    "Option width",
+    "Narrow",
 ];
 
 // The VarStores
@@ -114,9 +122,14 @@ const NO_VAR_STORE: u16 = 0;
 
 /// The QuestionId of "Linked value", whose value the VALUE of "Computed value" takes.
 const LINKED_VALUE_QUESTION: u16 = 2;
+/// The QuestionId and VarOffset of "Option width".
+const OPTION_WIDTH_QUESTION: u16 = 11;
+const OPTION_WIDTH_OFFSET: u16 = 9;
 
 /// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.11 §33.3.8.3.47).
 const UINT8_DECIMAL: u8 = 0x10;
+/// EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC.
+const UINT16_DECIMAL: u8 = 0x11;
 /// EFI_IFR_TYPE_NUM_SIZE_8 and _16, the types of UINT8 and UINT16 values.
 const NUM_SIZE_8: u8 = 0x00;
 const NUM_SIZE_16: u8 = 0x01;
@@ -253,6 +266,7 @@ fn form_package() -> Vec<u8> {
                 op(EFI_IFR_ADD_OP, false, &[]),
             ])],
         ),
+        option_width(),
     ];
     let form = [1u16.to_le_bytes(), TITLE.to_le_bytes()].concat();
     let body = [
@@ -304,6 +318,35 @@ fn one_of(id: u16, prompt: u16, flags: u8, children: &[Vec<u8>]) -> Vec<u8> {
         end(),
     ]
     .concat()
+}
+
+/// "Option width": a UINT16 ONE_OF at bytes 9 and 10 of ReadWriteData whose one option, "Narrow",
+/// is the UINT8 5, which set writes zero-extended in both bytes, as edk2-stable202608
+/// SetupBrowserDxe/Setup.c:2108 writes the StorageWidth bytes of a question.
+fn option_width() -> Vec<u8> {
+    let data = [
+        question_header(
+            OPTION_WIDTH_QUESTION,
+            OPTION_WIDTH,
+            (STORE, OPTION_WIDTH_OFFSET),
+            0,
+        ),
+        // Flags, MinValue, MaxValue, Step
+        [
+            &[UINT16_DECIMAL][..],
+            &0u16.to_le_bytes(),
+            &u16::MAX.to_le_bytes(),
+            &0u16.to_le_bytes(),
+        ]
+        .concat(),
+    ]
+    .concat();
+    let narrow = op(
+        EFI_IFR_ONE_OF_OPTION_OP,
+        false,
+        &[&NARROW.to_le_bytes()[..], &[0, NUM_SIZE_8, 5]].concat(),
+    );
+    [op(EFI_IFR_ONE_OF_OP, true, &data), narrow, end()].concat()
 }
 
 /// A UINT8 NUMERIC from 0 to 255 of question `id` at `var_store`, `(VarStoreId, VarOffset)`,

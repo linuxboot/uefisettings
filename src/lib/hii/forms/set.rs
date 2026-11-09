@@ -83,6 +83,16 @@ pub(crate) enum ChangeValueError {
         undetermined: IncludedStates,
         ranked_before: IncludedStates,
     },
+    /// A value, as of a ONE_OF option of a wider type, that the question's storage cannot hold
+    #[error(
+        "value {value:#x} of a {value_width}-byte type does not fit in the question's \
+         {storage_width}-byte storage"
+    )]
+    WiderThanStorage {
+        value: u64,
+        value_width: u8,
+        storage_width: u8,
+    },
     #[error(transparent)]
     Selection(#[from] SelectionError),
 
@@ -127,19 +137,24 @@ pub(super) struct VarStoreWrite<'a> {
 }
 
 impl<'a> VarStoreWrite<'a> {
-    /// The write of `value` at VarOffset `offset` of `store`, through variables of `interface`:
-    /// fails unless `value` is a number that fits in the Size of `store` there.
+    /// The write of `value` in the `width` bytes of its question's storage at VarOffset `offset`
+    /// of `store`, through variables of `interface`: a narrower value zero-extended, as
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue writes StorageWidth bytes
+    /// (:2061, :2108) of a HiiValue that DisplayEngineDxe/InputHandler.c SetValuesByType fills
+    /// in the option's type only (:1236-1267). Fails unless `width` is 1 to 8, `value` is a number
+    /// that fits in `width` bytes, and they fit in the Size of `store` there.
     pub(super) fn new(
         store: &'a dyn VariableStore,
         offset: u16,
+        width: u8,
         value: TypeValue,
         interface: VariableInterface,
-    ) -> Result<Self> {
-        let encoded = match value {
-            TypeValue::NumSize8(value) => value.to_le_bytes().to_vec(),
-            TypeValue::NumSize16(value) => value.to_le_bytes().to_vec(),
-            TypeValue::NumSize32(value) => value.to_le_bytes().to_vec(),
-            TypeValue::NumSize64(value) => value.to_le_bytes().to_vec(),
+    ) -> Result<Self, ChangeValueError> {
+        let (number, value_width) = match value {
+            TypeValue::NumSize8(value) => (u64::from(value), 1),
+            TypeValue::NumSize16(value) => (u64::from(value), 2),
+            TypeValue::NumSize32(value) => (u64::from(value), 4),
+            TypeValue::NumSize64(value) => (value, 8),
             TypeValue::Boolean(_)
             | TypeValue::Time(_)
             | TypeValue::Date(_)
@@ -149,20 +164,38 @@ impl<'a> VarStoreWrite<'a> {
             | TypeValue::Action(_)
             | TypeValue::Ref(_)
             | TypeValue::Unknown(_) => {
-                return Err(anyhow!("unsupported value type for {}", interface.write()))
+                return Err(anyhow!("unsupported value type for {}", interface.write()).into())
             }
         };
+        let bytes = number.to_le_bytes();
+        let Some((encoded, rest)) = bytes
+            .split_at_checked(usize::from(width))
+            .filter(|(encoded, _)| !encoded.is_empty())
+        else {
+            return Err(anyhow!("a question's storage of {width} bytes, not 1 to 8").into());
+        };
+        // Setup.c:2108 writes the low StorageWidth bytes of a wider value; set refuses it instead,
+        // as those bytes hold another value, where UEFI 2.11 §33.2.5.4.1 writes "the value to the
+        // question's storage"
+        if rest.iter().any(|&byte| byte != 0) {
+            return Err(ChangeValueError::WiderThanStorage {
+                value: number,
+                value_width,
+                storage_width: width,
+            });
+        }
         if usize::from(offset) + encoded.len() > usize::from(store.size()) {
             return Err(anyhow!(
                 "write at offset {} with width {} exceeds varstore size {}",
                 offset,
                 encoded.len(),
                 store.size()
-            ));
+            )
+            .into());
         }
         Ok(Self {
             store,
-            patches: vec![(offset, encoded)],
+            patches: vec![(offset, encoded.to_vec())],
         })
     }
 
@@ -247,7 +280,7 @@ pub(super) fn own_write<'a>(
     interface: VariableInterface,
 ) -> Result<(TypeValue, Option<VarStoreWrite<'a>>), ChangeValueError> {
     // writes take VarOffset in bytes
-    let ValueLocation::Bytes { offset, .. } = question.location else {
+    let ValueLocation::Bytes { offset, size } = question.location else {
         return Err(ChangeValueError::UnsupportedBitField);
     };
     let store = question.store(reach)?;
@@ -262,7 +295,7 @@ pub(super) fn own_write<'a>(
         NewValue::Text(text) => numeric_value(question, text)?,
     };
     let write = store
-        .map(|store| VarStoreWrite::new(store, offset, value, interface))
+        .map(|store| VarStoreWrite::new(store, offset, size, value, interface))
         .transpose()?;
     Ok((value, write))
 }
@@ -466,6 +499,14 @@ impl NotSetEverywhere {
 #[cfg(efivar_dumps)]
 mod set_questions_tests {
     use super::super::ifr_fixtures::*;
+    use super::super::EFI_IFR_NUMERIC_SIZE_1;
+    use super::super::EFI_IFR_NUMERIC_SIZE_2;
+    use super::super::EFI_IFR_NUMERIC_SIZE_4;
+    use super::super::EFI_IFR_NUMERIC_SIZE_8;
+    use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
+    use super::super::EFI_IFR_TYPE_NUM_SIZE_32;
+    use super::super::EFI_IFR_TYPE_NUM_SIZE_64;
+    use super::super::EFI_IFR_TYPE_NUM_SIZE_8;
     use super::*;
 
     const WRITE_ERROR: WriteError = WriteError {
@@ -494,6 +535,36 @@ mod set_questions_tests {
     /// A UINT8 ONE_OF with the one option `option` on `var_store`, as set sees it.
     fn one_of_on_store(option: Vec<u8>, var_store: VarStoreFixture) -> QuestionDescriptor {
         let (_root, node) = parse_question(&[], ONE_OF, &one_of_data(), &[option]);
+        question_descriptor(&node, var_store)
+    }
+
+    /// A ONE_OF or NUMERIC `op_code` of `size` bytes at VarOffset 0 of `var_store`, shown unsigned
+    /// (EFI_IFR_DISPLAY_UINT_DEC) from 0 to its largest value, holding `children`, as set sees it.
+    fn sized_on_store(
+        op_code: u8,
+        size: usize,
+        children: &[Vec<u8>],
+        var_store: VarStoreFixture,
+    ) -> QuestionDescriptor {
+        // EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.11 §33.3.8.3.47 EFI_IFR_NUMERIC)
+        const UINT_DEC: u8 = 0x10;
+        let size_flag = match size {
+            1 => EFI_IFR_NUMERIC_SIZE_1,
+            2 => EFI_IFR_NUMERIC_SIZE_2,
+            4 => EFI_IFR_NUMERIC_SIZE_4,
+            8 => EFI_IFR_NUMERIC_SIZE_8,
+            other => panic!("no EFI_IFR_NUMERIC_SIZE of {other} bytes"),
+        };
+        let step = [vec![1], vec![0; size - 1]].concat();
+        let data = [
+            question_header(0),
+            vec![UINT_DEC | size_flag],
+            vec![0; size],
+            vec![0xFF; size],
+            step,
+        ]
+        .concat();
+        let (_root, node) = parse_question(&[], op_code, &data, children);
         question_descriptor(&node, var_store)
     }
 
@@ -751,6 +822,152 @@ mod set_questions_tests {
                 "{case}"
             );
             assert_eq!(writes(&variables, "Boolean"), [], "{case}: writes");
+        }
+    }
+
+    /// set writes an option in all the bytes of its question's storage, as edk2-stable202608
+    /// SetupBrowserDxe/Setup.c:2108 writes StorageWidth bytes: a narrower option zero-extended,
+    /// also with its high bit set, and a wider-typed one whose value fits in those bytes.
+    #[test]
+    fn options_are_written_in_their_questions_storage_width() {
+        let option = |value_type, value: &[u8]| one_of_option(6, value_type, value);
+        let cases = [
+            (
+                "UINT8 5 in 2 bytes",
+                2,
+                option(EFI_IFR_TYPE_NUM_SIZE_8, &[5]),
+                vec![5, 0],
+            ),
+            (
+                "UINT8 0x85 in 2 bytes",
+                2,
+                option(EFI_IFR_TYPE_NUM_SIZE_8, &[0x85]),
+                vec![0x85, 0],
+            ),
+            (
+                "UINT16 0x0102 in 2 bytes",
+                2,
+                option(EFI_IFR_TYPE_NUM_SIZE_16, &0x0102u16.to_le_bytes()),
+                vec![0x02, 0x01],
+            ),
+            (
+                "UINT16 7 in 1 byte",
+                1,
+                option(EFI_IFR_TYPE_NUM_SIZE_16, &7u16.to_le_bytes()),
+                vec![7],
+            ),
+            (
+                "UINT8 5 in 4 bytes",
+                4,
+                option(EFI_IFR_TYPE_NUM_SIZE_8, &[5]),
+                vec![5, 0, 0, 0],
+            ),
+            (
+                "UINT16 0x8001 in 8 bytes",
+                8,
+                option(EFI_IFR_TYPE_NUM_SIZE_16, &0x8001u16.to_le_bytes()),
+                vec![0x01, 0x80, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                "UINT64 0x0304 in 4 bytes",
+                4,
+                option(EFI_IFR_TYPE_NUM_SIZE_64, &0x0304u64.to_le_bytes()),
+                vec![0x04, 0x03, 0, 0],
+            ),
+        ];
+        for (case, size, option, want) in cases {
+            let variables = MemoryVariables::default();
+            let store = writable_var_store("Store", &vec![0xEE; size], &variables);
+            let question = sized_on_store(ONE_OF, size, &[option], store);
+
+            assert_eq!(
+                set_options(&variables, &[("Q", &question)], "", &["Enabled"]),
+                Ok(vec![Some("Enabled".to_string())]),
+                "{case}"
+            );
+            assert_eq!(writes(&variables, "Store"), [(0, want)], "{case}: writes");
+        }
+    }
+
+    /// set refuses an option whose value sets a byte above its question's storage other than the
+    /// first, naming the option's width, and writes nothing.
+    #[test]
+    fn an_option_with_a_higher_byte_set_writes_no_match() {
+        let variables = MemoryVariables::default();
+        let wide = one_of_option(6, EFI_IFR_TYPE_NUM_SIZE_32, &0x0001_0000u32.to_le_bytes());
+        let b = sized_on_store(
+            ONE_OF,
+            1,
+            &[wide],
+            writable_var_store("B", &[0xEE], &variables),
+        );
+
+        assert_eq!(
+            set_options(&variables, &[("B", &b)], "", &["Enabled"]),
+            Err(
+                "value 0x10000 of a 4-byte type does not fit in the question's 1-byte storage"
+                    .to_string()
+            ),
+            "B's UINT32 option 0x10000 of a 1-byte ONE_OF"
+        );
+        assert_eq!(writes(&variables, "B"), [], "writes of B");
+    }
+
+    /// set refuses an option whose value its question's storage cannot hold, naming both widths,
+    /// before it writes any match, and leaves the stored bytes: edk2-stable202608
+    /// SetupBrowserDxe/Setup.c:2108 would write the low bytes, another value.
+    #[test]
+    fn an_option_wider_than_its_storage_writes_no_match() {
+        let variables = MemoryVariables::default();
+        let a = checkbox_on_store(writable_var_store("A", &[0], &variables));
+        let wide = one_of_option(6, EFI_IFR_TYPE_NUM_SIZE_16, &0x0105u16.to_le_bytes());
+        let b = sized_on_store(
+            ONE_OF,
+            1,
+            &[wide],
+            writable_var_store("B", &[0xEE, 0xEE], &variables),
+        );
+
+        assert_eq!(
+            set_options(&variables, &[("A", &a), ("B", &b)], "1", &["Enabled"]),
+            Err(
+                "value 0x105 of a 2-byte type does not fit in the question's 1-byte storage"
+                    .to_string()
+            ),
+            "B's UINT16 option 0x105 of a 1-byte ONE_OF"
+        );
+        assert_eq!(writes(&variables, "A"), [], "writes of A");
+        assert_eq!(writes(&variables, "B"), [], "writes of B");
+        assert_eq!(
+            variables.bytes(&variable_key("B")),
+            Some(efivar_file_bytes(NV_BS_RT, &[0xEE, 0xEE])),
+            "the bytes of B"
+        );
+    }
+
+    /// set writes a NUMERIC's value in all the bytes of its storage.
+    #[test]
+    fn numerics_are_written_in_their_storage_width() {
+        for (size, want) in [
+            (1, vec![5]),
+            (2, vec![5, 0]),
+            (4, vec![5, 0, 0, 0]),
+            (8, vec![5, 0, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let variables = MemoryVariables::default();
+            let store = writable_var_store("Store", &vec![0xEE; size], &variables);
+            let question = sized_on_store(NUMERIC, size, &[], store);
+
+            assert_eq!(
+                set(&variables, &[("Q", &question)], "5"),
+                Ok(()),
+                "{size} bytes"
+            );
+            assert_eq!(
+                writes(&variables, "Store"),
+                [(0, want)],
+                "{size} bytes: writes"
+            );
         }
     }
 

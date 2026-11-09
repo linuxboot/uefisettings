@@ -371,7 +371,7 @@ mod non_efi_varstore_tests {
 
     /// Writes 1 at offset 0 of `store`, as set does, in `variables`.
     fn write_one(store: &VarStoreEfi, variables: &MemoryVariables) -> Result<()> {
-        VarStoreWrite::new(store, 0, TypeValue::NumSize8(1), variables.interface())?
+        VarStoreWrite::new(store, 0, 1, TypeValue::NumSize8(1), variables.interface())?
             .write(variables)
     }
 

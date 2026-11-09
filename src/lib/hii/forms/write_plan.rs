@@ -575,6 +575,43 @@ mod tests {
         (outcome, written)
     }
 
+    /// set writes a UINT8 option of a UINT16 ONE_OF in both bytes of its storage, zero-extended, as
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c:2108 writes StorageWidth bytes.
+    #[test]
+    fn narrow_option_writes_the_questions_storage_width() {
+        let header = question_header_with(1, FIRST_PROMPT, STORE, 2, 0);
+        let one_of = [
+            // Flags UINT16 EFI_IFR_DISPLAY_UINT_DEC, MinValue 0, MaxValue 0xFFFF, Step 0
+            operation(
+                ONE_OF,
+                true,
+                &[header, vec![0x11, 0, 0, 0xFF, 0xFF, 0, 0]].concat(),
+            ),
+            one_of_option(FIRST_PROMPT + 1, EFI_IFR_TYPE_NUM_SIZE_8, &[5]),
+            one_of_option(FIRST_PROMPT + 2, EFI_IFR_TYPE_NUM_SIZE_16, &[0x05, 0x01]),
+            END.to_vec(),
+        ]
+        .concat();
+        let root = parse_form_set(&[
+            var_store_efi(STORE, "Store", NV_BS_RT, 6),
+            form(1, &[one_of]),
+        ]);
+        let strings = vec![StringMap::from([
+            (FIRST_PROMPT, "Width".into()),
+            (FIRST_PROMPT + 1, "Narrow".into()),
+            (FIRST_PROMPT + 2, "Wide".into()),
+        ])];
+        let got = set_in(&root, &strings, "Width", "Narrow", EFIVARFS);
+        assert_eq!(
+            got,
+            (
+                Ok(()),
+                BTreeMap::from([("Store", vec![(2, vec![0x05, 0x00])])])
+            ),
+            "Width = Narrow"
+        );
+    }
+
     /// set writes the SETs of a question's WRITE expression and its own value with one write
     /// per variable, through its largest VarStore, from the first byte that they change to the
     /// last, keeping the bytes between; the question's own value wins where a SET overlaps it,
@@ -930,6 +967,7 @@ mod tests {
             VarStoreWrite::new(
                 store,
                 0,
+                1,
                 TypeValue::NumSize8(1),
                 VariableInterface::Efivarfs,
             )

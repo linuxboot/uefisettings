@@ -41,6 +41,12 @@ uefisettings.efi hii set --json "Read transformed" 100
 echo uefisettings-shell: step set-read-transformed %lasterror%
 uefisettings.efi hii get --json "Read transformed"
 echo uefisettings-shell: step get-read-transformed-after %lasterror%
+uefisettings.efi hii get --json "Option width"
+echo uefisettings-shell: step get-option-width-before %lasterror%
+uefisettings.efi hii set --json "Option width" Narrow
+echo uefisettings-shell: step set-option-width %lasterror%
+uefisettings.efi hii get --json "Option width"
+echo uefisettings-shell: step get-option-width-after %lasterror%
 dmpstore ReadWriteData -guid 8C78A505-BAA0-4C4A-869F-000000000201
 echo uefisettings-shell: step dmpstore-after %lasterror%
 uefisettings.efi hii set --json "Absent target" 5
