@@ -14,6 +14,7 @@
 //! VarStore.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -30,7 +31,9 @@ use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
 use super::storageless::StoragelessRefusal;
-use super::write_plan::write_in_turn;
+use super::write_plan::batched_writes;
+use super::write_plan::check_efivar_files;
+use super::write_plan::BatchedWrite;
 use super::write_plan::WritePlan;
 use super::AnswerOption;
 use super::IFROpCode;
@@ -249,6 +252,15 @@ impl<'a> VarStoreWrite<'a> {
             bytes,
         })
     }
+
+    /// Adds the patches of `later`, a write of the same variable, after these, through the
+    /// larger of the two VarStores.
+    pub(super) fn merge(&mut self, later: Self) {
+        if later.store.size() > self.store.size() {
+            self.store = later.store;
+        }
+        self.patches.extend(later.patches);
+    }
 }
 
 /// What set takes for a question: the text of its value, or of a ONE_OF the option that it
@@ -366,9 +378,11 @@ pub(crate) struct WrittenQuestion<'a> {
 /// selected question, in its order; fails with SelectionError::NotFound when nothing is selected.
 /// It builds the WritePlan of every question before the first write, reading with `reader`, whose
 /// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
-/// one question refuses leaves every variable unchanged; then it writes each, also after a failed
-/// one, and fails unless every write succeeds: with the error of a single question unchanged,
-/// else with NotSetEverywhere.
+/// one question refuses leaves every variable unchanged; then it writes each variable once, with
+/// the changes of every question to it (batched_writes), in order, and stops at the first write
+/// that fails, with its error unchanged if it is the only write, else with NotSetEverywhere.
+/// Through efivarfs it refuses, before any write, two variables of one efivar file
+/// (check_efivar_files).
 #[expect(
     clippy::too_many_arguments,
     reason = "set's inputs: the question, its matches, the value, how to pick an option, and the \
@@ -426,76 +440,72 @@ pub(crate) fn set_questions<'a>(
         .collect();
     let variables = VolatileWritingVariables::new(variables, volatile);
 
-    if let [(_, question_writes)] = writes.as_slice() {
-        write_in_turn(question_writes, &variables)?;
-        return Ok(written_questions);
-    }
+    let batch = batched_writes(writes);
+    check_efivar_files(&batch, interface)?;
     let mut written = Vec::new();
-    let mut failed = Vec::new();
-    for (selector, question_writes) in &writes {
-        match write_in_turn(question_writes, &variables) {
-            Ok(()) => written.push(selector.to_string()),
-            Err(error) => failed.push((*selector, error)),
+    let mut unwritten = batch.iter();
+    while let Some(batched) = unwritten.next() {
+        let Err(error) = batched.write.write(&variables) else {
+            written.push(batched.label());
+            continue;
+        };
+        if batch.len() == 1 {
+            return Err(error);
         }
-    }
-    if !failed.is_empty() {
-        return Err(NotSetEverywhere::new(question, failed, written).into());
+        // edk2-stable202608 SetupBrowserDxe SubmitForFormSet goes on after a failed
+        // RouteConfig(); set stops, as UEFI 2.11 §35.4.4 RouteConfig() reports the first failing
+        // pair of a <MultiConfigResp>.
+        return Err(NotSetEverywhere {
+            question: question.to_owned(),
+            outcome: Outcome {
+                written,
+                failed: FailedWrite {
+                    label: batched.label(),
+                    error,
+                },
+                not_attempted: unwritten.map(BatchedWrite::label).collect(),
+            },
+        }
+        .into());
     }
     Ok(written_questions)
 }
 
-/// set's error when a write fails while set writes several questions: each Failure, and the
-/// selectors written.
+/// set's error when one of several writes fails.
 #[derive(Error, Debug)]
-#[error(
-    "question {question:?} was not set everywhere: {}",
-    outcome(.failures, .written)
-)]
+#[error("question {question:?} was not set everywhere: {outcome}")]
 struct NotSetEverywhere {
     question: String,
-    failures: Vec<Failure>,
-    written: Vec<String>,
+    outcome: Outcome,
 }
 
-/// A distinct error of NotSetEverywhere, with the selectors whose writes failed with it.
+/// How set's writes went when one failed, each by the label of its BatchedWrite: those written,
+/// the one that failed with its error, and those after it, which set did not attempt.
 #[derive(Debug)]
-struct Failure {
-    error: String,
-    selectors: Vec<String>,
+struct Outcome {
+    written: Vec<String>,
+    failed: FailedWrite,
+    not_attempted: Vec<String>,
 }
 
-/// The text of NotSetEverywhere after the question: `failures`, then the selectors `written`.
-fn outcome(failures: &[Failure], written: &[String]) -> String {
-    let failures: Vec<String> = failures
-        .iter()
-        .map(|Failure { error, selectors }| format!("{error} (in {})", selectors.join(", ")))
-        .collect();
-    let written = match written {
-        [] => "none".to_owned(),
-        _ => written.join(", "),
-    };
-    format!("{}; written in: {written}", failures.join("; "))
+/// The write that failed, by the label of its BatchedWrite, with its error.
+#[derive(Debug)]
+struct FailedWrite {
+    label: String,
+    error: anyhow::Error,
 }
 
-impl NotSetEverywhere {
-    /// The error of `question`, whose writes `failed` by selector, and were `written` by the
-    /// others: each error is named once.
-    fn new(question: &str, failed: Vec<(&str, anyhow::Error)>, written: Vec<String>) -> Self {
-        let mut failures: Vec<Failure> = Vec::new();
-        for (selector, error) in failed {
-            let error = format!("{error:#}");
-            match failures.iter_mut().find(|failure| failure.error == error) {
-                Some(failure) => failure.selectors.push(selector.to_owned()),
-                None => failures.push(Failure {
-                    error,
-                    selectors: vec![selector.to_owned()],
-                }),
-            }
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let FailedWrite { label, error } = &self.failed;
+        write!(f, "{error:#} (in {label}); written in: ")?;
+        match self.written.as_slice() {
+            [] => write!(f, "none")?,
+            written => write!(f, "{}", written.join(", "))?,
         }
-        Self {
-            question: question.to_owned(),
-            failures,
-            written,
+        match self.not_attempted.as_slice() {
+            [] => Ok(()),
+            not_attempted => write!(f, "; not attempted: {}", not_attempted.join(", ")),
         }
     }
 }
@@ -503,6 +513,8 @@ impl NotSetEverywhere {
 #[cfg(test)]
 #[cfg(efivar_dumps)]
 mod set_questions_tests {
+    use std::collections::BTreeMap;
+
     use super::super::ifr_fixtures::*;
     use super::super::EFI_IFR_NUMERIC_SIZE_1;
     use super::super::EFI_IFR_NUMERIC_SIZE_2;
@@ -592,7 +604,7 @@ mod set_questions_tests {
     /// set_questions of PROMPT to `new_value`, or to an option of the texts `texts`, in
     /// `variables`: the texts of the options written, or the error as the CLI prints it.
     fn set_options(
-        variables: &MemoryVariables,
+        variables: &impl FirmwareVariables,
         selected: &[(&str, &QuestionDescriptor)],
         new_value: &str,
         texts: &[&str],
@@ -624,7 +636,7 @@ mod set_questions_tests {
 
     /// set_questions of PROMPT to `new_value` in `variables`, its error as the CLI prints it.
     fn set(
-        variables: &MemoryVariables,
+        variables: &impl FirmwareVariables,
         selected: &[(&str, &QuestionDescriptor)],
         new_value: &str,
     ) -> std::result::Result<(), String> {
@@ -634,6 +646,12 @@ mod set_questions_tests {
     /// The writes to the variable `name`.
     fn writes(variables: &MemoryVariables, name: &str) -> Vec<(u16, Vec<u8>)> {
         variables.writes_to(&variable_key(name))
+    }
+
+    /// How NotSetEverywhere names the write of the variable `name` by the questions of the
+    /// selector `name`.
+    fn label(name: &str) -> String {
+        format!("{name} (EFI variable {})", variable_key(name))
     }
 
     #[test]
@@ -685,25 +703,80 @@ mod set_questions_tests {
         assert_eq!(writes(&variables, "B"), [(0, vec![2])], "writes of B");
     }
 
+    /// set writes in order and stops at the first write that fails, which fails set: the writes
+    /// before it are written, and those after it are not attempted and leave their variables
+    /// unchanged. The error is named with its context.
     #[test]
-    fn a_failed_write_fails_set_after_the_other_writes() {
-        let mut variables = MemoryVariables::default();
-        let a = checkbox_on_store(failing_var_store("A", WRITE_ERROR, &mut variables));
-        let b = checkbox_on_store(writable_var_store("B", &[0], &variables));
-
-        assert_eq!(
-            set(&variables, &[("A", &a), ("B", &b)], "1"),
-            Err(
-                "question \"Prompt\" was not set everywhere: write failed (in A); written in: B"
-                    .to_string()
+    fn set_stops_at_the_first_failed_write() {
+        const CHAINED: WriteError = WriteError {
+            cause: "permission denied",
+            context: Some("failed to write"),
+        };
+        let [in_a, in_b, in_c] = ["A", "B", "C"].map(label);
+        let cases = [
+            (
+                ["A", "B", "C"],
+                WRITE_ERROR,
+                format!(
+                    "write failed (in {in_a}); written in: none; not attempted: {in_b}, {in_c}"
+                ),
+                [false, false],
             ),
-            "set"
-        );
-        assert_eq!(
-            writes(&variables, "B"),
-            [(0, vec![1])],
-            "writes of B after A failed"
-        );
+            (
+                ["B", "A", "C"],
+                WRITE_ERROR,
+                format!("write failed (in {in_a}); written in: {in_b}; not attempted: {in_c}"),
+                [true, false],
+            ),
+            (
+                ["B", "C", "A"],
+                WRITE_ERROR,
+                format!("write failed (in {in_a}); written in: {in_b}, {in_c}"),
+                [true, true],
+            ),
+            (
+                ["A", "B", "C"],
+                CHAINED,
+                format!(
+                    "failed to write: permission denied (in {in_a}); written in: none; not \
+                     attempted: {in_b}, {in_c}"
+                ),
+                [false, false],
+            ),
+        ];
+        for (order, error, outcome, [b_written, c_written]) in cases {
+            let mut variables = MemoryVariables::default();
+            let a = checkbox_on_store(failing_var_store("A", error, &mut variables));
+            let b = checkbox_on_store(writable_var_store("B", &[0], &variables));
+            let c = checkbox_on_store(writable_var_store("C", &[0], &variables));
+            let questions = BTreeMap::from([("A", &a), ("B", &b), ("C", &c)]);
+            let selected: Vec<(&str, &QuestionDescriptor)> =
+                order.iter().map(|name| (*name, questions[name])).collect();
+
+            assert_eq!(
+                set(&variables, &selected, "1"),
+                Err(format!(
+                    "question \"Prompt\" was not set everywhere: {outcome}"
+                )),
+                "{order:?}"
+            );
+            for (name, written) in [("B", b_written), ("C", c_written)] {
+                let want = match written {
+                    true => vec![(0, vec![1])],
+                    false => Vec::new(),
+                };
+                assert_eq!(
+                    writes(&variables, name),
+                    want,
+                    "{order:?}: writes of {name}"
+                );
+                assert_eq!(
+                    variables.bytes(&variable_key(name)),
+                    Some(efivarfs_bytes(&[u8::from(written)])),
+                    "{order:?}: {name}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1144,51 +1217,299 @@ mod set_questions_tests {
         );
     }
 
+    /// `variables` behind firmware whose variable policy refuses a write of `key` that carries
+    /// its data byte at `offset`, as edk2's VarCheck refuses data that breaks a question's
+    /// constraints: that SetVariable() of a non-volatile variable saves nothing (UEFI 2.11
+    /// §8.2.3).
+    struct RefusingByte<'v> {
+        variables: &'v MemoryVariables,
+        key: VariableKey,
+        offset: u16,
+    }
+
+    impl FirmwareVariables for RefusingByte<'_> {
+        fn reach(&self) -> VariableReach {
+            self.variables.reach()
+        }
+
+        fn interface(&self) -> VariableInterface {
+            self.variables.interface()
+        }
+
+        fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
+            self.variables.read(key, size)
+        }
+
+        fn read_whole(&self, key: &VariableKey) -> Result<Vec<u8>> {
+            self.variables.read_whole(key)
+        }
+
+        fn write_patches(
+            &self,
+            key: &VariableKey,
+            size: u16,
+            patches: &[DataPatch<'_>],
+            volatile: VolatileWrites,
+        ) -> Result<()> {
+            let carries = |patch: &DataPatch<'_>| {
+                let carried =
+                    usize::from(patch.offset)..usize::from(patch.offset) + patch.bytes.len();
+                carried.contains(&usize::from(self.offset))
+            };
+            if *key == self.key && patches.iter().any(carries) {
+                return Err(anyhow!("EFI_SECURITY_VIOLATION"));
+            }
+            self.variables.write_patches(key, size, patches, volatile)
+        }
+    }
+
+    /// Two questions of one variable take one write of it: a SetVariable() of a non-volatile
+    /// variable saves all of its data or none (UEFI 2.11 §8.2.3), and edk2-stable202608
+    /// HiiDatabaseDxe ConfigRouting.c RouteConfigRespForEfiVarStore saves a FormSet's changes to
+    /// one EFI variable store in one SetVariable().
     #[test]
-    fn each_failure_is_named_once() {
-        const FIRST: WriteError = WriteError {
-            cause: "first failure",
-            context: None,
+    fn two_questions_of_one_variable_are_written_in_one_write() {
+        let variables = MemoryVariables::default();
+        let first = checkbox_at(0, writable_var_store("A", &[0, 0, 0], &variables));
+        let third = checkbox_at(2, writable_var_store("A", &[0, 0, 0], &variables));
+
+        assert_eq!(
+            set(&variables, &[("A", &first), ("A", &third)], "1"),
+            Ok(()),
+            "set"
+        );
+        assert_eq!(writes(&variables, "A"), [(0, vec![1, 0, 1])], "writes of A");
+        assert_eq!(
+            variables.bytes(&variable_key("A")),
+            Some(efivarfs_bytes(&[1, 0, 1])),
+            "A"
+        );
+    }
+
+    /// A write that merges questions of the selectors A, B and A again is named by each of its
+    /// selectors once, in question order, where it fails, is written or is not attempted.
+    #[test]
+    fn a_merged_write_names_each_of_its_selectors_once() {
+        let merged = |name: &'static str, fails: bool| {
+            [("A", name, fails), ("B", name, fails), ("A", name, fails)]
         };
-        const SECOND: WriteError = WriteError {
-            cause: "second failure",
-            context: None,
-        };
-        const CHAINED: WriteError = WriteError {
-            cause: "permission denied",
-            context: Some("failed to write"),
-        };
+        let named = |name: &str| format!("A, B (EFI variable {})", variable_key(name));
+        // the selector, the variable and whether its writes fail of each question in order; the
+        // outcome; and the writes of the merged variable
         let cases = [
             (
-                "one error",
-                [WRITE_ERROR, WRITE_ERROR, WRITE_ERROR],
-                "write failed (in A, B, C)",
+                "failed",
+                [&[("W", "W", false)][..], &merged("X", true)].concat(),
+                format!(
+                    "write failed (in {}); written in: {}",
+                    named("X"),
+                    label("W")
+                ),
+                ("X", vec![]),
             ),
             (
-                "two errors",
-                [FIRST, SECOND, FIRST],
-                "first failure (in A, C); second failure (in B)",
+                "written",
+                [&merged("Y", false)[..], &[("F", "F", true)]].concat(),
+                format!(
+                    "write failed (in {}); written in: {}",
+                    label("F"),
+                    named("Y")
+                ),
+                ("Y", vec![(0, vec![1])]),
             ),
             (
-                "an error in a context",
-                [CHAINED, WRITE_ERROR, CHAINED],
-                "failed to write: permission denied (in A, C); write failed (in B)",
+                "not attempted",
+                [&[("F", "F", true)][..], &merged("Y", false)].concat(),
+                format!(
+                    "write failed (in {}); written in: none; not attempted: {}",
+                    label("F"),
+                    named("Y")
+                ),
+                ("Y", vec![]),
             ),
         ];
-        for (case, [a_error, b_error, c_error], failures) in cases {
+        for (place, questions, outcome, (name, want_writes)) in cases {
             let mut variables = MemoryVariables::default();
-            let [a, b, c] =
-                [("A", a_error), ("B", b_error), ("C", c_error)].map(|(name, error)| {
-                    checkbox_on_store(failing_var_store(name, error, &mut variables))
-                });
+            let descriptors: Vec<(&str, QuestionDescriptor)> = questions
+                .iter()
+                .map(|&(selector, name, fails)| {
+                    let store = match fails {
+                        true => failing_var_store(name, WRITE_ERROR, &mut variables),
+                        false => writable_var_store(name, &[0], &variables),
+                    };
+                    (selector, checkbox_on_store(store))
+                })
+                .collect();
+            let selected: Vec<(&str, &QuestionDescriptor)> = descriptors
+                .iter()
+                .map(|(selector, question)| (*selector, question))
+                .collect();
+
             assert_eq!(
-                set(&variables, &[("A", &a), ("B", &b), ("C", &c)], "1"),
+                set(&variables, &selected, "1"),
                 Err(format!(
-                    "question \"Prompt\" was not set everywhere: {failures}; written in: none"
+                    "question \"Prompt\" was not set everywhere: {outcome}"
                 )),
-                "{case}"
+                "merged write {place}"
+            );
+            assert_eq!(
+                writes(&variables, name),
+                want_writes,
+                "merged write {place}: writes of {name}"
             );
         }
+    }
+
+    /// Through efivarfs, set refuses before any write two variables whose names differ only in
+    /// '/' and '!', which efivarfs keeps in one file; through the other interfaces they are two
+    /// variables, each written.
+    #[test]
+    fn variables_of_one_efivar_file_are_refused_through_efivarfs_only() {
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+            (
+                VariableReach::Runtime,
+                VariableInterface::FirmwareEnvironment,
+            ),
+        ] {
+            let variables = MemoryVariables::new(reach, interface);
+            let slash = checkbox_on_store(writable_var_store("A/B", &[0], &variables));
+            let bang = checkbox_on_store(writable_var_store("A!B", &[0], &variables));
+            let (want, want_writes) = match interface {
+                VariableInterface::Efivarfs => (
+                    Err(format!(
+                        "the EFI variables named \"A/B\" and \"A!B\" are one efivarfs file, {}: \
+                         set writes neither",
+                        variable_key("A!B")
+                    )),
+                    vec![],
+                ),
+                VariableInterface::VariableServices | VariableInterface::FirmwareEnvironment => {
+                    (Ok(()), vec![(0, vec![1])])
+                }
+            };
+
+            assert_eq!(
+                set(&variables, &[("slash", &slash), ("bang", &bang)], "1"),
+                want,
+                "{interface:?}"
+            );
+            for name in ["A/B", "A!B"] {
+                assert_eq!(
+                    writes(&variables, name),
+                    want_writes,
+                    "{interface:?}: writes of {name}"
+                );
+            }
+        }
+    }
+
+    /// Two questions of one byte take one write, with the later question's value.
+    #[test]
+    fn the_later_of_two_questions_of_one_byte_wins() {
+        let variables = MemoryVariables::default();
+        let first = one_of_on_store(
+            flagged_option(6, 0x00, 1),
+            writable_var_store("A", &[0], &variables),
+        );
+        let second = one_of_on_store(
+            flagged_option(5, 0x00, 2),
+            writable_var_store("A", &[0], &variables),
+        );
+
+        assert_eq!(
+            set_options(
+                &variables,
+                &[("first", &first), ("second", &second)],
+                "",
+                &["Enabled", "Disabled"]
+            ),
+            Ok(vec![
+                Some("Enabled".to_string()),
+                Some("Disabled".to_string())
+            ]),
+            "set"
+        );
+        assert_eq!(writes(&variables, "A"), [(0, vec![2])], "writes of A");
+    }
+
+    /// A write that the firmware refuses leaves its variable unchanged, though two questions
+    /// change it; as the only write of set, its error is set's.
+    #[test]
+    fn a_refused_write_leaves_its_variable_unchanged() {
+        let variables = MemoryVariables::default();
+        let first = checkbox_at(0, writable_var_store("A", &[0, 0], &variables));
+        let second = checkbox_at(1, writable_var_store("A", &[0, 0], &variables));
+        let refusing = RefusingByte {
+            variables: &variables,
+            key: variable_key("A"),
+            offset: 1,
+        };
+
+        let outcome = set(&refusing, &[("A", &first), ("A", &second)], "1");
+
+        assert_eq!(
+            variables.bytes(&variable_key("A")),
+            Some(efivarfs_bytes(&[0, 0])),
+            "A unchanged"
+        );
+        assert_eq!(writes(&variables, "A"), [], "writes of A");
+        assert_eq!(outcome, Err("EFI_SECURITY_VIOLATION".to_string()), "set");
+    }
+
+    /// A write of two questions of one variable keeps a byte between them that a withholding
+    /// reads as 0 as the variable holds it.
+    #[test]
+    fn a_write_of_two_questions_keeps_a_withheld_byte_between_them() {
+        let variables = MemoryVariables::default();
+        let first = checkbox_at(0, writable_var_store("A", &[0, 0xAA, 0], &variables));
+        let third = checkbox_at(2, writable_var_store("A", &[0, 0xAA, 0], &variables));
+        let zeroing = ZeroingByte {
+            variables: &variables,
+            key: variable_key("A"),
+            offset: 1,
+        };
+
+        assert_eq!(
+            set(&zeroing, &[("A", &first), ("A", &third)], "1"),
+            Ok(()),
+            "set"
+        );
+        assert_eq!(
+            variables.bytes(&variable_key("A")),
+            Some(efivarfs_bytes(&[1, 0xAA, 1])),
+            "A keeps 0xAA"
+        );
+    }
+
+    /// Two VarStores of one variable, of 2 and 4 bytes, on a variable of 3: the one write of
+    /// both questions checks the larger Size, and writes nothing, as the larger one's question
+    /// alone would.
+    #[test]
+    fn a_batch_checks_the_largest_var_store_of_its_variable() {
+        let variables = MemoryVariables::default();
+        let first = checkbox_at(0, writable_var_store("A", &[0, 0], &variables));
+        let second = checkbox_at(1, writable_var_store("A", &[0, 0, 0, 0], &variables));
+        variables.insert(variable_key("A"), NV_BS_RT, &[0, 0, 0]);
+
+        let outcome = set(&variables, &[("A", &first), ("A", &second)], "1");
+
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("shorter than the declared varstore: 3 < 4")),
+            "set: {outcome:?}"
+        );
+        assert_eq!(writes(&variables, "A"), [], "writes of A");
+        assert_eq!(
+            variables.bytes(&variable_key("A")),
+            Some(efivarfs_bytes(&[0, 0, 0])),
+            "A unchanged"
+        );
     }
 }
 

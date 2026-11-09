@@ -16,8 +16,11 @@
 //! edk2-stable202608 SetupBrowserDxe/Setup.c SubmitForForm then routes only the bytes of the
 //! form's questions, dropping SET bytes that no question covers; set writes every SET, as UEFI
 //! 2.11 §33.3.8.3.66 stores the value in the VarStore.
+//! set writes the plans of all its questions as one batch, one write per variable
+//! (batched_writes).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -43,8 +46,8 @@ use super::IFROpCode;
 use super::IFROperation;
 use super::QuestionDescriptor;
 use super::StoragelessRefusal;
+use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarRange;
-use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableReach;
@@ -179,59 +182,104 @@ struct Patch<'p> {
 /// The one write of `patches`, all of one variable, in order, through the largest of their
 /// VarStores.
 fn merged_write<'p>(patches: &[Patch<'p>]) -> Result<VarStoreWrite<'p>, ChangeValueError> {
-    let [first, rest @ ..] = patches else {
+    let mut writes = patches.iter().map(|patch| VarStoreWrite {
+        store: patch.store,
+        patches: vec![(patch.offset, patch.bytes.to_vec())],
+    });
+    let Some(mut merged) = writes.next() else {
         return Err(anyhow!("a variable write without bytes").into());
     };
-    let store = rest.iter().fold(first.store, |largest, patch| {
-        match patch.store.size() > largest.size() {
-            true => patch.store,
-            false => largest,
-        }
-    });
-    Ok(VarStoreWrite {
-        store,
-        patches: patches
-            .iter()
-            .map(|patch| (patch.offset, patch.bytes.to_vec()))
-            .collect(),
-    })
+    writes.for_each(|write| merged.merge(write));
+    Ok(merged)
 }
 
-/// Writes `writes` through `variables` in order, stopping at the first that fails.
-pub(super) fn write_in_turn(
-    writes: &[VarStoreWrite<'_>],
-    variables: &dyn FirmwareVariables,
-) -> Result<()> {
-    for (index, write) in writes.iter().enumerate() {
-        if let Err(error) = write.write(variables) {
-            let written: Vec<VariableKey> = writes
-                .iter()
-                .take(index)
-                .map(|write| write.store.variable_key())
-                .collect();
-            return Err(match written.is_empty() {
-                true => error,
-                false => PartlyWritten { error, written }.into(),
+/// The write of one variable in set's batch, with the selectors of the questions that change
+/// it.
+pub(super) struct BatchedWrite<'a> {
+    pub(super) write: VarStoreWrite<'a>,
+    pub(super) selectors: Vec<&'a str>,
+}
+
+impl BatchedWrite<'_> {
+    /// The write as set's errors name it: its selectors and its variable.
+    pub(super) fn label(&self) -> String {
+        format!(
+            "{} (EFI variable {})",
+            self.selectors.join(", "),
+            self.write.store.variable_key()
+        )
+    }
+}
+
+/// set's batch of `question_writes`, the writes of each question by its selector, in question
+/// order: one write per variable, in the order in which the questions first change each, with
+/// the patches of every question to it in question order, so that a later question's bytes win
+/// where they overlap, through the largest of its VarStores.
+pub(super) fn batched_writes<'a>(
+    question_writes: Vec<(&'a str, Vec<VarStoreWrite<'a>>)>,
+) -> Vec<BatchedWrite<'a>> {
+    let mut batch: Vec<BatchedWrite<'a>> = Vec::new();
+    for (selector, writes) in question_writes {
+        for write in writes {
+            let key = write.store.variable_key();
+            match batch
+                .iter_mut()
+                .find(|batched| batched.write.store.variable_key() == key)
+            {
+                Some(batched) => {
+                    batched.write.merge(write);
+                    if !batched.selectors.contains(&selector) {
+                        batched.selectors.push(selector);
+                    }
+                }
+                None => batch.push(BatchedWrite {
+                    write,
+                    selectors: vec![selector],
+                }),
+            }
+        }
+    }
+    batch
+}
+
+/// Refuses `batch` through efivarfs where two of its variables are one efivar file, their names
+/// differing only in '/' and '!' (EfivarFileName): efivarfs would take both writes on one
+/// variable. Through the other interfaces they are two variables.
+pub(super) fn check_efivar_files(
+    batch: &[BatchedWrite<'_>],
+    interface: VariableInterface,
+) -> Result<(), SharedEfivarFile> {
+    match interface {
+        VariableInterface::Efivarfs => {}
+        VariableInterface::VariableServices | VariableInterface::FirmwareEnvironment => {
+            return Ok(())
+        }
+    }
+    let mut files = BTreeMap::new();
+    for batched in batch {
+        let key = batched.write.store.variable_key();
+        let file = EfivarFileName::from(&key);
+        if let Some(first) = files.insert(file.clone(), key.name.clone()) {
+            return Err(SharedEfivarFile {
+                first,
+                second: key.name,
+                file,
             });
         }
     }
     Ok(())
 }
 
-/// A write of a question that failed after set wrote other variables for it.
+/// Two variables of set's batch that efivarfs keeps in one file.
 #[derive(Debug, Error)]
-#[error("{error:#}; set already wrote {}", written_keys(.written))]
-struct PartlyWritten {
-    error: anyhow::Error,
-    written: Vec<VariableKey>,
-}
-
-/// `keys`, as PartlyWritten names them.
-fn written_keys(keys: &[VariableKey]) -> String {
-    keys.iter()
-        .map(|key| format!("EFI variable {key}"))
-        .collect::<Vec<_>>()
-        .join(", ")
+#[error(
+    "the EFI variables named {first:?} and {second:?} are one efivarfs file, {file}: set writes \
+     neither"
+)]
+pub(super) struct SharedEfivarFile {
+    first: String,
+    second: String,
+    file: EfivarFileName,
 }
 
 /// Returns the root of the tree of `node`.
@@ -252,13 +300,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::super::ifr_fixtures::*;
-    #[cfg(efivar_dumps)]
-    use super::super::set::VarStoreWrite;
     use super::super::*;
-    #[cfg(efivar_dumps)]
-    use super::write_in_turn;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::variables::check_non_volatile;
+    use crate::hii::variables::FirmwareVariables;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
 
@@ -542,6 +587,35 @@ mod tests {
         through: (VariableReach, VariableInterface),
         volatile: VolatileWrites,
     ) -> (Result<Vec<bool>, String>, Written) {
+        let writes = variables(through);
+        let outcome = set_through(root, strings, prompt, value, volatile, &writes);
+        let written = [
+            "Store",
+            "Other",
+            "BootOnly",
+            "Absent",
+            "Enhanced",
+            "BadMetadata",
+            "Volatile",
+        ]
+        .into_iter()
+        .map(|name| (name, writes.writes_to(&key(name))))
+        .filter(|(_, writes)| !writes.is_empty())
+        .collect();
+        (outcome, written)
+    }
+
+    /// set_under() of the question of `prompt`, selected as "selector", writing through
+    /// `writes`, which reach and are read as variables() of their reach and interface.
+    fn set_through(
+        root: &Rc<RefCell<IFROperation>>,
+        strings: &[StringMap],
+        prompt: &str,
+        value: &str,
+        volatile: VolatileWrites,
+        writes: &MemoryVariables,
+    ) -> Result<Vec<bool>, String> {
+        let through = (writes.reach(), writes.interface());
         let mut reader = EfivarReader::with_variables(Box::new(variables(through)));
         let values = VarStoreValues::new(root, None);
         let selection = find_question_in(
@@ -558,10 +632,9 @@ mod tests {
             match choice_for_set(selection, prompt, &options, IncludedStates::all(), &reader) {
                 Ok(Choice::Chosen(descriptor, _)) => descriptor,
                 Ok(Choice::Skipped(states)) => panic!("{prompt}: not picked, {states}"),
-                Err(error) => return (Err(format!("{error:#}")), BTreeMap::new()),
+                Err(error) => return Err(format!("{error:#}")),
             };
-        let writes = variables(through);
-        let outcome = set_questions(
+        set_questions(
             prompt,
             &[("selector", &descriptor)],
             value,
@@ -570,24 +643,10 @@ mod tests {
             &mut reader,
             None,
             volatile,
-            &WithholdingVariables::new(&writes, WithheldBytes::default()),
+            &WithholdingVariables::new(writes, WithheldBytes::default()),
         )
         .map(|written| written.iter().map(|question| question.volatile).collect())
-        .map_err(|error| format!("{error:#}"));
-        let written = [
-            "Store",
-            "Other",
-            "BootOnly",
-            "Absent",
-            "Enhanced",
-            "BadMetadata",
-            "Volatile",
-        ]
-        .into_iter()
-        .map(|name| (name, writes.writes_to(&key(name))))
-        .filter(|(_, writes)| !writes.is_empty())
-        .collect();
-        (outcome, written)
+        .map_err(|error| format!("{error:#}"))
     }
 
     /// set writes a UINT8 option of a UINT16 ONE_OF in both bytes of its storage, zero-extended, as
@@ -1131,11 +1190,10 @@ mod tests {
         }
     }
 
-    /// Two package lists' questions of one prompt on one variable: the first writes byte 1, and
-    /// the second's write of its own byte 0 and its WRITE's byte 2 keeps byte 1 as the first left
-    /// it, not as set read it before any write.
+    /// Two package lists' questions of one prompt on one variable take one write of it: the
+    /// first's byte 1, and the second's own byte 0 and its WRITE's byte 2.
     #[test]
-    fn a_merged_write_keeps_the_bytes_that_an_earlier_write_of_the_same_set_changed() {
+    fn questions_of_two_package_lists_on_one_variable_take_one_write() {
         let op = |op_code| operation(op_code, false, &[]);
         let list = |offset: u16, write: Vec<u8>| {
             let data = [
@@ -1202,7 +1260,7 @@ mod tests {
 
         assert_eq!(
             writes.writes_to(&key("Store")),
-            [(1, vec![5]), (0, vec![5, 5, 5])],
+            [(0, vec![5, 5, 5])],
             "writes of Store"
         );
         let held = writes.bytes(&key("Store")).expect("Store exists");
@@ -1246,48 +1304,42 @@ mod tests {
         }
     }
 
-    /// A write that fails after set wrote other variables of the question names them; one that
-    /// fails first is its own error.
+    /// A write of a question that fails after set wrote another variable of it fails set and
+    /// names that variable.
     #[cfg(efivar_dumps)]
     #[test]
     fn a_failed_write_names_the_variables_that_set_already_wrote() {
-        let mut variables = variables(EFIVARFS);
-        variables.fail_writes(
+        let mut writes = variables(EFIVARFS);
+        writes.fail_writes(
             key("Store"),
             WriteError {
                 cause: "write failed",
                 context: None,
             },
         );
-        let (other, store) = (efi_variable("Other", 2), efi_variable("Store", 6));
-        let writes = [&other, &store].map(|store| {
-            VarStoreWrite::new(
-                store,
-                0,
-                1,
-                TypeValue::NumSize8(1),
-                VariableInterface::Efivarfs,
-            )
-            .expect("a write of one byte")
-        });
-        let outcome = |writes: &[VarStoreWrite<'_>]| {
-            write_in_turn(writes, &variables).map_err(|error| format!("{error:#}"))
-        };
+
+        let outcome = set_through(
+            &form_set(),
+            &prompts(),
+            "Other store",
+            "18",
+            VolatileWrites::Refuse,
+            &writes,
+        );
+
         assert_eq!(
-            outcome(&writes),
-            Err("write failed; set already wrote EFI variable \
-                 Other-00000000-0000-0000-0000-000000000000"
-                .to_string()),
-            "Store after Other"
+            outcome,
+            Err(format!(
+                "question \"Other store\" was not set everywhere: write failed (in selector (EFI \
+                 variable {})); written in: selector (EFI variable {})",
+                key("Store"),
+                key("Other")
+            )),
+            "set"
         );
         assert_eq!(
-            outcome(&writes[1..]),
-            Err("write failed".to_string()),
-            "Store alone"
-        );
-        assert_eq!(
-            variables.writes_to(&key("Other")),
-            [(0, vec![1])],
+            writes.writes_to(&key("Other")),
+            [(0, vec![18, 0])],
             "writes of Other"
         );
     }

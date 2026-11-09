@@ -1670,7 +1670,7 @@ mod tests {
     }
 
     /// Where one FormSet selects a writable "T" and another a read-only one, set refuses before
-    /// it writes either; with read-only included it writes both.
+    /// it writes either; with read-only included it writes both, in one write of their variable.
     #[test]
     fn read_only_refusal_comes_before_any_write() {
         let hiidb = [
@@ -1686,7 +1686,7 @@ mod tests {
         assert_eq!(got, Ok(()), "set T --include read-only");
         assert_eq!(
             writes,
-            [(0, vec![9]), (1, vec![9])],
+            [(0, vec![9, 9])],
             "set T --include read-only: writes"
         );
     }
