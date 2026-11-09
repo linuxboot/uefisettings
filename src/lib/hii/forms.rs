@@ -3613,13 +3613,13 @@ mod tests {
                 &efi_variable("Test", 42),
                 0,
                 1,
-                TypeValue::Boolean(true),
+                TypeValue::Unknown(0),
                 VariableInterface::Efivarfs
             )
             .map(drop)
             .map_err(|error| error.to_string()),
             Err("unsupported value type for efivarfs write".to_string()),
-            "BOOLEAN"
+            "a value of an unknown type"
         );
     }
 
@@ -3685,7 +3685,7 @@ mod tests {
                     &efi_variable("Test", 42),
                     0,
                     1,
-                    TypeValue::Boolean(true),
+                    TypeValue::Unknown(0),
                     interface
                 )
                 .map(drop)

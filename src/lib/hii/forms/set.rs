@@ -142,7 +142,7 @@ impl<'a> VarStoreWrite<'a> {
     /// edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue writes StorageWidth bytes
     /// (:2061, :2108) of a HiiValue that DisplayEngineDxe/InputHandler.c SetValuesByType fills
     /// in the option's type only (:1236-1267). Fails unless `width` is 1 to 8, `value` is a number
-    /// that fits in `width` bytes, and they fit in the Size of `store` there.
+    /// or a BOOLEAN that fits in `width` bytes, and they fit in the Size of `store` there.
     pub(super) fn new(
         store: &'a dyn VariableStore,
         offset: u16,
@@ -155,8 +155,8 @@ impl<'a> VarStoreWrite<'a> {
             TypeValue::NumSize16(value) => (u64::from(value), 2),
             TypeValue::NumSize32(value) => (u64::from(value), 4),
             TypeValue::NumSize64(value) => (value, 8),
-            TypeValue::Boolean(_)
-            | TypeValue::Time(_)
+            TypeValue::Boolean(value) => (u64::from(value), 1),
+            TypeValue::Time(_)
             | TypeValue::Date(_)
             | TypeValue::StringID(_)
             | TypeValue::Other
@@ -503,6 +503,7 @@ mod set_questions_tests {
     use super::super::EFI_IFR_NUMERIC_SIZE_2;
     use super::super::EFI_IFR_NUMERIC_SIZE_4;
     use super::super::EFI_IFR_NUMERIC_SIZE_8;
+    use super::super::EFI_IFR_TYPE_BOOLEAN;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_32;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_64;
@@ -728,9 +729,10 @@ mod set_questions_tests {
     fn a_write_that_the_ifr_of_one_match_refuses_writes_no_match() {
         let variables = MemoryVariables::default();
         let a = checkbox_on_store(writable_var_store("A", &[0], &variables));
-        let boolean_option = one_of_on_store(
-            one_of_option(6, 0x04, &[1]),
-            writable_var_store("Boolean", &[0], &variables),
+        // EFI_IFR_TYPE_STRING, a type that set does not write
+        let string_option = one_of_on_store(
+            one_of_option(6, 0x07, &[1, 0]),
+            writable_var_store("String", &[0], &variables),
         );
         let past_the_var_store = checkbox_at(1, writable_var_store("Short", &[0], &variables));
         // 8-bit UINT_DEC fields at bit 0: writes take VarOffset in bytes
@@ -748,10 +750,10 @@ mod set_questions_tests {
         );
         let cases = [
             (
-                "B's option of Type BOOLEAN",
-                &boolean_option,
+                "B's option of Type STRING",
+                &string_option,
                 "unsupported value type for efivarfs write",
-                "Boolean",
+                "String",
             ),
             (
                 "B at VarOffset 1 of its 1-byte VarStore",
@@ -810,18 +812,19 @@ mod set_questions_tests {
             ),
         ] {
             let variables = MemoryVariables::new(reach, interface);
-            let boolean_option = one_of_on_store(
-                one_of_option(6, 0x04, &[1]),
-                writable_var_store("Boolean", &[0], &variables),
+            // EFI_IFR_TYPE_STRING, a type that set does not write
+            let string_option = one_of_on_store(
+                one_of_option(6, 0x07, &[1, 0]),
+                writable_var_store("String", &[0], &variables),
             );
             let case = format!("{reach:?}, {interface:?}");
 
             assert_eq!(
-                set_options(&variables, &[("B", &boolean_option)], "1", &["Enabled"]),
+                set_options(&variables, &[("B", &string_option)], "1", &["Enabled"]),
                 Err(format!("unsupported value type for {write}")),
                 "{case}"
             );
-            assert_eq!(writes(&variables, "Boolean"), [], "{case}: writes");
+            assert_eq!(writes(&variables, "String"), [], "{case}: writes");
         }
     }
 
@@ -886,6 +889,30 @@ mod set_questions_tests {
                 "{case}"
             );
             assert_eq!(writes(&variables, "Store"), [(0, want)], "{case}: writes");
+        }
+    }
+
+    /// set writes a BOOLEAN option in all the bytes of its question's storage, zero-extended, as
+    /// edk2-stable202608 DisplayEngineDxe/InputHandler.c SetValuesByType copies its one byte
+    /// (:1243-1244) before SetupBrowserDxe/Setup.c:2108 writes StorageWidth bytes.
+    #[test]
+    fn boolean_options_are_written_in_their_questions_storage_width() {
+        for (value, want) in [(true, vec![1, 0]), (false, vec![0, 0])] {
+            let variables = MemoryVariables::default();
+            let store = writable_var_store("Store", &[0xEE; 2], &variables);
+            let option = one_of_option(6, EFI_IFR_TYPE_BOOLEAN, &[u8::from(value)]);
+            let question = sized_on_store(ONE_OF, 2, &[option], store);
+
+            assert_eq!(
+                set_options(&variables, &[("Q", &question)], "", &["Enabled"]),
+                Ok(vec![Some("Enabled".to_string())]),
+                "BOOLEAN {value} in 2 bytes"
+            );
+            assert_eq!(
+                writes(&variables, "Store"),
+                [(0, want)],
+                "BOOLEAN {value} in 2 bytes: writes"
+            );
         }
     }
 
