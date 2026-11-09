@@ -79,6 +79,8 @@ pub(crate) use question_values::QuestionIdentity;
 pub(crate) use question_values::QuestionMatch;
 pub use question_values::QuestionSelector;
 use set::ChangeValueError;
+use setup_password::password_storage_width;
+use setup_password::PasswordOp;
 use storage::storage_width;
 use storage::NameValueStore;
 use storage::ReadableLocation;
@@ -1172,12 +1174,16 @@ fn is_bit_varstore_guid(op: &IFROperation) -> bool {
 /// Whether VarStore `var_store_id` of `op` is a VARSTORE_EFI of the form before UEFI 2.3.1 that
 /// its FormSet declares: before `op`, while the FormSet is parsed.
 fn names_short_var_store(op: &IFROperation, var_store_id: u16) -> bool {
-    enclosing_form_set(op).is_some_and(|form_set| {
-        matches!(
-            declared_var_store(&form_set.borrow(), var_store_id),
-            Some(DeclaredStore::ShortEfi(_))
-        )
-    })
+    short_var_store_of(op, var_store_id).is_some()
+}
+
+/// VarStore `var_store_id` of `op`, if its FormSet declares it as a VARSTORE_EFI of the form
+/// before UEFI 2.3.1.
+fn short_var_store_of(op: &IFROperation, var_store_id: u16) -> Option<ShortVarStoreEfi> {
+    match declared_var_store(&enclosing_form_set(op)?.borrow(), var_store_id)? {
+        DeclaredStore::ShortEfi(store) => Some(store),
+        DeclaredStore::Variable(_) | DeclaredStore::NameValue(_) => None,
+    }
 }
 
 /// How a ONE_OF, NUMERIC or CHECKBOX stores its value, and a NUMERIC or ONE_OF its MinValue,
@@ -3635,31 +3641,40 @@ fn form_set_varstore(
 }
 
 /// The EFI variable of `question` on the VARSTORE_EFI before UEFI 2.3.1 `store`: of a ONE_OF,
-/// NUMERIC or CHECKBOX, whose value ValueEncoding::VarName places at byte 0, as wide as the value.
+/// NUMERIC or CHECKBOX, whose value ValueEncoding::VarName places at byte 0, as wide as the value;
+/// of a PASSWORD, of its StorageWidth (password_storage_width), whatever its MaxSize.
 fn short_efi_variable(
     store: &ShortVarStoreEfi,
     question: &IFROperation,
 ) -> Result<ShortEfiVariable, ShortEfiRefusal> {
     let id = store.var_store_id;
-    let Some(value_question) = value_question(question) else {
-        return Err(ShortEfiRefusal::new(
-            id,
-            ShortEfiReason::NotRead(question.op_code.spec_name()),
-        ));
-    };
-    let size = match (value_question.encoding(), value_question.location()) {
-        (ValueEncoding::VarName, ValueLocation::Bytes { size, .. }) => size,
-        (ValueEncoding::EdkiiBitField, _)
-        | (ValueEncoding::VarName, ValueLocation::Bits { .. }) => {
-            return Err(ShortEfiRefusal::new(id, ShortEfiReason::BitField))
-        }
-        // the store was not declared yet when the question was parsed
-        (ValueEncoding::NumericSize, _) => {
-            return Err(ShortEfiRefusal::new(id, ShortEfiReason::DeclaredAfter))
+    let (var_name, size) = match (value_question(question), PasswordOp::of(question)) {
+        (Some(value_question), _) => match (value_question.encoding(), value_question.location()) {
+            (ValueEncoding::VarName, ValueLocation::Bytes { size, .. }) => {
+                (value_question.header().var_store_info, u16::from(size))
+            }
+            (ValueEncoding::EdkiiBitField, _)
+            | (ValueEncoding::VarName, ValueLocation::Bits { .. }) => {
+                return Err(ShortEfiRefusal::new(id, ShortEfiReason::BitField))
+            }
+            // the store was not declared yet when the question was parsed
+            (ValueEncoding::NumericSize, _) => {
+                return Err(ShortEfiRefusal::new(id, ShortEfiReason::DeclaredAfter))
+            }
+        },
+        (None, Some(password)) => (
+            password.question.var_store_info,
+            password_storage_width(password.max_size),
+        ),
+        (None, None) => {
+            return Err(ShortEfiRefusal::new(
+                id,
+                ShortEfiReason::NotRead(question.op_code.spec_name()),
+            ))
         }
     };
     store
-        .variable(value_question.header().var_store_info, u16::from(size))
+        .variable(var_name, size)
         .map_err(|unresolved| ShortEfiRefusal::new(id, unresolved.into()))
 }
 

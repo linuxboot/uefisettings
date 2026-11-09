@@ -2250,7 +2250,30 @@ impl ShortVarStoreEfi {
             size,
         })
     }
+
+    /// The EFI variables that VarName `var_name` may name where it names none: of each string
+    /// that the strings packages differ on, or of UNKNOWN_STRING where none holds it.
+    pub(super) fn candidate_variables(&self, var_name: u16) -> Vec<VariableKey> {
+        let names = match self.var_names.get(&var_name) {
+            Some(Ok(name)) => vec![name.to_string()],
+            Some(Err(UnresolvedVarName::Disagreeing { strings, .. })) => {
+                strings.iter().map(|(_, string)| string.clone()).collect()
+            }
+            Some(Err(UnresolvedVarName::NoString(_))) | None => vec![UNKNOWN_STRING.to_owned()],
+        };
+        names
+            .into_iter()
+            .map(|name| VariableKey {
+                name,
+                guid: self.guid,
+            })
+            .collect()
+    }
 }
+
+/// The string that edk2-stable202608 SetupBrowserDxe/Setup.c GetToken takes for a string ID that
+/// no strings package holds (mUnknownString).
+const UNKNOWN_STRING: &str = "!";
 
 /// Why the VarName of an op on a ShortVarStoreEfi names no EFI variable.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

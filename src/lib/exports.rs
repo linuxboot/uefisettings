@@ -8375,6 +8375,96 @@ mod tests {
         }
     }
 
+    /// The PASSWORD on a VARSTORE_EFI before UEFI 2.3.1 keeps its password in the EFI variable of
+    /// its VarName, which get and set through variables of either reach withhold: the CHECKBOX B
+    /// on that VarName is neither read nor written, the NUMERIC A beside it is, and the variable
+    /// keeps the password. Through variables that reach BootServices, set refuses the HiiDB
+    /// without --bypass-setup-password.
+    #[test]
+    fn the_variable_of_a_short_var_store_password_is_withheld() {
+        // "Password" is string 14 and "ShortVarPw" string 15
+        let strings = [&SHORT_STRINGS[..], &["Password", "ShortVarPw"]].concat();
+        let packages = [
+            form_package(&[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(
+                    1,
+                    &[
+                        short_numeric_a(),
+                        password_on(6, 14, 1, 15),
+                        checkbox_at(2, 2, 1, 15),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&strings),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let password = short_key("ShortVarPw");
+        let password_variable = [&NV_BS_RT.to_ne_bytes()[..], &plaintext_password()].concat();
+        let refusal = "cannot set question \"B\": EFI variable \
+                       ShortVarPw-8c78a505-baa0-4c4a-869f-000000000b01 holds a password at bytes \
+                       0..40, which set never writes";
+        let reaches = [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ];
+        for (reach, interface) in reaches {
+            let variables = short_variables(reach, interface);
+            variables.insert(password.clone(), NV_BS_RT, &plaintext_password());
+
+            assert_eq!(
+                answers_of(&hiidb, "B", &variables),
+                [format!("{PASSWORD_BYTES} <IFR default: 0>")],
+                "{reach:?}: get B"
+            );
+            assert_eq!(
+                answers_of(&hiidb, "A", &variables),
+                ["5"],
+                "{reach:?}: get A"
+            );
+            assert_eq!(
+                set_bypassing(&hiidb, "B", "1", &variables),
+                Err(refusal.to_string()),
+                "{reach:?}: set B"
+            );
+            assert_eq!(
+                set_bypassing(&hiidb, "A", "9", &variables),
+                Ok(()),
+                "{reach:?}: set A"
+            );
+            assert_eq!(
+                variables.writes_to(&password),
+                vec![],
+                "{reach:?}: writes of ShortVarPw"
+            );
+            assert_eq!(
+                variables.bytes(&password),
+                Some(password_variable.clone()),
+                "{reach:?}: ShortVarPw keeps its password"
+            );
+        }
+
+        let variables = short_variables(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        variables.insert(password, NV_BS_RT, &plaintext_password());
+        assert_eq!(
+            set_of(&hiidb, "A", "9", &variables),
+            Err(
+                "this HiiDB declares a setup password question; the UEFI Shell runs no setup \
+                 browser, so no password is asked or checked; pass --bypass-setup-password to \
+                 write anyway"
+                    .to_string()
+            ),
+            "set A without --bypass-setup-password"
+        );
+    }
+
     /// set writes an existing per-question variable at its question's width with the variable's
     /// own attributes, not those that the VARSTORE_EFI declares: "If a preexisting variable is
     /// rewritten with different attributes, SetVariable() shall not modify the variable" (UEFI

@@ -72,7 +72,7 @@ pub(crate) const END: [u8; 2] = [0x29, IFR_OPERATION_HEADER_SIZE];
 pub(crate) const ONE_OF: u8 = 0x05;
 pub(crate) const CHECKBOX: u8 = 0x06;
 pub(crate) const NUMERIC: u8 = 0x07;
-pub(super) const PASSWORD: u8 = 0x08;
+pub(crate) const PASSWORD: u8 = 0x08;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
 pub(crate) const GRAY_OUT_IF: u8 = 0x19;

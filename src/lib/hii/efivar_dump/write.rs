@@ -312,12 +312,14 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+    use crate::hii::forms::ifr_fixtures::PASSWORD;
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::IFROperation;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
     use crate::hii::package::hiidb_fixtures::form_package;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::strings_package_of;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
     use crate::hii::package::read_db;
     use crate::hii::package::Guid;
@@ -1149,6 +1151,98 @@ mod tests {
             }),
             "dump with a VarName of 300 characters"
         );
+    }
+
+    /// A PASSWORD of QuestionId 3, prompted by string 1, on VarStore 1 at VarName `var_name`, of
+    /// MaxSize `max_size`.
+    fn password_of(var_name: u16, max_size: u16) -> Vec<u8> {
+        let data = [
+            question_header_with(3, 1, 1, var_name, 0x00),
+            [&0u16.to_le_bytes()[..], &max_size.to_le_bytes()].concat(), // MinSize, MaxSize
+        ]
+        .concat();
+        operation(PASSWORD, false, &data)
+    }
+
+    /// The redacted dump keeps no byte of the password of a PASSWORD on a VARSTORE_EFI before UEFI
+    /// 2.3.1 whose MaxSize takes more bytes than a UINT16, where a UINT16 NUMERIC names its
+    /// variable too: of the password "Sec", or "S" in the 2 bytes that the NUMERIC takes.
+    #[test]
+    fn redacted_dump_keeps_no_byte_of_a_short_password_past_a_uint16() {
+        let hiidb = short_store_hiidb(
+            &[password_of(2, 40_000), uint16_numeric_on(2, 2)],
+            &["P", "ShortVarPw"],
+        );
+        let password = short_efivar("ShortVarPw");
+        let passwords: [&[u8]; 2] = [&[b'S', 0, b'e', 0, b'c', 0], &[b'S', 0]];
+        for value in passwords {
+            let file = [&[7, 0, 0, 0][..], value].concat();
+            let live = efivars(&[(&password, &file)]);
+            let lists = read_db(&hiidb).expect("read the HiiDB");
+            let (_parent, dir) = dump_dir();
+
+            let decoded = decoded_bytes(lists).expect("find the decoded bytes");
+            write_dump(
+                HIIDB,
+                &decoded,
+                live.path(),
+                &dir,
+                EfivarRedaction::DecodedBytes,
+            )
+            .expect("dump efivars");
+
+            let mut redacted = file.clone();
+            redacted[4..].fill(0);
+            assert_eq!(
+                fs::read(dir.join(&password)).ok(),
+                decoded.contains_key(&password).then_some(redacted),
+                "redacted ShortVarPw of {value:?}"
+            );
+        }
+    }
+
+    /// The redacted dump keeps no byte of the password of a PASSWORD on a VARSTORE_EFI before UEFI
+    /// 2.3.1 whose VarName the strings packages differ on, "ShortVarPw" in en, where a UINT16
+    /// NUMERIC names ShortVarPw by another VarName: of 40 bytes, which get refuses, or of the 2
+    /// that the NUMERIC takes.
+    #[test]
+    fn redacted_dump_keeps_no_byte_of_a_password_of_a_disagreeing_var_name() {
+        let packages = [
+            form_package(&[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, &[password_of(3, 20), uint16_numeric_on(2, 4)]),
+            ]),
+            strings_package_of(b"en", &["P", "Q", "ShortVarPw", "ShortVarPw"]),
+            strings_package_of(b"fr", &["P", "Q", "MotDePasse", "ShortVarPw"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let password = short_efivar("ShortVarPw");
+        for size in [40, 2] {
+            let mut file = vec![7, 0, 0, 0, b'S', 0, b'e', 0, b'c', 0];
+            file.resize(4 + size, 0);
+            let live = efivars(&[(&password, &file)]);
+            let lists = read_db(&hiidb).expect("read the HiiDB");
+            let (_parent, dir) = dump_dir();
+
+            let decoded = decoded_bytes(lists).expect("find the decoded bytes");
+            write_dump(
+                HIIDB,
+                &decoded,
+                live.path(),
+                &dir,
+                EfivarRedaction::DecodedBytes,
+            )
+            .expect("dump efivars");
+
+            let dumped = fs::read(dir.join(&password)).ok();
+            assert!(
+                dumped
+                    .as_ref()
+                    .is_none_or(|bytes| bytes.iter().skip(4).all(|&byte| byte == 0)),
+                "redacted ShortVarPw of {size} bytes: {dumped:?}"
+            );
+        }
     }
 
     /// A dump keeps the bytes that the questions of VarStores named with '/' and with '!'

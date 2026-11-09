@@ -24,6 +24,7 @@ use thiserror::Error;
 
 use super::find_corresponding_varstore;
 use super::named_records;
+use super::short_var_store_of;
 use super::walk_scopes;
 use super::IFROpCode;
 use super::IFROperation;
@@ -35,6 +36,7 @@ use crate::hii::package::ParsedPackageList;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableKey;
+use crate::hii::variables::VariableLayout;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::WithheldBytes;
 use crate::hii::variables::WithholdingVariables;
@@ -44,18 +46,20 @@ use crate::parse_error::ReadParsed;
 const CHAR16_SIZE: usize = std::mem::size_of::<u16>();
 
 /// The PASSWORD questions of a HiiDB (UEFI 2.10 §33.3.8.3.54): whether it declares any, those
-/// with a VarStore, and the ops whose VarStore is unknown.
+/// with a VarStore, the ops whose VarStore is unknown, and the variables that may hold their
+/// passwords where they are known (candidate_questions).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct PasswordQuestions {
     declared: bool,
     questions: Vec<PasswordQuestion>,
     unresolved: Vec<UnresolvedPassword>,
+    candidates: Vec<PasswordQuestion>,
 }
 
 /// A PASSWORD question with a VarStore, EFI_IFR_FLAG_CALLBACK or not: its password takes MaxSize
-/// CHAR16s from its VarOffset, the StorageWidth that edk2-stable202608
-/// SetupBrowserDxe/IfrParse.c ParseOpCodes gives it, as a string question's NUL-padded string
-/// (UEFI 2.11 §33.2.5.4.9).
+/// CHAR16s from its VarOffset, or from byte 0 of the variable of its VarName on a VARSTORE_EFI
+/// before UEFI 2.3.1, the StorageWidth that edk2-stable202608 SetupBrowserDxe/IfrParse.c
+/// ParseOpCodes gives it, as a string question's NUL-padded string (UEFI 2.11 §33.2.5.4.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasswordQuestion {
     key: VariableKey,
@@ -66,22 +70,39 @@ struct PasswordQuestion {
 /// An EFI_IFR_PASSWORD after its op header (UEFI 2.11 §33.3.8.3.54).
 #[derive(BinRead)]
 #[br(little)]
-struct PasswordOp {
-    question: QuestionHeader,
+pub(super) struct PasswordOp {
+    pub(super) question: QuestionHeader,
     _min_size: u16,
-    max_size: u16,
+    pub(super) max_size: u16,
+}
+
+impl PasswordOp {
+    /// The PASSWORD `op`, if it is one and holds its question header, MinSize and MaxSize.
+    pub(super) fn of(op: &IFROperation) -> Option<Self> {
+        match op.op_code {
+            IFROpCode::Password => Cursor::new(&op.data).parse_ne().ok(),
+            _ => None,
+        }
+    }
+}
+
+/// The bytes of the storage of a password of `max_size` CHAR16s: MaxSize × 2.
+pub(super) fn password_width(max_size: u16) -> usize {
+    usize::from(max_size) * CHAR16_SIZE
+}
+
+/// The StorageWidth that edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes gives a
+/// PASSWORD of `max_size` CHAR16s, MaxSize × 2 cast to UINT16 (:2252), which drops the bits past
+/// 16 of the password_width of a MaxSize over 32767.
+pub(super) fn password_storage_width(max_size: u16) -> u16 {
+    max_size.wrapping_mul(2)
 }
 
 impl PasswordQuestion {
     /// The value bytes of its variable that hold its password.
     fn bytes(&self) -> Range<usize> {
         let start = usize::from(self.offset);
-        start..start + self.width()
-    }
-
-    /// The bytes of its password's storage: MaxSize × 2.
-    fn width(&self) -> usize {
-        usize::from(self.max_size) * CHAR16_SIZE
+        start..start + password_width(self.max_size)
     }
 }
 
@@ -126,6 +147,7 @@ impl PasswordQuestions {
                     Err(unresolved) => {
                         warn!("{unresolved}");
                         self.unresolved.push(unresolved);
+                        self.candidates.extend(candidate_questions(&op));
                     }
                 }
             }
@@ -138,14 +160,19 @@ impl PasswordQuestions {
     /// shown or written back. Through variables that reach BootServices, a PASSWORD op whose
     /// VarStore is unknown could keep its password in any variable, so this fails closed:
     /// UnresolvedPasswords, whatever the setup password policy, and no variable of the HiiDB is
-    /// read or written; through those that reach Runtime it withholds the bytes of the others.
+    /// read or written; through those that reach Runtime it withholds the bytes of the others,
+    /// and those of the variables that may hold its password, where they are known.
     fn withheld(&self, reach: VariableReach) -> Result<WithheldBytes, UnresolvedPasswords> {
         match (reach, self.unresolved.as_slice()) {
             (VariableReach::BootServices, [_, ..]) => {
                 Err(UnresolvedPasswords(self.unresolved.clone()))
             }
             (VariableReach::Runtime, _) | (VariableReach::BootServices, []) => {
-                Ok(self.password_bytes())
+                let mut withheld = self.password_bytes();
+                for candidate in &self.candidates {
+                    withheld.insert(candidate.key.clone(), candidate.bytes());
+                }
+                Ok(withheld)
             }
         }
     }
@@ -239,9 +266,35 @@ fn password_question(
         })?;
     Ok(Some(PasswordQuestion {
         key: store.variable_key(),
-        offset: header.var_store_info,
+        offset: store.layout().offset(header.var_store_info),
         max_size,
     }))
+}
+
+/// The variables that may hold the password of the PASSWORD `op`, whose VarStore is unknown: on
+/// a VARSTORE_EFI before UEFI 2.3.1, those that its VarName may name
+/// (ShortVarStoreEfi::candidate_variables), each from byte 0.
+fn candidate_questions(op: &IFROperation) -> Vec<PasswordQuestion> {
+    let Some(PasswordOp {
+        question: header,
+        max_size,
+        ..
+    }) = PasswordOp::of(op)
+    else {
+        return Vec::new();
+    };
+    let Some(store) = short_var_store_of(op, header.var_store_id) else {
+        return Vec::new();
+    };
+    store
+        .candidate_variables(header.var_store_info)
+        .into_iter()
+        .map(|key| PasswordQuestion {
+            key,
+            offset: VariableLayout::OneValue.offset(header.var_store_info),
+            max_size,
+        })
+        .collect()
 }
 
 /// A PASSWORD op whose VarStore is unknown.
@@ -322,6 +375,12 @@ mod tests {
     use super::super::ifr_fixtures::*;
     use super::super::QuestionFlags;
     use super::*;
+    use crate::hii::package::hiidb_fixtures::en_strings_package_of;
+    use crate::hii::package::hiidb_fixtures::form_package;
+    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::strings_package_of;
+    use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::read_db;
     use crate::hii::package::Guid;
     use crate::hii::variables::tests::WriteAt;
     use crate::hii::variables::VolatileWrites;
@@ -463,6 +522,7 @@ mod tests {
                     declared,
                     questions,
                     unresolved: vec![],
+                    candidates: vec![],
                 },
                 "{case}"
             );
@@ -481,6 +541,7 @@ mod tests {
                 declared: true,
                 questions: vec![amitse_setup_password(0)],
                 unresolved: vec![],
+                candidates: vec![],
             },
             "a password in the second FormSet"
         );
@@ -500,6 +561,7 @@ mod tests {
                     question_id: 2,
                     reason: "no supported varstore with matching id 0x0009 found".to_string(),
                 }],
+                candidates: vec![],
             },
             "a password on VarStore 9"
         );
@@ -652,8 +714,8 @@ mod tests {
         }
     }
 
-    /// A PASSWORD op on a VARSTORE_EFI of the form before UEFI 2.3.1, whose EFI variable its
-    /// VarName names, is unresolved: through variables that reach BootServices, withheld fails.
+    /// A PASSWORD op on a VARSTORE_EFI of the form before UEFI 2.3.1 whose VarName no string
+    /// holds is unresolved: through variables that reach BootServices, withheld fails.
     #[test]
     fn password_on_a_var_store_efi_before_uefi_2_3_1_is_unresolved() {
         let root = parse_form_set(&[short_var_store_efi(7), form(1, &[password_on(2, 3, 7, 0)])]);
@@ -666,11 +728,150 @@ mod tests {
                 .map_err(|error| error.to_string()),
             Err(
                 "PASSWORD question 0x0002 in FormSet 11111111-1111-1111-1111-111111111111: \
-                 VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): uefisettings reads \
-                 no EFI_IFR_PASSWORD on it; as the variable of that password is unknown, the \
-                 UEFI Shell build reads and writes no variable of this HiiDB"
+                 VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): no string 0x0000 \
+                 holds its VarName; as the variable of that password is unknown, the UEFI Shell \
+                 build reads and writes no variable of this HiiDB"
                     .to_string()
             ),
+            "BootServices"
+        );
+    }
+
+    /// The PASSWORD on a VARSTORE_EFI of the form before UEFI 2.3.1 keeps its password alone in
+    /// the EFI variable of its VarName, of the store's Guid (edk2-stable202608
+    /// SetupBrowserDxe/Setup.c GetQuestionValue): its MaxSize CHAR16s from byte 0 are withheld
+    /// through variables of either reach, all of them where its UINT16 StorageWidth in
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c holds fewer. Where no string holds its
+    /// VarName, or the strings packages differ on it, it is unresolved: through variables that
+    /// reach BootServices, withheld fails; through those that reach Runtime, it withholds them
+    /// from byte 0 of each variable that the VarName may name, the "!" that Setup.c GetToken
+    /// takes for a missing string, or each string.
+    #[test]
+    fn password_on_a_short_var_store_withholds_the_variable_of_its_var_name() {
+        // Prompt 3, VarName 5
+        let strings = ["Q", "Help", "Password", "Help", "ShortVarPw"];
+        let mut french = strings;
+        french[4] = "MotDePasse";
+        let withheld_of = |names: &[&str], bytes: std::ops::Range<usize>| {
+            let mut withheld = WithheldBytes::default();
+            for name in names {
+                withheld.insert(
+                    VariableKey {
+                        name: name.to_string(),
+                        guid: Guid::from(SHORT_VAR_STORE_GUID),
+                    },
+                    bytes.clone(),
+                );
+            }
+            withheld
+        };
+        let withheld = withheld_of(&["ShortVarPw"], 0..40);
+        let unresolved = |reason: &str| -> Result<WithheldBytes, String> {
+            Err(format!(
+                "PASSWORD question 0x0002 in FormSet 11111111-1111-1111-1111-111111111111: \
+                 VarStore 0x0007 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): {reason}; as the \
+                 variable of that password is unknown, the UEFI Shell build reads and writes no \
+                 variable of this HiiDB"
+            ))
+        };
+        let cases = [
+            (
+                "its VarName",
+                password_with(2, 7, 5, QuestionFlags::empty(), 20),
+                vec![en_strings_package_of(&strings)],
+                Ok(withheld.clone()),
+                Ok(withheld),
+            ),
+            (
+                "no string",
+                password_with(2, 7, 9, QuestionFlags::empty(), 20),
+                vec![en_strings_package_of(&strings)],
+                unresolved("no string 0x0009 holds its VarName"),
+                Ok(withheld_of(&["!"], 0..40)),
+            ),
+            (
+                "strings that differ",
+                password_with(2, 7, 5, QuestionFlags::empty(), 20),
+                vec![
+                    strings_package_of(b"en", &strings),
+                    strings_package_of(b"fr", &french),
+                ],
+                unresolved(
+                    "the strings packages differ on its VarName 0x0005: \"ShortVarPw\" in en, \
+                     \"MotDePasse\" in fr",
+                ),
+                Ok(withheld_of(&["ShortVarPw", "MotDePasse"], 0..40)),
+            ),
+            (
+                "MaxSize 40000",
+                password_with(2, 7, 5, QuestionFlags::empty(), 40_000),
+                vec![en_strings_package_of(&strings)],
+                Ok(withheld_of(&["ShortVarPw"], 0..80_000)),
+                Ok(withheld_of(&["ShortVarPw"], 0..80_000)),
+            ),
+        ];
+        for (case, password, strings, boot_services, runtime) in cases {
+            let packages = [
+                form_package(&[short_var_store_efi(7), form(1, &[password])]),
+                strings.concat(),
+                END_PACKAGE.to_vec(),
+            ];
+            let lists = read_db(&package_list_with_guid([0x55; 16], &packages.concat()))
+                .unwrap_or_else(|error| panic!("{case}: read the HiiDB: {error:#}"));
+            let passwords = PasswordQuestions::of_lists(&lists);
+
+            assert_eq!(
+                passwords
+                    .withheld(VariableReach::BootServices)
+                    .map_err(|error| error.to_string()),
+                boot_services,
+                "{case}: BootServices"
+            );
+            assert_eq!(
+                passwords
+                    .withheld(VariableReach::Runtime)
+                    .map_err(|error| error.to_string()),
+                runtime,
+                "{case}: Runtime"
+            );
+        }
+    }
+
+    /// A PASSWORD on a VARSTORE_EFI of the form before UEFI 2.3.1 inside the scope of an op that
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c IsUnKnownOpCode skips, which
+    /// PasswordQuestions visits, takes the variable of its VarName as one outside does.
+    #[test]
+    fn password_on_a_short_var_store_in_a_skipped_scope_withholds_its_variable() {
+        // an op past EFI_IFR_MATCH2_OP
+        const UNKNOWN: u8 = 0x70;
+        let strings = ["Q", "Help", "Password", "Help", "ShortVarPw"];
+        let skipped = [
+            operation(UNKNOWN, true, &[]),
+            password_with(2, 7, 5, QuestionFlags::empty(), 20),
+            END.to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[short_var_store_efi(7), form(1, &[skipped])]),
+            en_strings_package_of(&strings),
+            END_PACKAGE.to_vec(),
+        ];
+        let lists = read_db(&package_list_with_guid([0x55; 16], &packages.concat()))
+            .expect("read the HiiDB");
+        let mut withheld = WithheldBytes::default();
+        withheld.insert(
+            VariableKey {
+                name: "ShortVarPw".to_string(),
+                guid: Guid::from(SHORT_VAR_STORE_GUID),
+            },
+            0..40,
+        );
+
+        assert_eq!(
+            PasswordQuestions::of_lists(&lists)
+                .withheld(VariableReach::BootServices)
+                .map_err(|error| error.to_string()),
+            Ok(withheld),
             "BootServices"
         );
     }
