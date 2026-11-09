@@ -237,6 +237,18 @@ Shell and from Linux, that `get` and `set` read and write the variable of each q
 VarName, and the GET and the SET those of theirs, while no byte of the password's variable is
 read or written, and that `set` creates ShortVarD with the store's Attributes.
 
+`publish-hiidb.efi outside-form-set-password-forms` creates the variable `OutsidePassword`
+unless it exists and registers the forms of
+[`publish-hiidb/src/outside_form_set_password_forms.rs`](publish-hiidb/src/outside_form_set_password_forms.rs):
+a PASSWORD question outside any form set, which no Forms Browser shows but edk2's Config
+Keyword Handler finds, on the VarStoreId of the form set's VARSTORE_EFI `OutsidePassword`,
+which keeps its password, and NUMERICs over and beside the password's bytes.
+`publish-hiidb.efi rt-data-outside-form-set-password-forms` does the same, then publishes the
+database as `rt-data` does. In the scenario `shell-outside-form-set-password`
+`uefisettings.efi` reads and writes no variable of the HII database, and in
+`hii-outside-form-set-password` Linux shows no byte of the password and `set` refuses the
+question over it, while the question beside it reads.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
