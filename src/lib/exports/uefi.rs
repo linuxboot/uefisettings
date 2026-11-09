@@ -24,6 +24,7 @@ use anyhow::Result;
 use log::debug;
 
 use super::set_refusal;
+use super::staged_question;
 use super::text_languages;
 use super::CapsuleBackend;
 use super::DriverHeldValues;
@@ -75,7 +76,12 @@ use crate::hii::VariableReach;
 use crate::hii::VariableServices;
 use crate::hii::WithholdingVariables;
 use crate::runtime_time_services::RuntimeTimeServices;
+use crate::staged_set::apply::apply_staged_withholding;
+use crate::staged_set::apply::Application;
+use crate::staged_set::apply::StagedRequestDriver;
+use crate::staged_set::StagedRequest;
 use crate::uefi_config_table::SystemConfigurationTable;
+use crate::unsafe_operations::LiftedOperations;
 
 /// What set and get read and write when no file names them: this firmware's HII database and
 /// variables, through boot services.
@@ -376,6 +382,52 @@ impl DriverHeldValues for DriverCallbacks<'_> {
 /// The error of a package list `index` that the HII database does not have.
 fn no_package_list(index: usize) -> anyhow::Error {
     anyhow!("the HII database has no package list {index}")
+}
+
+impl HiiBackend {
+    /// apply-staged of `nonce`, which ends the command line of the staged set's Boot####: applies
+    /// the staged set of `nonce` through the drivers of this firmware's HII database, records its
+    /// outcome and deletes its Boot####, as staged_set::apply::apply_staged_withholding does, writing no byte
+    /// of a PASSWORD question; where it cannot tell those bytes, as for a PASSWORD question whose
+    /// VarStore it does not find, it writes nothing. Returns what it did, in lines, for
+    /// uefisettings.efi to print before it resets.
+    pub fn apply_staged(nonce: &str) -> Vec<String> {
+        match Self::apply_staged_set(nonce) {
+            Ok(application) => application.lines(),
+            Err(error) => vec![format!("failed: {error:#}")],
+        }
+    }
+
+    /// apply_staged_withholding of `nonce` through this firmware's variables, without the bytes of
+    /// the PASSWORD questions of its HII database.
+    fn apply_staged_set(nonce: &str) -> Result<Application> {
+        let lists = package::read_db(&Self::export_hiidb()?)?;
+        apply_staged_withholding(&lists, VariableServices, nonce, &StagedCallbacks)
+    }
+}
+
+/// The drivers of this firmware's HII database, as apply-staged reaches them.
+struct StagedCallbacks;
+
+impl StagedRequestDriver for StagedCallbacks {
+    /// Sets the question of `request` as set does, in the HII database as exported now, as the
+    /// Callback()s of a request before may have changed it.
+    fn apply(&self, request: &StagedRequest) -> Result<(String, Vec<UnsafeOperation>)> {
+        let hiidb = HiiBackend::export_hiidb()?;
+        let parsed = package::read_db(&hiidb)?;
+        let mut reader = PasswordQuestions::of_lists(&parsed).reader(Box::new(VariableServices))?;
+        let platform_lang = EfivarSource::System.platform_lang()?;
+        let (list, question, held, lifted) = staged_question(
+            &parsed,
+            request,
+            &text_languages(None, platform_lang.as_deref()),
+            &mut reader,
+        )?;
+        let set = DriverCallbacks { hiidb: &hiidb }
+            .set(&list, &question, &held, request.value)
+            .map(|annotation| annotation.trim_start().to_owned());
+        LiftedOperations::after(lifted, set)
+    }
 }
 
 /// The DriverQuestion of `held`.

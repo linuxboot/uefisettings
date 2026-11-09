@@ -892,6 +892,24 @@ fn write_warning(
     write_lines(output, console, OutputSyntax::Text, &warning)
 }
 
+/// Prints `line` of what apply-staged did, which may name the HiiDB's strings, such as the prompt
+/// of a staged question, as TerminalText after `apply-staged: `.
+#[cfg(target_os = "uefi")]
+fn print_apply_staged_line(line: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    write_apply_staged_line(&mut stdout.lock(), &mut platform::stdout_output()?, line)
+}
+
+#[cfg(any(target_os = "uefi", test))]
+fn write_apply_staged_line(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    line: &str,
+) -> io::Result<()> {
+    let line = format!("apply-staged: {}", TerminalText(line));
+    write_lines(output, console, OutputSyntax::Text, &line)
+}
+
 /// Prints `value` as TerminalText, or as its JSON text, as JsonText, if `json`.
 #[cfg(target_os = "uefi")]
 fn print_display_or_json(
@@ -2375,6 +2393,34 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A line of what apply-staged did, which names a staged question's prompt and its driver's
+    /// refusal, prints as TerminalText after `apply-staged: `, its line breaks escaped inside its
+    /// line, and through a console that renders ASCII only, every other character escaped too.
+    #[test]
+    fn apply_staged_lines_escape_firmware_texts() {
+        let line = "question \"Q\u{1b}[2J\u{202e}\u{10d}\": its driver refused\nthe value \\ \
+                    EFI_ACCESS_DENIED";
+        let mut unicode = Vec::new();
+        let mut ascii = Vec::new();
+
+        write_apply_staged_line(&mut unicode, &mut UnicodeTerminal, line).expect("write the line");
+        write_apply_staged_line(&mut ascii, &mut AsciiConsole, line)
+            .expect("write the line through ASCII");
+
+        assert_eq!(
+            String::from_utf8(unicode).expect("UTF-8"),
+            "apply-staged: question \"Q\\u{1b}[2J\\u{202e}\u{10d}\": its driver refused\\nthe \
+             value \\\\ EFI_ACCESS_DENIED\n",
+            "UTF-8 terminal"
+        );
+        assert_eq!(
+            String::from_utf8(ascii).expect("UTF-8"),
+            "apply-staged: question \"Q\\u{1b}[2J\\u{202e}\\u{10d}\": its driver refused\\nthe \
+             value \\\\ EFI_ACCESS_DENIED\n",
+            "ASCII console"
+        );
     }
 
     /// Text and JSON through a console that renders ASCII only: each other character escaped as

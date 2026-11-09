@@ -151,6 +151,8 @@ pub(crate) use set::set_questions;
 pub(crate) use set::DriverStore;
 pub(crate) use set::NewAnswer;
 pub(crate) use setup_password::PasswordQuestions;
+#[cfg(test)]
+pub(crate) use setup_password::StagingSetupPassword;
 pub(crate) use setup_password::UnresolvedPassword;
 #[cfg(all(variable_data, any(target_os = "uefi", test)))]
 pub(crate) use storage::DeclaredKind;
@@ -4115,6 +4117,27 @@ pub(crate) fn read_only_choice(
             Ok(choice)
         }
         None => Ok(selection.for_set(question)?),
+    }
+}
+
+/// apply-staged's check of `question`, the one question of a staged request, which `cause` makes
+/// read-only, if anything does, as read_only_choice's of a match that no other ranks before:
+/// ChangeValueError::ReadOnly where an EFI_IFR_VALUE gives its value, and to `writer` where
+/// EFI_IFR_FLAG_READ_ONLY makes it read-only.
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) fn check_staged_read_only(
+    question: String,
+    cause: Option<ReadOnlyCause>,
+    writer: ReadOnlyWriter<'_>,
+) -> std::result::Result<(), ChangeValueError> {
+    match cause {
+        Some(cause @ ReadOnlyCause::ValueExpression) => Err(ChangeValueError::ReadOnly {
+            question,
+            cause,
+            ranked_before: IncludedStates::empty(),
+        }),
+        Some(ReadOnlyCause::Flag) => writer.write_read_only(question, IncludedStates::empty()),
+        None => Ok(()),
     }
 }
 

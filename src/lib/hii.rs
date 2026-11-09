@@ -169,7 +169,6 @@ pub(crate) use variables::VariableInterface;
 pub use variables::VariableKey;
 #[cfg(all(variable_data, test))]
 pub(crate) use variables::VariableNotFound;
-#[cfg(variable_data)]
 pub(crate) use variables::VariableReach;
 pub use variables::VolatileWrites;
 pub(crate) use variables::WithholdingVariables;

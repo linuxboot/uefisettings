@@ -60,6 +60,8 @@ use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 use crate::unsafe_operations::UnsafeOperations;
 
+#[cfg(any(target_os = "uefi", test))]
+pub(crate) mod apply;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 
@@ -224,6 +226,8 @@ pub(crate) struct RequestOutcome {
     pub(crate) applied: bool,
     /// What set answers of it
     pub(crate) result: String,
+    /// The warning of each unsafe operation that applying it lifted, as set prints them
+    pub(crate) warnings: Vec<String>,
 }
 
 /// What became of a staged set's boot, each echoing the set's nonce.
@@ -356,7 +360,7 @@ pub(crate) fn settle(variables: &impl VariableData, files: &impl StagedFiles) ->
         StagedState::Over(set, outcome) => (set, outcome),
     };
     write_record(variables, STAGED_OUTCOME, &outcome)?;
-    remove_boot_option(variables, &set)?;
+    remove_boot_option(variables, boot_option_name(set.boot_option), set.nonce)?;
     remove_image(files, &set.image)?;
     variables.delete_variable(&record_key(STAGED_SET))?;
     Ok(Settled::Idle(Some(outcome)))
@@ -370,30 +374,41 @@ fn boot_option_name(number: u16) -> LoadOptionName {
     }
 }
 
-/// Deletes the Boot#### of `set` if it holds the set's command line, after BootNext if that
-/// names it.
-fn remove_boot_option(variables: &impl VariableData, set: &StagedSet) -> Result<()> {
-    let option = LoadOptionName {
-        kind: LoadOptionKind::Boot,
-        number: set.boot_option,
-    };
+/// Whether `option` is present and holds the command line of the staged set of `nonce`.
+fn starts_staged_set(
+    variables: &impl VariableData,
+    option: LoadOptionName,
+    nonce: Nonce,
+) -> Result<bool> {
     let Some(contents) = variables.variable_data(&option.key())? else {
-        return Ok(());
+        return Ok(false);
     };
-    let command = optional_data(set.nonce)?;
-    if !LoadOption::decode(contents.data())
-        .is_ok_and(|load_option| load_option.optional_data == command)
-    {
-        warn!(
-            "kept {option}: it no longer starts the staged set {}",
-            set.nonce
-        );
-        return Ok(());
+    let command = optional_data(nonce)?;
+    Ok(LoadOption::decode(contents.data())
+        .is_ok_and(|load_option| load_option.optional_data == command))
+}
+
+/// Deletes `option` if it holds the command line of the staged set of `nonce`, after BootNext if
+/// that names it; the variables deleted, in order.
+fn remove_boot_option(
+    variables: &impl VariableData,
+    option: LoadOptionName,
+    nonce: Nonce,
+) -> Result<Vec<VariableKey>> {
+    if !starts_staged_set(variables, option, nonce)? {
+        if variables.variable_data(&option.key())?.is_some() {
+            warn!("kept {option}: it no longer starts the staged set {nonce}");
+        }
+        return Ok(Vec::new());
     }
+    let mut deleted = Vec::new();
     if boot_next(variables)? == Some(option) {
         variables.delete_variable(&boot_next_key())?;
+        deleted.push(boot_next_key());
     }
-    variables.delete_variable(&option.key())
+    variables.delete_variable(&option.key())?;
+    deleted.push(option.key());
+    Ok(deleted)
 }
 
 /// Deletes the staged image if it is unchanged.
@@ -553,7 +568,7 @@ fn undo_new_set(
     files: &impl StagedFiles,
     set: &StagedSet,
 ) -> Result<()> {
-    remove_boot_option(variables, set)?;
+    remove_boot_option(variables, boot_option_name(set.boot_option), set.nonce)?;
     if variables.variable_data(&record_key(STAGED_SET))?.is_some() {
         variables.delete_variable(&record_key(STAGED_SET))?;
     }
@@ -833,18 +848,18 @@ mod tests {
     use crate::efi_variables::load_option::LoadOptionAttributes;
     use crate::hii::VariableInterface;
 
-    const NONCE: Nonce = Nonce([
+    pub(super) const NONCE: Nonce = Nonce([
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
         0xFF,
     ]);
-    const OTHER_NONCE: Nonce = Nonce([0xA5; 16]);
+    pub(super) const OTHER_NONCE: Nonce = Nonce([0xA5; 16]);
     const IMAGE: &str = "\\EFI\\uefisettings\\uefisettings.efi";
     const DIGEST: Sha256Digest = Sha256Digest([0x42; 32]);
     const FORM_SET: &str = "8C78A505-BAA0-4C4A-869F-000000001A09";
     /// The staged set's Boot####
-    const BOOT_OPTION: u16 = 0x0007;
+    pub(super) const BOOT_OPTION: u16 = 0x0007;
 
-    fn request(value: u64) -> StagedRequest {
+    pub(super) fn request(value: u64) -> StagedRequest {
         StagedRequest {
             question: "Generic Question".to_owned(),
             form_set: FORM_SET.parse().expect("FORM_SET"),
@@ -859,7 +874,7 @@ mod tests {
 
     /// request(2), selected with every state and access level of a user, staged with
     /// --i-am-fine-to-brick-this-system.
-    fn including_request() -> StagedRequest {
+    pub(super) fn including_request() -> StagedRequest {
         StagedRequest {
             include: IncludedStates::all(),
             access_level: Some(AccessLevel::User),
@@ -868,7 +883,7 @@ mod tests {
         }
     }
 
-    fn staged_set() -> StagedSet {
+    pub(super) fn staged_set() -> StagedSet {
         StagedSet {
             nonce: NONCE,
             boot_option: BOOT_OPTION,
@@ -880,17 +895,18 @@ mod tests {
         }
     }
 
-    fn started(nonce: Nonce) -> Outcome {
+    pub(super) fn started(nonce: Nonce) -> Outcome {
         Outcome::Started { nonce }
     }
 
-    fn finished(nonce: Nonce) -> Outcome {
+    pub(super) fn finished(nonce: Nonce) -> Outcome {
         Outcome::Finished {
             nonce,
             results: vec![RequestOutcome {
                 request: request(1),
                 applied: true,
                 result: "applied".to_owned(),
+                warnings: Vec::new(),
             }],
         }
     }
@@ -915,7 +931,7 @@ mod tests {
     }
 
     /// A Boot#### whose OptionalData is the command line of `nonce`.
-    fn boot_option(nonce: Nonce) -> Vec<u8> {
+    pub(super) fn boot_option(nonce: Nonce) -> Vec<u8> {
         let image = Ucs2String::try_from(IMAGE).expect("IMAGE in UCS-2");
         LoadOption {
             attributes: LoadOptionAttributes::ACTIVE
@@ -931,7 +947,7 @@ mod tests {
 
     /// Variables that hold the record of staged_set(), its Boot####, BootNext if given and the
     /// outcome if given.
-    fn staged(boot_next: Option<u16>, outcome: Option<&Outcome>) -> HeldVariables {
+    pub(super) fn staged(boot_next: Option<u16>, outcome: Option<&Outcome>) -> HeldVariables {
         let held = HeldVariables::default()
             .with(STAGED_SET, UEFISETTINGS_VENDOR_GUID, &json(&staged_set()))
             .with("Boot0007", EFI_GLOBAL_VARIABLE, &boot_option(NONCE));
@@ -946,11 +962,11 @@ mod tests {
     }
 
     /// The record `name` that `variables` hold, None if absent.
-    fn record<T: DeserializeOwned>(variables: &HeldVariables, name: &str) -> Option<T> {
+    pub(super) fn record<T: DeserializeOwned>(variables: &HeldVariables, name: &str) -> Option<T> {
         read_record(variables, name).expect("a record")
     }
 
-    fn held(variables: &HeldVariables, name: &str, vendor: Guid) -> bool {
+    pub(super) fn held(variables: &HeldVariables, name: &str, vendor: Guid) -> bool {
         variables
             .variables
             .borrow()
@@ -1005,9 +1021,9 @@ mod tests {
     }
 
     /// VariableData that fail to set `failing`, else are `held`.
-    struct FailingSet<'a> {
-        held: &'a HeldVariables,
-        failing: VariableKey,
+    pub(super) struct FailingSet<'a> {
+        pub(super) held: &'a HeldVariables,
+        pub(super) failing: VariableKey,
     }
 
     impl VariableData for FailingSet<'_> {
@@ -1073,7 +1089,7 @@ mod tests {
             (
                 finished(NONCE),
                 format!(
-                    r#"{{"state":"finished","nonce":"00112233445566778899aabbccddeeff","results":[{{"request":{request_json},"applied":true,"result":"applied"}}]}}"#
+                    r#"{{"state":"finished","nonce":"00112233445566778899aabbccddeeff","results":[{{"request":{request_json},"applied":true,"result":"applied","warnings":[]}}]}}"#
                 ),
             ),
             (

@@ -1155,10 +1155,11 @@ impl PasswordQuestions {
     /// `variables`, which reach `reach` and read something, without the bytes that questions set
     /// through them withhold, as withholding gives them.
     #[cfg_attr(
-        not(target_os = "linux"),
+        not(any(target_os = "linux", target_os = "uefi", all(variable_data, test))),
         allow(
             dead_code,
-            reason = "only the Linux build stages a set for the next boot yet"
+            reason = "only the Linux build stages a set for the next boot yet, and only the UEFI \
+                      Shell build applies one"
         )
     )]
     pub(crate) fn withholding_of<V>(
@@ -1223,6 +1224,30 @@ fn package_of(
     packages
         .get(package)
         .filter(|package| of(package).contains(&index))
+}
+
+impl PasswordQuestions {
+    /// Refuses a set staged for the next boot in a HiiDB that declares a PASSWORD question, both
+    /// staging it and applying it: the next boot applies it before the OS, where no setup browser
+    /// asks for the password either.
+    pub(crate) fn check_staging(&self) -> Result<(), StagingSetupPassword> {
+        match self.declared {
+            true => Err(StagingSetupPassword),
+            false => Ok(()),
+        }
+    }
+
+    /// Refuses what withholding_of refuses through variables that reach `reach`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "only the Linux build stages a set for the next boot yet"
+        )
+    )]
+    pub(crate) fn check_withholding(&self, reach: VariableReach) -> Result<(), WithholdingRefusal> {
+        self.withheld_reaching(reach).map(drop)
+    }
 }
 
 /// The PASSWORD `op`, of the FormSet `form_set`, of the root `root` of its package list, whose
@@ -1598,6 +1623,16 @@ pub(crate) enum WithholdingRefusal {
     #[error(transparent)]
     AnyVariable(AnyVariablePasswords),
 }
+
+/// The refusal to stage or apply a set for the next boot in a HiiDB that declares a setup password
+/// question.
+#[derive(Debug, Error)]
+#[error(
+    "this HiiDB declares a setup password question; a set staged for the next boot is applied \
+     before the OS, where no setup browser asks for or checks the password, so none is staged or \
+     applied"
+)]
+pub(crate) struct StagingSetupPassword;
 
 #[cfg(test)]
 mod tests {

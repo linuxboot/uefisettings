@@ -230,10 +230,13 @@ pub use crate::hii::SystemTableError;
 pub use crate::hii::VariableAttributes;
 #[cfg(any(variable_names, variable_info))]
 pub use crate::hii::VariableKey;
+use crate::hii::VariableReach;
 use crate::hii::WithholdingVariables;
 use crate::hii::VOLATILE_ANNOTATION;
 #[cfg(variable_data)]
 use crate::secret_file::Secret;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+use crate::staged_set::StagedRequest;
 use crate::terminal_text::TextLines;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
@@ -1105,6 +1108,16 @@ impl HiiBackend {
             held,
         )?;
 
+        // From an OS, set stages a question that its driver holds for the next boot
+        // (staged_set.rs); in the UEFI Shell, setup_password_bypass above took the setup password
+        // in.
+        if writes.reach() == VariableReach::Runtime
+            && selected
+                .iter()
+                .any(|selected| driver_of(held, &selected.descriptor).is_some())
+        {
+            passwords.check_staging()?;
+        }
         let answer = match value {
             SetValue::Text(text) => forms::NewAnswer::Text {
                 text,
@@ -1782,6 +1795,109 @@ impl DriverStore for DriverHeldSet<'_> {
     }
 }
 
+/// The question that apply-staged sets for `request` in `parsed_db`: the one whose driver holds its
+/// value as QuestionId `request.question_id` of the FormSet `request.form_set`, with its package
+/// list and how its driver holds it, and the unsafe operations that setting it lifts. Refused in a
+/// HiiDB that declares a setup password question, and unless exactly one question is that, the
+/// states of `request.include` cover each state it may be in, with conditions reading
+/// `request.access_level` if stated, as set's selection reads them with `reader`, it takes the
+/// request's value type, and no EFI_IFR_VALUE makes it read-only; one that EFI_IFR_FLAG_READ_ONLY
+/// makes read-only is an unsafe operation, checked against `request.unsafe_operations`, set's
+/// grant, as set checks it. Its texts show in the languages `requested` takes
+/// (ParsedPackageList::texts).
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+fn staged_question<'a>(
+    parsed_db: &'a [package::ParsedPackageList],
+    request: &StagedRequest,
+    requested: &[&str],
+    reader: &mut EfivarReader,
+) -> Result<(
+    QuestionList<'a>,
+    QuestionDescriptor,
+    DriverHeldQuestion,
+    Vec<UnsafeOperation>,
+)> {
+    PasswordQuestions::of_lists(parsed_db).check_staging()?;
+    forms::check_access_level(
+        parsed_db.iter().flat_map(|list| &list.forms),
+        request.access_level,
+    )?;
+    let mut found = Vec::new();
+    for (index, list) in parsed_db.iter().enumerate() {
+        let texts = list.texts(requested);
+        for root in &list.forms {
+            let questions = list_questions(
+                Rc::clone(root),
+                &texts,
+                IncludedStates::all(),
+                request.access_level,
+                reader,
+            );
+            found.extend(
+                questions
+                    .into_iter()
+                    .filter(|(descriptor, _)| {
+                        descriptor.driver_held().is_some_and(|held| {
+                            held.form_set == request.form_set
+                                && held.question_id == request.question_id
+                        })
+                    })
+                    .map(|(descriptor, state)| {
+                        let list = QuestionList {
+                            index,
+                            device_path: list.device_path.as_ref(),
+                        };
+                        (list, descriptor, state)
+                    }),
+            );
+        }
+    }
+
+    let named = format!(
+        "question {:?}, QuestionId {:#06x} of FormSet {}",
+        request.question, request.question_id, request.form_set
+    );
+    let (list, descriptor, state) = match <[_; 1]>::try_from(found) {
+        Ok([question]) => question,
+        Err(found) if found.is_empty() => {
+            return Err(anyhow!(
+                "the HII database holds no {named} whose driver holds its value"
+            ))
+        }
+        Err(found) => {
+            return Err(anyhow!(
+                "{} package lists of the HII database hold {named}",
+                found.len()
+            ))
+        }
+    };
+    if !state.is_allowed(request.include) {
+        return Err(anyhow!(
+            "{named} is{} now, which set did not include",
+            state.annotation()
+        ));
+    }
+    let held = match descriptor.driver_held() {
+        Some(held) if held.value_type == request.value_type => held.clone(),
+        Some(held) => {
+            return Err(anyhow!(
+                "{named} takes {} now, not {}",
+                held.value_type,
+                request.value_type
+            ))
+        }
+        None => return Err(anyhow!("{named} has a VarStore now")),
+    };
+    let mut unsafe_operations = PendingOperations::new(request.unsafe_operations);
+    forms::check_staged_read_only(
+        descriptor.question.clone(),
+        state.read_only(),
+        forms::ReadOnlyWriter::Set(&mut unsafe_operations),
+    )?;
+    let lifted = unsafe_operations.check()?;
+    Ok((list, descriptor, held, lifted))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1875,6 +1991,9 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::VAR_STORE_NAME_VALUE;
     #[cfg(variable_data)]
     use crate::hii::forms::ifr_fixtures::WRITE;
+    #[cfg(variable_data)]
+    use crate::hii::forms::IfrValueType;
+    use crate::hii::forms::StagingSetupPassword;
     use crate::hii::forms::StoragelessRefusal;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::package::hiidb_fixtures::device_path_package;
@@ -8157,6 +8276,357 @@ mod tests {
         }
     }
 
+    /// apply-staged finds a staged request's question by its FormSet GUID and QuestionId among
+    /// those that their driver holds, and refuses one that is gone, held twice, in a state that
+    /// set did not include, or of another value type.
+    #[cfg(variable_data)]
+    #[test]
+    fn apply_staged_finds_the_question_of_a_request_as_set_selected_it() {
+        // FormSet 11111111-…: Q (QuestionId 7) and, grayed out, R (8), both held by their
+        // driver; a FormSet whose Q (1) is at byte 0 of Setup
+        let held = |guid| {
+            let packages = [
+                form_package(&[form(
+                    1,
+                    &[
+                        callback_checkbox(7, 1),
+                        conditional(GRAY_OUT_IF, ifr_true(), &[callback_checkbox(8, 2)]),
+                    ],
+                )]),
+                en_strings_package_of(&["Q", "R"]),
+                strings_package_of(b"fr-FR", &["Q-fr", "R-fr"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid(guid, &packages.concat())
+        };
+        let stored = package_list_with_guid(
+            [0x55; 16],
+            &[
+                form_package(&[
+                    var_store_efi(1, "Setup", NV_BS_RT, 1),
+                    form(1, &[checkbox_on(1, 1, 1)]),
+                ]),
+                en_strings_package_of(&["Q"]),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let form_set: Guid = "11111111-1111-1111-1111-111111111111"
+            .parse()
+            .expect("a GUID");
+        let request = |question_id, include| StagedRequest {
+            question: "Q".to_owned(),
+            form_set,
+            question_id,
+            value_type: IfrValueType::Boolean,
+            value: 1,
+            include,
+            access_level: None,
+            unsafe_operations: UnsafeOperations::Refuse,
+        };
+        let found = |hiidb: &[u8], request: &StagedRequest| {
+            let parsed = package::read_db(hiidb).expect("the HiiDB");
+            let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            )));
+            staged_question(&parsed, request, &[], &mut reader)
+                .map(|(list, descriptor, _, _)| (list.index, descriptor.question))
+                .map_err(|error| format!("{error:#}"))
+        };
+        let hiidb = [stored.clone(), held([0x66; 16])].concat();
+        let named = |id: u16| format!("question \"Q\", QuestionId {id:#06x} of FormSet {form_set}");
+
+        let cases = [
+            (
+                "Q",
+                request(7, IncludedStates::empty()),
+                Ok((1, "Q".to_owned())),
+            ),
+            (
+                "grayed-out R, included",
+                request(8, IncludedStates::GRAYED_OUT),
+                Ok((1, "R".to_owned())),
+            ),
+            (
+                "grayed-out R",
+                request(8, IncludedStates::empty()),
+                Err(format!(
+                    "{} is <grayed-out> now, which set did not include",
+                    named(8)
+                )),
+            ),
+            (
+                "a QuestionId that no driver holds",
+                request(1, IncludedStates::empty()),
+                Err(format!(
+                    "the HII database holds no {} whose driver holds its value",
+                    named(1)
+                )),
+            ),
+            (
+                "another FormSet",
+                StagedRequest {
+                    form_set: "22222222-2222-2222-2222-222222222222"
+                        .parse()
+                        .expect("a GUID"),
+                    ..request(7, IncludedStates::empty())
+                },
+                Err(
+                    "the HII database holds no question \"Q\", QuestionId 0x0007 of FormSet \
+                     22222222-2222-2222-2222-222222222222 whose driver holds its value"
+                        .to_owned(),
+                ),
+            ),
+            (
+                "another value type",
+                StagedRequest {
+                    value_type: IfrValueType::NumSize8,
+                    ..request(7, IncludedStates::empty())
+                },
+                Err(format!(
+                    "{} takes EFI_IFR_TYPE_BOOLEAN now, not EFI_IFR_TYPE_NUM_SIZE_8",
+                    named(7)
+                )),
+            ),
+            (
+                "an access level without AMI's VarStore",
+                StagedRequest {
+                    access_level: Some(AccessLevel::User),
+                    ..request(7, IncludedStates::empty())
+                },
+                Err(
+                    "--access-level applies to AMI firmware whose HiiDB declares the \
+                     SystemAccess VarStore; this HiiDB declares none"
+                        .to_owned(),
+                ),
+            ),
+        ];
+        for (case, request, want) in cases {
+            assert_eq!(found(&hiidb, &request), want, "{case}");
+        }
+        // its texts show in the languages requested (ParsedPackageList::texts), as set's do
+        let parsed = package::read_db(&hiidb).expect("the HiiDB");
+        let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        )));
+        let (_, descriptor, _, _) = staged_question(
+            &parsed,
+            &request(7, IncludedStates::empty()),
+            &["fr-FR"],
+            &mut reader,
+        )
+        .expect("Q under fr-FR");
+        assert_eq!(descriptor.question, "Q-fr", "Q under fr-FR");
+        // a PASSWORD outside any FormSet declares a password too
+        let outside_password = package_list_with_guid(
+            [0x77; 16],
+            &[
+                form_package_of(
+                    &[
+                        password_on(3, 3, 2, 0),
+                        // the fixture, which `form_set` shadows here
+                        crate::hii::forms::ifr_fixtures::form_set(&[
+                            var_store(2, [0x44; 16], "AMITSESetup", 81),
+                            form(1, &[checkbox_at(2, 2, 2, 80)]),
+                        ]),
+                    ]
+                    .concat(),
+                ),
+                en_strings_package_of(&["Q", "P", "Password"]),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            found(
+                &[held([0x66; 16]), outside_password].concat(),
+                &request(7, IncludedStates::empty())
+            ),
+            Err(StagingSetupPassword.to_string()),
+            "a HiiDB with a PASSWORD outside any FormSet"
+        );
+        assert_eq!(
+            found(
+                &[held([0x66; 16]), password_hiidb()].concat(),
+                &request(7, IncludedStates::empty())
+            ),
+            Err(StagingSetupPassword.to_string()),
+            "a HiiDB that declares a setup password question"
+        );
+        assert_eq!(
+            found(
+                &[held([0x66; 16]), held([0x77; 16])].concat(),
+                &request(7, IncludedStates::empty())
+            ),
+            Err(format!(
+                "2 package lists of the HII database hold {}",
+                named(7)
+            )),
+            "Q in two package lists"
+        );
+    }
+
+    /// apply-staged checks again whether a request's question is read-only: one that
+    /// EFI_IFR_FLAG_READ_ONLY makes read-only is an unsafe operation, lifted only by the grant
+    /// that set recorded with the request, and one that an EFI_IFR_VALUE makes read-only, which
+    /// no driver holds then, is refused with either grant; a writable one lifts nothing.
+    #[cfg(variable_data)]
+    #[test]
+    fn apply_staged_checks_a_read_only_question_against_set_s_grant() {
+        // W (QuestionId 6), Q (7), flagged EFI_IFR_FLAG_READ_ONLY, and V (8), which an
+        // EFI_IFR_VALUE makes read-only, each held by its driver
+        let header = |question_id: u16, prompt: u16, flags: u8| {
+            [
+                &prompt.to_le_bytes()[..],
+                &1u16.to_le_bytes(),        // Help
+                &question_id.to_le_bytes(), // QuestionId
+                &0u16.to_le_bytes(),        // VarStoreId
+                &0xFFFFu16.to_le_bytes(),   // VarStoreInfo
+                &[flags, 0x00],             // question flags, CHECKBOX Flags
+            ]
+            .concat()
+        };
+        let hiidb = package_list_with_guid(
+            [0x66; 16],
+            &[
+                form_package(&[form(
+                    1,
+                    &[
+                        callback_checkbox(6, 3),
+                        // EFI_IFR_FLAG_CALLBACK | EFI_IFR_FLAG_READ_ONLY
+                        operation(CHECKBOX, false, &header(7, 1, 0x05)),
+                        [
+                            operation(CHECKBOX, true, &header(8, 2, 0x04)),
+                            value_of(ifr_true()),
+                            END.to_vec(),
+                        ]
+                        .concat(),
+                    ],
+                )]),
+                en_strings_package_of(&["Q", "V", "W"]),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let parsed = package::read_db(&hiidb).expect("the HiiDB");
+        let lifted = |question_id, grant| {
+            let request = StagedRequest {
+                question: "Q".to_owned(),
+                form_set: "11111111-1111-1111-1111-111111111111"
+                    .parse()
+                    .expect("a GUID"),
+                question_id,
+                value_type: IfrValueType::Boolean,
+                value: 1,
+                include: IncludedStates::empty(),
+                access_level: None,
+                unsafe_operations: grant,
+            };
+            let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            )));
+            staged_question(&parsed, &request, &[], &mut reader)
+                .map(|(_, _, _, lifted)| lifted)
+                .map_err(|error| format!("{error:#}"))
+        };
+        let read_only_q = UnsafeOperation::ReadOnlyQuestion {
+            question: "Q".to_owned(),
+            writable: IncludedStates::empty(),
+        };
+        // its EFI_IFR_VALUE gives V's value, so no driver holds it (StoragelessQuestion::route)
+        let no_driver_held_v = "the HII database holds no question \"Q\", QuestionId 0x0008 of \
+                                FormSet 11111111-1111-1111-1111-111111111111 whose driver holds \
+                                its value"
+            .to_owned();
+
+        let cases = [
+            ("W", 6, UnsafeOperations::Refuse, Ok(Vec::new())),
+            ("W, allowed", 6, UnsafeOperations::Allow, Ok(Vec::new())),
+            (
+                "Q",
+                7,
+                UnsafeOperations::Refuse,
+                flag_refusal("Q", "").map(|()| Vec::new()),
+            ),
+            (
+                "Q, allowed",
+                7,
+                UnsafeOperations::Allow,
+                Ok(vec![read_only_q]),
+            ),
+            (
+                "V",
+                8,
+                UnsafeOperations::Refuse,
+                Err(no_driver_held_v.clone()),
+            ),
+            (
+                "V, allowed",
+                8,
+                UnsafeOperations::Allow,
+                Err(no_driver_held_v),
+            ),
+        ];
+        for (case, question_id, grant, want) in cases {
+            assert_eq!(lifted(question_id, grant), want, "{case}");
+        }
+    }
+
+    /// apply-staged finds no question whose driver holds its value for a request of C or L of
+    /// callback_and_strings_list, a STRING and an ORDERED_LIST flagged EFI_IFR_FLAG_CALLBACK and
+    /// without a VarStore, which no driver holds: it refuses the request with either grant, before
+    /// any Callback(). That of Q, which its driver holds, it finds.
+    #[cfg(variable_data)]
+    #[test]
+    fn apply_staged_finds_no_driver_for_a_string_or_an_ordered_list() {
+        let parsed = package::read_db(&callback_and_strings_list()).expect("the HiiDB");
+        let found = |question: &str, question_id, grant| {
+            let request = StagedRequest {
+                question: question.to_owned(),
+                form_set: "11111111-1111-1111-1111-111111111111"
+                    .parse()
+                    .expect("a GUID"),
+                question_id,
+                value_type: IfrValueType::Boolean,
+                value: 1,
+                include: IncludedStates::empty(),
+                access_level: None,
+                unsafe_operations: grant,
+            };
+            let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            )));
+            staged_question(&parsed, &request, &[], &mut reader)
+                .map(|(_, descriptor, held, lifted)| {
+                    (descriptor.question, held.question_id, lifted)
+                })
+                .map_err(|error| format!("{error:#}"))
+        };
+
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            for (question, question_id) in [("C", 10), ("L", 11)] {
+                assert_eq!(
+                    found(question, question_id, grant),
+                    Err(format!(
+                        "the HII database holds no question {question:?}, QuestionId \
+                         {question_id:#06x} of FormSet 11111111-1111-1111-1111-111111111111 whose \
+                         driver holds its value"
+                    )),
+                    "{question}, {grant:?}"
+                );
+            }
+            assert_eq!(
+                found("Q", 9, grant),
+                Ok(("Q".to_owned(), 9, Vec::new())),
+                "Q, {grant:?}"
+            );
+        }
+    }
+
     /// set gives one value to questions of one kind, and items to an ORDERED_LIST only, also where
     /// a driver holds a question's value: a CHECKBOX that its driver holds and a DATE on Setup of
     /// its prompt are refused as two kinds, and --item for that CHECKBOX as for any other, before
@@ -9177,6 +9647,100 @@ mod tests {
         );
         assert!(driver.sets.borrow().is_empty(), "no driver asked to set");
         assert!(variables.writes_to(&setup()).is_empty(), "Setup unwritten");
+    }
+
+    /// In a HiiDB that declares a setup password question, set from an OS stages no question that
+    /// its driver holds, also with --i-am-fine-to-brick-this-system, as the next boot would apply
+    /// it where no setup browser asks for the password; set of a stored one from an OS, and in the
+    /// UEFI Shell with --i-am-fine-to-brick-this-system, write as before.
+    #[test]
+    fn set_from_an_os_stages_nothing_beside_a_setup_password_question() {
+        let callback = package_list_with_guid(
+            [0x66; 16],
+            &[
+                form_package(&[form(1, &[callback_checkbox(7, 1)])]),
+                en_strings_package_of(&["Q"]),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let cases = [
+            (
+                "from an OS",
+                [callback.clone(), password_hiidb()].concat(),
+                VariableReach::Runtime,
+                UnsafeOperations::Refuse,
+                Err(StagingSetupPassword.to_string()),
+                Vec::new(),
+            ),
+            (
+                "from an OS, allowed",
+                [callback.clone(), password_hiidb()].concat(),
+                VariableReach::Runtime,
+                UnsafeOperations::Allow,
+                Err(StagingSetupPassword.to_string()),
+                Vec::new(),
+            ),
+            (
+                "from an OS, without a question that its driver holds",
+                password_hiidb(),
+                VariableReach::Runtime,
+                UnsafeOperations::Refuse,
+                Ok(vec!["1".to_owned()]),
+                Vec::new(),
+            ),
+            (
+                "in the UEFI Shell, allowed",
+                [callback, password_hiidb()].concat(),
+                VariableReach::BootServices,
+                UnsafeOperations::Allow,
+                Ok(vec![
+                    "1 <set by the driver of QuestionId 7>".to_owned(),
+                    "1".to_owned(),
+                ]),
+                vec![(7, 1)],
+            ),
+        ];
+        for (case, hiidb, reach, unsafe_operations, want, sets) in cases {
+            let driver = RecordingDriver::default();
+            let variables = password_variables(reach, VariableInterface::VariableServices);
+            let options = SetOptions {
+                unsafe_operations,
+                ..SetOptions::default()
+            };
+
+            let set = HiiBackend::set_in(
+                &hiidb,
+                "Q",
+                &SetValue::Text("1".to_owned()),
+                None,
+                &options,
+                SetAccess {
+                    reads: shared(&variables),
+                    writes: &*variables,
+                    held: Some(&driver),
+                },
+                None,
+            );
+
+            assert_eq!(
+                set.map(|(set, _)| {
+                    set.responses
+                        .into_iter()
+                        .map(|response| response.question.answer)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| format!("{error:#}")),
+                want,
+                "{case}"
+            );
+            assert_eq!(*driver.sets.borrow(), sets, "{case}: the driver's sets");
+            assert_eq!(
+                variables.writes_to(&setup()).is_empty(),
+                want.is_err(),
+                "{case}: Setup written unless refused"
+            );
+        }
     }
 
     /// Through variables that reach BootServices, a HiiDB with a PASSWORD op whose VarStore is

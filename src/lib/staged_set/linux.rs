@@ -72,11 +72,35 @@ impl NextBootStaging {
         }
     }
 
-    /// `variables` without the bytes of PASSWORD questions, which staging fails to write over.
+    /// `variables` without the bytes of PASSWORD questions, which staging fails to write over:
+    /// staging writes at Runtime, and refuses up front what apply-staged's BootServices check
+    /// refuses.
     fn withholding<V: VariableData>(&self, variables: V) -> Result<WithholdingVariables<V>> {
         Ok(self
             .passwords
             .withholding_of(variables, VariableReach::Runtime)?)
+    }
+
+    /// Refuses, before anything is staged, what apply-staged would refuse before the OS, as its
+    /// withholding through BootServices refuses a PASSWORD question whose VarStore is unknown
+    /// (apply_staged_withholding), then what staging `question` through `variables` without the
+    /// bytes of PASSWORD questions, on the ESP that MountedEsp::locate finds in `paths`, would
+    /// refuse: prepare.
+    fn check(
+        &self,
+        variables: impl VariableData,
+        paths: &LinuxPaths<impl PathDevices>,
+        question: &str,
+    ) -> Result<()> {
+        self.passwords
+            .check_withholding(VariableReach::BootServices)?;
+        prepare(
+            &self.withholding(variables)?,
+            paths,
+            self.image.as_deref(),
+            question,
+        )
+        .map(drop)
     }
 
     /// Stages `request` through `variables` without the bytes of PASSWORD questions, on the ESP
@@ -127,20 +151,19 @@ impl DriverHeldValues for NextBootStaging {
         question.value.clone()
     }
 
-    /// set finds the ESP, plan_stage allows staging there, and a new set has a readable --image.
+    /// apply-staged would apply the set, set finds the ESP, plan_stage allows staging there, and
+    /// a new set has a readable --image: check.
     fn check_set(
         &self,
         _list: &QuestionList<'_>,
         question: &QuestionDescriptor,
         _held: &DriverHeldQuestion,
     ) -> Result<()> {
-        prepare(
-            &self.withholding(EfivarFiles::system())?,
+        self.check(
+            EfivarFiles::system(),
             &LinuxPaths::default(),
-            self.image.as_deref(),
             &question.question,
         )
-        .map(drop)
     }
 
     fn set(
@@ -233,6 +256,8 @@ fn missing_image(variables: &impl VariableData) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -252,6 +277,8 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::IfrValueType;
+    use crate::hii::forms::IgnoredIfr;
+    use crate::hii::forms::IgnoredPasswords;
     use crate::hii::package::hiidb_fixtures::form_package_of;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::password_past_the_walk_hiidb;
@@ -654,6 +681,76 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Staging refuses up front, with apply-staged's refusal, a set that apply-staged would refuse
+    /// before the OS: in a HiiDB where IFR that uefisettings ignores may hold a PASSWORD question,
+    /// whose VarStore is then unknown, nothing is staged.
+    #[test]
+    fn staging_refuses_up_front_what_apply_staged_refuses() {
+        let unresolved = "PASSWORD questions of package list 00000000-0000-0000-0000-000000000000 \
+                          may be in the IFR that uefisettings ignores at offset 4 of a form \
+                          package: an op that uefisettings cannot decode; as the variable of that \
+                          password is unknown, the UEFI Shell build reads and writes no variable \
+                          of this HiiDB";
+        let ignored = ParsedPackageList {
+            guid: NIL_GUID,
+            device_path: None,
+            strings: Vec::new(),
+            forms: Vec::new(),
+            ignored_ifr: vec![IgnoredIfr {
+                package_list: NIL_GUID,
+                offset: 4,
+                reason: "an op that uefisettings cannot decode".to_owned(),
+                passwords: IgnoredPasswords::Declared(Arc::default()),
+            }],
+            outside_ifr: Vec::new(),
+            malformed_outside_stores: Vec::new(),
+            disabled_forms: Vec::new(),
+            first_var_stores: Vec::new(),
+        };
+        let cases = [(
+            "IFR that uefisettings ignores",
+            ignored,
+            SetOptions::default(),
+            unresolved,
+        )];
+        for (case, list, options, refusal) in cases {
+            let (linux, esp) = FakeLinux::with_esp();
+            let variables = booted_from(Some(gpt_512_esp()));
+            let images = TempDir::new().expect("a temporary directory");
+            let image = images.path().join("uefisettings.efi");
+            fs::write(&image, b"MZ uefisettings").expect("the image");
+            let options = SetOptions {
+                staging_image: Some(image),
+                ..options
+            };
+
+            let checked =
+                NextBootStaging::of(&options, &[list]).check(&variables, &linux.paths, QUESTION);
+
+            assert_eq!(
+                checked.map_err(|err| format!("{err:#}")),
+                Err(refusal.to_owned()),
+                "{case}: the check"
+            );
+            assert!(
+                variables.set.borrow().is_empty(),
+                "{case}: no variable written"
+            );
+            assert_eq!(
+                StagedState::read(&variables).expect("the state"),
+                StagedState::Idle(None),
+                "{case}: nothing staged"
+            );
+            assert!(
+                !esp.join("EFI")
+                    .join("uefisettings")
+                    .join("uefisettings.efi")
+                    .exists(),
+                "{case}: no image on the ESP"
+            );
         }
     }
 

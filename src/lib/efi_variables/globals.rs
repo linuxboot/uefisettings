@@ -777,10 +777,10 @@ impl Setter {
 
 /// The Boot#### that BootCurrent names, if present.
 #[cfg_attr(
-    not(target_os = "linux"),
+    not(any(target_os = "linux", target_os = "uefi")),
     allow(
         dead_code,
-        reason = "only the Linux build stages a set for the next boot yet"
+        reason = "only the Linux build stages a set for the next boot, and uefisettings.efi applies it"
     )
 )]
 pub(crate) fn boot_current(variables: &impl VariableData) -> Result<Option<LoadOptionName>> {
