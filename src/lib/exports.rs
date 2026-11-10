@@ -45,7 +45,7 @@ use crate::efi_variables::authenticated::write_signed;
 #[cfg(variable_data)]
 use crate::efi_variables::authenticated::EnhancedSignedWrite;
 #[cfg(variable_data)]
-pub use crate::efi_variables::authenticated::SetupModeWrite;
+pub use crate::efi_variables::authenticated::SetupModeReading;
 #[cfg(variable_data)]
 pub use crate::efi_variables::authenticated::SignatureDigest;
 #[cfg(variable_data)]
@@ -346,16 +346,17 @@ impl VariableBackend {
     /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C" (UEFI 2.11 §8.2.6), with `attributes` and
     /// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS; the firmware verifies its signature.
     /// Refuses, before any write, other attributes, a payload without a complete descriptor,
-    /// attributes without access or a payload that would delete the variable, and, unless
-    /// `setup_mode` allows it, a Secure Boot Policy Variable or a device signature database (any
-    /// variable of EFI_DEVICE_SECURITY_DATABASE_GUID) in Setup Mode.
+    /// attributes without access or a payload that would delete the variable, and then, unless
+    /// `unsafe_operations` allows it, a Secure Boot Policy Variable or a device signature
+    /// database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID) in Setup Mode; returns the
+    /// unsafe operations that it lifted.
     pub fn write_signed(
         name: &str,
         vendor: &str,
         attributes: VariableAttributes,
         payload: &[u8],
-        setup_mode: SetupModeWrite,
-    ) -> Result<()> {
+        unsafe_operations: UnsafeOperations,
+    ) -> Result<Vec<UnsafeOperation>> {
         let key = VariableKey {
             name: name.to_owned(),
             guid: parse_vendor(vendor)?,
@@ -365,7 +366,7 @@ impl VariableBackend {
             &key,
             attributes,
             payload,
-            setup_mode,
+            unsafe_operations,
         )
     }
 
@@ -373,12 +374,13 @@ impl VariableBackend {
     /// (UEFI 2.11 §8.2.6) that carries `certificates`, a PEM bundle of the key's certificate,
     /// then any others, blinded over this platform's random source (EFI_RNG_PROTOCOL in the UEFI
     /// Shell, getrandom elsewhere), and writes it, then the data. Refuses what write_signed
-    /// refuses before it signs.
+    /// refuses before it signs, but the unsafe operations, which it checks after it signs and
+    /// returns as write_signed does.
     pub fn sign_and_write(
         write: &SignedVariableWrite<'_>,
         signing_key: &Secret,
         certificates: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Vec<UnsafeOperation>> {
         let key = VariableKey {
             name: write.name.to_owned(),
             guid: parse_vendor(write.vendor)?,
@@ -391,7 +393,7 @@ impl VariableBackend {
                 attributes: write.attributes,
                 data: write.data,
                 timestamp: write.timestamp,
-                setup_mode: write.setup_mode,
+                unsafe_operations: write.unsafe_operations,
             },
             &signer,
             &mut PlatformSeed::default(),
@@ -403,14 +405,15 @@ impl VariableBackend {
     /// certificate, then any others, and whose NewCert, if `write` names a new authority, hands
     /// the variable to it, blinded as sign_and_write blinds, and writes it, then the data, with
     /// the attributes and EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS. Refuses before it signs a
-    /// Secure Boot Policy Variable, a write that would delete the variable, a device signature
-    /// database while SetupMode is 1 unless `write` allows it, and, on Linux, every such write,
-    /// which efivarfs cannot make.
+    /// Secure Boot Policy Variable, a write that would delete the variable, and, on Linux, every
+    /// such write, which efivarfs cannot make; after it signs, a device signature database while
+    /// SetupMode is 1 or tells no mode unless `write` allows it. Returns the unsafe operations
+    /// that it lifted.
     pub fn sign_and_write_enhanced(
         write: &EnhancedVariableWrite<'_>,
         signing_key: &Secret,
         certificates: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Vec<UnsafeOperation>> {
         let key = VariableKey {
             name: write.name.to_owned(),
             guid: parse_vendor(write.vendor)?,
@@ -423,7 +426,7 @@ impl VariableBackend {
                 attributes: write.attributes,
                 data: write.data,
                 freshness: write.freshness,
-                setup_mode: write.setup_mode,
+                unsafe_operations: write.unsafe_operations,
             },
             &signer,
             new_authority.as_ref(),
@@ -472,8 +475,9 @@ pub struct EnhancedVariableWrite<'a> {
     pub digest: SignatureDigest,
     /// The authority that a NewCert hands the variable to, if any
     pub new_authority: Option<NewAuthority<'a>>,
-    /// Whether a device signature database is written while SetupMode is 1
-    pub setup_mode: SetupModeWrite,
+    /// Whether to do the unsafe operations that it meets, which it returns: a write of a device
+    /// signature database while SetupMode is 1 or tells no mode
+    pub unsafe_operations: UnsafeOperations,
 }
 
 /// The authority that the NewCert of an EFI_VARIABLE_AUTHENTICATION_3 hands a variable to (UEFI
@@ -503,9 +507,10 @@ pub struct SignedVariableWrite<'a> {
     pub timestamp: TimeStamp,
     /// The digest of the signature
     pub digest: SignatureDigest,
-    /// Whether a Secure Boot Policy Variable or a device signature database (any variable of
-    /// EFI_DEVICE_SECURITY_DATABASE_GUID) is written while SetupMode is 1
-    pub setup_mode: SetupModeWrite,
+    /// Whether to do the unsafe operations that it meets, which it returns: a write of a Secure
+    /// Boot Policy Variable or a device signature database (any variable of
+    /// EFI_DEVICE_SECURITY_DATABASE_GUID) while SetupMode is 1 or tells no mode
+    pub unsafe_operations: UnsafeOperations,
 }
 
 #[cfg(variable_storage_info)]
@@ -1641,7 +1646,7 @@ mod tests {
             freshness: &freshness,
             digest: SignatureDigest::Sha256,
             new_authority,
-            setup_mode: SetupModeWrite::Refuse,
+            unsafe_operations: UnsafeOperations::Refuse,
         };
         for (new_key, refused) in [
             (

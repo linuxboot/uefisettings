@@ -30,6 +30,8 @@
 #              warned: the step's output is lines that start with "warning: ", at least one,
 #                which line checks read, and then one line of JSON, which the jq filter of the
 #                argument finds true
+#              warnings: the step's output is lines that start with "warning: ", as many as
+#                the argument, which line checks read, and nothing else
 #              line: a line of the step's output matches the extended regular expression of
 #                the argument
 #              none: no line of the step's output matches that expression
@@ -161,6 +163,13 @@ check_step() {
         if (($(wc -l <"$out") < 2)) || grep --quiet --invert-match '^warning: ' <(head -n -1 "$out") ||
             ! tail -n 1 "$out" | jq --exit-status "$argument" >/dev/null 2>&1; then
             fail "$step" "not warnings, then one line of JSON for which $argument holds"
+        fi
+        ;;
+    warnings)
+        # the warnings of stderr, and nothing on stdout
+        if [[ ! $argument =~ ^[1-9][0-9]*$ ]] || (($(wc -l <"$out") != argument)) ||
+            grep --quiet --invert-match '^warning: ' "$out"; then
+            fail "$step" "not $argument lines of warnings alone"
         fi
         ;;
     line) grep --quiet --extended-regexp -- "$argument" "$out" || fail "$step" "no line matches $argument" ;;

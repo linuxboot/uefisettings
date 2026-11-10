@@ -21,8 +21,12 @@ use std::fmt;
 
 use thiserror::Error;
 
+#[cfg(variable_data)]
+use crate::efi_variables::authenticated::SetupModeReading;
 use crate::hii::forms::IncludedStates;
 use crate::hii::forms::ReadOnlyCause;
+#[cfg(variable_data)]
+use crate::hii::VariableKey;
 
 /// The flag of the CLI that grants UnsafeOperations::Allow, which every refusal of an
 /// UnsafeOperation names.
@@ -62,6 +66,22 @@ pub enum UnsafeOperation {
         question: String,
         writable: IncludedStates,
     },
+    /// A signed write of `variable`, a Secure Boot Policy Variable, while SetupMode is 1, when
+    /// the firmware writes it without checking the signature, or tells no mode, as `setup_mode`
+    /// tells
+    #[cfg(variable_data)]
+    SetupModePolicyWrite {
+        variable: VariableKey,
+        setup_mode: SetupModeReading,
+    },
+    /// A signed write of `variable`, a device signature database, while SetupMode is 1, when the
+    /// firmware may write it without checking the signature, or tells no mode, as `setup_mode`
+    /// tells
+    #[cfg(variable_data)]
+    SetupModeDeviceDatabaseWrite {
+        variable: VariableKey,
+        setup_mode: SetupModeReading,
+    },
 }
 
 impl UnsafeOperation {
@@ -70,6 +90,10 @@ impl UnsafeOperation {
         match self {
             Self::SetupPassword => "write without it",
             Self::ReadOnlyQuestion { .. } => "write it",
+            #[cfg(variable_data)]
+            Self::SetupModePolicyWrite { .. } | Self::SetupModeDeviceDatabaseWrite { .. } => {
+                "write it unchecked"
+            }
         }
     }
 
@@ -81,6 +105,10 @@ impl UnsafeOperation {
                 format!(", or also include {writable} questions to select a writable one")
             }
             Self::SetupPassword | Self::ReadOnlyQuestion { .. } => String::new(),
+            #[cfg(variable_data)]
+            Self::SetupModePolicyWrite { .. } | Self::SetupModeDeviceDatabaseWrite { .. } => {
+                String::new()
+            }
         }
     }
 
@@ -95,7 +123,9 @@ impl UnsafeOperation {
 }
 
 impl fmt::Display for UnsafeOperation {
-    /// What the operation is, and what it can do.
+    /// What the operation is, and what it can do. Those of Secure Boot spell "section", as edk2's
+    /// terminals but VT-UTF8 show '?' for '§' (edk2-stable202508 TerminalDxe/TerminalConOut.c
+    /// TerminalConOutOutputString()).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SetupPassword => f.write_str(
@@ -107,8 +137,45 @@ impl fmt::Display for UnsafeOperation {
                 "cannot set question {question:?}: {}",
                 ReadOnlyCause::Flag
             ),
+            #[cfg(variable_data)]
+            Self::SetupModePolicyWrite {
+                variable,
+                setup_mode,
+            } => {
+                let would = match setup_mode.reason() {
+                    None => "would",
+                    Some(_) => "may",
+                };
+                write!(
+                    f,
+                    "EFI variable {variable} is a Secure Boot policy variable and {setup_mode}, so \
+                     the firmware {would} write it without checking the payload's signature (UEFI \
+                     2.11 sections 3.3 and 8.2.6){}",
+                    reason_after(setup_mode)
+                )
+            }
+            #[cfg(variable_data)]
+            Self::SetupModeDeviceDatabaseWrite {
+                variable,
+                setup_mode,
+            } => write!(
+                f,
+                "EFI variable {variable} is a device signature database and {setup_mode}, so the \
+                 firmware may write it without checking the payload's signature (UEFI 2.11 \
+                 section 32.6.3){}",
+                reason_after(setup_mode)
+            ),
         }
     }
+}
+
+/// Why `setup_mode` tells no mode, after ": ", if it does not.
+#[cfg(variable_data)]
+fn reason_after(setup_mode: &SetupModeReading) -> String {
+    setup_mode
+        .reason()
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default()
 }
 
 /// The refusal of `operation`, without UnsafeOperations::Allow.

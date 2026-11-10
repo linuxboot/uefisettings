@@ -5,7 +5,7 @@ setup-mode	line	^  00000000: 01 +\*
 # uefisettings refuses the db append before SetVariable(), which would write db unverified,
 # and db stays absent
 policy	status	aborted
-policy	json	. == {"error_message": "EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f is a Secure Boot policy variable and SetupMode is 1, so the firmware would write it without checking the payload's signature (UEFI 2.11 sections 3.3 and 8.2.6)"}
+policy	json	. == {"error_message": "EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f is a Secure Boot policy variable and SetupMode is 1, so the firmware would write it without checking the payload's signature (UEFI 2.11 sections 3.3 and 8.2.6); pass --i-am-fine-to-brick-this-system to write it unchecked"}
 db-absent	status	aborted
 db-absent	json	. == {"error_message": "no EFI variable db-d719b2cb-3d3a-4596-a3bc-dad00e67656f"}
 # the same payload for a variable of no policy reaches SetVariable(), which verifies it

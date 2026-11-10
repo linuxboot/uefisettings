@@ -26,17 +26,42 @@ use uefisettings::exports::EnhancedVariableWrite;
 use uefisettings::exports::Freshness;
 use uefisettings::exports::NewAuthority;
 use uefisettings::exports::Nonce;
-use uefisettings::exports::SetupModeWrite;
 use uefisettings::exports::SignatureDigest;
 use uefisettings::exports::SignedVariableWrite;
 use uefisettings::exports::TimeStamp;
+use uefisettings::exports::UnsafeOperation;
 use uefisettings::exports::VariableAttributes;
 use uefisettings::exports::VariableBackend;
 
 use crate::platform;
+use crate::print_lifted;
+use crate::unsafe_long_help;
+use crate::UnsafeArgs;
+use crate::UNSAFE_ARG;
+
+/// What write-signed refuses without --i-am-fine-to-brick-this-system.
+const SETUP_MODE_WRITE: &str = "a write of a Secure Boot policy variable (PK, KEK, \
+                                OsRecoveryOrder, any OsRecovery####, any variable of \
+                                EFI_IMAGE_SECURITY_DATABASE_GUID such as db, dbx, dbt and dbr) \
+                                while SetupMode is 1, when the firmware checks no signature (UEFI \
+                                2.11 sections 3.3 and 32.3), or of a device signature database \
+                                (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID such as devdb), \
+                                which the firmware may then write without checking the signature \
+                                (section 32.6.3), either also while SetupMode cannot be read or \
+                                holds other than a UINT8 of 0 or 1, which may be 1. The payload \
+                                of a Secure Boot policy variable is \
+                                still an EFI_VARIABLE_AUTHENTICATION_2; that of a device signature \
+                                database may be either descriptor: an \
+                                EFI_VARIABLE_AUTHENTICATION_3 with enhanced-authenticated-access, \
+                                as section 32.6.3 formats a Setup Mode write, or an \
+                                EFI_VARIABLE_AUTHENTICATION_2, which edk2 takes. Writing PK moves \
+                                Setup Mode to User Mode, and Audit Mode to Deployed Mode (sections \
+                                32.3.1 and 32.3.4). PK may have to be signed with its own key \
+                                (section 32.3.1)";
 
 /// The variable, the attributes and the payload file of a signed write.
 #[derive(Debug, Args)]
+#[command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, &[SETUP_MODE_WRITE])))]
 pub(super) struct WriteSignedArgs {
     /// The variable, such as db
     name: String,
@@ -84,9 +109,8 @@ pub(super) struct WriteSignedArgs {
     /// The PEM X.509 certificates of --new-signing-key-file: the one of its public key, whose tbsCertificate the NewCert signs, then any others; a file of at most 64 KiB
     #[arg(long, requires = "new_signing_key_file")]
     new_signing_certificate_file: Option<PathBuf>,
-    /// Write a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, any OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID such as db, dbx, dbt and dbr) while SetupMode is 1, when the firmware checks no signature (UEFI 2.11 sections 3.3 and 32.3), or a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID such as devdb), which the firmware may then write without checking the signature (section 32.6.3). The payload of a Secure Boot policy variable is still an EFI_VARIABLE_AUTHENTICATION_2; that of a device signature database may be either descriptor: an EFI_VARIABLE_AUTHENTICATION_3 with enhanced-authenticated-access, as section 32.6.3 formats a Setup Mode write, or an EFI_VARIABLE_AUTHENTICATION_2, which edk2 takes. Writing PK moves Setup Mode to User Mode, and Audit Mode to Deployed Mode (sections 32.3.1 and 32.3.4). PK may have to be signed with its own key (section 32.3.1)
-    #[arg(long)]
-    allow_setup_mode_write_without_signature_check: bool,
+    #[command(flatten)]
+    unsafe_operations: UnsafeArgs,
 }
 
 /// An attribute of EFI variables (UEFI 2.11 §8.2.1) that a signed write takes as given.
@@ -150,9 +174,16 @@ struct NewAuthorityFiles<'a> {
 
 impl WriteSignedArgs {
     /// Writes the payload file, or the data file that the key signs, to the variable, printing
-    /// nothing.
+    /// only a warning per unsafe operation that it lifted.
     pub(super) fn run(&self) -> Result<()> {
-        let setup_mode = self.setup_mode();
+        print_lifted(&self.write()?)?;
+        Ok(())
+    }
+
+    /// Writes the payload file, or the data file that the key signs, to the variable; returns the
+    /// unsafe operations that it lifted.
+    fn write(&self) -> Result<Vec<UnsafeOperation>> {
+        let unsafe_operations = self.unsafe_operations.operations();
         let (Some(data_file), Some(key_file), Some(certificate_file)) = (
             &self.data_file,
             &self.signing_key_file,
@@ -167,7 +198,7 @@ impl WriteSignedArgs {
                 &self.guid,
                 self.attributes(),
                 &payload,
-                setup_mode,
+                unsafe_operations,
             );
         };
         let signing = self.signing(platform::signing_clock())?;
@@ -184,7 +215,7 @@ impl WriteSignedArgs {
                         data: &data,
                         timestamp,
                         digest: self.digest.into(),
-                        setup_mode,
+                        unsafe_operations,
                     },
                     &signing_key,
                     certificates.as_bytes(),
@@ -217,7 +248,7 @@ impl WriteSignedArgs {
                         key,
                         certificates: certificates.as_bytes(),
                     }),
-                setup_mode,
+                unsafe_operations,
             },
             &signing_key,
             certificates.as_bytes(),
@@ -275,15 +306,6 @@ impl WriteSignedArgs {
         )?))
     }
 
-    /// What a write of a Secure Boot policy variable or a device signature database (any
-    /// variable of EFI_DEVICE_SECURITY_DATABASE_GUID) does while SetupMode is 1.
-    fn setup_mode(&self) -> SetupModeWrite {
-        match self.allow_setup_mode_write_without_signature_check {
-            true => SetupModeWrite::WithoutSignatureCheck,
-            false => SetupModeWrite::Refuse,
-        }
-    }
-
     /// The attributes that these name.
     fn attributes(&self) -> VariableAttributes {
         self.attributes
@@ -319,14 +341,17 @@ fn signed_time_stamp(
 mod tests {
     use std::path::Path;
 
+    use clap::CommandFactory;
     use clap::Parser;
 
+    use uefisettings::exports::UnsafeOperations;
     use uefisettings::secret_file::MAX_SECRET_LEN;
 
     use super::*;
     use crate::variable_command::VariableSubcommands;
     use crate::Commands;
     use crate::UefiSettingsToolArgs;
+    use crate::UNSAFE_HELP;
 
     /// The arguments of `uefisettings variable write-signed` and then `args`, or the kind of
     /// error that their parse fails with.
@@ -429,11 +454,10 @@ mod tests {
     }
 
     /// write-signed signs --data-file with --signing-key-file and --signing-certificate-file at
-    /// --timestamp over --digest, SHA-256 by default, takes
-    /// --allow-setup-mode-write-without-signature-check, and refuses a data file next to a
-    /// payload file, one without its key or certificate, a TimeStamp that is no GMT time, a
-    /// digest that UEFI 2.11 §8.2.6 does not accept, and --digest or --timestamp without a data
-    /// file.
+    /// --timestamp over --digest, SHA-256 by default, takes --i-am-fine-to-brick-this-system, and
+    /// refuses a data file next to a payload file, one without its key or certificate, a TimeStamp
+    /// that is no GMT time, a digest that UEFI 2.11 §8.2.6 does not accept, and --digest or
+    /// --timestamp without a data file.
     #[test]
     fn write_signed_takes_a_data_file_to_sign() {
         use clap::error::ErrorKind::ArgumentConflict;
@@ -466,7 +490,7 @@ mod tests {
                 parsed.signing_certificate_file.as_deref(),
                 parsed.timestamp.map(|timestamp| timestamp.to_string()),
                 SignatureDigest::from(parsed.digest),
-                parsed.allow_setup_mode_write_without_signature_check,
+                parsed.unsafe_operations.operations(),
             ),
             (
                 None,
@@ -475,7 +499,7 @@ mod tests {
                 Some(Path::new("pk.crt")),
                 Some("2026-11-07T00:00:00Z".to_owned()),
                 SignatureDigest::Sha256,
-                false,
+                UnsafeOperations::Refuse,
             ),
             "signed write"
         );
@@ -490,13 +514,12 @@ mod tests {
                 "db.auth",
             ],
         ] {
-            let parsed = write_signed(
-                &[args, &["--allow-setup-mode-write-without-signature-check"]].concat(),
-            )
-            .unwrap_or_else(|kind| panic!("parse a Setup Mode write of {args:?}: {kind}"));
-            assert!(
-                parsed.allow_setup_mode_write_without_signature_check,
-                "--allow-setup-mode-write-without-signature-check after {args:?}"
+            let parsed = write_signed(&[args, &["--i-am-fine-to-brick-this-system"]].concat())
+                .unwrap_or_else(|kind| panic!("parse a Setup Mode write of {args:?}: {kind}"));
+            assert_eq!(
+                parsed.unsafe_operations.operations(),
+                UnsafeOperations::Allow,
+                "--i-am-fine-to-brick-this-system after {args:?}"
             );
         }
         for (name, digest) in [
@@ -845,7 +868,8 @@ mod tests {
     }
 
     /// write-signed refuses a Secure Boot policy variable while SetupMode is 1, and writes it
-    /// without a signature check only with --allow-setup-mode-write-without-signature-check.
+    /// without a signature check only with --i-am-fine-to-brick-this-system, whose long help
+    /// lists the write.
     #[test]
     fn setup_mode_write_is_without_signature_check_only_with_the_flag() {
         let payload = [
@@ -856,17 +880,41 @@ mod tests {
             "--payload-file",
             "db.auth",
         ];
-        for (flag, setup_mode) in [
-            (&[][..], SetupModeWrite::Refuse),
+        for (flag, unsafe_operations) in [
+            (&[][..], UnsafeOperations::Refuse),
             (
-                &["--allow-setup-mode-write-without-signature-check"][..],
-                SetupModeWrite::WithoutSignatureCheck,
+                &["--i-am-fine-to-brick-this-system"][..],
+                UnsafeOperations::Allow,
             ),
         ] {
             let parsed = write_signed(&[&payload[..], flag].concat())
                 .unwrap_or_else(|kind| panic!("parse a write with {flag:?}: {kind}"));
-            assert_eq!(parsed.setup_mode(), setup_mode, "a write with {flag:?}");
+            assert_eq!(
+                parsed.unsafe_operations.operations(),
+                unsafe_operations,
+                "a write with {flag:?}"
+            );
         }
+
+        let mut command = UefiSettingsToolArgs::command();
+        command.build();
+        let long_help = command
+            .find_subcommand("variable")
+            .and_then(|variable| variable.find_subcommand("write-signed"))
+            .and_then(|write_signed| {
+                write_signed
+                    .get_arguments()
+                    .find(|arg| arg.get_long() == Some("i-am-fine-to-brick-this-system"))
+            })
+            .and_then(|flag| flag.get_long_help())
+            .map(ToString::to_string);
+        assert_eq!(
+            long_help,
+            Some(format!(
+                "{UNSAFE_HELP}. This command refuses without it: {SETUP_MODE_WRITE}"
+            )),
+            "write-signed"
+        );
     }
 
     /// Each attribute of write-signed names the one of its spec name.

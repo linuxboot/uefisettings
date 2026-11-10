@@ -355,7 +355,7 @@ fn mode_key(name: &str) -> VariableKey {
 
 /// A mode variable that holds other than a UINT8 of 0 or 1 (UEFI 2.11 §3.3).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-enum ModeVariableError {
+pub(super) enum ModeVariableError {
     #[error("{name} holds {size} bytes, not the 1 of a UINT8 (UEFI 2.11 section 3.3)")]
     Size { name: &'static str, size: usize },
     #[error("{name} is {value}, neither 0 nor 1 (UEFI 2.11 section 3.3)")]
@@ -419,8 +419,7 @@ enum ModeTransitionError {
     #[error(
         "the firmware is in Audit Mode, where \"To enter Deployed Mode from Audit Mode, set the \
          variable PK\" (UEFI 2.11 section 32.3.4): `uefisettings.efi variable write-signed PK \
-         8BE4DF61-93CA-11D2-AA0D-00E098032B8C` writes it, with \
-         --allow-setup-mode-write-without-signature-check while SetupMode is 1"
+         8BE4DF61-93CA-11D2-AA0D-00E098032B8C` writes it"
     )]
     DeployedModeInAuditMode,
     #[error(
@@ -1274,8 +1273,7 @@ mod tests {
                 ModeTransitionError::DeployedModeInAuditMode,
                 "the firmware is in Audit Mode, where \"To enter Deployed Mode from Audit Mode, \
                  set the variable PK\" (UEFI 2.11 section 32.3.4): `uefisettings.efi variable \
-                 write-signed PK 8BE4DF61-93CA-11D2-AA0D-00E098032B8C` writes it, with \
-                 --allow-setup-mode-write-without-signature-check while SetupMode is 1",
+                 write-signed PK 8BE4DF61-93CA-11D2-AA0D-00E098032B8C` writes it",
             ),
             (
                 ModeTransitionError::AlreadyStarted,

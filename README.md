@@ -234,6 +234,8 @@ through`; its output on stdout, `--json` too, stays the same otherwise.
 |---|---|---|---|
 | A write in a HiiDB that declares a setup password question | `set`, `hii set`, `hii keyword set` | UEFI Shell | No password is asked or checked, as the UEFI Shell runs no setup browser |
 | A write of a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only | `set`, `hii set` | Linux, UEFI Shell, Windows | A value changes that the firmware declares read-only; the Keyword Handler refuses it as "a violation of system policy" (UEFI 2.11 §35.3.2) |
+| A signed write of a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware writes it without checking the signature (UEFI 2.11 §3.3, §32.3) |
+| A signed write of a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware may write it without checking the signature (UEFI 2.11 §32.6.3) |
 
 `capsule deliver` takes no flag: its payload goes to the firmware's JSON configuration processor,
 which UEFI 2.11 has check it against a schema and answer per capsule (§8.5.6.1.3), unlike
@@ -621,7 +623,7 @@ which is authenticated" (§32.3). Without the flag, set refuses DeployedMode. It
 variables as for Audit Mode and refuses Deployed Mode from Setup Mode, which §32.3 lists no
 unauthenticated transition to it from, and from Audit Mode, where SetupMode is 1 and enrolling PK
 enters Deployed Mode instead, as `variable write-signed PK` does with
-`--allow-setup-mode-write-without-signature-check` (§32.3.4). Linux and Windows refuse it, as
+`--i-am-fine-to-brick-this-system` (§32.3.4). Linux and Windows refuse it, as
 DeployedMode "Always becomes read-only after ExitBootServices() is called" (§3.3). It prints as for
 Audit Mode: §32.3 and §32.3.4 have this transition take effect immediately, so
 `EFI_WARN_RESET_REQUIRED` there is a firmware departure that set reports as returned.
@@ -648,17 +650,18 @@ EFI_VARIABLE_APPEND_WRITE. The firmware verifies the signature, which covers the
 vendor GUID, the attributes and the time stamp that the payload was made for. Before any write,
 uefisettings refuses a payload without a complete descriptor, one without data unless `--append`
 is given, and attributes without bootservice-access or runtime-access, either of which would
-delete the variable, and, while SetupMode is 1, a Secure Boot policy variable (PK, KEK,
+delete the variable, and, while SetupMode is 1, or cannot be read or holds other than a UINT8 of
+0 or 1, which may be 1, a Secure Boot policy variable (PK, KEK,
 OsRecoveryOrder, OsRecovery####, and every variable of EFI_IMAGE_SECURITY_DATABASE_GUID, such as
 db, dbx, dbt and dbr; §3.3), which the firmware writes then without checking the signature, or a
 device signature database (every variable of EFI_DEVICE_SECURITY_DATABASE_GUID, such as devdb),
 which the firmware may write then without checking the signature (§32.6.3), unless
-`--allow-setup-mode-write-without-signature-check` is given. In User Mode, a KEK or PK signs db,
-dbx, dbt and dbr (§32.5.3), and only PK signs devdb (§32.6.2, §32.6.3). edk2-stable202608 departs
-from that for devdb: it verifies devdb as any other time-based authenticated variable, in Setup
-Mode too, and then takes updates only from its first signer (SecurityPkg AuthVariableLib's
-AuthVariableLibProcessVariable routes devdb to ProcessVariable, and AuthService.c's
-VerifyTimeBasedPayload checks it in its AuthVarTypePriv branch).
+`--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)). In User
+Mode, a KEK or PK signs db, dbx, dbt and dbr (§32.5.3), and only PK signs devdb (§32.6.2, §32.6.3).
+edk2-stable202608 departs from that for devdb: it verifies devdb as any other time-based
+authenticated variable, in Setup Mode too, and then takes updates only from its first signer
+(SecurityPkg AuthVariableLib's AuthVariableLibProcessVariable routes devdb to ProcessVariable, and
+AuthService.c's VerifyTimeBasedPayload checks it in its AuthVarTypePriv branch).
 It prints nothing when the firmware accepts the payload. On Linux it checks first, as `set`
 does, that the write cannot crash Linux, then writes the variable's efivar file;
 `uefisettings.efi` calls SetVariable() and names the status that it returns, such as
@@ -674,7 +677,9 @@ FS0:\> uefisettings.efi variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E6
 2048 to 4096 bits, signs the EFI_VARIABLE_AUTHENTICATION_2 of §8.2.6, a PKCS #7 SignedData without
 signed attributes over SHA-256 or the `--digest`, which carries CERTIFICATES, a PEM bundle of KEY's
 certificate and then any others, such as intermediate CAs, in the order of DER (X.690 §11.6).
-uefisettings writes it, then the data, as above, and refuses the same writes before it signs.
+uefisettings writes it, then the data, as above, and refuses the same writes: before it signs,
+all but a write while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1,
+which it refuses after.
 The TimeStamp is TIME, a GMT time such as 2026-11-07T00:00:00Z, or else the current second of the
 system clock; `uefisettings.efi` reads no clock, so it signs the all-zero TimeStamp of §8.2.6 for
 `--append`, and needs `--timestamp` without it. RSA signs blinded, over a random source seeded
@@ -684,16 +689,18 @@ hardening, and uefisettings runs as the advisory's workaround allows: local use 
 non-compromised computer. uefisettings reads KEY as a secret; KEY and CERTIFICATES hold at most
 64 KiB each.
 
-`--allow-setup-mode-write-without-signature-check` has either form write, while SetupMode is 1, a
+`--i-am-fine-to-brick-this-system` has either form write, while SetupMode is 1, cannot be read
+or holds other than a UINT8 of 0 or 1, a
 Secure Boot policy variable, which the firmware writes then without checking the signature (§3.3,
 §32.3), as to enroll KEK and then PK, or a device signature database, which the firmware may write
 then without checking the signature (§32.6.3). The payload of a Secure Boot policy variable is
 still an EFI_VARIABLE_AUTHENTICATION_2; that of a device signature database may be either
 descriptor: an EFI_VARIABLE_AUTHENTICATION_3 with `enhanced-authenticated-access`, as §32.6.3
 formats a Setup Mode write, or an EFI_VARIABLE_AUTHENTICATION_2, which edk2 takes. A write without
-data and without `--append` stays refused, as edk2 deletes the variable then. Writing PK moves
-Setup Mode to User Mode, and Audit Mode to Deployed Mode (§32.3.1, §32.3.4). PK may have to be
-signed with its own key (§32.3.1).
+data and without `--append` stays refused, as edk2 deletes the variable then. uefisettings still
+reads SetupMode then, refusing where it cannot, and warns of each such write on stderr. Writing PK
+moves Setup Mode to User Mode, and Audit Mode to Deployed Mode (§32.3.1, §32.3.4). PK may have to
+be signed with its own key (§32.3.1).
 
 ```sh
 uefisettings variable write-signed db D719B2CB-3D3A-4596-A3BC-DAD00E67656F --attributes non-volatile,bootservice-access,runtime-access --append --data-file db.esl --signing-key-file kek.key --signing-certificate-file kek.pem

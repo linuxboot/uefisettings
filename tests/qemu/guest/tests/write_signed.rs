@@ -27,8 +27,8 @@
 //! CA, which it refuses, then a write without EFI_VARIABLE_APPEND_WRITE at the system clock's
 //! second, after which the firmware refuses an earlier TimeStamp; `signing_in_setup` in
 //! sign-setup, whose variable store is a template copy, where uefisettings refuses KEK, signed
-//! with PK's key, before any write, writes it with
-//! --allow-setup-mode-write-without-signature-check, then PK, signed with its own key, after which
+//! with PK's key, before any write, writes it with --i-am-fine-to-brick-this-system, warning
+//! of the write, then PK, signed with its own key, after which
 //! the firmware is in User Mode and verifies KEK appends against PK, with the flag too;
 //! `devdb_appended_by_the_shell` in shell-devdb-setup, after its UEFI Shell boot appended to
 //! devdb, still in Setup Mode, where uefisettings refuses another append before any write. No
@@ -48,6 +48,7 @@ use uefisettings_qemu_guest::security_violation_errno;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::variable_bytes;
 use uefisettings_qemu_guest::variable_data;
+use uefisettings_qemu_guest::Output;
 use uefisettings_qemu_guest::DB_APPEND;
 use uefisettings_qemu_guest::DB_FOREIGN;
 use uefisettings_qemu_guest::DB_TAMPERED;
@@ -57,6 +58,7 @@ use uefisettings_qemu_guest::EFIVARS;
 use uefisettings_qemu_guest::EFI_GLOBAL_VARIABLE;
 use uefisettings_qemu_guest::EFI_IMAGE_SECURITY_DATABASE;
 use uefisettings_qemu_guest::EINVAL;
+use uefisettings_qemu_guest::UNSAFE_OPERATIONS;
 
 /// The attributes that the payloads were signed with, but EFI_VARIABLE_APPEND_WRITE and
 /// EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS: NV+BS+RT.
@@ -174,6 +176,16 @@ fn sign_args(
 }
 
 /// The `&str`s of `args`.
+/// The lines of `output`'s stderr that warn.
+fn warnings(output: &Output) -> Vec<String> {
+    output
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("warning: "))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn strs(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
@@ -325,7 +337,8 @@ fn setup_mode() {
         format!(
             "EFI variable db-{EFI_IMAGE_SECURITY_DATABASE} is a Secure Boot policy variable and \
              SetupMode is 1, so the firmware would write it without checking the payload's \
-             signature (UEFI 2.11 sections 3.3 and 8.2.6)"
+             signature (UEFI 2.11 sections 3.3 and 8.2.6); pass --i-am-fine-to-brick-this-system \
+             to write it unchecked"
         ),
         "the db append"
     );
@@ -557,7 +570,7 @@ fn signing_in_setup() {
     let kek = format!("{EFIVARS}/KEK-{EFI_GLOBAL_VARIABLE}");
     assert_absent(&kek);
     let pk = ["PK.key", "PK.crt"];
-    let flag = ["--allow-setup-mode-write-without-signature-check".to_owned()];
+    let flag = UNSAFE_OPERATIONS.map(str::to_owned);
     let kek_write = sign_args(
         "KEK",
         EFI_GLOBAL_VARIABLE,
@@ -567,14 +580,18 @@ fn signing_in_setup() {
         "sha256",
     );
 
+    let kek_write_unchecked = format!(
+        "EFI variable KEK-{EFI_GLOBAL_VARIABLE} is a Secure Boot policy variable and SetupMode is \
+         1, so the firmware would write it without checking the payload's signature (UEFI 2.11 \
+         sections 3.3 and 8.2.6)"
+    );
+
     let error = json_error(&strs(&kek_write));
 
     assert_eq!(
         error.error_message,
         format!(
-            "EFI variable KEK-{EFI_GLOBAL_VARIABLE} is a Secure Boot policy variable and SetupMode \
-             is 1, so the firmware would write it without checking the payload's signature (UEFI \
-             2.11 sections 3.3 and 8.2.6)"
+            "{kek_write_unchecked}; pass --i-am-fine-to-brick-this-system to write it unchecked"
         ),
         "KEK without the flag"
     );
@@ -583,8 +600,15 @@ fn signing_in_setup() {
     let output = uefisettings(&strs(&[&kek_write[..], &flag].concat()));
 
     assert_eq!(
-        (output.code, output.stdout.as_str()),
-        (Some(0), ""),
+        (output.code, output.stdout.as_str(), warnings(&output)),
+        (
+            Some(0),
+            "",
+            vec![format!(
+                "warning: {kek_write_unchecked}; --i-am-fine-to-brick-this-system lets \
+                 uefisettings write it unchecked"
+            )]
+        ),
         "KEK with the flag: {output:#?}"
     );
     let mut kek_lists = fs::read(format!("{SIGN}/KEK.esl")).expect("cannot read KEK.esl");
@@ -605,8 +629,17 @@ fn signing_in_setup() {
     let output = uefisettings(&strs(&[&pk_write[..], &flag].concat()));
 
     assert_eq!(
-        (output.code, output.stdout.as_str()),
-        (Some(0), ""),
+        (output.code, output.stdout.as_str(), warnings(&output)),
+        (
+            Some(0),
+            "",
+            vec![format!(
+                "warning: EFI variable PK-{EFI_GLOBAL_VARIABLE} is a Secure Boot policy \
+                 variable and SetupMode is 1, so the firmware would write it without checking the \
+                 payload's signature (UEFI 2.11 sections 3.3 and 8.2.6); \
+                 --i-am-fine-to-brick-this-system lets uefisettings write it unchecked"
+            )]
+        ),
         "PK, signed with its own key, with the flag: {output:#?}"
     );
     assert_eq!(
@@ -697,7 +730,8 @@ fn devdb_appended_by_the_shell() {
         format!(
             "EFI variable devdb-{EFI_DEVICE_SECURITY_DATABASE} is a device signature database and \
              SetupMode is 1, so the firmware may write it without checking the payload's \
-             signature (UEFI 2.11 section 32.6.3)"
+             signature (UEFI 2.11 section 32.6.3); pass --i-am-fine-to-brick-this-system to write \
+             it unchecked"
         ),
         "the devdb append without the flag"
     );

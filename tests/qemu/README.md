@@ -419,9 +419,9 @@ writes it again with that key and with db's. `shell-sign-no-rng`, without that d
 handles of EFI_RNG_PROTOCOL first, and expects the refusal to sign where `dh` lists none, as
 `check-shell-log.sh`'s `if-line` and `unless-line` checks tell. In `secboot-setup`'s Setup Mode,
 `sign-setup` and `shell-sign-setup` check that it refuses KEK, signed with PK's key, before any
-write, and writes it with `--allow-setup-mode-write-without-signature-check`, then PK, signed with
-its own key, after which the firmware is in User Mode; `sign-setup` then checks that it refuses a
-KEK append signed with a foreign key, with the flag too.
+write, and writes it with `--i-am-fine-to-brick-this-system`, which warns of the write, then PK,
+signed with its own key, after which the firmware is in User Mode; `sign-setup` then checks that it
+refuses a KEK append signed with a foreign key, with the flag too.
 `sign-user` and `shell-sign-user` also write `EnhancedProbe` with
 EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: the payload that `auth-payload.sh auth3` signs, and
 those that `variable write-signed` signs at a TimeStamp, with a nonce and with a NewCert. Linux
@@ -431,8 +431,8 @@ absent.
 
 `shell-devdb-setup` checks, in Setup Mode, that `uefisettings.efi` refuses an append to devdb, the
 device signature database of UEFI 2.11 §32.6.3, signed with PK's key, before any write, and
-appends with `--allow-setup-mode-write-without-signature-check`, which creates devdb; that the
-firmware then refuses an append signed with KEK's key, as edk2 takes devdb's updates only from the
+appends with `--i-am-fine-to-brick-this-system`, which creates devdb; that the firmware then refuses
+an append signed with KEK's key, as edk2 takes devdb's updates only from the
 signer that created it, and takes one signed with PK's; and, in its Linux boot, that `variable
 write-signed` refuses another append without the flag. `variable-get-devdb` and
 `shell-variable-get-devdb` read, on the default firmware, the devdb that

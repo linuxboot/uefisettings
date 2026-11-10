@@ -7,12 +7,13 @@ absent	json	. == {"variable": "devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad", "abs
 # uefisettings refuses the append before SetVariable(), which may write devdb unverified in Setup
 # Mode (UEFI 2.11 section 32.6.3), and devdb stays absent
 refused	status	aborted
-refused	json	. == {"error_message": "EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad is a device signature database and SetupMode is 1, so the firmware may write it without checking the payload's signature (UEFI 2.11 section 32.6.3)"}
+refused	json	. == {"error_message": "EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad is a device signature database and SetupMode is 1, so the firmware may write it without checking the payload's signature (UEFI 2.11 section 32.6.3); pass --i-am-fine-to-brick-this-system to write it unchecked"}
 still-absent	status	aborted
 still-absent	json	. == {"error_message": "no EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad"}
-# with the flag, the append creates devdb, which holds devdb.esl
+# with the flag, the append creates devdb, which holds devdb.esl, and warns of the write
 written	status	0x0
-written	none	.
+written	warnings	1
+written	line	^warning: EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad is a device signature database and SetupMode is 1, so the firmware may write it without checking the payload's signature \(UEFI 2\.11 section 32\.6\.3\); --i-am-fine-to-brick-this-system lets uefisettings write it unchecked$
 devdb	status	0x0
 devdb	json	.variable == "devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad" and .attributes == 39 and (.value | length) == 1 and .value[0].type == "A5C059A1-94E4-4AA7-87B5-AB155C2BF072" and (.value[0].signatures | length) == 1 and .value[0].signatures[0].owner == "8C78A505-BAA0-4C4A-869F-000000000400"
 # edk2 verifies devdb as a private authenticated variable, in Setup Mode too, and takes its
@@ -20,12 +21,15 @@ devdb	json	.variable == "devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad" and .attrib
 # secboot images build, and edk2-stable202608: AuthVariableLibProcessVariable routes devdb to
 # ProcessVariable, and VerifyTimeBasedPayload checks it in its AuthVarTypePriv branch); x86_64's
 # pinned image, ovmf 2024.02-2ubuntu0.10, has no source here, so this step alone shows it there.
-# A firmware that writes devdb unverified, as section 32.6.3 lets it, fails other-signer.
+# A firmware that writes devdb unverified, as section 32.6.3 lets it, fails other-signer. The
+# step warns of the write that the flag let through, and its error counts it.
 other-signer	status	aborted
-other-signer	json	. == {"error_message": "SetVariable() of EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad: SECURITY_VIOLATION"}
+other-signer	warned	. == {"error_message": "after 1 unsafe operation(s) that --i-am-fine-to-brick-this-system let through: SetVariable() of EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad: SECURITY_VIOLATION"}
+other-signer	line	^warning: EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad is a device signature database and SetupMode is 1, so the firmware may write it without checking the payload's signature \(UEFI 2\.11 section 32\.6\.3\); --i-am-fine-to-brick-this-system lets uefisettings write it unchecked$
 devdb-after-other-signer	status	0x0
 devdb-after-other-signer	same	devdb
 pk-append	status	0x0
-pk-append	none	.
+pk-append	warnings	1
+pk-append	line	^warning: EFI variable devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad is a device signature database and SetupMode is 1, so the firmware may write it without checking the payload's signature \(UEFI 2\.11 section 32\.6\.3\); --i-am-fine-to-brick-this-system lets uefisettings write it unchecked$
 devdb-after-pk-append	status	0x0
 devdb-after-pk-append	json	.variable == "devdb-b9c2b4f4-bf5f-462d-8adf-c5c70ac35dad" and .attributes == 39 and (.value | length) == 2 and all(.value[]; .type == "A5C059A1-94E4-4AA7-87B5-AB155C2BF072" and (.signatures | length) == 1 and .signatures[0].owner == "8C78A505-BAA0-4C4A-869F-000000000400") and .value[0].signatures[0].sha256 != .value[1].signatures[0].sha256

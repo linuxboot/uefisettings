@@ -36,7 +36,7 @@ use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IncludedStates;
 use uefisettings::exports::KeywordName;
 use uefisettings::exports::KeywordNamespace;
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 use uefisettings::exports::LiftedOperations;
 use uefisettings::exports::ListQuestionsOptions;
 use uefisettings::exports::QuestionAddress;
@@ -46,9 +46,9 @@ use uefisettings::exports::SetOptions;
 #[cfg(all(system_hiidb, system_variables))]
 use uefisettings::exports::SetValue;
 use uefisettings::exports::ShowIfrOptions;
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 use uefisettings::exports::UnsafeOperation;
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 use uefisettings::exports::UnsafeOperations;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
@@ -491,14 +491,15 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
 
 /// The id of --i-am-fine-to-brick-this-system, under which each command's long help lists its own
 /// unsafe operations.
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 const UNSAFE_ARG: &str = "i_am_fine_to_brick_this_system";
 
 /// The help of --i-am-fine-to-brick-this-system, in every command that takes it.
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 const UNSAFE_HELP: &str = "Do what this command otherwise refuses because it can bypass this \
-                           machine's setup password or write a value that its firmware declares \
-                           read-only; each refusal names what this flag does there";
+                           machine's setup password, write a value that its firmware declares \
+                           read-only or weaken Secure Boot; each refusal names what this flag \
+                           does there";
 
 /// What set refuses without --i-am-fine-to-brick-this-system on every build.
 #[cfg(all(system_hiidb, system_variables))]
@@ -509,7 +510,7 @@ const READ_ONLY_WRITE: &str = "a write of a question that EFI_IFR_FLAG_READ_ONLY
                                selected";
 
 /// --i-am-fine-to-brick-this-system, which only the commands that have an unsafe operation take.
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag
 #[group(skip)]
@@ -518,7 +519,7 @@ struct UnsafeArgs {
     i_am_fine_to_brick_this_system: bool,
 }
 
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 impl UnsafeArgs {
     fn operations(&self) -> UnsafeOperations {
         match self.i_am_fine_to_brick_this_system {
@@ -530,7 +531,7 @@ impl UnsafeArgs {
 
 /// `arg`, --i-am-fine-to-brick-this-system, with a long help that lists `operations`, the unsafe
 /// operations of its command.
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 fn unsafe_long_help(arg: clap::Arg, operations: &[&str]) -> clap::Arg {
     arg.long_help(format!(
         "{UNSAFE_HELP}. This command refuses without it: {}",
@@ -646,7 +647,7 @@ fn main() -> ExitCode {
     };
 
     if let Err(why) = handle_cmds(args) {
-        #[cfg(all(system_hiidb, system_variables))]
+        #[cfg(system_variables)]
         if let Err(print_error) = print_lifted_of(&why) {
             log::debug!("failed to print the warnings of the error: {print_error}");
         }
@@ -794,14 +795,14 @@ fn write_warning(output: &mut impl Write, arguments: std::fmt::Arguments<'_>) ->
 
 /// Prints a warning per unsafe operation in `lifted`, which --i-am-fine-to-brick-this-system let
 /// a command do.
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 fn print_lifted(lifted: &[UnsafeOperation]) -> io::Result<()> {
     let stderr = io::stderr();
     let mut output = stderr.lock();
     write_lifted(&mut output, lifted)
 }
 
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 fn write_lifted(output: &mut impl Write, lifted: &[UnsafeOperation]) -> io::Result<()> {
     lifted.iter().try_for_each(|operation| {
         write_warning(output, format_args!("{}", operation.lifted_warning()))
@@ -810,14 +811,14 @@ fn write_lifted(output: &mut impl Write, lifted: &[UnsafeOperation]) -> io::Resu
 
 /// Prints a warning per unsafe operation that `error`, a command's, carries as lifted before
 /// the command failed (LiftedOperations).
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 fn print_lifted_of(error: &anyhow::Error) -> io::Result<()> {
     let stderr = io::stderr();
     let mut output = stderr.lock();
     write_lifted_of(&mut output, error)
 }
 
-#[cfg(all(system_hiidb, system_variables))]
+#[cfg(system_variables)]
 fn write_lifted_of(output: &mut impl Write, error: &anyhow::Error) -> io::Result<()> {
     match error.downcast_ref::<LiftedOperations>() {
         Some(lifted) => write_lifted(output, &lifted.0),
@@ -884,6 +885,19 @@ mod tests {
     /// and macOS takes --no-efivars only with -f. Only the tests of the efivar flags themselves
     /// pass others, on the builds that take them.
     const OFFLINE_SOURCE: [&str; 3] = ["-f", "hiidb.bin", "--no-efivars"];
+
+    /// A variable write-signed that parses.
+    #[cfg(variable_data)]
+    const WRITE_SIGNED: [&str; 8] = [
+        "variable",
+        "write-signed",
+        "db",
+        "D719B2CB-3D3A-4596-A3BC-DAD00E67656F",
+        "--attributes",
+        "non-volatile",
+        "--payload-file",
+        "db.auth",
+    ];
 
     // clap_lex's is_number takes these for negative numbers, which allow_negative_numbers lets a
     // positional take; it refuses the others, which need "--" before them.
@@ -1289,7 +1303,7 @@ mod tests {
     }
 
     /// write_lifted writes a "warning:" line per lifted unsafe operation, and none for none.
-    #[cfg(all(system_hiidb, system_variables))]
+    #[cfg(system_variables)]
     #[test]
     fn write_lifted_warns_per_operation() {
         let mut none = Vec::new();
@@ -1311,7 +1325,7 @@ mod tests {
 
     /// The error path writes a "warning:" line per unsafe operation that the error carries as
     /// lifted, also under a later context, and none for an error without.
-    #[cfg(all(system_hiidb, system_variables))]
+    #[cfg(system_variables)]
     #[test]
     fn write_lifted_of_warns_of_the_operations_before_an_error() {
         let error = LiftedOperations::attach(
@@ -1549,6 +1563,12 @@ mod tests {
                 clap::error::ErrorKind::InvalidValue,
             ),
         ];
+        #[cfg(variable_data)]
+        let cases = cases.into_iter().chain([(
+            &WRITE_SIGNED[..],
+            &["--allow-setup-mode-write-without-signature-check"][..],
+            clap::error::ErrorKind::UnknownArgument,
+        )]);
         for (command, flag, kind) in cases {
             let argv = [&["uefisettings"][..], command, flag].concat();
             let error =
