@@ -22,10 +22,12 @@ use std::fs;
 
 use uefisettings_qemu_guest::acpi_table_path;
 use uefisettings_qemu_guest::driver_sample::NUMERIC;
+use uefisettings_qemu_guest::extract_db_matches;
 use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::published_crc32;
 use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::single_response;
+use uefisettings_qemu_guest::uefisettings_with_env;
 use uefisettings_qemu_guest::variable_data;
 use uefisettings_qemu_guest::MachineInfo;
 use uefisettings_qemu_guest::BACKEND_HII;
@@ -82,6 +84,17 @@ fn get_returns_the_default() {
     }
 }
 
+/// extract-db through the vendor ACPI table method writes exactly the database of the table of
+/// `signature`: its body, as long, with the published CRC-32.
+fn extract_db_writes_the_table_s_database(signature: &str) {
+    let body = table(signature).len() - ACPI_HEADER_SIZE;
+    extract_db_matches(
+        &["--hii-source", "acpi"],
+        &format!("/tmp/hiidb-{signature}.bin"),
+        Some(body),
+    );
+}
+
 /// The tests of the scenario that publishes the vendor ACPI table of each signature, in a
 /// module named after it.
 macro_rules! table_tests {
@@ -105,6 +118,11 @@ macro_rules! table_tests {
             #[test]
             fn get_returns_the_default() {
                 super::get_returns_the_default();
+            }
+
+            #[test]
+            fn extract_db_writes_the_table_s_database() {
+                super::extract_db_writes_the_table_s_database($signature);
             }
         }
     )*};
@@ -145,5 +163,28 @@ mod two_tables {
     #[test]
     fn get_returns_the_default() {
         super::get_returns_the_default();
+    }
+
+    /// The vendor ACPI table method moves past the invalid QHII and reads the database from
+    /// HIID, as its debug log says.
+    #[test]
+    fn acpi_method_reads_hiid_past_the_invalid_qhii() {
+        super::extract_db_writes_the_table_s_database("HIID");
+
+        let args = [
+            "--hii-source",
+            "acpi",
+            "hii",
+            "extract-db",
+            "/tmp/hiidb-two-tables-logged.bin",
+        ];
+        let output = uefisettings_with_env(&args, &[("RUST_LOG", "debug")]);
+        assert_eq!(output.code, Some(0), "{output:#?}");
+        for line in [
+            "ACPI table QHII unavailable: ",
+            "HII database ACPI table: /sys/firmware/acpi/tables/HIID",
+        ] {
+            assert!(output.stderr.contains(line), "{line:?}: {output:#?}");
+        }
     }
 }

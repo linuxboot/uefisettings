@@ -28,6 +28,11 @@ boot-smoke	-	-	boot_smoke	-
 hii	/DriverSample.efi;/publish-hiidb.efi rt-data	my-ifr-nv-data-runtime-my-efi-var.json	hii,hii_write,hii_persistence	-
 hii-devmem-guard	/publish-hiidb.efi loader-data	-	hii_devmem_guard	-
 hii-no-runtime-access	/DriverSample.efi;/publish-hiidb.efi rt-data	-	hii_no_runtime_access	-
+hii-none	-	-	hii_none	-
+hii-reserved	/DriverSample.efi;/publish-hiidb.efi reserved	my-ifr-nv-data.json	hii_reserved	-
+hii-acpi-nvs	/publish-hiidb.efi acpi-nvs	-	hii_strict_devmem	arch=x86_64,i686
+hii-lockdown-acpi	/publish-hiidb.efi acpi-table	-	hii_lockdown/acpi::	kernel=lockdown
+hii-lockdown-efivar	/publish-hiidb.efi rt-data	-	hii_lockdown/efivar::	kernel=lockdown
 hii-global-variables	/publish-hiidb.efi padded-strings;/publish-hiidb.efi rt-data-global-variable-forms	-	hii_global_variables	-
 hii-readwrite	/DriverSample.efi;/publish-hiidb.efi rt-data-readwrite-forms	my-ifr-nv-data.json	hii_readwrite	-
 hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi/qhii::	-
@@ -51,6 +56,8 @@ json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services
 json-config-data-mmio	/publish-hiidb.efi json-config-data-mmio	-	capsule_config_data/refuses_a_table_in_memory_mapped_io	-
 hii-systab	/DriverSample.efi;/publish-hiidb.efi install-config-tables	my-ifr-nv-data.json	hii_systab	-
 hii-systab-vamap	/DriverSample.efi;/publish-hiidb.efi install-config-tables	my-ifr-nv-data.json	hii_systab	kernel=vamap arch=aarch64
+hii-no-memory-map-efivar	/publish-hiidb.efi rt-data	-	hii_no_memory_map/efivar_refuses_without_the_fdt	arch=aarch64
+hii-no-memory-map-systab	/publish-hiidb.efi install-config-tables	-	hii_no_memory_map/systab_refuses_without_the_fdt	arch=aarch64
 shell-json-config-data	/publish-hiidb.efi json-config-data	-	shell:json-config-data	-
 shell-json-config-data-past-region	/publish-hiidb.efi json-config-data-past-region	-	shell:json-config-data-refused	-
 shell-json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services	-	shell:json-config-data-refused	-

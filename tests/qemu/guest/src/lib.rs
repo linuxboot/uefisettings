@@ -384,6 +384,9 @@ pub const DB_FOREIGN: &str = "/auth/db-foreign.auth";
 const EFI_TIME_SIZE: usize = 16;
 /// The release of the guest's kernel.
 const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+/// Linux's EPERM, with which `/dev/mem` refuses a range under `CONFIG_STRICT_DEVMEM` and an open
+/// under kernel lockdown.
+pub const EPERM: i32 = 1;
 /// Linux's EACCES.
 pub const EACCES: i32 = 13;
 /// Linux's EINVAL.
@@ -509,6 +512,22 @@ pub fn read_dev_mem_byte(address: u64) -> io::Result<u8> {
     Ok(byte)
 }
 
+/// Reads the byte at physical `address` through mmap() of `/dev/mem`, with busybox devmem, which
+/// `uefisettings` tries where read() fails; the error is busybox's standard error.
+#[track_caller]
+pub fn map_dev_mem_byte(address: u64) -> Result<String, String> {
+    require_test_vm();
+    let output = Command::new("/bin/busybox")
+        .args(["devmem", &format!("{address:#x}"), "8"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run busybox devmem {address:#x}: {error}"));
+    match output.status.success() {
+        true => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+        false => Err(String::from_utf8_lossy(&output.stderr).into_owned()),
+    }
+}
+
 /// Whether `address` is in a System RAM range of `/proc/iomem`, which `/dev/mem` refuses to
 /// read and map under `CONFIG_STRICT_DEVMEM` (`devmem_is_allowed()`), except in x86's first
 /// MiB.
@@ -545,4 +564,49 @@ pub fn changed_bytes(before: &[u8], after: &[u8]) -> Vec<(usize, u8)> {
         .filter(|(_, (old, new))| old != new)
         .map(|(offset, (_, &new))| (offset, new))
         .collect()
+}
+
+/// How an error of `--hii-source` names the vendor ACPI table method's absent source, up to the
+/// errors of its tables (`src/lib/hii/extract.rs` AcpiTablesInvalid).
+pub const ACPI_ABSENT: &str = "acpi: absent: no vendor ACPI table holds an HII database (";
+
+/// How an error of `--hii-source` names the `HiiDB` variable method's absent source
+/// (`src/lib/hii/extract.rs` HiiDbVariableAbsent).
+pub const EFIVAR_ABSENT: &str = "efivar: absent: the HiiDB variable \
+     /sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0 does not exist";
+
+/// How an error of `--hii-source` names the configuration-table method's absent source
+/// (`src/lib/hii/system_table/hii_export.rs` HiiExportError::NotListed).
+pub const SYSTAB_ABSENT: &str = "systab: absent: the EFI System Table lists no configuration \
+     table of EFI_HII_DATABASE_PROTOCOL_GUID EF9FC172-A1B2-4693-B327-6D32FC416042 (UEFI 2.11 \
+     section 33.2.11.1)";
+
+/// Runs `hii extract-db` into the new file `path` with `flags` before it; panics unless it fails
+/// and leaves no file there, and returns its error.
+#[track_caller]
+pub fn extract_db_error(flags: &[&str], path: &str) -> ErrorObject {
+    assert_absent(path);
+    let error = json_error(&[flags, &["hii", "extract-db", path]].concat());
+    assert_absent(path);
+    error
+}
+
+/// Runs `hii extract-db` into `path` with `flags` before it; panics unless it writes exactly the
+/// database that publish-hiidb published: as many bytes as the body of `published_length`, if
+/// given, with the CRC-32 of [`HIIDB_CRC32_VARIABLE`].
+#[track_caller]
+pub fn extract_db_matches(flags: &[&str], path: &str, published_length: Option<usize>) {
+    let args = [flags, &["hii", "extract-db", path]].concat();
+    let output = uefisettings(&args);
+    assert_eq!(output.code, Some(0), "{args:?}: {output:#?}");
+    let database = fs::read(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
+    if let Some(length) = published_length {
+        assert_eq!(database.len(), length, "{args:?}: length");
+    }
+    assert_eq!(
+        crc32fast::hash(&database),
+        published_crc32(),
+        "{args:?}: CRC-32 of {} bytes",
+        database.len()
+    );
 }

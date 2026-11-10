@@ -7,13 +7,14 @@ publish = false
 description = "Tests of uefisettings that run inside the QEMU test guests (tests/qemu/run.sh)"
 
 [dependencies]
+# The CRC-32 of an extracted HII database, for extract_db_matches.
+crc32fast = "1.4"
 # FS_IOC_GETFLAGS and FS_IOC_SETFLAGS without unsafe code, for clear_immutable.
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
-crc32fast = "1.4"
 sha2 = "0.10.9"
 
 # The tests run only in the QEMU test guests, so they build only with this feature, which
@@ -96,4 +97,24 @@ required-features = ["test-vm"]
 
 [[test]]
 name = "hii_systab"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_none"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_reserved"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_lockdown"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_strict_devmem"
+required-features = ["test-vm"]
+
+[[test]]
+name = "hii_no_memory_map"
 required-features = ["test-vm"]

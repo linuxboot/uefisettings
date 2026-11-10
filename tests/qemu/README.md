@@ -147,11 +147,31 @@ take that option. `publish-hiidb.efi acpi-table-hiid` installs an `HIID` table i
 other vendor ACPI table that `uefisettings` reads: the scenario `hii-acpi-hiid`.
 `publish-hiidb.efi acpi-table-junk-qhii` installs a `QHII` table whose body holds no HII
 package list: in the scenario `hii-acpi-two-tables`, `uefisettings` moves on past it to the
-`HIID` table.
+`HIID` table. In these scenarios, `--hii-source acpi hii extract-db` writes exactly the
+database of the table that it reads. Under `lockdown=integrity`, which refuses `/dev/mem`, the
+scenario `hii-lockdown-acpi` checks that the vendor ACPI table method still reads the database,
+and `hii-lockdown-efivar`, with `publish-hiidb.efi rt-data`, that the `HiiDB` variable method
+refuses before it opens `/dev/mem`, naming lockdown, and that the automatic order stops there.
 
 `publish-hiidb.efi reserved` and `publish-hiidb.efi acpi-nvs` put the copy in memory that the
-firmware reserves without the RUNTIME attribute, which `uefisettings` refuses, as it reads only
-EFI runtime regions. No scenario boots them.
+firmware reserves without the RUNTIME attribute, which `uefisettings` refuses by default, as it
+reads only EFI runtime regions. The scenario `hii-reserved` checks that refusal of extract-db
+and set, and that `--efivar-memory firmware-reserved` reads the copy. In the scenario
+`hii-acpi-nvs`, on x86_64 and i686, Linux marks the ACPI NVS copy busy, which `/dev/mem`
+refuses to map under `CONFIG_IO_STRICT_DEVMEM`, and on x86_64 to read (i686's Linux fails read()
+of it with EFAULT, past its low memory): with `--efivar-memory firmware-reserved`, the `HiiDB`
+variable method reports the kernel's refusal. The scenario skips aarch64 because arm64 Linux
+v6.11 registers nomap memory as a non-busy reserved resource, which devmem_is_allowed() admits
+(lib/devmem_is_allowed.c:21-28; arch/arm64/kernel/setup.c:227-229).
+The scenario `hii-devmem-guard` checks that the `HiiDB` variable method refuses a copy in loader
+data, which Linux makes System RAM, by its range check before any read.
+
+The scenario `hii-none` publishes the database in no way: every hii command that reads it
+fails, and names the absent source of each method of `--hii-source auto`. On aarch64, the
+scenarios `hii-no-memory-map-efivar`, with `publish-hiidb.efi rt-data`, and
+`hii-no-memory-map-systab`, with `publish-hiidb.efi install-config-tables`, run `uefisettings`
+in a mount namespace without `/sys/firmware/fdt` and `/proc/kcore`, where no EFI memory map
+bounds the reads of firmware memory: both methods refuse, naming the missing FDT.
 
 `publish-hiidb.efi password-forms` publishes nothing: it registers the forms of
 [`publish-hiidb/src/password_forms.rs`](publish-hiidb/src/password_forms.rs) in the HII
