@@ -156,9 +156,9 @@ fn run(args: &[&str], hiidb: &[u8]) -> (String, String) {
 fn record(offset: usize) -> String {
     format!(
         "the IFR that uefisettings ignores at offset {offset} of a form package of package list \
-         {LIST_TEXT}: the FormSet {IGNORED_TEXT}, which does not parse; uefisettings ignores it, \
-         where UEFI 2.11 §33.2.5.10.1 disables only the form of a malformed op and ignores only a \
-         malformed forms set: "
+         {LIST_TEXT}: the FormSet {IGNORED_TEXT}, which holds, outside its forms, an op shorter \
+         than its minimum, which UEFI 2.11 §33.2.5.10.1 calls malformed, in no form for that \
+         section to disable: "
     )
 }
 
@@ -199,8 +199,8 @@ fn get_lists_the_ignored_ifr_in_its_answer() {
     );
     let records = answer["ignored_ifr"].as_array();
     let reason = format!(
-        "the FormSet {IGNORED_TEXT}, which does not parse; uefisettings ignores it, where UEFI \
-         2.11 §33.2.5.10.1"
+        "the FormSet {IGNORED_TEXT}, which holds, outside its forms, an op shorter than its \
+         minimum, which UEFI 2.11 §33.2.5.10.1"
     );
     // each record's package list, offset and whether its reason is that of the FormSet
     type Record<'a> = (Option<&'a str>, Option<u64>, bool);

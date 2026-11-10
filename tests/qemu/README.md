@@ -217,13 +217,21 @@ creates, the second with a PASSWORD and an op shorter than its minimum, which UE
 
 `publish-hiidb.efi formset-skip-forms` registers those of
 [`publish-hiidb/src/formset_skip_forms.rs`](publish-hiidb/src/formset_skip_forms.rs): two package
-lists on the variables that [`vars/formset-skip.json`](vars/formset-skip.json) creates, one of
-three form sets, the second with a PASSWORD and an op shorter than its minimum, and one of two
-form sets, the first such a form set. `uefisettings` ignores those form sets and reads the others,
-which edk2's walk for form sets finds after them: in the scenario `hii-formset-skip`, whose later
-`publish-hiidb.efi rt-data` exports the database, `uefisettings` reads and writes the questions of
-the form sets that it reads and names those that it ignores, while in `shell-formset-skip`
-`uefisettings.efi` reads and writes no variable.
+lists on the variables that [`vars/formset-skip.json`](vars/formset-skip.json) creates, one of four
+form sets, the second with a PASSWORD on a variable of its own and an op shorter than its minimum,
+and one of two form sets on one variable, the first such a form set. `uefisettings` ignores those
+form sets and reads the others, which edk2's walk for form sets finds after them: in the scenario
+`hii-formset-skip`, whose later `publish-hiidb.efi rt-data` exports the database, `uefisettings`
+reads and writes the questions of the form sets that it reads, but withholds every byte of each
+variable that a form set that it ignores declares, that of the second list too, and names those
+that it ignores, while in `shell-formset-skip` `uefisettings.efi` reads and writes no variable. The
+third form set of the first list has a second form with a PASSWORD and a CHECKBOX op shorter than
+its minimum: `uefisettings` disables that form alone, names it with the IFR that it ignores, and
+withholds the bytes of its PASSWORD, which a question of a fourth form set overlaps.
+`publish-hiidb.efi disabled-form-forms` registers a package list of such a form set alone, on the
+variable that [`vars/disabled-form.json`](vars/disabled-form.json) creates: in the scenario
+`shell-disabled-form`, `uefisettings.efi` reads and writes the questions of its other form, and
+no byte of that PASSWORD.
 
 `publish-hiidb.efi short-var-store-forms` registers those of
 [`publish-hiidb/src/short_var_store_forms.rs`](publish-hiidb/src/short_var_store_forms.rs):

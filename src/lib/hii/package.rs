@@ -396,6 +396,9 @@ pub struct ParsedPackageList {
     /// The VarStores of its form packages outside the FormSets that read_db parses that do not
     /// parse, whose VarStoreIds are unknown
     pub malformed_outside_stores: Vec<forms::IgnoredIfr>,
+    /// The forms that read_db drops from `forms`, whose PASSWORD ops are kept and resolved where
+    /// they parse
+    pub disabled_forms: Vec<forms::DisabledForm>,
 }
 
 impl ParsedPackageList {
@@ -404,6 +407,17 @@ impl ParsedPackageList {
     /// stated language and PlatformLang, in that order, those that are given.
     pub(crate) fn texts(&self, requested: &[&str]) -> ListTexts<'_> {
         ListTexts::new(&self.strings, requested)
+    }
+
+    /// The records of the IFR of its form packages that read_db leaves out of `forms`, which may
+    /// hold questions that no command reaches: that of `ignored_ifr`, then that of each of
+    /// `disabled_forms`.
+    pub fn ignored_records(&self) -> impl Iterator<Item = forms::IgnoredIfr> + '_ {
+        self.ignored_ifr.iter().cloned().chain(
+            self.disabled_forms
+                .iter()
+                .map(|disabled| disabled.record(self.guid)),
+        )
     }
 
     /// Fails if the list has forms but no strings packages.
@@ -445,6 +459,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     let mut ignored_ifr = Vec::new();
     let mut outside_ifr = Vec::new();
     let mut malformed_outside_stores = Vec::new();
+    let mut disabled_forms = Vec::new();
     let mut device_path = None;
 
     for package in get_packages(package_list)? {
@@ -466,6 +481,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                 ignored_ifr.extend(form_sets.ignored);
                 outside_ifr.extend(form_sets.outside);
                 malformed_outside_stores.extend(form_sets.malformed_stores);
+                disabled_forms.extend(form_sets.disabled_forms);
             }
             // NewPackageList creates the one device path package of a list (UEFI 2.10 §33.3.4)
             PackageType::DevicePath => {
@@ -482,7 +498,13 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         }
     }
 
-    forms::resolve_short_var_names(&roots, &string_packages);
+    // the PASSWORD ops of disabled forms keep their passwords in the variables of their VarNames
+    let named: Vec<IFRNodeLink> = roots
+        .iter()
+        .chain(disabled_forms.iter().map(|disabled| &disabled.form))
+        .cloned()
+        .collect();
+    forms::resolve_short_var_names(&named, &string_packages);
     Ok(ParsedPackageList {
         guid: package_list.guid,
         device_path,
@@ -491,6 +513,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         ignored_ifr,
         outside_ifr,
         malformed_outside_stores,
+        disabled_forms,
     })
 }
 
@@ -518,6 +541,7 @@ mod tests {
     use super::hiidb_fixtures::*;
     use super::*;
     use crate::hii::forms::ifr_fixtures::form;
+    use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::nested;
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::scopeless_form_set;
@@ -650,12 +674,11 @@ mod tests {
         // the FormSet's own scope and these
         let too_deep = nested(&subtitle_scope(5), MAX_SCOPE_NESTING, &[]);
         let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
-        let malformed = |form_set, op| {
+        let short = |form_set, op| {
             format!(
-                "{form_set}, which does not parse; uefisettings ignores it, where UEFI 2.11 \
-                 §33.2.5.10.1 disables only the form of a malformed op and ignores only a \
-                 malformed forms set: failed to parse op_code {op} properly: failed to parse \
-                 {op}'s data: "
+                "{form_set}, which holds, outside its forms, an op shorter than its minimum, which \
+                 UEFI 2.11 §33.2.5.10.1 calls malformed, in no form for that section to disable: \
+                 the {op} op at offset "
             )
         };
         let b0 = format!("the FormSet {}", Guid::from([0xB0; 16]));
@@ -700,12 +723,12 @@ mod tests {
                     form_set_of_guid(0xC0, &[]),
                 ]
                 .concat(),
-                Some(malformed(b0.as_str(), "CheckBox")),
+                Some(short(b0.as_str(), "EFI_IFR_CHECKBOX")),
             ),
             (
                 "a FormSet too short for its GUID, then a FormSet",
                 [&[0x0E, 0x84, 0xB0, 0xB0][..], &form_set_of_guid(0xC0, &[])].concat(),
-                Some(malformed("a FormSet", "FormSet")),
+                Some(short("a FormSet", "EFI_IFR_FORM_SET")),
             ),
             (
                 "a FormSet nested too deep, then a FormSet",
@@ -738,7 +761,7 @@ mod tests {
             (
                 "a FormSet without its Scope bit holding a malformed CheckBox",
                 scopeless_form_set(&[short_checkbox.to_vec()]),
-                Some(malformed(eleven, "CheckBox")),
+                Some(short(eleven, "EFI_IFR_CHECKBOX")),
             ),
         ];
         let after_first = u64::try_from(first.len()).expect("offset");
@@ -771,6 +794,350 @@ mod tests {
             ignored,
             [(0, opens_no_scope(eleven).as_str())],
             "IFR ignored with a first FormSet without its Scope bit"
+        );
+    }
+
+    /// The FormIds of the FORM and FORM_MAP ops of the first FormSet of the first root of `list`.
+    fn form_ids(list: &ParsedPackageList) -> Vec<u16> {
+        let Some(root) = list.forms.first() else {
+            return Vec::new();
+        };
+        let root = root.borrow();
+        let Some(form_set) = root.children.first() else {
+            return Vec::new();
+        };
+        let form_set = form_set.borrow();
+        form_set
+            .children
+            .iter()
+            .filter_map(|op| op.borrow().form_id())
+            .collect()
+    }
+
+    /// read_db disables the form of an op shorter than the minimum of its opcode or than its
+    /// fields require (UEFI 2.11 §33.2.5.10.1 "the entire form is disabled"), or that
+    /// uefisettings does not decode: it drops the form, a FORM_MAP's too, its ops and scopes up to
+    /// its End, keeps the other forms of its FormSet, and lists the form at the offset of its FORM
+    /// or FORM_MAP op, that op's own form if it fails, named by the FormId that it carries; in a
+    /// FormSet that it ignores, only that FormSet is listed.
+    #[test]
+    fn test_read_db_disables_the_form_of_a_malformed_op() {
+        // a Subtitle of prompt `id`
+        let subtitle = |id: u8| [0x02, 0x07, id, 0x00, 0x00, 0x00, 0x00];
+        let form = |id: u8, body: &[u8]| {
+            [
+                &[0x01, 0x86, id, 0x00, 0x01, 0x00][..],
+                &subtitle(id),
+                body,
+                &END,
+            ]
+            .concat()
+        };
+        let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
+        let suppress_if = |body: &[u8]| [&[0x0A, 0x82][..], body, &END].concat();
+        // a Subtitle that opens a scope, with 1 of its data bytes
+        let short_subtitle = |body: &[u8]| [&[0x02, 0x83, 0x00][..], body, &END].concat();
+        // a Form op with 1 of its data bytes
+        let short_form = |body: &[u8]| [&[0x01, 0x83, 0x02][..], &subtitle(2), body, &END].concat();
+        // a Form op of FormId 2 without its FormTitle
+        let titleless_form =
+            |body: &[u8]| [&[0x01, 0x84, 0x02, 0x00][..], &subtitle(2), body, &END].concat();
+        // a FORM_MAP of FormId 2 with one Method, of MethodTitle 0 and a nil MethodIdentifier
+        let form_map = |body: &[u8]| {
+            [
+                &[0x5D, 0x96, 0x02, 0x00, 0x00, 0x00][..],
+                &[0x00; 16],
+                &subtitle(2),
+                body,
+                &END,
+            ]
+            .concat()
+        };
+        // a ONE_OF_OPTION of Type EFI_IFR_TYPE_BUFFER with no byte of its buffer, which
+        // uefisettings reads one byte of
+        let buffer_option = [0x09, 0x06, 0x00, 0x00, 0x00, 0x0B];
+        // a UINT64 NUMERIC of the Length of a UINT8 one
+        let numeric = [
+            &[0x07, 0x11][..],
+            &[
+                0x02, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ], // header
+            &[0x03, 0x00, 0xFF, 0x01], // Flags EFI_IFR_NUMERIC_SIZE_8, then 3 bytes
+        ]
+        .concat();
+        let at = |parts: &[&[u8]]| {
+            u64::try_from(parts.iter().map(|part| part.len()).sum::<usize>()).expect("offset")
+        };
+        let form_set_op = &form_set_of_guid(0xA0, &[])[..39];
+        let first = form(1, &[]);
+        let a0 = Guid::from([0xA0; 16]);
+        let disabled = format!("the form 2 of the FormSet {a0}, whose");
+        let checkbox_disabled = format!("{disabled} EFI_IFR_CHECKBOX op is malformed");
+        let form_op = format!("a form of the FormSet {a0}, whose EFI_IFR_FORM op");
+        let third = format!("the form 3 of the FormSet {a0}, whose");
+        let b0 = format!(
+            "the FormSet {}, which holds, outside its forms, an op shorter than its minimum",
+            Guid::from([0xB0; 16])
+        );
+        let malformed =
+            "op is malformed; UEFI 2.11 §33.2.5.10.1 disables the form of a malformed op: ";
+        let short_of_its_flags = "whose EFI_IFR_NUMERIC op is malformed; UEFI 2.11 §33.2.5.10.1 \
+            disables the form of a malformed op: the EFI_IFR_NUMERIC op at offset 67 of a form \
+            package is 17 bytes long, shorter than the 38 bytes required by its Flags (UEFI 2.11 \
+            §33.3.8.3)";
+        // a name, a form package, its FormSets by the last byte of their GUID, the forms of the
+        // first by FormId, and its records by offset, the start of their reason, and what they
+        // hold
+        type Case<'a> = (
+            &'a str,
+            Vec<u8>,
+            &'a [u8],
+            &'a [u16],
+            Vec<(u64, &'a str, &'a str)>,
+        );
+        let cases: [Case<'_>; 12] = [
+            (
+                "a malformed op in a form",
+                form_set_of_guid(
+                    0xA0,
+                    &[first.clone(), form(2, &short_checkbox), form(3, &[])].concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &disabled, malformed)],
+            ),
+            (
+                "a malformed op in a scope of a form",
+                form_set_of_guid(
+                    0xA0,
+                    &[
+                        first.clone(),
+                        form(2, &suppress_if(&short_checkbox)),
+                        form(3, &[]),
+                    ]
+                    .concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &disabled, malformed)],
+            ),
+            (
+                "a malformed op after a nested scope of its form",
+                form_set_of_guid(
+                    0xA0,
+                    &[
+                        first.clone(),
+                        form(
+                            2,
+                            &[&suppress_if(&subtitle(9))[..], &short_checkbox].concat(),
+                        ),
+                        form(3, &[]),
+                    ]
+                    .concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &checkbox_disabled, malformed)],
+            ),
+            (
+                "a malformed op in a FORM_MAP",
+                form_set_of_guid(
+                    0xA0,
+                    &[first.clone(), form_map(&short_checkbox), form(3, &[])].concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &checkbox_disabled, malformed)],
+            ),
+            (
+                "a malformed op that opens a scope",
+                form_set_of_guid(
+                    0xA0,
+                    &[
+                        first.clone(),
+                        form(2, &short_subtitle(&[0x0A, 0x82, 0x29, 0x02])),
+                        form(3, &[]),
+                    ]
+                    .concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &disabled, malformed)],
+            ),
+            (
+                "a malformed Form op",
+                form_set_of_guid(
+                    0xA0,
+                    &[first.clone(), short_form(&[]), form(3, &[])].concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &form_op, malformed)],
+            ),
+            (
+                "a malformed Form op that carries its FormId",
+                form_set_of_guid(
+                    0xA0,
+                    &[first.clone(), titleless_form(&[]), form(3, &[])].concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &disabled, malformed)],
+            ),
+            (
+                "a malformed Form op without Scope",
+                form_set_of_guid(
+                    0xA0,
+                    &[first.clone(), vec![0x01, 0x03, 0x02], form(3, &[])].concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &form_op, malformed)],
+            ),
+            (
+                "an op shorter than its Flags require",
+                form_set_of_guid(
+                    0xA0,
+                    &[first.clone(), form(2, &numeric), form(3, &[])].concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(at(&[form_set_op, &first]), &disabled, short_of_its_flags)],
+            ),
+            (
+                "an op that uefisettings does not decode",
+                form_set_of_guid(
+                    0xA0,
+                    &[first.clone(), form(2, &buffer_option), form(3, &[])].concat(),
+                ),
+                &[0xA0],
+                &[1, 3],
+                vec![(
+                    at(&[form_set_op, &first]),
+                    &disabled,
+                    "EFI_IFR_ONE_OF_OPTION op uefisettings does not decode: the \
+                     EFI_IFR_ONE_OF_OPTION op at offset ",
+                )],
+            ),
+            (
+                "malformed ops in 2 forms",
+                form_set_of_guid(
+                    0xA0,
+                    &[
+                        first.clone(),
+                        form(2, &short_checkbox),
+                        form(3, &short_checkbox),
+                    ]
+                    .concat(),
+                ),
+                &[0xA0],
+                &[1],
+                vec![
+                    (at(&[form_set_op, &first]), &disabled, malformed),
+                    (
+                        at(&[form_set_op, &first, &form(2, &short_checkbox)]),
+                        &third,
+                        malformed,
+                    ),
+                ],
+            ),
+            (
+                "a disabled form in a FormSet that read_db ignores",
+                [
+                    form_set_of_guid(0xA0, &[]),
+                    form_set_of_guid(
+                        0xB0,
+                        &[form(2, &short_checkbox), short_checkbox.to_vec()].concat(),
+                    ),
+                    form_set_of_guid(0xC0, &[]),
+                ]
+                .concat(),
+                &[0xA0, 0xC0],
+                &[],
+                vec![(
+                    at(&[&form_set_of_guid(0xA0, &[])]),
+                    &b0,
+                    "the EFI_IFR_CHECKBOX op at offset ",
+                )],
+            ),
+        ];
+        for (name, ifr, want_roots, want_forms, want_records) in cases {
+            let list =
+                read_form_package(&ifr).unwrap_or_else(|error| panic!("read_db {name}: {error:#}"));
+            assert_eq!(
+                form_ids(&list),
+                want_forms,
+                "forms of the first FormSet of {name}"
+            );
+            let roots: Vec<u8> = form_set_guids(ifr)
+                .unwrap_or_else(|error| panic!("roots of {name}: {error:#}"))
+                .into_iter()
+                .map(|guid| guid.expect("a root holding a FormSet"))
+                .collect();
+            assert_eq!(
+                roots, want_roots,
+                "FormSets, by the last byte of their GUID, of {name}"
+            );
+            let records: Vec<forms::IgnoredIfr> = list.ignored_records().collect();
+            let got: Vec<(u64, bool)> = records
+                .iter()
+                .zip(&want_records)
+                .map(|(got, (_, start, holds))| {
+                    let reason = &got.reason;
+                    (
+                        got.offset,
+                        reason.starts_with(start)
+                            && reason.contains(holds)
+                            && !(holds.contains("does not decode") && reason.contains('§')),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                (records.len(), got),
+                (
+                    want_records.len(),
+                    want_records
+                        .iter()
+                        .map(|(offset, _, _)| (*offset, true))
+                        .collect::<Vec<_>>()
+                ),
+                "records of {name} (offset, reason as expected): {records:?}"
+            );
+        }
+    }
+
+    /// The scopes read up to the End of a disabled form close, so more than MAX_SCOPE_NESTING
+    /// disabled forms leave their FormSet a root and its next form parsed.
+    #[test]
+    fn test_read_db_closes_the_scopes_of_disabled_forms() {
+        let form = |id: u8, body: &[u8]| {
+            [
+                &[0x01, 0x86, id, 0x00, 0x01, 0x00][..],
+                &[0x02, 0x07, id, 0x00, 0x00, 0x00, 0x00], // Subtitle
+                body,
+                &END,
+            ]
+            .concat()
+        };
+        let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
+        let disabled = MAX_SCOPE_NESTING + 1;
+        let ifr = form_set_of_guid(
+            0xA0,
+            &[form(2, &short_checkbox).repeat(disabled), form(3, &[])].concat(),
+        );
+
+        let list = read_form_package(&ifr).unwrap_or_else(|error| panic!("read_db: {error:#}"));
+
+        assert_eq!(
+            form_ids(&list),
+            [3],
+            "forms parsed after {disabled} disabled forms"
+        );
+        assert_eq!(
+            list.ignored_records().count(),
+            disabled,
+            "records after {disabled} disabled forms: {:?}",
+            list.ignored_records().last()
         );
     }
 
@@ -851,10 +1218,10 @@ mod tests {
                 "a malformed first FormSet",
                 form_set_of_guid(0xA0, &short_checkbox),
                 format!(
-                    "{a0}, which does not parse; uefisettings ignores it, where UEFI 2.11 \
-                     §33.2.5.10.1 disables only the form of a malformed op and ignores only a \
-                     malformed forms set: failed to parse op_code CheckBox properly: failed to \
-                     parse CheckBox's data: "
+                    "{a0}, which holds, outside its forms, an op shorter than its minimum, which \
+                     UEFI 2.11 §33.2.5.10.1 calls malformed, in no form for that section to \
+                     disable: the EFI_IFR_CHECKBOX op at offset 39 of a form package is 3 bytes \
+                     long, shorter than its minimum of 14 (UEFI 2.11 §33.3.8.3)"
                 ),
             ),
             (
@@ -917,6 +1284,14 @@ mod tests {
                 Guid::from([guid; 16])
             )
         };
+        let short_op = |guid: u8| {
+            format!(
+                "the FormSet {}, which holds, outside its forms, an op shorter than its minimum, \
+                 which UEFI 2.11 §33.2.5.10.1 calls malformed, in no form for that section to \
+                 disable: ",
+                Guid::from([guid; 16])
+            )
+        };
         let nests_too_deep = format!(
             "the FormSet {}, which nests too deep: IFR scopes nest deeper than {MAX_SCOPE_NESTING} \
              at offset ",
@@ -938,7 +1313,7 @@ mod tests {
                 "a malformed FormSet, then a FormSet",
                 [&first[..], &malformed(0xB0), &form_set_of_guid(0xC0, &[])].concat(),
                 &[0xA0, 0xC0],
-                vec![(at(&[&first]), does_not_parse(0xB0))],
+                vec![(at(&[&first]), short_op(0xB0))],
             ),
             (
                 "a FormSet without its End, then a FormSet",
@@ -957,7 +1332,7 @@ mod tests {
                 ]
                 .concat(),
                 &[0xA0, 0xC0],
-                vec![(at(&[&first]), does_not_parse(0xB0))],
+                vec![(at(&[&first]), short_op(0xB0))],
             ),
             (
                 "a malformed FormSet holding, in a scope, a FormSet without its Scope bit that \
@@ -976,7 +1351,7 @@ mod tests {
                 .concat(),
                 &[0xA0, 0x11],
                 vec![
-                    (at(&[&first]), does_not_parse(0xB0)),
+                    (at(&[&first]), short_op(0xB0)),
                     (
                         at(&[&first, form_set_op]),
                         format!("the FormSet {} opens no scope", Guid::from([0x11; 16])),
@@ -1005,8 +1380,8 @@ mod tests {
                 .concat(),
                 &[0xA0, 0xD0],
                 vec![
-                    (at(&[&first]), does_not_parse(0xB0)),
-                    (at(&[&first, &malformed(0xB0)]), does_not_parse(0xC0)),
+                    (at(&[&first]), short_op(0xB0)),
+                    (at(&[&first, &malformed(0xB0)]), short_op(0xC0)),
                 ],
             ),
             (
@@ -1171,14 +1546,15 @@ mod tests {
         }
     }
 
-    /// read_db fails at an op that does not fit the walk for FormSets before the walk reads a
-    /// FORM_SET op.
+    /// read_db ends the walk for FormSets at an op that does not fit it before the walk reads a
+    /// FORM_SET op too, and lists the IFR from that op, without failing the package.
     #[test]
-    fn test_read_db_fails_at_an_op_that_does_not_fit_before_the_first_form_set() {
-        let cases: [(&str, Vec<u8>, &str); 4] = [
+    fn test_read_db_ignores_an_op_that_does_not_fit_before_the_first_form_set() {
+        let cases: [(&str, Vec<u8>, u64, &str); 5] = [
             (
                 "Length 1, then a FormSet",
                 [&[0x02, 0x01][..], &form_set_of_guid(0xB0, &[])].concat(),
+                0,
                 "invalid IFR operation length 1",
             ),
             (
@@ -1189,28 +1565,43 @@ mod tests {
                     &form_set_of_guid(0xB0, &[]),
                 ]
                 .concat(),
+                7,
                 "invalid IFR operation length 1",
             ),
             (
                 "zero bytes, then a FormSet",
                 [&[0x00, 0x00][..], &form_set_of_guid(0xB0, &[])].concat(),
+                0,
                 "invalid IFR operation length 0",
             ),
             (
                 "a Subtitle without its last data byte",
                 vec![0x02, 0x07, 0x05, 0x00, 0x06, 0x00],
+                0,
                 "not enough bytes in reader",
             ),
+            ("an End op without its Length", vec![0x29], 0, ""),
         ];
-        for (name, ifr, cause) in cases {
-            let error = form_set_guids(ifr).expect_err(name);
-            let msg = format!("{error:#}");
-            assert!(
-                msg.starts_with(
-                    "failed to parse package list 22222222-2222-2222-2222-222222222222: \
-                     failed to parse a form package: failed to parse IFR operation: "
-                ) && msg.contains(cause),
-                "{name}: {msg}"
+        for (name, ifr, offset, cause) in cases {
+            let list = read_form_package(&ifr)
+                .unwrap_or_else(|error| panic!("read_db of {name}: {error:#}"));
+            let ignored: Vec<(u64, bool)> = list
+                .ignored_ifr
+                .iter()
+                .map(|ignored| {
+                    let reason = &ignored.reason;
+                    let want = "an op that does not fit the form package, and the bytes after it: ";
+                    (
+                        ignored.offset,
+                        reason.starts_with(want) && reason.contains(cause),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                (list.forms.len(), ignored),
+                (0, vec![(offset, true)]),
+                "roots and IFR ignored (offset, reason as expected) of {name}: {:?}",
+                list.ignored_ifr
             );
         }
     }
@@ -2252,30 +2643,33 @@ mod tests {
         }
     }
 
-    /// The contexts that read_db gives the IFR that it ignores in a form package, a FormSet that
-    /// does not parse, are lowercase, for each op that handle_opcode parses.
+    /// The record of an op without data bytes, of each opcode that handle_opcode decodes, names
+    /// the op, its Length and its minimum (UEFI 2.11 §33.2.5.10.1): that of its FormSet, or of its
+    /// form for a FORM op.
     #[test]
-    fn test_read_db_form_error_contexts_are_lowercase() {
+    fn test_read_db_names_an_op_without_data_and_its_minimum() {
         let ops = [
-            (0x01, "Form"),
-            (0x02, "Subtitle"),
-            (0x03, "Text"),
-            (0x05, "OneOf"),
-            (0x06, "CheckBox"),
-            (0x07, "Numeric"),
-            (0x09, "OneOfOption"),
-            (0x0E, "FormSet"),
-            (0x12, "EqIdVal"),
-            (0x13, "EqIdId"),
-            (0x14, "EqIdValList"),
-            (0x24, "VarStore"),
-            (0x25, "VarStoreNameValue"),
-            (0x26, "VarStoreEfi"),
-            (0x40, "QuestionRef1"),
-            (0x5B, "Default"),
-            (0x5C, "DefaultStore"),
+            (0x01, "EFI_IFR_FORM", 6),
+            (0x02, "EFI_IFR_SUBTITLE", 7),
+            (0x03, "EFI_IFR_TEXT", 8),
+            (0x05, "EFI_IFR_ONE_OF", 17),
+            (0x06, "EFI_IFR_CHECKBOX", 14),
+            (0x07, "EFI_IFR_NUMERIC", 17),
+            (0x09, "EFI_IFR_ONE_OF_OPTION", 6),
+            (0x0E, "EFI_IFR_FORM_SET", 23),
+            (0x12, "EFI_IFR_EQ_ID_VAL", 6),
+            (0x13, "EFI_IFR_EQ_ID_ID", 6),
+            (0x14, "EFI_IFR_EQ_ID_VAL_LIST", 6),
+            (0x24, "EFI_IFR_VARSTORE", 23),
+            (0x25, "EFI_IFR_VARSTORE_NAME_VALUE", 20),
+            (0x26, "EFI_IFR_VARSTORE_EFI", 24),
+            (0x40, "EFI_IFR_QUESTION_REF1", 4),
+            (0x5B, "EFI_IFR_DEFAULT", 5),
+            (0x5C, "EFI_IFR_DEFAULTSTORE", 6),
         ];
-        for (op_code, name) in ops {
+        // after the FORM_SET op
+        let at = form_set(&[]).len() - END.len();
+        for (op_code, name, minimum) in ops {
             // in a FormSet, an op of Length 2: none of its data bytes
             let form_package = form_package(&[vec![op_code, 0x02]]);
             let hiidb = package_list_with_guid([0x22; 16], &form_package);
@@ -2283,44 +2677,26 @@ mod tests {
             let lists = read_db(&hiidb)
                 .unwrap_or_else(|error| panic!("read_db of a {name} op without data: {error:#}"));
 
-            // the record of the FormSet, at offset 0, that the op makes fail
-            let want =
-                format!("failed to parse op_code {name} properly: failed to parse {name}'s data: ");
-            let first = lists
-                .iter()
-                .flat_map(|list| &list.ignored_ifr)
-                .next()
-                .map(|ignored| (ignored.offset, ignored.reason.as_str()));
-            assert!(
-                first.is_some_and(|(offset, reason)| offset == 0 && reason.contains(&want)),
-                "{name}: lowercase contexts up to {name}'s data: {first:?}"
+            let at_op = u64::try_from(at).expect("offset");
+            let want_offsets: &[u64] = match op_code {
+                0x01 => &[at_op],
+                // the walk goes on from the op after the ignored FormSet's FORM_SET op
+                0x0E => &[0, at_op],
+                _ => &[0],
+            };
+            let want = format!(
+                "the {name} op at offset {at} of a form package is 2 bytes long, shorter than its \
+                 minimum of {minimum} (UEFI 2.11 §33.3.8.3)"
             );
+            let records: Vec<(u64, bool)> = lists
+                .iter()
+                .flat_map(ParsedPackageList::ignored_records)
+                .map(|record| (record.offset, record.reason.ends_with(&want)))
+                .collect();
+            let want_records: Vec<(u64, bool)> =
+                want_offsets.iter().map(|&offset| (offset, true)).collect();
+            assert_eq!(records, want_records, "{name}: {want}");
         }
-    }
-
-    /// read_db errors in a form package name the package list and the form
-    /// package.
-    #[test]
-    fn test_read_db_error_names_the_form_package() {
-        // an IFR End op without its length byte
-        let form_package = [0x05, 0x00, 0x00, 0x02, 0x29];
-        let hiidb = package_list_with_guid([0x22; 16], &form_package);
-
-        let Err(err) = read_db(&hiidb) else {
-            panic!("read_db parsed a truncated IFR op");
-        };
-
-        let msg = format!("{err:#}");
-        let want = "failed to parse package list 22222222-2222-2222-2222-222222222222: \
-                    failed to parse a form package: ";
-        assert!(
-            msg.starts_with(want),
-            "error names the list and package: {msg}"
-        );
-        assert!(
-            err.chain().any(|cause| cause.is::<ParseError>()),
-            "error keeps its cause: {msg}"
-        );
     }
 
     /// read_db names the offset of a package list whose header it cannot

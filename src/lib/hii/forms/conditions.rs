@@ -2850,7 +2850,6 @@ mod tests {
     const MULTIPLY: u8 = 0x3C;
     const DIVIDE: u8 = 0x3D;
     const MODULO: u8 = 0x3E;
-    const UINT16: u8 = 0x43;
     const UINT64: u8 = 0x45;
     const TO_UINT: u8 = 0x48;
     const TO_BOOLEAN: u8 = 0x4A;
@@ -3488,11 +3487,6 @@ mod tests {
                 "QUESTION_REF1 of no question",
                 vec![question_ref1(9)],
                 "EFI_IFR_QUESTION_REF1 of missing question 0x0009",
-            ),
-            (
-                "truncated UINT16",
-                vec![operation(UINT16, false, &[0x01])],
-                "EFI_IFR_UINT16 not decoded",
             ),
             (
                 "question in an expression",
@@ -6401,7 +6395,7 @@ mod store_expression_tests {
 
     /// edk2 fails the FormSet of a GET of an undeclared VarStore or of a type that names no
     /// stored value, and the expression of an integer GET without a VarStore; a GET past the
-    /// Size of its VarStore, or too short for its operand, is malformed here too.
+    /// Size of its VarStore is malformed here too.
     #[test]
     fn malformed_gets_are_refused() {
         let cases = [
@@ -6424,11 +6418,6 @@ mod store_expression_tests {
                 "OTHER",
                 get(STORE, 0, 0x08),
                 "EFI_IFR_GET of value type 0x08",
-            ),
-            (
-                "short",
-                operation(GET, false, &[0x02, 0x00, 0x00, 0x00]),
-                "EFI_IFR_GET not decoded",
             ),
         ];
         let efivars = store_holding(&[0; 5]);

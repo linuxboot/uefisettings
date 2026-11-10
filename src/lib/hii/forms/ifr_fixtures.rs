@@ -95,12 +95,12 @@ pub(crate) const THIS: u8 = 0x58;
 const ONES: u8 = 0x54;
 pub(crate) const VALUE: u8 = 0x5A;
 pub(super) const DEFAULT: u8 = 0x5B;
-const DEFAULT_STORE: u8 = 0x5C;
+pub(crate) const DEFAULT_STORE: u8 = 0x5C;
 pub(crate) const FORM_MAP: u8 = 0x5D;
 
 pub(crate) const VAR_STORE: u8 = 0x24;
 const VAR_STORE_NAME_VALUE: u8 = 0x25;
-pub(super) const VAR_STORE_EFI: u8 = 0x26;
+pub(crate) const VAR_STORE_EFI: u8 = 0x26;
 pub(crate) const READ: u8 = 0x2D;
 pub(super) const WRITE: u8 = 0x2E;
 
@@ -843,6 +843,18 @@ pub(super) fn form_map(methods: &[(u16, [u8; 16])], body: &[Vec<u8>]) -> Vec<u8>
 pub(crate) fn parse_form_set(body: &[Vec<u8>]) -> Rc<RefCell<IFROperation>> {
     let data = form_set(body);
     handle_form_set(&mut Cursor::new(&data)).expect("parse the FormSet")
+}
+
+/// Parses a FormSet holding `body`, and returns the root and the forms that the parse drops from
+/// it.
+pub(crate) fn parse_form_set_dropping(
+    body: &[Vec<u8>],
+) -> (Rc<RefCell<IFROperation>>, Vec<DisabledForm>) {
+    let data = form_set(body);
+    let parsed =
+        handle_form_set_within(&mut Cursor::new(&data), MAX_SCOPE_NESTING, &mut Vec::new())
+            .expect("parse the FormSet");
+    (parsed.root, parsed.disabled_forms)
 }
 
 /// Returns the first op under `node`, in IFR order, with `data`.

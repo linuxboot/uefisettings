@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "variables": [
+    {
+      "name": "UefisettingsDisabledForm",
+      "guid": "8c78a505-baa0-4c4a-869f-000000001231",
+      "attr": 7,
+      "data": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB0105"
+    }
+  ]
+}

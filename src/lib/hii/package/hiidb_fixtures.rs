@@ -10,9 +10,25 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use crate::hii::forms::ifr_fixtures::checkbox_at;
+use crate::hii::forms::ifr_fixtures::form;
+use crate::hii::forms::ifr_fixtures::form_set;
 use crate::hii::forms::ifr_fixtures::form_set_with_guid;
+use crate::hii::forms::ifr_fixtures::password_on;
+use crate::hii::forms::ifr_fixtures::var_store_efi_of;
+use crate::hii::forms::ifr_fixtures::NV_BS_RT;
+use crate::hii::variables::VariableKey;
 
 use super::*;
+
+/// The Guid of password_store, as stored.
+const PASSWORD_STORE_GUID: [u8; 16] = [0xC5; 16];
+/// The Guid of other_store, as stored.
+const OTHER_STORE_GUID: [u8; 16] = [0xC8; 16];
+/// The GUID of the package list of password_store_hiidb, as stored.
+const PASSWORD_STORE_LIST_GUID: [u8; 16] = [0xC6; 16];
+/// The GUID of the package list that password_past_the_walk_hiidb puts first, as stored.
+pub(crate) const PAST_THE_WALK_LIST_GUID: [u8; 16] = [0xC7; 16];
 
 /// END_PACKAGE is an EFI_HII_PACKAGE_HEADER with Length 4 and Type
 /// End (0xDF), the package that terminates a package list.
@@ -56,7 +72,7 @@ pub(crate) fn en_strings_list(guid: [u8; 16], letter: u8) -> Vec<u8> {
 ///
 /// Example: `package_list(&strings_package_header(0))` holds a package
 /// that is shorter than its own header.
-pub(super) fn strings_package_header(length: u32) -> Vec<u8> {
+pub(crate) fn strings_package_header(length: u32) -> Vec<u8> {
     package_header(0x04, length)
 }
 
@@ -219,4 +235,84 @@ pub(crate) fn device_path_package(device_path: &[u8]) -> Vec<u8> {
     let length = PACKAGE_HEADER_SIZE
         + u32::try_from(device_path.len()).expect("device path length fits a u32");
     [&package_header(0x08, length)[..], device_path].concat()
+}
+
+/// The variable of VarStore 1 of password_store_hiidb, of 60 bytes.
+pub(crate) fn password_store() -> VariableKey {
+    VariableKey {
+        name: "PasswordStore".to_string(),
+        guid: Guid::from(PASSWORD_STORE_GUID),
+    }
+}
+
+/// The variable of VarStore 2 of the second FormSet of password_store_hiidb, of 1 byte.
+pub(crate) fn other_store() -> VariableKey {
+    VariableKey {
+        name: "OtherStore".to_string(),
+        guid: Guid::from(OTHER_STORE_GUID),
+    }
+}
+
+/// The VARSTORE_EFI of password_store, VarStore 1.
+fn password_store_var_store() -> Vec<u8> {
+    var_store_efi_of(1, PASSWORD_STORE_GUID, "PasswordStore", NV_BS_RT, 60)
+}
+
+/// A package list of GUID `guid` holding a form package of `ifr` and the strings Q1, Q2, Q3,
+/// Password and O of string IDs 1 to 5.
+fn password_store_list(guid: [u8; 16], ifr: &[u8]) -> Vec<u8> {
+    let packages = [
+        form_package_of(ifr),
+        en_strings_package_of(&["Q1", "Q2", "Q3", "Password", "O"]),
+        END_PACKAGE.to_vec(),
+    ];
+    package_list_with_guid(guid, &packages.concat())
+}
+
+/// A HiiDB of one package list of two FormSets that declare password_store as VarStore 1: the
+/// first holds `level` outside its forms, the CHECKBOX Q1 at byte 50 in form 1 and `form2` in
+/// form 2; the second holds, in form 1, the CHECKBOXes O at byte 10 and Q2 at byte 5, and Q3 at
+/// byte 0 of other_store, its VarStore 2.
+pub(crate) fn password_store_hiidb(level: Vec<u8>, form2: Vec<u8>) -> Vec<u8> {
+    let ifr = [
+        form_set(&[
+            password_store_var_store(),
+            level,
+            form(1, &[checkbox_at(1, 1, 1, 50)]),
+            form(2, &[form2]),
+        ]),
+        form_set(&[
+            password_store_var_store(),
+            var_store_efi_of(2, OTHER_STORE_GUID, "OtherStore", NV_BS_RT, 1),
+            form(
+                1,
+                &[
+                    checkbox_at(5, 5, 1, 10),
+                    checkbox_at(2, 2, 1, 5),
+                    checkbox_at(3, 3, 2, 0),
+                ],
+            ),
+        ]),
+    ]
+    .concat();
+    password_store_list(PASSWORD_STORE_LIST_GUID, &ifr)
+}
+
+/// A HiiDB of a package list of PAST_THE_WALK_LIST_GUID whose form package starts with an op of
+/// Length 1, where the walk for FormSets ends, before a FormSet with a PASSWORD at bytes 10 to 49
+/// of password_store; then password_store_hiidb without `level` and with an empty form 2.
+pub(crate) fn password_past_the_walk_hiidb() -> Vec<u8> {
+    let ifr = [
+        vec![0x02, 0x01],
+        form_set(&[
+            password_store_var_store(),
+            form(1, &[password_on(4, 4, 1, 10)]),
+        ]),
+    ]
+    .concat();
+    [
+        password_store_list(PAST_THE_WALK_LIST_GUID, &ifr),
+        password_store_hiidb(Vec::new(), Vec::new()),
+    ]
+    .concat()
 }

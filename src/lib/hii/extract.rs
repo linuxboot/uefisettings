@@ -874,6 +874,7 @@ mod tests {
     use crate::hii::memory_access_denied::MemoryOperation;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::strings_package_header;
     #[cfg(firmware_memory_maps)]
     use crate::hii::system_table::boot_params::fixture::boot_params;
     #[cfg(firmware_memory_maps)]
@@ -1429,8 +1430,14 @@ mod tests {
         }
 
         let database = en_strings_list([0x11; 16], b'A');
-        // a form package of an IFR End op without its length byte
-        let unparsable = package_list_with_guid([0x33; 16], &[0x05, 0x00, 0x00, 0x02, 0x29]);
+        // a strings package too short for HdrSize and StringInfoOffset
+        let short_strings = [0x31, 0x00, 0x00, 0x00, 0x31];
+        let strings_length = package::PACKAGE_HEADER_SIZE
+            + u32::try_from(short_strings.len()).expect("a u32 package length");
+        let unparsable = package_list_with_guid(
+            [0x33; 16],
+            &[&strings_package_header(strings_length)[..], &short_strings].concat(),
+        );
         assert!(
             package::read_db(&unparsable).is_err(),
             "read_db parsed the unparsable package list"

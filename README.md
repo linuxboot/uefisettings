@@ -87,12 +87,26 @@ Commands:
   show-ifr        Show a human readable representation of the Hii Forms
 ```
 
-Questions never read or write the bytes of a password question that uefisettings finds: a
-question whose bytes overlap a password's shows `<ValueUnavailable: its bytes hold a password>`,
-and `set` refuses it; the other questions of its VarStore read and write. Outside the UEFI Shell, a
-password question in IFR that uefisettings ignores, or whose VarStore it cannot find, withholds no
-bytes from `get`, `set` or the redacted `dump-efivars`, which warn of it. The UEFI Shell build reads
-and writes no variable of a HiiDB with such a password question or with IFR that it ignores.
+Questions never read or write the bytes of a password question that uefisettings finds, in a
+disabled form too: a question whose bytes overlap a password's shows `<ValueUnavailable: its bytes
+hold a password>`, and `set` refuses it; the other questions of its VarStore read and write. Outside
+the UEFI Shell, a password question in a FormSet that uefisettings ignores, as it ignores one with a
+VarStore op in a form that a malformed op disables, can keep its password in a variable that the
+FormSet declares, and one that edk2 parses into a FormSet whose
+FORM_SET op opens no scope, past the End where uefisettings ends it, in one that the ops from that
+op up to the next FORM_SET op declare, or in any variable of the GUID of such a VarStore whose
+variable names it does not read, as those of a VARSTORE_EFI of the form before UEFI 2.3.1, which
+its questions' VarNames name, so `get`, `set` and the redacted `dump-efivars` withhold every byte
+of each of those, and, for a password question whose op ends before its
+MaxSize, every byte of its variable from its offset on. A password question in IFR that
+uefisettings ignores, or outside any FormSet, keeps its password at its offset in each variable of a
+VarStore of its VarStoreId in its package list too, which edk2's Config Keyword Handler may take,
+and a VarStore outside any FormSet that does not parse may hold a password in any variable of its
+GUID, so they withhold those bytes too. IFR after an op that does not fit its form
+package has no op boundary, so they read and write no variable of such a HiiDB, nor do
+`hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question whose VarStore
+uefisettings cannot find withholds no bytes, which they warn of. The UEFI Shell build reads and
+writes no variable of a HiiDB with such a password question or with IFR that it ignores.
 
 `variable`:
 
@@ -225,7 +239,7 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
 * Each question that `get`, `set` and `hii list-questions` print lists the Flags of its question header that are set (UEFI 2.11 §33.3.8.2.2), such as `READ_ONLY` and `RESET_REQUIRED`, in `flags`. A question of a FormSet whose ClassGuids hold `EFI_HII_REST_STYLE_FORMSET_GUID` lists `REST_STYLE`, which its Flags can then omit.
 * They also list, in `defaults`, each default that the IFR of the question declares (UEFI 2.11 §33.2.5.8), from an `EFI_IFR_DEFAULT`, the default flags of its options or the flags of a checkbox, with its value and the name of its default store. defaults lists the defaults the IFR declares, per DefaultId; it omits edk2-stable202608 GetQuestionDefault's fallbacks to another default store and to a per-type value.
 * And `question_id`, the QuestionId of the question header, 1 to 65535; `form_set_guid`, the GUID of the question's FormSet; and in `keywords`, its prompt in each strings package of a configuration language (one whose language starts with `x-`, UEFI 2.11 §33.2.6.1), with that language as `namespace_id`: its keyword strings (UEFI 2.11 §35.2.1.6), those that a `<KeywordRequest>` can name: whose language is a `<NameSpaceId>`, and whose prompt a `<Keyword>`, text without `&`, `=` or control characters with at most one `:`, which only 1 to 4 digits may follow. The Ilo backend sets none of `flags`, `defaults`, `question_id`, `form_set_guid` and `keywords`, so its text output shows them as `None`.
-* A FormSet whose IFR does not parse, or whose scopes nest too deep, is ignored, the first FormSet of a form package too, as UEFI 2.11 §33.2.5.10.1 ignores a malformed forms set, and the FormSets after it are read, as edk2-stable202608 SetupBrowserDxe GetIfrBinaryData finds them. `get` and `set` list the IFR that uefisettings ignores, which may hold more questions, in `ignored_ifr`: its package list, its offset in the form package and why. `set` names it when no question has the text, its first 16 records and the count of the rest, and `hii list-questions`, whose output stays a list of questions, prints it on stderr.
+* A form that holds an op shorter than the minimum length of its opcode or than the length that its Flags, Type or ListLength require, which UEFI 2.11 §33.2.5.10.1 calls malformed, or an op that uefisettings does not decode, is disabled: none of its questions is read or set, and the other forms of its FormSet are. A FormSet whose IFR does not parse, which holds such an op outside its forms, or whose scopes nest too deep, is ignored, the first FormSet of a form package too, as UEFI 2.11 §33.2.5.10.1 ignores a malformed forms set, and the FormSets after it are read, as edk2-stable202608 SetupBrowserDxe GetIfrBinaryData finds them. `get` and `set` list the IFR that uefisettings ignores, disabled forms too, which may hold more questions, in `ignored_ifr`: its package list, its offset in the form package and why; `hii show-ifr` prints each disabled form. `set` names it when no question has the text, its first 16 records and the count of the rest, and `hii list-questions`, whose output stays a list of questions, prints it on stderr.
 * Change UEFI settings by calculating the correct offsets and writing to entries in `efivarfs`.
 * `set` writes each EFI variable of the questions that match once, with the changes of all of them, in one SetVariable(), which saves all of the data of a non-volatile variable or none (UEFI 2.11 §8.2.3), in the order in which the questions first change each variable. It stops at the first write that fails, and its error names the writes done, the one that failed and those not attempted, each by the package lists of its questions and its EFI variable. Through `efivarfs` it refuses, before any write, two variables whose names differ only in `/` and `!`, which `efivarfs` keeps in one file.
 * Before the first write, `set` checks that it cannot crash Linux: Linux v5.8 (f88814cc2578; stable 5.7.11) to v6.7 without the upstream fix 0e8d2444168d crash on an efivarfs write when the firmware's `EFI_RT_PROPERTIES_TABLE` leaves out `SetVariable()`. It writes when `/proc/kallsyms` names `efivarfs_reconfigure`, the function of that fix, or, on x86_64 and on aarch64 from Linux v5.14, when the `set_variable` of Linux's `generic_ops`, which it reads through `/proc/kcore` (unless `lockdown=confidentiality`) at the address that `/proc/kallsyms` gives, is a `*_set_variable` function, and refuses when that `set_variable` is NULL. Where neither tells, it writes when the kernel log (`/dev/kmsg`, or `syslog(2)` under `printk.devkmsg=off`) names no such table that Linux applied, and else, on x86, x86_64 and aarch64, reads the table itself from `/dev/mem` as `capsule config-data` reads its table, unless the kernel lockdown mode refuses `/dev/mem`: it writes when the table lists `SetVariable()`, or the firmware lists no such table, and refuses when the table leaves it out. Otherwise it refuses, and `uefisettings.efi` in the UEFI Shell can change the setting.

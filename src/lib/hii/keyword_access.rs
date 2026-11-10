@@ -495,6 +495,7 @@ pub(super) fn call_error(
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use super::*;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
@@ -520,6 +521,7 @@ mod tests {
     use crate::hii::forms::keywords::KeywordRefusal;
     use crate::hii::forms::resolve_short_var_names;
     use crate::hii::forms::IgnoredIfr;
+    use crate::hii::forms::IgnoredPasswords;
     use crate::hii::package::hiidb_fixtures::form_package_of;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
@@ -721,6 +723,7 @@ mod tests {
             ignored_ifr: Vec::new(),
             outside_ifr: Vec::new(),
             malformed_outside_stores: Vec::new(),
+            disabled_forms: Vec::new(),
         }
     }
 
@@ -1385,6 +1388,7 @@ mod tests {
             package_list: dropped.guid,
             offset: 0x40,
             reason: "a FormSet that does not parse".to_owned(),
+            passwords: IgnoredPasswords::Declared(Arc::default()),
         }];
         let lists = [dropped];
         let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);

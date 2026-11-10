@@ -1489,25 +1489,6 @@ mod tests {
     }
 
     #[test]
-    fn truncated_default_is_unknown() {
-        let children = [operation(DEFAULT, false, &[0x00, 0x00, 0x00])];
-
-        let got = answer(
-            &[],
-            NUMERIC,
-            &uint8_numeric(0x10, 0, 10),
-            &children,
-            unavailable(),
-        );
-
-        assert_eq!(
-            got,
-            format!("{UNAVAILABLE} <IFR default: unknown (EFI_IFR_DEFAULT value missing)>"),
-            "DEFAULT without its value"
-        );
-    }
-
-    #[test]
     fn default_2_without_value_is_unknown() {
         // DefaultId STANDARD, Type EFI_IFR_TYPE_OTHER, and no nested EFI_IFR_VALUE
         let children = [operation(DEFAULT, false, &[0x00, 0x00, 0x08])];

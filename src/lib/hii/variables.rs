@@ -16,6 +16,7 @@
 //! (firmware_environment.rs).
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
@@ -48,6 +49,8 @@ const EFI_VARIABLE_AUTHENTICATED_ACCESS: u32 = VariableAttributes::AUTHENTICATED
     .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
     .bits()
     | EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS;
+/// Every value byte of a variable.
+const WHOLE_VALUE: &Range<usize> = &(0..usize::MAX);
 
 bitflags::bitflags! {
     /// The attributes of an EFI variable (UEFI 2.10 §8.2.1).
@@ -298,6 +301,10 @@ pub(crate) trait FirmwareVariables {
     fn reach(&self) -> VariableReach;
     /// The interface that these read and write through, which their errors name.
     fn interface(&self) -> VariableInterface;
+    /// Whether these read and write no variable at all, as those of EfivarSource::Disabled.
+    fn reads_nothing(&self) -> bool {
+        false
+    }
     /// The attributes word and the first `size` data bytes of `key`, as an efivarfs file starts.
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>>;
     /// The attributes word and all the data of `key`, as its efivarfs file holds them.
@@ -350,6 +357,10 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
         (**self).interface()
     }
 
+    fn reads_nothing(&self) -> bool {
+        (**self).reads_nothing()
+    }
+
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
         (**self).read(key, size)
     }
@@ -377,6 +388,10 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
 
     fn interface(&self) -> VariableInterface {
         (**self).interface()
+    }
+
+    fn reads_nothing(&self) -> bool {
+        (**self).reads_nothing()
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -830,6 +845,10 @@ impl FirmwareVariables for UnreadVariables {
         self.interface
     }
 
+    fn reads_nothing(&self) -> bool {
+        true
+    }
+
     fn read(&self, _key: &VariableKey, _size: u16) -> Result<Vec<u8>> {
         Err(EfivarsNotRead.into())
     }
@@ -992,15 +1011,48 @@ impl EfivarReader {
     }
 }
 
+/// The vendor GUIDs of variables whose names are unknown: these, or every GUID where one is unknown
+/// too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub(crate) struct VariableGuids {
+    guids: BTreeSet<Guid>,
+    every: bool,
+}
+
+impl VariableGuids {
+    /// Adds `guid`, or every GUID for None, an unknown one.
+    pub(crate) fn insert(&mut self, guid: Option<Guid>) {
+        match guid {
+            Some(guid) => {
+                self.guids.insert(guid);
+            }
+            None => self.every = true,
+        }
+    }
+
+    /// Adds those of `other`.
+    pub(crate) fn extend(&mut self, other: &Self) {
+        self.guids.extend(other.guids.iter().copied());
+        self.every |= other.every;
+    }
+
+    /// Whether it holds `guid`.
+    fn contains(&self, guid: &Guid) -> bool {
+        self.every || self.guids.contains(guid)
+    }
+}
+
 /// The bytes of variables in which PASSWORD questions keep their passwords (UEFI 2.11
 /// §33.3.8.3.54), by efivar file, counted from the start of its value: after its metadata, if any
 /// (value_of). Variable names that differ only in '/' and '!' name one efivar file, so they share
 /// withheld bytes; where they name two variables, as they do outside efivarfs, both are withheld,
-/// which fails safe. Bytes that many files withhold are recorded once, in a shared set.
+/// which fails safe. Bytes that many files withhold are recorded once, in a shared set. Every
+/// variable of `guids` is withheld whole.
 #[derive(Clone, Default)]
 pub(crate) struct WithheldBytes {
     files: BTreeMap<EfivarFileName, FileBytes>,
     shared: Vec<Vec<Range<usize>>>,
+    guids: VariableGuids,
 }
 
 /// The bytes that an efivar file withholds: its own, and the sets of WithheldBytes::shared at
@@ -1021,6 +1073,11 @@ impl WithheldBytes {
                 .own
                 .push(bytes);
         }
+    }
+
+    /// Withholds every variable of `guids` whole too.
+    pub(super) fn insert_guids(&mut self, guids: &VariableGuids) {
+        self.guids.extend(guids);
     }
 
     /// Records `sets` of value bytes, which withhold_shared shares, and returns their indexes;
@@ -1048,7 +1105,10 @@ impl WithheldBytes {
 
     /// The withheld bytes of `key`.
     pub(super) fn of<'a>(&'a self, key: &VariableKey) -> impl Iterator<Item = &'a Range<usize>> {
-        self.of_file(&EfivarFileName::from(key))
+        let whole = self.guids.contains(&key.guid).then_some(WHOLE_VALUE);
+        whole
+            .into_iter()
+            .chain(self.of_file(&EfivarFileName::from(key)))
     }
 
     /// The withheld bytes of the efivar file `file`.
@@ -1140,7 +1200,7 @@ impl WithheldBytes {
 
 impl PartialEq for WithheldBytes {
     fn eq(&self, other: &Self) -> bool {
-        self.by_file() == other.by_file()
+        self.by_file() == other.by_file() && self.guids == other.guids
     }
 }
 
@@ -1148,7 +1208,10 @@ impl Eq for WithheldBytes {}
 
 impl fmt::Debug for WithheldBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map().entries(self.by_file()).finish()
+        f.debug_struct("WithheldBytes")
+            .field("files", &self.by_file())
+            .field("guids", &self.guids)
+            .finish()
     }
 }
 
@@ -1197,6 +1260,10 @@ impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
 
     fn interface(&self) -> VariableInterface {
         self.variables.interface()
+    }
+
+    fn reads_nothing(&self) -> bool {
+        self.variables.reads_nothing()
     }
 
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
@@ -1260,6 +1327,10 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
         self.variables.interface()
     }
 
+    fn reads_nothing(&self) -> bool {
+        self.variables.reads_nothing()
+    }
+
     fn read(&self, key: &VariableKey, size: u16) -> Result<Vec<u8>> {
         self.variables.read(key, size)
     }
@@ -1284,13 +1355,25 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
 /// A write that WithholdingVariables refuse: it overlaps the bytes of a password.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error(
-    "EFI variable {key} holds a password at bytes {}..{}, which set never writes",
-    .bytes.start,
-    .bytes.end
+    "EFI variable {key} holds a password {}, which set never writes",
+    PasswordBytes(.bytes)
 )]
 pub(super) struct WithheldPassword {
     key: VariableKey,
     bytes: Range<usize>,
+}
+
+/// The withheld bytes of a WithheldPassword, as its error names them: a range, or all from its
+/// start on.
+struct PasswordBytes<'a>(&'a Range<usize>);
+
+impl std::fmt::Display for PasswordBytes<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.end {
+            usize::MAX => write!(f, "in every byte from {} on", self.0.start),
+            end => write!(f, "at bytes {}..{end}", self.0.start),
+        }
+    }
 }
 
 #[cfg(test)]

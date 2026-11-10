@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -46,6 +46,8 @@
 //! if it is missing and registers its package list, whose PASSWORD is outside any form set, for
 //! `uefisettings.efi` in the UEFI Shell; `rt-data-outside-form-set-password-forms` is `rt-data`,
 //! after it does the same, so that Linux finds it too.
+//! `disabled-form-forms` registers, alone, the package list of [`formset_skip_forms`] with a form
+//! that `uefisettings` disables.
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `string-blocks` does the same with the package list of [`string_blocks`].
@@ -252,6 +254,11 @@ fn efi_main() -> Status {
             .iter()
             .try_for_each(|list| register_package_list(list, "registering the formset skip forms"))
             .map(|()| println!("publish-hiidb: registered the formset skip forms")),
+        Some(Task::RegisterDisabledFormForms) => register_package_list(
+            &formset_skip_forms::disabled_form_package_list(),
+            "registering the disabled form forms",
+        )
+        .map(|()| println!("publish-hiidb: registered the disabled form forms")),
         Some(Task::RegisterShortVarStoreForms) => register_short_var_store_forms()
             .map(|()| println!("publish-hiidb: registered the short VARSTORE_EFI forms")),
         Some(Task::PublishShortVarStoreForms) => register_short_var_store_forms()
@@ -314,7 +321,7 @@ fn efi_main() -> Status {
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
                  |rt-data-readwrite-forms|password-forms|rt-data-password-forms\
                  |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
-                 |short-var-store-forms|rt-data-short-var-store-forms\
+                 |disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms\
                  |outside-form-set-password-forms|rt-data-outside-form-set-password-forms\
                  |padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|export-config|rt-properties-no-set-variable\
@@ -351,6 +358,9 @@ enum Task {
     RegisterDroppedPasswordForms,
     /// Register the package lists of [`formset_skip_forms`] in the HII database.
     RegisterFormSetSkipForms,
+    /// Register the package list of a disabled form of [`formset_skip_forms`] in the HII
+    /// database.
+    RegisterDisabledFormForms,
     /// Register the package list of [`short_var_store_forms`] in the HII database.
     RegisterShortVarStoreForms,
     /// Do what RegisterShortVarStoreForms does, then publish the database in runtime-data pages.
@@ -425,6 +435,9 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("formset-skip-forms") => {
             Some(Task::RegisterFormSetSkipForms)
+        }
+        Ok(option) if option == cstr16!("disabled-form-forms") => {
+            Some(Task::RegisterDisabledFormForms)
         }
         Ok(option) if option == cstr16!("short-var-store-forms") => {
             Some(Task::RegisterShortVarStoreForms)

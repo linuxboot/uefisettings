@@ -52,6 +52,7 @@ shell-dropped-password	/publish-hiidb.efi dropped-password-forms	dropped-passwor
 shell-formset-skip	/publish-hiidb.efi formset-skip-forms	formset-skip.json	shell:formset-skip	-
 shell-short-var-store	/publish-hiidb.efi short-var-store-forms	short-var-store.json	shell:short-var-store	-
 shell-outside-form-set-password	/publish-hiidb.efi outside-form-set-password-forms	-	shell:outside-form-set-password	-
+shell-disabled-form	/publish-hiidb.efi disabled-form-forms	disabled-form.json	shell:disabled-form	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 hii-auth87	/publish-hiidb.efi enhanced-auth-forms;/publish-hiidb.efi rt-data	enhanced-auth-87.json	hii_auth87	-
 shell-auth87	/publish-hiidb.efi enhanced-auth-forms	enhanced-auth-87.json	shell:auth87	-

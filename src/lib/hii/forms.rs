@@ -19,6 +19,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::rc::Rc;
 use std::rc::Weak;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -41,6 +42,7 @@ use crate::hii::variables::check_volatile_write;
 use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EnhancedAuthenticatedVariable;
+use crate::hii::variables::VariableGuids;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableLayout;
@@ -175,8 +177,16 @@ const EFI_IFR_TYPE_TIME: u8 = 0x05;
 const EFI_IFR_TYPE_DATE: u8 = 0x06;
 const EFI_IFR_TYPE_STRING: u8 = 0x07;
 const EFI_IFR_TYPE_OTHER: u8 = 0x08;
+// UEFI 2.11 §33.3.8.3.51
+const EFI_IFR_TYPE_ACTION: u8 = 0x0A;
 const EFI_IFR_TYPE_BUFFER: u8 = 0x0B;
 const EFI_IFR_TYPE_REF: u8 = 0x0C;
+/// The bytes of an EFI_HII_TIME, EFI_HII_DATE and EFI_HII_REF, packed
+/// (edk2-stable202608 MdePkg/Include/Uefi/UefiInternalFormRepresentation.h:659-676): Hour, Minute
+/// and Second; a UINT16 Year, Month and Day; QuestionId, FormId, FormSetGuid and DevicePath.
+const EFI_HII_TIME_SIZE: usize = 3;
+const EFI_HII_DATE_SIZE: usize = 4;
+const EFI_HII_REF_SIZE: usize = 22;
 // edk2-stable202608 MdeModulePkg/Include/Guid/MdeModuleHii.h; the GUID is
 // 82DDD68B-9163-4187-9B27-20A8FD60A71D, here in its EFI_GUID byte order
 const EDKII_IFR_BIT_VARSTORE_GUID: [u8; 16] = [
@@ -203,6 +213,12 @@ const IFR_OPERATION_HEADER_SIZE: u8 = 2;
 /// SetupBrowserDxe/IfrParse.c ParseOpCodes takes a shorter VARSTORE_EFI for the form before UEFI
 /// 2.3.1.
 const VAR_STORE_EFI_SIZE: u8 = 27;
+/// The offset of the Guid of an EFI_IFR_VARSTORE from the start of its op, after its op header
+/// (edk2-stable202608 MdePkg/Include/Uefi/UefiInternalFormRepresentation.h).
+const VAR_STORE_GUID_OFFSET: u64 = 2;
+/// The offset of the Guid of an EFI_IFR_VARSTORE_EFI from the start of its op, after its op
+/// header and VarStoreId (UefiInternalFormRepresentation.h).
+const VAR_STORE_EFI_GUID_OFFSET: u64 = 4;
 
 // UEFI 2.10 §33.3.8.3, Table 33.11 IFR Opcodes
 #[derive(BinRead, Debug, PartialEq, Copy, Clone)]
@@ -521,6 +537,115 @@ impl IFROpCode {
             Self::Unknown(_) => "an unknown IFR opcode",
         }
     }
+
+    /// The Length below which an op of the opcode is malformed (UEFI 2.11 §33.2.5.10.1): that of
+    /// its shortest encoding in UEFI 2.11 §33.3.8.3, its structure as edk2-stable202608
+    /// MdePkg/Include/Uefi/UefiInternalFormRepresentation.h packs it with the fewest entries that
+    /// the section allows in each array, those it leaves out of the structure too; of the
+    /// shortest form of the opcode where it has several. An unknown opcode has no structure past
+    /// its header.
+    fn minimum_length(self) -> u8 {
+        match self {
+            Self::SuppressIf
+            | Self::Locked
+            | Self::And
+            | Self::Or
+            | Self::Not
+            | Self::GrayOutIf
+            | Self::DisableIf
+            | Self::ToLower
+            | Self::ToUpper
+            | Self::Map
+            | Self::Version
+            | Self::End
+            | Self::Match
+            | Self::Read
+            | Self::Write
+            | Self::Equal
+            | Self::NotEqual
+            | Self::GreaterThan
+            | Self::GreaterEqual
+            | Self::LessThan
+            | Self::LessEqual
+            | Self::BitwiseAnd
+            | Self::BitwiseOr
+            | Self::BitwiseNot
+            | Self::ShiftLeft
+            | Self::ShiftRight
+            | Self::Add
+            | Self::Subtract
+            | Self::Multiply
+            | Self::Divide
+            | Self::Modulo
+            | Self::QuestionRef2
+            | Self::True
+            | Self::False
+            | Self::ToUint
+            | Self::ToBoolean
+            | Self::Mid
+            | Self::Token
+            | Self::StringRef2
+            | Self::Conditional
+            | Self::Zero
+            | Self::One
+            | Self::Ones
+            | Self::Undefined
+            | Self::Length
+            | Self::Dup
+            | Self::This
+            | Self::Value
+            | Self::Catenate
+            | Self::ModalTag
+            | Self::Unknown(_) => IFR_OPERATION_HEADER_SIZE,
+            // EFI_IFR_QUESTION_REF3, without the DevicePath of _2 and the Guid of _3
+            Self::QuestionRef3 => IFR_OPERATION_HEADER_SIZE,
+            Self::Rule
+            | Self::Refresh
+            | Self::RuleRef
+            | Self::Uint8
+            | Self::ToString
+            | Self::Find
+            | Self::Span => 3,
+            Self::Image
+            | Self::NoSubmitIf
+            | Self::InconsistentIf
+            | Self::Animation
+            | Self::VarStoreDevice
+            | Self::QuestionRef1
+            | Self::Uint16
+            | Self::StringRef1 => 4,
+            Self::WarningIf => 5,
+            // EFI_IFR_DEFAULT_2, whose value a nested EFI_IFR_VALUE gives
+            Self::Default => 5,
+            Self::Form | Self::EqIdVal | Self::EqIdId | Self::DefaultStore | Self::Uint32 => 6,
+            // no ValueList entry, which UEFI 2.11 §33.3.8.3.20 allows
+            Self::EqIdValList => 6,
+            // EFI_IFR_TYPE_OTHER, whose value a nested EFI_IFR_VALUE gives
+            Self::OneOfOption => 6,
+            Self::Subtitle | Self::Get | Self::Set => 7,
+            Self::Text | Self::ResetButton => 8,
+            Self::Uint64 => 10,
+            // EFI_IFR_ACTION_1 without QuestionConfig, and EFI_IFR_REF5 with no target
+            Self::Action | Self::Ref => 13,
+            Self::CheckBox | Self::Date | Self::Time => 14,
+            Self::OrderedList => 15,
+            Self::String => 16,
+            // EFI_IFR_NUMERIC_SIZE_1: a MinValue, a MaxValue and a Step of one byte each
+            Self::OneOf | Self::Numeric => 17,
+            Self::Password => 17,
+            Self::Guid | Self::Security | Self::RefreshId | Self::Match2 => 18,
+            Self::VarStoreNameValue => 20,
+            // one Method, of the one or more that UEFI 2.11 §33.3.8.3.25 requires
+            Self::FormMap => 22,
+            // an empty Name, its NUL counted in Length (UEFI 2.11 §33.3.8.3.89)
+            Self::VarStore => 23,
+            // no ClassGuid (UEFI 2.11 §33.3.8.3.26)
+            Self::FormSet => 23,
+            // up to Attributes: the form before UEFI 2.3.1, without Size, that edk2-stable202608
+            // SetupBrowserDxe/IfrParse.c ParseOpCodes takes
+            Self::VarStoreEfi => 24,
+        }
+    }
 }
 
 /// IFROperation is a node for a tree data structure.
@@ -558,6 +683,17 @@ pub struct IFROperation {
     pub children: Vec<Rc<RefCell<IFROperation>>>,
     #[br(default)]
     pub parsed_data: ParsedOperation,
+}
+
+impl IFROperation {
+    /// The FormId that a FORM or FORM_MAP op starts its data with (UEFI 2.11 §33.3.8.3.24,
+    /// §33.3.8.3.25), decoded or not; None for other ops and one whose Length leaves none.
+    pub(crate) fn form_id(&self) -> Option<u16> {
+        self.data
+            .first_chunk()
+            .filter(|_| matches!(self.op_code, IFROpCode::Form | IFROpCode::FormMap))
+            .map(|form_id| u16::from_le_bytes(*form_id))
+    }
 }
 
 // Debug is implemented manually because if we derived Debug instead then we'd
@@ -1468,7 +1604,7 @@ pub struct FormMap {
 impl FormMap {
     /// Decodes the FormId and the methods that fit in `data`, or None without room for the
     /// FormId. edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes fails the FormSet of a
-    /// FORM_MAP without a method; here its questions stay, as in other forms.
+    /// FORM_MAP without a method; here minimum_length disables its form.
     fn decode(data: &[u8]) -> Option<Self> {
         let (form_id, methods) = data.split_first_chunk::<2>()?;
         let methods = methods
@@ -1610,9 +1746,11 @@ fn type_value_parser<R: Read + Seek>(
 /// handle_form_set_within parses it, the walk going on after its End. A package without one has
 /// no root.
 /// That walk ends at an op whose Length runs past the package; here it also ends at one below the
-/// header size, which that walk loops on (Length 0) or steps into (Length 1). A FormSet whose
-/// bytes do not parse, or whose scopes nest deeper than MAX_SCOPE_NESTING, the first one too, is
-/// ignored, as UEFI 2.11 §33.2.5.10.1 ignores a malformed forms set wherever it is, and the walk
+/// header size, which that walk loops on (Length 0) or steps into (Length 1), before the first
+/// FORM_SET op too, without failing the package. A FormSet whose bytes do not parse, which holds,
+/// outside its forms, an op that is malformed or that uefisettings does not decode, or whose
+/// scopes nest deeper than MAX_SCOPE_NESTING, the first one too, is ignored, as UEFI 2.11
+/// §33.2.5.10.1 ignores a malformed forms set wherever it is, and the walk
 /// goes on from the op after its FORM_SET op, as that walk does, so a FORM_SET op in it becomes a
 /// root, as that walk finds it, though that section ignores the entire forms set. A FORM_SET op
 /// without Scope that a failed parse reads outside every scope that it opened is ignored with that
@@ -1621,47 +1759,48 @@ fn type_value_parser<R: Read + Seek>(
 /// no more than MAX_SCOPE_NESTING of: from the FORM_SET op that opens that scope and from one
 /// without Scope directly in it; then once from one without Scope outside them, and once by the
 /// walk.
-/// An op where the walk ends fails the package unless the walk has read a FORM_SET op before it.
+/// The forms that handle_form_set_within disables in the FormSets that it parses are returned too.
 /// The IFR that the walk leaves unread is returned too, as PASSWORD questions in it are unknown:
 /// such a FormSet, and the bytes after an op where the walk ends, unless they are padding.
 /// So is each FormSet, first or later, whose FORM_SET op opens no scope and that parses: edk2
 /// parses its ops on to the end of the package, past the End where handle_form_set_within ends
-/// it.
+/// it. Their records, and those of the FormSets that the walk ignores, hold the variables that
+/// IgnoredPasswords::Declared names.
 /// The VarStores and statements that the walk steps over outside a FormSet are returned as well:
 /// UEFI 2.11 §33.2.5.1 declares variable stores within a form set, and SetupBrowserDxe parses
 /// none outside one, but edk2-stable202608 ConfigKeywordHandler.c FindQuestionFromStringId and
 /// FindStorageFromVarId walk the whole form package. Statements, PASSWORDs among them, are
 /// returned undecoded, as FindQuestionFromStringId reads only their Prompt; a VarStore that does
-/// not parse, which hides only its VarStoreId, is returned apart. In a FormSet that the walk steps
-/// into as it ignores it, and after a FORM_SET op that opens no scope, whose ignored IFR already
-/// holds the PASSWORDs and malformed ops there, only the VarStores that parse are.
+/// not parse, which hides only its VarStoreId, is returned apart. In the IFR that those records
+/// cover (declared_ifr), which already counts the PASSWORDs and malformed ops there, only the
+/// VarStores that parse and the PASSWORDs are, marked so (OutsideOp::in_ignored_ifr).
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
     package_list_guid: Guid,
 ) -> Result<FormSets> {
     let mut roots = Vec::new();
     let mut ignored = Vec::new();
-    let mut form_set_read = false;
+    let mut disabled_forms = Vec::new();
+    // the records of the FormSets that the walk ignores and of those whose FORM_SET ops open no
+    // scope, by index in `ignored`
+    let mut declaring = Vec::new();
+    // the offsets of the FORM_SET ops of the FormSets that the walk ignores
+    let mut ignored_form_sets = Vec::new();
+    // the spans from the FORM_SET op without Scope of each FormSet that parses to the next FORM_SET
+    // op that the walk meets or the end of the package, and the start of the last one while open
+    let mut past_end: Vec<std::ops::Range<u64>> = Vec::new();
+    let mut open_past_end = None;
     // FORM_SET ops without Scope, by offset, that a failed parse read outside every scope that it
     // opened, with its failure, which the parse from each gives too
     let mut failing_alike: BTreeMap<u64, Rc<FormSetFailure>> = BTreeMap::new();
-    let mut outside = Vec::new();
-    let mut malformed_stores = Vec::new();
-    // set once a FORM_SET op without its Scope bit makes the rest of the package ignored IFR,
-    // which already counts the PASSWORDs and malformed ops in it
-    let mut rest_ignored = false;
-    // the scopes open in the ignored FormSets that the walk is in, whose ignored IFR counts them
-    // likewise
-    let mut ignored_depth: usize = 0;
+    // the ops outside a FormSet that the walk steps over, by offset
+    let mut walked = Vec::new();
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
         let offset = package_cursor.position();
         let op: IFROperation = match package_cursor.parse_ne() {
             Ok(op) => op,
-            Err(error) if !form_set_read => {
-                return Err(error).context("failed to parse IFR operation")
-            }
             Err(error)
                 if error.is_eof()
                     || matches!(error.root_cause(), binrw::Error::AssertFail { .. }) =>
@@ -1678,6 +1817,7 @@ pub(super) fn parse_form_sets(
                             "an op that does not fit the form package, and the bytes after it: \
                              {error}"
                         ),
+                        passwords: IgnoredPasswords::AnyVariable,
                     });
                 }
                 break;
@@ -1691,27 +1831,11 @@ pub(super) fn parse_form_sets(
                 "skipping {:?} outside a FormSet at offset {offset}",
                 op.op_code
             );
-            let in_ignored_ifr = rest_ignored || ignored_depth > 0;
-            if ignored_depth > 0 {
-                match (op.op_code, op.open_scope) {
-                    (IFROpCode::End, _) => ignored_depth -= 1,
-                    (_, true) => ignored_depth += 1,
-                    (_, false) => {}
-                }
-            }
-            record_outside_op(
-                op,
-                offset,
-                package_list_guid,
-                in_ignored_ifr,
-                &mut outside,
-                &mut malformed_stores,
-            );
+            walked.push((offset, op));
             continue;
         }
-        form_set_read = true;
-        if !op.open_scope {
-            rest_ignored = true;
+        if let Some(start) = open_past_end.take() {
+            past_end.push(start..offset);
         }
         let failure = match failing_alike.remove(&offset) {
             Some(failure) => failure,
@@ -1719,11 +1843,14 @@ pub(super) fn parse_form_sets(
                 package_cursor.set_position(offset);
                 let mut alike = Vec::new();
                 match handle_form_set_within(package_cursor, MAX_SCOPE_NESTING, &mut alike) {
-                    Ok(root) => {
+                    Ok(parsed) => {
                         if !op.open_scope {
+                            declaring.push(ignored.len());
                             ignored.push(opens_no_scope(&op, package_list_guid, offset));
+                            open_past_end = Some(offset);
                         }
-                        roots.push(root);
+                        roots.push(parsed.root);
+                        disabled_forms.extend(parsed.disabled_forms);
                         continue;
                     }
                     Err(error) => {
@@ -1739,31 +1866,64 @@ pub(super) fn parse_form_sets(
              package: {}",
             failure.error
         );
+        declaring.push(ignored.len());
+        ignored_form_sets.push(offset);
         ignored.push(IgnoredIfr {
             package_list: package_list_guid,
             offset,
             reason: failure.reason(&form_set_name(&op)),
+            passwords: IgnoredPasswords::Declared(Arc::default()),
         });
-        if op.open_scope {
-            ignored_depth += 1;
-        }
         package_cursor.set_position(after_op);
+    }
+    if let Some(start) = open_past_end {
+        past_end.push(start..package_length);
+    }
+    let package = package_cursor.get_ref();
+    let DeclaredIfr { spans, storage } = match declaring.is_empty() {
+        true => DeclaredIfr::default(),
+        false => declared_ifr(package, &ignored_form_sets, &past_end),
+    };
+    let declared = Arc::new(storage);
+    for index in declaring {
+        if let Some(record) = ignored.get_mut(index) {
+            record.passwords = IgnoredPasswords::Declared(Arc::clone(&declared));
+        }
+    }
+    let mut outside = Vec::new();
+    let mut malformed_stores = Vec::new();
+    for (offset, op) in walked {
+        let in_ignored_ifr = spans
+            .get(spans.partition_point(|span| span.end <= offset))
+            .is_some_and(|span| span.contains(&offset));
+        record_outside_op(
+            op,
+            offset,
+            package,
+            package_list_guid,
+            in_ignored_ifr,
+            &mut outside,
+            &mut malformed_stores,
+        );
     }
     Ok(FormSets {
         roots,
         ignored,
+        disabled_forms,
         outside,
         malformed_stores,
     })
 }
 
-/// Records the op `op` at `offset` of a form package of the package list `package_list`, outside
-/// any FormSet, in `outside` if it is a VarStore that parses or, unless it is in ignored IFR
-/// (`in_ignored_ifr`), a statement, and in `malformed_stores` if it is a VarStore that does not
-/// parse.
+/// Records the op `op` at `offset` of the form package `package` of the package list
+/// `package_list`, outside any FormSet, in `outside` if it is a VarStore that parses, a PASSWORD,
+/// or, unless it is in ignored IFR (`in_ignored_ifr`), another statement, and in
+/// `malformed_stores` if it is a VarStore that does not parse, with the storage that it may
+/// declare (DeclaredStorage::declare).
 fn record_outside_op(
     mut op: IFROperation,
     offset: u64,
+    package: &[u8],
     package_list: Guid,
     in_ignored_ifr: bool,
     outside: &mut Vec<OutsideOp>,
@@ -1772,28 +1932,186 @@ fn record_outside_op(
     match op.op_code {
         IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue => {
             match handle_opcode(&mut op) {
-                Ok(()) => outside.push(OutsideOp { offset, op }),
+                Ok(()) => outside.push(OutsideOp {
+                    offset,
+                    op,
+                    in_ignored_ifr,
+                }),
                 Err(error) if in_ignored_ifr => debug!(
                     "a malformed {} outside a FormSet, in ignored IFR: {error:#}",
                     op.op_code.spec_name()
                 ),
-                Err(error) => malformed_stores.push(IgnoredIfr {
-                    package_list,
-                    offset,
-                    reason: format!(
-                        "a malformed {} outside a FormSet: {error:#}",
-                        op.op_code.spec_name()
-                    ),
-                }),
+                Err(error) => {
+                    let mut storage = DeclaredStorage::default();
+                    storage.declare(&op, package, offset);
+                    malformed_stores.push(IgnoredIfr {
+                        package_list,
+                        offset,
+                        reason: format!(
+                            "a malformed {} outside a FormSet: {error:#}",
+                            op.op_code.spec_name()
+                        ),
+                        passwords: IgnoredPasswords::Declared(Arc::new(storage)),
+                    })
+                }
             }
         }
         // a statement that does not parse counts for the Keyword Handler, which reads its Prompt
         // alone; PasswordQuestions decodes a PASSWORD's question header
-        op_code if defaults::is_statement(op_code) && !in_ignored_ifr => {
-            outside.push(OutsideOp { offset, op })
-        }
+        op_code if defaults::is_statement(op_code) && !in_ignored_ifr => outside.push(OutsideOp {
+            offset,
+            op,
+            in_ignored_ifr,
+        }),
+        // in ignored IFR too, as FindQuestionFromStringId finds it there and FindStorageFromVarId
+        // takes the first VarStore of its VarStoreId in the form package
+        IFROpCode::Password => outside.push(OutsideOp {
+            offset,
+            op,
+            in_ignored_ifr,
+        }),
         _ => {}
     }
+}
+
+/// The IFR of a form package that IgnoredPasswords::Declared covers: its spans of offsets,
+/// ascending, and the storage that its ops declare.
+#[derive(Default)]
+struct DeclaredIfr {
+    spans: Vec<std::ops::Range<u64>>,
+    storage: DeclaredStorage,
+}
+
+/// The IFR of the FormSets of the form package `package` whose FORM_SET ops sit at `form_sets`,
+/// ascending, and that at offsets in the spans `past_end`, ascending, with the storage that its
+/// VARSTORE and VARSTORE_EFI ops declare (DeclaredStorage::declare). A FormSet's ops run from its
+/// FORM_SET op to the End of its scope, or, where that op opens none, to the end of the package,
+/// as edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes parses them. The walk goes op by
+/// op from the start of the package, as parse_form_sets' does, so it ends where that walk ends, at
+/// an op that does not fit the package, which parse_form_sets records as
+/// IgnoredPasswords::AnyVariable.
+fn declared_ifr(
+    package: &[u8],
+    form_sets: &[u64],
+    past_end: &[std::ops::Range<u64>],
+) -> DeclaredIfr {
+    let mut cursor = Cursor::new(package);
+    let mut form_sets = form_sets.iter().peekable();
+    let mut past_end = past_end.iter().peekable();
+    let mut depth: usize = 0;
+    // while a FormSet of `form_sets` is open: the depth that the End of the outermost one's scope
+    // returns to, or None for one whose FORM_SET op opens no scope, which runs to the end
+    let mut open: Option<Option<usize>> = None;
+    // the start of the span that the ops up to here are in, if they are
+    let mut span_start = None;
+    let mut declared = DeclaredIfr::default();
+    loop {
+        let offset = cursor.position();
+        // parse_form_sets' walk ends at the same op
+        let Ok(op) = cursor.parse_ne::<IFROperation>() else {
+            break;
+        };
+        while form_sets.next_if(|&&form_set| form_set < offset).is_some() {}
+        let starts = form_sets.next_if_eq(&&offset).is_some();
+        match (open, starts, op.open_scope) {
+            (None, true, true) => open = Some(Some(depth)),
+            (None | Some(Some(_)), true, false) => open = Some(None),
+            (_, false, _) | (Some(Some(_)), true, true) | (Some(None), true, _) => {}
+        }
+        while past_end.next_if(|span| span.end <= offset).is_some() {}
+        let declaring =
+            open.is_some() || past_end.peek().is_some_and(|span| span.contains(&offset));
+        match (declaring, span_start) {
+            (true, None) => span_start = Some(offset),
+            (false, Some(start)) => {
+                declared.spans.push(start..offset);
+                span_start = None;
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+        if declaring {
+            declared.storage.declare(&op, package, offset);
+        }
+        match (op.op_code, op.open_scope) {
+            (IFROpCode::End, _) => {
+                depth = depth.saturating_sub(1);
+                if open == Some(Some(depth)) {
+                    open = None;
+                }
+            }
+            (_, true) => depth += 1,
+            (_, false) => {}
+        }
+    }
+    // up to the end of the walk
+    if let Some(start) = span_start {
+        declared.spans.push(start..u64::MAX);
+    }
+    declared
+}
+
+/// The storage that VARSTORE and VARSTORE_EFI ops of IFR that read_db ignores, or such an op outside
+/// any FormSet that does not parse, declare.
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct DeclaredStorage {
+    /// The variables that they name
+    pub(crate) variables: BTreeSet<VariableKey>,
+    /// The vendor GUIDs of those whose variables' names are unknown, every variable of which
+    /// may be theirs
+    pub(crate) guids: VariableGuids,
+}
+
+impl DeclaredStorage {
+    /// Adds what the op `op`, at `offset` of the form package `package`, declares if it is a
+    /// VARSTORE or VARSTORE_EFI: its variable, decoded from its op alone, else its GUID, every
+    /// variable of which may be its, read where edk2-stable202608 SetupBrowserDxe/IfrParse.c
+    /// CreateStorage reads it whatever the op's Length (:440, :446), and unknown past the package.
+    /// The GUID is taken for a VARSTORE_EFI of the form before UEFI 2.3.1 too, which names a
+    /// variable for each question on it by the string of the question's VarName (CreateQuestion
+    /// :156, Setup.c GetToken :1069-1072, GetQuestionValue :1772-1774), any string for a question
+    /// that is not read.
+    fn declare(&mut self, op: &IFROperation, package: &[u8], offset: u64) {
+        let mut data = Cursor::new(&op.data);
+        let (variable, guid_offset) = match op.op_code {
+            IFROpCode::VarStore => (
+                data.parse_ne::<VarStore>()
+                    .ok()
+                    .map(|store| store.variable_key()),
+                VAR_STORE_GUID_OFFSET,
+            ),
+            IFROpCode::VarStoreEfi if op.length >= VAR_STORE_EFI_SIZE => (
+                data.parse_ne::<VarStoreEfi>()
+                    .ok()
+                    .map(|store| store.variable_key()),
+                VAR_STORE_EFI_GUID_OFFSET,
+            ),
+            IFROpCode::VarStoreEfi => (None, VAR_STORE_EFI_GUID_OFFSET),
+            _ => return,
+        };
+        match variable {
+            Some(variable) => {
+                self.variables.insert(variable);
+            }
+            None => self.guids.insert(guid_at(package, offset, guid_offset)),
+        }
+    }
+
+    /// Adds those of `other`.
+    pub(crate) fn extend(&mut self, other: &Self) {
+        self.variables.extend(other.variables.iter().cloned());
+        self.guids.extend(&other.guids);
+    }
+}
+
+/// The GUID at `guid_offset` of the op at `offset` of the form package `package`, if the package
+/// holds it.
+fn guid_at(package: &[u8], offset: u64, guid_offset: u64) -> Option<Guid> {
+    let start = usize::try_from(offset.checked_add(guid_offset)?).ok()?;
+    let bytes: [u8; 16] = package
+        .get(start..start.checked_add(16)?)?
+        .try_into()
+        .ok()?;
+    Some(Guid::from(bytes))
 }
 
 /// The record of the FormSet that parses from the FORM_SET op `op` without Scope, at offset
@@ -1811,6 +2129,7 @@ fn opens_no_scope(op: &IFROperation, package_list: Guid, offset: u64) -> Ignored
         package_list,
         offset,
         reason,
+        passwords: IgnoredPasswords::Declared(Arc::default()),
     }
 }
 
@@ -1831,24 +2150,50 @@ pub(crate) fn named_records(records: &[impl fmt::Display]) -> String {
     named.join("; ")
 }
 
-/// Why a FormSet that parse_form_sets ignores does not parse: the error of its parse, and whether
-/// its scopes nest too deep.
+/// Why a FormSet that parse_form_sets ignores does not parse: the error of its parse, and what
+/// fails.
 struct FormSetFailure {
-    too_deep: bool,
+    kind: FormSetFailureKind,
     error: String,
+}
+
+/// What fails in a FormSet that parse_form_sets ignores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormSetFailureKind {
+    /// Its scopes nest deeper than MAX_SCOPE_NESTING
+    TooDeep,
+    /// An op runs past the package or below the header size
+    Malformed,
+    /// An op outside its forms is shorter than the Length that it needs (ShortOp)
+    Short,
+    /// An op outside its forms that uefisettings does not decode
+    Undecoded,
+    /// A VarStore op in a form that a malformed op disables (VarStoreInDisabledForm)
+    VarStoreInDisabledForm,
 }
 
 impl FormSetFailure {
     /// That of the error `error` of handle_form_set_within, which ignores the FormSet if it nests
-    /// too deep or does not parse; `error` for any other.
+    /// too deep, does not parse or holds an op that uefisettings does not decode outside its
+    /// forms; `error` for any other.
     fn of(error: anyhow::Error) -> Result<Self> {
         let too_deep = error.chain().any(|cause| cause.is::<ScopesTooDeep>());
+        let var_store = error
+            .chain()
+            .any(|cause| cause.is::<VarStoreInDisabledForm>());
+        let undecoded = error.chain().any(|cause| cause.is::<UndecodedOp>());
+        let short = error.chain().any(|cause| cause.is::<ShortOp>());
         let malformed = error.chain().any(|cause| cause.is::<ParseError>());
-        if !too_deep && !malformed {
-            return Err(error);
-        }
+        let kind = match (too_deep, var_store, undecoded, short, malformed) {
+            (true, _, _, _, _) => FormSetFailureKind::TooDeep,
+            (false, true, _, _, _) => FormSetFailureKind::VarStoreInDisabledForm,
+            (false, false, true, _, _) => FormSetFailureKind::Undecoded,
+            (false, false, false, true, _) => FormSetFailureKind::Short,
+            (false, false, false, false, true) => FormSetFailureKind::Malformed,
+            (false, false, false, false, false) => return Err(error),
+        };
         Ok(Self {
-            too_deep,
+            kind,
             error: format!("{error:#}"),
         })
     }
@@ -1856,14 +2201,26 @@ impl FormSetFailure {
     /// The reason of the record of the FormSet `name` that fails so.
     fn reason(&self, name: &str) -> String {
         let error = &self.error;
-        if self.too_deep {
-            format!("{name}, which nests too deep: {error}")
-        } else {
-            format!(
+        match self.kind {
+            FormSetFailureKind::TooDeep => format!("{name}, which nests too deep: {error}"),
+            FormSetFailureKind::Malformed => format!(
                 "{name}, which does not parse; uefisettings ignores it, where UEFI 2.11 \
                  §33.2.5.10.1 disables only the form of a malformed op and ignores only a \
                  malformed forms set: {error}"
-            )
+            ),
+            FormSetFailureKind::Short => format!(
+                "{name}, which holds, outside its forms, an op shorter than its minimum, which \
+                 UEFI 2.11 §33.2.5.10.1 calls malformed, in no form for that section to disable: \
+                 {error}"
+            ),
+            FormSetFailureKind::Undecoded => format!(
+                "{name}, which holds, outside its forms, an op that uefisettings does not \
+                 decode: {error}"
+            ),
+            FormSetFailureKind::VarStoreInDisabledForm => format!(
+                "{name}, which holds a VarStore op in a form that a malformed op disables, whose \
+                 VarStoreId edk2's Config Keyword Handler reads all the same: {error}"
+            ),
         }
     }
 }
@@ -1878,21 +2235,51 @@ fn form_set_name(op: &IFROperation) -> String {
 }
 
 /// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
-/// ignores, and the VarStores and statements outside the FormSets that it parses, malformed
-/// VarStores apart.
+/// ignores, the forms that it drops from those roots, and the VarStores and statements outside the
+/// FormSets that it parses, malformed VarStores apart.
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
+    pub(super) disabled_forms: Vec<DisabledForm>,
     pub(super) outside: Vec<OutsideOp>,
     pub(super) malformed_stores: Vec<IgnoredIfr>,
 }
 
 /// A VarStore or statement op of a form package outside the FormSets that parse_form_sets
-/// parses, at `offset`.
+/// parses, at `offset`, and whether it is in the IFR that IgnoredPasswords::Declared covers.
 #[derive(Debug)]
 pub struct OutsideOp {
     pub offset: u64,
     pub op: IFROperation,
+    pub in_ignored_ifr: bool,
+}
+
+/// A form that parse_form_sets drops from the tree of its FormSet, as UEFI 2.11 §33.2.5.10.1
+/// disables the form of a malformed op, or as uefisettings does not decode an op in it, so that no
+/// question of it is read or set; its PASSWORD questions are withheld as those of the forms that
+/// it keeps.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DisabledForm {
+    /// The offset of its FORM or FORM_MAP op in its form package
+    pub offset: u64,
+    /// What it is and what disables it
+    pub reason: String,
+    /// Its FORM or FORM_MAP op, with its parent in the tree, holding its ops, undecoded from the
+    /// op that disables it on
+    pub form: Rc<RefCell<IFROperation>>,
+}
+
+impl DisabledForm {
+    /// Its record, as a form of a form package of the package list `package_list`.
+    pub fn record(&self, package_list: Guid) -> IgnoredIfr {
+        IgnoredIfr {
+            package_list,
+            offset: self.offset,
+            reason: self.reason.clone(),
+            passwords: IgnoredPasswords::Found,
+        }
+    }
 }
 
 /// IFR of a form package of the package list `package_list` that parse_form_sets ignores, from
@@ -1914,6 +2301,27 @@ pub struct IgnoredIfr {
     pub package_list: Guid,
     pub offset: u64,
     pub reason: String,
+    /// Where a PASSWORD in it, or of a VarStoreId that it may declare, may keep its password
+    pub(crate) passwords: IgnoredPasswords,
+}
+
+/// Where a PASSWORD in IFR that parse_form_sets ignores may keep its password, which
+/// PasswordQuestions::of_lists withholds.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum IgnoredPasswords {
+    /// In any variable: the IFR past an op where the walk for FormSets ends has no op boundary
+    AnyVariable,
+    /// In this storage: that which the VARSTORE and VARSTORE_EFI ops of the FormSets that the walk
+    /// ignores in the form package declare, and those of the ops from the FORM_SET op without
+    /// Scope of a FormSet that parses up to the next FORM_SET op that the walk meets, which edk2
+    /// parses into that FormSet past its End (declared_ifr), as find_corresponding_varstore
+    /// takes a PASSWORD's VarStore from its own FormSet; or that which a VarStore outside any
+    /// FormSet that does not parse may declare, as a PASSWORD of any VarStoreId may name it. A
+    /// PASSWORD there whose question header parses is withheld in each VarStore of its VarStoreId
+    /// too, as one outside any FormSet is (OutsideOp)
+    Declared(Arc<DeclaredStorage>),
+    /// Where PasswordQuestions finds it: a disabled form keeps its PASSWORD ops
+    Found,
 }
 
 impl fmt::Display for IgnoredIfr {
@@ -1934,23 +2342,38 @@ thread_local! {
     pub(crate) static OPS_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// handle_form_set_within for the tests, at MAX_SCOPE_NESTING
+/// The root of handle_form_set_within, for the tests, at MAX_SCOPE_NESTING
 #[cfg(test)]
 pub(crate) fn handle_form_set(
     package_cursor: &mut Cursor<&Vec<u8>>,
 ) -> Result<Rc<RefCell<IFROperation>>> {
     handle_form_set_within(package_cursor, MAX_SCOPE_NESTING, &mut Vec::new())
+        .map(|parsed| parsed.root)
 }
 
-/// handle_form_set, failing with ScopesTooDeep at an op that opens more than `limit` scopes at
-/// once, adding to `alike` the offset of each FORM_SET op without Scope after its first op that it
-/// reads outside every scope that it opened: the parse from such an op reads the ops after it as
-/// this one does, so it fails where this one fails.
+/// A FormSet that handle_form_set_within parses: the root of its tree, and the forms that it
+/// drops from it.
+struct ParsedFormSet {
+    root: Rc<RefCell<IFROperation>>,
+    disabled_forms: Vec<DisabledForm>,
+}
+
+/// Parses the FormSet at `package_cursor`, failing with ScopesTooDeep at an op that opens more
+/// than `limit` scopes at once, adding to `alike` the offset of each FORM_SET op without Scope
+/// after its first op that it reads outside every scope that it opened: the parse from such an op
+/// reads the ops after it as this one does, so it fails where this one fails.
+/// An op outside the scope of an op that skips_scope names that is shorter than the
+/// minimum_length of its opcode, or that uefisettings does not decode, disables its form: the
+/// innermost FORM or FORM_MAP op whose scope is open, or the op itself if it is one. The form's
+/// ops up to its End are read undecoded, and the form leaves the tree as a DisabledForm. Such an
+/// op outside every form fails the FormSet with ShortOp or UndecodedOp, and a VarStore op that
+/// would disable its form, or that a disabled form holds after the op that disables it, with
+/// VarStoreInDisabledForm.
 fn handle_form_set_within(
     package_cursor: &mut Cursor<&Vec<u8>>,
     limit: usize,
     alike: &mut Vec<u64>,
-) -> Result<Rc<RefCell<IFROperation>>> {
+) -> Result<ParsedFormSet> {
     let start = package_cursor.position();
     // this is the root element so all the values like op_code, length, etc are dummy
     debug!("new FormSet");
@@ -1971,6 +2394,12 @@ fn handle_form_set_within(
     let mut skipped_depth: usize = 0;
     // The scopes open, the FormSet's own and skipped ones counted
     let mut depth: usize = 0;
+    // The FORM and FORM_MAP ops whose scopes are open outside skipped ones, innermost last, with
+    // their offsets
+    let mut open_forms: Vec<(Rc<RefCell<IFROperation>>, u64)> = Vec::new();
+    // The form whose ops up to its End are read undecoded
+    let mut disabling: Option<DisabledForm> = None;
+    let mut disabled_forms = Vec::new();
 
     // this loop will terminate when it sees the IFR:End opcode as a child of FormSet
     // if input data is malformed then it will exit on erroring out cause none of the magic bytes match
@@ -1994,6 +2423,12 @@ fn handle_form_set_within(
             skipped_depth = skipped_depth.saturating_sub(1);
             depth = depth.saturating_sub(1);
             let current_scope_clone = Rc::clone(&current_scope);
+            if open_forms
+                .last()
+                .is_some_and(|(form, _)| Rc::ptr_eq(form, &current_scope_clone))
+            {
+                open_forms.pop();
+            }
             match current_scope_clone.borrow().parent.as_ref() {
                 Some(parent_ref) => {
                     if let Some(parent_ref_rc) = parent_ref.upgrade() {
@@ -2008,6 +2443,26 @@ fn handle_form_set_within(
                 }
                 None => debug!("IFR:End when parent_ref is none"),
             };
+            if let Some(disabled) =
+                disabling.take_if(|disabled| Rc::ptr_eq(&disabled.form, &current_scope_clone))
+            {
+                // every op after the form went into its scope, so it is its parent's last child
+                let mut parent = current_scope.borrow_mut();
+                match parent.children.last() {
+                    Some(last) if Rc::ptr_eq(last, &disabled.form) => {
+                        parent.children.pop();
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "the form disabled at offset {} of a form package is not the last op \
+                             of its parent",
+                            disabled.offset
+                        ))
+                    }
+                }
+                drop(parent);
+                disabled_forms.push(disabled);
+            }
 
             // back at the root: this FormSet has been parsed. The root is found by
             // identity: an IFR op may have opcode 0xFF, the root's DUMMY_OPCODE, and a scope.
@@ -2030,12 +2485,54 @@ fn handle_form_set_within(
         // before handle_opcode: ValueEncoding::from_question reads it
         current_node.borrow_mut().parent = Some(Rc::downgrade(&current_scope));
 
-        if skipped_depth == 0 {
-            let decoded = handle_opcode(&mut current_node.borrow_mut());
-            decoded.context(format!(
-                "failed to parse op_code {:?} properly",
-                &current_node.borrow().op_code,
-            ))?;
+        let (op_code, is_form, open_scope) = {
+            let node = current_node.borrow();
+            (
+                node.op_code,
+                matches!(node.op_code, IFROpCode::Form | IFROpCode::FormMap),
+                node.open_scope,
+            )
+        };
+        let var_store = VarStoreInDisabledForm {
+            op: op_code.spec_name(),
+            offset,
+        };
+        let is_var_store = matches!(
+            op_code,
+            IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue
+        );
+        if is_var_store && disabling.is_some() {
+            return Err(var_store.into());
+        }
+        if skipped_depth == 0 && disabling.is_none() {
+            if let Err(failure) = decode_op(&current_node, offset) {
+                let (form, form_offset) = match (is_form, open_forms.last(), is_var_store) {
+                    (true, _, _) => (Rc::clone(&current_node), offset),
+                    (false, Some(_), true) => return Err(var_store.into()),
+                    (false, Some((form, form_offset)), false) => (Rc::clone(form), *form_offset),
+                    (false, None, _) => return Err(failure.into()),
+                };
+                let form_set = root
+                    .borrow()
+                    .children
+                    .first()
+                    .map_or_else(|| "a FormSet".to_string(), |op| form_set_name(&op.borrow()));
+                let reason = failure.disabled_form_reason(&form_name(&form.borrow()), &form_set);
+                let disabled = DisabledForm {
+                    offset: form_offset,
+                    reason,
+                    form,
+                };
+                debug!(
+                    "disabling, at offset {}, {}",
+                    disabled.offset, disabled.reason
+                );
+                if !open_scope && Rc::ptr_eq(&disabled.form, &current_node) {
+                    disabled_forms.push(disabled);
+                    continue;
+                }
+                disabling = Some(disabled);
+            }
         }
 
         // add current_node to current_scope's children
@@ -2044,15 +2541,293 @@ fn handle_form_set_within(
             .children
             .push(Rc::clone(&current_node));
 
-        if current_node.borrow().open_scope {
-            if skipped_depth > 0 || skips_scope(&current_node.borrow()) {
-                skipped_depth += 1;
+        if open_scope {
+            match (
+                skipped_depth > 0 || skips_scope(&current_node.borrow()),
+                is_form,
+            ) {
+                (true, _) => skipped_depth += 1,
+                (false, true) => open_forms.push((Rc::clone(&current_node), offset)),
+                (false, false) => {}
             }
             current_scope = Rc::clone(&current_node);
         }
     }
 
-    Ok(root)
+    Ok(ParsedFormSet {
+        root,
+        disabled_forms,
+    })
+}
+
+/// Decodes the op at `node`, at offset `offset` of its form package, unless it is shorter than the
+/// minimum_length of its opcode or the required_length that its fields give it.
+fn decode_op(node: &Rc<RefCell<IFROperation>>, offset: u64) -> Result<(), OpFailure> {
+    let (op_code, short) = {
+        let op = node.borrow();
+        let minimum = Minimum {
+            bytes: usize::from(op.op_code.minimum_length()),
+            of: MinimumOf::Opcode,
+        };
+        let short = [Some(minimum), required_length(&op)]
+            .into_iter()
+            .flatten()
+            .find(|minimum| usize::from(op.length) < minimum.bytes)
+            .map(|minimum| ShortOp {
+                op: op.op_code.spec_name(),
+                offset,
+                length: op.length,
+                minimum,
+            });
+        (op.op_code, short)
+    };
+    if let Some(short) = short {
+        return Err(OpFailure::Short(short));
+    }
+    let decoded = handle_opcode(&mut node.borrow_mut());
+    decoded
+        .context(format!("failed to parse op_code {op_code:?} properly"))
+        .map_err(|error| {
+            OpFailure::Undecoded(UndecodedOp {
+                op: op_code.spec_name(),
+                offset,
+                detail: format!("{error:#}"),
+            })
+        })
+}
+
+/// The form that the FORM or FORM_MAP op `form` opens, named by its form_id, or "a form" if its
+/// Length leaves none.
+fn form_name(form: &IFROperation) -> String {
+    match form.form_id() {
+        Some(form_id) => format!("the form {form_id}"),
+        None => "a form".to_string(),
+    }
+}
+
+/// Why an op of a FormSet disables its form, or, outside every form, fails the FormSet.
+enum OpFailure {
+    /// Malformed, as UEFI 2.11 §33.2.5.10.1 calls it
+    Short(ShortOp),
+    Undecoded(UndecodedOp),
+}
+
+impl OpFailure {
+    /// The reason of the record of the form `form` of the FormSet `form_set` that it disables.
+    fn disabled_form_reason(&self, form: &str, form_set: &str) -> String {
+        match self {
+            Self::Short(short) => format!(
+                "{form} of {form_set}, whose {} op is malformed; UEFI 2.11 §33.2.5.10.1 disables \
+                 the form of a malformed op: {short}",
+                short.op
+            ),
+            Self::Undecoded(undecoded) => format!(
+                "{form} of {form_set}, whose {} op uefisettings does not decode: {undecoded}",
+                undecoded.op
+            ),
+        }
+    }
+}
+
+impl From<OpFailure> for anyhow::Error {
+    fn from(failure: OpFailure) -> Self {
+        match failure {
+            OpFailure::Short(short) => short.into(),
+            OpFailure::Undecoded(undecoded) => undecoded.into(),
+        }
+    }
+}
+
+/// An op shorter than the minimum_length of its opcode or the required_length of its fields, which
+/// UEFI 2.11 §33.2.5.10.1 calls malformed.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "the {op} op at offset {offset} of a form package is {length} bytes long, shorter than \
+     {minimum}"
+)]
+struct ShortOp {
+    op: &'static str,
+    offset: u64,
+    length: u8,
+    minimum: Minimum,
+}
+
+/// The Length below which an op is malformed, and what sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Minimum {
+    bytes: usize,
+    of: MinimumOf,
+}
+
+/// What sets a Minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinimumOf {
+    /// The opcode: minimum_length
+    Opcode,
+    /// The field that it names: required_length
+    Field(&'static str),
+}
+
+impl fmt::Display for Minimum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.of {
+            MinimumOf::Opcode => write!(f, "its minimum of {}", self.bytes),
+            MinimumOf::Field(field) => write!(f, "the {} bytes required by {field}", self.bytes),
+        }?;
+        f.write_str(" (UEFI 2.11 §33.3.8.3)")
+    }
+}
+
+/// The fields of a NUMERIC or ONE_OF before its MinValue (UEFI 2.11 §33.3.8.3.47, §33.3.8.3.50).
+#[derive(BinRead)]
+#[br(little)]
+struct NumericFlagsOp {
+    _question: QuestionHeader,
+    flags: u8,
+}
+
+/// The fields of a ONE_OF_OPTION before its Value (UEFI 2.11 §33.3.8.3.51).
+#[derive(BinRead)]
+#[br(little)]
+struct OptionTypeOp {
+    _option: u16,
+    _flags: u8,
+    option_type: u8,
+}
+
+/// The fields of a DEFAULT before its Value (UEFI 2.11 §33.3.8.3.12).
+#[derive(BinRead)]
+#[br(little)]
+struct DefaultTypeOp {
+    _default_id: u16,
+    default_type: u8,
+}
+
+/// The fields of a FORM_SET before its ClassGuid (UEFI 2.11 §33.3.8.3.26).
+#[derive(BinRead)]
+#[br(little)]
+struct FormSetFlagsOp {
+    _guid: Guid,
+    _title: u16,
+    _help: u16,
+    flags: u8,
+}
+
+/// The fields of an EQ_ID_VAL_LIST before its ValueList (UEFI 2.11 §33.3.8.3.20).
+#[derive(BinRead)]
+#[br(little)]
+struct ListLengthOp {
+    _question_id: u16,
+    list_length: u16,
+}
+
+/// The Length that a field of `op` gives it where that field fixes the size of the fields after
+/// it (UEFI 2.11 §33.3.8.3): of a NUMERIC or ONE_OF, the size of MinValue, MaxValue and Step that
+/// its Flags give (§33.3.8.3.47, §33.3.8.3.50), or UINT32 for an EDKII bit field; of a
+/// ONE_OF_OPTION or DEFAULT, that of the Value of its Type (type_value_size; §33.3.8.3.51,
+/// §33.3.8.3.12); of a FORM_SET, the ClassGuids that its Flags count (§33.3.8.3.26); of an
+/// EQ_ID_VAL_LIST, the ValueList entries of its ListLength (§33.3.8.3.20). None for other ops,
+/// Types of no fixed size, and an op too short for that field, which minimum_length refuses.
+fn required_length(op: &IFROperation) -> Option<Minimum> {
+    let header = usize::from(IFR_OPERATION_HEADER_SIZE);
+    let mut data = Cursor::new(&op.data);
+    let (bytes, field) = match op.op_code {
+        IFROpCode::Numeric | IFROpCode::OneOf => {
+            let NumericFlagsOp { flags, .. } = data.parse_le().ok()?;
+            let (size, field) = match ValueEncoding::from_question(op) {
+                ValueEncoding::NumericSize | ValueEncoding::VarName => {
+                    (numeric_size(flags), "its Flags")
+                }
+                ValueEncoding::EdkiiBitField => (std::mem::size_of::<u32>(), "its EDKII bit field"),
+            };
+            (usize::try_from(data.position()).ok()? + 3 * size, field)
+        }
+        IFROpCode::OneOfOption => {
+            let option: OptionTypeOp = data.parse_le().ok()?;
+            (
+                usize::try_from(data.position()).ok()? + type_value_size(option.option_type)?,
+                "its Type",
+            )
+        }
+        IFROpCode::Default => {
+            let default: DefaultTypeOp = data.parse_le().ok()?;
+            (
+                usize::try_from(data.position()).ok()? + type_value_size(default.default_type)?,
+                "its Type",
+            )
+        }
+        IFROpCode::FormSet => {
+            let form_set: FormSetFlagsOp = data.parse_le().ok()?;
+            let class_guids = usize::from(form_set.flags & EFI_IFR_FORM_SET_CLASS_GUID_COUNT);
+            (
+                usize::try_from(data.position()).ok()? + class_guids * std::mem::size_of::<Guid>(),
+                "the ClassGuid count of its Flags",
+            )
+        }
+        IFROpCode::EqIdValList => {
+            let list: ListLengthOp = data.parse_le().ok()?;
+            (
+                usize::try_from(data.position()).ok()?
+                    + usize::from(list.list_length) * std::mem::size_of::<u16>(),
+                "its ListLength",
+            )
+        }
+        _ => return None,
+    };
+    Some(Minimum {
+        bytes: header + bytes,
+        of: MinimumOf::Field(field),
+    })
+}
+
+/// The bytes of each of the MinValue, MaxValue and Step that the Flags `flags` of a NUMERIC or
+/// ONE_OF give them (UEFI 2.11 §33.3.8.3.47, §33.3.8.3.50).
+fn numeric_size(flags: u8) -> usize {
+    match flags & EFI_IFR_NUMERIC_SIZE {
+        EFI_IFR_NUMERIC_SIZE_1 => 1,
+        EFI_IFR_NUMERIC_SIZE_2 => 2,
+        EFI_IFR_NUMERIC_SIZE_4 => 4,
+        // EFI_IFR_NUMERIC_SIZE_8, the only value left
+        EFI_IFR_NUMERIC_SIZE_8.. => 8,
+    }
+}
+
+/// The bytes of the Value of Type `value_type` in an EFI_IFR_TYPE_VALUE (UEFI 2.11 §33.3.8.3.51),
+/// none for EFI_IFR_TYPE_OTHER, whose value a nested EFI_IFR_VALUE gives; None for
+/// EFI_IFR_TYPE_UNDEFINED and EFI_IFR_TYPE_BUFFER, whose size it does not fix, and unknown Types.
+fn type_value_size(value_type: u8) -> Option<usize> {
+    match value_type {
+        EFI_IFR_TYPE_NUM_SIZE_8 | EFI_IFR_TYPE_BOOLEAN => Some(1),
+        EFI_IFR_TYPE_NUM_SIZE_16 | EFI_IFR_TYPE_STRING | EFI_IFR_TYPE_ACTION => Some(2),
+        EFI_IFR_TYPE_NUM_SIZE_32 => Some(4),
+        EFI_IFR_TYPE_NUM_SIZE_64 => Some(8),
+        EFI_IFR_TYPE_TIME => Some(EFI_HII_TIME_SIZE),
+        EFI_IFR_TYPE_DATE => Some(EFI_HII_DATE_SIZE),
+        EFI_IFR_TYPE_REF => Some(EFI_HII_REF_SIZE),
+        EFI_IFR_TYPE_OTHER => Some(0),
+        _ => None,
+    }
+}
+
+/// A VarStore op in a form that a malformed op disables, that op or one after it: edk2-stable202608
+/// ConfigKeywordHandler.c FindStorageFromVarId takes a VarStore op of a question's VarStoreId
+/// wherever it is in the form package, whatever its Length, so it ignores its FormSet, whose
+/// storage IgnoredPasswords::Declared withholds whole.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("the {op} op at offset {offset} of a form package, in a form that uefisettings disables")]
+struct VarStoreInDisabledForm {
+    op: &'static str,
+    offset: u64,
+}
+
+/// An op that uefisettings does not decode, though it is no shorter than the minimum_length of its
+/// opcode.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("the {op} op at offset {offset} of a form package: {detail}")]
+struct UndecodedOp {
+    op: &'static str,
+    offset: u64,
+    detail: String,
 }
 
 fn handle_opcode(node: &mut IFROperation) -> Result<()> {
@@ -3891,6 +4666,7 @@ fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
 /// package holding its VarName gives, or the strings that they differ on. The strings are the
 /// list's, so every such store shares one map of them, filled after the walk, which borrows the
 /// ops that it visits.
+/// `roots` may hold the forms that their parse disables too, whose ops name VarNames as well.
 pub(super) fn resolve_short_var_names(
     roots: &[Rc<RefCell<IFROperation>>],
     string_packages: &[StringPackage],
@@ -4655,8 +5431,8 @@ mod tests {
     }
 
     /// The ops in the scope of an opcode above EFI_IFR_MATCH2_OP, nested ones too, are not
-    /// decoded, so a malformed one does not fail the FormSet; in a known opcode's scope
-    /// it still does.
+    /// decoded, so a malformed one does not disable its form; in a known opcode's scope it still
+    /// does.
     #[test]
     fn ops_in_an_unknown_opcode_scope_are_not_decoded() {
         let in_scope = |op_code: u8| {
@@ -4707,10 +5483,19 @@ mod tests {
         }
 
         let data = in_scope(GUID);
-        let error = handle_form_set(&mut Cursor::new(&data)).expect_err("GUID scope");
+        let parsed =
+            handle_form_set_within(&mut Cursor::new(&data), MAX_SCOPE_NESTING, &mut Vec::new())
+                .expect("parse the GUID scope");
+        let forms = parsed.root.borrow().children[0].borrow().children.len();
+        let reasons: Vec<&str> = parsed
+            .disabled_forms
+            .iter()
+            .map(|disabled| disabled.reason.as_str())
+            .collect();
         assert!(
-            format!("{error:#}").contains("failed to parse CheckBox's data"),
-            "GUID scope: {error:#}"
+            forms == 0
+                && matches!(reasons.as_slice(), [reason] if reason.contains("whose EFI_IFR_CHECKBOX op is malformed")),
+            "GUID scope: {forms} forms, disabled: {reasons:?}"
         );
     }
 
@@ -4781,17 +5566,19 @@ mod tests {
         }
     }
 
-    /// A FORM_SET that holds fewer ClassGuids than its Flags count does not parse (UEFI 2.11
-    /// §33.2.5.10.1).
+    /// A FORM_SET that holds fewer ClassGuids than its Flags count is malformed (UEFI 2.11
+    /// §33.2.5.10.1), shorter than the Length that they require.
     #[test]
     fn form_set_short_of_its_class_guid_count_does_not_parse() {
         let data = form_set_with_class_guids(0x03, &[[0x22; 16]], &[]);
 
         let error = handle_form_set(&mut Cursor::new(&data)).expect_err("3 counted, 1 held");
 
-        assert!(
-            format!("{error:#}").contains("failed to parse FormSet's data"),
-            "{error:#}"
+        assert_eq!(
+            format!("{error:#}"),
+            "the EFI_IFR_FORM_SET op at offset 0 of a form package is 39 bytes long, shorter than \
+             the 71 bytes required by the ClassGuid count of its Flags (UEFI 2.11 §33.3.8.3)",
+            "3 counted, 1 held"
         );
     }
 
@@ -4844,7 +5631,7 @@ mod tests {
         let error = parse(operation(VAR_STORE_EFI, false, &fields[..21]))
             .expect_err("Length 23 ends inside Attributes");
         assert!(
-            format!("{error:#}").contains("failed to parse VarStoreEfi's data"),
+            format!("{error:#}").contains("is 23 bytes long, shorter than its minimum of 24"),
             "Length 23: {error:#}"
         );
     }
@@ -4960,6 +5747,7 @@ mod nesting_tests {
         let ifr = deep_form_set(depth, nots, password);
         handle_form_set_within(&mut Cursor::new(&ifr), usize::MAX, &mut Vec::new())
             .expect("parse the FormSet")
+            .root
     }
 
     /// The op of the tree of `root` whose data is that of the op `op`.
@@ -5351,17 +6139,24 @@ mod expression_operand_tests {
         );
     }
 
-    /// A GET or SET too short for its operand is left undecoded, for the evaluation to refuse,
-    /// and does not fail the FormSet, whose other questions get and set still reach.
+    /// A GET or SET too short for its operand is malformed, so it disables its form (UEFI 2.11
+    /// §33.2.5.10.1).
     #[test]
-    fn short_get_and_set_are_not_decoded_and_keep_the_form_set() {
+    fn short_get_and_set_disable_their_form() {
         for op_code in [0x2B, 0x2C] {
-            let ops = parsed_form(&[operation(op_code, false, &[0x34, 0x12, 0xC1, 0x00])]);
+            let short = operation(op_code, false, &[0x34, 0x12, 0xC1, 0x00]);
+            let (root, disabled) = parse_form_set_dropping(&[form(1, &[short])]);
 
+            let forms = root.borrow().children[0].borrow().children.len();
+            let reasons: Vec<&str> = disabled
+                .iter()
+                .map(|disabled| disabled.reason.as_str())
+                .collect();
             assert!(
-                matches!(ops[0].borrow().parsed_data, ParsedOperation::Placeholder),
-                "opcode {op_code:#x}: {:?}",
-                ops[0].borrow().parsed_data
+                forms == 0
+                    && matches!(reasons.as_slice(), [reason] if reason.starts_with("the form 1 of")
+                        && reason.contains("op is malformed")),
+                "opcode {op_code:#x}: {forms} forms, disabled: {reasons:?}"
             );
         }
     }
@@ -5399,37 +6194,160 @@ mod expression_operand_tests {
         }
     }
 
-    /// A FORM_MAP keeps the methods that fit in its Length; one without room for its FormId is
-    /// left undecoded, and neither fails the FormSet.
+    /// A FORM_MAP keeps the methods that fit in its Length; one without room for a method is
+    /// malformed (UEFI 2.11 §33.3.8.3.25 requires one), so its form is disabled (§33.2.5.10.1).
     #[test]
     fn short_form_map_keeps_the_methods_that_fit() {
-        let truncated = [
-            operation(
-                FORM_MAP,
-                true,
-                &[
-                    &4u16.to_le_bytes()[..],
-                    &[0x06, 0x00],
-                    &STANDARD_FORM_GUID[..8],
-                ]
-                .concat(),
-            ),
-            END.to_vec(),
-        ]
-        .concat();
-        let op = parsed_first(&[truncated]);
+        let truncated = |methods: &[&[u8]]| {
+            let data = [&[&4u16.to_le_bytes()[..]], methods].concat().concat();
+            [operation(FORM_MAP, true, &data), END.to_vec()].concat()
+        };
+        let cut_off: &[u8] = &[&[0x06, 0x00][..], &STANDARD_FORM_GUID[..8]].concat();
+        let other: &[u8] = &[&[0x05, 0x00][..], &OTHER_GUID].concat();
+
+        let op = parsed_first(&[truncated(&[other, cut_off])]);
         let op = op.borrow();
         let ParsedOperation::FormMap(form_map) = &op.parsed_data else {
             panic!("FORM_MAP not decoded: {:?}", op.parsed_data);
         };
-        assert!(form_map.methods.is_empty(), "{:?}", form_map.methods);
+        let titles: Vec<u16> = form_map
+            .methods
+            .iter()
+            .map(|method| method.method_title)
+            .collect();
+        assert_eq!(titles, [5], "the whole method");
         assert!(!form_map.has_standard_method(), "a cut-off method");
 
-        let op = parsed_first(&[[operation(FORM_MAP, true, &[0x04]), END.to_vec()].concat()]);
+        for (name, methods) in [("a cut-off method", &[cut_off][..]), ("no method", &[])] {
+            let (root, disabled) = parse_form_set_dropping(&[truncated(methods)]);
+
+            let forms = root.borrow().children[0].borrow().children.len();
+            let reasons: Vec<&str> = disabled
+                .iter()
+                .map(|disabled| disabled.reason.as_str())
+                .collect();
+            assert!(
+                forms == 0
+                    && matches!(reasons.as_slice(), [reason] if reason.starts_with("the form 4 of")
+                        && reason.contains("whose EFI_IFR_FORM_MAP op is malformed")),
+                "{name}: {forms} forms, disabled: {reasons:?}"
+            );
+        }
+    }
+
+    /// An op shorter than the Length that its Flags, Type or ListLength require is malformed, so
+    /// it disables its form (UEFI 2.11 §33.2.5.10.1); one of that Length decodes.
+    #[test]
+    fn ops_shorter_than_their_fields_require_disable_their_form() {
+        const EQ_ID_VAL_LIST: u8 = 0x14;
+        let numeric = |op_code: u8, flags: u8, values: usize| {
+            let data = [question_header(0), vec![flags], vec![0; values]].concat();
+            operation(op_code, false, &data)
+        };
+        let bit_field =
+            |op: Vec<u8>| [operation(GUID, true, &BIT_VARSTORE_GUID), op, END.to_vec()].concat();
+        let cases = [
+            (
+                "UINT16 NUMERIC",
+                numeric(NUMERIC, 0x01, 3),
+                numeric(NUMERIC, 0x01, 6),
+                "EFI_IFR_NUMERIC op at offset",
+                "17 bytes long, shorter than the 20 bytes required by its Flags",
+            ),
+            (
+                "UINT32 ONE_OF",
+                numeric(ONE_OF, 0x02, 3),
+                numeric(ONE_OF, 0x02, 12),
+                "EFI_IFR_ONE_OF op at offset",
+                "17 bytes long, shorter than the 26 bytes required by its Flags",
+            ),
+            (
+                "bit-field NUMERIC",
+                bit_field(numeric(NUMERIC, 0x08, 3)),
+                bit_field(numeric(NUMERIC, 0x08, 12)),
+                "EFI_IFR_NUMERIC op at offset",
+                "17 bytes long, shorter than the 26 bytes required by its EDKII bit field",
+            ),
+            (
+                "UINT32 ONE_OF_OPTION",
+                one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_32, &[0]),
+                one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_32, &[0; 4]),
+                "EFI_IFR_ONE_OF_OPTION op at offset",
+                "7 bytes long, shorter than the 10 bytes required by its Type",
+            ),
+            (
+                "UINT16 DEFAULT",
+                operation(DEFAULT, false, &[0, 0, EFI_IFR_TYPE_NUM_SIZE_16, 0]),
+                operation(DEFAULT, false, &[0, 0, EFI_IFR_TYPE_NUM_SIZE_16, 0, 0]),
+                "EFI_IFR_DEFAULT op at offset",
+                "6 bytes long, shorter than the 7 bytes required by its Type",
+            ),
+            (
+                "EQ_ID_VAL_LIST of 2",
+                operation(EQ_ID_VAL_LIST, false, &[1, 0, 2, 0, 0, 0]),
+                operation(EQ_ID_VAL_LIST, false, &[1, 0, 2, 0, 0, 0, 0, 0]),
+                "EFI_IFR_EQ_ID_VAL_LIST op at offset",
+                "8 bytes long, shorter than the 10 bytes required by its ListLength",
+            ),
+        ];
+        for (name, short, whole, op, length) in cases {
+            let (root, disabled) = parse_form_set_dropping(&[form(1, &[short])]);
+
+            let forms = root.borrow().children[0].borrow().children.len();
+            let reasons: Vec<&str> = disabled
+                .iter()
+                .map(|disabled| disabled.reason.as_str())
+                .collect();
+            assert!(
+                forms == 0
+                    && matches!(reasons.as_slice(), [reason] if reason.starts_with("the form 1 of")
+                        && reason.contains(op)
+                        && reason.ends_with(&format!("{length} (UEFI 2.11 §33.3.8.3)"))),
+                "{name}: {forms} forms, disabled: {reasons:?}"
+            );
+
+            let (root, disabled) = parse_form_set_dropping(&[form(1, &[whole])]);
+            let forms = root.borrow().children[0].borrow().children.len();
+            assert!(
+                forms == 1 && disabled.is_empty(),
+                "{name} of its Length: {forms} forms, disabled: {disabled:?}"
+            );
+        }
+    }
+
+    /// A FormSet of live forms between disabled ones keeps every live form in order and records
+    /// every disabled one (UEFI 2.11 §33.2.5.10.1).
+    #[test]
+    fn interleaved_disabled_forms_leave_the_live_ones_in_order() {
+        let short_checkbox = operation(CHECKBOX, false, &[0x00]);
+        let forms: Vec<Vec<u8>> = [(1, true), (2, false), (3, false), (4, true), (5, false)]
+            .into_iter()
+            .map(|(form_id, live)| match live {
+                true => form(form_id, &[]),
+                false => form(form_id, std::slice::from_ref(&short_checkbox)),
+            })
+            .collect();
+
+        let (root, disabled) = parse_form_set_dropping(&forms);
+
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let live: Vec<u16> = form_set
+            .borrow()
+            .children
+            .iter()
+            .filter_map(|form| form.borrow().form_id())
+            .collect();
+        assert_eq!(live, [1, 4], "the live forms");
+        let reasons: Vec<&str> = disabled
+            .iter()
+            .map(|disabled| disabled.reason.as_str())
+            .collect();
         assert!(
-            matches!(op.borrow().parsed_data, ParsedOperation::Placeholder),
-            "{:?}",
-            op.borrow().parsed_data
+            matches!(reasons.as_slice(), [two, three, five]
+                if two.starts_with("the form 2 of")
+                    && three.starts_with("the form 3 of")
+                    && five.starts_with("the form 5 of")),
+            "disabled: {reasons:?}"
         );
     }
 }

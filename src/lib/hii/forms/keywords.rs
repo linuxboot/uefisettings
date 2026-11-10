@@ -67,6 +67,7 @@ use super::IFROpCode;
 use super::IFROperation;
 use super::IgnoredIfr;
 use super::IncludedStates;
+use super::OptionTypeOp;
 use super::OutsideOp;
 use super::ParsedOperation;
 use super::QuestionDescriptor;
@@ -77,6 +78,9 @@ use super::SelectionError;
 use super::ShortVarStoreEfi;
 use super::TypeValue;
 use super::Walk;
+use super::EFI_HII_DATE_SIZE;
+use super::EFI_HII_REF_SIZE;
+use super::EFI_HII_TIME_SIZE;
 use super::EFI_IFR_TYPE_NUM_SIZE_16;
 use super::EFI_IFR_TYPE_NUM_SIZE_32;
 use super::EFI_IFR_TYPE_NUM_SIZE_64;
@@ -1261,7 +1265,8 @@ enum Statement<'a> {
 
 /// The ops of `list` that IsStatementOpCode (ConfigKeywordHandler.c:1420) takes for statements
 /// and whose Prompt is `prompt`: in its FormSets, in IFR order, each with the root of its form
-/// package, then outside any FormSet, as FindQuestionFromStringId walks the whole form package.
+/// package, then outside any FormSet, as FindQuestionFromStringId walks the whole form package, but
+/// in ignored IFR (OutsideOp::in_ignored_ifr).
 fn statements(list: &ParsedPackageList, prompt: u16) -> Vec<Statement<'_>> {
     let mut found = Vec::new();
     for root in &list.forms {
@@ -1278,7 +1283,7 @@ fn statements(list: &ParsedPackageList, prompt: u16) -> Vec<Statement<'_>> {
     found.extend(
         list.outside_ifr
             .iter()
-            .filter(|outside| prompts(&outside.op, prompt))
+            .filter(|outside| !outside.in_ignored_ifr && prompts(&outside.op, prompt))
             .map(Statement::Outside),
     );
     found
@@ -1351,22 +1356,6 @@ struct OrderedListOp {
     _question: QuestionHeader,
     max_containers: u8,
 }
-
-/// The start of an EFI_IFR_ONE_OF_OPTION after its op header (UEFI 2.11 §33.3.8.3.51).
-#[derive(BinRead)]
-#[br(little)]
-struct OptionTypeOp {
-    _option: u16,
-    _flags: u8,
-    option_type: u8,
-}
-
-/// The bytes of an EFI_HII_TIME, EFI_HII_DATE and EFI_HII_REF, packed
-/// (edk2-stable202608 MdePkg/Include/Uefi/UefiInternalFormRepresentation.h:659-676): Hour, Minute
-/// and Second; a UINT16 Year, Month and Day; QuestionId, FormId, FormSetGuid and DevicePath.
-const EFI_HII_TIME_SIZE: usize = 3;
-const EFI_HII_DATE_SIZE: usize = 4;
-const EFI_HII_REF_SIZE: usize = 22;
 
 /// The value bytes of its variable that GetData() and SetData() take for the question `op` of
 /// `header`: GetWidth's (keyword_width) from its VarOffset, or every byte of the variable for an
@@ -1450,6 +1439,7 @@ mod tests {
     use super::super::ifr_fixtures::conditional;
     use super::super::ifr_fixtures::eq_id_val_of;
     use super::super::ifr_fixtures::flagged_option;
+    use super::super::ifr_fixtures::form;
     use super::super::ifr_fixtures::form_set;
     use super::super::ifr_fixtures::ifr_default;
     use super::super::ifr_fixtures::ifr_false;
@@ -1573,6 +1563,7 @@ mod tests {
             ignored_ifr: Vec::new(),
             outside_ifr: Vec::new(),
             malformed_outside_stores: Vec::new(),
+            disabled_forms: Vec::new(),
         }
     }
 
@@ -2289,34 +2280,6 @@ mod tests {
                 "{op}: set"
             );
         }
-        let short = [list(
-            PATH,
-            &[(NAMESPACE, KEYWORD)],
-            operation(STRING, false, &PROMPT.to_le_bytes()),
-        )];
-        let refusal = question_of(&short).check_get(&reader(1));
-        assert!(
-            matches!(
-                &refusal,
-                Err(KeywordRefusal::NoHeader {
-                    op: "EFI_IFR_STRING",
-                    reason,
-                    ..
-                }) if !reason.contains('\n') && !reason.contains("src/")
-            ),
-            "a STRING of a Prompt alone, the reason on one line: {refusal:?}"
-        );
-        let short_op = operation(STRING, false, &PROMPT.to_le_bytes());
-        assert!(
-            matches!(
-                refusal_of(check_set_of(short_op, "03", IncludedStates::empty())),
-                Some(KeywordRefusal::NoHeader {
-                    op: "EFI_IFR_STRING",
-                    ..
-                })
-            ),
-            "set of a STRING of a Prompt alone"
-        );
         let password = password_on(1, PROMPT, 1, 5);
         let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], password.clone())];
         assert_eq!(
@@ -2765,6 +2728,22 @@ mod tests {
                 "PATH {path:?}"
             );
         }
+    }
+
+    /// A PASSWORD in a FormSet that read_db ignores, which parse_form_sets returns for its
+    /// withholding (OutsideOp::in_ignored_ifr), is no statement that a keyword prompts, as no other
+    /// statement of IFR that read_db ignores is: resolve takes the FormSet's.
+    #[test]
+    fn resolve_takes_no_password_of_ignored_ifr_for_a_statement() {
+        let ignored = form_set(&[
+            form(1, &[password_on(9, PROMPT, 1, 0)]),
+            operation(CHECKBOX, false, &[0]),
+        ]);
+        let lists = [list_read(
+            [ignored, store_form_set(&[one_of(1, 0)])].concat(),
+        )];
+
+        assert_eq!(resolve(&lists, Some(PATH)).err(), None);
     }
 
     /// FindStorageFromVarId (ConfigKeywordHandler.c:1520) takes the first VarStore of the id in

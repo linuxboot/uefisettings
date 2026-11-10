@@ -2,9 +2,10 @@ echo -off
 # The boot of the scenario shell-formset-skip: publish-hiidb.efi formset-skip-forms registers
 # two package lists: three form sets on the variable UefisettingsFormSetSkip, which
 # tests/qemu/vars/formset-skip.json creates with 20 bytes of 0xAA, standing for a password, then
-# 1 and 3, and two on UefisettingsFirstFormSetSkip, which it creates with 20 bytes of 0xAA, then
-# 4; uefisettings ignores the second form set of the first list and the first of the second,
-# each holding a PASSWORD, and reads the others.
+# 1 and 3, 20 bytes of 0xBB, the password of a form that uefisettings disables, and 5, and two on
+# UefisettingsFirstFormSetSkip, which it creates with 20 bytes of 0xAA, then 4; uefisettings
+# ignores the second form set of the first list and the first of the second, each holding a
+# PASSWORD, and reads the others.
 # shell/formset-skip.tsv holds the checks of the steps.
 fs0:
 echo uefisettings-shell: start

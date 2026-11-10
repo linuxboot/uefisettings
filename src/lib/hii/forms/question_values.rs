@@ -1233,13 +1233,16 @@ mod question_value_tests {
             ),
             (
                 "DATE option before a UINT8 option of 0",
-                vec![one_of_option(5, 0x06, &[0]), one_of_option(6, 0x00, &[0])],
+                vec![
+                    one_of_option(5, 0x06, &[0; 4]),
+                    one_of_option(6, 0x00, &[0]),
+                ],
                 var_store_of(&[0]),
                 "Enabled",
             ),
             (
                 "DATE option without a current value",
-                vec![one_of_option(5, 0x06, &[0])],
+                vec![one_of_option(5, 0x06, &[0; 4])],
                 unavailable(),
                 UNAVAILABLE,
             ),

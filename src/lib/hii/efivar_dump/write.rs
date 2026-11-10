@@ -81,14 +81,16 @@ pub(crate) fn dump_efivars(
 }
 
 /// The payload bytes that the questions of `package_lists`, in any state, decode, by efivar
-/// file, found without reading any; none that a PASSWORD question that uefisettings finds holds.
-/// One in IFR that read_db ignores, or whose VarStore is unknown, withholds no bytes: of_lists
-/// warns of each.
+/// file, found without reading any, which the dump copies; none that a PASSWORD question that
+/// uefisettings finds holds, nor any of a variable that an ignored FormSet declares. One whose
+/// VarStore is unknown withholds no bytes: of_lists warns of each. IFR past an op where the walk
+/// for FormSets ends may keep a password in any variable, so a HiiDB with it fails.
 fn decoded_bytes(
     package_lists: Vec<ParsedPackageList>,
 ) -> Result<BTreeMap<EfivarFileName, Vec<DecodedValue>>> {
-    let mut reader = PasswordQuestions::of_lists(&package_lists)
-        .reader(EfivarSource::Disabled.into_variables()?)?;
+    let passwords = PasswordQuestions::of_lists(&package_lists);
+    passwords.check_bounded()?;
+    let mut reader = passwords.reader(EfivarSource::Disabled.into_variables()?)?;
     for list in package_lists {
         list.check_form_strings()?;
         // which questions read which bytes holds in every language
@@ -308,6 +310,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::DEFAULT_STORE;
     use crate::hii::forms::ifr_fixtures::DISABLE_IF;
     use crate::hii::forms::ifr_fixtures::NIL_GUID;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
@@ -318,9 +321,14 @@ mod tests {
     use crate::hii::forms::IFROperation;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
     use crate::hii::package::hiidb_fixtures::form_package;
+    use crate::hii::package::hiidb_fixtures::other_store;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::password_past_the_walk_hiidb;
+    use crate::hii::package::hiidb_fixtures::password_store;
+    use crate::hii::package::hiidb_fixtures::password_store_hiidb;
     use crate::hii::package::hiidb_fixtures::strings_package_of;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::hiidb_fixtures::PAST_THE_WALK_LIST_GUID;
     use crate::hii::package::read_db;
     use crate::hii::package::Guid;
     use crate::hii::strings::Language;
@@ -382,6 +390,87 @@ mod tests {
             kept.get(EFIVARFS_HEADER_SIZE + 80),
             Some(&1),
             "the CHECKBOX's byte in the dump"
+        );
+    }
+
+    /// The redacted dump of password_store_hiidb keeps no byte that a PASSWORD may hold: none from
+    /// the VarOffset of one without MaxSize on, and none of the variable of the VarStore of a
+    /// FormSet that uefisettings ignores; it keeps the bytes of the other questions. For IFR past
+    /// an op where the walk for FormSets ends, where a PASSWORD may name any variable, it fails.
+    #[test]
+    fn redacted_dump_keeps_no_byte_that_an_unresolved_password_may_hold() {
+        let without_max_size = operation(
+            PASSWORD,
+            false,
+            &[
+                question_header_with(4, 4, 1, 10, 0x00),
+                1u16.to_le_bytes().to_vec(), // MinSize
+            ]
+            .concat(),
+        );
+        // a DEFAULTSTORE op of 4 bytes, shorter than its minimum of 6, outside the forms
+        let short_default_store = operation(DEFAULT_STORE, false, &[0x00, 0x00]);
+        let password_store = EfivarFileName::from(&password_store()).to_string();
+        let other_store = EfivarFileName::from(&other_store()).to_string();
+        let cases = [
+            (
+                "the whole PASSWORD",
+                password_store_hiidb(Vec::new(), password_on(4, 4, 1, 10)),
+                vec![
+                    (&other_store, vec![(0, 1)]),
+                    (&password_store, vec![(50, 51), (5, 6)]),
+                ],
+            ),
+            (
+                "a PASSWORD without MaxSize",
+                password_store_hiidb(Vec::new(), without_max_size),
+                vec![
+                    (&other_store, vec![(0, 1)]),
+                    (&password_store, vec![(5, 6)]),
+                ],
+            ),
+            (
+                "a PASSWORD in an ignored FormSet",
+                password_store_hiidb(short_default_store, password_on(4, 4, 1, 10)),
+                vec![(&other_store, vec![(0, 1)])],
+            ),
+        ];
+        for (case, hiidb, want) in cases {
+            let decoded = decoded_bytes(read_db(&hiidb).expect("read the HiiDB")).expect("decode");
+
+            // each efivar file with the start and end of each value that it keeps
+            let kept: Vec<(String, Vec<(usize, usize)>)> = decoded
+                .iter()
+                .map(|(name, values)| {
+                    let ranges = values
+                        .iter()
+                        .map(|value| (value.value.start, value.value.end))
+                        .collect();
+                    (name.to_string(), ranges)
+                })
+                .collect();
+            let want: Vec<(String, Vec<(usize, usize)>)> = want
+                .into_iter()
+                .map(|(name, ranges)| (name.clone(), ranges))
+                .collect();
+            assert_eq!(kept, want, "{case}: the payload bytes that the dump keeps");
+        }
+
+        let past_the_walk = decoded_bytes(
+            read_db(&password_past_the_walk_hiidb()).expect("read the HiiDB past the walk"),
+        )
+        .map(drop)
+        .map_err(|error| error.to_string());
+        let refusal = format!(
+            "PASSWORD questions of package list {} may be in the IFR that uefisettings ignores at \
+             offset 0 of a form package, which has no op boundary, so in any variable: ",
+            Guid::from(PAST_THE_WALK_LIST_GUID)
+        );
+        assert!(
+            past_the_walk
+                .as_ref()
+                .is_err_and(|error| error.starts_with(&refusal)),
+            "past the walk: {past_the_walk:?}"
         );
     }
 
@@ -477,6 +566,7 @@ mod tests {
             ignored_ifr: Vec::new(),
             outside_ifr: Vec::new(),
             malformed_outside_stores: Vec::new(),
+            disabled_forms: Vec::new(),
         }
     }
 

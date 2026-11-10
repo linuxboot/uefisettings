@@ -684,6 +684,13 @@ impl HiiBackend {
                     &mut reader,
                 )?);
             }
+            for disabled in &list.disabled_forms {
+                writeln!(
+                    readable_representation,
+                    "Disabled at offset {}: {}",
+                    disabled.offset, disabled.reason
+                )?;
+            }
         }
 
         let resp = HiiShowIfrResponse {
@@ -731,8 +738,8 @@ impl HiiBackend {
     /// list_questions does not list.
     pub fn ignored_ifr(db_bytes: &[u8]) -> Result<Vec<IgnoredIfr>> {
         Ok(package::read_db(db_bytes)?
-            .into_iter()
-            .flat_map(|list| list.ignored_ifr)
+            .iter()
+            .flat_map(package::ParsedPackageList::ignored_records)
             .collect())
     }
 
@@ -800,7 +807,7 @@ impl HiiBackend {
         let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables, exported)?;
         let ignored_ifr = parsed_db
             .iter()
-            .flat_map(|list| list.ignored_ifr.iter().cloned())
+            .flat_map(package::ParsedPackageList::ignored_records)
             .collect();
         forms::check_access_level(
             parsed_db.iter().flat_map(|list| &list.forms),
@@ -1308,12 +1315,12 @@ fn select_for_set(
     }
     let mut ignored = parsed_db
         .iter()
-        .flat_map(|list| &list.ignored_ifr)
+        .flat_map(package::ParsedPackageList::ignored_records)
         .peekable();
     if selected.is_empty() && ignored.peek().is_some() {
         return Err(SelectionError::MaybeInIgnoredIfr {
             question: question.to_string(),
-            ignored: ignored.cloned().collect(),
+            ignored: ignored.collect(),
         }
         .into());
     }
@@ -1366,13 +1373,13 @@ fn listed_flags(flags: QuestionFlags) -> Option<Vec<String>> {
 fn listed_ignored_ifr(lists: &[package::ParsedPackageList]) -> Result<Option<Vec<HiiIgnoredIfr>>> {
     let listed = lists
         .iter()
-        .flat_map(|list| &list.ignored_ifr)
+        .flat_map(package::ParsedPackageList::ignored_records)
         .map(|ignored| {
             Ok(HiiIgnoredIfr {
                 package_list: ignored.package_list.to_string(),
                 offset: i64::try_from(ignored.offset)
                     .context("the offset of ignored IFR does not fit an i64")?,
-                reason: ignored.reason.clone(),
+                reason: ignored.reason,
                 ..Default::default()
             })
         })
@@ -1420,6 +1427,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::flagged_option;
     use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::form_set;
+    use crate::hii::forms::ifr_fixtures::form_set_with_guid;
     use crate::hii::forms::ifr_fixtures::ifr_default;
     use crate::hii::forms::ifr_fixtures::ifr_default_2;
     use crate::hii::forms::ifr_fixtures::ifr_false;
@@ -1451,6 +1459,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::BIT_VARSTORE_GUID;
     use crate::hii::forms::ifr_fixtures::BS_RT;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::DEFAULT_STORE;
     use crate::hii::forms::ifr_fixtures::DISABLE_IF;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
@@ -1461,6 +1470,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
     use crate::hii::forms::ifr_fixtures::OTHER_GUID;
+    use crate::hii::forms::ifr_fixtures::PASSWORD;
     use crate::hii::forms::ifr_fixtures::QUESTION_REF1;
     use crate::hii::forms::ifr_fixtures::READ;
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
@@ -1469,6 +1479,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::THIS;
     use crate::hii::forms::ifr_fixtures::VALUE;
     use crate::hii::forms::ifr_fixtures::VAR_STORE;
+    use crate::hii::forms::ifr_fixtures::VAR_STORE_EFI;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::package::hiidb_fixtures::device_path_package;
     use crate::hii::package::hiidb_fixtures::en_strings_list;
@@ -1478,9 +1489,14 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::form_package_of;
     use crate::hii::package::hiidb_fixtures::form_package_with_guid;
     use crate::hii::package::hiidb_fixtures::form_set_package;
+    use crate::hii::package::hiidb_fixtures::other_store;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::password_past_the_walk_hiidb;
+    use crate::hii::package::hiidb_fixtures::password_store;
+    use crate::hii::package::hiidb_fixtures::password_store_hiidb;
     use crate::hii::package::hiidb_fixtures::strings_package_of;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::hiidb_fixtures::PAST_THE_WALK_LIST_GUID;
     use crate::hii::package::Guid;
     use crate::hii::VariableAttributes;
     #[cfg(variable_data)]
@@ -5804,6 +5820,23 @@ mod tests {
         )
     }
 
+    /// The Guid of the variable of ignored_form_set_var_store, as stored.
+    const IGNORED_FORM_SET_STORE_GUID: [u8; 16] = [0x7A; 16];
+
+    /// The VARSTORE_EFI, VarStore 2, of a variable apart from dropped_password_store, for a
+    /// FormSet that uefisettings ignores beside questions on dropped_password_store that read:
+    /// each variable that an ignored FormSet declares is withheld whole, and a PASSWORD there is
+    /// withheld in each VarStore of its VarStoreId in the form package too.
+    fn ignored_form_set_var_store() -> Vec<u8> {
+        var_store_efi_of(
+            2,
+            IGNORED_FORM_SET_STORE_GUID,
+            "UefisettingsIgnored",
+            NV_BS_RT,
+            20,
+        )
+    }
+
     /// The first FormSet of dropped_password_hiidb, with the CHECKBOX Q at byte 0 of
     /// dropped_password_store.
     fn dropped_password_first_form_set() -> Vec<u8> {
@@ -5836,12 +5869,399 @@ mod tests {
         package_list_with_guid(DROPPED_PASSWORD_LIST_GUID, &packages.concat())
     }
 
+    /// A HiiDB of two FormSets with dropped_password_store of 60 bytes, each 0x01, and these
+    /// CHECKBOXes on it: in the first, Q1 at byte 50 in form 1, Q2 at byte 52 then `ops` in form
+    /// 2, and Q3 at byte 51 in form 3; in the second, O at byte 10; and the offset of form 2 in
+    /// its form package.
+    fn disabled_form_hiidb(ops: Vec<u8>) -> (Vec<u8>, usize) {
+        let store = var_store_efi_of(
+            1,
+            DROPPED_PASSWORD_STORE_GUID,
+            "UefisettingsTest",
+            NV_BS_RT,
+            60,
+        );
+        let first = [store.clone(), form(1, &[checkbox_at(1, 1, 1, 50)])];
+        let ifr = [
+            form_set(&[
+                first[0].clone(),
+                first[1].clone(),
+                form(2, &[checkbox_at(2, 2, 1, 52), ops]),
+                form(3, &[checkbox_at(3, 3, 1, 51)]),
+            ]),
+            form_set(&[store, form(1, &[checkbox_at(5, 5, 1, 10)])]),
+        ]
+        .concat();
+        let packages = [
+            form_package_of(&ifr),
+            en_strings_package_of(&["Q1", "Q2", "Q3", "Password", "O"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid(DROPPED_PASSWORD_LIST_GUID, &packages.concat());
+        (hiidb, form_set(&first).len() - END.len())
+    }
+
+    /// The variables of disabled_form_hiidb, of `reach` through `interface`.
+    fn disabled_form_variables(
+        reach: VariableReach,
+        interface: VariableInterface,
+    ) -> Rc<MemoryVariables> {
+        let variables = MemoryVariables::new(reach, interface);
+        variables.insert(dropped_password_store(), NV_BS_RT, &[0x01; 60]);
+        Rc::new(variables)
+    }
+
+    /// A form that a malformed op disables is dropped (UEFI 2.11 §33.2.5.10.1): through variables
+    /// of either reach, get and list-questions read the questions of the forms beside it, not its
+    /// own, and list its record, which show-ifr prints and set's refusal of its question names;
+    /// its PASSWORD stays known, so O, over that password's bytes, reads no value. Where the
+    /// FormSet of that form was ignored, variables that reach Runtime withheld none of them.
+    #[test]
+    fn a_disabled_form_is_dropped_and_its_password_withheld() {
+        let (hiidb, offset) = disabled_form_hiidb(
+            [
+                password_on(4, 4, 1, 0),
+                operation(CHECKBOX, false, &[0x00; 4]),
+            ]
+            .concat(),
+        );
+        let record = format!(
+            "the form 2 of the FormSet {}, whose EFI_IFR_CHECKBOX op is malformed; UEFI 2.11 \
+             §33.2.5.10.1 disables the form of a malformed op: the EFI_IFR_CHECKBOX op at offset ",
+            Guid::from([0x11; 16])
+        );
+        let list = Guid::from(DROPPED_PASSWORD_LIST_GUID).to_string();
+        let records_of = |ignored: Option<Vec<HiiIgnoredIfr>>| -> Vec<(String, i64, bool)> {
+            ignored
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ignored| {
+                    (
+                        ignored.package_list,
+                        ignored.offset,
+                        ignored.reason.starts_with(&record),
+                    )
+                })
+                .collect()
+        };
+        let want_records = vec![(list, i64::try_from(offset).expect("offset"), true)];
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = disabled_form_variables(reach, interface);
+            for (question, want) in [
+                ("O", vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]),
+                ("Q1", vec!["1".to_string()]),
+                ("Q2", vec![]),
+                ("Q3", vec!["1".to_string()]),
+            ] {
+                let got = HiiBackend::get_in(
+                    &hiidb,
+                    question,
+                    None,
+                    &GetOptions::default(),
+                    shared(&variables),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("{reach:?}: get {question}: {error:#}"));
+                let answers: Vec<String> = got
+                    .responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect();
+                assert_eq!(answers, want, "{reach:?}: get {question}");
+                assert_eq!(
+                    records_of(got.ignored_ifr),
+                    want_records,
+                    "{reach:?}: get {question}: ignored_ifr"
+                );
+            }
+            let (listed, records) = HiiBackend::list_questions_and_ignored_ifr_in(
+                &hiidb,
+                &ListQuestionsOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{reach:?}: list-questions: {error:#}"));
+            let names: Vec<String> = listed.into_iter().map(|question| question.name).collect();
+            let records: Vec<(u64, bool)> = records
+                .iter()
+                .map(|ignored| (ignored.offset, ignored.reason.starts_with(&record)))
+                .collect();
+            assert_eq!(
+                (names, records),
+                (
+                    vec!["Q1".to_string(), "Q3".to_string(), "O".to_string()],
+                    vec![(u64::try_from(offset).expect("offset"), true)]
+                ),
+                "{reach:?}: list-questions"
+            );
+            let set = set_bypassing(&hiidb, "Q2", "0", &variables);
+            assert!(
+                set.as_ref()
+                    .is_err_and(|error| error.contains(&format!("offset {offset}"))
+                        && error.contains(&record)),
+                "{reach:?}: set Q2: {set:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&dropped_password_store()),
+                [],
+                "{reach:?}: writes"
+            );
+        }
+
+        let shown = HiiBackend::show_ifr_using(
+            &hiidb,
+            &ShowIfrOptions {
+                efivars: EfivarSource::Disabled,
+                ..Default::default()
+            },
+        )
+        .expect("show-ifr")
+        .readable_representation;
+        assert!(
+            shown.contains(&format!("Disabled at offset {offset}: {record}")),
+            "show-ifr: {shown}"
+        );
+    }
+
+    /// A PASSWORD op of a disabled form without its question header is unresolved: through
+    /// variables that reach BootServices, get reads no variable; through those that reach
+    /// Runtime it reads the questions of the other forms, O too.
+    #[test]
+    fn a_headless_password_in_a_disabled_form_closes_boot_services() {
+        let (hiidb, _) = disabled_form_hiidb(operation(PASSWORD, false, &[3, 0, 4, 0]));
+
+        let boot_services = disabled_form_variables(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let want = format!(
+            "PASSWORD op without a question header in FormSet {}: ",
+            Guid::from([0x11; 16])
+        );
+        for question in ["Q1", "Q3"] {
+            let got = HiiBackend::get_in(
+                &hiidb,
+                question,
+                None,
+                &GetOptions::default(),
+                shared(&boot_services),
+                None,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| error.to_string());
+            assert!(
+                got.as_ref().is_err_and(|error| error.starts_with(&want)),
+                "BootServices: get {question}: {got:?}"
+            );
+        }
+        assert_eq!(boot_services.reads(), [], "BootServices: reads");
+
+        let runtime = disabled_form_variables(VariableReach::Runtime, VariableInterface::Efivarfs);
+        for (question, want) in [
+            ("Q1", vec!["1"]),
+            ("Q2", vec![]),
+            ("Q3", vec!["1"]),
+            ("O", vec!["1"]),
+        ] {
+            assert_eq!(
+                answers_of(&hiidb, question, &runtime),
+                want,
+                "Runtime: get {question}"
+            );
+        }
+    }
+
+    /// The variables of password_store_hiidb, of `reach`, each byte 0x01.
+    fn password_store_variables(reach: VariableReach) -> Rc<MemoryVariables> {
+        let interface = match reach {
+            VariableReach::Runtime => VariableInterface::Efivarfs,
+            VariableReach::BootServices => VariableInterface::VariableServices,
+        };
+        let variables = MemoryVariables::new(reach, interface);
+        variables.insert(password_store(), NV_BS_RT, &[0x01; 60]);
+        variables.insert(other_store(), NV_BS_RT, &[0x01]);
+        Rc::new(variables)
+    }
+
+    /// A PASSWORD op that ends after its question header and MinSize disables its form (UEFI 2.11
+    /// §33.2.5.10.1) but still names its VarStore and VarOffset: through variables that reach
+    /// Runtime, every byte of its variable from there on is withheld, so O, over its first byte,
+    /// and Q1, past it, read no value, while Q2, before it, and Q3, on another variable, read;
+    /// through variables that reach BootServices it is unresolved, so get reads no variable. The
+    /// whole PASSWORD withholds its 40 bytes alone.
+    #[test]
+    fn a_password_without_max_size_withholds_its_variable_from_its_var_offset_on() {
+        let without_max_size = operation(
+            PASSWORD,
+            false,
+            &[
+                question_header_with(4, 4, 1, 10, 0x00),
+                1u16.to_le_bytes().to_vec(), // MinSize
+            ]
+            .concat(),
+        );
+        let read = || Ok(vec!["1".to_string()]);
+        let withheld = || Ok(vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]);
+        // each with what Runtime get of Q1 answers, and the start of BootServices get's refusal
+        for (case, password, q1, refusal) in [
+            ("the whole PASSWORD", password_on(4, 4, 1, 10), read(), None),
+            (
+                "a PASSWORD without MaxSize",
+                without_max_size,
+                withheld(),
+                Some("PASSWORD question 0x0004 without MaxSize in FormSet "),
+            ),
+        ] {
+            let hiidb = password_store_hiidb(Vec::new(), password);
+
+            let runtime = password_store_variables(VariableReach::Runtime);
+            for (question, want) in [
+                ("O", withheld()),
+                ("Q1", q1.clone()),
+                ("Q2", read()),
+                ("Q3", read()),
+            ] {
+                assert_eq!(
+                    answers_or_error_of(&hiidb, question, &runtime),
+                    want,
+                    "{case}: Runtime: get {question}"
+                );
+            }
+
+            let boot_services = password_store_variables(VariableReach::BootServices);
+            let got = answers_or_error_of(&hiidb, "Q3", &boot_services);
+            match refusal {
+                None => assert_eq!(got, read(), "{case}: BootServices: get Q3"),
+                Some(refusal) => {
+                    assert!(
+                        got.as_ref().is_err_and(|error| error.starts_with(refusal)),
+                        "{case}: BootServices: get Q3: {got:?}"
+                    );
+                    assert_eq!(boot_services.reads(), [], "{case}: BootServices: reads");
+                }
+            }
+        }
+    }
+
+    /// Each variable that a VARSTORE or VARSTORE_EFI op of a FormSet that uefisettings ignores
+    /// declares is withheld whole through variables that reach Runtime, as a PASSWORD in that
+    /// FormSet may name any of them: O and Q2, on the variable of its VarStore 1, read no
+    /// value and that variable is never read, while Q3, on another variable, reads; through
+    /// variables that reach BootServices get reads no variable.
+    #[test]
+    fn the_variables_that_an_ignored_form_set_declares_are_withheld_whole() {
+        // a DEFAULTSTORE op of 4 bytes, shorter than its minimum of 6, outside the forms
+        let short_default_store = operation(DEFAULT_STORE, false, &[0x00, 0x00]);
+        let hiidb = password_store_hiidb(short_default_store, password_on(4, 4, 1, 10));
+
+        let runtime = password_store_variables(VariableReach::Runtime);
+        let withheld = Ok(vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]);
+        for (question, want) in [
+            ("O", withheld.clone()),
+            ("Q2", withheld),
+            ("Q3", Ok(vec!["1".to_string()])),
+        ] {
+            assert_eq!(
+                answers_or_error_of(&hiidb, question, &runtime),
+                want,
+                "Runtime: get {question}"
+            );
+        }
+        assert_eq!(runtime.reads(), [(other_store(), 1)], "Runtime: reads");
+
+        let boot_services = password_store_variables(VariableReach::BootServices);
+        let got = answers_or_error_of(&hiidb, "Q3", &boot_services);
+        assert!(
+            got.as_ref()
+                .is_err_and(|error| error.starts_with("PASSWORD questions of package list ")),
+            "BootServices: get Q3: {got:?}"
+        );
+        assert_eq!(boot_services.reads(), [], "BootServices: reads");
+    }
+
+    /// IFR past an op where the walk for FormSets ends has no op boundary, so a PASSWORD in it may
+    /// name any variable: through variables of either reach, get and list-questions read no
+    /// variable of the HiiDB and refuse, naming that IFR; list-questions and show-ifr without
+    /// efivars still list the questions of the FormSets that uefisettings reads.
+    #[test]
+    fn ifr_past_the_end_of_the_form_set_walk_closes_every_variable() {
+        let hiidb = password_past_the_walk_hiidb();
+        let want = format!(
+            "PASSWORD questions of package list {} may be in the IFR that uefisettings ignores at \
+             offset 0 of a form package, which has no op boundary, so in any variable: an op that \
+             does not fit the form package, and the bytes after it: ",
+            Guid::from(PAST_THE_WALK_LIST_GUID)
+        );
+        for reach in [VariableReach::Runtime, VariableReach::BootServices] {
+            let variables = password_store_variables(reach);
+            for question in ["O", "Q3"] {
+                let got = answers_or_error_of(&hiidb, question, &variables);
+                assert!(
+                    got.as_ref().is_err_and(|error| error.starts_with(&want)),
+                    "{reach:?}: get {question}: {got:?}"
+                );
+            }
+            let listed = HiiBackend::list_questions_and_ignored_ifr_in(
+                &hiidb,
+                &ListQuestionsOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| error.to_string());
+            assert!(
+                listed.as_ref().is_err_and(|error| error.starts_with(&want)),
+                "{reach:?}: list-questions: {listed:?}"
+            );
+            assert_eq!(variables.reads(), [], "{reach:?}: reads");
+        }
+
+        let (listed, _) = HiiBackend::list_questions_and_ignored_ifr_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            EfivarSource::Disabled
+                .into_variables()
+                .expect("variables that read nothing"),
+            None,
+            None,
+        )
+        .expect("list-questions without efivars");
+        let names: Vec<String> = listed.into_iter().map(|question| question.name).collect();
+        assert_eq!(
+            names,
+            ["Q1", "O", "Q2", "Q3"],
+            "list-questions without efivars"
+        );
+        let shown = HiiBackend::show_ifr_using(
+            &hiidb,
+            &ShowIfrOptions {
+                efivars: EfivarSource::Disabled,
+                ..Default::default()
+            },
+        )
+        .expect("show-ifr without efivars")
+        .readable_representation;
+        assert!(shown.contains("Q3"), "show-ifr without efivars: {shown}");
+    }
+
     /// Through variables that reach BootServices, a HiiDB whose form package holds IFR that
     /// uefisettings ignores, a FormSet that does not parse or nests too deep, the ops after one
     /// where its walk for FormSets ends or a FormSet without its Scope bit, whose second form edk2
     /// parses into it, has get and set read and write no variable: a PASSWORD question in it
     /// could name any variable. A HiiDB without that IFR withholds the PASSWORD's bytes as
-    /// before, and through variables that reach Runtime each reads as before.
+    /// before. Through variables that reach Runtime, the variables that an ignored FormSet or the
+    /// FormSet without its Scope bit declares are withheld whole, and the ops after an op where
+    /// the walk ends close every variable.
     #[test]
     fn ignored_ifr_closes_every_variable_to_boot_services() {
         let offset = dropped_password_first_form_set().len();
@@ -5851,8 +6271,16 @@ mod tests {
             Guid::from(DROPPED_PASSWORD_LIST_GUID)
         );
         let second = "the FormSet 11111111-1111-1111-1111-111111111111";
+        let past_the_walk = format!(
+            "PASSWORD questions of package list {} may be in the IFR that uefisettings ignores at \
+             offset {offset} of a form package, which has no op boundary, so in any variable: ",
+            Guid::from(DROPPED_PASSWORD_LIST_GUID)
+        );
         let closed = "; as the variable of that password is unknown, the UEFI Shell build reads \
                       and writes no variable of this HiiDB";
+        let refused = "; as a PASSWORD there may keep its password in any variable, uefisettings \
+                       reads and writes no variable of this HiiDB";
+        let withheld = Ok(vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]);
         // a VARSTORE op that ends after 4 of the 20 bytes before its Name
         let malformed = operation(VAR_STORE, false, &[0x00; 4]);
         // the FormSet's own scope and these
@@ -5867,11 +6295,11 @@ mod tests {
                 Vec::new(),
                 form_set(&dropped_password_second_ops(malformed)),
                 format!(
-                    "{ignored}{second}, which does not parse; uefisettings ignores it, where UEFI \
-                     2.11 §33.2.5.10.1 disables only the form of a malformed op and ignores only \
-                     a malformed forms set: failed to parse op_code VarStore properly: failed to \
-                     parse VarStore's data: "
+                    "{ignored}{second}, which holds, outside its forms, an op shorter than its \
+                     minimum, which UEFI 2.11 §33.2.5.10.1 calls malformed, in no form for that \
+                     section to disable: the EFI_IFR_VARSTORE op at offset "
                 ),
+                (withheld.clone(), &[][..]),
             ),
             (
                 "nested too deep",
@@ -5881,14 +6309,22 @@ mod tests {
                     "{ignored}{second}, which nests too deep: IFR scopes nest deeper than \
                      {MAX_SCOPE_NESTING} at offset {too_deep_at} of a form package{closed}"
                 ),
+                (withheld.clone(), &[]),
             ),
             (
                 "an End op of Length 1 before it",
                 vec![0x29, 0x01],
                 form_set(&dropped_password_second_ops(Vec::new())),
                 format!(
-                    "{ignored}an op that does not fit the form package, and the bytes after it: \
-                     invalid IFR operation length 1"
+                    "{past_the_walk}an op that does not fit the form package, and the bytes after \
+                     it: invalid IFR operation length 1"
+                ),
+                (
+                    Err(format!(
+                        "{past_the_walk}an op that does not fit the form package, and the bytes \
+                         after it: invalid IFR operation length 1 at {offset:#x}{refused}"
+                    )),
+                    &[],
                 ),
             ),
             (
@@ -5901,6 +6337,7 @@ mod tests {
                      SetupBrowserDxe IfrParse.c ParseOpCodes pushes a scope only for Scope != 0, \
                      and ends a FormSet only at the End of a FORM_SET scope){closed}"
                 ),
+                (withheld, &[]),
             ),
         ];
         let get = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
@@ -5939,7 +6376,7 @@ mod tests {
             Rc::new(variables)
         };
 
-        for (case, between, second_form_set, want) in dropped {
+        for (case, between, second_form_set, want, (runtime, reads)) in dropped {
             let hiidb = dropped_password_hiidb(between, second_form_set);
             let variables = variables_of(
                 VariableReach::BootServices,
@@ -5970,14 +6407,14 @@ mod tests {
             let variables = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
             assert_eq!(
                 get(&hiidb, &variables).map_err(|error| error.to_string()),
-                Ok(vec!["1".to_string()]),
+                runtime,
                 "{case}: Runtime: get"
             );
-            assert_eq!(
-                variables.reads_of(&dropped_password_store()),
-                [20],
-                "{case}: Runtime: reads"
-            );
+            let reads: Vec<(VariableKey, u16)> = reads
+                .iter()
+                .map(|&size| (dropped_password_store(), size))
+                .collect();
+            assert_eq!(variables.reads(), reads, "{case}: Runtime: reads");
         }
 
         let variables = variables_of(
@@ -6077,9 +6514,9 @@ mod tests {
     }
 
     /// Through variables that reach Runtime, get reads the questions of a FormSet after one that
-    /// uefisettings ignores, as edk2-stable202608 GetIfrBinaryData finds it, and those before;
-    /// through variables that reach BootServices, the PASSWORD of the ignored FormSet still closes
-    /// every variable of the HiiDB.
+    /// uefisettings ignores, as edk2-stable202608 GetIfrBinaryData finds it, and those before, on
+    /// a variable that the ignored one does not declare; through variables that reach
+    /// BootServices, the PASSWORD of the ignored FormSet still closes every variable of the HiiDB.
     #[test]
     fn form_sets_after_an_ignored_one_are_read() {
         let ifr = [
@@ -6088,8 +6525,8 @@ mod tests {
                 form(1, &[checkbox_on(1, 1, 1)]),
             ]),
             form_set(&[
-                dropped_password_var_store(),
-                form(1, &[password_on(2, 2, 1, 0)]),
+                ignored_form_set_var_store(),
+                form(1, &[password_on(2, 2, 2, 0)]),
                 short_var_store(),
             ]),
             form_set(&[
@@ -6129,12 +6566,257 @@ mod tests {
         assert_eq!(boot_services.reads(), [], "BootServices: reads");
     }
 
+    /// Through variables that reach Runtime, the variables that the ops from the FORM_SET op of a
+    /// FormSet without its Scope bit to the next FORM_SET op declare, past its End too, are withheld
+    /// whole, as edk2 parses a PASSWORD there into that FormSet; a question on a variable that the
+    /// next FormSet declares reads. Through variables that reach BootServices, get refuses.
+    #[test]
+    fn variables_past_the_end_of_a_scopeless_form_set_are_withheld() {
+        const OTHER_STORE_GUID: [u8; 16] = [0x5B; 16];
+        let other_key = VariableKey {
+            name: "UefisettingsOther".to_string(),
+            guid: Guid::from(OTHER_STORE_GUID),
+        };
+        let ifr = [
+            // which uefisettings ends at the End of form 1
+            scopeless_form_set(&[
+                form(1, &[]),
+                dropped_password_var_store(),
+                form(2, &[password_on(2, 2, 1, 0)]),
+            ]),
+            form_set_with_guid(
+                [0x22; 16],
+                &[
+                    dropped_password_var_store(),
+                    var_store_efi_of(2, OTHER_STORE_GUID, "UefisettingsOther", NV_BS_RT, 20),
+                    form(1, &[checkbox_on(1, 1, 1), checkbox_on(3, 3, 2)]),
+                ],
+            ),
+        ]
+        .concat();
+        let hiidb = three_questions_hiidb(&ifr);
+        let variables_of = |reach, interface| {
+            let variables = MemoryVariables::new(reach, interface);
+            variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+            variables.insert(other_key.clone(), NV_BS_RT, &[0xAA; 20]);
+            Rc::new(variables)
+        };
+
+        let boot_services = variables_of(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let got = answers_or_error_of(&hiidb, "Q3", &boot_services);
+        assert!(
+            got.as_ref()
+                .is_err_and(|error| error.starts_with(&three_questions_refusal())),
+            "BootServices: get Q3: {got:?}"
+        );
+        assert_eq!(boot_services.reads(), [], "BootServices: reads");
+
+        let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
+        assert_eq!(
+            answers_or_error_of(&hiidb, "Q1", &runtime),
+            Ok(vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]),
+            "Runtime: get Q1"
+        );
+        assert_eq!(
+            answers_or_error_of(&hiidb, "Q3", &runtime),
+            Ok(vec!["1".to_string()]),
+            "Runtime: get Q3"
+        );
+        assert_eq!(runtime.reads(), [(other_key, 20)], "Runtime: reads");
+    }
+
+    /// Through variables that reach Runtime, every variable of the GUID of a VARSTORE_EFI of the
+    /// form before UEFI 2.3.1 in a FormSet that uefisettings ignores is withheld whole, as the
+    /// VarName of a PASSWORD on it, which is not read, names its variable by any string: a
+    /// question on another variable of that GUID shows none, one on a variable of another GUID
+    /// reads. Every variable is withheld where the Guid of that VARSTORE_EFI runs past the form
+    /// package, so is unknown. Through variables that reach BootServices, get refuses.
+    #[test]
+    fn every_variable_of_a_short_var_store_in_ignored_ifr_is_withheld() {
+        let short_store_variable = VariableKey {
+            name: "UefisettingsShort".to_string(),
+            guid: Guid::from(SHORT_VAR_STORE_GUID),
+        };
+        let parsed = form_set(&[
+            var_store_efi_of(1, SHORT_VAR_STORE_GUID, "UefisettingsShort", NV_BS_RT, 20),
+            var_store_efi_of(
+                2,
+                DROPPED_PASSWORD_STORE_GUID,
+                "UefisettingsTest",
+                NV_BS_RT,
+                20,
+            ),
+            form(1, &[checkbox_on(1, 1, 1), checkbox_on(3, 3, 2)]),
+        ]);
+        // VarName 2, "Password"
+        let password = form(1, &[password_on(2, 2, 1, 2)]);
+        let withheld = Ok(vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]);
+        let cases = [
+            (
+                "a short CHECKBOX outside its forms",
+                [
+                    form_set_with_guid(
+                        [0x44; 16],
+                        &[
+                            short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                            password.clone(),
+                            operation(CHECKBOX, false, &[0x00; 4]),
+                        ],
+                    ),
+                    parsed.clone(),
+                ]
+                .concat(),
+                Ok(vec!["1".to_string()]),
+                vec![(dropped_password_store(), 20)],
+            ),
+            (
+                "a VARSTORE_EFI that ends after its VarStoreId, last",
+                [
+                    parsed,
+                    form_set_with_guid(
+                        [0x44; 16],
+                        &[
+                            password,
+                            operation(VAR_STORE_EFI, false, &1u16.to_le_bytes()),
+                        ],
+                    ),
+                ]
+                .concat(),
+                withheld.clone(),
+                vec![],
+            ),
+        ];
+        for (case, ifr, q3, reads) in cases {
+            let hiidb = three_questions_hiidb(&ifr);
+            let variables_of = |reach, interface| {
+                let variables = MemoryVariables::new(reach, interface);
+                variables.insert(dropped_password_store(), NV_BS_RT, &[0xAA; 20]);
+                variables.insert(short_store_variable.clone(), NV_BS_RT, &[0xAA; 20]);
+                Rc::new(variables)
+            };
+
+            let boot_services = variables_of(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            );
+            let got = answers_or_error_of(&hiidb, "Q3", &boot_services);
+            assert!(
+                got.as_ref()
+                    .is_err_and(|error| error.starts_with(&three_questions_refusal())),
+                "{case}: BootServices: get Q3: {got:?}"
+            );
+            assert_eq!(boot_services.reads(), [], "{case}: BootServices: reads");
+
+            let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
+            assert_eq!(
+                answers_or_error_of(&hiidb, "Q1", &runtime),
+                withheld,
+                "{case}: Runtime: get Q1"
+            );
+            assert_eq!(
+                answers_or_error_of(&hiidb, "Q3", &runtime),
+                q3,
+                "{case}: Runtime: get Q3"
+            );
+            assert_eq!(runtime.reads(), reads, "{case}: Runtime: reads");
+        }
+    }
+
+    /// By QuestionId, a question of a disabled form or of an ignored FormSet is refused as by its
+    /// prompt: get answers none and lists the same records, and set's MaybeInIgnoredIfr names
+    /// them.
+    #[test]
+    fn question_ids_in_ignored_ifr_are_refused_as_prompts() {
+        let (disabled_form, _) = disabled_form_hiidb(operation(CHECKBOX, false, &[0x00; 4]));
+        let ignored_form_set = three_questions_hiidb(
+            &[
+                form_set(&[
+                    dropped_password_var_store(),
+                    form(1, &[checkbox_on(1, 1, 1)]),
+                ]),
+                form_set_with_guid(
+                    [0x33; 16],
+                    &[
+                        dropped_password_var_store(),
+                        form(1, &[checkbox_on(3, 3, 1)]),
+                        short_var_store(),
+                    ],
+                ),
+            ]
+            .concat(),
+        );
+        let options = SetOptions {
+            setup_password: SetupPasswordPolicy::Bypass,
+            ..SetOptions::default()
+        };
+        let cases = [
+            ("a disabled form", disabled_form, "Q2", [0x11; 16], 2),
+            ("an ignored FormSet", ignored_form_set, "Q3", [0x33; 16], 3),
+        ];
+        for (case, hiidb, prompt, form_set, question_id) in cases {
+            let refusals = [
+                QuestionSelector::from(prompt),
+                by_address(&format!("{}:{question_id}", Guid::from(form_set))),
+            ]
+            .map(|question| {
+                let variables =
+                    disabled_form_variables(VariableReach::Runtime, VariableInterface::Efivarfs);
+                let got = HiiBackend::get_in(
+                    &hiidb,
+                    question.clone(),
+                    None,
+                    &GetOptions::default(),
+                    shared(&variables),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("{case}: get {question}: {error:#}"));
+                let set = HiiBackend::set_in(
+                    &hiidb,
+                    question.clone(),
+                    "0",
+                    None,
+                    &options,
+                    shared(&variables),
+                    &*variables,
+                    None,
+                )
+                .map(drop)
+                .map_err(|error| error.to_string());
+                let records = set.as_ref().err().and_then(|error| {
+                    error
+                        .strip_prefix(&format!(
+                            "no question {:?} in the HiiDB, but it may be in ",
+                            question.to_string()
+                        ))
+                        .map(str::to_owned)
+                });
+                assert!(records.is_some(), "{case}: set {question}: {set:?}");
+                (got.responses.len(), got.ignored_ifr, records)
+            });
+            let [by_prompt, by_question_id] = refusals;
+            assert_eq!(by_prompt.0, 0, "{case}: get by prompt");
+            assert!(
+                by_prompt
+                    .1
+                    .as_ref()
+                    .is_some_and(|records| !records.is_empty()),
+                "{case}: get by prompt: ignored_ifr"
+            );
+            assert_eq!(by_question_id, by_prompt, "{case}: by QuestionId");
+        }
+    }
+
     /// Through variables that reach BootServices, get and set, with and without the setup
     /// password bypass, refuse and touch no variable when a PASSWORD may sit in IFR that the
     /// parser does not read: a FormSet that it ignores, a FormSet after one, and a FormSet in one
     /// that has its End, which edk2's walk for FormSets finds. Through variables that reach
-    /// Runtime, the questions around that IFR read. Without IFR that it ignores, the PASSWORD that
-    /// it reads leaves get and the bypassed set open.
+    /// Runtime, the questions around that IFR read, but those on a variable that a VARSTORE or
+    /// VARSTORE_EFI op in an ignored FormSet declares, which is withheld whole. Without IFR that it
+    /// ignores, the PASSWORD that it reads leaves get and the bypassed set open.
     #[test]
     fn unread_password_regions_close_boot_services() {
         const PASSWORD_STORE_GUID: [u8; 16] = [0x5A; 16];
@@ -6160,30 +6842,36 @@ mod tests {
                 form(1, &[checkbox_on(3, 3, 1), password_on(2, 2, 2, 0)]),
             ])
         };
-        let cases: [(&str, Vec<u8>); 4] = [
+        let read = Ok(vec!["1".to_string()]);
+        let withheld = Ok(vec![format!("{PASSWORD_BYTES} <IFR default: 0>")]);
+        // each with what get of Q1 and Q3 answers through variables that reach Runtime
+        let cases: [(&str, Vec<u8>, _); 4] = [
             (
                 "a PASSWORD in an ignored FormSet",
                 [
                     q1.clone(),
                     form_set(&[
-                        dropped_password_var_store(),
-                        form(1, &[password_on(2, 2, 1, 0)]),
+                        password_store(),
+                        form(1, &[password_on(2, 2, 2, 0)]),
                         short_var_store(),
                     ]),
                     q3,
                 ]
                 .concat(),
+                read.clone(),
             ),
             (
                 "a PASSWORD in a FormSet after an ignored one",
                 [
                     q1.clone(),
-                    form_set(&[dropped_password_var_store(), short_var_store()]),
+                    form_set(&[password_store(), short_var_store()]),
                     q3_and_password(),
                 ]
                 .concat(),
+                read.clone(),
             ),
             (
+                // the nested FormSet's VARSTORE_EFI of dropped_password_store is in the ignored one
                 "a PASSWORD in a FormSet in an ignored one that has its End",
                 [
                     q1.clone(),
@@ -6194,6 +6882,7 @@ mod tests {
                     ]),
                 ]
                 .concat(),
+                withheld,
             ),
             (
                 "control: a PASSWORD in a FormSet after a FormSet that parses",
@@ -6203,6 +6892,7 @@ mod tests {
                     q3_and_password(),
                 ]
                 .concat(),
+                read,
             ),
         ];
         let variables_of = |reach, interface| {
@@ -6212,14 +6902,14 @@ mod tests {
             Rc::new(variables)
         };
         let refused = three_questions_refusal();
-        for (name, ifr) in cases {
+        for (name, ifr, runtime_answers) in cases {
             let hiidb = three_questions_hiidb(&ifr);
 
             let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
             for question in ["Q1", "Q3"] {
                 assert_eq!(
                     answers_or_error_of(&hiidb, question, &runtime),
-                    Ok(vec!["1".to_string()]),
+                    runtime_answers,
                     "{name}: Runtime: get {question}"
                 );
             }
@@ -6312,16 +7002,16 @@ mod tests {
             (
                 "a first FormSet that does not parse",
                 form_set(&[
-                    dropped_password_var_store(),
-                    form(1, &[password_on(2, 2, 1, 0)]),
+                    ignored_form_set_var_store(),
+                    form(1, &[password_on(2, 2, 2, 0)]),
                     short_var_store(),
                 ]),
             ),
             (
                 "a first FormSet nested too deep",
                 form_set(&[
-                    dropped_password_var_store(),
-                    form(1, &[password_on(2, 2, 1, 0)]),
+                    ignored_form_set_var_store(),
+                    form(1, &[password_on(2, 2, 2, 0)]),
                     too_deep,
                 ]),
             ),
@@ -6449,8 +7139,8 @@ mod tests {
         ]);
         // a FormSet that uefisettings ignores, with the CHECKBOX Q2 of string ID 2
         let ignored = form_set(&[
-            dropped_password_var_store(),
-            form(1, &[checkbox_on(2, 2, 1)]),
+            ignored_form_set_var_store(),
+            form(1, &[checkbox_on(2, 2, 2)]),
             short_var_store(),
         ]);
         let q3 = form_set(&[
@@ -6461,10 +7151,9 @@ mod tests {
         let without = three_questions_hiidb(&[q1.clone(), q3].concat());
         let list = Guid::from(DROPPED_PASSWORD_LIST_GUID).to_string();
         let reason = format!(
-            "the FormSet {}, which does not parse; uefisettings ignores it, where UEFI 2.11 \
-             §33.2.5.10.1 disables only the form of a malformed op and ignores only a malformed \
-             forms set: failed to parse op_code VarStore properly: failed to parse VarStore's \
-             data: ",
+            "the FormSet {}, which holds, outside its forms, an op shorter than its minimum, which \
+             UEFI 2.11 §33.2.5.10.1 calls malformed, in no form for that section to disable: the \
+             EFI_IFR_VARSTORE op at offset ",
             Guid::from([0x11; 16])
         );
         let offset = q1.len();
@@ -6872,14 +7561,14 @@ mod tests {
         operation(0x70, true, &[])
     }
 
-    /// Every command ignores the FormSet of a HiiDB whose VarStore op ends inside its Guid, and
+    /// Every command ignores the FormSet of a HiiDB whose VarStore op ends inside its Name, and
     /// the record of that FormSet, which list-questions prints on stderr and refusals name, gives
     /// the error on one line: the fields being parsed, without the Rust source locations of
     /// binrw's backtrace frames.
     #[test]
     fn commands_ignore_a_truncated_var_store_and_name_it_on_one_line() {
-        // EFI_IFR_VARSTORE, whose 5 bytes end in the Data2 of its Guid
-        let var_store = operation(0x24, false, &[0x11; 5]);
+        // EFI_IFR_VARSTORE of the Length of an empty Name, whose last byte is no NUL
+        let var_store = operation(0x24, false, &[&[0x11; 20][..], b"A"].concat());
         let packages = [
             en_strings_package_of(&["FormSet"]),
             form_package(&[var_store]),
@@ -6888,11 +7577,11 @@ mod tests {
         let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
         let want = format!(
             "the IFR that uefisettings ignores at offset 0 of a form package of package list \
-             55555555-5555-5555-5555-555555555555: the FormSet {}, which does not parse; \
-             uefisettings ignores it, where UEFI 2.11 §33.2.5.10.1 disables only the form of a \
-             malformed op and ignores only a malformed forms set: failed to parse op_code \
-             VarStore properly: failed to parse VarStore's data: failed to fill whole buffer \
-             (While parsing field 'data2' in Guid; While parsing field 'guid' in VarStore)",
+             55555555-5555-5555-5555-555555555555: the FormSet {}, which holds, outside its \
+             forms, an op that uefisettings does not decode: the EFI_IFR_VARSTORE op at offset \
+             39 of a form package: failed to parse op_code VarStore properly: failed to parse \
+             VarStore's data: failed to fill whole buffer (While parsing field 'name' in \
+             VarStore)",
             Guid::from([0x11; 16])
         );
         for (name, command) in commands() {
@@ -7321,6 +8010,7 @@ mod tests {
             &config_hdr(N_GUID, "NStore", &DRIVER_PATH),
             &config_hdr(N_GUID, "NStore", &[0x7F, 0xFF, 0x04, 0x00]),
         );
+        let withheld_n = format!("{PASSWORD_BYTES} <IFR default: 0>");
         let dropped_form_set = {
             // a VARSTORE op that ends after 4 of the 20 bytes before its Name
             let malformed = operation(VAR_STORE, false, &[0x00; 4]);
@@ -7384,11 +8074,12 @@ mod tests {
                 true,
             ),
             (
-                "a FormSet that the parser drops, whose PASSWORD ops are unknown",
+                "a FormSet that the parser drops, whose PASSWORD ops are unknown, and whose \
+                 VARSTORE's Guid runs past the form package, so every variable is withheld",
                 dropped_form_set,
                 no_variables(),
                 snapshot_text(),
-                MISSING_N_STORE,
+                withheld_n.as_str(),
                 true,
             ),
         ] {
@@ -7496,6 +8187,86 @@ mod tests {
 
             assert_eq!(got, want, "{case}: get");
             assert_eq!(listed, want, "{case}: list-questions");
+            assert_no_password_byte(&outputs);
+            assert_eq!(
+                logged.iter().any(|message| message.ends_with(REFUSED)),
+                refused,
+                "{case}: the refusal in {logged:?}"
+            );
+        }
+    }
+
+    /// A form that a malformed op disables (UEFI 2.11 §33.2.5.10.1) has no question that the
+    /// snapshot answers, and the snapshot withholds the bytes of its PASSWORD as get does: a
+    /// question over them shows none, the other bytes of that storage show. A PASSWORD op there
+    /// without its question header leaves its bytes unknown, so the snapshot is not read.
+    #[test]
+    fn the_snapshot_answers_no_question_of_a_disabled_form_and_withholds_its_password() {
+        const REFUSED: &str = "; as the VarStore of that password is unknown, uefisettings \
+            cannot withhold its bytes, so no value is shown from the ExportConfig snapshot";
+        // the forms of snapshot_hiidb, with W and the PASSWORD in a form 2 that a CHECKBOX op
+        // ending after 4 of the 12 bytes of its data disables
+        let hiidb_with = |password: Vec<u8>| {
+            let packages = [
+                device_path_package(&DRIVER_PATH),
+                form_package(&[
+                    var_store(1, N_GUID, "NStore", 3),
+                    var_store(2, P_GUID, "AMITSESetup", 81),
+                    form(
+                        1,
+                        &[
+                            checkbox_on(1, 1, 1),
+                            uint16_numeric(8, 8, 2, 40),
+                            uint16_numeric(9, 9, 2, 38),
+                        ],
+                    ),
+                    form(
+                        2,
+                        &[
+                            uint16_numeric(2, 2, 1, 1),
+                            password,
+                            operation(CHECKBOX, false, &[0x00; 4]),
+                        ],
+                    ),
+                ]),
+                en_strings_package_of(&["N", "W", "P", "Password", "O", "Off", "On", "S", "X"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid([0x55; 16], &packages.concat())
+        };
+        for (case, password, names, want, refused) in [
+            (
+                "a PASSWORD",
+                password_on(3, 4, 2, 0),
+                &["N", "W", "S", "X"][..],
+                &["1 <snapshot>", "22136 <snapshot>", WITHHELD][..],
+                false,
+            ),
+            (
+                "a PASSWORD op without its question header",
+                operation(PASSWORD, false, &[3, 0, 4, 0]),
+                &["N", "W"],
+                &[MISSING_N_STORE],
+                true,
+            ),
+        ] {
+            let mut answers = None;
+            let logged = logged_by(|| {
+                answers = Some(answers_with_snapshot(
+                    &hiidb_with(password),
+                    names,
+                    &no_variables(),
+                    &snapshot_text(),
+                ));
+            });
+            let (got, listed, ifr, outputs) = answers.expect("the answers");
+
+            assert_eq!(got, want, "{case}: get");
+            assert_eq!(listed, want, "{case}: list-questions");
+            assert!(
+                !ifr.contains("4660"),
+                "{case}: show-ifr shows W's snapshot value: {ifr}"
+            );
             assert_no_password_byte(&outputs);
             assert_eq!(
                 logged.iter().any(|message| message.ends_with(REFUSED)),
