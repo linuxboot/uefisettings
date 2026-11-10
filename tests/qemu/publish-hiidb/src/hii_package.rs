@@ -56,6 +56,7 @@ pub(crate) const EFI_IFR_DISABLE_IF_OP: u8 = 0x1E;
 pub(crate) const EFI_IFR_MAP_OP: u8 = 0x22;
 pub(crate) const EFI_IFR_ORDERED_LIST_OP: u8 = 0x23;
 pub(crate) const EFI_IFR_VARSTORE_OP: u8 = 0x24;
+pub(crate) const EFI_IFR_VARSTORE_NAME_VALUE_OP: u8 = 0x25;
 pub(crate) const EFI_IFR_VARSTORE_EFI_OP: u8 = 0x26;
 const EFI_IFR_END_OP: u8 = 0x29;
 pub(crate) const EFI_IFR_GET_OP: u8 = 0x2B;

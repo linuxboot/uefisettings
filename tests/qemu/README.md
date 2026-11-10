@@ -314,6 +314,22 @@ Config Keyword Handler, one at a time and two in one SetData(), and refuses befo
 VALUE that changes a suppressed field, an hour out of range, a container after an empty one, an
 option twice and the REF, which `dmpstore` shows wrote nothing.
 
+`publish-hiidb.efi name-value-password-forms` registers the package lists of
+[`publish-hiidb/src/name_value_password_forms.rs`](publish-hiidb/src/name_value_password_forms.rs)
+for one device path: a form set with a NUMERIC over the variable `NvBacking`, which
+[`vars/name-value-password.json`](vars/name-value-password.json) creates, and a NUMERIC and a
+PASSWORD question on a name of a VARSTORE_NAME_VALUE, then a form set with a NUMERIC over the
+variable `Other`. A VARSTORE_NAME_VALUE is one whose values its driver exposes, as UEFI 2.11
+§33.2.5.6 says, through EFI_HII_CONFIG_ACCESS_PROTOCOL, in storage of its own choosing, so that
+password may be in any variable. `publish-hiidb.efi
+rt-data-name-value-password-forms` does the same, then publishes the database as `rt-data` does,
+and `publish-hiidb.efi export-config-name-value-password` does it before it installs
+ExportConfig()'s results as `export-config` does, with a `<ConfigResp>` of the
+VARSTORE_NAME_VALUE. In the scenarios `shell-name-value-password`, `hii-name-value-password` and
+`hii-name-value-password-snapshot` `uefisettings` reads and writes no variable of that HiiDB, in
+the UEFI Shell and from Linux, and shows no byte of `NvBacking`, nor of the snapshot, while
+`hii list-questions --no-efivars` lists its questions from Linux.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
