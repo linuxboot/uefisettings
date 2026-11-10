@@ -812,7 +812,17 @@ configuration languages such as `x-UEFI-ns`, through EFI_CONFIG_KEYWORD_HANDLER_
 digits of the device path of the keyword's package list, and a KEYWORD, and prints GetData()'s
 `<KeywordResp>`, one per package list without PATH. It reads the keyword's question whatever its
 conditions, as GetData() does, so it takes no `--include`, but not one whose bytes, as GetData()
-reads them, overlap a password's. `set` takes a `<MultiKeywordResp>`,
+reads them, overlap a password's. A `<Filter>` after the KEYWORD (§35.2.1.6) selects the
+questions whose `EFI_IFR_FLAG_READ_ONLY` and HII Keyword Data Type, by §35.2.1.6's table, pass
+it, from the IFR before any GetData(), which gets no `<Filter>`. This departs from
+edk2-stable202608's GetData(): the `<Filter>` selects among the instances, which §35.2.1.6 makes
+every one for a request without PATH, where edk2 fails the call with
+KEYWORD_HANDLER_INCOMPATIBLE_VALUE_DETECTED (ConfigKeywordHandler.c:3341-3346); a CHECKBOX is
+`Boolean` by the table, where edk2's `Numeric[:n]` passes it (:597-619); and a request that no
+instance passes is refused before any GetData(). `--filter-by-get-data` sends GetData() each
+instance with its PATH and the `<Filter>` unchanged instead, so on edk2 one instance that does not
+pass it fails the whole GetData().
+`set` takes a `<MultiKeywordResp>`,
 refuses it if `set` would refuse a keyword's question or value, if SetData() would write one
 otherwise than `set` (edk2's evaluates no condition or expression, sends no Callback() and checks
 no option or range), or if two keywords write a byte of one variable, and else writes every

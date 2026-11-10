@@ -110,6 +110,26 @@ keyword-get	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db552395113021
 # DriverSample's inventory list holds the keyword's string too, but none of its questions
 keyword-get-no-path	status	0x0
 keyword-get-no-path	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01$
+# a <Filter> (UEFI 2.11 §35.2.1.6), which the IFR applies: iSCSIBootEnable's question is a
+# read-write UINT8 ONE_OF (edk2-stable202608 DriverSampleDxe Vfr.vfr:283-290), so ReadOnly and
+# Buffer pass none of its instances
+keyword-filter	status	0x0
+keyword-filter	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01$
+keyword-filter-none	status	aborted
+keyword-filter-none	json	. == {"error_message": "keyword iSCSIBootEnable: no question of it passes the <Filter> of KEYWORD=iSCSIBootEnable&ReadOnly: PATH=01041400f4274aa000df424db55239511302113d7fff0400: ReadWrite&Numeric:1"}
+keyword-filter-buffer	status	aborted
+keyword-filter-buffer	json	. == {"error_message": "keyword iSCSIBootEnable: no question of it passes the <Filter> of KEYWORD=iSCSIBootEnable&Buffer: PATH=01041400f4274aa000df424db55239511302113d7fff0400: ReadWrite&Numeric:1"}
+keyword-filter-bogus	status	aborted
+keyword-filter-bogus	json	. == {"error_message": "expected KEYWORDINFO=, then a <Filter> (ReadOnly or ReadWrite, then Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time), each optional, then the end of the <KeywordRequest>, found \"Numeric:3\""}
+keyword-filter-info	status	0x0
+keyword-filter-info	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01&DATATYPE=Numeric:1$
+# --filter-by-get-data sends GetData() the <Filter>: edk2-stable202608 ConfigKeywordHandler.c
+# passes ReadWrite&Numeric:1 (ValidateFilter), and its ExtractFilter knows no Boolean, which the
+# next ExtractDevicePath refuses as malformed, Progress at the '&' before it
+keyword-filter-get-data	status	0x0
+keyword-filter-get-data	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01$
+keyword-filter-get-data-boolean	status	aborted
+keyword-filter-get-data-boolean	json	. == {"error_message": "GetData(): INVALID_PARAMETER, ProgressErr 0x2 (MALFORMED_STRING), Progress at character 77"}
 keyword-dmpstore-before	status	any
 keyword-dmpstore-before	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. .. 01 00 
 # SetData() would store 2, which no option holds: uefisettings refuses before it calls SetData()
@@ -159,8 +179,9 @@ keyword-dmpstore-allow-volatile	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. 
 # the placeholders of the help texts, each check up to a space, where clap may wrap the line
 keyword-get-help	status	0x0
 keyword-get-help	line	\[PATH=<hex( |$)
-keyword-get-help	line	(^| )digits>&\]KEYWORD=<keyword>\[&KEYWORDINFO=<filter>\]:
+keyword-get-help	line	(^| )digits>&\]KEYWORD=<keyword>\[&KEYWORDINFO=<filter>\]\[&<Filter>\]:
 keyword-get-help	line	--keyword-info-from-get-data
+keyword-get-help	line	--filter-by-get-data
 keyword-set-help	status	0x0
 keyword-set-help	line	NAMESPACE=<language>&PATH=<hex( |$)
 keyword-set-help	line	(^| )digits>&KEYWORD=<keyword>&VALUE=<hex( |$)

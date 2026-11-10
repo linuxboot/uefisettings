@@ -48,7 +48,7 @@ use crate::hii::set_keywords;
 use crate::hii::time_services::TimeServices;
 use crate::hii::FirmwareKeywordHandler;
 use crate::hii::FirmwareVariables;
-use crate::hii::KeywordInfoSource;
+use crate::hii::KeywordGetOptions;
 use crate::hii::KeywordValues;
 use crate::hii::VariableReach;
 use crate::hii::VariableServices;
@@ -138,16 +138,17 @@ impl HiiBackend {
     }
 
     /// What GetData() (UEFI 2.11 §35.3.3) of EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL reads of
-    /// `request`, a `<KeywordRequest>` of an optional PATH, a KEYWORD and an optional
-    /// KEYWORDINFO, in `namespace`, such as "x-UEFI-ns", else in a language of the prefix
-    /// "x-UEFI": a `<KeywordResp>` per package list of this firmware's HiiDB whose question of
-    /// the keyword get would read as GetData() does, with the `<KeywordInfoResp>` of KEYWORDINFO
-    /// from `info_source`: the HiiDB's IFR, its texts in the language that PlatformLang picks, or
-    /// GetData().
+    /// `request`, a `<KeywordRequest>` of an optional PATH, a KEYWORD, an optional KEYWORDINFO
+    /// and an optional `<Filter>`, in `namespace`, such as "x-UEFI-ns", else in a language of the
+    /// prefix "x-UEFI": a `<KeywordResp>` per package list of this firmware's HiiDB whose question
+    /// of the keyword get would read as GetData() does and that passes the `<Filter>`, which
+    /// `options.filter_by` applies, with the `<KeywordInfoResp>` of KEYWORDINFO from
+    /// `options.info_source`: the HiiDB's IFR, its texts in the language that PlatformLang picks,
+    /// or GetData().
     pub fn keyword_get(
         request: &str,
         namespace: Option<&str>,
-        info_source: KeywordInfoSource,
+        options: KeywordGetOptions,
     ) -> Result<KeywordValues> {
         let lists = package::read_db(&Self::export_hiidb()?)?;
         let platform_lang = EfivarSource::System.platform_lang()?;
@@ -156,7 +157,7 @@ impl HiiBackend {
             request,
             namespace,
             &text_languages(None, platform_lang.as_deref()),
-            info_source,
+            options,
             Box::new(VariableServices),
             &FirmwareKeywordHandler,
         )

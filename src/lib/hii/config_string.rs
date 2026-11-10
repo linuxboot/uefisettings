@@ -59,8 +59,9 @@ const NUMERIC_TYPE: &str = "Numeric[:1|:2|:4|:8]";
 const KEYWORD_INFO_FILTER: &str =
     "<KeywordInfoFilter>: All, or DataType, ValueAttribute, Default and DisplayName in this order";
 const KEYWORD_RESP_END: &str = "the next <KeywordResp> or the end";
-const KEYWORD_REQUEST_END: &str =
-    "the end of a <KeywordRequest> of PATH=, KEYWORD= and KEYWORDINFO= alone";
+const KEYWORD_REQUEST_END: &str = "KEYWORDINFO=, then a <Filter> (ReadOnly or ReadWrite, then \
+     Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time), each optional, then the end of \
+     the <KeywordRequest>";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ConfigStringError {
@@ -702,6 +703,16 @@ pub(crate) enum Usage {
     ReadWrite,
 }
 
+impl Usage {
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "ReadOnly" => Some(Self::ReadOnly),
+            "ReadWrite" => Some(Self::ReadWrite),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for Usage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -765,15 +776,32 @@ pub(crate) enum DataFilter {
 
 impl DataFilter {
     fn parse(name: &str, text: &str) -> Result<Self, ConfigStringError> {
+        Self::from_text(text).ok_or_else(|| invalid_value(name, text, DATA_FILTER))
+    }
+
+    fn from_text(text: &str) -> Option<Self> {
         match text {
-            "Buffer" => Ok(Self::Buffer),
-            "String" => Ok(Self::String),
-            "Boolean" => Ok(Self::Boolean),
-            "Date" => Ok(Self::Date),
-            "Time" => Ok(Self::Time),
-            _ => Numeric::parse(text)
-                .map(Self::Numeric)
-                .ok_or_else(|| invalid_value(name, text, DATA_FILTER)),
+            "Buffer" => Some(Self::Buffer),
+            "String" => Some(Self::String),
+            "Boolean" => Some(Self::Boolean),
+            "Date" => Some(Self::Date),
+            "Time" => Some(Self::Time),
+            _ => Numeric::parse(text).map(Self::Numeric),
+        }
+    }
+
+    /// Whether a keyword of the HII Keyword Data Type `data_type`, None for one that UEFI 2.11
+    /// §35.2.1.6's table gives none, passes this filter: 'Numeric' without a byte size passes
+    /// every size, as then "the value may vary in size"; Buffer passes every type but Numeric and
+    /// Boolean, as "Other than the EFI_IFR_TYPE_BOOLEAN and EFI_IFR_TYPE_NUM_x data types, all of
+    /// the HII configuration data types are treated as a sequence of data", which edk2-stable202608
+    /// ValidateFilter does too (ConfigKeywordHandler.c:589-592).
+    fn admits(self, data_type: Option<Self>) -> bool {
+        match (self, data_type) {
+            (Self::Buffer, Some(Self::Numeric(_) | Self::Boolean)) => false,
+            (Self::Buffer, _) => true,
+            (Self::Numeric(Numeric { width: None }), Some(Self::Numeric(_))) => true,
+            (filter, data_type) => data_type == Some(filter),
         }
     }
 }
@@ -914,8 +942,17 @@ impl fmt::Display for KeywordRequest {
     }
 }
 
-/// A `<KeywordRequest>` of an optional PATH, a KEYWORD and an optional KEYWORDINFO; the filters
-/// are refused.
+impl KeywordRequest {
+    /// Whether a keyword of `usage` and of the HII Keyword Data Type `data_type`, None for one
+    /// without, passes the request's `<Filter>`: a request without one takes every keyword.
+    pub(crate) fn admits(&self, usage: Usage, data_type: Option<DataFilter>) -> bool {
+        self.usage.is_none_or(|filter| filter == usage)
+            && self.data.is_none_or(|filter| filter.admits(data_type))
+    }
+}
+
+/// A `<KeywordRequest>` of an optional PATH, a KEYWORD, an optional KEYWORDINFO and an optional
+/// `<Filter>`.
 impl FromStr for KeywordRequest {
     type Err = ConfigStringError;
 
@@ -930,6 +967,9 @@ impl FromStr for KeywordRequest {
             .optional_value("KEYWORDINFO=")
             .map(KeywordInfoFilter::parse)
             .transpose()?;
+        // <Filter> ::= <UsageFilter> | <DataFilter> | <UsageFilter> '&' <DataFilter>
+        let usage = elements.take_parsed(Usage::parse);
+        let data = elements.take_parsed(DataFilter::from_text);
         if let Some(found) = elements.next() {
             return Err(ConfigStringError::Unexpected {
                 expected: KEYWORD_REQUEST_END,
@@ -940,8 +980,8 @@ impl FromStr for KeywordRequest {
             device_path,
             keyword,
             info,
-            usage: None,
-            data: None,
+            usage,
+            data,
         })
     }
 }
@@ -1171,6 +1211,13 @@ impl<'a> Elements<'a> {
     /// Takes the next element if it is `element`.
     fn take_if_eq(&mut self, element: &str) -> bool {
         self.0.next_if_eq(&element).is_some()
+    }
+
+    /// What `parse` makes of the next element, which it then takes, if `parse` makes anything.
+    fn take_parsed<T>(&mut self, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
+        let parsed = parse(self.0.peek()?)?;
+        self.0.next();
+        Some(parsed)
     }
 
     /// The value of the next element, which starts with `prefix`, such as "GUID=".
@@ -2068,12 +2115,12 @@ mod tests {
                 Err(unexpected(KEYWORD_REQUEST_END, "KEYWORDINFO=Default")),
             ),
             (
-                "KEYWORD=BIOSVendor&KEYWORDINFO=All&ReadOnly",
-                Err(unexpected(KEYWORD_REQUEST_END, "ReadOnly")),
+                "KEYWORD=BIOSVendor&ReadOnly&KEYWORDINFO=All",
+                Err(unexpected(KEYWORD_REQUEST_END, "KEYWORDINFO=All")),
             ),
             (
-                "KEYWORD=BIOSVendor&ReadOnly",
-                Err(unexpected(KEYWORD_REQUEST_END, "ReadOnly")),
+                "KEYWORD=BIOSVendor&KEYWORD=BIOSVendor",
+                Err(unexpected(KEYWORD_REQUEST_END, "KEYWORD=BIOSVendor")),
             ),
             (
                 "PATH=7fff04&KEYWORD=BIOSVendor",
@@ -2089,6 +2136,183 @@ mod tests {
         ];
         for (text, expected) in cases {
             assert_eq!(text.parse::<KeywordRequest>(), expected, "{text:?}");
+        }
+    }
+
+    /// `<Filter>` ::= `<UsageFilter>` | `<DataFilter>` | `<UsageFilter>` '&' `<DataFilter>`,
+    /// after the KEYWORDINFO, if any.
+    #[test]
+    fn keyword_request_with_a_filter_parses() {
+        let filtered = |usage, data| KeywordRequest {
+            usage,
+            data,
+            ..keyword_request("BIOSVendor")
+        };
+        let numeric = |width| DataFilter::Numeric(Numeric { width });
+        let cases = [
+            (
+                "KEYWORD=BIOSVendor&ReadOnly",
+                Ok(filtered(Some(Usage::ReadOnly), None)),
+            ),
+            (
+                "KEYWORD=BIOSVendor&Numeric:2",
+                Ok(filtered(None, Some(numeric(Some(NumericWidth::Two))))),
+            ),
+            (
+                "KEYWORD=BIOSVendor&ReadWrite&Numeric",
+                Ok(filtered(Some(Usage::ReadWrite), Some(numeric(None)))),
+            ),
+            (
+                "KEYWORD=BIOSVendor&ReadOnly&Time",
+                Ok(filtered(Some(Usage::ReadOnly), Some(DataFilter::Time))),
+            ),
+            (
+                "KEYWORD=BIOSVendor&KEYWORDINFO=DataType&ReadWrite&Boolean",
+                Ok(KeywordRequest {
+                    info: Some(KeywordInfoFilter::DATA_TYPE),
+                    ..filtered(Some(Usage::ReadWrite), Some(DataFilter::Boolean))
+                }),
+            ),
+            (
+                "KEYWORD=BIOSVendor&Numeric:3",
+                Err(unexpected(KEYWORD_REQUEST_END, "Numeric:3")),
+            ),
+            (
+                "KEYWORD=BIOSVendor&Buffer&ReadOnly",
+                Err(unexpected(KEYWORD_REQUEST_END, "ReadOnly")),
+            ),
+            (
+                "KEYWORD=BIOSVendor&ReadOnly&ReadWrite",
+                Err(unexpected(KEYWORD_REQUEST_END, "ReadWrite")),
+            ),
+            (
+                "KEYWORD=BIOSVendor&Buffer&String",
+                Err(unexpected(KEYWORD_REQUEST_END, "String")),
+            ),
+            (
+                "KEYWORD=BIOSVendor&readonly",
+                Err(unexpected(KEYWORD_REQUEST_END, "readonly")),
+            ),
+            (
+                "KEYWORD=BIOSVendor&",
+                Err(unexpected(KEYWORD_REQUEST_END, "")),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(text.parse::<KeywordRequest>(), expected, "{text:?}");
+        }
+    }
+
+    /// What a `<KeywordRequest>` with a `<Filter>` writes, it parses back.
+    #[test]
+    fn keyword_request_with_a_filter_reads_back() {
+        let request = KeywordRequest {
+            device_path: Some(end_keyword_path()),
+            info: Some(KeywordInfoFilter::DEFAULT),
+            usage: Some(Usage::ReadWrite),
+            data: Some(DataFilter::Boolean),
+            ..keyword_request("iSCSIBootEnable")
+        };
+
+        assert_eq!(
+            request.to_string().parse::<KeywordRequest>(),
+            Ok(request),
+            "PATH, KEYWORD, KEYWORDINFO and both filters"
+        );
+    }
+
+    /// A `<Filter>` passes the keywords of its usage and data type; 'Numeric' alone, those of
+    /// every byte size; Buffer, all but the Numeric and Boolean ones; no `<Filter>`, every keyword.
+    #[test]
+    fn keyword_request_admits_the_keywords_that_pass_its_filter() {
+        let numeric = |width| Some(DataFilter::Numeric(Numeric { width }));
+        let one = numeric(Some(NumericWidth::One));
+        let cases = [
+            ("KEYWORD=K", Usage::ReadOnly, None, true),
+            ("KEYWORD=K&ReadOnly", Usage::ReadOnly, one, true),
+            ("KEYWORD=K&ReadOnly", Usage::ReadWrite, one, false),
+            ("KEYWORD=K&ReadWrite", Usage::ReadWrite, None, true),
+            ("KEYWORD=K&Numeric", Usage::ReadWrite, one, true),
+            (
+                "KEYWORD=K&Numeric",
+                Usage::ReadWrite,
+                Some(DataFilter::Boolean),
+                false,
+            ),
+            ("KEYWORD=K&Numeric", Usage::ReadWrite, None, false),
+            ("KEYWORD=K&Numeric:1", Usage::ReadWrite, one, true),
+            (
+                "KEYWORD=K&Numeric:1",
+                Usage::ReadWrite,
+                numeric(Some(NumericWidth::Eight)),
+                false,
+            ),
+            (
+                "KEYWORD=K&Numeric:1",
+                Usage::ReadWrite,
+                numeric(None),
+                false,
+            ),
+            ("KEYWORD=K&Buffer", Usage::ReadWrite, None, true),
+            (
+                "KEYWORD=K&Buffer",
+                Usage::ReadWrite,
+                Some(DataFilter::String),
+                true,
+            ),
+            (
+                "KEYWORD=K&Buffer",
+                Usage::ReadWrite,
+                Some(DataFilter::Buffer),
+                true,
+            ),
+            ("KEYWORD=K&Buffer", Usage::ReadWrite, one, false),
+            (
+                "KEYWORD=K&Buffer",
+                Usage::ReadWrite,
+                Some(DataFilter::Boolean),
+                false,
+            ),
+            ("KEYWORD=K&ReadOnly&Buffer", Usage::ReadWrite, None, false),
+            (
+                "KEYWORD=K&Boolean",
+                Usage::ReadWrite,
+                Some(DataFilter::Boolean),
+                true,
+            ),
+            ("KEYWORD=K&Boolean", Usage::ReadWrite, None, false),
+            (
+                "KEYWORD=K&String",
+                Usage::ReadWrite,
+                Some(DataFilter::Buffer),
+                false,
+            ),
+            (
+                "KEYWORD=K&ReadOnly&Date",
+                Usage::ReadOnly,
+                Some(DataFilter::Date),
+                true,
+            ),
+            (
+                "KEYWORD=K&ReadOnly&Date",
+                Usage::ReadWrite,
+                Some(DataFilter::Date),
+                false,
+            ),
+            (
+                "KEYWORD=K&ReadOnly&Date",
+                Usage::ReadOnly,
+                Some(DataFilter::Time),
+                false,
+            ),
+        ];
+        for (text, usage, data_type, admitted) in cases {
+            let request: KeywordRequest = text.parse().expect("a <KeywordRequest>");
+            assert_eq!(
+                request.admits(usage, data_type),
+                admitted,
+                "{text} of {usage} {data_type:?}"
+            );
         }
     }
 

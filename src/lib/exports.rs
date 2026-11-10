@@ -191,6 +191,10 @@ use crate::hii::FirmwareVariables;
 #[cfg(firmware_memory_maps)]
 pub use crate::hii::HiiExportError;
 #[cfg(target_os = "uefi")]
+pub use crate::hii::KeywordFilterBy;
+#[cfg(target_os = "uefi")]
+pub use crate::hii::KeywordGetOptions;
+#[cfg(target_os = "uefi")]
 pub use crate::hii::KeywordInfoSource;
 #[cfg(target_os = "uefi")]
 pub use crate::hii::KeywordValues;

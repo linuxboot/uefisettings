@@ -18,6 +18,7 @@
 //! EfiConfigKeywordHandlerSetData), so set's own checks run here first.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -88,6 +89,11 @@ use super::Walk;
 use super::EFI_HII_DATE_SIZE;
 use super::EFI_HII_REF_SIZE;
 use super::EFI_HII_TIME_SIZE;
+use super::EFI_IFR_NUMERIC_SIZE;
+use super::EFI_IFR_NUMERIC_SIZE_1;
+use super::EFI_IFR_NUMERIC_SIZE_2;
+use super::EFI_IFR_NUMERIC_SIZE_4;
+use super::EFI_IFR_NUMERIC_SIZE_8;
 use super::EFI_IFR_TYPE_NUM_SIZE_16;
 use super::EFI_IFR_TYPE_NUM_SIZE_32;
 use super::EFI_IFR_TYPE_NUM_SIZE_64;
@@ -180,6 +186,12 @@ pub(crate) enum KeywordRefusal {
         op: &'static str,
         reason: String,
     },
+    #[error("keyword {keyword}: its {op} has no Flags after its question header: {reason}")]
+    NoNumericFlags {
+        keyword: String,
+        op: &'static str,
+        reason: String,
+    },
     #[error("keyword {keyword}: question \"{question}\" {reason}")]
     Question {
         keyword: String,
@@ -208,6 +220,33 @@ pub(crate) enum KeywordRefusal {
         second: String,
         variable: String,
     },
+    #[error(
+        "keyword {keyword}: no question of it passes the <Filter> of {request}: {}",
+        .found.join("; ")
+    )]
+    Filtered {
+        keyword: String,
+        request: String,
+        /// Each question's PATH and KeywordKind
+        found: Vec<String>,
+    },
+}
+
+/// What a `<Filter>` tests of a keyword's question: its `<UsageFilter>`, and its HII Keyword Data
+/// Type, if UEFI 2.11 §35.2.1.6's table gives it one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeywordKind {
+    pub(crate) usage: Usage,
+    pub(crate) data_type: Option<DataFilter>,
+}
+
+impl fmt::Display for KeywordKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.data_type {
+            Some(data_type) => write!(f, "{}&{data_type}", self.usage),
+            None => write!(f, "{}, of no HII Keyword Data Type", self.usage),
+        }
+    }
 }
 
 /// Why the Keyword Handler would not read or write a question as get and set do.
@@ -310,7 +349,7 @@ pub(crate) enum KeywordInfoRefusal {
 
 /// The `<DataType>` that UEFI 2.11 §35.2.1.6's table gives the question of an opcode.
 enum TableType {
-    /// Numeric, as wide as the value of the ONE_OF or NUMERIC
+    /// Numeric, of the size that the EFI_IFR_NUMERIC_SIZE of the ONE_OF's or NUMERIC's Flags gives
     Numeric,
     Fixed(FixedType),
     /// None: the op is no question, or a PASSWORD or ACTION, which the table leaves out
@@ -831,7 +870,11 @@ impl<'a> KeywordQuestion<'a> {
         let mut walk = FormSetWalk::new(&self.texts, reader, &values, IncludedStates::empty());
         let mut info = KeywordInfo::default();
         if filter.contains(KeywordInfoFilter::DATA_TYPE) {
-            info.data_type = Some(self.data_type(&op)?);
+            let data_type = self.data_type(&op)?;
+            info.data_type = Some(data_type.ok_or_else(|| KeywordInfoRefusal::NoDataType {
+                keyword: self.keyword.to_string(),
+                op: op.op_code.spec_name(),
+            })?);
         }
         if filter.contains(KeywordInfoFilter::VALUE_ATTRIBUTE) {
             info.range = self.value_range(&op)?;
@@ -862,21 +905,53 @@ impl<'a> KeywordQuestion<'a> {
         Ok(info)
     }
 
-    /// The `<DataType>` of `op`, the question, by the table of UEFI 2.11 §35.2.1.6.
-    fn data_type(&self, op: &IFROperation) -> Result<DataFilter, KeywordInfoRefusal> {
-        let data_type = match TableType::of(op.op_code) {
-            TableType::Numeric => match value_question(op) {
-                Some(ValueQuestion::OneOf(one_of)) => Some(numeric_type(&one_of.data)),
-                Some(ValueQuestion::Numeric(numeric)) => Some(numeric_type(&numeric.data)),
-                Some(ValueQuestion::CheckBox(_) | ValueQuestion::DateTime(_)) | None => None,
-            },
+    /// The question's KeywordKind: ReadOnly if it has EFI_IFR_FLAG_READ_ONLY, the flag of the
+    /// "&READONLY" of edk2-stable202608's `<KeywordResp>` and of its `<UsageFilter>`
+    /// (ExtractReadOnlyFromOpCode, ConfigKeywordHandler.c:510-520), and its data_type.
+    pub(crate) fn kind(&self) -> Result<KeywordKind, KeywordRefusal> {
+        let op = self.op.borrow();
+        let usage = match self.header(&op)?.flags().contains(QuestionFlags::READ_ONLY) {
+            true => Usage::ReadOnly,
+            false => Usage::ReadWrite,
+        };
+        Ok(KeywordKind {
+            usage,
+            data_type: self.data_type(&op)?,
+        })
+    }
+
+    /// The HII Keyword Data Type of `op`, the question, by the table of UEFI 2.11 §35.2.1.6, None
+    /// for an op that it leaves out; by op code, decoded or not, as edk2-stable202608
+    /// ValidateFilter types it (ConfigKeywordHandler.c:559, :589-619): a ONE_OF's or NUMERIC's
+    /// Numeric is of the EFI_IFR_NUMERIC_SIZE of the Flags after its question header, as
+    /// "Numeric:2" is "a two-byte numeric value", refused if the op ends before them.
+    fn data_type(&self, op: &IFROperation) -> Result<Option<DataFilter>, KeywordRefusal> {
+        Ok(match TableType::of(op.op_code) {
+            TableType::Numeric => Some(self.numeric_type(op)?),
             TableType::Fixed(fixed) => Some(fixed.into()),
             TableType::Untyped | TableType::Reference => None,
-        };
-        data_type.ok_or_else(|| KeywordInfoRefusal::NoDataType {
-            keyword: self.keyword.to_string(),
-            op: op.op_code.spec_name(),
         })
+    }
+
+    /// The Numeric `<DataType>` of `op`, a ONE_OF or NUMERIC, of the EFI_IFR_NUMERIC_SIZE of its
+    /// Flags.
+    fn numeric_type(&self, op: &IFROperation) -> Result<DataFilter, KeywordRefusal> {
+        let numeric: NumericFlagsOp =
+            Cursor::new(&op.data)
+                .parse_le()
+                .map_err(|error| KeywordRefusal::NoNumericFlags {
+                    keyword: self.keyword.to_string(),
+                    op: op.op_code.spec_name(),
+                    reason: error.to_string(),
+                })?;
+        let width = match numeric.flags & EFI_IFR_NUMERIC_SIZE {
+            EFI_IFR_NUMERIC_SIZE_1 => NumericWidth::One,
+            EFI_IFR_NUMERIC_SIZE_2 => NumericWidth::Two,
+            EFI_IFR_NUMERIC_SIZE_4 => NumericWidth::Four,
+            // EFI_IFR_NUMERIC_SIZE_8, the only value left
+            EFI_IFR_NUMERIC_SIZE_8.. => NumericWidth::Eight,
+        };
+        Ok(DataFilter::Numeric(KeywordNumeric { width: Some(width) }))
     }
 
     /// The `<ValueRange>` of `op`: a NUMERIC's MinValue, MaxValue and Step, which a Step of 0
@@ -1434,15 +1509,13 @@ fn numeric_bytes(value: TypeValue) -> Option<(Vec<u8>, NumericWidth)> {
     }
 }
 
-/// The Numeric `<DataType>` of a ONE_OF or NUMERIC whose Range is `range`, as wide as its value.
-fn numeric_type(range: &IfrRange) -> DataFilter {
-    let width = match range {
-        IfrRange::Range8(_) => NumericWidth::One,
-        IfrRange::Range16(_) => NumericWidth::Two,
-        IfrRange::Range32(_) => NumericWidth::Four,
-        IfrRange::Range64(_) => NumericWidth::Eight,
-    };
-    DataFilter::Numeric(KeywordNumeric { width: Some(width) })
+/// The start of an EFI_IFR_ONE_OF or EFI_IFR_NUMERIC after its op header (UEFI 2.11
+/// §33.3.8.3.50, §33.3.8.3.47).
+#[derive(BinRead)]
+#[br(little)]
+struct NumericFlagsOp {
+    _question: QuestionHeader,
+    flags: u8,
 }
 
 /// An EFI_IFR_STRING after its op header (UEFI 2.11 §33.3.8.3.70).
@@ -4246,5 +4319,156 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A question's KeywordKind: ReadOnly by EFI_IFR_FLAG_READ_ONLY, and the data type of UEFI
+    /// 2.11 §35.2.1.6's table by op code, decoded or not: a NUMERIC's or ONE_OF's Numeric of the
+    /// EFI_IFR_NUMERIC_SIZE of its Flags.
+    #[test]
+    fn kind_tells_the_usage_and_the_data_type_of_the_table() {
+        let flagged = |op_code: u8, flags: u8, rest: &[u8]| {
+            let data = [question_header_with(1, PROMPT, 1, 5, flags), rest.to_vec()].concat();
+            operation(op_code, false, &data)
+        };
+        let numeric = |width| Some(DataFilter::Numeric(KeywordNumeric { width: Some(width) }));
+        let range = |size: u8, bytes: &[u8]| [&[size][..], bytes, bytes, bytes].concat();
+        let buffer_like = [0x00, 0x01, 0x02, 0x00];
+        let cases = [
+            (
+                "UINT8 ONE_OF",
+                one_of(1, 0),
+                Usage::ReadWrite,
+                numeric(NumericWidth::One),
+            ),
+            (
+                "read-only ONE_OF",
+                one_of(1, 0x01),
+                Usage::ReadOnly,
+                numeric(NumericWidth::One),
+            ),
+            (
+                "UINT16 NUMERIC",
+                flagged(NUMERIC, 0, &range(0x01, &[0; 2])),
+                Usage::ReadWrite,
+                numeric(NumericWidth::Two),
+            ),
+            (
+                "UINT32 NUMERIC",
+                flagged(NUMERIC, 0, &range(0x02, &[0; 4])),
+                Usage::ReadWrite,
+                numeric(NumericWidth::Four),
+            ),
+            (
+                "read-only UINT64 NUMERIC",
+                flagged(NUMERIC, 0x01, &range(0x03, &[0; 8])),
+                Usage::ReadOnly,
+                numeric(NumericWidth::Eight),
+            ),
+            (
+                "CHECKBOX",
+                checkbox_at(1, PROMPT, 1, 5),
+                Usage::ReadWrite,
+                Some(DataFilter::Boolean),
+            ),
+            (
+                "STRING",
+                flagged(STRING, 0, &buffer_like),
+                Usage::ReadWrite,
+                Some(DataFilter::String),
+            ),
+            (
+                "ORDERED_LIST",
+                flagged(ORDERED_LIST, 0, &buffer_like),
+                Usage::ReadWrite,
+                Some(DataFilter::Buffer),
+            ),
+            (
+                "DATE",
+                flagged(DATE, 0x01, &buffer_like),
+                Usage::ReadOnly,
+                Some(DataFilter::Date),
+            ),
+            (
+                "TIME",
+                flagged(TIME, 0, &buffer_like),
+                Usage::ReadWrite,
+                Some(DataFilter::Time),
+            ),
+            ("REF", flagged(REF, 0, &[1, 0]), Usage::ReadWrite, None),
+            (
+                "undecoded CHECKBOX without Flags",
+                in_unknown_scope(&flagged(CHECKBOX, 0, &[])),
+                Usage::ReadWrite,
+                Some(DataFilter::Boolean),
+            ),
+            (
+                "undecoded UINT16 ONE_OF, without its range",
+                in_unknown_scope(&flagged(ONE_OF, 0x01, &[0x01])),
+                Usage::ReadOnly,
+                numeric(NumericWidth::Two),
+            ),
+            (
+                "undecoded UINT64 NUMERIC, without its range",
+                in_unknown_scope(&flagged(NUMERIC, 0, &[0x03])),
+                Usage::ReadWrite,
+                numeric(NumericWidth::Eight),
+            ),
+        ];
+        for (name, ops, usage, data_type) in cases {
+            let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
+            assert_eq!(
+                question_of(&lists).kind(),
+                Ok(KeywordKind { usage, data_type }),
+                "{name}"
+            );
+        }
+    }
+
+    /// A ONE_OF or NUMERIC that ends before its Flags has no data type, which kind and info
+    /// refuse rather than leave out.
+    #[test]
+    fn kind_and_info_refuse_a_one_of_or_numeric_without_flags() {
+        for (op_code, op) in [(ONE_OF, "EFI_IFR_ONE_OF"), (NUMERIC, "EFI_IFR_NUMERIC")] {
+            let flagless = || {
+                let data = question_header_with(1, PROMPT, 1, 5, 0);
+                in_unknown_scope(&operation(op_code, false, &data))
+            };
+            let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], flagless())];
+
+            let kind = question_of(&lists).kind();
+            let info = info_of(flagless(), KeywordInfoFilter::DATA_TYPE);
+
+            assert!(
+                matches!(&kind, Err(KeywordRefusal::NoNumericFlags { keyword, op: found, .. })
+                    if keyword == KEYWORD && *found == op),
+                "{op}: kind {kind:?}"
+            );
+            assert!(
+                matches!(&info, Err(KeywordInfoRefusal::Question(
+                    KeywordRefusal::NoNumericFlags { keyword, op: found, .. }
+                )) if keyword == KEYWORD && *found == op),
+                "{op}: info {info:?}"
+            );
+            assert!(
+                info_of(flagless(), KeywordInfoFilter::DISPLAY_NAME).is_ok(),
+                "{op}: its other items"
+            );
+        }
+    }
+
+    /// KEYWORDINFO's DATATYPE is the data type that kind gives, an undecoded ONE_OF's too.
+    #[test]
+    fn info_data_type_of_an_undecoded_one_of_is_that_of_its_flags() {
+        let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![0x02]].concat();
+        let undecoded = in_unknown_scope(&operation(ONE_OF, false, &data));
+
+        assert_eq!(
+            info_of(undecoded, KeywordInfoFilter::DATA_TYPE),
+            Ok(KeywordInfo {
+                data_type: numeric_of(NumericWidth::Four),
+                ..KeywordInfo::default()
+            }),
+            "a UINT32 ONE_OF without its range"
+        );
     }
 }

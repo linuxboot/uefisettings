@@ -27,8 +27,6 @@ use thiserror::Error;
 
 use super::config_string::Keyword;
 use super::config_string::KeywordInfo;
-use super::config_string::KeywordInfoFilter;
-use super::config_string::KeywordPath;
 use super::config_string::KeywordRequest;
 use super::config_string::KeywordResp;
 use super::config_string::MultiKeywordResp;
@@ -194,11 +192,47 @@ pub enum KeywordInfoSource {
     GetData,
 }
 
+/// What applies the `<Filter>` of a `<KeywordRequest>`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KeywordFilterBy {
+    /// uefisettings, by the KeywordKind of each question in the HiiDB's IFR, before any
+    /// GetData(), which gets no `<Filter>`. This departs from edk2-stable202608 GetData(): the
+    /// `<Filter>` selects among the instances of the request (all of them without PATH, UEFI
+    /// 2.11 §35.2.1.6), where edk2 fails the call with
+    /// KEYWORD_HANDLER_INCOMPATIBLE_VALUE_DETECTED (ConfigKeywordHandler.c:3341-3346); a
+    /// CHECKBOX is Boolean by §35.2.1.6's table, where edk2's `Numeric[:n]` passes it
+    /// (:597-619); and a request that no instance passes is refused before any GetData(). edk2
+    /// GetData() fails a String, Boolean, Date or Time `<DataFilter>` with
+    /// KEYWORD_HANDLER_MALFORMED_STRING besides: ExtractFilter knows none of them (:373-496), so
+    /// ValidateFilter leaves the element unread (:671-675) and the next ExtractDevicePath refuses
+    /// it (:3284-3287).
+    #[default]
+    Ifr,
+    /// GetData(), sent the `<Filter>` unchanged with each instance's PATH, so that on edk2 one
+    /// instance that fails it fails the whole GetData()
+    GetData,
+}
+
+/// How get by keyword answers a KEYWORDINFO and applies a `<Filter>`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct KeywordGetOptions {
+    /// Where the `<KeywordInfoResp>` of a KEYWORDINFO comes from
+    pub info_source: KeywordInfoSource,
+    /// What applies a `<Filter>`
+    pub filter_by: KeywordFilterBy,
+}
+
 /// Why get by keyword reads no value.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum KeywordGetError {
     #[error("GetData() returned {0}, with a <KeywordInfoResp> that it was not asked for")]
     UnaskedInfo(String),
+    #[error(
+        "GetData() returned {read}, whose READONLY contradicts the <UsageFilter> of {request}"
+    )]
+    Usage { request: String, read: String },
 }
 
 /// Why set by keyword writes nothing, or reports a failed write.
@@ -216,42 +250,46 @@ pub(crate) enum KeywordSetError {
     ReadBackFailed(String, String, #[source] anyhow::Error),
 }
 
-/// The values of the keyword of `request`, a `<KeywordRequest>` of an optional PATH, a KEYWORD
-/// and an optional KEYWORDINFO, in `namespace`, else in a language of the prefix "x-UEFI", in
-/// `lists`: GetData() of `handler` reads each question that KeywordQuestion::resolve finds, once
-/// each passes check_get with the bytes of the PASSWORD questions of `lists` in `variables`
-/// withheld, which it never reads. With `info_source` KeywordInfoSource::Ifr, each
-/// `<KeywordResp>` gets the `<KeywordInfoResp>` of KEYWORDINFO from the IFR, its texts in the
-/// language that `requested` picks (KeywordQuestion::info), built before any call; GetData()
+/// The values of the keyword of `request`, a `<KeywordRequest>` of an optional PATH, a KEYWORD,
+/// an optional KEYWORDINFO and an optional `<Filter>`, in `namespace`, else in a language of the
+/// prefix "x-UEFI", in `lists`: GetData() of `handler` reads each question that
+/// KeywordQuestion::resolve finds and admitted passes, once each passes check_get with the bytes
+/// of the PASSWORD questions of `lists` in `variables` withheld, which it never reads. With
+/// `options.info_source` KeywordInfoSource::Ifr, each `<KeywordResp>` gets the
+/// `<KeywordInfoResp>` of KEYWORDINFO from the IFR, its texts in the language that `requested`
+/// picks (KeywordQuestion::info), built before any call; GetData()
 /// gets no KEYWORDINFO, which edk2-stable202608 GetData() fails with EFI_INVALID_PARAMETER and
 /// KEYWORD_HANDLER_MALFORMED_STRING (ConfigKeywordHandler.c ValidateFilter leaves it unread,
 /// ExtractDevicePath refuses it). With KeywordInfoSource::GetData, GetData() gets the KEYWORDINFO
 /// unchanged and its `<KeywordResp>`s are taken as returned. Whenever GetData() gets no
 /// KEYWORDINFO, a `<KeywordResp>` that holds a `<KeywordInfoResp>` is refused
-/// (KeywordGetError::UnaskedInfo).
+/// (KeywordGetError::UnaskedInfo). GetData() gets the `<Filter>` with `options.filter_by`
+/// KeywordFilterBy::GetData alone, and a `<KeywordResp>` whose READONLY contradicts a
+/// `<UsageFilter>` is refused (KeywordGetError::Usage).
 pub(crate) fn get_keyword(
     lists: &[ParsedPackageList],
     request: &str,
     namespace: Option<&str>,
     requested: &[&str],
-    info_source: KeywordInfoSource,
+    options: KeywordGetOptions,
     variables: Box<dyn FirmwareVariables>,
     handler: &impl KeywordData,
 ) -> Result<KeywordValues> {
     let request: KeywordRequest = request.parse()?;
     let namespace = namespace.map(Namespace::try_from).transpose()?;
     let mut reader = PasswordQuestions::of_lists(lists).reader(variables)?;
-    let questions = KeywordQuestion::resolve(
+    let found = KeywordQuestion::resolve(
         lists,
         namespace.as_ref(),
         request.device_path.as_ref(),
         &request.keyword,
         requested,
     )?;
+    let questions = admitted(&found, &request, options.filter_by)?;
     for question in &questions {
         question.check_get(&reader)?;
     }
-    let (infos, sent_info) = match (request.info, info_source) {
+    let (infos, sent_info) = match (request.info, options.info_source) {
         (Some(filter), KeywordInfoSource::Ifr) => (
             questions
                 .iter()
@@ -263,19 +301,31 @@ pub(crate) fn get_keyword(
             (vec![None; questions.len()], sent_info)
         }
     };
+    let (usage, data) = match options.filter_by {
+        KeywordFilterBy::Ifr => (None, None),
+        KeywordFilterBy::GetData => (request.usage, request.data),
+    };
     let values = questions
         .iter()
         .zip(infos)
         .map(|(question, info)| {
-            let mut resp = read_keyword(
-                handler,
-                question.namespace(),
-                question.path(),
-                &request.keyword,
-                sent_info,
-            )?;
+            let sent = KeywordRequest {
+                device_path: Some(question.path().clone()),
+                keyword: request.keyword.clone(),
+                info: sent_info,
+                usage,
+                data,
+            };
+            let mut resp = read_keyword(handler, question.namespace(), &sent)?;
             if sent_info.is_none() && resp.info != KeywordInfo::default() {
                 return Err(KeywordGetError::UnaskedInfo(resp.to_string()).into());
+            }
+            if request.usage.is_some_and(|usage| usage != resp.usage) {
+                return Err(KeywordGetError::Usage {
+                    request: request.to_string(),
+                    read: resp.to_string(),
+                }
+                .into());
             }
             if let Some(info) = info {
                 resp.info = info;
@@ -287,6 +337,40 @@ pub(crate) fn get_keyword(
         resps: MultiKeywordResp::try_from(values)?,
         volatile: BTreeSet::new(),
     })
+}
+
+/// The questions of `found`, those of `request`'s keyword, that get reads: with `filter_by`
+/// KeywordFilterBy::Ifr, those whose KeywordKind passes the request's `<Filter>`, refused when
+/// none does (KeywordRefusal::Filtered); every one with KeywordFilterBy::GetData, or of a request
+/// without a `<Filter>`.
+fn admitted<'q, 'a>(
+    found: &'q [KeywordQuestion<'a>],
+    request: &KeywordRequest,
+    filter_by: KeywordFilterBy,
+) -> Result<Vec<&'q KeywordQuestion<'a>>, KeywordRefusal> {
+    match (filter_by, request.usage.is_some() || request.data.is_some()) {
+        (KeywordFilterBy::Ifr, true) => {}
+        (KeywordFilterBy::Ifr, false) | (KeywordFilterBy::GetData, _) => {
+            return Ok(found.iter().collect())
+        }
+    }
+    let mut questions = Vec::new();
+    let mut filtered = Vec::new();
+    for question in found {
+        let kind = question.kind()?;
+        match request.admits(kind.usage, kind.data_type) {
+            true => questions.push(question),
+            false => filtered.push(format!("PATH={}: {kind}", question.path())),
+        }
+    }
+    match questions.is_empty() {
+        true => Err(KeywordRefusal::Filtered {
+            keyword: request.keyword.to_string(),
+            request: request.to_string(),
+            found: filtered,
+        }),
+        false => Ok(questions),
+    }
 }
 
 /// Writes `keywords`, a `<MultiKeywordResp>`, with one SetData() of `handler`, once each keyword's
@@ -414,33 +498,25 @@ fn significant(mut bytes: &[u8]) -> &[u8] {
 
 /// The `<KeywordResp>` of the keyword of `resp` that GetData() of `handler` reads.
 fn read_back(handler: &impl KeywordData, resp: &KeywordResp) -> Result<KeywordResp> {
-    read_keyword(
-        handler,
-        &resp.namespace,
-        &resp.device_path,
-        &resp.keyword,
-        None,
-    )
-}
-
-/// The `<KeywordResp>` of `keyword` in `namespace` of the package list of `path` that GetData() of
-/// `handler` returns, asked with all three: UEFI 2.11 §35.3.3 takes NamespaceId as the language
-/// alone, edk2-stable202608 ExtractNameSpace (ConfigKeywordHandler.c:202, from GetData() at
-/// :3251) as a `<NameSpaceId>`, which this sends. The request holds KEYWORDINFO `info`, if any.
-fn read_keyword(
-    handler: &impl KeywordData,
-    namespace: &Namespace,
-    path: &KeywordPath,
-    keyword: &Keyword,
-    info: Option<KeywordInfoFilter>,
-) -> Result<KeywordResp> {
     let request = KeywordRequest {
-        device_path: Some(path.clone()),
-        keyword: keyword.clone(),
-        info,
+        device_path: Some(resp.device_path.clone()),
+        keyword: resp.keyword.clone(),
+        info: None,
         usage: None,
         data: None,
     };
+    read_keyword(handler, &resp.namespace, &request)
+}
+
+/// The `<KeywordResp>` of the keyword of `request`, of a PATH, in `namespace` that GetData() of
+/// `handler` returns, asked with all three: UEFI 2.11 §35.3.3 takes NamespaceId as the language
+/// alone, edk2-stable202608 ExtractNameSpace (ConfigKeywordHandler.c:202, from GetData() at
+/// :3251) as a `<NameSpaceId>`, which this sends.
+fn read_keyword(
+    handler: &impl KeywordData,
+    namespace: &Namespace,
+    request: &KeywordRequest,
+) -> Result<KeywordResp> {
     let results = handler.get_data(&format!("NAMESPACE={namespace}"), &request.to_string())?;
     let resps: MultiKeywordResp = results
         .parse()
@@ -448,8 +524,8 @@ fn read_keyword(
     match resps.as_slice() {
         [resp]
             if resp.namespace == *namespace
-                && resp.device_path == *path
-                && resp.keyword == *keyword =>
+                && request.device_path.as_ref() == Some(&resp.device_path)
+                && resp.keyword == request.keyword =>
         {
             Ok(resp.clone())
         }
@@ -498,12 +574,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::hii::config_string::KeywordPath;
     use crate::hii::forms::ifr_fixtures::checkbox_on;
     use crate::hii::forms::ifr_fixtures::conditional;
     use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::flagged_option;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::form_set_with_guid;
+    use crate::hii::forms::ifr_fixtures::in_unknown_scope;
     use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::parse_form_set;
     use crate::hii::forms::ifr_fixtures::password_on;
@@ -514,11 +592,14 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::VariableInterface;
     use crate::hii::forms::ifr_fixtures::VariableKey;
     use crate::hii::forms::ifr_fixtures::VariableReach;
+    use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::DATE;
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
+    use crate::hii::forms::ifr_fixtures::TIME;
     use crate::hii::forms::keywords::KeywordRefusal;
     use crate::hii::forms::resolve_short_var_names;
     use crate::hii::forms::IgnoredIfr;
@@ -544,6 +625,8 @@ mod tests {
     const ATTRIBUTES: u32 = 0x07;
     /// BS+RT
     const VOLATILE: u32 = 0x06;
+    /// EFI_IFR_FLAG_READ_ONLY
+    const READ_ONLY: u8 = 0x01;
 
     /// What a MemoryKeywordHandler was called for.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,8 +639,8 @@ mod tests {
     }
 
     /// A Keyword Handler of the VALUEs in `values` by "PATH=…&KEYWORD=…", which records its
-    /// calls. Its SetData() fails with `set_failure` if given, and else stores the VALUEs unless
-    /// `stale`.
+    /// calls. Its GetData() reads a request whatever `<Filter>` follows it. Its SetData() fails
+    /// with `set_failure` if given, and else stores the VALUEs unless `stale`.
     #[derive(Default)]
     struct MemoryKeywordHandler {
         values: RefCell<BTreeMap<String, String>>,
@@ -593,15 +676,20 @@ mod tests {
             let namespace = namespace_id
                 .strip_prefix("NAMESPACE=")
                 .ok_or_else(|| anyhow!("MALFORMED_STRING"))?;
+            let request: KeywordRequest = keyword_string.parse()?;
+            let key = KeywordRequest {
+                usage: None,
+                data: None,
+                ..request
+            }
+            .to_string();
             let value = self
                 .values
                 .borrow()
-                .get(keyword_string)
+                .get(&key)
                 .cloned()
                 .ok_or_else(|| anyhow!("KEYWORD_NOT_FOUND"))?;
-            Ok(format!(
-                "NAMESPACE={namespace}&{keyword_string}&VALUE={value}"
-            ))
+            Ok(format!("NAMESPACE={namespace}&{key}&VALUE={value}"))
         }
 
         fn set_data(&self, keyword_string: &str) -> Result<()> {
@@ -768,10 +856,28 @@ mod tests {
             &format!("KEYWORD={KEYWORD}"),
             None,
             &[],
-            KeywordInfoSource::Ifr,
+            KeywordGetOptions::default(),
             variables(),
             handler,
         )
+    }
+
+    /// The options of the KEYWORDINFO from `info_source`, the `<Filter>` by `filter_by`.
+    fn options(info_source: KeywordInfoSource, filter_by: KeywordFilterBy) -> KeywordGetOptions {
+        KeywordGetOptions {
+            info_source,
+            filter_by,
+        }
+    }
+
+    /// get_keyword of `request` with `options`, reading variables().
+    fn get_with(
+        lists: &[ParsedPackageList],
+        request: &str,
+        options: KeywordGetOptions,
+        handler: &impl KeywordData,
+    ) -> Result<KeywordValues> {
+        get_keyword(lists, request, None, &[], options, variables(), handler)
     }
 
     fn set(
@@ -994,7 +1100,7 @@ mod tests {
                 &format!("KEYWORD={keyword}"),
                 None,
                 &[],
-                KeywordInfoSource::Ifr,
+                KeywordGetOptions::default(),
                 variables(),
                 handler,
             )
@@ -1518,7 +1624,7 @@ mod tests {
                     &format!("KEYWORD={KEYWORD}"),
                     None,
                     &[],
-                    KeywordInfoSource::Ifr,
+                    KeywordGetOptions::default(),
                     variables(),
                     &handler,
                 )
@@ -1584,7 +1690,7 @@ mod tests {
                 &format!("KEYWORD={keyword}"),
                 None,
                 &[],
-                KeywordInfoSource::Ifr,
+                KeywordGetOptions::default(),
                 runtime(),
                 &handler,
             )
@@ -1764,7 +1870,7 @@ mod tests {
             &format!("PATH={OTHER_PATH}&KEYWORD={KEYWORD}"),
             None,
             &[],
-            KeywordInfoSource::Ifr,
+            KeywordGetOptions::default(),
             variables(),
             &handler,
         )
@@ -1868,7 +1974,7 @@ mod tests {
             &format!("KEYWORD={KEYWORD}&KEYWORDINFO=All"),
             None,
             &[],
-            KeywordInfoSource::Ifr,
+            KeywordGetOptions::default(),
             variables(),
             &handler,
         )
@@ -1923,7 +2029,7 @@ mod tests {
             &format!("KEYWORD={KEYWORD}&KEYWORDINFO=ValueAttribute"),
             None,
             &[],
-            KeywordInfoSource::Ifr,
+            KeywordGetOptions::default(),
             variables(),
             &handler,
         )
@@ -1963,7 +2069,7 @@ mod tests {
                 request,
                 None,
                 &[],
-                KeywordInfoSource::GetData,
+                options(KeywordInfoSource::GetData, KeywordFilterBy::Ifr),
                 variables(),
                 handler,
             )
@@ -2003,7 +2109,7 @@ mod tests {
             &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType"),
             None,
             &[],
-            KeywordInfoSource::Ifr,
+            KeywordGetOptions::default(),
             variables(),
             &handler,
         )
@@ -2037,7 +2143,7 @@ mod tests {
                     &format!("KEYWORD={KEYWORD}"),
                     None,
                     &[],
-                    source,
+                    options(source, KeywordFilterBy::Ifr),
                     variables(),
                     &handler,
                 );
@@ -2143,7 +2249,7 @@ mod tests {
                     request,
                     None,
                     &[],
-                    KeywordInfoSource::Ifr,
+                    KeywordGetOptions::default(),
                     Box::new(memory),
                     &handler,
                 ) {
@@ -2186,7 +2292,7 @@ mod tests {
                 request,
                 None,
                 &[],
-                KeywordInfoSource::Ifr,
+                KeywordGetOptions::default(),
                 variables(),
                 &handler,
             )
@@ -2225,5 +2331,547 @@ mod tests {
                 "{name} outside the FormSet: KEYWORDINFO refuses as get does"
             );
         }
+    }
+
+    /// The refusal of `result`, if get refused it.
+    fn refusal_of(result: Result<KeywordValues>) -> Option<KeywordRefusal> {
+        result.err()?.downcast::<KeywordRefusal>().ok()
+    }
+
+    /// A read-write question of KEYWORD in the list of PATH and a read-only one in that of
+    /// OTHER_PATH, both UINT8 ONE_OFs.
+    fn read_write_and_read_only() -> [ParsedPackageList; 2] {
+        [
+            list(PATH, &[one_of(3, 5, 1)]),
+            list(OTHER_PATH, &[flagged_one_of(3, 5, 1, READ_ONLY)]),
+        ]
+    }
+
+    /// By the IFR, get reads only the questions that pass the request's `<Filter>`, and sends
+    /// GetData() none; it refuses a request none of whose questions passes it, before any call.
+    #[test]
+    fn get_reads_only_the_questions_that_pass_the_filter_by_the_ifr() {
+        let lists = read_write_and_read_only();
+        let read_write = resp(PATH, KEYWORD, "01");
+        let read_only = format!("{}&READONLY", resp(OTHER_PATH, KEYWORD, "03"));
+        let cases = [
+            ("ReadOnly", vec![OTHER_PATH], vec![read_only.clone()]),
+            ("ReadWrite&Numeric:1", vec![PATH], vec![read_write.clone()]),
+            (
+                "Numeric",
+                vec![PATH, OTHER_PATH],
+                vec![read_write, read_only],
+            ),
+        ];
+        for (filter, paths, expected) in cases {
+            let handler = MemoryKeywordHandler::with(&[
+                (PATH, KEYWORD, "01"),
+                (OTHER_PATH, KEYWORD, "03&READONLY"),
+            ]);
+
+            let values = get_with(
+                &lists,
+                &format!("KEYWORD={KEYWORD}&{filter}"),
+                KeywordGetOptions::default(),
+                &handler,
+            )
+            .unwrap_or_else(|error| panic!("get of {filter}: {error:#}"));
+
+            assert_eq!(
+                values.to_string(),
+                expected.join("&"),
+                "{filter}: the values"
+            );
+            assert_eq!(
+                handler.calls(),
+                paths
+                    .iter()
+                    .map(|path| get_call(path, KEYWORD))
+                    .collect::<Vec<_>>(),
+                "{filter}: GetData() of the questions that pass, without a <Filter>"
+            );
+        }
+        for filter in ["Boolean", "Numeric:2", "ReadOnly&Buffer", "Buffer"] {
+            let handler = MemoryKeywordHandler::default();
+            let request = format!("KEYWORD={KEYWORD}&{filter}");
+
+            let refusal = refusal_of(get_with(
+                &lists,
+                &request,
+                KeywordGetOptions::default(),
+                &handler,
+            ));
+
+            assert_eq!(
+                refusal,
+                Some(KeywordRefusal::Filtered {
+                    keyword: KEYWORD.to_owned(),
+                    request: request.clone(),
+                    found: vec![
+                        format!("PATH={PATH}: ReadWrite&Numeric:1"),
+                        format!("PATH={OTHER_PATH}: ReadOnly&Numeric:1"),
+                    ],
+                }),
+                "{filter}: no question passes"
+            );
+            assert_eq!(handler.calls(), vec![], "{filter}: no call");
+        }
+    }
+
+    /// A question that the IFR shows the `<Filter>` takes out is not checked: check_get would
+    /// refuse this one, of an undeclared VarStore.
+    #[test]
+    fn get_takes_out_the_questions_of_the_filter_before_checking_them() {
+        let lists = [
+            list(PATH, &questions()),
+            list(OTHER_PATH, &[flagged_one_of(3, 5, 9, READ_ONLY)]),
+        ];
+        let handler =
+            MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (OTHER_PATH, KEYWORD, "01")]);
+        let get_of =
+            |request: &str| get_with(&lists, request, KeywordGetOptions::default(), &handler);
+
+        let values = get_of(&format!("KEYWORD={KEYWORD}&ReadWrite")).expect("the read-write one");
+
+        assert_eq!(
+            values.to_string(),
+            resp(PATH, KEYWORD, "01"),
+            "the question that passes"
+        );
+        assert!(
+            matches!(
+                refusal_of(get_of(&format!("KEYWORD={KEYWORD}"))),
+                Some(KeywordRefusal::Question { .. })
+            ),
+            "refused without the <Filter>"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![get_call(PATH, KEYWORD)],
+            "GetData() of the question that passes alone"
+        );
+    }
+
+    /// GetData()'s READONLY must be that of the `<UsageFilter>`, whichever applies it.
+    #[test]
+    fn get_refuses_a_readonly_of_get_data_that_contradicts_the_usage_filter() {
+        let lists = [list(PATH, &[flagged_one_of(3, 5, 1, READ_ONLY)])];
+        for filter_by in [KeywordFilterBy::Ifr, KeywordFilterBy::GetData] {
+            let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+            let get_of = |request: &str| {
+                get_with(
+                    &lists,
+                    request,
+                    options(KeywordInfoSource::Ifr, filter_by),
+                    &handler,
+                )
+            };
+            let request = format!("KEYWORD={KEYWORD}&ReadOnly");
+
+            let error = get_of(&request).expect_err("a READONLY that differs");
+
+            assert_eq!(
+                error.downcast_ref::<KeywordGetError>(),
+                Some(&KeywordGetError::Usage {
+                    request,
+                    read: resp(PATH, KEYWORD, "01"),
+                }),
+                "{filter_by:?}: the refusal"
+            );
+            assert_eq!(
+                get_of(&format!("KEYWORD={KEYWORD}&Numeric:1"))
+                    .map(|values| values.to_string())
+                    .ok(),
+                Some(resp(PATH, KEYWORD, "01")),
+                "{filter_by:?}: no <UsageFilter>, no check"
+            );
+        }
+    }
+
+    /// With the `<Filter>` by GetData(), get sends it unchanged with each question's PATH and
+    /// reads every question, the IFR's KeywordKind untested.
+    #[test]
+    fn get_by_get_data_sends_each_filter_unchanged() {
+        let lists = read_write_and_read_only();
+        for filter in ["Numeric:1", "Boolean", "Date"] {
+            let handler =
+                MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (OTHER_PATH, KEYWORD, "03")]);
+
+            let values = get_with(
+                &lists,
+                &format!("KEYWORD={KEYWORD}&{filter}"),
+                options(KeywordInfoSource::Ifr, KeywordFilterBy::GetData),
+                &handler,
+            )
+            .unwrap_or_else(|error| panic!("get of {filter}: {error:#}"));
+
+            assert_eq!(
+                values.to_string(),
+                format!(
+                    "{}&{}",
+                    resp(PATH, KEYWORD, "01"),
+                    resp(OTHER_PATH, KEYWORD, "03")
+                ),
+                "{filter}: what GetData() returns"
+            );
+            assert_eq!(
+                handler.calls(),
+                vec![
+                    get_call(PATH, &format!("{KEYWORD}&{filter}")),
+                    get_call(OTHER_PATH, &format!("{KEYWORD}&{filter}")),
+                ],
+                "{filter}: the <Filter> sent with each PATH"
+            );
+        }
+    }
+
+    /// Whichever applies the `<Filter>`, every question passes check_get before any GetData():
+    /// a PASSWORD, and a question over the bytes of one, are refused.
+    #[test]
+    fn get_checks_every_question_before_any_call_whichever_applies_the_filter() {
+        let lists = [list(
+            PATH,
+            &[vec![one_of(5, 6, 1)], vec![password_on(9, 3, 1, 6)]].concat(),
+        )];
+        let cases = [
+            (
+                KEYWORD,
+                "Buffer",
+                "keyword Keyword: question \"Keyword question\" is a PASSWORD, which uefisettings \
+                 neither reads nor writes",
+            ),
+            (
+                SECOND_KEYWORD,
+                "ReadWrite&Numeric:1",
+                "keyword SecondKeyword: question \"Second question\" spans bytes that hold a \
+                 password, which uefisettings neither reads nor writes",
+            ),
+        ];
+        for filter_by in [KeywordFilterBy::Ifr, KeywordFilterBy::GetData] {
+            for (keyword, filter, refusal) in cases {
+                let handler = MemoryKeywordHandler::with(&[
+                    (PATH, KEYWORD, "01"),
+                    (PATH, SECOND_KEYWORD, "01"),
+                ]);
+
+                let error = get_with(
+                    &lists,
+                    &format!("KEYWORD={keyword}&{filter}"),
+                    options(KeywordInfoSource::Ifr, filter_by),
+                    &handler,
+                )
+                .expect_err("a password");
+
+                assert_eq!(
+                    format!("{error:#}"),
+                    refusal,
+                    "{filter_by:?}, {keyword}: the refusal"
+                );
+                assert_eq!(handler.calls(), vec![], "{filter_by:?}, {keyword}: no call");
+            }
+        }
+    }
+
+    /// The IFR types a CHECKBOX Boolean by its op code, also one that is left undecoded without
+    /// its Flags: Boolean passes it, Buffer does not.
+    #[test]
+    fn get_filters_an_undecoded_checkbox_as_boolean() {
+        let data = question_header_with(3, 3, 1, 5, 0);
+        let undecoded = in_unknown_scope(&operation(CHECKBOX, false, &data));
+        let lists = [list(PATH, &[undecoded])];
+        let get_of = |filter: &str, handler: &MemoryKeywordHandler| {
+            get_with(
+                &lists,
+                &format!("KEYWORD={KEYWORD}&{filter}"),
+                KeywordGetOptions::default(),
+                handler,
+            )
+        };
+
+        let read = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+        assert_eq!(
+            get_of("Boolean", &read)
+                .map(|values| values.to_string())
+                .map_err(|error| format!("{error:#}")),
+            Ok(resp(PATH, KEYWORD, "01")),
+            "Boolean"
+        );
+        assert_eq!(read.calls(), vec![get_call(PATH, KEYWORD)], "Boolean: read");
+
+        let refused = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+        assert_eq!(
+            refusal_of(get_of("Buffer", &refused)),
+            Some(KeywordRefusal::Filtered {
+                keyword: KEYWORD.to_owned(),
+                request: format!("KEYWORD={KEYWORD}&Buffer"),
+                found: vec![format!("PATH={PATH}: ReadWrite&Boolean")],
+            }),
+            "Buffer"
+        );
+        assert_eq!(refused.calls(), vec![], "Buffer: no call");
+    }
+
+    /// UEFI 2.11 §35.2.1.6's table gives a DATE the data type Date and a TIME Time: Date passes
+    /// the DATE alone, Time the TIME alone, Buffer both, and no other `<Filter>` either.
+    #[test]
+    fn get_filters_dates_and_times_by_their_own_data_types() {
+        let question = |op_code: u8, offset: u16| {
+            // Flags: no field suppressed, EFI_QF_DATE_STORAGE / QF_TIME_STORAGE normal
+            let data = [question_header_with(3, 3, 1, offset, 0), vec![0x00]].concat();
+            operation(op_code, false, &data)
+        };
+        let lists = [
+            list(PATH, &[question(DATE, 5)]),
+            list(OTHER_PATH, &[question(TIME, 9)]),
+        ];
+        let date = resp(PATH, KEYWORD, "0a0b07e8");
+        let time = resp(OTHER_PATH, KEYWORD, "001e0c");
+        let get_of = |filter: &str, handler: &MemoryKeywordHandler| {
+            get_with(
+                &lists,
+                &format!("KEYWORD={KEYWORD}&{filter}"),
+                KeywordGetOptions::default(),
+                handler,
+            )
+        };
+
+        for (filter, paths, expected) in [
+            ("Date", vec![PATH], vec![date.as_str()]),
+            ("ReadWrite&Date", vec![PATH], vec![date.as_str()]),
+            ("Time", vec![OTHER_PATH], vec![time.as_str()]),
+            (
+                "Buffer",
+                vec![PATH, OTHER_PATH],
+                vec![date.as_str(), time.as_str()],
+            ),
+        ] {
+            let handler = MemoryKeywordHandler::with(&[
+                (PATH, KEYWORD, "0a0b07e8"),
+                (OTHER_PATH, KEYWORD, "001e0c"),
+            ]);
+
+            let values = get_of(filter, &handler)
+                .unwrap_or_else(|error| panic!("get of {filter}: {error:#}"));
+
+            assert_eq!(
+                values.to_string(),
+                expected.join("&"),
+                "{filter}: the values"
+            );
+            assert_eq!(
+                handler.calls(),
+                paths
+                    .iter()
+                    .map(|path| get_call(path, KEYWORD))
+                    .collect::<Vec<_>>(),
+                "{filter}: GetData() of the questions that pass"
+            );
+        }
+        for filter in ["ReadOnly&Date", "String", "Boolean", "Numeric"] {
+            let handler = MemoryKeywordHandler::default();
+
+            assert_eq!(
+                refusal_of(get_of(filter, &handler)),
+                Some(KeywordRefusal::Filtered {
+                    keyword: KEYWORD.to_owned(),
+                    request: format!("KEYWORD={KEYWORD}&{filter}"),
+                    found: vec![
+                        format!("PATH={PATH}: ReadWrite&Date"),
+                        format!("PATH={OTHER_PATH}: ReadWrite&Time"),
+                    ],
+                }),
+                "{filter}: no question passes"
+            );
+            assert_eq!(handler.calls(), vec![], "{filter}: no call");
+        }
+    }
+
+    /// A request that no question passes is refused naming each question's KeywordKind, also of
+    /// a PASSWORD, which UEFI 2.11 §35.2.1.6's table gives no data type.
+    #[test]
+    fn get_names_the_kind_of_a_question_of_no_data_type_that_the_filter_takes_out() {
+        let lists = [
+            list(PATH, &[password_on(9, 3, 1, 6)]),
+            list(OTHER_PATH, &[one_of(3, 5, 1)]),
+        ];
+        let handler = MemoryKeywordHandler::with(&[(OTHER_PATH, KEYWORD, "01")]);
+
+        let error = get_with(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&Boolean"),
+            KeywordGetOptions::default(),
+            &handler,
+        )
+        .expect_err("no Boolean question");
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "keyword {KEYWORD}: no question of it passes the <Filter> of \
+                 KEYWORD={KEYWORD}&Boolean: PATH={PATH}: ReadWrite, of no HII Keyword Data Type; \
+                 PATH={OTHER_PATH}: ReadWrite&Numeric:1"
+            ),
+            "the refusal"
+        );
+        assert_eq!(handler.calls(), vec![], "no call");
+    }
+
+    /// KEYWORDINFO from the IFR, `<Filter>` by the IFR: GetData() gets neither, for the
+    /// questions that pass alone, and each `<KeywordResp>` gets the IFR's `<KeywordInfoResp>`.
+    #[test]
+    fn get_with_keyword_info_and_filter_both_from_the_ifr() {
+        let lists = read_write_and_read_only();
+        let handler = MemoryKeywordHandler::with(&[
+            (PATH, KEYWORD, "01"),
+            (OTHER_PATH, KEYWORD, "03&READONLY"),
+        ]);
+
+        let values = get_with(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType&ReadOnly&Numeric:1"),
+            options(KeywordInfoSource::Ifr, KeywordFilterBy::Ifr),
+            &handler,
+        )
+        .expect("get of the read-only question");
+
+        assert_eq!(
+            values.to_string(),
+            format!(
+                "{}&READONLY&DATATYPE=Numeric:1",
+                resp(OTHER_PATH, KEYWORD, "03")
+            ),
+            "the read-only question, its DATATYPE from the IFR"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![get_call(OTHER_PATH, KEYWORD)],
+            "GetData() without KEYWORDINFO or <Filter>"
+        );
+    }
+
+    /// KEYWORDINFO from the IFR, `<Filter>` by GetData(): GetData() gets the `<Filter>` alone,
+    /// for every question, and each `<KeywordResp>` gets the IFR's `<KeywordInfoResp>`.
+    #[test]
+    fn get_with_keyword_info_from_the_ifr_and_filter_by_get_data() {
+        let lists = read_write_and_read_only();
+        let handler = MemoryKeywordHandler::with(&[
+            (PATH, KEYWORD, "01&READONLY"),
+            (OTHER_PATH, KEYWORD, "03&READONLY"),
+        ]);
+
+        let values = get_with(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType&ReadOnly&Numeric:1"),
+            options(KeywordInfoSource::Ifr, KeywordFilterBy::GetData),
+            &handler,
+        )
+        .expect("get of both questions");
+
+        assert_eq!(
+            values.to_string(),
+            format!(
+                "{}&READONLY&DATATYPE=Numeric:1&{}&READONLY&DATATYPE=Numeric:1",
+                resp(PATH, KEYWORD, "01"),
+                resp(OTHER_PATH, KEYWORD, "03")
+            ),
+            "both questions as GetData() returns them, each DATATYPE from the IFR"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![
+                get_call(PATH, &format!("{KEYWORD}&ReadOnly&Numeric:1")),
+                get_call(OTHER_PATH, &format!("{KEYWORD}&ReadOnly&Numeric:1")),
+            ],
+            "GetData() of the <Filter> without KEYWORDINFO"
+        );
+
+        let unasked = MemoryKeywordHandler::with(&[
+            (PATH, KEYWORD, "01&READONLY&DATATYPE=Numeric:1"),
+            (OTHER_PATH, KEYWORD, "03&READONLY"),
+        ]);
+        let error = get_with(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType&ReadOnly"),
+            options(KeywordInfoSource::Ifr, KeywordFilterBy::GetData),
+            &unasked,
+        )
+        .expect_err("unasked info");
+        assert_eq!(
+            error.downcast_ref::<KeywordGetError>(),
+            Some(&KeywordGetError::UnaskedInfo(format!(
+                "{}&READONLY&DATATYPE=Numeric:1",
+                resp(PATH, KEYWORD, "01")
+            ))),
+            "a <KeywordInfoResp> that GetData() was not asked for"
+        );
+    }
+
+    /// KEYWORDINFO from GetData(), `<Filter>` by the IFR: GetData() gets the KEYWORDINFO alone,
+    /// for the questions that pass, and its `<KeywordResp>`s are taken as returned.
+    #[test]
+    fn get_with_keyword_info_from_get_data_and_filter_by_the_ifr() {
+        let lists = read_write_and_read_only();
+        let sent = format!("{KEYWORD}&KEYWORDINFO=DataType");
+        let handler = RewritingHandler {
+            inner: MemoryKeywordHandler::with(&[(PATH, &sent, "01"), (OTHER_PATH, &sent, "03")]),
+            from: "&KEYWORDINFO=DataType&VALUE=01".to_owned(),
+            to: "&VALUE=01&DATATYPE=Numeric:2".to_owned(),
+        };
+
+        let values = get_with(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType&ReadWrite"),
+            options(KeywordInfoSource::GetData, KeywordFilterBy::Ifr),
+            &handler,
+        )
+        .expect("get of the read-write question");
+
+        assert_eq!(
+            values.to_string(),
+            format!("{}&DATATYPE=Numeric:2", resp(PATH, KEYWORD, "01")),
+            "the read-write question as GetData() returns it"
+        );
+        assert_eq!(
+            handler.inner.calls(),
+            vec![get_call(PATH, &sent)],
+            "GetData() of the KEYWORDINFO without <Filter>"
+        );
+    }
+
+    /// KEYWORDINFO from GetData(), `<Filter>` by GetData(): GetData() gets both unchanged, for
+    /// every question, and its `<KeywordResp>`s are taken as returned.
+    #[test]
+    fn get_with_keyword_info_and_filter_both_by_get_data() {
+        let lists = read_write_and_read_only();
+        let key = format!("{KEYWORD}&KEYWORDINFO=DataType");
+        let handler = RewritingHandler {
+            inner: MemoryKeywordHandler::with(&[(PATH, &key, "01"), (OTHER_PATH, &key, "01")]),
+            from: "&KEYWORDINFO=DataType&VALUE=01".to_owned(),
+            to: "&VALUE=01&DATATYPE=Boolean".to_owned(),
+        };
+
+        let values = get_with(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType&ReadWrite&Boolean"),
+            options(KeywordInfoSource::GetData, KeywordFilterBy::GetData),
+            &handler,
+        )
+        .expect("get of both questions");
+
+        assert_eq!(
+            values.to_string(),
+            format!(
+                "{}&DATATYPE=Boolean&{}&DATATYPE=Boolean",
+                resp(PATH, KEYWORD, "01"),
+                resp(OTHER_PATH, KEYWORD, "01")
+            ),
+            "both questions as GetData() returns them"
+        );
+        let sent = format!("{key}&ReadWrite&Boolean");
+        assert_eq!(
+            handler.inner.calls(),
+            vec![get_call(PATH, &sent), get_call(OTHER_PATH, &sent)],
+            "GetData() of the KEYWORDINFO and the <Filter>"
+        );
     }
 }
