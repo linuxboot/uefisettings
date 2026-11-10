@@ -44,6 +44,33 @@ pub const HIIDB_ACPI_PATH: &str = "/sys/firmware/acpi/tables/HIID";
 // prefixes the HII database bytes in the HIID table.
 const ACPI_HEADER_LEN: usize = 36;
 
+// Linux prints the physical address of the EFI System Table's ConfigurationTable
+// array here (an EFI_CONFIGURATION_TABLE[]). Not every kernel creates it (e.g.
+// NVIDIA aarch64 does not).
+pub const EFI_CONFIG_TABLE_PATH: &str = "/sys/firmware/efi/config_table";
+
+// gEfiHiiDatabaseProtocolGuid, EF9FC172-A1B2-4693-B327-6D32FC416042, in memory
+// byte order (the first three fields little-endian). HiiDatabaseDxe installs
+// the exported database under it when PcdHiiOsRuntimeSupport is TRUE.
+const HII_DATABASE_GUID: [u8; 16] = [
+    0x72, 0xc1, 0x9f, 0xef, 0xb2, 0xa1, 0x93, 0x46, 0xb3, 0x27, 0x6d, 0x32, 0xfc, 0x41, 0x60, 0x42,
+];
+
+// A 64-bit EFI_CONFIGURATION_TABLE entry: VendorGuid (16 bytes) + VendorTable
+// pointer (8 bytes).
+const CONFIG_TABLE_ENTRY_LEN: usize = 24;
+
+// The entry count lives in the EFI System Table, which Linux does not expose, so
+// stop after this many entries (firmware has a few dozen).
+const MAX_CONFIG_TABLE_ENTRIES: u64 = 256;
+
+// EFI_HII_PACKAGE_LIST_HEADER: PackageListGuid (16 bytes) + PackageLength (u32,
+// which includes this header).
+const PACKAGE_LIST_HEADER_LEN: usize = 20;
+
+// Upper bound for the database size found by walking its package lists.
+const MAX_HII_DB_LEN: usize = 64 * 1024 * 1024;
+
 const DEV_MEM_PATH: &str = "/dev/mem";
 
 /// Below this address (1 MiB), x86 read() of /dev/mem may return zeros.
@@ -114,11 +141,22 @@ impl HiiDBEFIVar {
 }
 
 pub fn extract_db() -> Result<Vec<u8>> {
-    // Prefer the vendor ACPI table that carries the HII database content
-    // directly (read from sysfs, no /dev/mem); fall back to the OCP variable +
-    // /dev/mem when it is absent (e.g. genuine OCP hardware). The fallback
-    // reason is printed to stderr so a failure here is not masked by the OCP
-    // error below.
+    // Prefer the spec-standard route (the HII database configuration table
+    // found through the EFI System Table), then the vendor ACPI table that
+    // carries the database content directly (read from sysfs, no /dev/mem), and
+    // fall back to the OCP variable + /dev/mem. Each fallback reason is printed
+    // to stderr so a failure here is not masked by the OCP error below.
+    match extract_db_efi_config_table() {
+        Ok(bytes) => {
+            debug!("HII database source: EFI configuration table ({EFI_CONFIG_TABLE_PATH})");
+            return Ok(bytes);
+        }
+        Err(e) => eprintln!(
+            "[uefisettings] could not use the EFI configuration table \
+             ({EFI_CONFIG_TABLE_PATH}): {e:#}; falling back to the HII ACPI table"
+        ),
+    }
+
     match extract_db_acpi() {
         Ok(bytes) => return Ok(bytes),
         Err(e) => eprintln!(
@@ -141,6 +179,86 @@ pub fn extract_db() -> Result<Vec<u8>> {
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
     read_physical_memory(db_info.address, db_info.length.try_into()?)
+}
+
+/// Reads the HII database through the EFI configuration table: the
+/// ConfigurationTable address from EFI_CONFIG_TABLE_PATH, the entry for
+/// gEfiHiiDatabaseProtocolGuid in it, then the database that entry points to.
+/// Every step reads /dev/mem.
+fn extract_db_efi_config_table() -> Result<Vec<u8>> {
+    let text = std::fs::read_to_string(EFI_CONFIG_TABLE_PATH)
+        .context(format!("Failed to read {EFI_CONFIG_TABLE_PATH}"))?;
+    let table_address = parse_hex_address(&text)?;
+
+    let mem_file =
+        File::open(DEV_MEM_PATH).with_context(|| format!("Failed to open {DEV_MEM_PATH}"))?;
+    let read = |address: u64, length: usize| {
+        read_physical_memory_at(&mem_file, address, length, FileExt::read_exact_at)
+    };
+
+    let mut db_address = None;
+    for index in 0..MAX_CONFIG_TABLE_ENTRIES {
+        let entry_address = table_address + index * CONFIG_TABLE_ENTRY_LEN as u64;
+        let entry = read(entry_address, CONFIG_TABLE_ENTRY_LEN)?;
+        if let Some(address) = parse_hii_config_table_entry(&entry) {
+            db_address = Some(address);
+            break;
+        }
+    }
+    let db_address = db_address.with_context(|| {
+        format!(
+            "No gEfiHiiDatabaseProtocolGuid entry in the first {MAX_CONFIG_TABLE_ENTRIES} \
+             configuration table entries (is PcdHiiOsRuntimeSupport FALSE?)"
+        )
+    })?;
+
+    let length = hii_db_length(|offset, len| read(db_address + offset as u64, len))?;
+    read(db_address, length)
+}
+
+/// Parses the address in `text`, as Linux prints it ("0x7fc2d198").
+fn parse_hex_address(text: &str) -> Result<u64> {
+    let text = text.trim();
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    u64::from_str_radix(digits, 16).with_context(|| format!("Not a hexadecimal address: {text:?}"))
+}
+
+/// Returns the VendorTable pointer of `entry` (an EFI_CONFIGURATION_TABLE) when
+/// it is the gEfiHiiDatabaseProtocolGuid entry with a non-NULL pointer.
+fn parse_hii_config_table_entry(entry: &[u8]) -> Option<u64> {
+    let (guid, pointer) = entry.split_at(16);
+    if guid != HII_DATABASE_GUID {
+        return None;
+    }
+    let address = u64::from_le_bytes(pointer.try_into().ok()?);
+    (address != 0).then_some(address)
+}
+
+/// Returns the size of the exported database, which the configuration table does
+/// not record: HiiDatabaseDxe over-allocates the buffer by 25% and zero-fills it
+/// (HiiGetDatabaseInfo), so the database is the run of package lists, walked by
+/// their PackageLength, that ends at the first zero PackageLength. `read(offset,
+/// length)` returns database bytes.
+fn hii_db_length(read: impl Fn(usize, usize) -> Result<Vec<u8>>) -> Result<usize> {
+    let mut total = 0;
+    loop {
+        let header = read(total, PACKAGE_LIST_HEADER_LEN)?;
+        let length = u32::from_le_bytes(header[16..20].try_into()?) as usize;
+        if length == 0 {
+            break;
+        }
+        if length < PACKAGE_LIST_HEADER_LEN {
+            bail!("HII package list at offset 0x{total:x} has a bad PackageLength: {length}");
+        }
+        total += length;
+        if total > MAX_HII_DB_LEN {
+            bail!("HII database is larger than {MAX_HII_DB_LEN} bytes");
+        }
+    }
+    if total == 0 {
+        bail!("HII database holds no package list");
+    }
+    Ok(total)
 }
 
 /// Reads the HII database from the vendor ACPI table (HIIDB_ACPI_PATH) whose
@@ -622,5 +740,65 @@ mod tests {
                 read_physical_memory_at(&file, address, 100, failing_pread(errno)).unwrap_err();
             assert_eq!(root_errno(&err), Some(errno), "{err:#}");
         }
+    }
+
+    #[test]
+    fn parses_config_table_address() {
+        assert_eq!(parse_hex_address("0x7fc2d198\n").unwrap(), 0x7fc2d198);
+        assert_eq!(parse_hex_address("7fc2d198").unwrap(), 0x7fc2d198);
+        assert!(parse_hex_address("none").is_err());
+    }
+
+    #[test]
+    fn finds_only_the_hii_database_config_table_entry() {
+        let mut entry = [0u8; CONFIG_TABLE_ENTRY_LEN];
+        entry[..16].copy_from_slice(&HII_DATABASE_GUID);
+        entry[16..].copy_from_slice(&0x7fc0_6018u64.to_le_bytes());
+        assert_eq!(parse_hii_config_table_entry(&entry), Some(0x7fc0_6018));
+
+        entry[16..].fill(0);
+        assert_eq!(parse_hii_config_table_entry(&entry), None, "NULL pointer");
+
+        entry[16..].copy_from_slice(&0x7fc0_6018u64.to_le_bytes());
+        entry[0] ^= 1;
+        assert_eq!(parse_hii_config_table_entry(&entry), None, "other GUID");
+    }
+
+    /// A package list of `length` bytes: a header whose PackageLength is `length`.
+    fn package_list(length: u32) -> Vec<u8> {
+        let mut list = vec![0xaa; length as usize];
+        list[16..20].copy_from_slice(&length.to_le_bytes());
+        list
+    }
+
+    #[test]
+    fn hii_db_length_stops_at_zero_padding() {
+        let mut db = package_list(40);
+        db.extend(package_list(24));
+        db.extend([0u8; 30]); // the 25% over-allocation, zero-filled
+        let read = |offset: usize, len: usize| Ok(db[offset..offset + len].to_vec());
+        assert_eq!(hii_db_length(read).unwrap(), 64);
+    }
+
+    #[test]
+    fn hii_db_length_rejects_bad_databases() {
+        let empty = [0u8; 32];
+        let read = |offset: usize, len: usize| Ok(empty[offset..offset + len].to_vec());
+        assert!(hii_db_length(read).is_err(), "no package list");
+
+        let mut short = package_list(20);
+        short[16..20].copy_from_slice(&19u32.to_le_bytes());
+        let read = |offset: usize, len: usize| Ok(short[offset..offset + len].to_vec());
+        assert!(
+            hii_db_length(read).is_err(),
+            "PackageLength below the header"
+        );
+
+        // Every list claims 16 MiB and the data never ends.
+        let endless = package_list(20);
+        let mut header = endless[..PACKAGE_LIST_HEADER_LEN].to_vec();
+        header[16..20].copy_from_slice(&(16u32 << 20).to_le_bytes());
+        let read = |_: usize, _: usize| Ok(header.clone());
+        assert!(hii_db_length(read).is_err(), "over the size cap");
     }
 }
