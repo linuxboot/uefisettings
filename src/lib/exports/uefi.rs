@@ -14,7 +14,8 @@
 //! firmware it runs on and write its variables, through boot services.
 //!
 //! Every export that reaches this firmware, those here, VariableBackend's, CapsuleBackend's, and
-//! get, set, list-questions and show-ifr of EfivarSource::System, calls the uefi crate, which
+//! get, set, list-questions and show-ifr, which read its Time Services and, from
+//! EfivarSource::System, its variables, calls the uefi crate, which
 //! panics unless the image has initialized it: uefi::table::set_system_table, then
 //! uefi::boot::set_image_handle, as uefisettings.efi's entry point uefi_std_entry does.
 
@@ -44,12 +45,14 @@ use crate::hii::export_package_lists;
 use crate::hii::get_keyword;
 use crate::hii::package;
 use crate::hii::set_keywords;
+use crate::hii::time_services::TimeServices;
 use crate::hii::FirmwareKeywordHandler;
 use crate::hii::FirmwareVariables;
 use crate::hii::KeywordInfoSource;
 use crate::hii::KeywordValues;
 use crate::hii::VariableReach;
 use crate::hii::VariableServices;
+use crate::runtime_time_services::RuntimeTimeServices;
 use crate::uefi_config_table::SystemConfigurationTable;
 
 /// What set and get read and write when no file names them: this firmware's HII database and
@@ -63,6 +66,11 @@ impl HiiBackend {
     /// This firmware's variables.
     pub(super) fn system_variables() -> Result<impl FirmwareVariables> {
         Ok(VariableServices)
+    }
+
+    /// This firmware's Time Services.
+    pub(super) fn system_time_services() -> impl TimeServices {
+        RuntimeTimeServices
     }
 }
 

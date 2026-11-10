@@ -149,6 +149,25 @@ of the question. The scenarios `hii-readwrite` and
 `shell-readwrite` get and set them from Linux and from the UEFI Shell, and DriverSample's
 "Serial port number", whose WRITE sets three more fields.
 
+`publish-hiidb.efi wakeup-time-forms` registers the forms of
+[`publish-hiidb/src/wakeup_time_forms.rs`](publish-hiidb/src/wakeup_time_forms.rs) and
+publishes the database the same way, over the variable `DateTimeData`, which it creates
+unless it exists: a DATE and a TIME, which suppresses its second, on that variable, and a DATE
+and a TIME of the wake-up time, EFI Date/Time Storage without a VarStore (UEFI 2.11 §33.2.5.6).
+First it arms the wake-up alarm for 23:59:59 of the day of GetTime(), so that GetWakeupTime()
+gives a valid time, and it registers a reset notification that disarms the alarm,
+SetWakeupTime(FALSE), when the UEFI Shell resets the machine. The firmware of the debs that
+[`run.sh`](run.sh) boots, 2024.02-2ubuntu0.10, is built from `edk2-stable202402`: on x86_64 and
+i686, PcatRealTimeClockRuntimeDxe's PcRtcSetWakeupTime() (PcRtc.c) takes an alarm within a day
+after GetTime() and returns EFI_UNSUPPORTED beyond it, and its GetWakeupTime() returns
+EFI_DEVICE_ERROR for an alarm whose fields are out of range; on aarch64, PL031RealTimeClockLib's
+LibGetWakeupTime() and LibSetWakeupTime() (PL031RealTimeClockLib.c) return EFI_UNSUPPORTED. The
+scenario `hii-time-storage` gets and sets these questions from Linux, which reaches no Time
+Services, and `shell-time-storage` from the UEFI Shell, with DriverSample's "System Date" and
+"System Time" of the system time, whose writes last for the boot, as QEMU starts the RTC at the
+host's time; `shell/time-storage.aarch64.tsv` holds the checks of its aarch64 boot, as
+`run.sh` takes `shell/NAME.ARCH.tsv` instead of `shell/NAME.tsv` where it exists.
+
 `publish-hiidb.efi acpi-table` sets no `HiiDB` variable: it installs the database as the body
 of a `QHII` ACPI table through `EFI_ACPI_TABLE_PROTOCOL`, which `uefisettings` reads from
 `/sys/firmware/acpi/tables/QHII`. QEMU's `-acpitable` cannot add it: only the x86 machines

@@ -36,6 +36,8 @@ use uefisettings_qemu_guest::driver_sample::READ_ONLY_NUMERIC;
 use uefisettings_qemu_guest::driver_sample::READ_ONLY_NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
+use uefisettings_qemu_guest::driver_sample::SYSTEM_DATE;
+use uefisettings_qemu_guest::driver_sample::SYSTEM_TIME;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::variable_bytes;
@@ -402,4 +404,32 @@ fn set_with_an_access_level_is_refused_without_system_access() {
             );
         }
     }
+}
+
+/// "System Time" selects the first of DriverSample's two TIMEs of that prompt, of one state: that
+/// of the system time. Linux reaches no Time Services (UEFI 2.11 §8.3), so set refuses it before
+/// any write, and the variable, whose EFI_HII_TIME the other TIME holds, stays. get shows the
+/// DATE of the system time without a value.
+#[test]
+fn set_of_the_system_time_is_refused_without_a_write() {
+    assert_eq!(
+        refuse(&["hii"], SYSTEM_TIME, "10:20:30", &INCLUDE_SUPPRESSED).error_message,
+        "cannot set question \"System Time\": EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is \
+         written only through SetTime(); run uefisettings.efi in the UEFI Shell"
+    );
+    let (got, _) = single_response(
+        &[
+            &["hii", "get", SYSTEM_DATE, "--json"][..],
+            &INCLUDE_SUPPRESSED,
+        ]
+        .concat(),
+        BACKEND_HII,
+    );
+    assert!(
+        got.answer.starts_with(
+            "<ValueUnavailable: EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is read only \
+             through GetTime(); run uefisettings.efi in the UEFI Shell>"
+        ) && got.answer.ends_with(" <suppressed>"),
+        "{got:#?}"
+    );
 }

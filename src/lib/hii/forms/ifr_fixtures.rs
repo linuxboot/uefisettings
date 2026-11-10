@@ -52,6 +52,8 @@ pub(crate) use crate::hii::strings::ListTexts;
 pub(crate) use crate::hii::strings::StringMap;
 pub(crate) use crate::hii::strings::StringPackage;
 #[cfg(efivar_dumps)]
+use crate::hii::time_services::TimeServices;
+#[cfg(efivar_dumps)]
 pub(super) use crate::hii::variables::tests::variable_key;
 pub(crate) use crate::hii::variables::tests::MemoryVariables;
 #[cfg(efivar_dumps)]
@@ -952,11 +954,33 @@ pub(super) fn question_descriptor_with(
     VarStoreFixture { store, efivars }: VarStoreFixture,
     values: &impl QuestionValues,
 ) -> QuestionDescriptor {
+    describe(node, store, values, &mut efivars.reader())
+}
+
+/// question_descriptor, reading EFI Date/Time Storage through `time_services`.
+#[cfg(efivar_dumps)]
+pub(super) fn question_descriptor_timed(
+    node: &Rc<RefCell<IFROperation>>,
+    VarStoreFixture { store, efivars }: VarStoreFixture,
+    time_services: Option<Rc<dyn TimeServices>>,
+) -> QuestionDescriptor {
+    let values = VarStoreValues::new(&root_of(node), None);
+    let mut reader = efivars.reader().with_time_services(time_services);
+    describe(node, store, &values, &mut reader)
+}
+
+/// The QuestionDescriptor of `node` on `store`, reading through `reader`.
+#[cfg(efivar_dumps)]
+fn describe(
+    node: &Rc<RefCell<IFROperation>>,
+    store: Result<Box<dyn VariableStore>>,
+    values: &impl QuestionValues,
+    reader: &mut EfivarReader,
+) -> QuestionDescriptor {
     let current = node.borrow();
     let strings = strings();
     let texts = ListTexts::new(&strings, &[]);
-    let mut reader = efivars.reader();
-    let walk = &mut FormSetWalk::new(&texts, &mut reader, values, IncludedStates::empty());
+    let walk = &mut FormSetWalk::new(&texts, reader, values, IncludedStates::empty());
     let flags = value_question(&current)
         .expect("a question")
         .header()

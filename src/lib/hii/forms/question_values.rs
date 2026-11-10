@@ -32,6 +32,7 @@ use super::conditions::IncludedStates;
 use super::conditions::QuestionValues;
 use super::conditions::StateEvaluation;
 use super::date_time::DateTimeInput;
+use super::date_time::DateTimeKind;
 use super::date_time::DateTimeQuestion;
 use super::date_time::DateTimeStorage;
 use super::defaults::option_text;
@@ -48,6 +49,7 @@ use super::storage::RetrievedValue;
 use super::storage::ValueLocation;
 use super::storage::ValueSource;
 use super::storage::VariableStore;
+use super::time_storage::TimeStorage;
 use super::walk_scopes;
 use super::AnswerOption;
 use super::CheckBox;
@@ -110,6 +112,18 @@ impl ValueQuestion<'_> {
             ValueQuestion::Numeric(question) => question.encoding,
             ValueQuestion::CheckBox(question) => question.encoding,
             ValueQuestion::DateTime(question) => question.encoding(),
+        }
+    }
+
+    /// The kind and EFI Date/Time Storage of a DATE or TIME of such storage.
+    pub(super) fn time_storage(&self) -> Option<(DateTimeKind, TimeStorage)> {
+        match self {
+            ValueQuestion::DateTime(question) => question
+                .time_storage()
+                .map(|storage| (question.kind, storage)),
+            ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) | ValueQuestion::CheckBox(_) => {
+                None
+            }
         }
     }
 }
@@ -252,7 +266,8 @@ impl fmt::Display for QuestionKind {
     }
 }
 
-/// Returns `op` as a ONE_OF, NUMERIC, CHECKBOX, or a DATE or TIME of Normal storage.
+/// Returns `op` as a ONE_OF, NUMERIC, CHECKBOX, DATE or TIME, but a DATE or TIME whose UEFI
+/// Storage is none of the three valid values.
 pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
     match &op.parsed_data {
         ParsedOperation::OneOf(question) => Some(ValueQuestion::OneOf(question)),
@@ -260,11 +275,10 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
         ParsedOperation::CheckBox(question) => Some(ValueQuestion::CheckBox(question)),
         ParsedOperation::Date(question) | ParsedOperation::Time(question) => {
             match question.storage() {
-                DateTimeStorage::Normal => Some(ValueQuestion::DateTime(question)),
-                // the system time and wake-up time, which uefisettings does not reach yet
-                DateTimeStorage::SystemTime
-                | DateTimeStorage::WakeupTime
-                | DateTimeStorage::Reserved => None,
+                DateTimeStorage::Normal | DateTimeStorage::Efi(_) => {
+                    Some(ValueQuestion::DateTime(question))
+                }
+                DateTimeStorage::Reserved => None,
             }
         }
         ParsedOperation::FormSet(_)
@@ -1266,10 +1280,10 @@ mod question_value_tests {
         }
     }
 
-    /// A DATE or TIME whose UEFI Storage is the system time or wake-up time is left out, as
-    /// before uefisettings decoded DATE and TIME; one of Normal storage is listed.
+    /// A DATE or TIME of Normal storage, the system time or the wake-up time is listed; one whose
+    /// UEFI Storage is 0x30, none of the three valid values, is left out.
     #[test]
-    fn only_date_and_time_of_normal_storage_are_listed() {
+    fn date_and_time_of_valid_storage_are_listed() {
         let efivars = Efivars::new();
         efivars.write(
             &efi_variable("Setup", 8),
@@ -1278,11 +1292,12 @@ mod question_value_tests {
         let cases = [
             ("DATE of Normal storage", DATE, 0x00, 1),
             ("TIME of Normal storage", TIME, 0x00, 1),
-            ("DATE of system time", DATE, 0x10, 0),
-            ("DATE of wake-up time", DATE, 0x20, 0),
-            ("TIME of system time", TIME, 0x10, 0),
-            ("TIME of wake-up time", TIME, 0x20, 0),
+            ("DATE of system time", DATE, 0x10, 1),
+            ("DATE of wake-up time", DATE, 0x20, 1),
+            ("TIME of system time", TIME, 0x10, 1),
+            ("TIME of wake-up time", TIME, 0x20, 1),
             ("DATE of reserved storage", DATE, 0x30, 0),
+            ("TIME of reserved storage", TIME, 0x37, 0),
         ];
         for (name, op_code, flags, listed) in cases {
             let root = parse_form_set(&[

@@ -16,8 +16,8 @@
 //! edk2-stable202608 SetupBrowserDxe/Setup.c SubmitForForm then routes only the bytes of the
 //! form's questions, dropping SET bytes that no question covers; set writes every SET, as UEFI
 //! 2.11 §33.3.8.3.66 stores the value in the VarStore.
-//! set writes the plans of all its questions as one batch, one write per variable
-//! (batched_writes).
+//! set writes the plans of all its questions as one batch: their writes of EFI Date/Time Storage,
+//! then one write per variable (batched_writes).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -31,7 +31,7 @@ use thiserror::Error;
 use super::check_read;
 use super::conditions::evaluate_write;
 use super::conditions::ExpressionInputs;
-use super::conditions::PlannedSet;
+use super::conditions::PlannedSets;
 use super::conditions::QuestionValue;
 use super::conditions::VarStoreValues;
 use super::set::own_write;
@@ -39,6 +39,10 @@ use super::set::ChangeValueError;
 use super::set::NewValue;
 use super::set::VarStoreWrite;
 use super::storage::VariableStore;
+use super::time_storage::value_changes;
+use super::time_storage::FieldChange;
+use super::time_storage::TimeStorage;
+use super::time_storage::TimeWrite;
 use super::AccessLevel;
 use super::EfivarReader;
 use super::IFROpCode;
@@ -48,17 +52,26 @@ use super::StoragelessRefusal;
 use super::TypeValue;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarRange;
+use crate::hii::variables::FirmwareVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
 
-/// The writes that set one question: the SETs of its WRITE expression, in order, then its own
-/// value, which wins where they overlap.
+/// The writes that set one question: those of EFI Date/Time Storage first (UEFI 2.11
+/// §33.2.5.6), then the SETs of its WRITE expression, in order, then its own value, which wins
+/// where they overlap.
 pub(super) struct WritePlan<'a> {
     question: &'a QuestionDescriptor,
-    sets: Vec<PlannedSet>,
+    time: Vec<TimeWrite>,
+    sets: PlannedSets,
     own: Option<VarStoreWrite<'a>>,
+}
+
+/// The writes of a WritePlan: of EFI Date/Time Storage, then of variables, in order.
+pub(super) struct QuestionWrites<'p> {
+    pub(super) time: &'p [TimeWrite],
+    pub(super) variables: Vec<VarStoreWrite<'p>>,
 }
 
 impl<'a> WritePlan<'a> {
@@ -90,7 +103,8 @@ impl<'a> WritePlan<'a> {
             refusal,
         })?
         .unwrap_or_default();
-        if own.is_none() && sets.is_empty() {
+        let time = time_writes(question, value, &sets.system_time, reader)?;
+        if own.is_none() && sets.var_store.is_empty() && time.is_empty() {
             return Err(ChangeValueError::Storageless {
                 question: question.question.clone(),
                 refusal: StoragelessRefusal::WriteSetsNothing,
@@ -98,23 +112,25 @@ impl<'a> WritePlan<'a> {
         }
         Ok(Self {
             question,
+            time,
             sets,
             own,
         })
     }
 
-    /// The plan's writes, one per variable, in the order in which the plan first changes each,
-    /// each of its patches in order. Refuses a SET of a VarStore whose variable set may not
-    /// write, through what `reader` read of it, under `volatile`, and a write one of whose patches
-    /// overlaps the bytes of a password that `reader` withholds, so that set writes no variable of
-    /// the plan.
-    pub(super) fn variable_writes(
+    /// The plan's writes: of EFI Date/Time Storage, then one per variable, in the order in which
+    /// the plan first changes each, each of its patches in order. Refuses a SET of a VarStore,
+    /// or the VarStore of a question of EFI Date/Time Storage, whose variable set may not write,
+    /// through what `reader` read of it, under `volatile`, and a variable write one of whose
+    /// patches overlaps the bytes of a password that `reader` withholds, so that set writes
+    /// neither a time nor a variable of the plan.
+    pub(super) fn writes(
         &self,
         reader: &mut EfivarReader,
         volatile: VolatileWrites,
-    ) -> Result<Vec<VarStoreWrite<'_>>, ChangeValueError> {
+    ) -> Result<QuestionWrites<'_>, ChangeValueError> {
         let through = (reader.reach(), reader.interface());
-        for set in &self.sets {
+        for set in &self.sets.var_store {
             let store = set.store.as_ref();
             let range = usize::from(set.offset)..usize::from(set.offset) + set.bytes.len();
             let read = reader.read(EfivarRange::of(store), range);
@@ -125,8 +141,22 @@ impl<'a> WritePlan<'a> {
                 }
             })?;
         }
+        // the selection reads no VarStore of a question of EFI Date/Time Storage, whose value
+        // comes from the Time Services: read and check it here, before SetTime()
+        if let Some(own) = self
+            .own
+            .as_ref()
+            .filter(|_| self.question.time_storage().is_some())
+        {
+            for (offset, bytes) in &own.patches {
+                let range = usize::from(*offset)..usize::from(*offset) + bytes.len();
+                let read = reader.read(EfivarRange::of(own.store), range);
+                check_read(own.store, read, through, volatile)?;
+            }
+        }
         let patches = self
             .sets
+            .var_store
             .iter()
             .map(|set| Patch {
                 store: set.store.as_ref(),
@@ -148,13 +178,13 @@ impl<'a> WritePlan<'a> {
                 None => variables.push((key, vec![patch])),
             }
         }
-        let writes = variables
+        let variables = variables
             .into_iter()
             .map(|(_, patches)| merged_write(&patches))
             .collect::<Result<Vec<_>, _>>()?;
         // each backend applies the patches to its own read of the variable, so the bytes
         // between them keep what it holds
-        for write in &writes {
+        for write in &variables {
             reader
                 .check_patches(&write.store.variable_key(), write.data_patches())
                 .map_err(|refusal| ChangeValueError::PasswordBytes {
@@ -162,8 +192,51 @@ impl<'a> WritePlan<'a> {
                     refusal,
                 })?;
         }
-        Ok(writes)
+        Ok(QuestionWrites {
+            time: &self.time,
+            variables,
+        })
     }
+}
+
+/// The writes of EFI Date/Time Storage that set `question` to `value`, with the changes
+/// `system_time` of the SETs of its WRITE expression: of the system time, then of the
+/// question's own storage, each read through the Time Services of `reader` before any write.
+fn time_writes(
+    question: &QuestionDescriptor,
+    value: TypeValue,
+    system_time: &[FieldChange],
+    reader: &EfivarReader,
+) -> Result<Vec<TimeWrite>, ChangeValueError> {
+    let own = match question.time_storage() {
+        Some(storage) => {
+            let changes = value_changes(value).ok_or_else(|| {
+                anyhow!("a value of EFI Date/Time Storage that is no DATE or TIME")
+            })?;
+            Some((storage, changes))
+        }
+        None => None,
+    };
+    let mut storages: Vec<(TimeStorage, Vec<FieldChange>)> = Vec::new();
+    if !system_time.is_empty() {
+        storages.push((TimeStorage::SystemTime, system_time.to_vec()));
+    }
+    match (own, storages.first_mut()) {
+        (Some((TimeStorage::SystemTime, changes)), Some((_, sets))) => sets.extend(changes),
+        (Some(own), _) => storages.push(own),
+        (None, _) => {}
+    }
+    storages
+        .into_iter()
+        .map(|(storage, changes)| {
+            TimeWrite::plan(storage, reader.time_services(), &changes).map_err(|refusal| {
+                ChangeValueError::TimeStorage {
+                    question: question.question.clone(),
+                    refusal,
+                }
+            })
+        })
+        .collect()
 }
 
 /// THIS of the WRITE expression of a question of `opcode` that set sets to `value`, of the type of
@@ -231,6 +304,38 @@ impl BatchedWrite<'_> {
             self.selectors.join(", "),
             self.write.store.variable_key()
         )
+    }
+}
+
+/// A write of set's batch: of EFI Date/Time Storage for the question of a selector, or of a
+/// variable.
+pub(super) enum BatchedStore<'b, 'a> {
+    Time {
+        selector: &'a str,
+        write: &'b TimeWrite,
+    },
+    Variable(&'b BatchedWrite<'a>),
+}
+
+impl BatchedStore<'_, '_> {
+    /// The write as set's errors name it: its selectors and its storage or variable.
+    pub(super) fn label(&self) -> String {
+        match self {
+            Self::Time { selector, write } => format!("{selector} ({})", write.storage()),
+            Self::Variable(batched) => batched.label(),
+        }
+    }
+
+    /// Writes it, a variable through `variables`, and returns its label with the EFI_TIME that a
+    /// write of EFI Date/Time Storage wrote.
+    pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<String> {
+        match self {
+            Self::Time { selector, write } => Ok(format!("{selector} ({})", write.write()?)),
+            Self::Variable(batched) => {
+                batched.write.write(variables)?;
+                Ok(batched.label())
+            }
+        }
     }
 }
 

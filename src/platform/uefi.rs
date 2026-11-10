@@ -81,6 +81,13 @@ pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the
 pub(super) const GET_ABOUT: &str = "Get the current value of a question";
 /// The about of top-level set, which writes this firmware's HII database, as hii set does.
 pub(super) const SET_ABOUT: &str = "Set/change the value of a question";
+/// The long about of set and hii set, which write the wake-up time through this firmware's Time
+/// Services, arming the alarm.
+pub(super) const SET_LONG_ABOUT: &str = "Set/change the value of a question.\n\n\
+     A date or time question whose UEFI Storage is the wake-up time (QF_DATE_STORAGE_WAKEUP or \
+     QF_TIME_STORAGE_WAKEUP) is set through SetWakeupTime(TRUE, ...), arming the alarm, which \
+     \"causes the system to wake up or power on at the set time\" (UEFI 2.11 §8.3.4), as \
+     edk2-stable202608 SetupBrowserDxe/Setup.c:2051 does.";
 
 /// The help of --hii-source, which this build ignores.
 pub(super) const HII_SOURCE_HELP: &str =

@@ -80,6 +80,10 @@ name = "hii_shell_parity"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_time_storage"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_write"
 required-features = ["test-vm"]
 

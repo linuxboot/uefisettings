@@ -174,6 +174,7 @@ use crate::hii::forms::QuestionFlags;
 use crate::hii::package;
 #[cfg(any(variable_names, variable_info, variable_data))]
 pub use crate::hii::package::Guid;
+use crate::hii::time_services::TimeServices;
 #[cfg(target_os = "linux")]
 pub use crate::hii::DenialCause;
 #[cfg(target_os = "linux")]
@@ -922,7 +923,7 @@ impl HiiBackend {
         let parsed_db = package::read_db(db_bytes)?;
         let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
         let passwords = PasswordQuestions::of_lists(&parsed_db);
-        let mut reader = passwords.reader(reads)?;
+        let mut reader = passwords.reader(reads)?.with_time_services(time_services());
         let writes = passwords.withholding(writes)?;
         passwords.check_set(writes.reach(), options.setup_password)?;
 
@@ -1154,7 +1155,9 @@ fn read_db_withholding(
 ) -> Result<(Vec<package::ParsedPackageList>, EfivarReader)> {
     let parsed_db = package::read_db(db_bytes)?;
     let passwords = PasswordQuestions::of_lists(&parsed_db);
-    let reader = passwords.reader(variables)?;
+    let reader = passwords
+        .reader(variables)?
+        .with_time_services(time_services());
     let Some(exported) = exported else {
         return Ok((parsed_db, reader));
     };
@@ -1248,6 +1251,20 @@ fn keyword_statements<'a>(
     };
     forms::check_keyword_namespace(&question.to_string(), &statements)?;
     Ok(statements)
+}
+
+/// The Time Services through which DATE and TIME questions of EFI Date/Time Storage read and set
+/// writes: this firmware's.
+#[cfg(system_time)]
+fn time_services() -> Option<Rc<dyn TimeServices>> {
+    Some(Rc::new(HiiBackend::system_time_services()))
+}
+
+/// None: this build reaches no Time Services, so DATE and TIME questions of EFI Date/Time Storage
+/// have no value and set refuses them.
+#[cfg(not(system_time))]
+fn time_services() -> Option<Rc<dyn TimeServices>> {
+    None
 }
 
 /// set's phase before its first write, so that no error follows a write: checks every package
@@ -3028,6 +3045,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// get and set by QuestionId and by keyword of a DATE of the system time with a VarStore, in
+    /// a build without Time Services, show and refuse it as by prompt, writing nothing.
+    #[test]
+    fn dates_of_time_storage_select_by_question_id_or_keyword_as_by_prompt() {
+        let data = [question_header_with(0x8001, 3, 1, 0, 0x00), vec![0x10]].concat();
+        let hiidb = keyed_question_hiidb(operation(DATE, false, &data), 4, &[]);
+        assert_answered_by_each_selector(
+            &hiidb,
+            &[0xE8, 0x07, 2, 29],
+            "2027-01-02",
+            &Answered {
+                got: vec![
+                    "<ValueUnavailable: EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is read \
+                           only through GetTime(); run uefisettings.efi in the UEFI Shell>"
+                        .to_owned(),
+                ],
+                set: Err(
+                    "cannot set question \"Keyed\": EFI Date/Time Storage (UEFI 2.11 \
+                          §33.2.5.6) is written only through SetTime(); run uefisettings.efi in \
+                          the UEFI Shell"
+                        .to_owned(),
+                ),
+                writes: vec![],
+            },
+        );
     }
 
     /// A HiiDB whose FormSet holds the CHECKBOXes 0xA at byte 0 and 0x14 at byte 1 of Setup,
@@ -9588,6 +9632,55 @@ mod tests {
                 N_STORE_NOT_EXPOSED,
                 "set {question}"
             );
+        }
+    }
+
+    /// A DATE or TIME of EFI Date/Time Storage keeps its value there (UEFI 2.11 §33.2.5.6), not
+    /// in the snapshot, which holds the bytes of VarStores only: on Linux, which reaches no Time
+    /// Services, it shows why it has no value, untagged, also when the snapshot holds the bytes
+    /// of its VarStore.
+    #[test]
+    fn dates_and_times_of_time_storage_take_no_snapshot_value() {
+        // the system time's date at byte 0 of NStore, the wake-up time's time at byte 4, and the
+        // system time's date without a VarStore
+        let date = [question_header_with(1, 1, 1, 0, 0x00), vec![0x10]].concat();
+        let time = [question_header_with(2, 2, 1, 4, 0x00), vec![0x20]].concat();
+        let only = [question_header_with(3, 3, 0, 0, 0x00), vec![0x10]].concat();
+        let hiidb = n_store_hiidb(
+            7,
+            &[
+                operation(DATE, false, &date),
+                operation(TIME, false, &time),
+                operation(DATE, false, &only),
+            ],
+            &["D", "W", "S"],
+        );
+        let text = n_store_snapshot(&[0xEA, 0x07, 11, 10, 12, 34, 56]);
+
+        let (got, listed, ifr, outputs) =
+            answers_with_snapshot(&hiidb, &["D", "W", "S"], &no_variables(), &text);
+
+        let unread = |service: &str| {
+            format!(
+                "<ValueUnavailable: EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is read only \
+                 through {service}; run uefisettings.efi in the UEFI Shell>"
+            )
+        };
+        let want = [
+            unread("GetTime()"),
+            unread("GetWakeupTime()"),
+            unread("GetTime()"),
+        ];
+        assert_eq!(got, want, "get");
+        assert_eq!(listed, want, "list-questions");
+        for shown in &want {
+            assert!(
+                ifr.contains(&format!("-Answer: {shown}\n")),
+                "show-ifr lacks {shown:?}: {ifr}"
+            );
+        }
+        for output in outputs {
+            assert!(!output.contains("<snapshot>"), "{output}");
         }
     }
 

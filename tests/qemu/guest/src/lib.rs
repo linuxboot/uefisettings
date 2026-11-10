@@ -160,6 +160,12 @@ pub mod driver_sample {
     /// The flag that makes `set` write questions that EFI_IFR_FLAG_READ_ONLY makes read-only,
     /// such as [`READ_ONLY_NUMERIC`]; `get` shows them regardless.
     pub const INCLUDE_READ_ONLY: [&str; 2] = ["--include", "read-only"];
+    /// The prompt of the DATE of the system time in the form that [`INCLUDE_SUPPRESSED`]
+    /// selects.
+    pub const SYSTEM_DATE: &str = "System Date";
+    /// The prompt of two TIMEs in that form: one of the system time, which get and set select,
+    /// then one on the variable's EFI_HII_TIME at byte 199, which suppresses its second.
+    pub const SYSTEM_TIME: &str = "System Time";
 }
 
 /// How a `uefisettings` run exited, and what it printed.

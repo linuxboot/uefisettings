@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -31,6 +31,13 @@
 //! `rt-data-readwrite-forms` is `rt-data`, after it creates the variable of
 //! [`readwrite_forms`] if it is missing and registers its package list in the HII database, so
 //! that both Linux and `uefisettings.efi` in the UEFI Shell find it.
+//! `wakeup-time-forms` does the same with [`wakeup_time_forms`] and its variable, after it arms
+//! the wake-up alarm for 23:59:59 of the day of GetTime(), within the day that EDK2's
+//! PcatRealTimeClockRuntimeDxe takes (PcRtcSetWakeupTime), so that GetWakeupTime() gives a
+//! valid time to read and change; PL031RealTimeClockLib returns EFI_UNSUPPORTED for both, which
+//! it reports. A reset notification disarms the alarm, SetWakeupTime(FALSE), when the UEFI
+//! Shell resets the machine, as ResetSystem() calls those notifications only before
+//! ExitBootServices().
 //! `password-forms` publishes nothing: it creates the variable of [`plaintext_password_forms`]
 //! if it is missing and registers the package lists of [`password_forms`] and
 //! [`plaintext_password_forms`] in the HII database, for `uefisettings.efi` in the UEFI Shell,
@@ -112,6 +119,7 @@ mod plaintext_password_forms;
 mod readwrite_forms;
 mod short_var_store_forms;
 mod string_blocks;
+mod wakeup_time_forms;
 
 use alloc::vec::Vec;
 use core::ptr;
@@ -130,6 +138,7 @@ use uefi::proto::acpi::AcpiTable;
 use uefi::proto::hii::database::HiiDatabase;
 use uefi::proto::loaded_image::LoadOptionsError;
 use uefi::proto::loaded_image::LoadedImage;
+use uefi::proto::misc::ResetNotification;
 use uefi::proto::unsafe_protocol;
 use uefi::runtime;
 use uefi::runtime::VariableAttributes;
@@ -140,6 +149,10 @@ use uefi::Handle;
 use uefi::Status;
 use uefi::StatusExt;
 use uefi_raw::protocol::hii::database::HiiDatabaseProtocol;
+use uefi_raw::table::runtime::ResetType;
+use uefi_raw::table::runtime::RuntimeServices;
+use uefi_raw::time::Time;
+use uefi_raw::Boolean;
 
 /// Name of the variable that `uefisettings` looks for.
 const HIIDB_NAME: &CStr16 = cstr16!("HiiDB");
@@ -312,6 +325,14 @@ fn efi_main() -> Status {
             "registering the string blocks",
         )
         .map(|()| println!("publish-hiidb: registered the string blocks")),
+        Some(Task::PublishWakeupTimeForms) => {
+            publish_wakeup_time_forms().map(|(alarm, address, length)| {
+                println!(
+                    "publish-hiidb: wake-up alarm: {alarm:?}; date and time forms registered; \
+                     {length} bytes at {address:#x}"
+                );
+            })
+        }
         Some(Task::PublishAcpiTable(signature)) => publish_acpi_table(signature).map(|length| {
             let signature = signature.escape_ascii();
             println!("publish-hiidb: {length} bytes in the {signature} ACPI table");
@@ -335,7 +356,8 @@ fn efi_main() -> Status {
             println!(
                 "usage: publish-hiidb \
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
-                 |rt-data-readwrite-forms|password-forms|rt-data-password-forms\
+                 |rt-data-readwrite-forms|wakeup-time-forms|password-forms\
+                 |rt-data-password-forms\
                  |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
                  |disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms\
                  |outside-form-set-password-forms|rt-data-outside-form-set-password-forms\
@@ -401,6 +423,10 @@ enum Task {
     PublishReadWriteForms,
     /// Register the package list of [`string_blocks`] in the HII database.
     RegisterStringBlocks,
+    /// Arm the wake-up alarm and register its disarming at reset, create the variable of
+    /// [`wakeup_time_forms`] if missing, register its package list in the HII database, then
+    /// publish the database in runtime-data pages.
+    PublishWakeupTimeForms,
     /// Publish the database in an ACPI table of the signature.
     PublishAcpiTable([u8; 4]),
     /// Install an ACPI table of the signature whose body is JUNK_TABLE_BODY.
@@ -446,6 +472,7 @@ fn load_option() -> Option<Task> {
         Ok(option) if option == cstr16!("rt-data-readwrite-forms") => {
             Some(Task::PublishReadWriteForms)
         }
+        Ok(option) if option == cstr16!("wakeup-time-forms") => Some(Task::PublishWakeupTimeForms),
         Ok(option) if option == cstr16!("password-forms") => Some(Task::RegisterPasswordForms),
         Ok(option) if option == cstr16!("rt-data-password-forms") => {
             Some(Task::PublishPasswordForms)
@@ -695,6 +722,110 @@ fn publish_readwrite_forms() -> Result<(u64, u32), Failure> {
         "registering the read/write forms",
     )?;
     publish(MemoryType::RUNTIME_SERVICES_DATA, Database::Exported)
+}
+
+/// Arms the wake-up alarm, registers its disarming at reset, creates the variable of
+/// [`wakeup_time_forms`] unless it exists, registers the package list of [`wakeup_time_forms`],
+/// then publishes the database in runtime-data pages. Returns the status of SetWakeupTime(),
+/// and the address and length of the copy.
+fn publish_wakeup_time_forms() -> Result<(Status, u64, u32), Failure> {
+    let alarm = arm_wakeup_alarm()?;
+    boot::get_handle_for_protocol::<ResetNotification>()
+        .and_then(boot::open_protocol_exclusive::<ResetNotification>)
+        .and_then(|mut notification| notification.register_reset_notify(disarm_wakeup_alarm))
+        .map_err(|error| ("registering the reset notification", error.status()))?;
+    let vendor = VariableVendor(wakeup_time_forms::STORE_VENDOR);
+    match runtime::get_variable(wakeup_time_forms::STORE_NAME, &vendor, &mut []) {
+        Err(error) if error.status() == Status::NOT_FOUND => runtime::set_variable(
+            wakeup_time_forms::STORE_NAME,
+            &vendor,
+            wakeup_time_forms::STORE_ATTRIBUTES,
+            &wakeup_time_forms::STORE_DATA,
+        )
+        .map_err(|error| ("creating the DateTimeData variable", error.status()))?,
+        // it exists, with data
+        Err(error) if error.status() == Status::BUFFER_TOO_SMALL => {}
+        Err(error) => return Err(("reading the DateTimeData variable", error.status())),
+        Ok(_) => return Err(("reading the DateTimeData variable", Status::BAD_BUFFER_SIZE)),
+    }
+    register_package_list(
+        &wakeup_time_forms::package_list_bytes(),
+        "registering the date and time forms",
+    )?;
+    let (address, length) = publish(MemoryType::RUNTIME_SERVICES_DATA, Database::Exported)?;
+    Ok((alarm, address, length))
+}
+
+/// The firmware's EFI_RUNTIME_SERVICES, of which the uefi crate wraps no GetWakeupTime() or
+/// SetWakeupTime().
+fn runtime_services() -> Result<&'static RuntimeServices, Failure> {
+    let system_table =
+        uefi::table::system_table_raw().ok_or(("finding the System Table", Status::NOT_FOUND))?;
+    #[expect(unsafe_code, reason = "the System Table is a raw pointer")]
+    // SAFETY: the entry point set the System Table, which the firmware keeps valid while boot
+    // services run
+    let runtime_services = unsafe { system_table.as_ref() }.runtime_services;
+    #[expect(unsafe_code, reason = "the runtime services are a raw pointer")]
+    // SAFETY: the System Table's RuntimeServices, which the firmware keeps valid, if not null
+    let runtime_services = unsafe { runtime_services.as_ref() };
+    runtime_services.ok_or(("finding the runtime services", Status::NOT_FOUND))
+}
+
+/// Arms the wake-up alarm for 23:59:59 of the day of GetTime() (UEFI 2.11 §8.3.4), which
+/// GetWakeupTime() then gives. Returns the status of SetWakeupTime(): EFI_SUCCESS, or
+/// EFI_UNSUPPORTED, where the platform has no wake-up alarm.
+fn arm_wakeup_alarm() -> Result<Status, Failure> {
+    let services = runtime_services()?;
+    let mut now = Time::invalid();
+    #[expect(
+        unsafe_code,
+        reason = "GetTime() is a function pointer of the runtime services"
+    )]
+    // SAFETY: Time points at an EFI_TIME that outlives the call; Capabilities is OPTIONAL
+    // (UEFI 2.11 §8.3.1)
+    let status = unsafe { (services.get_time)(&mut now, ptr::null_mut()) };
+    status
+        .to_result()
+        .map_err(|error| ("reading the time", error.status()))?;
+    let alarm = Time {
+        hour: 23,
+        minute: 59,
+        second: 59,
+        nanosecond: 0,
+        ..now
+    };
+    #[expect(
+        unsafe_code,
+        reason = "SetWakeupTime() is a function pointer of the runtime services"
+    )]
+    // SAFETY: Time points at an EFI_TIME that outlives the call (UEFI 2.11 §8.3.4)
+    let status = unsafe { (services.set_wakeup_time)(Boolean::TRUE, &alarm) };
+    match status {
+        Status::SUCCESS | Status::UNSUPPORTED => Ok(status),
+        _ => Err(("arming the wake-up alarm", status)),
+    }
+}
+
+/// The reset notification that disarms the wake-up alarm, so that it wakes no machine after the
+/// test; register_reset_notify takes it as an unsafe function, which reads no argument.
+extern "efiapi" fn disarm_wakeup_alarm(
+    _reset_type: ResetType,
+    _status: Status,
+    _data_size: usize,
+    _data: *const u8,
+) {
+    let disarmed = runtime_services().map(disarm);
+    println!("publish-hiidb: wake-up alarm disarmed: {disarmed:?}");
+}
+
+/// SetWakeupTime(FALSE, NULL) of `services`.
+#[expect(
+    unsafe_code,
+    reason = "SetWakeupTime() is a function pointer of the runtime services"
+)]
+fn disarm(services: &RuntimeServices) -> Status {
+    // SAFETY: Time is OPTIONAL with Enable FALSE (UEFI 2.11 §8.3.4)
+    unsafe { (services.set_wakeup_time)(Boolean::FALSE, ptr::null()) }
 }
 
 /// The HII database that publish-hiidb copies.

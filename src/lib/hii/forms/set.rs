@@ -34,9 +34,11 @@ use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
 use super::storageless::StoragelessRefusal;
+use super::time_storage::TimeWriteRefusal;
 use super::write_plan::batched_writes;
 use super::write_plan::check_efivar_files;
-use super::write_plan::BatchedWrite;
+use super::write_plan::BatchedStore;
+use super::write_plan::QuestionWrites;
 use super::write_plan::WritePlan;
 use super::AnswerOption;
 use super::IFROpCode;
@@ -93,6 +95,13 @@ pub(crate) enum ChangeValueError {
     PasswordBytes {
         question: String,
         refusal: WithheldPassword,
+    },
+    /// A question of EFI Date/Time Storage, or with a SET of the system time, whose write set
+    /// does not plan
+    #[error("cannot set question {question:?}: {refusal}")]
+    TimeStorage {
+        question: String,
+        refusal: TimeWriteRefusal,
     },
     /// A question that `cause` makes read-only, which set writes only with `lifted_with`, the
     /// states that lift `cause` where its caller can include them, else never, and
@@ -263,9 +272,9 @@ impl<'a> VarStoreWrite<'a> {
     }
 
     /// Writes `patches` through `variables`, creating the missing variable that created_attributes
-    /// gives attributes for. choice_for_set and WritePlan::variable_writes are the only checks of
-    /// runtime access before a write: they refuse a variable without EFI_VARIABLE_RUNTIME_ACCESS
-    /// that the selection or the plan read, or that set would create, and set writes only
+    /// gives attributes for. choice_for_set and WritePlan::writes are the only checks of runtime
+    /// access before a write: they refuse a variable without EFI_VARIABLE_RUNTIME_ACCESS that the
+    /// selection or the plan read, or that set would create, and set writes only
     /// variables that they read. Firmware refuses such a write if the variable changed since that
     /// read (edk2-stable202608 VariableServiceSetVariable, EFI_WRITE_PROTECTED).
     pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<()> {
@@ -445,7 +454,8 @@ pub(crate) struct WrittenQuestion<'a> {
 /// and with MixedKinds for questions of more than one QuestionKind.
 /// It builds the WritePlan of every question before the first write, reading with `reader`, whose
 /// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
-/// one question refuses leaves every variable unchanged; then it writes each variable once, with
+/// one question refuses leaves every variable unchanged; then it writes the system or wake-up time
+/// of each question of EFI Date/Time Storage, in question order, then each variable once, with
 /// the changes of every question to it (batched_writes), in order, and stops at the first write
 /// that fails, with its error unchanged if it is the only write, else with NotSetEverywhere.
 /// Through efivarfs it refuses, before any write, two variables of one efivar file
@@ -494,14 +504,14 @@ pub(crate) fn set_questions<'a>(
         .collect::<Result<Vec<_>>>()?;
     let writes = plans
         .iter()
-        .map(|(selector, plan, _)| Ok((*selector, plan.variable_writes(reader, volatile)?)))
+        .map(|(selector, plan, _)| Ok((*selector, plan.writes(reader, volatile)?)))
         .collect::<Result<Vec<_>>>()?;
     let written_questions = plans
         .iter()
         .zip(&writes)
         .map(|((_, _, option), (_, question_writes))| WrittenQuestion {
             option: *option,
-            volatile: question_writes.iter().any(|write| {
+            volatile: question_writes.variables.iter().any(|write| {
                 reader
                     .attributes(write.store)
                     .or_else(|| created_attributes(write.store, reach, interface))
@@ -511,16 +521,33 @@ pub(crate) fn set_questions<'a>(
         .collect();
     let variables = VolatileWritingVariables::new(variables, volatile);
 
-    let batch = batched_writes(writes)?;
+    let mut times = Vec::new();
+    let mut variable_writes = Vec::new();
+    for (selector, QuestionWrites { time, variables }) in writes {
+        times.extend(
+            time.iter()
+                .map(|write| BatchedStore::Time { selector, write }),
+        );
+        variable_writes.push((selector, variables));
+    }
+    let batch = batched_writes(variable_writes)?;
     check_efivar_files(&batch, interface)?;
+    // a question's time before its VarStore, which a failed time write leaves unwritten
+    let stores: Vec<BatchedStore<'_, '_>> = times
+        .into_iter()
+        .chain(batch.iter().map(BatchedStore::Variable))
+        .collect();
     let mut written = Vec::new();
-    let mut unwritten = batch.iter();
-    while let Some(batched) = unwritten.next() {
-        let Err(error) = batched.write.write(&variables) else {
-            written.push(batched.label());
-            continue;
+    let mut unwritten = stores.iter();
+    while let Some(store) = unwritten.next() {
+        let error = match store.write(&variables) {
+            Ok(label) => {
+                written.push(label);
+                continue;
+            }
+            Err(error) => error,
         };
-        if batch.len() == 1 {
+        if stores.len() == 1 {
             return Err(error);
         }
         // edk2-stable202608 SetupBrowserDxe SubmitForFormSet goes on after a failed
@@ -531,10 +558,10 @@ pub(crate) fn set_questions<'a>(
             outcome: Outcome {
                 written,
                 failed: FailedWrite {
-                    label: batched.label(),
+                    label: store.label(),
                     error,
                 },
-                not_attempted: unwritten.map(BatchedWrite::label).collect(),
+                not_attempted: unwritten.map(BatchedStore::label).collect(),
             },
         }
         .into());
@@ -594,8 +621,9 @@ struct NotSetEverywhere {
     outcome: Outcome,
 }
 
-/// How set's writes went when one failed, each by the label of its BatchedWrite: those written,
-/// the one that failed with its error, and those after it, which set did not attempt.
+/// How set's writes went when one failed, each by the label of its BatchedStore: those written,
+/// a time with the EFI_TIME written, the one that failed with its error, and those after it,
+/// which set did not attempt.
 #[derive(Debug)]
 struct Outcome {
     written: Vec<String>,
@@ -603,7 +631,7 @@ struct Outcome {
     not_attempted: Vec<String>,
 }
 
-/// The write that failed, by the label of its BatchedWrite, with its error.
+/// The write that failed, by the label of its BatchedStore, with its error.
 #[derive(Debug)]
 struct FailedWrite {
     label: String,
@@ -2647,5 +2675,763 @@ mod date_time_write_tests {
         );
         assert_eq!(variables.writes_to(&variable_key("DateTime")), []);
         assert_eq!(variables.writes_to(&variable_key("Number")), []);
+    }
+}
+
+#[cfg(test)]
+#[cfg(efivar_dumps)]
+mod time_storage_write_tests {
+    use std::rc::Rc;
+
+    use super::super::find_corresponding_varstore;
+    use super::super::ifr_fixtures::*;
+    use super::*;
+    use crate::hii::time_services::tests::FakeTimeServices;
+    use crate::hii::time_services::tests::TimeCall;
+    use crate::hii::time_services::tests::TimeService;
+    use crate::hii::time_services::tests::ALARM;
+    use crate::hii::time_services::tests::NOW;
+    use crate::hii::time_services::EfiTime;
+    use crate::hii::time_services::TimeServices;
+    use crate::hii::variables::WithheldBytes;
+    use crate::hii::variables::EFIVARFS_HEADER_SIZE;
+
+    /// QF_DATE_STORAGE_TIME and QF_TIME_STORAGE_TIME.
+    const SYSTEM_TIME: u8 = 0x10;
+    /// QF_DATE_STORAGE_WAKEUP and QF_TIME_STORAGE_WAKEUP.
+    const WAKEUP_TIME: u8 = 0x20;
+    /// QF_TIME_SECOND_SUPPRESS.
+    const SECOND_SUPPRESS: u8 = 0x04;
+    const SET: u8 = 0x2C;
+
+    /// What set of some questions did: its error as the CLI prints it, the calls of the Time
+    /// Services, and the writes of the EFI variable "DateTime".
+    type TimeSetOutcome = (
+        std::result::Result<(), String>,
+        Vec<TimeCall>,
+        Vec<(u16, Vec<u8>)>,
+    );
+
+    /// FakeTimeServices failing `failing`, and the same as a reader takes them.
+    fn fake_services(failing: Option<TimeService>) -> (Rc<FakeTimeServices>, Rc<dyn TimeServices>) {
+        let services = Rc::new(FakeTimeServices::new(failing));
+        let shared: Rc<dyn TimeServices> = Rc::<FakeTimeServices>::clone(&services);
+        (services, shared)
+    }
+
+    /// A DATE or TIME (`op_code`) of `flags` without a VarStore, prompt 3, read through
+    /// `services`.
+    fn storageless(
+        op_code: u8,
+        flags: u8,
+        services: Option<&Rc<dyn TimeServices>>,
+    ) -> (RootAndQuestion, QuestionDescriptor) {
+        let data = [question_header_on(1, 3, 0, 0), vec![flags]].concat();
+        let (root, node) = parse_question(&[], op_code, &data, &[]);
+        let fixture = VarStoreFixture {
+            store: find_corresponding_varstore(Rc::clone(&node), 0),
+            efivars: Efivars::new(),
+        };
+        let question = question_descriptor_timed(&node, fixture, services.cloned());
+        ((root, node), question)
+    }
+
+    /// A DATE or TIME (`op_code`) of `flags` at VarOffset 0 of the EFI variable "DateTime", which
+    /// holds `payload` in `variables` too, read through `services`.
+    fn on_var_store(
+        op_code: u8,
+        flags: u8,
+        payload: &[u8],
+        variables: &MemoryVariables,
+        services: Option<&Rc<dyn TimeServices>>,
+    ) -> (RootAndQuestion, QuestionDescriptor) {
+        let (root, node) = parse_question(
+            &[var_store_efi(1, "DateTime", NV_BS_RT, 4)],
+            op_code,
+            &date_time(0, flags),
+            &[],
+        );
+        let fixture = writable_var_store("DateTime", payload, variables);
+        let question = question_descriptor_timed(&node, fixture, services.cloned());
+        ((root, node), question)
+    }
+
+    /// set of `selected` to `text`, reading through `services` and the efivar "DateTime" of
+    /// `variables`, and writing `variables`.
+    fn set_through(
+        selected: &[(&str, &QuestionDescriptor)],
+        text: &str,
+        services: Option<&Rc<FakeTimeServices>>,
+        variables: &MemoryVariables,
+    ) -> TimeSetOutcome {
+        let reads = MemoryVariables::default();
+        if let Some(bytes) = variables.bytes(&variable_key("DateTime")) {
+            let payload = bytes.get(EFIVARFS_HEADER_SIZE..).unwrap_or_default();
+            reads.insert(variable_key("DateTime"), NV_BS_RT, payload);
+        }
+        let shared = services
+            .map(|services| -> Rc<dyn TimeServices> { Rc::<FakeTimeServices>::clone(services) });
+        let mut reader = EfivarReader::with_variables(Box::new(reads)).with_time_services(shared);
+        let calls_before = services.map_or(0, |services| services.calls.borrow().len());
+        let set = set_questions(
+            PROMPT,
+            selected,
+            text,
+            &BTreeSet::new(),
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            VolatileWrites::Refuse,
+            &WithholdingVariables::new(variables, WithheldBytes::default()),
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+        let calls = services.map_or_else(Vec::new, |services| {
+            services.calls.borrow()[calls_before..].to_vec()
+        });
+        (set, calls, variables.writes_to(&variable_key("DateTime")))
+    }
+
+    /// get shows the fields of the EFI_TIME of a question's EFI Date/Time Storage: GetTime()'s
+    /// for the system time, the alarm's for the wake-up time, also where it has a VarStore too,
+    /// whose bytes it does not show.
+    #[test]
+    fn time_storage_shows_the_time_of_its_service() {
+        let (services, shared) = fake_services(None);
+        let (_, date) = storageless(DATE, SYSTEM_TIME, Some(&shared));
+        assert_eq!(date.value, "2026-11-07", "DATE of the system time");
+        let (_, time) = storageless(TIME, WAKEUP_TIME, Some(&shared));
+        assert_eq!(time.value, "00:30:00", "TIME of the wake-up time");
+        let variables = MemoryVariables::default();
+        let (_, both) = on_var_store(TIME, SYSTEM_TIME, &[9, 9, 9, 9], &variables, Some(&shared));
+        assert_eq!(
+            both.value, "01:02:03",
+            "TIME of the system time and a VarStore"
+        );
+        assert!(
+            services
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| matches!(call, TimeCall::GetTime | TimeCall::GetWakeupTime)),
+            "get calls only the Get services: {:?}",
+            services.calls.borrow()
+        );
+    }
+
+    /// Without Time Services, get names the service that reads the storage and the UEFI Shell;
+    /// a failed one shows its status, no fields of 0xFF.
+    #[test]
+    fn time_storage_without_a_read_shows_why() {
+        let (_, date) = storageless(DATE, SYSTEM_TIME, None);
+        assert!(
+            date.value.starts_with(
+                "<ValueUnavailable: EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is read only \
+                 through GetTime(); run uefisettings.efi in the UEFI Shell>"
+            ),
+            "{}",
+            date.value
+        );
+        let (_, time) = storageless(TIME, WAKEUP_TIME, None);
+        assert!(
+            time.value.starts_with(
+                "<ValueUnavailable: EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is read only \
+                 through GetWakeupTime(); run uefisettings.efi in the UEFI Shell>"
+            ),
+            "{}",
+            time.value
+        );
+        let (_, shared) = fake_services(Some(TimeService::GetTime));
+        let (_, failed) = storageless(DATE, SYSTEM_TIME, Some(&shared));
+        assert!(
+            failed
+                .value
+                .starts_with("<ValueUnavailable: GetTime(): DEVICE_ERROR>"),
+            "{}",
+            failed.value
+        );
+        assert!(!failed.value.contains("255"), "{}", failed.value);
+    }
+
+    /// A DATE of the system time is set through SetTime(), which takes GetTime()'s EFI_TIME
+    /// with the new date; a TIME of the wake-up time through SetWakeupTime(TRUE, …), which
+    /// arms the alarm, with the alarm's EFI_TIME with the new time.
+    #[test]
+    fn time_storage_is_set_through_its_service() {
+        let variables = MemoryVariables::default();
+        let (services, shared) = fake_services(None);
+        let (_, date) = storageless(DATE, SYSTEM_TIME, Some(&shared));
+        let want = EfiTime {
+            year: 2027,
+            month: 2,
+            day: 28,
+            ..NOW
+        };
+        assert_eq!(
+            set_through(&[("A", &date)], "2027-02-28", Some(&services), &variables),
+            (
+                Ok(()),
+                vec![
+                    TimeCall::GetTime,
+                    TimeCall::GetTime,
+                    TimeCall::SetTime(want)
+                ],
+                vec![]
+            ),
+            "DATE of the system time"
+        );
+
+        let (_, time) = storageless(TIME, WAKEUP_TIME, Some(&shared));
+        let want = EfiTime {
+            hour: 23,
+            minute: 59,
+            second: 58,
+            ..ALARM
+        };
+        assert_eq!(
+            set_through(&[("A", &time)], "23:59:58", Some(&services), &variables),
+            (
+                Ok(()),
+                vec![
+                    TimeCall::GetWakeupTime,
+                    TimeCall::GetWakeupTime,
+                    TimeCall::SetWakeupTime(true, want)
+                ],
+                vec![]
+            ),
+            "TIME of the wake-up time"
+        );
+    }
+
+    /// A suppressed field keeps the stored one: "10:20:--" keeps the alarm's second.
+    #[test]
+    fn suppressed_field_of_time_storage_keeps_its_value() {
+        let variables = MemoryVariables::default();
+        let (services, shared) = fake_services(None);
+        let (_, time) = storageless(TIME, WAKEUP_TIME | SECOND_SUPPRESS, Some(&shared));
+        let (set, calls, _) = set_through(&[("A", &time)], "10:20:--", Some(&services), &variables);
+        assert_eq!(set, Ok(()));
+        assert_eq!(
+            calls.last(),
+            Some(&TimeCall::SetWakeupTime(
+                true,
+                EfiTime {
+                    hour: 10,
+                    minute: 20,
+                    ..ALARM
+                }
+            ))
+        );
+    }
+
+    /// "System Time" of DriverSample selects a TIME of the system time and a TIME on a VarStore:
+    /// on a backend without Time Services set refuses both before any write.
+    #[test]
+    fn system_time_pair_without_time_services_writes_nothing() {
+        let variables = MemoryVariables::default();
+        let (_, system) = storageless(TIME, SYSTEM_TIME, None);
+        let (_, stored) = on_var_store(TIME, 0x00, &[1, 2, 3, 0], &variables, None);
+        assert_eq!(
+            set_through(
+                &[("A", &system), ("B", &stored)],
+                "10:20:30",
+                None,
+                &variables
+            ),
+            (
+                Err(
+                    "cannot set question \"\": EFI Date/Time Storage (UEFI 2.11 \
+                     §33.2.5.6) is written only through SetTime(); run uefisettings.efi in the \
+                     UEFI Shell"
+                        .to_string()
+                ),
+                vec![],
+                vec![]
+            )
+        );
+        let (_, wakeup) = storageless(TIME, WAKEUP_TIME, None);
+        let (set, _, writes) = set_through(&[("A", &wakeup)], "10:20:30", None, &variables);
+        assert_eq!(
+            set,
+            Err(
+                "cannot set question \"\": EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) \
+                 is written only through SetWakeupTime(); run uefisettings.efi in the UEFI Shell"
+                    .to_string()
+            )
+        );
+        assert_eq!(writes, []);
+    }
+
+    /// A DATE of the system time on a VarStore too writes the system time, then the VarStore
+    /// (UEFI 2.11 §33.2.5.4.6: "In addition to normal question Value Storage").
+    #[test]
+    fn time_storage_with_a_var_store_writes_the_time_then_the_var_store() {
+        let variables = MemoryVariables::default();
+        let (services, shared) = fake_services(None);
+        let (_, date) = on_var_store(DATE, SYSTEM_TIME, &[0; 4], &variables, Some(&shared));
+        let want = EfiTime {
+            year: 2027,
+            month: 2,
+            day: 28,
+            ..NOW
+        };
+        assert_eq!(
+            set_through(&[("A", &date)], "2027-02-28", Some(&services), &variables),
+            (
+                Ok(()),
+                vec![
+                    TimeCall::GetTime,
+                    TimeCall::GetTime,
+                    TimeCall::SetTime(want)
+                ],
+                vec![(0, vec![0xEB, 0x07, 2, 28])]
+            )
+        );
+    }
+
+    /// Where the VarStore write fails after SetTime(), set's Outcome names the time written.
+    #[test]
+    fn failed_var_store_write_names_the_time_written() {
+        let mut variables = MemoryVariables::default();
+        let (services, shared) = fake_services(None);
+        let (_, date) = {
+            variables.fail_writes(
+                variable_key("DateTime"),
+                WriteError {
+                    cause: "write failed",
+                    context: None,
+                },
+            );
+            on_var_store(DATE, SYSTEM_TIME, &[0; 4], &variables, Some(&shared))
+        };
+        let (set, calls, _) =
+            set_through(&[("A", &date)], "2027-02-28", Some(&services), &variables);
+        assert_eq!(
+            set,
+            Err(format!(
+                "question \"Prompt\" was not set everywhere: write failed (in A (EFI variable {})); \
+                 written in: A (the system time 2027-02-28 01:02:03)",
+                variable_key("DateTime")
+            ))
+        );
+        assert_eq!(calls.len(), 3, "GetTime() twice and SetTime(): {calls:?}");
+    }
+
+    /// An EFI_TIME outside UEFI 2.11 §8.3.1's ranges, of a date that a DATE takes, is refused
+    /// before any write of any selected question.
+    #[test]
+    fn time_outside_efi_time_ranges_writes_nothing() {
+        let variables = MemoryVariables::default();
+        let (services, shared) = fake_services(None);
+        let (_, system) = storageless(DATE, SYSTEM_TIME, Some(&shared));
+        let (_, stored) = on_var_store(DATE, 0x00, &[0; 4], &variables, Some(&shared));
+        assert_eq!(
+            set_through(
+                &[("A", &stored), ("B", &system)],
+                "1899-12-31",
+                Some(&services),
+                &variables
+            ),
+            (
+                Err(
+                    "cannot set question \"\": EFI_TIME 1899-12-31 01:02:03 has Year \
+                     1899, outside 1900 to 9999 (UEFI 2.11 §8.3.1)"
+                        .to_string()
+                ),
+                vec![TimeCall::GetTime],
+                vec![]
+            )
+        );
+    }
+
+    /// A failed GetTime() refuses the set before any write; a failed SetTime() stops set's writes,
+    /// so the question's VarStore stays, which set's Outcome names as not attempted.
+    #[test]
+    fn failed_time_services_stop_the_writes() {
+        let variables = MemoryVariables::default();
+        let (services, shared) = fake_services(Some(TimeService::GetTime));
+        let (_, system) = storageless(DATE, SYSTEM_TIME, Some(&shared));
+        let (_, stored) = on_var_store(DATE, 0x00, &[0; 4], &variables, Some(&shared));
+        let (set, calls, writes) = set_through(
+            &[("A", &stored), ("B", &system)],
+            "2027-02-28",
+            Some(&services),
+            &variables,
+        );
+        assert_eq!(
+            set,
+            Err(
+                "cannot set question \"\": the system time cannot be read: GetTime(): \
+                 DEVICE_ERROR"
+                    .to_string()
+            )
+        );
+        assert_eq!(calls, [TimeCall::GetTime], "calls");
+        assert_eq!(writes, [], "writes");
+
+        let variables = MemoryVariables::default();
+        let (services, shared) = fake_services(Some(TimeService::SetTime));
+        let (_, both) = on_var_store(DATE, SYSTEM_TIME, &[0; 4], &variables, Some(&shared));
+        let (set, calls, writes) =
+            set_through(&[("A", &both)], "2027-02-28", Some(&services), &variables);
+        assert_eq!(
+            set,
+            Err(format!(
+                "question \"Prompt\" was not set everywhere: SetTime(): DEVICE_ERROR (in A (the \
+                 system time)); written in: none; not attempted: A (EFI variable {})",
+                variable_key("DateTime")
+            ))
+        );
+        assert_eq!(calls.len(), 3, "GetTime() twice and SetTime(): {calls:?}");
+        assert_eq!(writes, [], "writes");
+    }
+
+    /// A SET of a DATE field without a VarStore in a WRITE expression writes that field of the
+    /// system time, as edk2-stable202608 SetupBrowserDxe/Expression.c does; without Time
+    /// Services set refuses it before any write.
+    #[test]
+    fn write_expression_sets_a_field_of_the_system_time() {
+        // SET of VarStoreId 0, VarOffset 3 (the day), EFI_IFR_TYPE_DATE
+        let set_day = operation(SET, false, &[0x00, 0x00, 0x03, 0x00, 0x06]);
+        let write = [
+            operation(WRITE, false, &[]),
+            scoped_expression(&[uint8(15), set_day], 0),
+        ];
+        let question = |variables: &MemoryVariables| {
+            let (root, node) = parse_question(
+                &[var_store_efi(1, "DateTime", NV_BS_RT, 4)],
+                DATE,
+                &date_time(0, 0x00),
+                &write,
+            );
+            let question = question_descriptor_timed(
+                &node,
+                writable_var_store("DateTime", &[0; 4], variables),
+                None,
+            );
+            ((root, node), question)
+        };
+
+        let variables = MemoryVariables::default();
+        let (services, _) = fake_services(None);
+        let (_, date) = question(&variables);
+        let (set, calls, writes) =
+            set_through(&[("A", &date)], "2027-02-28", Some(&services), &variables);
+        assert_eq!(set, Ok(()));
+        assert_eq!(
+            calls,
+            [
+                TimeCall::GetTime,
+                TimeCall::GetTime,
+                TimeCall::SetTime(EfiTime { day: 15, ..NOW })
+            ]
+        );
+        assert_eq!(writes, [(0, vec![0xEB, 0x07, 2, 28])]);
+
+        let variables = MemoryVariables::default();
+        let (_, date) = question(&variables);
+        let (set, _, writes) = set_through(&[("A", &date)], "2027-02-28", None, &variables);
+        assert_eq!(
+            set,
+            Err(
+                "cannot set question \"\": EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) \
+                 is written only through SetTime(); run uefisettings.efi in the UEFI Shell"
+                    .to_string()
+            )
+        );
+        assert_eq!(writes, []);
+    }
+
+    /// What set of a DATE of EFI Date/Time Storage on the VarStore "DateTime" did, through
+    /// variables that reach BootServices: choice_for_set's outcome on the reader that set reads
+    /// with, set's error as the CLI prints it or whether it says that each question's write is
+    /// volatile, the calls of the Time Services by set, and the writes of "DateTime".
+    type VarStoreSetOutcome = (
+        std::result::Result<(), String>,
+        std::result::Result<Vec<bool>, String>,
+        Vec<TimeCall>,
+        Vec<(u16, Vec<u8>)>,
+    );
+
+    /// set of a DATE of `storage`, SYSTEM_TIME or WAKEUP_TIME, on the VarStore "DateTime" to
+    /// 2027-02-28 under `volatile`, through the UEFI Shell's variables, which hold "DateTime" with
+    /// `attributes` if `present` and withhold its bytes `password`, if any, as those of a PASSWORD
+    /// question.
+    fn set_time_storage_on(
+        storage: u8,
+        attributes: u32,
+        present: bool,
+        password: Option<std::ops::Range<usize>>,
+        volatile: VolatileWrites,
+    ) -> VarStoreSetOutcome {
+        let (services, shared) = fake_services(None);
+        let scratch = MemoryVariables::default();
+        let (_, date) = on_var_store(DATE, storage, &[0; 4], &scratch, Some(&shared));
+        let (_, picked) = on_var_store(DATE, storage, &[0; 4], &scratch, Some(&shared));
+        let variables = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let reads = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        if present {
+            variables.insert(variable_key("DateTime"), attributes, &[0; 4]);
+            reads.insert(variable_key("DateTime"), attributes, &[0; 4]);
+        }
+        let mut withheld = WithheldBytes::default();
+        if let Some(password) = password {
+            withheld.insert(variable_key("DateTime"), password);
+        }
+        let mut reader = EfivarReader::withholding(Box::new(reads), withheld.clone())
+            .with_time_services(Some(Rc::clone(&shared)));
+        let chosen = super::super::choice_for_set(
+            super::super::Selection::Picked {
+                picked: (picked, super::super::StateEvaluation::selectable()),
+                ranked_before: IncludedStates::empty(),
+            },
+            PROMPT,
+            &crate::exports::SetOptions {
+                volatile,
+                ..crate::exports::SetOptions::default()
+            },
+            IncludedStates::all(),
+            &reader,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+        let calls_before = services.calls.borrow().len();
+        let set = set_questions(
+            PROMPT,
+            &[("A", &date)],
+            "2027-02-28",
+            &BTreeSet::new(),
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            volatile,
+            &WithholdingVariables::new(&variables, withheld),
+        )
+        .map(|written| written.iter().map(|question| question.volatile).collect())
+        .map_err(|error| format!("{error:#}"));
+        let calls = services.calls.borrow()[calls_before..].to_vec();
+        (
+            chosen,
+            set,
+            calls,
+            variables.writes_to(&variable_key("DateTime")),
+        )
+    }
+
+    /// set refuses a DATE of the system time whose VarStore set may not write before SetTime():
+    /// a volatile and a missing variable, which choice_for_set does not see, as get takes the
+    /// value from GetTime(); it writes a writable one after SetTime().
+    #[test]
+    fn var_store_that_set_may_not_write_is_refused_before_set_time() {
+        let cases = [
+            (
+                "volatile",
+                BS_RT,
+                true,
+                "EFI variable DateTime-00000000-0000-0000-0000-000000000000 is volatile (no \
+                 EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle; pass \
+                 --allow-volatile to write it anyway",
+            ),
+            (
+                "missing",
+                NV_BS_RT,
+                false,
+                "no EFI variable DateTime-00000000-0000-0000-0000-000000000000: the firmware has \
+                 not created it, and set creates only the per-question variables of an \
+                 EFI_IFR_VARSTORE_EFI before UEFI 2.3.1",
+            ),
+        ];
+        for (case, attributes, present, refusal) in cases {
+            let (chosen, set, calls, writes) = set_time_storage_on(
+                SYSTEM_TIME,
+                attributes,
+                present,
+                None,
+                VolatileWrites::Refuse,
+            );
+            assert_eq!(chosen, Ok(()), "{case}: choice_for_set");
+            assert_eq!(set, Err(refusal.to_string()), "{case}");
+            assert_eq!(calls, [TimeCall::GetTime], "{case}: calls");
+            assert_eq!(writes, [], "{case}: writes");
+        }
+
+        let (_, set, calls, writes) =
+            set_time_storage_on(SYSTEM_TIME, NV_BS_RT, true, None, VolatileWrites::Refuse);
+        assert_eq!(set, Ok(vec![false]), "writable");
+        assert_eq!(
+            calls.last(),
+            Some(&TimeCall::SetTime(EfiTime {
+                year: 2027,
+                month: 2,
+                day: 28,
+                ..NOW
+            })),
+            "writable: calls"
+        );
+        assert_eq!(writes, [(0, vec![0xEB, 0x07, 2, 28])], "writable: writes");
+    }
+
+    /// set refuses a DATE of the system time or of the wake-up time whose bytes on its VarStore
+    /// overlap a password's before it calls SetTime() or SetWakeupTime(), through variables that
+    /// withhold those bytes, and writes nothing; one beside the password is written after the Set
+    /// call.
+    #[test]
+    fn var_store_of_time_storage_over_a_password_is_refused_before_the_set_call() {
+        for (storage, read, set_call) in [
+            (SYSTEM_TIME, TimeCall::GetTime, "SetTime"),
+            (WAKEUP_TIME, TimeCall::GetWakeupTime, "SetWakeupTime"),
+        ] {
+            let (chosen, set, calls, writes) =
+                set_time_storage_on(storage, NV_BS_RT, true, Some(2..4), VolatileWrites::Refuse);
+            assert_eq!(chosen, Ok(()), "{set_call}: choice_for_set");
+            assert_eq!(
+                set,
+                Err("cannot set question \"\": EFI variable \
+                     DateTime-00000000-0000-0000-0000-000000000000 holds a password at bytes \
+                     2..4, which set never writes"
+                    .to_string()),
+                "{set_call}"
+            );
+            assert_eq!(calls, [read], "{set_call}: calls");
+            assert_eq!(writes, [], "{set_call}: writes");
+
+            let (_, set, calls, writes) =
+                set_time_storage_on(storage, NV_BS_RT, true, Some(4..6), VolatileWrites::Refuse);
+            assert_eq!(set, Ok(vec![false]), "{set_call} beside the password");
+            assert!(
+                calls
+                    .last()
+                    .is_some_and(|call| format!("{call:?}").starts_with(set_call)),
+                "{set_call} beside the password: calls {calls:?}"
+            );
+            assert_eq!(
+                writes,
+                [(0, vec![0xEB, 0x07, 2, 28])],
+                "{set_call} beside the password: writes"
+            );
+        }
+    }
+
+    /// Under VolatileWrites::Allow, set writes a DATE of the system time on a volatile VarStore
+    /// after SetTime(), and says that the write is volatile.
+    #[test]
+    fn volatile_var_store_of_time_storage_is_written_if_allowed_and_says_so() {
+        let (chosen, set, calls, writes) =
+            set_time_storage_on(SYSTEM_TIME, BS_RT, true, None, VolatileWrites::Allow);
+        assert_eq!(chosen, Ok(()), "choice_for_set");
+        assert_eq!(set, Ok(vec![true]));
+        assert_eq!(
+            calls.last(),
+            Some(&TimeCall::SetTime(EfiTime {
+                year: 2027,
+                month: 2,
+                day: 28,
+                ..NOW
+            })),
+            "calls"
+        );
+        assert_eq!(writes, [(0, vec![0xEB, 0x07, 2, 28])], "writes");
+    }
+
+    /// The question's own fields win over the SETs of the same fields of the system time in its
+    /// WRITE expression: edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue evaluates the
+    /// WRITE expression first (:1995-2002), then sets the question's own value (:2048-2052).
+    #[test]
+    fn own_fields_win_over_write_expression_sets_of_the_system_time() {
+        // SET of VarStoreId 0, VarOffset 3 (the day), EFI_IFR_TYPE_DATE
+        let set_day = operation(SET, false, &[0x00, 0x00, 0x03, 0x00, 0x06]);
+        let write = [
+            operation(WRITE, false, &[]),
+            scoped_expression(&[uint8(15), set_day], 0),
+        ];
+        let (services, shared) = fake_services(None);
+        let data = [question_header_on(1, 3, 0, 0), vec![SYSTEM_TIME]].concat();
+        let (_root, node) = parse_question(&[], DATE, &data, &write);
+        let fixture = VarStoreFixture {
+            store: find_corresponding_varstore(Rc::clone(&node), 0),
+            efivars: Efivars::new(),
+        };
+        let date = question_descriptor_timed(&node, fixture, Some(shared));
+        let (set, calls, _) = set_through(
+            &[("A", &date)],
+            "2027-02-28",
+            Some(&services),
+            &MemoryVariables::default(),
+        );
+        assert_eq!(set, Ok(()));
+        // the SET's day joins the question's own write: one read to plan, one to write, one
+        // SetTime()
+        assert_eq!(
+            calls,
+            [
+                TimeCall::GetTime,
+                TimeCall::GetTime,
+                TimeCall::SetTime(EfiTime {
+                    year: 2027,
+                    month: 2,
+                    day: 28,
+                    ..NOW
+                })
+            ]
+        );
+    }
+
+    /// The only store of a set, a failed SetTime() of a DATE without a VarStore, is set's error
+    /// as the service gives it, and nothing else is written.
+    #[test]
+    fn lone_failed_set_time_is_the_error() {
+        let variables = MemoryVariables::default();
+        let (services, shared) = fake_services(Some(TimeService::SetTime));
+        let (_, system) = storageless(DATE, SYSTEM_TIME, Some(&shared));
+        let (set, calls, writes) =
+            set_through(&[("A", &system)], "2027-02-28", Some(&services), &variables);
+        assert_eq!(set, Err("SetTime(): DEVICE_ERROR".to_string()));
+        assert_eq!(calls.len(), 3, "GetTime() twice and SetTime(): {calls:?}");
+        assert_eq!(writes, [], "writes");
+    }
+
+    /// With its day suppressed, a DATE of the system time gets the day that the browser would
+    /// adjust after a month or year edit (suppressed_day_is_adjusted_as_the_browser_adjusts_it),
+    /// and SetTime() gets that date.
+    #[test]
+    fn suppressed_day_of_the_system_time_is_adjusted_for_set_time() {
+        const DAY_SUPPRESS: u8 = 0x04;
+        let cases = [
+            ("month edit", (2024, 1, 31), "2024-02---", (2024, 2, 29)),
+            ("year edit", (2024, 2, 29), "2023-02---", (2023, 2, 1)),
+        ];
+        for (name, (year, month, day), text, (new_year, new_month, new_day)) in cases {
+            let (services, shared) = fake_services(None);
+            services.time.set(EfiTime {
+                year,
+                month,
+                day,
+                ..NOW
+            });
+            let (_, date) = storageless(DATE, SYSTEM_TIME | DAY_SUPPRESS, Some(&shared));
+            let (set, calls, _) = set_through(
+                &[("A", &date)],
+                text,
+                Some(&services),
+                &MemoryVariables::default(),
+            );
+            assert_eq!(set, Ok(()), "{name}");
+            assert_eq!(
+                calls.last(),
+                Some(&TimeCall::SetTime(EfiTime {
+                    year: new_year,
+                    month: new_month,
+                    day: new_day,
+                    ..NOW
+                })),
+                "{name}"
+            );
+        }
     }
 }

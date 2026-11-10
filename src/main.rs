@@ -157,6 +157,7 @@ enum Commands {
     // lone positional is VALUE, so `set QUESTION` fails for its missing selector.
     #[cfg(all(system_hiidb, system_variables))]
     #[command(about = platform::SET_ABOUT, next_display_order = None, allow_missing_positional = true)]
+    #[cfg_attr(system_time, command(long_about = platform::SET_LONG_ABOUT))]
     Set {
         #[command(flatten)]
         question: QuestionArgs,
@@ -213,6 +214,7 @@ enum HiiSubcommands {
     /// Set/change the value of a question
     #[cfg(all(system_hiidb, system_variables))]
     #[command(next_display_order = None, allow_missing_positional = true)]
+    #[cfg_attr(system_time, command(long_about = platform::SET_LONG_ABOUT))]
     Set {
         #[command(flatten)]
         question: QuestionArgs,

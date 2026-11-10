@@ -28,6 +28,8 @@ use super::question_values::value_question;
 use super::question_values::ValueQuestion;
 use super::storageless::NoVarStore;
 use super::storageless::StoragelessRefusal;
+use super::time_storage::question_value;
+use super::time_storage::TimeStorageUnread;
 use super::IFROpCode;
 use super::IFROperation;
 use super::NumericFormatError;
@@ -1255,6 +1257,13 @@ pub(super) enum ValueUnavailable {
     /// The number of a name/value setting in the ExportConfig snapshot, wider than the question
     #[error("its number in the ExportConfig snapshot does not fit in {bits} bits")]
     SnapshotNumber { bits: usize },
+    /// A DATE or TIME of EFI Date/Time Storage on a backend without Time Services
+    #[error("{0}")]
+    TimeStorageUnread(TimeStorageUnread),
+    /// The error of the Time Service that reads a DATE or TIME of EFI Date/Time Storage, as
+    /// `{:#}` shows it
+    #[error("{0}")]
+    TimeService(String),
     /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
     /// level replaces it only in conditions
     #[error(
@@ -1315,7 +1324,9 @@ impl ValueUnavailable {
             | Self::BitField(_)
             | Self::NotDecoded(_)
             | Self::CheckboxOverByte(_)
-            | Self::SnapshotNumber { .. } => "ValueUnavailable",
+            | Self::SnapshotNumber { .. }
+            | Self::TimeStorageUnread(_)
+            | Self::TimeService(_) => "ValueUnavailable",
         }
     }
 }
@@ -1394,7 +1405,7 @@ fn value_bytes(question: &IFROperation) -> Option<std::ops::Range<usize>> {
 /// the values that decide its state, which get and list-questions tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValueSource {
-    /// Its variable, or an expression, now
+    /// Its variable, its EFI Date/Time Storage, or an expression, now
     Current,
     /// The ExportConfig snapshot that the firmware took before the OS ran (UEFI 2.11
     /// §33.2.11.1), in place of a missing variable
@@ -1454,9 +1465,12 @@ impl std::fmt::Display for NameValueStore {
 
 impl std::error::Error for NameValueStore {}
 
-/// Returns where the question keeps its value and the value, or why it cannot be read: from the
-/// ExportConfig snapshot of `reader`, if any, where the question's variable is missing or its
-/// storage is name/value (snapshot_bytes).
+/// Returns where the question keeps its value and the value, or why it cannot be read: of a
+/// DATE or TIME of EFI Date/Time Storage, the fields of the EFI_TIME of that storage, which
+/// UEFI 2.11 §33.2.5.6 reads through GetTime() or GetWakeupTime(), also when it has a VarStore
+/// too, and never the ExportConfig snapshot, which holds no EFI_TIME; else from the snapshot of
+/// `reader`, if any, where the question's variable is missing or its storage is name/value
+/// (snapshot_bytes).
 pub(super) fn read_question_value(
     question: &IFROperation,
     varstore: &Result<Box<dyn VariableStore>>,
@@ -1471,6 +1485,21 @@ pub(super) fn read_question_value(
         .location()
         .check()
         .map_err(ValueUnavailable::BitField)?;
+    if let Some((kind, storage)) = value_question.time_storage() {
+        let services = reader
+            .time_services()
+            .ok_or(ValueUnavailable::TimeStorageUnread(TimeStorageUnread(
+                storage,
+            )))?;
+        let time = storage
+            .read(services.as_ref())
+            .map_err(|error| ValueUnavailable::TimeService(format!("{error:#}")))?;
+        return Ok(RetrievedValue {
+            location,
+            value: question_value(kind, &time),
+            source: ValueSource::Current,
+        });
+    }
     let unread = match read_question_bytes(question, varstore, reader) {
         Ok(bytes) => {
             return Ok(RetrievedValue {

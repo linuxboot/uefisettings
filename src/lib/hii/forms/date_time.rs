@@ -20,6 +20,7 @@ use binrw::BinRead;
 use thiserror::Error;
 
 use super::storage::ValueLocation;
+use super::time_storage::TimeStorage;
 use super::Date;
 use super::Question;
 use super::QuestionHeader;
@@ -66,7 +67,7 @@ impl DateTimeKind {
     }
 
     /// The fields of its value, in text order.
-    fn fields(self) -> [Field; 3] {
+    pub(super) fn fields(self) -> [Field; 3] {
         match self {
             Self::Date => [Field::Year, Field::Month, Field::Day],
             Self::Time => [Field::Hour, Field::Minute, Field::Second],
@@ -118,6 +119,18 @@ pub(crate) enum Field {
 }
 
 impl Field {
+    /// Where it is in the bytes of its value, little-endian.
+    pub(super) fn bytes(self) -> std::ops::Range<usize> {
+        match self {
+            Self::Year => 0..2,
+            Self::Month => 2..3,
+            Self::Day => 3..4,
+            Self::Hour => 0..1,
+            Self::Minute => 1..2,
+            Self::Second => 2..3,
+        }
+    }
+
     /// The digits that get shows: of a year at least, of the others exactly.
     fn digits(self) -> usize {
         match self {
@@ -127,7 +140,7 @@ impl Field {
     }
 
     /// Its value in `bytes`, the bytes of a value of its kind, an EFI_HII_TIME's then a 0.
-    fn value(self, &[first, second, third, fourth]: &[u8; 4]) -> u16 {
+    pub(super) fn value(self, &[first, second, third, fourth]: &[u8; 4]) -> u16 {
         match self {
             Self::Year => u16::from_le_bytes([first, second]),
             Self::Month | Self::Second => third.into(),
@@ -139,7 +152,7 @@ impl Field {
 
     /// Puts `value` into `bytes`, the bytes of a value of its kind: a field of a byte takes its
     /// low byte.
-    fn put(self, [first, second, third, fourth]: &mut [u8; 4], value: u16) {
+    pub(super) fn put(self, [first, second, third, fourth]: &mut [u8; 4], value: u16) {
         let [low, high] = value.to_le_bytes();
         match self {
             Self::Year => (*first, *second) = (low, high),
@@ -202,10 +215,8 @@ impl fmt::Display for Field {
 pub(crate) enum DateTimeStorage {
     /// The question's Value Storage only
     Normal,
-    /// The system time too, through GetTime() and SetTime()
-    SystemTime,
-    /// The system wake-up time too, through GetWakeupTime() and SetWakeupTime()
-    WakeupTime,
+    /// EFI Date/Time Storage, in addition to any Value Storage
+    Efi(TimeStorage),
     /// 0x30, none of the three valid values
     Reserved,
 }
@@ -233,9 +244,17 @@ impl DateTimeQuestion {
     pub(crate) fn storage(&self) -> DateTimeStorage {
         match self.flags & STORAGE {
             STORAGE_NORMAL => DateTimeStorage::Normal,
-            STORAGE_TIME => DateTimeStorage::SystemTime,
-            STORAGE_WAKEUP => DateTimeStorage::WakeupTime,
+            STORAGE_TIME => DateTimeStorage::Efi(TimeStorage::SystemTime),
+            STORAGE_WAKEUP => DateTimeStorage::Efi(TimeStorage::WakeupTime),
             _ => DateTimeStorage::Reserved,
+        }
+    }
+
+    /// Its EFI Date/Time Storage, if any.
+    pub(crate) fn time_storage(&self) -> Option<TimeStorage> {
+        match self.storage() {
+            DateTimeStorage::Efi(storage) => Some(storage),
+            DateTimeStorage::Normal | DateTimeStorage::Reserved => None,
         }
     }
 

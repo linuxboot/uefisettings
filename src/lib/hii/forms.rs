@@ -113,6 +113,8 @@ use storageless::NoVarStore;
 use storageless::StoragelessQuestion;
 use storageless::StoragelessRefusal;
 use storageless::StoragelessRoute;
+use time_storage::TimeStorage;
+use time_storage::TimeStorageOnly;
 
 pub use ami_access_level::AccessLevel;
 pub use conditions::IncludedStates;
@@ -152,6 +154,7 @@ mod set;
 mod setup_password;
 mod storage;
 mod storageless;
+mod time_storage;
 mod write_plan;
 
 const DUMMY_OPCODE: u8 = 0xFFu8; // doesn't correspond to any known IFROpCode
@@ -3356,6 +3359,13 @@ impl AnswerOption {
 }
 
 impl QuestionDescriptor {
+    /// The EFI Date/Time Storage of a DATE or TIME of such storage.
+    fn time_storage(&self) -> Option<TimeStorage> {
+        value_question(&self.node.borrow())
+            .and_then(|question| question.time_storage())
+            .map(|(_, storage)| storage)
+    }
+
     /// The VarStore of the question, or None for a question without one whose WRITE expression
     /// alone takes the value, or why set, through variables of `reach`, cannot write it.
     fn store(
@@ -3366,6 +3376,10 @@ impl QuestionDescriptor {
             Ok(store) => return Ok(Some(store.as_ref())),
             Err(reason) => reason,
         };
+        // its value goes to its EFI Date/Time Storage only
+        if reason.downcast_ref::<TimeStorageOnly>().is_some() {
+            return Ok(None);
+        }
         match reason.downcast_ref::<NoVarStore>() {
             Some(NoVarStore(storageless)) => {
                 match storageless.refusal(QuestionExpression::Write, reach) {
@@ -4839,6 +4853,10 @@ fn find_corresponding_varstore(
     var_store_id: u16,
 ) -> Result<Box<dyn VariableStore>> {
     if var_store_id == 0 {
+        let storage = value_question(&node.borrow()).and_then(|question| question.time_storage());
+        if let Some((_, storage)) = storage {
+            return Err(TimeStorageOnly(storage).into());
+        }
         return Err(match StoragelessQuestion::of(&node) {
             Some(question) => NoVarStore(question).into(),
             None => anyhow!(

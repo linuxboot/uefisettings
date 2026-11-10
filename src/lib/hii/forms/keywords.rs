@@ -79,6 +79,7 @@ use super::Range as IfrRange;
 use super::SelectionError;
 use super::ShortVarStoreEfi;
 use super::TextInput;
+use super::TimeStorage;
 use super::TypeValue;
 use super::Walk;
 use super::EFI_HII_DATE_SIZE;
@@ -241,6 +242,11 @@ pub(crate) enum QuestionRefusal {
          list, which does not parse"
     )]
     MalformedOutsideVarStore(u64),
+    #[error(
+        "keeps its value in {0} (UEFI 2.11 §33.2.5.6), which get and set read and write, where \
+         GetData() and SetData() take the bytes of its VarStore"
+    )]
+    TimeStorage(TimeStorage),
     #[error(
         "has UEFI Storage 0x30, which neither QF_DATE_STORAGE (UEFI 2.11 §33.3.8.3.11) nor \
          QF_TIME_STORAGE (§33.3.8.3.78) defines and get does not read, where GetData() and \
@@ -693,21 +699,21 @@ impl<'a> KeywordQuestion<'a> {
 
     /// Refuses a get of the question that GetData() would answer otherwise than get: with the
     /// stored value of one whose value READ or EFI_IFR_VALUE gives, with the bytes at its bit
-    /// offset, or with its VarStore's bytes of a DATE or TIME of UEFI Storage 0x30; or of a
-    /// PASSWORD, or of a question whose bytes (keyword_bytes) overlap those that `reader`
-    /// withholds, which hold a password.
+    /// offset, or with its VarStore's bytes of a DATE or TIME of EFI Date/Time Storage or of UEFI
+    /// Storage 0x30; or of a PASSWORD, or of a question whose bytes (keyword_bytes) overlap those
+    /// that `reader` withholds, which hold a password.
     pub(crate) fn check_get(&self, reader: &EfivarReader) -> Result<(), KeywordRefusal> {
         self.check_question(QuestionExpression::Read, reader)?;
         Ok(())
     }
 
     /// Refuses a set of `resp`, the question's keyword, that SetData() would write otherwise than
-    /// set: through no WRITE expression, Callback() or UEFI Storage 0x30; else takes it through
-    /// set's own checks, with `include`, `volatile` and the variables of `reader`: the question's
-    /// state, whether it is read-only, which no `include` lifts, its option of the VALUE or the
-    /// VALUE's range, the variable's, and whether the bytes written overlap those that `reader`
-    /// withholds, which hold a password (ChangeValueError::PasswordBytes). Returns what SetData()
-    /// writes.
+    /// set: through no WRITE expression, Callback(), EFI Date/Time Storage or UEFI Storage 0x30;
+    /// else takes it through set's own checks, with `include`, `volatile` and the variables of
+    /// `reader`: the question's state, whether it is read-only, which no `include` lifts, its
+    /// option of the VALUE or the VALUE's range, the variable's, and whether the bytes written
+    /// overlap those that `reader` withholds, which hold a password
+    /// (ChangeValueError::PasswordBytes). Returns what SetData() writes.
     pub(crate) fn check_set(
         &self,
         resp: &KeywordResp,
@@ -1066,17 +1072,20 @@ impl<'a> KeywordQuestion<'a> {
         if header.var_store_id == 0 {
             return Err(self.question_refusal(&header, QuestionRefusal::Storageless));
         }
-        // edk2-stable202608 SetupBrowserDxe neither reads nor writes a DATE or TIME of UEFI
-        // Storage 0x30 (IfrParse.c gives it no Storage, Setup.c GetQuestionValue returns), while
-        // ConfigKeywordHandler.c GetWidth gives it the bytes of an EFI_HII_DATE or EFI_HII_TIME
         if let ParsedOperation::Date(question) | ParsedOperation::Time(question) = &op.parsed_data {
             match question.storage() {
+                DateTimeStorage::Normal => {}
+                DateTimeStorage::Efi(storage) => {
+                    return Err(
+                        self.question_refusal(&header, QuestionRefusal::TimeStorage(storage))
+                    )
+                }
+                // edk2-stable202608 SetupBrowserDxe neither reads nor writes it (IfrParse.c gives
+                // it no Storage, Setup.c GetQuestionValue returns), while ConfigKeywordHandler.c
+                // GetWidth gives it the bytes of an EFI_HII_DATE or EFI_HII_TIME
                 DateTimeStorage::Reserved => {
                     return Err(self.question_refusal(&header, QuestionRefusal::ReservedStorage))
                 }
-                DateTimeStorage::Normal
-                | DateTimeStorage::SystemTime
-                | DateTimeStorage::WakeupTime => {}
             }
         }
         let value_expression = question_value_expression(&op).is_some();
@@ -2293,6 +2302,47 @@ mod tests {
         assert!(
             check_set_of(hidden(ifr_false()), "03", IncludedStates::empty()).is_ok(),
             "an option that a FALSE condition shows"
+        );
+    }
+
+    /// GetData() and SetData() take the VarStore bytes of a DATE or TIME of EFI Date/Time Storage,
+    /// whose value get and set read and write through the Time Services: both refuse it, the
+    /// system time and the wake-up time.
+    #[test]
+    fn date_and_time_of_efi_date_time_storage_are_refused() {
+        const STORAGE_TIME: u8 = 0x10;
+        const STORAGE_WAKEUP: u8 = 0x20;
+        for (op_code, flags, storage) in [
+            (DATE, STORAGE_TIME, TimeStorage::SystemTime),
+            (TIME, STORAGE_TIME, TimeStorage::SystemTime),
+            (DATE, STORAGE_WAKEUP, TimeStorage::WakeupTime),
+            (TIME, STORAGE_WAKEUP, TimeStorage::WakeupTime),
+        ] {
+            let op = || {
+                let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![flags]].concat();
+                operation(op_code, false, &data)
+            };
+            let name = format!("op {op_code:#04x}, Flags {flags:#04x}");
+            let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], op())];
+            assert_eq!(
+                question_of(&lists).check_get(&reader(1)),
+                Err(question_refusal(QuestionRefusal::TimeStorage(storage))),
+                "{name}: get"
+            );
+            let error = check_set_of(op(), "03", IncludedStates::empty()).expect_err(&name);
+            assert_eq!(
+                error.to_string(),
+                question_refusal(QuestionRefusal::TimeStorage(storage)).to_string(),
+                "{name}: set"
+            );
+        }
+        assert_eq!(
+            question_refusal(QuestionRefusal::TimeStorage(TimeStorage::WakeupTime)).to_string(),
+            format!(
+                "keyword {KEYWORD}: question \"{QUESTION}\" keeps its value in the wake-up time \
+                 (UEFI 2.11 §33.2.5.6), which get and set read and write, where GetData() and \
+                 SetData() take the bytes of its VarStore"
+            )
         );
     }
 

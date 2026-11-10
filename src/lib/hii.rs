@@ -59,6 +59,7 @@ mod memory_access_denied;
 pub mod package;
 mod scsu;
 mod strings;
+pub(crate) mod time_services;
 // The EFI System Table and its configuration tables, which the Linux build reads from physical
 // memory where a firmware memory map bounds the reads.
 #[cfg(firmware_memory_maps)]

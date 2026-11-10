@@ -561,7 +561,10 @@ while IFS=$'\t' read -r -u 3 name drivers variables boots options || [[ -n $name
         passed=yes
         case $spec in
         shell:*)
-            "$here/check-shell-log.sh" "$arch" "$script.tsv" "$log.console.log" || passed=no
+            # shell/NAME.ARCH.tsv, if any, holds the checks of shell/NAME.nsh on ARCH instead
+            expectations=$script.tsv
+            [[ ! -f $script.$arch.tsv ]] || expectations=$script.$arch.tsv
+            "$here/check-shell-log.sh" "$arch" "$expectations" "$log.console.log" || passed=no
             if grep --quiet --line-regexp @LINUX@ "$script.nsh"; then
                 linux_passed "$log" || passed=no
             fi

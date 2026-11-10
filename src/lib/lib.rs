@@ -45,6 +45,8 @@ mod ilorest;
 ))]
 mod memory_map;
 pub mod parse_error;
+#[cfg(target_os = "uefi")]
+mod runtime_time_services;
 pub mod secret_file;
 mod translation;
 #[cfg(target_os = "uefi")]

@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
+use std::rc::Rc;
 
 #[cfg(any(system_variables, test))]
 use anyhow::anyhow;
@@ -34,6 +35,7 @@ use crate::hii::config_snapshot::SnapshotLookup;
 #[cfg(all(efivar_dumps, not(system_variables)))]
 use crate::hii::efivarfs_format::EfivarCopy;
 use crate::hii::package::Guid;
+use crate::hii::time_services::TimeServices;
 
 /// The size of the attributes word that FirmwareVariables::read gives before the data, as
 /// efivarfs does.
@@ -914,6 +916,9 @@ pub(super) struct DecodedValue {
 /// keys of one efivarfs file, which it reads once for each.
 pub(crate) struct EfivarReader {
     variables: Box<dyn FirmwareVariables>,
+    /// The Time Services through which DATE and TIME questions of EFI Date/Time Storage read
+    /// and set writes their values, if the build reaches any
+    time_services: Option<Rc<dyn TimeServices>>,
     pub(super) outcomes: BTreeMap<EfivarRange, Result<Vec<u8>>>,
     /// The payload bytes that the callers of read decode, by variable
     pub(super) decoded: BTreeMap<VariableKey, Vec<DecodedValue>>,
@@ -947,6 +952,7 @@ impl EfivarReader {
     ) -> Self {
         Self {
             variables: Box::new(WithholdingVariables::new(variables, withheld.clone())),
+            time_services: None,
             outcomes: BTreeMap::new(),
             decoded: BTreeMap::new(),
             withheld,
@@ -971,6 +977,19 @@ impl EfivarReader {
         patches: impl IntoIterator<Item = DataPatch<'p>>,
     ) -> std::result::Result<(), WithheldPassword> {
         self.withheld.check_patches(key, patches)
+    }
+
+    /// This reader, with `time_services`.
+    pub(crate) fn with_time_services(self, time_services: Option<Rc<dyn TimeServices>>) -> Self {
+        Self {
+            time_services,
+            ..self
+        }
+    }
+
+    /// The Time Services of DATE and TIME questions of EFI Date/Time Storage, if any.
+    pub(crate) fn time_services(&self) -> Option<&Rc<dyn TimeServices>> {
+        self.time_services.as_ref()
     }
 
     /// Which variables this reader reaches.

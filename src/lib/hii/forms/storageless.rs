@@ -43,9 +43,15 @@ pub(crate) struct StoragelessQuestion {
 }
 
 impl StoragelessQuestion {
-    /// Classifies `question`; None unless value_question takes it and it has no VarStore.
+    /// Classifies `question`; None unless value_question takes it and it has no VarStore, and
+    /// for a DATE or TIME of EFI Date/Time Storage, which keeps its value there.
     pub(crate) fn of(question: &Rc<RefCell<IFROperation>>) -> Option<Self> {
-        let header = value_question(&question.borrow())?.header();
+        let op = question.borrow();
+        let value_question = value_question(&op)?;
+        if value_question.time_storage().is_some() {
+            return None;
+        }
+        let header = value_question.header();
         (header.var_store_id == 0).then(|| Self {
             read: question_expression(question, QuestionExpression::Read).is_some(),
             write: question_expression(question, QuestionExpression::Write).is_some(),
@@ -587,6 +593,33 @@ mod tests {
                 classify(|body| form(1, body), &data, &[expression_of(READ)]),
                 None,
                 "flags {flags:#04x}"
+            );
+        }
+    }
+
+    /// A DATE or TIME without a VarStore is storage-less unless its UEFI Storage is the system
+    /// time or the wake-up time, its EFI Date/Time Storage (UEFI 2.11 §33.2.5.6).
+    #[test]
+    fn date_and_time_of_efi_date_time_storage_are_not_storageless() {
+        let cases = [
+            (DATE, 0x00, true),
+            (TIME, 0x00, true),
+            (DATE, 0x10, false),
+            (TIME, 0x10, false),
+            (DATE, 0x20, false),
+            (TIME, 0x24, false),
+        ];
+        for (op_code, flags, storageless) in cases {
+            let data = [question_header_on(1, 3, 0, 0), vec![flags]].concat();
+            let root = parse_form_set(&[form(
+                1,
+                &[[operation(op_code, true, &data), END.to_vec()].concat()],
+            )]);
+            let question = find_op(&root, &data).expect("the DATE or TIME");
+            assert_eq!(
+                StoragelessQuestion::of(&question).is_some(),
+                storageless,
+                "op {op_code:#04x} of flags {flags:#04x}"
             );
         }
     }

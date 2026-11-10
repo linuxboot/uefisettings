@@ -27,7 +27,7 @@ struct Capability {
     target_arches: Option<&'static [&'static str]>,
 }
 
-const CAPABILITIES: [Capability; 12] = [
+const CAPABILITIES: [Capability; 13] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
@@ -108,6 +108,14 @@ const CAPABILITIES: [Capability; 12] = [
         cfg: "configuration_tables",
         target_oses: &["linux"],
         target_arches: Some(&["x86", "x86_64", "aarch64"]),
+    },
+    // HiiBackend::system_time_services: the Time Services of this machine's firmware, which
+    // DATE and TIME questions of EFI Date/Time Storage read and set writes; an OS reaches them
+    // only through routes of its own, such as Linux's rtc-efi, which uefisettings does not take
+    Capability {
+        cfg: "system_time",
+        target_oses: &["uefi"],
+        target_arches: None,
     },
 ];
 

@@ -30,6 +30,7 @@ use super::ami_access_level::AMI_ACCESS_LEVEL;
 use super::date_time::widened_date;
 use super::date_time::widened_time;
 use super::date_time::DateTimeKind;
+use super::date_time::Field;
 use super::declared_var_store;
 use super::defaults::is_parent_statement;
 use super::defaults::question_scope;
@@ -52,6 +53,11 @@ use super::storage::VariableStore;
 use super::storage::VariableStoreKind;
 use super::storageless::NoVarStore;
 use super::storageless::StoragelessRefusal;
+use super::time_storage::field_value;
+use super::time_storage::system_time_field;
+use super::time_storage::FieldChange;
+use super::time_storage::TimeStorage;
+use super::time_storage::TimeStorageUnread;
 use super::walk_scopes;
 use super::AccessLevel;
 use super::DeclaredStore;
@@ -1403,11 +1409,11 @@ pub(crate) fn evaluate_write(
     question: &Rc<RefCell<IFROperation>>,
     this: QuestionValue,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-) -> std::result::Result<Option<Vec<PlannedSet>>, ExpressionRefusal> {
+) -> std::result::Result<Option<PlannedSets>, ExpressionRefusal> {
     let Some(expression) = question_expression(question, QuestionExpression::Write) else {
         return Ok(None);
     };
-    let mut sets = Vec::new();
+    let mut sets = PlannedSets::default();
     let mut evaluation = Evaluation::new(
         inputs,
         Role::Write {
@@ -1735,6 +1741,14 @@ enum Gap {
     NotEvaluated(String),
 }
 
+/// The SETs of a WRITE expression, each kind in order: those of VarStores, and those of a DATE or
+/// TIME without a VarStore, of a field of the system time.
+#[derive(Default)]
+pub(crate) struct PlannedSets {
+    pub(crate) var_store: Vec<PlannedSet>,
+    pub(crate) system_time: Vec<FieldChange>,
+}
+
 /// A SET of a WRITE expression: the little-endian `bytes` that it writes at VarOffset `offset` of
 /// `store`, VarStore `var_store_id`, as edk2-stable202608 SetupBrowserDxe/Expression.c
 /// EvaluateExpression copies them into its edit buffer.
@@ -1769,7 +1783,7 @@ enum Role<'a> {
     /// The WRITE of a question: THIS is its new value, and each SET joins `sets`
     Write {
         this: QuestionValue,
-        sets: &'a mut Vec<PlannedSet>,
+        sets: &'a mut PlannedSets,
     },
 }
 
@@ -2592,7 +2606,9 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
-        self.check_not_system_time(op, operand, kind)?;
+        if let Some(field) = self.system_time_field(op, operand, kind)? {
+            return Ok(self.system_time(op, field));
+        }
         let store = match variable_store(operand_store(op, operand)?, operand, kind) {
             Ok(store) => store,
             Err((store, reach)) => {
@@ -2655,7 +2671,23 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
-        self.check_not_system_time(op, operand, kind)?;
+        if let Some(field) = self.system_time_field(op, operand, kind)? {
+            let Some(value) = value.as_u64() else {
+                return Err(Abort::NotEvaluated(format!(
+                    "{} of a value that cannot be read",
+                    op.op_code.spec_name()
+                )));
+            };
+            // Value.u16 for the year, Value.u8 for the others, which FieldChange takes
+            let [low, high, ..] = value.to_le_bytes();
+            if let Role::Write { sets, .. } = &mut self.role {
+                sets.system_time.push(FieldChange {
+                    field,
+                    value: u16::from_le_bytes([low, high]),
+                });
+            }
+            return Ok(Operand::Boolean(Some(1)));
+        }
         let store = match variable_store(operand_store(op, operand)?, operand, kind) {
             Ok(store) => store,
             Err((store, reach)) => {
@@ -2715,7 +2747,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 Abort::Malformed(format!("{} wider than 8 bytes", op.op_code.spec_name()))
             })?;
         if let Role::Write { sets, .. } = &mut self.role {
-            sets.push(PlannedSet {
+            sets.var_store.push(PlannedSet {
                 var_store_id: id,
                 store,
                 offset,
@@ -2756,24 +2788,56 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         )))
     }
 
-    /// Refuses the GET or SET `op` of a DATE or TIME without a VarStore, a field of the system
-    /// time, which edk2-stable202608 SetupBrowserDxe/Expression.c reaches through GetTime() and
-    /// SetTime() and uefisettings does not reach yet.
-    fn check_not_system_time(
-        &mut self,
+    /// The field of the system time that the GET or SET `op` of a DATE or TIME without a
+    /// VarStore reads or writes in GetTime()'s EFI_TIME, as edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression does, which fails at a VarOffset of no
+    /// field; None for another GET or SET.
+    fn system_time_field(
+        &self,
         op: &IFROperation,
         operand: &VarStoreOperand,
         kind: OperandKind,
-    ) -> Result<(), Abort> {
-        match (operand.var_store_id, kind) {
-            (0, OperandKind::Date | OperandKind::Time) => Err(self.not_evaluated(format!(
-                "{} of a {kind} field of the system time",
-                op.op_code.spec_name()
-            ))),
+    ) -> Result<Option<Field>, Abort> {
+        let kind = match (operand.var_store_id, kind) {
+            (0, OperandKind::Date) => DateTimeKind::Date,
+            (0, OperandKind::Time) => DateTimeKind::Time,
             (
                 _,
                 OperandKind::Boolean | OperandKind::Uint(_) | OperandKind::Date | OperandKind::Time,
-            ) => Ok(()),
+            ) => return Ok(None),
+        };
+        system_time_field(kind, operand.var_store_info)
+            .map(Some)
+            .ok_or_else(|| {
+                Abort::Malformed(format!(
+                    "{} of a {kind} field of the system time at VarOffset {}",
+                    op.op_code.spec_name(),
+                    operand.var_store_info
+                ))
+            })
+    }
+
+    /// The value of `field` of the system time that the GET `op` reads: GetTime()'s, a UINT16
+    /// year or a UINT8 otherwise, as edk2-stable202608 SetupBrowserDxe/Expression.c types it;
+    /// one that this backend cannot read is unknown.
+    fn system_time(&mut self, op: &IFROperation, field: Field) -> Operand {
+        let read = match self.reader.time_services() {
+            Some(services) => TimeStorage::SystemTime
+                .read(services.as_ref())
+                .map_err(|error| format!("{error:#}")),
+            None => Err(TimeStorageUnread(TimeStorage::SystemTime).to_string()),
+        };
+        match read {
+            Ok(time) => Operand::Uint(Some(field_value(&time, field).into())),
+            Err(reason) => {
+                self.unknown.get_or_insert_with(|| {
+                    format!(
+                        "{} of the {field} of the system time: {reason}",
+                        op.op_code.spec_name()
+                    )
+                });
+                Operand::Uint(None)
+            }
         }
     }
 }
@@ -6209,6 +6273,9 @@ mod store_expression_tests {
     use crate::hii::config_snapshot::tests::warned_by;
     use crate::hii::package::Guid;
     use crate::hii::strings::StringMap;
+    use crate::hii::time_services::tests::FakeTimeServices;
+    use crate::hii::time_services::tests::TimeService;
+    use crate::hii::time_services::TimeServices;
     use crate::hii::variables::VariableKey;
 
     const MAP: u8 = 0x22;
@@ -6410,7 +6477,8 @@ mod store_expression_tests {
             },
         )?;
         Ok(sets.map(|sets| {
-            sets.into_iter()
+            sets.var_store
+                .into_iter()
                 .map(|set| (set.var_store_id, set.store.name(), set.offset, set.bytes))
                 .collect()
         }))
@@ -6801,19 +6869,79 @@ mod store_expression_tests {
         }
     }
 
-    /// GET of a DATE or TIME without a VarStore, a field of the system time, is not evaluated.
+    /// GET of a DATE or TIME without a VarStore reads a field of GetTime()'s EFI_TIME, as
+    /// edk2-stable202608 SetupBrowserDxe/Expression.c does: of a DATE the year at VarOffset 0,
+    /// the month at 2 and the day at 3; of a TIME the hour at 0, the minute at 1 and the second
+    /// at 2. Without Time Services, or where GetTime() fails, it has no value; another VarOffset
+    /// is malformed.
     #[test]
-    fn get_of_a_system_time_field_is_not_evaluated() {
-        let efivars = store_holding(&DATES);
-        for (value_type, name) in [(EFI_IFR_TYPE_DATE, "DATE"), (EFI_IFR_TYPE_TIME, "TIME")] {
+    fn get_of_a_system_time_field_reads_get_time() {
+        let services: Rc<dyn TimeServices> = Rc::new(FakeTimeServices::new(None));
+        let cases = [
+            (EFI_IFR_TYPE_DATE, 0, 2026),
+            (EFI_IFR_TYPE_DATE, 2, 11),
+            (EFI_IFR_TYPE_DATE, 3, 7),
+            (EFI_IFR_TYPE_TIME, 0, 1),
+            (EFI_IFR_TYPE_TIME, 1, 2),
+            (EFI_IFR_TYPE_TIME, 2, 3),
+        ];
+        for (value_type, offset, want) in cases {
             assert_eq!(
-                value_in(get(0, 0, value_type), &efivars),
-                Err(format!(
-                    "EFI_IFR_GET of a {name} field of the system time not evaluated"
-                )),
-                "{name}"
+                value_timed(get(0, offset, value_type), Some(services.clone())),
+                Ok(want),
+                "type {value_type:#04x} at {offset}"
             );
         }
+        assert_eq!(
+            value_timed(get(0, 0, EFI_IFR_TYPE_DATE), None),
+            Err(
+                "EFI_IFR_GET of the year of the system time: EFI Date/Time Storage (UEFI 2.11 \
+                 §33.2.5.6) is read only through GetTime(); run uefisettings.efi in the UEFI \
+                 Shell"
+                    .to_string()
+            ),
+            "without Time Services"
+        );
+        let failing: Rc<dyn TimeServices> =
+            Rc::new(FakeTimeServices::new(Some(TimeService::GetTime)));
+        assert_eq!(
+            value_timed(get(0, 3, EFI_IFR_TYPE_DATE), Some(failing)),
+            Err("EFI_IFR_GET of the day of the system time: GetTime(): DEVICE_ERROR".to_string()),
+            "failed GetTime()"
+        );
+        assert_eq!(
+            value_timed(get(0, 1, EFI_IFR_TYPE_DATE), Some(services)),
+            Err(
+                "malformed expression: EFI_IFR_GET of a DATE field of the system time at \
+                 VarOffset 1"
+                    .to_string()
+            ),
+            "DATE at 1"
+        );
+    }
+
+    /// value_in, with no efivars and `time_services`.
+    fn value_timed(
+        expression: Vec<u8>,
+        time_services: Option<Rc<dyn TimeServices>>,
+    ) -> std::result::Result<u64, String> {
+        let declarations = declarations();
+        let root = parse_form_set(&[
+            declarations.concat(),
+            operation(VALUE, true, &[]),
+            expression,
+            END.to_vec(),
+        ]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let scope = Rc::clone(&form_set.borrow().children[declarations.len()]);
+        let scope = scope.borrow();
+        evaluate_value(
+            &scope,
+            &mut ExpressionInputs {
+                reader: &mut Efivars::new().reader().with_time_services(time_services),
+                values: &no_values(),
+            },
+        )
     }
 
     /// MAP matches a DATE with a DATE of the same bytes, and passes over a pair whose match
@@ -7435,7 +7563,8 @@ mod store_expression_tests {
             )
             .map_err(|refusal| refusal.to_string())?;
             Ok::<_, String>(sets.map(|sets| {
-                sets.into_iter()
+                sets.var_store
+                    .into_iter()
                     .map(|set| (set.var_store_id, set.store.name(), set.offset, set.bytes))
                     .collect::<Vec<_>>()
             }))
