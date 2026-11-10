@@ -72,6 +72,12 @@ use crate::hii::firmware_memory::kcore::read_kcore_file;
 use crate::hii::firmware_memory::kcore::KcoreAddress;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::hii::firmware_memory::kcore::KCORE_PATH;
+#[cfg(firmware_memory_maps)]
+use crate::hii::firmware_memory::runtime_memory::DevMem;
+#[cfg(firmware_memory_maps)]
+use crate::hii::firmware_memory::runtime_memory::PhysicalMemory;
+#[cfg(not(firmware_memory_maps))]
+use crate::hii::firmware_memory::MemoryMapUnavailable;
 use crate::hii::kallsyms::GenericSetVariable;
 use crate::hii::kallsyms::KernelSymbols;
 use crate::hii::kallsyms::KALLSYMS_PATH;
@@ -83,6 +89,14 @@ use crate::hii::lockdown::LOCKDOWN_PATH;
 use crate::hii::memory_access_denied::mark_refused_open;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::hii::memory_access_denied::MemoryDevice;
+#[cfg(firmware_memory_maps)]
+use crate::hii::package::Guid;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::ConfigurationTables;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::PointerSpace;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::SystemTableFiles;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
@@ -108,6 +122,18 @@ const EFIVARFS_STATFS_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_V
 /// EFI_RT_SUPPORTED_SET_VARIABLE, RuntimeServicesSupported's bit of SetVariable() (UEFI 2.11
 /// §4.6.2).
 const EFI_RT_SUPPORTED_SET_VARIABLE: u32 = 0x0040;
+/// EFI_RT_PROPERTIES_TABLE_GUID (UEFI 2.11 §4.6.2).
+#[cfg(firmware_memory_maps)]
+const EFI_RT_PROPERTIES_TABLE_GUID: Guid = Guid {
+    data1: 0xeb66_918a,
+    data2: 0x7eef,
+    data3: 0x402a,
+    data4: [0x84, 0x2e, 0x93, 0x1d, 0x21, 0xc3, 0x8a, 0xe9],
+};
+/// The size of EFI_RT_PROPERTIES_TABLE: Version, Length and RuntimeServicesSupported (UEFI 2.11
+/// §4.6.2).
+#[cfg(firmware_memory_maps)]
+const RT_PROPERTIES_TABLE_SIZE: usize = 8;
 
 impl EfivarSource {
     /// The firmware variables that questions read from this source, which validate accepts.
@@ -415,6 +441,29 @@ fn kernel_survives_writes(evidence: &dyn WriteSafetyEvidence) -> Result<KernelSu
     }
 }
 
+/// The RuntimeServicesSupported of the EFI_RT_PROPERTIES_TABLE that the System Table of `files`
+/// lists, in the physical memory that `open_memory` opens, or None without one: Linux takes it
+/// whatever the table's Version and Length (Linux v6.11 drivers/firmware/efi/efi.c:779-784), and
+/// so does this. Its address is physical and never converted (UEFI 2.11 §4.6.2), so a virtual
+/// range that holds it does not lead to it.
+#[cfg(firmware_memory_maps)]
+fn read_rt_properties_supported<M: PhysicalMemory>(
+    files: &SystemTableFiles,
+    open_memory: impl FnOnce(&Path, &Path) -> Result<M>,
+) -> Result<Option<u32>> {
+    let Some(table) = ConfigurationTables::read(files, open_memory)?
+        .into_table(&EFI_RT_PROPERTIES_TABLE_GUID, PointerSpace::PhysicalOnly)?
+    else {
+        return Ok(None);
+    };
+    let bytes = table
+        .read_at(0, RT_PROPERTIES_TABLE_SIZE)
+        .context("Failed to read the EFI_RT_PROPERTIES_TABLE")?;
+    let [_, _, _, _, s0, s1, s2, s3] = <[u8; RT_PROPERTIES_TABLE_SIZE]>::try_from(bytes)
+        .map_err(|bytes| anyhow!("read {} bytes of the EFI_RT_PROPERTIES_TABLE", bytes.len()))?;
+    Ok(Some(u32::from_le_bytes([s0, s1, s2, s3])))
+}
+
 /// The evidence of this Linux: its symbol table, its memory and its log.
 struct LinuxEvidence {
     kallsyms: PathBuf,
@@ -437,6 +486,10 @@ struct LinuxEvidence {
     kmsg_device: Option<libc::dev_t>,
     /// syslog(2), where the kernel refuses `kmsg`.
     kernel_log: Box<dyn KernelLog>,
+    /// The files that locate the firmware's configuration tables, among them the RT properties
+    /// table.
+    #[cfg(firmware_memory_maps)]
+    system_table: SystemTableFiles,
 }
 
 impl LinuxEvidence {
@@ -456,6 +509,8 @@ impl LinuxEvidence {
             kmsg: PathBuf::from(KMSG_PATH),
             kmsg_device: Some(KMSG_DEVICE),
             kernel_log: Box::new(Syslog),
+            #[cfg(firmware_memory_maps)]
+            system_table: SystemTableFiles::default(),
         }
     }
 
@@ -585,8 +640,16 @@ impl WriteSafetyEvidence for LinuxEvidence {
         )
     }
 
+    /// The RT properties table that the System Table lists, from /dev/mem (system_table).
+    #[cfg(firmware_memory_maps)]
     fn rt_properties_supported(&self) -> Result<Option<u32>> {
-        bail!("reading the firmware's EFI_RT_PROPERTIES_TABLE is not supported on Linux yet")
+        read_rt_properties_supported(&self.system_table, DevMem::open)
+    }
+
+    /// Refuses: no firmware memory map bounds the read of the table on this architecture.
+    #[cfg(not(firmware_memory_maps))]
+    fn rt_properties_supported(&self) -> Result<Option<u32>> {
+        Err(MemoryMapUnavailable::NoMapReader.into())
     }
 }
 
@@ -1047,6 +1110,19 @@ mod tests {
             kmsg: dir.join("kmsg"),
             kmsg_device: None,
             kernel_log: Box::new(FakeSyslog(Err(libc::ENOSYS))),
+            #[cfg(firmware_memory_maps)]
+            system_table: SystemTableFiles {
+                locator: crate::hii::system_table::SystemTableLocator::BootParams {
+                    boot_params: dir.join("boot_params"),
+                    config_table: dir.join("config_table"),
+                },
+                maps: crate::hii::firmware_memory::MemoryMapFiles::Sysfs {
+                    runtime_map: dir.join("runtime-map"),
+                    firmware_memmap: dir.join("memmap"),
+                },
+                dev_mem: dir.join("mem"),
+                lockdown: dir.join("lockdown"),
+            },
         };
         write_kallsyms(&evidence.kallsyms, kallsyms);
         evidence
@@ -2017,6 +2093,228 @@ mod tests {
             format!("Failed to open {kmsg}: {kmsg} is not the character device 1:11"),
             "the kernel log's device"
         );
+    }
+
+    /// The RT properties table, as Linux finds it through the System Table.
+    #[cfg(firmware_memory_maps)]
+    mod rt_properties {
+        use std::os::unix::fs::FileExt;
+
+        use super::*;
+        use crate::firmware_width::FirmwareWidth;
+        use crate::hii::system_table::fixture::configuration_table;
+        use crate::hii::system_table::fixture::valid_system_table;
+        use crate::hii::system_table::fixture::x86_files;
+        use crate::hii::system_table::fixture::SegmentMemory;
+        use crate::memory_map::efi_memory_map::MemoryType;
+
+        /// Two runtime data regions: A, whose virtual addresses after SetVirtualAddressMap() are
+        /// B's physical ones, and B.
+        const REGION_A_AT: u64 = 0x7e00_0000;
+        const REGION_B_AT: u64 = 0x7f00_0000;
+        const REGION_PAGES: u64 = 16;
+        const REGIONS: [(MemoryType, u64, u64, u64); 2] = [
+            (
+                MemoryType::RUNTIME_SERVICES_DATA,
+                REGION_A_AT,
+                REGION_B_AT,
+                REGION_PAGES,
+            ),
+            (
+                MemoryType::RUNTIME_SERVICES_DATA,
+                REGION_B_AT,
+                0xffff_fffe_ff00_0000,
+                REGION_PAGES,
+            ),
+        ];
+        /// The System Table and its entries, in A.
+        const SYSTEM_TABLE_AT: u64 = REGION_A_AT + 0x18;
+        const ENTRIES_AT: u64 = REGION_A_AT + 0x200;
+        /// The RT properties table, in B, where its pointer taken as virtual leads to A.
+        const TABLE_AT: u64 = REGION_B_AT + 0x100;
+        const DECOY_AT: u64 = REGION_A_AT + 0x100;
+        /// Another table that the System Table lists.
+        const OTHER: Guid = Guid {
+            data1: 0x8c78_a505,
+            data2: 0xbaa0,
+            data3: 0x4c4a,
+            data4: [0x86, 0x9f, 0, 0, 0, 0, 0x17, 0x02],
+        };
+
+        /// An EFI_RT_PROPERTIES_TABLE of `version`, `length` and `supported`, and `length` bytes
+        /// in all, at least 8.
+        fn rt_table(version: u16, length: u16, supported: u32) -> Vec<u8> {
+            let mut bytes = [
+                &version.to_le_bytes()[..],
+                &length.to_le_bytes(),
+                &supported.to_le_bytes(),
+            ]
+            .concat();
+            bytes.resize(usize::from(length).max(RT_PROPERTIES_TABLE_SIZE), 0xa5);
+            bytes
+        }
+
+        /// The (address, bytes) of physical memory where a System Table of `width` lists
+        /// `entries`, with `table` at TABLE_AT, and a decoy table that lists every runtime
+        /// service at DECOY_AT.
+        fn segments(
+            width: FirmwareWidth,
+            entries: &[(Guid, u64)],
+            table: Vec<u8>,
+        ) -> Vec<(u64, Vec<u8>)> {
+            let count = u64::try_from(entries.len()).expect("a u64 count");
+            vec![
+                (
+                    SYSTEM_TABLE_AT,
+                    valid_system_table(width, count, ENTRIES_AT),
+                ),
+                (ENTRIES_AT, configuration_table(width, entries)),
+                (TABLE_AT, table),
+                (DECOY_AT, rt_table(1, 8, u32::MAX)),
+            ]
+        }
+
+        /// What read_rt_properties_supported finds through x86's files in `dir` in `segments`.
+        fn read(
+            dir: &Path,
+            width: FirmwareWidth,
+            segments: Vec<(u64, Vec<u8>)>,
+        ) -> Result<Option<u32>> {
+            let files = x86_files(dir, width, SYSTEM_TABLE_AT, ENTRIES_AT, &REGIONS);
+            read_rt_properties_supported(&files, |_, _| Ok(SegmentMemory(segments)))
+        }
+
+        /// The listed table's RuntimeServicesSupported is read whatever its Version and Length, as
+        /// Linux reads it, at its physical address, never the virtual one that SetVirtualAddressMap()
+        /// would give it.
+        #[test]
+        fn reads_the_table_at_its_physical_address_whatever_its_version() {
+            for width in [FirmwareWidth::Bits32, FirmwareWidth::Bits64] {
+                for (version, length, supported) in [(1, 8, 0x3fbf), (2, 12, 0x3fff), (0, 0, 0)] {
+                    let case = format!("{width:?}: version {version}, length {length}");
+                    let dir = tempfile::tempdir().expect("create a directory");
+                    let entries = [(OTHER, DECOY_AT), (EFI_RT_PROPERTIES_TABLE_GUID, TABLE_AT)];
+
+                    let got = read(
+                        dir.path(),
+                        width,
+                        segments(width, &entries, rt_table(version, length, supported)),
+                    )
+                    .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+                    assert_eq!(got, Some(supported), "{case}");
+                }
+            }
+        }
+
+        /// A System Table that lists no RT properties table gives none.
+        #[test]
+        fn finds_no_table_that_the_system_table_does_not_list() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let width = FirmwareWidth::Bits64;
+
+            let got = read(
+                dir.path(),
+                width,
+                segments(width, &[(OTHER, TABLE_AT)], rt_table(1, 8, 0x3fbf)),
+            )
+            .expect("read the configuration tables");
+
+            assert_eq!(got, None);
+        }
+
+        /// A table whose 8 bytes run past its runtime region is refused.
+        #[test]
+        fn refuses_a_table_past_its_region() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let width = FirmwareWidth::Bits64;
+            let at = REGION_B_AT + REGION_PAGES * 0x1000 - 4;
+            let mut segments = segments(width, &[(EFI_RT_PROPERTIES_TABLE_GUID, at)], Vec::new());
+            segments.push((at, rt_table(1, 8, 0x3fbf)));
+
+            let error = read(dir.path(), width, segments).expect_err("read past the region");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("{at:#x}+0x8 lies in no EFI_MEMORY_RUNTIME region")),
+                "{message}"
+            );
+        }
+
+        /// A table that no runtime region holds is refused, though a runtime region's virtual
+        /// range holds its address, as arm64's runtime virtual addresses from 512 MiB may hold
+        /// the physical address of other memory: the table "will be referenced as physical and
+        /// will not be fixed up" (UEFI 2.11 §4.6.2), so that address never leads to the bytes of
+        /// that region, here a decoy that lists every runtime service.
+        #[test]
+        fn refuses_a_table_outside_the_runtime_regions() {
+            const VIRTUAL_AT: u64 = 0x2000_0000;
+            let dir = tempfile::tempdir().expect("create a directory");
+            let width = FirmwareWidth::Bits64;
+            let at = VIRTUAL_AT + (DECOY_AT - REGION_A_AT);
+            let files = x86_files(
+                dir.path(),
+                width,
+                SYSTEM_TABLE_AT,
+                ENTRIES_AT,
+                &[(
+                    MemoryType::RUNTIME_SERVICES_DATA,
+                    REGION_A_AT,
+                    VIRTUAL_AT,
+                    REGION_PAGES,
+                )],
+            );
+            let memory = segments(width, &[(EFI_RT_PROPERTIES_TABLE_GUID, at)], Vec::new());
+
+            let error = read_rt_properties_supported(&files, |_, _| Ok(SegmentMemory(memory)))
+                .expect_err("read a table outside the runtime regions");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("{at:#x}+0x8 lies in no EFI_MEMORY_RUNTIME region")),
+                "{message}"
+            );
+        }
+
+        /// LinuxEvidence reads the table from its /dev/mem, so that a kernel without the fix,
+        /// whose log names the table and whose generic_ops it cannot read, refuses a write by the
+        /// table, which leaves SetVariable() out.
+        #[test]
+        fn linux_evidence_refuses_by_the_table_that_it_reads_from_dev_mem() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let width = FirmwareWidth::Bits64;
+            let mut evidence = linux_evidence(dir.path(), UNFIXED_KALLSYMS);
+            evidence.system_table =
+                x86_files(dir.path(), width, SYSTEM_TABLE_AT, ENTRIES_AT, &REGIONS);
+            fs::write(
+                &evidence.kmsg,
+                "6,12,1000,-;efi: ACPI=0x3fb7e000 RTPROP=0x7f000100 \n",
+            )
+            .expect("write the kernel log");
+            let mem =
+                fs::File::create(&evidence.system_table.dev_mem).expect("create the memory file");
+            let entries = [(EFI_RT_PROPERTIES_TABLE_GUID, TABLE_AT)];
+            for (address, bytes) in segments(width, &entries, rt_table(1, 8, 0x3fbf)) {
+                mem.write_all_at(&bytes, address)
+                    .expect("write physical memory");
+            }
+
+            let error = kernel_survives_writes(&evidence).expect_err("survive the write");
+
+            assert_eq!(
+                error.downcast_ref::<CrashingWrite>(),
+                Some(&CrashingWrite::TableOmitsSetVariable(0x3fbf)),
+                "{error:#}"
+            );
+        }
+
+        #[test]
+        fn rt_properties_table_guid_is_the_specification_s() {
+            assert_eq!(
+                EFI_RT_PROPERTIES_TABLE_GUID.to_string(),
+                "EB66918A-7EEF-402A-842E-931D21C38AE9"
+            );
+        }
     }
 
     /// An outcome of a WriteSafetyEvidence step for FakeEvidence: a value, or an error.

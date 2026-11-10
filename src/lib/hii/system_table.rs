@@ -144,14 +144,27 @@ pub enum SystemTableError {
     NullVendorTable { guid: Guid },
 }
 
-/// The physical address of the firmware pointer `pointer`: translated through the virtual ranges
-/// of the memory map `map`, as SetVirtualAddressMap() converts the System Table's
-/// ConfigurationTable (UEFI 2.11 §8.4.1) and the VendorTable of the JSON configuration and
-/// capsule result tables (§4.6.1.2), else as it is, as firmware that converts nothing leaves
-/// them; Linux leaves the configuration tables as the firmware gives them. The reads check the
-/// address that it gives.
-fn resolve(map: &EfiMemoryMap, pointer: u64) -> u64 {
-    map.physical_address(pointer).unwrap_or(pointer)
+/// Whether firmware converts a pointer to a virtual address at SetVirtualAddressMap() (UEFI 2.11
+/// §8.4.1), which tells uefisettings the address space to try first: Linux leaves the
+/// configuration tables as the firmware gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointerSpace {
+    /// Converted: the System Table's ConfigurationTable (§8.4.1), and the VendorTable of the
+    /// JSON configuration and capsule result tables (§4.6.1.2). Firmware that converts nothing,
+    /// as where the OS calls no SetVirtualAddressMap(), leaves them physical.
+    Virtual,
+    /// Never converted: EFI_RT_PROPERTIES_TABLE, which "will not be fixed up" (§4.6.2), so a
+    /// virtual range that holds its address leads to other memory.
+    PhysicalOnly,
+}
+
+/// The physical address of the firmware pointer `pointer`, in `space` first, by the memory map
+/// `map`: the reads check the address that it gives.
+fn resolve(map: &EfiMemoryMap, pointer: u64, space: PointerSpace) -> u64 {
+    match space {
+        PointerSpace::PhysicalOnly => pointer,
+        PointerSpace::Virtual => map.physical_address(pointer).unwrap_or(pointer),
+    }
 }
 
 /// What Linux tells of the System Table: where its two sources of it are on this architecture.
@@ -443,9 +456,13 @@ impl<M: PhysicalMemory> ConfigurationTables<M> {
         let map = files.maps.runtime_bound(&files.lockdown)?;
         let memory = RuntimeMemory::new(map, open_memory(&files.dev_mem, &files.lockdown)?);
         let system_table = read_system_table(&memory, located.address, located.width)?;
-        let address = located
-            .configuration_table
-            .unwrap_or_else(|| resolve(memory.map(), system_table.configuration_table));
+        let address = located.configuration_table.unwrap_or_else(|| {
+            resolve(
+                memory.map(),
+                system_table.configuration_table,
+                PointerSpace::Virtual,
+            )
+        });
         let entries = read_entries(&memory, address, system_table.entries, located.width)?;
         Ok(Self {
             entries,
@@ -454,10 +471,12 @@ impl<M: PhysicalMemory> ConfigurationTables<M> {
         })
     }
 
-    /// The table of `guid`, if the System Table lists it.
+    /// The table of `guid`, if the System Table lists it, whose VendorTable it takes in `space`
+    /// first.
     pub(in crate::hii) fn into_table(
         self,
         guid: &Guid,
+        space: PointerSpace,
     ) -> Result<Option<SystemVendorTable<M>>, SystemTableError> {
         let mut listed = self
             .entries
@@ -478,7 +497,7 @@ impl<M: PhysicalMemory> ConfigurationTables<M> {
             return Err(SystemTableError::NullVendorTable { guid: *guid });
         }
         Ok(Some(SystemVendorTable {
-            address: resolve(self.memory.map(), pointer),
+            address: resolve(self.memory.map(), pointer, space),
             width: self.width,
             memory: self.memory,
         }))
@@ -513,9 +532,13 @@ impl<M: PhysicalMemory> VendorTable for SystemVendorTable<M> {
     }
 }
 
-/// The configuration table of `guid` that this machine's System Table lists, if any.
-pub(crate) fn system_vendor_table(guid: &Guid) -> Result<Option<impl VendorTable>> {
-    Ok(ConfigurationTables::system()?.into_table(guid)?)
+/// The configuration table of `guid` that this machine's System Table lists, if any, whose
+/// VendorTable it takes in `space` first.
+pub(crate) fn system_vendor_table(
+    guid: &Guid,
+    space: PointerSpace,
+) -> Result<Option<impl VendorTable>> {
+    Ok(ConfigurationTables::system()?.into_table(guid, space)?)
 }
 
 /// System Tables, configuration tables and the files that locate them, for the tests.
@@ -577,6 +600,21 @@ pub(in crate::hii) mod fixture {
     /// The size of the EFI_SYSTEM_TABLE of UEFI 2.11 for firmware of `width`.
     pub(in crate::hii) fn system_table_size(width: FirmwareWidth) -> u32 {
         u32::try_from(SystemTableLayout::of(width).size()).expect("a u32 size")
+    }
+
+    /// A System Table of `width` and UEFI 2.11's size that lists `count` tables at `table`.
+    pub(in crate::hii) fn valid_system_table(
+        width: FirmwareWidth,
+        count: u64,
+        table: u64,
+    ) -> Vec<u8> {
+        system_table(
+            width,
+            EFI_SYSTEM_TABLE_SIGNATURE,
+            system_table_size(width),
+            count,
+            table,
+        )
     }
 
     /// The EFI_CONFIGURATION_TABLE entries `entries` of (VendorGuid, VendorTable) of firmware of
@@ -731,6 +769,7 @@ mod tests {
     use crate::hii::memory_access_denied::DenialCause;
     use crate::hii::memory_access_denied::MemoryAccessDenied;
     use crate::hii::memory_access_denied::MemoryOperation;
+    use crate::memory_map::efi_memory_map::fixture::runtime_map;
     use crate::memory_map::efi_memory_map::MemoryType;
     use crate::memory_map::efi_memory_map::RangeRefusal;
     use crate::memory_map::efi_memory_map::EFI_MEMORY_RUNTIME;
@@ -809,17 +848,6 @@ mod tests {
         ConfigurationTables::read(&files, |_, _| Ok(memory(system_table, entries)))
     }
 
-    /// A System Table of `width` and UEFI 2.11's size that lists `count` tables at `table`.
-    fn valid_system_table(width: FirmwareWidth, count: u64, table: u64) -> Vec<u8> {
-        system_table(
-            width,
-            EFI_SYSTEM_TABLE_SIGNATURE,
-            system_table_size(width),
-            count,
-            table,
-        )
-    }
-
     /// On x86, of either width, boot_params locates the System Table and config_table its entries,
     /// whose ConfigurationTable is virtual after SetVirtualAddressMap(); a listed table reads
     /// from its VendorTable, and an unlisted one is absent.
@@ -843,7 +871,7 @@ mod tests {
             };
 
             let table = read()
-                .into_table(&LISTED)
+                .into_table(&LISTED, PointerSpace::PhysicalOnly)
                 .expect("find the listed table")
                 .expect("a listed table");
 
@@ -855,7 +883,7 @@ mod tests {
             assert_eq!(table.firmware_width(), width, "{width:?}");
             assert!(
                 read()
-                    .into_table(&UNLISTED)
+                    .into_table(&UNLISTED, PointerSpace::PhysicalOnly)
                     .expect("look for an unlisted table")
                     .is_none(),
                 "{width:?}: unlisted"
@@ -902,7 +930,7 @@ mod tests {
                 Ok(memory(valid_system_table(width, 1, converted), entries))
             })
             .unwrap_or_else(|error| panic!("{case}: {error:#}"))
-            .into_table(&LISTED)
+            .into_table(&LISTED, PointerSpace::PhysicalOnly)
             .expect("find the listed table")
             .expect("a listed table");
 
@@ -959,7 +987,7 @@ mod tests {
 
             for (case, tables) in [("x86", x86), ("arm64", arm64)] {
                 let table = tables
-                    .into_table(&LISTED)
+                    .into_table(&LISTED, PointerSpace::PhysicalOnly)
                     .unwrap_or_else(|error| panic!("{width:?}: {case}: {error:#}"))
                     .unwrap_or_else(|| panic!("{width:?}: {case}: the second table"));
                 assert_eq!(
@@ -1093,7 +1121,7 @@ mod tests {
         .expect("read MAX_TABLE_ENTRIES entries");
         assert!(
             tables
-                .into_table(&LISTED)
+                .into_table(&LISTED, PointerSpace::PhysicalOnly)
                 .expect("find the last table")
                 .is_some(),
             "the last of MAX_TABLE_ENTRIES"
@@ -1169,7 +1197,7 @@ mod tests {
         .expect("read no entries");
         assert!(
             tables
-                .into_table(&LISTED)
+                .into_table(&LISTED, PointerSpace::PhysicalOnly)
                 .expect("look for a table")
                 .is_none(),
             "no entries"
@@ -1211,7 +1239,11 @@ mod tests {
             ),
             (UNLISTED, None),
         ] {
-            assert_eq!(read().into_table(&guid).err(), want, "{guid}");
+            assert_eq!(
+                read().into_table(&guid, PointerSpace::PhysicalOnly).err(),
+                want,
+                "{guid}"
+            );
         }
     }
 
@@ -1419,5 +1451,42 @@ mod tests {
             Some(&MemoryMapUnavailable::NoKcore(kcore.clone())),
             "arm64: {error:#}"
         );
+    }
+
+    /// resolve leaves a pointer of PointerSpace::PhysicalOnly as it is, though a virtual range
+    /// holds it, and translates one of PointerSpace::Virtual through the virtual ranges; it
+    /// leaves a pointer that no virtual range holds as it is, for the read to refuse.
+    #[test]
+    fn resolve_tries_the_pointer_s_space_first() {
+        // the virtual range of the first region is the physical range of the second
+        let map = runtime_map(&[
+            (
+                0x7f00_0000,
+                0x7e00_0000,
+                0x10,
+                MemoryType::RUNTIME_SERVICES_DATA,
+            ),
+            (
+                0x7e00_0000,
+                0x2000_0000,
+                0x10,
+                MemoryType::RUNTIME_SERVICES_DATA,
+            ),
+        ]);
+        for (pointer, space, want) in [
+            (0x7e00_0010, PointerSpace::PhysicalOnly, 0x7e00_0010),
+            (0x7e00_0010, PointerSpace::Virtual, 0x7f00_0010),
+            (0x2000_0010, PointerSpace::PhysicalOnly, 0x2000_0010),
+            (0x2000_0010, PointerSpace::Virtual, 0x7e00_0010),
+            (0x7f00_0010, PointerSpace::Virtual, 0x7f00_0010),
+            (0x9000_0000, PointerSpace::PhysicalOnly, 0x9000_0000),
+            (0x9000_0000, PointerSpace::Virtual, 0x9000_0000),
+        ] {
+            assert_eq!(
+                resolve(&map, pointer, space),
+                want,
+                "{pointer:#x} {space:?}"
+            );
+        }
     }
 }

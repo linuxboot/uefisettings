@@ -47,6 +47,15 @@ const NO_SET_VARIABLE: &str =
      0e8d2444168d, Linux v6.8), crashes on an efivarfs write; run uefisettings.efi in the UEFI \
      Shell";
 
+/// The refusal where the firmware's RT properties table, which Linux applied, leaves out
+/// SetVariable(): publish-hiidb's lists every runtime service but it (src/lib/hii/efivarfs.rs
+/// CrashingWrite).
+const TABLE_OMITS_SET_VARIABLE: &str =
+    "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes on an \
+     efivarfs write without a runtime SetVariable(), as on firmware whose \
+     EFI_RT_PROPERTIES_TABLE (UEFI 2.11 §4.6.2) leaves it out, as this one does \
+     (RuntimeServicesSupported 0x3fbf); run uefisettings.efi in the UEFI Shell";
+
 /// The refusal where uefisettings cannot tell (src/lib/hii/efivarfs.rs CrashingWrite).
 const UNKNOWN: &str =
     "Linux without efivarfs_reconfigure() (upstream 0e8d2444168d, Linux v6.8) crashes on an \
@@ -147,8 +156,15 @@ fn set_refuses_a_kernel_without_set_variable() {
     set_one_of(Outcome::Refuse(NO_SET_VARIABLE));
 }
 
-/// Linux without the fix applied an RT properties table that uefisettings does not read on
-/// Linux, or cannot.
+/// Linux without the fix applied the RT properties table, which leaves SetVariable() out, and
+/// uefisettings reads the table, where neither the kernel's symbols nor its generic_ops tell.
+#[test]
+fn set_refuses_a_table_without_set_variable() {
+    set_one_of(Outcome::Refuse(TABLE_OMITS_SET_VARIABLE));
+}
+
+/// Linux without the fix applied an RT properties table that uefisettings cannot read, as under
+/// lockdown=confidentiality, which refuses both /proc/kcore and /dev/mem.
 #[test]
 fn set_refuses_what_it_cannot_tell() {
     set_one_of(Outcome::Refuse(UNKNOWN));

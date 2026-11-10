@@ -188,6 +188,11 @@ that cannot write variables at runtime publishes, and `publish-hiidb.efi rt-prop
 that lists every runtime service.
 `rt-properties-version-2` and `rt-properties-version-2-all` install the same tables with
 Version 2, which no UEFI version defines and which Linux reads all the same.
+Where neither the kernel's symbols nor its `generic_ops` tell, as on i686 or under
+`kernel.kptr_restrict=2`, the scenarios `crash-guard-nosetvar-i686` and
+`crash-guard-nosetvar-kptr2` check that `uefisettings` refuses the write by the table that it
+reads from `/dev/mem`, and `crash-guard-all-ro-kptr2` that it writes by the one that lists
+`SetVariable()`.
 
 `publish-hiidb.efi json-config-data` publishes nothing: it installs an
 `EFI_JSON_CAPSULE_CONFIG_DATA` of two items, JSON text and bytes that are no UTF-8, as the EFI

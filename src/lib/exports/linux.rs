@@ -60,6 +60,8 @@ use crate::hii::EfivarDump;
 use crate::hii::EfivarFiles;
 use crate::hii::EfivarSource;
 use crate::hii::FirmwareVariables;
+#[cfg(configuration_tables)]
+use crate::hii::PointerSpace;
 use crate::hii::SavedDump;
 use crate::ilorest::chif;
 use crate::ilorest::requests;
@@ -126,12 +128,12 @@ impl CapsuleBackend {
     /// The JSON configuration table, whose VendorTable SetVirtualAddressMap() converts (UEFI 2.11
     /// §4.6.1.2).
     pub(super) fn system_json_config_data_table() -> Result<Option<impl VendorTable>> {
-        system_vendor_table(&EFI_JSON_CONFIG_DATA_TABLE_GUID)
+        system_vendor_table(&EFI_JSON_CONFIG_DATA_TABLE_GUID, PointerSpace::Virtual)
     }
 
     /// The JSON capsule result table, whose VendorTable SetVirtualAddressMap() converts too.
     pub(super) fn system_json_capsule_result_table() -> Result<Option<impl VendorTable>> {
-        system_vendor_table(&EFI_JSON_CAPSULE_RESULT_TABLE_GUID)
+        system_vendor_table(&EFI_JSON_CAPSULE_RESULT_TABLE_GUID, PointerSpace::Virtual)
     }
 }
 
