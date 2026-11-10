@@ -1537,6 +1537,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::string_default;
     use crate::hii::forms::ifr_fixtures::string_on;
+    use crate::hii::forms::ifr_fixtures::string_option;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::uint16_option;
     use crate::hii::forms::ifr_fixtures::uint8;
@@ -12658,6 +12659,81 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// A STRING without a value shows the default of a flagged EFI_IFR_ONE_OF_OPTION of Type
+    /// EFI_IFR_TYPE_STRING in its scope, the text of the option's Value, below an EFI_IFR_DEFAULT,
+    /// as EFI_IFR_STRING (UEFI 2.11 §33.3.8.3.70) orders them; an option of no default flag, or one
+    /// that a SUPPRESS_IF hides, gives none.
+    #[test]
+    fn strings_show_the_defaults_of_their_flagged_options() {
+        const OPTION_DEFAULT: u8 = 0x10;
+        let option = || string_option(3, OPTION_DEFAULT, 4);
+        let cases = [
+            ("flagged option", vec![option()], " <IFR default: Bonjour>"),
+            (
+                "flagged option and EFI_IFR_DEFAULT",
+                vec![option(), string_default(0, 2)],
+                " <IFR default: Hello>",
+            ),
+            ("option of no flag", vec![string_option(3, 0x00, 4)], ""),
+            (
+                "suppressed flagged option",
+                vec![conditional(SUPPRESS_IF, ifr_true(), &[option()])],
+                "",
+            ),
+        ];
+        for (case, children, default) in cases {
+            let hiidb = string_list_of(
+                [0x7F; 16],
+                ((0, 8), 0x00),
+                &children,
+                16,
+                &["S", "Hello", "Option", "Bonjour"],
+            );
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+
+            assert_eq!(
+                answers_of(&hiidb, "S", &Rc::new(variables)),
+                [format!("{MISSING_SETUP}{default}")],
+                "{case}"
+            );
+        }
+    }
+
+    /// A ONE_OF whose flagged EFI_IFR_ONE_OF_OPTION is of Type EFI_IFR_TYPE_STRING shows its
+    /// default as unknown, naming the Type mismatch: a ONE_OF stores a number.
+    #[test]
+    fn one_ofs_show_a_string_option_default_as_unknown() {
+        let data = [
+            question_header_with(1, 1, 1, 0, 0x00),
+            // Flags EFI_IFR_NUMERIC_SIZE_1, MinValue, MaxValue, Step
+            vec![0x00, 0x00, 0xFF, 0x01],
+        ]
+        .concat();
+        let one_of = [
+            operation(ONE_OF, true, &data),
+            string_option(2, 0x10, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package(&[var_store_efi(1, "Setup", NV_BS_RT, 1), form(1, &[one_of])]),
+            en_strings_package_of(&["O", "Hello"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x5F; 16], &packages.concat());
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+
+        assert_eq!(
+            answers_of(&hiidb, "O", &Rc::new(variables)),
+            [format!(
+                "{MISSING_SETUP} <IFR default: unknown (a default of EFI_IFR_TYPE_STRING where the \
+                 question stores a number)>"
+            )],
+            "get"
+        );
     }
 
     /// set writes at most MaxSize − 1 characters of a STRING as UCS-2, NULL-padded to its MaxSize

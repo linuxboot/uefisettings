@@ -1832,7 +1832,6 @@ pub enum TypeValue {
     Boolean(bool),
     Time(Time),
     Date(Date),
-    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     StringID(u16),
     /// EFI_IFR_TYPE_OTHER, of no bytes: a nested EFI_IFR_VALUE gives the value
     Other,
@@ -1918,6 +1917,10 @@ fn type_value_parser<R: Read + Seek>(
                 return Ok(TypeValue::Boolean(true));
             }
             Ok(TypeValue::Boolean(false))
+        }
+        EFI_IFR_TYPE_STRING => {
+            let r: u16 = BinRead::read_options(reader, endian, ())?;
+            Ok(TypeValue::StringID(r))
         }
         EFI_IFR_TYPE_OTHER => Ok(TypeValue::Other),
         EFI_IFR_TYPE_TIME => Ok(TypeValue::Time(BinRead::read_options(reader, endian, ())?)),

@@ -673,7 +673,10 @@ fn takes_option_defaults(op_code: IFROpCode) -> bool {
 /// edk2-stable202608 SetupBrowserDxe/IfrParse.c:2369-2402 makes it a buffer default and no option.
 /// An EFI_IFR_DEFAULT still comes first for an ORDERED_LIST, by UEFI 2.11 §33.2.5.8, where
 /// edk2-stable202608 Setup.c GetQuestionDefault takes whichever of the two comes first in IFR
-/// order.
+/// order. A flagged option of Type EFI_IFR_TYPE_STRING gives a STRING the string of its Value, as
+/// EFI_IFR_STRING (UEFI 2.11 §33.3.8.3.70) takes defaults from "one or more nested
+/// EFI_IFR_ONE_OF_OPTION (lowest priority)", and any other question a default that it refuses for
+/// its Type.
 fn default_for_id(
     question: &IFROperation,
     scope: &[Rc<RefCell<IFROperation>>],
@@ -735,6 +738,11 @@ fn default_for_id(
                 option_value(question, &op, option, inputs)
                     .map_err(DefaultError::OptionValue)
                     .and_then(|value| {
+                        // the string of an option of Type EFI_IFR_TYPE_STRING, which a question
+                        // that stores no string refuses for its Type
+                        if let TypeValue::StringID(id) = value {
+                            return Ok(TypedDefault::String(id));
+                        }
                         // a DATE or TIME option's bytes, as an EFI_IFR_DEFAULT's
                         value
                             .widened()

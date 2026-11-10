@@ -473,6 +473,18 @@ pub(crate) fn flagged_option(string_id: u16, flags: u8, value: u8) -> Vec<u8> {
     operation(ONE_OF_OPTION, false, &data)
 }
 
+/// An EFI_IFR_ONE_OF_OPTION of Type EFI_IFR_TYPE_STRING with `flags`, whose Value is the string
+/// `value`.
+pub(crate) fn string_option(string_id: u16, flags: u8, value: u16) -> Vec<u8> {
+    let data = [
+        &string_id.to_le_bytes()[..],
+        &[flags, 0x07],
+        &value.to_le_bytes(),
+    ]
+    .concat();
+    operation(ONE_OF_OPTION, false, &data)
+}
+
 /// An EFI_IFR_DEFAULT of Type UINT8.
 pub(crate) fn ifr_default(default_id: u16, value: u8) -> Vec<u8> {
     let data = [&default_id.to_le_bytes()[..], &[0x00, value]].concat();
