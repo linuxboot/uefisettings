@@ -13,7 +13,9 @@
 //! The VarStores that IFR questions keep their values in, and the reads of those values from
 //! the EFI variables behind them.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -21,10 +23,11 @@ use binrw::BinRead;
 use thiserror::Error;
 
 use super::bit_field_bits;
+use super::conditions::question_expression;
+use super::conditions::question_value_expression;
 use super::conditions::ExpressionRefusal;
 use super::conditions::QuestionExpression;
 use super::conditions::MAX_READ_DEPTH;
-use super::ordered_list::ListExpression;
 use super::question_values::value_question;
 use super::question_values::ListedQuestion;
 use super::storageless::NoVarStore;
@@ -1265,9 +1268,9 @@ pub(super) enum ValueUnavailable {
     /// `{:#}` shows it
     #[error("{0}")]
     TimeService(String),
-    /// An expression that would give an ORDERED_LIST its value
+    /// An expression that would give an ORDERED_LIST or a REF its value
     #[error("{0}")]
-    OrderedList(ListExpression),
+    BufferExpression(BufferExpression),
     /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
     /// level replaces it only in conditions
     #[error(
@@ -1331,13 +1334,42 @@ impl ValueUnavailable {
             | Self::SnapshotNumber { .. }
             | Self::TimeStorageUnread(_)
             | Self::TimeService(_)
-            | Self::OrderedList(_) => "ValueUnavailable",
+            | Self::BufferExpression(_) => "ValueUnavailable",
         }
     }
 }
 
-/// Where a ONE_OF, NUMERIC, CHECKBOX, DATE, TIME or ORDERED_LIST keeps its value in the payload of
-/// its VarStore.
+/// A question whose value is a buffer, not a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BufferQuestion {
+    OrderedList,
+    /// A REF on a VarStore, whose value is an EFI_HII_REF (UEFI 2.11 §33.2.5.4.10)
+    CrossReference,
+}
+
+impl fmt::Display for BufferQuestion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OrderedList => f.write_str("the buffer of an ORDERED_LIST"),
+            Self::CrossReference => f.write_str("the EFI_HII_REF of a cross-reference question"),
+        }
+    }
+}
+
+/// An expression that gives a question its buffer or takes it, which uefisettings does not
+/// evaluate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum BufferExpression {
+    #[error("its READ expression gives {0}, which uefisettings does not evaluate")]
+    Read(BufferQuestion),
+    #[error("its WRITE expression takes {0}, which uefisettings does not evaluate")]
+    Write(BufferQuestion),
+    #[error("its EFI_IFR_VALUE expression gives {0}, which uefisettings does not evaluate")]
+    Value(BufferQuestion),
+}
+
+/// Where a ONE_OF, NUMERIC, CHECKBOX, DATE, TIME, ORDERED_LIST or REF keeps its value in the
+/// payload of its VarStore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ValueLocation {
     /// `size` bytes from byte `offset`, little-endian
@@ -1613,6 +1645,39 @@ fn read_question_bytes<'a>(
             offset,
             len: bytes.len(),
         })
+}
+
+/// The bytes of the location of `question`, a `buffer` on `varstore`, read through `reader`
+/// (read_sourced_bytes), and where they come from, or why get takes none: an expression that would
+/// give them, or how a question without a VarStore has no value.
+pub(super) fn read_buffer(
+    question: &Rc<RefCell<IFROperation>>,
+    buffer: BufferQuestion,
+    varstore: &Result<Box<dyn VariableStore>>,
+    reader: &mut EfivarReader,
+) -> std::result::Result<(Vec<u8>, ValueSource), ValueUnavailable> {
+    // the browser takes EFI_IFR_VALUE first (edk2-stable202608 SetupBrowserDxe/Setup.c
+    // GetQuestionValue)
+    if question_value_expression(&question.borrow()).is_some() {
+        return Err(ValueUnavailable::BufferExpression(BufferExpression::Value(
+            buffer,
+        )));
+    }
+    let storageless = varstore
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<NoVarStore>());
+    if let Some(NoVarStore(storageless)) = storageless {
+        if let Some(refusal) = storageless.refusal(QuestionExpression::Read, reader.reach()) {
+            return Err(ValueUnavailable::Storageless(refusal));
+        }
+    }
+    if question_expression(question, QuestionExpression::Read).is_some() {
+        return Err(ValueUnavailable::BufferExpression(BufferExpression::Read(
+            buffer,
+        )));
+    }
+    read_sourced_bytes(&question.borrow(), varstore, reader)
 }
 
 /// The little-endian integer that `bytes`, the value_bytes of a question, store.

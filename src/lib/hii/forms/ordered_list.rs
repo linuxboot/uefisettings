@@ -21,27 +21,24 @@ use binrw::BinRead;
 use thiserror::Error;
 
 use super::conditions::option_state;
-use super::conditions::question_expression;
-use super::conditions::question_value_expression;
 use super::conditions::ExpressionInputs;
 use super::conditions::IncludedStates;
-use super::conditions::QuestionExpression;
 use super::conditions::QuestionValues;
 use super::conditions::StateEvaluation;
+use super::defaults::buffer_defaults;
 use super::defaults::is_ordered_list_default;
-use super::defaults::list_defaults;
 use super::defaults::option_value;
 use super::defaults::push_default;
 use super::defaults::question_scope;
 use super::question_values::shown_option;
 use super::set::ChangeValueError;
-use super::storage::read_sourced_bytes;
+use super::storage::read_buffer;
 use super::storage::stored_value;
+use super::storage::BufferExpression;
+use super::storage::BufferQuestion;
 use super::storage::ValueLocation;
 use super::storage::ValueSource;
-use super::storage::ValueUnavailable;
 use super::storage::VariableStore;
-use super::storageless::NoVarStore;
 use super::AnswerOption;
 use super::FormSetWalk;
 use super::IFROperation;
@@ -56,7 +53,6 @@ use super::EFI_IFR_TYPE_NUM_SIZE_16;
 use super::EFI_IFR_TYPE_NUM_SIZE_32;
 use super::EFI_IFR_TYPE_NUM_SIZE_64;
 use crate::hii::strings::ListTexts;
-use crate::hii::variables::EfivarReader;
 
 /// EFI_IFR_UNIQUE_SET and EFI_IFR_NO_EMPTY_SET (UEFI 2.11 §33.3.8.3.53).
 const EFI_IFR_UNIQUE_SET: u8 = 0x01;
@@ -201,21 +197,6 @@ pub(super) fn items_answer(options: &[&AnswerOption]) -> String {
     list_text(&items)
 }
 
-/// An expression that gives an ORDERED_LIST its value or takes it, a buffer, which uefisettings
-/// does not evaluate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub(crate) enum ListExpression {
-    #[error("its READ expression gives the buffer of an ORDERED_LIST, which uefisettings does not evaluate")]
-    Read,
-    #[error("its WRITE expression takes the buffer of an ORDERED_LIST, which uefisettings does not evaluate")]
-    Write,
-    #[error(
-        "its EFI_IFR_VALUE expression gives the buffer of an ORDERED_LIST, which uefisettings \
-         does not evaluate"
-    )]
-    Value,
-}
-
 /// Why set refuses to give an ORDERED_LIST, or another question, a value.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ListRefusal {
@@ -266,7 +247,7 @@ pub(crate) enum ListRefusal {
     #[error("its items cannot be read, so set cannot keep those of hidden options: {0}")]
     StoredUnread(String),
     #[error("{0}")]
-    Expression(ListExpression),
+    Expression(BufferExpression),
 }
 
 impl ListRefusal {
@@ -454,34 +435,6 @@ fn list_options(
         .collect()
 }
 
-/// The bytes of the location of the ORDERED_LIST `question` on `varstore`, read through
-/// `reader` (read_sourced_bytes), and where they come from, or why get takes none: an expression
-/// that would give them, or how a question without a VarStore has no value.
-fn read_list(
-    question: &Rc<RefCell<IFROperation>>,
-    varstore: &anyhow::Result<Box<dyn VariableStore>>,
-    reader: &mut EfivarReader,
-) -> Result<(Vec<u8>, ValueSource), ValueUnavailable> {
-    // the browser takes EFI_IFR_VALUE first (edk2-stable202608 SetupBrowserDxe/Setup.c
-    // GetQuestionValue)
-    if question_value_expression(&question.borrow()).is_some() {
-        return Err(ValueUnavailable::OrderedList(ListExpression::Value));
-    }
-    let storageless = varstore
-        .as_ref()
-        .err()
-        .and_then(|error| error.downcast_ref::<NoVarStore>());
-    if let Some(NoVarStore(storageless)) = storageless {
-        if let Some(refusal) = storageless.refusal(QuestionExpression::Read, reader.reach()) {
-            return Err(ValueUnavailable::Storageless(refusal));
-        }
-    }
-    if question_expression(question, QuestionExpression::Read).is_some() {
-        return Err(ValueUnavailable::OrderedList(ListExpression::Read));
-    }
-    read_sourced_bytes(&question.borrow(), varstore, reader)
-}
-
 /// The answer that show-ifr shows for the ORDERED_LIST `question` of the op `node` on
 /// `varstore`: its items as get shows them, or why it has none.
 pub(super) fn display_list_answer(
@@ -492,7 +445,7 @@ pub(super) fn display_list_answer(
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> String {
     let options = list_options(&node.borrow(), texts, inputs);
-    match read_list(node, varstore, inputs.reader) {
+    match read_buffer(node, BufferQuestion::OrderedList, varstore, inputs.reader) {
         Ok((bytes, source)) => {
             let items: Vec<Item<'_>> = question
                 .containers(&bytes)
@@ -517,7 +470,13 @@ pub(super) fn handle_ordered_list(
 ) -> QuestionDescriptor {
     let current_node = &node.borrow();
     let possible_options = list_options(current_node, walk.texts, &mut walk.inputs);
-    let (stored, value_source) = match read_list(node, &varstore, walk.inputs.reader) {
+    let read = read_buffer(
+        node,
+        BufferQuestion::OrderedList,
+        &varstore,
+        walk.inputs.reader,
+    );
+    let (stored, value_source) = match read {
         Ok((bytes, source)) => (Ok(question.containers(&bytes)), source),
         Err(reason) => (Err(reason), ValueSource::Current),
     };
@@ -532,8 +491,9 @@ pub(super) fn handle_ordered_list(
         Err(reason) => reason.to_answer(),
     };
     let stores = walk.default_stores.of(current_node, &mut walk.inputs);
-    let defaults = list_defaults(
+    let defaults = buffer_defaults(
         current_node,
+        BufferQuestion::OrderedList,
         stores,
         walk.texts,
         &mut walk.inputs,

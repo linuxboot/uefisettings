@@ -35,8 +35,10 @@ use uefisettings_qemu_guest::driver_sample::ONE_OF_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF_PROMPT;
 use uefisettings_qemu_guest::driver_sample::ONE_OF_PROMPT_FR_FR;
 use uefisettings_qemu_guest::driver_sample::PICK_1;
+use uefisettings_qemu_guest::driver_sample::REF_DATA_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
+use uefisettings_qemu_guest::driver_sample::UPDATE_DEST;
 use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::published_database;
@@ -54,6 +56,7 @@ use uefisettings_qemu_guest::EFAULT;
 use uefisettings_qemu_guest::EFIVARFS_HEADER_SIZE;
 use uefisettings_qemu_guest::MY_EFI_VAR;
 use uefisettings_qemu_guest::MY_EFI_VAR_QUESTION;
+use uefisettings_qemu_guest::PREFIXES;
 use uefisettings_qemu_guest::UNAVAILABLE;
 
 /// Linux's SIGBUS on arm64 (`include/uapi/asm-generic/signal.h`).
@@ -377,6 +380,60 @@ fn list_questions_lists_ordered_lists_with_their_items() {
         ],
         "{INCLUDE_ALL:?}"
     );
+}
+
+/// get shows the EFI_HII_REF that DriverSample's cross-reference question UPDATE_DEST holds at
+/// RefData of its variable: its QuestionId, FormId and FormSetGuid, and its DevicePath, none for
+/// string 0, else the text of that string, quoted. A SUPPRESS_IF hides its form.
+#[test]
+fn get_shows_the_efi_hii_ref_of_a_cross_reference_question() {
+    let data = variable_data(DRIVER_SAMPLE_VARIABLE).expect("the variable does not exist");
+    let stored = &data[REF_DATA_OFFSET..REF_DATA_OFFSET + 22];
+    let field = |at: usize| u16::from_le_bytes([stored[at], stored[at + 1]]);
+    let guid = format!(
+        "{:08X}-{:04X}-{:04X}-{}-{}",
+        u32::from_le_bytes([stored[4], stored[5], stored[6], stored[7]]),
+        field(8),
+        field(10),
+        hex(&stored[12..14]),
+        hex(&stored[14..20]),
+    );
+    let device_paths: Vec<String> = match field(20) {
+        0 => vec!["none".to_owned()],
+        id => {
+            let packages: Vec<StringPackage> = json(&["hii", "list-strings", "--json"]);
+            packages
+                .iter()
+                .filter_map(|package| package.string_package.get(&id.to_string()))
+                .map(|text| format!("{text:?}"))
+                .collect()
+        }
+    };
+    for prefix in PREFIXES {
+        let (got, _) = single_response(
+            &[prefix, &["get", UPDATE_DEST, "--json"], &INCLUDE_SUPPRESSED].concat(),
+            BACKEND_HII,
+        );
+        let device_path = got
+            .answer
+            .strip_prefix(&format!(
+                "QuestionId {:#06x}, FormId {:#06x}, FormSetGuid {guid}, DevicePath ",
+                field(0),
+                field(2),
+            ))
+            .and_then(|rest| rest.strip_suffix(" <suppressed>"));
+        assert!(
+            device_path.is_some_and(|device_path| device_paths.iter().any(|d| d == device_path)),
+            "{prefix:?}: {got:#?}, stored {stored:02x?}, DevicePath one of {device_paths:?}"
+        );
+        assert_eq!(got.options, Vec::<String>::new(), "{prefix:?}");
+        assert_eq!(got.items, None, "{prefix:?}");
+    }
+}
+
+/// The bytes, in upper-case hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 #[test]

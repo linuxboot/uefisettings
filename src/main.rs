@@ -261,7 +261,7 @@ enum HiiSubcommands {
         #[command(flatten)]
         output: JsonArgs,
     },
-    /// List the one-of, numeric, checkbox, date, time and ordered-list questions of the HiiDB, whose values get reads.
+    /// List the one-of, numeric, checkbox, date, time and ordered-list questions of the HiiDB, and its cross-reference questions on a VarStore, whose values get reads; set does not write a cross-reference's value, the target of its link.
     #[command(next_display_order = None)]
     ListQuestions {
         #[command(flatten)]

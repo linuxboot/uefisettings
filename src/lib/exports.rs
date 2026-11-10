@@ -1518,6 +1518,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::PASSWORD;
     use crate::hii::forms::ifr_fixtures::QUESTION_REF1;
     use crate::hii::forms::ifr_fixtures::READ;
+    use crate::hii::forms::ifr_fixtures::REF;
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
@@ -2721,8 +2722,8 @@ mod tests {
         }
     }
 
-    /// A keyword that prompts a DATE, TIME or ORDERED_LIST of a FormSet and a CHECKBOX outside any
-    /// FormSet selects neither, as for a CHECKBOX of the FormSet
+    /// A keyword that prompts a DATE, TIME, ORDERED_LIST or REF of a FormSet and a CHECKBOX outside
+    /// any FormSet selects neither, as for a CHECKBOX of the FormSet
     /// (keywords_that_prompt_a_statement_outside_a_form_set_are_refused): get and set refuse it,
     /// and set writes nothing.
     #[test]
@@ -2754,6 +2755,11 @@ mod tests {
                 ]
                 .concat(),
                 SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+            ),
+            (
+                "REF",
+                operation(REF, false, &header),
+                SetValue::Text("x".to_owned()),
             ),
         ];
         let refusal = KeywordRefusal::AmbiguousStatements {
@@ -3225,6 +3231,70 @@ mod tests {
         );
     }
 
+    /// list-questions and show-ifr show the prompt and the help of a REF on a VarStore, and the
+    /// text of its DevicePath, in the platform language, else in the first display language,
+    /// never in the configuration language before them.
+    #[test]
+    fn cross_references_show_their_texts_in_the_platform_language() {
+        let data = question_header_with(0x8001, 3, 1, 0, 0x00);
+        let en_us = ["Link", "Link help", "Path"];
+        let fr_fr = ["Lien", "Aide du lien", "Chemin"];
+        let hiidb = translated_question_hiidb(operation(REF, false, &data), 22, &en_us, &fr_fr);
+        let stored = [&[5, 0, 1, 0][..], &[0x11; 16], &[5, 0]].concat();
+        for (platform_lang, [name, help, path]) in [(None, en_us), (Some("fr-FR"), fr_fr)] {
+            let (listed, shown) = listed_and_shown(&hiidb, &stored, platform_lang);
+
+            let answer = format!(
+                "QuestionId 0x0005, FormId 0x0001, FormSetGuid \
+                 11111111-1111-1111-1111-111111111111, DevicePath {path:?}"
+            );
+            let listed: Vec<[String; 3]> = listed
+                .into_iter()
+                .map(|question| [question.name, question.help, question.answer])
+                .collect();
+            assert_eq!(
+                listed,
+                [[name, help, &answer].map(str::to_owned)],
+                "{platform_lang:?}: list-questions"
+            );
+            for line in [
+                format!("Q: {name} - Help: {help}\n"),
+                format!("-Answer: {answer}\n"),
+            ] {
+                assert!(
+                    shown.contains(&line),
+                    "{platform_lang:?}: show-ifr shows {line:?}: {shown}"
+                );
+            }
+        }
+    }
+
+    /// get by QuestionId and by keyword answers a REF on a VarStore as by prompt, its DevicePath
+    /// a string of the display language, and set by each refuses it alike, writing nothing.
+    #[test]
+    fn cross_references_select_by_question_id_or_keyword_as_by_prompt() {
+        let data = question_header_with(0x8001, 3, 1, 0, 0x00);
+        let hiidb = keyed_question_hiidb(operation(REF, false, &data), 22, &["Path"]);
+        let stored = [&[5, 0, 1, 0][..], &[0x11; 16], &[6, 0]].concat();
+        assert_answered_by_each_selector(
+            &hiidb,
+            &stored,
+            &SetValue::Text("x".to_owned()),
+            &Answered {
+                got: vec!["QuestionId 0x0005, FormId 0x0001, FormSetGuid \
+                     11111111-1111-1111-1111-111111111111, DevicePath \"Path\""
+                    .to_owned()],
+                set: Err(
+                    "cannot set question \"Keyed\": set does not write the EFI_HII_REF of \
+                          a cross-reference question, the target of its link (UEFI 2.11 \
+                          §33.2.5.4.10)"
+                        .to_owned(),
+                ),
+                writes: vec![],
+            },
+        );
+    }
+
     /// A HiiDB whose FormSet holds the CHECKBOXes 0xA at byte 0 and 0x14 at byte 1 of Setup,
     /// prompted "First" and "Second" in en-US, of which x-UEFI-ns names 0xA "Foo" and x-UEFI-AMI
     /// names 0x14 "Foo".
@@ -3432,10 +3502,11 @@ mod tests {
     }
 
     /// get and set weigh every listed question of a --keyword in its namespaces, an ORDERED_LIST
-    /// as a CHECKBOX (get_and_set_refuse_a_keyword_of_questions_in_different_namespaces): they
-    /// refuse a keyword that names one in each of two package lists, of x-UEFI-ns and
-    /// x-UEFI-AMI, naming each, and set --item writes nothing; under x-UEFI-ns they select the
-    /// first list's alone, and set --item writes it.
+    /// or a REF on a VarStore as a CHECKBOX
+    /// (get_and_set_refuse_a_keyword_of_questions_in_different_namespaces): they refuse a keyword
+    /// that names one in each of two package lists, of x-UEFI-ns and x-UEFI-AMI, naming each, and
+    /// set --item writes nothing; under x-UEFI-ns they select the first list's alone, and set
+    /// --item writes the ORDERED_LIST and refuses the REF, as for any REF.
     #[test]
     fn get_and_set_weigh_every_listed_question_in_the_namespaces_of_a_keyword() {
         let other = "8C78A505-BAA0-4C4A-869F-000000000803";
@@ -3458,16 +3529,37 @@ mod tests {
             ]
             .concat()
         };
-        let cases = [(
-            "ORDERED_LIST",
-            keyword_in_two_lists_hiidb_of(b"x-UEFI-ns", b"x-UEFI-AMI", 2, ordered_list),
-            &[0, 0][..],
-            Selected {
-                got: first.clone(),
-                set: Ok(first),
-                writes: vec![(0, vec![1])],
-            },
-        )];
+        // an EFI_IFR_REF5 on Setup
+        let reference =
+            |offset| operation(REF, false, &question_header_with(0xA, 1, 1, offset, 0x00));
+        let cases = [
+            (
+                "ORDERED_LIST",
+                keyword_in_two_lists_hiidb_of(b"x-UEFI-ns", b"x-UEFI-AMI", 2, ordered_list),
+                &[0, 0][..],
+                Selected {
+                    got: first.clone(),
+                    set: Ok(first.clone()),
+                    writes: vec![(0, vec![1])],
+                },
+            ),
+            (
+                "REF",
+                // its 22 bytes at byte 1 of the second list's Setup
+                keyword_in_two_lists_hiidb_of(b"x-UEFI-ns", b"x-UEFI-AMI", 23, reference),
+                &[0; 23][..],
+                Selected {
+                    got: first,
+                    set: Err(
+                        "cannot set question \"First\": set does not write the EFI_HII_REF \
+                              of a cross-reference question, the target of its link (UEFI 2.11 \
+                              §33.2.5.4.10)"
+                            .to_owned(),
+                    ),
+                    writes: vec![],
+                },
+            ),
+        ];
         let items = SetValue::Items(vec!["On".to_owned()]);
         for (kind, hiidb, stored, under_ns) in cases {
             assert_eq!(
@@ -3624,9 +3716,9 @@ mod tests {
         );
     }
 
-    /// get and set refuse a --question-id that an ORDERED_LIST shares with a NUMERIC of its
-    /// FormSet, naming both, as for two CHECKBOXes (get_and_set_refuse_a_question_id_of_two_questions);
-    /// set writes nothing.
+    /// get and set refuse a --question-id that an ORDERED_LIST or a REF on a VarStore shares with
+    /// a NUMERIC of its FormSet, naming both, as for two CHECKBOXes
+    /// (get_and_set_refuse_a_question_id_of_two_questions); set writes nothing.
     #[test]
     fn get_and_set_refuse_a_question_id_that_a_listed_question_shares() {
         // a UINT8 NUMERIC "First" of QuestionId 7 at byte 0 of Setup
@@ -3637,16 +3729,24 @@ mod tests {
         .concat();
         // an ORDERED_LIST "Second" of QuestionId 7 at byte 1, of one UINT8 container
         let list = [question_header_with(7, 2, 1, 1, 0x00), vec![1, 0x00]].concat();
-        let cases = [(
-            "ORDERED_LIST",
-            2,
-            [
-                operation(ORDERED_LIST, true, &list),
-                flagged_option(3, 0x00, 1),
-                END.to_vec(),
-            ]
-            .concat(),
-        )];
+        let cases = [
+            (
+                "ORDERED_LIST",
+                2,
+                [
+                    operation(ORDERED_LIST, true, &list),
+                    flagged_option(3, 0x00, 1),
+                    END.to_vec(),
+                ]
+                .concat(),
+            ),
+            (
+                "REF",
+                // an EFI_IFR_REF5 "Second" of QuestionId 7, its 22 bytes at byte 1
+                23,
+                operation(REF, false, &question_header_with(7, 2, 1, 1, 0x00)),
+            ),
+        ];
         for (kind, size, question) in cases {
             let packages = [
                 form_package_with_guid(
@@ -10078,6 +10178,35 @@ mod tests {
         );
     }
 
+    /// A REF on a VarStore whose variable is missing shows the EFI_HII_REF that the snapshot
+    /// holds, tagged, as get shows other values.
+    #[test]
+    fn cross_references_show_snapshot_values() {
+        // an EFI_IFR_REF5 at byte 0 of NStore
+        let reference = operation(REF, false, &question_header_with(1, 1, 1, 0, 0x00));
+        let hiidb = n_store_hiidb(22, &[reference], &["R"]);
+        // QuestionId 5, FormId 1, FormSetGuid N_GUID, DevicePath 0
+        let stored = [
+            &5u16.to_le_bytes()[..],
+            &1u16.to_le_bytes(),
+            &N_GUID,
+            &0u16.to_le_bytes(),
+        ]
+        .concat();
+
+        let (got, listed, ifr, _) =
+            answers_with_snapshot(&hiidb, &["R"], &no_variables(), &n_store_snapshot(&stored));
+
+        let want = "QuestionId 0x0005, FormId 0x0001, FormSetGuid \
+            8C78A505-BAA0-4C4A-869F-000000001401, DevicePath none <snapshot>";
+        assert_eq!(got, [want], "get");
+        assert_eq!(listed, [want], "list-questions");
+        assert!(
+            ifr.contains(&format!("-Answer: {want}\n")),
+            "show-ifr: {ifr}"
+        );
+    }
+
     /// Reading a snapshot logs none of its bytes, at any level, also when it is no
     /// <MultiConfigAltResp> or holds a <ConfigAltResp> that does not parse.
     #[test]
@@ -11229,6 +11358,62 @@ mod tests {
             [],
             "writes to AMITSESetup"
         );
+    }
+
+    /// A REF on a VARSTORE_EFI before UEFI 2.3.1 is refused by name, as a STRING there is:
+    /// uefisettings reads no EFI_HII_REF of the variable of a VarName.
+    #[test]
+    fn cross_references_of_a_short_var_store_are_refused() {
+        // an EFI_IFR_REF5 of prompt "R", string 1, on the VarName 2
+        let reference = operation(REF, false, &question_header_with(1, 1, 1, 2, 0x00));
+        let hiidb = short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, &[reference]),
+            ],
+            &[en_strings_package_of(&["R", "ShortRef"])],
+        );
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(short_key("ShortRef"), NV_BS_RT, &[0; 22]);
+        let variables = Rc::new(variables);
+
+        assert_eq!(
+            answers_of(&hiidb, "R", &variables),
+            [
+                "<ValueUnavailable: VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): \
+              uefisettings reads no EFI_IFR_REF on it>"
+            ],
+            "get"
+        );
+    }
+
+    /// A REF over the bytes of a PASSWORD outside any FormSet of its VarStoreId keeps them
+    /// withheld, as a NUMERIC does: get answers that its bytes hold a password.
+    #[test]
+    fn cross_references_keep_an_outside_password_withheld() {
+        // an EFI_IFR_REF5 at byte 0 of AMITSESetup
+        let reference = operation(REF, false, &question_header_with(4, 4, 2, 0, 0x00));
+        let packages = [
+            form_package_of(
+                &[
+                    password_on(3, 3, 2, 0),
+                    form_set(&[
+                        var_store(2, [0x44; 16], "AMITSESetup", 81),
+                        form(1, &[reference]),
+                    ]),
+                ]
+                .concat(),
+            ),
+            en_strings_package_of(&["Q", "P", "Password", "R"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let stored = [plaintext_password().as_slice(), &[0xAA; 40], &[1]].concat();
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(amitse_setup(), NV_BS_RT, &stored);
+        let variables = Rc::new(variables);
+
+        assert_eq!(answers_of(&hiidb, "R", &variables), [PASSWORD_BYTES], "get");
     }
 
     /// Two VARSTORE_EFIs before UEFI 2.3.1 of two Guids each take the VarNames of their questions

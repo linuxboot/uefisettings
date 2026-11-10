@@ -36,6 +36,8 @@ use super::conditions::QuestionValues;
 #[cfg(efivar_dumps)]
 use super::conditions::VarStoreValues;
 #[cfg(efivar_dumps)]
+use super::cross_reference::handle_cross_reference;
+#[cfg(efivar_dumps)]
 use super::ordered_list::handle_ordered_list;
 #[cfg(efivar_dumps)]
 use super::ordered_list::OrderedListQuestion;
@@ -84,6 +86,7 @@ pub(crate) const PASSWORD: u8 = 0x08;
 pub(crate) const DATE: u8 = 0x1A;
 pub(crate) const TIME: u8 = 0x1B;
 pub(crate) const ORDERED_LIST: u8 = 0x23;
+pub(crate) const REF: u8 = 0x0F;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
 pub(crate) const GRAY_OUT_IF: u8 = 0x19;
@@ -1024,6 +1027,9 @@ fn describe(
             node,
             walk,
         ),
+        ParsedOperation::Ref(parsed) => {
+            handle_cross_reference(store, parsed, "", flags, node, walk)
+        }
         other => panic!("not a question: {other:?}"),
     }
 }

@@ -61,6 +61,8 @@ use conditions::ExpressionInputs;
 use conditions::QuestionExpression;
 use conditions::QuestionValues;
 use conditions::VarStoreValues;
+use cross_reference::display_ref_answer;
+use cross_reference::CrossReference;
 use date_time::widened_date;
 use date_time::widened_time;
 use date_time::DateTimeInput;
@@ -141,6 +143,7 @@ pub(crate) use setup_password::UnresolvedPassword;
 
 mod ami_access_level;
 mod conditions;
+mod cross_reference;
 mod date_time;
 mod defaults;
 #[cfg(test)]
@@ -1007,6 +1010,7 @@ pub enum ParsedOperation {
     Date(DateTimeQuestion),
     Time(DateTimeQuestion),
     OrderedList(OrderedList),
+    Ref(CrossReference),
     #[default]
     Placeholder,
 }
@@ -1558,10 +1562,13 @@ enum IfrDefaultValue {
     /// Of Type EFI_IFR_TYPE_BUFFER: every byte after Type, as edk2-stable202608
     /// SetupBrowserDxe/IfrParse.c:2335-2337 copies them
     Buffer(Vec<u8>),
+    /// Of Type EFI_IFR_TYPE_REF: every byte after Type, an EFI_HII_REF
+    Ref(Vec<u8>),
     /// Absent from EFI_IFR_DEFAULT_2 (Type EFI_IFR_TYPE_OTHER), whose value is a nested
     /// EFI_IFR_VALUE.
     InValueOp,
-    /// Of a Type other than numeric, boolean, date, time, string, buffer and EFI_IFR_TYPE_OTHER.
+    /// Of a Type other than numeric, boolean, date, time, string, buffer, EFI_IFR_TYPE_REF and
+    /// EFI_IFR_TYPE_OTHER.
     NotDecoded,
     /// Length leaves no room for a value of Type.
     Missing,
@@ -1597,12 +1604,13 @@ fn default_value_parser<R: Read + Seek>(
             Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
             Err(error) => Err(error),
         },
-        EFI_IFR_TYPE_BUFFER => {
+        EFI_IFR_TYPE_BUFFER | EFI_IFR_TYPE_REF => {
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes)?;
-            Ok(match bytes.is_empty() {
-                true => IfrDefaultValue::Missing,
-                false => IfrDefaultValue::Buffer(bytes),
+            Ok(match (bytes.is_empty(), args.0) {
+                (true, _) => IfrDefaultValue::Missing,
+                (false, EFI_IFR_TYPE_REF) => IfrDefaultValue::Ref(bytes),
+                (false, _) => IfrDefaultValue::Buffer(bytes),
             })
         }
         EFI_IFR_TYPE_OTHER => Ok(IfrDefaultValue::InValueOp),
@@ -1776,6 +1784,7 @@ impl Date {
     }
 }
 
+/// An EFI_HII_REF (UEFI 2.11 §33.3.8.3.51).
 #[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 pub struct Ref {
@@ -1783,6 +1792,22 @@ pub struct Ref {
     pub form_id: u16,
     pub form_set_guid: Guid,
     pub device_path_string_id: u16,
+}
+
+impl Ref {
+    /// The bytes of one, as stored.
+    pub(crate) const SIZE: u16 = 22;
+
+    pub(crate) fn from_bytes(bytes: [u8; Self::SIZE as usize]) -> Self {
+        let [question_low, question_high, form_low, form_high, guid @ .., path_low, path_high] =
+            bytes;
+        Self {
+            question_id: u16::from_le_bytes([question_low, question_high]),
+            form_id: u16::from_le_bytes([form_low, form_high]),
+            form_set_guid: Guid::from(guid),
+            device_path_string_id: u16::from_le_bytes([path_low, path_high]),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -3294,6 +3319,11 @@ fn handle_opcode(node: &mut IFROperation) -> Result<()> {
             Ok(parsed) => node.parsed_data = ParsedOperation::OrderedList(parsed),
             Err(error) => debug!("leaving an OrderedList undecoded: {error}"),
         },
+        // and a REF
+        IFROpCode::Ref => match data_cursor.parse_ne() {
+            Ok(parsed) => node.parsed_data = ParsedOperation::Ref(parsed),
+            Err(error) => debug!("leaving a Ref undecoded: {error}"),
+        },
         _ => (),
     }
 
@@ -3346,6 +3376,8 @@ enum TextInput {
     DateTime(DateTimeInput),
     /// An ORDERED_LIST, which takes options as items instead
     OrderedList(ListInput),
+    /// A REF on a VarStore, whose EFI_HII_REF set does not write
+    CrossReference,
 }
 
 #[derive(Debug)]
@@ -3434,7 +3466,10 @@ impl QuestionDescriptor {
     pub(crate) fn items(&self) -> Option<Vec<String>> {
         match &self.input {
             TextInput::OrderedList(input) => input.items(&self.possible_options),
-            TextInput::Range(_) | TextInput::Maximum(_) | TextInput::DateTime(_) => None,
+            TextInput::Range(_)
+            | TextInput::Maximum(_)
+            | TextInput::DateTime(_)
+            | TextInput::CrossReference => None,
         }
     }
 
@@ -4858,6 +4893,22 @@ fn display_op(
             );
         }
 
+        ParsedOperation::Ref(parsed) if parsed.question_header.var_store_id != 0 => {
+            let header = parsed.question_header();
+            let varstore = find_corresponding_varstore(Rc::clone(node), header.var_store_id);
+            let answer_disp = display_ref_answer(node, &varstore, texts, inputs);
+
+            result.push_str(
+                format!(
+                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-Answer: {answer_disp}\n",
+                    current_node.op_code,
+                    texts.display(header.prompt_string_id),
+                    texts.display(header.help_string_id),
+                )
+                .as_str(),
+            );
+        }
+
         // TODO: we have already made structs for the most popular opcodes so we should finish the display function for them
         // however display is only for debugging and a visual representation of the forms for humans
         _ => result
@@ -5056,6 +5107,7 @@ fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
         | ParsedOperation::Date(_)
         | ParsedOperation::Time(_)
         | ParsedOperation::OrderedList(_)
+        | ParsedOperation::Ref(_)
         | ParsedOperation::Placeholder => None,
     }
 }

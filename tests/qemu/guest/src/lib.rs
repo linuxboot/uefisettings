@@ -175,6 +175,12 @@ pub mod driver_sample {
     /// "#2" and "#3" store 3, 2 and 1, which the form disables while SuppressGrayOutSomething is
     /// 2, and of a selectable one-of question after it, which get and set select instead.
     pub const PICK_1: &str = "Pick 1";
+    /// A cross-reference question on the variable's EFI_HII_REF at [`REF_DATA_OFFSET`], in the
+    /// form that [`INCLUDE_SUPPRESSED`] selects.
+    pub const UPDATE_DEST: &str = "Update dest through retrieve";
+    /// Offset of the 22-byte EFI_HII_REF of [`UPDATE_DEST`], RefData in DriverSample's
+    /// NVDataStruc.h.
+    pub const REF_DATA_OFFSET: usize = 127;
 }
 
 /// How a `uefisettings` run exited, and what it printed.

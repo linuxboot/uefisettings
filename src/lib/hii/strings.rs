@@ -280,7 +280,9 @@ impl<'a> ListTexts<'a> {
 
     /// The text of the string `id`: the chosen package's, else that of the first package of no
     /// configuration language that holds it, else "" (edk2-stable202608 SetupBrowserDxe
-    /// GetToken shows "!"), as a firmware may leave a string untranslated or out.
+    /// GetToken shows "!"), as a firmware may leave a string untranslated or out. Unlike
+    /// shown_text, it takes the chosen package also where it is of a configuration language,
+    /// as for --language x-UEFI-ns, whose prompts are the keywords.
     pub(crate) fn display(&self, id: u16) -> &'a str {
         let text = self
             .chosen

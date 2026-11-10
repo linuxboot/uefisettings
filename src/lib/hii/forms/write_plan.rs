@@ -36,13 +36,14 @@ use super::conditions::PlannedSets;
 use super::conditions::QuestionExpression;
 use super::conditions::QuestionValue;
 use super::conditions::VarStoreValues;
-use super::ordered_list::ListExpression;
 use super::ordered_list::ListRefusal;
 use super::ordered_list::ListWrite;
 use super::set::own_write;
 use super::set::ChangeValueError;
 use super::set::NewValue;
 use super::set::VarStoreWrite;
+use super::storage::BufferExpression;
+use super::storage::BufferQuestion;
 use super::storage::VariableStore;
 use super::time_storage::value_changes;
 use super::time_storage::FieldChange;
@@ -132,7 +133,10 @@ impl<'a> WritePlan<'a> {
     ) -> Result<Self, ChangeValueError> {
         let store = question.store(reach)?;
         if question_expression(&question.node, QuestionExpression::Write).is_some() {
-            return Err(ListRefusal::Expression(ListExpression::Write).of(question));
+            return Err(ListRefusal::Expression(BufferExpression::Write(
+                BufferQuestion::OrderedList,
+            ))
+            .of(question));
         }
         let Some(store) = store else {
             return Err(ChangeValueError::Storageless {

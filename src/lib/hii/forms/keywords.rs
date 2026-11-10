@@ -306,8 +306,10 @@ enum TableType {
     /// Numeric, as wide as the value of the ONE_OF or NUMERIC
     Numeric,
     Fixed(FixedType),
-    /// None: the op is no question, or a PASSWORD, ACTION or REF, which the table leaves out
+    /// None: the op is no question, or a PASSWORD or ACTION, which the table leaves out
     Untyped,
+    /// None: a REF, which the table leaves out, whose value is an EFI_HII_REF
+    Reference,
 }
 
 /// A `<DataType>` of the table that no width qualifies.
@@ -341,7 +343,8 @@ impl TableType {
             IFROpCode::OrderedList => Self::Fixed(FixedType::Buffer),
             IFROpCode::Date => Self::Fixed(FixedType::Date),
             IFROpCode::Time => Self::Fixed(FixedType::Time),
-            IFROpCode::Password | IFROpCode::Action | IFROpCode::Ref => Self::Untyped,
+            IFROpCode::Password | IFROpCode::Action => Self::Untyped,
+            IFROpCode::Ref => Self::Reference,
             IFROpCode::Form
             | IFROpCode::Subtitle
             | IFROpCode::Text
@@ -750,9 +753,10 @@ impl<'a> KeywordQuestion<'a> {
                 // a CHECKBOX has no NumericRange, nor a NUMERIC bit field, which own_write refuses
                 text = match &descriptor.input {
                     TextInput::Range(range) => range.format.decode(number).to_string(),
-                    TextInput::Maximum(_) | TextInput::DateTime(_) | TextInput::OrderedList(_) => {
-                        number.to_string()
-                    }
+                    TextInput::Maximum(_)
+                    | TextInput::DateTime(_)
+                    | TextInput::OrderedList(_)
+                    | TextInput::CrossReference => number.to_string(),
                 };
                 NewValue::Text(&text)
             }
@@ -857,7 +861,7 @@ impl<'a> KeywordQuestion<'a> {
                 Some(ValueQuestion::CheckBox(_) | ValueQuestion::DateTime(_)) | None => None,
             },
             TableType::Fixed(fixed) => Some(fixed.into()),
-            TableType::Untyped => None,
+            TableType::Untyped | TableType::Reference => None,
         };
         data_type.ok_or_else(|| KeywordInfoRefusal::NoDataType {
             keyword: self.keyword.to_string(),
@@ -976,8 +980,8 @@ impl<'a> KeywordQuestion<'a> {
     /// the CHAR16s of display's language, zero-padded to MaxSize CHAR16s, as edk2-stable202608
     /// SetupBrowserDxe/Setup.c:4501-4512 stores it in a storage of MaxSize × 2 bytes
     /// (IfrParse.c:2225); an ORDERED_LIST's buffer (Setup.c:4493-4495), whose missing containers
-    /// are 0 (UEFI 2.11 §33.2.5.4.8). Refuses a default that does not fit, of another type, or of
-    /// a PASSWORD, ACTION or REF, which the table leaves out.
+    /// are 0 (UEFI 2.11 §33.2.5.4.8); a REF's EFI_HII_REF. Refuses a default that does not fit,
+    /// of another type, or of a PASSWORD or ACTION, which the table leaves out.
     fn default_number(
         &self,
         op: &IFROperation,
@@ -1005,6 +1009,7 @@ impl<'a> KeywordQuestion<'a> {
             {
                 bytes
             }
+            (TableType::Reference, TypedDefault::Ref(bytes)) => bytes,
             (
                 TableType::Numeric
                 | TableType::Fixed(
@@ -1013,17 +1018,22 @@ impl<'a> KeywordQuestion<'a> {
                     | FixedType::Buffer
                     | FixedType::Date
                     | FixedType::Time,
-                ),
+                )
+                | TableType::Reference,
                 value @ (TypedDefault::Number(_)
                 | TypedDefault::String(_)
-                | TypedDefault::Buffer(_)),
+                | TypedDefault::Buffer(_)
+                | TypedDefault::Ref(_)),
             ) => {
                 let reason = format!("{name} holds no {value:?}");
                 return Err(self.default_refusal(default_id, reason));
             }
             (
                 TableType::Untyped,
-                TypedDefault::Number(_) | TypedDefault::String(_) | TypedDefault::Buffer(_),
+                TypedDefault::Number(_)
+                | TypedDefault::String(_)
+                | TypedDefault::Buffer(_)
+                | TypedDefault::Ref(_),
             ) => {
                 let reason = format!("uefisettings does not decode a default of {name}");
                 return Err(self.default_refusal(default_id, reason));
@@ -2310,6 +2320,26 @@ mod tests {
         );
     }
 
+    /// GetData() reads the EFI_HII_REF of a REF on a VarStore as stored, which check_get takes;
+    /// check_set refuses it, as set does.
+    #[test]
+    fn check_get_takes_a_ref_and_check_set_refuses_it() {
+        let op = || {
+            let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![1, 0]].concat();
+            operation(REF, false, &data)
+        };
+        let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], op())];
+        assert_eq!(question_of(&lists).check_get(&reader(1)), Ok(()), "get");
+        let error = check_set_of(op(), "03", IncludedStates::empty()).expect_err("set");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "keyword {KEYWORD}: uefisettings does not yet implement keyword set of EFI_IFR_REF"
+            ),
+            "set"
+        );
+    }
+
     /// GetData() and SetData() take the VarStore bytes of a DATE or TIME of EFI Date/Time Storage,
     /// whose value get and set read and write through the Time Services: both refuse it, the
     /// system time and the wake-up time.
@@ -3550,6 +3580,105 @@ mod tests {
                 ..KeywordInfo::default()
             }),
             "KEYWORDINFO: 1 1, zero-padded"
+        );
+    }
+
+    /// A REF of QuestionId 1 at OFFSET of VarStore 1 whose EFI_IFR_DEFAULT of DefaultId STANDARD
+    /// has Type `value_type` and Value `value`.
+    fn ref_with_default(value_type: u8, value: &[u8]) -> Vec<u8> {
+        // FormId 1
+        let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![1, 0]].concat();
+        [
+            operation(REF, true, &data),
+            typed_default(0x0000, value_type, value),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// An EFI_HII_REF: QuestionId 5, FormId 1, FormSetGuid 11111111-1111-1111-1111-111111111111
+    /// and DevicePath 0.
+    fn hii_ref_bytes() -> Vec<u8> {
+        [&[5, 0, 1, 0][..], &[0x11; 16], &[0, 0]].concat()
+    }
+
+    /// get and KEYWORDINFO answer one default of a REF: the EFI_HII_REF of its EFI_IFR_DEFAULT of
+    /// Type EFI_IFR_TYPE_REF.
+    #[test]
+    fn get_and_info_take_the_hii_ref_default_of_a_ref() {
+        let ops = ref_with_default(0x0C, &hii_ref_bytes()); // EFI_IFR_TYPE_REF
+        let lists = [info_list(ops.clone())];
+        let texts = ListTexts::new(&lists[0].strings, &[]);
+        let get: Vec<(DefaultId, String)> = list_questions(
+            Rc::clone(&lists[0].forms[0]),
+            &texts,
+            IncludedStates::empty(),
+            None,
+            &mut reader(1),
+        )
+        .into_iter()
+        .flat_map(|(descriptor, _)| descriptor.defaults)
+        .map(|default| (default.default_id, default.value.to_string()))
+        .collect();
+
+        assert_eq!(
+            get,
+            [(
+                DefaultId::STANDARD,
+                "QuestionId 0x0005, FormId 0x0001, FormSetGuid \
+                 11111111-1111-1111-1111-111111111111, DevicePath none"
+                    .to_owned()
+            )],
+            "get"
+        );
+        assert_eq!(
+            info_of(ops, KeywordInfoFilter::DEFAULT),
+            Ok(KeywordInfo {
+                standard_default: Some(number(&hii_ref_bytes())),
+                ..KeywordInfo::default()
+            }),
+            "KEYWORDINFO"
+        );
+    }
+
+    /// KEYWORDINFO refuses a default of a REF wider than an EFI_HII_REF, or of a Type other than
+    /// EFI_IFR_TYPE_REF, and gives a REF no `<DataType>`.
+    #[test]
+    fn info_refuses_a_ref_default_that_is_no_hii_ref() {
+        let refusal = |reason: &str| {
+            Err(KeywordInfoRefusal::Default {
+                keyword: KEYWORD.to_owned(),
+                default_id: DefaultId::STANDARD,
+                reason: reason.to_owned(),
+            })
+        };
+        let wider = [hii_ref_bytes(), vec![1]].concat();
+        let cases = [
+            (
+                "EFI_IFR_TYPE_REF of 23 bytes",
+                ref_with_default(0x0C, &wider),
+                refusal("it is wider than the question's 22 bytes"),
+            ),
+            (
+                "EFI_IFR_TYPE_NUM_SIZE_8 1",
+                ref_with_default(0x00, &[1]),
+                refusal("EFI_IFR_REF holds no Number(1)"),
+            ),
+        ];
+        for (name, ops, expected) in cases {
+            assert_eq!(info_of(ops, KeywordInfoFilter::DEFAULT), expected, "{name}");
+        }
+
+        assert_eq!(
+            info_of(
+                ref_with_default(0x0C, &hii_ref_bytes()),
+                KeywordInfoFilter::DATA_TYPE
+            ),
+            Err(KeywordInfoRefusal::NoDataType {
+                keyword: KEYWORD.to_owned(),
+                op: "EFI_IFR_REF",
+            }),
+            "DATATYPE"
         );
     }
 

@@ -28,6 +28,7 @@ use super::conditions::ExpressionInputs;
 use super::conditions::QuestionValues;
 use super::conditions::Truth;
 use super::is_bit_varstore_guid;
+use super::storage::BufferQuestion;
 use super::storage::ValueLocation;
 use super::walk_scopes;
 use super::IFRDefault;
@@ -122,6 +123,8 @@ pub(super) enum TypedDefault {
     /// Of Type EFI_IFR_TYPE_BUFFER, or the Value of a flagged option of an ORDERED_LIST, which
     /// UEFI 2.11 §33.2.5.4.8 makes "the default value for all Containers"
     Buffer(Vec<u8>),
+    /// Of Type EFI_IFR_TYPE_REF: an EFI_HII_REF (UEFI 2.11 §33.2.5.4.10)
+    Ref(Vec<u8>),
 }
 
 impl TypedDefault {
@@ -131,6 +134,7 @@ impl TypedDefault {
             Self::Number(number) => Ok(number),
             Self::String(_) => Err(DefaultError::NotNumber("EFI_IFR_TYPE_STRING")),
             Self::Buffer(_) => Err(DefaultError::NotNumber("EFI_IFR_TYPE_BUFFER")),
+            Self::Ref(_) => Err(DefaultError::NotNumber("EFI_IFR_TYPE_REF")),
         }
     }
 
@@ -140,6 +144,17 @@ impl TypedDefault {
             Self::Buffer(bytes) => Ok(bytes),
             Self::Number(_) => Err(DefaultError::NotBuffer("a number")),
             Self::String(_) => Err(DefaultError::NotBuffer("EFI_IFR_TYPE_STRING")),
+            Self::Ref(_) => Err(DefaultError::NotBuffer("EFI_IFR_TYPE_REF")),
+        }
+    }
+
+    /// The EFI_HII_REF, refused for a number, a string or a buffer, which no REF stores.
+    fn hii_ref(self) -> Result<Vec<u8>, DefaultError> {
+        match self {
+            Self::Ref(bytes) => Ok(bytes),
+            Self::Number(_) => Err(DefaultError::NotRef("a number")),
+            Self::String(_) => Err(DefaultError::NotRef("EFI_IFR_TYPE_STRING")),
+            Self::Buffer(_) => Err(DefaultError::NotRef("EFI_IFR_TYPE_BUFFER")),
         }
     }
 }
@@ -153,6 +168,8 @@ pub(super) enum DefaultError {
     NotNumber(&'static str),
     #[error("a default of {0} where the question stores a buffer")]
     NotBuffer(&'static str),
+    #[error("a default of {0} where the question stores an EFI_HII_REF")]
+    NotRef(&'static str),
     #[error("EFI_IFR_DEFAULT value missing")]
     DefaultValueMissing,
     #[error("EFI_IFR_DEFAULT_2 without EFI_IFR_VALUE")]
@@ -439,6 +456,7 @@ fn ifr_default_value(
                 .ok_or(DefaultError::DefaultType(default.value_type)),
             IfrDefaultValue::String(id) => Ok(TypedDefault::String(*id)),
             IfrDefaultValue::Buffer(bytes) => Ok(TypedDefault::Buffer(bytes.clone())),
+            IfrDefaultValue::Ref(bytes) => Ok(TypedDefault::Ref(bytes.clone())),
             IfrDefaultValue::InValueOp => Err(DefaultError::ValueOpMissing),
             IfrDefaultValue::NotDecoded => Err(DefaultError::DefaultType(default.value_type)),
             IfrDefaultValue::Missing => Err(DefaultError::DefaultValueMissing),
@@ -711,10 +729,12 @@ pub(super) fn push_default(
     }
 }
 
-/// Returns every default that the IFR declares for the ORDERED_LIST `question`, as
-/// question_default_values finds them, each a buffer that `text` shows.
-pub(super) fn list_defaults(
+/// Returns every default that the IFR declares for `question`, a question of `buffer`, as
+/// question_default_values finds them, each the buffer of an ORDERED_LIST or the EFI_HII_REF
+/// of a REF that `text` shows.
+pub(super) fn buffer_defaults(
     question: &IFROperation,
+    buffer: BufferQuestion,
     stores: &DefaultStores,
     texts: &ListTexts<'_>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
@@ -724,8 +744,11 @@ pub(super) fn list_defaults(
         .into_iter()
         .map(|(default_id, value)| {
             let value = value
-                .and_then(TypedDefault::buffer)
-                .map(|buffer| text(&buffer));
+                .and_then(|value| match buffer {
+                    BufferQuestion::OrderedList => value.buffer(),
+                    BufferQuestion::CrossReference => value.hii_ref(),
+                })
+                .map(|bytes| text(&bytes));
             declared_default(default_id, value, stores, texts)
         })
         .collect()

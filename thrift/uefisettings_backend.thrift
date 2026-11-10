@@ -59,8 +59,8 @@ struct Question {
   1: string name;
   // answer values:
   // hii - the current value; if unreadable, the reason, followed, only if the IFR of a ONE_OF,
-  // NUMERIC, CHECKBOX, DATE, TIME or ORDERED_LIST declares a default, by " <IFR default: v>" or
-  // " <IFR default (DefaultId 0x0001): v>", v being "unknown (<reason>)" if undetermined;
+  // NUMERIC, CHECKBOX, DATE, TIME, ORDERED_LIST or REF declares a default, by " <IFR default: v>"
+  // or " <IFR default (DefaultId 0x0001): v>", v being "unknown (<reason>)" if undetermined;
   // firmware Callback/ALTCFG defaults may differ. defaults lists every default that the IFR
   // declares.
   // hii answers end with " <s>" if IFR conditions put the question in state s (grayed-out,
@@ -68,6 +68,10 @@ struct Question {
   // undetermined among s1, s2, ... (selectable too).
   // The stored option's state precedes it: " <option s>" or " <option s1 or s2: reasons>".
   // An ORDERED_LIST answers its items, joined by ", ", each with its option's state.
+  // A REF on a VarStore answers its EFI_HII_REF, as "QuestionId 0x0005, FormId 0x0001,
+  // FormSetGuid <GUID>, DevicePath d", d being the quoted text of string DevicePath in the
+  // language of the other texts, none for string 0, or "string 0x0063 not found" for a string id
+  // without a text in that language or a display language.
   // set's hii answer ends with " <volatile: lasts until the next reset or power cycle>" when it
   // wrote a volatile variable (UEFI Shell, --allow-volatile).
   2: string answer;

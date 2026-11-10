@@ -40,6 +40,7 @@ use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SYSTEM_DATE;
 use uefisettings_qemu_guest::driver_sample::SYSTEM_TIME;
+use uefisettings_qemu_guest::driver_sample::UPDATE_DEST;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::variable_bytes;
@@ -554,6 +555,40 @@ fn set_ordered_list_stores_its_items_and_keeps_the_hidden_one() {
 
 /// set takes the items of an ordered list with --item, and the value of another question as
 /// VALUE: it refuses each the other way, before any write.
+/// set refuses DriverSample's cross-reference question UPDATE_DEST, whose EFI_HII_REF is the
+/// target of its link, with VALUE and with --item, and writes nothing.
+#[test]
+fn set_refuses_a_cross_reference_question() {
+    let refusal = format!(
+        "cannot set question {UPDATE_DEST:?}: set does not write the EFI_HII_REF of a \
+         cross-reference question, the target of its link (UEFI 2.11 §33.2.5.4.10)"
+    );
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse(prefix, UPDATE_DEST, "0", &INCLUDE_SUPPRESSED).error_message,
+            refusal,
+            "{prefix:?} VALUE"
+        );
+        let before = driver_sample_data();
+        let error = json_error(
+            &[
+                prefix,
+                &["set", UPDATE_DEST, "--item", "x", "--json"],
+                &INCLUDE_SUPPRESSED,
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            (
+                error.error_message,
+                changed_bytes(&before, &driver_sample_data())
+            ),
+            (refusal.clone(), vec![]),
+            "{prefix:?} --item"
+        );
+    }
+}
+
 #[test]
 fn set_takes_items_for_ordered_lists_only() {
     for prefix in PREFIXES {

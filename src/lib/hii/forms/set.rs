@@ -111,6 +111,12 @@ pub(crate) enum ChangeValueError {
         question: String,
         refusal: ListRefusal,
     },
+    /// A REF on a VarStore, whose EFI_HII_REF is where its link goes, not a setting
+    #[error(
+        "cannot set question {question:?}: set does not write the EFI_HII_REF of a \
+         cross-reference question, the target of its link (UEFI 2.11 §33.2.5.4.10)"
+    )]
+    CrossReference { question: String },
     /// A question that `cause` makes read-only, which set writes only with `lifted_with`, the
     /// states that lift `cause` where its caller can include them, else never, and
     /// `undetermined`, the states that it may be in where the selection is undetermined;
@@ -462,6 +468,11 @@ fn text_value(
         TextInput::Range(range) => range.parse_value(new_value)?,
         TextInput::DateTime(input) => input.value(new_value)?,
         TextInput::OrderedList(_) => return Err(ListRefusal::Text.of(question)),
+        TextInput::CrossReference => {
+            return Err(ChangeValueError::CrossReference {
+                question: question.question.clone(),
+            })
+        }
         TextInput::Maximum(maximum) => match *maximum {
             RangeType::NumSize8(m) => {
                 let data_to_write = new_value
@@ -635,6 +646,12 @@ fn plan_question<'a>(
     access_level: Option<AccessLevel>,
 ) -> Result<(WritePlan<'a>, Written<'a>)> {
     match (&question.input, answer) {
+        (TextInput::CrossReference, NewAnswer::Items(_) | NewAnswer::Text { .. }) => {
+            Err(ChangeValueError::CrossReference {
+                question: question.question.clone(),
+            }
+            .into())
+        }
         (TextInput::OrderedList(input), NewAnswer::Items(items)) => {
             let (write, options) = input.write(question, items, include)?;
             let plan = WritePlan::of_list(question, write, through.0)?;
