@@ -123,8 +123,9 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
 
 ### For OCP hardware
 
-* Extract HiiDB. Linux exposes no file that holds it, and `/sys/firmware/efi/systab` does not list its address, so the OCP way is to read the physical address and length from the `HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0` efivar and then read that memory from `/dev/mem`.
-* If the firmware publishes a copy of the HiiDB as the vendor ACPI table `HIID`, it is read from `/sys/firmware/acpi/tables/HIID` instead (skip the 36-byte ACPI header), without `/dev/mem`. This is the way where `/dev/mem` cannot reach the database (e.g. aarch64, whose EFI runtime memory is `nomap`) or the database is too large for one efivarfs read. When the table is missing or unreadable, the reason goes to stderr and the OCP way is used.
+* Extract HiiDB. Linux exposes no file that holds it, so the standard way is to follow the EFI System Table: `/sys/firmware/efi/config_table` holds the address of its `EFI_CONFIGURATION_TABLE` array, the entry for `gEfiHiiDatabaseProtocolGuid` points at the exported database, and every step is read from `/dev/mem`. The firmware must install that entry (`PcdHiiOsRuntimeSupport`, TRUE by default in edk2), and not every kernel creates `config_table`. The length is not recorded, so it is found by walking the package lists up to the zero padding after them.
+* If that fails, the reason goes to stderr and the vendor ACPI table `HIID` is tried: if the firmware publishes a copy of the HiiDB there, it is read from `/sys/firmware/acpi/tables/HIID` (skip the 36-byte ACPI header), without `/dev/mem`. This is the way where `/dev/mem` cannot reach the database (e.g. aarch64, whose EFI runtime memory is `nomap`) or the database is too large for one efivarfs read.
+* If that fails too, the reason goes to stderr and the OCP way is used: read the physical address and length from the `HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0` efivar and then read that memory from `/dev/mem`.
 * Library (`hii`) in Rust partially implements the UEFI Hii specification.
 * It parses the HiiDB op-codes into a DOM tree like representation which can be read by machines and humans.
 * It can ask questions about UEFI settings from HiiDB and get their answers.
@@ -214,7 +215,7 @@ uefisettings hii dump-efivars -f hiidb.bin efivars
 uefisettings hii list-questions --efivars efivars
 ```
 
-`extract-db` reads the HiiDB from the `HIID` ACPI table or, failing that, from /dev/mem; either needs root (the table is root-only, /dev/mem needs CAP_SYS_RAWIO). `dump-efivars -f` reads
+`extract-db` reads the HiiDB from the EFI configuration table, failing that from the `HIID` ACPI table, and failing that through the OCP efivar and /dev/mem; all need root (the table is root-only, /dev/mem needs CAP_SYS_RAWIO). `dump-efivars -f` reads
 only efivarfs, whose files every user can read, so run it unprivileged: as root, it would leave a
 directory that only root can read.
 
