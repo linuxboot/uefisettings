@@ -36,6 +36,7 @@ use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
 use super::storageless::StoragelessRefusal;
+use super::string_question::StringRefusal;
 use super::time_storage::TimeWriteRefusal;
 use super::write_plan::batched_writes;
 use super::write_plan::check_efivar_files;
@@ -126,6 +127,12 @@ pub(crate) enum ChangeValueError {
          for a DATE or TIME"
     )]
     NumberOfNoDateTime { question: String },
+    /// A STRING whose text set refuses
+    #[error("cannot set question {question:?}: {refusal}")]
+    String {
+        question: String,
+        refusal: StringRefusal,
+    },
     /// A question that `cause` makes read-only, which set never writes where an EFI_IFR_VALUE
     /// gives its value, nor the Keyword Handler where EFI_IFR_FLAG_READ_ONLY makes it read-only;
     /// `ranked_before` selects a writable match that ranks before it
@@ -475,7 +482,8 @@ fn number_value(question: &QuestionDescriptor, number: u64) -> Result<TypeValue,
         TextInput::Range(_)
         | TextInput::Maximum(_)
         | TextInput::OrderedList(_)
-        | TextInput::CrossReference => Err(ChangeValueError::NumberOfNoDateTime {
+        | TextInput::CrossReference
+        | TextInput::String(_) => Err(ChangeValueError::NumberOfNoDateTime {
             question: question.question.clone(),
         }),
     }
@@ -496,6 +504,7 @@ fn text_value(
                 question: question.question.clone(),
             })
         }
+        TextInput::String(_) => return Err(StringRefusal::NotNumber.of(question)),
         TextInput::Maximum(maximum) => match *maximum {
             RangeType::NumSize8(m) => {
                 let data_to_write = new_value
@@ -687,6 +696,12 @@ fn plan_question<'a>(
         (TextInput::OrderedList(_), NewAnswer::Text { .. }) => {
             Err(ListRefusal::Text.of(question).into())
         }
+        (TextInput::String(input), NewAnswer::Text { text, .. }) => {
+            let write = input.write(text).map_err(|refusal| refusal.of(question))?;
+            let plan = WritePlan::of_string(question, write, through.0)?;
+            Ok((plan, Written::Text))
+        }
+        (TextInput::String(_), NewAnswer::Items(_)) => Err(ListRefusal::Items.of(question).into()),
         (
             TextInput::Range(_) | TextInput::Maximum(_) | TextInput::DateTime(_),
             NewAnswer::Items(_),

@@ -53,6 +53,8 @@ use super::storage::RetrievedValue;
 use super::storage::ValueLocation;
 use super::storage::ValueSource;
 use super::storage::VariableStore;
+use super::string_question::handle_string;
+use super::string_question::StringQuestion;
 use super::time_storage::TimeStorage;
 use super::walk_scopes;
 use super::AnswerOption;
@@ -133,13 +135,14 @@ impl ValueQuestion<'_> {
 }
 
 /// A question that list-questions lists and get and set select: a ValueQuestion, an
-/// ORDERED_LIST, whose value is a list of numbers, or a REF on a VarStore, whose value is an
-/// EFI_HII_REF.
+/// ORDERED_LIST, whose value is a list of numbers, a REF on a VarStore, whose value is an
+/// EFI_HII_REF, or a STRING, whose value is a string.
 #[derive(Clone, Copy)]
 pub(super) enum ListedQuestion<'a> {
     Value(ValueQuestion<'a>),
     OrderedList(OrderedListQuestion<'a>),
     Ref(&'a CrossReference),
+    String(&'a StringQuestion),
 }
 
 impl ListedQuestion<'_> {
@@ -156,6 +159,9 @@ impl ListedQuestion<'_> {
             return (reference.question_header.var_store_id != 0)
                 .then_some(ListedQuestion::Ref(reference));
         }
+        if let ParsedOperation::String(string) = &op.parsed_data {
+            return Some(ListedQuestion::String(string));
+        }
         value_question(op).map(ListedQuestion::Value)
     }
 
@@ -164,6 +170,7 @@ impl ListedQuestion<'_> {
             ListedQuestion::Value(question) => question.header(),
             ListedQuestion::OrderedList(question) => question.list.question_header(),
             ListedQuestion::Ref(reference) => reference.question_header(),
+            ListedQuestion::String(string) => string.question_header(),
         }
     }
 
@@ -172,6 +179,7 @@ impl ListedQuestion<'_> {
             ListedQuestion::Value(question) => question.location(),
             ListedQuestion::OrderedList(question) => question.location(),
             ListedQuestion::Ref(reference) => reference.location(),
+            ListedQuestion::String(string) => string.location(),
         }
     }
 
@@ -179,7 +187,9 @@ impl ListedQuestion<'_> {
     pub(super) fn time_storage(self) -> Option<TimeStorage> {
         match self {
             ListedQuestion::Value(question) => question.time_storage().map(|(_, storage)| storage),
-            ListedQuestion::OrderedList(_) | ListedQuestion::Ref(_) => None,
+            ListedQuestion::OrderedList(_) | ListedQuestion::Ref(_) | ListedQuestion::String(_) => {
+                None
+            }
         }
     }
 }
@@ -357,6 +367,7 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
         | ParsedOperation::FormMap(_)
         | ParsedOperation::OrderedList(_)
         | ParsedOperation::Ref(_)
+        | ParsedOperation::String(_)
         | ParsedOperation::Placeholder => None,
     }
 }
@@ -843,6 +854,9 @@ pub(super) fn describe_question(
         }
         ListedQuestion::Ref(reference) => {
             handle_cross_reference(varstore, reference, prompt, flags, question, walk)
+        }
+        ListedQuestion::String(string) => {
+            handle_string(varstore, string, prompt, flags, question, walk)
         }
     }
 }

@@ -599,7 +599,7 @@ pub(super) fn handle_ordered_list(
                 .into_iter()
                 .map(|value| Item::of(&possible_options, value).text())
                 .collect();
-            texts.join(", ")
+            Ok(texts.join(", "))
         },
     );
     if stored.is_err() {

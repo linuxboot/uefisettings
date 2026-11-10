@@ -45,6 +45,8 @@ use super::set::VarStoreWrite;
 use super::storage::BufferExpression;
 use super::storage::BufferQuestion;
 use super::storage::VariableStore;
+use super::string_question::StringRefusal;
+use super::string_question::StringWrite;
 use super::time_storage::value_changes;
 use super::time_storage::FieldChange;
 use super::time_storage::TimeStorage;
@@ -131,12 +133,33 @@ impl<'a> WritePlan<'a> {
         write: ListWrite,
         reach: VariableReach,
     ) -> Result<Self, ChangeValueError> {
-        Ok(Self {
+        Ok(Self::of_own(
+            question,
+            list_own_write(question, write, reach)?,
+        ))
+    }
+
+    /// The plan that writes `write`, the CHAR16s of the STRING `question`, through variables
+    /// of `reach` (string_own_write).
+    pub(super) fn of_string(
+        question: &'a QuestionDescriptor,
+        write: StringWrite,
+        reach: VariableReach,
+    ) -> Result<Self, ChangeValueError> {
+        Ok(Self::of_own(
+            question,
+            string_own_write(question, write, reach)?,
+        ))
+    }
+
+    /// The plan that writes `own`, the value of the buffer `question`, alone.
+    fn of_own(question: &'a QuestionDescriptor, own: VarStoreWrite<'a>) -> Self {
+        Self {
             question,
             time: Vec::new(),
             sets: PlannedSets::default(),
-            own: Some(list_own_write(question, write, reach)?),
-        })
+            own: Some(own),
+        }
     }
 
     /// The plan's writes: of EFI Date/Time Storage, then one per variable, in the order in which
@@ -227,12 +250,35 @@ pub(super) fn list_own_write<'a>(
     ListWrite { offset, bytes }: ListWrite,
     reach: VariableReach,
 ) -> Result<VarStoreWrite<'a>, ChangeValueError> {
+    buffer_own_write(question, (offset, bytes), reach, || {
+        ListRefusal::Expression(BufferExpression::Write(BufferQuestion::OrderedList)).of(question)
+    })
+}
+
+/// The write of `write`, the CHAR16s of the STRING `question`, through variables of `reach`:
+/// refuses one with a WRITE expression, which takes its characters, or without a VarStore.
+fn string_own_write<'a>(
+    question: &'a QuestionDescriptor,
+    StringWrite { offset, bytes }: StringWrite,
+    reach: VariableReach,
+) -> Result<VarStoreWrite<'a>, ChangeValueError> {
+    buffer_own_write(question, (offset, bytes), reach, || {
+        StringRefusal::Expression(BufferExpression::Write(BufferQuestion::String)).of(question)
+    })
+}
+
+/// The write of `bytes` at VarOffset `offset` of the VarStore of `question` through variables of
+/// `reach`, or the refusal that `expression` gives one with a WRITE expression, or the refusal of
+/// one without a VarStore.
+fn buffer_own_write<'a>(
+    question: &'a QuestionDescriptor,
+    (offset, bytes): (u16, Vec<u8>),
+    reach: VariableReach,
+    expression: impl FnOnce() -> ChangeValueError,
+) -> Result<VarStoreWrite<'a>, ChangeValueError> {
     let store = question.store(reach)?;
     if question_expression(&question.node, QuestionExpression::Write).is_some() {
-        return Err(
-            ListRefusal::Expression(BufferExpression::Write(BufferQuestion::OrderedList))
-                .of(question),
-        );
+        return Err(expression());
     }
     let Some(store) = store else {
         return Err(ChangeValueError::Storageless {

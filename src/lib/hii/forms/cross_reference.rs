@@ -140,7 +140,7 @@ pub(super) fn handle_cross_reference(
         stores,
         texts,
         &mut walk.inputs,
-        |value| ref_text(hii_ref(value), texts),
+        |value| Ok(ref_text(hii_ref(value), texts)),
     );
     let (answer, value_source) = match stored {
         Ok(stored) => stored,

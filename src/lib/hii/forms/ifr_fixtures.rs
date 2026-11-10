@@ -52,6 +52,8 @@ use super::question_values::handle_oneof;
 use super::set::own_write;
 use super::set::NewValue;
 use super::storage::VariableStoreKind;
+#[cfg(efivar_dumps)]
+use super::string_question::handle_string;
 use super::*;
 pub(crate) use crate::hii::strings::Language;
 pub(crate) use crate::hii::strings::ListTexts;
@@ -785,6 +787,55 @@ pub(crate) fn password_on(
     operation(PASSWORD, false, &data)
 }
 
+/// A STRING op of QuestionId `question_id`, prompted string `prompt`, at VarOffset `offset` of
+/// VarStore `var_store_id`, of MinSize and MaxSize `sizes` and no Flags, holding `children`.
+pub(crate) fn string_on(
+    question_id: u16,
+    prompt: u16,
+    location: (u16, u16),
+    sizes: (u8, u8),
+    children: &[Vec<u8>],
+) -> Vec<u8> {
+    flagged_string_on(question_id, prompt, location, sizes, (0x00, 0x00), children)
+}
+
+/// string_on, with the question Flags and the STRING Flags `flags`: question Flags 0x01 is
+/// EFI_IFR_FLAG_READ_ONLY.
+pub(crate) fn flagged_string_on(
+    question_id: u16,
+    prompt: u16,
+    (var_store_id, offset): (u16, u16),
+    (min_size, max_size): (u8, u8),
+    (question_flags, flags): (u8, u8),
+    children: &[Vec<u8>],
+) -> Vec<u8> {
+    let data = [
+        question_header_with(question_id, prompt, var_store_id, offset, question_flags),
+        vec![min_size, max_size, flags],
+    ]
+    .concat();
+    match children {
+        [] => operation(STRING, false, &data),
+        children => [
+            operation(STRING, true, &data),
+            children.concat(),
+            END.to_vec(),
+        ]
+        .concat(),
+    }
+}
+
+/// An EFI_IFR_DEFAULT of `default_id` of Type STRING, whose Value is the string `string_id`.
+pub(crate) fn string_default(default_id: u16, string_id: u16) -> Vec<u8> {
+    let data = [
+        &default_id.to_le_bytes()[..],
+        &[0x07],
+        &string_id.to_le_bytes(),
+    ]
+    .concat();
+    operation(DEFAULT, false, &data)
+}
+
 /// A UINT8 NUMERIC of QuestionId `question_id`, prompted string `prompt`, from 0 to 255 at
 /// VarOffset 0 of VarStore `var_store_id`.
 pub(super) fn uint8_numeric_on(question_id: u16, prompt: u16, var_store_id: u16) -> Vec<u8> {
@@ -1042,6 +1093,7 @@ fn describe(
         ParsedOperation::Ref(parsed) => {
             handle_cross_reference(store, parsed, "", flags, node, walk)
         }
+        ParsedOperation::String(parsed) => handle_string(store, parsed, "", flags, node, walk),
         other => panic!("not a question: {other:?}"),
     }
 }

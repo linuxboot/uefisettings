@@ -31,6 +31,7 @@ use super::is_bit_varstore_guid;
 use super::question_values::QuestionKind;
 use super::storage::BufferQuestion;
 use super::storage::ValueLocation;
+use super::string_question::NotUcs2;
 use super::walk_scopes;
 use super::IFRDefault;
 use super::IFROpCode;
@@ -149,6 +150,17 @@ impl TypedDefault {
         }
     }
 
+    /// The string id, refused for a number, a buffer or an EFI_HII_REF, which no STRING
+    /// stores.
+    fn string_id(self) -> Result<u16, DefaultError> {
+        match self {
+            Self::String(id) => Ok(id),
+            Self::Number(_) => Err(DefaultError::NotString("a number")),
+            Self::Buffer(_) => Err(DefaultError::NotString("EFI_IFR_TYPE_BUFFER")),
+            Self::Ref(_) => Err(DefaultError::NotString("EFI_IFR_TYPE_REF")),
+        }
+    }
+
     /// The EFI_HII_REF, refused for a number, a string or a buffer, which no REF stores.
     fn hii_ref(self) -> Result<Vec<u8>, DefaultError> {
         match self {
@@ -171,6 +183,18 @@ pub(super) enum DefaultError {
     NotBuffer(&'static str),
     #[error("a default of {0} where the question stores an EFI_HII_REF")]
     NotRef(&'static str),
+    #[error("a default of {0} where the question stores a string")]
+    NotString(&'static str),
+    #[error("EFI_IFR_TYPE_STRING default: string {0:#06x} not found")]
+    StringNotFound(u16),
+    #[error(
+        "EFI_IFR_TYPE_STRING default: string {id:#06x} holds {character:?} (U+{code:04X}), which \
+         UCS-2 has no character for (UEFI 2.11 §33.2.6.2.2)",
+        code = u32::from(*.character)
+    )]
+    StringNotUcs2 { id: u16, character: char },
+    #[error("EFI_IFR_TYPE_STRING default: {0}")]
+    StringText(NotUcs2),
     #[error("EFI_IFR_DEFAULT value missing")]
     DefaultValueMissing,
     #[error("EFI_IFR_DEFAULT_2 without EFI_IFR_VALUE")]
@@ -764,15 +788,15 @@ pub(super) fn push_default(
 }
 
 /// Returns every default that the IFR declares for `question`, a question of `buffer`, as
-/// question_default_values finds them, each the buffer of an ORDERED_LIST or the EFI_HII_REF
-/// of a REF that `text` shows.
+/// question_default_values finds them, each the buffer of an ORDERED_LIST, the EFI_HII_REF
+/// of a REF or the CHAR16s of the string of a STRING that `text` shows, or why it cannot.
 pub(super) fn buffer_defaults(
     question: &IFROperation,
     buffer: BufferQuestion,
     stores: &DefaultStores,
     texts: &ListTexts<'_>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-    mut text: impl FnMut(&[u8]) -> String,
+    mut text: impl FnMut(&[u8]) -> Result<String, DefaultError>,
 ) -> Vec<DeclaredDefault> {
     question_default_values(question, stores, inputs)
         .into_iter()
@@ -781,11 +805,30 @@ pub(super) fn buffer_defaults(
                 .and_then(|value| match buffer {
                     BufferQuestion::OrderedList => value.buffer(),
                     BufferQuestion::CrossReference => value.hii_ref(),
+                    BufferQuestion::String => {
+                        value.string_id().and_then(|id| string_bytes(texts, id))
+                    }
                 })
-                .map(|bytes| text(&bytes));
+                .and_then(|bytes| text(&bytes));
             declared_default(default_id, value, stores, texts)
         })
         .collect()
+}
+
+/// The little-endian CHAR16s of the text of the string `id` that `texts` show, as
+/// edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault takes a default of Type STRING
+/// through HiiGetString in the platform language, refused with a character beyond UCS-2.
+pub(super) fn string_bytes(texts: &ListTexts<'_>, id: u16) -> Result<Vec<u8>, DefaultError> {
+    let text = texts
+        .shown_text(id)
+        .ok_or(DefaultError::StringNotFound(id))?;
+    if let Some(character) = text
+        .chars()
+        .find(|&character| u16::try_from(u32::from(character)).is_err())
+    {
+        return Err(DefaultError::StringNotUcs2 { id, character });
+    }
+    Ok(text.encode_utf16().flat_map(u16::to_le_bytes).collect())
 }
 
 /// Returns the text of the first option in the question's scope with `value` that no

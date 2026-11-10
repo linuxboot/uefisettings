@@ -1514,6 +1514,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::default_store_named;
     use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::flagged_option;
+    use crate::hii::forms::ifr_fixtures::flagged_string_on;
     use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::form_set_with_guid;
@@ -1534,6 +1535,8 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::scopeless_form_set;
     use crate::hii::forms::ifr_fixtures::short_var_store_efi;
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
+    use crate::hii::forms::ifr_fixtures::string_default;
+    use crate::hii::forms::ifr_fixtures::string_on;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::uint16_option;
     use crate::hii::forms::ifr_fixtures::uint8;
@@ -10069,6 +10072,46 @@ mod tests {
         }
     }
 
+    /// A STRING of name/value storage takes no value from the snapshot, whose settings of that
+    /// storage uefisettings keeps as numbers only, while a CHECKBOX there takes its number; one
+    /// whose setting the snapshot lacks says why it has no value, as a CHECKBOX does.
+    #[test]
+    fn name_value_strings_take_no_snapshot_value() {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                var_store_name_value(3, N_GUID),
+                form(
+                    1,
+                    &[
+                        string_on(1, 1, (3, 3), (0, 4), &[]),
+                        checkbox_at(2, 2, 3, 4),
+                        string_on(5, 5, (3, 6), (0, 4), &[]),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["S", "C", "Text", "Flag", "Unset", "Gone"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let text = format!(
+            "{}&Text=00410042&Flag=01",
+            config_hdr(N_GUID, "", &DRIVER_PATH)
+        );
+
+        let (got, listed, _, _) =
+            answers_with_snapshot(&hiidb, &["S", "C", "Unset"], &no_variables(), &text);
+
+        let want = [
+            "<ValueUnavailable: uefisettings keeps the ExportConfig snapshot's settings of a \
+             VARSTORE_NAME_VALUE as numbers only, so it takes no string from them>",
+            "1 <snapshot>",
+            "<ValueUnavailable: HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+        ];
+        assert_eq!(got, want, "get");
+        assert_eq!(listed, want, "list-questions");
+    }
+
     /// A name/value question takes its snapshot number by the label that its VarName string
     /// shows in the language of the other texts: PlatformLang, or --language before it.
     #[test]
@@ -11891,6 +11934,77 @@ mod tests {
         );
     }
 
+    /// A STRING on a VARSTORE_EFI before UEFI 2.3.1 reads and sets its MaxSize CHAR16s as the
+    /// whole EFI variable that its VarName names, as an ORDERED_LIST does; a variable of another
+    /// size is refused, and one before the store took its VarStoreInfo for a VarOffset and is
+    /// refused as declared after it.
+    #[test]
+    fn strings_of_a_short_var_store_read_and_set_the_variables_of_their_var_names() {
+        // prompt "S", string 1, on the VarName 2; MinSize 0, MaxSize 4
+        let string = flagged_string_on(1, 1, (1, 2), (0, 4), (0x00, 0x00), &[]);
+        let strings = [en_strings_package_of(&["S", "ShortStr"])];
+        let short_store = short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT);
+        let hiidb = short_store_list(
+            &[short_store.clone(), form(1, std::slice::from_ref(&string))],
+            &strings,
+        );
+        let variables = |value: &[u8]| {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(short_key("ShortStr"), NV_BS_RT, value);
+            Rc::new(variables)
+        };
+
+        let stored = variables(&[0x41, 0, 0x42, 0, 0, 0, 0, 0]);
+        assert_eq!(answers_of(&hiidb, "S", &stored), ["AB"], "get");
+        assert_eq!(set_of(&hiidb, "S", "XYZ", &stored), Ok(()), "set");
+        assert_eq!(
+            stored.writes_to(&short_key("ShortStr")),
+            [(0, vec![0x58, 0, 0x59, 0, 0x5A, 0, 0, 0])],
+            "writes of ShortStr"
+        );
+
+        let wider = variables(&[0x41, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let why = "EFI variable ShortStr-8c78a505-baa0-4c4a-869f-000000000b01 holds 10 bytes; \
+                   the question takes 8";
+        assert_eq!(
+            answers_of(&hiidb, "S", &wider),
+            [format!("<ValueUnavailable: {why}>")],
+            "get of 10 bytes"
+        );
+        assert_eq!(
+            set_of(&hiidb, "S", "XYZ", &wider),
+            Err(why.to_owned()),
+            "set of 10 bytes"
+        );
+        assert_eq!(
+            wider.writes_to(&short_key("ShortStr")),
+            Vec::<(u16, Vec<u8>)>::new(),
+            "writes of 10 bytes"
+        );
+
+        let declared_after = short_store_list(&[form(1, &[string]), short_store], &strings);
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): declared after the \
+                   question, which took its VarStoreInfo for a VarOffset; a question names a \
+                   previously declared VarStore (UEFI 2.11 §33.3.8.2.2 EFI_IFR_QUESTION_HEADER)";
+        let stored = variables(&[0x41, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            answers_of(&declared_after, "S", &stored),
+            [format!("<ValueUnavailable: {why}>")],
+            "get of the STRING before its store"
+        );
+        assert_eq!(
+            set_of(&declared_after, "S", "XYZ", &stored),
+            Err(format!("cannot set question \"S\": {why}")),
+            "set of the STRING before its store"
+        );
+        assert_eq!(
+            stored.writes_to(&short_key("ShortStr")),
+            Vec::<(u16, Vec<u8>)>::new(),
+            "writes of the STRING before its store"
+        );
+    }
+
     /// set of an ORDERED_LIST on a VARSTORE_EFI before UEFI 2.3.1 whose variable is missing
     /// creates it with the store's Attributes, holding the new items and empty containers after
     /// them, as edk2-stable202608 SetupBrowserDxe writes the zeroed BufferValue that it keeps
@@ -12402,6 +12516,726 @@ mod tests {
         let variables = Rc::new(variables);
 
         assert_eq!(answers_of(&hiidb, "R", &variables), [PASSWORD_BYTES], "get");
+    }
+
+    /// A package list with GUID `guid` whose form holds the STRING "S", string 1, of MinSize and
+    /// MaxSize `sizes` and the Flags `flags`, holding `children`, at byte 0 of the EFI variable
+    /// Setup of `var_size` bytes, with the texts `strings`.
+    fn string_list_of(
+        guid: [u8; 16],
+        (sizes, flags): ((u8, u8), u8),
+        children: &[Vec<u8>],
+        var_size: u16,
+        strings: &[&str],
+    ) -> Vec<u8> {
+        let string = flagged_string_on(1, 1, (1, 0), sizes, (0x00, flags), children);
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, var_size),
+                form(1, &[string]),
+            ]),
+            en_strings_package_of(strings),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(guid, &packages.concat())
+    }
+
+    /// string_list_of without Flags, its Setup of MaxSize CHAR16s, string 2 "Hello".
+    fn string_list(guid: [u8; 16], sizes: (u8, u8), children: &[Vec<u8>]) -> Vec<u8> {
+        let var_size = u16::from(sizes.1) * 2;
+        string_list_of(guid, (sizes, 0x00), children, var_size, &["S", "Hello"])
+    }
+
+    /// The variables of a HiiDB that reach Runtime through efivarfs, Setup holding `stored`.
+    fn setup_holding(stored: &[u8]) -> Rc<MemoryVariables> {
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(setup(), NV_BS_RT, stored);
+        Rc::new(variables)
+    }
+
+    /// The answer of a STRING without its variable Setup.
+    const MISSING_SETUP: &str =
+        "<ValueUnavailable: no EFI variable Setup-00000000-0000-0000-0000-000000000000>";
+
+    /// get, list-questions and show-ifr show a STRING on a VarStore as the UCS-2 characters of its
+    /// MaxSize CHAR16s up to the first NULL, all of them without one, as edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c:2229 keeps one more CHAR16, zero, after them; a UTF-16
+    /// surrogate, which UCS-2 has no character for (UEFI 2.11 §33.2.6.2.2), gives no value.
+    #[test]
+    fn strings_show_their_characters_up_to_the_first_null() {
+        let hiidb = string_list([0x71; 16], (0, 4), &[]);
+        let surrogate = "<ValueUnavailable: its character 1 is CHAR16 0xd83d, a UTF-16 surrogate, \
+                         which UCS-2 has no character for (UEFI 2.11 §33.2.6.2.2)>";
+        let cases: [(&str, [u8; 8], &str); 6] = [
+            ("null-terminated", [0x41, 0, 0x42, 0, 0, 0, 0, 0], "AB"),
+            ("no null", [0x41, 0, 0x42, 0, 0x43, 0, 0x44, 0], "ABCD"),
+            ("empty", [0; 8], ""),
+            ("after the null", [0x41, 0, 0, 0, 0x43, 0, 0x44, 0], "A"),
+            ("beyond ASCII", [0xE9, 0, 0xAC, 0x20, 0, 0, 0, 0], "é€"),
+            (
+                "surrogate",
+                [0x41, 0, 0x3D, 0xD8, 0x00, 0xDE, 0, 0],
+                surrogate,
+            ),
+        ];
+        for (case, stored, answer) in cases {
+            let (listed, shown) = listed_and_shown(&hiidb, &stored, None);
+            let listed: Vec<(&str, &str)> = listed
+                .iter()
+                .map(|question| (&*question.name, &*question.answer))
+                .collect();
+
+            assert_eq!(
+                answers_of(&hiidb, "S", &setup_holding(&stored)),
+                [answer],
+                "{case}: get"
+            );
+            assert_eq!(listed, [("S", answer)], "{case}: list-questions");
+            assert!(
+                shown.contains(&format!("-Answer: {answer}\n")),
+                "{case}: show-ifr: {shown}"
+            );
+        }
+    }
+
+    /// A STRING of MaxSize 4 reads its 8 bytes alone of a variable of 12 whose characters go on
+    /// past them without a NULL.
+    #[test]
+    fn strings_read_no_character_past_their_max_size() {
+        let hiidb = string_list_of([0x77; 16], ((0, 4), 0x00), &[], 12, &["S", "Hello"]);
+        let stored = [0x41, 0, 0x42, 0, 0x43, 0, 0x44, 0, 0x45, 0, 0x46, 0];
+        let (listed, shown) = listed_and_shown(&hiidb, &stored, None);
+        let listed: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|question| (&*question.name, &*question.answer))
+            .collect();
+
+        assert_eq!(
+            answers_of(&hiidb, "S", &setup_holding(&stored)),
+            ["ABCD"],
+            "get"
+        );
+        assert_eq!(listed, [("S", "ABCD")], "list-questions");
+        assert!(shown.contains("-Answer: ABCD\n"), "show-ifr: {shown}");
+    }
+
+    /// A STRING without a value shows its default of Type STRING, the text of that string, cut to
+    /// MaxSize characters, as edk2-stable202608 SetupBrowserDxe/Setup.c:4507-4511
+    /// GetQuestionDefault copies at most StorageWidth bytes of it; a string that the package list
+    /// lacks, or one with a character beyond UCS-2 (UEFI 2.11 §33.2.6.2.2), gives no default.
+    #[test]
+    fn strings_without_a_variable_show_their_string_default() {
+        let unknown_text = "unknown (EFI_IFR_TYPE_STRING default: string 0x0002 holds \
+                            '\u{1F600}' (U+1F600), which UCS-2 has no character for (UEFI 2.11 \
+                            §33.2.6.2.2))";
+        let cases = [
+            ("MaxSize 8", 8, 2, ["S", "Hello"], "Hello"),
+            ("MaxSize 4", 4, 2, ["S", "Hello"], "Hell"),
+            ("MaxSize 5", 5, 2, ["S", "Hello"], "Hello"),
+            (
+                "missing string",
+                8,
+                9,
+                ["S", "Hello"],
+                "unknown (EFI_IFR_TYPE_STRING default: string 0x0009 not found)",
+            ),
+            ("beyond UCS-2", 8, 2, ["S", "A\u{1F600}"], unknown_text),
+        ];
+        for (case, max_size, string_id, strings, default) in cases {
+            let hiidb = string_list_of(
+                [0x72; 16],
+                ((0, max_size), 0x00),
+                &[string_default(0, string_id)],
+                u16::from(max_size) * 2,
+                &strings,
+            );
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+
+            assert_eq!(
+                answers_of(&hiidb, "S", &Rc::new(variables)),
+                [format!("{MISSING_SETUP} <IFR default: {default}>")],
+                "{case}"
+            );
+        }
+    }
+
+    /// set writes at most MaxSize − 1 characters of a STRING as UCS-2, NULL-padded to its MaxSize
+    /// CHAR16s, so that a NULL ends them (UEFI 2.11 §33.2.5.4.9); get shows them then.
+    #[test]
+    fn set_writes_a_string_null_padded_to_max_size() {
+        let hiidb = string_list([0x73; 16], (0, 4), &[]);
+        let cases: [(&str, [u8; 8]); 5] = [
+            ("Hi", [0x48, 0, 0x69, 0, 0, 0, 0, 0]),
+            ("é€", [0xE9, 0, 0xAC, 0x20, 0, 0, 0, 0]),
+            ("XYZ", [0x58, 0, 0x59, 0, 0x5A, 0, 0, 0]),
+            ("\u{F900}", [0x00, 0xF9, 0, 0, 0, 0, 0, 0]),
+            ("", [0; 8]),
+        ];
+        for (text, written) in cases {
+            let variables = setup_holding(&[0x41, 0, 0x42, 0, 0x43, 0, 0x44, 0]);
+
+            assert_eq!(
+                set_of(&hiidb, "S", text, &variables),
+                Ok(()),
+                "set {text:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&setup()),
+                [(0, written.to_vec())],
+                "set {text:?}: writes"
+            );
+            assert_eq!(
+                answers_of(&hiidb, "S", &variables),
+                [text],
+                "set {text:?}: get"
+            );
+        }
+    }
+
+    /// set of a STRING through `hiidb`'s variables with `value`, as the CLI prints an error, and
+    /// what it wrote to Setup, which held `stored`.
+    fn string_set(hiidb: &[u8], value: &SetValue, stored: &[u8]) -> SetOutcome {
+        let variables = setup_holding(stored);
+        let got = HiiBackend::set_in(
+            hiidb,
+            "S",
+            value,
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+        (got, variables.writes_to(&setup()))
+    }
+
+    /// set refuses, before any write, MaxSize characters, which leave no CHAR16 for the NULL
+    /// (UEFI 2.11 §33.2.5.4.9), fewer than MinSize, as edk2-stable202608
+    /// DisplayEngineDxe/InputHandler.c:209 does, a character that UCS-2 has none for, one of the
+    /// Private Use Area (UEFI 2.11 §33.2.6.2.1), a line break without EFI_IFR_STRING_MULTI_LINE, a
+    /// NULL, which ends a STRING, and items.
+    #[test]
+    fn set_refuses_a_string_that_its_sizes_or_ucs_2_cannot_hold() {
+        let hiidb = string_list([0x74; 16], (2, 4), &[]);
+        let refusal = |reason: &str| Err(format!("cannot set question \"S\": {reason}"));
+        let line_break = "the STRING is single-line (no EFI_IFR_STRING_MULTI_LINE, UEFI 2.11 \
+                          §33.3.8.3.70), so it takes no line break";
+        let cases = [
+            (
+                SetValue::Text("ABCD".to_owned()),
+                refusal(
+                    "the STRING takes at most 3 characters, its last CHAR16 of MaxSize 4 holding \
+                     the NULL (UEFI 2.11 §33.2.5.4.9), not 4",
+                ),
+            ),
+            (
+                SetValue::Text("A".to_owned()),
+                refusal("the STRING takes at least 2 characters (MinSize), not 1"),
+            ),
+            (
+                SetValue::Text("A\u{1F600}".to_owned()),
+                refusal(
+                    "'\u{1F600}' (U+1F600) has no UCS-2 character, which the STRING stores \
+                     (UEFI 2.11 §33.2.6.2.2)",
+                ),
+            ),
+            (
+                SetValue::Text("A\u{E000}".to_owned()),
+                refusal(
+                    "'\\u{e000}' (U+E000) lies in the Private Use Area, U+E000..U+F8FF, which \
+                     UEFI 2.11 §33.2.6.2.1 prohibits",
+                ),
+            ),
+            (
+                SetValue::Text("\u{F6FF}B".to_owned()),
+                refusal(
+                    "'\\u{f6ff}' (U+F6FF) lies in the Private Use Area, U+E000..U+F8FF, which \
+                     UEFI 2.11 §33.2.6.2.1 prohibits",
+                ),
+            ),
+            (SetValue::Text("A\nB".to_owned()), refusal(line_break)),
+            (SetValue::Text("A\rB".to_owned()), refusal(line_break)),
+            (
+                SetValue::Text("A\0B".to_owned()),
+                refusal(
+                    "a NULL character ends a STRING, which takes none within (UEFI 2.11 \
+                     §33.2.5.4.9)",
+                ),
+            ),
+            (
+                SetValue::Items(vec!["AB".to_owned()]),
+                refusal("--item gives the options of an ORDERED_LIST; this question takes VALUE"),
+            ),
+        ];
+        for (value, want) in cases {
+            assert_eq!(
+                string_set(&hiidb, &value, &[0; 8]),
+                (want, Vec::new()),
+                "set {value:?}"
+            );
+        }
+    }
+
+    /// set refuses, before any write, every VALUE of a STRING of MaxSize 0, which has no CHAR16
+    /// for the NULL, and of one whose MinSize is above MaxSize − 1, naming both bounds.
+    #[test]
+    fn set_refuses_every_value_of_a_string_without_a_length() {
+        let refusal = |reason: &str| Err(format!("cannot set question \"S\": {reason}"));
+        let no_null = refusal(
+            "the STRING of MaxSize 0 has no CHAR16 for the NULL that ends it (UEFI 2.11 \
+             §33.2.5.4.9), so it takes no VALUE",
+        );
+        let no_length = refusal(
+            "the STRING takes at least 4 characters (MinSize) and at most 3, its last CHAR16 of \
+             MaxSize 4 holding the NULL (UEFI 2.11 §33.2.5.4.9), so it takes no VALUE",
+        );
+        let cases = [
+            ("MaxSize 0", (0, 0), 2, "", no_null.clone()),
+            ("MaxSize 0", (0, 0), 2, "A", no_null),
+            ("MinSize 4 MaxSize 4", (4, 4), 8, "ABC", no_length.clone()),
+            ("MinSize 4 MaxSize 4", (4, 4), 8, "ABCD", no_length),
+        ];
+        for (case, sizes, var_size, text, want) in cases {
+            let hiidb = string_list_of([0x78; 16], (sizes, 0x00), &[], var_size, &["S"]);
+            let value = SetValue::Text(text.to_owned());
+
+            assert_eq!(
+                string_set(&hiidb, &value, &vec![0x41; usize::from(var_size)]),
+                (want, Vec::new()),
+                "{case}: set {text:?}"
+            );
+        }
+    }
+
+    /// set writes line breaks into a STRING with EFI_IFR_STRING_MULTI_LINE (UEFI 2.11
+    /// §33.3.8.3.70) in its Flags, and refuses them before any write into one without.
+    #[test]
+    fn set_writes_line_breaks_with_multi_line_alone() {
+        let text = SetValue::Text("A\r\nB".to_owned());
+        let multi_line = string_list_of([0x79; 16], ((0, 8), 0x01), &[], 16, &["S"]);
+        let single_line = string_list_of([0x7A; 16], ((0, 8), 0xFE), &[], 16, &["S"]);
+        let written = [0x41, 0, 0x0D, 0, 0x0A, 0, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        assert_eq!(
+            string_set(&multi_line, &text, &[0; 16]),
+            (Ok(()), vec![(0, written.to_vec())]),
+            "Flags 0x01"
+        );
+        assert_eq!(
+            string_set(&single_line, &text, &[0; 16]),
+            (
+                Err("cannot set question \"S\": the STRING is single-line (no \
+                     EFI_IFR_STRING_MULTI_LINE, UEFI 2.11 §33.3.8.3.70), so it takes no line \
+                     break"
+                    .to_owned()),
+                Vec::new()
+            ),
+            "Flags 0xFE"
+        );
+    }
+
+    /// set refuses a STRING with a WRITE expression, which takes its characters, before any write,
+    /// and get shows why one with a READ expression has no value: uefisettings evaluates neither.
+    #[test]
+    fn strings_with_read_or_write_expressions_take_no_value() {
+        const WRITE: u8 = 0x2E;
+        let expression =
+            |op_code| [operation(op_code, true, &[]), ifr_true(), END.to_vec()].concat();
+        let write = string_list([0x7B; 16], (0, 4), &[expression(WRITE)]);
+        let read = string_list([0x7C; 16], (0, 4), &[expression(READ)]);
+
+        assert_eq!(
+            string_set(&write, &SetValue::Text("AB".to_owned()), &[0; 8]),
+            (
+                Err(
+                    "cannot set question \"S\": its WRITE expression takes the CHAR16s of a \
+                     STRING, which uefisettings does not evaluate"
+                        .to_owned()
+                ),
+                Vec::new()
+            ),
+            "set with a WRITE expression"
+        );
+        assert_eq!(
+            answers_of(&read, "S", &setup_holding(&[0x41, 0, 0, 0, 0, 0, 0, 0])),
+            [
+                "<ValueUnavailable: its READ expression gives the CHAR16s of a STRING, which \
+              uefisettings does not evaluate>"
+            ],
+            "get with a READ expression"
+        );
+    }
+
+    /// A STRING whose EFI_IFR_DEFAULT, or flagged option, is of a numeric Type shows that default
+    /// as unknown, naming the Type mismatch, and takes no string of that number for its id.
+    #[test]
+    fn strings_show_a_numeric_default_as_unknown() {
+        let unknown = " <IFR default: unknown (a default of a number where the question stores a \
+                       string)>";
+        for (case, child) in [
+            ("UINT8 EFI_IFR_DEFAULT", ifr_default(0, 2)),
+            ("flagged UINT8 option", flagged_option(2, 0x10, 2)),
+        ] {
+            let hiidb = string_list_of([0x60; 16], ((0, 8), 0x00), &[child], 16, &["S", "Hello"]);
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+
+            assert_eq!(
+                answers_of(&hiidb, "S", &Rc::new(variables)),
+                [format!("{MISSING_SETUP}{unknown}")],
+                "{case}"
+            );
+        }
+    }
+
+    /// A STRING without a VarStore is listed with why it has no value, and set refuses it before
+    /// any write.
+    #[test]
+    fn storageless_strings_are_listed_and_refused() {
+        let reason = "question has no VarStore, READ or WRITE expression, or \
+                      EFI_IFR_FLAG_CALLBACK, one of which UEFI 2.11 §33.2.5.6 requires";
+        let string = flagged_string_on(1, 1, (0, 0), (0, 4), (0x00, 0x00), &[]);
+        let packages = [
+            form_package(&[var_store_efi(1, "Setup", NV_BS_RT, 8), form(1, &[string])]),
+            en_strings_package_of(&["S"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x61; 16], &packages.concat());
+        let variables = setup_holding(&[0; 8]);
+        let (listed, _) = listed_and_shown(&hiidb, &[0; 8], None);
+        let listed: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|question| (&*question.name, &*question.answer))
+            .collect();
+
+        assert_eq!(
+            listed,
+            [("S", &*format!("<ValueUnavailable: {reason}>"))],
+            "list-questions"
+        );
+        assert_eq!(
+            set_of(&hiidb, "S", "AB", &variables),
+            Err(format!("cannot set question \"S\": {reason}")),
+            "set AB"
+        );
+        assert_eq!(
+            variables.writes_to(&setup()),
+            Vec::<(u16, Vec<u8>)>::new(),
+            "set AB: writes"
+        );
+    }
+
+    /// A HiiDB whose form holds the STRING "S" of MaxSize 4 at byte 0 of the EFI variable Setup,
+    /// of the question Flags `flags`, and password_hiidb's PASSWORD on the buffer VarStore
+    /// AMITSESetup.
+    fn string_and_password_list(flags: u8) -> Vec<u8> {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 8),
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(
+                    1,
+                    &[
+                        flagged_string_on(1, 1, (1, 0), (0, 4), (flags, 0x00), &[]),
+                        password_on(3, 3, 2, 0),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["S", "Hello", "Password"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x7D; 16], &packages.concat())
+    }
+
+    /// set of a STRING takes UnsafeOperations as the other kinds do. One that
+    /// EFI_IFR_FLAG_READ_ONLY makes read-only it refuses before any write, and writes with
+    /// UnsafeOperations::Allow, which it returns as lifted. Through variables that reach
+    /// BootServices, in a HiiDB that declares a password question, it refuses unless Allow, and
+    /// then returns UnsafeOperation::SetupPassword, lifted before the read-only flag. A VALUE that
+    /// the STRING cannot hold it refuses before either, with and without Allow.
+    #[test]
+    fn string_set_follows_the_unsafe_operations_grant() {
+        let read_only = UnsafeOperation::ReadOnlyQuestion {
+            question: "S".to_owned(),
+            writable: IncludedStates::empty(),
+        };
+        let password = "this HiiDB declares a setup password question, and the UEFI Shell runs no \
+                        setup browser, so no password is asked or checked; pass \
+                        --i-am-fine-to-brick-this-system to write without it"
+            .to_owned();
+        let too_long = "cannot set question \"S\": the STRING takes at most 3 characters, its \
+                        last CHAR16 of MaxSize 4 holding the NULL (UEFI 2.11 §33.2.5.4.9), not 4"
+            .to_owned();
+        let runtime = (VariableReach::Runtime, VariableInterface::Efivarfs);
+        let boot_services = (
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        // (variables, question Flags, VALUE, what set gives with UnsafeOperations::Refuse, Allow)
+        let cases = [
+            (
+                runtime,
+                0x01,
+                "AB",
+                [
+                    flag_refusal("S", "").map(|()| vec![]),
+                    Ok(vec![read_only.clone()]),
+                ],
+            ),
+            (
+                runtime,
+                0x01,
+                "ABCD",
+                [Err(too_long.clone()), Err(too_long.clone())],
+            ),
+            (
+                boot_services,
+                0x00,
+                "AB",
+                [
+                    Err(password.clone()),
+                    Ok(vec![UnsafeOperation::SetupPassword]),
+                ],
+            ),
+            (
+                boot_services,
+                0x01,
+                "AB",
+                [
+                    Err(password),
+                    Ok(vec![UnsafeOperation::SetupPassword, read_only]),
+                ],
+            ),
+            (
+                boot_services,
+                0x00,
+                "ABCD",
+                [Err(too_long.clone()), Err(too_long)],
+            ),
+        ];
+        for ((reach, interface), flags, text, wants) in cases {
+            let grants = [UnsafeOperations::Refuse, UnsafeOperations::Allow];
+            for (grant, want) in grants.into_iter().zip(wants) {
+                let variables = password_variables(reach, interface);
+                variables.insert(setup(), NV_BS_RT, &[0; 8]);
+                let want_writes = match want {
+                    Ok(_) => vec![(0, vec![0x41, 0, 0x42, 0, 0, 0, 0, 0])],
+                    Err(_) => vec![],
+                };
+
+                let got = HiiBackend::set_in(
+                    &string_and_password_list(flags),
+                    "S",
+                    &SetValue::Text(text.to_owned()),
+                    None,
+                    &SetOptions {
+                        unsafe_operations: grant,
+                        ..SetOptions::default()
+                    },
+                    shared(&variables),
+                    &*variables,
+                    None,
+                )
+                .map(|(_, lifted)| lifted)
+                .map_err(|error| format!("{error:#}"));
+
+                let case =
+                    format!("{reach:?}, question Flags {flags:#04x}, set S {text}, {grant:?}");
+                assert_eq!(got, want, "{case}");
+                assert_eq!(variables.writes_to(&setup()), want_writes, "{case}: writes");
+            }
+        }
+    }
+
+    /// A STRING over the bytes of a PASSWORD keeps them withheld, as a NUMERIC does: get answers
+    /// that its bytes hold a password and set writes nothing, while a STRING after them is read
+    /// and written; the PASSWORD, whose characters a STRING would show, stays no question that
+    /// get selects.
+    #[test]
+    fn strings_keep_the_bytes_of_a_password_withheld() {
+        let packages = [
+            form_package_of(&form_set(&[
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(
+                    1,
+                    &[
+                        password_on(3, 3, 2, 0),
+                        string_on(4, 4, (2, 10), (0, 4), &[]),
+                        string_on(5, 5, (2, 40), (0, 4), &[]),
+                    ],
+                ),
+            ])),
+            en_strings_package_of(&["Q", "P", "Password", "Over", "After"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let after: Vec<u8> = [0x41, 0, 0x42, 0, 0, 0, 0, 0].into();
+        let stored = [plaintext_password().as_slice(), &after, &[0; 33]].concat();
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(amitse_setup(), NV_BS_RT, &stored);
+        let variables = Rc::new(variables);
+
+        assert_eq!(
+            answers_of(&hiidb, "Over", &variables),
+            [PASSWORD_BYTES],
+            "get Over"
+        );
+        assert_eq!(answers_of(&hiidb, "After", &variables), ["AB"], "get After");
+        assert_eq!(
+            answers_of(&hiidb, "Password", &variables),
+            Vec::<String>::new(),
+            "get Password"
+        );
+        let set = set_bypassing(&hiidb, "Over", "ab", &variables);
+        assert!(
+            set.as_ref()
+                .is_err_and(|error| error
+                    .contains("holds a password at bytes 0..40, which set never writes")),
+            "set Over: {set:?}"
+        );
+        assert_eq!(variables.writes_to(&amitse_setup()), [], "set Over: writes");
+        assert_eq!(
+            set_bypassing(&hiidb, "After", "Z", &variables),
+            Ok(()),
+            "set After"
+        );
+        assert_eq!(
+            variables.writes_to(&amitse_setup()),
+            [(40, vec![0x5A, 0, 0, 0, 0, 0, 0, 0])],
+            "set After: writes"
+        );
+    }
+
+    /// list-questions and show-ifr withhold the bytes of a PASSWORD under a STRING, and show no
+    /// character of the password, while they show a STRING after it.
+    #[test]
+    fn strings_list_and_show_no_password_character() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 48),
+                form(
+                    1,
+                    &[
+                        password_on(3, 3, 1, 0),
+                        string_on(4, 4, (1, 2), (0, 4), &[]),
+                        string_on(5, 5, (1, 40), (0, 4), &[]),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "Over", "After"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x7D; 16], &packages.concat());
+        let stored = [
+            plaintext_password().as_slice(),
+            &[0x41, 0, 0x42, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+
+        let (listed, shown) = listed_and_shown(&hiidb, &stored, None);
+
+        let listed: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|question| (&*question.name, &*question.answer))
+            .collect();
+        assert_eq!(
+            listed,
+            [("Over", PASSWORD_BYTES), ("After", "AB")],
+            "list-questions"
+        );
+        assert!(
+            shown.contains(&format!("-Answer: {PASSWORD_BYTES}\n")),
+            "show-ifr: {shown}"
+        );
+        assert!(shown.contains("-Answer: AB\n"), "show-ifr: {shown}");
+        for output in [format!("{listed:?}"), shown] {
+            assert!(
+                !output.contains("unter"),
+                "a password character in {output}"
+            );
+        }
+    }
+
+    /// A STRING of a VARSTORE whose bytes the ExportConfig snapshot holds shows " <snapshot>" in
+    /// get, list-questions and show-ifr, and one over a PASSWORD's bytes in the snapshot shows
+    /// none of them, as bytes or as characters, in any text or JSON output.
+    #[test]
+    fn snapshot_strings_show_their_source_and_no_password() {
+        let packages = [
+            device_path_package(&DRIVER_PATH),
+            form_package(&[
+                var_store(1, N_GUID, "NStore", 8),
+                var_store(2, P_GUID, "AMITSESetup", 81),
+                form(
+                    1,
+                    &[
+                        string_on(1, 1, (1, 0), (0, 4), &[]),
+                        password_on(3, 4, 2, 0),
+                        string_on(5, 5, (2, 2), (0, 4), &[]),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["S", "W", "P", "Password", "Over"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x7E; 16], &packages.concat());
+        let mut amitse_setup = [0; 81];
+        amitse_setup[..40].fill(0xA5);
+        let text = [
+            block_resp(
+                &config_hdr(N_GUID, "NStore", &DRIVER_PATH),
+                0,
+                &[0x41, 0, 0x42, 0, 0, 0, 0, 0],
+            ),
+            block_resp(
+                &config_hdr(P_GUID, "AMITSESetup", &DRIVER_PATH),
+                0,
+                &amitse_setup,
+            ),
+        ]
+        .join("&");
+
+        let (got, listed, shown, outputs) =
+            answers_with_snapshot(&hiidb, &["S", "Over"], &no_variables(), &text);
+
+        assert_eq!(got, ["AB <snapshot>", PASSWORD_BYTES], "get");
+        assert_eq!(listed, got, "list-questions");
+        assert!(
+            shown.contains("-Answer: AB <snapshot>\n"),
+            "show-ifr: {shown}"
+        );
+        assert!(
+            shown.contains(&format!("-Answer: {PASSWORD_BYTES}\n")),
+            "show-ifr: {shown}"
+        );
+        assert_no_password_byte(&outputs);
+        for output in &outputs {
+            assert!(!output.contains('\u{A5A5}'), "U+A5A5 in {output}");
+        }
+    }
+
+    /// set refuses a STRING and a NUMERIC that one prompt selects in two FormSets before it
+    /// writes either: it gives one value to questions of one kind.
+    #[test]
+    fn set_refuses_a_string_and_a_numeric_of_one_prompt() {
+        let hiidb = [
+            string_list([0x75; 16], (0, 1), &[]),
+            one_form_list([0x76; 16], "S", &[numeric_at(1, 0, 0)]),
+        ]
+        .concat();
+        let variables = setup_holding(&[0; 3]);
+
+        let set = set_of(&hiidb, "S", "1", &variables);
+        assert!(
+            set.as_ref()
+                .is_err_and(|error| error.contains("STRING (in ")
+                    && error.contains("set gives one value to questions of one kind")),
+            "set S: {set:?}"
+        );
+        assert_eq!(variables.writes_to(&setup()), [], "set S: writes");
     }
 
     /// Two VARSTORE_EFIs before UEFI 2.3.1 of two Guids each take the VarNames of their questions

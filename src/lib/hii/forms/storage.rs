@@ -33,6 +33,7 @@ use super::question_values::value_question;
 use super::question_values::ListedQuestion;
 use super::storageless::NoVarStore;
 use super::storageless::StoragelessRefusal;
+use super::string_question::NotUcs2;
 use super::time_storage::question_value;
 use super::time_storage::TimeStorageUnread;
 use super::IFROpCode;
@@ -1270,9 +1271,18 @@ pub(super) enum ValueUnavailable {
     /// `{:#}` shows it
     #[error("{0}")]
     TimeService(String),
-    /// An expression that would give an ORDERED_LIST or a REF its value
+    /// An expression that would give an ORDERED_LIST, a REF or a STRING its value
     #[error("{0}")]
     BufferExpression(BufferExpression),
+    /// The CHAR16s of a STRING, one of which no UCS-2 character is
+    #[error("{0}")]
+    StoredString(NotUcs2),
+    /// A STRING of a VARSTORE_NAME_VALUE, whose setting ConfigSnapshot keeps as a number only
+    #[error(
+        "uefisettings keeps the ExportConfig snapshot's settings of a VARSTORE_NAME_VALUE as \
+         numbers only, so it takes no string from them"
+    )]
+    NameValueString,
     /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
     /// level replaces it only in conditions
     #[error(
@@ -1336,7 +1346,9 @@ impl ValueUnavailable {
             | Self::SnapshotNumber { .. }
             | Self::TimeStorageUnread(_)
             | Self::TimeService(_)
-            | Self::BufferExpression(_) => "ValueUnavailable",
+            | Self::BufferExpression(_)
+            | Self::StoredString(_)
+            | Self::NameValueString => "ValueUnavailable",
         }
     }
 }
@@ -1347,6 +1359,9 @@ pub(crate) enum BufferQuestion {
     OrderedList,
     /// A REF on a VarStore, whose value is an EFI_HII_REF (UEFI 2.11 §33.2.5.4.10)
     CrossReference,
+    /// A STRING, whose value is MaxSize CHAR16s (edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c:2225)
+    String,
 }
 
 impl fmt::Display for BufferQuestion {
@@ -1354,6 +1369,7 @@ impl fmt::Display for BufferQuestion {
         match self {
             Self::OrderedList => f.write_str("the buffer of an ORDERED_LIST"),
             Self::CrossReference => f.write_str("the EFI_HII_REF of a cross-reference question"),
+            Self::String => f.write_str("the CHAR16s of a STRING"),
         }
     }
 }
@@ -1370,8 +1386,8 @@ pub(crate) enum BufferExpression {
     Value(BufferQuestion),
 }
 
-/// Where a ONE_OF, NUMERIC, CHECKBOX, DATE, TIME, ORDERED_LIST or REF keeps its value in the
-/// payload of its VarStore.
+/// Where a ONE_OF, NUMERIC, CHECKBOX, DATE, TIME, ORDERED_LIST, REF or STRING keeps its value
+/// in the payload of its VarStore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ValueLocation {
     /// `size` bytes from byte `offset`, little-endian
@@ -1609,6 +1625,12 @@ fn snapshot_bytes(
             let number = snapshot
                 .number(*guid, question.header().var_store_info)
                 .ok_or(unread)?;
+            match question {
+                ListedQuestion::String(_) => return Err(ValueUnavailable::NameValueString),
+                ListedQuestion::Value(_)
+                | ListedQuestion::OrderedList(_)
+                | ListedQuestion::Ref(_) => {}
+            }
             number_bytes(number, value.len())
         }
     }

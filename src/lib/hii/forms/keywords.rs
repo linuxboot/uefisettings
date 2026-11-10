@@ -29,7 +29,6 @@ use binrw::BinRead;
 use log::debug;
 use thiserror::Error;
 
-use super::char16_storage_width;
 use super::choice_for_set;
 use super::conditions::is_question;
 use super::conditions::question_expression;
@@ -49,6 +48,7 @@ use super::defaults::option_value;
 use super::defaults::option_visibility;
 use super::defaults::question_default_values;
 use super::defaults::question_scope;
+use super::defaults::string_bytes;
 use super::defaults::DefaultError;
 use super::defaults::DefaultId;
 use super::defaults::OptionVisibility;
@@ -87,7 +87,6 @@ use super::Range as IfrRange;
 use super::ReadOnlyWriter;
 use super::SelectionError;
 use super::ShortVarStoreEfi;
-use super::StringOp;
 use super::TextInput;
 use super::TimeStorage;
 use super::TypeValue;
@@ -378,8 +377,10 @@ pub(crate) enum KeywordInfoRefusal {
     Question(#[from] KeywordRefusal),
     #[error("keyword {keyword}: UEFI 2.11 §35.2.1.6 names no <DataType> of {op}")]
     NoDataType { keyword: String, op: &'static str },
-    #[error("keyword {keyword}: its EFI_IFR_STRING has no MinSize and MaxSize: {reason}")]
-    StringSizes { keyword: String, reason: String },
+    #[error(
+        "keyword {keyword}: its EFI_IFR_STRING does not decode, which gives no MinSize and MaxSize"
+    )]
+    StringSizes { keyword: String },
     #[error(
         "keyword {keyword}: whether SetupBrowserDxe shows its option of string {option} is \
          unknown: {reason}"
@@ -844,10 +845,13 @@ impl<'a> KeywordQuestion<'a> {
             return Err(KeywordRefusal::ReadOnlyResp(self.keyword.to_string()).into());
         }
         let op = self.op.borrow();
-        // set takes no STRING (ListedQuestion), and keyword set takes none yet
         let Some(listed) = ListedQuestion::of(&op) else {
             return Err(self.unchecked(&op).into());
         };
+        // set takes a STRING, but keyword set takes none yet: refused before its VALUE
+        if let ListedQuestion::String(_) = listed {
+            return Err(self.unchecked(&op).into());
+        }
         let prompt = self.texts.display(header.prompt_string_id);
         if keyword_width(&op) != Some(resp.value.as_bytes().len()) {
             return Err(self.value_refusal(resp, prompt, ValueRefusal::Width).into());
@@ -877,6 +881,8 @@ impl<'a> KeywordQuestion<'a> {
                 })
                 .with_context(|| format!("keyword {}", self.keyword));
             }
+            // refused before its VALUE, above
+            ListedQuestion::String(_) => return Err(self.unchecked(&op).into()),
         };
         let write =
             write.ok_or_else(|| self.question_refusal(&header, QuestionRefusal::Storageless))?;
@@ -1058,13 +1064,11 @@ impl<'a> KeywordQuestion<'a> {
         if op.op_code != IFROpCode::String {
             return Ok(None);
         }
-        let string: StringOp =
-            Cursor::new(&op.data)
-                .parse_le()
-                .map_err(|error| KeywordInfoRefusal::StringSizes {
-                    keyword: self.keyword.to_string(),
-                    reason: error.to_string(),
-                })?;
+        let ParsedOperation::String(string) = &op.parsed_data else {
+            return Err(KeywordInfoRefusal::StringSizes {
+                keyword: self.keyword.to_string(),
+            });
+        };
         Ok(Some(ValueRange {
             max: Number::try_from(vec![string.max_size])?,
             min: Number::try_from(vec![string.min_size])?,
@@ -1126,7 +1130,8 @@ impl<'a> KeywordQuestion<'a> {
     /// `value`, the question's default of `default_id`, as the `<Number>` of the question's value
     /// bytes (keyword_width): a ONE_OF's, NUMERIC's or CHECKBOX's number; a DATE's or TIME's
     /// number, its EFI_HII_DATE or EFI_HII_TIME as TypeValue::widened takes it; a STRING's string, in
-    /// the CHAR16s of display's language, zero-padded to MaxSize CHAR16s, as edk2-stable202608
+    /// the CHAR16s of display's language (string_bytes), cut (StringQuestion::default_bytes) or
+    /// zero-padded to MaxSize CHAR16s, as edk2-stable202608
     /// SetupBrowserDxe/Setup.c:4501-4512 stores it in a storage of MaxSize × 2 bytes
     /// (IfrParse.c:2225); an ORDERED_LIST's buffer (Setup.c:4493-4495), whose missing containers
     /// are 0 (UEFI 2.11 §33.2.5.4.8); a REF's EFI_HII_REF. Refuses a default that does not fit,
@@ -1148,11 +1153,16 @@ impl<'a> KeywordQuestion<'a> {
                 | TableType::Fixed(FixedType::Boolean | FixedType::Date | FixedType::Time),
                 TypedDefault::Number(number),
             ) => number.to_le_bytes().to_vec(),
-            (TableType::Fixed(FixedType::String), TypedDefault::String(id)) => self
-                .text(id)?
-                .iter()
-                .flat_map(|unit| unit.to_le_bytes())
-                .collect(),
+            (TableType::Fixed(FixedType::String), TypedDefault::String(id)) => {
+                let ParsedOperation::String(string) = &op.parsed_data else {
+                    return Err(KeywordInfoRefusal::StringSizes {
+                        keyword: self.keyword.to_string(),
+                    });
+                };
+                let bytes = string_bytes(&self.texts, id)
+                    .map_err(|error| self.default_refusal(default_id, error.to_string()))?;
+                string.default_bytes(&bytes).to_vec()
+            }
             (TableType::Fixed(FixedType::Buffer), TypedDefault::Buffer(bytes))
                 if !bytes.is_empty() =>
             {
@@ -1440,7 +1450,8 @@ impl<'a> KeywordQuestion<'a> {
                     TextInput::Maximum(_)
                     | TextInput::DateTime(_)
                     | TextInput::OrderedList(_)
-                    | TextInput::CrossReference => number.to_string(),
+                    | TextInput::CrossReference
+                    | TextInput::String(_) => number.to_string(),
                 };
                 NewValue::Text(&text)
             }
@@ -1761,8 +1772,10 @@ fn keyword_width(op: &IFROperation) -> Option<usize> {
             Some(get_width_container_bytes(op)? * usize::from(list.max_containers))
         }
         IFROpCode::String => {
-            let string: StringOp = data.parse_le().ok()?;
-            Some(usize::from(char16_storage_width(string.max_size)))
+            let ParsedOperation::String(string) = &op.parsed_data else {
+                return None;
+            };
+            Some(usize::from(string.storage_width()))
         }
         IFROpCode::Date => Some(EFI_HII_DATE_SIZE),
         IFROpCode::Time => Some(EFI_HII_TIME_SIZE),
@@ -4716,10 +4729,11 @@ mod tests {
         }
     }
 
-    /// A STRING's default is its string's CHAR16s in the texts' language, zero-padded to MaxSize
-    /// CHAR16s; an ORDERED_LIST's is its EFI_IFR_TYPE_BUFFER default or its flagged option's
-    /// value, which is no option then, zero-padded to MaxContainers, an option of both flags
-    /// giving the standard default alone; a longer one refuses, and one of a DATE is its bytes.
+    /// A STRING's default is its string's CHAR16s in the texts' language, cut or zero-padded to
+    /// MaxSize CHAR16s, as get shows it; an ORDERED_LIST's is its EFI_IFR_TYPE_BUFFER default or
+    /// its flagged option's value, which is no option then, zero-padded to MaxContainers, an
+    /// option of both flags giving the standard default alone; a longer one refuses, and one of a
+    /// DATE is its bytes.
     #[test]
     fn info_of_string_and_ordered_list_defaults_is_their_value_bytes() {
         // MinSize 1, MaxSize 4, Flags
@@ -4758,7 +4772,7 @@ mod tests {
                 reason: reason.to_owned(),
             })
         };
-        let cases: [(&str, Vec<u8>, &[&str], _); 6] = [
+        let cases: [(&str, Vec<u8>, &[&str], _); 7] = [
             (
                 "STRING of \"One\"",
                 string(one.clone()),
@@ -4772,10 +4786,16 @@ mod tests {
                 standard(&[b'U', 0, b'n', 0, 0, 0, 0, 0]),
             ),
             (
-                "STRING of \"Three\", 5 CHAR16s",
+                "STRING of \"Three\", 5 CHAR16s cut to MaxSize 4",
                 string(three),
                 &[],
-                refusal("it is wider than the question's 8 bytes"),
+                standard(&[b'T', 0, b'h', 0, b'r', 0, b'e', 0]),
+            ),
+            (
+                "STRING of a missing string",
+                string(typed_default(0x0000, 0x07, &0x99_u16.to_le_bytes())),
+                &[],
+                refusal("EFI_IFR_TYPE_STRING default: string 0x0099 not found"),
             ),
             (
                 "ORDERED_LIST of EFI_IFR_TYPE_BUFFER 3 1",

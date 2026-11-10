@@ -123,6 +123,9 @@ use storageless::NoVarStore;
 use storageless::StoragelessQuestion;
 use storageless::StoragelessRefusal;
 use storageless::StoragelessRoute;
+use string_question::display_string_answer;
+use string_question::StringInput;
+use string_question::StringQuestion;
 use time_storage::TimeStorage;
 use time_storage::TimeStorageOnly;
 
@@ -168,6 +171,7 @@ mod set;
 mod setup_password;
 mod storage;
 mod storageless;
+mod string_question;
 mod time_storage;
 mod write_plan;
 
@@ -1015,6 +1019,7 @@ pub enum ParsedOperation {
     Time(DateTimeQuestion),
     OrderedList(OrderedList),
     Ref(CrossReference),
+    String(StringQuestion),
     #[default]
     Placeholder,
 }
@@ -3443,6 +3448,11 @@ fn handle_opcode(node: &mut IFROperation) -> Result<()> {
             Ok(parsed) => node.parsed_data = ParsedOperation::Ref(parsed),
             Err(error) => debug!("leaving a Ref undecoded: {error}"),
         },
+        // and a STRING
+        IFROpCode::String => match data_cursor.parse_ne_args((parsed_layout(node),)) {
+            Ok(parsed) => node.parsed_data = ParsedOperation::String(parsed),
+            Err(error) => debug!("leaving a String undecoded: {error}"),
+        },
         _ => (),
     }
 
@@ -3497,6 +3507,8 @@ enum TextInput {
     OrderedList(ListInput),
     /// A REF on a VarStore, whose EFI_HII_REF set does not write
     CrossReference,
+    /// A STRING, which takes characters
+    String(StringInput),
 }
 
 impl TextInput {
@@ -3508,6 +3520,7 @@ impl TextInput {
             Self::DateTime(_) => "DateTime",
             Self::OrderedList(_) => "OrderedList",
             Self::CrossReference => "CrossReference",
+            Self::String(_) => "String",
         }
     }
 }
@@ -3603,7 +3616,8 @@ impl QuestionDescriptor {
             TextInput::Range(_)
             | TextInput::Maximum(_)
             | TextInput::DateTime(_)
-            | TextInput::CrossReference => None,
+            | TextInput::CrossReference
+            | TextInput::String(_) => None,
         }
     }
 
@@ -5089,6 +5103,25 @@ fn display_op(
             );
         }
 
+        ParsedOperation::String(parsed) => {
+            let header = parsed.question_header();
+            let varstore = find_corresponding_varstore(Rc::clone(node), header.var_store_id);
+            let answer_disp = display_string_answer(node, &varstore, inputs);
+
+            result.push_str(
+                format!(
+                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-MinSize: {} - MaxSize: {} - Flags: {:#04x}\n{extra_spaces}-Answer: {answer_disp}\n",
+                    current_node.op_code,
+                    texts.display(header.prompt_string_id),
+                    texts.display(header.help_string_id),
+                    parsed.min_size,
+                    parsed.max_size,
+                    parsed.flags
+                )
+                .as_str(),
+            );
+        }
+
         // TODO: we have already made structs for the most popular opcodes so we should finish the display function for them
         // however display is only for debugging and a visual representation of the forms for humans
         _ => result
@@ -5216,9 +5249,9 @@ fn short_efi_variable(
 /// and the StorageWidth of edk2-stable202608 SetupBrowserDxe/IfrParse.c that its variable holds
 /// whole, as Setup.c GetQuestionValue and SetQuestionValue read and write it (:1764-1782,
 /// :2061-2077): the bytes of the location of an ORDERED_LIST, MaxContainers containers (:2492),
-/// or of a REF, an EFI_HII_REF (:2041); of a STRING, string_var_name's. An ORDERED_LIST without
-/// options has none. An ORDERED_LIST or REF parsed before the store took its VarStoreInfo for a
-/// VarOffset.
+/// or of a REF, an EFI_HII_REF (:2041); of a STRING, MaxSize CHAR16s (:2225). An ORDERED_LIST
+/// without options has none. An ORDERED_LIST, REF or STRING parsed before the store took its
+/// VarStoreInfo for a VarOffset.
 fn buffer_var_name(question: &IFROperation) -> Result<(u16, u16), ShortEfiReason> {
     let (header, layout, location) = match &question.parsed_data {
         ParsedOperation::OrderedList(list) => {
@@ -5233,9 +5266,11 @@ fn buffer_var_name(question: &IFROperation) -> Result<(u16, u16), ShortEfiReason
             reference.layout,
             reference.location(),
         ),
-        // what handle_opcode does not decode, a STRING among them
-        ParsedOperation::Placeholder => return string_var_name(question),
-        ParsedOperation::FormSet(_)
+        ParsedOperation::String(string) => {
+            (string.question_header, string.layout, string.location())
+        }
+        ParsedOperation::Placeholder
+        | ParsedOperation::FormSet(_)
         | ParsedOperation::OneOf(_)
         | ParsedOperation::CheckBox(_)
         | ParsedOperation::OneOfOption(_)
@@ -5261,7 +5296,7 @@ fn buffer_var_name(question: &IFROperation) -> Result<(u16, u16), ShortEfiReason
     };
     let size = match location {
         ValueLocation::Bytes { size, .. } => size,
-        // no ORDERED_LIST or REF is an EDKII bit varstore field
+        // no ORDERED_LIST, REF or STRING is an EDKII bit varstore field
         ValueLocation::Bits { .. } => return Err(not_read(question)),
     };
     match layout {
@@ -5271,44 +5306,9 @@ fn buffer_var_name(question: &IFROperation) -> Result<(u16, u16), ShortEfiReason
     }
 }
 
-/// The VarName of the STRING `question` on a VARSTORE_EFI before UEFI 2.3.1 and its StorageWidth,
-/// MaxSize CHAR16s (edk2-stable202608 SetupBrowserDxe/IfrParse.c:2225), wherever the store is, as
-/// only the Keyword Handler reaches it, whose FindStorageFromVarId (ConfigKeywordHandler.c:1520)
-/// finds the store so.
-fn string_var_name(question: &IFROperation) -> Result<(u16, u16), ShortEfiReason> {
-    if question.op_code != IFROpCode::String {
-        return Err(not_read(question));
-    }
-    // decode_op disables the form of a STRING shorter than its minimum_length, so none of a
-    // parsed form fails here
-    let string: StringOp = Cursor::new(&question.data)
-        .parse_le()
-        .map_err(|_| not_read(question))?;
-    Ok((
-        string.question.var_store_info,
-        char16_storage_width(string.max_size),
-    ))
-}
-
 /// Why get and set read no value of `question` on a VARSTORE_EFI before UEFI 2.3.1.
 fn not_read(question: &IFROperation) -> ShortEfiReason {
     ShortEfiReason::NotRead(question.op_code.spec_name())
-}
-
-/// An EFI_IFR_STRING after its op header (UEFI 2.11 §33.3.8.3.70).
-#[derive(BinRead)]
-#[br(little)]
-pub(super) struct StringOp {
-    pub(super) question: QuestionHeader,
-    pub(super) min_size: u8,
-    pub(super) max_size: u8,
-}
-
-/// The StorageWidth that edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes gives a STRING
-/// of `max_size` CHAR16s, MaxSize × 2 (:2225), as HiiDatabaseDxe/ConfigKeywordHandler.c GetWidth
-/// does (:1644).
-pub(super) fn char16_storage_width(max_size: u8) -> u16 {
-    u16::from(max_size) * 2
 }
 
 /// A VarStore that a FormSet, or an op outside any, declares.
@@ -5448,6 +5448,7 @@ fn declared_store(parsed: &ParsedOperation) -> Option<(u16, DeclaredStore)> {
         | ParsedOperation::Time(_)
         | ParsedOperation::OrderedList(_)
         | ParsedOperation::Ref(_)
+        | ParsedOperation::String(_)
         | ParsedOperation::Placeholder => None,
     }
 }

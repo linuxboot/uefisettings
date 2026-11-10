@@ -913,6 +913,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
+    use crate::hii::forms::ifr_fixtures::string_on;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::MemoryVariables;
     use crate::hii::forms::ifr_fixtures::VariableInterface;
@@ -1708,6 +1709,39 @@ mod tests {
         .map(|(_, lifted)| lifted)
         .map_err(|error| format!("{error:#}"));
         assert_eq!(got, Ok(vec![]), "no password: lifted");
+    }
+
+    /// In a HiiDB that declares a PASSWORD question, set refuses a keyword of a STRING, whose
+    /// keyword set uefisettings does not implement yet, before the setup password, with and
+    /// without UnsafeOperations::Allow, and calls no SetData().
+    #[test]
+    fn set_refuses_a_string_before_the_setup_password() {
+        let lists = [list(
+            PATH,
+            &[vec![string_on(3, 3, (1, 8), (0, 4), &[])], password()].concat(),
+        )];
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "4100000000000000")]);
+
+            let got = set(
+                &lists,
+                &resp(PATH, KEYWORD, "4100420000000000"),
+                grant,
+                &handler,
+            )
+            .map(|values| values.to_string())
+            .map_err(|error| format!("{error:#}"));
+
+            assert_eq!(
+                got,
+                Err(format!(
+                    "keyword {KEYWORD}: uefisettings does not yet implement keyword set of \
+                     EFI_IFR_STRING"
+                )),
+                "{grant:?}"
+            );
+            assert_eq!(handler.calls(), [], "{grant:?}: calls");
+        }
     }
 
     /// set refuses a keyword whose question EFI_IFR_FLAG_READ_ONLY makes read-only, under a
@@ -4127,5 +4161,74 @@ mod tests {
             ),
             "the report"
         );
+    }
+
+    /// Get by keyword of a STRING over a PASSWORD's bytes fails before any call through
+    /// variables of either reach, as get withholds them; a STRING after them is read through
+    /// GetData().
+    #[test]
+    fn get_withholds_a_password_under_a_string() {
+        let mut password: Vec<u8> = "hunter2secret"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        password.resize(48, 0);
+        for (reach, interface) in [
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+        ] {
+            for (case, offset, want) in [
+                (
+                    "over the password",
+                    2,
+                    Err(
+                        "keyword Keyword: question \"Keyword question\" spans bytes that hold a \
+                         password, which uefisettings neither reads nor writes"
+                            .to_owned(),
+                    ),
+                ),
+                (
+                    "after the password",
+                    40,
+                    Ok(resp(PATH, KEYWORD, "4100420000000000")),
+                ),
+            ] {
+                let ifr = form_set(&[
+                    var_store(1, STORE_GUID, "Store", 48),
+                    password_on(9, 9, 1, 0),
+                    string_on(7, 3, (1, offset), (0, 4), &[]),
+                ]);
+                let variables = MemoryVariables::new(reach, interface);
+                let key = VariableKey {
+                    name: "Store".to_owned(),
+                    guid: Guid::from(STORE_GUID),
+                };
+                variables.insert(key, ATTRIBUTES, &password);
+                let lists = [list_of_ifr(PATH, &ifr)];
+                let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "4100420000000000")]);
+
+                let got = get_keywords(
+                    &lists,
+                    &format!("KEYWORD={KEYWORD}"),
+                    None,
+                    &[],
+                    KeywordGetOptions::default(),
+                    Box::new(variables),
+                    &handler,
+                )
+                .map(|values| values.to_string())
+                .map_err(|error| format!("{error:#}"));
+
+                let calls = match want.is_ok() {
+                    true => vec![get_call(PATH, KEYWORD)],
+                    false => vec![],
+                };
+                assert_eq!(got, want, "{case}: {reach:?}");
+                assert_eq!(handler.calls(), calls, "{case}: {reach:?}: calls");
+            }
+        }
     }
 }

@@ -308,6 +308,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::password_on;
     use crate::hii::forms::ifr_fixtures::question_header_with;
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
+    use crate::hii::forms::ifr_fixtures::string_on;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
     use crate::hii::forms::ifr_fixtures::var_store_name_value;
@@ -1649,5 +1650,53 @@ mod tests {
             "a manifest without a version: {manifest}"
         );
         manifest
+    }
+
+    /// The redacted dump of a HiiDB with a STRING over bytes 2..10 of a PASSWORD's 40 bytes keeps
+    /// no byte of the password, and keeps the CHAR16s of a STRING after them.
+    #[test]
+    fn redacted_dump_keeps_no_password_byte_under_a_string() {
+        let packages = [
+            form_package(&[
+                var_store(2, [0x44; 16], "AMITSESetup", 48),
+                form(
+                    1,
+                    &[
+                        password_on(3, 3, 2, 0),
+                        string_on(4, 4, (2, 2), (0, 4), &[]),
+                        string_on(5, 5, (2, 40), (0, 4), &[]),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["Q", "P", "Password", "Over", "After"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let mut password: Vec<u8> = "hunter2secret"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        password.resize(40, 0);
+        let after = [0x41, 0, 0x42, 0, 0, 0, 0, 0];
+        let file = [&NV_BS_RT.to_ne_bytes()[..], &password, &after].concat();
+
+        let decoded = decoded_bytes(read_db(&hiidb).expect("read the HiiDB")).expect("decode");
+        let values: Vec<DecodedValue> = decoded
+            .iter()
+            .filter(|(name, _)| name.to_string().starts_with("AMITSESetup-"))
+            .flat_map(|(_, values)| values.iter().cloned())
+            .collect();
+        let kept = keep_decoded(&file, &values);
+
+        assert_eq!(
+            kept.get(EFIVARFS_HEADER_SIZE..EFIVARFS_HEADER_SIZE + 40),
+            Some(&[0; 40][..]),
+            "the password's bytes in the dump"
+        );
+        assert_eq!(
+            kept.get(EFIVARFS_HEADER_SIZE + 40..),
+            Some(&after[..]),
+            "the STRING After's bytes in the dump"
+        );
     }
 }
