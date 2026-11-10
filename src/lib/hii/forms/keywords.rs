@@ -36,6 +36,7 @@ use super::conditions::question_value_expression;
 use super::conditions::select;
 use super::conditions::QuestionExpression;
 use super::conditions::VarStoreValues;
+use super::declared_store;
 use super::declared_var_store;
 use super::defaults::is_statement;
 use super::find_corresponding_varstore;
@@ -53,7 +54,9 @@ use super::DeclaredStore;
 use super::FormSetWalk;
 use super::IFROpCode;
 use super::IFROperation;
+use super::IgnoredIfr;
 use super::IncludedStates;
+use super::OutsideOp;
 use super::QuestionDescriptor;
 use super::QuestionFlags;
 use super::QuestionHeader;
@@ -121,6 +124,15 @@ pub(crate) enum KeywordRefusal {
          may take another than the first"
     )]
     AmbiguousStatements { keyword: String, count: usize },
+    #[error(
+        "keyword {keyword}: it prompts an {op} outside any FormSet, at offset {offset} of a form \
+         package, whose question uefisettings neither reads nor writes"
+    )]
+    OutsideFormSet {
+        keyword: String,
+        op: &'static str,
+        offset: u64,
+    },
     #[error("keyword {keyword}: it prompts an {op}, which has no question header")]
     NotQuestion { keyword: String, op: &'static str },
     #[error("keyword {keyword}: its {op} has no question header: {reason}")]
@@ -186,6 +198,16 @@ pub(crate) enum QuestionRefusal {
     PasswordBytes,
     #[error("has VarStoreId {0}, which another FormSet of its package list declares for {1}")]
     RedeclaredVarStore(u16, String),
+    #[error(
+        "has VarStoreId {0}, which a VarStore outside any FormSet of its package list declares \
+         for {1}"
+    )]
+    OutsideVarStore(u16, String),
+    #[error(
+        "may have the VarStoreId of the VarStore at offset {0} of a form package of its package \
+         list, outside any FormSet, which does not parse"
+    )]
+    MalformedOutsideVarStore(u64),
 }
 
 /// Why a VALUE is not one that set would write to a question.
@@ -264,6 +286,11 @@ pub(crate) struct KeywordQuestion<'a, P = KeywordPath> {
     texts: ListTexts<'a>,
     /// The roots of the form packages of the package list
     roots: &'a [Rc<RefCell<IFROperation>>],
+    /// The VarStores and statements of the form packages of the package list outside any FormSet
+    outside: &'a [OutsideOp],
+    /// The VarStores of the form packages of the package list outside any FormSet that do not
+    /// parse
+    malformed_stores: &'a [IgnoredIfr],
     /// The root of the form package of the statement
     root: &'a Rc<RefCell<IFROperation>>,
     op: Rc<RefCell<IFROperation>>,
@@ -281,8 +308,9 @@ impl<'a, P> KeywordQuestion<'a, P> {
     /// keyword (GetStringIdFromRecord) and whose statements it prompts; there the first
     /// statement, in IFR order, that the keyword's string prompts (FindQuestionFromStringId,
     /// IsStatementOpCode). Refuses a keyword that other strings packages of the list hold too,
-    /// or that prompts other statements too, which firmware may take instead, and a list that
-    /// `list_path`, given the list and the keyword, refuses before its statements are searched.
+    /// or that prompts other statements too, which firmware may take instead, or a statement
+    /// outside any FormSet, and a list that `list_path`, given the list and the keyword, refuses
+    /// before its statements are searched.
     fn find(
         lists: &'a [ParsedPackageList],
         namespace: Option<&Namespace>,
@@ -353,8 +381,15 @@ impl<'a, P> KeywordQuestion<'a, P> {
             language: string.language.0.escape_ascii().to_string(),
         })?;
         let path = list_path(list, &text)?;
-        let Statement { root, op } = match <[_; 1]>::try_from(statements(list, string.id)) {
-            Ok([statement]) => statement,
+        let (root, op) = match <[_; 1]>::try_from(statements(list, string.id)) {
+            Ok([Statement::InFormSet { root, op }]) => (root, op),
+            Ok([Statement::Outside(outside)]) => {
+                return Err(KeywordRefusal::OutsideFormSet {
+                    keyword: text,
+                    op: outside.op.op_code.spec_name(),
+                    offset: outside.offset,
+                })
+            }
             Err(statements) if statements.is_empty() => {
                 return Err(KeywordRefusal::NoStatement(text))
             }
@@ -371,6 +406,8 @@ impl<'a, P> KeywordQuestion<'a, P> {
             path,
             texts: list.texts(&[]),
             roots: &list.forms,
+            outside: &list.outside_ifr,
+            malformed_stores: &list.malformed_outside_stores,
             root,
             op,
         })
@@ -599,6 +636,19 @@ impl<'a> KeywordQuestion<'a> {
                 QuestionRefusal::RedeclaredVarStore(header.var_store_id, other),
             ));
         }
+        if let Some(other) = self.outside_declaration(header.var_store_id, &store.variable_key()) {
+            return Err(self.question_refusal(
+                &header,
+                QuestionRefusal::OutsideVarStore(header.var_store_id, other),
+            ));
+        }
+        // FindStorageFromVarId reads the VarStoreId of such a VarStore as it reads any
+        if let Some(malformed) = self.malformed_stores.first() {
+            return Err(self.question_refusal(
+                &header,
+                QuestionRefusal::MalformedOutsideVarStore(malformed.offset),
+            ));
+        }
         Ok(header)
     }
 
@@ -613,16 +663,18 @@ impl<'a> KeywordQuestion<'a> {
             .filter(|root| !Rc::ptr_eq(root, self.root))
             .flat_map(|root| root.borrow().children.clone())
             .filter(|op| op.borrow().op_code == IFROpCode::FormSet)
-            .find_map(
-                |form_set| match declared_var_store(&form_set.borrow(), id)? {
-                    DeclaredStore::Variable(store) if store.variable_key() == *variable => None,
-                    DeclaredStore::Variable(store) => {
-                        Some(format!("EFI variable {}", store.variable_key()))
-                    }
-                    DeclaredStore::NameValue(_) => Some("a VARSTORE_NAME_VALUE".to_owned()),
-                    DeclaredStore::ShortEfi(_) => Some(format!("an {}", ShortVarStoreEfi::LABEL)),
-                },
-            )
+            .find_map(|form_set| other_store(declared_var_store(&form_set.borrow(), id)?, variable))
+    }
+
+    /// The store, as text, that a VarStore outside any FormSet of the package list declares for
+    /// VarStoreId `id`, unless it is the EFI variable `variable` too: FindStorageFromVarId walks
+    /// the whole form package.
+    fn outside_declaration(&self, id: u16, variable: &VariableKey) -> Option<String> {
+        self.outside
+            .iter()
+            .filter_map(|outside| declared_store(&outside.op))
+            .filter(|&(declared, _)| declared == id)
+            .find_map(|(_, store)| other_store(store, variable))
     }
 
     /// The EFI_IFR_QUESTION_HEADER of `op`, the question's.
@@ -721,22 +773,36 @@ pub(crate) fn keyword_of(language: &Language, text: &str) -> Option<(Namespace, 
     }
 }
 
-/// A statement of a package list, with the root of its form package.
-struct Statement<'a> {
-    root: &'a Rc<RefCell<IFROperation>>,
-    op: Rc<RefCell<IFROperation>>,
+/// `declared`, a VarStore of a question's VarStoreId, as text, unless it is the EFI variable
+/// `variable`, the question's.
+fn other_store(declared: DeclaredStore, variable: &VariableKey) -> Option<String> {
+    match declared {
+        DeclaredStore::Variable(store) if store.variable_key() == *variable => None,
+        DeclaredStore::Variable(store) => Some(format!("EFI variable {}", store.variable_key())),
+        DeclaredStore::NameValue(_) => Some("a VARSTORE_NAME_VALUE".to_owned()),
+        DeclaredStore::ShortEfi(_) => Some(format!("an {}", ShortVarStoreEfi::LABEL)),
+    }
 }
 
-/// The ops of `list`, in IFR order, that IsStatementOpCode (ConfigKeywordHandler.c:1420) takes
-/// for statements and whose Prompt is `prompt`, each with the root of its form package:
-/// FindQuestionFromStringId reads the Prompt of an EFI_IFR_GUID from the start of its GUID.
+/// A statement of a package list: in a FormSet, with the root of its form package, or outside
+/// any.
+enum Statement<'a> {
+    InFormSet {
+        root: &'a Rc<RefCell<IFROperation>>,
+        op: Rc<RefCell<IFROperation>>,
+    },
+    Outside(&'a OutsideOp),
+}
+
+/// The ops of `list` that IsStatementOpCode (ConfigKeywordHandler.c:1420) takes for statements
+/// and whose Prompt is `prompt`: in its FormSets, in IFR order, each with the root of its form
+/// package, then outside any FormSet, as FindQuestionFromStringId walks the whole form package.
 fn statements(list: &ParsedPackageList, prompt: u16) -> Vec<Statement<'_>> {
     let mut found = Vec::new();
     for root in &list.forms {
         walk_scopes(std::slice::from_ref(root), (), |node, ()| {
-            let op = node.borrow();
-            if is_statement(op.op_code) && op.data.get(..2) == Some(&prompt.to_le_bytes()[..]) {
-                found.push(Statement {
+            if prompts(&node.borrow(), prompt) {
+                found.push(Statement::InFormSet {
                     root,
                     op: Rc::clone(node),
                 });
@@ -744,7 +810,25 @@ fn statements(list: &ParsedPackageList, prompt: u16) -> Vec<Statement<'_>> {
             Walk::Enter(())
         });
     }
+    found.extend(
+        list.outside_ifr
+            .iter()
+            .filter(|outside| prompts(&outside.op, prompt))
+            .map(Statement::Outside),
+    );
     found
+}
+
+/// Whether `op` is a statement whose Prompt is `prompt`: FindQuestionFromStringId reads the
+/// Prompt of an EFI_IFR_GUID from the start of its GUID, and that of a statement shorter than its
+/// Prompt from the bytes after it, as it reads the Prompt at OpCodeData + 2 whatever the op's
+/// Length (ConfigKeywordHandler.c:1498-1499): such a statement prompts every keyword.
+fn prompts(op: &IFROperation, prompt: u16) -> bool {
+    is_statement(op.op_code)
+        && op
+            .data
+            .get(..2)
+            .is_none_or(|bytes| bytes == &prompt.to_le_bytes()[..])
 }
 
 /// The bytes of a question's value: of a ONE_OF or NUMERIC its size, of a CHECKBOX a BOOLEAN.
@@ -870,6 +954,7 @@ mod tests {
     use super::super::ifr_fixtures::checkbox_on;
     use super::super::ifr_fixtures::conditional;
     use super::super::ifr_fixtures::flagged_option;
+    use super::super::ifr_fixtures::form_set;
     use super::super::ifr_fixtures::ifr_false;
     use super::super::ifr_fixtures::ifr_true;
     use super::super::ifr_fixtures::locked_op;
@@ -895,12 +980,17 @@ mod tests {
     use super::super::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use super::super::ifr_fixtures::SUPPRESS_IF;
     use super::super::ifr_fixtures::VALUE;
+    use super::super::ifr_fixtures::VAR_STORE;
     use super::super::ifr_fixtures::WRITE;
     use super::super::resolve_short_var_names;
     use super::super::storage::VariableNotExported;
     use super::super::ChangeValueError;
     use super::*;
     use crate::hii::config_string::MultiKeywordResp;
+    use crate::hii::package::hiidb_fixtures::form_package_of;
+    use crate::hii::package::hiidb_fixtures::package_list_with_guid;
+    use crate::hii::package::hiidb_fixtures::END_PACKAGE;
+    use crate::hii::package::read_db;
     use crate::hii::package::DevicePath;
     use crate::hii::package::Guid;
     use crate::hii::strings::StringPackage;
@@ -2043,5 +2133,234 @@ mod tests {
                 "VALUE={value} in -5..5"
             );
         }
+    }
+
+    /// The package list of list(PATH, ..) with what read_db reads from a form package of `ifr`:
+    /// its FormSets and the ops outside them.
+    fn list_read(ifr: Vec<u8>) -> ParsedPackageList {
+        let read = read_db(&package_list_with_guid(
+            [0x22; 16],
+            &[form_package_of(&ifr), END_PACKAGE.to_vec()].concat(),
+        ))
+        .expect("read_db")
+        .remove(0);
+        ParsedPackageList {
+            forms: read.forms,
+            ignored_ifr: read.ignored_ifr,
+            outside_ifr: read.outside_ifr,
+            malformed_outside_stores: read.malformed_outside_stores,
+            ..list(PATH, &[(NAMESPACE, KEYWORD)], Vec::new())
+        }
+    }
+
+    /// The FormSet of list(), VarStore 1 of the variable Store, holding `ops`.
+    fn store_form_set(ops: &[Vec<u8>]) -> Vec<u8> {
+        form_set(&[var_store(1, STORE_GUID, "Store", 16), ops.concat()])
+    }
+
+    /// edk2-stable202608 FindQuestionFromStringId (ConfigKeywordHandler.c:1478) walks the whole
+    /// form package, so a statement outside any FormSet, before it, that the keyword prompts is
+    /// the statement that GetData() and SetData() take: a second statement of the keyword, also
+    /// one whose bytes do not parse, as FindQuestionFromStringId reads its Prompt alone
+    /// (:1497-1501).
+    #[test]
+    fn resolve_refuses_a_keyword_that_also_prompts_a_statement_outside_a_form_set() {
+        for (name, outside) in [
+            ("a PASSWORD", password_on(9, PROMPT, 1, 0)),
+            (
+                "a ONE_OF of its Prompt alone",
+                operation(ONE_OF, false, &PROMPT.to_le_bytes()),
+            ),
+        ] {
+            let lists = [list_read(
+                [outside, store_form_set(&[one_of(1, 0)])].concat(),
+            )];
+
+            assert_eq!(
+                resolve(&lists, Some(PATH)).err(),
+                Some(KeywordRefusal::AmbiguousStatements {
+                    keyword: KEYWORD.to_owned(),
+                    count: 2,
+                }),
+                "{name}"
+            );
+        }
+    }
+
+    /// A ONE_OF outside any FormSet of 1 data byte, 0x03, then an op 0x00 of no data:
+    /// edk2-stable202608 FindQuestionFromStringId reads the ONE_OF's Prompt at OpCodeData + 2
+    /// whatever its Length (ConfigKeywordHandler.c:1498-1499), from 0x03 and the next op's first
+    /// byte, PROMPT.
+    fn short_one_of() -> Vec<u8> {
+        [
+            operation(ONE_OF, false, &[0x03]),
+            operation(0x00, false, &[]),
+        ]
+        .concat()
+    }
+
+    /// A statement outside any FormSet shorter than its Prompt prompts every keyword, so a keyword
+    /// that a FormSet's statement prompts prompts two.
+    #[test]
+    fn resolve_refuses_a_keyword_that_a_short_statement_outside_a_form_set_may_prompt() {
+        let lists = [list_read(
+            [short_one_of(), store_form_set(&[one_of(1, 0)])].concat(),
+        )];
+
+        assert_eq!(
+            resolve(&lists, Some(PATH)).err(),
+            Some(KeywordRefusal::AmbiguousStatements {
+                keyword: KEYWORD.to_owned(),
+                count: 2,
+            })
+        );
+    }
+
+    /// A keyword that only a statement outside any FormSet shorter than its Prompt may prompt
+    /// prompts that statement: resolve refuses it, with or without PATH.
+    #[test]
+    fn resolve_refuses_a_keyword_that_only_a_short_statement_outside_a_form_set_may_prompt() {
+        let lists = [list_read([short_one_of(), store_form_set(&[])].concat())];
+
+        for path in [Some(PATH), None] {
+            assert_eq!(
+                resolve(&lists, path).err(),
+                Some(KeywordRefusal::OutsideFormSet {
+                    keyword: KEYWORD.to_owned(),
+                    op: "EFI_IFR_ONE_OF",
+                    offset: 0,
+                }),
+                "PATH {path:?}"
+            );
+        }
+    }
+
+    /// A statement outside any FormSet that the keyword alone prompts is the one that GetData()
+    /// and SetData() take, and no FormSet gives it a VarStore: resolve refuses it, with or without
+    /// PATH.
+    #[test]
+    fn resolve_refuses_a_keyword_that_prompts_only_a_statement_outside_a_form_set() {
+        let lists = [list_read(
+            [password_on(9, PROMPT, 1, 0), store_form_set(&[])].concat(),
+        )];
+        let want =
+            "keyword Keyword: it prompts an EFI_IFR_PASSWORD outside any FormSet, at offset \
+                    0 of a form package, whose question uefisettings neither reads nor writes";
+
+        for path in [Some(PATH), None] {
+            assert_eq!(
+                resolve(&lists, path)
+                    .err()
+                    .map(|refusal| refusal.to_string()),
+                Some(want.to_owned()),
+                "PATH {path:?}"
+            );
+        }
+    }
+
+    /// FindStorageFromVarId (ConfigKeywordHandler.c:1520) takes the first VarStore of the id in
+    /// the form package, so a VarStore outside any FormSet, before or after the question's,
+    /// declares its VarStoreId for another variable, or a VARSTORE_NAME_VALUE: check_get and
+    /// check_set refuse it, and take one declared for the same variable.
+    #[test]
+    fn check_get_refuses_a_var_store_id_that_a_var_store_outside_a_form_set_declares() {
+        let refusal = |store: &str| {
+            format!(
+                "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which a \
+                 VarStore outside any FormSet of its package list declares for {store}"
+            )
+        };
+        let name_value = operation(
+            VAR_STORE_NAME_VALUE,
+            false,
+            &[1_u16.to_le_bytes().to_vec(), vec![0x55; 16]].concat(),
+        );
+        let cases = [
+            (
+                "the variable Other",
+                var_store(1, [0x44; 16], "Other", 16),
+                Some(refusal(
+                    "EFI variable Other-44444444-4444-4444-4444-444444444444",
+                )),
+            ),
+            (
+                "a VARSTORE_NAME_VALUE",
+                name_value,
+                Some(refusal("a VARSTORE_NAME_VALUE")),
+            ),
+            (
+                "a VARSTORE_EFI before UEFI 2.3.1",
+                short_var_store_efi(1),
+                Some(refusal("an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1")),
+            ),
+            (
+                "the variable Store",
+                var_store(1, STORE_GUID, "Store", 16),
+                None,
+            ),
+        ];
+        for ((name, declaration, want), after) in cases
+            .into_iter()
+            .flat_map(|case| [(case.clone(), false), (case, true)])
+        {
+            let form_set = store_form_set(&[one_of(1, 0)]);
+            let ifr = match after {
+                false => [declaration, form_set],
+                true => [form_set, declaration],
+            };
+            let lists = [list_read(ifr.concat())];
+            let question = question_of(&lists);
+
+            let get = question.check_get(&reader(1));
+            let set = question.check_set(
+                &resp("03"),
+                IncludedStates::empty(),
+                VolatileWrites::Refuse,
+                &mut reader(1),
+            );
+
+            assert_eq!(
+                (
+                    get.err().map(|error| error.to_string()),
+                    set.err().map(|error| error.to_string())
+                ),
+                (want.clone(), want),
+                "VarStore 1 of {name} outside the FormSet, after it: {after}"
+            );
+        }
+    }
+
+    /// A VarStore outside any FormSet that does not parse hides its VarStoreId, which may be the
+    /// question's: check_get and check_set refuse the question.
+    #[test]
+    fn check_get_and_set_refuse_a_var_store_id_that_a_malformed_outside_var_store_may_declare() {
+        let lists = [list_read(
+            [
+                operation(VAR_STORE, false, &[1, 0]),
+                store_form_set(&[one_of(1, 0)]),
+            ]
+            .concat(),
+        )];
+        let question = question_of(&lists);
+        let want = "keyword Keyword: question \"Keyword question\" may have the VarStoreId of the \
+                    VarStore at offset 0 of a form package of its package list, outside any \
+                    FormSet, which does not parse"
+            .to_owned();
+
+        let get = question.check_get(&reader(1));
+        let set = question.check_set(
+            &resp("03"),
+            IncludedStates::empty(),
+            VolatileWrites::Refuse,
+            &mut reader(1),
+        );
+
+        assert_eq!(
+            (
+                get.err().map(|error| error.to_string()),
+                set.err().map(|error| error.to_string())
+            ),
+            (Some(want.clone()), Some(want))
+        );
     }
 }

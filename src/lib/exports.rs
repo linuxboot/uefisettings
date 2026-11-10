@@ -2576,6 +2576,87 @@ mod tests {
         }
     }
 
+    /// A keyword that prompts a CHECKBOX outside any FormSet, alone or with the CHECKBOX 0x8001 of
+    /// a FormSet, which the Keyword Handler may take instead (edk2-stable202608
+    /// ConfigKeywordHandler.c FindQuestionFromStringId), selects neither none nor 0x8001: get and
+    /// set refuse it, and set writes nothing.
+    #[test]
+    fn keywords_that_prompt_a_statement_outside_a_form_set_are_refused() {
+        for (case, prompt, refusal) in [
+            (
+                "alone",
+                5,
+                KeywordRefusal::OutsideFormSet {
+                    keyword: "Keyword:5".to_owned(),
+                    op: "EFI_IFR_CHECKBOX",
+                    offset: 0,
+                },
+            ),
+            (
+                "with 0x8001",
+                3,
+                KeywordRefusal::AmbiguousStatements {
+                    keyword: "Keyword:5".to_owned(),
+                    count: 2,
+                },
+            ),
+        ] {
+            let packages = [
+                form_package_of(
+                    &[
+                        checkbox_at(9, 3, 1, 1),
+                        form_set(&[
+                            var_store_efi(1, "Setup", NV_BS_RT, 2),
+                            form(1, &[checkbox_at(0x8001, prompt, 1, 0)]),
+                        ]),
+                    ]
+                    .concat(),
+                ),
+                strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
+                strings_package_of(b"en-US", &["Title", "Help", "Keyed", "Help text", "Plain"]),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat());
+            let question = by_keyword("Keyword:5", None);
+            let variables = Rc::new(MemoryVariables::default());
+            variables.insert(setup(), 7, &[0, 0]);
+
+            let got = HiiBackend::get_in(
+                &hiidb,
+                question.clone(),
+                None,
+                &GetOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .map(|got| got.responses.len())
+            .map_err(|error| format!("{error:#}"));
+            let set = HiiBackend::set_in(
+                &hiidb,
+                question.clone(),
+                "1",
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(|set| set.responses.len())
+            .map_err(|error| format!("{error:#}"));
+
+            for (action, result) in [("get", &got), ("set", &set)] {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.contains(&refusal.to_string())),
+                    "{case}: {action}: {result:?}"
+                );
+            }
+            assert_eq!(variables.writes_to(&setup()), [], "{case}: set writes");
+        }
+    }
+
     /// A HiiDB whose FormSet holds the CHECKBOXes 0xA at byte 0 and 0x14 at byte 1 of Setup,
     /// prompted "First" and "Second" in en-US, of which x-UEFI-ns names 0xA "Foo" and x-UEFI-AMI
     /// names 0x14 "Foo".

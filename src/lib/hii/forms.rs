@@ -1608,13 +1608,14 @@ fn type_value_parser<R: Read + Seek>(
 /// So is each FormSet, first or later, whose FORM_SET op opens no scope and that parses: edk2
 /// parses its ops on to the end of the package, past the End where handle_form_set_within ends
 /// it.
-/// The VarStores and PASSWORDs that the walk steps over outside a FormSet are returned as well:
+/// The VarStores and statements that the walk steps over outside a FormSet are returned as well:
 /// UEFI 2.11 §33.2.5.1 declares variable stores within a form set, and SetupBrowserDxe parses
 /// none outside one, but edk2-stable202608 ConfigKeywordHandler.c FindQuestionFromStringId and
-/// FindStorageFromVarId walk the whole form package. PASSWORDs are returned undecoded; a VarStore
-/// that does not parse, which hides only its VarStoreId, is returned apart. In a FormSet that the
-/// walk steps into as it ignores it, and after a FORM_SET op that opens no scope, whose ignored
-/// IFR already holds the PASSWORDs and malformed ops there, only the VarStores that parse are.
+/// FindStorageFromVarId walk the whole form package. Statements, PASSWORDs among them, are
+/// returned undecoded, as FindQuestionFromStringId reads only their Prompt; a VarStore that does
+/// not parse, which hides only its VarStoreId, is returned apart. In a FormSet that the walk steps
+/// into as it ignores it, and after a FORM_SET op that opens no scope, whose ignored IFR already
+/// holds the PASSWORDs and malformed ops there, only the VarStores that parse are.
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
     package_list_guid: Guid,
@@ -1739,7 +1740,7 @@ pub(super) fn parse_form_sets(
 
 /// Records the op `op` at `offset` of a form package of the package list `package_list`, outside
 /// any FormSet, in `outside` if it is a VarStore that parses or, unless it is in ignored IFR
-/// (`in_ignored_ifr`), a PASSWORD, and in `malformed_stores` if it is a VarStore that does not
+/// (`in_ignored_ifr`), a statement, and in `malformed_stores` if it is a VarStore that does not
 /// parse.
 fn record_outside_op(
     mut op: IFROperation,
@@ -1767,8 +1768,11 @@ fn record_outside_op(
                 }),
             }
         }
-        // PasswordQuestions decodes its question header
-        IFROpCode::Password if !in_ignored_ifr => outside.push(OutsideOp { offset, op }),
+        // a statement that does not parse counts for the Keyword Handler, which reads its Prompt
+        // alone; PasswordQuestions decodes a PASSWORD's question header
+        op_code if defaults::is_statement(op_code) && !in_ignored_ifr => {
+            outside.push(OutsideOp { offset, op })
+        }
         _ => {}
     }
 }
@@ -1855,7 +1859,7 @@ fn form_set_name(op: &IFROperation) -> String {
 }
 
 /// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
-/// ignores, and the VarStores and PASSWORDs outside the FormSets that it parses, malformed
+/// ignores, and the VarStores and statements outside the FormSets that it parses, malformed
 /// VarStores apart.
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
@@ -1864,8 +1868,8 @@ pub(super) struct FormSets {
     pub(super) malformed_stores: Vec<IgnoredIfr>,
 }
 
-/// A VarStore or PASSWORD op of a form package outside the FormSets that parse_form_sets parses,
-/// at `offset`.
+/// A VarStore or statement op of a form package outside the FormSets that parse_form_sets
+/// parses, at `offset`.
 #[derive(Debug)]
 pub struct OutsideOp {
     pub offset: u64,
