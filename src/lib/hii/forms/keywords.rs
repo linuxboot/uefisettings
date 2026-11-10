@@ -230,6 +230,8 @@ pub(crate) enum KeywordRefusal {
         /// Each question's PATH and KeywordKind
         found: Vec<String>,
     },
+    #[error("keyword {keyword}: the request names its question of PATH={path} twice")]
+    Duplicate { keyword: String, path: String },
 }
 
 /// What a `<Filter>` tests of a keyword's question: its `<UsageFilter>`, and its HII Keyword Data

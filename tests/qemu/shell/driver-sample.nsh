@@ -95,6 +95,16 @@ uefisettings.efi hii keyword get --filter-by-get-data --namespace x-UEFI-ns "PAT
 echo uefisettings-shell: step keyword-filter-get-data %lasterror%
 uefisettings.efi hii keyword get --filter-by-get-data --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&Boolean"
 echo uefisettings-shell: step keyword-filter-get-data-boolean %lasterror%
+uefisettings.efi hii keyword get --namespace x-UEFI-ns "KEYWORD=iSCSIBootEnable&KEYWORD=xUefiHiiOption"
+echo uefisettings-shell: step keyword-multi %lasterror%
+uefisettings.efi hii keyword get --json --namespace x-UEFI-ns "KEYWORD=iSCSIBootEnable&KEYWORD=xUefiHiiOption"
+echo uefisettings-shell: step keyword-multi-json %lasterror%
+uefisettings.efi hii keyword get --namespace x-UEFI-ns "KEYWORD=iSCSIBootEnable&KEYWORD=NoSuchKeyword"
+echo uefisettings-shell: step keyword-multi-refused %lasterror%
+uefisettings.efi hii keyword get --namespace x-UEFI-ns "KEYWORD=iSCSIBootEnable&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable"
+echo uefisettings-shell: step keyword-multi-twice %lasterror%
+uefisettings.efi hii keyword get --filter-by-get-data --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=xUefiHiiOption&ReadOnly"
+echo uefisettings-shell: step keyword-multi-partial %lasterror%
 dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
 echo uefisettings-shell: step keyword-dmpstore-before %lasterror%
 uefisettings.efi hii keyword set "NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=02"

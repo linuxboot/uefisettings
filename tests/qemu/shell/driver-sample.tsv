@@ -120,7 +120,7 @@ keyword-filter-none	json	. == {"error_message": "keyword iSCSIBootEnable: no que
 keyword-filter-buffer	status	aborted
 keyword-filter-buffer	json	. == {"error_message": "keyword iSCSIBootEnable: no question of it passes the <Filter> of KEYWORD=iSCSIBootEnable&Buffer: PATH=01041400f4274aa000df424db55239511302113d7fff0400: ReadWrite&Numeric:1"}
 keyword-filter-bogus	status	aborted
-keyword-filter-bogus	json	. == {"error_message": "expected KEYWORDINFO=, then a <Filter> (ReadOnly or ReadWrite, then Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time), each optional, then the end of the <KeywordRequest>, found \"Numeric:3\""}
+keyword-filter-bogus	json	. == {"error_message": "expected KEYWORDINFO=, then a <Filter> (ReadOnly or ReadWrite, then Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time), each optional, then the next <KeywordRequest> or the end, found \"Numeric:3\""}
 keyword-filter-info	status	0x0
 keyword-filter-info	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01&DATATYPE=Numeric:1$
 # --filter-by-get-data sends GetData() the <Filter>: edk2-stable202608 ConfigKeywordHandler.c
@@ -129,7 +129,21 @@ keyword-filter-info	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db5523
 keyword-filter-get-data	status	0x0
 keyword-filter-get-data	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01$
 keyword-filter-get-data-boolean	status	aborted
-keyword-filter-get-data-boolean	json	. == {"error_message": "GetData(): INVALID_PARAMETER, ProgressErr 0x2 (MALFORMED_STRING), Progress at character 77"}
+keyword-filter-get-data-boolean	json	. == {"error_message": "GetData() read [NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01], a value of every keyword, then failed after the last: GetData(): INVALID_PARAMETER, ProgressErr 0x2 (MALFORMED_STRING), Progress at character 77"}
+# a <MultiKeywordRequest> (UEFI 2.11 §35.3.3): one GetData() of both keywords, xUefiHiiOption at
+# its DEFAULT 1 (Vfr.vfr:298-305), refused as a whole if one request is refused or two name one
+# question; --filter-by-get-data sends ReadOnly, which edk2-stable202608's ValidateFilter fails
+# for the read-write xUefiHiiOption (ConfigKeywordHandler.c:571-576) after reading iSCSIBootEnable
+keyword-multi	status	0x0
+keyword-multi	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01&NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=xUefiHiiOption&VALUE=01$
+keyword-multi-json	status	0x0
+keyword-multi-json	json	. == [{"namespace": "x-UEFI-ns", "path": "01041400f4274aa000df424db55239511302113d7fff0400", "keyword": "iSCSIBootEnable", "value": "01", "read_only": false}, {"namespace": "x-UEFI-ns", "path": "01041400f4274aa000df424db55239511302113d7fff0400", "keyword": "xUefiHiiOption", "value": "01", "read_only": false}]
+keyword-multi-refused	status	aborted
+keyword-multi-refused	json	.error_message | startswith("keyword NoSuchKeyword: no package list holds it")
+keyword-multi-twice	status	aborted
+keyword-multi-twice	json	. == {"error_message": "keyword iSCSIBootEnable: the request names its question of PATH=01041400f4274aa000df424db55239511302113d7fff0400 twice"}
+keyword-multi-partial	status	aborted
+keyword-multi-partial	json	. == {"error_message": "GetData() failed after reading [NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01]; it read no value of [PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=xUefiHiiOption&ReadOnly]: GetData(): INVALID_PARAMETER, ProgressErr 0x8 (INCOMPATIBLE_VALUE_DETECTED), Progress at character 154"}
 keyword-dmpstore-before	status	any
 keyword-dmpstore-before	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. .. 01 00 
 # SetData() would store 2, which no option holds: uefisettings refuses before it calls SetData()
@@ -153,9 +167,11 @@ keyword-info-json	status	0x0
 keyword-info-json	json	. == [{"namespace": "x-UEFI-ns", "path": "01041400f4274aa000df424db55239511302113d7fff0400", "keyword": "iSCSIBootEnable", "value": "01", "read_only": false, "data_type": "Numeric:1", "options": [{"value": "00", "string": "My one-of text #1"}, {"value": "01", "string": "My one-of text #2"}, {"value": "03", "string": "My one-of text #3"}], "standard_default": "01", "display_name": "My Keyword Namespace Test"}]
 keyword-info-bogus	status	aborted
 keyword-info-bogus	json	. == {"error_message": "KEYWORDINFO=\"Bogus\" is not <KeywordInfoFilter>: All, or DataType, ValueAttribute, Default and DisplayName in this order"}
-# GetData() of KEYWORDINFO, which edk2-stable202608 ConfigKeywordHandler.c refuses
+# GetData() of KEYWORDINFO, which edk2-stable202608 ConfigKeywordHandler.c refuses after it
+# reads the keyword: ValidateFilter leaves KEYWORDINFO unread, which the next ExtractDevicePath
+# refuses
 keyword-info-get-data	status	aborted
-keyword-info-get-data	json	.error_message | test("^GetData\\(\\): INVALID_PARAMETER, ProgressErr 0x2 \\(MALFORMED_STRING\\), Progress at ")
+keyword-info-get-data	json	. == {"error_message": "GetData() read [NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01], a value of every keyword, then failed after the last: GetData(): INVALID_PARAMETER, ProgressErr 0x2 (MALFORMED_STRING), Progress at character 77"}
 keyword-set	status	0x0
 keyword-set	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=03$
 keyword-get-after	status	0x0
@@ -179,7 +195,7 @@ keyword-dmpstore-allow-volatile	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. 
 # the placeholders of the help texts, each check up to a space, where clap may wrap the line
 keyword-get-help	status	0x0
 keyword-get-help	line	\[PATH=<hex( |$)
-keyword-get-help	line	(^| )digits>&\]KEYWORD=<keyword>\[&KEYWORDINFO=<filter>\]\[&<Filter>\]:
+keyword-get-help	line	(^| )digits>&\]KEYWORD=<keyword>\[&KEYWORDINFO=<filter>\]\[&<Filter>\]( |$)
 keyword-get-help	line	--keyword-info-from-get-data
 keyword-get-help	line	--filter-by-get-data
 keyword-set-help	status	0x0

@@ -42,7 +42,7 @@ use crate::efi_variables::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
 use crate::efi_variables::EFI_JSON_CONFIG_DATA_TABLE_GUID;
 use crate::firmware_width::FirmwareWidth;
 use crate::hii::export_package_lists;
-use crate::hii::get_keyword;
+use crate::hii::get_keywords;
 use crate::hii::package;
 use crate::hii::set_keywords;
 use crate::hii::time_services::TimeServices;
@@ -138,23 +138,23 @@ impl HiiBackend {
     }
 
     /// What GetData() (UEFI 2.11 §35.3.3) of EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL reads of
-    /// `request`, a `<KeywordRequest>` of an optional PATH, a KEYWORD, an optional KEYWORDINFO
-    /// and an optional `<Filter>`, in `namespace`, such as "x-UEFI-ns", else in a language of the
-    /// prefix "x-UEFI": a `<KeywordResp>` per package list of this firmware's HiiDB whose question
-    /// of the keyword get would read as GetData() does and that passes the `<Filter>`, which
-    /// `options.filter_by` applies, with the `<KeywordInfoResp>` of KEYWORDINFO from
-    /// `options.info_source`: the HiiDB's IFR, its texts in the language that PlatformLang picks,
-    /// or GetData().
+    /// `requests`, a `<MultiKeywordRequest>` of `<KeywordRequest>`s of an optional PATH, a
+    /// KEYWORD, an optional KEYWORDINFO and an optional `<Filter>`, in `namespace`, such as
+    /// "x-UEFI-ns", else in a language of the prefix "x-UEFI": for each request, a `<KeywordResp>`
+    /// per package list of this firmware's HiiDB whose question of the keyword get would read as
+    /// GetData() does and that passes the `<Filter>`, which `options.filter_by` applies, with the
+    /// `<KeywordInfoResp>` of KEYWORDINFO from `options.info_source`: the HiiDB's IFR, its texts
+    /// in the language that PlatformLang picks, or GetData().
     pub fn keyword_get(
-        request: &str,
+        requests: &str,
         namespace: Option<&str>,
         options: KeywordGetOptions,
     ) -> Result<KeywordValues> {
         let lists = package::read_db(&Self::export_hiidb()?)?;
         let platform_lang = EfivarSource::System.platform_lang()?;
-        get_keyword(
+        get_keywords(
             &lists,
-            request,
+            requests,
             namespace,
             &text_languages(None, platform_lang.as_deref()),
             options,

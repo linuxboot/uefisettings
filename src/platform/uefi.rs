@@ -142,7 +142,7 @@ impl HiiPlatformCommands {
 /// checks of get and set.
 #[derive(Debug, Subcommand)]
 pub(super) enum KeywordCommands {
-    /// Get the value of a keyword, as GetData() returns it, with the KeywordInfoResp of a KEYWORDINFO built from the HiiDB's IFR, which GetData() is not sent: a KeywordResp per package list whose question passes the Filter, which the IFR applies too
+    /// Get the values of keywords with one GetData() per configuration language, as it returns them, with the KeywordInfoResp of a KEYWORDINFO built from the HiiDB's IFR, which GetData() is not sent: a KeywordResp per KeywordRequest and package list whose question passes the Filter, which the IFR applies too
     ///
     /// Its defaults are those the IFR declares (EFI_IFR_DEFAULT, flagged options, CHECKBOX flags), which a driver's Callback() with EFI_BROWSER_ACTION_DEFAULT_x and its ALTCFG response outrank (UEFI 2.11 §33.2.5.8), so a platform's default may differ; those of a question of EFI_IFR_FLAG_CALLBACK are refused.
     ///
@@ -151,9 +151,9 @@ pub(super) enum KeywordCommands {
     Get {
         // a doc comment would make rustdoc take the placeholders for HTML tags
         #[arg(
-            help = "A KeywordRequest, [PATH=<hex digits>&]KEYWORD=<keyword>[&KEYWORDINFO=<filter>][&<Filter>]: an optional PATH, the device path of the keyword's package list, the KEYWORD, an optional KEYWORDINFO, All or DataType, ValueAttribute, Default and DisplayName in this order, and an optional Filter, ReadOnly or ReadWrite, then Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time, each optional"
+            help = "A MultiKeywordRequest, a KeywordRequest [PATH=<hex digits>&]KEYWORD=<keyword>[&KEYWORDINFO=<filter>][&<Filter>] per keyword, joined by &: an optional PATH, the device path of the keyword's package list, the KEYWORD, an optional KEYWORDINFO, All or DataType, ValueAttribute, Default and DisplayName in this order, and an optional Filter, ReadOnly or ReadWrite, then Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time, each optional"
         )]
-        request: String,
+        requests: String,
         /// The configuration language of the keyword, such as x-UEFI-ns; else one of the prefix x-UEFI
         #[arg(long)]
         namespace: Option<String>,
@@ -188,7 +188,7 @@ impl KeywordCommands {
     fn run(&self) -> Result<()> {
         let (values, output) = match self {
             Self::Get {
-                request,
+                requests,
                 namespace,
                 keyword_info_from_get_data,
                 filter_by_get_data,
@@ -204,7 +204,7 @@ impl KeywordCommands {
                     true => KeywordFilterBy::GetData,
                 };
                 (
-                    HiiBackend::keyword_get(request, namespace.as_deref(), options)?,
+                    HiiBackend::keyword_get(requests, namespace.as_deref(), options)?,
                     output,
                 )
             }

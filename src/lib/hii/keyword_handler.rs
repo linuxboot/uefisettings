@@ -30,6 +30,7 @@ use uefi_raw::protocol::hii::config::ConfigKeywordHandlerProtocol;
 
 use super::keyword_access::call_error;
 use super::keyword_access::progress_char;
+use super::keyword_access::GetDataError;
 use super::keyword_access::KeywordData;
 
 /// EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL, whose functions uefi's ConfigKeywordHandler keeps private.
@@ -42,9 +43,9 @@ struct KeywordHandler(ConfigKeywordHandlerProtocol);
 pub(crate) struct FirmwareKeywordHandler;
 
 impl KeywordData for FirmwareKeywordHandler {
-    fn get_data(&self, namespace_id: &str, keyword_string: &str) -> Result<String> {
-        let namespace_id = CString16::try_from(namespace_id)?;
-        let keyword_string = CString16::try_from(keyword_string)?;
+    fn get_data(&self, namespace_id: &str, keyword_string: &str) -> Result<String, GetDataError> {
+        let namespace_id = CString16::try_from(namespace_id).map_err(anyhow::Error::from)?;
+        let keyword_string = CString16::try_from(keyword_string).map_err(anyhow::Error::from)?;
         let protocol = open()?;
         let handler = protocol
             .get()
@@ -69,13 +70,29 @@ impl KeywordData for FirmwareKeywordHandler {
             let text = unsafe { CStr16::from_ptr(results.as_ptr().cast()) }.to_string();
             // SAFETY: that pool memory, which the caller frees (UEFI 2.11 §35.3.3), freed once,
             // after its last use
-            let freed = unsafe { boot::free_pool(results.cast()) };
-            freed.map(|()| text)
+            let freed = unsafe { boot::free_pool(results.cast()) }.map_err(|error| {
+                anyhow!("FreePool() of GetData()'s Results: {:?}", error.status())
+            });
+            (text, freed)
         });
-        check_status("GetData()", status, progress, &keyword_string, progress_err)?;
-        results
-            .ok_or_else(|| anyhow!("GetData() succeeded without Results"))?
-            .map_err(|error| anyhow!("FreePool() of GetData()'s Results: {:?}", error.status()))
+        // on a failure, Results holds the values of the keywords before the failing one
+        // (UEFI 2.11 §35.3.3)
+        match (
+            check_status("GetData()", status, progress, &keyword_string, progress_err),
+            results,
+        ) {
+            (Ok(()), Some((text, freed))) => freed.map(|()| text).map_err(GetDataError::from),
+            (Ok(()), None) => Err(anyhow!("GetData() succeeded without Results").into()),
+            (Err(error), None) => Err(error.into()),
+            (Err(error), Some((text, Ok(())))) => Err(GetDataError {
+                results: Some(text),
+                error,
+            }),
+            (Err(error), Some((text, Err(freed)))) => Err(GetDataError {
+                results: Some(text),
+                error: error.context(freed),
+            }),
+        }
     }
 
     fn set_data(&self, keyword_string: &str) -> Result<()> {

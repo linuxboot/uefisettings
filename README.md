@@ -808,11 +808,16 @@ no `--allow-volatile`.
 
 `hii keyword get` and `hii keyword set` read and write questions by the keywords of UEFI
 configuration languages such as `x-UEFI-ns`, through EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL (UEFI
-2.11 §35.3.1), which no OS reaches. `get` takes a `<KeywordRequest>` of an optional PATH, the hex
-digits of the device path of the keyword's package list, and a KEYWORD, and prints GetData()'s
-`<KeywordResp>`, one per package list without PATH. It reads the keyword's question whatever its
+2.11 §35.3.1), which no OS reaches. `get` takes a `<MultiKeywordRequest>`, `<KeywordRequest>`s
+joined by `&`, each of an optional PATH, the hex digits of the device path of the keyword's
+package list, and a KEYWORD, and prints GetData()'s `<KeywordResp>`s, one per request and package
+list without PATH, in the requests' order. It reads the keyword's question whatever its
 conditions, as GetData() does, so it takes no `--include`, but not one whose bytes, as GetData()
-reads them, overlap a password's. A `<Filter>` after the KEYWORD (§35.2.1.6) selects the
+reads them, overlap a password's. It refuses every request that it would not read, and a question
+that two requests name, before any GetData(), and reads the keywords of each configuration
+language with one GetData(): when one fails, it prints the `<KeywordResp>`s read before it and
+the requests read no value of, and calls no further GetData(). A `<Filter>` after the KEYWORD
+(§35.2.1.6) selects the
 questions whose `EFI_IFR_FLAG_READ_ONLY` and HII Keyword Data Type, by §35.2.1.6's table, pass
 it, from the IFR before any GetData(), which gets no `<Filter>`. This departs from
 edk2-stable202608's GetData(): the `<Filter>` selects among the instances, which §35.2.1.6 makes

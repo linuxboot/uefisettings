@@ -60,8 +60,13 @@ const KEYWORD_INFO_FILTER: &str =
     "<KeywordInfoFilter>: All, or DataType, ValueAttribute, Default and DisplayName in this order";
 const KEYWORD_RESP_END: &str = "the next <KeywordResp> or the end";
 const KEYWORD_REQUEST_END: &str = "KEYWORDINFO=, then a <Filter> (ReadOnly or ReadWrite, then \
-     Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time), each optional, then the end of \
-     the <KeywordRequest>";
+     Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time), each optional, then the next \
+     <KeywordRequest> or the end";
+const ONE_KEYWORD_REQUEST_END: &str = "the end of the one <KeywordRequest>";
+const LABEL: &str = "<Label>: a letter or _, then letters, digits and _";
+const KEYWORD: &str = "<Keyword>: text without &, = or :, then optionally : and 1 to 4 digits";
+const NAMESPACE_ID: &str =
+    "<NameSpaceId>: ASCII letters, digits and punctuation other than & and =";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ConfigStringError {
@@ -81,17 +86,13 @@ pub(crate) enum ConfigStringError {
     /// Leaves the value out, as a setting may be a password.
     #[error("{name}= holds {len} characters, not {}", NUMBER)]
     InvalidNumber { name: String, len: usize },
-    #[error("{0:?} is not a <Label>: a letter or _, then letters, digits and _")]
+    #[error("{0:?} is not a {}", LABEL)]
     InvalidLabel(String),
     #[error("{0} is a reserved name, so no <Label>")]
     ReservedName(String),
-    #[error(
-        "{0:?} is not a <Keyword>: text without &, = or :, then optionally : and 1 to 4 digits"
-    )]
+    #[error("{0:?} is not a {}", KEYWORD)]
     InvalidKeyword(String),
-    #[error(
-        "{0:?} is not a <NameSpaceId>: ASCII letters, digits and punctuation other than & and ="
-    )]
+    #[error("{0:?} is not a {}", NAMESPACE_ID)]
     InvalidNamespace(String),
     #[error("VALUE's {digits} hex digits hold a nonzero byte past WIDTH={width}")]
     ValueWiderThanWidth { digits: usize, width: usize },
@@ -105,6 +106,8 @@ pub(crate) enum ConfigStringError {
     EmptyRequest,
     #[error("a <MultiKeywordResp> has at least one <KeywordResp>")]
     EmptyMultiKeywordResp,
+    #[error("a <MultiKeywordRequest> has at least one <KeywordRequest>")]
+    EmptyMultiKeywordRequest,
     #[error(
         "a keyword string's PATH holds {0} bytes, fewer than the {} of an End node",
         MIN_DEVICE_PATH_LEN
@@ -120,6 +123,42 @@ pub(crate) enum ConfigStringError {
         width: usize,
         len: usize,
     },
+}
+
+impl ConfigStringError {
+    /// What the string should have held where it fails, without the text that it holds there.
+    fn expected(&self) -> &'static str {
+        match self {
+            Self::Unexpected { expected, .. }
+            | Self::Truncated { expected }
+            | Self::InvalidValue { expected, .. } => expected,
+            Self::InvalidNumber { .. } => NUMBER,
+            Self::InvalidLabel(_) => LABEL,
+            Self::ReservedName(_) => "a <Label> that is no reserved name",
+            Self::InvalidKeyword(_) => KEYWORD,
+            Self::InvalidNamespace(_) => NAMESPACE_ID,
+            Self::ValueWiderThanWidth { .. } => "a VALUE that WIDTH holds",
+            Self::BlockBeyondStorage { .. } => "a block inside an IFR varstore",
+            Self::AltRespFirst => "a <ConfigResp> before any <AltResp>",
+            Self::AltRespHeader => "an <AltResp> of the storage of its <ConfigResp>",
+            Self::EmptyRequest => "a <RequestElement>",
+            Self::EmptyMultiKeywordResp => "a <KeywordResp>",
+            Self::EmptyMultiKeywordRequest => "a <KeywordRequest>",
+            Self::ShortKeywordPath(_) => "a PATH of at least an End node",
+            Self::EmptyValue => "a <Number> of at least one byte",
+            Self::OutsideBuffer { .. } => "a block inside the buffer",
+        }
+    }
+}
+
+/// Why GetData()'s Results are no `<MultiKeywordResp>`: what was expected at their character
+/// `at`, a CHAR16 index as Progress counts, told without the text there, which may be a
+/// password's VALUE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("expected {expected} at character {at}")]
+pub(crate) struct UnparsedResults {
+    pub(crate) expected: &'static str,
+    pub(crate) at: usize,
 }
 
 /// `<ConfigHdr>`: the storage that a request or a response routes to.
@@ -949,15 +988,10 @@ impl KeywordRequest {
         self.usage.is_none_or(|filter| filter == usage)
             && self.data.is_none_or(|filter| filter.admits(data_type))
     }
-}
 
-/// A `<KeywordRequest>` of an optional PATH, a KEYWORD, an optional KEYWORDINFO and an optional
-/// `<Filter>`.
-impl FromStr for KeywordRequest {
-    type Err = ConfigStringError;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let mut elements = Elements::new(text);
+    /// Parses a `<KeywordRequest>` of an optional PATH, a KEYWORD, an optional KEYWORDINFO and an
+    /// optional `<Filter>`, up to the next `<KeywordRequest>` or the end.
+    fn parse(elements: &mut Elements<'_>) -> Result<Self, ConfigStringError> {
         let device_path = elements
             .optional_value("PATH=")
             .map(str::parse::<KeywordPath>)
@@ -970,19 +1004,82 @@ impl FromStr for KeywordRequest {
         // <Filter> ::= <UsageFilter> | <DataFilter> | <UsageFilter> '&' <DataFilter>
         let usage = elements.take_parsed(Usage::parse);
         let data = elements.take_parsed(DataFilter::from_text);
-        if let Some(found) = elements.next() {
-            return Err(ConfigStringError::Unexpected {
+        match elements.peek() {
+            Some(found) if !starts_keyword_request(found) => Err(ConfigStringError::Unexpected {
                 expected: KEYWORD_REQUEST_END,
                 found: found.to_owned(),
-            });
+            }),
+            None | Some(_) => Ok(Self {
+                device_path,
+                keyword,
+                info,
+                usage,
+                data,
+            }),
         }
-        Ok(Self {
-            device_path,
-            keyword,
-            info,
-            usage,
-            data,
-        })
+    }
+}
+
+/// A `<KeywordRequest>` alone.
+impl FromStr for KeywordRequest {
+    type Err = ConfigStringError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut elements = Elements::new(text);
+        let request = Self::parse(&mut elements)?;
+        match elements.next() {
+            None => Ok(request),
+            Some(found) => Err(ConfigStringError::Unexpected {
+                expected: ONE_KEYWORD_REQUEST_END,
+                found: found.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Whether `element` starts a `<KeywordRequest>`.
+fn starts_keyword_request(element: &str) -> bool {
+    element.starts_with("PATH=") || element.starts_with("KEYWORD=")
+}
+
+/// `<MultiKeywordRequest>`: at least one `<KeywordRequest>`, the next starting at its PATH or
+/// KEYWORD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MultiKeywordRequest(Vec<KeywordRequest>);
+
+impl MultiKeywordRequest {
+    pub(crate) fn as_slice(&self) -> &[KeywordRequest] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<KeywordRequest>> for MultiKeywordRequest {
+    type Error = ConfigStringError;
+
+    fn try_from(requests: Vec<KeywordRequest>) -> Result<Self, Self::Error> {
+        if requests.is_empty() {
+            return Err(ConfigStringError::EmptyMultiKeywordRequest);
+        }
+        Ok(Self(requests))
+    }
+}
+
+impl FromStr for MultiKeywordRequest {
+    type Err = ConfigStringError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut elements = Elements::new(text);
+        let mut requests = vec![KeywordRequest::parse(&mut elements)?];
+        while elements.peek().is_some() {
+            requests.push(KeywordRequest::parse(&mut elements)?);
+        }
+        Ok(Self(requests))
+    }
+}
+
+impl fmt::Display for MultiKeywordRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_joined(f, &self.0)
     }
 }
 
@@ -1153,6 +1250,10 @@ impl MultiKeywordResp {
     pub(crate) fn as_slice(&self) -> &[KeywordResp] {
         &self.0
     }
+
+    pub(crate) fn into_vec(self) -> Vec<KeywordResp> {
+        self.0
+    }
 }
 
 impl TryFrom<Vec<KeywordResp>> for MultiKeywordResp {
@@ -1166,22 +1267,40 @@ impl TryFrom<Vec<KeywordResp>> for MultiKeywordResp {
     }
 }
 
-impl FromStr for MultiKeywordResp {
-    type Err = ConfigStringError;
+impl MultiKeywordResp {
+    /// `results`, GetData()'s Results, parsed as FromStr parses them, but refused by what was
+    /// expected where they fail and the character there (UnparsedResults), never by their text.
+    pub(crate) fn from_results(results: &str) -> Result<Self, UnparsedResults> {
+        let mut elements = Elements::new(results);
+        Self::parse(&mut elements).map_err(|error| UnparsedResults {
+            expected: error.expected(),
+            at: elements.taken_char(),
+        })
+    }
 
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let mut elements = Elements::new(text);
-        let mut resps = vec![KeywordResp::parse(&mut elements)?];
+    /// The `<KeywordResp>`s of `elements`, failing at the element taken last.
+    fn parse(elements: &mut Elements<'_>) -> Result<Self, ConfigStringError> {
+        let mut resps = vec![KeywordResp::parse(elements)?];
         while let Some(element) = elements.peek() {
             if !element.starts_with("NAMESPACE=") {
+                // taken, so that the failure is at it
+                elements.next();
                 return Err(ConfigStringError::Unexpected {
                     expected: KEYWORD_RESP_END,
                     found: element.to_owned(),
                 });
             }
-            resps.push(KeywordResp::parse(&mut elements)?);
+            resps.push(KeywordResp::parse(elements)?);
         }
         Ok(Self(resps))
+    }
+}
+
+impl FromStr for MultiKeywordResp {
+    type Err = ConfigStringError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::parse(&mut Elements::new(text))
     }
 }
 
@@ -1191,39 +1310,59 @@ impl fmt::Display for MultiKeywordResp {
     }
 }
 
-/// The '&'-separated elements of a configuration string.
-struct Elements<'a>(Peekable<Split<'a, char>>);
+/// The '&'-separated elements of a configuration string, and where the element taken last
+/// starts.
+struct Elements<'a> {
+    text: &'a str,
+    elements: Peekable<Split<'a, char>>,
+    /// The byte offset in `text` of the next element
+    next_at: usize,
+    /// The byte offset in `text` of the element taken last, or the length of `text` once none
+    /// was left
+    taken_at: usize,
+}
 
 impl<'a> Elements<'a> {
     fn new(text: &'a str) -> Self {
-        Self(text.split('&').peekable())
+        Self {
+            text,
+            elements: text.split('&').peekable(),
+            next_at: 0,
+            taken_at: 0,
+        }
     }
 
     fn peek(&mut self) -> Option<&'a str> {
-        self.0.peek().copied()
+        self.elements.peek().copied()
     }
 
     /// The next element unless it starts a `<ConfigHdr>`.
     fn next_unless_header(&mut self) -> Option<&'a str> {
-        self.0.next_if(|element| !element.starts_with("GUID="))
+        if self.peek()?.starts_with("GUID=") {
+            return None;
+        }
+        self.next()
     }
 
     /// Takes the next element if it is `element`.
     fn take_if_eq(&mut self, element: &str) -> bool {
-        self.0.next_if_eq(&element).is_some()
+        let equal = self.peek() == Some(element);
+        if equal {
+            self.next();
+        }
+        equal
     }
 
     /// What `parse` makes of the next element, which it then takes, if `parse` makes anything.
     fn take_parsed<T>(&mut self, parse: impl Fn(&str) -> Option<T>) -> Option<T> {
-        let parsed = parse(self.0.peek()?)?;
-        self.0.next();
+        let parsed = parse(self.peek()?)?;
+        self.next();
         Some(parsed)
     }
 
     /// The value of the next element, which starts with `prefix`, such as "GUID=".
     fn required_value(&mut self, prefix: &'static str) -> Result<&'a str, ConfigStringError> {
         let element = self
-            .0
             .next()
             .ok_or(ConfigStringError::Truncated { expected: prefix })?;
         element
@@ -1236,9 +1375,17 @@ impl<'a> Elements<'a> {
 
     /// The value of the next element if it starts with `prefix`, which it then takes.
     fn optional_value(&mut self, prefix: &str) -> Option<&'a str> {
-        let value = self.0.peek()?.strip_prefix(prefix)?;
-        self.0.next();
+        let value = self.peek()?.strip_prefix(prefix)?;
+        self.next();
         Some(value)
+    }
+
+    /// The CHAR16 index in the text of the element taken last, or of the text's end once none
+    /// was left.
+    fn taken_char(&self) -> usize {
+        self.text
+            .get(..self.taken_at)
+            .map_or(0, |taken| taken.encode_utf16().count())
     }
 }
 
@@ -1246,7 +1393,14 @@ impl<'a> Iterator for Elements<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
+        let Some(element) = self.elements.next() else {
+            self.taken_at = self.text.len();
+            return None;
+        };
+        self.taken_at = self.next_at;
+        // the element and the '&' after it
+        self.next_at = self.next_at.saturating_add(element.len() + 1);
+        Some(element)
     }
 }
 
@@ -2120,7 +2274,7 @@ mod tests {
             ),
             (
                 "KEYWORD=BIOSVendor&KEYWORD=BIOSVendor",
-                Err(unexpected(KEYWORD_REQUEST_END, "KEYWORD=BIOSVendor")),
+                Err(unexpected(ONE_KEYWORD_REQUEST_END, "KEYWORD=BIOSVendor")),
             ),
             (
                 "PATH=7fff04&KEYWORD=BIOSVendor",
@@ -2313,6 +2467,60 @@ mod tests {
                 admitted,
                 "{text} of {usage} {data_type:?}"
             );
+        }
+    }
+
+    /// A `<MultiKeywordRequest>`'s next `<KeywordRequest>` starts at a PATH or a KEYWORD.
+    #[test]
+    fn multi_keyword_request_splits_at_each_path_or_keyword() {
+        let text = "KEYWORD=A&ReadOnly&PATH=7fff0400&KEYWORD=B&KEYWORDINFO=DataType&Numeric\
+                    &KEYWORD=C&KEYWORDINFO=All";
+        let expected = vec![
+            KeywordRequest {
+                usage: Some(Usage::ReadOnly),
+                ..keyword_request("A")
+            },
+            KeywordRequest {
+                device_path: Some(end_keyword_path()),
+                info: Some(KeywordInfoFilter::DATA_TYPE),
+                data: Some(DataFilter::Numeric(Numeric { width: None })),
+                ..keyword_request("B")
+            },
+            KeywordRequest {
+                info: Some(KeywordInfoFilter::all()),
+                ..keyword_request("C")
+            },
+        ];
+
+        let requests: MultiKeywordRequest = text.parse().expect("three requests");
+
+        assert_eq!(requests.as_slice(), expected, "the requests");
+        assert_eq!(requests.to_string(), text, "written back");
+        assert_eq!(
+            MultiKeywordRequest::try_from(Vec::new()),
+            Err(ConfigStringError::EmptyMultiKeywordRequest),
+            "none"
+        );
+        let refused = [
+            ("", unexpected("KEYWORD=", "")),
+            (
+                "KEYWORD=A&Bogus&KEYWORD=B",
+                unexpected(KEYWORD_REQUEST_END, "Bogus"),
+            ),
+            ("KEYWORD=A&", unexpected(KEYWORD_REQUEST_END, "")),
+            (
+                "KEYWORD=A&PATH=7fff0400",
+                ConfigStringError::Truncated {
+                    expected: "KEYWORD=",
+                },
+            ),
+            (
+                "KEYWORD=A&KEYWORDINFO=All&PATH=7fff0400&ReadOnly",
+                unexpected("KEYWORD=", "ReadOnly"),
+            ),
+        ];
+        for (text, error) in refused {
+            assert_eq!(text.parse::<MultiKeywordRequest>(), Err(error), "{text:?}");
         }
     }
 
@@ -2673,6 +2881,49 @@ mod tests {
             MultiKeywordResp::try_from(Vec::new()),
             Err(ConfigStringError::EmptyMultiKeywordResp),
             "no KeywordResp"
+        );
+    }
+
+    /// GetData()'s Results that do not parse are refused by what was expected and the CHAR16
+    /// where, never by the text there, which may be a password's VALUE.
+    #[test]
+    fn multi_keyword_resp_from_results_tells_where_they_fail_without_the_text() {
+        const SECRET: &str = "5ec2e7";
+        // 61 characters
+        let first = "NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=BIOSVendor&VALUE=01";
+        let cases = [
+            ("empty", String::new(), "NAMESPACE=", 0),
+            (
+                "an element after a <KeywordResp>",
+                format!("{first}&{SECRET}"),
+                KEYWORD_RESP_END,
+                62,
+            ),
+            (
+                "a PATH of no hex digits",
+                format!("{first}&NAMESPACE=x-UEFI-ns&PATH=zz{SECRET}"),
+                DEVICE_PATH,
+                82,
+            ),
+            // "€" is 3 bytes of the text but 1 CHAR16
+            (
+                "the end before VALUE",
+                format!("{first}&NAMESPACE=x-UEFI-ns&PATH=7fff0400&KEYWORD=€uro"),
+                "VALUE=",
+                108,
+            ),
+        ];
+        for (name, results, expected, at) in cases {
+            assert_eq!(
+                MultiKeywordResp::from_results(&results),
+                Err(UnparsedResults { expected, at }),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            MultiKeywordResp::from_results(first),
+            Ok(first.parse().expect("a <MultiKeywordResp>")),
+            "Results that parse"
         );
     }
 

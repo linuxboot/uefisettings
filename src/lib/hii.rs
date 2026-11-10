@@ -106,7 +106,7 @@ pub use firmware_memory::MemoryMapUnavailable;
 #[cfg(target_os = "windows")]
 pub(crate) use hiidb_driver::read_hiidb;
 #[cfg(target_os = "uefi")]
-pub(crate) use keyword_access::get_keyword;
+pub(crate) use keyword_access::get_keywords;
 #[cfg(target_os = "uefi")]
 pub(crate) use keyword_access::set_keywords;
 #[cfg(target_os = "uefi")]

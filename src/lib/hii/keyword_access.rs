@@ -29,6 +29,7 @@ use super::config_string::Keyword;
 use super::config_string::KeywordInfo;
 use super::config_string::KeywordRequest;
 use super::config_string::KeywordResp;
+use super::config_string::MultiKeywordRequest;
 use super::config_string::MultiKeywordResp;
 use super::config_string::Namespace;
 use super::config_string::Number;
@@ -41,6 +42,7 @@ use super::forms::IncludedStates;
 use super::forms::PasswordQuestions;
 use super::forms::SetupPasswordPolicy;
 use super::package::ParsedPackageList;
+use super::variables::EfivarReader;
 use super::variables::FirmwareVariables;
 use super::variables::VolatileWrites;
 use super::variables::VOLATILE_ANNOTATION;
@@ -60,9 +62,35 @@ const PROGRESS_ERRORS: [(u32, &str); 6] = [
 pub(crate) trait KeywordData {
     /// The Results of GetData() of `keyword_string`, a `<MultiKeywordRequest>`, with the
     /// NamespaceId `namespace_id`.
-    fn get_data(&self, namespace_id: &str, keyword_string: &str) -> Result<String>;
+    fn get_data(&self, namespace_id: &str, keyword_string: &str) -> Result<String, GetDataError>;
     /// SetData() of `keyword_string`, a `<MultiKeywordResp>`.
     fn set_data(&self, keyword_string: &str) -> Result<()>;
+}
+
+/// GetData()'s failure, with the Results that it returned: UEFI 2.11 §35.3.3 leaves there the
+/// values of the keywords before the one that failed.
+#[derive(Debug, Error)]
+pub(crate) struct GetDataError {
+    pub(crate) results: Option<String>,
+    pub(crate) error: anyhow::Error,
+}
+
+/// The error alone, without the Results, which may hold a password's VALUE (answers). By hand:
+/// thiserror's `#[error]` binds every field, and `-D warnings` refuses `results` unread there.
+impl fmt::Display for GetDataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl From<anyhow::Error> for GetDataError {
+    /// A failure without Results.
+    fn from(error: anyhow::Error) -> Self {
+        Self {
+            results: None,
+            error,
+        }
+    }
 }
 
 /// The keywords that get and set by keyword print: their `<MultiKeywordResp>`, as GetData()
@@ -224,15 +252,62 @@ pub struct KeywordGetOptions {
     pub filter_by: KeywordFilterBy,
 }
 
+/// A refusal of get by keyword, before any GetData(): of a keyword's request or question, or of
+/// the `<KeywordInfoResp>` of its KEYWORDINFO that the IFR does not tell.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub(crate) enum KeywordGetRefusal {
+    #[error(transparent)]
+    Keyword(#[from] KeywordRefusal),
+    #[error(transparent)]
+    Info(#[from] KeywordInfoRefusal),
+}
+
 /// Why get by keyword reads no value.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum KeywordGetError {
+    /// Every refusal, in the requests' order, all before any GetData()
+    #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    Refused(Vec<KeywordGetRefusal>),
     #[error("GetData() returned {0}, with a <KeywordInfoResp> that it was not asked for")]
     UnaskedInfo(String),
     #[error(
         "GetData() returned {read}, whose READONLY contradicts the <UsageFilter> of {request}"
     )]
     Usage { request: String, read: String },
+}
+
+/// GetData()'s failure, after the `<KeywordResp>`s that it read, with the `<KeywordRequest>`s of
+/// the keywords that it read no value of and get's refusals of what it read.
+#[derive(Debug, Error)]
+pub(crate) struct KeywordGetFailure {
+    read: Vec<String>,
+    unread: Vec<String>,
+    refused: Vec<KeywordGetError>,
+    error: anyhow::Error,
+}
+
+impl fmt::Display for KeywordGetFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let read = self.read.join("&");
+        let unread = self.unread.join("&");
+        match (read.is_empty(), unread.is_empty()) {
+            // Progress then points after the last keyword, at what GetData() could not parse
+            (false, true) => write!(
+                f,
+                "GetData() read [{read}], a value of every keyword, then failed after the last"
+            )?,
+            (true, false) => write!(f, "GetData() read no value of [{unread}]")?,
+            (false, false) | (true, true) => write!(
+                f,
+                "GetData() failed after reading [{read}]; it read no value of [{unread}]"
+            )?,
+        }
+        if !self.refused.is_empty() {
+            let refused: Vec<String> = self.refused.iter().map(ToString::to_string).collect();
+            write!(f, "; get refuses what it read: {}", refused.join("; "))?;
+        }
+        write!(f, ": {:#}", self.error)
+    }
 }
 
 /// Why set by keyword writes nothing, or reports a failed write.
@@ -250,93 +325,244 @@ pub(crate) enum KeywordSetError {
     ReadBackFailed(String, String, #[source] anyhow::Error),
 }
 
-/// The values of the keyword of `request`, a `<KeywordRequest>` of an optional PATH, a KEYWORD,
-/// an optional KEYWORDINFO and an optional `<Filter>`, in `namespace`, else in a language of the
-/// prefix "x-UEFI", in `lists`: GetData() of `handler` reads each question that
-/// KeywordQuestion::resolve finds and admitted passes, once each passes check_get with the bytes
-/// of the PASSWORD questions of `lists` in `variables` withheld, which it never reads. With
+/// The values of the keywords of `requests`, a `<MultiKeywordRequest>` of `<KeywordRequest>`s of
+/// an optional PATH, a KEYWORD, an optional KEYWORDINFO and an optional `<Filter>`, in
+/// `namespace`, else in a language of the prefix "x-UEFI", in `lists`: GetData() of `handler`
+/// reads each question that KeywordQuestion::resolve finds and admitted passes, once each passes
+/// check_get with the bytes of the PASSWORD questions of `lists` in `variables` withheld, which it
+/// never reads, and no request names a question that another names too. With
 /// `options.info_source` KeywordInfoSource::Ifr, each `<KeywordResp>` gets the
 /// `<KeywordInfoResp>` of KEYWORDINFO from the IFR, its texts in the language that `requested`
-/// picks (KeywordQuestion::info), built before any call; GetData()
+/// picks (KeywordQuestion::info). get refuses every request, question and KEYWORDINFO that fails,
+/// in the requests' order, all before any GetData() (KeywordGetError::Refused). GetData()
 /// gets no KEYWORDINFO, which edk2-stable202608 GetData() fails with EFI_INVALID_PARAMETER and
 /// KEYWORD_HANDLER_MALFORMED_STRING (ConfigKeywordHandler.c ValidateFilter leaves it unread,
 /// ExtractDevicePath refuses it). With KeywordInfoSource::GetData, GetData() gets the KEYWORDINFO
-/// unchanged and its `<KeywordResp>`s are taken as returned. Whenever GetData() gets no
-/// KEYWORDINFO, a `<KeywordResp>` that holds a `<KeywordInfoResp>` is refused
-/// (KeywordGetError::UnaskedInfo). GetData() gets the `<Filter>` with `options.filter_by`
-/// KeywordFilterBy::GetData alone, and a `<KeywordResp>` whose READONLY contradicts a
-/// `<UsageFilter>` is refused (KeywordGetError::Usage).
-pub(crate) fn get_keyword(
+/// unchanged and its `<KeywordResp>`s are taken as returned. GetData() gets the `<Filter>` with
+/// `options.filter_by` KeywordFilterBy::GetData alone. read_all reads them.
+pub(crate) fn get_keywords(
     lists: &[ParsedPackageList],
-    request: &str,
+    requests: &str,
     namespace: Option<&str>,
     requested: &[&str],
     options: KeywordGetOptions,
     variables: Box<dyn FirmwareVariables>,
     handler: &impl KeywordData,
 ) -> Result<KeywordValues> {
-    let request: KeywordRequest = request.parse()?;
+    let requests: MultiKeywordRequest = requests.parse()?;
     let namespace = namespace.map(Namespace::try_from).transpose()?;
     let mut reader = PasswordQuestions::of_lists(lists).reader(variables)?;
-    let found = KeywordQuestion::resolve(
-        lists,
-        namespace.as_ref(),
-        request.device_path.as_ref(),
-        &request.keyword,
-        requested,
-    )?;
-    let questions = admitted(&found, &request, options.filter_by)?;
-    for question in &questions {
-        question.check_get(&reader)?;
-    }
-    let (infos, sent_info) = match (request.info, options.info_source) {
-        (Some(filter), KeywordInfoSource::Ifr) => (
-            questions
-                .iter()
-                .map(|question| question.info(filter, &mut reader).map(Some))
-                .collect::<Result<Vec<_>, KeywordInfoRefusal>>()?,
-            None,
-        ),
-        (sent_info, KeywordInfoSource::GetData) | (sent_info @ None, KeywordInfoSource::Ifr) => {
-            (vec![None; questions.len()], sent_info)
+    // each refusal with the index of its request, which orders them
+    let mut refusals = Vec::new();
+    let mut resolved = Vec::new();
+    for (index, request) in requests.as_slice().iter().enumerate() {
+        match KeywordQuestion::resolve(
+            lists,
+            namespace.as_ref(),
+            request.device_path.as_ref(),
+            &request.keyword,
+            requested,
+        ) {
+            Ok(found) => resolved.push((index, request, found)),
+            Err(refusal) => refusals.push((index, refusal.into())),
         }
-    };
-    let (usage, data) = match options.filter_by {
-        KeywordFilterBy::Ifr => (None, None),
-        KeywordFilterBy::GetData => (request.usage, request.data),
-    };
-    let values = questions
-        .iter()
-        .zip(infos)
-        .map(|(question, info)| {
-            let sent = KeywordRequest {
-                device_path: Some(question.path().clone()),
-                keyword: request.keyword.clone(),
-                info: sent_info,
-                usage,
-                data,
-            };
-            let mut resp = read_keyword(handler, question.namespace(), &sent)?;
-            if sent_info.is_none() && resp.info != KeywordInfo::default() {
-                return Err(KeywordGetError::UnaskedInfo(resp.to_string()).into());
+    }
+    let mut reads = Vec::new();
+    for (index, request, found) in &resolved {
+        let questions = match admitted(found, request, options.filter_by) {
+            Ok(questions) => questions,
+            Err(refusal) => {
+                refusals.push((*index, refusal.into()));
+                continue;
             }
-            if request.usage.is_some_and(|usage| usage != resp.usage) {
-                return Err(KeywordGetError::Usage {
-                    request: request.to_string(),
-                    read: resp.to_string(),
-                }
-                .into());
+        };
+        for question in questions {
+            match KeywordRead::checked(question, request, options.info_source, &mut reader) {
+                Ok(read) => reads.push(read),
+                Err(refusal) => refusals.push((*index, refusal)),
             }
-            if let Some(info) = info {
+        }
+    }
+    refusals.sort_by_key(|&(index, _)| index);
+    let mut refusals: Vec<KeywordGetRefusal> =
+        refusals.into_iter().map(|(_, refusal)| refusal).collect();
+    refusals.extend(duplicates(&reads).into_iter().map(KeywordGetRefusal::from));
+    if !refusals.is_empty() {
+        return Err(KeywordGetError::Refused(refusals).into());
+    }
+    let values: Vec<KeywordResp> = read_all(handler, &reads, options)?
+        .into_iter()
+        .zip(reads)
+        .map(|(mut resp, read)| {
+            if let Some(info) = read.info {
                 resp.info = info;
             }
-            Ok(resp)
+            resp
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
     Ok(KeywordValues {
         resps: MultiKeywordResp::try_from(values)?,
         volatile: BTreeSet::new(),
     })
+}
+
+/// A question that get reads, the request that names it, and the `<KeywordInfoResp>` of its
+/// KEYWORDINFO from the IFR, if it takes one.
+struct KeywordRead<'q, 'a> {
+    question: &'q KeywordQuestion<'a>,
+    request: &'q KeywordRequest,
+    info: Option<KeywordInfo>,
+}
+
+impl<'q, 'a> KeywordRead<'q, 'a> {
+    /// The read of `question`, which `request` names, once it passes check_get with `reader`,
+    /// with the `<KeywordInfoResp>` of the request's KEYWORDINFO that the IFR tells
+    /// (KeywordQuestion::info) if `info_source` is KeywordInfoSource::Ifr.
+    fn checked(
+        question: &'q KeywordQuestion<'a>,
+        request: &'q KeywordRequest,
+        info_source: KeywordInfoSource,
+        reader: &mut EfivarReader,
+    ) -> Result<Self, KeywordGetRefusal> {
+        question.check_get(reader)?;
+        let info = match (request.info, info_source) {
+            (Some(filter), KeywordInfoSource::Ifr) => Some(question.info(filter, reader)?),
+            (_, KeywordInfoSource::GetData) | (None, KeywordInfoSource::Ifr) => None,
+        };
+        Ok(Self {
+            question,
+            request,
+            info,
+        })
+    }
+}
+
+impl KeywordRead<'_, '_> {
+    /// The `<KeywordRequest>` that GetData() gets: of the question's PATH and the KEYWORD, with
+    /// the request's KEYWORDINFO and `<Filter>` if `options` take them from GetData().
+    fn sent(&self, options: KeywordGetOptions) -> KeywordRequest {
+        let info = match options.info_source {
+            KeywordInfoSource::Ifr => None,
+            KeywordInfoSource::GetData => self.request.info,
+        };
+        let (usage, data) = match options.filter_by {
+            KeywordFilterBy::Ifr => (None, None),
+            KeywordFilterBy::GetData => (self.request.usage, self.request.data),
+        };
+        KeywordRequest {
+            device_path: Some(self.question.path().clone()),
+            keyword: self.request.keyword.clone(),
+            info,
+            usage,
+            data,
+        }
+    }
+
+    /// Refuses `resp`, GetData()'s `<KeywordResp>` of `sent`, that holds a `<KeywordInfoResp>`
+    /// though `sent` has no KEYWORDINFO (KeywordGetError::UnaskedInfo), or whose READONLY
+    /// contradicts the request's `<UsageFilter>` (KeywordGetError::Usage).
+    fn check(&self, sent: &KeywordRequest, resp: &KeywordResp) -> Result<(), KeywordGetError> {
+        if sent.info.is_none() && resp.info != KeywordInfo::default() {
+            return Err(KeywordGetError::UnaskedInfo(resp.to_string()));
+        }
+        if self.request.usage.is_some_and(|usage| usage != resp.usage) {
+            return Err(KeywordGetError::Usage {
+                request: self.request.to_string(),
+                read: resp.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A refusal of each of `reads` of the NAMESPACE, PATH and KEYWORD of an earlier one, which
+/// GetData() would read twice.
+fn duplicates(reads: &[KeywordRead<'_, '_>]) -> Vec<KeywordRefusal> {
+    let mut seen = BTreeSet::new();
+    reads
+        .iter()
+        .filter(|read| {
+            !seen.insert((
+                read.question.namespace().to_string(),
+                read.question.path().to_string(),
+                read.request.keyword.to_string(),
+            ))
+        })
+        .map(|read| KeywordRefusal::Duplicate {
+            keyword: read.request.keyword.to_string(),
+            path: read.question.path().to_string(),
+        })
+        .collect()
+}
+
+/// The `<KeywordResp>`s of `reads`, in their order, that GetData() of `handler` reads with one
+/// call per NAMESPACE, in the order of its first read, of the `<KeywordRequest>` that `options`
+/// send (KeywordRead::sent) of each of its reads, in order: GetData() takes one NamespaceId, and
+/// edk2-stable202608's keeps the language that a NULL one finds for the first keyword for the
+/// rest (GetStringIdFromRecord, ConfigKeywordHandler.c:1380-1395). Refuses the first
+/// `<KeywordResp>` of a call that KeywordRead::check refuses. When GetData() fails, no later
+/// NAMESPACE is read, and KeywordGetFailure holds the `<KeywordResp>`s read, the requests of the
+/// keywords read no value of, and the refusals of what was read.
+fn read_all(
+    handler: &impl KeywordData,
+    reads: &[KeywordRead<'_, '_>],
+    options: KeywordGetOptions,
+) -> Result<Vec<KeywordResp>> {
+    let mut namespaces: Vec<&Namespace> = Vec::new();
+    for read in reads {
+        if !namespaces.contains(&read.question.namespace()) {
+            namespaces.push(read.question.namespace());
+        }
+    }
+    let mut values: Vec<Option<KeywordResp>> = vec![None; reads.len()];
+    for namespace in namespaces {
+        let group: Vec<(usize, &KeywordRead<'_, '_>)> = reads
+            .iter()
+            .enumerate()
+            .filter(|(_, read)| read.question.namespace() == namespace)
+            .collect();
+        let requests = MultiKeywordRequest::try_from(
+            group
+                .iter()
+                .map(|(_, read)| read.sent(options))
+                .collect::<Vec<_>>(),
+        )?;
+        let (resps, failure) = match read_keywords(handler, namespace, &requests) {
+            Ok(resps) => (resps, None),
+            Err(ReadFailure::GetData { read, error }) => (read, Some(error)),
+            Err(ReadFailure::Results(error)) => return Err(error),
+        };
+        let mut refused = Vec::new();
+        for (((index, read), sent), resp) in group.iter().zip(requests.as_slice()).zip(resps) {
+            if let Err(refusal) = read.check(sent, &resp) {
+                refused.push(refusal);
+            }
+            if let Some(value) = values.get_mut(*index) {
+                *value = Some(resp);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(KeywordGetFailure {
+                read: values.iter().flatten().map(ToString::to_string).collect(),
+                unread: reads
+                    .iter()
+                    .zip(&values)
+                    .filter(|(_, value)| value.is_none())
+                    .map(|(read, _)| read.sent(options).to_string())
+                    .collect(),
+                refused,
+                error,
+            }
+            .into());
+        }
+        if let Some(refusal) = refused.into_iter().next() {
+            return Err(refusal.into());
+        }
+    }
+    values
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow!("GetData() read no value of a keyword"))
 }
 
 /// The questions of `found`, those of `request`'s keyword, that get reads: with `filter_by`
@@ -505,32 +731,114 @@ fn read_back(handler: &impl KeywordData, resp: &KeywordResp) -> Result<KeywordRe
         usage: None,
         data: None,
     };
-    read_keyword(handler, &resp.namespace, &request)
+    let requests = MultiKeywordRequest::try_from(vec![request])?;
+    read_keywords(handler, &resp.namespace, &requests)
+        .map_err(ReadFailure::into_error)?
+        .pop()
+        .ok_or_else(|| anyhow!("GetData() of {requests} read no value"))
 }
 
-/// The `<KeywordResp>` of the keyword of `request`, of a PATH, in `namespace` that GetData() of
-/// `handler` returns, asked with all three: UEFI 2.11 §35.3.3 takes NamespaceId as the language
-/// alone, edk2-stable202608 ExtractNameSpace (ConfigKeywordHandler.c:202, from GetData() at
-/// :3251) as a `<NameSpaceId>`, which this sends.
-fn read_keyword(
+/// Why read_keywords read no value of some keyword.
+enum ReadFailure {
+    /// GetData() failed, after the `<KeywordResp>`s of the first requests, which its Results held
+    GetData {
+        read: Vec<KeywordResp>,
+        error: anyhow::Error,
+    },
+    /// Results that are not the `<KeywordResp>`s of the requests
+    Results(anyhow::Error),
+}
+
+impl ReadFailure {
+    /// The error, without the `<KeywordResp>`s that GetData() read before it.
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::GetData { read: _, error } | Self::Results(error) => error,
+        }
+    }
+}
+
+/// The `<KeywordResp>`s that GetData() of `handler` returns for `requests`, each of a PATH and a
+/// KEYWORD, asked with the NamespaceId of `namespace`: UEFI 2.11 §35.3.3 takes NamespaceId as the
+/// language alone, edk2-stable202608 ExtractNameSpace (ConfigKeywordHandler.c:202, from GetData()
+/// at :3251) as a `<NameSpaceId>`, which this sends. They must be one per request, in order.
+/// No error holds the text of the Results, which may be the VALUE of a question that get does
+/// not read, such as a PASSWORD (answers).
+fn read_keywords(
     handler: &impl KeywordData,
     namespace: &Namespace,
-    request: &KeywordRequest,
-) -> Result<KeywordResp> {
-    let results = handler.get_data(&format!("NAMESPACE={namespace}"), &request.to_string())?;
-    let resps: MultiKeywordResp = results
-        .parse()
-        .with_context(|| format!("GetData() of {request} returned {results:?}"))?;
-    match resps.as_slice() {
-        [resp]
-            if resp.namespace == *namespace
-                && request.device_path.as_ref() == Some(&resp.device_path)
-                && resp.keyword == request.keyword =>
-        {
-            Ok(resp.clone())
-        }
-        _ => Err(anyhow!(
-            "GetData() of {request} returned {results:?}, not that keyword's <KeywordResp> alone"
+    requests: &MultiKeywordRequest,
+) -> Result<Vec<KeywordResp>, ReadFailure> {
+    let GetDataError { results, error } =
+        match handler.get_data(&format!("NAMESPACE={namespace}"), &requests.to_string()) {
+            Ok(results) => {
+                let resps = answers(namespace, requests, &results).map_err(ReadFailure::Results)?;
+                return match resps.len() == requests.as_slice().len() {
+                    true => Ok(resps),
+                    false => Err(ReadFailure::Results(anyhow!(
+                        "GetData() of {requests} succeeded with a <KeywordResp> of only the first \
+                         {} keywords",
+                        resps.len()
+                    ))),
+                };
+            }
+            Err(failure) => failure,
+        };
+    let read = match results.as_deref() {
+        // as no Results: a <MultiKeywordResp> holds at least one <KeywordResp>
+        None | Some("") => Vec::new(),
+        Some(results) => answers(namespace, requests, results).map_err(|reason| {
+            ReadFailure::Results(reason.context(format!("GetData() failed: {error:#}")))
+        })?,
+    };
+    Err(ReadFailure::GetData { read, error })
+}
+
+/// The `<KeywordResp>`s of `results`, GetData()'s `<MultiKeywordResp>` for `requests`, refused
+/// unless each is of `namespace` and of the PATH and KEYWORD of the request in its place, no more
+/// than the requests: UEFI 2.11 §35.3.3 leaves out the keywords from the one that failed. The
+/// refusal names the place, NAMESPACE, PATH and KEYWORD of each `<KeywordResp>` that is not of
+/// its request, or where `results` fail to parse, never their text.
+fn answers(
+    namespace: &Namespace,
+    requests: &MultiKeywordRequest,
+    results: &str,
+) -> Result<Vec<KeywordResp>> {
+    let resps = MultiKeywordResp::from_results(results)
+        .with_context(|| {
+            format!("GetData() of {requests} returned Results that are no <MultiKeywordResp>")
+        })?
+        .into_vec();
+    let unanswered: Vec<String> = resps
+        .iter()
+        .enumerate()
+        .filter_map(|(at, resp)| {
+            let place = match requests.as_slice().get(at) {
+                Some(request)
+                    if resp.namespace == *namespace
+                        && request.device_path.as_ref() == Some(&resp.device_path)
+                        && resp.keyword == request.keyword =>
+                {
+                    return None
+                }
+                Some(_) => "",
+                None => " past the last request",
+            };
+            Some(format!(
+                "<KeywordResp> {} of NAMESPACE={}&PATH={}&KEYWORD={}{place}",
+                at + 1,
+                resp.namespace,
+                resp.device_path,
+                resp.keyword
+            ))
+        })
+        .collect();
+    match unanswered.is_empty() {
+        true => Ok(resps),
+        false => Err(anyhow!(
+            "GetData() of {requests} returned {}: not the <KeywordResp> of each keyword asked \
+             for, in order",
+            unanswered.join("; ")
         )),
     }
 }
@@ -601,6 +909,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::ifr_fixtures::TIME;
     use crate::hii::forms::keywords::KeywordRefusal;
+    use crate::hii::forms::keywords::QuestionRefusal;
     use crate::hii::forms::resolve_short_var_names;
     use crate::hii::forms::IgnoredIfr;
     use crate::hii::forms::IgnoredPasswords;
@@ -614,7 +923,10 @@ mod tests {
 
     const PATH: &str = "01041400111111111111111111111111111111117fff0400";
     const OTHER_PATH: &str = "01041400222222222222222222222222222222227fff0400";
+    /// The device path of no package list
+    const THIRD_PATH: &str = "01041400444444444444444444444444444444447fff0400";
     const NAMESPACE: &str = "x-UEFI-ns";
+    const OTHER_NAMESPACE: &str = "x-UEFI-AB";
     /// The keyword of string 3, which prompts a question at VarOffset 5
     const KEYWORD: &str = "Keyword";
     /// The keyword of string 5, which prompts a question at VarOffset 6
@@ -639,8 +951,10 @@ mod tests {
     }
 
     /// A Keyword Handler of the VALUEs in `values` by "PATH=…&KEYWORD=…", which records its
-    /// calls. Its GetData() reads a request whatever `<Filter>` follows it. Its SetData() fails
-    /// with `set_failure` if given, and else stores the VALUEs unless `stale`.
+    /// calls. Its GetData() reads each request whatever `<Filter>` follows it, and fails at the
+    /// first that it has no VALUE of, with the `<KeywordResp>`s before it in Results, as UEFI
+    /// 2.11 §35.3.3 leaves them. Its SetData() fails with `set_failure` if given, and else stores
+    /// the VALUEs unless `stale`.
     #[derive(Default)]
     struct MemoryKeywordHandler {
         values: RefCell<BTreeMap<String, String>>,
@@ -668,7 +982,11 @@ mod tests {
     }
 
     impl KeywordData for MemoryKeywordHandler {
-        fn get_data(&self, namespace_id: &str, keyword_string: &str) -> Result<String> {
+        fn get_data(
+            &self,
+            namespace_id: &str,
+            keyword_string: &str,
+        ) -> Result<String, GetDataError> {
             self.calls.borrow_mut().push(KeywordCall::GetData {
                 namespace_id: namespace_id.to_owned(),
                 keyword_string: keyword_string.to_owned(),
@@ -676,20 +994,25 @@ mod tests {
             let namespace = namespace_id
                 .strip_prefix("NAMESPACE=")
                 .ok_or_else(|| anyhow!("MALFORMED_STRING"))?;
-            let request: KeywordRequest = keyword_string.parse()?;
-            let key = KeywordRequest {
-                usage: None,
-                data: None,
-                ..request
+            let requests: MultiKeywordRequest =
+                keyword_string.parse().map_err(anyhow::Error::from)?;
+            let mut resps = Vec::new();
+            for request in requests.as_slice() {
+                let key = KeywordRequest {
+                    usage: None,
+                    data: None,
+                    ..request.clone()
+                }
+                .to_string();
+                let Some(value) = self.values.borrow().get(&key).cloned() else {
+                    return Err(GetDataError {
+                        results: (!resps.is_empty()).then(|| resps.join("&")),
+                        error: anyhow!("KEYWORD_NOT_FOUND"),
+                    });
+                };
+                resps.push(format!("NAMESPACE={namespace}&{key}&VALUE={value}"));
             }
-            .to_string();
-            let value = self
-                .values
-                .borrow()
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| anyhow!("KEYWORD_NOT_FOUND"))?;
-            Ok(format!("NAMESPACE={namespace}&{key}&VALUE={value}"))
+            Ok(resps.join("&"))
         }
 
         fn set_data(&self, keyword_string: &str) -> Result<()> {
@@ -765,7 +1088,11 @@ mod tests {
     }
 
     impl KeywordData for RewritingHandler {
-        fn get_data(&self, namespace_id: &str, keyword_string: &str) -> Result<String> {
+        fn get_data(
+            &self,
+            namespace_id: &str,
+            keyword_string: &str,
+        ) -> Result<String, GetDataError> {
             Ok(self
                 .inner
                 .get_data(namespace_id, keyword_string)?
@@ -781,9 +1108,13 @@ mod tests {
     struct FailingReads(MemoryKeywordHandler);
 
     impl KeywordData for FailingReads {
-        fn get_data(&self, namespace_id: &str, keyword_string: &str) -> Result<String> {
+        fn get_data(
+            &self,
+            namespace_id: &str,
+            keyword_string: &str,
+        ) -> Result<String, GetDataError> {
             self.0.get_data(namespace_id, keyword_string)?;
-            Err(anyhow!("GetData(): DEVICE_ERROR"))
+            Err(anyhow!("GetData(): DEVICE_ERROR").into())
         }
 
         fn set_data(&self, keyword_string: &str) -> Result<()> {
@@ -794,6 +1125,11 @@ mod tests {
     /// A package list of the device path `path` that declares VarStore 1 and holds `ops`, whose
     /// x-UEFI-ns strings package names strings 3 and 5 KEYWORD and SECOND_KEYWORD.
     fn list(path: &str, ops: &[Vec<u8>]) -> ParsedPackageList {
+        list_in(path, NAMESPACE, ops)
+    }
+
+    /// list(), its keywords in a strings package of `namespace`.
+    fn list_in(path: &str, namespace: &str, ops: &[Vec<u8>]) -> ParsedPackageList {
         let strings = |language: &[u8], first: &str, second: &str| StringPackage {
             language: Language(language.to_vec()),
             strings: BTreeMap::from([(3, first.into()), (5, second.into())]),
@@ -804,7 +1140,7 @@ mod tests {
             device_path: Some(device_path.as_ref().clone()),
             strings: vec![
                 strings(b"en-US", "Keyword question", "Second question"),
-                strings(NAMESPACE.as_bytes(), KEYWORD, SECOND_KEYWORD),
+                strings(namespace.as_bytes(), KEYWORD, SECOND_KEYWORD),
             ],
             forms: vec![parse_form_set(
                 &[vec![var_store(1, STORE_GUID, "Store", 16)], ops.to_vec()].concat(),
@@ -840,18 +1176,26 @@ mod tests {
     }
 
     fn resp(path: &str, keyword: &str, value: &str) -> String {
-        format!("NAMESPACE={NAMESPACE}&PATH={path}&KEYWORD={keyword}&VALUE={value}")
+        resp_in(NAMESPACE, path, keyword, value)
+    }
+
+    fn resp_in(namespace: &str, path: &str, keyword: &str, value: &str) -> String {
+        format!("NAMESPACE={namespace}&PATH={path}&KEYWORD={keyword}&VALUE={value}")
     }
 
     fn get_call(path: &str, keyword: &str) -> KeywordCall {
+        get_call_of(NAMESPACE, &keyword_string(path, keyword))
+    }
+
+    fn get_call_of(namespace: &str, keyword_string: &str) -> KeywordCall {
         KeywordCall::GetData {
-            namespace_id: format!("NAMESPACE={NAMESPACE}"),
-            keyword_string: keyword_string(path, keyword),
+            namespace_id: format!("NAMESPACE={namespace}"),
+            keyword_string: keyword_string.to_owned(),
         }
     }
 
     fn get(lists: &[ParsedPackageList], handler: &impl KeywordData) -> Result<KeywordValues> {
-        get_keyword(
+        get_keywords(
             lists,
             &format!("KEYWORD={KEYWORD}"),
             None,
@@ -870,14 +1214,14 @@ mod tests {
         }
     }
 
-    /// get_keyword of `request` with `options`, reading variables().
+    /// get_keywords of `request` with `options`, reading variables().
     fn get_with(
         lists: &[ParsedPackageList],
         request: &str,
         options: KeywordGetOptions,
         handler: &impl KeywordData,
     ) -> Result<KeywordValues> {
-        get_keyword(lists, request, None, &[], options, variables(), handler)
+        get_keywords(lists, request, None, &[], options, variables(), handler)
     }
 
     fn set(
@@ -936,9 +1280,9 @@ mod tests {
         assert_eq!(handler.calls(), vec![], "no GetData() or SetData()");
     }
 
-    /// GetData() reads the question that check_get passed: by the NAMESPACE of its strings
-    /// package and the PATH of its package list, which the request names neither of, once per
-    /// list.
+    /// GetData() reads the questions that check_get passed: by the NAMESPACE of their strings
+    /// package and the PATH of each package list, which the request names neither of, in one
+    /// call.
     #[test]
     fn get_names_the_namespace_path_and_keyword_of_each_question() {
         let lists = [list(PATH, &questions()), list(OTHER_PATH, &questions())];
@@ -958,8 +1302,15 @@ mod tests {
         );
         assert_eq!(
             handler.calls(),
-            vec![get_call(PATH, KEYWORD), get_call(OTHER_PATH, KEYWORD)],
-            "a GetData() per list, of NAMESPACE, PATH and KEYWORD"
+            vec![get_call_of(
+                NAMESPACE,
+                &format!(
+                    "{}&{}",
+                    keyword_string(PATH, KEYWORD),
+                    keyword_string(OTHER_PATH, KEYWORD)
+                )
+            )],
+            "one GetData() of NAMESPACE, and PATH and KEYWORD per list"
         );
     }
 
@@ -971,11 +1322,14 @@ mod tests {
         let handler =
             MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (OTHER_PATH, KEYWORD, "01")]);
 
-        let error = get(&lists, &handler).expect_err("a question of an undeclared VarStore");
+        let refusals = refusals_of(get(&lists, &handler));
 
         assert!(
-            error.downcast_ref::<KeywordRefusal>().is_some(),
-            "refused: {error:#}"
+            matches!(
+                refusals.as_deref(),
+                Some([KeywordGetRefusal::Keyword(KeywordRefusal::Question { .. })])
+            ),
+            "a question of an undeclared VarStore refused: {refusals:?}"
         );
         assert_eq!(handler.calls(), vec![], "no call");
     }
@@ -990,7 +1344,7 @@ mod tests {
         let error = get(&lists, &handler).expect_err("results of two keywords");
 
         assert!(
-            format!("{error:#}").contains("not that keyword's <KeywordResp> alone"),
+            format!("{error:#}").contains("not the <KeywordResp> of each keyword asked for"),
             "refused: {error:#}"
         );
     }
@@ -1095,7 +1449,7 @@ mod tests {
             &[questions(), vec![password_on(9, 9, 1, 6)]].concat(),
         )];
         let get_of = |keyword: &str, handler: &MemoryKeywordHandler| {
-            get_keyword(
+            get_keywords(
                 &lists,
                 &format!("KEYWORD={keyword}"),
                 None,
@@ -1552,7 +1906,7 @@ mod tests {
     /// PASSWORD is on id 1 from VarOffset 0, on its own Pw, and where that PASSWORD's FormSet nests
     /// the keyword's first, Store is the first VarStore of id 1 and keeps the password: get by
     /// keyword of the ONE_OF over Store's byte 5 fails before any call, through variables of
-    /// either reach, with the reader that get_keyword builds. A nested PASSWORD of another
+    /// either reach, with the reader that get_keywords builds. A nested PASSWORD of another
     /// VarStoreId keeps none of Store, which the keyword reads.
     #[test]
     fn get_withholds_a_password_in_the_first_var_store_of_a_nesting_or_nested_form_set() {
@@ -1619,7 +1973,7 @@ mod tests {
             ] {
                 let lists = [list_of_ifr(PATH, &ifr)];
                 let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
-                let got = get_keyword(
+                let got = get_keywords(
                     &lists,
                     &format!("KEYWORD={KEYWORD}"),
                     None,
@@ -1685,7 +2039,7 @@ mod tests {
         let handler =
             MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (PATH, SECOND_KEYWORD, "01")]);
         let get_of = |keyword: &str| {
-            get_keyword(
+            get_keywords(
                 &lists,
                 &format!("KEYWORD={keyword}"),
                 None,
@@ -1865,7 +2219,7 @@ mod tests {
         let handler =
             MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (OTHER_PATH, KEYWORD, "03")]);
 
-        let values = get_keyword(
+        let values = get_keywords(
             &lists,
             &format!("PATH={OTHER_PATH}&KEYWORD={KEYWORD}"),
             None,
@@ -1917,7 +2271,7 @@ mod tests {
             let error = get(&lists, &handler).expect_err(name);
 
             assert!(
-                format!("{error:#}").contains("not that keyword's <KeywordResp> alone"),
+                format!("{error:#}").contains("not the <KeywordResp> of each keyword asked for"),
                 "{name}: {error:#}"
             );
         }
@@ -1969,7 +2323,7 @@ mod tests {
         let lists = [list_with_option_texts(&[defaulted_one_of()])];
         let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
 
-        let values = get_keyword(
+        let values = get_keywords(
             &lists,
             &format!("KEYWORD={KEYWORD}&KEYWORDINFO=All"),
             None,
@@ -2024,7 +2378,7 @@ mod tests {
         let lists = [list(PATH, &questions())];
         let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
 
-        let error = get_keyword(
+        let refusals = refusals_of(get_keywords(
             &lists,
             &format!("KEYWORD={KEYWORD}&KEYWORDINFO=ValueAttribute"),
             None,
@@ -2032,15 +2386,15 @@ mod tests {
             KeywordGetOptions::default(),
             variables(),
             &handler,
-        )
-        .expect_err("options without texts");
+        ));
 
         assert_eq!(
-            error.downcast_ref::<KeywordInfoRefusal>(),
-            Some(&KeywordInfoRefusal::NoText {
+            refusals,
+            Some(vec![KeywordInfoRefusal::NoText {
                 keyword: KEYWORD.to_owned(),
                 id: 4,
-            }),
+            }
+            .into()]),
             "the refusal"
         );
         assert_eq!(handler.calls(), Vec::new(), "no GetData()");
@@ -2064,7 +2418,7 @@ mod tests {
             request: &str,
             handler: &impl KeywordData,
         ) -> Result<KeywordValues> {
-            get_keyword(
+            get_keywords(
                 lists,
                 request,
                 None,
@@ -2092,7 +2446,10 @@ mod tests {
             .expect_err("a failed GetData()");
         assert_eq!(
             format!("{error:#}"),
-            "KEYWORD_NOT_FOUND",
+            format!(
+                "GetData() read no value of [{}]: KEYWORD_NOT_FOUND",
+                keyword_string(PATH, &sent)
+            ),
             "GetData()'s error"
         );
     }
@@ -2104,7 +2461,7 @@ mod tests {
         let lists = [list(PATH, &questions())];
         let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01&DATATYPE=Numeric:1")]);
 
-        let error = get_keyword(
+        let error = get_keywords(
             &lists,
             &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType"),
             None,
@@ -2138,7 +2495,7 @@ mod tests {
         for source in [KeywordInfoSource::Ifr, KeywordInfoSource::GetData] {
             let get = |value: &str| {
                 let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, value)]);
-                let got = get_keyword(
+                let got = get_keywords(
                     &lists,
                     &format!("KEYWORD={KEYWORD}"),
                     None,
@@ -2244,7 +2601,7 @@ mod tests {
                 password[15] = byte;
                 memory.insert(key("Password", PASSWORD_GUID), ATTRIBUTES, &password);
                 let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
-                match get_keyword(
+                match get_keywords(
                     lists,
                     request,
                     None,
@@ -2287,7 +2644,7 @@ mod tests {
     fn get_with_keyword_info_refuses_as_get_does_for_ifr_outside_a_form_set() {
         let get_of = |lists: &[ParsedPackageList], request: &str| {
             let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
-            let got = get_keyword(
+            let got = get_keywords(
                 lists,
                 request,
                 None,
@@ -2333,9 +2690,12 @@ mod tests {
         }
     }
 
-    /// The refusal of `result`, if get refused it.
-    fn refusal_of(result: Result<KeywordValues>) -> Option<KeywordRefusal> {
-        result.err()?.downcast::<KeywordRefusal>().ok()
+    /// The refusals of `result`, if get refused it.
+    fn refusals_of(result: Result<KeywordValues>) -> Option<Vec<KeywordGetRefusal>> {
+        match result.err()?.downcast::<KeywordGetError>() {
+            Ok(KeywordGetError::Refused(refusals)) => Some(refusals),
+            Ok(_) | Err(_) => None,
+        }
     }
 
     /// A read-write question of KEYWORD in the list of PATH and a read-only one in that of
@@ -2382,12 +2742,13 @@ mod tests {
                 expected.join("&"),
                 "{filter}: the values"
             );
+            let sent: Vec<String> = paths
+                .iter()
+                .map(|path| keyword_string(path, KEYWORD))
+                .collect();
             assert_eq!(
                 handler.calls(),
-                paths
-                    .iter()
-                    .map(|path| get_call(path, KEYWORD))
-                    .collect::<Vec<_>>(),
+                vec![get_call_of(NAMESPACE, &sent.join("&"))],
                 "{filter}: GetData() of the questions that pass, without a <Filter>"
             );
         }
@@ -2395,7 +2756,7 @@ mod tests {
             let handler = MemoryKeywordHandler::default();
             let request = format!("KEYWORD={KEYWORD}&{filter}");
 
-            let refusal = refusal_of(get_with(
+            let refusals = refusals_of(get_with(
                 &lists,
                 &request,
                 KeywordGetOptions::default(),
@@ -2403,15 +2764,16 @@ mod tests {
             ));
 
             assert_eq!(
-                refusal,
-                Some(KeywordRefusal::Filtered {
+                refusals,
+                Some(vec![KeywordRefusal::Filtered {
                     keyword: KEYWORD.to_owned(),
                     request: request.clone(),
                     found: vec![
                         format!("PATH={PATH}: ReadWrite&Numeric:1"),
                         format!("PATH={OTHER_PATH}: ReadOnly&Numeric:1"),
                     ],
-                }),
+                }
+                .into()]),
                 "{filter}: no question passes"
             );
             assert_eq!(handler.calls(), vec![], "{filter}: no call");
@@ -2440,8 +2802,8 @@ mod tests {
         );
         assert!(
             matches!(
-                refusal_of(get_of(&format!("KEYWORD={KEYWORD}"))),
-                Some(KeywordRefusal::Question { .. })
+                refusals_of(get_of(&format!("KEYWORD={KEYWORD}"))).as_deref(),
+                Some([KeywordGetRefusal::Keyword(KeywordRefusal::Question { .. })])
             ),
             "refused without the <Filter>"
         );
@@ -2516,10 +2878,14 @@ mod tests {
             );
             assert_eq!(
                 handler.calls(),
-                vec![
-                    get_call(PATH, &format!("{KEYWORD}&{filter}")),
-                    get_call(OTHER_PATH, &format!("{KEYWORD}&{filter}")),
-                ],
+                vec![get_call_of(
+                    NAMESPACE,
+                    &format!(
+                        "{}&{filter}&{}&{filter}",
+                        keyword_string(PATH, KEYWORD),
+                        keyword_string(OTHER_PATH, KEYWORD)
+                    )
+                )],
                 "{filter}: the <Filter> sent with each PATH"
             );
         }
@@ -2600,12 +2966,13 @@ mod tests {
 
         let refused = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
         assert_eq!(
-            refusal_of(get_of("Buffer", &refused)),
-            Some(KeywordRefusal::Filtered {
+            refusals_of(get_of("Buffer", &refused)),
+            Some(vec![KeywordRefusal::Filtered {
                 keyword: KEYWORD.to_owned(),
                 request: format!("KEYWORD={KEYWORD}&Buffer"),
                 found: vec![format!("PATH={PATH}: ReadWrite&Boolean")],
-            }),
+            }
+            .into()]),
             "Buffer"
         );
         assert_eq!(refused.calls(), vec![], "Buffer: no call");
@@ -2658,12 +3025,13 @@ mod tests {
                 expected.join("&"),
                 "{filter}: the values"
             );
+            let sent: Vec<String> = paths
+                .iter()
+                .map(|path| keyword_string(path, KEYWORD))
+                .collect();
             assert_eq!(
                 handler.calls(),
-                paths
-                    .iter()
-                    .map(|path| get_call(path, KEYWORD))
-                    .collect::<Vec<_>>(),
+                vec![get_call_of(NAMESPACE, &sent.join("&"))],
                 "{filter}: GetData() of the questions that pass"
             );
         }
@@ -2671,15 +3039,16 @@ mod tests {
             let handler = MemoryKeywordHandler::default();
 
             assert_eq!(
-                refusal_of(get_of(filter, &handler)),
-                Some(KeywordRefusal::Filtered {
+                refusals_of(get_of(filter, &handler)),
+                Some(vec![KeywordRefusal::Filtered {
                     keyword: KEYWORD.to_owned(),
                     request: format!("KEYWORD={KEYWORD}&{filter}"),
                     found: vec![
                         format!("PATH={PATH}: ReadWrite&Date"),
                         format!("PATH={OTHER_PATH}: ReadWrite&Time"),
                     ],
-                }),
+                }
+                .into()]),
                 "{filter}: no question passes"
             );
             assert_eq!(handler.calls(), vec![], "{filter}: no call");
@@ -2778,10 +3147,14 @@ mod tests {
         );
         assert_eq!(
             handler.calls(),
-            vec![
-                get_call(PATH, &format!("{KEYWORD}&ReadOnly&Numeric:1")),
-                get_call(OTHER_PATH, &format!("{KEYWORD}&ReadOnly&Numeric:1")),
-            ],
+            vec![get_call_of(
+                NAMESPACE,
+                &format!(
+                    "{}&ReadOnly&Numeric:1&{}&ReadOnly&Numeric:1",
+                    keyword_string(PATH, KEYWORD),
+                    keyword_string(OTHER_PATH, KEYWORD)
+                )
+            )],
             "GetData() of the <Filter> without KEYWORDINFO"
         );
 
@@ -2870,8 +3243,583 @@ mod tests {
         let sent = format!("{key}&ReadWrite&Boolean");
         assert_eq!(
             handler.inner.calls(),
-            vec![get_call(PATH, &sent), get_call(OTHER_PATH, &sent)],
+            vec![get_call_of(
+                NAMESPACE,
+                &format!(
+                    "{}&{}",
+                    keyword_string(PATH, &sent),
+                    keyword_string(OTHER_PATH, &sent)
+                )
+            )],
             "GetData() of the KEYWORDINFO and the <Filter>"
+        );
+    }
+
+    /// get_keywords of `requests`, whose `<Filter>`s the IFR applies.
+    fn get_of(
+        lists: &[ParsedPackageList],
+        requests: &str,
+        handler: &impl KeywordData,
+    ) -> Result<KeywordValues> {
+        get_with(lists, requests, KeywordGetOptions::default(), handler)
+    }
+
+    /// The failure of `result`, if GetData() failed.
+    fn failure_of(result: &Result<KeywordValues>) -> Option<&KeywordGetFailure> {
+        result.as_ref().err()?.downcast_ref::<KeywordGetFailure>()
+    }
+
+    /// A Keyword Handler whose GetData() fails with INVALID_PARAMETER after reading what
+    /// `inner` reads, the `<KeywordResp>` `extra` appended to its Results if given.
+    struct FailingAfter {
+        inner: MemoryKeywordHandler,
+        extra: Option<String>,
+    }
+
+    impl KeywordData for FailingAfter {
+        fn get_data(
+            &self,
+            namespace_id: &str,
+            keyword_string: &str,
+        ) -> Result<String, GetDataError> {
+            let results = self.inner.get_data(namespace_id, keyword_string)?;
+            Err(GetDataError {
+                results: Some(match &self.extra {
+                    Some(extra) => format!("{results}&{extra}"),
+                    None => results,
+                }),
+                error: anyhow!("GetData(): INVALID_PARAMETER"),
+            })
+        }
+
+        fn set_data(&self, keyword_string: &str) -> Result<()> {
+            self.inner.set_data(keyword_string)
+        }
+    }
+
+    /// The keywords of a `<MultiKeywordRequest>` are read with one GetData(), in order.
+    #[test]
+    fn get_reads_several_keywords_with_one_get_data() {
+        let lists = [list(PATH, &questions())];
+        let handler =
+            MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (PATH, SECOND_KEYWORD, "03")]);
+
+        let values = get_of(
+            &lists,
+            &format!("KEYWORD={SECOND_KEYWORD}&KEYWORD={KEYWORD}"),
+            &handler,
+        )
+        .expect("get of two keywords");
+
+        assert_eq!(
+            values.to_string(),
+            format!(
+                "{}&{}",
+                resp(PATH, SECOND_KEYWORD, "03"),
+                resp(PATH, KEYWORD, "01")
+            ),
+            "both keywords, in order"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![get_call_of(
+                NAMESPACE,
+                &format!(
+                    "{}&{}",
+                    keyword_string(PATH, SECOND_KEYWORD),
+                    keyword_string(PATH, KEYWORD)
+                )
+            )],
+            "one GetData()"
+        );
+    }
+
+    /// Every request that get refuses is refused, in order, before any call: one not found, one
+    /// of a PATH of no package list, one of a question over the bytes of a PASSWORD, and one
+    /// whose `<Filter>` no question passes.
+    #[test]
+    fn get_refuses_every_refused_keyword_before_any_call() {
+        let lists = [list(
+            PATH,
+            &[questions(), vec![password_on(9, 9, 1, 6)]].concat(),
+        )];
+        let handler =
+            MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (PATH, SECOND_KEYWORD, "01")]);
+        let requests = format!(
+            "KEYWORD={KEYWORD}&KEYWORD=Missing&PATH={THIRD_PATH}&KEYWORD={KEYWORD}\
+             &KEYWORD={SECOND_KEYWORD}&KEYWORD={KEYWORD}&Boolean"
+        );
+
+        let refusals = refusals_of(get_of(&lists, &requests, &handler));
+
+        assert!(
+            matches!(
+                refusals.as_deref(),
+                Some([
+                    KeywordGetRefusal::Keyword(KeywordRefusal::NotFound { keyword, .. }),
+                    KeywordGetRefusal::Keyword(KeywordRefusal::NoDriver(path)),
+                    KeywordGetRefusal::Keyword(KeywordRefusal::Question {
+                        reason: QuestionRefusal::PasswordBytes,
+                        ..
+                    }),
+                    KeywordGetRefusal::Keyword(KeywordRefusal::Filtered { .. }),
+                ]) if keyword == "Missing" && path == THIRD_PATH
+            ),
+            "each refusal: {refusals:?}"
+        );
+        assert_eq!(handler.calls(), vec![], "no call");
+    }
+
+    /// A KEYWORDINFO that the IFR cannot tell is refused with the other refusals, in the
+    /// requests' order, before any GetData(): the texts of the options, string 4, are in no
+    /// display language.
+    #[test]
+    fn get_refuses_every_keyword_info_with_the_other_refusals_before_any_call() {
+        let lists = [list(PATH, &questions())];
+        let handler =
+            MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (PATH, SECOND_KEYWORD, "01")]);
+        let requests = format!(
+            "KEYWORD={KEYWORD}&KEYWORDINFO=ValueAttribute&KEYWORD=Missing\
+             &KEYWORD={SECOND_KEYWORD}&KEYWORDINFO=ValueAttribute"
+        );
+
+        let refusals = refusals_of(get_of(&lists, &requests, &handler));
+
+        assert!(
+            matches!(
+                refusals.as_deref(),
+                Some([
+                    KeywordGetRefusal::Info(KeywordInfoRefusal::NoText { keyword: first, id: 4 }),
+                    KeywordGetRefusal::Keyword(KeywordRefusal::NotFound { keyword: missing, .. }),
+                    KeywordGetRefusal::Info(KeywordInfoRefusal::NoText { keyword: second, id: 4 }),
+                ]) if first == KEYWORD && missing == "Missing" && second == SECOND_KEYWORD
+            ),
+            "each refusal: {refusals:?}"
+        );
+        assert_eq!(handler.calls(), vec![], "no call");
+    }
+
+    /// A request may name a question once: twice would read it twice.
+    #[test]
+    fn get_refuses_a_question_named_twice() {
+        let lists = [list(PATH, &questions())];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+
+        let refusals = refusals_of(get_of(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&PATH={PATH}&KEYWORD={KEYWORD}&ReadWrite"),
+            &handler,
+        ));
+
+        assert_eq!(
+            refusals,
+            Some(vec![KeywordRefusal::Duplicate {
+                keyword: KEYWORD.to_owned(),
+                path: PATH.to_owned(),
+            }
+            .into()]),
+            "the second naming"
+        );
+        assert_eq!(handler.calls(), vec![], "no call");
+    }
+
+    /// Two package lists of one PATH whose keywords are in strings packages of two NAMESPACEs
+    /// hold two questions: get reads both, each with the GetData() of its NAMESPACE.
+    #[test]
+    fn get_reads_the_questions_of_one_path_in_two_namespaces() {
+        let lists = [
+            list(PATH, &questions()),
+            list_in(PATH, OTHER_NAMESPACE, &questions()),
+        ];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+
+        let values = get_of(&lists, &format!("KEYWORD={KEYWORD}"), &handler)
+            .unwrap_or_else(|error| panic!("get in two namespaces: {error:#}"));
+
+        assert_eq!(
+            values.to_string(),
+            format!(
+                "{}&{}",
+                resp(PATH, KEYWORD, "01"),
+                resp_in(OTHER_NAMESPACE, PATH, KEYWORD, "01")
+            ),
+            "both values"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![
+                get_call(PATH, KEYWORD),
+                get_call_of(OTHER_NAMESPACE, &keyword_string(PATH, KEYWORD)),
+            ],
+            "a GetData() per NAMESPACE"
+        );
+    }
+
+    /// A successful GetData() must hold a `<KeywordResp>` of every keyword asked for.
+    #[test]
+    fn get_refuses_a_successful_get_data_of_fewer_keywords_than_asked() {
+        let lists = [list(PATH, &questions())];
+        let handler = RewritingHandler {
+            inner: MemoryKeywordHandler::with(&[
+                (PATH, KEYWORD, "01"),
+                (PATH, SECOND_KEYWORD, "03"),
+            ]),
+            from: format!("&{}", resp(PATH, SECOND_KEYWORD, "03")),
+            to: String::new(),
+        };
+
+        let error = get_of(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORD={SECOND_KEYWORD}"),
+            &handler,
+        )
+        .expect_err("the first keyword alone");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.ends_with("succeeded with a <KeywordResp> of only the first 1 keywords"),
+            "refused: {text}"
+        );
+        assert!(!text.contains("VALUE="), "no Results text: {text}");
+        assert_eq!(
+            handler.inner.calls(),
+            vec![get_call_of(
+                NAMESPACE,
+                &format!(
+                    "{}&{}",
+                    keyword_string(PATH, KEYWORD),
+                    keyword_string(PATH, SECOND_KEYWORD)
+                )
+            )],
+            "one GetData()"
+        );
+    }
+
+    /// GetData() takes one NamespaceId: the keywords of each NAMESPACE are read with a call of
+    /// their own, and printed in the request's order.
+    #[test]
+    fn get_reads_each_namespace_with_a_get_data_of_its_own() {
+        let lists = [
+            list(PATH, &questions()),
+            list_in(OTHER_PATH, OTHER_NAMESPACE, &questions()),
+        ];
+        let handler = MemoryKeywordHandler::with(&[
+            (PATH, KEYWORD, "01"),
+            (PATH, SECOND_KEYWORD, "03"),
+            (OTHER_PATH, KEYWORD, "00"),
+            (OTHER_PATH, SECOND_KEYWORD, "01"),
+        ]);
+
+        let values = get_of(
+            &lists,
+            &format!("KEYWORD={SECOND_KEYWORD}&KEYWORD={KEYWORD}"),
+            &handler,
+        )
+        .expect("get in two namespaces");
+
+        assert_eq!(
+            values.to_string(),
+            [
+                resp(PATH, SECOND_KEYWORD, "03"),
+                resp_in(OTHER_NAMESPACE, OTHER_PATH, SECOND_KEYWORD, "01"),
+                resp(PATH, KEYWORD, "01"),
+                resp_in(OTHER_NAMESPACE, OTHER_PATH, KEYWORD, "00"),
+            ]
+            .join("&"),
+            "each keyword of each list, in the request's order"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![
+                get_call_of(
+                    NAMESPACE,
+                    &format!(
+                        "{}&{}",
+                        keyword_string(PATH, SECOND_KEYWORD),
+                        keyword_string(PATH, KEYWORD)
+                    )
+                ),
+                get_call_of(
+                    OTHER_NAMESPACE,
+                    &format!(
+                        "{}&{}",
+                        keyword_string(OTHER_PATH, SECOND_KEYWORD),
+                        keyword_string(OTHER_PATH, KEYWORD)
+                    )
+                ),
+            ],
+            "a GetData() per NAMESPACE"
+        );
+    }
+
+    /// When GetData() fails, get reports the `<KeywordResp>`s that its Results held, of the
+    /// keywords before the failing one, and the keywords it read no value of.
+    #[test]
+    fn get_reports_what_get_data_read_before_it_failed() {
+        let lists = [list(PATH, &questions())];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+
+        let got = get_of(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORD={SECOND_KEYWORD}"),
+            &handler,
+        );
+
+        let failure = failure_of(&got).expect("no value of the second keyword");
+        assert_eq!(failure.read, [resp(PATH, KEYWORD, "01")], "read");
+        assert_eq!(
+            failure.unread,
+            [keyword_string(PATH, SECOND_KEYWORD)],
+            "unread"
+        );
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "GetData() failed after reading [{}]; it read no value of [{}]: KEYWORD_NOT_FOUND",
+                resp(PATH, KEYWORD, "01"),
+                keyword_string(PATH, SECOND_KEYWORD)
+            ),
+            "the report"
+        );
+    }
+
+    /// A GetData() that fails in the first NAMESPACE leaves unread the rest of its keywords and
+    /// every keyword of the NAMESPACEs after it, which get calls no GetData() for.
+    #[test]
+    fn get_reads_no_namespace_after_a_failed_get_data() {
+        let lists = [
+            list(PATH, &questions()),
+            list_in(OTHER_PATH, OTHER_NAMESPACE, &questions()),
+        ];
+        let handler = MemoryKeywordHandler::with(&[
+            (PATH, KEYWORD, "01"),
+            (OTHER_PATH, KEYWORD, "00"),
+            (OTHER_PATH, SECOND_KEYWORD, "01"),
+        ]);
+
+        let got = get_of(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORD={SECOND_KEYWORD}"),
+            &handler,
+        );
+
+        let failure = failure_of(&got).expect("no value of the second keyword of PATH");
+        assert_eq!(failure.read, [resp(PATH, KEYWORD, "01")], "read");
+        assert_eq!(
+            failure.unread,
+            [
+                keyword_string(OTHER_PATH, KEYWORD),
+                keyword_string(PATH, SECOND_KEYWORD),
+                keyword_string(OTHER_PATH, SECOND_KEYWORD),
+            ],
+            "unread, in the request's order"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![get_call_of(
+                NAMESPACE,
+                &format!(
+                    "{}&{}",
+                    keyword_string(PATH, KEYWORD),
+                    keyword_string(PATH, SECOND_KEYWORD)
+                )
+            )],
+            "no GetData() of the second NAMESPACE"
+        );
+    }
+
+    /// The Results of a failed GetData() must be `<KeywordResp>`s of the first requests, no more
+    /// than them.
+    #[test]
+    fn get_refuses_results_of_a_failed_get_data_beyond_the_requests() {
+        let lists = [list(PATH, &questions())];
+        let handler = FailingAfter {
+            inner: MemoryKeywordHandler::with(&[
+                (PATH, KEYWORD, "01"),
+                (PATH, SECOND_KEYWORD, "03"),
+            ]),
+            extra: Some(resp(PATH, SECOND_KEYWORD, "03")),
+        };
+
+        let got = get_of(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORD={SECOND_KEYWORD}"),
+            &handler,
+        );
+
+        let error = got.expect_err("three <KeywordResp>s of two requests");
+        assert!(
+            error.downcast_ref::<KeywordGetFailure>().is_none(),
+            "not taken as read: {error:#}"
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("GetData() failed: GetData(): INVALID_PARAMETER: GetData() of ")
+                && text.ends_with("not the <KeywordResp> of each keyword asked for, in order"),
+            "refused: {text}"
+        );
+    }
+
+    /// A READONLY that contradicts the `<UsageFilter>` is reported with GetData()'s failure
+    /// after it, and both name what was read and what was not.
+    #[test]
+    fn get_reports_a_contradicting_readonly_with_the_failure_after_it() {
+        let lists = [list(PATH, &questions())];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01&READONLY")]);
+
+        let got = get_of(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&ReadWrite&KEYWORD={SECOND_KEYWORD}"),
+            &handler,
+        );
+
+        let failure = failure_of(&got).expect("no value of the second keyword");
+        let read = format!("{}&READONLY", resp(PATH, KEYWORD, "01"));
+        assert_eq!(
+            failure.refused,
+            [KeywordGetError::Usage {
+                request: format!("KEYWORD={KEYWORD}&ReadWrite"),
+                read: read.clone(),
+            }],
+            "the READONLY refused"
+        );
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "GetData() failed after reading [{read}]; it read no value of [{}]; get refuses \
+                 what it read: GetData() returned {read}, whose READONLY contradicts the \
+                 <UsageFilter> of KEYWORD={KEYWORD}&ReadWrite: KEYWORD_NOT_FOUND",
+                keyword_string(PATH, SECOND_KEYWORD)
+            ),
+            "the report"
+        );
+    }
+
+    /// A GetData() that fails once it has read a value of every keyword, as at a `<Filter>`
+    /// after the last that it cannot parse, is told so, with its error.
+    #[test]
+    fn get_says_that_get_data_failed_after_the_last_keyword() {
+        let lists = [list(PATH, &questions())];
+        let handler = FailingAfter {
+            inner: MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]),
+            extra: None,
+        };
+
+        let got = get_of(&lists, &format!("KEYWORD={KEYWORD}"), &handler);
+
+        let failure = failure_of(&got).expect("a failed GetData()");
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "GetData() read [{}], a value of every keyword, then failed after the last: \
+                 GetData(): INVALID_PARAMETER",
+                resp(PATH, KEYWORD, "01")
+            ),
+            "the report"
+        );
+    }
+
+    /// Results that are not the `<KeywordResp>`s asked for are refused naming the place,
+    /// NAMESPACE, PATH and KEYWORD of each other one, and Results that do not parse naming what
+    /// was expected and the character where, never their text: here the VALUE of a PASSWORD's
+    /// keyword, which firmware returns unasked after a successful or a failed GetData().
+    #[test]
+    fn get_refuses_results_beyond_the_requests_without_their_values() {
+        const SECRET: &str = "5ec2e7";
+        let lists = [
+            list(PATH, &[one_of(3, 5, 1)]),
+            list(OTHER_PATH, &[password_on(9, 3, 1, 6)]),
+        ];
+        let read = resp(PATH, KEYWORD, "01");
+        let password = resp(OTHER_PATH, KEYWORD, SECRET);
+        let values = || MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+        let succeeding = |extra: &str| RewritingHandler {
+            inner: values(),
+            from: read.clone(),
+            to: format!("{read}&{extra}"),
+        };
+        let failing = |extra: &str| FailingAfter {
+            inner: values(),
+            extra: Some(extra.to_owned()),
+        };
+        let request = format!("KEYWORD={KEYWORD}&Numeric");
+        let text_of = |result: Result<KeywordValues>| format!("{:#}", result.expect_err("refused"));
+        let unasked = format!(
+            "<KeywordResp> 2 of NAMESPACE={NAMESPACE}&PATH={OTHER_PATH}&KEYWORD={KEYWORD} past the \
+             last request"
+        );
+        let unparsed = format!(
+            "expected the next <KeywordResp> or the end at character {}",
+            read.len() + 1
+        );
+        let cases = [
+            (
+                "succeeded with an unasked <KeywordResp>",
+                text_of(get_of(&lists, &request, &succeeding(&password))),
+                &unasked,
+            ),
+            (
+                "failed with an unasked <KeywordResp>",
+                text_of(get_of(&lists, &request, &failing(&password))),
+                &unasked,
+            ),
+            (
+                "succeeded with an element that does not parse",
+                text_of(get_of(&lists, &request, &succeeding(SECRET))),
+                &unparsed,
+            ),
+            (
+                "failed with an element that does not parse",
+                text_of(get_of(&lists, &request, &failing(SECRET))),
+                &unparsed,
+            ),
+        ];
+        for (name, text, named) in cases {
+            assert!(text.contains(named.as_str()), "{name}: named: {text}");
+            assert!(!text.contains(SECRET), "{name}: no VALUE: {text}");
+        }
+    }
+
+    /// A Keyword Handler whose GetData() fails with NOT_FOUND, its text the Results.
+    struct FailingWithResults(&'static str);
+
+    impl KeywordData for FailingWithResults {
+        fn get_data(
+            &self,
+            _namespace_id: &str,
+            _keyword_string: &str,
+        ) -> Result<String, GetDataError> {
+            Err(GetDataError {
+                results: Some(self.0.to_owned()),
+                error: anyhow!("GetData(): NOT_FOUND"),
+            })
+        }
+
+        fn set_data(&self, _keyword_string: &str) -> Result<()> {
+            Err(anyhow!("no SetData()"))
+        }
+    }
+
+    /// A failed GetData() whose Results are empty, which no `<MultiKeywordResp>` is, read no
+    /// value, as without Results.
+    #[test]
+    fn get_takes_the_empty_results_of_a_failed_get_data_for_none() {
+        let lists = [list(PATH, &questions())];
+
+        let got = get_of(
+            &lists,
+            &format!("KEYWORD={KEYWORD}"),
+            &FailingWithResults(""),
+        );
+
+        let failure = failure_of(&got).expect("a failed GetData()");
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "GetData() read no value of [{}]: GetData(): NOT_FOUND",
+                keyword_string(PATH, KEYWORD)
+            ),
+            "the report"
         );
     }
 }
