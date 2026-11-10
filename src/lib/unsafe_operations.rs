@@ -23,6 +23,8 @@ use thiserror::Error;
 
 #[cfg(variable_data)]
 use crate::efi_variables::authenticated::SetupModeReading;
+#[cfg(variable_data)]
+use crate::efi_variables::secure_boot_mode::ModeTransition;
 use crate::hii::forms::IncludedStates;
 use crate::hii::forms::ReadOnlyCause;
 #[cfg(variable_data)]
@@ -82,6 +84,10 @@ pub enum UnsafeOperation {
         variable: VariableKey,
         setup_mode: SetupModeReading,
     },
+    /// `transition`, which clears PK, or cannot be undone without a platform-specific method or
+    /// deleting PK
+    #[cfg(variable_data)]
+    ModeTransition { transition: ModeTransition },
 }
 
 impl UnsafeOperation {
@@ -94,6 +100,8 @@ impl UnsafeOperation {
             Self::SetupModePolicyWrite { .. } | Self::SetupModeDeviceDatabaseWrite { .. } => {
                 "write it unchecked"
             }
+            #[cfg(variable_data)]
+            Self::ModeTransition { .. } => "enter it",
         }
     }
 
@@ -106,9 +114,9 @@ impl UnsafeOperation {
             }
             Self::SetupPassword | Self::ReadOnlyQuestion { .. } => String::new(),
             #[cfg(variable_data)]
-            Self::SetupModePolicyWrite { .. } | Self::SetupModeDeviceDatabaseWrite { .. } => {
-                String::new()
-            }
+            Self::SetupModePolicyWrite { .. }
+            | Self::SetupModeDeviceDatabaseWrite { .. }
+            | Self::ModeTransition { .. } => String::new(),
         }
     }
 
@@ -165,6 +173,8 @@ impl fmt::Display for UnsafeOperation {
                  section 32.6.3){}",
                 reason_after(setup_mode)
             ),
+            #[cfg(variable_data)]
+            Self::ModeTransition { transition } => write!(f, "{transition}"),
         }
     }
 }

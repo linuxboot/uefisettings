@@ -495,8 +495,8 @@ impl Global {
         }
     }
 
-    /// The global variable that `transition` sets, a byte of UEFI 2.11 §3.3, which variable set
-    /// writes only with the transition's flag.
+    /// The global variable that `transition` sets, a byte of UEFI 2.11 §3.3, which set_mode
+    /// writes, not set.
     const fn mode_transition(transition: ModeTransition) -> Self {
         Self {
             name: transition.variable(),
@@ -541,7 +541,7 @@ impl Global {
                 name: global.name,
                 reason,
             }),
-            Access::ModeTransition(transition) => Err(SetRefusal::NeedsFlag(transition)),
+            Access::ModeTransition(transition) => Err(SetRefusal::ModeTransition(transition)),
         }
     }
 
@@ -613,8 +613,8 @@ enum Access {
     Writable(Setter),
     /// The OS does not write it, for these words of UEFI 2.11
     ReadOnly(Quote),
-    /// Setting it makes this Secure Boot mode transition (UEFI 2.11 §32.3), which variable set
-    /// makes only with its flag
+    /// Setting it makes this Secure Boot mode transition (UEFI 2.11 §32.3), which set_mode
+    /// makes, not set
     ModeTransition(ModeTransition),
 }
 
@@ -829,12 +829,10 @@ enum SetRefusal {
     #[error("variable set does not write {name}: {reason}")]
     ReadOnly { name: &'static str, reason: Quote },
     #[error(
-        "variable set writes {} only with {}, in the UEFI Shell: {}",
-        .0.variable(),
-        .0.flag(),
-        .0.consequence()
+        "set writes no {}, whose write makes a Secure Boot mode transition, which set_mode makes",
+        .0.variable()
     )]
-    NeedsFlag(ModeTransition),
+    ModeTransition(ModeTransition),
     #[error(
         "Timeout takes seconds from 0 to 65535, or \"{}\", not \"{0}\"",
         WAIT_FOR_USER_INPUT_TEXT
@@ -2005,7 +2003,8 @@ pub(crate) mod tests {
                  JSON_CONFIG_DATA_REFRESH, comma-separated, or none, not \"{text}\""
             )
         };
-        let cases: Vec<(&str, &str, String)> = vec![
+        let cases: Vec<(&str, &str, String)> =
+            vec![
             (
                 "BootOrder",
                 "Boot0001,Boot0002,Boot0001",
@@ -2158,18 +2157,15 @@ pub(crate) mod tests {
             (
                 "AuditMode",
                 "1",
-                "variable set writes AuditMode only with --enter-audit-mode-clearing-pk, in the \
-                 UEFI Shell: \"Entering Audit Mode has the side effect of changing SetupMode == \
-                 1, PK is cleared, and the new DeployedMode == 0\" (UEFI 2.11 section 32.3.3)"
+                "set writes no AuditMode, whose write makes a Secure Boot mode transition, which \
+                 set_mode makes"
                     .to_string(),
             ),
             (
                 "DeployedMode",
                 "1",
-                "variable set writes DeployedMode only with --enter-deployed-mode-irreversibly, in \
-                 the UEFI Shell: \"to move from Deployed Mode to any other mode requires a secure \
-                 platform-specific method, or deleting the PK, which is authenticated\" (UEFI \
-                 2.11 section 32.3)"
+                "set writes no DeployedMode, whose write makes a Secure Boot mode transition, \
+                 which set_mode makes"
                     .to_string(),
             ),
             (

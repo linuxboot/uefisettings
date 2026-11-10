@@ -326,19 +326,21 @@ impl VariableBackend {
         write_global(&Self::system_variable_data()?, name, value)
     }
 
-    /// Sets the global variable `name` to `value`, as set does, to make the Secure Boot mode
-    /// transition `transition` of UEFI 2.11 §32.3, which only the UEFI Shell build makes, as
-    /// AuditMode and DeployedMode each "Always becomes read-only after ExitBootServices() is
-    /// called" (§3.3). Refuses, before it opens the variables, another variable or value and the
-    /// builds that run after ExitBootServices(), and, before any write, a transition that the
-    /// current mode does not allow; returns what it wrote and what SetVariable() returned.
+    /// Sets the global variable `name`, AuditMode or DeployedMode, to `value`, 1, as set does, to
+    /// make its Secure Boot mode transition of UEFI 2.11 §32.3 (ModeTransition::of_variable),
+    /// which only the UEFI Shell build makes, as AuditMode and DeployedMode each "Always becomes
+    /// read-only after ExitBootServices() is called" (§3.3). Refuses, before it opens the
+    /// variables, another variable or value and the builds that run after ExitBootServices();
+    /// before any write, a transition that the current mode does not allow, and then, unless
+    /// `unsafe_operations` allows it, the transition, an unsafe operation. Returns what it wrote
+    /// and what SetVariable() returned, and the transition, lifted.
     pub fn set_mode(
         name: &str,
         value: &str,
-        transition: ModeTransition,
-    ) -> Result<ModeTransitionWrite> {
-        let request = ModeRequest::new(transition, Self::SYSTEM_VARIABLE_REACH, name, value)?;
-        set_mode(&Self::system_variable_data()?, request)
+        unsafe_operations: UnsafeOperations,
+    ) -> Result<(ModeTransitionWrite, Vec<UnsafeOperation>)> {
+        let request = ModeRequest::new(Self::SYSTEM_VARIABLE_REACH, name, value)?;
+        set_mode(&Self::system_variable_data()?, request, unsafe_operations)
     }
 
     /// Writes `payload`, an EFI_VARIABLE_AUTHENTICATION_2 descriptor and the new data of the EFI

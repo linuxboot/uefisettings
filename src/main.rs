@@ -498,8 +498,8 @@ const UNSAFE_ARG: &str = "i_am_fine_to_brick_this_system";
 #[cfg(system_variables)]
 const UNSAFE_HELP: &str = "Do what this command otherwise refuses because it can bypass this \
                            machine's setup password, write a value that its firmware declares \
-                           read-only or weaken Secure Boot; each refusal names what this flag \
-                           does there";
+                           read-only, weaken Secure Boot or change it irreversibly; each refusal \
+                           names what this flag does there";
 
 /// What set refuses without --i-am-fine-to-brick-this-system on every build.
 #[cfg(all(system_hiidb, system_variables))]
@@ -1564,11 +1564,23 @@ mod tests {
             ),
         ];
         #[cfg(variable_data)]
-        let cases = cases.into_iter().chain([(
-            &WRITE_SIGNED[..],
-            &["--allow-setup-mode-write-without-signature-check"][..],
-            clap::error::ErrorKind::UnknownArgument,
-        )]);
+        let cases = cases.into_iter().chain([
+            (
+                &WRITE_SIGNED[..],
+                &["--allow-setup-mode-write-without-signature-check"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["variable", "set", "AuditMode", "1"],
+                &["--enter-audit-mode-clearing-pk"],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["variable", "set", "DeployedMode", "1"],
+                &["--enter-deployed-mode-irreversibly"],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+        ]);
         for (command, flag, kind) in cases {
             let argv = [&["uefisettings"][..], command, flag].concat();
             let error =

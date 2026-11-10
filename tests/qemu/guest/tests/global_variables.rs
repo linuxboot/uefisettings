@@ -40,6 +40,7 @@ use uefisettings_qemu_guest::require_test_vm;
 use uefisettings_qemu_guest::variable_bytes;
 use uefisettings_qemu_guest::EFIVARFS_HEADER_SIZE;
 use uefisettings_qemu_guest::EFIVARS;
+use uefisettings_qemu_guest::UNSAFE_OPERATIONS;
 
 /// EFI_GLOBAL_VARIABLE, as efivarfs names the files of its variables.
 const EFI_GLOBAL_VARIABLE: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
@@ -320,47 +321,26 @@ fn get_secboot_user() {
 fn set_mode_from_linux() {
     require_test_vm();
     let before = efivars();
-    let cases: [(&[&str], &str); 4] = [
+    let cases = [
         (
-            &["variable", "set", "AuditMode", "1"],
-            "variable set writes AuditMode only with --enter-audit-mode-clearing-pk, in the UEFI \
-             Shell: \"Entering Audit Mode has the side effect of changing SetupMode == 1, PK is \
-             cleared, and the new DeployedMode == 0\" (UEFI 2.11 section 32.3.3)",
+            "AuditMode",
+            "AuditMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI 2.11 \
+             section 3.3): run `uefisettings.efi variable set AuditMode 1` in the UEFI Shell",
         ),
         (
-            &[
-                "variable",
-                "set",
-                "AuditMode",
-                "1",
-                "--enter-audit-mode-clearing-pk",
-            ],
-            "AuditMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
-             2.11 section 3.3): run `uefisettings.efi variable set AuditMode 1 \
-             --enter-audit-mode-clearing-pk` in the UEFI Shell",
-        ),
-        (
-            &["variable", "set", "DeployedMode", "1"],
-            "variable set writes DeployedMode only with --enter-deployed-mode-irreversibly, in the \
-             UEFI Shell: \"to move from Deployed Mode to any other mode requires a secure \
-             platform-specific method, or deleting the PK, which is authenticated\" (UEFI 2.11 \
-             section 32.3)",
-        ),
-        (
-            &[
-                "variable",
-                "set",
-                "DeployedMode",
-                "1",
-                "--enter-deployed-mode-irreversibly",
-            ],
+            "DeployedMode",
             "DeployedMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
-             2.11 section 3.3): run `uefisettings.efi variable set DeployedMode 1 \
-             --enter-deployed-mode-irreversibly` in the UEFI Shell",
+             2.11 section 3.3): run `uefisettings.efi variable set DeployedMode 1` in the UEFI \
+             Shell",
         ),
     ];
-    for (args, refusal) in cases {
-        assert_eq!(json_error(args).error_message, refusal, "{args:?}");
+    // the flag lifts nothing after ExitBootServices(), and the refusal names none
+    for ((name, refusal), flag) in cases
+        .into_iter()
+        .flat_map(|case| [&[][..], &UNSAFE_OPERATIONS].map(|flag| (case, flag)))
+    {
+        let args = [&["variable", "set", name, "1"][..], flag].concat();
+        assert_eq!(json_error(&args).error_message, refusal, "{args:?}");
     }
     assert_eq!(efivars(), before, "the efivar files");
 }

@@ -236,6 +236,8 @@ through`; its output on stdout, `--json` too, stays the same otherwise.
 | A write of a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only | `set`, `hii set` | Linux, UEFI Shell, Windows | A value changes that the firmware declares read-only; the Keyword Handler refuses it as "a violation of system policy" (UEFI 2.11 §35.3.2) |
 | A signed write of a Secure Boot policy variable (PK, KEK, OsRecoveryOrder, OsRecovery####, any variable of EFI_IMAGE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware writes it without checking the signature (UEFI 2.11 §3.3, §32.3) |
 | A signed write of a device signature database (any variable of EFI_DEVICE_SECURITY_DATABASE_GUID) while SetupMode is 1, cannot be read or holds other than a UINT8 of 0 or 1 | `variable write-signed` | Linux, UEFI Shell, Windows | The firmware may write it without checking the signature (UEFI 2.11 §32.6.3) |
+| Setting AuditMode to 1, which enters Audit Mode | `variable set` | UEFI Shell | "PK is cleared" and SetupMode becomes 1 (UEFI 2.11 §32.3.3), so the firmware writes Secure Boot policy variables without checking their signatures (§32.3) |
+| Setting DeployedMode to 1, which enters Deployed Mode | `variable set` | UEFI Shell | Leaving Deployed Mode "requires a secure platform-specific method, or deleting the PK, which is authenticated" (UEFI 2.11 §32.3) |
 
 `capsule deliver` takes no flag: its payload goes to the firmware's JSON configuration processor,
 which UEFI 2.11 has check it against a schema and answer per capsule (§8.5.6.1.3), unlike
@@ -601,35 +603,37 @@ take authenticated writes.
 uefisettings variable set BootOrder Boot0002,Boot0001
 ```
 
-`variable set AuditMode 1 --enter-audit-mode-clearing-pk`, in the UEFI Shell, enters Audit Mode from
-Setup Mode or User Mode, which clears PK and sets SetupMode to 1 and DeployedMode to 0 (UEFI 2.11
-§32.3.3); setting PK then enters Deployed Mode, not User Mode (§32.3.4). Without the flag, set
-refuses AuditMode. It reads SetupMode, AuditMode and DeployedMode first and refuses, before any
-write, a firmware without them, as edk2 is, values that tell no mode of §32.3, and Audit Mode from
-Audit Mode or Deployed Mode. Linux and Windows refuse it, as AuditMode "Always becomes read-only
-after ExitBootServices() is called" (§3.3). It prints what it wrote, as set does, and `status`, what
-SetVariable() returned: `EFI_SUCCESS`, or `EFI_WARN_RESET_REQUIRED` if the firmware queued the
-transition for the next reset, the mode variables unchanged until then (§32.3); a firmware that has
-queued one refuses another with EFI_ALREADY_STARTED, which set reports as an error.
+`variable set AuditMode 1 --i-am-fine-to-brick-this-system`, in the UEFI Shell, enters Audit Mode
+from Setup Mode or User Mode, which clears PK and sets SetupMode to 1 and DeployedMode to 0 (UEFI
+2.11 §32.3.3); setting PK then enters Deployed Mode, not User Mode (§32.3.4). It reads SetupMode,
+AuditMode and DeployedMode first and refuses, before any write, a firmware without them, as edk2 is,
+values that tell no mode of §32.3, and Audit Mode from Audit Mode or Deployed Mode, with the flag
+too; only then, without the flag, it refuses AuditMode (see [Unsafe
+operations](#unsafe-operations)). Linux and Windows refuse it first, naming no flag, as AuditMode
+"Always becomes read-only after ExitBootServices() is called" (§3.3). It prints a warning of the
+transition on stderr, then what it wrote, as set does, and `status`, what SetVariable() returned:
+`EFI_SUCCESS`, or `EFI_WARN_RESET_REQUIRED` if the firmware queued the transition for the next
+reset, the mode variables unchanged until then (§32.3); a firmware that has queued one refuses
+another with EFI_ALREADY_STARTED, which set reports as an error.
 
 ```plain
-FS0:\> uefisettings.efi variable set AuditMode 1 --enter-audit-mode-clearing-pk
+FS0:\> uefisettings.efi variable set AuditMode 1 --i-am-fine-to-brick-this-system
 ```
 
-`variable set DeployedMode 1 --enter-deployed-mode-irreversibly`, in the UEFI Shell, enters Deployed
+`variable set DeployedMode 1 --i-am-fine-to-brick-this-system`, in the UEFI Shell, enters Deployed
 Mode from User Mode, which sets SetupMode to 0, and AuditMode to 0 and DeployedMode to 1, both made
 read-only (§32.3.4); leaving it "requires a secure platform-specific method, or deleting the PK,
-which is authenticated" (§32.3). Without the flag, set refuses DeployedMode. It checks the mode
-variables as for Audit Mode and refuses Deployed Mode from Setup Mode, which §32.3 lists no
-unauthenticated transition to it from, and from Audit Mode, where SetupMode is 1 and enrolling PK
-enters Deployed Mode instead, as `variable write-signed PK` does with
-`--i-am-fine-to-brick-this-system` (§32.3.4). Linux and Windows refuse it, as
-DeployedMode "Always becomes read-only after ExitBootServices() is called" (§3.3). It prints as for
-Audit Mode: §32.3 and §32.3.4 have this transition take effect immediately, so
-`EFI_WARN_RESET_REQUIRED` there is a firmware departure that set reports as returned.
+which is authenticated" (§32.3). It checks the mode variables as for Audit Mode and refuses Deployed
+Mode from Setup Mode, which §32.3 lists no unauthenticated transition to it from, and from Audit
+Mode, where SetupMode is 1 and enrolling PK enters Deployed Mode instead, as `variable write-signed
+PK` does with the flag (§32.3.4); it refuses these with the flag too, and only then, without the
+flag, DeployedMode. Linux and Windows refuse it first, naming no flag, as DeployedMode "Always
+becomes read-only after ExitBootServices() is called" (§3.3). It prints as for Audit Mode: §32.3 and
+§32.3.4 have this transition take effect immediately, so `EFI_WARN_RESET_REQUIRED` there is a
+firmware departure that set reports as returned.
 
 ```plain
-FS0:\> uefisettings.efi variable set DeployedMode 1 --enter-deployed-mode-irreversibly
+FS0:\> uefisettings.efi variable set DeployedMode 1 --i-am-fine-to-brick-this-system
 ```
 
 `variable storage [--attributes ATTRIBUTES]` prints what QueryVariableInfo() (UEFI 2.10 §8.2.4)

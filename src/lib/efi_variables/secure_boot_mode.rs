@@ -11,7 +11,7 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The Secure Boot modes of UEFI 2.11 §32.3, which SetupMode, AuditMode and DeployedMode tell
-//! (§3.3), and the transitions between them that variable set makes, each behind its own flag.
+//! (§3.3), and the transitions between them that variable set makes, each an unsafe operation.
 //! Firmware may queue a transition to Audit Mode for the next reset instead of making it at once
 //! (§32.3), which SetVariable() returns as EFI_WARN_RESET_REQUIRED, or EFI_ALREADY_STARTED while
 //! one is queued; set reports either as returned. The transition to Deployed Mode takes effect
@@ -34,6 +34,9 @@ use super::VariableData;
 use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 use crate::hii::VariableReach;
+use crate::unsafe_operations::LiftedOperations;
+use crate::unsafe_operations::UnsafeOperation;
+use crate::unsafe_operations::UnsafeOperations;
 
 /// The variable of EFI_GLOBAL_VARIABLE that tells whether the firmware writes the Secure Boot
 /// Policy Variables without checking their signatures (UEFI 2.11 §3.3): 1 in Setup Mode and in
@@ -47,7 +50,8 @@ const ENTER: u8 = 1;
 /// ENTER as variable set takes it.
 const ENTER_TEXT: &str = "1";
 
-/// A Secure Boot mode transition of UEFI 2.11 §32.3 that variable set makes behind its own flag.
+/// A Secure Boot mode transition of UEFI 2.11 §32.3, which set_mode makes only as an unsafe
+/// operation.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModeTransition {
@@ -69,15 +73,24 @@ impl ModeTransition {
         }
     }
 
-    /// The flag of variable set that asks for the transition.
-    pub const fn flag(self) -> &'static str {
-        match self {
-            Self::EnterAuditModeClearingPk => "--enter-audit-mode-clearing-pk",
-            Self::EnterDeployedModeIrreversibly => "--enter-deployed-mode-irreversibly",
+    /// The transition that setting the global variable `name` to 1 makes, if any.
+    pub fn of_variable(name: &str) -> Option<Self> {
+        match name {
+            AUDIT_MODE => Some(Self::EnterAuditModeClearingPk),
+            DEPLOYED_MODE => Some(Self::EnterDeployedModeIrreversibly),
+            _ => None,
         }
     }
 
-    /// Why the transition takes its flag, in the words of UEFI 2.11.
+    /// The mode that the transition enters.
+    const fn mode(self) -> SecureBootMode {
+        match self {
+            Self::EnterAuditModeClearingPk => SecureBootMode::Audit,
+            Self::EnterDeployedModeIrreversibly => SecureBootMode::Deployed,
+        }
+    }
+
+    /// Why the transition is an unsafe operation, in the words of UEFI 2.11.
     pub(crate) const fn consequence(self) -> &'static str {
         match self {
             Self::EnterAuditModeClearingPk => {
@@ -115,6 +128,19 @@ impl ModeTransition {
                 Err(ModeTransitionError::AlreadyIn(mode))
             }
         }
+    }
+}
+
+impl fmt::Display for ModeTransition {
+    /// What the transition does, and why it is an unsafe operation.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "setting {} to {ENTER_TEXT} enters {}: {}",
+            self.variable(),
+            self.mode(),
+            self.consequence()
+        )
     }
 }
 
@@ -190,22 +216,13 @@ pub(crate) struct ModeRequest {
 }
 
 impl ModeRequest {
-    /// `transition`, which setting the global variable `name` to `text` through variables that
+    /// The transition that setting the global variable `name` to `text` through variables that
     /// reach `reach` asks for. Refuses, before any variable is read, any other variable or value,
     /// and a write after ExitBootServices().
-    pub(crate) fn new(
-        transition: ModeTransition,
-        reach: VariableReach,
-        name: &str,
-        text: &str,
-    ) -> Result<Self> {
-        if name != transition.variable() {
-            return Err(ModeTransitionError::OtherVariable {
-                transition,
-                name: name.to_owned(),
-            }
-            .into());
-        }
+    pub(crate) fn new(reach: VariableReach, name: &str, text: &str) -> Result<Self> {
+        let Some(transition) = ModeTransition::of_variable(name) else {
+            return Err(ModeTransitionError::OtherVariable(name.to_owned()).into());
+        };
         if text != ENTER_TEXT {
             return Err(ModeTransitionError::OtherValue {
                 transition,
@@ -223,16 +240,21 @@ impl ModeRequest {
 }
 
 /// Sets the variable of `request` to 1 in `variables` to make its transition, after checking
-/// that the current Secure Boot mode allows it; returns what it wrote and what SetVariable()
-/// returned. Refuses, before any write, a firmware without the mode variables or with values that
-/// tell no mode, and a transition that UEFI 2.11 §32.3 does not make from the current mode.
+/// that the current Secure Boot mode allows it, and then that `unsafe_operations` allows the
+/// transition, an unsafe operation; returns what it wrote and what SetVariable() returned, and
+/// the transition, lifted, which the error of a failed SetVariable() carries too
+/// (LiftedOperations). Refuses, before any write, a firmware without the mode variables or with
+/// values that tell no mode, and a transition that UEFI 2.11 §32.3 does not make from the current
+/// mode.
 pub(crate) fn set_mode(
     variables: &impl VariableData,
     request: ModeRequest,
-) -> Result<ModeTransitionWrite> {
+    unsafe_operations: UnsafeOperations,
+) -> Result<(ModeTransitionWrite, Vec<UnsafeOperation>)> {
     let transition = request.transition;
     let modes = ModeVariables::read(variables)?;
     transition.check_from(modes.mode()?)?;
+    let lifted = vec![unsafe_operations.check(UnsafeOperation::ModeTransition { transition })?];
 
     let key = mode_key(transition.variable());
     let attributes = modes.attributes(transition);
@@ -244,12 +266,13 @@ pub(crate) fn set_mode(
                 ModeTransitionStatus::WarnResetRequired
             }
             Some(SetVariableStatus::AlreadyStarted(_)) => {
-                return Err(ModeTransitionError::AlreadyStarted.into())
+                let error = ModeTransitionError::AlreadyStarted.into();
+                return Err(LiftedOperations::attach(lifted, error));
             }
-            None => return Err(error),
+            None => return Err(LiftedOperations::attach(lifted, error)),
         },
     };
-    Ok(ModeTransitionWrite {
+    let write = ModeTransitionWrite {
         written: GlobalVariable {
             variable: key.to_string(),
             contents: Some(GlobalContents {
@@ -258,7 +281,8 @@ pub(crate) fn set_mode(
             }),
         },
         status,
-    })
+    };
+    Ok((write, lifted))
 }
 
 /// SetupMode, AuditMode and DeployedMode as a firmware holds them, 1 as true and 0 as false,
@@ -366,22 +390,18 @@ pub(super) enum ModeVariableError {
 /// not take.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 enum ModeTransitionError {
-    #[error("{} sets {}, not {name}", .transition.flag(), .transition.variable())]
-    OtherVariable {
-        transition: ModeTransition,
-        name: String,
-    },
-    #[error("{} sets {} to {ENTER_TEXT}, not \"{text}\"", .transition.flag(), .transition.variable())]
+    #[error("a Secure Boot mode transition sets {AUDIT_MODE} or {DEPLOYED_MODE}, not {0}")]
+    OtherVariable(String),
+    #[error("variable set writes {} only as {ENTER_TEXT}, not \"{text}\"", .transition.variable())]
     OtherValue {
         transition: ModeTransition,
         text: String,
     },
     #[error(
         "{} \"Always becomes read-only after ExitBootServices() is called\" (UEFI 2.11 section \
-         3.3): run `uefisettings.efi variable set {} {ENTER_TEXT} {}` in the UEFI Shell",
+         3.3): run `uefisettings.efi variable set {} {ENTER_TEXT}` in the UEFI Shell",
         .0.variable(),
-        .0.variable(),
-        .0.flag()
+        .0.variable()
     )]
     AfterExitBootServices(ModeTransition),
     #[error(
@@ -447,6 +467,7 @@ mod tests {
 
     use super::*;
     use crate::hii::VariableInterface;
+    use crate::unsafe_operations::UnsafeOperationRefused;
 
     /// BS+RT: the attributes of SetupMode, AuditMode and DeployedMode in UEFI 2.11 §3.3.
     const BS_RT: VariableAttributes =
@@ -619,8 +640,20 @@ mod tests {
         }
     }
 
-    /// What VariableBackend::set_mode does with `firmware`, which `reach`es: asks for
-    /// `transition` by setting `name` to `text`, then makes it.
+    /// What VariableBackend::set_mode does with `firmware`, which `reach`es, with `grant`: sets
+    /// `name` to `text` to make its transition.
+    fn request_and_set_mode_with(
+        firmware: &ModeFirmware,
+        reach: VariableReach,
+        name: &str,
+        text: &str,
+        grant: UnsafeOperations,
+    ) -> Result<(ModeTransitionWrite, Vec<UnsafeOperation>)> {
+        set_mode(firmware, ModeRequest::new(reach, name, text)?, grant)
+    }
+
+    /// What VariableBackend::set_mode does with `firmware`, which `reach`es, with the flag: sets
+    /// `name` to `text` to make `transition`, which it returns as lifted.
     fn request_and_set_mode(
         firmware: &ModeFirmware,
         reach: VariableReach,
@@ -628,11 +661,19 @@ mod tests {
         text: &str,
         transition: ModeTransition,
     ) -> Result<ModeTransitionWrite> {
-        set_mode(firmware, ModeRequest::new(transition, reach, name, text)?)
+        let (write, lifted) =
+            request_and_set_mode_with(firmware, reach, name, text, UnsafeOperations::Allow)?;
+        assert_eq!(
+            lifted,
+            [UnsafeOperation::ModeTransition { transition }],
+            "{transition:?} of {name} {text}: lifted"
+        );
+        Ok(write)
     }
 
-    /// The error that request_and_set_mode of `name` to `text` refuses `transition` with in
-    /// `firmware`, through `reach`, which must write nothing.
+    /// The error that set_mode of `name` to `text` refuses `transition` with in `firmware`,
+    /// through `reach`, which must write nothing, the same with the flag and without: the flag
+    /// lifts no refusal that comes before its own.
     #[track_caller]
     fn refusal<E>(
         firmware: &ModeFirmware,
@@ -645,21 +686,138 @@ mod tests {
         E: fmt::Display + fmt::Debug + Send + Sync + 'static,
     {
         let state = firmware.state();
-        let error = request_and_set_mode(firmware, reach, name, text, transition)
-            .expect_err("set_mode refuses the transition");
+        let [refused, allowed] = [UnsafeOperations::Refuse, UnsafeOperations::Allow].map(|grant| {
+            let error = request_and_set_mode_with(firmware, reach, name, text, grant)
+                .expect_err("set_mode refuses the transition");
+            assert_eq!(
+                firmware.written.borrow().as_slice(),
+                [],
+                "{transition:?} of {name} {text}, {grant:?}: no write"
+            );
+            assert_eq!(
+                firmware.state(),
+                state,
+                "{transition:?} of {name} {text}, {grant:?}: the mode variables and PK as they were"
+            );
+            error
+        });
         assert_eq!(
-            firmware.written.borrow().as_slice(),
-            [],
-            "{transition:?} of {name} {text}: no write"
+            refused.to_string(),
+            allowed.to_string(),
+            "{transition:?} of {name} {text}: the refusal without the flag and with it"
         );
-        assert_eq!(
-            firmware.state(),
-            state,
-            "{transition:?} of {name} {text}: the mode variables and PK as they were"
-        );
-        error
+        allowed
             .downcast::<E>()
             .unwrap_or_else(|error| panic!("{transition:?} of {name} {text}: {error:#}"))
+    }
+
+    /// set_mode refuses each transition that the current mode allows unless the flag is given,
+    /// after it reads the mode variables and checks the mode, writing nothing: the refusal names
+    /// the flag and what the transition does.
+    #[test]
+    fn set_mode_refuses_each_transition_without_the_flag() {
+        let cases = [
+            (
+                SecureBootMode::Setup,
+                ModeTransition::EnterAuditModeClearingPk,
+            ),
+            (
+                SecureBootMode::User,
+                ModeTransition::EnterAuditModeClearingPk,
+            ),
+            (
+                SecureBootMode::User,
+                ModeTransition::EnterDeployedModeIrreversibly,
+            ),
+        ];
+        for (mode, transition) in cases {
+            let firmware = ModeFirmware::in_mode(mode, Taking::AtOnce);
+            let state = firmware.state();
+
+            let error = request_and_set_mode_with(
+                &firmware,
+                VariableReach::BootServices,
+                transition.variable(),
+                ENTER_TEXT,
+                UnsafeOperations::Refuse,
+            )
+            .expect_err("set_mode refuses the transition without the flag");
+
+            assert_eq!(
+                error.downcast_ref::<UnsafeOperationRefused>(),
+                Some(&UnsafeOperationRefused {
+                    operation: UnsafeOperation::ModeTransition { transition }
+                }),
+                "{transition:?} from {mode}: {error:#}"
+            );
+            assert_eq!(
+                firmware.read.borrow().as_slice(),
+                [SETUP_MODE, AUDIT_MODE, DEPLOYED_MODE].map(mode_key),
+                "{transition:?} from {mode}: the mode variables are read first"
+            );
+            assert_eq!(
+                firmware.written.borrow().as_slice(),
+                [],
+                "{transition:?} from {mode}: no write"
+            );
+            assert_eq!(firmware.state(), state, "{transition:?} from {mode}: state");
+        }
+    }
+
+    /// The refusal of each transition without the flag, and the warning of it with the flag, say
+    /// what it does in the words of UEFI 2.11.
+    #[test]
+    fn mode_transitions_name_what_they_do() {
+        let cases = [
+            (
+                ModeTransition::EnterAuditModeClearingPk,
+                "setting AuditMode to 1 enters Audit Mode: \"Entering Audit Mode has the side \
+                 effect of changing SetupMode == 1, PK is cleared, and the new DeployedMode == 0\" \
+                 (UEFI 2.11 section 32.3.3)",
+            ),
+            (
+                ModeTransition::EnterDeployedModeIrreversibly,
+                "setting DeployedMode to 1 enters Deployed Mode: \"to move from Deployed Mode to \
+                 any other mode requires a secure platform-specific method, or deleting the PK, \
+                 which is authenticated\" (UEFI 2.11 section 32.3)",
+            ),
+        ];
+        for (transition, what) in cases {
+            let operation = UnsafeOperation::ModeTransition { transition };
+
+            assert_eq!(
+                UnsafeOperationRefused {
+                    operation: operation.clone()
+                }
+                .to_string(),
+                format!("{what}; pass --i-am-fine-to-brick-this-system to enter it"),
+                "{transition:?}: refusal"
+            );
+            assert_eq!(
+                operation.lifted_warning(),
+                format!("{what}; --i-am-fine-to-brick-this-system lets uefisettings enter it"),
+                "{transition:?}: warning"
+            );
+        }
+    }
+
+    /// The transition of a variable is the one that sets it: AuditMode's and DeployedMode's, and
+    /// none of another name, however close.
+    #[test]
+    fn mode_transition_of_variable_is_the_one_that_sets_it() {
+        for transition in [
+            ModeTransition::EnterAuditModeClearingPk,
+            ModeTransition::EnterDeployedModeIrreversibly,
+        ] {
+            assert_eq!(
+                ModeTransition::of_variable(transition.variable()),
+                Some(transition),
+                "{transition:?}"
+            );
+        }
+        for name in ["Timeout", "SetupMode", "auditmode", "AuditMode ", ""] {
+            assert_eq!(ModeTransition::of_variable(name), None, "{name:?}");
+        }
     }
 
     /// set_mode enters Audit Mode from Setup Mode and from User Mode, writing AuditMode alone:
@@ -821,41 +979,23 @@ mod tests {
         }
     }
 
-    /// ModeRequest refuses any variable but the transition's, and any value but 1, so set_mode
-    /// reads no variable.
+    /// ModeRequest refuses any variable but AuditMode and DeployedMode, and any value but 1, so
+    /// set_mode reads no variable.
     #[test]
     fn set_mode_refuses_other_variables_and_values() {
         let audit = ModeTransition::EnterAuditModeClearingPk;
         let deployed = ModeTransition::EnterDeployedModeIrreversibly;
-        let other_variable = |transition, name: &str| ModeTransitionError::OtherVariable {
-            transition,
-            name: name.to_owned(),
-        };
+        let other_variable = |name: &str| ModeTransitionError::OtherVariable(name.to_owned());
         let other_value = |transition, text: &str| ModeTransitionError::OtherValue {
             transition,
             text: text.to_owned(),
         };
         let cases = [
-            (
-                audit,
-                DEPLOYED_MODE,
-                ENTER_TEXT,
-                other_variable(audit, DEPLOYED_MODE),
-            ),
-            (
-                audit,
-                "Timeout",
-                ENTER_TEXT,
-                other_variable(audit, "Timeout"),
-            ),
+            (audit, "Timeout", ENTER_TEXT, other_variable("Timeout")),
+            (audit, "auditmode", ENTER_TEXT, other_variable("auditmode")),
+            (audit, SETUP_MODE, ENTER_TEXT, other_variable(SETUP_MODE)),
             (audit, AUDIT_MODE, "0", other_value(audit, "0")),
             (audit, AUDIT_MODE, "01", other_value(audit, "01")),
-            (
-                deployed,
-                AUDIT_MODE,
-                ENTER_TEXT,
-                other_variable(deployed, AUDIT_MODE),
-            ),
             (deployed, DEPLOYED_MODE, "0", other_value(deployed, "0")),
         ];
         for (transition, name, text, expected) in cases {
@@ -880,21 +1020,22 @@ mod tests {
 
     /// ModeRequest refuses every transition after ExitBootServices(), as from Linux or Windows,
     /// so set_mode reads no variable: AuditMode and DeployedMode "Always become read-only after
-    /// ExitBootServices() is called" (UEFI 2.11 §3.3).
+    /// ExitBootServices() is called" (UEFI 2.11 §3.3). The refusal names no flag, as the flag
+    /// lifts none there.
     #[test]
     fn set_mode_refuses_after_exit_boot_services() {
         let cases = [
             (
                 ModeTransition::EnterAuditModeClearingPk,
                 "AuditMode \"Always becomes read-only after ExitBootServices() is called\" (UEFI \
-                 2.11 section 3.3): run `uefisettings.efi variable set AuditMode 1 \
-                 --enter-audit-mode-clearing-pk` in the UEFI Shell",
+                 2.11 section 3.3): run `uefisettings.efi variable set AuditMode 1` in the UEFI \
+                 Shell",
             ),
             (
                 ModeTransition::EnterDeployedModeIrreversibly,
                 "DeployedMode \"Always becomes read-only after ExitBootServices() is called\" \
-                 (UEFI 2.11 section 3.3): run `uefisettings.efi variable set DeployedMode 1 \
-                 --enter-deployed-mode-irreversibly` in the UEFI Shell",
+                 (UEFI 2.11 section 3.3): run `uefisettings.efi variable set DeployedMode 1` in the \
+                 UEFI Shell",
             ),
         ];
         for (transition, text) in cases {
@@ -1098,6 +1239,13 @@ mod tests {
             "the second transition: {error:#}"
         );
         assert_eq!(
+            error.downcast_ref::<LiftedOperations>(),
+            Some(&LiftedOperations(vec![UnsafeOperation::ModeTransition {
+                transition: ModeTransition::EnterAuditModeClearingPk
+            }])),
+            "the second transition: lifted"
+        );
+        assert_eq!(
             firmware.state(),
             state,
             "the mode variables and PK as they were"
@@ -1110,7 +1258,7 @@ mod tests {
     }
 
     /// set_mode passes on a failure of SetVariable() other than the two of a queued
-    /// transition, which the firmware leaves unmade.
+    /// transition, which the firmware leaves unmade, with the transition that it lifted.
     #[test]
     fn set_mode_passes_on_other_set_variable_failures() {
         let firmware = ModeFirmware::in_mode(SecureBootMode::User, Taking::Refused);
@@ -1126,12 +1274,19 @@ mod tests {
         .expect_err("the firmware's refusal");
 
         assert_eq!(
-            error.to_string(),
+            error.root_cause().to_string(),
             format!(
                 "SetVariable() of EFI variable {}: SECURITY_VIOLATION",
                 mode_key(AUDIT_MODE)
             ),
             "the firmware's refusal"
+        );
+        assert_eq!(
+            error.downcast_ref::<LiftedOperations>(),
+            Some(&LiftedOperations(vec![UnsafeOperation::ModeTransition {
+                transition: ModeTransition::EnterAuditModeClearingPk
+            }])),
+            "the firmware's refusal: lifted"
         );
         assert_eq!(
             firmware.state(),
@@ -1199,21 +1354,17 @@ mod tests {
     /// The refusals name the variables, the values and the spec's words.
     #[test]
     fn refusals_name_their_reasons() {
-        let transition = ModeTransition::EnterAuditModeClearingPk;
         let cases = [
             (
-                ModeTransitionError::OtherVariable {
-                    transition,
-                    name: "Timeout".to_owned(),
-                },
-                "--enter-audit-mode-clearing-pk sets AuditMode, not Timeout",
+                ModeTransitionError::OtherVariable("Timeout".to_owned()),
+                "a Secure Boot mode transition sets AuditMode or DeployedMode, not Timeout",
             ),
             (
                 ModeTransitionError::OtherValue {
-                    transition,
+                    transition: ModeTransition::EnterAuditModeClearingPk,
                     text: "0".to_owned(),
                 },
-                "--enter-audit-mode-clearing-pk sets AuditMode to 1, not \"0\"",
+                "variable set writes AuditMode only as 1, not \"0\"",
             ),
             (
                 ModeTransitionError::Absent(vec![AUDIT_MODE, DEPLOYED_MODE]),
@@ -1253,11 +1404,11 @@ mod tests {
                  firmware is in Deployed Mode",
             ),
             (
-                ModeTransitionError::OtherVariable {
+                ModeTransitionError::OtherValue {
                     transition: ModeTransition::EnterDeployedModeIrreversibly,
-                    name: AUDIT_MODE.to_owned(),
+                    text: "2".to_owned(),
                 },
-                "--enter-deployed-mode-irreversibly sets DeployedMode, not AuditMode",
+                "variable set writes DeployedMode only as 1, not \"2\"",
             ),
             (
                 ModeTransitionError::AlreadyIn(SecureBootMode::Deployed),

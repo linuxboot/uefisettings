@@ -12,6 +12,7 @@
 
 //! The variable command: this machine's EFI variables.
 
+#[cfg(not(all(variable_names, variable_storage_info)))]
 use anyhow::anyhow;
 use anyhow::Result;
 #[cfg(variable_data)]
@@ -34,8 +35,16 @@ use uefisettings::exports::VariableKey;
 #[cfg(variable_storage_info)]
 use uefisettings::exports::VariableStorage;
 
+#[cfg(variable_data)]
+use crate::print_lifted;
 #[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
 use crate::print_line;
+#[cfg(variable_data)]
+use crate::unsafe_long_help;
+#[cfg(variable_data)]
+use crate::UnsafeArgs;
+#[cfg(variable_data)]
+use crate::UNSAFE_ARG;
 
 #[cfg(variable_data)]
 mod write_signed;
@@ -81,8 +90,7 @@ enum VariableSubcommands {
     },
     /// Set a global variable of UEFI 2.11 section 3.3 that the OS may write: Timeout, BootOrder,
     /// DriverOrder, SysPrepOrder, BootNext, PlatformLang or OsIndications; or, in the UEFI Shell,
-    /// AuditMode with --enter-audit-mode-clearing-pk and DeployedMode with
-    /// --enter-deployed-mode-irreversibly
+    /// AuditMode and DeployedMode with --i-am-fine-to-brick-this-system
     #[cfg(variable_data)]
     #[command(next_display_order = None)]
     Set(SetArgs),
@@ -109,9 +117,24 @@ enum VariableSubcommands {
     WriteSigned(Box<write_signed::WriteSignedArgs>),
 }
 
+/// What variable set refuses without --i-am-fine-to-brick-this-system.
+#[cfg(variable_data)]
+const MODE_TRANSITIONS: &str = "AuditMode set to 1, in the UEFI Shell, from Setup Mode or User \
+                                Mode, to enter Audit Mode, which clears PK and sets SetupMode to \
+                                1 and DeployedMode to 0 (UEFI 2.11 section 32.3.3); the firmware \
+                                may queue it for the next reset (section 32.3); setting PK then \
+                                enters Deployed Mode, not User Mode (section 32.3.4). And \
+                                DeployedMode set to 1, in the UEFI Shell, from User Mode, to \
+                                enter Deployed Mode irreversibly: leaving it \"requires a secure \
+                                platform-specific method, or deleting the PK, which is \
+                                authenticated\" (section 32.3). From Audit Mode, where SetupMode \
+                                is 1, enrolling PK enters it instead, as `variable write-signed \
+                                PK` does with this flag (section 32.3.4)";
+
 /// What variable set takes.
 #[cfg(variable_data)]
 #[derive(Debug, Args)]
+#[command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, &[MODE_TRANSITIONS])))]
 struct SetArgs {
     /// The variable, such as Timeout
     name: String,
@@ -120,50 +143,33 @@ struct SetArgs {
     /// a code of PlatformLangCodes for PlatformLang, bits such as BOOT_TO_FW_UI, or none,
     /// for OsIndications, which keeps its reserved bits; 1 for AuditMode and DeployedMode
     value: String,
-    /// Set AuditMode to 1, in the UEFI Shell, from Setup Mode or User Mode, to enter Audit Mode,
-    /// which clears PK and sets SetupMode to 1 and DeployedMode to 0 (UEFI 2.11 section 32.3.3);
-    /// the firmware may queue it for the next reset (section 32.3); setting PK then enters
-    /// Deployed Mode, not User Mode (UEFI 2.11 section 32.3.4)
-    #[arg(long, conflicts_with = "enter_deployed_mode_irreversibly")]
-    enter_audit_mode_clearing_pk: bool,
-    /// Set DeployedMode to 1, in the UEFI Shell, from User Mode, to enter Deployed Mode
-    /// irreversibly: leaving it "requires a secure platform-specific method, or deleting the PK,
-    /// which is authenticated" (UEFI 2.11 section 32.3). From Audit Mode, where SetupMode is 1,
-    /// enrolling PK enters it instead, as `variable write-signed PK` does with its flag for Setup
-    /// Mode (section 32.3.4)
-    #[arg(long)]
-    enter_deployed_mode_irreversibly: bool,
+    #[command(flatten)]
+    unsafe_operations: UnsafeArgs,
 }
 
 #[cfg(variable_data)]
 impl SetArgs {
     /// Sets the variable and prints what it wrote, as print_global prints it, and, for a Secure
-    /// Boot mode transition, what SetVariable() returned.
+    /// Boot mode transition, what SetVariable() returned, after a warning of the transition.
     fn run(&self) -> Result<()> {
-        match self.transition()? {
+        match self.transition() {
             None => print_global_variable(&VariableBackend::set(&self.name, &self.value)?),
-            Some(transition) => {
-                let write = VariableBackend::set_mode(&self.name, &self.value, transition)?;
+            Some(_) => {
+                let (write, lifted) = VariableBackend::set_mode(
+                    &self.name,
+                    &self.value,
+                    self.unsafe_operations.operations(),
+                )?;
+                print_lifted(&lifted)?;
                 print_line(format_args!("{}", serde_json::to_string(&write)?))?;
                 Ok(())
             }
         }
     }
 
-    /// The Secure Boot mode transition that the flags ask for, if any; clap refuses both.
-    fn transition(&self) -> Result<Option<ModeTransition>> {
-        match (
-            self.enter_audit_mode_clearing_pk,
-            self.enter_deployed_mode_irreversibly,
-        ) {
-            (false, false) => Ok(None),
-            (true, false) => Ok(Some(ModeTransition::EnterAuditModeClearingPk)),
-            (false, true) => Ok(Some(ModeTransition::EnterDeployedModeIrreversibly)),
-            (true, true) => Err(anyhow!(
-                "--enter-audit-mode-clearing-pk and --enter-deployed-mode-irreversibly ask for \
-                 two transitions"
-            )),
-        }
+    /// The Secure Boot mode transition that setting the variable makes, if any.
+    fn transition(&self) -> Option<ModeTransition> {
+        ModeTransition::of_variable(&self.name)
     }
 }
 
@@ -308,11 +314,17 @@ struct StorageReport {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(variable_data)]
+    use clap::CommandFactory;
     use clap::Parser;
+    #[cfg(variable_data)]
+    use uefisettings::exports::UnsafeOperations;
 
     use super::*;
     use crate::Commands;
     use crate::UefiSettingsToolArgs;
+    #[cfg(variable_data)]
+    use crate::UNSAFE_HELP;
 
     /// The variable subcommand that `args`, after `uefisettings variable`, parse to.
     fn variable(args: &[&str]) -> VariableSubcommands {
@@ -455,34 +467,47 @@ mod tests {
         );
     }
 
-    /// set takes --enter-audit-mode-clearing-pk after its name and value, which asks for the
-    /// transition to Audit Mode, and asks for none without it.
+    /// set takes --i-am-fine-to-brick-this-system after its name and value, which grants
+    /// UnsafeOperations::Allow, and routes AuditMode and DeployedMode, with the flag or without, to
+    /// their transitions; its long help lists them.
     #[cfg(variable_data)]
     #[test]
-    fn set_takes_the_audit_mode_flag() {
-        let transition = ModeTransition::EnterAuditModeClearingPk;
-        let (name, flag) = (transition.variable(), transition.flag());
-        let argv = ["uefisettings", "variable", "set", name, "1", flag];
-
-        let parsed = UefiSettingsToolArgs::try_parse_from(argv);
-
-        assert!(
-            matches!(
-                parsed.as_ref().map(|args| &args.command),
-                Ok(Commands::Variable(VariableCommand {
-                    command: VariableSubcommands::Set(_)
-                }))
-            ),
-            "{argv:?}: {parsed:?}"
-        );
+    fn set_takes_the_unsafe_flag() {
+        let audit = ModeTransition::EnterAuditModeClearingPk;
+        let deployed = ModeTransition::EnterDeployedModeIrreversibly;
         let cases = [
-            (&["set", name, "1", flag][..], Some(transition)),
-            (&["set", name, "1"], None),
-            (&["set", "Timeout", "5"], None),
+            (
+                &["set", "AuditMode", "1", "--i-am-fine-to-brick-this-system"][..],
+                UnsafeOperations::Allow,
+                Some(audit),
+            ),
+            (
+                &[
+                    "set",
+                    "DeployedMode",
+                    "1",
+                    "--i-am-fine-to-brick-this-system",
+                ],
+                UnsafeOperations::Allow,
+                Some(deployed),
+            ),
+            (
+                &["set", "AuditMode", "1"],
+                UnsafeOperations::Refuse,
+                Some(audit),
+            ),
+            (
+                &["set", "DeployedMode", "0"],
+                UnsafeOperations::Refuse,
+                Some(deployed),
+            ),
+            (&["set", "Timeout", "5"], UnsafeOperations::Refuse, None),
         ];
-        for (args, want) in cases {
+        for (args, grant, transition) in cases {
             let asked = match variable(args) {
-                VariableSubcommands::Set(set) => set.transition().expect("one transition"),
+                VariableSubcommands::Set(set) => {
+                    (set.unsafe_operations.operations(), set.transition())
+                }
                 #[cfg(variable_info)]
                 parsed @ VariableSubcommands::Info { .. } => {
                     panic!("{args:?} is no set: {parsed:?}")
@@ -495,58 +520,26 @@ mod tests {
                 }
             };
 
-            assert_eq!(asked, want, "{args:?}");
+            assert_eq!(asked, (grant, transition), "{args:?}");
         }
-    }
 
-    /// set takes --enter-deployed-mode-irreversibly after its name and value, which asks for the
-    /// transition to Deployed Mode, and refuses it with --enter-audit-mode-clearing-pk.
-    #[cfg(variable_data)]
-    #[test]
-    fn set_takes_the_deployed_mode_flag() {
-        let deployed = ModeTransition::EnterDeployedModeIrreversibly;
-        let argv = [
-            "uefisettings",
-            "variable",
-            "set",
-            deployed.variable(),
-            "1",
-            deployed.flag(),
-        ];
-
-        let parsed = UefiSettingsToolArgs::try_parse_from(argv);
-
-        assert!(
-            matches!(
-                parsed.as_ref().map(|args| &args.command),
-                Ok(Commands::Variable(VariableCommand {
-                    command: VariableSubcommands::Set(_)
-                }))
-            ),
-            "{argv:?}: {parsed:?}"
-        );
-        let transition = match variable(&argv[2..]) {
-            VariableSubcommands::Set(set) => set.transition().expect("one transition"),
-            #[cfg(variable_info)]
-            parsed @ VariableSubcommands::Info { .. } => panic!("{argv:?} is no set: {parsed:?}"),
-            parsed @ (VariableSubcommands::List { .. }
-            | VariableSubcommands::Get { .. }
-            | VariableSubcommands::Storage { .. }
-            | VariableSubcommands::WriteSigned(_)) => panic!("{argv:?} is no set: {parsed:?}"),
-        };
-        assert_eq!(transition, Some(deployed), "{argv:?}");
-        let both = UefiSettingsToolArgs::try_parse_from(
-            [
-                &argv[..],
-                &[ModeTransition::EnterAuditModeClearingPk.flag()],
-            ]
-            .concat(),
-        )
-        .map_err(|error| error.kind());
+        let mut command = UefiSettingsToolArgs::command();
+        command.build();
+        let long_help = command
+            .find_subcommand("variable")
+            .and_then(|variable| variable.find_subcommand("set"))
+            .and_then(|set| {
+                set.get_arguments()
+                    .find(|arg| arg.get_long() == Some("i-am-fine-to-brick-this-system"))
+            })
+            .and_then(|flag| flag.get_long_help())
+            .map(ToString::to_string);
         assert_eq!(
-            both.err(),
-            Some(clap::error::ErrorKind::ArgumentConflict),
-            "both flags"
+            long_help,
+            Some(format!(
+                "{UNSAFE_HELP}. This command refuses without it: {MODE_TRANSITIONS}"
+            )),
+            "variable set"
         );
     }
 
