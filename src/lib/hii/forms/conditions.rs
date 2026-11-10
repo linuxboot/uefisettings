@@ -13,6 +13,22 @@
 //! The conditions of SUPPRESS_IF, GRAY_OUT_IF and DISABLE_IF scopes, evaluated as
 //! edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression evaluates them, and the
 //! questions and options that they leave to get, set and list-questions.
+//!
+//! Where UEFI 2.11 and edk2 disagree, the ops here follow edk2, as the table says: conditions
+//! decide which questions a user sees and sets, as the platform's setup browser, mostly edk2's,
+//! shows them, and the spec would make every EQ_ID_VAL of a CHECKBOX, which holds a BOOLEAN,
+//! UNDEFINED. Where edk2 ASSERTs, the result is not evaluated. Lines are of edk2-stable202608.
+//!
+//! | Operation | UEFI 2.11 | edk2 | Here |
+//! |---|---|---|---|
+//! | Order of two integers | as unsigned 64-bit integers (§33.2.5.7.4, §33.3.8.3.36) | by the sign of their difference as an INT64 (SetupBrowserDxe/Expression.c:2325-2333) | edk2 |
+//! | A BOOLEAN with an integer | UNDEFINED, as two types (§33.3.8.3.18) or as a question value that is no unsigned integer (§33.3.8.3.21) | compared as integers (IsTypeInUINT64, Expression.c:1011-1027) | edk2 |
+//! | A condition of another type than BOOLEAN | applies only where it evaluates to TRUE, as SUPPRESS_IF, GRAY_OUT_IF and DISABLE_IF say (§33.3.8.3.75, §33.3.8.3.28, §33.3.8.3.14) | IsTrue: an integer TRUE if not 0, a DATE, TIME, STRING or buffer FALSE (Expression.c:3760-3784) | edk2 |
+//! | Two DATEs, TIMEs or buffers compared | UNDEFINED, as no strings, Booleans or unsigned integers (§33.2.5.7.4, §33.3.8.3.18) | by their bytes, then the longer greater (IsTypeInBuffer, Expression.c:985-1000, :2295-2319) | edk2 |
+//! | The right operand of MULTIPLY, DIVIDE and MODULO | 64 bits (§33.3.8.3.43, §33.3.8.3.15, §33.3.8.3.42) | its low 32 bits (Expression.c:3398-3406) | edk2 |
+//! | EQ_ID_VAL_LIST | the question's value in the list (§33.3.8.3.20) | its low 16 bits (Expression.c:2716) | edk2 |
+//! | A zero divisor; a shift of 64 bits or more | UNDEFINED, as DIVIDE and MODULO push (§33.3.8.3.15, §33.3.8.3.42); no limit (§33.3.8.3.67, §33.3.8.3.68) | an ASSERT (MdePkg/Library/BaseLib/DivU64x32.c:34, DivU64x32Remainder.c:38, LShiftU64.c:33, RShiftU64.c:33) | not evaluated |
+//! | A SET after an UNDEFINED | EFI_IFR_SET (§33.3.8.3.66) stores its value and pushes TRUE or FALSE | never reached, as the expression ends at the UNDEFINED (Expression.c:3713-3715) | edk2: no SET planned |
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -1339,11 +1355,14 @@ pub(crate) fn evaluate_condition(
         Ok(Operand::Boolean(None) | Operand::Uint(None)) => {
             Truth::Unknown(evaluation.into_unknown())
         }
-        // edk2-stable202608 SetupBrowserDxe/Expression.c IsTrue takes a DATE or TIME as FALSE
-        Ok(Operand::Date(_) | Operand::Time(_)) => Truth::Known(false),
+        // edk2-stable202608 SetupBrowserDxe/Expression.c IsTrue takes a DATE, TIME, STRING or
+        // buffer as FALSE
+        Ok(Operand::Date(_) | Operand::Time(_) | Operand::String(_) | Operand::Buffer(_)) => {
+            Truth::Known(false)
+        }
         // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends at an
         // UNDEFINED, keeping it as the result, which IsTrue takes as FALSE
-        Err(Abort::Undefined) => Truth::Known(false),
+        Ok(Operand::Undefined) | Err(Abort::Undefined) => Truth::Known(false),
         // edk2-stable202608 SetupBrowserDxe/Presentation.c EvaluateFormExpressions refuses to
         // show the form
         Err(Abort::Malformed(reason)) => Truth::Unknown(format!("malformed condition: {reason}")),
@@ -1427,8 +1446,8 @@ pub(crate) fn evaluate_value(
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> std::result::Result<u64, String> {
     let mut evaluation = Evaluation::new(inputs, Role::Reads);
-    match evaluation.run(scope) {
-        Ok(operand) => operand.as_u64().ok_or_else(|| evaluation.into_unknown()),
+    match evaluation.run(scope).and_then(|operand| operand.as_u64()) {
+        Ok(value) => value.ok_or_else(|| evaluation.into_unknown()),
         Err(Abort::Undefined) => Err("UNDEFINED result".to_string()),
         Err(Abort::Malformed(reason)) => Err(format!("malformed expression: {reason}")),
         Err(Abort::NotEvaluated(reason)) => Err(reason),
@@ -1461,13 +1480,13 @@ pub(crate) fn evaluate_read(
     };
     let mut evaluation = Evaluation::new(inputs, Role::Read(this));
     match evaluation.run_ops(&expression) {
+        Ok(Operand::Undefined) | Err(Abort::Undefined | Abort::Malformed(_)) => ReadOutcome::Stored,
         Ok(operand) => match ExpressionValue::of(operand) {
             Some(value) => ReadOutcome::Value(value),
             None => ReadOutcome::Refused(
                 evaluation.into_refusal(QuestionExpression::Read, "no value".to_string()),
             ),
         },
-        Err(Abort::Undefined | Abort::Malformed(_)) => ReadOutcome::Stored,
         Err(Abort::NotEvaluated(reason)) => {
             ReadOutcome::Refused(evaluation.into_refusal(QuestionExpression::Read, reason))
         }
@@ -1602,7 +1621,7 @@ fn evaluates_read_and_write(question: &IFROperation) -> bool {
 }
 
 /// An EFI_HII_VALUE on the expression stack; None is a value that cannot be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Operand {
     /// EFI_IFR_TYPE_BOOLEAN, the stored byte as is
     Boolean(Option<u8>),
@@ -1613,36 +1632,103 @@ enum Operand {
     Date(Option<[u8; 4]>),
     /// EFI_IFR_TYPE_TIME, an EFI_HII_TIME as stored
     Time(Option<[u8; 3]>),
+    /// EFI_IFR_TYPE_STRING, a null-terminated string (UEFI 2.11 §33.2.5.7.4), without the null
+    #[allow(
+        dead_code,
+        reason = "no op evaluated here gives a STRING, nor does any question value"
+    )]
+    String(Option<Rc<[u16]>>),
+    /// EFI_IFR_TYPE_BUFFER: a buffer result, the EFI_HII_REF of a Ref question value (UEFI 2.11
+    /// §33.2.5.7.4) or the items of an ORDERED_LIST, which edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c ParseOpCodes types as a buffer
+    #[allow(
+        dead_code,
+        reason = "no op evaluated here gives a buffer, nor does any question value"
+    )]
+    Buffer(Option<Rc<[u8]>>),
+    /// EFI_IFR_TYPE_UNDEFINED, a value that later ops take (UEFI 2.11 §33.2.5.7.4), though
+    /// edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends the expression at
+    /// the first one
+    Undefined,
 }
+
+/// The longest STRING, in characters, or buffer, in bytes, that an op may give: DUP and CATENATE
+/// would double one without end, and edk2-stable202608 SetupBrowserDxe/Expression.c IfrCatenate
+/// stores the length of a longer buffer as a UINT16 and overflows the heap with its bytes
+/// (Expression.c:1381, :1393, :1401).
+const MAX_OPERAND_LENGTH: usize = 0xFFFF;
 
 impl Operand {
     /// Returns the value as edk2-stable202608 SetupBrowserDxe/Expression.c HiiValueToUINT64
     /// does, which the arithmetic and bitwise ops take: a DATE as its EFI_HII_DATE, a TIME as its
-    /// EFI_HII_TIME, little-endian.
-    fn as_u64(self) -> Option<u64> {
+    /// EFI_HII_TIME, little-endian. A STRING, a buffer and UNDEFINED give UNDEFINED, as
+    /// EvaluateExpression gives it for a type above EFI_IFR_TYPE_DATE.
+    fn as_u64(&self) -> Result<Option<u64>, Abort> {
         match self {
-            Operand::Boolean(value) => value.map(u64::from),
-            Operand::Uint(value) => value,
-            Operand::Date(value) => value.map(widened_date),
-            Operand::Time(value) => value.map(widened_time),
+            Operand::Boolean(value) => Ok(value.map(u64::from)),
+            Operand::Uint(value) => Ok(*value),
+            Operand::Date(value) => Ok(value.map(widened_date)),
+            Operand::Time(value) => Ok(value.map(widened_time)),
+            Operand::String(_) | Operand::Buffer(_) | Operand::Undefined => Err(Abort::Undefined),
         }
     }
 
     /// Returns the BOOLEAN value as a C condition takes it, or Undefined for another type.
-    fn as_bool(self) -> Result<Option<bool>, Abort> {
+    fn as_bool(&self) -> Result<Option<bool>, Abort> {
         match self {
             Operand::Boolean(value) => Ok(value.map(|value| value != 0)),
-            Operand::Uint(_) | Operand::Date(_) | Operand::Time(_) => Err(Abort::Undefined),
+            Operand::Uint(_)
+            | Operand::Date(_)
+            | Operand::Time(_)
+            | Operand::String(_)
+            | Operand::Buffer(_)
+            | Operand::Undefined => Err(Abort::Undefined),
         }
     }
 
+    /// The type of a STRING or buffer, which ops that do not evaluate it name, else None.
+    fn unevaluated_type(&self) -> Option<&'static str> {
+        match self {
+            Operand::String(_) => Some("STRING"),
+            Operand::Buffer(_) => Some("buffer"),
+            Operand::Boolean(_)
+            | Operand::Uint(_)
+            | Operand::Date(_)
+            | Operand::Time(_)
+            | Operand::Undefined => None,
+        }
+    }
+
+    /// A STRING longer than MAX_OPERAND_LENGTH characters, or a buffer longer than that many
+    /// bytes, as refusals name it; None for another value.
+    fn over_max_length(&self) -> Option<String> {
+        let (length, unit) = match self {
+            Operand::String(Some(value)) => (value.len(), "characters"),
+            Operand::Buffer(Some(value)) => (value.len(), "bytes"),
+            Operand::String(None)
+            | Operand::Buffer(None)
+            | Operand::Boolean(_)
+            | Operand::Uint(_)
+            | Operand::Date(_)
+            | Operand::Time(_)
+            | Operand::Undefined => return None,
+        };
+        let kind = self.unevaluated_type()?;
+        (length > MAX_OPERAND_LENGTH).then(|| format!("a {kind} of {length} {unit}"))
+    }
+
     /// What edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue compares of it: an
-    /// integer or BOOLEAN as its value, a DATE or TIME as its bytes.
+    /// integer or BOOLEAN as its value, a STRING as its characters, a DATE, TIME or buffer as its
+    /// bytes (IsTypeInBuffer).
     fn compared(&self) -> Compared<'_> {
         match self {
-            Operand::Boolean(_) | Operand::Uint(_) => Compared::Integer(self.as_u64()),
+            Operand::Boolean(value) => Compared::Integer(value.map(u64::from)),
+            Operand::Uint(value) => Compared::Integer(*value),
+            Operand::String(value) => Compared::Characters(value.as_deref()),
             Operand::Date(value) => Compared::Bytes(value.as_ref().map(<[u8; 4]>::as_slice)),
             Operand::Time(value) => Compared::Bytes(value.as_ref().map(<[u8; 3]>::as_slice)),
+            Operand::Buffer(value) => Compared::Bytes(value.as_deref()),
+            Operand::Undefined => Compared::Undefined,
         }
     }
 }
@@ -1650,7 +1736,10 @@ impl Operand {
 /// What CompareHiiValue compares of an operand; None for a value that cannot be read.
 enum Compared<'a> {
     Integer(Option<u64>),
+    Characters(Option<&'a [u16]>),
     Bytes(Option<&'a [u8]>),
+    /// UNDEFINED, which it compares with nothing
+    Undefined,
 }
 
 /// How CompareHiiValue orders two operands.
@@ -1658,26 +1747,46 @@ enum Order {
     Known(std::cmp::Ordering),
     /// One of them cannot be read
     Unknown,
-    /// An integer or BOOLEAN and a DATE or TIME, which it does not compare (EFI_UNSUPPORTED)
+    /// Two of different kinds, or UNDEFINED, which it does not compare (EFI_UNSUPPORTED)
     Unsupported,
 }
 
 /// Orders `left` and `right` as CompareHiiValue does: integers and BOOLEANs by the sign of their
-/// difference as an INT64, DATEs and TIMEs by their bytes, then the longer greater.
-fn order(left: Operand, right: Operand) -> Order {
+/// difference as an INT64, STRINGs by their characters as StrCmp does, DATEs, TIMEs and buffers by
+/// their bytes, then the longer greater.
+fn order(left: &Operand, right: &Operand) -> Order {
     match (left.compared(), right.compared()) {
         (Compared::Integer(Some(left)), Compared::Integer(Some(right))) => {
             Order::Known(left.wrapping_sub(right).cast_signed().cmp(&0))
         }
+        (Compared::Characters(Some(left)), Compared::Characters(Some(right))) => {
+            Order::Known(left.cmp(right))
+        }
         (Compared::Bytes(Some(left)), Compared::Bytes(Some(right))) => {
             Order::Known(left.cmp(right))
         }
-        (Compared::Integer(_), Compared::Integer(_)) | (Compared::Bytes(_), Compared::Bytes(_)) => {
-            Order::Unknown
-        }
-        (Compared::Integer(_), Compared::Bytes(_)) | (Compared::Bytes(_), Compared::Integer(_)) => {
-            Order::Unsupported
-        }
+        (Compared::Integer(_), Compared::Integer(_))
+        | (Compared::Characters(_), Compared::Characters(_))
+        | (Compared::Bytes(_), Compared::Bytes(_)) => Order::Unknown,
+        (
+            Compared::Integer(_),
+            Compared::Characters(_) | Compared::Bytes(_) | Compared::Undefined,
+        )
+        | (
+            Compared::Characters(_),
+            Compared::Integer(_) | Compared::Bytes(_) | Compared::Undefined,
+        )
+        | (
+            Compared::Bytes(_),
+            Compared::Integer(_) | Compared::Characters(_) | Compared::Undefined,
+        )
+        | (
+            Compared::Undefined,
+            Compared::Integer(_)
+            | Compared::Characters(_)
+            | Compared::Bytes(_)
+            | Compared::Undefined,
+        ) => Order::Unsupported,
     }
 }
 
@@ -1704,13 +1813,14 @@ pub(crate) enum ExpressionValue {
 }
 
 impl ExpressionValue {
-    /// Returns `operand` if its value can be read.
+    /// Returns `operand` if its value can be read and is of a type that a READ gives here.
     fn of(operand: Operand) -> Option<Self> {
         match operand {
             Operand::Boolean(value) => value.map(Self::Boolean),
             Operand::Uint(value) => value.map(Self::Uint),
             Operand::Date(value) => value.map(Self::Date),
             Operand::Time(value) => value.map(Self::Time),
+            Operand::String(_) | Operand::Buffer(_) | Operand::Undefined => None,
         }
     }
 
@@ -2024,6 +2134,7 @@ fn store_label(store: &dyn VariableStore) -> String {
 }
 
 /// Why an evaluation ended before its last op.
+#[derive(Debug, PartialEq, Eq)]
 enum Abort {
     /// An op gave EFI_IFR_TYPE_UNDEFINED
     Undefined,
@@ -2039,7 +2150,7 @@ fn not_decoded(op: &IFROperation) -> Abort {
 }
 
 /// What conditions take an op for.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum OpRole {
     /// An op of edk2-stable202608 SetupBrowserDxe/IfrParse.c IsExpressionOpCode
     Expression(ExpressionOp),
@@ -2053,7 +2164,7 @@ enum OpRole {
 }
 
 /// An expression op, by how it is evaluated.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ExpressionOp {
     EqIdVal,
     EqIdId,
@@ -2219,11 +2330,22 @@ struct Evaluation<'a, V> {
     reader: &'a mut EfivarReader,
     values: &'a V,
     role: Role<'a>,
-    stack: Vec<Operand>,
+    /// The expression that it is in: the whole one, or an expression of a MAP
+    frame: Frame,
     /// Why the first value that cannot be read cannot be
     unknown: Option<String>,
     /// The first VarStore that it cannot reach, or op that is not evaluated
     gap: Option<Gap>,
+}
+
+/// The stack of an expression that an evaluation is in: the whole one, or an expression of a MAP,
+/// which edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression evaluates with a call
+/// of its own.
+#[derive(Default)]
+struct Frame {
+    stack: Vec<Operand>,
+    /// The op that gave its first UNDEFINED, where EvaluateExpression ends it with that result
+    ended: Option<&'static str>,
 }
 
 impl<'a, V: QuestionValues> Evaluation<'a, V> {
@@ -2232,7 +2354,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             reader: inputs.reader,
             values: inputs.values,
             role,
-            stack: Vec::new(),
+            frame: Frame::default(),
             unknown: None,
             gap: None,
         }
@@ -2262,22 +2384,20 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             .map(|op| Pending::Op(Rc::clone(op)))
             .collect();
         while let Some(next) = pending.pop() {
-            let mut done = match next {
+            match next {
                 Pending::Op(op) => self.visit(&op, &mut pending),
                 Pending::Match(progress) => self.matched(progress, &mut pending),
-                Pending::Return { outer } => self.returned(outer),
-            };
-            // edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue matches no
-            // UNDEFINED: the match expression that gives it, whatever op in it does, takes its
-            // MAP to the next pair
-            while let Err(Abort::Undefined) = done {
-                let Some(progress) = unwind_to_match(&mut pending) else {
-                    return Err(Abort::Undefined);
-                };
-                self.stack.clear();
-                done = self.next_pair(progress.next(), &mut pending);
-            }
-            done?;
+                Pending::Return { map, outer } => self.returned(&map, outer, &mut pending),
+            }?;
+        }
+        self.frame_value()
+    }
+
+    /// The value that the expression of the frame leaves: UNDEFINED where edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression ended it, else its one value.
+    fn frame_value(&mut self) -> Result<Operand, Abort> {
+        if self.frame.ended.is_some() {
+            return Ok(Operand::Undefined);
         }
         self.sole_value()
     }
@@ -2285,10 +2405,11 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// Pops the one value that the stack holds, as an expression leaves it.
     fn sole_value(&mut self) -> Result<Operand, Abort> {
         let result = self
+            .frame
             .stack
             .pop()
             .ok_or_else(|| Abort::Malformed("no value".to_string()))?;
-        match self.stack.len() {
+        match self.frame.stack.len() {
             0 => Ok(result),
             left => Err(Abort::Malformed(format!("{} values left", left + 1))),
         }
@@ -2310,12 +2431,18 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 map: Rc::clone(op),
                 checked: self.pop(&borrowed)?,
                 pair: 0,
-                outer: std::mem::take(&mut self.stack),
+                outer: std::mem::take(&mut self.frame),
             };
             return self.next_pair(progress, pending);
         }
-        let value = self.step(&borrowed)?;
-        self.stack.push(value);
+        match self.step(&borrowed) {
+            Ok(value) => self.push(&borrowed, value)?,
+            Err(Abort::Undefined) => {
+                self.end_at_undefined(&borrowed, pending);
+                return Ok(());
+            }
+            Err(abort) => return Err(abort),
+        }
         pending.extend(
             borrowed
                 .children
@@ -2324,6 +2451,29 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 .map(|child| Pending::Op(Rc::clone(child))),
         );
         Ok(())
+    }
+
+    /// Pushes `value`, which `op` gives; a STRING or buffer longer than MAX_OPERAND_LENGTH is not
+    /// evaluated.
+    fn push(&mut self, op: &IFROperation, value: Operand) -> Result<(), Abort> {
+        if let Some(long) = value.over_max_length() {
+            return Err(self.not_evaluated(format!(
+                "{long} from {}, over {MAX_OPERAND_LENGTH:#06X}",
+                op.op_code.spec_name()
+            )));
+        }
+        self.frame.stack.push(value);
+        Ok(())
+    }
+
+    /// Ends the expression of the frame at the UNDEFINED that `op` gives, as edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression does: the ops left in it are dropped, and
+    /// it gives UNDEFINED.
+    fn end_at_undefined(&mut self, op: &IFROperation, pending: &mut Vec<Pending>) {
+        self.frame.ended = Some(op.op_code.spec_name());
+        while let Some(Pending::Op(_)) = pending.last() {
+            pending.pop();
+        }
     }
 
     /// Starts the match expression of the pair that `progress` is at, on a stack of its own, as
@@ -2335,7 +2485,12 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         progress: MapProgress,
         pending: &mut Vec<Pending>,
     ) -> Result<(), Abort> {
-        let matched = progress.match_expression()?.ok_or(Abort::Undefined)?;
+        let Some(matched) = progress.match_expression()? else {
+            self.frame = progress.outer;
+            self.end_at_undefined(&progress.map.borrow(), pending);
+            return Ok(());
+        };
+        self.frame = Frame::default();
         pending.push(Pending::Match(progress));
         pending.push(Pending::Op(matched));
         Ok(())
@@ -2344,11 +2499,12 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// Takes the value of the match expression of the pair that `progress` is at: if it equals
     /// the value that the MAP compares, starts the pair's return expression, else the next pair.
     fn matched(&mut self, progress: MapProgress, pending: &mut Vec<Pending>) -> Result<(), Abort> {
-        let candidate = self.sole_value()?;
-        match order(progress.checked, candidate) {
+        let candidate = self.frame_value()?;
+        match order(&progress.checked, &candidate) {
             Order::Known(order) if order.is_eq() => {
                 let returned = progress.return_expression()?;
                 pending.push(Pending::Return {
+                    map: progress.map,
                     outer: progress.outer,
                 });
                 pending.push(Pending::Op(returned));
@@ -2364,12 +2520,20 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         }
     }
 
-    /// Takes the value of the return expression of a MAP as the MAP's, on `outer`, the stack
-    /// before the MAP.
-    fn returned(&mut self, outer: Vec<Operand>) -> Result<(), Abort> {
-        let value = self.sole_value()?;
-        self.stack = outer;
-        self.stack.push(value);
+    /// Takes the value of the return expression of `map` as the MAP's, in `outer`, the frame of
+    /// the MAP.
+    fn returned(
+        &mut self,
+        map: &Rc<RefCell<IFROperation>>,
+        outer: Frame,
+        pending: &mut Vec<Pending>,
+    ) -> Result<(), Abort> {
+        let value = self.frame_value()?;
+        self.frame = outer;
+        match value {
+            Operand::Undefined => self.end_at_undefined(&map.borrow(), pending),
+            value => self.frame.stack.push(value),
+        }
         Ok(())
     }
 
@@ -2430,9 +2594,22 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
 
     /// Pops the operand of `op`.
     fn pop(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
-        self.stack.pop().ok_or_else(|| {
+        self.frame.stack.pop().ok_or_else(|| {
             Abort::Malformed(format!("{} without an operand", op.op_code.spec_name()))
         })
+    }
+
+    /// Returns `value` as the integer that `op` takes; `op` does not evaluate a STRING or buffer
+    /// here.
+    fn integer_operand(
+        &mut self,
+        op: &IFROperation,
+        value: &Operand,
+    ) -> Result<Option<u64>, Abort> {
+        if let Some(kind) = value.unevaluated_type() {
+            return Err(self.not_evaluated(format!("{} of a {kind}", op.op_code.spec_name())));
+        }
+        value.as_u64()
     }
 
     /// Returns the value of `op` (edk2-stable202608 SetupBrowserDxe/Expression.c
@@ -2458,8 +2635,8 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 };
                 compare(
                     Comparison::Equal,
-                    question,
-                    Operand::Uint(Some(parsed.value.into())),
+                    &question,
+                    &Operand::Uint(Some(parsed.value.into())),
                 )
             }
             ExpressionOp::EqIdId => {
@@ -2470,7 +2647,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 let second = self.question(op, parsed.question_id_2)?;
                 match (first, second) {
                     (QuestionOperand::Value(first), QuestionOperand::Value(second)) => {
-                        compare(Comparison::Equal, first, second)
+                        compare(Comparison::Equal, &first, &second)
                     }
                     // edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue gives
                     // EFI_UNSUPPORTED for an integer and a type that is no integer, which
@@ -2528,7 +2705,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             ExpressionOp::Not => Ok(boolean(self.pop(op)?.as_bool()?.map(|value| !value))),
             ExpressionOp::ToBoolean => self.convert_to_boolean(op),
             ExpressionOp::BitwiseNot => {
-                Ok(Operand::Uint(self.pop(op)?.as_u64().map(|value| !value)))
+                Ok(Operand::Uint(self.pop(op)?.as_u64()?.map(|value| !value)))
             }
             // edk2-stable202608 SetupBrowserDxe/Expression.c pops both operands of AND and OR
             // before it checks their types
@@ -2536,10 +2713,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             ExpressionOp::Or => self.or(op),
             ExpressionOp::Compare(comparison) => {
                 let (left, right) = self.pop_pair(op)?;
-                compare(comparison, left, right)
+                compare(comparison, &left, &right)
             }
             ExpressionOp::Arithmetic(arithmetic) => self.arithmetic(op, arithmetic),
-            ExpressionOp::Dup => self.stack.last().copied().ok_or_else(|| {
+            ExpressionOp::Dup => self.frame.stack.last().cloned().ok_or_else(|| {
                 Abort::Malformed(format!("{} without an operand", op.op_code.spec_name()))
             }),
             ExpressionOp::Conditional => self.conditional(op),
@@ -2561,7 +2738,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         let question = self.question(op, parsed.question_id)?.decoded()?;
         // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression compares
         // HiiValue.Value.u16
-        Ok(boolean(question.as_u64().map(|value| {
+        Ok(boolean(question.as_u64()?.map(|value| {
             parsed
                 .value_list
                 .iter()
@@ -2571,7 +2748,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
 
     /// Returns the popped operand of TO_BOOLEAN as a BOOLEAN: FALSE for 0, else TRUE.
     fn convert_to_boolean(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
-        Ok(boolean(self.pop(op)?.as_u64().map(|value| value != 0)))
+        let value = self.pop(op)?;
+        Ok(boolean(
+            self.integer_operand(op, &value)?.map(|value| value != 0),
+        ))
     }
 
     /// Pops the operands of a binary op: the right one, then the left one.
@@ -2602,9 +2782,11 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
 
     /// Returns `arithmetic` of the popped operands.
     fn arithmetic(&mut self, op: &IFROperation, arithmetic: Arithmetic) -> Result<Operand, Abort> {
+        // edk2-stable202608 SetupBrowserDxe/Expression.c pops both operands before it checks
+        // their types
         let (left, right) = self.pop_pair(op)?;
         arithmetic
-            .apply(left.as_u64(), right.as_u64())
+            .apply(left.as_u64()?, right.as_u64()?)
             .map(Operand::Uint)
     }
 
@@ -2771,10 +2953,11 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 op.op_code.spec_name()
             )));
         };
+        let value = self.integer_operand(op, &value)?;
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
         if let Some(field) = self.system_time_field(op, operand, kind)? {
-            let Some(value) = value.as_u64() else {
+            let Some(value) = value else {
                 return Err(Abort::NotEvaluated(format!(
                     "{} of a value that cannot be read",
                     op.op_code.spec_name()
@@ -2798,7 +2981,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             }
         };
         let range = operand_range(op, operand, kind, store.as_ref())?;
-        let Some(value) = value.as_u64() else {
+        let Some(value) = value else {
             return Err(Abort::NotEvaluated(format!(
                 "{} of a value that cannot be read",
                 op.op_code.spec_name()
@@ -2950,9 +3133,12 @@ enum Pending {
     Op(Rc<RefCell<IFROperation>>),
     /// A MAP that awaits the value of the match expression of a pair
     Match(MapProgress),
-    /// A MAP that awaits the value of the return expression of a pair; `outer` is the stack
-    /// before the MAP
-    Return { outer: Vec<Operand> },
+    /// `map`, which awaits the value of the return expression of a pair; `outer` is the frame of
+    /// the MAP
+    Return {
+        map: Rc<RefCell<IFROperation>>,
+        outer: Frame,
+    },
 }
 
 /// A MAP partway through its pairs.
@@ -2962,8 +3148,8 @@ struct MapProgress {
     checked: Operand,
     /// The index of the pair that it is at
     pair: usize,
-    /// The stack before the MAP
-    outer: Vec<Operand>,
+    /// The frame of the MAP, with the stack before it
+    outer: Frame,
 }
 
 impl MapProgress {
@@ -3012,18 +3198,6 @@ impl MapProgress {
     }
 }
 
-/// Drops what is left of the innermost match expression of a MAP in `pending`, and returns
-/// that MAP; None outside MAPs.
-fn unwind_to_match(pending: &mut Vec<Pending>) -> Option<MapProgress> {
-    while let Some(next) = pending.pop() {
-        match next {
-            Pending::Match(progress) => return Some(progress),
-            Pending::Op(_) | Pending::Return { .. } => {}
-        }
-    }
-    None
-}
-
 /// The leading expression ops of `ops`, each with the ops of its own scope, in IFR order: for
 /// well-formed IFR, the first op holding the rest, as edk2-stable202608
 /// SetupBrowserDxe/IfrParse.c ParseOpCodes takes them. AMI firmware sets the Scope bit on a later
@@ -3063,7 +3237,7 @@ impl QuestionOperand {
 
 /// Compares two values as order does, as edk2-stable202608 SetupBrowserDxe/Expression.c
 /// CompareHiiValue does, whose EFI_UNSUPPORTED the comparison ops turn into UNDEFINED.
-fn compare(comparison: Comparison, left: Operand, right: Operand) -> Result<Operand, Abort> {
+fn compare(comparison: Comparison, left: &Operand, right: &Operand) -> Result<Operand, Abort> {
     let order = match order(left, right) {
         Order::Known(order) => order,
         Order::Unknown => return Ok(Operand::Boolean(None)),
@@ -3732,6 +3906,218 @@ mod tests {
             truth(&[question_ref1(6), op(ONE), op(EQUAL)]),
             unknown("EFI_IFR_QUESTION_REF1 of question 0x0006: <ValueUnavailable: test>"),
             "type not decoded == ONE"
+        );
+    }
+
+    fn string(text: &str) -> Operand {
+        Operand::String(Some(text.encode_utf16().collect()))
+    }
+
+    fn buffer(bytes: &[u8]) -> Operand {
+        Operand::Buffer(Some(bytes.into()))
+    }
+
+    /// STRINGs compare by their UCS-2 code units, as StrCmp compares them, and buffers, DATEs
+    /// and TIMEs by their bytes, then the longer greater; two of different kinds, or UNDEFINED,
+    /// compare as UNDEFINED (edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue,
+    /// MdePkg/Library/BaseLib/String.c StrCmp).
+    #[test]
+    fn strings_and_buffers_compare_as_compare_hii_value_does() {
+        let known = |value: bool| Ok(Operand::Boolean(Some(u8::from(value))));
+        let date = Operand::Date(Some([0xE8, 0x07, 0x02, 0x1D]));
+        let cases = [
+            (
+                "STRING == STRING",
+                Comparison::Equal,
+                string("ABC"),
+                string("ABC"),
+                known(true),
+            ),
+            (
+                "STRING == another",
+                Comparison::Equal,
+                string("ABC"),
+                string("ABD"),
+                known(false),
+            ),
+            (
+                "STRING != another",
+                Comparison::NotEqual,
+                string("A"),
+                string("B"),
+                known(true),
+            ),
+            (
+                "a prefix is less",
+                Comparison::LessThan,
+                string("AB"),
+                string("ABC"),
+                known(true),
+            ),
+            (
+                "by the first unequal character",
+                Comparison::GreaterThan,
+                string("ABD"),
+                string("ABC"),
+                known(true),
+            ),
+            (
+                "by the code unit, not the letter",
+                Comparison::LessThan,
+                string("B"),
+                string("a"),
+                known(true),
+            ),
+            (
+                "code units are unsigned",
+                Comparison::GreaterThan,
+                Operand::String(Some([0x8000].into())),
+                Operand::String(Some([0x7FFF].into())),
+                known(true),
+            ),
+            (
+                "buffer == buffer",
+                Comparison::Equal,
+                buffer(&[1, 2]),
+                buffer(&[1, 2]),
+                known(true),
+            ),
+            (
+                "a shorter buffer with the same start is less",
+                Comparison::LessThan,
+                buffer(&[1, 2]),
+                buffer(&[1, 2, 0]),
+                known(true),
+            ),
+            (
+                "by the first unequal byte",
+                Comparison::GreaterThan,
+                buffer(&[2]),
+                buffer(&[1, 9]),
+                known(true),
+            ),
+            (
+                "bytes are unsigned",
+                Comparison::GreaterThan,
+                buffer(&[0x80]),
+                buffer(&[0x7F]),
+                known(true),
+            ),
+            (
+                "buffer == DATE of its bytes",
+                Comparison::Equal,
+                buffer(&[0xE8, 0x07, 0x02, 0x1D]),
+                date.clone(),
+                known(true),
+            ),
+            (
+                "TIME < buffer",
+                Comparison::LessThan,
+                Operand::Time(Some([1, 2, 3])),
+                buffer(&[1, 2, 4]),
+                known(true),
+            ),
+            (
+                "STRING == UINT",
+                Comparison::Equal,
+                string("1"),
+                Operand::Uint(Some(1)),
+                Err(Abort::Undefined),
+            ),
+            (
+                "buffer == STRING",
+                Comparison::Equal,
+                buffer(&[0x41, 0]),
+                string("A"),
+                Err(Abort::Undefined),
+            ),
+            (
+                "STRING == DATE",
+                Comparison::Equal,
+                string("A"),
+                date,
+                Err(Abort::Undefined),
+            ),
+            (
+                "BOOLEAN == buffer",
+                Comparison::Equal,
+                Operand::Boolean(Some(1)),
+                buffer(&[1]),
+                Err(Abort::Undefined),
+            ),
+            (
+                "UNDEFINED == UNDEFINED",
+                Comparison::Equal,
+                Operand::Undefined,
+                Operand::Undefined,
+                Err(Abort::Undefined),
+            ),
+            (
+                "UINT == UNDEFINED",
+                Comparison::Equal,
+                Operand::Uint(Some(0)),
+                Operand::Undefined,
+                Err(Abort::Undefined),
+            ),
+            (
+                "unreadable STRING == STRING",
+                Comparison::Equal,
+                Operand::String(None),
+                string("A"),
+                Ok(Operand::Boolean(None)),
+            ),
+            (
+                "buffer == unreadable buffer",
+                Comparison::Equal,
+                buffer(&[]),
+                Operand::Buffer(None),
+                Ok(Operand::Boolean(None)),
+            ),
+            (
+                "unreadable STRING == UINT",
+                Comparison::Equal,
+                Operand::String(None),
+                Operand::Uint(Some(1)),
+                Err(Abort::Undefined),
+            ),
+        ];
+        for (name, comparison, left, right, want) in cases {
+            assert_eq!(compare(comparison, &left, &right), want, "{name}");
+        }
+    }
+
+    /// The arithmetic, bitwise and logic ops take no STRING, buffer or UNDEFINED: edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression gives UNDEFINED for a type above
+    /// EFI_IFR_TYPE_DATE, and for one that is no BOOLEAN where it takes a BOOLEAN.
+    #[test]
+    fn strings_buffers_and_undefined_are_undefined_to_integer_and_boolean_ops() {
+        let operands = [
+            ("STRING", string("1")),
+            ("unreadable STRING", Operand::String(None)),
+            ("buffer", buffer(&[1])),
+            ("UNDEFINED", Operand::Undefined),
+        ];
+        for (name, operand) in operands {
+            assert_eq!(
+                operand.as_u64(),
+                Err(Abort::Undefined),
+                "{name} as a UINT64"
+            );
+            assert_eq!(
+                operand.as_bool(),
+                Err(Abort::Undefined),
+                "{name} as a BOOLEAN"
+            );
+        }
+        assert_eq!(
+            Operand::Uint(Some(5)).as_u64(),
+            Ok(Some(5)),
+            "UINT as a UINT64"
+        );
+        assert_eq!(
+            Operand::Boolean(Some(2)).as_bool(),
+            Ok(Some(true)),
+            "BOOLEAN as a BOOLEAN"
         );
     }
 
@@ -6392,10 +6778,12 @@ mod store_expression_tests {
     const UINT16: u8 = 0x43;
     const UINT32: u8 = 0x44;
     const TO_UINT: u8 = 0x48;
+    const TO_BOOLEAN: u8 = 0x4A;
     const CONDITIONAL: u8 = 0x50;
     const ZERO: u8 = 0x52;
     const ONE: u8 = 0x53;
     const UNDEFINED: u8 = 0x55;
+    const DUP: u8 = 0x57;
     const VALUE: u8 = 0x5A;
     const GREATER_THAN: u8 = 0x31;
     const LESS_THAN: u8 = 0x33;
@@ -7148,6 +7536,37 @@ mod store_expression_tests {
         );
     }
 
+    /// A MAP whose return expression gives UNDEFINED gives UNDEFINED, where edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression ends the expression that holds the MAP: no
+    /// SET after it is planned.
+    #[test]
+    fn undefined_return_of_a_map_ends_its_expression() {
+        let efivars = store_holding(&[0; 5]);
+        let sets_after = |returned: Vec<u8>| {
+            let write = scoped_expression(
+                &[
+                    uint8(1),
+                    map(&[(uint8(1), returned)]),
+                    op(THIS),
+                    set(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8),
+                    op(EQUAL),
+                ],
+                0,
+            );
+            writes_of(&[op(WRITE), write], QuestionValue::Uint(3), &efivars)
+        };
+        assert_eq!(
+            sets_after(op(UNDEFINED)),
+            Ok(Some(Vec::new())),
+            "UNDEFINED returned"
+        );
+        assert_eq!(
+            sets_after(uint8(5)),
+            Ok(Some(vec![(STORE, "Store".to_string(), 1, vec![0x03])])),
+            "5 returned"
+        );
+    }
+
     /// A SET outside a WRITE expression would change a stored value: it is not evaluated.
     #[test]
     fn set_outside_a_write_expression_is_not_evaluated() {
@@ -7365,6 +7784,144 @@ mod store_expression_tests {
             Ok(None),
             "no WRITE"
         );
+    }
+
+    /// What `run` gives of the first op of the WRITE expression `write`, with THIS 3, on a stack
+    /// that holds `operands`; with the refusal that the evaluation leaves, and the number of SETs
+    /// that it plans.
+    fn with_write_op<T>(
+        write: Vec<u8>,
+        operands: Vec<Operand>,
+        run: impl FnOnce(&mut Evaluation<'_, MapValues>, &IFROperation) -> T,
+    ) -> (T, ExpressionRefusal, usize) {
+        let (_root, question) = question_holding(&[op(WRITE), write]);
+        let expression = question_expression(&question, QuestionExpression::Write)
+            .expect("the question has a WRITE expression");
+        let first = expression.first().expect("the WRITE expression has an op");
+        let efivars = store_holding(&[0; 5]);
+        let mut reader = efivars.reader();
+        let values = no_values();
+        let mut inputs = ExpressionInputs {
+            reader: &mut reader,
+            values: &values,
+        };
+        let mut sets = PlannedSets::default();
+        let mut evaluation = Evaluation::new(
+            &mut inputs,
+            Role::Write {
+                this: QuestionValue::Uint(3),
+                sets: &mut sets,
+            },
+        );
+        evaluation.frame.stack = operands;
+        let got = run(&mut evaluation, &first.borrow());
+        let refusal = evaluation.into_refusal(QuestionExpression::Write, "no gap".to_string());
+        (got, refusal, sets.var_store.len())
+    }
+
+    /// TO_BOOLEAN and SET do not evaluate a STRING or buffer here: they are refused as such,
+    /// and no SET is planned.
+    #[test]
+    fn to_boolean_and_set_refuse_strings_and_buffers() {
+        let string = Operand::String(Some("1".encode_utf16().collect()));
+        let buffer = Operand::Buffer(Some([1].into()));
+        let set_of_store = || set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8);
+        let cases = [
+            (
+                op(TO_BOOLEAN),
+                string.clone(),
+                "EFI_IFR_TO_BOOLEAN of a STRING",
+            ),
+            (
+                op(TO_BOOLEAN),
+                buffer.clone(),
+                "EFI_IFR_TO_BOOLEAN of a buffer",
+            ),
+            (set_of_store(), string, "EFI_IFR_SET of a STRING"),
+            (set_of_store(), buffer, "EFI_IFR_SET of a buffer"),
+        ];
+        for (write, operand, what) in cases {
+            let (got, refusal, sets) =
+                with_write_op(write, vec![operand], |evaluation, op| evaluation.step(op));
+            assert_eq!(
+                got,
+                Err(Abort::NotEvaluated(format!("{what} not evaluated"))),
+                "{what}"
+            );
+            assert_eq!(
+                refusal,
+                ExpressionRefusal::NotEvaluated {
+                    expression: QuestionExpression::Write,
+                    what: what.to_string(),
+                },
+                "refusal of {what}"
+            );
+            assert_eq!(sets, 0, "SETs of {what}");
+        }
+
+        let integer = vec![Operand::Uint(Some(2))];
+        let (got, _, _) = with_write_op(op(TO_BOOLEAN), integer.clone(), |evaluation, op| {
+            evaluation.step(op)
+        });
+        assert_eq!(got, Ok(Operand::Boolean(Some(1))), "TO_BOOLEAN of 2");
+        let (got, _, sets) = with_write_op(set_of_store(), integer, |evaluation, op| {
+            evaluation.step(op)
+        });
+        assert_eq!((got, sets), (Ok(Operand::Boolean(Some(1))), 1), "SET of 2");
+    }
+
+    /// A STRING longer than 0xFFFF characters, or a buffer longer than 0xFFFF bytes, is not
+    /// evaluated, naming the op that gives it and its length: DUP and CATENATE would double one
+    /// without end.
+    #[test]
+    fn results_over_the_length_cap_are_not_evaluated() {
+        let string = |length: usize| Operand::String(Some(vec![u16::from(b'A'); length].into()));
+        let buffer = |length: usize| Operand::Buffer(Some(vec![0; length].into()));
+        let cases = [
+            ("STRING of 0xFFFF", string(0xFFFF), None),
+            ("buffer of 0xFFFF", buffer(0xFFFF), None),
+            (
+                "STRING of 0x10000",
+                string(0x10000),
+                Some("a STRING of 65536 characters from EFI_IFR_DUP, over 0xFFFF"),
+            ),
+            (
+                "buffer of 0x10000",
+                buffer(0x10000),
+                Some("a buffer of 65536 bytes from EFI_IFR_DUP, over 0xFFFF"),
+            ),
+        ];
+        for (name, value, refused) in cases {
+            let ((pushed, stack), refusal, _) =
+                with_write_op(op(DUP), Vec::new(), |evaluation, op| {
+                    let pushed = evaluation.push(op, value);
+                    (pushed, evaluation.frame.stack.len())
+                });
+            match refused {
+                None => {
+                    assert_eq!((pushed, stack), (Ok(()), 1), "{name}");
+                    assert!(
+                        matches!(refusal, ExpressionRefusal::Unread { .. }),
+                        "{name}: {refusal:?}"
+                    );
+                }
+                Some(what) => {
+                    assert_eq!(
+                        (pushed, stack),
+                        (Err(Abort::NotEvaluated(format!("{what} not evaluated"))), 0),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        refusal,
+                        ExpressionRefusal::NotEvaluated {
+                            expression: QuestionExpression::Write,
+                            what: what.to_string(),
+                        },
+                        "refusal of the {name}"
+                    );
+                }
+            }
+        }
     }
 
     /// An UNDEFINED ends a WRITE after the SETs before it, as edk2-stable202608
