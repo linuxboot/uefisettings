@@ -12,7 +12,7 @@ uefisettings.efi hii set --json "Value behind accepted metadata" 44
 echo uefisettings-shell: step set %lasterror%
 uefisettings.efi set --json "Value behind accepted metadata" 44
 echo uefisettings-shell: step top-set %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Value behind accepted metadata" 44
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Value behind accepted metadata" 44
 echo uefisettings-shell: step set-bypass %lasterror%
 dmpstore EnhancedAuthData -guid 8C78A505-BAA0-4C4A-869F-000000000301
 echo uefisettings-shell: step dmpstore-after %lasterror%

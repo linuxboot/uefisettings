@@ -11,8 +11,8 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! The part of the CLI that only the UEFI Shell build has: the HiiDB and the variables of the
-//! firmware it runs on, --bypass-setup-password, --allow-volatile, whose written value lasts only
-//! until the next reset or power cycle, and the `-` of the secret flags.
+//! firmware it runs on, whose setup password set and keyword set bypass, --allow-volatile, whose
+//! written value lasts only until the next reset or power cycle, and the `-` of the secret flags.
 
 use std::fmt::Debug;
 use std::io;
@@ -55,7 +55,7 @@ use uefisettings::exports::KeywordValues;
 use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetValue;
-use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::exports::UnsafeOperation;
 use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::read_shell_secret;
@@ -69,7 +69,9 @@ use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii_get;
 use crate::hii_set;
+use crate::print_lifted;
 use crate::print_line;
+use crate::unsafe_long_help;
 use crate::variable_command::print_info;
 use crate::HiiSourceArgs;
 use crate::IncludeArgs;
@@ -78,6 +80,8 @@ use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
 use crate::SetIncludeState;
+use crate::UnsafeArgs;
+use crate::UNSAFE_ARG;
 
 /// The about of hii, whose commands read this firmware's HII database.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -99,6 +103,13 @@ pub(super) const HII_SOURCE_HELP: &str =
 /// The help of --efivar-memory, which this build ignores.
 pub(super) const EFIVAR_MEMORY_HELP: &str =
     "Accepted as on Linux, and ignored: this build reads the HiiDB by the HII Database Protocol";
+
+/// What set and keyword set refuse here without --i-am-fine-to-brick-this-system.
+const SETUP_PASSWORD_WRITE: &str = "a write in a HiiDB that declares a setup password question, \
+                                    which the UEFI Shell, running no setup browser, neither asks \
+                                    for nor checks";
+/// The unsafe operations of set, which its long help lists.
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[SETUP_PASSWORD_WRITE];
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
@@ -167,7 +178,10 @@ pub(super) enum KeywordCommands {
         output: JsonArgs,
     },
     /// Set keywords with one SetData(), unless set would refuse a keyword's question or value, and get them back; never a read-only question, which the Keyword Handler refuses
-    #[command(next_display_order = None)]
+    #[command(
+        next_display_order = None,
+        mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, &[SETUP_PASSWORD_WRITE]))
+    )]
     Set {
         #[arg(
             help = "A MultiKeywordResp, NAMESPACE=<language>&PATH=<hex digits>&KEYWORD=<keyword>&VALUE=<hex digits> per keyword, joined by &"
@@ -176,7 +190,7 @@ pub(super) enum KeywordCommands {
         #[command(flatten)]
         include: IncludeArgs,
         #[command(flatten)]
-        setup_password: SetupPasswordArgs,
+        unsafe_operations: UnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
         #[command(flatten)]
@@ -211,15 +225,17 @@ impl KeywordCommands {
             Self::Set {
                 keywords,
                 include,
-                setup_password,
+                unsafe_operations,
                 volatile,
                 output,
             } => {
                 let mut options = KeywordSetOptions::default();
                 options.include = include.states();
-                options.setup_password = setup_password.policy();
+                options.unsafe_operations = unsafe_operations.operations();
                 options.volatile = volatile.policy();
-                (HiiBackend::keyword_set(keywords, &options)?, output)
+                let (values, lifted) = HiiBackend::keyword_set(keywords, &options)?;
+                print_lifted(&lifted)?;
+                (values, output)
             }
         };
         print_keyword_values(&values, output.json)
@@ -271,24 +287,9 @@ impl EfivarArgs {
     }
 }
 
-/// What set does in a HiiDB that declares a setup password question.
-#[derive(Debug, Args)]
-// no ArgGroup, which usage would name instead of the flag
-#[group(skip)]
-pub(super) struct SetupPasswordArgs {
-    /// Write even though the HiiDB declares a setup password question. The UEFI Shell runs no setup browser, so no password is asked or checked.
-    #[arg(long)]
-    bypass_setup_password: bool,
-}
-
-impl SetupPasswordArgs {
-    pub(super) fn policy(&self) -> SetupPasswordPolicy {
-        match self.bypass_setup_password {
-            false => SetupPasswordPolicy::Refuse,
-            true => SetupPasswordPolicy::Bypass,
-        }
-    }
-}
+/// What set takes for its unsafe operations, a write in a HiiDB that declares a setup password
+/// question among them: --i-am-fine-to-brick-this-system.
+pub(super) type SetUnsafeArgs = UnsafeArgs;
 
 /// Whether set writes a volatile variable.
 #[derive(Debug, Args)]
@@ -342,7 +343,7 @@ pub(super) fn set_using(
     value: &SetValue,
     options: &SetOptions,
     _source: &HiiSourceArgs,
-) -> Result<SetResponseList> {
+) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
     HiiBackend::set_using(question, value, None, options)
 }
 

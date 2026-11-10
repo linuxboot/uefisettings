@@ -19,7 +19,7 @@ dmpstore UefisettingsFormSetSkip -guid 8C78A505-BAA0-4C4A-869F-000000001203
 echo uefisettings-shell: step dmpstore-before %lasterror%
 uefisettings.efi hii set --json "Third setting" 4
 echo uefisettings-shell: step set %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Third setting" 4
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Third setting" 4
 echo uefisettings-shell: step set-bypassed %lasterror%
 dmpstore UefisettingsFormSetSkip -guid 8C78A505-BAA0-4C4A-869F-000000001203
 echo uefisettings-shell: step dmpstore-after %lasterror%

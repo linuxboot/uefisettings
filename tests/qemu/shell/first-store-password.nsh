@@ -19,13 +19,13 @@ uefisettings.efi hii show-ifr
 echo uefisettings-shell: step show-ifr %lasterror%
 dmpstore FirstStore -guid 8C78A505-BAA0-4C4A-869F-000000001D01
 echo uefisettings-shell: step dmpstore-before %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "First store password prefix as a number" 1
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "First store password prefix as a number" 1
 echo uefisettings-shell: step set-over-password %lasterror%
-uefisettings.efi set --json --bypass-setup-password "First store password prefix as a number" 1
+uefisettings.efi set --json --i-am-fine-to-brick-this-system "First store password prefix as a number" 1
 echo uefisettings-shell: step top-set-over-password %lasterror%
 dmpstore FirstStore -guid 8C78A505-BAA0-4C4A-869F-000000001D01
 echo uefisettings-shell: step dmpstore-refused %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Setting beside the first store password" 6
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Setting beside the first store password" 6
 echo uefisettings-shell: step set-beside-password %lasterror%
 dmpstore FirstStore -guid 8C78A505-BAA0-4C4A-869F-000000001D01
 echo uefisettings-shell: step dmpstore-after %lasterror%

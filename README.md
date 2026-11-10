@@ -215,6 +215,31 @@ them. Dumps: see the [appendix](#appendix).
 
 ---
 
+## Unsafe operations
+
+`uefisettings` refuses each operation below unless `--i-am-fine-to-brick-this-system` is given,
+which only the commands of the operations take; the refusal names it. The flag lifts only a
+refusal whose only basis is `uefisettings`' judgement that the operation may harm the machine: (1)
+an IFR restriction that binds writers outside the browser or declares the value invalid; (2)
+fail-closed uncertainty about the write itself, never one whose lift would disclose a secret; (3)
+weakened Secure Boot or setup-password protection; (4) irreversible actions; (5) reads of memory
+that may be device memory. Condition states and the inputs of conditions are selection, which
+`--include` and the input flags state; the flag never lifts routing, invalid operations or
+confidentiality. A command runs every check that the flag does not lift first, and prints a
+`warning:` line on stderr for each operation that the flag let through, also when it then fails,
+whose error then begins `after <n> unsafe operation(s) that --i-am-fine-to-brick-this-system let
+through`; its output on stdout, `--json` too, stays the same otherwise.
+
+| Operation | Commands | Build | Consequence |
+|---|---|---|---|
+| A write in a HiiDB that declares a setup password question | `set`, `hii set`, `hii keyword set` | UEFI Shell | No password is asked or checked, as the UEFI Shell runs no setup browser |
+
+`capsule deliver` takes no flag: its payload goes to the firmware's JSON configuration processor,
+which UEFI 2.11 has check it against a schema and answer per capsule (§8.5.6.1.3), unlike
+SetVariable(), which stores bytes with "no read, write, or delete security protection" (§8.2.3).
+
+---
+
 ## Changing UEFI settings with automation
 
 To change BIOS settings from Linux terminal there are usually next ways available:
@@ -796,8 +821,8 @@ FS0:\> uefisettings.efi capsule results
 A failing command returns EFI_ABORTED, which `%lasterror%` shows as 0x15 (0x80000015 on i686).
 
 The UEFI Shell runs no setup browser, so nothing there asks for or checks a setup password: in a
-HiiDB that declares a password question, `set` writes nothing unless `--bypass-setup-password` is
-given.
+HiiDB that declares a password question, `set` writes nothing unless
+`--i-am-fine-to-brick-this-system` is given (see [Unsafe operations](#unsafe-operations)).
 
 `set` refuses a variable without EFI_VARIABLE_NON_VOLATILE unless `--allow-volatile` is given.
 The UEFI Shell runs before ExitBootServices, when SetVariable() still sets volatile variables
@@ -834,7 +859,7 @@ otherwise than `set` (edk2's evaluates no condition or expression, sends no Call
 no option or range), or if two keywords write a byte of one variable, and else writes every
 keyword with one SetData() and prints what GetData() reads back, which must hold each VALUE
 written, as a number. It never writes a read-only question, which the Keyword Handler refuses, so
-its `--include` takes no `read-only`; else `--include`, `--bypass-setup-password` and
+its `--include` takes no `read-only`; else `--include`, `--i-am-fine-to-brick-this-system` and
 `--allow-volatile` work as for `set`: the `<KeywordResp>` of a keyword whose variable is volatile
 ends with ` <volatile: lasts until the next reset or power cycle>`. `-j` prints JSON instead.
 A VALUE holds every byte that SetData() writes, last byte first, as edk2's GetValueOfNumber

@@ -61,6 +61,9 @@ use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::VolatileWritingVariables;
 use crate::hii::variables::WithheldPassword;
 use crate::hii::variables::WithholdingVariables;
+use crate::unsafe_operations::LiftedOperations;
+use crate::unsafe_operations::PendingOperations;
+use crate::unsafe_operations::UnsafeOperation;
 
 #[derive(Error, Debug)]
 pub(crate) enum ChangeValueError {
@@ -576,7 +579,9 @@ pub(crate) struct WrittenQuestion<'a> {
 /// the changes of every question to it (batched_writes), in order, and stops at the first write
 /// that fails, with its error unchanged if it is the only write, else with NotSetEverywhere.
 /// Through efivarfs it refuses, before any write, two variables of one efivar file
-/// (check_efivar_files).
+/// (check_efivar_files). It checks `unsafe_operations` after all of these refusals, right before
+/// the first write, and returns the operations that it lifted, with the error of a failed write
+/// too (LiftedOperations).
 #[expect(
     clippy::too_many_arguments,
     reason = "set's inputs: the question, its matches, the value, how to pick an option, and the \
@@ -590,8 +595,9 @@ pub(crate) fn set_questions<'a>(
     reader: &mut EfivarReader,
     access_level: Option<AccessLevel>,
     volatile: VolatileWrites,
+    unsafe_operations: PendingOperations,
     variables: &WithholdingVariables<impl FirmwareVariables>,
-) -> Result<Vec<WrittenQuestion<'a>>> {
+) -> Result<(Vec<WrittenQuestion<'a>>, Vec<UnsafeOperation>)> {
     if selected.is_empty() {
         return Err(SelectionError::NotFound {
             question: question.to_owned(),
@@ -638,6 +644,7 @@ pub(crate) fn set_questions<'a>(
     }
     let batch = batched_writes(variable_writes)?;
     check_efivar_files(&batch, through.1)?;
+    let lifted = unsafe_operations.check()?;
     // a question's time before its VarStore, which a failed time write leaves unwritten
     let stores: Vec<BatchedStore<'_, '_>> = times
         .into_iter()
@@ -654,12 +661,12 @@ pub(crate) fn set_questions<'a>(
             Err(error) => error,
         };
         if stores.len() == 1 {
-            return Err(error);
+            return Err(LiftedOperations::attach(lifted, error));
         }
         // edk2-stable202608 SetupBrowserDxe SubmitForFormSet goes on after a failed
         // RouteConfig(); set stops, as UEFI 2.11 §35.4.4 RouteConfig() reports the first failing
         // pair of a <MultiConfigResp>.
-        return Err(NotSetEverywhere {
+        let error = NotSetEverywhere {
             question: question.to_owned(),
             outcome: Outcome {
                 written,
@@ -669,10 +676,10 @@ pub(crate) fn set_questions<'a>(
                 },
                 not_attempted: unwritten.map(BatchedStore::label).collect(),
             },
-        }
-        .into());
+        };
+        return Err(LiftedOperations::attach(lifted, error.into()));
     }
-    Ok(written_questions)
+    Ok((written_questions, lifted))
 }
 
 /// The WritePlan that gives `question` `answer` through variables of `through`, as set_questions
@@ -828,10 +835,15 @@ mod set_questions_tests {
     use crate::hii::variables::VariableKey;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::EFIVARFS_HEADER_SIZE;
+    use crate::unsafe_operations::UnsafeOperations;
 
     const WRITE_ERROR: WriteError = WriteError {
         cause: "write failed",
         context: None,
+    };
+    const ONE: NewAnswer<'static> = NewAnswer::Text {
+        text: "1",
+        variations: &BTreeSet::new(),
     };
 
     /// A CHECKBOX at VarOffset `offset` of `var_store`, as set sees it.
@@ -908,25 +920,16 @@ mod set_questions_tests {
         new_value: &str,
         texts: &[&str],
     ) -> std::result::Result<Vec<Option<String>>, String> {
-        // no question here has a WRITE expression, whose GETs and merges would read
-        let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
-            variables.reach(),
-            variables.interface(),
-        )));
-        set_questions(
-            PROMPT,
+        set_pending(
+            variables,
             selected,
             NewAnswer::Text {
                 text: new_value,
                 variations: &texts.iter().map(|text| text.to_string()).collect(),
             },
-            IncludedStates::empty(),
-            &mut reader,
-            None,
-            VolatileWrites::Refuse,
-            &WithholdingVariables::new(variables, WithheldBytes::default()),
+            PendingOperations::new(UnsafeOperations::Refuse),
         )
-        .map(|written| {
+        .map(|(written, _)| {
             written
                 .into_iter()
                 .map(|question| match question.given {
@@ -936,6 +939,31 @@ mod set_questions_tests {
                 .collect()
         })
         .map_err(|error| format!("{error:#}"))
+    }
+
+    /// set_questions of PROMPT to `answer` in `variables`, with the unsafe operations `pending`.
+    fn set_pending<'a>(
+        variables: &impl FirmwareVariables,
+        selected: &[(&str, &'a QuestionDescriptor)],
+        answer: NewAnswer<'_>,
+        pending: PendingOperations,
+    ) -> Result<(Vec<WrittenQuestion<'a>>, Vec<UnsafeOperation>)> {
+        // no question here has a WRITE expression, whose GETs and merges would read
+        let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::new(
+            variables.reach(),
+            variables.interface(),
+        )));
+        set_questions(
+            PROMPT,
+            selected,
+            answer,
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            VolatileWrites::Refuse,
+            pending,
+            &WithholdingVariables::new(variables, WithheldBytes::default()),
+        )
     }
 
     /// set_questions of PROMPT to `new_value` in `variables`, its error as the CLI prints it.
@@ -1093,6 +1121,65 @@ mod set_questions_tests {
             Err(WRITE_ERROR.cause.to_string()),
             "one match"
         );
+    }
+
+    /// With UnsafeOperations::Allow, the error of a failed write carries the operation that set
+    /// lifted before it as LiftedOperations, beside the error itself: NotSetEverywhere once B is
+    /// written and A fails, and A's own error where A is the only match. An error after nothing
+    /// lifted carries none.
+    #[test]
+    fn a_failed_write_keeps_the_lifted_operations() {
+        let password = UnsafeOperation::SetupPassword;
+        let not_set_everywhere = format!(
+            "question \"Prompt\" was not set everywhere: write failed (in {}); written in: {}",
+            label("A"),
+            label("B")
+        );
+        let single = WRITE_ERROR.cause.to_owned();
+        let cases: [(&[&str], _, _); 3] = [
+            (&["B", "A"], Some(&password), &not_set_everywhere),
+            (&["A"], Some(&password), &single),
+            (&["B", "A"], None, &not_set_everywhere),
+        ];
+        for (order, operation, error_text) in cases {
+            let mut variables = MemoryVariables::default();
+            let a = checkbox_on_store(failing_var_store("A", WRITE_ERROR, &mut variables));
+            let b = checkbox_on_store(writable_var_store("B", &[0], &variables));
+            let questions = BTreeMap::from([("A", &a), ("B", &b)]);
+            let selected: Vec<(&str, &QuestionDescriptor)> =
+                order.iter().map(|name| (*name, questions[name])).collect();
+            let mut pending = PendingOperations::new(UnsafeOperations::Allow);
+            if let Some(operation) = operation {
+                pending.add(operation.clone());
+            }
+
+            let error = set_pending(&variables, &selected, ONE, pending)
+                .map(drop)
+                .expect_err("A fails");
+
+            assert_eq!(
+                error.downcast_ref::<LiftedOperations>(),
+                operation
+                    .map(|operation| LiftedOperations(vec![operation.clone()]))
+                    .as_ref(),
+                "{order:?}: lifted"
+            );
+            let own_error = match order.len() {
+                1 => error.downcast_ref::<&str>().map(ToString::to_string),
+                _ => error
+                    .downcast_ref::<NotSetEverywhere>()
+                    .map(ToString::to_string),
+            };
+            assert_eq!(own_error.as_ref(), Some(error_text), "{order:?}: error");
+            assert_eq!(
+                writes(&variables, "B"),
+                match order.len() {
+                    1 => Vec::new(),
+                    _ => vec![(0, vec![1])],
+                },
+                "{order:?}: writes of B"
+            );
+        }
     }
 
     #[test]
@@ -1582,6 +1669,7 @@ mod set_questions_tests {
                 &mut reader,
                 None,
                 VolatileWrites::Refuse,
+                PendingOperations::new(UnsafeOperations::Refuse),
                 &WithholdingVariables::new(&variables, withheld),
             )
             .map(drop)
@@ -2496,6 +2584,7 @@ mod date_time_write_tests {
     use super::super::ifr_fixtures::*;
     use super::*;
     use crate::hii::variables::WithheldBytes;
+    use crate::unsafe_operations::UnsafeOperations;
 
     /// A DATE or TIME (`op_code`) with `flags` at VarOffset 0 of the EFI variable "DateTime",
     /// which holds `payload`, as set sees it, and the variables that hold it too.
@@ -2872,6 +2961,7 @@ mod date_time_write_tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, WithheldBytes::default()),
         )
         .map(drop)
@@ -2903,6 +2993,7 @@ mod date_time_write_tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, WithheldBytes::default()),
         )
         .map(drop)
@@ -2937,6 +3028,7 @@ mod time_storage_write_tests {
     use crate::hii::time_services::TimeServices;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::EFIVARFS_HEADER_SIZE;
+    use crate::unsafe_operations::UnsafeOperations;
 
     /// QF_DATE_STORAGE_TIME and QF_TIME_STORAGE_TIME.
     const SYSTEM_TIME: u8 = 0x10;
@@ -3026,6 +3118,7 @@ mod time_storage_write_tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(variables, WithheldBytes::default()),
         )
         .map(drop)
@@ -3457,9 +3550,10 @@ mod time_storage_write_tests {
             &mut reader,
             None,
             volatile,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, withheld),
         )
-        .map(|written| written.iter().map(|question| question.volatile).collect())
+        .map(|(written, _)| written.iter().map(|question| question.volatile).collect())
         .map_err(|error| format!("{error:#}"));
         let calls = services.calls.borrow()[calls_before..].to_vec();
         (

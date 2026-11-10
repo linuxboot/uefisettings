@@ -790,6 +790,8 @@ mod get_and_set_tests {
     use super::super::*;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
+    use crate::unsafe_operations::PendingOperations;
+    use crate::unsafe_operations::UnsafeOperations;
 
     /// Each storage-less CHECKBOX of storageless_form_set(): its prompt, then whether it has
     /// EFI_IFR_FLAG_CALLBACK, a READ and a WRITE.
@@ -975,6 +977,7 @@ mod get_and_set_tests {
                     &mut reader,
                     None,
                     VolatileWrites::Refuse,
+                    PendingOperations::new(UnsafeOperations::Refuse),
                     &WithholdingVariables::new(&variables, WithheldBytes::default()),
                 )
                 .map(|_| ())

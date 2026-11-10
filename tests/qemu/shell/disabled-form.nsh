@@ -21,11 +21,11 @@ dmpstore UefisettingsDisabledForm -guid 8C78A505-BAA0-4C4A-869F-000000001231
 echo uefisettings-shell: step dmpstore-before %lasterror%
 uefisettings.efi hii set --json "Live setting" 2
 echo uefisettings-shell: step set-refused %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Disabled setting" 6
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Disabled setting" 6
 echo uefisettings-shell: step set-disabled %lasterror%
 dmpstore UefisettingsDisabledForm -guid 8C78A505-BAA0-4C4A-869F-000000001231
 echo uefisettings-shell: step dmpstore-refused %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Live setting" 2
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Live setting" 2
 echo uefisettings-shell: step set-bypassed %lasterror%
 dmpstore UefisettingsDisabledForm -guid 8C78A505-BAA0-4C4A-869F-000000001231
 echo uefisettings-shell: step dmpstore-after %lasterror%

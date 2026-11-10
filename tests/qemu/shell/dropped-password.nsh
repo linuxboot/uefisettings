@@ -16,7 +16,7 @@ dmpstore UefisettingsDropped -guid 8C78A505-BAA0-4C4A-869F-000000000F02
 echo uefisettings-shell: step dmpstore-before %lasterror%
 uefisettings.efi hii set --json "Shared setting" 0
 echo uefisettings-shell: step set %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Shared setting" 0
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Shared setting" 0
 echo uefisettings-shell: step set-bypassed %lasterror%
 dmpstore UefisettingsDropped -guid 8C78A505-BAA0-4C4A-869F-000000000F02
 echo uefisettings-shell: step dmpstore-after %lasterror%

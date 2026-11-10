@@ -26,7 +26,8 @@ use super::CapsuleBackend;
 use super::EfivarSource;
 use super::HiiBackend;
 use super::IncludedStates;
-use super::SetupPasswordPolicy;
+use super::UnsafeOperation;
+use super::UnsafeOperations;
 use super::VariableBackend;
 use super::VolatileWrites;
 use crate::capsule_services::RuntimeCapsuleServices;
@@ -166,14 +167,18 @@ impl HiiBackend {
     /// Writes `keywords`, a `<MultiKeywordResp>`, with one SetData() (UEFI 2.11 §35.3.2) of
     /// EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL, unless set, with `options`, would refuse a keyword's
     /// question or value in this firmware's HiiDB and variables; then returns what GetData() reads
-    /// back, which must hold each VALUE written, as a number.
-    pub fn keyword_set(keywords: &str, options: &KeywordSetOptions) -> Result<KeywordValues> {
+    /// back, which must hold each VALUE written, as a number, and the unsafe operations that it
+    /// lifted.
+    pub fn keyword_set(
+        keywords: &str,
+        options: &KeywordSetOptions,
+    ) -> Result<(KeywordValues, Vec<UnsafeOperation>)> {
         let lists = package::read_db(&Self::export_hiidb()?)?;
         set_keywords(
             &lists,
             keywords,
             options.include,
-            options.setup_password,
+            options.unsafe_operations,
             options.volatile,
             Box::new(VariableServices),
             &FirmwareKeywordHandler,
@@ -188,8 +193,9 @@ pub struct KeywordSetOptions {
     /// The states of the questions and options to select too, as set selects them, but
     /// READ_ONLY: the Keyword Handler writes no read-only question
     pub include: IncludedStates,
-    /// Whether to write in a HiiDB that declares a setup password question
-    pub setup_password: SetupPasswordPolicy,
+    /// Whether to do the unsafe operations that it meets, which it returns: a write in a HiiDB
+    /// that declares a setup password question
+    pub unsafe_operations: UnsafeOperations,
     /// Whether to write a keyword whose question keeps its value in a volatile variable, as
     /// SetOptions::volatile
     pub volatile: VolatileWrites,

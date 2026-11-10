@@ -1,7 +1,7 @@
 # The checks of shell/driver-sample.nsh: in the scenario shell-driver-sample, DriverSample
 # creates its variables MyIfrNVData and MyEfiVar boot-service-only (NV+BS), which Linux
 # cannot reach, and declares no PASSWORD question, so set writes without
-# --bypass-setup-password. See check-shell-log.sh.
+# --i-am-fine-to-brick-this-system. See check-shell-log.sh.
 get-check-box	status	0x0
 get-check-box	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "1"
 get-numeric	status	0x0
@@ -99,7 +99,9 @@ hii-get-help	status	0x0
 hii-get-help	line	--no-efivars
 hii-get-help	none	--efivars|--filename
 hii-set-help	status	0x0
-hii-set-help	line	--bypass-setup-password
+hii-set-help	line	--i-am-fine-to-brick-this-system
+# its long help lists set's unsafe operations, each check up to a space, where clap may wrap
+hii-set-help	line	(^| )browser,( |$)
 # get and set by keyword through EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL (UEFI 2.11 §35.3.1):
 # DriverSample's "My Keyword Namespace Test" has the x-UEFI-ns keyword iSCSIBootEnable, the byte at
 # 0x5B, with the options 0, 1 and 3; PATH is the vendor device path of DriverSample's main form set
@@ -202,4 +204,6 @@ keyword-set-help	status	0x0
 keyword-set-help	line	NAMESPACE=<language>&PATH=<hex( |$)
 keyword-set-help	line	(^| )digits>&KEYWORD=<keyword>&VALUE=<hex( |$)
 keyword-set-help	line	--allow-volatile
+keyword-set-help	line	--i-am-fine-to-brick-this-system
+keyword-set-help	line	(^| )browser,( |$)
 keyword-set-help	line	(^| )read-only( |$)

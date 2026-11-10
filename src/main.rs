@@ -40,6 +40,8 @@ use uefisettings::exports::HiiBackend;
 use uefisettings::exports::IncludedStates;
 use uefisettings::exports::KeywordName;
 use uefisettings::exports::KeywordNamespace;
+#[cfg(all(system_hiidb, system_variables))]
+use uefisettings::exports::LiftedOperations;
 use uefisettings::exports::ListQuestionsOptions;
 use uefisettings::exports::QuestionAddress;
 use uefisettings::exports::QuestionSelector;
@@ -48,6 +50,10 @@ use uefisettings::exports::SetOptions;
 #[cfg(all(system_hiidb, system_variables))]
 use uefisettings::exports::SetValue;
 use uefisettings::exports::ShowIfrOptions;
+#[cfg(all(system_hiidb, system_variables))]
+use uefisettings::exports::UnsafeOperation;
+#[cfg(target_os = "uefi")]
+use uefisettings::exports::UnsafeOperations;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
 #[cfg(system_variables)]
@@ -58,7 +64,7 @@ use platform::HiiPlatformCommands;
 use platform::ListStringsHiiDbArgs;
 use platform::PlatformCommands;
 #[cfg(all(system_hiidb, system_variables))]
-use platform::SetupPasswordArgs;
+use platform::SetUnsafeArgs;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::VolatileArgs;
 #[cfg(system_variables)]
@@ -169,6 +175,10 @@ enum Commands {
         .args(["question", "question_id", "keyword", "items"])
         .required(true)
         .multiple(true)))]
+    #[cfg_attr(
+        target_os = "uefi",
+        command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, platform::SET_UNSAFE_OPERATIONS)))
+    )]
     Set {
         #[command(flatten)]
         target: SetArgs,
@@ -177,7 +187,7 @@ enum Commands {
         #[command(flatten)]
         selection: SelectionArgs<SetIncludeState>,
         #[command(flatten)]
-        setup_password: SetupPasswordArgs,
+        unsafe_operations: SetUnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
     },
@@ -231,6 +241,10 @@ enum HiiSubcommands {
         .args(["question", "question_id", "keyword", "items"])
         .required(true)
         .multiple(true)))]
+    #[cfg_attr(
+        target_os = "uefi",
+        command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, platform::SET_UNSAFE_OPERATIONS)))
+    )]
     Set {
         #[command(flatten)]
         target: SetArgs,
@@ -239,7 +253,7 @@ enum HiiSubcommands {
         #[command(flatten)]
         selection: SelectionArgs<SetIncludeState>,
         #[command(flatten)]
-        setup_password: SetupPasswordArgs,
+        unsafe_operations: SetUnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
     },
@@ -504,15 +518,55 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
     }
 }
 
-/// The SetOptions of `selection`, `setup_password` and `volatile`.
+/// The id of --i-am-fine-to-brick-this-system, under which each command's long help lists its own
+/// unsafe operations.
+#[cfg(target_os = "uefi")]
+const UNSAFE_ARG: &str = "i_am_fine_to_brick_this_system";
+
+/// The help of --i-am-fine-to-brick-this-system, in every command that takes it.
+#[cfg(target_os = "uefi")]
+const UNSAFE_HELP: &str = "Do what this command otherwise refuses because it can bypass this \
+                           machine's setup password; each refusal names what this flag does there";
+
+/// --i-am-fine-to-brick-this-system, which only the commands that have an unsafe operation take.
+#[cfg(target_os = "uefi")]
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+struct UnsafeArgs {
+    #[arg(long, help = UNSAFE_HELP)]
+    i_am_fine_to_brick_this_system: bool,
+}
+
+#[cfg(target_os = "uefi")]
+impl UnsafeArgs {
+    fn operations(&self) -> UnsafeOperations {
+        match self.i_am_fine_to_brick_this_system {
+            false => UnsafeOperations::Refuse,
+            true => UnsafeOperations::Allow,
+        }
+    }
+}
+
+/// `arg`, --i-am-fine-to-brick-this-system, with a long help that lists `operations`, the unsafe
+/// operations of its command.
+#[cfg(target_os = "uefi")]
+fn unsafe_long_help(arg: clap::Arg, operations: &[&str]) -> clap::Arg {
+    arg.long_help(format!(
+        "{UNSAFE_HELP}. This command refuses without it: {}",
+        operations.join("; ")
+    ))
+}
+
+/// The SetOptions of `selection`, `unsafe_operations` and `volatile`.
 #[cfg(all(system_hiidb, system_variables))]
 fn set_options(
     selection: &SelectionArgs<SetIncludeState>,
-    setup_password: &SetupPasswordArgs,
+    unsafe_operations: &SetUnsafeArgs,
     volatile: &VolatileArgs,
 ) -> SetOptions {
     let mut options = SetOptions::from(selection);
-    options.setup_password = setup_password.policy();
+    options.unsafe_operations = unsafe_operations.operations();
     options.volatile = volatile.policy();
     options
 }
@@ -530,7 +584,7 @@ fn hii_get(
 }
 
 /// set of `question` to `value` with `options`, in this machine's HiiDB, read as `source` says,
-/// and variables, printed as JSON if `json`.
+/// and variables, printed as JSON if `json`, after a warning per unsafe operation that it lifted.
 #[cfg(all(system_hiidb, system_variables))]
 fn hii_set(
     question: QuestionSelector,
@@ -539,7 +593,8 @@ fn hii_set(
     json: bool,
     source: &HiiSourceArgs,
 ) -> Result<()> {
-    let res = platform::set_using(question, value, options, source)?;
+    let (res, lifted) = platform::set_using(question, value, options, source)?;
+    print_lifted(&lifted)?;
     print_with_style(res, json)?;
     Ok(())
 }
@@ -655,6 +710,10 @@ fn main() -> ExitCode {
     };
 
     if let Err(why) = handle_cmds(args) {
+        #[cfg(all(system_hiidb, system_variables))]
+        if let Err(print_error) = print_lifted_of(&why) {
+            log::debug!("failed to print the warnings of the error: {print_error}");
+        }
         if is_broken_pipe(&why) {
             return ExitCode::SUCCESS;
         }
@@ -705,11 +764,11 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 target,
                 output,
                 selection,
-                setup_password,
+                unsafe_operations,
                 volatile,
             } => {
                 let (question, value) = target.target()?;
-                let options = set_options(selection, setup_password, volatile);
+                let options = set_options(selection, unsafe_operations, volatile);
                 hii_set(question, &value, &options, output.json, source)?
             }
             HiiSubcommands::ShowIFR {
@@ -763,10 +822,10 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             target,
             output,
             selection,
-            setup_password,
+            unsafe_operations,
             volatile,
         } => {
-            let options = set_options(selection, setup_password, volatile);
+            let options = set_options(selection, unsafe_operations, volatile);
             platform::auto_set(target, output.json, selection, &options, source)?
         }
         Commands::ShowTranslations { output } => {
@@ -790,7 +849,44 @@ fn print_line(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
 fn print_warning(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     let stderr = io::stderr();
     let mut output = stderr.lock();
+    write_warning(&mut output, arguments)
+}
+
+fn write_warning(output: &mut impl Write, arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     writeln!(output, "warning: {}", arguments)
+}
+
+/// Prints a warning per unsafe operation in `lifted`, which --i-am-fine-to-brick-this-system let
+/// a command do.
+#[cfg(all(system_hiidb, system_variables))]
+fn print_lifted(lifted: &[UnsafeOperation]) -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
+    write_lifted(&mut output, lifted)
+}
+
+#[cfg(all(system_hiidb, system_variables))]
+fn write_lifted(output: &mut impl Write, lifted: &[UnsafeOperation]) -> io::Result<()> {
+    lifted.iter().try_for_each(|operation| {
+        write_warning(output, format_args!("{}", operation.lifted_warning()))
+    })
+}
+
+/// Prints a warning per unsafe operation that `error`, a command's, carries as lifted before
+/// the command failed (LiftedOperations).
+#[cfg(all(system_hiidb, system_variables))]
+fn print_lifted_of(error: &anyhow::Error) -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
+    write_lifted_of(&mut output, error)
+}
+
+#[cfg(all(system_hiidb, system_variables))]
+fn write_lifted_of(output: &mut impl Write, error: &anyhow::Error) -> io::Result<()> {
+    match error.downcast_ref::<LiftedOperations>() {
+        Some(lifted) => write_lifted(output, &lifted.0),
+        None => Ok(()),
+    }
 }
 
 // print_with_style either prints as json or with rust's debug pretty-printer
@@ -1188,6 +1284,53 @@ mod tests {
         }
     }
 
+    /// write_lifted writes a "warning:" line per lifted unsafe operation, and none for none.
+    #[cfg(all(system_hiidb, system_variables))]
+    #[test]
+    fn write_lifted_warns_per_operation() {
+        let mut none = Vec::new();
+        write_lifted(&mut none, &[]).expect("write no warning");
+        assert_eq!(String::from_utf8_lossy(&none), "", "none");
+
+        let mut warned = Vec::new();
+        let lifted = [UnsafeOperation::SetupPassword];
+        write_lifted(&mut warned, &lifted).expect("write the warning");
+        assert_eq!(
+            String::from_utf8_lossy(&warned),
+            format!(
+                "warning: {}\n",
+                UnsafeOperation::SetupPassword.lifted_warning()
+            ),
+            "SetupPassword"
+        );
+    }
+
+    /// The error path writes a "warning:" line per unsafe operation that the error carries as
+    /// lifted, also under a later context, and none for an error without.
+    #[cfg(all(system_hiidb, system_variables))]
+    #[test]
+    fn write_lifted_of_warns_of_the_operations_before_an_error() {
+        let error = LiftedOperations::attach(
+            vec![UnsafeOperation::SetupPassword],
+            anyhow!("write failed"),
+        )
+        .context("set failed");
+        let mut warned = Vec::new();
+        write_lifted_of(&mut warned, &error).expect("write the warning");
+        assert_eq!(
+            String::from_utf8_lossy(&warned),
+            format!(
+                "warning: {}\n",
+                UnsafeOperation::SetupPassword.lifted_warning()
+            ),
+            "lifted"
+        );
+
+        let mut none = Vec::new();
+        write_lifted_of(&mut none, &anyhow!("write failed")).expect("write no warning");
+        assert_eq!(String::from_utf8_lossy(&none), "", "none lifted");
+    }
+
     /// The flags, such as --efivars, that `text` names.
     pub(super) fn flags_named_in(text: &str) -> Vec<String> {
         text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
@@ -1372,6 +1515,37 @@ mod tests {
             let error = UefiSettingsToolArgs::try_parse_from(argv).expect_err("parse error");
 
             assert_eq!(parse_error_exit_code(&error), want, "{args:?}");
+        }
+    }
+
+    /// Each removed flag of an unsafe operation fails as an unknown flag does, with exit 2:
+    /// --i-am-fine-to-brick-this-system replaces it, with no alias.
+    #[cfg(all(system_hiidb, system_variables))]
+    #[test]
+    fn removed_unsafe_flags_exit_2() {
+        let cases: [(&[&str], &[&str], clap::error::ErrorKind); 2] = [
+            (
+                &["hii", "set", "Q", "V"],
+                &["--bypass-setup-password"],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["set", "Q", "V"],
+                &["--bypass-setup-password"],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+        ];
+        for (command, flag, kind) in cases {
+            let argv = [&["uefisettings"][..], command, flag].concat();
+            let error =
+                UefiSettingsToolArgs::try_parse_from(argv).expect_err("parse a removed flag");
+
+            assert_eq!(error.kind(), kind, "{command:?} {flag:?}");
+            assert_eq!(
+                parse_error_exit_code(&error),
+                ExitCode::from(2),
+                "{command:?} {flag:?}"
+            );
         }
     }
 

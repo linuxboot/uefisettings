@@ -29,7 +29,8 @@ use uefisettings::exports::HiiBackend;
 use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetValue;
-use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::exports::UnsafeOperation;
+use uefisettings::exports::UnsafeOperations;
 use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
@@ -135,16 +136,16 @@ impl EfivarArgs {
 }
 
 /// None: Windows writes through the firmware environment calls, which reach runtime
-/// variables like efivarfs, so set takes no setup password policy, as on Linux.
+/// variables like efivarfs, so set does no unsafe operation, as on Linux.
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag
 #[group(skip)]
-pub(super) struct SetupPasswordArgs {}
+pub(super) struct SetUnsafeArgs {}
 
-impl SetupPasswordArgs {
+impl SetUnsafeArgs {
     /// The default, which set through the firmware environment calls does not consult.
-    pub(super) fn policy(&self) -> SetupPasswordPolicy {
-        SetupPasswordPolicy::default()
+    pub(super) fn operations(&self) -> UnsafeOperations {
+        UnsafeOperations::default()
     }
 }
 
@@ -195,7 +196,7 @@ pub(super) fn set_using(
     value: &SetValue,
     options: &SetOptions,
     _source: &HiiSourceArgs,
-) -> Result<SetResponseList> {
+) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
     HiiBackend::set_using(question, value, None, options)
 }
 

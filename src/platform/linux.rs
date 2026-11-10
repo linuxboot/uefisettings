@@ -41,7 +41,8 @@ use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetValue;
 use uefisettings::exports::SettingsBackend;
-use uefisettings::exports::SetupPasswordPolicy;
+use uefisettings::exports::UnsafeOperation;
+use uefisettings::exports::UnsafeOperations;
 use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
@@ -291,16 +292,16 @@ impl EfivarArgs {
     }
 }
 
-/// None: efivarfs writes from Linux, where set takes no setup password policy.
+/// None: efivarfs writes from Linux, where set does no unsafe operation.
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag
 #[group(skip)]
-pub(super) struct SetupPasswordArgs {}
+pub(super) struct SetUnsafeArgs {}
 
-impl SetupPasswordArgs {
+impl SetUnsafeArgs {
     /// The default, which set through efivarfs does not consult.
-    pub(super) fn policy(&self) -> SetupPasswordPolicy {
-        SetupPasswordPolicy::default()
+    pub(super) fn operations(&self) -> UnsafeOperations {
+        UnsafeOperations::default()
     }
 }
 
@@ -411,7 +412,7 @@ pub(super) fn set_using(
     value: &SetValue,
     options: &SetOptions,
     source: &HiiSourceArgs,
-) -> Result<SetResponseList> {
+) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
     HiiBackend::set_from(question, value, None, options, &hii_source_options(source))
 }
 
@@ -758,24 +759,6 @@ mod tests {
             let argv = [&["uefisettings"][..], command, &["--allow-volatile"]].concat();
             let error =
                 UefiSettingsToolArgs::try_parse_from(argv).expect_err("parse --allow-volatile");
-
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::UnknownArgument,
-                "{command:?}"
-            );
-        }
-    }
-
-    /// The Linux build takes no --bypass-setup-password: set through efivarfs has no setup
-    /// password policy.
-    #[test]
-    fn set_takes_no_setup_password_flag() {
-        let commands: [&[&str]; 2] = [&["hii", "set", "Q", "V"], &["set", "Q", "V"]];
-        for command in commands {
-            let argv = [&["uefisettings"][..], command, &["--bypass-setup-password"]].concat();
-            let error = UefiSettingsToolArgs::try_parse_from(argv)
-                .expect_err("parse --bypass-setup-password");
 
             assert_eq!(
                 error.kind(),

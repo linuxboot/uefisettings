@@ -17,20 +17,22 @@ dmpstore-pw-before	status	any
 dmpstore-pw-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarPw' DataSize = 0x14$
 # set refuses to write in a HiiDB that declares a password question
 set-refused	status	aborted
-set-refused	json	. == {"error_message": "this HiiDB declares a setup password question; the UEFI Shell runs no setup browser, so no password is asked or checked; pass --bypass-setup-password to write anyway"}
+set-refused	json	. == {"error_message": "this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; pass --i-am-fine-to-brick-this-system to write without it"}
 dmpstore-a-refused	status	any
 dmpstore-a-refused	same	dmpstore-a-before
-# unless --bypass-setup-password is given; the GET of its SUPPRESS_IF reads 5 from ShortVarA, which
+# unless --i-am-fine-to-brick-this-system is given; the GET of its SUPPRESS_IF reads 5 from ShortVarA, which
 # hides the CHECKBOX until ShortVarA holds 9
 set-suppressed	status	aborted
 set-suppressed	json	. == {"error_message": "question \"Short checkbox\" is suppressed; also include suppressed questions to select it"}
 set-numeric	status	0x0
-set-numeric	json	.responses | length == 1 and .[0].question.answer == "9" and .[0].modified == true
+set-numeric	warned	.responses | length == 1 and .[0].question.answer == "9" and .[0].modified == true
+set-numeric	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
 dmpstore-a-after	status	any
 dmpstore-a-after	line	^  00000000: 09 
 # the CHECKBOX writes ShortVarC, and the SET of its WRITE ShortVarB, which the ONE_OF answers
 set-checkbox	status	0x0
-set-checkbox	json	.responses | length == 1 and .[0].question.answer == "1" and .[0].modified == true
+set-checkbox	warned	.responses | length == 1 and .[0].question.answer == "1" and .[0].modified == true
+set-checkbox	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
 get-one-of-after	status	0x0
 get-one-of-after	json	.responses | length == 1 and .[0].question.answer == "Enabled"
 dmpstore-b-after	status	any
@@ -45,7 +47,8 @@ dmpstore-pw-after	same	dmpstore-pw-before
 dmpstore-d-before	status	0xE
 dmpstore-d-before	none	ShortVarD' DataSize
 set-created	status	0x0
-set-created	json	.responses | length == 1 and .[0].question.answer == "513" and .[0].modified == true
+set-created	warned	.responses | length == 1 and .[0].question.answer == "513" and .[0].modified == true
+set-created	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
 dmpstore-d-after	status	any
 dmpstore-d-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarD' DataSize = 0x02$
 dmpstore-d-after	line	^  00000000: 01 02 
@@ -55,7 +58,8 @@ get-created	json	.responses | length == 1 and .[0].question.answer == "513"
 get-list	status	0x0
 get-list	json	.responses | length == 1 and .[0].question.answer == "Third, First, Second" and .[0].question.items == ["Third", "First", "Second"]
 set-list	status	0x0
-set-list	json	.responses | length == 1 and .[0].question.answer == "First, Third" and .[0].modified == true
+set-list	warned	.responses | length == 1 and .[0].question.answer == "First, Third" and .[0].modified == true
+set-list	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
 dmpstore-l-after	status	any
 dmpstore-l-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarL' DataSize = 0x03$
 dmpstore-l-after	line	^  00000000: 01 03 00 
@@ -87,7 +91,8 @@ dmpstore-pw-list-after	same	dmpstore-pw-before
 dmpstore-n-before	status	0xE
 dmpstore-n-before	none	ShortVarN' DataSize
 set-missing-list	status	0x0
-set-missing-list	json	.responses | length == 1 and .[0].question.answer == "Second" and .[0].modified == true
+set-missing-list	warned	.responses | length == 1 and .[0].question.answer == "Second" and .[0].modified == true
+set-missing-list	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
 dmpstore-n-after	status	any
 dmpstore-n-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarN' DataSize = 0x03$
 dmpstore-n-after	line	^  00000000: 02 00 00 

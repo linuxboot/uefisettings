@@ -40,12 +40,15 @@ use super::forms::keywords::KeywordRefusal;
 use super::forms::keywords::KeywordWrite;
 use super::forms::IncludedStates;
 use super::forms::PasswordQuestions;
-use super::forms::SetupPasswordPolicy;
 use super::package::ParsedPackageList;
 use super::variables::EfivarReader;
 use super::variables::FirmwareVariables;
 use super::variables::VolatileWrites;
 use super::variables::VOLATILE_ANNOTATION;
+use crate::unsafe_operations::LiftedOperations;
+use crate::unsafe_operations::PendingOperations;
+use crate::unsafe_operations::UnsafeOperation;
+use crate::unsafe_operations::UnsafeOperations;
 
 /// The ProgressErr bits of UEFI 2.11 §35.3.2, with their names.
 const PROGRESS_ERRORS: [(u32, &str); 6] = [
@@ -601,22 +604,27 @@ fn admitted<'q, 'a>(
 
 /// Writes `keywords`, a `<MultiKeywordResp>`, with one SetData() of `handler`, once each keyword's
 /// question in `lists` passes check_set with `include`, `volatile` and `variables`, through which
-/// set would write, no two keywords write a byte of one variable (check_disjoint), and `lists`
-/// declare no setup password unless `setup_password` bypasses it; then reads each keyword back
-/// with GetData(), which must hold the number written. When SetData() fails, it reads them back
-/// too and reports each with the error.
+/// set would write, and no two keywords write a byte of one variable (check_disjoint); then, unless
+/// `unsafe_operations` allows it, it refuses a write in `lists` that declare a setup password,
+/// which set through `variables` would bypass. It reads each keyword back with GetData(), which
+/// must hold the number written, and returns them with the unsafe operations that it lifted, which
+/// an error after the check carries too (LiftedOperations). When SetData() fails, it reads them
+/// back too and reports each with the error.
 pub(crate) fn set_keywords(
     lists: &[ParsedPackageList],
     keywords: &str,
     include: IncludedStates,
-    setup_password: SetupPasswordPolicy,
+    unsafe_operations: UnsafeOperations,
     volatile: VolatileWrites,
     variables: Box<dyn FirmwareVariables>,
     handler: &impl KeywordData,
-) -> Result<KeywordValues> {
+) -> Result<(KeywordValues, Vec<UnsafeOperation>)> {
     let resps: MultiKeywordResp = keywords.parse()?;
     let passwords = PasswordQuestions::of_lists(lists);
-    passwords.check_set(variables.reach(), setup_password)?;
+    let mut pending = PendingOperations::new(unsafe_operations);
+    if let Some(bypass) = passwords.setup_password_bypass(variables.reach()) {
+        pending.add(bypass);
+    }
     let mut reader = passwords.reader(variables)?;
     let mut writes = Vec::new();
     for (index, resp) in resps.as_slice().iter().enumerate() {
@@ -636,6 +644,23 @@ pub(crate) fn set_keywords(
         }
     }
     check_disjoint(&writes)?;
+    let lifted = pending.check()?;
+    let volatile = writes
+        .iter()
+        .filter(|(_, _, write)| write.volatile)
+        .map(|&(index, _, _)| index)
+        .collect();
+    let (resps, lifted) = LiftedOperations::after(lifted, write_keywords(&resps, handler))?;
+    Ok((KeywordValues { resps, volatile }, lifted))
+}
+
+/// Writes `resps` with one SetData() of `handler` and reads each keyword back with GetData(),
+/// which must hold the number written; when SetData() fails, it reads them back too and reports
+/// each with the error.
+fn write_keywords(
+    resps: &MultiKeywordResp,
+    handler: &impl KeywordData,
+) -> Result<MultiKeywordResp> {
     // the VALUEs re-serialized, each as wide as its question
     let keyword_string = resps.to_string();
     if let Err(error) = handler.set_data(&keyword_string) {
@@ -672,14 +697,7 @@ pub(crate) fn set_keywords(
             Ok(value)
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(KeywordValues {
-        resps: MultiKeywordResp::try_from(values)?,
-        volatile: writes
-            .iter()
-            .filter(|(_, _, write)| write.volatile)
-            .map(|&(index, _, _)| index)
-            .collect(),
-    })
+    Ok(MultiKeywordResp::try_from(values)?)
 }
 
 /// Refuses `writes`, each with its keyword, of which two write a byte of one variable: SetData()
@@ -1228,18 +1246,19 @@ mod tests {
     fn set(
         lists: &[ParsedPackageList],
         keywords: &str,
-        setup_password: SetupPasswordPolicy,
+        unsafe_operations: UnsafeOperations,
         handler: &impl KeywordData,
     ) -> Result<KeywordValues> {
         set_keywords(
             lists,
             keywords,
             IncludedStates::empty(),
-            setup_password,
+            unsafe_operations,
             VolatileWrites::Refuse,
             variables(),
             handler,
         )
+        .map(|(values, _)| values)
     }
 
     /// get and set by KEYWORD of a ONE_OF on a VARSTORE_EFI before UEFI 2.3.1, on VarName 7
@@ -1267,7 +1286,7 @@ mod tests {
         let set = set(
             &lists,
             &resp(PATH, KEYWORD, "03"),
-            SetupPasswordPolicy::Refuse,
+            UnsafeOperations::Refuse,
             &handler,
         )
         .map(drop)
@@ -1364,7 +1383,7 @@ mod tests {
         );
 
         let values =
-            set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler).expect("set by keyword");
+            set(&lists, &keywords, UnsafeOperations::Refuse, &handler).expect("set by keyword");
 
         let written = format!(
             "{}&{}",
@@ -1394,7 +1413,7 @@ mod tests {
             resp(PATH, SECOND_KEYWORD, "02")
         );
 
-        let error = set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler)
+        let error = set(&lists, &keywords, UnsafeOperations::Refuse, &handler)
             .expect_err("a VALUE of no option");
 
         assert_eq!(
@@ -1438,7 +1457,7 @@ mod tests {
         );
 
         let values =
-            set(&lists, &written, SetupPasswordPolicy::Refuse, &handler).expect("set by keyword");
+            set(&lists, &written, UnsafeOperations::Refuse, &handler).expect("set by keyword");
 
         assert_eq!(values.to_string(), written, "the values read back");
         assert_eq!(
@@ -1470,7 +1489,7 @@ mod tests {
             resp(PATH, SECOND_KEYWORD, "010003")
         );
 
-        let error = set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler)
+        let error = set(&lists, &keywords, UnsafeOperations::Refuse, &handler)
             .expect_err("a container after an empty one");
 
         assert_eq!(
@@ -1485,37 +1504,208 @@ mod tests {
         assert_eq!(handler.calls(), vec![], "no call");
     }
 
-    /// In a HiiDB that declares a PASSWORD question, set refuses before any call, unless the
-    /// setup password policy bypasses it.
-    #[test]
-    fn set_with_a_declared_password_refuses_before_any_call_unless_bypassed() {
-        let password = [
-            questions(),
-            vec![
-                var_store(2, [0x44; 16], "Password", 20),
-                password_on(9, 9, 2, 0),
-            ],
+    /// The ops of a VarStore 2 and a PASSWORD question on it.
+    fn password() -> Vec<Vec<u8>> {
+        vec![
+            var_store(2, [0x44; 16], "Password", 20),
+            password_on(9, 9, 2, 0),
         ]
-        .concat();
-        let lists = [list(PATH, &password)];
+    }
+
+    /// In a HiiDB that declares a PASSWORD question, set refuses before any call unless
+    /// UnsafeOperations allows it, and then returns UnsafeOperation::SetupPassword, lifted.
+    #[test]
+    fn set_with_a_declared_password_refuses_before_any_call_unless_allowed() {
+        let lists = [list(PATH, &[questions(), password()].concat())];
         let keywords = resp(PATH, KEYWORD, "03");
 
         let refused = MemoryKeywordHandler::default();
-        let error = set(&lists, &keywords, SetupPasswordPolicy::Refuse, &refused)
+        let error = set(&lists, &keywords, UnsafeOperations::Refuse, &refused)
             .expect_err("a declared setup password");
-        assert!(
-            error.to_string().contains("--bypass-setup-password"),
-            "refused: {error:#}"
+        assert_eq!(
+            format!("{error:#}"),
+            "this HiiDB declares a setup password question, and the UEFI Shell runs no setup \
+             browser, so no password is asked or checked; pass --i-am-fine-to-brick-this-system \
+             to write without it",
+            "refused"
         );
         assert_eq!(refused.calls(), vec![], "no call");
 
-        let bypassed = MemoryKeywordHandler::default();
-        set(&lists, &keywords, SetupPasswordPolicy::Bypass, &bypassed).expect("bypassed");
+        let allowed = MemoryKeywordHandler::default();
+        let (_, lifted) = set_keywords(
+            &lists,
+            &keywords,
+            IncludedStates::empty(),
+            UnsafeOperations::Allow,
+            VolatileWrites::Refuse,
+            variables(),
+            &allowed,
+        )
+        .expect("allowed");
+        assert_eq!(lifted, vec![UnsafeOperation::SetupPassword], "lifted");
         assert_eq!(
-            bypassed.calls().first(),
+            allowed.calls().first(),
             Some(&KeywordCall::SetData(keywords)),
-            "SetData() when bypassed"
+            "SetData() when allowed"
         );
+    }
+
+    /// keyword set of a DATE and an ORDERED_LIST in a HiiDB that declares a PASSWORD question
+    /// takes UnsafeOperations as the other kinds do: the ORDERED_LIST's own refusal comes before
+    /// the setup password's, which refuses before any call unless UnsafeOperations allows it;
+    /// then one SetData() writes both and UnsafeOperation::SetupPassword returns, lifted.
+    #[test]
+    fn set_of_a_date_and_an_ordered_list_with_a_declared_password_needs_the_flag() {
+        let lists = [list(PATH, &[date_and_list(), password()].concat())];
+        let written = format!(
+            "{}&{}",
+            resp(PATH, KEYWORD, "1f0c07e9"),
+            resp(PATH, SECOND_KEYWORD, "000103")
+        );
+        let invalid = format!(
+            "{}&{}",
+            resp(PATH, KEYWORD, "1f0c07e9"),
+            resp(PATH, SECOND_KEYWORD, "010003")
+        );
+
+        let refused = MemoryKeywordHandler::default();
+        let password = set(&lists, &written, UnsafeOperations::Refuse, &refused)
+            .expect_err("a declared setup password");
+        let list = set(&lists, &invalid, UnsafeOperations::Refuse, &refused)
+            .expect_err("a container after an empty one");
+        let allowed = MemoryKeywordHandler::default();
+        let (values, lifted) = set_keywords(
+            &lists,
+            &written,
+            IncludedStates::empty(),
+            UnsafeOperations::Allow,
+            VolatileWrites::Refuse,
+            variables(),
+            &allowed,
+        )
+        .expect("allowed");
+
+        assert_eq!(
+            format!("{password:#}"),
+            "this HiiDB declares a setup password question, and the UEFI Shell runs no setup \
+             browser, so no password is asked or checked; pass --i-am-fine-to-brick-this-system \
+             to write without it",
+            "refused"
+        );
+        assert!(
+            format!("{list:#}").starts_with(&format!(
+                "keyword {SECOND_KEYWORD}: VALUE=010003 of question \"Second question\": "
+            )),
+            "the ORDERED_LIST's refusal first: {list:#}"
+        );
+        assert_eq!(refused.calls(), vec![], "no call when refused");
+        assert_eq!(values.to_string(), written, "allowed: the values read back");
+        assert_eq!(
+            lifted,
+            vec![UnsafeOperation::SetupPassword],
+            "allowed: lifted"
+        );
+        assert_eq!(
+            allowed.calls(),
+            vec![
+                KeywordCall::SetData(written.clone()),
+                get_call(PATH, KEYWORD),
+                get_call(PATH, SECOND_KEYWORD),
+            ],
+            "allowed: one SetData(), then a GetData() per keyword"
+        );
+    }
+
+    /// In a HiiDB that declares a PASSWORD question, with UnsafeOperations::Allow, the error of a
+    /// failed SetData() and that of a failed read-back after it carry
+    /// UnsafeOperation::SetupPassword, lifted before them, beside their own error.
+    #[test]
+    fn a_failed_write_keeps_the_lifted_setup_password() {
+        let lists = [list(PATH, &[questions(), password()].concat())];
+        let keywords = resp(PATH, KEYWORD, "03");
+        let failed_set = MemoryKeywordHandler {
+            set_failure: Some("SetData(): ACCESS_DENIED"),
+            ..MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")])
+        };
+        let failed_read = FailingReads(MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]));
+        let got = [
+            (
+                "SetData()",
+                set(&lists, &keywords, UnsafeOperations::Allow, &failed_set),
+            ),
+            (
+                "GetData()",
+                set(&lists, &keywords, UnsafeOperations::Allow, &failed_read),
+            ),
+        ];
+
+        for (failed, got) in got {
+            let error = got.expect_err(failed);
+            assert_eq!(
+                error.downcast_ref::<LiftedOperations>(),
+                Some(&LiftedOperations(vec![UnsafeOperation::SetupPassword])),
+                "{failed}: lifted"
+            );
+            assert!(
+                error.downcast_ref::<KeywordSetError>().is_some(),
+                "{failed}: the error: {error:#}"
+            );
+        }
+    }
+
+    /// In a HiiDB that declares a PASSWORD question, set refuses a keyword for what
+    /// UnsafeOperations cannot lift before the setup password, with and without Allow: a VALUE of
+    /// no option, and an EFI_IFR_FLAG_READ_ONLY question, whose SetData() sets
+    /// KEYWORD_HANDLER_ACCESS_NOT_PERMITTED (UEFI 2.11 §35.3.2). A write that these leave it lifts
+    /// nothing without a password.
+    #[test]
+    fn set_refuses_what_unsafe_operations_cannot_lift_before_the_setup_password() {
+        let read_only = [
+            vec![one_of(3, 5, 1), flagged_one_of(5, 6, 1, 0x01)],
+            password(),
+        ]
+        .concat();
+        let cases = [
+            (
+                resp(PATH, KEYWORD, "02"),
+                "keyword Keyword: VALUE=02 is no option of question \"Keyword question\"",
+            ),
+            (
+                resp(PATH, SECOND_KEYWORD, "03"),
+                "keyword SecondKeyword: cannot set question \"Second question\": \
+                 EFI_IFR_FLAG_READ_ONLY makes it read-only (UEFI 2.11 §33.3.8.2.2)",
+            ),
+        ];
+        let lists = [list(PATH, &read_only)];
+        for (keywords, refusal) in cases {
+            for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+                let handler = MemoryKeywordHandler::with(&[
+                    (PATH, KEYWORD, "01"),
+                    (PATH, SECOND_KEYWORD, "01"),
+                ]);
+
+                let got = set(&lists, &keywords, grant, &handler)
+                    .map(|values| values.to_string())
+                    .map_err(|error| format!("{error:#}"));
+
+                assert_eq!(got, Err(refusal.to_owned()), "{keywords}, {grant:?}");
+                assert_eq!(handler.calls(), [], "{keywords}, {grant:?}: calls");
+            }
+        }
+
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+        let got = set_keywords(
+            &[list(PATH, &questions())],
+            &resp(PATH, KEYWORD, "03"),
+            IncludedStates::empty(),
+            UnsafeOperations::Allow,
+            VolatileWrites::Refuse,
+            variables(),
+            &handler,
+        )
+        .map(|(_, lifted)| lifted)
+        .map_err(|error| format!("{error:#}"));
+        assert_eq!(got, Ok(vec![]), "no password: lifted");
     }
 
     /// get and set by keyword neither read nor write the bytes of a password, those of a
@@ -1544,7 +1734,7 @@ mod tests {
             set(
                 &lists,
                 &resp(PATH, keyword, "03"),
-                SetupPasswordPolicy::Bypass,
+                UnsafeOperations::Allow,
                 handler,
             )
             .map(|values| values.to_string())
@@ -1609,7 +1799,7 @@ mod tests {
         let error = set(
             &lists,
             &resp(PATH, KEYWORD, "03"),
-            SetupPasswordPolicy::Refuse,
+            UnsafeOperations::Refuse,
             &handler,
         )
         .expect_err("a stale read-back");
@@ -1638,7 +1828,7 @@ mod tests {
             resp(PATH, SECOND_KEYWORD, "03")
         );
 
-        let error = set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler)
+        let error = set(&lists, &keywords, UnsafeOperations::Refuse, &handler)
             .expect_err("a stale read-back of the second keyword");
 
         assert!(
@@ -1666,7 +1856,7 @@ mod tests {
             resp(PATH, SECOND_KEYWORD, "00")
         );
 
-        let error = set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler)
+        let error = set(&lists, &keywords, UnsafeOperations::Refuse, &handler)
             .expect_err("a failed SetData()");
 
         let Some(KeywordSetError::SetData(read_back, _)) = error.downcast_ref::<KeywordSetError>()
@@ -1704,7 +1894,7 @@ mod tests {
         let keywords = format!("{}&DATATYPE=Numeric:1", resp(PATH, KEYWORD, "03"));
 
         let error =
-            set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler).expect_err("KEYWORDINFO");
+            set(&lists, &keywords, UnsafeOperations::Refuse, &handler).expect_err("KEYWORDINFO");
 
         assert!(
             matches!(
@@ -1820,12 +2010,12 @@ mod tests {
                 &lists,
                 &keywords,
                 IncludedStates::empty(),
-                SetupPasswordPolicy::Refuse,
+                UnsafeOperations::Refuse,
                 volatile,
                 variables_of(VOLATILE),
                 &handler,
             )
-            .map(|values| values.to_string())
+            .map(|(values, _)| values.to_string())
             .map_err(|error| format!("{error:#}"));
 
             assert_eq!(got, want, "{volatile:?}");
@@ -1855,12 +2045,12 @@ mod tests {
                 &lists,
                 &keywords,
                 include,
-                SetupPasswordPolicy::Refuse,
+                UnsafeOperations::Refuse,
                 VolatileWrites::Refuse,
                 variables(),
                 &handler,
             )
-            .map(|values| values.to_string())
+            .map(|(values, _)| values.to_string())
             .map_err(|error| format!("{error:#}"));
 
             assert_eq!(
@@ -1938,7 +2128,7 @@ mod tests {
         let written = set(
             &lists,
             &resp(PATH, KEYWORD, "03"),
-            SetupPasswordPolicy::Bypass,
+            UnsafeOperations::Allow,
             &handler,
         )
         .map(|values| values.to_string());
@@ -2091,7 +2281,7 @@ mod tests {
         let written = set(
             &lists,
             &resp(PATH, KEYWORD, "03"),
-            SetupPasswordPolicy::Bypass,
+            UnsafeOperations::Allow,
             &handler,
         )
         .map(|values| values.to_string());
@@ -2185,8 +2375,7 @@ mod tests {
                 (PATH, SECOND_KEYWORD, "0001"),
             ]);
 
-            let error =
-                set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler).expect_err(name);
+            let error = set(&lists, &keywords, UnsafeOperations::Refuse, &handler).expect_err(name);
 
             assert_eq!(error.to_string(), refusal, "{name}");
             assert_eq!(handler.calls(), vec![], "{name}: no call");
@@ -2201,7 +2390,7 @@ mod tests {
             resp(PATH, SECOND_KEYWORD, "0002")
         );
         assert_eq!(
-            set(&apart, &keywords, SetupPasswordPolicy::Refuse, &handler)
+            set(&apart, &keywords, UnsafeOperations::Refuse, &handler)
                 .map(|values| values.to_string())
                 .map_err(|error| format!("{error:#}")),
             Ok(keywords),
@@ -2218,7 +2407,7 @@ mod tests {
         let error = set(
             &lists,
             &resp(PATH, KEYWORD, "03"),
-            SetupPasswordPolicy::Refuse,
+            UnsafeOperations::Refuse,
             &handler,
         )
         .expect_err("a failed read-back");
@@ -2283,7 +2472,7 @@ mod tests {
             let result = set(
                 &lists,
                 &resp(PATH, keyword, value),
-                SetupPasswordPolicy::Refuse,
+                UnsafeOperations::Refuse,
                 &handler,
             );
 

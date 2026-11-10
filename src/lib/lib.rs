@@ -55,3 +55,4 @@ mod uefi_config_table;
 mod uefi_entry;
 #[cfg(any(target_os = "uefi", test))]
 mod unaligned_array;
+mod unsafe_operations;

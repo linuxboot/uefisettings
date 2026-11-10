@@ -9,7 +9,7 @@ dmpstore-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000301:
 # seeded bytes as they are
 get	status	0x0
 get	json	.responses | length == 1 and .[0].question.answer == "18"
-# set refuses to write it, with or without --bypass-setup-password, before SetVariable()
+# set refuses to write it, with or without --i-am-fine-to-brick-this-system, before SetVariable()
 set	status	aborted
 set	json	. == {"error_message": "EFI variable EnhancedAuthData-8c78a505-baa0-4c4a-869f-000000000301 has authenticated access (attributes 0x87), which uefisettings does not write"}
 top-set	status	aborted

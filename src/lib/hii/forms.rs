@@ -127,7 +127,6 @@ pub use ami_access_level::AccessLevel;
 pub use conditions::IncludedStates;
 pub use conditions::QuestionState;
 pub use conditions::SelectionError;
-pub use setup_password::SetupPasswordPolicy;
 
 pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
@@ -6788,8 +6787,8 @@ mod nesting_tests {
         on_small_stack("PasswordQuestions::of", || {
             for password in [true, false] {
                 let declared = PasswordQuestions::of([&parse_deep(DEEP, DEEP, password)])
-                    .check_set(VariableReach::BootServices, SetupPasswordPolicy::Refuse)
-                    .is_err();
+                    .setup_password_bypass(VariableReach::BootServices)
+                    .is_some();
                 assert_eq!(declared, password, "declares the PASSWORD at the bottom");
             }
         });

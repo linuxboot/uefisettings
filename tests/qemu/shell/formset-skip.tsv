@@ -1,7 +1,7 @@
 # The checks of shell/formset-skip.nsh. See check-shell-log.sh.
 # The PASSWORD of each form set that uefisettings ignores could name any variable, so get,
 # list-questions and set of a question of a form set after one read and write none, even with
-# --bypass-setup-password
+# --i-am-fine-to-brick-this-system
 get	status	aborted
 get	json	.error_message | startswith("PASSWORD questions of package list 8C78A505-BAA0-4C4A-869F-000000001200 may be in the IFR that uefisettings ignores at offset 118 of a form package: the FormSet 8C78A505-BAA0-4C4A-869F-000000001201, which holds, outside its forms, an op shorter than its minimum, which UEFI 2.11 ") and endswith("; as the variable of that password is unknown, the UEFI Shell build reads and writes no variable of this HiiDB")
 get	json	.error_message | contains("; PASSWORD questions of package list 8C78A505-BAA0-4C4A-869F-000000001210 may be in the IFR that uefisettings ignores at offset 0 of a form package: the FormSet 8C78A505-BAA0-4C4A-869F-000000001211, which holds, outside its forms, an op shorter than its minimum, which UEFI 2.11 ")

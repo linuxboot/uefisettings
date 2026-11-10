@@ -5,7 +5,7 @@ dmpstore-before	line	^Variable NV\+RT\+BS\+AT 'A04A27F4-DF00-4D42-B552-395113021
 # get decodes it, as only EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS puts metadata in the data
 get	status	0x0
 get	json	.responses | length == 1 and .[0].question.answer == "18"
-# set refuses to write it, with or without --bypass-setup-password, before SetVariable()
+# set refuses to write it, with or without --i-am-fine-to-brick-this-system, before SetVariable()
 set	status	aborted
 set	json	. == {"error_message": "EFI variable MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d has authenticated access (attributes 0x27), which uefisettings does not write"}
 top-set	status	aborted

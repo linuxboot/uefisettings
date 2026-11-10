@@ -29,29 +29,31 @@ uefisettings.efi hii set --json "How old are you? (Step)" 30
 echo uefisettings-shell: step set-refused %lasterror%
 uefisettings.efi set --json "How old are you? (Step)" 30
 echo uefisettings-shell: step top-set-refused %lasterror%
+uefisettings.efi hii set --json --bypass-setup-password "How old are you? (Step)" 30
+echo uefisettings-shell: step set-removed-flag %lasterror%
 dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
 echo uefisettings-shell: step dmpstore-refused %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "How old are you? (Step)" 30
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "How old are you? (Step)" 30
 echo uefisettings-shell: step set-bypassed %lasterror%
 uefisettings.efi hii get --json "How old are you? (Step)"
 echo uefisettings-shell: step get-bypassed %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Password prefix as a number" 1
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Password prefix as a number" 1
 echo uefisettings-shell: step set-over-password %lasterror%
-uefisettings.efi set --json --bypass-setup-password "Password prefix as a number" 1
+uefisettings.efi set --json --i-am-fine-to-brick-this-system "Password prefix as a number" 1
 echo uefisettings-shell: step top-set-over-password %lasterror%
 dmpstore PlaintextPassword -guid 8C78A505-BAA0-4C4A-869F-000000001101
 echo uefisettings-shell: step dmpstore-plaintext-after %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Quiet Boot" Disabled
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Quiet Boot" Disabled
 echo uefisettings-shell: step set-password-store %lasterror%
-uefisettings.efi set --json --bypass-setup-password "Quiet Boot" Disabled
+uefisettings.efi set --json --i-am-fine-to-brick-this-system "Quiet Boot" Disabled
 echo uefisettings-shell: step top-set-password-store %lasterror%
 dmpstore ConOutDev -guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
 echo uefisettings-shell: step dmpstore-volatile-before %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Volatile setting" 1
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Volatile setting" 1
 echo uefisettings-shell: step set-volatile %lasterror%
 dmpstore ConOutDev -guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
 echo uefisettings-shell: step dmpstore-volatile-refused %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password --allow-volatile "Volatile setting" 3
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system --allow-volatile "Volatile setting" 3
 echo uefisettings-shell: step set-volatile-allowed %lasterror%
 dmpstore ConOutDev -guid 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
 echo uefisettings-shell: step dmpstore-volatile-after %lasterror%

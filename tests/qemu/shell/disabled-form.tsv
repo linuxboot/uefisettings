@@ -26,15 +26,16 @@ dmpstore-before	line	^  00000010: BB BB BB BB 01 05
 # The PASSWORD of the disabled form is a setup password question, which no setup browser asks
 # for in the UEFI Shell
 set-refused	status	aborted
-set-refused	json	. == {"error_message": "this HiiDB declares a setup password question; the UEFI Shell runs no setup browser, so no password is asked or checked; pass --bypass-setup-password to write anyway"}
+set-refused	json	. == {"error_message": "this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; pass --i-am-fine-to-brick-this-system to write without it"}
 # and no question of the disabled form is set
 set-disabled	status	aborted
 set-disabled	json	.error_message | startswith("no question \"Disabled setting\" in the HiiDB, but it may be in the IFR that uefisettings ignores at offset 136 of a form package of package list 8C78A505-BAA0-4C4A-869F-000000001230: the form 2 of the FormSet 8C78A505-BAA0-4C4A-869F-000000001230, whose EFI_IFR_CHECKBOX op is malformed; UEFI 2.11 ")
 dmpstore-refused	status	any
 dmpstore-refused	same	dmpstore-before
-# --bypass-setup-password writes Live setting's byte alone
+# --i-am-fine-to-brick-this-system writes Live setting's byte alone
 set-bypassed	status	0x0
-set-bypassed	json	.responses | length == 1 and .[0].question.answer == "2" and .[0].modified == true
+set-bypassed	warned	.responses | length == 1 and .[0].question.answer == "2" and .[0].modified == true
+set-bypassed	line	^warning: this HiiDB declares a setup password question, and the UEFI Shell runs no setup browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets uefisettings write without it$
 dmpstore-after	status	any
 dmpstore-after	line	^  00000000: BB BB BB BB BB BB BB BB-BB BB BB BB BB BB BB BB  \*\.{16}\*$
 dmpstore-after	line	^  00000010: BB BB BB BB 02 05 

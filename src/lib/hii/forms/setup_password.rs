@@ -61,6 +61,7 @@ use crate::hii::variables::WithheldBytes;
 use crate::hii::variables::WithholdingVariables;
 use crate::parse_error::ParseError;
 use crate::parse_error::ReadParsed;
+use crate::unsafe_operations::UnsafeOperation;
 
 /// The bytes of a CHAR16
 const CHAR16_SIZE: usize = std::mem::size_of::<u16>();
@@ -995,21 +996,14 @@ impl PasswordQuestions {
         Ok(EfivarReader::withholding(variables, withheld))
     }
 
-    /// Refuses set through variables that reach BootServices, as in the UEFI Shell, in a HiiDB
-    /// that declares a PASSWORD question, unless `policy` bypasses: no setup browser runs there,
-    /// so none asks for the password. Set through variables that reach Runtime writes as before.
-    pub(crate) fn check_set(
-        &self,
-        reach: VariableReach,
-        policy: SetupPasswordPolicy,
-    ) -> Result<(), SetupPasswordDeclared> {
-        match (reach, self.declared, policy) {
-            (VariableReach::BootServices, true, SetupPasswordPolicy::Refuse) => {
-                Err(SetupPasswordDeclared)
-            }
-            (VariableReach::BootServices, true, SetupPasswordPolicy::Bypass)
-            | (VariableReach::BootServices, false, _)
-            | (VariableReach::Runtime, _, _) => Ok(()),
+    /// The unsafe operation of set through variables that reach `reach` in this HiiDB, if any:
+    /// UnsafeOperation::SetupPassword through variables that reach BootServices, as in the UEFI
+    /// Shell, where the HiiDB declares a PASSWORD question: no setup browser runs there, so none
+    /// asks for the password. Set through variables that reach Runtime writes as before.
+    pub(crate) fn setup_password_bypass(&self, reach: VariableReach) -> Option<UnsafeOperation> {
+        match (reach, self.declared) {
+            (VariableReach::BootServices, true) => Some(UnsafeOperation::SetupPassword),
+            (VariableReach::BootServices, false) | (VariableReach::Runtime, _) => None,
         }
     }
 }
@@ -1357,26 +1351,6 @@ pub(crate) enum WithholdingRefusal {
     #[error(transparent)]
     AnyVariable(AnyVariablePasswords),
 }
-
-/// What set does in the UEFI Shell in a HiiDB that declares a setup password question, which no
-/// setup browser there asks for.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum SetupPasswordPolicy {
-    /// Write nothing
-    #[default]
-    Refuse,
-    /// Write anyway; the bytes of PASSWORD questions stay unread as values and unwritten
-    Bypass,
-}
-
-/// set's refusal, in the UEFI Shell, of a HiiDB that declares a setup password question.
-#[derive(Debug, Error)]
-#[error(
-    "this HiiDB declares a setup password question; the UEFI Shell runs no setup browser, so no \
-     password is asked or checked; pass --bypass-setup-password to write anyway"
-)]
-pub(crate) struct SetupPasswordDeclared;
 
 #[cfg(test)]
 mod tests {
@@ -2020,49 +1994,28 @@ mod tests {
         }
     }
 
-    /// set through variables that reach BootServices refuses a HiiDB that declares a password
-    /// question unless the caller bypasses; set through variables that reach Runtime, and set in
-    /// a HiiDB without one, write.
+    /// set through variables that reach BootServices bypasses the setup password of a HiiDB that
+    /// declares a password question; set through variables that reach Runtime, and set in a
+    /// HiiDB without one, bypass none.
     #[test]
-    fn boot_services_refuse_set_with_a_declared_password() {
+    fn boot_services_bypass_a_declared_password() {
         let declared = password_questions(&[password_on(2, 3, 0, 0)]);
         let undeclared = password_questions(&[checkbox_on(1, 3, 1)]);
-        let refusal = "this HiiDB declares a setup password question; the UEFI Shell runs no \
-                       setup browser, so no password is asked or checked; pass \
-                       --bypass-setup-password to write anyway";
         let cases = [
             (
                 &declared,
                 VariableReach::BootServices,
-                SetupPasswordPolicy::Refuse,
-                Err(refusal.to_string()),
+                Some(UnsafeOperation::SetupPassword),
             ),
-            (
-                &declared,
-                VariableReach::BootServices,
-                SetupPasswordPolicy::Bypass,
-                Ok(()),
-            ),
-            (
-                &declared,
-                VariableReach::Runtime,
-                SetupPasswordPolicy::Refuse,
-                Ok(()),
-            ),
-            (
-                &undeclared,
-                VariableReach::BootServices,
-                SetupPasswordPolicy::Refuse,
-                Ok(()),
-            ),
+            (&declared, VariableReach::Runtime, None),
+            (&undeclared, VariableReach::BootServices, None),
+            (&undeclared, VariableReach::Runtime, None),
         ];
-        for (passwords, reach, policy, want) in cases {
+        for (passwords, reach, want) in cases {
             assert_eq!(
-                passwords
-                    .check_set(reach, policy)
-                    .map_err(|error| error.to_string()),
+                passwords.setup_password_bypass(reach),
                 want,
-                "{reach:?}, {policy:?}, declared: {}",
+                "{reach:?}, declared: {}",
                 passwords.declared
             );
         }
@@ -2153,8 +2106,8 @@ mod tests {
             );
             assert!(
                 passwords
-                    .check_set(VariableReach::BootServices, SetupPasswordPolicy::Refuse)
-                    .is_err(),
+                    .setup_password_bypass(VariableReach::BootServices)
+                    .is_some(),
                 "{case}: set through BootServices"
             );
         }
@@ -2203,8 +2156,8 @@ mod tests {
         );
         assert!(
             passwords
-                .check_set(VariableReach::BootServices, SetupPasswordPolicy::Refuse)
-                .is_err(),
+                .setup_password_bypass(VariableReach::BootServices)
+                .is_some(),
             "set through BootServices"
         );
     }

@@ -1051,6 +1051,8 @@ mod write_tests {
     use crate::hii::variables::VolatileWrites;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
+    use crate::unsafe_operations::PendingOperations;
+    use crate::unsafe_operations::UnsafeOperations;
 
     /// UINT16 options: Disabled 2, Enabled 1, AllOnes 3.
     fn uint16_options() -> Vec<Vec<u8>> {
@@ -1116,9 +1118,10 @@ mod write_tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(variables, WithheldBytes::default()),
         )
-        .map(|written| {
+        .map(|(written, _)| {
             let [written] = written.as_slice() else {
                 panic!("one question written");
             };

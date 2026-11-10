@@ -12,7 +12,7 @@ uefisettings.efi hii set --json "How old are you? (Step)" 44
 echo uefisettings-shell: step set %lasterror%
 uefisettings.efi set --json "How old are you? (Step)" 44
 echo uefisettings-shell: step top-set %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "How old are you? (Step)" 44
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "How old are you? (Step)" 44
 echo uefisettings-shell: step set-bypass %lasterror%
 dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
 echo uefisettings-shell: step dmpstore-after %lasterror%

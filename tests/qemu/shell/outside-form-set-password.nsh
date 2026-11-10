@@ -20,9 +20,9 @@ dmpstore OutsidePassword -guid 8C78A505-BAA0-4C4A-869F-000000001B01
 echo uefisettings-shell: step dmpstore-before %lasterror%
 uefisettings.efi hii set --json "Setting beside the outside password" 6
 echo uefisettings-shell: step set %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Setting beside the outside password" 6
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Setting beside the outside password" 6
 echo uefisettings-shell: step set-bypassed %lasterror%
-uefisettings.efi set --json --bypass-setup-password "Setting beside the outside password" 6
+uefisettings.efi set --json --i-am-fine-to-brick-this-system "Setting beside the outside password" 6
 echo uefisettings-shell: step top-set-bypassed %lasterror%
 dmpstore OutsidePassword -guid 8C78A505-BAA0-4C4A-869F-000000001B01
 echo uefisettings-shell: step dmpstore-after %lasterror%

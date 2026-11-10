@@ -25,13 +25,13 @@ dmpstore NestedPassword -guid 8C78A505-BAA0-4C4A-869F-000000001C01
 echo uefisettings-shell: step dmpstore-password-before %lasterror%
 dmpstore NestedChoice -guid 8C78A505-BAA0-4C4A-869F-000000001C01
 echo uefisettings-shell: step dmpstore-choice-before %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Nested password prefix as a number" 1
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Nested password prefix as a number" 1
 echo uefisettings-shell: step set-over-password %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Nested password prefix from another form set" 1
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Nested password prefix from another form set" 1
 echo uefisettings-shell: step set-over-password-elsewhere %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Nested setting beside the password" 0
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Nested setting beside the password" 0
 echo uefisettings-shell: step set-beside-password %lasterror%
-uefisettings.efi hii set --json --bypass-setup-password "Nested choice" 1
+uefisettings.efi hii set --json --i-am-fine-to-brick-this-system "Nested choice" 1
 echo uefisettings-shell: step set-choice %lasterror%
 dmpstore NestedPassword -guid 8C78A505-BAA0-4C4A-869F-000000001C01
 echo uefisettings-shell: step dmpstore-password-after %lasterror%

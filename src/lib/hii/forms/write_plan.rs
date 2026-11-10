@@ -480,6 +480,8 @@ mod tests {
     use crate::hii::variables::FirmwareVariables;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
+    use crate::unsafe_operations::PendingOperations;
+    use crate::unsafe_operations::UnsafeOperations;
 
     const AND: u8 = 0x15;
     const SET: u8 = 0x2C;
@@ -828,9 +830,10 @@ mod tests {
             &mut reader,
             None,
             volatile,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(writes, WithheldBytes::default()),
         )
-        .map(|written| written.iter().map(|question| question.volatile).collect())
+        .map(|(written, _)| written.iter().map(|question| question.volatile).collect())
         .map_err(|error| format!("{error:#}"))
     }
 
@@ -1014,6 +1017,7 @@ mod tests {
                 &mut reader,
                 None,
                 VolatileWrites::Refuse,
+                PendingOperations::new(UnsafeOperations::Refuse),
                 &passwords
                     .withholding(&writes)
                     .expect("resolve the VarStore of the PASSWORD question"),
@@ -1131,6 +1135,7 @@ mod tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &passwords
                 .withholding(&writes)
                 .expect("resolve the VarStore of the PASSWORD question"),
@@ -1292,6 +1297,7 @@ mod tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &passwords
                 .withholding(&writes)
                 .expect("resolve the VarStore of the PASSWORD question"),
@@ -1692,6 +1698,7 @@ mod tests {
             &mut reader,
             None,
             VolatileWrites::Refuse,
+            PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&writes, WithheldBytes::default()),
         )
         .expect("set both questions");

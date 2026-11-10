@@ -229,6 +229,7 @@ use crate::secret_file::Secret;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
+use crate::unsafe_operations::PendingOperations;
 
 pub use crate::hii::forms::AccessLevel;
 pub use crate::hii::forms::IgnoredIfr;
@@ -243,8 +244,12 @@ pub use crate::hii::forms::QuestionAddressError;
 pub use crate::hii::forms::QuestionSelector;
 pub use crate::hii::forms::QuestionState;
 pub use crate::hii::forms::SelectionError;
-pub use crate::hii::forms::SetupPasswordPolicy;
 pub use crate::hii::VolatileWrites;
+pub use crate::unsafe_operations::LiftedOperations;
+pub use crate::unsafe_operations::UnsafeOperation;
+pub use crate::unsafe_operations::UnsafeOperationRefused;
+pub use crate::unsafe_operations::UnsafeOperations;
+pub use crate::unsafe_operations::UNSAFE_OPERATIONS_FLAG;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -600,8 +605,9 @@ pub struct SetOptions {
     pub include: IncludedStates,
     /// The AMI Setup access level that conditions read instead of the stored one, if stated
     pub access_level: Option<AccessLevel>,
-    /// In the UEFI Shell, whether set writes in a HiiDB that declares a setup password question
-    pub setup_password: SetupPasswordPolicy,
+    /// Whether set does the unsafe operations that it meets, which it returns: in the UEFI
+    /// Shell, a write in a HiiDB that declares a setup password question
+    pub unsafe_operations: UnsafeOperations,
     /// Whether set writes a volatile variable: only through variables that reach BootServices, as
     /// in the UEFI Shell
     pub volatile: VolatileWrites,
@@ -867,12 +873,14 @@ impl HiiBackend {
 #[cfg(all(system_hiidb, system_variables))]
 impl SettingsBackend for HiiBackend {
     fn set(question: &str, new_value: &str, selector: Option<&str>) -> Result<SetResponseList> {
+        // the default options lift no unsafe operation
         Self::set_using(
             question,
             &SetValue::Text(new_value.to_owned()),
             selector,
             &SetOptions::default(),
         )
+        .map(|(responses, _)| responses)
     }
 
     fn get(question: &str, selector: Option<&str>) -> Result<GetResponseList> {
@@ -886,14 +894,15 @@ impl SettingsBackend for HiiBackend {
 }
 
 impl HiiBackend {
-    /// set with `options`, in this machine's HiiDB and variables, as set_in does.
+    /// set with `options`, in this machine's HiiDB and variables, as set_in does, and the unsafe
+    /// operations that it lifted.
     #[cfg(all(system_hiidb, system_variables))]
     pub fn set_using(
         question: impl Into<QuestionSelector>,
         value: &SetValue,
         selector: Option<&str>,
         options: &SetOptions,
-    ) -> Result<SetResponseList> {
+    ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
         Self::set_in(
             &Self::system_hiidb()?,
             question,
@@ -911,7 +920,9 @@ impl HiiBackend {
     /// through `writes`, neither of them the bytes of password questions
     /// (PasswordQuestions::reader and withholding), on a platform of PlatformLang
     /// `platform_lang`, if any: fails with SelectionError::NotFound when it selects none, and
-    /// unless every selected match is written, also after writing the others.
+    /// unless every selected match is written, also after writing the others. It checks its unsafe
+    /// operations against `options` after every refusal that they cannot lift, right before its
+    /// first write, and returns those that it lifted.
     #[cfg_attr(
         not(system_variables),
         allow(
@@ -933,7 +944,7 @@ impl HiiBackend {
         reads: Box<dyn FirmwareVariables>,
         writes: &dyn FirmwareVariables,
         platform_lang: Option<&str>,
-    ) -> Result<SetResponseList> {
+    ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
         // TODO: use selector to only change values which match question + selector
         let include = options.include;
 
@@ -944,7 +955,10 @@ impl HiiBackend {
         let passwords = PasswordQuestions::of_lists(&parsed_db);
         let mut reader = passwords.reader(reads)?.with_time_services(time_services());
         let writes = passwords.withholding(writes)?;
-        passwords.check_set(writes.reach(), options.setup_password)?;
+        let mut unsafe_operations = PendingOperations::new(options.unsafe_operations);
+        if let Some(bypass) = passwords.setup_password_bypass(writes.reach()) {
+            unsafe_operations.add(bypass);
+        }
 
         let question = question.into();
         let name = question.to_string();
@@ -972,7 +986,7 @@ impl HiiBackend {
             },
             SetValue::Items(items) => forms::NewAnswer::Items(items),
         };
-        let written: Vec<(String, Option<Vec<String>>, bool)> = forms::set_questions(
+        let (written, lifted) = forms::set_questions(
             &name,
             &selected
                 .iter()
@@ -983,17 +997,19 @@ impl HiiBackend {
             &mut reader,
             options.access_level,
             options.volatile,
+            unsafe_operations,
             &writes,
-        )?
-        .iter()
-        .map(|written| {
-            (
-                written.given.answer(new_value),
-                written.given.items(),
-                written.volatile,
-            )
-        })
-        .collect();
+        )?;
+        let written: Vec<(String, Option<Vec<String>>, bool)> = written
+            .iter()
+            .map(|written| {
+                (
+                    written.given.answer(new_value),
+                    written.given.items(),
+                    written.volatile,
+                )
+            })
+            .collect();
 
         for ((guid, question_descriptor, state), (answer, items, volatile)) in
             selected.into_iter().zip(written)
@@ -1019,11 +1035,14 @@ impl HiiBackend {
             resp.push(set_resp);
         }
 
-        Ok(SetResponseList {
-            responses: resp,
-            ignored_ifr,
-            ..Default::default()
-        })
+        Ok((
+            SetResponseList {
+                responses: resp,
+                ignored_ifr,
+                ..Default::default()
+            },
+            lifted,
+        ))
     }
 
     /// get from the HiiDB `db_bytes`, with `options`
@@ -1558,6 +1577,34 @@ mod tests {
 
     use super::*;
 
+    /// HiiBackend::set_in, without the unsafe operations that it lifted.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the arguments of HiiBackend::set_in, which it passes on"
+    )]
+    fn set_responses(
+        db_bytes: &[u8],
+        question: impl Into<QuestionSelector>,
+        new_value: &SetValue,
+        selector: Option<&str>,
+        options: &SetOptions,
+        reads: Box<dyn FirmwareVariables>,
+        writes: &dyn FirmwareVariables,
+        platform_lang: Option<&str>,
+    ) -> Result<SetResponseList> {
+        HiiBackend::set_in(
+            db_bytes,
+            question,
+            new_value,
+            selector,
+            options,
+            reads,
+            writes,
+            platform_lang,
+        )
+        .map(|(responses, _)| responses)
+    }
+
     /// The refusal of enhanced_signers for the Signers of `write`, of `key` and `certificates`.
     #[cfg(variable_data)]
     fn signers_refusal(
@@ -1941,7 +1988,7 @@ mod tests {
             None,
         )
         .expect("get BootEnable");
-        let set = HiiBackend::set_in(
+        let set = set_responses(
             &hiidb,
             "BootEnable",
             &SetValue::Text("1".to_owned()),
@@ -1952,7 +1999,7 @@ mod tests {
             None,
         );
         let keyword_writes = variables.writes_to(&setup());
-        let boot = HiiBackend::set_in(
+        let boot = set_responses(
             &hiidb,
             "Boot",
             &SetValue::Text("1".to_owned()),
@@ -2237,7 +2284,7 @@ mod tests {
             None,
             None,
         );
-        let set = HiiBackend::set_in(
+        let set = set_responses(
             &crossed_prompts_hiidb(),
             "Boot",
             &SetValue::Text("1".to_owned()),
@@ -2307,7 +2354,7 @@ mod tests {
         let variables = Rc::new(MemoryVariables::default());
         variables.insert(setup(), 7, &[0]);
 
-        HiiBackend::set_in(
+        set_responses(
             &hiidb,
             "Mode",
             &SetValue::Text("Enabled".to_owned()),
@@ -2355,7 +2402,7 @@ mod tests {
         let variables = Rc::new(MemoryVariables::default());
         variables.insert(setup(), 7, &[1]);
 
-        let got = HiiBackend::set_in(
+        let got = set_responses(
             &hiidb,
             "Mode",
             &SetValue::Text("Off".to_owned()),
@@ -2449,7 +2496,7 @@ mod tests {
             None,
         )
         .expect("get Keyed");
-        let set = HiiBackend::set_in(
+        let set = set_responses(
             &keyed_hiidb("Keyed"),
             "Keyed",
             &SetValue::Text("1".to_owned()),
@@ -2556,7 +2603,7 @@ mod tests {
             None,
         )
         .unwrap_or_else(|error| panic!("get {question}: {error}"));
-        let set = HiiBackend::set_in(
+        let set = set_responses(
             &keyed_hiidb(""),
             question.clone(),
             &SetValue::Text("1".to_owned()),
@@ -2702,7 +2749,7 @@ mod tests {
             )
             .map(|got| got.responses.len())
             .map_err(|error| format!("{error:#}"));
-            let set = HiiBackend::set_in(
+            let set = set_responses(
                 &hiidb,
                 question.clone(),
                 &SetValue::Text("1".to_owned()),
@@ -2803,7 +2850,7 @@ mod tests {
             )
             .map(|got| got.responses.len())
             .map_err(|error| format!("{error:#}"));
-            let set = HiiBackend::set_in(
+            let set = set_responses(
                 &hiidb,
                 question.clone(),
                 &value,
@@ -3186,7 +3233,7 @@ mod tests {
 
         let variables = Rc::new(MemoryVariables::default());
         variables.insert(setup(), 7, &[1, 2]);
-        let set = HiiBackend::set_in(
+        let set = set_responses(
             &hiidb,
             "Order",
             &SetValue::Items(vec!["Second".to_owned(), "First".to_owned()]),
@@ -3388,7 +3435,7 @@ mod tests {
             None,
             None,
         );
-        let set = HiiBackend::set_in(
+        let set = set_responses(
             hiidb,
             question.clone(),
             value,
@@ -3828,7 +3875,7 @@ mod tests {
             None,
             None,
         );
-        let set = HiiBackend::set_in(
+        let set = set_responses(
             &conditioned_keyed_hiidb(),
             question.clone(),
             &SetValue::Text("1".to_owned()),
@@ -4952,7 +4999,7 @@ mod tests {
                 MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
             variables.insert(setup(), NV_BS_RT, &[0; 6]);
             let variables = Rc::new(variables);
-            let got = HiiBackend::set_in(
+            let got = set_responses(
                 &defaults_hiidb(),
                 name,
                 &SetValue::Text("3".to_owned()),
@@ -5020,7 +5067,7 @@ mod tests {
         let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
         variables.insert(setup(), NV_BS_RT, &[0; 3]);
         let variables = Rc::new(variables);
-        let got = HiiBackend::set_in(
+        let got = set_responses(
             hiidb,
             question,
             &SetValue::Text("9".to_owned()),
@@ -5150,7 +5197,7 @@ mod tests {
                 MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
             variables.insert(setup(), NV_BS_RT, &[0; FLAGGED.len()]);
             let variables = Rc::new(variables);
-            let got = HiiBackend::set_in(
+            let got = set_responses(
                 &flags_hiidb(),
                 prompt,
                 &SetValue::Text("9".to_owned()),
@@ -5232,21 +5279,22 @@ mod tests {
     }
 
     /// set through variables that reach BootServices, in a HiiDB that declares a password
-    /// question, refuses unless the caller bypasses; set through those that reach Runtime writes,
-    /// as before; whatever their interface and whether volatile writes are allowed. Either writes
-    /// P, beside the password.
+    /// question, refuses unless UnsafeOperations allows it, and then returns
+    /// UnsafeOperation::SetupPassword, lifted; set through those that reach Runtime writes, as
+    /// before, and lifts nothing; whatever their interface and whether volatile writes are
+    /// allowed. Either writes P, beside the password.
     #[test]
-    fn set_follows_the_setup_password_policy() {
-        let refusal = "this HiiDB declares a setup password question; the UEFI Shell runs no \
+    fn set_follows_the_unsafe_operations_grant_for_a_setup_password() {
+        let refusal = "this HiiDB declares a setup password question, and the UEFI Shell runs no \
                        setup browser, so no password is asked or checked; pass \
-                       --bypass-setup-password to write anyway";
+                       --i-am-fine-to-brick-this-system to write without it";
         let cases = [
             (
                 VariableReach::Runtime,
                 VariableInterface::Efivarfs,
                 "Q",
-                SetupPasswordPolicy::Refuse,
-                Ok(()),
+                UnsafeOperations::Refuse,
+                Ok(vec![]),
                 vec![(0, vec![1])],
                 vec![],
             ),
@@ -5254,8 +5302,8 @@ mod tests {
                 VariableReach::Runtime,
                 VariableInterface::Efivarfs,
                 "P",
-                SetupPasswordPolicy::Refuse,
-                Ok(()),
+                UnsafeOperations::Refuse,
+                Ok(vec![]),
                 vec![],
                 vec![(80, vec![0])],
             ),
@@ -5263,7 +5311,7 @@ mod tests {
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
                 "Q",
-                SetupPasswordPolicy::Refuse,
+                UnsafeOperations::Refuse,
                 Err(refusal),
                 vec![],
                 vec![],
@@ -5272,8 +5320,8 @@ mod tests {
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
                 "Q",
-                SetupPasswordPolicy::Bypass,
-                Ok(()),
+                UnsafeOperations::Allow,
+                Ok(vec![UnsafeOperation::SetupPassword]),
                 vec![(0, vec![1])],
                 vec![],
             ),
@@ -5281,7 +5329,7 @@ mod tests {
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
                 "P",
-                SetupPasswordPolicy::Refuse,
+                UnsafeOperations::Refuse,
                 Err(refusal),
                 vec![],
                 vec![],
@@ -5290,8 +5338,8 @@ mod tests {
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
                 "P",
-                SetupPasswordPolicy::Bypass,
-                Ok(()),
+                UnsafeOperations::Allow,
+                Ok(vec![UnsafeOperation::SetupPassword]),
                 vec![],
                 vec![(80, vec![0])],
             ),
@@ -5299,7 +5347,7 @@ mod tests {
                 VariableReach::BootServices,
                 VariableInterface::Efivarfs,
                 "Q",
-                SetupPasswordPolicy::Refuse,
+                UnsafeOperations::Refuse,
                 Err(refusal),
                 vec![],
                 vec![],
@@ -5308,8 +5356,8 @@ mod tests {
                 VariableReach::BootServices,
                 VariableInterface::Efivarfs,
                 "P",
-                SetupPasswordPolicy::Bypass,
-                Ok(()),
+                UnsafeOperations::Allow,
+                Ok(vec![UnsafeOperation::SetupPassword]),
                 vec![],
                 vec![(80, vec![0])],
             ),
@@ -5317,8 +5365,8 @@ mod tests {
                 VariableReach::Runtime,
                 VariableInterface::VariableServices,
                 "P",
-                SetupPasswordPolicy::Refuse,
-                Ok(()),
+                UnsafeOperations::Refuse,
+                Ok(vec![]),
                 vec![],
                 vec![(80, vec![0])],
             ),
@@ -5332,7 +5380,7 @@ mod tests {
         {
             let variables = password_variables(reach, interface);
             let options = SetOptions {
-                setup_password: policy,
+                unsafe_operations: policy,
                 volatile,
                 ..SetOptions::default()
             };
@@ -5356,7 +5404,8 @@ mod tests {
                 "{reach:?}, {interface:?}, set {question} {value}, {policy:?}, {volatile:?}"
             );
             assert_eq!(
-                got.map(drop).map_err(|error| error.to_string()),
+                got.map(|(_, lifted)| lifted)
+                    .map_err(|error| error.to_string()),
                 want.map_err(str::to_string),
                 "{case}"
             );
@@ -5365,6 +5414,67 @@ mod tests {
                 variables.writes_to(&amitse_setup()),
                 want_amitse_setup,
                 "{case}: AMITSESetup"
+            );
+        }
+    }
+
+    /// set through variables that reach BootServices, in a HiiDB that declares a password
+    /// question, refuses what UnsafeOperations cannot lift before the setup password, with the
+    /// same refusal with and without Allow, which names no --i-am-fine-to-brick-this-system, and
+    /// writes nothing: a question that no prompt names, a value above the CHECKBOX's maximum, and
+    /// a volatile variable.
+    #[test]
+    fn set_refuses_what_unsafe_operations_cannot_lift_before_the_setup_password() {
+        let cases = [
+            ("R", "1", NV_BS_RT, "no question \"R\" in the HiiDB"),
+            ("Q", "2", NV_BS_RT, "exceeded max possible value"),
+            (
+                "Q",
+                "1",
+                BS_RT,
+                "is volatile (no EFI_VARIABLE_NON_VOLATILE)",
+            ),
+        ];
+        for (question, value, setup_attributes, refusal) in cases {
+            let case = format!("set {question} {value}, Setup of Attributes {setup_attributes:#x}");
+            let got = [UnsafeOperations::Refuse, UnsafeOperations::Allow].map(|grant| {
+                let variables = password_variables(
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                );
+                variables.insert(setup(), setup_attributes, &[0]);
+                let options = SetOptions {
+                    unsafe_operations: grant,
+                    ..SetOptions::default()
+                };
+                let got = set_responses(
+                    &password_hiidb(),
+                    question,
+                    &SetValue::Text(value.to_owned()),
+                    None,
+                    &options,
+                    shared(&variables),
+                    &*variables,
+                    None,
+                )
+                .map(drop)
+                .map_err(|error| format!("{error:#}"));
+                let writes = [setup(), amitse_setup()].map(|key| variables.writes_to(&key));
+                (got, writes)
+            });
+
+            let [(refused, refused_writes), (allowed, allowed_writes)] = got;
+            assert!(
+                refused.as_ref().is_err_and(
+                    |error| error.contains(refusal) && !error.contains(UNSAFE_OPERATIONS_FLAG)
+                ),
+                "{case}, Refuse: {refused:?}"
+            );
+            assert_eq!(allowed, refused, "{case}: Allow as Refuse");
+            assert_eq!(
+                (refused_writes, allowed_writes),
+                ([vec![], vec![]], [vec![], vec![]]),
+                "{case}: writes"
             );
         }
     }
@@ -5411,7 +5521,7 @@ mod tests {
     }
 
     /// set of `question` to `value` in the HiiDB `hiidb` through `variables` with
-    /// --bypass-setup-password, as the CLI prints an error.
+    /// UnsafeOperations::Allow, as the CLI prints an error.
     fn set_bypassing(
         hiidb: &[u8],
         question: &str,
@@ -5419,10 +5529,10 @@ mod tests {
         variables: &Rc<MemoryVariables>,
     ) -> Result<(), String> {
         let options = SetOptions {
-            setup_password: SetupPasswordPolicy::Bypass,
+            unsafe_operations: UnsafeOperations::Allow,
             ..SetOptions::default()
         };
-        HiiBackend::set_in(
+        set_responses(
             hiidb,
             question,
             &SetValue::Text(value.to_owned()),
@@ -5755,7 +5865,7 @@ mod tests {
         let question = by_address("11111111-1111-1111-1111-111111111111:4");
         let stored = [plaintext_password().as_slice(), &[0xAA; 40], &[1]].concat();
         let options = SetOptions {
-            setup_password: SetupPasswordPolicy::Bypass,
+            unsafe_operations: UnsafeOperations::Allow,
             ..SetOptions::default()
         };
         for (reach, interface) in [
@@ -5785,7 +5895,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .map_err(|error| format!("{error:#}"));
-            let set = HiiBackend::set_in(
+            let set = set_responses(
                 &hiidb,
                 question.clone(),
                 &SetValue::Text("1".to_owned()),
@@ -6452,7 +6562,7 @@ mod tests {
                 variables.insert(setup(), attributes, &[0]);
                 let variables = Rc::new(variables);
 
-                let got = HiiBackend::set_in(
+                let got = set_responses(
                     &boot_service_only_hiidb(),
                     "Q",
                     &SetValue::Text("1".to_owned()),
@@ -6500,7 +6610,7 @@ mod tests {
                 ..SetOptions::default()
             };
 
-            let got = HiiBackend::set_in(
+            let got = set_responses(
                 &boot_service_only_hiidb(),
                 "Q",
                 &SetValue::Text("1".to_owned()),
@@ -6570,7 +6680,7 @@ mod tests {
                 ..SetOptions::default()
             };
 
-            let got = HiiBackend::set_in(
+            let got = set_responses(
                 &boot_service_only_hiidb(),
                 "Q",
                 &SetValue::Text("1".to_owned()),
@@ -6628,7 +6738,7 @@ mod tests {
                 ..SetOptions::default()
             };
 
-            let got = HiiBackend::set_in(
+            let got = set_responses(
                 &boot_service_only_hiidb(),
                 "Q",
                 &SetValue::Text("1".to_owned()),
@@ -6703,7 +6813,7 @@ mod tests {
                 ..SetOptions::default()
             };
 
-            let got = HiiBackend::set_in(
+            let got = set_responses(
                 &hiidb,
                 "L",
                 &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
@@ -6766,7 +6876,7 @@ mod tests {
             ..SetOptions::default()
         };
 
-        let got = HiiBackend::set_in(
+        let got = set_responses(
             &hiidb,
             "Q",
             &SetValue::Text("1".to_owned()),
@@ -6792,7 +6902,8 @@ mod tests {
 
     /// Through variables that reach BootServices, a HiiDB with a PASSWORD op whose VarStore is
     /// unknown has get, list-questions, show-ifr and set read and write no variable, even with
-    /// --bypass-setup-password; through those that reach Runtime they work, as before.
+    /// UnsafeOperations::Allow, which lifts no refusal that would disclose a password; through
+    /// those that reach Runtime they work, as before.
     #[test]
     fn unresolved_password_closes_every_variable_to_boot_services() {
         let hiidb = password_hiidb_with(password_on(3, 3, 9, 0));
@@ -6800,12 +6911,12 @@ mod tests {
                       no supported varstore with matching id 0x0009 found; as the variable of \
                       that password is unknown, the UEFI Shell build reads and writes no variable \
                       of this HiiDB";
-        let set = |variables: &Rc<MemoryVariables>, setup_password| {
+        let set = |variables: &Rc<MemoryVariables>, unsafe_operations| {
             let options = SetOptions {
-                setup_password,
+                unsafe_operations,
                 ..SetOptions::default()
             };
-            HiiBackend::set_in(
+            set_responses(
                 &hiidb,
                 "Q",
                 &SetValue::Text("1".to_owned()),
@@ -6862,14 +6973,14 @@ mod tests {
             "BootServices: show-ifr"
         );
         assert_eq!(
-            set(&variables, SetupPasswordPolicy::Refuse),
+            set(&variables, UnsafeOperations::Refuse),
             Err(closed.to_string()),
             "BootServices: set"
         );
         assert_eq!(
-            set(&variables, SetupPasswordPolicy::Bypass),
+            set(&variables, UnsafeOperations::Allow),
             Err(closed.to_string()),
-            "BootServices: set --bypass-setup-password"
+            "BootServices: set with UnsafeOperations::Allow"
         );
         assert_eq!(variables.reads(), [], "BootServices: reads");
         assert_eq!(variables.writes_to(&setup()), [], "BootServices: writes");
@@ -6892,7 +7003,7 @@ mod tests {
             .collect();
         assert_eq!(answers, ["0"], "Runtime: get");
         assert_eq!(
-            set(&variables, SetupPasswordPolicy::Refuse),
+            set(&variables, UnsafeOperations::Refuse),
             Ok(()),
             "Runtime: set"
         );
@@ -7468,7 +7579,7 @@ mod tests {
             })
         };
         let set = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
-            HiiBackend::set_in(
+            set_responses(
                 hiidb,
                 "Q",
                 &SetValue::Text("0".to_owned()),
@@ -7586,14 +7697,14 @@ mod tests {
     fn set_count_of(
         hiidb: &[u8],
         question: &str,
-        policy: SetupPasswordPolicy,
+        policy: UnsafeOperations,
         variables: &Rc<MemoryVariables>,
     ) -> Result<usize, String> {
         let options = SetOptions {
-            setup_password: policy,
+            unsafe_operations: policy,
             ..SetOptions::default()
         };
-        HiiBackend::set_in(
+        set_responses(
             hiidb,
             question,
             &SetValue::Text("0".to_owned()),
@@ -7859,7 +7970,7 @@ mod tests {
             .concat(),
         );
         let options = SetOptions {
-            setup_password: SetupPasswordPolicy::Bypass,
+            unsafe_operations: UnsafeOperations::Allow,
             ..SetOptions::default()
         };
         let cases = [
@@ -7884,7 +7995,7 @@ mod tests {
                     None,
                 )
                 .unwrap_or_else(|error| panic!("{case}: get {question}: {error:#}"));
-                let set = HiiBackend::set_in(
+                let set = set_responses(
                     &hiidb,
                     question.clone(),
                     &SetValue::Text("0".to_owned()),
@@ -8044,14 +8155,14 @@ mod tests {
                         "{name}: BootServices: get {question}"
                     ),
                 }
-                for policy in [SetupPasswordPolicy::Refuse, SetupPasswordPolicy::Bypass] {
+                for policy in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
                     let got = set_count_of(&hiidb, question, policy, &boot_services);
                     match (control, policy) {
                         (false, _) => assert!(
                             got.as_ref().is_err_and(|error| error.starts_with(&refused)),
                             "{name}: BootServices: set {question} {policy:?}: {got:?}"
                         ),
-                        (true, SetupPasswordPolicy::Refuse) => assert!(
+                        (true, UnsafeOperations::Refuse) => assert!(
                             got.as_ref().is_err_and(|error| error
                                 .starts_with("this HiiDB declares a setup password question")),
                             "{name}: BootServices: set {question} {policy:?}: {got:?}"
@@ -8151,7 +8262,7 @@ mod tests {
                 got.as_ref().is_err_and(|error| error.starts_with(&refused)),
                 "{name}: BootServices: get Q3: {got:?}"
             );
-            for policy in [SetupPasswordPolicy::Refuse, SetupPasswordPolicy::Bypass] {
+            for policy in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
                 let got = set_count_of(&hiidb, "Q3", policy, &boot_services);
                 assert!(
                     got.as_ref().is_err_and(|error| error.starts_with(&refused)),
@@ -8230,7 +8341,7 @@ mod tests {
         );
 
         let runtime = variables_of(VariableReach::Runtime, VariableInterface::Efivarfs);
-        let error = set_count_of(&hiidb, "Q2", SetupPasswordPolicy::Refuse, &runtime)
+        let error = set_count_of(&hiidb, "Q2", UnsafeOperations::Refuse, &runtime)
             .expect_err("Runtime: set Q2");
         assert_eq!(offsets_named(&error), want, "Runtime: set Q2: {error}");
         assert!(error.ends_with("; and 1 more"), "Runtime: set Q2: {error}");
@@ -8316,7 +8427,7 @@ mod tests {
         };
         let set = |hiidb: &[u8], question: &str| {
             let variables = variables();
-            HiiBackend::set_in(
+            set_responses(
                 hiidb,
                 question,
                 &SetValue::Text("0".to_owned()),
@@ -9965,7 +10076,7 @@ mod tests {
             answers_with_snapshot(&snapshot_hiidb(), &["N"], &variables, &snapshot_text());
         assert_eq!(got, ["1 <snapshot>"], "get");
 
-        let error = HiiBackend::set_in(
+        let error = set_responses(
             &snapshot_hiidb(),
             "N",
             &SetValue::Text("0".to_owned()),
@@ -10382,7 +10493,7 @@ mod tests {
         value: &str,
         variables: &Rc<MemoryVariables>,
     ) -> Result<(), String> {
-        HiiBackend::set_in(
+        set_responses(
             hiidb,
             question,
             &SetValue::Text(value.to_owned()),
@@ -10554,7 +10665,7 @@ mod tests {
                 None,
             )
             .unwrap_or_else(|error| panic!("get {question}: {error:#}"));
-            let set = HiiBackend::set_in(
+            let set = set_responses(
                 &hiidb,
                 question.clone(),
                 &SetValue::Text(value.to_string()),
@@ -10871,7 +10982,7 @@ mod tests {
                 ..SetOptions::default()
             };
 
-            let got = HiiBackend::set_in(
+            let got = set_responses(
                 &hiidb,
                 "A",
                 &SetValue::Text("9".to_owned()),
@@ -11689,7 +11800,7 @@ mod tests {
             &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
             None,
             &SetOptions {
-                setup_password: SetupPasswordPolicy::Bypass,
+                unsafe_operations: UnsafeOperations::Allow,
                 ..SetOptions::default()
             },
             shared(&variables),
@@ -11746,7 +11857,7 @@ mod tests {
         variables.insert(amitse_setup(), NV_BS_RT, &stored);
         let variables = Rc::new(variables);
         let options = SetOptions {
-            setup_password: SetupPasswordPolicy::Bypass,
+            unsafe_operations: UnsafeOperations::Allow,
             ..SetOptions::default()
         };
 
@@ -11918,7 +12029,7 @@ mod tests {
     /// its VarName, which get and set through variables of either reach withhold: the CHECKBOX B
     /// on that VarName is neither read nor written, the NUMERIC A beside it is, and the variable
     /// keeps the password. Through variables that reach BootServices, set refuses the HiiDB
-    /// without --bypass-setup-password.
+    /// without UnsafeOperations::Allow.
     #[test]
     fn the_variable_of_a_short_var_store_password_is_withheld() {
         // "Password" is string 14 and "ShortVarPw" string 15
@@ -11995,12 +12106,12 @@ mod tests {
         assert_eq!(
             set_of(&hiidb, "A", "9", &variables),
             Err(
-                "this HiiDB declares a setup password question; the UEFI Shell runs no setup \
-                 browser, so no password is asked or checked; pass --bypass-setup-password to \
-                 write anyway"
+                "this HiiDB declares a setup password question, and the UEFI Shell runs no setup \
+                 browser, so no password is asked or checked; pass \
+                 --i-am-fine-to-brick-this-system to write without it"
                     .to_string()
             ),
-            "set A without --bypass-setup-password"
+            "set A without UnsafeOperations::Allow"
         );
     }
 

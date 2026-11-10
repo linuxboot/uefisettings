@@ -40,6 +40,7 @@ use super::QuestionSelector;
 use super::SetOptions;
 use super::SetValue;
 use super::SettingsBackend;
+use super::UnsafeOperation;
 use super::VariableBackend;
 use crate::capsule_loader::CapsuleLoader;
 use crate::efi_variables::CapsuleDelivery;
@@ -187,7 +188,7 @@ impl HiiBackend {
         selector: Option<&str>,
         options: &SetOptions,
         source: &HiiSourceOptions,
-    ) -> Result<SetResponseList> {
+    ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
         Self::set_in(
             &extract::extract_db_from(source)?,
             question,

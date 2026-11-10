@@ -192,6 +192,8 @@ mod tests {
     use crate::hii::variables::VolatileWrites;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
+    use crate::unsafe_operations::PendingOperations;
+    use crate::unsafe_operations::UnsafeOperations;
 
     /// The FormSetGuid of stored_ref.
     const GUID_TEXT: &str = "8C78A505-BAA0-4C4A-869F-000000000502";
@@ -515,6 +517,7 @@ mod tests {
                 &mut reader,
                 None,
                 VolatileWrites::Refuse,
+                PendingOperations::new(UnsafeOperations::Refuse),
                 &WithholdingVariables::new(&variables, WithheldBytes::default()),
             )
             .map(drop)
