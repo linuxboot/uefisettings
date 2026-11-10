@@ -419,6 +419,7 @@ pub(crate) mod tests {
             outside_ifr: Vec::new(),
             malformed_outside_stores: Vec::new(),
             disabled_forms: Vec::new(),
+            first_var_stores: Vec::new(),
         }
     }
 

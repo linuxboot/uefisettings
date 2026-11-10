@@ -1571,6 +1571,7 @@ mod tests {
             outside_ifr: Vec::new(),
             malformed_outside_stores: Vec::new(),
             disabled_forms: Vec::new(),
+            first_var_stores: Vec::new(),
         }
     }
 
@@ -2628,6 +2629,7 @@ mod tests {
             ignored_ifr: read.ignored_ifr,
             outside_ifr: read.outside_ifr,
             malformed_outside_stores: read.malformed_outside_stores,
+            first_var_stores: read.first_var_stores,
             ..list(PATH, &[(NAMESPACE, KEYWORD)], Vec::new())
         }
     }

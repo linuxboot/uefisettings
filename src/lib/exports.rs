@@ -5109,6 +5109,251 @@ mod tests {
         }
     }
 
+    /// The HiiDB of one package list whose form package holds `ifr` and whose strings are those of
+    /// the tests of first declarations: string 4 is N0 and string 5 ShortVarPw.
+    fn first_declarations_hiidb(ifr: &[Vec<u8>]) -> Vec<u8> {
+        let packages = [
+            form_package_of(&ifr.concat()),
+            en_strings_package_of(&["Q", "P", "Password", "N0", "ShortVarPw"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// The FormSet B of the tests of first declarations: its PASSWORD of VarStoreId 2 and
+    /// VarStoreInfo 5 on its AMITSESetup.
+    fn form_set_b() -> Vec<u8> {
+        form_set(&[
+            var_store(2, [0x44; 16], "AMITSESetup", 81),
+            form(1, &[password_on(3, 3, 2, 5)]),
+        ])
+    }
+
+    /// The variable Other of the tests of first declarations.
+    fn other() -> VariableKey {
+        VariableKey {
+            name: "Other".to_string(),
+            guid: Guid::from([0x77; 16]),
+        }
+    }
+
+    /// MemoryVariables of `reach` and `interface` with AMITSESetup and Other, whose bytes 0..5
+    /// hold 1, bytes 5..45 the password plaintext_password, and the rest 0xAA.
+    fn first_declarations_variables(
+        reach: VariableReach,
+        interface: VariableInterface,
+    ) -> Rc<MemoryVariables> {
+        let variables = MemoryVariables::new(reach, interface);
+        variables.insert(amitse_setup(), NV_BS_RT, &[0; 81]);
+        variables.insert(
+            other(),
+            NV_BS_RT,
+            &[&[1; 5][..], &plaintext_password(), &[0xAA; 36]].concat(),
+        );
+        Rc::new(variables)
+    }
+
+    /// The children of the FormSet A of the tests of first declarations: its VarStore Other of
+    /// VarStoreId 2 and a form with the UINT64 NUMERIC N0 over Other's bytes 5..13.
+    fn form_set_a_children() -> [Vec<u8>; 2] {
+        let n0 = operation(
+            NUMERIC,
+            false,
+            &[
+                question_header_with(4, 4, 2, 5, 0x00),
+                vec![0x13], // EFI_IFR_NUMERIC_SIZE_8 | EFI_IFR_DISPLAY_UINT_DEC
+                0u64.to_le_bytes().to_vec(),
+                u64::MAX.to_le_bytes().to_vec(),
+                1u64.to_le_bytes().to_vec(),
+            ]
+            .concat(),
+        );
+        [var_store(2, [0x77; 16], "Other", 81), form(1, &[n0])]
+    }
+
+    /// Asserts that through variables of either reach, N0 of `hiidb` answers that its bytes hold
+    /// a password and set refuses it, with nothing written to Other, in the case `case`.
+    fn assert_n0_withheld(case: &str, hiidb: &[u8]) {
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = first_declarations_variables(reach, interface);
+
+            let got = answers_or_error_of(hiidb, "N0", &variables);
+            let set = set_bypassing(hiidb, "N0", "1", &variables);
+
+            assert!(
+                got.as_ref().is_ok_and(
+                    |answers| answers.len() == 1 && answers[0].starts_with(PASSWORD_BYTES)
+                ),
+                "{case}: {reach:?}: get: {got:?}"
+            );
+            assert!(
+                set.as_ref()
+                    .is_err_and(|error| error.contains("holds a password at bytes 5..45")),
+                "{case}: {reach:?}: set: {set:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&other()),
+                [],
+                "{case}: {reach:?}: writes to Other"
+            );
+        }
+    }
+
+    /// Other, which FormSet A declares for VarStoreId 2 before FormSet B, whose PASSWORD is on id
+    /// 2 at VarOffset 5, is the first VarStore of that id in their form package, where a keyword
+    /// request of that PASSWORD lands (edk2-stable202608 ConfigKeywordHandler.c
+    /// FindStorageFromVarId :1520): the UINT64 NUMERIC N0 of FormSet A over its bytes 5..13, which
+    /// hold that password, answers that they do and set refuses it, through variables of either
+    /// reach, with nothing written. Where FormSet B comes first, its own AMITSESetup is the
+    /// first, and N0 reads Other.
+    #[test]
+    fn the_first_var_store_of_a_password_s_id_in_an_earlier_form_set_is_withheld() {
+        let form_set_a = form_set_with_guid([0x12; 16], &form_set_a_children());
+        // "hunt", the first 4 CHAR16s of the password, as N0 reads them
+        let hunt = "32651569752506472".to_string();
+        for (case, ifr, withheld) in [
+            ("Other first", [form_set_a.clone(), form_set_b()], true),
+            ("AMITSESetup first", [form_set_b(), form_set_a], false),
+        ] {
+            let hiidb = first_declarations_hiidb(&ifr);
+            if withheld {
+                assert_n0_withheld(case, &hiidb);
+                continue;
+            }
+            for (reach, interface) in [
+                (VariableReach::Runtime, VariableInterface::Efivarfs),
+                (
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                ),
+            ] {
+                let variables = first_declarations_variables(reach, interface);
+
+                let got = answers_or_error_of(&hiidb, "N0", &variables);
+
+                assert_eq!(got, Ok(vec![hunt.clone()]), "{case}: {reach:?}: get");
+            }
+        }
+    }
+
+    /// A FormSet nested in another is another FormSet either way round, as FindStorageFromVarId
+    /// walks the form package op by op: where FormSet A declares Other for VarStoreId 2 and then
+    /// nests FormSet B, whose PASSWORD is on id 2 of its own AMITSESetup, and where a FormSet C
+    /// nests A first, with C's PASSWORD on C's AMITSESetup, Other is the first VarStore of id 2
+    /// and keeps the password: N0 of A answers that its bytes hold a password and set refuses it,
+    /// writing nothing, through variables of either reach.
+    #[test]
+    fn the_first_var_store_of_a_nesting_or_nested_form_set_is_withheld() {
+        let b_nested_in_a =
+            form_set_with_guid([0x12; 16], &[form_set_a_children().concat(), form_set_b()]);
+        let a_nested_in_c = form_set_with_guid(
+            [0x13; 16],
+            &[
+                form_set_with_guid([0x12; 16], &form_set_a_children()),
+                var_store(2, [0x44; 16], "AMITSESetup", 81),
+                form(2, &[password_on(3, 3, 2, 5)]),
+            ],
+        );
+        for (case, ifr) in [
+            ("B nested in A after Other", b_nested_in_a),
+            ("A nested first in C, C's PASSWORD", a_nested_in_c),
+        ] {
+            assert_n0_withheld(case, &first_declarations_hiidb(&[ifr]));
+        }
+    }
+
+    /// Where FormSet A declares a VARSTORE_NAME_VALUE or a VARSTORE_EFI before UEFI 2.3.1 for
+    /// VarStoreId 2 before FormSet B, whose PASSWORD is on id 2, the first VarStore of that id in
+    /// their form package names no variable, and no variable is known to hold the password:
+    /// through variables that reach BootServices, get and set of the CHECKBOX N0 of FormSet A
+    /// fail closed, writing nothing. Through those that reach Runtime, N0 on VarStore 5, Other,
+    /// reads; N0 of the VarName that the PASSWORD's VarStoreInfo names on the short VarStore,
+    /// string 5, at byte 0 of ShortVarPw of its Guid, answers that its bytes hold a password and
+    /// set refuses it.
+    #[test]
+    fn a_first_var_store_naming_no_variable_in_an_earlier_form_set_fails_closed() {
+        for (case, store, n0, refusal, runtime_withheld) in [
+            (
+                "VARSTORE_NAME_VALUE",
+                var_store_name_value(2, [0x77; 16]),
+                checkbox_at(4, 4, 5, 0),
+                "is a VARSTORE_NAME_VALUE of FormSet",
+                false,
+            ),
+            (
+                "VARSTORE_EFI before UEFI 2.3.1",
+                short_var_store_efi(2),
+                checkbox_at(4, 4, 2, 5),
+                "is an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1 of FormSet",
+                true,
+            ),
+        ] {
+            let form_set_a = form_set_with_guid(
+                [0x12; 16],
+                &[store, var_store(5, [0x77; 16], "Other", 81), form(1, &[n0])],
+            );
+            let hiidb = first_declarations_hiidb(&[form_set_a, form_set_b()]);
+            for (reach, interface) in [
+                (VariableReach::Runtime, VariableInterface::Efivarfs),
+                (
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                ),
+            ] {
+                let variables = first_declarations_variables(reach, interface);
+                variables.insert(short_key("ShortVarPw"), NV_BS_RT, &plaintext_password());
+
+                let got = answers_or_error_of(&hiidb, "N0", &variables);
+                let set = set_bypassing(&hiidb, "N0", "0", &variables);
+
+                match (reach, runtime_withheld) {
+                    (VariableReach::BootServices, _) => {
+                        for (step, result) in [("get", got.map(drop)), ("set", set)] {
+                            assert!(
+                                result.as_ref().is_err_and(|error| error.contains(refusal)),
+                                "{case}: {reach:?}: {step}: {result:?}"
+                            );
+                        }
+                    }
+                    (VariableReach::Runtime, true) => {
+                        assert!(
+                            got.as_ref().is_ok_and(|answers| answers.len() == 1
+                                && answers[0].starts_with(PASSWORD_BYTES)),
+                            "{case}: {reach:?}: get: {got:?}"
+                        );
+                        assert!(
+                            set.as_ref().is_err_and(
+                                |error| error.contains("holds a password at bytes 0..40")
+                            ),
+                            "{case}: {reach:?}: set: {set:?}"
+                        );
+                    }
+                    (VariableReach::Runtime, false) => {
+                        assert_eq!(got, Ok(vec!["1".to_string()]), "{case}: {reach:?}: get")
+                    }
+                }
+                assert_eq!(
+                    variables.writes_to(&short_key("ShortVarPw")),
+                    [],
+                    "{case}: {reach:?}: writes to ShortVarPw"
+                );
+                if reach == VariableReach::BootServices {
+                    assert_eq!(
+                        variables.writes_to(&other()),
+                        [],
+                        "{case}: {reach:?}: writes to Other"
+                    );
+                }
+            }
+        }
+    }
+
     /// A HiiDB whose AMITSESetup has a PASSWORD at bytes 40..80, the UINT16 NUMERIC S at bytes
     /// 39..41, across its start, and the UINT16 NUMERIC E at bytes 79..81, across its end.
     fn straddling_password_hiidb() -> Vec<u8> {

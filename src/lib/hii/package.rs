@@ -399,6 +399,9 @@ pub struct ParsedPackageList {
     /// The forms that read_db drops from `forms`, whose PASSWORD ops are kept and resolved where
     /// they parse
     pub disabled_forms: Vec<forms::DisabledForm>,
+    /// The FormSets and disabled forms of each of its form packages and the first VarStores that
+    /// those FormSets declare
+    pub(crate) first_var_stores: Vec<forms::FirstVarStores>,
 }
 
 impl ParsedPackageList {
@@ -460,6 +463,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     let mut outside_ifr = Vec::new();
     let mut malformed_outside_stores = Vec::new();
     let mut disabled_forms = Vec::new();
+    let mut first_var_stores = Vec::new();
     let mut device_path = None;
 
     for package in get_packages(package_list)? {
@@ -477,6 +481,12 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                 // We can also continue to ignore the error because we already know the bounds of each package so we can skip to the next one.
                 let form_sets = forms::parse_form_sets(&mut package_cursor, package_list.guid)
                     .context("failed to parse a form package")?;
+                first_var_stores.push(forms::FirstVarStores {
+                    form_sets: roots.len()..roots.len() + form_sets.roots.len(),
+                    disabled_forms: disabled_forms.len()
+                        ..disabled_forms.len() + form_sets.disabled_forms.len(),
+                    declared_by: form_sets.first_var_stores,
+                });
                 roots.extend(form_sets.roots);
                 ignored_ifr.extend(form_sets.ignored);
                 outside_ifr.extend(form_sets.outside);
@@ -514,6 +524,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         outside_ifr,
         malformed_outside_stores,
         disabled_forms,
+        first_var_stores,
     })
 }
 

@@ -1807,6 +1807,8 @@ pub(super) fn parse_form_sets(
     package_list_guid: Guid,
 ) -> Result<FormSets> {
     let mut roots = Vec::new();
+    // the VarStore ops of the roots, disabled forms' among them, with their offsets, in IFR order
+    let mut var_stores = Vec::new();
     let mut ignored = Vec::new();
     let mut disabled_forms = Vec::new();
     // the records of the FormSets that the walk ignores and of those whose FORM_SET ops open no
@@ -1878,6 +1880,7 @@ pub(super) fn parse_form_sets(
                             ignored.push(opens_no_scope(&op, package_list_guid, offset));
                             open_past_end = Some(offset);
                         }
+                        var_stores.extend(parsed.var_stores);
                         roots.push(parsed.root);
                         disabled_forms.extend(parsed.disabled_forms);
                         for store in parsed.unknown_scope_stores {
@@ -1943,13 +1946,53 @@ pub(super) fn parse_form_sets(
             &mut malformed_stores,
         );
     }
+    let first_var_stores = first_var_stores(&var_stores, &outside);
     Ok(FormSets {
         roots,
         ignored,
         disabled_forms,
         outside,
         malformed_stores,
+        first_var_stores,
     })
+}
+
+/// The first VarStore of each VarStoreId of a form package that a FormSet declares, with the
+/// FORM_SET op nearest around it: of `var_stores`, those in the FormSets that parse_form_sets
+/// parses, disabled forms' among them, and `outside`, those outside them or in the scope of an
+/// unknown opcode in them, each in IFR order with its offset. edk2-stable202608
+/// ConfigKeywordHandler.c FindStorageFromVarId takes that VarStore for every question of the id in
+/// the package, as it walks the package op by op (:1520-1567), FORM_SET ops or not, so a FormSet
+/// nested in another is another FormSet, and steps into the scope of an unknown opcode as into any
+/// (:1566). An id whose first VarStore is outside any FormSet or in such a scope is not in it:
+/// PasswordQuestions withholds those as VarStores outside any FormSet.
+fn first_var_stores(
+    var_stores: &[(u64, Rc<RefCell<IFROperation>>)],
+    outside: &[OutsideOp],
+) -> BTreeMap<u16, FirstVarStore> {
+    let mut first = BTreeMap::new();
+    let mut outside = outside.iter().peekable();
+    for (offset, store) in var_stores {
+        while let Some(op) = outside.next_if(|op| op.offset < *offset) {
+            if let Some((var_store_id, _)) = declared_store(&op.op) {
+                first.entry(var_store_id).or_insert(None);
+            }
+        }
+        let op = store.borrow();
+        if let Some((var_store_id, _)) = declared_store(&op) {
+            first.entry(var_store_id).or_insert_with(|| {
+                let form_set = enclosing_form_set(&op)?;
+                Some(FirstVarStore {
+                    form_set,
+                    store: Rc::clone(store),
+                })
+            });
+        }
+    }
+    first
+        .into_iter()
+        .filter_map(|(var_store_id, first)| Some((var_store_id, first?)))
+        .collect()
 }
 
 /// Where an op that parse_form_sets records outside the FormSets that it parses sits.
@@ -2297,15 +2340,37 @@ fn form_set_name(op: &IFROperation) -> String {
 }
 
 /// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
-/// ignores, the forms that it drops from those roots, and the VarStores and statements outside the
+/// ignores, the forms that it drops from those roots, the VarStores and statements outside the
 /// FormSets that it parses, with the VarStores in the scope of an unknown opcode in those,
-/// malformed VarStores apart.
+/// malformed VarStores apart, and the first VarStore of each VarStoreId that a FormSet declares
+/// (first_var_stores).
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
     pub(super) disabled_forms: Vec<DisabledForm>,
     pub(super) outside: Vec<OutsideOp>,
     pub(super) malformed_stores: Vec<IgnoredIfr>,
+    pub(super) first_var_stores: BTreeMap<u16, FirstVarStore>,
+}
+
+/// The FormSets of a form package of a package list, by index in its forms, the forms that read_db
+/// disables in them, by index in its disabled_forms, and the first VarStore of each VarStoreId of
+/// the package where a FormSet declares it, by that id: the VarStore that edk2-stable202608
+/// ConfigKeywordHandler.c FindStorageFromVarId (:1520) takes for every question of the id in the
+/// package (first_var_stores).
+#[derive(Debug, Clone)]
+pub(crate) struct FirstVarStores {
+    pub(crate) form_sets: std::ops::Range<usize>,
+    pub(crate) disabled_forms: std::ops::Range<usize>,
+    pub(crate) declared_by: BTreeMap<u16, FirstVarStore>,
+}
+
+/// The first VarStore op of a VarStoreId of a form package, `store`, and the FORM_SET op nearest
+/// around it, `form_set`, which declares it.
+#[derive(Debug, Clone)]
+pub(crate) struct FirstVarStore {
+    pub(crate) form_set: Rc<RefCell<IFROperation>>,
+    pub(crate) store: Rc<RefCell<IFROperation>>,
 }
 
 /// A VarStore or statement op of a form package outside the FormSets that parse_form_sets
@@ -2437,13 +2502,15 @@ pub(crate) fn handle_form_set(
         .map(|parsed| parsed.root)
 }
 
-/// A FormSet that handle_form_set_within parses: the root of its tree, and the forms that it
-/// drops from it.
+/// A FormSet that handle_form_set_within parses: the root of its tree, the forms that it drops
+/// from it, and the VarStore ops that it puts in the tree, those of the forms that it drops among
+/// them, each with its offset, in IFR order.
 struct ParsedFormSet {
     root: Rc<RefCell<IFROperation>>,
     disabled_forms: Vec<DisabledForm>,
     /// The offsets of the VarStore ops in the scopes of unknown opcodes, which are not decoded
     unknown_scope_stores: Vec<u64>,
+    var_stores: Vec<(u64, Rc<RefCell<IFROperation>>)>,
 }
 
 /// Parses the FormSet at `package_cursor`, failing with ScopesTooDeep at an op that opens more
@@ -2490,6 +2557,7 @@ fn handle_form_set_within(
     let mut disabling: Option<DisabledForm> = None;
     let mut disabled_forms = Vec::new();
     let mut unknown_scope_stores = Vec::new();
+    let mut var_stores = Vec::new();
 
     // this loop will terminate when it sees the IFR:End opcode as a child of FormSet
     // if input data is malformed then it will exit on erroring out cause none of the magic bytes match
@@ -2634,6 +2702,9 @@ fn handle_form_set_within(
             .borrow_mut()
             .children
             .push(Rc::clone(&current_node));
+        if is_var_store {
+            var_stores.push((offset, Rc::clone(&current_node)));
+        }
 
         if open_scope {
             match (
@@ -2652,6 +2723,7 @@ fn handle_form_set_within(
         root,
         disabled_forms,
         unknown_scope_stores,
+        var_stores,
     })
 }
 

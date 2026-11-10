@@ -503,6 +503,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::flagged_option;
     use crate::hii::forms::ifr_fixtures::form_set;
+    use crate::hii::forms::ifr_fixtures::form_set_with_guid;
     use crate::hii::forms::ifr_fixtures::operation;
     use crate::hii::forms::ifr_fixtures::parse_form_set;
     use crate::hii::forms::ifr_fixtures::password_on;
@@ -724,6 +725,7 @@ mod tests {
             outside_ifr: Vec::new(),
             malformed_outside_stores: Vec::new(),
             disabled_forms: Vec::new(),
+            first_var_stores: Vec::new(),
         }
     }
 
@@ -1417,9 +1419,15 @@ mod tests {
             form_set(&[var_store(1, STORE_GUID, "Store", 16), ops.concat()]),
         ]
         .concat();
+        list_of_ifr(path, &ifr)
+    }
+
+    /// The package list of the device path `path` and the strings of list(path, ops), as read_db
+    /// reads it from a form package of the IFR `ifr`.
+    fn list_of_ifr(path: &str, ifr: &[u8]) -> ParsedPackageList {
         let read = read_db(&package_list_with_guid(
             [0x22; 16],
-            &[form_package_of(&ifr), END_PACKAGE.to_vec()].concat(),
+            &[form_package_of(ifr), END_PACKAGE.to_vec()].concat(),
         ))
         .expect("read_db")
         .remove(0);
@@ -1429,6 +1437,101 @@ mod tests {
             device_path: list.device_path,
             strings: list.strings,
             ..read
+        }
+    }
+
+    /// A FormSet nested in another is another FormSet either way round, as edk2-stable202608
+    /// ConfigKeywordHandler.c FindStorageFromVarId walks the form package op by op (:1520-1567):
+    /// where the keyword's FormSet declares Store for VarStoreId 1 and then nests a FormSet whose
+    /// PASSWORD is on id 1 from VarOffset 0, on its own Pw, and where that PASSWORD's FormSet nests
+    /// the keyword's first, Store is the first VarStore of id 1 and keeps the password: get by
+    /// keyword of the ONE_OF over Store's byte 5 fails before any call, through variables of
+    /// either reach, with the reader that get_keyword builds. A nested PASSWORD of another
+    /// VarStoreId keeps none of Store, which the keyword reads.
+    #[test]
+    fn get_withholds_a_password_in_the_first_var_store_of_a_nesting_or_nested_form_set() {
+        let store = var_store(1, STORE_GUID, "Store", 16);
+        let pw = var_store(1, [0x44; 16], "Pw", 16);
+        let password = password_on(9, 9, 1, 0);
+        let password_form_set = |children: &[Vec<u8>]| form_set_with_guid([0x66; 16], children);
+        let password_nested_in_keyword_s = form_set(&[
+            store.clone(),
+            one_of(3, 5, 1),
+            password_form_set(&[pw.clone(), password.clone()]),
+        ]);
+        let keyword_s_nested_in_password_s =
+            password_form_set(&[form_set(&[store.clone(), one_of(3, 5, 1)]), pw, password]);
+        let other_id_nested = form_set(&[
+            store,
+            one_of(3, 5, 1),
+            password_form_set(&[var_store(2, [0x44; 16], "Pw", 16), password_on(9, 9, 2, 0)]),
+        ]);
+        for (reach, interface) in [
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+        ] {
+            let variables = || {
+                let variables = MemoryVariables::new(reach, interface);
+                let key = VariableKey {
+                    name: "Store".to_owned(),
+                    guid: Guid::from(STORE_GUID),
+                };
+                variables.insert(
+                    key,
+                    ATTRIBUTES,
+                    &[0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                );
+                Box::new(variables) as Box<dyn FirmwareVariables>
+            };
+            for (case, ifr, want) in [
+                (
+                    "the PASSWORD's FormSet nested in the keyword's after Store",
+                    password_nested_in_keyword_s.clone(),
+                    Err(
+                        "keyword Keyword: question \"Keyword question\" spans bytes that hold a \
+                         password, which uefisettings neither reads nor writes"
+                            .to_owned(),
+                    ),
+                ),
+                (
+                    "the keyword's FormSet nested first in the PASSWORD's",
+                    keyword_s_nested_in_password_s.clone(),
+                    Err(
+                        "keyword Keyword: question \"Keyword question\" spans bytes that hold a \
+                         password, which uefisettings neither reads nor writes"
+                            .to_owned(),
+                    ),
+                ),
+                (
+                    "a PASSWORD of another VarStoreId nested in the keyword's FormSet",
+                    other_id_nested.clone(),
+                    Ok(resp(PATH, KEYWORD, "01")),
+                ),
+            ] {
+                let lists = [list_of_ifr(PATH, &ifr)];
+                let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+                let got = get_keyword(
+                    &lists,
+                    &format!("KEYWORD={KEYWORD}"),
+                    None,
+                    &[],
+                    KeywordInfoSource::Ifr,
+                    variables(),
+                    &handler,
+                )
+                .map(|values| values.to_string())
+                .map_err(|error| format!("{error:#}"));
+                let calls = match want.is_ok() {
+                    true => vec![get_call(PATH, KEYWORD)],
+                    false => vec![],
+                };
+
+                assert_eq!(got, want, "{case}: {reach:?}");
+                assert_eq!(handler.calls(), calls, "{case}: {reach:?}: calls");
+            }
         }
     }
 
