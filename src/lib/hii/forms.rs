@@ -2112,7 +2112,7 @@ pub(super) fn parse_form_sets(
             &mut malformed_stores,
         );
     }
-    let first_var_stores = first_var_stores(&var_stores, &outside);
+    let (first_var_stores, name_value_first) = first_var_stores(&var_stores, &outside);
     Ok(FormSets {
         roots,
         ignored,
@@ -2120,45 +2120,57 @@ pub(super) fn parse_form_sets(
         outside,
         malformed_stores,
         first_var_stores,
+        name_value_first,
     })
 }
 
-/// The first VarStore of each VarStoreId of a form package that a FormSet declares, with the
-/// FORM_SET op nearest around it: of `var_stores`, those in the FormSets that parse_form_sets
-/// parses, disabled forms' among them, and `outside`, those outside them or in the scope of an
-/// unknown opcode in them, each in IFR order with its offset. edk2-stable202608
+/// The first VarStore of each VarStoreId of a form package where a FormSet declares it, with the
+/// FORM_SET op nearest around it, and the VarStoreIds whose first VarStore is a
+/// VARSTORE_NAME_VALUE, in a FormSet or not: of `var_stores`, those in the FormSets that
+/// parse_form_sets parses, disabled forms' among them, and `outside`, those outside them or in the
+/// scope of an unknown opcode in them, each in IFR order with its offset. edk2-stable202608
 /// ConfigKeywordHandler.c FindStorageFromVarId takes that VarStore for every question of the id in
 /// the package, as it walks the package op by op (:1520-1567), FORM_SET ops or not, so a FormSet
 /// nested in another is another FormSet, and steps into the scope of an unknown opcode as into any
-/// (:1566). An id whose first VarStore is outside any FormSet or in such a scope is not in it:
+/// (:1566). An id whose first VarStore is outside any FormSet or in such a scope has no FormSet's:
 /// PasswordQuestions withholds those as VarStores outside any FormSet.
 fn first_var_stores(
     var_stores: &[(u64, Rc<RefCell<IFROperation>>)],
     outside: &[OutsideOp],
-) -> BTreeMap<u16, FirstVarStore> {
+) -> (BTreeMap<u16, FirstVarStore>, BTreeSet<u16>) {
+    let in_form_sets = var_stores.iter().filter_map(|(offset, store)| {
+        let (var_store_id, declared) = declared_store(&store.borrow().parsed_data)?;
+        Some((*offset, var_store_id, declared, Some(store)))
+    });
+    let outside = outside.iter().filter_map(|op| {
+        let (var_store_id, declared) = declared_store(&op.op.parsed_data)?;
+        Some((op.offset, var_store_id, declared, None))
+    });
+    let mut stores: Vec<_> = in_form_sets.chain(outside).collect();
+    stores.sort_by_key(|&(offset, ..)| offset);
     let mut first = BTreeMap::new();
-    let mut outside = outside.iter().peekable();
-    for (offset, store) in var_stores {
-        while let Some(op) = outside.next_if(|op| op.offset < *offset) {
-            if let Some((var_store_id, _)) = declared_store(&op.op.parsed_data) {
-                first.entry(var_store_id).or_insert(None);
-            }
+    let mut name_value_first = BTreeSet::new();
+    for (_, var_store_id, declared, store) in stores {
+        if first.contains_key(&var_store_id) {
+            continue;
         }
-        let op = store.borrow();
-        if let Some((var_store_id, _)) = declared_store(&op.parsed_data) {
-            first.entry(var_store_id).or_insert_with(|| {
-                let form_set = enclosing_form_set(&op)?;
-                Some(FirstVarStore {
-                    form_set,
-                    store: Rc::clone(store),
-                })
-            });
+        if let DeclaredStore::NameValue(_) = declared {
+            name_value_first.insert(var_store_id);
         }
+        let declared_by = store.and_then(|store| {
+            let form_set = enclosing_form_set(&store.borrow())?;
+            Some(FirstVarStore {
+                form_set,
+                store: Rc::clone(store),
+            })
+        });
+        first.insert(var_store_id, declared_by);
     }
-    first
+    let first = first
         .into_iter()
         .filter_map(|(var_store_id, first)| Some((var_store_id, first?)))
-        .collect()
+        .collect();
+    (first, name_value_first)
 }
 
 /// Where an op that parse_form_sets records outside the FormSets that it parses sits.
@@ -2330,6 +2342,12 @@ pub(crate) struct DeclaredStorage {
     /// The vendor GUIDs of those whose variables' names are unknown, every variable of which
     /// may be theirs
     pub(crate) guids: VariableGuids,
+    /// Whether a VARSTORE_NAME_VALUE op is among the ops, decoded or not: edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c creates its storage whatever its Length (:1885-1895), as
+    /// ConfigKeywordHandler.c FindStorageFromVarId takes it by its VarStoreId (:1547-1550), and
+    /// it is one whose values its driver exposes, as UEFI 2.11 §33.2.5.6 says, through
+    /// EFI_HII_CONFIG_ACCESS_PROTOCOL, in storage of its own choosing
+    pub(crate) name_value: bool,
 }
 
 impl DeclaredStorage {
@@ -2340,7 +2358,7 @@ impl DeclaredStorage {
     /// The GUID is taken for a VARSTORE_EFI of the form before UEFI 2.3.1 too, which names a
     /// variable for each question on it by the string of the question's VarName (CreateQuestion
     /// :156, Setup.c GetToken :1069-1072, GetQuestionValue :1772-1774), any string for a question
-    /// that is not read.
+    /// that is not read. A VARSTORE_NAME_VALUE declares no variable: it sets name_value.
     fn declare(&mut self, op: &IFROperation, package: &[u8], offset: u64) {
         self.declare_with(op, |guid_offset| guid_at(package, offset, guid_offset));
     }
@@ -2382,6 +2400,10 @@ impl DeclaredStorage {
                 VAR_STORE_EFI_GUID_OFFSET,
             ),
             IFROpCode::VarStoreEfi => (None, VAR_STORE_EFI_GUID_OFFSET),
+            IFROpCode::VarStoreNameValue => {
+                self.name_value = true;
+                return;
+            }
             _ => return,
         };
         match variable {
@@ -2396,6 +2418,7 @@ impl DeclaredStorage {
     pub(crate) fn extend(&mut self, other: &Self) {
         self.variables.extend(other.variables.iter().cloned());
         self.guids.extend(&other.guids);
+        self.name_value |= other.name_value;
     }
 }
 
@@ -2533,8 +2556,8 @@ fn form_set_name(op: &IFROperation) -> String {
 /// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
 /// ignores, the forms that it drops from those roots, the VarStores and statements outside the
 /// FormSets that it parses, with the VarStores in the scope of an unknown opcode in those,
-/// malformed VarStores apart, and the first VarStore of each VarStoreId that a FormSet declares
-/// (first_var_stores).
+/// malformed VarStores apart, the first VarStore of each VarStoreId that a FormSet declares, and
+/// the VarStoreIds whose first VarStore is a VARSTORE_NAME_VALUE (first_var_stores).
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
@@ -2542,17 +2565,23 @@ pub(super) struct FormSets {
     pub(super) outside: Vec<OutsideOp>,
     pub(super) malformed_stores: Vec<IgnoredIfr>,
     pub(super) first_var_stores: BTreeMap<u16, FirstVarStore>,
+    pub(super) name_value_first: BTreeSet<u16>,
 }
 
 /// The FormSets of a form package of a package list, by index in its forms, which the forms that
-/// read_db disables in them name too (DisabledForm::root_index), and the first VarStore of each
-/// VarStoreId of the package where a FormSet declares it, by that id: the VarStore that
-/// edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId (:1520) takes for every question
-/// of the id in the package (first_var_stores).
+/// read_db disables in them name too (DisabledForm::root_index), its ops outside them, by index in
+/// the list's outside_ifr, and the first VarStore of each VarStoreId of the package where a
+/// FormSet declares it, by that id: the VarStore that edk2-stable202608 ConfigKeywordHandler.c
+/// FindStorageFromVarId (:1520) takes for every question of the id in the package
+/// (first_var_stores).
 #[derive(Debug, Clone)]
 pub(crate) struct FirstVarStores {
     pub(crate) form_sets: std::ops::Range<usize>,
+    pub(crate) outside: std::ops::Range<usize>,
     pub(crate) declared_by: BTreeMap<u16, FirstVarStore>,
+    /// The VarStoreIds whose first VarStore in the package, in a FormSet or not, is a
+    /// VARSTORE_NAME_VALUE
+    pub(crate) name_value_first: BTreeSet<u16>,
 }
 
 /// The first VarStore op of a VarStoreId of a form package, `store`, and the FORM_SET op nearest

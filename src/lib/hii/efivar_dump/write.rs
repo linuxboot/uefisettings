@@ -84,7 +84,8 @@ pub(crate) fn dump_efivars(
 /// file, found without reading any, which the dump copies; none that a PASSWORD question that
 /// uefisettings finds holds, nor any of a variable that an ignored FormSet declares. One whose
 /// VarStore is unknown withholds no bytes: of_lists warns of each. IFR past an op where the walk
-/// for FormSets ends may keep a password in any variable, so a HiiDB with it fails.
+/// for FormSets ends, or the driver of a VARSTORE_NAME_VALUE that edk2 may route a PASSWORD to,
+/// may keep a password in any variable, so a HiiDB with either fails (check_bounded).
 fn decoded_bytes(
     package_lists: Vec<ParsedPackageList>,
 ) -> Result<BTreeMap<EfivarFileName, Vec<DecodedValue>>> {
@@ -309,6 +310,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::var_store;
     use crate::hii::forms::ifr_fixtures::var_store_efi;
+    use crate::hii::forms::ifr_fixtures::var_store_name_value;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::DEFAULT_STORE;
     use crate::hii::forms::ifr_fixtures::DISABLE_IF;
@@ -471,6 +473,49 @@ mod tests {
                 .as_ref()
                 .is_err_and(|error| error.starts_with(&refusal)),
             "past the walk: {past_the_walk:?}"
+        );
+    }
+
+    /// A PASSWORD on a VARSTORE_NAME_VALUE, whose driver may keep its password in any variable,
+    /// has the dump fail before it copies any; one of VarStoreId 0, which names no VarStore,
+    /// leaves the CHECKBOX B on Backing to copy.
+    #[test]
+    fn dump_refuses_a_hiidb_with_a_password_on_a_name_value_var_store() {
+        let hiidb = |var_store_id| {
+            let packages = [
+                form_package(&[
+                    var_store(1, [0x44; 16], "Backing", 4),
+                    var_store_name_value(3, [0x66; 16]),
+                    form(
+                        1,
+                        &[checkbox_at(1, 1, 1, 0), password_on(3, 3, var_store_id, 4)],
+                    ),
+                ]),
+                en_strings_package_of(&["B", "x", "Password", "Pin"]),
+                END_PACKAGE.to_vec(),
+            ];
+            package_list_with_guid([0x55; 16], &packages.concat())
+        };
+        let decoded = |var_store_id| {
+            decoded_bytes(read_db(&hiidb(var_store_id)).expect("read the HiiDB"))
+                .map(|decoded| decoded.keys().map(ToString::to_string).collect::<Vec<_>>())
+                .map_err(|error| format!("{error:#}"))
+        };
+
+        let refused = decoded(3);
+        assert!(
+            refused.as_ref().is_err_and(|error| error.ends_with(
+                "; as a PASSWORD there may keep its password in any variable, uefisettings \
+                 reads and writes no variable of this HiiDB"
+            )),
+            "VarStoreId 3: {refused:?}"
+        );
+        assert_eq!(
+            decoded(0),
+            Ok(vec![
+                "Backing-44444444-4444-4444-4444-444444444444".to_owned()
+            ]),
+            "VarStoreId 0"
         );
     }
 

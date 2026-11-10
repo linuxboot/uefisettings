@@ -112,7 +112,12 @@ Config Keyword Handler takes, counts as one outside any FormSet, also for the pa
 FormSets of its VarStoreId. IFR after an op that does not fit its form
 package has no op boundary, so they read and write no variable of such a HiiDB, nor do
 `hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question whose VarStore
-uefisettings cannot find withholds no bytes, which they warn of. The UEFI Shell build reads and
+uefisettings cannot find withholds no bytes, which they warn of. A password question that edk2 may
+route to a VARSTORE_NAME_VALUE, whose values its driver exposes, as UEFI 2.11 §33.2.5.6 says,
+through EFI_HII_CONFIG_ACCESS_PROTOCOL, in storage of its own choosing, may keep its password in any
+variable, so they read and write no variable of a HiiDB with one, as for IFR without an op boundary,
+nor do `hii list-questions` and `hii show-ifr` but with `--no-efivars`.
+The UEFI Shell build reads and
 writes no variable of a HiiDB with such a password question or with IFR that it ignores.
 
 `variable`:

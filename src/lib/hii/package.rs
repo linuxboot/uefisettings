@@ -400,7 +400,8 @@ pub struct ParsedPackageList {
     /// they parse
     pub disabled_forms: Vec<forms::DisabledForm>,
     /// The FormSets of each of its form packages, which hold their disabled forms too
-    /// (DisabledForm::root_index), and the first VarStores that those FormSets declare
+    /// (DisabledForm::root_index), its ops in `outside_ifr`, the first VarStores that those
+    /// FormSets declare, and the VarStoreIds whose first VarStore is a VARSTORE_NAME_VALUE
     pub(crate) first_var_stores: Vec<forms::FirstVarStores>,
 }
 
@@ -482,9 +483,12 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                 let form_sets = forms::parse_form_sets(&mut package_cursor, package_list.guid)
                     .context("failed to parse a form package")?;
                 let roots_before = roots.len();
+                let outside_before = outside_ifr.len();
                 first_var_stores.push(forms::FirstVarStores {
                     form_sets: roots_before..roots_before + form_sets.roots.len(),
+                    outside: outside_before..outside_before + form_sets.outside.len(),
                     declared_by: form_sets.first_var_stores,
+                    name_value_first: form_sets.name_value_first,
                 });
                 roots.extend(form_sets.roots);
                 ignored_ifr.extend(form_sets.ignored);

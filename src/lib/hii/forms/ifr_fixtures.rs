@@ -117,7 +117,7 @@ pub(crate) const FORM_MAP: u8 = 0x5D;
 const UNKNOWN: u8 = 0xF0;
 
 pub(crate) const VAR_STORE: u8 = 0x24;
-const VAR_STORE_NAME_VALUE: u8 = 0x25;
+pub(crate) const VAR_STORE_NAME_VALUE: u8 = 0x25;
 pub(crate) const VAR_STORE_EFI: u8 = 0x26;
 pub(crate) const READ: u8 = 0x2D;
 pub(super) const WRITE: u8 = 0x2E;
