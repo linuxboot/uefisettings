@@ -10,8 +10,8 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The ONE_OF, NUMERIC and CHECKBOX questions that get reads and set writes, found by their
-//! prompts, and the text that get shows for their values.
+//! The ONE_OF, NUMERIC, CHECKBOX, DATE and TIME questions that get reads and set writes, found by
+//! their prompts, and the text that get shows for their values.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -31,6 +31,9 @@ use super::conditions::skips_scope;
 use super::conditions::IncludedStates;
 use super::conditions::QuestionValues;
 use super::conditions::StateEvaluation;
+use super::date_time::DateTimeInput;
+use super::date_time::DateTimeQuestion;
+use super::date_time::DateTimeStorage;
 use super::defaults::option_text;
 use super::defaults::option_value;
 use super::defaults::push_default;
@@ -62,6 +65,7 @@ use super::QuestionFlags;
 use super::QuestionHeader;
 use super::Range;
 use super::RangeType;
+use super::TextInput;
 use super::ValueEncoding;
 use super::Walk;
 use crate::hii::config_string;
@@ -76,6 +80,8 @@ pub(super) enum ValueQuestion<'a> {
     OneOf(&'a OneOf),
     Numeric(&'a Numeric),
     CheckBox(&'a CheckBox),
+    /// A DATE or TIME
+    DateTime(&'a DateTimeQuestion),
 }
 
 impl ValueQuestion<'_> {
@@ -84,6 +90,7 @@ impl ValueQuestion<'_> {
             ValueQuestion::OneOf(question) => question.question_header(),
             ValueQuestion::Numeric(question) => question.question_header(),
             ValueQuestion::CheckBox(question) => question.question_header(),
+            ValueQuestion::DateTime(question) => question.question_header(),
         }
     }
 
@@ -92,6 +99,7 @@ impl ValueQuestion<'_> {
             ValueQuestion::OneOf(question) => question.location,
             ValueQuestion::Numeric(question) => question.location,
             ValueQuestion::CheckBox(question) => question.location,
+            ValueQuestion::DateTime(question) => question.location(),
         }
     }
 
@@ -101,6 +109,7 @@ impl ValueQuestion<'_> {
             ValueQuestion::OneOf(question) => question.encoding,
             ValueQuestion::Numeric(question) => question.encoding,
             ValueQuestion::CheckBox(question) => question.encoding,
+            ValueQuestion::DateTime(question) => question.encoding(),
         }
     }
 }
@@ -243,12 +252,21 @@ impl fmt::Display for QuestionKind {
     }
 }
 
-/// Returns `op` as a ONE_OF, NUMERIC or CHECKBOX.
+/// Returns `op` as a ONE_OF, NUMERIC, CHECKBOX, or a DATE or TIME of Normal storage.
 pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
     match &op.parsed_data {
         ParsedOperation::OneOf(question) => Some(ValueQuestion::OneOf(question)),
         ParsedOperation::Numeric(question) => Some(ValueQuestion::Numeric(question)),
         ParsedOperation::CheckBox(question) => Some(ValueQuestion::CheckBox(question)),
+        ParsedOperation::Date(question) | ParsedOperation::Time(question) => {
+            match question.storage() {
+                DateTimeStorage::Normal => Some(ValueQuestion::DateTime(question)),
+                // the system time and wake-up time, which uefisettings does not reach yet
+                DateTimeStorage::SystemTime
+                | DateTimeStorage::WakeupTime
+                | DateTimeStorage::Reserved => None,
+            }
+        }
         ParsedOperation::FormSet(_)
         | ParsedOperation::OneOfOption(_)
         | ParsedOperation::VarStore(_)
@@ -271,16 +289,16 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
     }
 }
 
-/// A ONE_OF, NUMERIC or CHECKBOX whose prompt is one of the phrases of questions_named.
+/// A question that value_question takes whose prompt is one of the phrases of questions_named.
 pub(super) struct NamedQuestion {
     pub(super) node: Rc<RefCell<IFROperation>>,
     /// Which question it is, and the languages whose text of its prompt is a phrase
     pub(super) prompt: PromptMatch,
 }
 
-/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, whose prompt
-/// in a language of `texts` of no configuration language is one of `phrases`, ignoring ASCII
-/// case and surrounding whitespace, with those languages.
+/// Returns the questions that value_question takes under `node`, in IFR order, whose prompt in
+/// a language of `texts` of no configuration language is one of `phrases`, ignoring ASCII case
+/// and surrounding whitespace, with those languages.
 pub(super) fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
@@ -314,8 +332,8 @@ where
     found
 }
 
-/// Calls `visit` with each ONE_OF, NUMERIC and CHECKBOX under `node`, in IFR order, the GUID of
-/// its FormSet and its header.
+/// Calls `visit` with each question that value_question takes under `node`, in IFR order, the
+/// GUID of its FormSet and its header.
 fn visit_value_questions(
     node: &Rc<RefCell<IFROperation>>,
     mut visit: impl FnMut(&Rc<RefCell<IFROperation>>, Option<Guid>, QuestionHeader),
@@ -329,7 +347,7 @@ fn visit_value_questions(
             ParsedOperation::FormSet(parsed) => Some(parsed.guid),
             _ => form_set,
         };
-        // Only Numeric, OneOf and CheckBox are questions.
+        // Only the questions whose values get reads count.
         if let Some(question) = value_question(&op) {
             visit(node, form_set, question.header());
         }
@@ -347,8 +365,8 @@ pub(crate) enum QuestionMatch<'a, T> {
     Keyword(&'a [KeywordStatement<'a>]),
 }
 
-/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, that
-/// `matching` selects, of texts `texts`.
+/// Returns the questions that value_question takes under `node`, in IFR order, that `matching`
+/// selects, of texts `texts`.
 pub(super) fn questions_matching<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
@@ -373,7 +391,7 @@ where
     }
 }
 
-/// Returns the ONE_OF, NUMERIC and CHECKBOX questions under `node`, in IFR order, of the address
+/// Returns the questions that value_question takes under `node`, in IFR order, of the address
 /// `address`: two or more only where QuestionIds repeat in a FormSet.
 pub(super) fn questions_addressed(
     node: &Rc<RefCell<IFROperation>>,
@@ -745,6 +763,9 @@ pub(super) fn describe_question(
         ValueQuestion::CheckBox(parsed) => {
             handle_checkbox(varstore, parsed, prompt, flags, question, walk)
         }
+        ValueQuestion::DateTime(parsed) => {
+            handle_date_time(varstore, parsed, prompt, flags, question, walk)
+        }
     }
 }
 
@@ -815,8 +836,7 @@ pub(super) fn handle_checkbox(
         possible_options: Vec::new(),
         varstore,
         location: parsed.location,
-        max_value: RangeType::NumSize8(1),
-        numeric_range: None,
+        input: TextInput::Maximum(RangeType::NumSize8(1)),
         opcode: current_node.op_code,
         flags,
         defaults,
@@ -917,13 +937,7 @@ pub(super) fn handle_oneof(
         possible_options,
         varstore,
         location: parsed.location,
-        max_value: match &parsed.data {
-            Range::Range8(r) => RangeType::NumSize8(r.max_value),
-            Range::Range16(r) => RangeType::NumSize16(r.max_value),
-            Range::Range32(r) => RangeType::NumSize32(r.max_value),
-            Range::Range64(r) => RangeType::NumSize64(r.max_value),
-        },
-        numeric_range: None,
+        input: TextInput::Maximum(maximum(&parsed.data)),
         opcode: current_node.op_code,
         flags,
         defaults,
@@ -1019,16 +1033,12 @@ pub(super) fn handle_numeric(
         possible_options: Vec::new(),
         varstore,
         location: parsed.location,
-        max_value: match &parsed.data {
-            Range::Range8(r) => RangeType::NumSize8(r.max_value),
-            Range::Range16(r) => RangeType::NumSize16(r.max_value),
-            Range::Range32(r) => RangeType::NumSize32(r.max_value),
-            Range::Range64(r) => RangeType::NumSize64(r.max_value),
-        },
         // set refuses bit fields, whose Flags from_ifr would misread
-        numeric_range: match parsed.location {
-            ValueLocation::Bytes { .. } => Some(NumericRange::from_ifr(&parsed.data, parsed.flags)),
-            ValueLocation::Bits { .. } => None,
+        input: match parsed.location {
+            ValueLocation::Bytes { .. } => {
+                TextInput::Range(NumericRange::from_ifr(&parsed.data, parsed.flags))
+            }
+            ValueLocation::Bits { .. } => TextInput::Maximum(maximum(&parsed.data)),
         },
         opcode: current_node.op_code,
         flags,
@@ -1039,6 +1049,71 @@ pub(super) fn handle_numeric(
         node: Rc::clone(node),
     };
     res
+}
+
+/// The MaxValue of `range`.
+fn maximum(range: &Range) -> RangeType {
+    match range {
+        Range::Range8(r) => RangeType::NumSize8(r.max_value),
+        Range::Range16(r) => RangeType::NumSize16(r.max_value),
+        Range::Range32(r) => RangeType::NumSize32(r.max_value),
+        Range::Range64(r) => RangeType::NumSize64(r.max_value),
+    }
+}
+
+/// The QuestionDescriptor of the DATE or TIME `parsed`: its value as YYYY-MM-DD or HH:MM:SS,
+/// with dashes in its suppressed fields, else why it has none and its default.
+pub(super) fn handle_date_time(
+    varstore: Result<Box<dyn VariableStore>, anyhow::Error>,
+    parsed: &DateTimeQuestion,
+    question: &str,
+    flags: QuestionFlags,
+    node: &Rc<RefCell<IFROperation>>,
+    walk: &mut FormSetWalk<'_, impl QuestionValues>,
+) -> QuestionDescriptor {
+    let current_node = &node.borrow();
+    let format = parsed.format();
+    let mut answer = String::new();
+    let (stored, source) = match retrieve_question_value(node, &varstore, &mut walk.inputs) {
+        Ok(retrieved) => {
+            answer.push_str(&format.text(retrieved.value));
+            (Ok(retrieved.value), retrieved.source)
+        }
+        Err(reason) => {
+            answer.push_str(&reason.to_answer());
+            (Err(reason.to_string()), ValueSource::Current)
+        }
+    };
+    let stores = walk.default_stores.of(current_node, &mut walk.inputs);
+    let defaults = question_defaults(
+        current_node,
+        stores,
+        walk.texts,
+        &mut walk.inputs,
+        |v, _| Ok(format.text(v)),
+    );
+    if stored.is_err() {
+        push_default(&mut answer, &defaults, stores);
+    }
+    QuestionDescriptor {
+        question: question.to_string(),
+        value: answer,
+        help: walk
+            .texts
+            .display(parsed.question_header().help_string_id)
+            .to_string(),
+        possible_options: Vec::new(),
+        varstore,
+        location: parsed.location(),
+        input: TextInput::DateTime(DateTimeInput { format, stored }),
+        opcode: current_node.op_code,
+        flags,
+        defaults,
+        identity: QuestionIdentity::of(current_node, &parsed.question_header(), walk.texts),
+        value_state: StateEvaluation::selectable(),
+        value_source: source,
+        node: Rc::clone(node),
+    }
 }
 
 #[cfg(test)]
@@ -1088,6 +1163,213 @@ mod question_value_tests {
         ];
         for (op_code, want) in cases {
             assert_eq!(QuestionKind::of(op_code), want, "{op_code:?}");
+        }
+    }
+
+    /// A DATE shows its EFI_HII_DATE as YYYY-MM-DD and a TIME its EFI_HII_TIME as HH:MM:SS
+    /// (UEFI 2.11 §33.2.5.4.6, §33.2.5.4.11), from their bytes on the VarStore, without a default.
+    #[test]
+    fn date_and_time_show_their_fields() {
+        let cases = [
+            ("DATE", DATE, &[0xE8, 0x07, 0x02, 0x1D][..], "2024-02-29"),
+            (
+                "DATE of year 1",
+                DATE,
+                &[0x01, 0x00, 0x0C, 0x1F],
+                "0001-12-31",
+            ),
+            (
+                "DATE of year 65535",
+                DATE,
+                &[0xFF, 0xFF, 0x01, 0x01],
+                "65535-01-01",
+            ),
+            ("TIME", TIME, &[0x09, 0x05, 0x07], "09:05:07"),
+        ];
+        for (name, op_code, payload, want) in cases {
+            let children = [typed_default(0x0000, 0x06, &[0xD4, 0x07, 1, 1])];
+            assert_eq!(
+                answer(
+                    &[],
+                    op_code,
+                    &date_time(0, 0x00),
+                    &children,
+                    var_store_of(payload)
+                ),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// The fields that a DATE or TIME suppresses show dashes, as a browser does not display them
+    /// (UEFI 2.11 §33.2.5.4.6, §33.2.5.4.11).
+    #[test]
+    fn suppressed_fields_show_dashes() {
+        let date = [0xE8, 0x07, 0x02, 0x1D];
+        let time = [0x0A, 0x14, 0x1E];
+        let cases = [
+            ("YEAR_SUPPRESS", DATE, 0x01, &date[..], "-----02-29"),
+            ("MONTH_SUPPRESS", DATE, 0x02, &date, "2024----29"),
+            ("DAY_SUPPRESS", DATE, 0x04, &date, "2024-02---"),
+            ("every DATE field", DATE, 0x07, &date, "----------"),
+            ("SECOND_SUPPRESS", TIME, 0x04, &time, "10:20:--"),
+            ("HOUR_SUPPRESS", TIME, 0x01, &time, "--:20:30"),
+        ];
+        for (name, op_code, flags, payload, want) in cases {
+            assert_eq!(
+                answer(
+                    &[],
+                    op_code,
+                    &date_time(0, flags),
+                    &[],
+                    var_store_of(payload)
+                ),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// A DATE or TIME without a value shows its EFI_IFR_DEFAULT of Type DATE or TIME, with
+    /// dashes in its suppressed fields.
+    #[test]
+    fn date_and_time_defaults_show_without_a_value() {
+        let cases = [
+            (
+                "DATE",
+                DATE,
+                0x00,
+                typed_default(0x0000, 0x06, &[0xD4, 0x07, 1, 1]),
+                "2004-01-01",
+            ),
+            (
+                "TIME with SECOND_SUPPRESS",
+                TIME,
+                0x04,
+                typed_default(0x0000, 0x05, &[15, 33, 33]),
+                "15:33:--",
+            ),
+        ];
+        for (name, op_code, flags, default, want) in cases {
+            assert_eq!(
+                answer(
+                    &[],
+                    op_code,
+                    &date_time(0, flags),
+                    &[default],
+                    unavailable()
+                ),
+                format!("{UNAVAILABLE} <IFR default: {want}>"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A DATE or TIME whose UEFI Storage is the system time or wake-up time is left out, as
+    /// before uefisettings decoded DATE and TIME; one of Normal storage is listed.
+    #[test]
+    fn only_date_and_time_of_normal_storage_are_listed() {
+        let efivars = Efivars::new();
+        efivars.write(
+            &efi_variable("Setup", 8),
+            &[0xE8, 0x07, 0x02, 0x1D, 0, 0, 0, 0],
+        );
+        let cases = [
+            ("DATE of Normal storage", DATE, 0x00, 1),
+            ("TIME of Normal storage", TIME, 0x00, 1),
+            ("DATE of system time", DATE, 0x10, 0),
+            ("DATE of wake-up time", DATE, 0x20, 0),
+            ("TIME of system time", TIME, 0x10, 0),
+            ("TIME of wake-up time", TIME, 0x20, 0),
+            ("DATE of reserved storage", DATE, 0x30, 0),
+        ];
+        for (name, op_code, flags, listed) in cases {
+            let root = parse_form_set(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 8),
+                operation(op_code, false, &date_time(0, flags)),
+            ]);
+            let questions = super::super::list_questions(
+                root,
+                &ListTexts::new(&strings(), &[]),
+                IncludedStates::all(),
+                None,
+                &mut efivars.reader(),
+            );
+            assert_eq!(questions.len(), listed, "{name}");
+        }
+    }
+
+    /// show-ifr shows a DATE or TIME with its Flags and its value as get shows it.
+    #[test]
+    fn show_ifr_shows_date_and_time_as_get_does() {
+        let cases = [
+            (
+                DATE,
+                0x00,
+                [0xE8, 0x07, 0x02, 0x1D],
+                [
+                    "OpCode: Date - Q: Prompt - Help: ",
+                    "-Flags: 0x00",
+                    "-Answer: 2024-02-29",
+                ],
+            ),
+            (
+                TIME,
+                0x04,
+                [0x0A, 0x14, 0x1E, 0x00],
+                [
+                    "OpCode: Time - Q: Prompt - Help: ",
+                    "-Flags: 0x04",
+                    "-Answer: 10:20:--",
+                ],
+            ),
+        ];
+        for (op_code, flags, payload, want) in cases {
+            let efivars = Efivars::new();
+            efivars.write(&efi_variable("Setup", 4), &payload);
+            let root = parse_form_set(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 4),
+                operation(op_code, false, &date_time(0, flags)),
+            ]);
+            let shown = super::super::display(
+                root,
+                0,
+                &ListTexts::new(&strings(), &[]),
+                &mut efivars.reader(),
+            )
+            .expect("display");
+            let lines: Vec<&str> = shown.lines().map(str::trim_start).collect();
+            let at = lines
+                .iter()
+                .position(|line| *line == want[0])
+                .unwrap_or_else(|| panic!("{op_code:#04x}: no line {:?}: {shown}", want[0]));
+            assert_eq!(
+                lines.get(at..at + 3),
+                Some(&want[..]),
+                "{op_code:#04x}: {shown}"
+            );
+        }
+    }
+
+    /// A DATE or TIME too short for its Flags is malformed (UEFI 2.11 §33.2.5.10.1) and disables
+    /// its form alone: get still lists the questions of the FormSet's other forms.
+    #[test]
+    fn short_date_and_time_disable_their_form() {
+        for op_code in [DATE, TIME] {
+            let (root, disabled) = parse_form_set_dropping(&[
+                form(1, &[operation(op_code, false, &question_header(0))]),
+                form(2, &[operation(CHECKBOX, false, &checkbox(0, 0x00))]),
+            ]);
+            assert_eq!(disabled.len(), 1, "{op_code:#04x}: its form, disabled");
+            let questions = super::super::list_questions(
+                root,
+                &ListTexts::new(&strings(), &[]),
+                IncludedStates::all(),
+                None,
+                &mut disabled_reader(),
+            );
+            assert_eq!(questions.len(), 1, "{op_code:#04x}: the CHECKBOX");
         }
     }
 

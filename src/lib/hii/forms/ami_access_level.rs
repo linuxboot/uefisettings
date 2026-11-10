@@ -110,6 +110,8 @@ fn declares_ami_access_level(op: &IFROperation) -> bool {
         | ParsedOperation::Get(_)
         | ParsedOperation::Set(_)
         | ParsedOperation::FormMap(_)
+        | ParsedOperation::Date(_)
+        | ParsedOperation::Time(_)
         | ParsedOperation::Placeholder => false,
     }
 }

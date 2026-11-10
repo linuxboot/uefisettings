@@ -43,7 +43,7 @@ pub(crate) struct StoragelessQuestion {
 }
 
 impl StoragelessQuestion {
-    /// Classifies `question`; None unless it is a ONE_OF, NUMERIC or CHECKBOX without a VarStore.
+    /// Classifies `question`; None unless value_question takes it and it has no VarStore.
     pub(crate) fn of(question: &Rc<RefCell<IFROperation>>) -> Option<Self> {
         let header = value_question(&question.borrow())?.header();
         (header.var_store_id == 0).then(|| Self {

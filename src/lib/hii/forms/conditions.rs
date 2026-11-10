@@ -27,6 +27,9 @@ use log::warn;
 use thiserror::Error;
 
 use super::ami_access_level::AMI_ACCESS_LEVEL;
+use super::date_time::widened_date;
+use super::date_time::widened_time;
+use super::date_time::DateTimeKind;
 use super::declared_var_store;
 use super::defaults::is_parent_statement;
 use super::defaults::question_scope;
@@ -1116,6 +1119,10 @@ fn value_kind(value_question: ValueQuestion) -> ValueKind {
     match value_question {
         ValueQuestion::CheckBox(_) => ValueKind::Boolean,
         ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => ValueKind::Uint,
+        ValueQuestion::DateTime(question) => match question.kind {
+            DateTimeKind::Date => ValueKind::Date,
+            DateTimeKind::Time => ValueKind::Time,
+        },
     }
 }
 
@@ -1238,6 +1245,15 @@ fn typed_value(
             .map(QuestionValue::Boolean)
             .map_err(|_| ValueUnavailable::CheckboxOverByte(value)),
         ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) => Ok(QuestionValue::Uint(value)),
+        // the bytes of an EFI_HII_DATE or EFI_HII_TIME, which read_question_value reads
+        // little-endian
+        ValueQuestion::DateTime(question) => {
+            let [first, second, third, fourth, ..] = value.to_le_bytes();
+            Ok(match question.kind {
+                DateTimeKind::Date => QuestionValue::Date([first, second, third, fourth]),
+                DateTimeKind::Time => QuestionValue::Time([first, second, third]),
+            })
+        }
     }
 }
 
@@ -1258,6 +1274,10 @@ pub(crate) enum ValueKind {
     Boolean,
     /// EFI_IFR_TYPE_NUM_SIZE_8 to _64 of a ONE_OF or NUMERIC
     Uint,
+    /// EFI_IFR_TYPE_DATE of a DATE
+    Date,
+    /// EFI_IFR_TYPE_TIME of a TIME
+    Time,
     /// Any other type, which nothing here decodes
     Other,
 }
@@ -1268,6 +1288,10 @@ pub(crate) enum QuestionValue {
     /// The stored byte as is
     Boolean(u8),
     Uint(u64),
+    /// An EFI_HII_DATE, as stored
+    Date([u8; 4]),
+    /// An EFI_HII_TIME, as stored
+    Time([u8; 3]),
     Unreadable {
         kind: ValueKind,
         reason: String,
@@ -1305,6 +1329,8 @@ pub(crate) fn evaluate_condition(
         Ok(Operand::Boolean(None) | Operand::Uint(None)) => {
             Truth::Unknown(evaluation.into_unknown())
         }
+        // edk2-stable202608 SetupBrowserDxe/Expression.c IsTrue takes a DATE or TIME as FALSE
+        Ok(Operand::Date(_) | Operand::Time(_)) => Truth::Known(false),
         // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends at an
         // UNDEFINED, keeping it as the result, which IsTrue takes as FALSE
         Err(Abort::Undefined) => Truth::Known(false),
@@ -1504,23 +1530,74 @@ enum Operand {
     /// EFI_IFR_TYPE_NUM_SIZE_8 to _64, which edk2-stable202608 SetupBrowserDxe/Expression.c
     /// HiiValueToUINT64 widens
     Uint(Option<u64>),
+    /// EFI_IFR_TYPE_DATE, an EFI_HII_DATE as stored
+    Date(Option<[u8; 4]>),
+    /// EFI_IFR_TYPE_TIME, an EFI_HII_TIME as stored
+    Time(Option<[u8; 3]>),
 }
 
 impl Operand {
     /// Returns the value as edk2-stable202608 SetupBrowserDxe/Expression.c HiiValueToUINT64
-    /// does.
+    /// does, which the arithmetic and bitwise ops take: a DATE as its EFI_HII_DATE, a TIME as its
+    /// EFI_HII_TIME, little-endian.
     fn as_u64(self) -> Option<u64> {
         match self {
             Operand::Boolean(value) => value.map(u64::from),
             Operand::Uint(value) => value,
+            Operand::Date(value) => value.map(widened_date),
+            Operand::Time(value) => value.map(widened_time),
         }
     }
 
-    /// Returns the BOOLEAN value as a C condition takes it, or Undefined for an integer.
+    /// Returns the BOOLEAN value as a C condition takes it, or Undefined for another type.
     fn as_bool(self) -> Result<Option<bool>, Abort> {
         match self {
             Operand::Boolean(value) => Ok(value.map(|value| value != 0)),
-            Operand::Uint(_) => Err(Abort::Undefined),
+            Operand::Uint(_) | Operand::Date(_) | Operand::Time(_) => Err(Abort::Undefined),
+        }
+    }
+
+    /// What edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue compares of it: an
+    /// integer or BOOLEAN as its value, a DATE or TIME as its bytes.
+    fn compared(&self) -> Compared<'_> {
+        match self {
+            Operand::Boolean(_) | Operand::Uint(_) => Compared::Integer(self.as_u64()),
+            Operand::Date(value) => Compared::Bytes(value.as_ref().map(<[u8; 4]>::as_slice)),
+            Operand::Time(value) => Compared::Bytes(value.as_ref().map(<[u8; 3]>::as_slice)),
+        }
+    }
+}
+
+/// What CompareHiiValue compares of an operand; None for a value that cannot be read.
+enum Compared<'a> {
+    Integer(Option<u64>),
+    Bytes(Option<&'a [u8]>),
+}
+
+/// How CompareHiiValue orders two operands.
+enum Order {
+    Known(std::cmp::Ordering),
+    /// One of them cannot be read
+    Unknown,
+    /// An integer or BOOLEAN and a DATE or TIME, which it does not compare (EFI_UNSUPPORTED)
+    Unsupported,
+}
+
+/// Orders `left` and `right` as CompareHiiValue does: integers and BOOLEANs by the sign of their
+/// difference as an INT64, DATEs and TIMEs by their bytes, then the longer greater.
+fn order(left: Operand, right: Operand) -> Order {
+    match (left.compared(), right.compared()) {
+        (Compared::Integer(Some(left)), Compared::Integer(Some(right))) => {
+            Order::Known(left.wrapping_sub(right).cast_signed().cmp(&0))
+        }
+        (Compared::Bytes(Some(left)), Compared::Bytes(Some(right))) => {
+            Order::Known(left.cmp(right))
+        }
+        (Compared::Integer(_), Compared::Integer(_)) | (Compared::Bytes(_), Compared::Bytes(_)) => {
+            Order::Unknown
+        }
+        (Compared::Integer(_), Compared::Bytes(_)) | (Compared::Bytes(_), Compared::Integer(_)) => {
+            Order::Unsupported
         }
     }
 }
@@ -1541,6 +1618,10 @@ pub(crate) enum ExpressionValue {
     Boolean(u8),
     /// EFI_IFR_TYPE_NUM_SIZE_8 to _64
     Uint(u64),
+    /// EFI_IFR_TYPE_DATE, an EFI_HII_DATE as stored
+    Date([u8; 4]),
+    /// EFI_IFR_TYPE_TIME, an EFI_HII_TIME as stored
+    Time([u8; 3]),
 }
 
 impl ExpressionValue {
@@ -1549,15 +1630,19 @@ impl ExpressionValue {
         match operand {
             Operand::Boolean(value) => value.map(Self::Boolean),
             Operand::Uint(value) => value.map(Self::Uint),
+            Operand::Date(value) => value.map(Self::Date),
+            Operand::Time(value) => value.map(Self::Time),
         }
     }
 
     /// Returns the value as edk2-stable202608 SetupBrowserDxe/Expression.c HiiValueToUINT64
-    /// does.
+    /// does: of a DATE or TIME, the bytes that a question of its type stores, little-endian.
     fn as_u64(self) -> u64 {
         match self {
             Self::Boolean(value) => u64::from(value),
             Self::Uint(value) => value,
+            Self::Date(bytes) => widened_date(bytes),
+            Self::Time(bytes) => widened_time(bytes),
         }
     }
 }
@@ -1695,6 +1780,10 @@ enum OperandKind {
     Boolean,
     /// An integer of this many bytes
     Uint(u8),
+    /// EFI_IFR_TYPE_DATE, an EFI_HII_DATE
+    Date,
+    /// EFI_IFR_TYPE_TIME, an EFI_HII_TIME
+    Time,
 }
 
 impl OperandKind {
@@ -1702,6 +1791,8 @@ impl OperandKind {
         match self {
             Self::Boolean => 1,
             Self::Uint(width) => width,
+            Self::Date => 4,
+            Self::Time => 3,
         }
     }
 
@@ -1710,6 +1801,8 @@ impl OperandKind {
         match self {
             Self::Boolean => Operand::Boolean(bytes.first().copied()),
             Self::Uint(_) => Operand::Uint(Some(stored_value(bytes))),
+            Self::Date => Operand::Date(bytes.try_into().ok()),
+            Self::Time => Operand::Time(bytes.try_into().ok()),
         }
     }
 
@@ -1718,7 +1811,20 @@ impl OperandKind {
         match self {
             Self::Boolean => Operand::Boolean(None),
             Self::Uint(_) => Operand::Uint(None),
+            Self::Date => Operand::Date(None),
+            Self::Time => Operand::Time(None),
         }
+    }
+}
+
+impl fmt::Display for OperandKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Boolean => "BOOLEAN",
+            Self::Uint(_) => "integer",
+            Self::Date => "DATE",
+            Self::Time => "TIME",
+        })
     }
 }
 
@@ -2149,9 +2255,8 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// the value that the MAP compares, starts the pair's return expression, else the next pair.
     fn matched(&mut self, progress: MapProgress, pending: &mut Vec<Pending>) -> Result<(), Abort> {
         let candidate = self.sole_value()?;
-        match compare(Comparison::Equal, progress.checked, candidate) {
-            Operand::Boolean(Some(0)) => self.next_pair(progress.next(), pending),
-            Operand::Boolean(Some(_)) => {
+        match order(progress.checked, candidate) {
+            Order::Known(order) if order.is_eq() => {
                 let returned = progress.return_expression()?;
                 pending.push(Pending::Return {
                     outer: progress.outer,
@@ -2159,7 +2264,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 pending.push(Pending::Op(returned));
                 Ok(())
             }
-            Operand::Boolean(None) | Operand::Uint(_) => Err(Abort::NotEvaluated(format!(
+            // edk2-stable202608 SetupBrowserDxe/Expression.c matches a pair only where
+            // CompareHiiValue succeeds
+            Order::Known(_) | Order::Unsupported => self.next_pair(progress.next(), pending),
+            Order::Unknown => Err(Abort::NotEvaluated(format!(
                 "{} on a value that cannot be read",
                 progress.map.borrow().op_code.spec_name()
             ))),
@@ -2258,11 +2366,11 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 else {
                     return Err(Abort::Undefined);
                 };
-                Ok(compare(
+                compare(
                     Comparison::Equal,
                     question,
                     Operand::Uint(Some(parsed.value.into())),
-                ))
+                )
             }
             ExpressionOp::EqIdId => {
                 let ParsedOperation::EqIdId(parsed) = &op.parsed_data else {
@@ -2272,7 +2380,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 let second = self.question(op, parsed.question_id_2)?;
                 match (first, second) {
                     (QuestionOperand::Value(first), QuestionOperand::Value(second)) => {
-                        Ok(compare(Comparison::Equal, first, second))
+                        compare(Comparison::Equal, first, second)
                     }
                     // edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue gives
                     // EFI_UNSUPPORTED for an integer and a type that is no integer, which
@@ -2368,7 +2476,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             ExpressionOp::Compare(comparison) => {
                 let right = self.pop(op)?;
                 let left = self.pop(op)?;
-                Ok(compare(comparison, left, right))
+                compare(comparison, left, right)
             }
             ExpressionOp::Arithmetic(arithmetic) => {
                 let right = self.pop(op)?.as_u64();
@@ -2425,6 +2533,12 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             QuestionValue::Uint(value) => {
                 return QuestionOperand::Value(Operand::Uint(Some(value)))
             }
+            QuestionValue::Date(value) => {
+                return QuestionOperand::Value(Operand::Date(Some(value)))
+            }
+            QuestionValue::Time(value) => {
+                return QuestionOperand::Value(Operand::Time(Some(value)))
+            }
             QuestionValue::Unreadable { kind, reason } => {
                 (kind, format!("{}: {reason}", subject()))
             }
@@ -2437,6 +2551,14 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             ValueKind::Uint => {
                 self.unknown.get_or_insert(reason);
                 QuestionOperand::Value(Operand::Uint(None))
+            }
+            ValueKind::Date => {
+                self.unknown.get_or_insert(reason);
+                QuestionOperand::Value(Operand::Date(None))
+            }
+            ValueKind::Time => {
+                self.unknown.get_or_insert(reason);
+                QuestionOperand::Value(Operand::Time(None))
             }
             ValueKind::Other => QuestionOperand::Undecoded(reason),
         }
@@ -2470,6 +2592,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
+        self.check_not_system_time(op, operand, kind)?;
         let store = match variable_store(operand_store(op, operand)?, operand, kind) {
             Ok(store) => store,
             Err((store, reach)) => {
@@ -2532,6 +2655,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         let kind = self.operand_kind(op, operand)?;
         let id = operand.var_store_id;
+        self.check_not_system_time(op, operand, kind)?;
         let store = match variable_store(operand_store(op, operand)?, operand, kind) {
             Ok(store) => store,
             Err((store, reach)) => {
@@ -2615,8 +2739,8 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             EFI_IFR_TYPE_NUM_SIZE_16 => return Ok(OperandKind::Uint(2)),
             EFI_IFR_TYPE_NUM_SIZE_32 => return Ok(OperandKind::Uint(4)),
             EFI_IFR_TYPE_NUM_SIZE_64 => return Ok(OperandKind::Uint(8)),
-            EFI_IFR_TYPE_TIME => "TIME",
-            EFI_IFR_TYPE_DATE => "DATE",
+            EFI_IFR_TYPE_TIME => return Ok(OperandKind::Time),
+            EFI_IFR_TYPE_DATE => return Ok(OperandKind::Date),
             EFI_IFR_TYPE_STRING => "STRING",
             EFI_IFR_TYPE_REF => "REF",
             other => {
@@ -2630,6 +2754,27 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             "{} of a {not_evaluated} value",
             op.op_code.spec_name()
         )))
+    }
+
+    /// Refuses the GET or SET `op` of a DATE or TIME without a VarStore, a field of the system
+    /// time, which edk2-stable202608 SetupBrowserDxe/Expression.c reaches through GetTime() and
+    /// SetTime() and uefisettings does not reach yet.
+    fn check_not_system_time(
+        &mut self,
+        op: &IFROperation,
+        operand: &VarStoreOperand,
+        kind: OperandKind,
+    ) -> Result<(), Abort> {
+        match (operand.var_store_id, kind) {
+            (0, OperandKind::Date | OperandKind::Time) => Err(self.not_evaluated(format!(
+                "{} of a {kind} field of the system time",
+                op.op_code.spec_name()
+            ))),
+            (
+                _,
+                OperandKind::Boolean | OperandKind::Uint(_) | OperandKind::Date | OperandKind::Time,
+            ) => Ok(()),
+        }
     }
 }
 
@@ -2750,21 +2895,22 @@ impl QuestionOperand {
     }
 }
 
-/// Compares integers and BOOLEANs by the sign of their difference as an INT64, as
-/// edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue does.
-fn compare(comparison: Comparison, left: Operand, right: Operand) -> Operand {
-    let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) else {
-        return Operand::Boolean(None);
+/// Compares two values as order does, as edk2-stable202608 SetupBrowserDxe/Expression.c
+/// CompareHiiValue does, whose EFI_UNSUPPORTED the comparison ops turn into UNDEFINED.
+fn compare(comparison: Comparison, left: Operand, right: Operand) -> Result<Operand, Abort> {
+    let order = match order(left, right) {
+        Order::Known(order) => order,
+        Order::Unknown => return Ok(Operand::Boolean(None)),
+        Order::Unsupported => return Err(Abort::Undefined),
     };
-    let order = left.wrapping_sub(right).cast_signed().cmp(&0);
-    boolean(Some(match comparison {
+    Ok(boolean(Some(match comparison {
         Comparison::Equal => order.is_eq(),
         Comparison::NotEqual => order.is_ne(),
         Comparison::GreaterThan => order.is_gt(),
         Comparison::GreaterEqual => order.is_ge(),
         Comparison::LessThan => order.is_lt(),
         Comparison::LessEqual => order.is_le(),
-    }))
+    })))
 }
 
 impl Arithmetic {
@@ -3208,6 +3354,78 @@ mod tests {
         ];
         for (name, op, want) in cases {
             assert_eq!(truth(&[op]), want, "{name}");
+        }
+    }
+
+    /// Questions 1 and 2 are DATEs that compare as bytes the other way round from UINT32s, 3 a
+    /// TIME of the first 3 bytes of 1, 4 the UINT 1, 5 an unreadable DATE.
+    fn date_values() -> MapValues {
+        MapValues(BTreeMap::from([
+            (1, QuestionValue::Date([0x10, 0x20, 0x30, 0x40])),
+            (2, QuestionValue::Date([0x20, 0x30, 0x40, 0x05])),
+            (3, QuestionValue::Time([0x10, 0x20, 0x30])),
+            (4, QuestionValue::Uint(1)),
+            (5, unreadable(ValueKind::Date)),
+        ]))
+    }
+
+    /// The questions that a condition refers to compare as their values do in edk2-stable202608
+    /// SetupBrowserDxe/Expression.c: DATEs and TIMEs with each other as bytes, with integers
+    /// not at all (UNDEFINED); EQ_ID_VAL_LIST takes the low 16 bits of a DATE, its year, and
+    /// arithmetic widens it, as VfrCompile's ideqval Date.Day needs.
+    #[test]
+    fn date_and_time_questions_compare_as_their_values() {
+        let reason = "EFI_IFR_EQ_ID_ID of question 0x0005: <ValueUnavailable: test>";
+        let day = scoped_expression(
+            &[
+                question_ref1(1),
+                operation(0x44, false, &0xFF00_0000u32.to_le_bytes()),
+                op(BITWISE_AND),
+                uint8(24),
+                op(SHIFT_RIGHT),
+                uint8(0x40),
+                op(EQUAL),
+            ],
+            0,
+        );
+        let cases = [
+            ("DATE 1 == DATE 1", eq_id_id(1, 1), Truth::Known(true)),
+            ("DATE 1 == DATE 2", eq_id_id(1, 2), Truth::Known(false)),
+            (
+                "DATE 1 < DATE 2",
+                scoped_expression(&[question_ref1(1), question_ref1(2), op(LESS_THAN)], 0),
+                Truth::Known(true),
+            ),
+            (
+                "TIME 3 < DATE 1",
+                scoped_expression(&[question_ref1(3), question_ref1(1), op(LESS_THAN)], 0),
+                Truth::Known(true),
+            ),
+            ("DATE 1 == UINT 4", eq_id_id(1, 4), Truth::Known(false)),
+            (
+                "DATE 1 == 0x2010",
+                eq_id_val_of(1, 0x2010),
+                Truth::Known(false),
+            ),
+            (
+                "year of DATE 1 listed",
+                eq_id_val_list(1, &[0x2010]),
+                Truth::Known(true),
+            ),
+            ("day of DATE 1", day, Truth::Known(true)),
+            (
+                "DATE 1 == unreadable DATE 5",
+                eq_id_id(1, 5),
+                unknown(reason),
+            ),
+            (
+                "unreadable DATE 5 == UINT 4",
+                eq_id_id(5, 4),
+                Truth::Known(false),
+            ),
+        ];
+        for (name, condition, want) in cases {
+            assert_eq!(truth_of(condition, &date_values()), want, "{name}");
         }
     }
 
@@ -5383,8 +5601,9 @@ mod tests {
         assert_eq!(
             values.value(&referrer, 12, &mut Efivars::new().reader()),
             Some(QuestionValue::Unreadable {
-                kind: ValueKind::Other,
-                reason: "<ValueUnavailable: EFI_IFR_DATE value not decoded>".to_string()
+                kind: ValueKind::Date,
+                reason: "<ValueUnavailable: no supported varstore with matching id 0x0001 found>"
+                    .to_string()
             }),
             "DATE 12"
         );
@@ -6002,12 +6221,15 @@ mod store_expression_tests {
     const ADD: u8 = 0x3A;
     const SUBTRACT: u8 = 0x3B;
     const UINT16: u8 = 0x43;
+    const UINT32: u8 = 0x44;
     const TO_UINT: u8 = 0x48;
     const CONDITIONAL: u8 = 0x50;
     const ZERO: u8 = 0x52;
     const ONE: u8 = 0x53;
     const UNDEFINED: u8 = 0x55;
     const VALUE: u8 = 0x5A;
+    const GREATER_THAN: u8 = 0x31;
+    const LESS_THAN: u8 = 0x33;
 
     /// The VARSTORE_EFI of the tests, of 5 bytes.
     const STORE: u16 = 2;
@@ -6430,22 +6652,185 @@ mod store_expression_tests {
         }
     }
 
-    /// GET of a TIME, DATE, STRING or REF value, which nothing here decodes, is not evaluated.
+    /// GET of a STRING or REF value, which nothing here decodes, is not evaluated.
     #[test]
-    fn get_of_a_value_that_is_not_an_integer_is_not_evaluated() {
+    fn get_of_a_string_or_ref_value_is_not_evaluated() {
         let efivars = store_holding(&[0; 5]);
-        for (value_type, name) in [
-            (0x05, "TIME"),
-            (0x06, "DATE"),
-            (0x07, "STRING"),
-            (0x0C, "REF"),
-        ] {
+        for (value_type, name) in [(0x07, "STRING"), (0x0C, "REF")] {
             assert_eq!(
                 value_in(get(STORE, 0, value_type), &efivars),
                 Err(format!("EFI_IFR_GET of a {name} value not evaluated")),
                 "{name}"
             );
         }
+    }
+
+    /// The EFI_HII_DATE of the tests' STORE at VarOffset 0, and the one at VarOffset 1: compared
+    /// as bytes the first is less, as UINT32s it is greater.
+    const DATES: [u8; 5] = [0x10, 0x20, 0x30, 0x40, 0x05];
+
+    fn uint32(value: u32) -> Vec<u8> {
+        operation(UINT32, false, &value.to_le_bytes())
+    }
+
+    /// DATE and TIME values compare with each other as their bytes, as edk2-stable202608
+    /// SetupBrowserDxe/Expression.c CompareHiiValue compares buffers: the bytes of the shorter
+    /// first, then the longer greater; an EFI_HII_DATE's first byte is the low byte of its year.
+    #[test]
+    fn date_and_time_compare_as_their_bytes() {
+        let efivars = store_holding(&DATES);
+        let date = |offset| get(STORE, offset, EFI_IFR_TYPE_DATE);
+        let time = |offset| get(STORE, offset, EFI_IFR_TYPE_TIME);
+        let cases = [
+            ("DATE at 0 < DATE at 1", date(0), date(1), LESS_THAN, true),
+            (
+                "DATE at 0 > DATE at 1",
+                date(0),
+                date(1),
+                GREATER_THAN,
+                false,
+            ),
+            ("DATE at 0 == itself", date(0), date(0), EQUAL, true),
+            ("DATE at 0 != DATE at 1", date(0), date(1), NOT_EQUAL, true),
+            ("TIME at 0 < DATE at 0", time(0), date(0), LESS_THAN, true),
+            ("TIME at 0 == DATE at 0", time(0), date(0), EQUAL, false),
+            (
+                "TIME at 1 > TIME at 0",
+                time(1),
+                time(0),
+                GREATER_THAN,
+                true,
+            ),
+        ];
+        for (name, left, right, comparison, want) in cases {
+            let condition = scoped_expression(&[left, right, op(comparison)], 0);
+            assert_eq!(
+                truth_in(condition, &efivars, &no_values()),
+                Truth::Known(want),
+                "{name}"
+            );
+        }
+    }
+
+    /// CompareHiiValue does not compare a DATE or TIME with an integer (EFI_UNSUPPORTED), which
+    /// the comparison ops turn into UNDEFINED, which a condition takes as FALSE.
+    #[test]
+    fn date_or_time_and_an_integer_compare_to_undefined() {
+        let efivars = store_holding(&DATES);
+        for (name, value) in [
+            ("DATE", get(STORE, 0, EFI_IFR_TYPE_DATE)),
+            ("TIME", get(STORE, 0, EFI_IFR_TYPE_TIME)),
+        ] {
+            for comparison in [EQUAL, NOT_EQUAL, GREATER_THAN] {
+                let condition =
+                    scoped_expression(&[value.clone(), uint32(0x4030_2010), op(comparison)], 0);
+                assert_eq!(
+                    truth_in(condition, &efivars, &no_values()),
+                    Truth::Known(false),
+                    "{name}, op {comparison:#04x}"
+                );
+            }
+            let undefined = scoped_expression(
+                &[value.clone(), uint32(0x4030_2010), op(NOT_EQUAL), op(NOT)],
+                0,
+            );
+            assert_eq!(
+                truth_in(undefined, &efivars, &no_values()),
+                Truth::Known(false),
+                "{name}: NOT of UNDEFINED"
+            );
+        }
+    }
+
+    /// Arithmetic and bitwise ops widen a DATE to the UINT64 of its EFI_HII_DATE and a TIME to
+    /// that of its 3 bytes, as edk2-stable202608 SetupBrowserDxe/Expression.c HiiValueToUINT64
+    /// does, which VfrCompile's ideqval Date.Day needs.
+    #[test]
+    fn date_and_time_widen_to_integers_in_arithmetic() {
+        let efivars = store_holding(&DATES);
+        let cases = [
+            (
+                "Date.Day: (DATE & 0xFF000000) >> 24",
+                vec![
+                    get(STORE, 0, EFI_IFR_TYPE_DATE),
+                    uint32(0xFF00_0000),
+                    op(BITWISE_AND),
+                    uint8(24),
+                    op(SHIFT_RIGHT),
+                ],
+                0x40,
+            ),
+            (
+                "DATE + 0",
+                vec![get(STORE, 0, EFI_IFR_TYPE_DATE), op(ZERO), op(ADD)],
+                0x4030_2010,
+            ),
+            (
+                "TIME + 0",
+                vec![get(STORE, 1, EFI_IFR_TYPE_TIME), op(ZERO), op(ADD)],
+                0x0040_3020,
+            ),
+        ];
+        for (name, ops, want) in cases {
+            assert_eq!(
+                value_in(scoped_expression(&ops, 0), &efivars),
+                Ok(want),
+                "{name}"
+            );
+        }
+    }
+
+    /// A condition whose value is a DATE or TIME is FALSE (edk2-stable202608
+    /// SetupBrowserDxe/Expression.c IsTrue), and NOT of one is UNDEFINED.
+    #[test]
+    fn date_or_time_as_a_condition_is_false() {
+        let efivars = store_holding(&DATES);
+        for (name, condition) in [
+            ("DATE", get(STORE, 0, EFI_IFR_TYPE_DATE)),
+            ("TIME", get(STORE, 0, EFI_IFR_TYPE_TIME)),
+            (
+                "NOT DATE",
+                scoped_expression(&[get(STORE, 0, EFI_IFR_TYPE_DATE), op(NOT)], 0),
+            ),
+        ] {
+            assert_eq!(
+                truth_in(condition, &efivars, &no_values()),
+                Truth::Known(false),
+                "{name}"
+            );
+        }
+    }
+
+    /// GET of a DATE or TIME without a VarStore, a field of the system time, is not evaluated.
+    #[test]
+    fn get_of_a_system_time_field_is_not_evaluated() {
+        let efivars = store_holding(&DATES);
+        for (value_type, name) in [(EFI_IFR_TYPE_DATE, "DATE"), (EFI_IFR_TYPE_TIME, "TIME")] {
+            assert_eq!(
+                value_in(get(0, 0, value_type), &efivars),
+                Err(format!(
+                    "EFI_IFR_GET of a {name} field of the system time not evaluated"
+                )),
+                "{name}"
+            );
+        }
+    }
+
+    /// MAP matches a DATE with a DATE of the same bytes, and passes over a pair whose match
+    /// expression is an integer, which CompareHiiValue does not compare with it.
+    #[test]
+    fn map_matches_a_date_by_its_bytes() {
+        let efivars = store_holding(&DATES);
+        let expression = [
+            get(STORE, 0, EFI_IFR_TYPE_DATE),
+            map(&[
+                (uint32(0x4030_2010), uint8(1)),
+                (get(STORE, 1, EFI_IFR_TYPE_DATE), uint8(2)),
+                (get(STORE, 0, EFI_IFR_TYPE_DATE), uint8(3)),
+            ]),
+        ]
+        .concat();
+        assert_eq!(value_in(expression, &efivars), Ok(3));
     }
 
     /// MAP pushes the return expression of the first pair whose match expression equals the value

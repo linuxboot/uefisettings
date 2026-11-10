@@ -880,7 +880,7 @@ pub(super) struct EfivarRange {
 /// How the variable of a VarStore holds the values of its questions, which decides what of it
 /// read_value_bytes reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum VariableLayout {
+pub enum VariableLayout {
     /// Each at its VarOffset, in a value at least as large as the VarStore
     Offsets,
     /// The value of one question, alone and whole: the variable of a VarName on a VARSTORE_EFI

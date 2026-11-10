@@ -38,6 +38,8 @@ use super::conditions::VarStoreValues;
 #[cfg(efivar_dumps)]
 use super::question_values::handle_checkbox;
 #[cfg(efivar_dumps)]
+use super::question_values::handle_date_time;
+#[cfg(efivar_dumps)]
 use super::question_values::handle_numeric;
 #[cfg(efivar_dumps)]
 use super::question_values::handle_oneof;
@@ -73,6 +75,8 @@ pub(crate) const ONE_OF: u8 = 0x05;
 pub(crate) const CHECKBOX: u8 = 0x06;
 pub(crate) const NUMERIC: u8 = 0x07;
 pub(crate) const PASSWORD: u8 = 0x08;
+pub(crate) const DATE: u8 = 0x1A;
+pub(crate) const TIME: u8 = 0x1B;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
 pub(crate) const GRAY_OUT_IF: u8 = 0x19;
@@ -455,6 +459,18 @@ pub(crate) fn ifr_default(default_id: u16, value: u8) -> Vec<u8> {
 pub(super) fn uint32_default(default_id: u16, value: u32) -> Vec<u8> {
     let data = [&default_id.to_le_bytes()[..], &[0x02], &value.to_le_bytes()].concat();
     operation(DEFAULT, false, &data)
+}
+
+/// An EFI_IFR_DEFAULT of `default_id` of Type `value_type` (UEFI 2.11 §33.3.8.3.12) holding
+/// `value`.
+pub(super) fn typed_default(default_id: u16, value_type: u8, value: &[u8]) -> Vec<u8> {
+    let data = [&default_id.to_le_bytes()[..], &[value_type], value].concat();
+    operation(DEFAULT, false, &data)
+}
+
+/// The data of a DATE or TIME of QuestionId 1 at VarOffset `offset` of VarStore 1, with `flags`.
+pub(super) fn date_time(offset: u16, flags: u8) -> Vec<u8> {
+    [question_header(offset), vec![flags]].concat()
 }
 
 /// An EFI_IFR_DEFAULT_2 whose EFI_IFR_VALUE holds `expression`.
@@ -949,6 +965,9 @@ pub(super) fn question_descriptor_with(
         ParsedOperation::OneOf(parsed) => handle_oneof(store, parsed, "", flags, node, walk),
         ParsedOperation::Numeric(parsed) => handle_numeric(store, parsed, "", flags, node, walk),
         ParsedOperation::CheckBox(parsed) => handle_checkbox(store, parsed, "", flags, node, walk),
+        ParsedOperation::Date(parsed) | ParsedOperation::Time(parsed) => {
+            handle_date_time(store, parsed, "", flags, node, walk)
+        }
         other => panic!("not a question: {other:?}"),
     }
 }

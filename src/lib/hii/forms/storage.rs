@@ -191,6 +191,7 @@ mod non_efi_varstore_tests {
     use super::super::QuestionFlags;
     use super::super::QuestionIdentity;
     use super::super::RangeType;
+    use super::super::TextInput;
     use super::super::TypeValue;
     use super::super::DUMMY_OPCODE;
     use super::*;
@@ -1061,8 +1062,7 @@ mod non_efi_varstore_tests {
             question: "SHA-1 PCR Bank".to_string(),
             help: String::new(),
             value: "Disabled".to_string(),
-            max_value: RangeType::NumSize8(1),
-            numeric_range: None,
+            input: TextInput::Maximum(RangeType::NumSize8(1)),
             opcode: IFROpCode::OneOf,
             flags: QuestionFlags::empty(),
             defaults: Vec::new(),
@@ -1320,7 +1320,7 @@ impl ValueUnavailable {
     }
 }
 
-/// Where a ONE_OF, NUMERIC or CHECKBOX keeps its value in the payload of its VarStore.
+/// Where a ONE_OF, NUMERIC, CHECKBOX, DATE or TIME keeps its value in the payload of its VarStore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ValueLocation {
     /// `size` bytes from byte `offset`, little-endian
@@ -1383,7 +1383,7 @@ impl ReadableLocation {
     }
 }
 
-/// The payload bytes that hold the value of `question`, if it is a ONE_OF, NUMERIC or CHECKBOX,
+/// The payload bytes that hold the value of `question`, if value_question takes it,
 /// where edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes places it: an EDKII bit
 /// varstore field, whose VarOffset and width count bits, spans the bytes of its bits.
 fn value_bytes(question: &IFROperation) -> Option<std::ops::Range<usize>> {
@@ -2014,6 +2014,8 @@ mod efivar_reader_tests {
                 bit_field(CHECKBOX, &checkbox(16, 0x00)),
                 2..3,
             ),
+            ("DATE at 2", in_form_set(DATE, &date_time(2, 0x00)), 2..6),
+            ("TIME at 9", in_form_set(TIME, &date_time(9, 0x00)), 9..12),
         ]
     }
 

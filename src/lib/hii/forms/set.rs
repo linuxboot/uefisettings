@@ -26,6 +26,7 @@ use super::conditions::ExpressionRefusal;
 use super::conditions::IncludedStates;
 use super::conditions::ReadOnlyCause;
 use super::conditions::SelectionError;
+use super::date_time::DateTimeTextError;
 use super::defaults::OptionValueError;
 use super::question_values::QuestionKind;
 use super::storage::created_attributes;
@@ -41,6 +42,7 @@ use super::AnswerOption;
 use super::IFROpCode;
 use super::QuestionDescriptor;
 use super::RangeType;
+use super::TextInput;
 use super::TypeValue;
 use crate::hii::variables::is_volatile;
 use crate::hii::variables::DataPatch;
@@ -70,6 +72,8 @@ pub(crate) enum ChangeValueError {
     HexTooWide { value: String, bits: u32 },
     #[error("hexadecimal value {0:?} takes no sign")]
     SignedHex(String),
+    #[error(transparent)]
+    DateTimeText(#[from] DateTimeTextError),
     #[error("setting EDKII bit-field values is not supported")]
     UnsupportedBitField,
     #[error("cannot set question {question:?}: {reason}")]
@@ -177,11 +181,13 @@ pub(super) struct VarStoreWrite<'a> {
 
 impl<'a> VarStoreWrite<'a> {
     /// The write of `value` in the `width` bytes of its question's storage at VarOffset `offset`
-    /// of `store`, through variables of `interface`: a narrower value zero-extended, as
+    /// of `store`, through variables of `interface`: a narrower number or BOOLEAN zero-extended, as
     /// edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue writes StorageWidth bytes
     /// (:2061, :2108) of a HiiValue that DisplayEngineDxe/InputHandler.c SetValuesByType fills
-    /// in the option's type only (:1236-1267). Fails unless `width` is 1 to 8, `value` is a number
-    /// or a BOOLEAN that fits in `width` bytes, and they fit in the Size of `store` there.
+    /// in the option's type only (:1236-1267); an EFI_HII_DATE or an EFI_HII_TIME as its bytes, which
+    /// fill the storage of a DATE or TIME. Fails unless `width` is 1 to 8, `value` is a number or a
+    /// BOOLEAN that fits in `width` bytes or a date or time of `width` bytes, and they fit in the
+    /// Size of `store` there.
     pub(super) fn new(
         store: &'a dyn VariableStore,
         offset: u16,
@@ -195,9 +201,9 @@ impl<'a> VarStoreWrite<'a> {
             TypeValue::NumSize32(value) => (u64::from(value), 4),
             TypeValue::NumSize64(value) => (value, 8),
             TypeValue::Boolean(value) => (u64::from(value), 1),
-            TypeValue::Time(_)
-            | TypeValue::Date(_)
-            | TypeValue::StringID(_)
+            TypeValue::Date(date) => return Self::filling(store, offset, width, &date.to_bytes()),
+            TypeValue::Time(time) => return Self::filling(store, offset, width, &time.to_bytes()),
+            TypeValue::StringID(_)
             | TypeValue::Other
             | TypeValue::Undefined
             | TypeValue::Action(_)
@@ -222,6 +228,24 @@ impl<'a> VarStoreWrite<'a> {
                 value_width,
                 storage_width: width,
             });
+        }
+        Self::filling(store, offset, width, encoded)
+    }
+
+    /// The write of `encoded` in the `width` bytes of a question's storage at VarOffset `offset` of
+    /// `store`: fails unless `encoded` fills them and fits in the Size of `store` there.
+    fn filling(
+        store: &'a dyn VariableStore,
+        offset: u16,
+        width: u8,
+        encoded: &[u8],
+    ) -> Result<Self, ChangeValueError> {
+        if encoded.len() != usize::from(width) {
+            return Err(anyhow!(
+                "a question's storage of {width} bytes, not the {} of its value",
+                encoded.len()
+            )
+            .into());
         }
         if usize::from(offset) + encoded.len() > usize::from(store.size()) {
             return Err(anyhow!(
@@ -333,7 +357,7 @@ pub(super) fn own_write<'a>(
                 .ok_or(ChangeValueError::InvalidOption)?;
             option_value(question, option)?
         }
-        NewValue::Text(text) => numeric_value(question, text)?,
+        NewValue::Text(text) => text_value(question, text)?,
     };
     let write = store
         .map(|store| VarStoreWrite::new(store, offset, size, value, interface))
@@ -356,14 +380,16 @@ fn option_value(
         })
 }
 
-/// The value of the NUMERIC or CHECKBOX `question` that `new_value` gives, within its range.
-fn numeric_value(
+/// The value that `new_value` gives `question`, which takes no option: of a NUMERIC or CHECKBOX
+/// within its range, of a DATE or TIME a calendar date or a time.
+fn text_value(
     question: &QuestionDescriptor,
     new_value: &str,
 ) -> Result<TypeValue, ChangeValueError> {
-    Ok(match &question.numeric_range {
-        Some(range) => range.parse_value(new_value)?,
-        None => match question.max_value {
+    Ok(match &question.input {
+        TextInput::Range(range) => range.parse_value(new_value)?,
+        TextInput::DateTime(input) => input.value(new_value)?,
+        TextInput::Maximum(maximum) => match *maximum {
             RangeType::NumSize8(m) => {
                 let data_to_write = new_value
                     .parse::<u8>()
@@ -2246,5 +2272,380 @@ mod write_validation_tests {
         for (name, format, value, want) in cases {
             assert_eq!(format.encode(value), want, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(efivar_dumps)]
+mod date_time_write_tests {
+    use super::super::ifr_fixtures::*;
+    use super::*;
+    use crate::hii::variables::WithheldBytes;
+
+    /// A DATE or TIME (`op_code`) with `flags` at VarOffset 0 of the EFI variable "DateTime",
+    /// which holds `payload`, as set sees it, and the variables that hold it too.
+    fn date_time_on(
+        op_code: u8,
+        flags: u8,
+        payload: &[u8],
+    ) -> (QuestionDescriptor, MemoryVariables) {
+        let variables = MemoryVariables::default();
+        let (_root, node) = parse_question(&[], op_code, &date_time(0, flags), &[]);
+        let question =
+            question_descriptor(&node, writable_var_store("DateTime", payload, &variables));
+        (question, variables)
+    }
+
+    /// What set of a question did: its error as the CLI prints it, and the writes.
+    type SetOutcome = (std::result::Result<(), String>, Vec<(u16, Vec<u8>)>);
+
+    /// set of `question` to `text` in `variables`.
+    fn set_to(
+        question: &QuestionDescriptor,
+        text: &str,
+        variables: &MemoryVariables,
+    ) -> SetOutcome {
+        let changed = change_value(question, text, variables).map_err(|error| format!("{error:#}"));
+        (changed, variables.writes_to(&variable_key("DateTime")))
+    }
+
+    /// set writes a DATE as its EFI_HII_DATE and a TIME as its EFI_HII_TIME (UEFI 2.11
+    /// §33.2.5.4.6, §33.2.5.4.11), from YYYY-MM-DD and HH:MM:SS.
+    #[test]
+    fn date_and_time_are_written_as_stored() {
+        let cases = [
+            (DATE, "2024-02-29", vec![0xE8, 0x07, 0x02, 0x1D]),
+            (DATE, "2000-02-29", vec![0xD0, 0x07, 0x02, 0x1D]),
+            (DATE, "0001-01-01", vec![0x01, 0x00, 0x01, 0x01]),
+            (DATE, "65535-12-31", vec![0xFF, 0xFF, 0x0C, 0x1F]),
+            (TIME, "23:59:58", vec![23, 59, 58]),
+            (TIME, "00:00:00", vec![0, 0, 0]),
+        ];
+        for (op_code, text, bytes) in cases {
+            let payload = vec![0xAA; bytes.len()];
+            let (question, variables) = date_time_on(op_code, 0x00, &payload);
+            assert_eq!(
+                set_to(&question, text, &variables),
+                (Ok(()), vec![(0, bytes)]),
+                "{text}"
+            );
+        }
+    }
+
+    /// set checks each field against the ranges of edk2-stable202608
+    /// DisplayEngineDxe/InputHandler.c (month 1 to 12, the days of the month and year, year 1 to
+    /// 65535, hour up to 23, minute and second up to 59) before any write.
+    #[test]
+    fn date_and_time_out_of_range_write_nothing() {
+        let cases = [
+            (DATE, "2023-02-29", "day 29 is outside 1 to 28"),
+            (DATE, "1900-02-29", "day 29 is outside 1 to 28"),
+            (DATE, "2024-04-31", "day 31 is outside 1 to 30"),
+            (DATE, "2024-01-32", "day 32 is outside 1 to 31"),
+            (DATE, "2024-01-00", "day 0 is outside 1 to 31"),
+            (DATE, "2024-13-01", "month 13 is outside 1 to 12"),
+            (DATE, "2024-00-01", "month 0 is outside 1 to 12"),
+            (DATE, "0000-01-01", "year 0 is outside 1 to 65535"),
+            (DATE, "65536-01-01", "year 65536 is outside 1 to 65535"),
+            (TIME, "24:00:00", "hour 24 is outside 0 to 23"),
+            (TIME, "12:60:00", "minute 60 is outside 0 to 59"),
+            (TIME, "12:00:60", "second 60 is outside 0 to 59"),
+        ];
+        for (op_code, text, error) in cases {
+            let payload = [0xAA; 4];
+            let (question, variables) = date_time_on(op_code, 0x00, &payload);
+            assert_eq!(
+                set_to(&question, text, &variables),
+                (Err(error.to_string()), vec![]),
+                "{text}"
+            );
+        }
+    }
+
+    /// set takes a DATE as YYYY-MM-DD and a TIME as HH:MM:SS only, two digits in each field but
+    /// the year, which takes 1 to 5.
+    #[test]
+    fn malformed_date_and_time_write_nothing() {
+        let date = "DATE value {text:?} is not YYYY-MM-DD, with dashes in each field that the \
+                    question suppresses";
+        let time = "TIME value {text:?} is not HH:MM:SS, with dashes in each field that the \
+                    question suppresses";
+        let cases = [
+            (DATE, "2024/01/01", date),
+            (DATE, "2024-1-01", date),
+            (DATE, "2024-01-1", date),
+            (DATE, " 2024-01-01", date),
+            (DATE, "2024-01-01 ", date),
+            (DATE, "+2024-01-01", date),
+            (DATE, "123456-01-01", date),
+            (DATE, "-01-01", date),
+            (DATE, "", date),
+            (TIME, "1:02:03", time),
+            (TIME, "10:20", time),
+            (TIME, "10:20:30:40", time),
+            (TIME, "10-20-30", time),
+            (TIME, "", time),
+        ];
+        for (op_code, text, error) in cases {
+            let (question, variables) = date_time_on(op_code, 0x00, &[0xAA; 4]);
+            assert_eq!(
+                set_to(&question, text, &variables),
+                (Err(error.replace("{text:?}", &format!("{text:?}"))), vec![]),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A TIME with SECOND_SUPPRESS takes "--" for its second and keeps the stored one; a digit
+    /// there is refused, as are dashes in a field that it does not suppress.
+    #[test]
+    fn second_suppress_keeps_the_stored_second() {
+        let cases = [
+            ("10:20:--", Ok(()), vec![(0, vec![10, 20, 45])]),
+            (
+                "10:20:30",
+                Err(
+                    "the second of this TIME is suppressed (UEFI 2.11 §33.2.5.4.11): give \
+                     dashes there, which keep it",
+                ),
+                vec![],
+            ),
+            (
+                "--:20:--",
+                Err("the hour of this TIME is not suppressed: give its digits, not dashes"),
+                vec![],
+            ),
+        ];
+        for (text, want, writes) in cases {
+            let (question, variables) = date_time_on(TIME, 0x04, &[1, 2, 45]);
+            assert_eq!(
+                set_to(&question, text, &variables),
+                (want.map_err(str::to_string), writes),
+                "{text}"
+            );
+        }
+    }
+
+    /// A digit in a suppressed day is refused, and the refusal says what dashes there keep: the
+    /// stored day, except one that the new month or year lacks, which becomes the month's last day
+    /// after a month change, else 1.
+    #[test]
+    fn digit_in_a_suppressed_day_is_refused_naming_its_adjustment() {
+        const DAY_SUPPRESS: u8 = 0x04;
+        let (question, variables) = date_time_on(DATE, DAY_SUPPRESS, &[0xE8, 0x07, 0x01, 0x1F]);
+        assert_eq!(
+            set_to(&question, "2024-02-15", &variables),
+            (
+                Err(
+                    "the day of this DATE is suppressed (UEFI 2.11 §33.2.5.4.6): give dashes \
+                     there, which keep it, except a day that the new month or year lacks, which \
+                     becomes the month's last day after a month change, else 1"
+                        .to_string()
+                ),
+                vec![]
+            )
+        );
+    }
+
+    /// The days of a month whose field a DATE suppresses are those of the stored month and year.
+    #[test]
+    fn day_is_checked_against_a_suppressed_month() {
+        // 2023-02-10
+        let stored = [0xE7, 0x07, 0x02, 0x0A];
+        let cases = [
+            (
+                "2023----28",
+                Ok(()),
+                vec![(0, vec![0xE7, 0x07, 0x02, 0x1C])],
+            ),
+            ("2023----29", Err("day 29 is outside 1 to 28"), vec![]),
+            (
+                "2024----29",
+                Ok(()),
+                vec![(0, vec![0xE8, 0x07, 0x02, 0x1D])],
+            ),
+        ];
+        for (text, want, writes) in cases {
+            let (question, variables) = date_time_on(DATE, 0x02, &stored);
+            assert_eq!(
+                set_to(&question, text, &variables),
+                (want.map_err(str::to_string), writes),
+                "{text}"
+            );
+        }
+    }
+
+    /// With its day suppressed, a DATE keeps the stored day where it fits the new month and year,
+    /// else gets the day that edk2-stable202608 DisplayEngineDxe/InputHandler.c
+    /// AdjustQuestionValue gives after a browser's edit: the last of the month after a month edit,
+    /// 1 after a year edit.
+    #[test]
+    fn suppressed_day_is_adjusted_as_the_browser_adjusts_it() {
+        const DAY_SUPPRESS: u8 = 0x04;
+        let cases = [
+            (
+                "month edit, day past the month's end",
+                [0xE8, 0x07, 1, 31],
+                "2024-02---",
+                [0xE8, 0x07, 2, 29],
+            ),
+            (
+                "month edit, day past the month's end in a non-leap year",
+                [0xE7, 0x07, 1, 31],
+                "2023-02---",
+                [0xE7, 0x07, 2, 28],
+            ),
+            (
+                "year and month edit, day past the month's end",
+                [0xE8, 0x07, 1, 31],
+                "2023-02---",
+                [0xE7, 0x07, 2, 28],
+            ),
+            (
+                "month edit, day that fits",
+                [0xE8, 0x07, 1, 28],
+                "2024-02---",
+                [0xE8, 0x07, 2, 28],
+            ),
+            (
+                "month edit, day that fits a longer month",
+                [0xE8, 0x07, 3, 15],
+                "2024-04---",
+                [0xE8, 0x07, 4, 15],
+            ),
+            (
+                "year edit, day past the month's end",
+                [0xE8, 0x07, 2, 29],
+                "2023-02---",
+                [0xE7, 0x07, 2, 1],
+            ),
+            (
+                "year edit, day that fits",
+                [0xE8, 0x07, 1, 31],
+                "2025-01---",
+                [0xE9, 0x07, 1, 31],
+            ),
+        ];
+        for (name, stored, text, written) in cases {
+            let (question, variables) = date_time_on(DATE, DAY_SUPPRESS, &stored);
+            assert_eq!(
+                set_to(&question, text, &variables),
+                (Ok(()), vec![(0, written.to_vec())]),
+                "{name}"
+            );
+        }
+    }
+
+    /// set refuses a DATE or TIME with a suppressed field whose stored value it cannot read,
+    /// as it cannot keep that field, and one without a suppressed field writes without it.
+    #[test]
+    fn suppressed_fields_need_the_stored_value() {
+        for (flags, text, refused) in [(0x01, "-----01-01", true), (0x00, "2024-01-01", false)] {
+            let variables = MemoryVariables::default();
+            let store = efi_variable("DateTime", 4);
+            variables.insert(store.variable_key(), NV_BS_RT, &[0xAA; 4]);
+            // no efivar file: the value that get reads is missing
+            let (_root, node) = parse_question(&[], DATE, &date_time(0, flags), &[]);
+            let question = question_descriptor(
+                &node,
+                VarStoreFixture {
+                    store: Ok(Box::new(store)),
+                    efivars: Efivars::new(),
+                },
+            );
+            let (changed, writes) = set_to(&question, text, &variables);
+            match refused {
+                true => {
+                    let error = changed.expect_err("set with an unreadable suppressed year");
+                    assert!(
+                        error.starts_with(
+                            "cannot keep the suppressed fields of this DATE: its stored value \
+                             cannot be read: "
+                        ),
+                        "{text}: {error}"
+                    );
+                    assert_eq!(writes, [], "{text}: writes");
+                }
+                false => {
+                    assert_eq!(changed, Ok(()), "{text}");
+                    assert_eq!(writes, [(0, vec![0xE8, 0x07, 1, 1])], "{text}: writes");
+                }
+            }
+        }
+    }
+
+    /// THIS of the WRITE expression of a DATE is the new DATE: a SET of a DATE writes its bytes,
+    /// in one write of the variable with the question's own value.
+    #[test]
+    fn write_expression_of_a_date_takes_this_as_a_date() {
+        const SET: u8 = 0x2C;
+        const THIS: u8 = 0x58;
+        let variables = MemoryVariables::default();
+        let set_date = operation(SET, false, &[0x01, 0x00, 0x04, 0x00, 0x06]);
+        let (_root, node) = parse_question(
+            &[var_store_efi(1, "DateTime", NV_BS_RT, 8)],
+            DATE,
+            &date_time(0, 0x00),
+            &[
+                operation(WRITE, false, &[]),
+                scoped_expression(&[operation(THIS, false, &[]), set_date], 0),
+            ],
+        );
+        let date = question_descriptor(&node, writable_var_store("DateTime", &[0; 8], &variables));
+        let reads = MemoryVariables::default();
+        reads.insert(variable_key("DateTime"), NV_BS_RT, &[0; 8]);
+        let mut reader = EfivarReader::with_variables(Box::new(reads));
+        let set = set_questions(
+            PROMPT,
+            &[("A", &date)],
+            "2024-02-29",
+            &BTreeSet::new(),
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            VolatileWrites::Refuse,
+            &WithholdingVariables::new(&variables, WithheldBytes::default()),
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+        assert_eq!(set, Ok(()));
+        assert_eq!(
+            variables.writes_to(&variable_key("DateTime")),
+            [(0, vec![0xE8, 0x07, 0x02, 0x1D, 0xE8, 0x07, 0x02, 0x1D])]
+        );
+    }
+
+    /// A DATE and a NUMERIC that one prompt selects are refused before any write.
+    #[test]
+    fn date_and_numeric_of_one_prompt_write_nothing() {
+        let variables = MemoryVariables::default();
+        let (_root, node) = parse_question(&[], DATE, &date_time(0, 0x00), &[]);
+        let date = question_descriptor(&node, writable_var_store("DateTime", &[0; 4], &variables));
+        let (_root, node) = parse_question(&[], NUMERIC, &uint8_numeric(0x10, 0, 200), &[]);
+        let numeric = question_descriptor(&node, writable_var_store("Number", &[0], &variables));
+        let mut reader = EfivarReader::with_variables(Box::new(MemoryVariables::default()));
+        let set = set_questions(
+            PROMPT,
+            &[("A", &date), ("B", &numeric)],
+            "1",
+            &BTreeSet::new(),
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            VolatileWrites::Refuse,
+            &WithholdingVariables::new(&variables, WithheldBytes::default()),
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            set,
+            Err(
+                "question \"Prompt\" selects questions of more than one kind: DATE (in A), \
+                 ONE_OF, NUMERIC or CHECKBOX (in B); set gives one value to questions of one kind"
+                    .to_string()
+            )
+        );
+        assert_eq!(variables.writes_to(&variable_key("DateTime")), []);
+        assert_eq!(variables.writes_to(&variable_key("Number")), []);
     }
 }

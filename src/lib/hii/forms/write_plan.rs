@@ -45,6 +45,7 @@ use super::IFROpCode;
 use super::IFROperation;
 use super::QuestionDescriptor;
 use super::StoragelessRefusal;
+use super::TypeValue;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarRange;
 use crate::hii::variables::VariableInterface;
@@ -72,13 +73,8 @@ impl<'a> WritePlan<'a> {
         access_level: Option<AccessLevel>,
     ) -> Result<Self, ChangeValueError> {
         let (value, own) = own_write(question, new_value, reach, interface)?;
-        let Some(value) = value.as_u64() else {
+        let Some(this) = this_value(question.opcode, value) else {
             return Err(anyhow!("unsupported value type for {}", interface.write()).into());
-        };
-        // a CHECKBOX's value is a BOOLEAN, which set writes as 0 or 1
-        let this = match question.opcode == IFROpCode::CheckBox {
-            true => QuestionValue::Boolean(u8::from(value != 0)),
-            false => QuestionValue::Uint(value),
         };
         let values = VarStoreValues::new(&root_of(&question.node), access_level);
         let sets = evaluate_write(
@@ -168,6 +164,33 @@ impl<'a> WritePlan<'a> {
         }
         Ok(writes)
     }
+}
+
+/// THIS of the WRITE expression of a question of `opcode` that set sets to `value`, of the type of
+/// the question's value.
+fn this_value(opcode: IFROpCode, value: TypeValue) -> Option<QuestionValue> {
+    Some(match value {
+        TypeValue::Date(date) => QuestionValue::Date(date.to_bytes()),
+        TypeValue::Time(time) => QuestionValue::Time(time.to_bytes()),
+        TypeValue::NumSize8(_)
+        | TypeValue::NumSize16(_)
+        | TypeValue::NumSize32(_)
+        | TypeValue::NumSize64(_)
+        | TypeValue::Boolean(_) => {
+            let value = value.as_u64()?;
+            // a CHECKBOX's value is a BOOLEAN, which set writes as 0 or 1
+            match opcode == IFROpCode::CheckBox {
+                true => QuestionValue::Boolean(u8::from(value != 0)),
+                false => QuestionValue::Uint(value),
+            }
+        }
+        TypeValue::StringID(_)
+        | TypeValue::Other
+        | TypeValue::Undefined
+        | TypeValue::Action(_)
+        | TypeValue::Ref(_)
+        | TypeValue::Unknown(_) => return None,
+    })
 }
 
 /// Bytes that a plan writes at VarOffset `offset` of `store`.
@@ -1028,6 +1051,130 @@ mod tests {
                     set_around_a_password(own, set_at, set_type, through),
                     want,
                     "Store span {span} through {through:?}"
+                );
+            }
+        }
+    }
+
+    /// What set did: its error as the CLI prints it, and the writes to Store.
+    type StoreOutcome = (Result<(), String>, Vec<(u16, Vec<u8>)>);
+
+    /// set of the DATE or TIME `op_code` Around, at byte `own` of Store, to `text` through
+    /// variables of `through`, beside a PASSWORD of MaxSize 1 at bytes 1..3 of Store.
+    fn set_date_time_by_a_password(
+        op_code: u8,
+        own: u16,
+        text: &str,
+        through: (VariableReach, VariableInterface),
+    ) -> StoreOutcome {
+        let password = operation(
+            PASSWORD,
+            false,
+            &[
+                question_header_with(2, FIRST_PROMPT + 1, STORE, 1, 0),
+                vec![1, 0, 1, 0],
+            ]
+            .concat(),
+        );
+        let around = [
+            operation(
+                op_code,
+                true,
+                &[
+                    question_header_with(1, FIRST_PROMPT, STORE, own, 0),
+                    vec![0],
+                ]
+                .concat(),
+            ),
+            END.to_vec(),
+        ]
+        .concat();
+        let root = parse_form_set(&[
+            var_store_efi(STORE, "Store", NV_BS_RT, 6),
+            form(1, &[password, around]),
+        ]);
+        let strings = vec![en_us_package(StringMap::from([
+            (FIRST_PROMPT, "Around".into()),
+            (FIRST_PROMPT + 1, "Password".into()),
+        ]))];
+        let passwords = PasswordQuestions::of([&root]);
+        let mut reader = passwords
+            .reader(Box::new(variables(through)))
+            .expect("resolve the VarStore of the PASSWORD question");
+        let values = VarStoreValues::new(&root, None);
+        let selection = find_question_in(
+            &root,
+            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+            &mut FormSetWalk::new(
+                &ListTexts::new(&strings, &[]),
+                &mut reader,
+                &values,
+                IncludedStates::empty(),
+            ),
+        );
+        let Selection::Picked {
+            picked: (descriptor, _),
+            ..
+        } = &selection
+        else {
+            panic!("Around: not picked through {through:?}");
+        };
+        let writes = variables(through);
+        let outcome = set_questions(
+            "Around",
+            &[("selector", descriptor)],
+            text,
+            &BTreeSet::from([text.to_string()]),
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            VolatileWrites::Refuse,
+            &passwords
+                .withholding(&writes)
+                .expect("resolve the VarStore of the PASSWORD question"),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"));
+        (outcome, writes.writes_to(&key("Store")))
+    }
+
+    /// The EFI_HII_DATE or EFI_HII_TIME of a question that overlaps a password's bytes, by any
+    /// of its bytes: set refuses before any write, through variables of every backend. One beside
+    /// the password writes its bytes.
+    #[test]
+    fn a_date_or_time_over_a_password_writes_nothing() {
+        let refused = || {
+            (
+                Err("cannot set question \"Around\": EFI variable \
+                     Store-00000000-0000-0000-0000-000000000000 holds a password at bytes 1..3, \
+                     which set never writes"
+                    .to_string()),
+                vec![],
+            )
+        };
+        let cases = [
+            ("DATE at 0..4, across", DATE, 0, "2024-02-29", refused()),
+            (
+                "TIME at 2..5, its last byte",
+                TIME,
+                2,
+                "23:59:58",
+                refused(),
+            ),
+            (
+                "TIME at 3..6, beside it",
+                TIME,
+                3,
+                "23:59:58",
+                (Ok(()), vec![(3, vec![23, 59, 58])]),
+            ),
+        ];
+        for (name, op_code, own, text, want) in cases {
+            for through in [EFIVARFS, VARIABLE_SERVICES, FIRMWARE_ENVIRONMENT] {
+                assert_eq!(
+                    set_date_time_by_a_password(op_code, own, text, through),
+                    want,
+                    "{name} through {through:?}"
                 );
             }
         }

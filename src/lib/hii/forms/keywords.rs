@@ -38,6 +38,7 @@ use super::conditions::ExpressionInputs;
 use super::conditions::QuestionExpression;
 use super::conditions::QuestionValues;
 use super::conditions::VarStoreValues;
+use super::date_time::DateTimeStorage;
 use super::declared_store;
 use super::declared_var_store;
 use super::defaults::is_ordered_list_default;
@@ -77,6 +78,7 @@ use super::QuestionHeader;
 use super::Range as IfrRange;
 use super::SelectionError;
 use super::ShortVarStoreEfi;
+use super::TextInput;
 use super::TypeValue;
 use super::Walk;
 use super::EFI_HII_DATE_SIZE;
@@ -184,7 +186,7 @@ pub(crate) enum KeywordRefusal {
         "keyword {0}: its <KeywordResp> has &READONLY, and SetData() writes no read-only keyword"
     )]
     ReadOnlyResp(String),
-    #[error("keyword {keyword}: uefisettings does not yet check values of {op}")]
+    #[error("keyword {keyword}: uefisettings does not yet implement keyword set of {op}")]
     Unchecked { keyword: String, op: &'static str },
     #[error("keyword {keyword}: VALUE={value} {reason} question \"{question}\"")]
     Value {
@@ -239,6 +241,12 @@ pub(crate) enum QuestionRefusal {
          list, which does not parse"
     )]
     MalformedOutsideVarStore(u64),
+    #[error(
+        "has UEFI Storage 0x30, which neither QF_DATE_STORAGE (UEFI 2.11 §33.3.8.3.11) nor \
+         QF_TIME_STORAGE (§33.3.8.3.78) defines and get does not read, where GetData() and \
+         SetData() take the bytes of its VarStore"
+    )]
+    ReservedStorage,
 }
 
 /// Why a VALUE is not one that set would write to a question.
@@ -684,20 +692,22 @@ impl<'a> KeywordQuestion<'a> {
     }
 
     /// Refuses a get of the question that GetData() would answer otherwise than get: with the
-    /// stored value of one whose value READ or EFI_IFR_VALUE gives, or with the bytes at its bit
-    /// offset; or of a PASSWORD, or of a question whose bytes (keyword_bytes) overlap those that
-    /// `reader` withholds, which hold a password.
+    /// stored value of one whose value READ or EFI_IFR_VALUE gives, with the bytes at its bit
+    /// offset, or with its VarStore's bytes of a DATE or TIME of UEFI Storage 0x30; or of a
+    /// PASSWORD, or of a question whose bytes (keyword_bytes) overlap those that `reader`
+    /// withholds, which hold a password.
     pub(crate) fn check_get(&self, reader: &EfivarReader) -> Result<(), KeywordRefusal> {
         self.check_question(QuestionExpression::Read, reader)?;
         Ok(())
     }
 
     /// Refuses a set of `resp`, the question's keyword, that SetData() would write otherwise than
-    /// set: through no WRITE expression or Callback(); else takes it through set's own checks,
-    /// with `include`, `volatile` and the variables of `reader`: the question's state, whether it
-    /// is read-only, which no `include` lifts, its option of the VALUE or the VALUE's range, the
-    /// variable's, and whether the bytes written overlap those that `reader` withholds, which
-    /// hold a password (ChangeValueError::PasswordBytes). Returns what SetData() writes.
+    /// set: through no WRITE expression, Callback() or UEFI Storage 0x30; else takes it through
+    /// set's own checks, with `include`, `volatile` and the variables of `reader`: the question's
+    /// state, whether it is read-only, which no `include` lifts, its option of the VALUE or the
+    /// VALUE's range, the variable's, and whether the bytes written overlap those that `reader`
+    /// withholds, which hold a password (ChangeValueError::PasswordBytes). Returns what SetData()
+    /// writes.
     pub(crate) fn check_set(
         &self,
         resp: &KeywordResp,
@@ -710,12 +720,11 @@ impl<'a> KeywordQuestion<'a> {
             return Err(KeywordRefusal::ReadOnlyResp(self.keyword.to_string()).into());
         }
         let op = self.op.borrow();
-        let Some(question) = value_question(&op) else {
-            return Err(KeywordRefusal::Unchecked {
-                keyword: self.keyword.to_string(),
-                op: op.op_code.spec_name(),
-            }
-            .into());
+        // keyword set of a DATE or TIME is not implemented yet: SetData() would also write the
+        // fields that its Flags suppress, which set keeps
+        let question = match value_question(&op) {
+            Some(ValueQuestion::DateTime(_)) | None => return Err(self.unchecked(&op).into()),
+            Some(question) => question,
         };
         let prompt = self.texts.display(header.prompt_string_id);
         let number = value_number(question, resp.value.as_bytes())
@@ -732,12 +741,13 @@ impl<'a> KeywordQuestion<'a> {
             ),
             ValueQuestion::Numeric(_) | ValueQuestion::CheckBox(_) => {
                 // a CHECKBOX has no NumericRange, nor a NUMERIC bit field, which own_write refuses
-                text = descriptor.numeric_range.as_ref().map_or_else(
-                    || number.to_string(),
-                    |range| range.format.decode(number).to_string(),
-                );
+                text = match &descriptor.input {
+                    TextInput::Range(range) => range.format.decode(number).to_string(),
+                    TextInput::Maximum(_) | TextInput::DateTime(_) => number.to_string(),
+                };
                 NewValue::Text(&text)
             }
+            ValueQuestion::DateTime(_) => return Err(self.unchecked(&op).into()),
         };
         let (_, write) = own_write(&descriptor, new_value, reader.reach(), reader.interface())
             .with_context(|| {
@@ -835,7 +845,7 @@ impl<'a> KeywordQuestion<'a> {
             TableType::Numeric => match value_question(op) {
                 Some(ValueQuestion::OneOf(one_of)) => Some(numeric_type(&one_of.data)),
                 Some(ValueQuestion::Numeric(numeric)) => Some(numeric_type(&numeric.data)),
-                Some(ValueQuestion::CheckBox(_)) | None => None,
+                Some(ValueQuestion::CheckBox(_) | ValueQuestion::DateTime(_)) | None => None,
             },
             TableType::Fixed(fixed) => Some(fixed.into()),
             TableType::Untyped => None,
@@ -952,12 +962,13 @@ impl<'a> KeywordQuestion<'a> {
     }
 
     /// `value`, the question's default of `default_id`, as the `<Number>` of the question's value
-    /// bytes (keyword_width): a ONE_OF's, NUMERIC's or CHECKBOX's number; a STRING's string, in
+    /// bytes (keyword_width): a ONE_OF's, NUMERIC's or CHECKBOX's number; a DATE's or TIME's
+    /// number, its EFI_HII_DATE or EFI_HII_TIME as TypeValue::widened takes it; a STRING's string, in
     /// the CHAR16s of display's language, zero-padded to MaxSize CHAR16s, as edk2-stable202608
     /// SetupBrowserDxe/Setup.c:4501-4512 stores it in a storage of MaxSize × 2 bytes
     /// (IfrParse.c:2225); an ORDERED_LIST's buffer (Setup.c:4493-4495), whose missing containers
     /// are 0 (UEFI 2.11 §33.2.5.4.8). Refuses a default that does not fit, of another type, or of
-    /// a DATE or TIME, whose values uefisettings does not decode.
+    /// a PASSWORD, ACTION or REF, which the table leaves out.
     fn default_number(
         &self,
         op: &IFROperation,
@@ -971,7 +982,8 @@ impl<'a> KeywordQuestion<'a> {
         })?;
         let mut bytes = match (TableType::of(op.op_code), value) {
             (
-                TableType::Numeric | TableType::Fixed(FixedType::Boolean),
+                TableType::Numeric
+                | TableType::Fixed(FixedType::Boolean | FixedType::Date | FixedType::Time),
                 TypedDefault::Number(number),
             ) => number.to_le_bytes().to_vec(),
             (TableType::Fixed(FixedType::String), TypedDefault::String(id)) => self
@@ -986,7 +998,13 @@ impl<'a> KeywordQuestion<'a> {
             }
             (
                 TableType::Numeric
-                | TableType::Fixed(FixedType::Boolean | FixedType::String | FixedType::Buffer),
+                | TableType::Fixed(
+                    FixedType::Boolean
+                    | FixedType::String
+                    | FixedType::Buffer
+                    | FixedType::Date
+                    | FixedType::Time,
+                ),
                 value @ (TypedDefault::Number(_)
                 | TypedDefault::String(_)
                 | TypedDefault::Buffer(_)),
@@ -995,7 +1013,7 @@ impl<'a> KeywordQuestion<'a> {
                 return Err(self.default_refusal(default_id, reason));
             }
             (
-                TableType::Fixed(FixedType::Date | FixedType::Time) | TableType::Untyped,
+                TableType::Untyped,
                 TypedDefault::Number(_) | TypedDefault::String(_) | TypedDefault::Buffer(_),
             ) => {
                 let reason = format!("uefisettings does not decode a default of {name}");
@@ -1047,6 +1065,19 @@ impl<'a> KeywordQuestion<'a> {
         }
         if header.var_store_id == 0 {
             return Err(self.question_refusal(&header, QuestionRefusal::Storageless));
+        }
+        // edk2-stable202608 SetupBrowserDxe neither reads nor writes a DATE or TIME of UEFI
+        // Storage 0x30 (IfrParse.c gives it no Storage, Setup.c GetQuestionValue returns), while
+        // ConfigKeywordHandler.c GetWidth gives it the bytes of an EFI_HII_DATE or EFI_HII_TIME
+        if let ParsedOperation::Date(question) | ParsedOperation::Time(question) = &op.parsed_data {
+            match question.storage() {
+                DateTimeStorage::Reserved => {
+                    return Err(self.question_refusal(&header, QuestionRefusal::ReservedStorage))
+                }
+                DateTimeStorage::Normal
+                | DateTimeStorage::SystemTime
+                | DateTimeStorage::WakeupTime => {}
+            }
         }
         let value_expression = question_value_expression(&op).is_some();
         let flags = header.flags();
@@ -1203,6 +1234,14 @@ impl<'a> KeywordQuestion<'a> {
         }
     }
 
+    /// The refusal of a keyword set of `op`, which uefisettings does not implement yet.
+    fn unchecked(&self, op: &IFROperation) -> KeywordRefusal {
+        KeywordRefusal::Unchecked {
+            keyword: self.keyword.to_string(),
+            op: op.op_code.spec_name(),
+        }
+    }
+
     fn question_refusal(&self, header: &QuestionHeader, reason: QuestionRefusal) -> KeywordRefusal {
         KeywordRefusal::Question {
             keyword: self.keyword.to_string(),
@@ -1307,12 +1346,14 @@ fn prompts(op: &IFROperation, prompt: u16) -> bool {
             .is_none_or(|bytes| bytes == &prompt.to_le_bytes()[..])
 }
 
-/// The bytes of a question's value: of a ONE_OF or NUMERIC its size, of a CHECKBOX a BOOLEAN.
+/// The bytes of a question's value: of a ONE_OF or NUMERIC its size, of a CHECKBOX a BOOLEAN, of
+/// a DATE or TIME an EFI_HII_DATE or EFI_HII_TIME.
 fn value_width(question: ValueQuestion<'_>) -> u8 {
     match question {
         ValueQuestion::OneOf(one_of) => one_of.data.size(),
         ValueQuestion::Numeric(numeric) => numeric.data.size(),
         ValueQuestion::CheckBox(_) => 1,
+        ValueQuestion::DateTime(question) => question.kind.size(),
     }
 }
 
@@ -1459,6 +1500,7 @@ mod tests {
     use super::super::ifr_fixtures::password_on;
     use super::super::ifr_fixtures::question_header_with;
     use super::super::ifr_fixtures::short_var_store_efi;
+    use super::super::ifr_fixtures::typed_default;
     use super::super::ifr_fixtures::uint32_default;
     use super::super::ifr_fixtures::uint8;
     use super::super::ifr_fixtures::var_store;
@@ -1467,7 +1509,6 @@ mod tests {
     use super::super::ifr_fixtures::VariableReach;
     use super::super::ifr_fixtures::BIT_VARSTORE_GUID;
     use super::super::ifr_fixtures::CHECKBOX;
-    use super::super::ifr_fixtures::DEFAULT;
     use super::super::ifr_fixtures::DISABLE_IF;
     use super::super::ifr_fixtures::END;
     use super::super::ifr_fixtures::GRAY_OUT_IF;
@@ -2255,8 +2296,48 @@ mod tests {
         );
     }
 
+    /// GetData() and SetData() take the bytes of a DATE or TIME of UEFI Storage 0x30 at its
+    /// VarOffset, which a browser neither reads nor writes and get does not read: check_get and
+    /// check_set refuse it by name.
+    #[test]
+    fn date_and_time_of_reserved_storage_are_refused() {
+        const STORAGE_RESERVED: u8 = 0x30;
+        for op_code in [DATE, TIME] {
+            let op = || {
+                let data = [
+                    question_header_with(1, PROMPT, 1, 5, 0),
+                    vec![STORAGE_RESERVED],
+                ]
+                .concat();
+                operation(op_code, false, &data)
+            };
+            let name = format!("op {op_code:#04x}");
+            let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], op())];
+            assert_eq!(
+                question_of(&lists).check_get(&reader(1)),
+                Err(question_refusal(QuestionRefusal::ReservedStorage)),
+                "{name}: get"
+            );
+            let error = check_set_of(op(), "03", IncludedStates::empty()).expect_err(&name);
+            assert_eq!(
+                error.to_string(),
+                question_refusal(QuestionRefusal::ReservedStorage).to_string(),
+                "{name}: set"
+            );
+        }
+        assert_eq!(
+            question_refusal(QuestionRefusal::ReservedStorage).to_string(),
+            format!(
+                "keyword {KEYWORD}: question \"{QUESTION}\" has UEFI Storage 0x30, which neither \
+                 QF_DATE_STORAGE (UEFI 2.11 §33.3.8.3.11) nor QF_TIME_STORAGE (§33.3.8.3.78) \
+                 defines and get does not read, where GetData() and SetData() take the bytes of \
+                 its VarStore"
+            )
+        );
+    }
+
     /// GetData() reads a STRING, DATE, TIME or ORDERED_LIST as stored, which check_get takes;
-    /// check_set refuses them, whose values uefisettings does not check yet; both refuse a
+    /// check_set refuses them, as keyword set of them is not implemented yet; both refuse a
     /// PASSWORD.
     #[test]
     fn check_get_takes_string_date_time_and_ordered_list_but_not_password() {
@@ -2284,7 +2365,9 @@ mod tests {
                 check_set_of(question(op_code), "03", IncludedStates::empty()).expect_err(op);
             assert_eq!(
                 error.to_string(),
-                format!("keyword {KEYWORD}: uefisettings does not yet check values of {op}"),
+                format!(
+                    "keyword {KEYWORD}: uefisettings does not yet implement keyword set of {op}"
+                ),
                 "{op}: set"
             );
         }
@@ -3017,13 +3100,6 @@ mod tests {
         .concat()
     }
 
-    /// An EFI_IFR_DEFAULT of `default_id` of Type `value_type` (UEFI 2.11 §33.3.8.3.12) holding
-    /// `value`.
-    fn typed_default(default_id: u16, value_type: u8, value: &[u8]) -> Vec<u8> {
-        let data = [&default_id.to_le_bytes()[..], &[value_type], value].concat();
-        operation(DEFAULT, false, &data)
-    }
-
     /// A NUMERIC's `<KeywordInfoResp>`: Numeric of its width, its MinValue, MaxValue and Step,
     /// its defaults of DefaultIds 0 and 2, not that of a platform default store, and its prompt
     /// in en-US, not the x-UEFI-ns keyword that comes first.
@@ -3204,7 +3280,7 @@ mod tests {
     /// A STRING's default is its string's CHAR16s in the texts' language, zero-padded to MaxSize
     /// CHAR16s; an ORDERED_LIST's is its EFI_IFR_TYPE_BUFFER default or its flagged option's
     /// value, which is no option then, zero-padded to MaxContainers, an option of both flags
-    /// giving the standard default alone; a longer one, or one of a DATE, refuses.
+    /// giving the standard default alone; a longer one refuses, and one of a DATE is its bytes.
     #[test]
     fn info_of_string_and_ordered_list_defaults_is_their_value_bytes() {
         // MinSize 1, MaxSize 4, Flags
@@ -3291,7 +3367,7 @@ mod tests {
                 ]
                 .concat(),
                 &[],
-                refusal("uefisettings does not decode a default of EFI_IFR_DATE"),
+                standard(&[1, 0, 0, 0]),
             ),
         ];
         for (name, ops, requested, expected) in cases {
@@ -3319,6 +3395,65 @@ mod tests {
             }),
             "the flagged option of an ORDERED_LIST is no option"
         );
+    }
+
+    /// A DATE's or TIME's default is the bytes of its EFI_HII_DATE or EFI_HII_TIME, whether of its
+    /// Type or of a numeric one; one of Type STRING or BUFFER, or wider than the question's 4 or 3
+    /// bytes, refuses.
+    #[test]
+    fn info_of_date_and_time_defaults_is_their_value_bytes() {
+        let question = |op_code: u8, default: Vec<u8>| {
+            let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![0]].concat();
+            [operation(op_code, true, &data), default, END.to_vec()].concat()
+        };
+        let standard = |value: &[u8]| {
+            Ok(KeywordInfo {
+                standard_default: Some(number(value)),
+                ..KeywordInfo::default()
+            })
+        };
+        let refusal = |reason: &str| {
+            Err(KeywordInfoRefusal::Default {
+                keyword: KEYWORD.to_owned(),
+                default_id: DefaultId::STANDARD,
+                reason: reason.to_owned(),
+            })
+        };
+        let cases = [
+            (
+                "DATE of EFI_IFR_TYPE_DATE 2024-02-29",
+                question(DATE, typed_default(0x0000, 0x06, &[0xE8, 0x07, 2, 29])),
+                standard(&[0xE8, 0x07, 2, 29]),
+            ),
+            (
+                "TIME of EFI_IFR_TYPE_TIME 23:59:58",
+                question(TIME, typed_default(0x0000, 0x05, &[23, 59, 58])),
+                standard(&[23, 59, 58]),
+            ),
+            (
+                "DATE of EFI_IFR_TYPE_STRING 6",
+                question(DATE, typed_default(0x0000, 0x07, &6_u16.to_le_bytes())),
+                refusal("EFI_IFR_DATE holds no String(6)"),
+            ),
+            (
+                "DATE of EFI_IFR_TYPE_BUFFER",
+                question(DATE, typed_default(0x0000, 0x0B, &[0xE8, 0x07, 2, 29])),
+                refusal("EFI_IFR_DATE holds no Buffer([232, 7, 2, 29])"),
+            ),
+            (
+                "TIME of EFI_IFR_TYPE_BUFFER",
+                question(TIME, typed_default(0x0000, 0x0B, &[0xE8, 0x07, 2, 29])),
+                refusal("EFI_IFR_TIME holds no Buffer([232, 7, 2, 29])"),
+            ),
+            (
+                "TIME of EFI_IFR_TYPE_NUM_SIZE_32 0x01000000",
+                question(TIME, uint32_default(0x0000, 0x0100_0000)),
+                refusal("it is wider than the question's 3 bytes"),
+            ),
+        ];
+        for (name, ops, expected) in cases {
+            assert_eq!(info_of(ops, KeywordInfoFilter::DEFAULT), expected, "{name}");
+        }
     }
 
     /// DISPLAYNAME and OPTIONSTRING come in the language that `requested` picks, never from a
@@ -3516,6 +3651,92 @@ mod tests {
                 }),
                 "{name}"
             );
+        }
+    }
+
+    /// check_get and check_set refuse a DATE, TIME or ORDERED_LIST where they refuse a ONE_OF, the
+    /// refusal before check_set finds keyword set of them unimplemented: on a VARSTORE_EFI before
+    /// UEFI 2.3.1, whose variable get reads of a DATE or TIME and of no ORDERED_LIST; on a
+    /// VarStoreId that a VarStore outside any FormSet declares for another variable; and beside an
+    /// outside VarStore that does not parse.
+    #[test]
+    fn check_get_and_set_refuse_dates_times_and_ordered_lists_where_they_refuse_a_one_of() {
+        let question = |op_code: u8, var_store_id: u16| {
+            let data = [
+                question_header_with(1, PROMPT, var_store_id, 5, 0),
+                vec![0x00, 0x01, 0x02, 0x00],
+            ]
+            .concat();
+            operation(op_code, false, &data)
+        };
+        let outside = "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which a \
+                       VarStore outside a FormSet of its package list declares for EFI \
+                       variable Other-44444444-4444-4444-4444-444444444444";
+        let malformed = "keyword Keyword: question \"Keyword question\" may have the VarStoreId \
+                         of the VarStore at offset 0 of a form package of its package list, \
+                         which does not parse";
+        for (op_code, op, short) in [
+            (DATE, "EFI_IFR_DATE", QuestionRefusal::ShortVarStore),
+            (TIME, "EFI_IFR_TIME", QuestionRefusal::ShortVarStore),
+            (
+                ORDERED_LIST,
+                "EFI_IFR_ORDERED_LIST",
+                QuestionRefusal::UnreadVarStore(
+                    "VarStore 0x0002 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): uefisettings reads \
+                     no EFI_IFR_ORDERED_LIST on it"
+                        .to_owned(),
+                ),
+            ),
+        ] {
+            let mut short_lists = [list(
+                PATH,
+                &[(NAMESPACE, KEYWORD)],
+                [short_var_store_efi(2), question(op_code, 2)].concat(),
+            )];
+            short_lists[0].strings[0]
+                .strings
+                .insert(5, "ShortVar".into());
+            resolve_short_var_names(&short_lists[0].forms, &short_lists[0].strings);
+            let outside_lists = [list_read(
+                [
+                    var_store(1, [0x44; 16], "Other", 16),
+                    store_form_set(&[question(op_code, 1)]),
+                ]
+                .concat(),
+            )];
+            let malformed_lists = [list_read(
+                [
+                    operation(VAR_STORE, false, &[1, 0]),
+                    store_form_set(&[question(op_code, 1)]),
+                ]
+                .concat(),
+            )];
+            let short = question_refusal(short).to_string();
+
+            for (name, lists, want) in [
+                ("short store", &short_lists, short.as_str()),
+                ("outside VarStore", &outside_lists, outside),
+                ("malformed outside VarStore", &malformed_lists, malformed),
+            ] {
+                let keyword_question = question_of(lists);
+
+                let get = keyword_question.check_get(&reader(1));
+                let set = keyword_question.check_set(
+                    &resp("03"),
+                    IncludedStates::empty(),
+                    VolatileWrites::Refuse,
+                    &mut reader(1),
+                );
+
+                assert_eq!(
+                    (
+                        get.err().map(|error| error.to_string()),
+                        set.err().map(|error| error.to_string())
+                    ),
+                    (Some(want.to_owned()), Some(want.to_owned())),
+                    "{op}, {name}: get and set"
+                );
+            }
         }
     }
 }

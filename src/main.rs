@@ -245,7 +245,7 @@ enum HiiSubcommands {
         #[command(flatten)]
         output: JsonArgs,
     },
-    /// List questions HiiDB. Note that these are not all possible questions, because we don't parse certain non-useful question types.
+    /// List the one-of, numeric, checkbox, date and time questions of the HiiDB, whose values get reads.
     #[command(next_display_order = None)]
     ListQuestions {
         #[command(flatten)]

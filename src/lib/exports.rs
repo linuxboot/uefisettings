@@ -1459,6 +1459,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::BIT_VARSTORE_GUID;
     use crate::hii::forms::ifr_fixtures::BS_RT;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
+    use crate::hii::forms::ifr_fixtures::DATE;
     use crate::hii::forms::ifr_fixtures::DEFAULT_STORE;
     use crate::hii::forms::ifr_fixtures::DISABLE_IF;
     use crate::hii::forms::ifr_fixtures::END;
@@ -1477,6 +1478,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
     use crate::hii::forms::ifr_fixtures::THIS;
+    use crate::hii::forms::ifr_fixtures::TIME;
     use crate::hii::forms::ifr_fixtures::VALUE;
     use crate::hii::forms::ifr_fixtures::VAR_STORE;
     use crate::hii::forms::ifr_fixtures::VAR_STORE_EFI;
@@ -2672,6 +2674,359 @@ mod tests {
                 );
             }
             assert_eq!(variables.writes_to(&setup()), [], "{case}: set writes");
+        }
+    }
+
+    /// A keyword that prompts a DATE or TIME of a FormSet and a CHECKBOX outside any FormSet
+    /// selects neither, as for a CHECKBOX of the FormSet
+    /// (keywords_that_prompt_a_statement_outside_a_form_set_are_refused): get and set refuse it,
+    /// and set writes nothing.
+    #[test]
+    fn keywords_that_prompt_a_statement_outside_a_form_set_refuse_each_kind() {
+        let header = question_header_with(0x8001, 3, 1, 0, 0x00);
+        let cases = [
+            (
+                "DATE",
+                operation(DATE, false, &[header.clone(), vec![0x00]].concat()),
+                "2027-01-02",
+            ),
+            (
+                "TIME",
+                operation(TIME, false, &[header.clone(), vec![0x00]].concat()),
+                "01:02:03",
+            ),
+        ];
+        let refusal = KeywordRefusal::AmbiguousStatements {
+            keyword: "Keyword:5".to_owned(),
+            count: 2,
+        };
+        for (kind, question, value) in cases {
+            let packages = [
+                form_package_of(
+                    &[
+                        checkbox_at(9, 3, 1, 1),
+                        form_set(&[
+                            var_store_efi(1, "Setup", NV_BS_RT, 22),
+                            form(1, &[question]),
+                        ]),
+                    ]
+                    .concat(),
+                ),
+                strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
+                strings_package_of(b"en-US", &["Title", "Help", "Keyed", "Help text", "A", "B"]),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat());
+            let question = by_keyword("Keyword:5", None);
+            let variables = Rc::new(MemoryVariables::default());
+            variables.insert(setup(), 7, &[0; 22]);
+
+            let got = HiiBackend::get_in(
+                &hiidb,
+                question.clone(),
+                None,
+                &GetOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .map(|got| got.responses.len())
+            .map_err(|error| format!("{error:#}"));
+            let set = HiiBackend::set_in(
+                &hiidb,
+                question.clone(),
+                value,
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(|set| set.responses.len())
+            .map_err(|error| format!("{error:#}"));
+
+            for (action, result) in [("get", &got), ("set", &set)] {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.contains(&refusal.to_string())),
+                    "{kind}: {action}: {result:?}"
+                );
+            }
+            assert_eq!(variables.writes_to(&setup()), [], "{kind}: set writes");
+        }
+    }
+
+    /// A HiiDB as keyed_hiidb's whose FormSet holds only `question`, an op of QuestionId 0x8001
+    /// and prompt string 3, "Keyed" in en-US and Keyword:5 in x-UEFI-ns, on Setup, a VarStore of
+    /// `size` bytes, and en-US strings `strings` from string 6.
+    fn keyed_question_hiidb(question: Vec<u8>, size: u16, strings: &[&str]) -> Vec<u8> {
+        let en_us = [&["Title", "Help", "Keyed", "Help text", "Plain"], strings].concat();
+        let packages = [
+            form_package_with_guid(
+                guid_bytes(KEYED_FORM_SET),
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, size),
+                    form(1, &[question]),
+                ],
+            ),
+            strings_package_of(b"x-UEFI-ns", &["", "", "Keyword:5"]),
+            strings_package_of(b"en-US", &en_us),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat())
+    }
+
+    /// A HiiDB whose FormSet holds only `question`, an op prompted by string 3 with help string 4,
+    /// on Setup, a VarStore of `size` bytes, and strings packages of x-UEFI-ns, en-US and fr-FR,
+    /// in that order: `en_us` and `fr_fr` translate the strings from 3, and x-UEFI-ns gives each
+    /// of them a keyword that no text shows.
+    fn translated_question_hiidb(
+        question: Vec<u8>,
+        size: u16,
+        en_us: &[&str],
+        fr_fr: &[&str],
+    ) -> Vec<u8> {
+        let keywords: Vec<String> = (3..3 + en_us.len()).map(|id| format!("x{id}:1")).collect();
+        let keywords: Vec<&str> = keywords.iter().map(String::as_str).collect();
+        let packages = [
+            form_package_with_guid(
+                guid_bytes(KEYED_FORM_SET),
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, size),
+                    form(1, &[question]),
+                ],
+            ),
+            strings_package_of(b"x-UEFI-ns", &[&["", ""][..], &keywords].concat()),
+            strings_package_of(b"en-US", &[&["Title", "Help"][..], en_us].concat()),
+            strings_package_of(b"fr-FR", &[&["Titre", "Aide"][..], fr_fr].concat()),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat())
+    }
+
+    /// What list-questions and show-ifr show of `hiidb`, whose Setup holds `stored`, on a
+    /// platform of PlatformLang `platform_lang`, if any.
+    fn listed_and_shown(
+        hiidb: &[u8],
+        stored: &[u8],
+        platform_lang: Option<&str>,
+    ) -> (Vec<Question>, String) {
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, stored);
+        let listed = HiiBackend::list_questions_in(
+            hiidb,
+            &ListQuestionsOptions::default(),
+            shared(&variables),
+            None,
+            platform_lang,
+        )
+        .expect("list the questions");
+        let shown = HiiBackend::show_ifr_in(
+            hiidb,
+            &ShowIfrOptions::default(),
+            shared(&variables),
+            None,
+            platform_lang,
+        )
+        .expect("show the IFR")
+        .readable_representation;
+        (listed, shown)
+    }
+
+    /// list-questions and show-ifr show the prompt and the help of a DATE and a TIME in the
+    /// platform language, else in the first display language, never in the configuration
+    /// language before them.
+    #[test]
+    fn dates_and_times_show_their_texts_in_the_platform_language() {
+        let cases = [
+            (DATE, &[0xE8, 0x07, 2, 29][..], "2024-02-29"),
+            (TIME, &[12, 34, 56][..], "12:34:56"),
+        ];
+        for (op_code, stored, answer) in cases {
+            let data = [question_header_with(0x8001, 3, 1, 0, 0x00), vec![0x00]].concat();
+            let hiidb = translated_question_hiidb(
+                operation(op_code, false, &data),
+                u16::try_from(stored.len()).expect("a short VarStore"),
+                &["When", "When help"],
+                &["Quand", "Aide de quand"],
+            );
+            for (platform_lang, name, help) in [
+                (None, "When", "When help"),
+                (Some("fr-FR"), "Quand", "Aide de quand"),
+            ] {
+                let (listed, shown) = listed_and_shown(&hiidb, stored, platform_lang);
+
+                let listed: Vec<[&str; 3]> = listed
+                    .iter()
+                    .map(|question| [&*question.name, &*question.help, &*question.answer])
+                    .collect();
+                assert_eq!(
+                    listed,
+                    [[name, help, answer]],
+                    "{op_code:#04x} {platform_lang:?}: list-questions"
+                );
+                assert!(
+                    shown.contains(&format!("Q: {name} - Help: {help}\n")),
+                    "{op_code:#04x} {platform_lang:?}: show-ifr: {shown}"
+                );
+            }
+        }
+    }
+
+    /// What get of a question answers and set of it writes.
+    #[derive(Debug, PartialEq)]
+    struct Answered {
+        got: Vec<String>,
+        /// set's error if it fails
+        set: std::result::Result<(), String>,
+        writes: Vec<(u16, Vec<u8>)>,
+    }
+
+    /// Asserts that get of the question 0x8001 of `hiidb`, a keyed_question_hiidb whose Setup
+    /// holds `stored`, and set of it to `value`, give `want` by its prompt, by its QuestionId and
+    /// by its keyword alike.
+    #[track_caller]
+    fn assert_answered_by_each_selector(hiidb: &[u8], stored: &[u8], value: &str, want: &Answered) {
+        for question in [
+            QuestionSelector::from("Keyed"),
+            by_address(&format!("{KEYED_FORM_SET}:0x8001")),
+            by_keyword("Keyword:5", None),
+        ] {
+            let variables = Rc::new(MemoryVariables::default());
+            variables.insert(setup(), 7, stored);
+            let got = HiiBackend::get_in(
+                hiidb,
+                question.clone(),
+                None,
+                &GetOptions::default(),
+                shared(&variables),
+                None,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("get {question}: {error}"));
+            // each answer shows the QuestionId, the FormSet's GUID and the keyword of 0x8001
+            let identity = [
+                Some(serde_json::json!(0x8001)),
+                Some(serde_json::json!(KEYED_FORM_SET)),
+                Some(serde_json::json!([{"namespace_id": "x-UEFI-ns", "keyword": "Keyword:5"}])),
+            ];
+            for response in &got.responses {
+                assert_eq!(
+                    identity_json(&response.question),
+                    identity,
+                    "{question:?}: identity of {:?}",
+                    response.question.answer
+                );
+            }
+            let set = HiiBackend::set_in(
+                hiidb,
+                question.clone(),
+                value,
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            );
+            let answered = Answered {
+                got: got
+                    .responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect(),
+                set: set.map(drop).map_err(|error| format!("{error:#}")),
+                writes: variables.writes_to(&setup()),
+            };
+            assert_eq!(&answered, want, "{question:?}");
+        }
+    }
+
+    /// get by QuestionId and by keyword answers a DATE and a TIME on a VarStore as by prompt,
+    /// and set by each writes the same EFI_HII_DATE or EFI_HII_TIME.
+    #[test]
+    fn dates_and_times_select_by_question_id_or_keyword_as_by_prompt() {
+        let cases = [
+            (
+                DATE,
+                &[0xE8, 0x07, 2, 29][..],
+                "2024-02-29",
+                "2027-01-02",
+                vec![0xEB, 0x07, 1, 2],
+            ),
+            (
+                TIME,
+                &[12, 34, 56][..],
+                "12:34:56",
+                "01:02:03",
+                vec![1, 2, 3],
+            ),
+        ];
+        for (op_code, stored, shown, value, written) in cases {
+            let data = [question_header_with(0x8001, 3, 1, 0, 0x00), vec![0x00]].concat();
+            let hiidb = keyed_question_hiidb(
+                operation(op_code, false, &data),
+                u16::try_from(stored.len()).expect("a short VarStore"),
+                &[],
+            );
+            assert_answered_by_each_selector(
+                &hiidb,
+                stored,
+                value,
+                &Answered {
+                    got: vec![shown.to_owned()],
+                    set: Ok(()),
+                    writes: vec![(0, written)],
+                },
+            );
+        }
+    }
+
+    /// get and set by prompt, by QuestionId and by keyword alike find no DATE or TIME of the
+    /// reserved UEFI Storage 0x30, which list-questions does not list either.
+    #[test]
+    fn dates_and_times_of_reserved_storage_select_by_no_selector() {
+        for op_code in [DATE, TIME] {
+            let data = [question_header_with(0x8001, 3, 1, 0, 0x00), vec![0x30]].concat();
+            let hiidb = keyed_question_hiidb(operation(op_code, false, &data), 4, &[]);
+            for question in [
+                QuestionSelector::from("Keyed"),
+                by_address(&format!("{KEYED_FORM_SET}:0x8001")),
+                by_keyword("Keyword:5", None),
+            ] {
+                let variables = Rc::new(MemoryVariables::default());
+                variables.insert(setup(), 7, &[0; 4]);
+                let got = HiiBackend::get_in(
+                    &hiidb,
+                    question.clone(),
+                    None,
+                    &GetOptions::default(),
+                    shared(&variables),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("get {question}: {error}"));
+                let set = HiiBackend::set_in(
+                    &hiidb,
+                    question.clone(),
+                    "1",
+                    None,
+                    &SetOptions::default(),
+                    shared(&variables),
+                    &*variables,
+                    None,
+                );
+                let not_found = format!("no question {:?} in the HiiDB", question.to_string());
+                assert_eq!(
+                    (
+                        got.responses.len(),
+                        set.map(drop).map_err(|error| error.to_string()),
+                        variables.writes_to(&setup()),
+                    ),
+                    (0, Err(not_found), vec![]),
+                    "{op_code:#04x} {question:?}"
+                );
+            }
         }
     }
 
@@ -9200,6 +9555,42 @@ mod tests {
         }
     }
 
+    /// A DATE and a TIME on a VarStore whose variable is missing show their values from the
+    /// snapshot, tagged, as get shows a NUMERIC's; set refuses them, as it never takes the
+    /// snapshot.
+    #[test]
+    fn dates_and_times_show_snapshot_values_and_set_refuses_them() {
+        let date = [question_header_with(1, 1, 1, 0, 0x00), vec![0x00]].concat();
+        let time = [question_header_with(2, 2, 1, 4, 0x00), vec![0x00]].concat();
+        let hiidb = n_store_hiidb(
+            7,
+            &[operation(DATE, false, &date), operation(TIME, false, &time)],
+            &["D", "T"],
+        );
+        // the EFI_HII_DATE 2026-11-10 and the EFI_HII_TIME 12:34:56
+        let text = n_store_snapshot(&[0xEA, 0x07, 11, 10, 12, 34, 56]);
+
+        let (got, listed, ifr, _) =
+            answers_with_snapshot(&hiidb, &["D", "T"], &no_variables(), &text);
+
+        let want = ["2026-11-10 <snapshot>", "12:34:56 <snapshot>"];
+        assert_eq!(got, want, "get");
+        assert_eq!(listed, want, "list-questions");
+        for shown in want {
+            assert!(
+                ifr.contains(&format!("-Answer: {shown}\n")),
+                "show-ifr lacks {shown:?}: {ifr}"
+            );
+        }
+        for (question, value) in [("D", "2027-01-02"), ("T", "01:02:03")] {
+            assert_eq!(
+                set_error_without_variables(&hiidb, question, value),
+                N_STORE_NOT_EXPOSED,
+                "set {question}"
+            );
+        }
+    }
+
     /// Reading a snapshot logs none of its bytes, at any level, also when it is no
     /// <MultiConfigAltResp> or holds a <ConfigAltResp> that does not parse.
     #[test]
@@ -10073,6 +10464,159 @@ mod tests {
                 set_of(&hiidb, "A", "9", &variables),
                 Err(format!("cannot set question \"A\": {why}")),
                 "VarStoreInfo {var_store_info}: set A"
+            );
+        }
+    }
+
+    /// A DATE and a TIME on a VARSTORE_EFI before UEFI 2.3.1 read and set the EFI variable that
+    /// their VarName names, their EFI_HII_DATE or EFI_HII_TIME from byte 0, as a NUMERIC there
+    /// does; set writes no other variable. A DATE before the store took its VarStoreInfo for a
+    /// VarOffset and is refused as a NUMERIC is.
+    #[test]
+    fn dates_and_times_of_a_short_var_store_read_and_set_the_variables_of_their_var_names() {
+        // prompts "Day" and "Hour", strings 1 and 2, on the VarNames 3 and 4
+        let date = operation(
+            DATE,
+            false,
+            &[question_header_with(1, 1, 1, 3, 0x00), vec![0x00]].concat(),
+        );
+        let time = operation(
+            TIME,
+            false,
+            &[question_header_with(2, 2, 1, 4, 0x00), vec![0x00]].concat(),
+        );
+        let strings = [en_strings_package_of(&[
+            "Day",
+            "Hour",
+            "ShortDate",
+            "ShortTime",
+        ])];
+        let short_store = short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT);
+        let hiidb = short_store_list(
+            &[short_store.clone(), form(1, &[date.clone(), time])],
+            &strings,
+        );
+        // the EFI_HII_DATE 2026-11-10 and the EFI_HII_TIME 12:34:56
+        let stored = [
+            ("ShortDate", vec![0xEA, 0x07, 11, 10]),
+            ("ShortTime", vec![12, 34, 56]),
+        ];
+        let variables = || {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            for (name, value) in &stored {
+                variables.insert(short_key(name), NV_BS_RT, value);
+            }
+            Rc::new(variables)
+        };
+        let cases = [
+            (
+                "Day",
+                "2026-11-10",
+                "2027-01-02",
+                "ShortDate",
+                vec![0xEB, 0x07, 1, 2],
+            ),
+            ("Hour", "12:34:56", "01:02:03", "ShortTime", vec![1, 2, 3]),
+        ];
+
+        for (question, value, new_value, name, written) in cases {
+            let variables = variables();
+
+            assert_eq!(
+                answers_of(&hiidb, question, &variables),
+                [value],
+                "get {question}"
+            );
+            assert_eq!(
+                set_of(&hiidb, question, new_value, &variables),
+                Ok(()),
+                "set {question}"
+            );
+
+            for (other, _) in &stored {
+                let want = match *other == name {
+                    true => vec![(0, written.clone())],
+                    false => vec![],
+                };
+                assert_eq!(
+                    variables.writes_to(&short_key(other)),
+                    want,
+                    "set {question}: writes of {other}"
+                );
+            }
+            assert_eq!(
+                answers_of(&hiidb, question, &variables),
+                [new_value],
+                "get {question} after set"
+            );
+        }
+
+        let declared_after = short_store_list(&[form(1, &[date]), short_store], &strings);
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): declared after the \
+                   question, which took its VarStoreInfo for a VarOffset; a question names a \
+                   previously declared VarStore (UEFI 2.11 §33.3.8.2.2 EFI_IFR_QUESTION_HEADER)";
+        let variables = variables();
+        assert_eq!(
+            answers_of(&declared_after, "Day", &variables),
+            [format!("<ValueUnavailable: {why}>")],
+            "get of the DATE before its store"
+        );
+        assert_eq!(
+            set_of(&declared_after, "Day", "2027-01-02", &variables),
+            Err(format!("cannot set question \"Day\": {why}")),
+            "set of the DATE before its store"
+        );
+    }
+
+    /// A DATE and a TIME over the bytes of a PASSWORD outside any FormSet of their VarStoreId keep
+    /// them withheld, as a NUMERIC does: get answers that their bytes hold a password, and set
+    /// refuses them and writes nothing.
+    #[test]
+    fn dates_and_times_keep_an_outside_password_withheld() {
+        let date = [question_header_with(4, 4, 2, 0, 0x00), vec![0x00]].concat();
+        let time = [question_header_with(5, 5, 2, 4, 0x00), vec![0x00]].concat();
+        let packages = [
+            form_package_of(
+                &[
+                    password_on(3, 3, 2, 0),
+                    form_set(&[
+                        var_store(2, [0x44; 16], "AMITSESetup", 81),
+                        form(
+                            1,
+                            &[operation(DATE, false, &date), operation(TIME, false, &time)],
+                        ),
+                    ]),
+                ]
+                .concat(),
+            ),
+            en_strings_package_of(&["Q", "P", "Password", "D", "T"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let stored = [plaintext_password().as_slice(), &[0xAA; 40], &[1]].concat();
+
+        for (question, value) in [("D", "2027-01-02"), ("T", "01:02:03")] {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(amitse_setup(), NV_BS_RT, &stored);
+            let variables = Rc::new(variables);
+
+            assert_eq!(
+                answers_of(&hiidb, question, &variables),
+                [PASSWORD_BYTES],
+                "get {question}"
+            );
+            let set = set_bypassing(&hiidb, question, value, &variables);
+            assert!(
+                set.as_ref().is_err_and(|error| error
+                    .contains("holds a password at bytes 0..40, which set never writes")),
+                "set {question}: {set:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&amitse_setup()),
+                [],
+                "set {question}: writes to AMITSESetup"
             );
         }
     }

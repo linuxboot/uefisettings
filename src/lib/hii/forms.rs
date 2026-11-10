@@ -61,6 +61,11 @@ use conditions::ExpressionInputs;
 use conditions::QuestionExpression;
 use conditions::QuestionValues;
 use conditions::VarStoreValues;
+use date_time::widened_date;
+use date_time::widened_time;
+use date_time::DateTimeInput;
+use date_time::DateTimeKind;
+use date_time::DateTimeQuestion;
 use defaults::FormSetDefaultStores;
 use defaults::OptionValueError;
 use keywords::KeywordStatement;
@@ -82,6 +87,7 @@ pub use question_values::QuestionAddressError;
 pub(crate) use question_values::QuestionIdentity;
 pub(crate) use question_values::QuestionMatch;
 pub use question_values::QuestionSelector;
+use question_values::ValueQuestion;
 use set::ChangeValueError;
 use setup_password::password_storage_width;
 use setup_password::PasswordOp;
@@ -127,6 +133,7 @@ pub(crate) use setup_password::UnresolvedPassword;
 
 mod ami_access_level;
 mod conditions;
+mod date_time;
 mod defaults;
 #[cfg(test)]
 pub(crate) mod ifr_fixtures;
@@ -987,6 +994,8 @@ pub enum ParsedOperation {
     Get(VarStoreOperand),
     Set(VarStoreOperand),
     FormMap(FormMap),
+    Date(DateTimeQuestion),
+    Time(DateTimeQuestion),
     #[default]
     Placeholder,
 }
@@ -1387,11 +1396,24 @@ fn short_var_store_of(op: &IFROperation, var_store_id: u16) -> Option<ShortVarSt
     }
 }
 
-/// How a ONE_OF, NUMERIC or CHECKBOX stores its value, and a NUMERIC or ONE_OF its MinValue,
-/// MaxValue and Step.
+/// The layout of the variable that `question` names, while the FormSet is parsed: OneValue on a
+/// VARSTORE_EFI before UEFI 2.3.1 declared before it.
+fn parsed_layout(question: &IFROperation) -> VariableLayout {
+    if parse_question_header(question)
+        .is_some_and(|header| names_short_var_store(question, header.var_store_id))
+    {
+        VariableLayout::OneValue
+    } else {
+        VariableLayout::Offsets
+    }
+}
+
+/// How a ONE_OF, NUMERIC, CHECKBOX, DATE or TIME stores its value, and a NUMERIC or ONE_OF its
+/// MinValue, MaxValue and Step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ValueEncoding {
-    /// In the size of EFI_IFR_NUMERIC_SIZE in its Flags, a CHECKBOX value in a byte.
+    /// In the size of EFI_IFR_NUMERIC_SIZE in its Flags, a CHECKBOX value in a byte, a DATE or
+    /// TIME value in its EFI_HII_DATE or EFI_HII_TIME.
     NumericSize,
     /// As UINT32, as edk2-stable202608 VfrSyntax.g stores them for an EDKII bit varstore field,
     /// whose Flags hold its width in bits; the value in that width, a CHECKBOX value in 1 bit.
@@ -1403,14 +1425,10 @@ pub enum ValueEncoding {
 
 impl ValueEncoding {
     fn from_question(question: &IFROperation) -> Self {
-        match (
-            refers_to_bit_field(question),
-            parse_question_header(question)
-                .is_some_and(|header| names_short_var_store(question, header.var_store_id)),
-        ) {
+        match (refers_to_bit_field(question), parsed_layout(question)) {
             (true, _) => Self::EdkiiBitField,
-            (false, true) => Self::VarName,
-            (false, false) => Self::NumericSize,
+            (false, VariableLayout::OneValue) => Self::VarName,
+            (false, VariableLayout::Offsets) => Self::NumericSize,
         }
     }
 
@@ -1532,7 +1550,7 @@ enum IfrDefaultValue {
     /// Absent from EFI_IFR_DEFAULT_2 (Type EFI_IFR_TYPE_OTHER), whose value is a nested
     /// EFI_IFR_VALUE.
     InValueOp,
-    /// Of a Type other than numeric, boolean, string, buffer and EFI_IFR_TYPE_OTHER.
+    /// Of a Type other than numeric, boolean, date, time, string, buffer and EFI_IFR_TYPE_OTHER.
     NotDecoded,
     /// Length leaves no room for a value of Type.
     Missing,
@@ -1550,6 +1568,16 @@ fn default_value_parser<R: Read + Seek>(
         | EFI_IFR_TYPE_NUM_SIZE_64
         | EFI_IFR_TYPE_BOOLEAN => match type_value_parser(reader, endian, args) {
             Ok(value) => Ok(IfrDefaultValue::Decoded(value)),
+            Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
+            Err(error) => Err(error),
+        },
+        EFI_IFR_TYPE_DATE => match BinRead::read_options(reader, endian, ()) {
+            Ok(date) => Ok(IfrDefaultValue::Decoded(TypeValue::Date(date))),
+            Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
+            Err(error) => Err(error),
+        },
+        EFI_IFR_TYPE_TIME => match BinRead::read_options(reader, endian, ()) {
+            Ok(time) => Ok(IfrDefaultValue::Decoded(TypeValue::Time(time))),
             Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
             Err(error) => Err(error),
         },
@@ -1688,6 +1716,7 @@ impl FormMap {
     }
 }
 
+/// An EFI_HII_TIME.
 #[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 pub struct Time {
@@ -1696,12 +1725,44 @@ pub struct Time {
     pub second: u8,
 }
 
+impl Time {
+    pub(crate) fn from_bytes([hour, minute, second]: [u8; 3]) -> Self {
+        Self {
+            hour,
+            minute,
+            second,
+        }
+    }
+
+    /// Its bytes, as stored.
+    pub(crate) fn to_bytes(self) -> [u8; 3] {
+        [self.hour, self.minute, self.second]
+    }
+}
+
+/// An EFI_HII_DATE.
 #[derive(BinRead, Debug, PartialEq, Clone, Copy)]
 #[br(little)]
 pub struct Date {
     pub year: u16,
     pub month: u8,
     pub day: u8,
+}
+
+impl Date {
+    pub(crate) fn from_bytes([low, high, month, day]: [u8; 4]) -> Self {
+        Self {
+            year: u16::from_le_bytes([low, high]),
+            month,
+            day,
+        }
+    }
+
+    /// Its bytes, as stored.
+    pub(crate) fn to_bytes(self) -> [u8; 4] {
+        let [low, high] = self.year.to_le_bytes();
+        [low, high, self.month, self.day]
+    }
 }
 
 #[derive(BinRead, Debug, PartialEq, Clone, Copy)]
@@ -1722,9 +1783,7 @@ pub enum TypeValue {
     NumSize32(u32),
     NumSize64(u64),
     Boolean(bool),
-    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Time(Time),
-    #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     Date(Date),
     #[expect(dead_code, reason = "type_value_parser does not decode this type yet")]
     StringID(u16),
@@ -1757,6 +1816,27 @@ impl TypeValue {
             | TypeValue::Action(_)
             | TypeValue::Ref(_)
             | TypeValue::Unknown(_) => None,
+        }
+    }
+
+    /// Returns the value as edk2-stable202608 SetupBrowserDxe/Expression.c HiiValueToUINT64
+    /// widens it: a number or BOOLEAN as as_u64 does, an EFI_HII_DATE or EFI_HII_TIME as its
+    /// bytes, little-endian.
+    fn widened(self) -> Option<u64> {
+        match self {
+            TypeValue::Date(date) => Some(widened_date(date.to_bytes())),
+            TypeValue::Time(time) => Some(widened_time(time.to_bytes())),
+            TypeValue::NumSize8(_)
+            | TypeValue::NumSize16(_)
+            | TypeValue::NumSize32(_)
+            | TypeValue::NumSize64(_)
+            | TypeValue::Boolean(_)
+            | TypeValue::StringID(_)
+            | TypeValue::Other
+            | TypeValue::Undefined
+            | TypeValue::Action(_)
+            | TypeValue::Ref(_)
+            | TypeValue::Unknown(_) => self.as_u64(),
         }
     }
 }
@@ -3184,6 +3264,20 @@ fn handle_opcode(node: &mut IFROperation) -> Result<()> {
             Some(parsed) => node.parsed_data = ParsedOperation::FormMap(parsed),
             None => debug!("leaving a FormMap without a FormId undecoded"),
         },
+        // A DATE or TIME too short for its fields is left undecoded, as uefisettings left every
+        // DATE and TIME before it decoded them, and keeps the FormSet.
+        IFROpCode::Date => {
+            match data_cursor.parse_ne_args((DateTimeKind::Date, parsed_layout(node))) {
+                Ok(parsed) => node.parsed_data = ParsedOperation::Date(parsed),
+                Err(error) => debug!("leaving a Date undecoded: {error}"),
+            }
+        }
+        IFROpCode::Time => {
+            match data_cursor.parse_ne_args((DateTimeKind::Time, parsed_layout(node))) {
+                Ok(parsed) => node.parsed_data = ParsedOperation::Time(parsed),
+                Err(error) => debug!("leaving a Time undecoded: {error}"),
+            }
+        }
         _ => (),
     }
 
@@ -3194,8 +3288,8 @@ pub struct QuestionDescriptor {
     pub question: String,
     pub help: String,
     pub value: String,
-    max_value: RangeType,
-    numeric_range: Option<NumericRange>,
+    /// How set takes the text of a new value, unless it picks an option
+    input: TextInput,
     opcode: IFROpCode,
     /// The Flags of its question header
     pub flags: QuestionFlags,
@@ -3224,6 +3318,16 @@ impl fmt::Debug for QuestionDescriptor {
             .field("possible_options", &self.possible_options)
             .finish()
     }
+}
+
+/// How set takes the text of a question's new value, unless it picks an option.
+enum TextInput {
+    /// A NUMERIC on bytes: a number within its range
+    Range(NumericRange),
+    /// A CHECKBOX, or a ONE_OF or NUMERIC on bits: a decimal number up to this maximum
+    Maximum(RangeType),
+    /// A DATE or TIME
+    DateTime(DateTimeInput),
 }
 
 #[derive(Debug)]
@@ -3477,8 +3581,8 @@ fn list_questions_in(
     res
 }
 
-/// Returns the QuestionDescriptor and states of a ONE_OF, NUMERIC or CHECKBOX in a state that
-/// `walk.include` may allow.
+/// Returns the QuestionDescriptor and states of a question that value_question takes, in a state
+/// that `walk.include` may allow.
 fn listed_question(
     question: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
@@ -3560,7 +3664,7 @@ where
 }
 
 /// Refuses with SelectionError::Ambiguous the `statements` of the keyword `question` whose
-/// ONE_OF, NUMERIC and CHECKBOX questions are of more than one NAMESPACE, naming each: a
+/// questions that value_question takes are of more than one NAMESPACE, naming each: a
 /// NAMESPACE "is equivalent to the platform configuration language being used for the keyword
 /// definition" (UEFI 2.11 §35.2.1.6), so they would be settings of different definitions.
 pub(crate) fn check_keyword_namespace(
@@ -4678,6 +4782,23 @@ fn display_op(
             );
         }
 
+        ParsedOperation::Date(parsed) | ParsedOperation::Time(parsed) => {
+            let varstore =
+                find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
+            let answer_disp = display_answer(node, &varstore, inputs);
+
+            result.push_str(
+                format!(
+                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-Flags: {:#04x}\n{extra_spaces}-Answer: {answer_disp}\n",
+                    current_node.op_code,
+                    texts.display(parsed.question_header().prompt_string_id),
+                    texts.display(parsed.question_header().help_string_id),
+                    parsed.flags
+                )
+                .as_str(),
+            );
+        }
+
         // TODO: we have already made structs for the most popular opcodes so we should finish the display function for them
         // however display is only for debugging and a visual representation of the forms for humans
         _ => result
@@ -4696,7 +4817,18 @@ fn display_answer(
 ) -> String {
     match retrieve_question_value(question, varstore, inputs) {
         Err(reason) => reason.to_answer(),
-        Ok(retrieved) => format!("{}{}", retrieved.value, retrieved.source.annotation()),
+        Ok(retrieved) => {
+            let value = match value_question(&question.borrow()) {
+                Some(ValueQuestion::DateTime(parsed)) => parsed.format().text(retrieved.value),
+                Some(
+                    ValueQuestion::OneOf(_)
+                    | ValueQuestion::Numeric(_)
+                    | ValueQuestion::CheckBox(_),
+                )
+                | None => retrieved.value.to_string(),
+            };
+            format!("{value}{}", retrieved.source.annotation())
+        }
     }
 }
 
@@ -4755,7 +4887,8 @@ fn form_set_varstore(
 }
 
 /// The EFI variable of `question` on the VARSTORE_EFI before UEFI 2.3.1 `store`: of a ONE_OF,
-/// NUMERIC or CHECKBOX, whose value ValueEncoding::VarName places at byte 0, as wide as the value;
+/// NUMERIC, CHECKBOX, DATE or TIME, whose value ValueEncoding::VarName places at byte 0, as wide
+/// as the value;
 /// of a PASSWORD, of its StorageWidth (password_storage_width), whatever its MaxSize.
 fn short_efi_variable(
     store: &ShortVarStoreEfi,
@@ -4857,6 +4990,8 @@ fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
         | ParsedOperation::Get(_)
         | ParsedOperation::Set(_)
         | ParsedOperation::FormMap(_)
+        | ParsedOperation::Date(_)
+        | ParsedOperation::Time(_)
         | ParsedOperation::Placeholder => None,
     }
 }
@@ -5288,6 +5423,40 @@ mod tests {
         }
         for width in 1..=8 {
             assert_eq!(write(width), Ok(()), "{width} bytes");
+        }
+    }
+
+    /// VarStoreWrite::new writes a date or time as its EFI_HII_DATE or EFI_HII_TIME, which fills
+    /// the 4 bytes of a DATE's storage or the 3 of a TIME's, and refuses a storage of another width.
+    #[test]
+    fn dates_and_times_fill_their_storage_with_their_bytes() {
+        let date = TypeValue::Date(Date::from_bytes([0xE8, 0x07, 0x02, 0x1D]));
+        let time = TypeValue::Time(Time::from_bytes([23, 59, 58]));
+        let write = |value, width| {
+            VarStoreWrite::new(
+                &efi_variable("Test", 42),
+                1,
+                width,
+                value,
+                VariableInterface::Efivarfs,
+            )
+            .map(|write| write.patches)
+            .map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            write(date, 4),
+            Ok(vec![(1, vec![0xE8, 0x07, 0x02, 0x1D])]),
+            "DATE"
+        );
+        assert_eq!(write(time, 3), Ok(vec![(1, vec![23, 59, 58])]), "TIME");
+        for (value, width, size) in [(date, 3, 4), (date, 8, 4), (time, 4, 3), (time, 1, 3)] {
+            assert_eq!(
+                write(value, width),
+                Err(format!(
+                    "a question's storage of {width} bytes, not the {size} of its value"
+                )),
+                "{value:?} in {width} bytes"
+            );
         }
     }
 

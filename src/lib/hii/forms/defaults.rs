@@ -113,7 +113,8 @@ impl DefaultStores {
 /// A question's default, as the IFR declares it (default_for_id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TypedDefault {
-    /// Of a numeric or BOOLEAN Type, an EFI_IFR_VALUE, a flagged option of a ONE_OF, or a
+    /// Of a numeric, BOOLEAN, DATE or TIME Type (an EFI_HII_DATE or EFI_HII_TIME as
+    /// TypeValue::widened takes it), an EFI_IFR_VALUE, a flagged option of a ONE_OF, or a
     /// CHECKBOX's flags
     Number(u64),
     /// Of Type EFI_IFR_TYPE_STRING: the identifier of the string
@@ -422,7 +423,7 @@ fn ifr_default_value(
     let Some(value) = value else {
         return match &default.value {
             IfrDefaultValue::Decoded(value) => value
-                .as_u64()
+                .widened()
                 .map(TypedDefault::Number)
                 .ok_or(DefaultError::DefaultType(default.value_type)),
             IfrDefaultValue::String(id) => Ok(TypedDefault::String(*id)),
