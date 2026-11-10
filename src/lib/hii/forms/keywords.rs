@@ -54,6 +54,7 @@ use super::defaults::TypedDefault;
 use super::find_corresponding_varstore;
 use super::question_values::describe_question;
 use super::question_values::value_question;
+use super::question_values::ListedQuestion;
 use super::question_values::ValueQuestion;
 use super::refers_to_bit_field;
 use super::set::own_write;
@@ -749,7 +750,9 @@ impl<'a> KeywordQuestion<'a> {
                 // a CHECKBOX has no NumericRange, nor a NUMERIC bit field, which own_write refuses
                 text = match &descriptor.input {
                     TextInput::Range(range) => range.format.decode(number).to_string(),
-                    TextInput::Maximum(_) | TextInput::DateTime(_) => number.to_string(),
+                    TextInput::Maximum(_) | TextInput::DateTime(_) | TextInput::OrderedList(_) => {
+                        number.to_string()
+                    }
                 };
                 NewValue::Text(&text)
             }
@@ -1225,8 +1228,9 @@ impl<'a> KeywordQuestion<'a> {
             let values = VarStoreValues::new(self.root, None);
             let mut walk = FormSetWalk::new(&self.texts, reader, &values, include);
             let state = question_state(&self.op.borrow(), &mut walk.inputs);
-            select(vec![(question, state)], include)
-                .map(|question| describe_question(&self.op, question, &mut walk))
+            select(vec![(question, state)], include).map(|question| {
+                describe_question(&self.op, ListedQuestion::Value(question), &mut walk)
+            })
         };
         let options = SetOptions {
             include,
@@ -1530,6 +1534,7 @@ mod tests {
     use super::super::ifr_fixtures::VALUE;
     use super::super::ifr_fixtures::VAR_STORE;
     use super::super::ifr_fixtures::WRITE;
+    use super::super::list_questions;
     use super::super::resolve_short_var_names;
     use super::super::storage::VariableNotExported;
     use super::super::ChangeValueError;
@@ -3504,6 +3509,48 @@ mod tests {
         for (name, ops, expected) in cases {
             assert_eq!(info_of(ops, KeywordInfoFilter::DEFAULT), expected, "{name}");
         }
+    }
+
+    /// get and KEYWORDINFO answer one default of an ORDERED_LIST whose option flagged
+    /// EFI_IFR_OPTION_DEFAULT comes before its EFI_IFR_DEFAULT of DefaultId STANDARD in IFR order:
+    /// the EFI_IFR_DEFAULT's, which UEFI 2.11 §33.2.5.8 ranks above the option's.
+    #[test]
+    fn get_and_info_take_the_ifr_default_of_an_ordered_list_before_its_flagged_option() {
+        let ops = ordered_list(
+            3,
+            &[
+                flagged_option(4, 0, 1),
+                flagged_option(7, OPTION_DEFAULT, 3),
+                typed_default(0x0000, 0x0B, &[1, 1]), // EFI_IFR_TYPE_BUFFER
+            ],
+        );
+        let lists = [info_list(ops.clone())];
+        let texts = ListTexts::new(&lists[0].strings, &[]);
+        let get: Vec<(DefaultId, String)> = list_questions(
+            Rc::clone(&lists[0].forms[0]),
+            &texts,
+            IncludedStates::empty(),
+            None,
+            &mut reader(1),
+        )
+        .into_iter()
+        .flat_map(|(descriptor, _)| descriptor.defaults)
+        .map(|default| (default.default_id, default.value.to_string()))
+        .collect();
+
+        assert_eq!(
+            get,
+            [(DefaultId::STANDARD, "Zero, Zero".to_owned())],
+            "get: the items of 1 1"
+        );
+        assert_eq!(
+            info_of(ops, KeywordInfoFilter::DEFAULT),
+            Ok(KeywordInfo {
+                standard_default: Some(number(&[1, 1, 0])),
+                ..KeywordInfo::default()
+            }),
+            "KEYWORDINFO: 1 1, zero-padded"
+        );
     }
 
     /// DISPLAYNAME and OPTIONSTRING come in the language that `requested` picks, never from a

@@ -19,6 +19,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use serde::Deserialize;
+use uefisettings_qemu_guest::driver_sample::BOOT_ORDER;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
@@ -33,6 +34,7 @@ use uefisettings_qemu_guest::driver_sample::ONE_OF;
 use uefisettings_qemu_guest::driver_sample::ONE_OF_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF_PROMPT;
 use uefisettings_qemu_guest::driver_sample::ONE_OF_PROMPT_FR_FR;
+use uefisettings_qemu_guest::driver_sample::PICK_1;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
 use uefisettings_qemu_guest::json;
@@ -199,6 +201,7 @@ fn question(name: &str, answer: &str, options: &[&str]) -> Question {
         name: name.to_owned(),
         answer: answer.to_owned(),
         options: options.iter().map(|&option| option.to_owned()).collect(),
+        items: None,
     }
 }
 
@@ -320,6 +323,60 @@ fn list_questions_lists_the_defaults() {
             );
         }
     }
+}
+
+/// list-questions lists DriverSample's ordered lists with the texts of their items, in container
+/// order, besides their options: "Boot Order" and "Get Call Back default", empty, and with
+/// --include disabled "Pick 1", whose 1, 2 and 3 are the options "My one-of text #3", "#2" and
+/// "#1". "Boot Order" lists its option "USB", which a SUPPRESS_IF hides, only with --include
+/// suppressed.
+#[test]
+fn list_questions_lists_ordered_lists_with_their_items() {
+    let ordered_lists = |flags: &[&str]| -> Vec<Question> {
+        let questions: Vec<Question> =
+            json(&[&["hii", "list-questions", "--json"][..], flags].concat());
+        questions
+            .into_iter()
+            .filter(|question| question.items.is_some())
+            .collect()
+    };
+    let list = |name: &str, answer: &str, options: &[&str], items: &[&str]| Question {
+        items: Some(items.iter().map(|&item| item.to_owned()).collect()),
+        ..question(name, answer, options)
+    };
+    let texts = [
+        "My one-of text #1",
+        "My one-of text #2",
+        "My one-of text #3",
+    ];
+    let boot_order = ["ATAPI CD", "IDE HDD", "PXE"];
+    let get_call_back = list("Get Call Back default", "", &texts, &[]);
+    assert_eq!(
+        ordered_lists(&[]),
+        [
+            list(BOOT_ORDER, "", &boot_order, &[]),
+            get_call_back.clone()
+        ],
+        "without flags"
+    );
+    assert_eq!(
+        ordered_lists(&INCLUDE_ALL),
+        [
+            list(BOOT_ORDER, "", &[&boot_order[..], &["USB"]].concat(), &[]),
+            list(
+                PICK_1,
+                "My one-of text #3, My one-of text #2, My one-of text #1 <disabled>",
+                &texts,
+                &[
+                    "My one-of text #3",
+                    "My one-of text #2",
+                    "My one-of text #1"
+                ],
+            ),
+            get_call_back,
+        ],
+        "{INCLUDE_ALL:?}"
+    );
 }
 
 #[test]
@@ -448,7 +505,7 @@ fn list_questions_lists_the_declared_defaults() {
         ),
         (
             "Get Call Back default",
-            vec![Some(vec![driver_sample_default(0, "18")])],
+            vec![Some(vec![driver_sample_default(0, "18")]), None],
         ),
         (MATCH2, vec![None]),
     ];

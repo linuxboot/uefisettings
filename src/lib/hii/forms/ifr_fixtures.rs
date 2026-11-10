@@ -36,6 +36,10 @@ use super::conditions::QuestionValues;
 #[cfg(efivar_dumps)]
 use super::conditions::VarStoreValues;
 #[cfg(efivar_dumps)]
+use super::ordered_list::handle_ordered_list;
+#[cfg(efivar_dumps)]
+use super::ordered_list::OrderedListQuestion;
+#[cfg(efivar_dumps)]
 use super::question_values::handle_checkbox;
 #[cfg(efivar_dumps)]
 use super::question_values::handle_date_time;
@@ -79,6 +83,7 @@ pub(crate) const NUMERIC: u8 = 0x07;
 pub(crate) const PASSWORD: u8 = 0x08;
 pub(crate) const DATE: u8 = 0x1A;
 pub(crate) const TIME: u8 = 0x1B;
+pub(crate) const ORDERED_LIST: u8 = 0x23;
 
 pub(crate) const SUPPRESS_IF: u8 = 0x0A;
 pub(crate) const GRAY_OUT_IF: u8 = 0x19;
@@ -461,6 +466,25 @@ pub(crate) fn ifr_default(default_id: u16, value: u8) -> Vec<u8> {
 pub(super) fn uint32_default(default_id: u16, value: u32) -> Vec<u8> {
     let data = [&default_id.to_le_bytes()[..], &[0x02], &value.to_le_bytes()].concat();
     operation(DEFAULT, false, &data)
+}
+
+/// An EFI_IFR_DEFAULT of Type EFI_IFR_TYPE_BUFFER whose Value is `buffer`, as
+/// edk2-stable202608 VfrCompile emits the `default = {...}` of an ORDERED_LIST.
+pub(super) fn buffer_default(default_id: u16, buffer: &[u8]) -> Vec<u8> {
+    let data = [&default_id.to_le_bytes()[..], &[0x0B], buffer].concat();
+    operation(DEFAULT, false, &data)
+}
+
+/// An EFI_IFR_ONE_OF_OPTION of Type EFI_IFR_TYPE_BUFFER with `flags` whose Value is `buffer`.
+pub(super) fn buffer_option(string_id: u16, flags: u8, buffer: &[u8]) -> Vec<u8> {
+    let data = [&string_id.to_le_bytes()[..], &[flags, 0x0B], buffer].concat();
+    operation(ONE_OF_OPTION, false, &data)
+}
+
+/// The data of an ORDERED_LIST of QuestionId 1 at VarOffset `offset` of VarStore 1, with
+/// MaxContainers `max_containers` and `flags`.
+pub(super) fn ordered_list(offset: u16, max_containers: u8, flags: u8) -> Vec<u8> {
+    [question_header(offset), vec![max_containers, flags]].concat()
 }
 
 /// An EFI_IFR_DEFAULT of `default_id` of Type `value_type` (UEFI 2.11 §33.3.8.3.12) holding
@@ -981,7 +1005,7 @@ fn describe(
     let strings = strings();
     let texts = ListTexts::new(&strings, &[]);
     let walk = &mut FormSetWalk::new(&texts, reader, values, IncludedStates::empty());
-    let flags = value_question(&current)
+    let flags = ListedQuestion::of(&current)
         .expect("a question")
         .header()
         .flags();
@@ -992,6 +1016,14 @@ fn describe(
         ParsedOperation::Date(parsed) | ParsedOperation::Time(parsed) => {
             handle_date_time(store, parsed, "", flags, node, walk)
         }
+        ParsedOperation::OrderedList(parsed) => handle_ordered_list(
+            store,
+            OrderedListQuestion::of(&current, parsed),
+            "",
+            flags,
+            node,
+            walk,
+        ),
         other => panic!("not a question: {other:?}"),
     }
 }

@@ -578,6 +578,16 @@ pub struct GetOptions {
     pub language: Option<String>,
 }
 
+/// The value that HiiBackend::set_using gives a question.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SetValue {
+    /// The text of a value, or of an option
+    Text(String),
+    /// The texts of the options of an ORDERED_LIST, in order, one per container
+    Items(Vec<String>),
+}
+
 /// The options of HiiBackend::set_using.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -853,7 +863,12 @@ impl HiiBackend {
 #[cfg(all(system_hiidb, system_variables))]
 impl SettingsBackend for HiiBackend {
     fn set(question: &str, new_value: &str, selector: Option<&str>) -> Result<SetResponseList> {
-        Self::set_using(question, new_value, selector, &SetOptions::default())
+        Self::set_using(
+            question,
+            &SetValue::Text(new_value.to_owned()),
+            selector,
+            &SetOptions::default(),
+        )
     }
 
     fn get(question: &str, selector: Option<&str>) -> Result<GetResponseList> {
@@ -871,14 +886,14 @@ impl HiiBackend {
     #[cfg(all(system_hiidb, system_variables))]
     pub fn set_using(
         question: impl Into<QuestionSelector>,
-        new_value: &str,
+        value: &SetValue,
         selector: Option<&str>,
         options: &SetOptions,
     ) -> Result<SetResponseList> {
         Self::set_in(
             &Self::system_hiidb()?,
             question,
-            new_value,
+            value,
             selector,
             options,
             EfivarSource::System.into_variables()?,
@@ -908,7 +923,7 @@ impl HiiBackend {
     fn set_in(
         db_bytes: &[u8],
         question: impl Into<QuestionSelector>,
-        new_value: &str,
+        value: &SetValue,
         _selector: Option<&str>,
         options: &SetOptions,
         reads: Box<dyn FirmwareVariables>,
@@ -929,6 +944,11 @@ impl HiiBackend {
 
         let question = question.into();
         let name = question.to_string();
+        // only the question of items has spellings: the database spells one answer
+        let new_value = match value {
+            SetValue::Text(text) => text.as_str(),
+            SetValue::Items(_) => "",
+        };
         let (question_variations, new_value_variations, is_translated) =
             spellings(&question, new_value);
 
@@ -941,31 +961,38 @@ impl HiiBackend {
             &mut reader,
         )?;
 
-        let annotations: Vec<(String, bool)> = forms::set_questions(
+        let answer = match value {
+            SetValue::Text(text) => forms::NewAnswer::Text {
+                text,
+                variations: &new_value_variations,
+            },
+            SetValue::Items(items) => forms::NewAnswer::Items(items),
+        };
+        let written: Vec<(String, Option<Vec<String>>, bool)> = forms::set_questions(
             &name,
             &selected
                 .iter()
                 .map(|(guid, question_descriptor, _)| (guid.as_str(), question_descriptor))
                 .collect::<Vec<_>>(),
-            new_value,
-            &new_value_variations,
+            answer,
             include,
             &mut reader,
             options.access_level,
             options.volatile,
             &writes,
         )?
-        .into_iter()
+        .iter()
         .map(|written| {
-            let option_annotation = written
-                .option
-                .map_or_else(String::new, |option| option.state.option_annotation());
-            (option_annotation, written.volatile)
+            (
+                written.given.answer(new_value),
+                written.given.items(),
+                written.volatile,
+            )
         })
         .collect();
 
-        for ((guid, question_descriptor, state), (option_annotation, volatile)) in
-            selected.into_iter().zip(annotations)
+        for ((guid, question_descriptor, state), (answer, items, volatile)) in
+            selected.into_iter().zip(written)
         {
             let volatile_annotation = match volatile {
                 true => VOLATILE_ANNOTATION,
@@ -977,10 +1004,8 @@ impl HiiBackend {
                 backend: Backend::Hii,
                 is_translated,
                 question: Question {
-                    answer: new_value.to_owned()
-                        + &option_annotation
-                        + &state.annotation()
-                        + volatile_annotation,
+                    answer: answer + &state.annotation() + volatile_annotation,
+                    items,
                     ..question_of(question_descriptor, include)
                 },
                 modified: true,
@@ -1349,6 +1374,7 @@ fn select_for_set(
 fn question_of(descriptor: forms::QuestionDescriptor, include: IncludedStates) -> Question {
     Question {
         options: descriptor.listed_options(include),
+        items: descriptor.items(),
         name: descriptor.question,
         answer: descriptor.value,
         help: descriptor.help,
@@ -1487,6 +1513,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NV_BS;
     use crate::hii::forms::ifr_fixtures::NV_BS_RT;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
+    use crate::hii::forms::ifr_fixtures::ORDERED_LIST;
     use crate::hii::forms::ifr_fixtures::OTHER_GUID;
     use crate::hii::forms::ifr_fixtures::PASSWORD;
     use crate::hii::forms::ifr_fixtures::QUESTION_REF1;
@@ -1911,7 +1938,7 @@ mod tests {
         let set = HiiBackend::set_in(
             &hiidb,
             "BootEnable",
-            "1",
+            &SetValue::Text("1".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -1922,7 +1949,7 @@ mod tests {
         let boot = HiiBackend::set_in(
             &hiidb,
             "Boot",
-            "1",
+            &SetValue::Text("1".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -2207,7 +2234,7 @@ mod tests {
         let set = HiiBackend::set_in(
             &crossed_prompts_hiidb(),
             "Boot",
-            "1",
+            &SetValue::Text("1".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -2277,7 +2304,7 @@ mod tests {
         HiiBackend::set_in(
             &hiidb,
             "Mode",
-            "Enabled",
+            &SetValue::Text("Enabled".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -2325,7 +2352,7 @@ mod tests {
         let got = HiiBackend::set_in(
             &hiidb,
             "Mode",
-            "Off",
+            &SetValue::Text("Off".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -2419,7 +2446,7 @@ mod tests {
         let set = HiiBackend::set_in(
             &keyed_hiidb("Keyed"),
             "Keyed",
-            "1",
+            &SetValue::Text("1".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -2526,7 +2553,7 @@ mod tests {
         let set = HiiBackend::set_in(
             &keyed_hiidb(""),
             question.clone(),
-            "1",
+            &SetValue::Text("1".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -2672,7 +2699,7 @@ mod tests {
             let set = HiiBackend::set_in(
                 &hiidb,
                 question.clone(),
-                "1",
+                &SetValue::Text("1".to_owned()),
                 None,
                 &SetOptions::default(),
                 shared(&variables),
@@ -2694,8 +2721,8 @@ mod tests {
         }
     }
 
-    /// A keyword that prompts a DATE or TIME of a FormSet and a CHECKBOX outside any FormSet
-    /// selects neither, as for a CHECKBOX of the FormSet
+    /// A keyword that prompts a DATE, TIME or ORDERED_LIST of a FormSet and a CHECKBOX outside any
+    /// FormSet selects neither, as for a CHECKBOX of the FormSet
     /// (keywords_that_prompt_a_statement_outside_a_form_set_are_refused): get and set refuse it,
     /// and set writes nothing.
     #[test]
@@ -2705,12 +2732,28 @@ mod tests {
             (
                 "DATE",
                 operation(DATE, false, &[header.clone(), vec![0x00]].concat()),
-                "2027-01-02",
+                SetValue::Text("2027-01-02".to_owned()),
             ),
             (
                 "TIME",
                 operation(TIME, false, &[header.clone(), vec![0x00]].concat()),
-                "01:02:03",
+                SetValue::Text("01:02:03".to_owned()),
+            ),
+            (
+                "ORDERED_LIST",
+                [
+                    operation(
+                        ORDERED_LIST,
+                        true,
+                        &[header.clone(), vec![2, 0x00]].concat(),
+                    ),
+                    // A and B, strings 5 and 6
+                    flagged_option(5, 0x00, 1),
+                    flagged_option(6, 0x00, 2),
+                    END.to_vec(),
+                ]
+                .concat(),
+                SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
             ),
         ];
         let refusal = KeywordRefusal::AmbiguousStatements {
@@ -2752,7 +2795,7 @@ mod tests {
             let set = HiiBackend::set_in(
                 &hiidb,
                 question.clone(),
-                value,
+                &value,
                 None,
                 &SetOptions::default(),
                 shared(&variables),
@@ -2904,7 +2947,12 @@ mod tests {
     /// holds `stored`, and set of it to `value`, give `want` by its prompt, by its QuestionId and
     /// by its keyword alike.
     #[track_caller]
-    fn assert_answered_by_each_selector(hiidb: &[u8], stored: &[u8], value: &str, want: &Answered) {
+    fn assert_answered_by_each_selector(
+        hiidb: &[u8],
+        stored: &[u8],
+        value: &SetValue,
+        want: &Answered,
+    ) {
         for question in [
             QuestionSelector::from("Keyed"),
             by_address(&format!("{KEYED_FORM_SET}:0x8001")),
@@ -2989,7 +3037,7 @@ mod tests {
             assert_answered_by_each_selector(
                 &hiidb,
                 stored,
-                value,
+                &SetValue::Text(value.to_owned()),
                 &Answered {
                     got: vec![shown.to_owned()],
                     set: Ok(()),
@@ -3026,7 +3074,7 @@ mod tests {
                 let set = HiiBackend::set_in(
                     &hiidb,
                     question.clone(),
-                    "1",
+                    &SetValue::Text("1".to_owned()),
                     None,
                     &SetOptions::default(),
                     shared(&variables),
@@ -3056,7 +3104,7 @@ mod tests {
         assert_answered_by_each_selector(
             &hiidb,
             &[0xE8, 0x07, 2, 29],
-            "2027-01-02",
+            &SetValue::Text("2027-01-02".to_owned()),
             &Answered {
                 got: vec![
                     "<ValueUnavailable: EFI Date/Time Storage (UEFI 2.11 §33.2.5.6) is read \
@@ -3070,6 +3118,109 @@ mod tests {
                         .to_owned(),
                 ),
                 writes: vec![],
+            },
+        );
+    }
+
+    /// list-questions and show-ifr show the prompt, the help and the option texts of an
+    /// ORDERED_LIST in the platform language, else in the first display language, never in the
+    /// configuration language before them; set on a platform of PlatformLang fr-FR takes en-US
+    /// items and answers in fr-FR.
+    #[test]
+    fn ordered_lists_show_their_texts_in_the_platform_language() {
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(0x8001, 3, 1, 0, 0x00), vec![2, 0x00]].concat(),
+            ),
+            flagged_option(5, 0x00, 1),
+            flagged_option(6, 0x00, 2),
+            END.to_vec(),
+        ];
+        let en_us = ["Order", "Order help", "First", "Second"];
+        let fr_fr = ["Ordre", "Aide de l'ordre", "Premier", "Deuxieme"];
+        let hiidb = translated_question_hiidb(list.concat(), 2, &en_us, &fr_fr);
+        for (platform_lang, [name, help, first, second]) in [(None, en_us), (Some("fr-FR"), fr_fr)]
+        {
+            let (listed, shown) = listed_and_shown(&hiidb, &[2, 1], platform_lang);
+
+            let listed: Vec<_> = listed
+                .into_iter()
+                .map(|question| {
+                    let texts = [question.name, question.help, question.answer];
+                    (texts, question.options, question.items)
+                })
+                .collect();
+            let strings = |texts: &[&str]| texts.iter().map(|&text| text.to_owned()).collect();
+            assert_eq!(
+                listed,
+                [(
+                    [name, help, &format!("{second}, {first}")].map(str::to_owned),
+                    strings(&[first, second]),
+                    Some(strings(&[second, first])),
+                )],
+                "{platform_lang:?}: list-questions"
+            );
+            for line in [
+                format!("Q: {name} - Help: {help}\n"),
+                format!("-Answer: {second}, {first}\n"),
+            ] {
+                assert!(
+                    shown.contains(&line),
+                    "{platform_lang:?}: show-ifr shows {line:?}: {shown}"
+                );
+            }
+        }
+
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), 7, &[1, 2]);
+        let set = HiiBackend::set_in(
+            &hiidb,
+            "Order",
+            &SetValue::Items(vec!["Second".to_owned(), "First".to_owned()]),
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            Some("fr-FR"),
+        )
+        .expect("set Order");
+        let answers: Vec<String> = set
+            .responses
+            .into_iter()
+            .map(|response| response.question.answer)
+            .collect();
+        assert_eq!(
+            (answers, variables.writes_to(&setup())),
+            (vec!["Deuxieme, Premier".to_owned()], vec![(0, vec![2, 1])]),
+            "set Order --item Second --item First"
+        );
+    }
+
+    /// get by QuestionId and by keyword answers an ORDERED_LIST on a VarStore as by prompt, and
+    /// set of its items by each writes the same values.
+    #[test]
+    fn ordered_lists_select_by_question_id_or_keyword_as_by_prompt() {
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(0x8001, 3, 1, 0, 0x00), vec![2, 0x00]].concat(),
+            ),
+            flagged_option(6, 0x00, 1),
+            flagged_option(7, 0x00, 2),
+            END.to_vec(),
+        ];
+        let hiidb = keyed_question_hiidb(list.concat(), 2, &["A", "B"]);
+        assert_answered_by_each_selector(
+            &hiidb,
+            &[1, 2],
+            &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+            &Answered {
+                got: vec!["A, B".to_owned()],
+                set: Ok(()),
+                writes: vec![(0, vec![2, 1])],
             },
         );
     }
@@ -3096,16 +3247,28 @@ mod tests {
     /// Setup, prompted "First" and "Second" in en-US, and named "Foo" in the configuration
     /// languages `first` and `second`.
     fn keyword_in_two_lists_hiidb(first: &[u8], second: &[u8]) -> Vec<u8> {
+        keyword_in_two_lists_hiidb_of(first, second, 2, |offset| checkbox_at(0xA, 1, 1, offset))
+    }
+
+    /// keyword_in_two_lists_hiidb with `question(offset)`, an op of QuestionId 0xA and prompt
+    /// string 1 at byte `offset` of Setup, in place of each CHECKBOX, Setup a VarStore of `size`
+    /// bytes, and the en-US string 2 "On".
+    fn keyword_in_two_lists_hiidb_of(
+        first: &[u8],
+        second: &[u8],
+        size: u16,
+        question: impl Fn(u16) -> Vec<u8>,
+    ) -> Vec<u8> {
         let list = |form_set: &str, offset: u16, prompt: &str, namespace: &[u8], guid: u8| {
             let packages = [
                 form_package_with_guid(
                     guid_bytes(form_set),
                     &[
-                        var_store_efi(1, "Setup", NV_BS_RT, 2),
-                        form(1, &[checkbox_at(0xA, 1, 1, offset)]),
+                        var_store_efi(1, "Setup", NV_BS_RT, size),
+                        form(1, &[question(offset)]),
                     ],
                 ),
-                strings_package_of(b"en-US", &[prompt]),
+                strings_package_of(b"en-US", &[prompt, "On"]),
                 strings_package_of(namespace, &["Foo"]),
                 END_PACKAGE.to_vec(),
             ];
@@ -3127,9 +3290,19 @@ mod tests {
     /// What get of `question`, and set of `question` to 1, select in `hiidb`, by name and
     /// QuestionId, and set's writes to Setup.
     fn selected_in(hiidb: &[u8], question: &QuestionSelector) -> Selected {
+        selected_by_set_of(hiidb, question, &[0, 0], &SetValue::Text("1".to_owned()))
+    }
+
+    /// selected_in with Setup holding `stored`, and set of `question` to `value`.
+    fn selected_by_set_of(
+        hiidb: &[u8],
+        question: &QuestionSelector,
+        stored: &[u8],
+        value: &SetValue,
+    ) -> Selected {
         let identified = |question: &Question| (question.name.clone(), question.question_id);
         let variables = Rc::new(MemoryVariables::default());
-        variables.insert(setup(), 7, &[0, 0]);
+        variables.insert(setup(), 7, stored);
 
         let got = HiiBackend::get_in(
             hiidb,
@@ -3143,7 +3316,7 @@ mod tests {
         let set = HiiBackend::set_in(
             hiidb,
             question.clone(),
-            "1",
+            value,
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -3254,6 +3427,63 @@ mod tests {
                 selected_in(&hiidb, &by_keyword("Foo", namespace)),
                 want,
                 "{case}"
+            );
+        }
+    }
+
+    /// get and set weigh every listed question of a --keyword in its namespaces, an ORDERED_LIST
+    /// as a CHECKBOX (get_and_set_refuse_a_keyword_of_questions_in_different_namespaces): they
+    /// refuse a keyword that names one in each of two package lists, of x-UEFI-ns and
+    /// x-UEFI-AMI, naming each, and set --item writes nothing; under x-UEFI-ns they select the
+    /// first list's alone, and set --item writes it.
+    #[test]
+    fn get_and_set_weigh_every_listed_question_in_the_namespaces_of_a_keyword() {
+        let other = "8C78A505-BAA0-4C4A-869F-000000000803";
+        let ambiguous = || {
+            refused(&format!(
+                "\"keyword Foo of a namespace starting with x-UEFI\" is the prompt of QuestionId \
+                 0x000A of FormSet {KEYED_FORM_SET} in x-UEFI-ns and of QuestionId 0x000A of \
+                 FormSet {other} in x-UEFI-AMI: no one language holds it as the prompt of every \
+                 question it names"
+            ))
+        };
+        let first = vec![("First".to_owned(), Some(0xA))];
+        // an ORDERED_LIST of one UINT8 container, whose option On holds 1
+        let ordered_list = |offset| {
+            let data = [question_header_with(0xA, 1, 1, offset, 0x00), vec![1, 0x00]].concat();
+            [
+                operation(ORDERED_LIST, true, &data),
+                flagged_option(2, 0x00, 1),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let cases = [(
+            "ORDERED_LIST",
+            keyword_in_two_lists_hiidb_of(b"x-UEFI-ns", b"x-UEFI-AMI", 2, ordered_list),
+            &[0, 0][..],
+            Selected {
+                got: first.clone(),
+                set: Ok(first),
+                writes: vec![(0, vec![1])],
+            },
+        )];
+        let items = SetValue::Items(vec!["On".to_owned()]);
+        for (kind, hiidb, stored, under_ns) in cases {
+            assert_eq!(
+                selected_by_set_of(&hiidb, &by_keyword("Foo", None), stored, &items),
+                ambiguous(),
+                "{kind}"
+            );
+            assert_eq!(
+                selected_by_set_of(
+                    &hiidb,
+                    &by_keyword("Foo", Some("x-UEFI-ns")),
+                    stored,
+                    &items
+                ),
+                under_ns,
+                "{kind}, x-UEFI-ns"
             );
         }
     }
@@ -3394,6 +3624,54 @@ mod tests {
         );
     }
 
+    /// get and set refuse a --question-id that an ORDERED_LIST shares with a NUMERIC of its
+    /// FormSet, naming both, as for two CHECKBOXes (get_and_set_refuse_a_question_id_of_two_questions);
+    /// set writes nothing.
+    #[test]
+    fn get_and_set_refuse_a_question_id_that_a_listed_question_shares() {
+        // a UINT8 NUMERIC "First" of QuestionId 7 at byte 0 of Setup
+        let numeric = [
+            question_header_with(7, 1, 1, 0, 0x00),
+            vec![0x10, 0, 255, 1],
+        ]
+        .concat();
+        // an ORDERED_LIST "Second" of QuestionId 7 at byte 1, of one UINT8 container
+        let list = [question_header_with(7, 2, 1, 1, 0x00), vec![1, 0x00]].concat();
+        let cases = [(
+            "ORDERED_LIST",
+            2,
+            [
+                operation(ORDERED_LIST, true, &list),
+                flagged_option(3, 0x00, 1),
+                END.to_vec(),
+            ]
+            .concat(),
+        )];
+        for (kind, size, question) in cases {
+            let packages = [
+                form_package_with_guid(
+                    guid_bytes(KEYED_FORM_SET),
+                    &[
+                        var_store_efi(1, "Setup", NV_BS_RT, size),
+                        form(1, &[operation(NUMERIC, false, &numeric), question]),
+                    ],
+                ),
+                strings_package_of(b"en-US", &["First", "Second", "On"]),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid(guid_bytes(KEYED_LIST), &packages.concat());
+
+            assert_eq!(
+                selected_in(&hiidb, &by_address(&format!("{KEYED_FORM_SET}:7"))),
+                refused(&format!(
+                    "QuestionId 0x0007 of FormSet {KEYED_FORM_SET} is that of the questions \
+                     \"First\" and \"Second\": a QuestionId identifies one question of its FormSet"
+                )),
+                "{kind}"
+            );
+        }
+    }
+
     /// A HiiDB whose FormSet of GUID KEYED_FORM_SET holds, at byte 0 of Setup, the CHECKBOX of
     /// QuestionId 0x8001 that a SUPPRESS_IF TRUE suppresses, which x-UEFI-ns names "Hidden", and,
     /// at byte 1, that of QuestionId 0x8003 that a GRAY_OUT_IF TRUE grays out, named "Grayed".
@@ -3448,7 +3726,7 @@ mod tests {
         let set = HiiBackend::set_in(
             &conditioned_keyed_hiidb(),
             question.clone(),
-            "1",
+            &SetValue::Text("1".to_owned()),
             None,
             &SetOptions {
                 include,
@@ -4572,7 +4850,7 @@ mod tests {
             let got = HiiBackend::set_in(
                 &defaults_hiidb(),
                 name,
-                "3",
+                &SetValue::Text("3".to_owned()),
                 None,
                 &SetOptions::default(),
                 shared(&variables),
@@ -4640,7 +4918,7 @@ mod tests {
         let got = HiiBackend::set_in(
             hiidb,
             question,
-            "9",
+            &SetValue::Text("9".to_owned()),
             None,
             &SetOptions {
                 include,
@@ -4770,7 +5048,7 @@ mod tests {
             let got = HiiBackend::set_in(
                 &flags_hiidb(),
                 prompt,
-                "9",
+                &SetValue::Text("9".to_owned()),
                 None,
                 &options,
                 shared(&variables),
@@ -4961,7 +5239,7 @@ mod tests {
             let got = HiiBackend::set_in(
                 &password_hiidb(),
                 question,
-                value,
+                &SetValue::Text(value.to_owned()),
                 None,
                 &options,
                 shared(&variables),
@@ -5042,7 +5320,7 @@ mod tests {
         HiiBackend::set_in(
             hiidb,
             question,
-            value,
+            &SetValue::Text(value.to_owned()),
             None,
             &options,
             shared(variables),
@@ -5405,7 +5683,7 @@ mod tests {
             let set = HiiBackend::set_in(
                 &hiidb,
                 question.clone(),
-                "1",
+                &SetValue::Text("1".to_owned()),
                 None,
                 &options,
                 shared(&variables),
@@ -6072,7 +6350,7 @@ mod tests {
                 let got = HiiBackend::set_in(
                     &boot_service_only_hiidb(),
                     "Q",
-                    "1",
+                    &SetValue::Text("1".to_owned()),
                     None,
                     &SetOptions::default(),
                     shared(&variables),
@@ -6120,7 +6398,7 @@ mod tests {
             let got = HiiBackend::set_in(
                 &boot_service_only_hiidb(),
                 "Q",
-                "1",
+                &SetValue::Text("1".to_owned()),
                 None,
                 &options,
                 shared(&variables),
@@ -6190,7 +6468,7 @@ mod tests {
             let got = HiiBackend::set_in(
                 &boot_service_only_hiidb(),
                 "Q",
-                "1",
+                &SetValue::Text("1".to_owned()),
                 None,
                 &options,
                 shared(&variables),
@@ -6248,7 +6526,7 @@ mod tests {
             let got = HiiBackend::set_in(
                 &boot_service_only_hiidb(),
                 "Q",
-                "1",
+                &SetValue::Text("1".to_owned()),
                 None,
                 &options,
                 shared(&reads),
@@ -6263,6 +6541,87 @@ mod tests {
             );
             assert_eq!(
                 writes.writes_to(&setup()),
+                want_writes,
+                "{volatile:?}: writes"
+            );
+        }
+    }
+
+    /// set of the items of an ORDERED_LIST on a volatile variable follows SetOptions::volatile:
+    /// refused before any write under VolatileWrites::Refuse, written under Allow with an answer
+    /// that says that the value is volatile.
+    #[test]
+    fn set_of_an_ordered_list_on_a_volatile_variable_follows_the_volatile_policy() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                form(
+                    1,
+                    &[
+                        operation(
+                            ORDERED_LIST,
+                            true,
+                            &[question_header_with(1, 1, 1, 0, 0x00), vec![2, 0x00]].concat(),
+                        ),
+                        flagged_option(2, 0x00, 1),
+                        flagged_option(3, 0x00, 2),
+                        END.to_vec(),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["L", "A", "B"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let refusal = "EFI variable Setup-00000000-0000-0000-0000-000000000000 is volatile (no \
+                       EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle; \
+                       pass --allow-volatile to write it anyway";
+        let cases = [
+            (VolatileWrites::Refuse, Err(refusal.to_string()), vec![]),
+            (
+                VolatileWrites::Allow,
+                Ok(vec![
+                    "B, A <volatile: lasts until the next reset or power cycle>".to_string(),
+                ]),
+                vec![(0, vec![2, 1])],
+            ),
+        ];
+        for (volatile, want, want_writes) in cases {
+            let variables = MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            );
+            variables.insert(setup(), BS_RT, &[1, 2]);
+            let variables = Rc::new(variables);
+            let options = SetOptions {
+                volatile,
+                ..SetOptions::default()
+            };
+
+            let got = HiiBackend::set_in(
+                &hiidb,
+                "L",
+                &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+                None,
+                &options,
+                shared(&variables),
+                &*variables,
+                None,
+            );
+
+            let answers = got.map(|list| {
+                list.responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                answers.map_err(|error| error.to_string()),
+                want,
+                "{volatile:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&setup()),
                 want_writes,
                 "{volatile:?}: writes"
             );
@@ -6305,7 +6664,7 @@ mod tests {
         let got = HiiBackend::set_in(
             &hiidb,
             "Q",
-            "1",
+            &SetValue::Text("1".to_owned()),
             None,
             &options,
             shared(&variables),
@@ -6344,7 +6703,7 @@ mod tests {
             HiiBackend::set_in(
                 &hiidb,
                 "Q",
-                "1",
+                &SetValue::Text("1".to_owned()),
                 None,
                 &options,
                 shared(variables),
@@ -7007,7 +7366,7 @@ mod tests {
             HiiBackend::set_in(
                 hiidb,
                 "Q",
-                "0",
+                &SetValue::Text("0".to_owned()),
                 None,
                 &SetOptions::default(),
                 shared(variables),
@@ -7132,7 +7491,7 @@ mod tests {
         HiiBackend::set_in(
             hiidb,
             question,
-            "0",
+            &SetValue::Text("0".to_owned()),
             None,
             &options,
             shared(variables),
@@ -7423,7 +7782,7 @@ mod tests {
                 let set = HiiBackend::set_in(
                     &hiidb,
                     question.clone(),
-                    "0",
+                    &SetValue::Text("0".to_owned()),
                     None,
                     &options,
                     shared(&variables),
@@ -7855,7 +8214,7 @@ mod tests {
             HiiBackend::set_in(
                 hiidb,
                 question,
-                "0",
+                &SetValue::Text("0".to_owned()),
                 None,
                 &SetOptions::default(),
                 shared(&variables),
@@ -9504,7 +9863,7 @@ mod tests {
         let error = HiiBackend::set_in(
             &snapshot_hiidb(),
             "N",
-            "0",
+            &SetValue::Text("0".to_owned()),
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -9551,12 +9910,12 @@ mod tests {
     /// The error of set of `question` of `hiidb` to `value` through no variables, after
     /// asserting that it wrote nothing.
     #[track_caller]
-    fn set_error_without_variables(hiidb: &[u8], question: &str, value: &str) -> String {
+    fn set_error_without_variables(hiidb: &[u8], question: &str, value: SetValue) -> String {
         let variables = no_variables();
         let error = HiiBackend::set_in(
             hiidb,
             question,
-            value,
+            &value,
             None,
             &SetOptions::default(),
             shared(&variables),
@@ -9592,7 +9951,7 @@ mod tests {
         );
         for value in ["0x1E", "30"] {
             assert_eq!(
-                set_error_without_variables(&hiidb, "H", value),
+                set_error_without_variables(&hiidb, "H", SetValue::Text(value.to_owned())),
                 N_STORE_NOT_EXPOSED,
                 "set {value}"
             );
@@ -9628,7 +9987,7 @@ mod tests {
         }
         for (question, value) in [("D", "2027-01-02"), ("T", "01:02:03")] {
             assert_eq!(
-                set_error_without_variables(&hiidb, question, value),
+                set_error_without_variables(&hiidb, question, SetValue::Text(value.to_owned())),
                 N_STORE_NOT_EXPOSED,
                 "set {question}"
             );
@@ -9682,6 +10041,41 @@ mod tests {
         for output in outputs {
             assert!(!output.contains("<snapshot>"), "{output}");
         }
+    }
+
+    /// An ORDERED_LIST on a VarStore whose variable is missing shows its items from the snapshot,
+    /// tagged, as get shows a ONE_OF's option; set refuses new items, as it never takes the
+    /// snapshot.
+    #[test]
+    fn ordered_lists_show_snapshot_items_and_set_refuses_them() {
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(1, 1, 1, 0, 0x00), vec![2, 0x00]].concat(),
+            ),
+            flagged_option(2, 0x00, 1),
+            flagged_option(3, 0x00, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let hiidb = n_store_hiidb(2, &[list], &["L", "A", "B"]);
+
+        let (got, listed, ifr, _) =
+            answers_with_snapshot(&hiidb, &["L"], &no_variables(), &n_store_snapshot(&[2, 1]));
+
+        assert_eq!(got, ["B, A <snapshot>"], "get");
+        assert_eq!(listed, ["B, A <snapshot>"], "list-questions");
+        assert!(
+            ifr.contains("-Answer: B, A <snapshot>\n"),
+            "show-ifr: {ifr}"
+        );
+        let items = SetValue::Items(vec!["A".to_owned(), "B".to_owned()]);
+        assert_eq!(
+            set_error_without_variables(&hiidb, "L", items),
+            N_STORE_NOT_EXPOSED,
+            "set"
+        );
     }
 
     /// Reading a snapshot logs none of its bytes, at any level, also when it is no
@@ -9857,7 +10251,7 @@ mod tests {
         HiiBackend::set_in(
             hiidb,
             question,
-            value,
+            &SetValue::Text(value.to_owned()),
             None,
             &SetOptions::default(),
             shared(variables),
@@ -10029,7 +10423,7 @@ mod tests {
             let set = HiiBackend::set_in(
                 &hiidb,
                 question.clone(),
-                &value.to_string(),
+                &SetValue::Text(value.to_string()),
                 None,
                 &SetOptions::default(),
                 shared(&variables),
@@ -10346,7 +10740,7 @@ mod tests {
             let got = HiiBackend::set_in(
                 &hiidb,
                 "A",
-                "9",
+                &SetValue::Text("9".to_owned()),
                 None,
                 &options,
                 shared(&variables),
@@ -10712,6 +11106,129 @@ mod tests {
                 "set {question}: writes to AMITSESetup"
             );
         }
+    }
+
+    /// An ORDERED_LIST on a VARSTORE_EFI before UEFI 2.3.1 is refused by name, as a STRING there
+    /// is: uefisettings reads no ORDERED_LIST of the variable of a VarName, and set writes none.
+    #[test]
+    fn ordered_lists_of_a_short_var_store_are_refused() {
+        // prompt "L", string 1, on the VarName 4
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(1, 1, 1, 4, 0x00), vec![2, 0x00]].concat(),
+            ),
+            flagged_option(2, 0x00, 1),
+            flagged_option(3, 0x00, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let hiidb = short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, &[list]),
+            ],
+            &[en_strings_package_of(&["L", "A", "B", "ShortList"])],
+        );
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(short_key("ShortList"), NV_BS_RT, &[1, 2]);
+        let variables = Rc::new(variables);
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): uefisettings reads \
+                   no EFI_IFR_ORDERED_LIST on it";
+
+        assert_eq!(
+            answers_of(&hiidb, "L", &variables),
+            [format!("<ValueUnavailable: {why}>")],
+            "get"
+        );
+        let set = HiiBackend::set_in(
+            &hiidb,
+            "L",
+            &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+        assert_eq!(set, Err(format!("cannot set question \"L\": {why}")), "set");
+        assert_eq!(
+            variables.writes_to(&short_key("ShortList")),
+            vec![],
+            "writes of ShortList"
+        );
+    }
+
+    /// An ORDERED_LIST over the bytes of a PASSWORD outside any FormSet of its VarStoreId keeps
+    /// them withheld, as a NUMERIC does: get answers that its bytes hold a password, and set
+    /// refuses new items, whose hidden ones it cannot keep unread, and writes nothing.
+    #[test]
+    fn ordered_lists_keep_an_outside_password_withheld() {
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(4, 4, 2, 0, 0x00), vec![2, 0x00]].concat(),
+            ),
+            flagged_option(5, 0x00, 1),
+            flagged_option(6, 0x00, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let packages = [
+            form_package_of(
+                &[
+                    password_on(3, 3, 2, 0),
+                    form_set(&[
+                        var_store(2, [0x44; 16], "AMITSESetup", 81),
+                        form(1, &[list]),
+                    ]),
+                ]
+                .concat(),
+            ),
+            en_strings_package_of(&["Q", "P", "Password", "L", "A", "B"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let stored = [plaintext_password().as_slice(), &[0xAA; 40], &[1]].concat();
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(amitse_setup(), NV_BS_RT, &stored);
+        let variables = Rc::new(variables);
+        let options = SetOptions {
+            setup_password: SetupPasswordPolicy::Bypass,
+            ..SetOptions::default()
+        };
+
+        assert_eq!(answers_of(&hiidb, "L", &variables), [PASSWORD_BYTES], "get");
+        let set = HiiBackend::set_in(
+            &hiidb,
+            "L",
+            &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+            None,
+            &options,
+            shared(&variables),
+            &*variables,
+            None,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            set,
+            Err(
+                "cannot set question \"L\": its items cannot be read, so set cannot keep those of \
+                 hidden options: its bytes hold a password"
+                    .to_owned()
+            ),
+            "set"
+        );
+        assert_eq!(
+            variables.writes_to(&amitse_setup()),
+            [],
+            "writes to AMITSESetup"
+        );
     }
 
     /// Two VARSTORE_EFIs before UEFI 2.3.1 of two Guids each take the VarNames of their questions

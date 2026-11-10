@@ -28,6 +28,7 @@ use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
 use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
+use uefisettings::exports::SetValue;
 use uefisettings::exports::SetupPasswordPolicy;
 use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
@@ -43,6 +44,7 @@ use crate::write_extracted_db;
 use crate::HiiSourceArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
+use crate::SetArgs;
 use crate::SetIncludeState;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
@@ -177,20 +179,20 @@ impl VolatileArgs {
 
 /// set, in this machine's HiiDB.
 pub(super) fn auto_set(
-    question: &QuestionArgs,
-    value: &str,
+    target: &SetArgs,
     json: bool,
     _selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {
-    hii_set(question.selector()?, value, options, json, source)
+    let (question, value) = target.target()?;
+    hii_set(question, &value, options, json, source)
 }
 
 /// HiiBackend::set_using, whatever `_source` names.
 pub(super) fn set_using(
     question: QuestionSelector,
-    value: &str,
+    value: &SetValue,
     options: &SetOptions,
     _source: &HiiSourceArgs,
 ) -> Result<SetResponseList> {

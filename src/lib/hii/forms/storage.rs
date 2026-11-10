@@ -24,8 +24,9 @@ use super::bit_field_bits;
 use super::conditions::ExpressionRefusal;
 use super::conditions::QuestionExpression;
 use super::conditions::MAX_READ_DEPTH;
+use super::ordered_list::ListExpression;
 use super::question_values::value_question;
-use super::question_values::ValueQuestion;
+use super::question_values::ListedQuestion;
 use super::storageless::NoVarStore;
 use super::storageless::StoragelessRefusal;
 use super::time_storage::question_value;
@@ -1264,6 +1265,9 @@ pub(super) enum ValueUnavailable {
     /// `{:#}` shows it
     #[error("{0}")]
     TimeService(String),
+    /// An expression that would give an ORDERED_LIST its value
+    #[error("{0}")]
+    OrderedList(ListExpression),
     /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
     /// level replaces it only in conditions
     #[error(
@@ -1326,16 +1330,18 @@ impl ValueUnavailable {
             | Self::CheckboxOverByte(_)
             | Self::SnapshotNumber { .. }
             | Self::TimeStorageUnread(_)
-            | Self::TimeService(_) => "ValueUnavailable",
+            | Self::TimeService(_)
+            | Self::OrderedList(_) => "ValueUnavailable",
         }
     }
 }
 
-/// Where a ONE_OF, NUMERIC, CHECKBOX, DATE or TIME keeps its value in the payload of its VarStore.
+/// Where a ONE_OF, NUMERIC, CHECKBOX, DATE, TIME or ORDERED_LIST keeps its value in the payload of
+/// its VarStore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ValueLocation {
     /// `size` bytes from byte `offset`, little-endian
-    Bytes { offset: u16, size: u8 },
+    Bytes { offset: u16, size: u16 },
     /// `width` bits from bit `offset`: an EDKII bit varstore field, its BitVarOffset and
     /// BitStorageWidth in edk2-stable202608 SetupBrowserDxe/IfrParse.c
     Bits { offset: u16, width: u8 },
@@ -1394,11 +1400,11 @@ impl ReadableLocation {
     }
 }
 
-/// The payload bytes that hold the value of `question`, if value_question takes it,
+/// The payload bytes that hold the value of `question`, if it is a ListedQuestion,
 /// where edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes places it: an EDKII bit
 /// varstore field, whose VarOffset and width count bits, spans the bytes of its bits.
 fn value_bytes(question: &IFROperation) -> Option<std::ops::Range<usize>> {
-    Some(value_question(question)?.location().bytes())
+    Some(ListedQuestion::of(question)?.location().bytes())
 }
 
 /// Where the value of a question comes from, which get, list-questions and show-ifr tag, or
@@ -1500,35 +1506,43 @@ pub(super) fn read_question_value(
             source: ValueSource::Current,
         });
     }
-    let unread = match read_question_bytes(question, varstore, reader) {
-        Ok(bytes) => {
-            return Ok(RetrievedValue {
-                location,
-                value: location.read(bytes),
-                source: ValueSource::Current,
-            })
-        }
-        Err(unread) => unread,
-    };
-    let bytes = snapshot_bytes(value_question, location, varstore, reader, unread)?;
-    if let Some(snapshot) = reader.snapshot.as_mut() {
-        snapshot.count_taken();
-    }
+    let (bytes, source) = read_sourced_bytes(question, varstore, reader)?;
     Ok(RetrievedValue {
         location,
         value: location.read(&bytes),
-        source: ValueSource::Snapshot,
+        source,
     })
 }
 
-/// The bytes of `question`'s value at `location` in the ExportConfig snapshot of `reader`, if
-/// its variable is missing or its storage is name/value, or `unread`, why the question has no
-/// value otherwise, as of a variable of a VarName: the snapshot holds no byte of a PASSWORD
-/// question (ConfigSnapshot::parse), so a value over one gives `unread`, PasswordBytes
+/// Returns the value_bytes of the question and where they come from, or why they cannot be read:
+/// from the ExportConfig snapshot of `reader`, if any, where the question's variable is missing
+/// or its storage is name/value (snapshot_bytes).
+pub(super) fn read_sourced_bytes(
+    question: &IFROperation,
+    varstore: &Result<Box<dyn VariableStore>>,
+    reader: &mut EfivarReader,
+) -> std::result::Result<(Vec<u8>, ValueSource), ValueUnavailable> {
+    let Some(listed) = ListedQuestion::of(question) else {
+        return Err(ValueUnavailable::NotDecoded(question.op_code));
+    };
+    let unread = match read_question_bytes(question, varstore, reader) {
+        Ok(bytes) => return Ok((bytes.to_vec(), ValueSource::Current)),
+        Err(unread) => unread,
+    };
+    let bytes = snapshot_bytes(listed, varstore, reader, unread)?;
+    if let Some(snapshot) = reader.snapshot.as_mut() {
+        snapshot.count_taken();
+    }
+    Ok((bytes, ValueSource::Snapshot))
+}
+
+/// The bytes of `question`'s value in the ExportConfig snapshot of `reader`, if its variable is
+/// missing or its storage is name/value, or `unread`, why the question has no value otherwise, as
+/// of a variable of a VarName: the snapshot holds no byte of a PASSWORD question
+/// (ConfigSnapshot::parse), so a value over one gives `unread`, PasswordBytes
 /// (read_current_value_bytes).
 fn snapshot_bytes(
-    question: ValueQuestion<'_>,
-    location: ReadableLocation,
+    question: ListedQuestion<'_>,
     varstore: &Result<Box<dyn VariableStore>>,
     reader: &EfivarReader,
     unread: ValueUnavailable,
@@ -1536,7 +1550,7 @@ fn snapshot_bytes(
     let Some(snapshot) = &reader.snapshot else {
         return Err(unread);
     };
-    let value = location.0.bytes();
+    let value = question.location().bytes();
     match varstore {
         Ok(store) => {
             // edk2-stable202608 ExportConfig() asks a driver only for the storages that
@@ -1627,6 +1641,7 @@ mod efivar_reader_tests {
     use super::super::list_questions;
     use super::super::EFI_IFR_NUMERIC_SIZE_2;
     use super::super::EFI_IFR_NUMERIC_SIZE_4;
+    use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
     use super::*;
     use crate::hii::variables::DecodedValue;
 
@@ -2045,6 +2060,16 @@ mod efivar_reader_tests {
             ),
             ("DATE at 2", in_form_set(DATE, &date_time(2, 0x00)), 2..6),
             ("TIME at 9", in_form_set(TIME, &date_time(9, 0x00)), 9..12),
+            (
+                "ORDERED_LIST of 3 UINT16 containers at 4",
+                parse_question(
+                    &[var_store_efi(1, "Setup", NV_BS_RT, 16)],
+                    ORDERED_LIST,
+                    &ordered_list(4, 3, 0x00),
+                    &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_16, &[1, 0])],
+                ),
+                4..10,
+            ),
         ]
     }
 

@@ -19,6 +19,8 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use uefisettings_qemu_guest::changed_bytes;
+use uefisettings_qemu_guest::driver_sample::BOOT_ORDER;
+use uefisettings_qemu_guest::driver_sample::BOOT_ORDER_OFFSET;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
@@ -432,4 +434,158 @@ fn set_of_the_system_time_is_refused_without_a_write() {
         ) && got.answer.ends_with(" <suppressed>"),
         "{got:#?}"
     );
+}
+
+/// `--item` before each of `items`.
+fn item_args<'a>(items: &[&'a str]) -> Vec<&'a str> {
+    items.iter().flat_map(|&item| ["--item", item]).collect()
+}
+
+/// Sets BOOT_ORDER to `items` with `set` after `prefix` and `flags`, and checks that `get`
+/// answers as `set` did. Returns the answer and the items, and the bytes of DriverSample's
+/// variable that changed.
+#[track_caller]
+fn set_boot_order(
+    prefix: &[&str],
+    items: &[&str],
+    flags: &[&str],
+) -> (String, Option<Vec<String>>, Vec<(usize, u8)>) {
+    let before = driver_sample_data();
+    let (set, modified) = single_response(
+        &[
+            prefix,
+            &["set", BOOT_ORDER],
+            &item_args(items),
+            &["--json"],
+            flags,
+        ]
+        .concat(),
+        BACKEND_HII,
+    );
+    assert!(modified, "{set:#?}");
+    let (got, _) = single_response(
+        &[prefix, &["get", BOOT_ORDER, "--json"], flags].concat(),
+        BACKEND_HII,
+    );
+    assert_eq!(
+        (&got.answer, &got.items),
+        (&set.answer, &set.items),
+        "get after set"
+    );
+    (
+        set.answer,
+        set.items,
+        changed_bytes(&before, &driver_sample_data()),
+    )
+}
+
+/// Checks that `set` after `prefix` refuses `items` for BOOT_ORDER with `flags` without changing
+/// the variable. Returns the error that `set` printed.
+#[track_caller]
+fn refuse_boot_order(prefix: &[&str], items: &[&str], flags: &[&str]) -> ErrorObject {
+    let before = driver_sample_data();
+    let error = json_error(
+        &[
+            prefix,
+            &["set", BOOT_ORDER],
+            &item_args(items),
+            &["--json"],
+            flags,
+        ]
+        .concat(),
+    );
+    assert_eq!(
+        changed_bytes(&before, &driver_sample_data()),
+        [],
+        "{prefix:?} {items:?} {flags:?}"
+    );
+    error
+}
+
+/// The text of `items`, owned.
+fn owned(items: &[&str]) -> Option<Vec<String>> {
+    Some(items.iter().map(|&item| item.to_owned()).collect())
+}
+
+/// set writes the items of DriverSample's ordered list "Boot Order" to its UINT16 containers in
+/// order; it takes "USB", whose option a SUPPRESS_IF hides while BootOrderLarge is 0, only with
+/// --include suppressed, and then keeps it: a list that drops it is refused. hii_persistence
+/// checks the last items after a reboot.
+#[test]
+fn set_ordered_list_stores_its_items_and_keeps_the_hidden_one() {
+    let suppressed = format!(
+        "option \"USB\" of question {BOOT_ORDER:?} is suppressed; also include suppressed \
+         questions to select it"
+    );
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse_boot_order(prefix, &["USB"], &[]).error_message,
+            suppressed,
+            "{prefix:?}"
+        );
+    }
+
+    let (answer, items, changed) = set_boot_order(&["hii"], &["ATAPI CD", "IDE HDD"], &[]);
+    assert_eq!(answer, "ATAPI CD, IDE HDD");
+    assert_eq!(items, owned(&["ATAPI CD", "IDE HDD"]));
+    assert_eq!(
+        changed,
+        [(BOOT_ORDER_OFFSET, 2), (BOOT_ORDER_OFFSET + 2, 1)],
+        "ATAPI CD 2, IDE HDD 1"
+    );
+
+    let (answer, items, changed) = set_boot_order(&[], &["USB", "PXE"], &INCLUDE_SUPPRESSED);
+    assert_eq!(answer, "USB <option suppressed>, PXE");
+    assert_eq!(items, owned(&["USB", "PXE"]));
+    assert_eq!(
+        changed,
+        [(BOOT_ORDER_OFFSET, 4), (BOOT_ORDER_OFFSET + 2, 3)],
+        "USB 4, PXE 3"
+    );
+
+    assert_eq!(
+        refuse_boot_order(&["hii"], &["PXE"], &INCLUDE_SUPPRESSED).error_message,
+        format!(
+            "cannot set question {BOOT_ORDER:?}: it holds \"USB\" <option suppressed>, and set \
+             drops no item of a hidden option: give it with --item, and --include suppressed"
+        )
+    );
+}
+
+/// set takes the items of an ordered list with --item, and the value of another question as
+/// VALUE: it refuses each the other way, before any write.
+#[test]
+fn set_takes_items_for_ordered_lists_only() {
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse(prefix, BOOT_ORDER, "PXE", &[]).error_message,
+            format!(
+                "cannot set question {BOOT_ORDER:?}: an ORDERED_LIST takes its options in order, \
+                 each with --item"
+            ),
+            "{prefix:?} VALUE"
+        );
+        let before = driver_sample_data();
+        let error = json_error(
+            &[
+                prefix,
+                &["set", ONE_OF, "--item", "My one-of text #3", "--json"],
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            (
+                error.error_message,
+                changed_bytes(&before, &driver_sample_data())
+            ),
+            (
+                format!(
+                    "cannot set question {ONE_OF:?}: --item gives the options of an ORDERED_LIST; \
+                     this question takes VALUE"
+                ),
+                vec![]
+            ),
+            "{prefix:?} --item"
+        );
+    }
 }

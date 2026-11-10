@@ -30,10 +30,15 @@ use thiserror::Error;
 
 use super::check_read;
 use super::conditions::evaluate_write;
+use super::conditions::question_expression;
 use super::conditions::ExpressionInputs;
 use super::conditions::PlannedSets;
+use super::conditions::QuestionExpression;
 use super::conditions::QuestionValue;
 use super::conditions::VarStoreValues;
+use super::ordered_list::ListExpression;
+use super::ordered_list::ListRefusal;
+use super::ordered_list::ListWrite;
 use super::set::own_write;
 use super::set::ChangeValueError;
 use super::set::NewValue;
@@ -115,6 +120,31 @@ impl<'a> WritePlan<'a> {
             time,
             sets,
             own,
+        })
+    }
+
+    /// The plan that writes `write`, the containers of the ORDERED_LIST `question`, through
+    /// variables of `reach`: refuses one with a WRITE expression, which takes a buffer.
+    pub(super) fn of_list(
+        question: &'a QuestionDescriptor,
+        ListWrite { offset, bytes }: ListWrite,
+        reach: VariableReach,
+    ) -> Result<Self, ChangeValueError> {
+        let store = question.store(reach)?;
+        if question_expression(&question.node, QuestionExpression::Write).is_some() {
+            return Err(ListRefusal::Expression(ListExpression::Write).of(question));
+        }
+        let Some(store) = store else {
+            return Err(ChangeValueError::Storageless {
+                question: question.question.clone(),
+                refusal: StoragelessRefusal::WriteSetsNothing,
+            });
+        };
+        Ok(Self {
+            question,
+            time: Vec::new(),
+            sets: PlannedSets::default(),
+            own: Some(VarStoreWrite::of_bytes(store, offset, bytes)?),
         })
     }
 
@@ -428,7 +458,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::super::ifr_fixtures::*;
+    use super::super::ordered_list::ListWrite;
     use super::super::*;
+    use super::WritePlan;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::hii::variables::check_non_volatile;
     use crate::hii::variables::FirmwareVariables;
@@ -774,8 +806,10 @@ mod tests {
         set_questions(
             prompt,
             &[("selector", &descriptor)],
-            value,
-            &BTreeSet::from([value.to_string()]),
+            NewAnswer::Text {
+                text: value,
+                variations: &BTreeSet::from([value.to_string()]),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,
@@ -958,8 +992,10 @@ mod tests {
             let outcome = set_questions(
                 "Around",
                 &[("selector", descriptor)],
-                "5",
-                &BTreeSet::from(["5".to_string()]),
+                NewAnswer::Text {
+                    text: "5",
+                    variations: &BTreeSet::from(["5".to_string()]),
+                },
                 IncludedStates::empty(),
                 &mut reader,
                 None,
@@ -1073,8 +1109,10 @@ mod tests {
         let outcome = set_questions(
             "Around",
             &[("selector", descriptor)],
-            "5",
-            &BTreeSet::from(["5".to_string()]),
+            NewAnswer::Text {
+                text: "5",
+                variations: &BTreeSet::from(["5".to_string()]),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,
@@ -1164,14 +1202,12 @@ mod tests {
     /// What set did: its error as the CLI prints it, and the writes to Store.
     type StoreOutcome = (Result<(), String>, Vec<(u16, Vec<u8>)>);
 
-    /// set of the DATE or TIME `op_code` Around, at byte `own` of Store, to `text` through
-    /// variables of `through`, beside a PASSWORD of MaxSize 1 at bytes 1..3 of Store.
-    fn set_date_time_by_a_password(
-        op_code: u8,
-        own: u16,
-        text: &str,
-        through: (VariableReach, VariableInterface),
-    ) -> StoreOutcome {
+    /// The FormSet of the question Around, `around` with the prompt FIRST_PROMPT on Store, beside
+    /// a PASSWORD of MaxSize 1 at bytes 1..3 of Store, and its strings, those of `options` too.
+    fn beside_a_password(
+        around: Vec<u8>,
+        options: &[(u16, &str)],
+    ) -> (Rc<RefCell<IFROperation>>, Vec<StringPackage>) {
         let password = operation(
             PASSWORD,
             false,
@@ -1181,6 +1217,84 @@ mod tests {
             ]
             .concat(),
         );
+        let root = parse_form_set(&[
+            var_store_efi(STORE, "Store", NV_BS_RT, 6),
+            form(1, &[password, around]),
+        ]);
+        let strings = [(FIRST_PROMPT, "Around"), (FIRST_PROMPT + 1, "Password")]
+            .iter()
+            .chain(options)
+            .map(|&(id, text)| (id, Rc::from(text)))
+            .collect();
+        (root, vec![en_us_package(strings)])
+    }
+
+    /// Around in `root`, whose strings are `strings`, as the selection picks it through `reader`.
+    fn around_in(
+        root: &Rc<RefCell<IFROperation>>,
+        strings: &[StringPackage],
+        reader: &mut EfivarReader,
+    ) -> QuestionDescriptor {
+        let values = VarStoreValues::new(root, None);
+        let selection = find_question_in(
+            root,
+            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+            &mut FormSetWalk::new(
+                &ListTexts::new(strings, &[]),
+                reader,
+                &values,
+                IncludedStates::empty(),
+            ),
+        );
+        match selection {
+            Selection::Picked {
+                picked: (descriptor, _),
+                ..
+            } => descriptor,
+            other => panic!("Around: not picked: {other:?}"),
+        }
+    }
+
+    /// set of Around, `around` beside a password (beside_a_password), to `answer` through
+    /// variables of `through`.
+    fn set_beside_a_password(
+        around: Vec<u8>,
+        options: &[(u16, &str)],
+        answer: NewAnswer<'_>,
+        through: (VariableReach, VariableInterface),
+    ) -> StoreOutcome {
+        let (root, strings) = beside_a_password(around, options);
+        let passwords = PasswordQuestions::of([&root]);
+        let mut reader = passwords
+            .reader(Box::new(variables(through)))
+            .expect("resolve the VarStore of the PASSWORD question");
+        let descriptor = around_in(&root, &strings, &mut reader);
+        let writes = variables(through);
+        let outcome = set_questions(
+            "Around",
+            &[("selector", &descriptor)],
+            answer,
+            IncludedStates::empty(),
+            &mut reader,
+            None,
+            VolatileWrites::Refuse,
+            &passwords
+                .withholding(&writes)
+                .expect("resolve the VarStore of the PASSWORD question"),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"));
+        (outcome, writes.writes_to(&key("Store")))
+    }
+
+    /// set of the DATE or TIME `op_code` Around, at byte `own` of Store, to `text` through
+    /// variables of `through`, beside a password (beside_a_password).
+    fn set_date_time_by_a_password(
+        op_code: u8,
+        own: u16,
+        text: &str,
+        through: (VariableReach, VariableInterface),
+    ) -> StoreOutcome {
         let around = [
             operation(
                 op_code,
@@ -1194,53 +1308,11 @@ mod tests {
             END.to_vec(),
         ]
         .concat();
-        let root = parse_form_set(&[
-            var_store_efi(STORE, "Store", NV_BS_RT, 6),
-            form(1, &[password, around]),
-        ]);
-        let strings = vec![en_us_package(StringMap::from([
-            (FIRST_PROMPT, "Around".into()),
-            (FIRST_PROMPT + 1, "Password".into()),
-        ]))];
-        let passwords = PasswordQuestions::of([&root]);
-        let mut reader = passwords
-            .reader(Box::new(variables(through)))
-            .expect("resolve the VarStore of the PASSWORD question");
-        let values = VarStoreValues::new(&root, None);
-        let selection = find_question_in(
-            &root,
-            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
-            &mut FormSetWalk::new(
-                &ListTexts::new(&strings, &[]),
-                &mut reader,
-                &values,
-                IncludedStates::empty(),
-            ),
-        );
-        let Selection::Picked {
-            picked: (descriptor, _),
-            ..
-        } = &selection
-        else {
-            panic!("Around: not picked through {through:?}");
-        };
-        let writes = variables(through);
-        let outcome = set_questions(
-            "Around",
-            &[("selector", descriptor)],
+        let answer = NewAnswer::Text {
             text,
-            &BTreeSet::from([text.to_string()]),
-            IncludedStates::empty(),
-            &mut reader,
-            None,
-            VolatileWrites::Refuse,
-            &passwords
-                .withholding(&writes)
-                .expect("resolve the VarStore of the PASSWORD question"),
-        )
-        .map(|_| ())
-        .map_err(|error| format!("{error:#}"));
-        (outcome, writes.writes_to(&key("Store")))
+            variations: &BTreeSet::from([text.to_string()]),
+        };
+        set_beside_a_password(around, &[], answer, through)
     }
 
     /// The EFI_HII_DATE or EFI_HII_TIME of a question that overlaps a password's bytes, by any
@@ -1282,6 +1354,77 @@ mod tests {
                     "{name} through {through:?}"
                 );
             }
+        }
+    }
+
+    /// The containers of an ORDERED_LIST that overlap a password's bytes: set refuses before any
+    /// write, through variables of every backend, as its stored items read as unavailable, and the
+    /// list's write plan refuses the overlapping write itself. A list beside the password writes
+    /// its containers.
+    #[test]
+    fn an_ordered_list_over_a_password_writes_nothing() {
+        let list = |own: u16| {
+            [
+                operation(
+                    ORDERED_LIST,
+                    true,
+                    &[
+                        question_header_with(1, FIRST_PROMPT, STORE, own, 0),
+                        vec![2, 0],
+                    ]
+                    .concat(),
+                ),
+                one_of_option(FIRST_PROMPT + 2, EFI_IFR_TYPE_NUM_SIZE_8, &[5]),
+                one_of_option(FIRST_PROMPT + 3, EFI_IFR_TYPE_NUM_SIZE_8, &[6]),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let options = [(FIRST_PROMPT + 2, "Five"), (FIRST_PROMPT + 3, "Six")];
+        let items = ["Five".to_string(), "Six".to_string()];
+        for through in [EFIVARFS, VARIABLE_SERVICES, FIRMWARE_ENVIRONMENT] {
+            for (span, own) in [("0..2, its last byte", 0), ("2..4, its first byte", 2)] {
+                assert_eq!(
+                    set_beside_a_password(list(own), &options, NewAnswer::Items(&items), through),
+                    (
+                        Err(
+                            "cannot set question \"Around\": its items cannot be read, so set \
+                             cannot keep those of hidden options: its bytes hold a password"
+                                .to_string()
+                        ),
+                        vec![]
+                    ),
+                    "{span} through {through:?}"
+                );
+
+                // the write plan of the same containers, past the read of the stored items
+                let (root, strings) = beside_a_password(list(own), &options);
+                let passwords = PasswordQuestions::of([&root]);
+                let mut reader = passwords
+                    .reader(Box::new(variables(through)))
+                    .expect("resolve the VarStore of the PASSWORD question");
+                let descriptor = around_in(&root, &strings, &mut reader);
+                let planned = ListWrite {
+                    offset: own,
+                    bytes: vec![5, 6],
+                };
+                let refusal = WritePlan::of_list(&descriptor, planned, through.0)
+                    .and_then(|plan| plan.writes(&mut reader, VolatileWrites::Refuse).map(drop))
+                    .map_err(|error| error.to_string());
+                assert_eq!(
+                    refusal,
+                    Err("cannot set question \"Around\": EFI variable \
+                         Store-00000000-0000-0000-0000-000000000000 holds a password at bytes \
+                         1..3, which set never writes"
+                        .to_string()),
+                    "{span} through {through:?}: plan"
+                );
+            }
+            assert_eq!(
+                set_beside_a_password(list(3), &options, NewAnswer::Items(&items), through),
+                (Ok(()), vec![(3, vec![5, 6])]),
+                "3..5, beside it through {through:?}"
+            );
         }
     }
 
@@ -1527,8 +1670,10 @@ mod tests {
         set_questions(
             "Dup",
             &selected,
-            "5",
-            &BTreeSet::from(["5".to_string()]),
+            NewAnswer::Text {
+                text: "5",
+                variations: &BTreeSet::from(["5".to_string()]),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,

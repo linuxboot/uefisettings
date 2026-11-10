@@ -28,6 +28,8 @@ use super::conditions::ReadOnlyCause;
 use super::conditions::SelectionError;
 use super::date_time::DateTimeTextError;
 use super::defaults::OptionValueError;
+use super::ordered_list::items_answer;
+use super::ordered_list::ListRefusal;
 use super::question_values::QuestionKind;
 use super::storage::created_attributes;
 use super::storage::ValueLocation;
@@ -103,6 +105,12 @@ pub(crate) enum ChangeValueError {
         question: String,
         refusal: TimeWriteRefusal,
     },
+    /// An ORDERED_LIST whose items set refuses, or another question given items
+    #[error("cannot set question {question:?}: {refusal}")]
+    OrderedList {
+        question: String,
+        refusal: ListRefusal,
+    },
     /// A question that `cause` makes read-only, which set writes only with `lifted_with`, the
     /// states that lift `cause` where its caller can include them, else never, and
     /// `undetermined`, the states that it may be in where the selection is undetermined;
@@ -126,7 +134,7 @@ pub(crate) enum ChangeValueError {
     WiderThanStorage {
         value: u64,
         value_width: u8,
-        storage_width: u8,
+        storage_width: u16,
     },
     /// A ONE_OF option whose value is not known
     #[error("cannot set question {question:?} to option {option:?}: {reason}")]
@@ -200,7 +208,7 @@ impl<'a> VarStoreWrite<'a> {
     pub(super) fn new(
         store: &'a dyn VariableStore,
         offset: u16,
-        width: u8,
+        width: u16,
         value: TypeValue,
         interface: VariableInterface,
     ) -> Result<Self, ChangeValueError> {
@@ -246,7 +254,7 @@ impl<'a> VarStoreWrite<'a> {
     fn filling(
         store: &'a dyn VariableStore,
         offset: u16,
-        width: u8,
+        width: u16,
         encoded: &[u8],
     ) -> Result<Self, ChangeValueError> {
         if encoded.len() != usize::from(width) {
@@ -256,18 +264,27 @@ impl<'a> VarStoreWrite<'a> {
             )
             .into());
         }
+        Ok(Self::of_bytes(store, offset, encoded.to_vec())?)
+    }
+
+    /// The write of `encoded` at VarOffset `offset` of `store`: fails unless it fits in the Size
+    /// of `store` there.
+    pub(super) fn of_bytes(
+        store: &'a dyn VariableStore,
+        offset: u16,
+        encoded: Vec<u8>,
+    ) -> Result<Self> {
         if usize::from(offset) + encoded.len() > usize::from(store.size()) {
             return Err(anyhow!(
                 "write at offset {} with width {} exceeds varstore size {}",
                 offset,
                 encoded.len(),
                 store.size()
-            )
-            .into());
+            ));
         }
         Ok(Self {
             store,
-            patches: vec![(offset, encoded.to_vec())],
+            patches: vec![(offset, encoded)],
         })
     }
 
@@ -335,6 +352,52 @@ impl<'a> VarStoreWrite<'a> {
     }
 }
 
+/// The new value that set gives the questions that it selects.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NewAnswer<'v> {
+    /// The text of a value, or of the option of a ONE_OF, one of `variations`, which the
+    /// spellings database gives
+    Text {
+        text: &'v str,
+        variations: &'v BTreeSet<String>,
+    },
+    /// The texts of the options of an ORDERED_LIST, in order
+    Items(&'v [String]),
+}
+
+/// What set gives one question: its value as text, the option of a ONE_OF, or the options of an
+/// ORDERED_LIST, in order.
+pub(crate) enum Written<'a> {
+    Text,
+    Option(&'a AnswerOption),
+    Items(Vec<&'a AnswerOption>),
+}
+
+impl Written<'_> {
+    /// The answer that set shows for the question, given `text`: that text, with the state of a
+    /// ONE_OF's option; or the options of an ORDERED_LIST as get shows them.
+    pub(crate) fn answer(&self, text: &str) -> String {
+        match self {
+            Written::Text => text.to_owned(),
+            Written::Option(option) => text.to_owned() + &option.state.option_annotation(),
+            Written::Items(options) => items_answer(options),
+        }
+    }
+
+    /// The texts of the options of an ORDERED_LIST, as get shows them without their states.
+    pub(crate) fn items(&self) -> Option<Vec<String>> {
+        match self {
+            Written::Items(options) => Some(
+                options
+                    .iter()
+                    .map(|option| option.value.trim().to_string())
+                    .collect(),
+            ),
+            Written::Text | Written::Option(_) => None,
+        }
+    }
+}
+
 /// What set takes for a question: the text of its value, or of a ONE_OF the option that it
 /// picked.
 #[derive(Clone, Copy)]
@@ -398,6 +461,7 @@ fn text_value(
     Ok(match &question.input {
         TextInput::Range(range) => range.parse_value(new_value)?,
         TextInput::DateTime(input) => input.value(new_value)?,
+        TextInput::OrderedList(_) => return Err(ListRefusal::Text.of(question)),
         TextInput::Maximum(maximum) => match *maximum {
             RangeType::NumSize8(m) => {
                 let data_to_write = new_value
@@ -439,19 +503,21 @@ fn text_value(
     })
 }
 
-/// What set wrote for one question: the option that it picked, None for a value, and whether a
-/// variable that it wrote is volatile, as the reader read its attributes before the write, or as
-/// set created it (created_attributes).
+/// What set wrote for one question: what it gave it, and whether a variable that it wrote is
+/// volatile, as the reader read its attributes before the write, or as set created it
+/// (created_attributes).
 pub(crate) struct WrittenQuestion<'a> {
-    pub(crate) option: Option<&'a AnswerOption>,
+    pub(crate) given: Written<'a>,
     pub(crate) volatile: bool,
 }
 
-/// Sets each of the `selected` questions, by the selector of its package list, to `new_value`
-/// or to its option of one of `texts` that chosen_option picks with `include`, in `variables`,
-/// writing a volatile variable only if `volatile` allows it, and returns a WrittenQuestion per
-/// selected question, in its order; fails with SelectionError::NotFound when nothing is selected,
-/// and with MixedKinds for questions of more than one QuestionKind.
+/// Sets each of the `selected` questions, by the selector of its package list, to `answer`, in
+/// `variables`: an ORDERED_LIST to its items, each an option that select_option picks with
+/// `include`, another question to the text or to its option of one of the variations that
+/// chosen_option picks with `include`; writes a volatile variable only if `volatile` allows it,
+/// and returns a WrittenQuestion per selected question, in its order; fails with
+/// SelectionError::NotFound when nothing is selected, and with MixedKinds for questions of more
+/// than one QuestionKind.
 /// It builds the WritePlan of every question before the first write, reading with `reader`, whose
 /// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
 /// one question refuses leaves every variable unchanged; then it writes the system or wake-up time
@@ -468,8 +534,7 @@ pub(crate) struct WrittenQuestion<'a> {
 pub(crate) fn set_questions<'a>(
     question: &str,
     selected: &[(&str, &'a QuestionDescriptor)],
-    new_value: &str,
-    texts: &BTreeSet<String>,
+    answer: NewAnswer<'_>,
     include: IncludedStates,
     reader: &mut EfivarReader,
     access_level: Option<AccessLevel>,
@@ -483,38 +548,28 @@ pub(crate) fn set_questions<'a>(
         .into());
     }
     check_one_kind(question, selected)?;
-    let (reach, interface) = (variables.reach(), variables.interface());
-    let plans = selected
-        .iter()
-        .map(|&(selector, descriptor)| {
-            // if the descriptor provides options then set the closest one from texts
-            // (example whatever matches from [Enabled, Enable])
-            // else try setting the new_value because it might be some arbitrary value like a number
-            // (will return error if doesn't match constraints)
-            let (value, option) = match descriptor.possible_options.is_empty() {
-                true => (NewValue::Text(new_value), None),
-                false => {
-                    let option = descriptor.chosen_option(texts, include)?;
-                    (NewValue::Option(option), Some(option))
-                }
-            };
-            let plan = WritePlan::new(descriptor, value, (reach, interface), reader, access_level)?;
-            Ok((selector, plan, option))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let through = (variables.reach(), variables.interface());
+    let mut plans = Vec::new();
+    let mut given = Vec::new();
+    for &(selector, descriptor) in selected {
+        let (plan, written) =
+            plan_question(descriptor, answer, include, through, reader, access_level)?;
+        plans.push((selector, plan));
+        given.push(written);
+    }
     let writes = plans
         .iter()
-        .map(|(selector, plan, _)| Ok((*selector, plan.writes(reader, volatile)?)))
+        .map(|(selector, plan)| Ok((*selector, plan.writes(reader, volatile)?)))
         .collect::<Result<Vec<_>>>()?;
-    let written_questions = plans
-        .iter()
+    let written_questions = given
+        .into_iter()
         .zip(&writes)
-        .map(|((_, _, option), (_, question_writes))| WrittenQuestion {
-            option: *option,
+        .map(|(given, (_, question_writes))| WrittenQuestion {
+            given,
             volatile: question_writes.variables.iter().any(|write| {
                 reader
                     .attributes(write.store)
-                    .or_else(|| created_attributes(write.store, reach, interface))
+                    .or_else(|| created_attributes(write.store, through.0, through.1))
                     .is_some_and(is_volatile)
             }),
         })
@@ -531,7 +586,7 @@ pub(crate) fn set_questions<'a>(
         variable_writes.push((selector, variables));
     }
     let batch = batched_writes(variable_writes)?;
-    check_efivar_files(&batch, interface)?;
+    check_efivar_files(&batch, through.1)?;
     // a question's time before its VarStore, which a failed time write leaves unwritten
     let stores: Vec<BatchedStore<'_, '_>> = times
         .into_iter()
@@ -567,6 +622,50 @@ pub(crate) fn set_questions<'a>(
         .into());
     }
     Ok(written_questions)
+}
+
+/// The WritePlan that gives `question` `answer` through variables of `through`, as set_questions
+/// does, and what it gives it.
+fn plan_question<'a>(
+    question: &'a QuestionDescriptor,
+    answer: NewAnswer<'_>,
+    include: IncludedStates,
+    through: (VariableReach, VariableInterface),
+    reader: &mut EfivarReader,
+    access_level: Option<AccessLevel>,
+) -> Result<(WritePlan<'a>, Written<'a>)> {
+    match (&question.input, answer) {
+        (TextInput::OrderedList(input), NewAnswer::Items(items)) => {
+            let (write, options) = input.write(question, items, include)?;
+            let plan = WritePlan::of_list(question, write, through.0)?;
+            Ok((plan, Written::Items(options)))
+        }
+        (TextInput::OrderedList(_), NewAnswer::Text { .. }) => {
+            Err(ListRefusal::Text.of(question).into())
+        }
+        (
+            TextInput::Range(_) | TextInput::Maximum(_) | TextInput::DateTime(_),
+            NewAnswer::Items(_),
+        ) => Err(ListRefusal::Items.of(question).into()),
+        (
+            TextInput::Range(_) | TextInput::Maximum(_) | TextInput::DateTime(_),
+            NewAnswer::Text { text, variations },
+        ) => {
+            // if the descriptor provides options then set the closest one from texts
+            // (example whatever matches from [Enabled, Enable])
+            // else try setting the new_value because it might be some arbitrary value like a number
+            // (will return error if doesn't match constraints)
+            let (value, written) = match question.possible_options.is_empty() {
+                true => (NewValue::Text(text), Written::Text),
+                false => {
+                    let option = question.chosen_option(variations, include)?;
+                    (NewValue::Option(option), Written::Option(option))
+                }
+            };
+            let plan = WritePlan::new(question, value, through, reader, access_level)?;
+            Ok((plan, written))
+        }
+    }
 }
 
 /// Refuses `selected`, the questions that the text `question` selects, by selector, unless they
@@ -760,8 +859,10 @@ mod set_questions_tests {
         set_questions(
             PROMPT,
             selected,
-            new_value,
-            &texts.iter().map(|text| text.to_string()).collect(),
+            NewAnswer::Text {
+                text: new_value,
+                variations: &texts.iter().map(|text| text.to_string()).collect(),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,
@@ -771,7 +872,10 @@ mod set_questions_tests {
         .map(|written| {
             written
                 .into_iter()
-                .map(|question| question.option.map(|option| option.value.clone()))
+                .map(|question| match question.given {
+                    Written::Option(option) => Some(option.value.clone()),
+                    Written::Text | Written::Items(_) => None,
+                })
                 .collect()
         })
         .map_err(|error| format!("{error:#}"))
@@ -1389,8 +1493,10 @@ mod set_questions_tests {
             let got = set_questions(
                 PROMPT,
                 &[("A", &a), ("B", &b)],
-                "1",
-                &BTreeSet::new(),
+                NewAnswer::Text {
+                    text: "1",
+                    variations: &BTreeSet::new(),
+                },
                 IncludedStates::empty(),
                 &mut reader,
                 None,
@@ -1842,7 +1948,7 @@ mod write_validation_tests {
             flags: width_code | display,
             location: ValueLocation::Bytes {
                 offset: 2,
-                size: range.size(),
+                size: range.size().into(),
             },
             encoding: ValueEncoding::NumericSize,
             data: range,
@@ -2626,8 +2732,10 @@ mod date_time_write_tests {
         let set = set_questions(
             PROMPT,
             &[("A", &date)],
-            "2024-02-29",
-            &BTreeSet::new(),
+            NewAnswer::Text {
+                text: "2024-02-29",
+                variations: &BTreeSet::new(),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,
@@ -2655,8 +2763,10 @@ mod date_time_write_tests {
         let set = set_questions(
             PROMPT,
             &[("A", &date), ("B", &numeric)],
-            "1",
-            &BTreeSet::new(),
+            NewAnswer::Text {
+                text: "1",
+                variations: &BTreeSet::new(),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,
@@ -2776,8 +2886,10 @@ mod time_storage_write_tests {
         let set = set_questions(
             PROMPT,
             selected,
-            text,
-            &BTreeSet::new(),
+            NewAnswer::Text {
+                text,
+                variations: &BTreeSet::new(),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,
@@ -3205,8 +3317,10 @@ mod time_storage_write_tests {
         let set = set_questions(
             PROMPT,
             &[("A", &date)],
-            "2027-02-28",
-            &BTreeSet::new(),
+            NewAnswer::Text {
+                text: "2027-02-28",
+                variations: &BTreeSet::new(),
+            },
             IncludedStates::empty(),
             &mut reader,
             None,

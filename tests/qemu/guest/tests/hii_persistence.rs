@@ -14,6 +14,8 @@
 //! variables keep the answers that the first boot set, and both the HII and the generic
 //! commands read them.
 
+use uefisettings_qemu_guest::driver_sample::BOOT_ORDER;
+use uefisettings_qemu_guest::driver_sample::BOOT_ORDER_OFFSET;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
@@ -38,7 +40,7 @@ use uefisettings_qemu_guest::MY_EFI_VAR_QUESTION;
 
 /// The questions that `hii_write.rs` sets and their new answers.
 /// Each comes with the flags that make `get` select it.
-fn answers() -> [(&'static str, &'static [&'static str], String); 6] {
+fn answers() -> [(&'static str, &'static [&'static str], String); 7] {
     [
         (ONE_OF, &[], "My one-of text #3".to_string()),
         (CHECK_BOX, &[], "0".to_string()),
@@ -54,6 +56,7 @@ fn answers() -> [(&'static str, &'static [&'static str], String); 6] {
             format!("5 <selectable or grayed-out: {MATCH2_REASON}>"),
         ),
         (MY_EFI_VAR_QUESTION, &[], "32".to_string()),
+        (BOOT_ORDER, &[], "USB <option suppressed>, PXE".to_string()),
     ]
 }
 
@@ -68,6 +71,11 @@ fn driver_sample_variable_keeps_the_new_answers() {
         0x2f8u16.to_le_bytes()
     );
     assert_eq!(data[MATCH2_OFFSET], 5, "{MATCH2}");
+    assert_eq!(
+        data[BOOT_ORDER_OFFSET..BOOT_ORDER_OFFSET + 6],
+        [4, 0, 3, 0, 0, 0],
+        "{BOOT_ORDER}"
+    );
 }
 
 /// MyEfiVar keeps the answer that the first boot set and its attributes, with runtime access:

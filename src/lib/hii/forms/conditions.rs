@@ -484,6 +484,11 @@ impl StateEvaluation {
         self.excluded_states(include).is_empty()
     }
 
+    /// The possible states that only an --include allows.
+    pub(crate) fn hidden_states(&self) -> IncludedStates {
+        self.excluded_states(IncludedStates::empty())
+    }
+
     /// Whether `include` allows some possible state.
     pub(crate) fn may_be_allowed(&self, include: IncludedStates) -> bool {
         self.lowest_allowed(include).is_some()

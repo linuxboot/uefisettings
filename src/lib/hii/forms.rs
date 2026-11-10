@@ -69,6 +69,10 @@ use date_time::DateTimeQuestion;
 use defaults::FormSetDefaultStores;
 use defaults::OptionValueError;
 use keywords::KeywordStatement;
+use ordered_list::display_list_answer;
+use ordered_list::ListInput;
+use ordered_list::OrderedList;
+use ordered_list::OrderedListQuestion;
 use question_values::describe_question;
 use question_values::form_set_guid;
 use question_values::questions_addressed;
@@ -80,6 +84,7 @@ pub(crate) use question_values::Keyword;
 pub use question_values::KeywordError;
 pub use question_values::KeywordName;
 pub use question_values::KeywordNamespace;
+use question_values::ListedQuestion;
 pub use question_values::OptionMatch;
 pub use question_values::PromptMatch;
 pub use question_values::QuestionAddress;
@@ -130,6 +135,7 @@ pub(crate) use conditions::StateEvaluation;
 pub(crate) use defaults::DeclaredDefault;
 pub(crate) use defaults::DefaultId;
 pub(crate) use set::set_questions;
+pub(crate) use set::NewAnswer;
 pub(crate) use setup_password::PasswordQuestions;
 pub(crate) use setup_password::UnresolvedPassword;
 
@@ -149,6 +155,7 @@ pub(crate) mod ifr_fixtures;
     )
 )]
 pub(crate) mod keywords;
+mod ordered_list;
 mod question_values;
 mod set;
 mod setup_password;
@@ -999,6 +1006,7 @@ pub enum ParsedOperation {
     FormMap(FormMap),
     Date(DateTimeQuestion),
     Time(DateTimeQuestion),
+    OrderedList(OrderedList),
     #[default]
     Placeholder,
 }
@@ -1441,7 +1449,7 @@ impl ValueEncoding {
         match self {
             Self::NumericSize => ValueLocation::Bytes {
                 offset: var_store_info,
-                size: range.size(),
+                size: range.size().into(),
             },
             Self::EdkiiBitField => ValueLocation::Bits {
                 offset: var_store_info,
@@ -1449,7 +1457,7 @@ impl ValueEncoding {
             },
             Self::VarName => ValueLocation::Bytes {
                 offset: VariableLayout::OneValue.offset(var_store_info),
-                size: range.size(),
+                size: range.size().into(),
             },
         }
     }
@@ -3281,6 +3289,11 @@ fn handle_opcode(node: &mut IFROperation) -> Result<()> {
                 Err(error) => debug!("leaving a Time undecoded: {error}"),
             }
         }
+        // likewise an ORDERED_LIST, which uefisettings did not decode before either
+        IFROpCode::OrderedList => match data_cursor.parse_ne() {
+            Ok(parsed) => node.parsed_data = ParsedOperation::OrderedList(parsed),
+            Err(error) => debug!("leaving an OrderedList undecoded: {error}"),
+        },
         _ => (),
     }
 
@@ -3331,6 +3344,8 @@ enum TextInput {
     Maximum(RangeType),
     /// A DATE or TIME
     DateTime(DateTimeInput),
+    /// An ORDERED_LIST, which takes options as items instead
+    OrderedList(ListInput),
 }
 
 #[derive(Debug)]
@@ -3412,6 +3427,15 @@ impl QuestionDescriptor {
     ) -> Option<std::result::Result<StoragelessRoute, StoragelessRefusal>> {
         let NoVarStore(storageless) = self.varstore.as_ref().err()?.downcast_ref::<NoVarStore>()?;
         Some(storageless.route(expression))
+    }
+
+    /// The texts of the options of the stored items of an ORDERED_LIST, in order, as get shows
+    /// them without their states; None for another question, or one whose items cannot be read.
+    pub(crate) fn items(&self) -> Option<Vec<String>> {
+        match &self.input {
+            TextInput::OrderedList(input) => input.items(&self.possible_options),
+            TextInput::Range(_) | TextInput::Maximum(_) | TextInput::DateTime(_) => None,
+        }
     }
 
     /// The option that set writes for one of `texts`.
@@ -3595,19 +3619,19 @@ fn list_questions_in(
     res
 }
 
-/// Returns the QuestionDescriptor and states of a question that value_question takes, in a state
-/// that `walk.include` may allow.
+/// Returns the QuestionDescriptor and states of a ListedQuestion, in a state that `walk.include`
+/// may allow.
 fn listed_question(
     question: &Rc<RefCell<IFROperation>>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Option<(QuestionDescriptor, StateEvaluation)> {
     let op = question.borrow();
-    let value_question = value_question(&op)?;
+    let listed = ListedQuestion::of(&op)?;
     let state = question_state(&op, &mut walk.inputs);
     if !state.may_be_allowed(walk.include) {
         return None;
     }
-    let descriptor = describe_question(question, value_question, walk);
+    let descriptor = describe_question(question, listed, walk);
     Some((descriptor, state))
 }
 
@@ -3651,13 +3675,13 @@ where
         .iter()
         .zip(&ops)
         .filter_map(|(question, op)| {
-            let value_question = value_question(op)?;
+            let listed = ListedQuestion::of(op)?;
             let state = question_state(op, &mut walk.inputs);
-            Some(((question, value_question), state))
+            Some(((question, listed), state))
         })
         .collect();
     select(matches, walk.include)
-        .map(|(question, value_question)| describe_question(question, value_question, walk))
+        .map(|(question, listed)| describe_question(question, listed, walk))
 }
 
 /// The questions under the root `node` of a FormSet whose prompt is one of
@@ -3678,7 +3702,7 @@ where
 }
 
 /// Refuses with SelectionError::Ambiguous the `statements` of the keyword `question` whose
-/// questions that value_question takes are of more than one NAMESPACE, naming each: a
+/// ListedQuestions are of more than one NAMESPACE, naming each: a
 /// NAMESPACE "is equivalent to the platform configuration language being used for the keyword
 /// definition" (UEFI 2.11 §35.2.1.6), so they would be settings of different definitions.
 pub(crate) fn check_keyword_namespace(
@@ -3689,7 +3713,7 @@ pub(crate) fn check_keyword_namespace(
         .iter()
         .filter_map(|statement| {
             let op = statement.op().borrow();
-            let header = value_question(&op)?.header();
+            let header = ListedQuestion::of(&op)?.header();
             Some(PromptMatch {
                 question_id: header.question_id,
                 form_set: form_set_guid(&op),
@@ -3725,7 +3749,8 @@ pub(crate) fn check_address_unique(
             .iter()
             .filter_map(|question| {
                 let op = question.borrow();
-                value_question(&op).map(|value| texts.display(value.header().prompt_string_id))
+                ListedQuestion::of(&op)
+                    .map(|question| texts.display(question.header().prompt_string_id))
             })
             .map(str::to_owned)
             .collect(),
@@ -4813,6 +4838,26 @@ fn display_op(
             );
         }
 
+        ParsedOperation::OrderedList(parsed) => {
+            let header = parsed.question_header();
+            let varstore = find_corresponding_varstore(Rc::clone(node), header.var_store_id);
+            let question = OrderedListQuestion::of(&current_node, parsed);
+            let answer_disp =
+                display_list_answer(node, question, &varstore, texts, inputs);
+
+            result.push_str(
+                format!(
+                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-MaxContainers: {} - Flags: {:#04x}\n{extra_spaces}-Answer: {answer_disp}\n",
+                    current_node.op_code,
+                    texts.display(header.prompt_string_id),
+                    texts.display(header.help_string_id),
+                    parsed.max_containers,
+                    parsed.flags
+                )
+                .as_str(),
+            );
+        }
+
         // TODO: we have already made structs for the most popular opcodes so we should finish the display function for them
         // however display is only for debugging and a visual representation of the forms for humans
         _ => result
@@ -4916,7 +4961,7 @@ fn short_efi_variable(
     let (var_name, size) = match (value_question(question), PasswordOp::of(question)) {
         (Some(value_question), _) => match (value_question.encoding(), value_question.location()) {
             (ValueEncoding::VarName, ValueLocation::Bytes { size, .. }) => {
-                (value_question.header().var_store_info, u16::from(size))
+                (value_question.header().var_store_info, size)
             }
             (ValueEncoding::EdkiiBitField, _)
             | (ValueEncoding::VarName, ValueLocation::Bits { .. }) => {
@@ -5010,6 +5055,7 @@ fn declared_store(op: &IFROperation) -> Option<(u16, DeclaredStore)> {
         | ParsedOperation::FormMap(_)
         | ParsedOperation::Date(_)
         | ParsedOperation::Time(_)
+        | ParsedOperation::OrderedList(_)
         | ParsedOperation::Placeholder => None,
     }
 }
@@ -5322,7 +5368,7 @@ mod tests {
             let write = VarStoreWrite::new(
                 &store,
                 u16::try_from(offset).expect("offset fits u16"),
-                u8::try_from(encoded.len()).expect("width fits u8"),
+                u16::try_from(encoded.len()).expect("width fits u16"),
                 data,
                 variables.interface(),
             )

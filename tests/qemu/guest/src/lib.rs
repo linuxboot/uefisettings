@@ -166,6 +166,15 @@ pub mod driver_sample {
     /// The prompt of two TIMEs in that form: one of the system time, which get and set select,
     /// then one on the variable's EFI_HII_TIME at byte 199, which suppresses its second.
     pub const SYSTEM_TIME: &str = "System Time";
+    /// An ordered list of 8 UINT16 containers whose options "ATAPI CD", "IDE HDD", "PXE" and
+    /// "USB" store 2, 1, 3 and 4; a SUPPRESS_IF hides "USB" while BootOrderLarge is 0.
+    pub const BOOT_ORDER: &str = "Boot Order";
+    /// Offset of the containers of [`BOOT_ORDER`].
+    pub const BOOT_ORDER_OFFSET: usize = 102;
+    /// The prompt of an ordered list of 8 UINT8 containers whose options "My one-of text #1",
+    /// "#2" and "#3" store 3, 2 and 1, which the form disables while SuppressGrayOutSomething is
+    /// 2, and of a selectable one-of question after it, which get and set select instead.
+    pub const PICK_1: &str = "Pick 1";
 }
 
 /// How a `uefisettings` run exited, and what it printed.
@@ -271,14 +280,17 @@ pub struct ErrorObject {
 
 /// A question as `hii list-questions --json` prints it, and as `get` and `set` print it in
 /// their responses (`Question`).
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Question {
     /// The prompt.
     pub name: String,
     /// The current answer.
     pub answer: String,
-    /// The answers that a one-of question accepts.
+    /// The answers that a one-of question accepts, or the items that an ordered list does.
     pub options: Vec<String>,
+    /// The items of an ordered list, which the output leaves out for other questions.
+    #[serde(default)]
+    pub items: Option<Vec<String>>,
 }
 
 /// Output of `get --json` and `set --json` (`GetResponseList` and `SetResponseList`).

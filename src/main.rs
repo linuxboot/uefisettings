@@ -25,6 +25,8 @@ use anyhow::anyhow;
 use anyhow::Result;
 #[cfg(all(system_hiidb, system_variables))]
 use clap::builder::PossibleValue;
+#[cfg(all(system_hiidb, system_variables))]
+use clap::ArgGroup;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
@@ -43,6 +45,8 @@ use uefisettings::exports::QuestionAddress;
 use uefisettings::exports::QuestionSelector;
 #[cfg(all(system_hiidb, system_variables))]
 use uefisettings::exports::SetOptions;
+#[cfg(all(system_hiidb, system_variables))]
+use uefisettings::exports::SetValue;
 use uefisettings::exports::ShowIfrOptions;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
@@ -158,11 +162,16 @@ enum Commands {
     #[cfg(all(system_hiidb, system_variables))]
     #[command(about = platform::SET_ABOUT, next_display_order = None, allow_missing_positional = true)]
     #[cfg_attr(system_time, command(long_about = platform::SET_LONG_ABOUT))]
+    // With --item, which leaves no VALUE, a lone positional is QUESTION (SetArgs::target), so
+    // SetTarget, which --item meets too, stands in for the requirement of QuestionSelectorArgs.
+    #[command(mut_group("QuestionSelectorArgs", |group| group.required(false)))]
+    #[command(group(ArgGroup::new("SetTarget")
+        .args(["question", "question_id", "keyword", "items"])
+        .required(true)
+        .multiple(true)))]
     Set {
         #[command(flatten)]
-        question: QuestionArgs,
-        #[arg(allow_negative_numbers = true)]
-        value: String,
+        target: SetArgs,
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
@@ -215,11 +224,16 @@ enum HiiSubcommands {
     #[cfg(all(system_hiidb, system_variables))]
     #[command(next_display_order = None, allow_missing_positional = true)]
     #[cfg_attr(system_time, command(long_about = platform::SET_LONG_ABOUT))]
+    // With --item, which leaves no VALUE, a lone positional is QUESTION (SetArgs::target), so
+    // SetTarget, which --item meets too, stands in for the requirement of QuestionSelectorArgs.
+    #[command(mut_group("QuestionSelectorArgs", |group| group.required(false)))]
+    #[command(group(ArgGroup::new("SetTarget")
+        .args(["question", "question_id", "keyword", "items"])
+        .required(true)
+        .multiple(true)))]
     Set {
         #[command(flatten)]
-        question: QuestionArgs,
-        #[arg(allow_negative_numbers = true)]
-        value: String,
+        target: SetArgs,
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
@@ -247,7 +261,7 @@ enum HiiSubcommands {
         #[command(flatten)]
         output: JsonArgs,
     },
-    /// List the one-of, numeric, checkbox, date and time questions of the HiiDB, whose values get reads.
+    /// List the one-of, numeric, checkbox, date, time and ordered-list questions of the HiiDB, whose values get reads.
     #[command(next_display_order = None)]
     ListQuestions {
         #[command(flatten)]
@@ -261,6 +275,54 @@ enum HiiSubcommands {
     },
     #[command(flatten)]
     Platform(HiiPlatformCommands),
+}
+
+/// What set selects, and the value or the items that it gives.
+#[cfg(all(system_hiidb, system_variables))]
+#[derive(Debug, Args)]
+struct SetArgs {
+    #[command(flatten)]
+    question: QuestionArgs,
+    /// The new value; required unless --item gives the items of an ORDERED_LIST
+    #[arg(allow_negative_numbers = true, required_unless_present = "items")]
+    value: Option<String>,
+    /// Give an ORDERED_LIST question the option of this text in its next container, in order,
+    /// instead of VALUE: repeat it for each item (UEFI 2.11 §33.3.8.3.53)
+    #[arg(long = "item", value_name = "TEXT")]
+    items: Vec<String>,
+}
+
+#[cfg(all(system_hiidb, system_variables))]
+impl SetArgs {
+    /// The questions that set selects and the value that it gives them, VALUE or the items.
+    /// clap takes a lone positional as VALUE (allow_missing_positional), so with items, which
+    /// leave no VALUE, a lone positional is QUESTION; beside --question-id or --keyword it is
+    /// neither.
+    fn target(&self) -> Result<(QuestionSelector, SetValue)> {
+        let QuestionSelectorArgs {
+            question: prompt,
+            question_id,
+            keyword,
+        } = &self.question.selector;
+        let selects_nothing = prompt.is_none() && question_id.is_none() && keyword.is_none();
+        match (&self.value, self.items.is_empty()) {
+            (Some(value), true) => Ok((self.question.selector()?, SetValue::Text(value.clone()))),
+            (None, false) => Ok((
+                self.question.selector()?,
+                SetValue::Items(self.items.clone()),
+            )),
+            (Some(lone), false) if selects_nothing => Ok((
+                QuestionSelector::Prompt(lone.clone()),
+                SetValue::Items(self.items.clone()),
+            )),
+            (Some(_), false) if prompt.is_none() => Err(anyhow::anyhow!(
+                "set takes no QUESTION or VALUE beside --item and --question-id or --keyword"
+            )),
+            (Some(_), false) | (None, true) => {
+                Err(anyhow::anyhow!("set takes either VALUE or --item"))
+            }
+        }
+    }
 }
 
 /// -j/--json, which overrides itself: it may repeat, as under clap 3.
@@ -472,7 +534,7 @@ fn hii_get(
 #[cfg(all(system_hiidb, system_variables))]
 fn hii_set(
     question: QuestionSelector,
-    value: &str,
+    value: &SetValue,
     options: &SetOptions,
     json: bool,
     source: &HiiSourceArgs,
@@ -640,15 +702,15 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             }
             #[cfg(all(system_hiidb, system_variables))]
             HiiSubcommands::Set {
-                question,
-                value,
+                target,
                 output,
                 selection,
                 setup_password,
                 volatile,
             } => {
+                let (question, value) = target.target()?;
                 let options = set_options(selection, setup_password, volatile);
-                hii_set(question.selector()?, value, &options, output.json, source)?
+                hii_set(question, &value, &options, output.json, source)?
             }
             HiiSubcommands::ShowIFR {
                 hiidb,
@@ -698,15 +760,14 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
         } => platform::auto_get(question, output.json, selection, source)?,
         #[cfg(all(system_hiidb, system_variables))]
         Commands::Set {
-            question,
-            value,
+            target,
             output,
             selection,
             setup_password,
             volatile,
         } => {
             let options = set_options(selection, setup_password, volatile);
-            platform::auto_set(question, value, output.json, selection, &options, source)?
+            platform::auto_set(target, output.json, selection, &options, source)?
         }
         Commands::ShowTranslations { output } => {
             print_with_style(&*translation_db, output.json)?;
@@ -1478,15 +1539,22 @@ mod tests {
             Commands::Hii(HiiCommand {
                 command:
                     HiiSubcommands::Set {
-                        question, value, ..
+                        target:
+                            SetArgs {
+                                question, value, ..
+                            },
+                        ..
                     },
-            }) => (question, Some(value)),
+            }) => (question, value),
             #[cfg(all(system_hiidb, system_variables))]
             Commands::Get { question, .. } => (question, None),
             #[cfg(all(system_hiidb, system_variables))]
             Commands::Set {
-                question, value, ..
-            } => (question, Some(value)),
+                target: SetArgs {
+                    question, value, ..
+                },
+                ..
+            } => (question, value),
             other => panic!("{args:?} is no get or set: {other:?}"),
         };
         let selector = question
@@ -1610,6 +1678,82 @@ mod tests {
                     want.map(|selector| (selector, Some("1".to_owned()))),
                     "{args:?}"
                 );
+            }
+        }
+    }
+
+    /// hii set and set take the items of an ordered list, in order, as repeated --item instead of
+    /// VALUE, with QUESTION, which clap takes as VALUE when it is the lone positional, or with
+    /// --question-id or --keyword; they refuse VALUE beside QUESTION and --item, a lone
+    /// positional beside --item and --question-id or --keyword, each with its own error, and
+    /// --item without a question.
+    #[test]
+    #[cfg(all(system_hiidb, system_variables))]
+    fn set_takes_items_instead_of_a_value() {
+        const ADDRESS: &str = "8C78A505-BAA0-4C4A-869F-000000000800:0x8001";
+        let items = |items: &[&str]| SetValue::Items(items.iter().map(|&i| i.to_owned()).collect());
+        let prompt = || QuestionSelector::from("Q");
+        let keyword = QuestionSelector::Keyword {
+            keyword: "K:5".parse().expect("parse the keyword"),
+            namespace: None,
+        };
+        let either = "set takes either VALUE or --item".to_owned();
+        let beside = "set takes no QUESTION or VALUE beside --item and --question-id or --keyword"
+            .to_owned();
+        type Target = Result<(QuestionSelector, SetValue), String>;
+        let cases: [(&[&str], Target); 11] = [
+            (
+                &["Q", "--item", "B", "--item", "A"],
+                Ok((prompt(), items(&["B", "A"]))),
+            ),
+            (&["--item", "B", "Q"], Ok((prompt(), items(&["B"])))),
+            (&["Q", "V"], Ok((prompt(), SetValue::Text("V".to_owned())))),
+            (
+                &["--question-id", ADDRESS, "--item", "A"],
+                Ok((
+                    QuestionSelector::Address(ADDRESS.parse().expect("parse the address")),
+                    items(&["A"]),
+                )),
+            ),
+            (
+                &["--keyword", "K:5", "--item", "A"],
+                Ok((keyword, items(&["A"]))),
+            ),
+            (&["Q", "V", "--item", "A"], Err(either)),
+            (
+                &["--keyword", "K:5", "Q", "--item", "A"],
+                Err(beside.clone()),
+            ),
+            (&["--question-id", ADDRESS, "Q", "--item", "A"], Err(beside)),
+            (
+                &["--item", "A"],
+                Err("exactly one of QUESTION, --question-id and --keyword is required".to_owned()),
+            ),
+            (
+                &["Q"],
+                Err(format!(
+                    "{:?}",
+                    clap::error::ErrorKind::MissingRequiredArgument
+                )),
+            ),
+            (
+                &["Q", "V", "--keyword", "K"],
+                Err(format!("{:?}", clap::error::ErrorKind::ArgumentConflict)),
+            ),
+        ];
+        for command in [&["hii", "set"][..], &["set"]] {
+            for (args, want) in &cases {
+                let argv = [&["uefisettings"][..], command, args].concat();
+                let got = UefiSettingsToolArgs::try_parse_from(argv)
+                    .map_err(|error| format!("{:?}", error.kind()))
+                    .and_then(|parsed| match parsed.command {
+                        Commands::Set { target, .. }
+                        | Commands::Hii(HiiCommand {
+                            command: HiiSubcommands::Set { target, .. },
+                        }) => target.target().map_err(|error| error.to_string()),
+                        other => panic!("{command:?} {args:?}: {other:?}"),
+                    });
+                assert_eq!(&got, want, "{command:?} {args:?}");
             }
         }
     }

@@ -38,6 +38,7 @@ use super::DumpEfivarsOptions;
 use super::HiiBackend;
 use super::QuestionSelector;
 use super::SetOptions;
+use super::SetValue;
 use super::SettingsBackend;
 use super::VariableBackend;
 use crate::capsule_loader::CapsuleLoader;
@@ -182,7 +183,7 @@ impl HiiBackend {
     /// set_using, in this machine's HiiDB read as `source` says.
     pub fn set_from(
         question: impl Into<QuestionSelector>,
-        new_value: &str,
+        value: &SetValue,
         selector: Option<&str>,
         options: &SetOptions,
         source: &HiiSourceOptions,
@@ -190,7 +191,7 @@ impl HiiBackend {
         Self::set_in(
             &extract::extract_db_from(source)?,
             question,
-            new_value,
+            value,
             selector,
             options,
             EfivarSource::System.into_variables()?,

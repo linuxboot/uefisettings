@@ -59,7 +59,7 @@ struct Question {
   1: string name;
   // answer values:
   // hii - the current value; if unreadable, the reason, followed, only if the IFR of a ONE_OF,
-  // NUMERIC, CHECKBOX, DATE or TIME declares a default, by " <IFR default: v>" or
+  // NUMERIC, CHECKBOX, DATE, TIME or ORDERED_LIST declares a default, by " <IFR default: v>" or
   // " <IFR default (DefaultId 0x0001): v>", v being "unknown (<reason>)" if undetermined;
   // firmware Callback/ALTCFG defaults may differ. defaults lists every default that the IFR
   // declares.
@@ -67,11 +67,12 @@ struct Question {
   // suppressed or disabled), or with " <s1 or s2: reasons>" if the reasons leave its state
   // undetermined among s1, s2, ... (selectable too).
   // The stored option's state precedes it: " <option s>" or " <option s1 or s2: reasons>".
+  // An ORDERED_LIST answers its items, joined by ", ", each with its option's state.
   // set's hii answer ends with " <volatile: lasts until the next reset or power cycle>" when it
   // wrote a volatile variable (UEFI Shell, --allow-volatile).
   2: string answer;
-  // hii - the ONE_OF options that set takes: those that IFR conditions certainly leave
-  // selectable or in a state that --include allows.
+  // hii - the ONE_OF and ORDERED_LIST options that set takes: those that IFR conditions
+  // certainly leave selectable or in a state that --include allows.
   3: list<string> options;
   4: string help;
   // hii - the question's Flags (UEFI 2.11 §33.3.8.2.2) that are set, by their names there
@@ -92,6 +93,10 @@ struct Question {
   // hii - the defaults that the IFR declares for the question, by default_id ascending. Unset if
   // it declares none.
   9: optional list<QuestionDefault> defaults;
+  // hii - the items of an ORDERED_LIST, in order: the texts of the options of its containers
+  // up to the first empty one, without their states; unset for other questions, and while its
+  // value cannot be read.
+  10: optional list<string> items;
 }
 
 struct SetResponse {

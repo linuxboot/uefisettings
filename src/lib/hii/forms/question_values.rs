@@ -10,8 +10,8 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The ONE_OF, NUMERIC, CHECKBOX, DATE and TIME questions that get reads and set writes, found by
-//! their prompts, and the text that get shows for their values.
+//! The ONE_OF, NUMERIC, CHECKBOX, DATE, TIME and ORDERED_LIST questions that get reads and set
+//! writes, found by their prompts, and the text that get shows for their values.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -45,6 +45,8 @@ use super::keywords::keyword_of;
 use super::keywords::KeywordStatement;
 use super::keywords::UEFI_CONFIG_LANG;
 use super::numeric_format;
+use super::ordered_list::handle_ordered_list;
+use super::ordered_list::OrderedListQuestion;
 use super::storage::RetrievedValue;
 use super::storage::ValueLocation;
 use super::storage::ValueSource;
@@ -124,6 +126,48 @@ impl ValueQuestion<'_> {
             ValueQuestion::OneOf(_) | ValueQuestion::Numeric(_) | ValueQuestion::CheckBox(_) => {
                 None
             }
+        }
+    }
+}
+
+/// A question that list-questions lists and get and set select: a ValueQuestion, or an
+/// ORDERED_LIST, whose value is a list of numbers.
+#[derive(Clone, Copy)]
+pub(super) enum ListedQuestion<'a> {
+    Value(ValueQuestion<'a>),
+    OrderedList(OrderedListQuestion<'a>),
+}
+
+impl ListedQuestion<'_> {
+    /// Returns `op` as a ListedQuestion.
+    pub(super) fn of(op: &IFROperation) -> Option<ListedQuestion<'_>> {
+        if let ParsedOperation::OrderedList(list) = &op.parsed_data {
+            return Some(ListedQuestion::OrderedList(OrderedListQuestion::of(
+                op, list,
+            )));
+        }
+        value_question(op).map(ListedQuestion::Value)
+    }
+
+    pub(super) fn header(self) -> QuestionHeader {
+        match self {
+            ListedQuestion::Value(question) => question.header(),
+            ListedQuestion::OrderedList(question) => question.list.question_header(),
+        }
+    }
+
+    pub(super) fn location(self) -> ValueLocation {
+        match self {
+            ListedQuestion::Value(question) => question.location(),
+            ListedQuestion::OrderedList(question) => question.location(),
+        }
+    }
+
+    /// The EFI Date/Time Storage of a DATE or TIME of such storage.
+    pub(super) fn time_storage(self) -> Option<TimeStorage> {
+        match self {
+            ListedQuestion::Value(question) => question.time_storage().map(|(_, storage)| storage),
+            ListedQuestion::OrderedList(_) => None,
         }
     }
 }
@@ -299,20 +343,21 @@ pub(super) fn value_question(op: &IFROperation) -> Option<ValueQuestion<'_>> {
         | ParsedOperation::Get(_)
         | ParsedOperation::Set(_)
         | ParsedOperation::FormMap(_)
+        | ParsedOperation::OrderedList(_)
         | ParsedOperation::Placeholder => None,
     }
 }
 
-/// A question that value_question takes whose prompt is one of the phrases of questions_named.
+/// A ListedQuestion whose prompt is one of the phrases of questions_named.
 pub(super) struct NamedQuestion {
     pub(super) node: Rc<RefCell<IFROperation>>,
     /// Which question it is, and the languages whose text of its prompt is a phrase
     pub(super) prompt: PromptMatch,
 }
 
-/// Returns the questions that value_question takes under `node`, in IFR order, whose prompt in
-/// a language of `texts` of no configuration language is one of `phrases`, ignoring ASCII case
-/// and surrounding whitespace, with those languages.
+/// Returns the ListedQuestions under `node`, in IFR order, whose prompt in a language of `texts`
+/// of no configuration language is one of `phrases`, ignoring ASCII case and surrounding
+/// whitespace, with those languages.
 pub(super) fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
@@ -322,7 +367,7 @@ where
     T: AsRef<str>,
 {
     let mut found = Vec::new();
-    visit_value_questions(node, |node, form_set, header| {
+    visit_listed_questions(node, |node, form_set, header| {
         let languages: Vec<String> = texts
             .matching(header.prompt_string_id)
             .filter(|(_, prompt)| {
@@ -346,9 +391,9 @@ where
     found
 }
 
-/// Calls `visit` with each question that value_question takes under `node`, in IFR order, the
-/// GUID of its FormSet and its header.
-fn visit_value_questions(
+/// Calls `visit` with each ListedQuestion under `node`, in IFR order, the GUID of its FormSet
+/// and its header.
+fn visit_listed_questions(
     node: &Rc<RefCell<IFROperation>>,
     mut visit: impl FnMut(&Rc<RefCell<IFROperation>>, Option<Guid>, QuestionHeader),
 ) {
@@ -362,7 +407,7 @@ fn visit_value_questions(
             _ => form_set,
         };
         // Only the questions whose values get reads count.
-        if let Some(question) = value_question(&op) {
+        if let Some(question) = ListedQuestion::of(&op) {
             visit(node, form_set, question.header());
         }
         Walk::Enter(form_set)
@@ -379,8 +424,8 @@ pub(crate) enum QuestionMatch<'a, T> {
     Keyword(&'a [KeywordStatement<'a>]),
 }
 
-/// Returns the questions that value_question takes under `node`, in IFR order, that `matching`
-/// selects, of texts `texts`.
+/// Returns the ListedQuestions under `node`, in IFR order, that `matching` selects, of texts
+/// `texts`.
 pub(super) fn questions_matching<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
@@ -399,20 +444,20 @@ where
             .iter()
             .filter(|statement| Rc::ptr_eq(statement.root(), node))
             .map(KeywordStatement::op)
-            .filter(|op| value_question(&op.borrow()).is_some())
+            .filter(|op| ListedQuestion::of(&op.borrow()).is_some())
             .cloned()
             .collect(),
     }
 }
 
-/// Returns the questions that value_question takes under `node`, in IFR order, of the address
-/// `address`: two or more only where QuestionIds repeat in a FormSet.
+/// Returns the ListedQuestions under `node`, in IFR order, of the address `address`: two or more
+/// only where QuestionIds repeat in a FormSet.
 pub(super) fn questions_addressed(
     node: &Rc<RefCell<IFROperation>>,
     address: &QuestionAddress,
 ) -> Vec<Rc<RefCell<IFROperation>>> {
     let mut found = Vec::new();
-    visit_value_questions(node, |node, form_set, header| {
+    visit_listed_questions(node, |node, form_set, header| {
         if form_set == Some(address.form_set) && header.question_id == address.question_id.get() {
             found.push(Rc::clone(node));
         }
@@ -733,7 +778,7 @@ pub(crate) struct Keyword {
 
 impl QuestionIdentity {
     /// The identity of the question `op`, of header `header`, whose keywords `texts` hold.
-    fn of(op: &IFROperation, header: &QuestionHeader, texts: &ListTexts<'_>) -> Self {
+    pub(super) fn of(op: &IFROperation, header: &QuestionHeader, texts: &ListTexts<'_>) -> Self {
         Self {
             question_id: header.question_id,
             form_set: form_set_guid(op),
@@ -757,28 +802,31 @@ pub(super) fn form_set_guid(op: &IFROperation) -> Option<Guid> {
     })
 }
 
-/// Returns the QuestionDescriptor of `question`, whose op is `value_question`.
+/// Returns the QuestionDescriptor of `question`, whose op is `listed`.
 pub(super) fn describe_question(
     question: &Rc<RefCell<IFROperation>>,
-    value_question: ValueQuestion<'_>,
+    listed: ListedQuestion<'_>,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
-    let header = value_question.header();
+    let header = listed.header();
     let prompt = walk.texts.display(header.prompt_string_id);
     let flags = header.flags() | class_question_flags(&question.borrow());
     let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
-    match value_question {
-        ValueQuestion::OneOf(parsed) => {
+    match listed {
+        ListedQuestion::Value(ValueQuestion::OneOf(parsed)) => {
             handle_oneof(varstore, parsed, prompt, flags, question, walk)
         }
-        ValueQuestion::Numeric(parsed) => {
+        ListedQuestion::Value(ValueQuestion::Numeric(parsed)) => {
             handle_numeric(varstore, parsed, prompt, flags, question, walk)
         }
-        ValueQuestion::CheckBox(parsed) => {
+        ListedQuestion::Value(ValueQuestion::CheckBox(parsed)) => {
             handle_checkbox(varstore, parsed, prompt, flags, question, walk)
         }
-        ValueQuestion::DateTime(parsed) => {
+        ListedQuestion::Value(ValueQuestion::DateTime(parsed)) => {
             handle_date_time(varstore, parsed, prompt, flags, question, walk)
+        }
+        ListedQuestion::OrderedList(list) => {
+            handle_ordered_list(varstore, list, prompt, flags, question, walk)
         }
     }
 }
@@ -967,7 +1015,7 @@ pub(super) fn handle_oneof(
 /// `also_matching`, if any, matching too: the first match that may be shown, as
 /// edk2-stable202608 SetupBrowserDxe/Setup.c ValueToOption finds it, else the first, which a
 /// SUPPRESS_IF hides.
-fn shown_option(
+pub(super) fn shown_option(
     options: &[AnswerOption],
     value: u64,
     also_matching: Option<usize>,

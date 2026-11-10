@@ -133,6 +133,15 @@ impl TypedDefault {
             Self::Buffer(_) => Err(DefaultError::NotNumber("EFI_IFR_TYPE_BUFFER")),
         }
     }
+
+    /// The buffer, refused for a number or a string, which no ORDERED_LIST stores.
+    fn buffer(self) -> Result<Vec<u8>, DefaultError> {
+        match self {
+            Self::Buffer(bytes) => Ok(bytes),
+            Self::Number(_) => Err(DefaultError::NotBuffer("a number")),
+            Self::String(_) => Err(DefaultError::NotBuffer("EFI_IFR_TYPE_STRING")),
+        }
+    }
 }
 
 /// Why a question's default is not known.
@@ -142,6 +151,8 @@ pub(super) enum DefaultError {
     DefaultType(u8),
     #[error("a default of {0} where the question stores a number")]
     NotNumber(&'static str),
+    #[error("a default of {0} where the question stores a buffer")]
+    NotBuffer(&'static str),
     #[error("EFI_IFR_DEFAULT value missing")]
     DefaultValueMissing,
     #[error("EFI_IFR_DEFAULT_2 without EFI_IFR_VALUE")]
@@ -500,17 +511,11 @@ pub(super) fn question_defaults<V: QuestionValues>(
 ) -> Vec<DeclaredDefault> {
     question_default_values(question, stores, inputs)
         .into_iter()
-        .map(|(default_id, value)| DeclaredDefault {
-            default_id,
-            store_name: stores
-                .0
-                .get(&default_id)
-                .map(|&name| texts.display(name).to_string()),
-            value: DefaultValue(
-                value
-                    .and_then(TypedDefault::number)
-                    .and_then(|value| text(value, inputs)),
-            ),
+        .map(|(default_id, value)| {
+            let value = value
+                .and_then(TypedDefault::number)
+                .and_then(|value| text(value, inputs));
+            declared_default(default_id, value, stores, texts)
         })
         .collect()
 }
@@ -522,9 +527,25 @@ pub(super) fn question_default_values(
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> Vec<(DefaultId, Result<TypedDefault, DefaultError>)> {
     let scope = question_scope(question);
+    declared_default_ids(question, &scope, stores)
+        .into_iter()
+        .filter_map(|default_id| {
+            let value = default_for_id(question, &scope, default_id, inputs)?;
+            Some((default_id, value))
+        })
+        .collect()
+}
+
+/// The DefaultIds of the defaults that question_defaults lists for `question`, whose scope is
+/// `scope`.
+fn declared_default_ids(
+    question: &IFROperation,
+    scope: &[Rc<RefCell<IFROperation>>],
+    stores: &DefaultStores,
+) -> BTreeSet<DefaultId> {
     let mut default_ids: BTreeSet<DefaultId> = stores.0.keys().copied().collect();
     default_ids.insert(DefaultId::STANDARD);
-    if has_manufacturing_flag(question, &scope) {
+    if has_manufacturing_flag(question, scope) {
         default_ids.insert(DefaultId::MANUFACTURING);
     }
     default_ids.extend(
@@ -536,12 +557,24 @@ pub(super) fn question_default_values(
             }),
     );
     default_ids
-        .into_iter()
-        .filter_map(|default_id| {
-            let value = default_for_id(question, &scope, default_id, inputs)?;
-            Some((default_id, value))
-        })
-        .collect()
+}
+
+/// The default of `default_id` with `value`, with the DefaultName of its DEFAULTSTORE in
+/// `stores`, if any.
+fn declared_default(
+    default_id: DefaultId,
+    value: Result<String, DefaultError>,
+    stores: &DefaultStores,
+    texts: &ListTexts<'_>,
+) -> DeclaredDefault {
+    DeclaredDefault {
+        default_id,
+        store_name: stores
+            .0
+            .get(&default_id)
+            .map(|&name| texts.display(name).to_string()),
+        value: DefaultValue(value),
+    }
 }
 
 /// Whether `option`, in the scope of `question`, is a flagged option of an ORDERED_LIST, which
@@ -676,6 +709,26 @@ pub(super) fn push_default(
         DefaultId::STANDARD => answer.push_str(&format!(" <IFR default: {value}>")),
         _ => answer.push_str(&format!(" <IFR default (DefaultId {default_id}): {value}>")),
     }
+}
+
+/// Returns every default that the IFR declares for the ORDERED_LIST `question`, as
+/// question_default_values finds them, each a buffer that `text` shows.
+pub(super) fn list_defaults(
+    question: &IFROperation,
+    stores: &DefaultStores,
+    texts: &ListTexts<'_>,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+    mut text: impl FnMut(&[u8]) -> String,
+) -> Vec<DeclaredDefault> {
+    question_default_values(question, stores, inputs)
+        .into_iter()
+        .map(|(default_id, value)| {
+            let value = value
+                .and_then(TypedDefault::buffer)
+                .map(|buffer| text(&buffer));
+            declared_default(default_id, value, stores, texts)
+        })
+        .collect()
 }
 
 /// Returns the text of the first option in the question's scope with `value` that no
@@ -1613,6 +1666,55 @@ mod tests {
             assert_eq!(
                 one_of_default(&[], &children),
                 format!("{UNAVAILABLE}{suffix}"),
+                "{name}"
+            );
+        }
+    }
+
+    /// The Value of an EFI_IFR_DEFAULT of Type BUFFER, or of an option of an ORDERED_LIST flagged
+    /// default, is the rest of its op; one without a Value is refused, not taken as an empty
+    /// default.
+    #[test]
+    fn op_that_ends_before_its_value_is_refused() {
+        // option 6, Enabled, of Type UINT16 and value 1, which sizes the containers
+        let option = one_of_option(6, 0x01, &1_u16.to_le_bytes());
+        // option 5 flagged EFI_IFR_OPTION_DEFAULT of Type EFI_IFR_TYPE_OTHER, whose op ends at Type
+        let other = other_option(5, 0x10, &[]);
+        let cases = [
+            (
+                "EFI_IFR_DEFAULT",
+                buffer_default(0x0000, &[1, 0]),
+                Ok("Enabled"),
+            ),
+            (
+                "EFI_IFR_DEFAULT without its Value",
+                buffer_default(0x0000, &[]),
+                Err(DefaultError::DefaultValueMissing),
+            ),
+            (
+                "option flagged default",
+                buffer_option(5, 0x10, &[1, 0]),
+                Ok("Enabled"),
+            ),
+            (
+                "option flagged default without its Value",
+                other,
+                Err(DefaultError::OptionType(0x08)),
+            ),
+        ];
+        for (name, child, want) in cases {
+            let children = [option.clone(), child];
+            let (_root, node) =
+                parse_question(&[], ORDERED_LIST, &ordered_list(0, 1, 0x00), &children);
+            let defaults: Vec<(DefaultId, Result<String, DefaultError>)> =
+                question_descriptor(&node, unavailable())
+                    .defaults
+                    .into_iter()
+                    .map(|default| (default.default_id, default.value.0))
+                    .collect();
+            assert_eq!(
+                defaults,
+                [(DefaultId::STANDARD, want.map(str::to_owned))],
                 "{name}"
             );
         }

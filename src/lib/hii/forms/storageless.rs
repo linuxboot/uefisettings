@@ -24,7 +24,7 @@ use super::conditions::question_expression;
 use super::conditions::question_value_expression;
 use super::conditions::QuestionExpression;
 use super::conditions::VALUE_MAKES_READ_ONLY;
-use super::question_values::value_question;
+use super::question_values::ListedQuestion;
 use super::IFROperation;
 use super::QuestionFlags;
 use crate::hii::variables::VariableReach;
@@ -43,15 +43,15 @@ pub(crate) struct StoragelessQuestion {
 }
 
 impl StoragelessQuestion {
-    /// Classifies `question`; None unless value_question takes it and it has no VarStore, and
-    /// for a DATE or TIME of EFI Date/Time Storage, which keeps its value there.
+    /// Classifies `question`; None unless it is a ListedQuestion and has no VarStore, and for a
+    /// DATE or TIME of EFI Date/Time Storage, which keeps its value there.
     pub(crate) fn of(question: &Rc<RefCell<IFROperation>>) -> Option<Self> {
         let op = question.borrow();
-        let value_question = value_question(&op)?;
-        if value_question.time_storage().is_some() {
+        let listed = ListedQuestion::of(&op)?;
+        if listed.time_storage().is_some() {
             return None;
         }
-        let header = value_question.header();
+        let header = listed.header();
         (header.var_store_id == 0).then(|| Self {
             read: question_expression(question, QuestionExpression::Read).is_some(),
             write: question_expression(question, QuestionExpression::Write).is_some(),
@@ -624,6 +624,28 @@ mod tests {
         }
     }
 
+    /// An ORDERED_LIST without a VarStore is storage-less, as a ONE_OF is, and one with a
+    /// VarStore is not.
+    #[test]
+    fn ordered_list_without_a_var_store_is_storageless() {
+        for (var_store_id, storageless) in [(0, true), (1, false)] {
+            let data = [question_header_on(1, 3, var_store_id, 0), vec![4, 0x00]].concat();
+            let list = [
+                operation(ORDERED_LIST, true, &data),
+                one_of_option(5, 0x00, &[1]),
+                END.to_vec(),
+            ]
+            .concat();
+            let root = parse_form_set(&[form(1, &[list])]);
+            let question = find_op(&root, &data).expect("the ORDERED_LIST");
+            assert_eq!(
+                StoragelessQuestion::of(&question).is_some(),
+                storageless,
+                "VarStoreId {var_store_id}"
+            );
+        }
+    }
+
     /// Each refusal names what the question lacks or what its driver answered, in UEFI terms.
     #[test]
     fn refusals_say_why_in_uefi_terms() {
@@ -945,8 +967,10 @@ mod get_and_set_tests {
                 let planned = set_questions(
                     prompt,
                     &[("selector", descriptor)],
-                    "1",
-                    &BTreeSet::from(["1".to_string()]),
+                    NewAnswer::Text {
+                        text: "1",
+                        variations: &BTreeSet::from(["1".to_string()]),
+                    },
                     IncludedStates::empty(),
                     &mut reader,
                     None,

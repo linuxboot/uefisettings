@@ -39,6 +39,7 @@ use uefisettings::exports::HiiSourceOptions;
 use uefisettings::exports::IloBackend;
 use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
+use uefisettings::exports::SetValue;
 use uefisettings::exports::SettingsBackend;
 use uefisettings::exports::SetupPasswordPolicy;
 use uefisettings::exports::VolatileWrites;
@@ -61,6 +62,7 @@ use crate::HiiSourceArgs;
 use crate::JsonArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
+use crate::SetArgs;
 use crate::SetIncludeState;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
@@ -377,8 +379,7 @@ impl VolatileArgs {
 
 /// set, on this machine's backend, whose HiiDB it reads as `source` says.
 pub(super) fn auto_set(
-    question: &QuestionArgs,
-    value: &str,
+    target: &SetArgs,
     json: bool,
     selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
@@ -388,11 +389,18 @@ pub(super) fn auto_set(
     if machine.backend.contains(&Backend::Unknown) {
         return Err(anyhow!("unknown backend"));
     }
+    let (selector, value) = target.target()?;
     if prioritize_backend(&machine, json)? == Backend::Ilo {
-        let res = IloBackend::set(refuse_on_ilo(question, selection)?, value, None)?;
+        let SetValue::Text(value) = value else {
+            return Err(anyhow!(
+                "--item gives the options of an ORDERED_LIST of the HII backend; the iLO backend \
+                 takes VALUE"
+            ));
+        };
+        let res = IloBackend::set(refuse_on_ilo(&target.question, selection)?, &value, None)?;
         print_with_style(res, json)?;
     } else {
-        hii_set(question.selector()?, value, options, json, source)?;
+        hii_set(selector, &value, options, json, source)?;
     }
     Ok(())
 }
@@ -400,7 +408,7 @@ pub(super) fn auto_set(
 /// HiiBackend::set_using, in this machine's HiiDB read as `source` says.
 pub(super) fn set_using(
     question: QuestionSelector,
-    value: &str,
+    value: &SetValue,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<SetResponseList> {

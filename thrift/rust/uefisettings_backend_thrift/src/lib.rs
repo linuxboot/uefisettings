@@ -64,6 +64,7 @@ pub struct Question {
     pub form_set_guid: ::std::option::Option<::std::string::String>,
     pub keywords: ::std::option::Option<::std::vec::Vec<crate::types::QuestionKeyword>>,
     pub defaults: ::std::option::Option<::std::vec::Vec<crate::types::QuestionDefault>>,
+    pub items: ::std::option::Option<::std::vec::Vec<::std::string::String>>,
     // This field forces `..Default::default()` when instantiating this
     // struct, to make code future-proof against new fields added later to
     // the definition in Thrift. If you don't want this, add the annotation
@@ -902,6 +903,7 @@ impl ::std::default::Default for self::Question {
             form_set_guid: ::std::option::Option::None,
             keywords: ::std::option::Option::None,
             defaults: ::std::option::Option::None,
+            items: ::std::option::Option::None,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         }
     }
@@ -920,6 +922,7 @@ impl ::std::fmt::Debug for self::Question {
             .field("form_set_guid", &self.form_set_guid)
             .field("keywords", &self.keywords)
             .field("defaults", &self.defaults)
+            .field("items", &self.items)
             .finish()
     }
 }
@@ -975,6 +978,11 @@ where
             ::fbthrift::Serialize::write(some, p);
             p.write_field_end();
         }
+        if let ::std::option::Option::Some(some) = &self.items {
+            p.write_field_begin("items", ::fbthrift::TType::List, 10);
+            ::fbthrift::Serialize::write(some, p);
+            p.write_field_end();
+        }
         p.write_field_stop();
         p.write_struct_end();
     }
@@ -991,6 +999,7 @@ where
             ::fbthrift::Field::new("flags", ::fbthrift::TType::List, 5),
             ::fbthrift::Field::new("form_set_guid", ::fbthrift::TType::String, 7),
             ::fbthrift::Field::new("help", ::fbthrift::TType::String, 4),
+            ::fbthrift::Field::new("items", ::fbthrift::TType::List, 10),
             ::fbthrift::Field::new("keywords", ::fbthrift::TType::List, 8),
             ::fbthrift::Field::new("name", ::fbthrift::TType::String, 1),
             ::fbthrift::Field::new("options", ::fbthrift::TType::List, 3),
@@ -1005,6 +1014,7 @@ where
         let mut field_form_set_guid = ::std::option::Option::None;
         let mut field_keywords = ::std::option::Option::None;
         let mut field_defaults = ::std::option::Option::None;
+        let mut field_items = ::std::option::Option::None;
         let _ = p.read_struct_begin(|_| ())?;
         loop {
             let (_, fty, fid) = p.read_field_begin(|_| (), FIELDS)?;
@@ -1019,6 +1029,7 @@ where
                 (::fbthrift::TType::String, 7) => field_form_set_guid = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::List, 8) => field_keywords = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (::fbthrift::TType::List, 9) => field_defaults = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
+                (::fbthrift::TType::List, 10) => field_items = ::std::option::Option::Some(::fbthrift::Deserialize::read(p)?),
                 (fty, _) => p.skip(fty)?,
             }
             p.read_field_end()?;
@@ -1034,6 +1045,7 @@ where
             form_set_guid: field_form_set_guid,
             keywords: field_keywords,
             defaults: field_defaults,
+            items: field_items,
             _dot_dot_Default_default: self::dot_dot::OtherFields(()),
         })
     }
@@ -1071,6 +1083,8 @@ impl ::fbthrift::metadata::ThriftAnnotations for Question {
             8 => {
             },
             9 => {
+            },
+            10 => {
             },
             _ => {}
         }

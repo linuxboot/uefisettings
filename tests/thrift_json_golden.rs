@@ -470,12 +470,21 @@ fn identified_question() -> Question {
     }
 }
 
+/// question() as an ORDERED_LIST of two items.
+fn listed_question() -> Question {
+    Question {
+        items: Some(vec!["Enabled".to_owned(), TRICKY.to_owned()]),
+        ..question()
+    }
+}
+
 /// The JSON of the optional fields that Question gained for hii questions.
 fn question_fields() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("question-flags.json", json(&flagged_question())),
         ("question-defaults.json", json(&defaulted_question())),
         ("question-identity.json", json(&identified_question())),
+        ("question-items.json", json(&listed_question())),
     ]
 }
 
@@ -545,6 +554,7 @@ fn unset_optionals_are_omitted_and_set_ones_present() {
         &identified_question(),
         &["question_id", "form_set_guid", "keywords"],
     );
+    assert_optionals("Question", &question(), &listed_question(), &["items"]);
     assert_optionals(
         "QuestionDefault",
         &QuestionDefault::default(),

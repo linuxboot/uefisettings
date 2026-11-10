@@ -263,7 +263,7 @@ impl DateTimeQuestion {
     pub(super) fn location(&self) -> ValueLocation {
         ValueLocation::Bytes {
             offset: self.layout.offset(self.question_header.var_store_info),
-            size: self.kind.size(),
+            size: self.kind.size().into(),
         }
     }
 
