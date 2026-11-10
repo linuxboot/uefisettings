@@ -42,7 +42,6 @@ use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetValue;
 use uefisettings::exports::SettingsBackend;
 use uefisettings::exports::UnsafeOperation;
-use uefisettings::exports::UnsafeOperations;
 use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
@@ -64,7 +63,7 @@ use crate::JsonArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
-use crate::SetIncludeState;
+use crate::READ_ONLY_WRITE;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -292,25 +291,13 @@ impl EfivarArgs {
     }
 }
 
-/// None: efivarfs writes from Linux, where set does no unsafe operation.
-#[derive(Debug, Args)]
-// no ArgGroup, which usage would name instead of the flag
-#[group(skip)]
-pub(super) struct SetUnsafeArgs {}
-
-impl SetUnsafeArgs {
-    /// The default, which set through efivarfs does not consult.
-    pub(super) fn operations(&self) -> UnsafeOperations {
-        UnsafeOperations::default()
-    }
-}
+/// The unsafe operations of set, which its long help lists: efivarfs writes from Linux, which
+/// no setup password gates.
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE];
 
 /// The QUESTION of `question` for the Ilo backend; fails if a flag of the HII backend is given:
 /// Ilo attributes have no QuestionId, no keywords, no IFR conditions and no HII strings.
-fn refuse_on_ilo<'a, S>(question: &'a QuestionArgs, selection: &SelectionArgs<S>) -> Result<&'a str>
-where
-    S: clap::ValueEnum + Clone + Send + Sync + 'static,
-{
+fn refuse_on_ilo<'a>(question: &'a QuestionArgs, selection: &SelectionArgs) -> Result<&'a str> {
     let stated: Vec<&str> = [
         ("--question-id", question.selector.question_id.is_some()),
         ("--keyword", question.selector.keyword.is_some()),
@@ -382,7 +369,7 @@ impl VolatileArgs {
 pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
-    selection: &SelectionArgs<SetIncludeState>,
+    selection: &SelectionArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {

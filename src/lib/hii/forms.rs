@@ -51,6 +51,9 @@ use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
 use crate::parse_error::ParseError;
 use crate::parse_error::ReadParsed;
+use crate::unsafe_operations::PendingOperations;
+use crate::unsafe_operations::UnsafeOperation;
+use crate::unsafe_operations::UnsafeOperations;
 use conditions::constant_condition;
 use conditions::enclosing_form_set;
 use conditions::parse_question_header;
@@ -131,6 +134,8 @@ pub use conditions::SelectionError;
 pub(crate) use ami_access_level::check_access_level;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Exclusion;
+pub(crate) use conditions::RankedBefore;
+pub(crate) use conditions::ReadOnlyCause;
 pub(crate) use conditions::Selection;
 pub(crate) use conditions::StateEvaluation;
 pub(crate) use defaults::DeclaredDefault;
@@ -3913,55 +3918,100 @@ pub(crate) fn check_prompt_language(
     }
 }
 
-/// set's choice of the selection of a FormSet: that of Selection::for_set, unless the
-/// match that set would write, or the likely match, is read-only, which only the
-/// `options.include` that lifts its ReadOnlyCause, within `liftable`, the states that the caller
-/// can include, makes writable: then ChangeValueError::ReadOnly,
-/// before the efivar checks; or has no VarStore, or its efivar is missing, unreadable, e.g.
-/// withheld, boot-service-only, volatile or authenticated, which --include cannot make writable:
-/// then ChangeValueError::NoVarStore, DeclaredBootServiceOnly, VariableNotExported or the read's
-/// error, as `reader` found it, BootServiceOnlyVariable, VolatileVariable or
-/// AuthenticatedVariable.
+/// Who writes a question that EFI_IFR_FLAG_READ_ONLY makes read-only.
+pub(crate) enum ReadOnlyWriter<'a> {
+    /// set, which takes the write in as an unsafe operation, done only with
+    /// UnsafeOperations::Allow
+    Set(&'a mut PendingOperations),
+    /// The Keyword Handler, which refuses it: "trying to write a read-only element" is "a
+    /// violation of system policy", for which SetData() sets KEYWORD_HANDLER_ACCESS_NOT_PERMITTED
+    /// (UEFI 2.11 §35.3.2), as edk2-stable202608 EfiConfigKeywordHandlerSetData does
+    /// (ConfigKeywordHandler.c:3033-3047)
+    KeywordHandler,
+}
+
+impl ReadOnlyWriter<'_> {
+    /// Takes in the write of `question`, which EFI_IFR_FLAG_READ_ONLY makes read-only, or refuses
+    /// it; including the states `ranked_before` selects a writable match instead.
+    fn write_read_only(
+        self,
+        question: String,
+        ranked_before: IncludedStates,
+    ) -> std::result::Result<(), ChangeValueError> {
+        match self {
+            Self::Set(pending) => {
+                pending.add(UnsafeOperation::ReadOnlyQuestion {
+                    question,
+                    writable: ranked_before,
+                });
+                Ok(())
+            }
+            Self::KeywordHandler => Err(ChangeValueError::ReadOnly {
+                question,
+                cause: ReadOnlyCause::Flag,
+                ranked_before,
+            }),
+        }
+    }
+
+    /// The states of `ranked_before` that select a match that this writes: a writable one, or
+    /// also one that EFI_IFR_FLAG_READ_ONLY makes read-only where it writes those.
+    fn selecting_written(&self, ranked_before: RankedBefore) -> IncludedStates {
+        match self {
+            Self::Set(pending) if pending.grant() == UnsafeOperations::Allow => {
+                ranked_before.writable | ranked_before.flag_read_only
+            }
+            Self::Set(_) | Self::KeywordHandler => ranked_before.writable,
+        }
+    }
+}
+
+/// set's choice of the selection of a FormSet: that of Selection::for_set, unless the match that
+/// set would write, or the likely match, has no VarStore, or its efivar is missing, unreadable,
+/// e.g. withheld, boot-service-only, volatile or authenticated, which --include cannot make
+/// writable: then ChangeValueError::NoVarStore, DeclaredBootServiceOnly, VariableNotExported or
+/// the read's error, as `reader` found it, BootServiceOnlyVariable, VolatileVariable or
+/// AuthenticatedVariable; or is read-only by an EFI_IFR_VALUE, which nothing makes writable:
+/// then ChangeValueError::ReadOnly. A chosen match that EFI_IFR_FLAG_READ_ONLY makes read-only
+/// goes to `writer` after these refusals and those of Selection::for_set.
 pub(crate) fn choice_for_set(
     selection: Selection<QuestionDescriptor>,
     question: &str,
     options: &SetOptions,
-    liftable: IncludedStates,
+    writer: ReadOnlyWriter<'_>,
     reader: &EfivarReader,
 ) -> Result<Choice<QuestionDescriptor>> {
-    let ((descriptor, evaluation), undetermined, ranked_before) = match &selection {
+    let ((descriptor, evaluation), ranked_before) = match &selection {
         Selection::Picked {
             picked,
             ranked_before,
-        } => (picked, IncludedStates::empty(), *ranked_before),
+        } => (picked, *ranked_before),
         Selection::Undetermined {
             likely,
-            states,
             ranked_before,
             ..
-        } => (likely, *states, *ranked_before),
+        } => (likely, *ranked_before),
         Selection::Excluded(_) | Selection::NotFound => return Ok(selection.for_set(question)?),
     };
-    if let Some(cause) = evaluation
-        .read_only()
-        .filter(|cause| !cause.lifted_by(options.include & liftable))
-    {
-        return Err(ChangeValueError::ReadOnly {
-            question: descriptor.question.clone(),
-            cause,
-            lifted_with: cause
-                .lifted_with()
-                .filter(|states| liftable.contains(*states)),
-            undetermined,
-            ranked_before,
-        }
-        .into());
-    }
     // the WRITE expression of a question without a VarStore names the stores that set writes
     if let Some(store) = descriptor.store(reader.reach())? {
         check_writable(store, reader, options.volatile)?;
     }
-    Ok(selection.for_set(question)?)
+    let name = descriptor.question.clone();
+    match evaluation.read_only() {
+        Some(cause @ ReadOnlyCause::ValueExpression) => Err(ChangeValueError::ReadOnly {
+            question: name,
+            cause,
+            ranked_before: writer.selecting_written(ranked_before),
+        }
+        .into()),
+        Some(ReadOnlyCause::Flag) => {
+            let choice = selection.for_set(question)?;
+            writer.write_read_only(name, ranked_before.writable)?;
+            Ok(choice)
+        }
+        None => Ok(selection.for_set(question)?),
+    }
 }
 
 /// Refuses `store` unless set may write its variable, which `reader` has read (check_read).
@@ -4041,6 +4091,7 @@ mod choice_for_set_tests {
     use super::storage::read_current_value_bytes;
     use super::*;
     use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
+    use crate::unsafe_operations::UnsafeOperations;
 
     /// The refusal of the efivar Present with the attributes NV_BS through variables that reach
     /// Runtime.
@@ -4124,7 +4175,7 @@ mod choice_for_set_tests {
             selection,
             PROMPT,
             &SetOptions::default(),
-            IncludedStates::all(),
+            ReadOnlyWriter::Set(&mut PendingOperations::new(UnsafeOperations::Refuse)),
             &reader,
         )
     }
@@ -5761,7 +5812,7 @@ mod tests {
                 find(prompt, phrase),
                 Selection::Picked {
                     picked: ((), StateEvaluation::selectable()),
-                    ranked_before: IncludedStates::empty(),
+                    ranked_before: RankedBefore::default(),
                 },
                 "prompt {prompt:?}, phrase {phrase:?}"
             );

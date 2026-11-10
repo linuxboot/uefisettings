@@ -79,8 +79,8 @@ use crate::JsonArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
-use crate::SetIncludeState;
 use crate::UnsafeArgs;
+use crate::READ_ONLY_WRITE;
 use crate::UNSAFE_ARG;
 
 /// The about of hii, whose commands read this firmware's HII database.
@@ -109,7 +109,7 @@ const SETUP_PASSWORD_WRITE: &str = "a write in a HiiDB that declares a setup pas
                                     which the UEFI Shell, running no setup browser, neither asks \
                                     for nor checks";
 /// The unsafe operations of set, which its long help lists.
-pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[SETUP_PASSWORD_WRITE];
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[SETUP_PASSWORD_WRITE, READ_ONLY_WRITE];
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
@@ -287,10 +287,6 @@ impl EfivarArgs {
     }
 }
 
-/// What set takes for its unsafe operations, a write in a HiiDB that declares a setup password
-/// question among them: --i-am-fine-to-brick-this-system.
-pub(super) type SetUnsafeArgs = UnsafeArgs;
-
 /// Whether set writes a volatile variable.
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag
@@ -329,7 +325,7 @@ pub(super) fn auto_get(
 pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
-    _selection: &SelectionArgs<SetIncludeState>,
+    _selection: &SelectionArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {

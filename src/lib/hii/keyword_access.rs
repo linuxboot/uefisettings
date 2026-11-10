@@ -921,6 +921,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::DATE;
     use crate::hii::forms::ifr_fixtures::END;
+    use crate::hii::forms::ifr_fixtures::GRAY_OUT_IF;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
     use crate::hii::forms::ifr_fixtures::ORDERED_LIST;
@@ -939,6 +940,7 @@ mod tests {
     use crate::hii::package::Guid;
     use crate::hii::strings::Language;
     use crate::hii::strings::StringPackage;
+    use crate::unsafe_operations::UNSAFE_OPERATIONS_FLAG;
 
     const PATH: &str = "01041400111111111111111111111111111111117fff0400";
     const OTHER_PATH: &str = "01041400222222222222222222222222222222227fff0400";
@@ -1706,6 +1708,42 @@ mod tests {
         .map(|(_, lifted)| lifted)
         .map_err(|error| format!("{error:#}"));
         assert_eq!(got, Ok(vec![]), "no password: lifted");
+    }
+
+    /// set refuses a keyword whose question EFI_IFR_FLAG_READ_ONLY makes read-only, under a
+    /// GRAY_OUT_IF on question 11 of the variable Other, which the variables do not hold, as
+    /// undetermined before it refuses it as read-only, with UnsafeOperations::Allow or not, which
+    /// lifts neither, and calls no SetData().
+    #[test]
+    fn undetermined_read_only_keyword_is_refused_as_undetermined_first() {
+        let ops = [
+            var_store(2, [0x44; 16], "Other", 16),
+            one_of(11, 0, 2),
+            conditional(
+                GRAY_OUT_IF,
+                eq_id_val_of(11, 1),
+                &[flagged_one_of(3, 5, 1, 0x01)],
+            ),
+        ];
+        let lists = [list(PATH, &ops)];
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+
+            let got = set(&lists, &resp(PATH, KEYWORD, "03"), grant, &handler)
+                .map(|values| values.to_string())
+                .map_err(|error| format!("{error:#}"));
+
+            assert!(
+                got.as_ref().is_err_and(|error| {
+                    error.starts_with(
+                        "keyword Keyword: cannot tell whether question \"Keyword question\" is \
+                         grayed-out: ",
+                    ) && !error.contains(UNSAFE_OPERATIONS_FLAG)
+                }),
+                "{grant:?}: {got:?}"
+            );
+            assert_eq!(handler.calls(), [], "{grant:?}: calls");
+        }
     }
 
     /// get and set by keyword neither read nor write the bytes of a password, those of a

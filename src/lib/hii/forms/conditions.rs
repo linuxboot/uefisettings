@@ -126,27 +126,11 @@ impl fmt::Display for QuestionState {
 pub(crate) enum ReadOnlyCause {
     /// EFI_IFR_FLAG_READ_ONLY (UEFI 2.11 §33.3.8.2.2), which edk2-stable202608
     /// HiiDatabaseDxe/ConfigKeywordHandler.c EfiConfigKeywordHandlerSetData, the write by name,
-    /// refuses with EFI_ACCESS_DENIED; set writes it with IncludedStates::READ_ONLY
+    /// refuses with EFI_ACCESS_DENIED; set writes it with UnsafeOperations::Allow
     Flag,
     /// An EFI_IFR_VALUE, which gives the question its value (§33.3.8.3.88) and which
     /// edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue never writes; nor does set
     ValueExpression,
-}
-
-impl ReadOnlyCause {
-    /// The states that set includes to write a question that this makes read-only, if any.
-    pub(crate) fn lifted_with(self) -> Option<IncludedStates> {
-        match self {
-            ReadOnlyCause::Flag => Some(IncludedStates::READ_ONLY),
-            ReadOnlyCause::ValueExpression => None,
-        }
-    }
-
-    /// Whether set writes a question that this makes read-only, with `include`.
-    pub(crate) fn lifted_by(self, include: IncludedStates) -> bool {
-        self.lifted_with()
-            .is_some_and(|states| include.contains(states))
-    }
 }
 
 impl fmt::Display for ReadOnlyCause {
@@ -162,16 +146,12 @@ impl fmt::Display for ReadOnlyCause {
 
 bitflags::bitflags! {
     /// The states, besides selectable, of the questions and options that get, set and
-    /// list-questions select, and READ_ONLY. IncludedStates::all() includes READ_ONLY, so set
-    /// with it writes EFI_IFR_FLAG_READ_ONLY questions too; CONDITIONS does not.
+    /// list-questions select.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct IncludedStates: u64 {
         const GRAYED_OUT = 1;
         const SUPPRESSED = 1 << 1;
         const DISABLED = 1 << 2;
-        /// set writes the questions that EFI_IFR_FLAG_READ_ONLY makes read-only; get and
-        /// list-questions show read-only questions regardless
-        const READ_ONLY = 1 << 3;
     }
 }
 
@@ -221,9 +201,6 @@ impl fmt::Display for IncludedStates {
         for state in self.states() {
             write!(f, "{separator}{state}")?;
             separator = ",";
-        }
-        if self.contains(IncludedStates::READ_ONLY) {
-            write!(f, "{separator}read-only")?;
         }
         Ok(())
     }
@@ -365,7 +342,7 @@ pub(crate) struct StateEvaluation {
 /// possible state comes before a likely one whatever their Ranks. A read-only match ranks after
 /// every writable one, whatever their states, as no --include of a condition state makes it
 /// writable; of read-only ones, a ReadOnlyCause::Flag one, which set writes with
-/// IncludedStates::READ_ONLY, ranks before a ReadOnlyCause::ValueExpression one. Rank does not
+/// UnsafeOperations::Allow, ranks before a ReadOnlyCause::ValueExpression one. Rank does not
 /// ask whether set may write the efivar of a match, so a writable match whose efivar set refuses
 /// hides a read-only twin that set would write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -557,13 +534,21 @@ fn possible_states_of(
         .collect()
 }
 
+/// The states to include to select a match that ranks before a read-only one: a writable match,
+/// or, before one that an EFI_IFR_VALUE makes read-only, one that EFI_IFR_FLAG_READ_ONLY does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RankedBefore {
+    pub(crate) writable: IncludedStates,
+    pub(crate) flag_read_only: IncludedStates,
+}
+
 /// Which of the matches of a question to select.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Selection<T> {
     Picked {
         picked: (T, StateEvaluation),
         /// The states to include to select a match that ranks before it, as it is read-only
-        ranked_before: IncludedStates,
+        ranked_before: RankedBefore,
     },
     /// No match is certainly in a state that `include` allows, but some may be
     Undetermined {
@@ -575,7 +560,7 @@ pub(crate) enum Selection<T> {
         states: IncludedStates,
         /// The states to include to select a match that ranks before the likely one, as it is
         /// read-only
-        ranked_before: IncludedStates,
+        ranked_before: RankedBefore,
     },
     /// Every match is in a state that `include` does not allow
     Excluded(Exclusion),
@@ -606,8 +591,8 @@ struct Selector<T> {
     undetermined: IncludedStates,
     excluded: Exclusion,
     /// The states that `include` may not allow of the matches that it does not allow in every
-    /// possible state, by why each is read-only
-    unselected: BTreeMap<Option<ReadOnlyCause>, IncludedStates>,
+    /// possible state: the writable ones, and those that EFI_IFR_FLAG_READ_ONLY makes read-only
+    unselected: RankedBefore,
 }
 
 impl<T> Selector<T> {
@@ -620,7 +605,7 @@ impl<T> Selector<T> {
             reasons: Vec::new(),
             undetermined: IncludedStates::empty(),
             excluded: Exclusion::NONE,
-            unselected: BTreeMap::new(),
+            unselected: RankedBefore::default(),
         }
     }
 
@@ -647,7 +632,7 @@ impl<T> Selector<T> {
                     .collect();
                 self.reasons.extend(new);
                 self.undetermined |= excluded_states;
-                *self.unselected.entry(evaluation.read_only).or_default() |= excluded_states;
+                self.unselect(evaluation.read_only, excluded_states);
                 let rank = evaluation.rank(lowest);
                 if self.likely.as_ref().is_none_or(|&(_, _, best)| rank < best) {
                     self.likely = Some((candidate, evaluation, rank));
@@ -658,23 +643,32 @@ impl<T> Selector<T> {
                     states: excluded_states,
                     source: evaluation.source(),
                 };
-                *self.unselected.entry(evaluation.read_only).or_default() |= excluded_states;
+                self.unselect(evaluation.read_only, excluded_states);
             }
         }
     }
 
+    /// Takes in `states`, which `include` may not allow, of a match that `read_only` makes
+    /// read-only, if anything does, and that it does not allow in every possible state.
+    fn unselect(&mut self, read_only: Option<ReadOnlyCause>, states: IncludedStates) {
+        match read_only {
+            None => self.unselected.writable |= states,
+            Some(ReadOnlyCause::Flag) => self.unselected.flag_read_only |= states,
+            Some(ReadOnlyCause::ValueExpression) => {}
+        }
+    }
+
     /// The states to include to select a match that ranks before one that `read_only` makes
-    /// read-only, of those taken in: the states of the matches with a lower read_only, with
-    /// those that make them writable, except the states that set includes.
-    fn ranked_before(&self, read_only: Option<ReadOnlyCause>) -> IncludedStates {
-        self.unselected
-            .range(..read_only)
-            .filter_map(|(&cause, &states)| match cause {
-                None => Some(states),
-                Some(cause) => cause.lifted_with().map(|lifted_with| states | lifted_with),
-            })
-            .fold(IncludedStates::empty(), |all, states| all | states)
-            .difference(self.include)
+    /// read-only, of those taken in.
+    fn ranked_before(&self, read_only: Option<ReadOnlyCause>) -> RankedBefore {
+        match read_only {
+            Some(ReadOnlyCause::ValueExpression) => self.unselected,
+            Some(ReadOnlyCause::Flag) => RankedBefore {
+                writable: self.unselected.writable,
+                ..RankedBefore::default()
+            },
+            None => RankedBefore::default(),
+        }
     }
 
     /// The selection of the matches taken in.
@@ -4579,7 +4573,7 @@ mod tests {
     fn picked_as<T>(candidate: T, evaluation: StateEvaluation) -> Selection<T> {
         Selection::Picked {
             picked: (candidate, evaluation),
-            ranked_before: IncludedStates::empty(),
+            ranked_before: RankedBefore::default(),
         }
     }
 
@@ -4590,7 +4584,7 @@ mod tests {
             likely: (likely, StateEvaluation::selectable()),
             reasons: reasons.iter().map(ToString::to_string).collect(),
             states,
-            ranked_before: IncludedStates::empty(),
+            ranked_before: RankedBefore::default(),
         }
     }
 
@@ -4934,7 +4928,7 @@ mod tests {
                     ),
                     reasons: vec![reason.to_string()],
                     states: include,
-                    ranked_before: IncludedStates::empty(),
+                    ranked_before: RankedBefore::default(),
                 },
             ),
             (

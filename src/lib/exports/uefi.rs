@@ -190,11 +190,11 @@ impl HiiBackend {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct KeywordSetOptions {
-    /// The states of the questions and options to select too, as set selects them, but
-    /// READ_ONLY: the Keyword Handler writes no read-only question
+    /// The states of the questions and options to select too, as set selects them
     pub include: IncludedStates,
     /// Whether to do the unsafe operations that it meets, which it returns: a write in a HiiDB
-    /// that declares a setup password question
+    /// that declares a setup password question, never one of a read-only question, which the
+    /// Keyword Handler refuses
     pub unsafe_operations: UnsafeOperations,
     /// Whether to write a keyword whose question keeps its value in a volatile variable, as
     /// SetOptions::volatile

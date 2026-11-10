@@ -606,7 +606,8 @@ pub struct SetOptions {
     /// The AMI Setup access level that conditions read instead of the stored one, if stated
     pub access_level: Option<AccessLevel>,
     /// Whether set does the unsafe operations that it meets, which it returns: in the UEFI
-    /// Shell, a write in a HiiDB that declares a setup password question
+    /// Shell, a write in a HiiDB that declares a setup password question; a write of a question
+    /// that EFI_IFR_FLAG_READ_ONLY makes read-only
     pub unsafe_operations: UnsafeOperations,
     /// Whether set writes a volatile variable: only through variables that reach BootServices, as
     /// in the UEFI Shell
@@ -976,6 +977,7 @@ impl HiiBackend {
             &question_variations,
             options,
             &text_languages(options.language.as_deref(), platform_lang),
+            &mut unsafe_operations,
             &mut reader,
         )?;
 
@@ -1323,13 +1325,15 @@ fn time_services() -> Option<Rc<dyn TimeServices>> {
 /// (ParsedPackageList::texts), reading each range once with `reader`; returns them with the
 /// GUID of their package list, or SelectionError::Excluded for `question` if each FormSet skips
 /// it for its states, or else MaybeInIgnoredIfr if none holds it and read_db ignores IFR of
-/// `parsed_db`.
+/// `parsed_db`. It takes the write of each that EFI_IFR_FLAG_READ_ONLY makes read-only into
+/// `unsafe_operations`.
 fn select_for_set(
     parsed_db: &[package::ParsedPackageList],
     question: &QuestionSelector,
     question_variations: &BTreeSet<String>,
     options: &SetOptions,
     requested: &[&str],
+    unsafe_operations: &mut PendingOperations,
     reader: &mut EfivarReader,
 ) -> Result<Vec<(String, forms::QuestionDescriptor, forms::StateEvaluation)>> {
     forms::check_access_level(
@@ -1358,12 +1362,11 @@ fn select_for_set(
                 options.access_level,
                 reader,
             );
-            // set may include every state, READ_ONLY too
             match forms::choice_for_set(
                 selection,
                 &question.to_string(),
                 options,
-                IncludedStates::all(),
+                forms::ReadOnlyWriter::Set(&mut *unsafe_operations),
                 reader,
             )? {
                 Choice::Chosen(question_descriptor, state) => {
@@ -4149,16 +4152,15 @@ mod tests {
     /// set's refusal of `question`, which EFI_IFR_FLAG_READ_ONLY makes read-only, followed by
     /// `then`.
     fn flag_refusal(question: &str, then: &str) -> Result<(), String> {
-        flag_refusal_with(question, "read-only", then)
-    }
-
-    /// flag_refusal, naming `states` as the ones that write `question`.
-    fn flag_refusal_with(question: &str, states: &str, then: &str) -> Result<(), String> {
         Err(format!(
             "cannot set question {question:?}: EFI_IFR_FLAG_READ_ONLY makes it read-only (UEFI \
-             2.11 §33.3.8.2.2); also include {states} questions to write it{then}"
+             2.11 §33.3.8.2.2); pass --i-am-fine-to-brick-this-system to write it{then}"
         ))
     }
+
+    /// What flag_refusal follows with where including grayed-out questions selects a writable
+    /// twin.
+    const GRAYED_OUT_TWIN: &str = ", or also include grayed-out questions to select a writable one";
 
     /// A package list with GUID `guid` whose form holds the CHECKBOX "U", question 3, on the
     /// EFI variable Other, which set_to_9 does not hold, then `questions`, each prompted string
@@ -4185,8 +4187,8 @@ mod tests {
     }
 
     /// Of two NUMERICs "T" in one form, the first read-only, set writes the second, the
-    /// writable one, with read-only included or not, as select prefers a selectable match to a
-    /// grayed-out one.
+    /// writable one, with UnsafeOperations::Allow or not, which then lifts nothing, as select
+    /// prefers a selectable match to a grayed-out one.
     #[test]
     fn set_writes_the_writable_twin_of_a_read_only_question() {
         let hiidb = one_form_list(
@@ -4194,33 +4196,57 @@ mod tests {
             "T",
             &[numeric_at(1, 0, 0x01), numeric_at(2, 1, 0)],
         );
-        for include in [IncludedStates::empty(), IncludedStates::READ_ONLY] {
-            let (got, writes) = set_to_9(&hiidb, "T", include);
-            assert_eq!(got, Ok(()), "set T --include {include}");
-            assert_eq!(writes, [(1, vec![9])], "set T --include {include}: writes");
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            let (got, writes) = set_to_9_lifting(&hiidb, "T", IncludedStates::empty(), grant);
+            assert_eq!(got, Ok(vec![]), "set T, {grant:?}");
+            assert_eq!(writes, [(1, vec![9])], "set T, {grant:?}: writes");
         }
     }
 
     /// set refuses a question that EFI_IFR_FLAG_READ_ONLY makes read-only before any write,
-    /// whichever condition states it includes, and writes it with read-only included.
+    /// whichever condition states it includes, and writes it with UnsafeOperations::Allow, which
+    /// it returns as lifted.
     #[test]
-    fn flag_is_refused_unless_read_only_is_included() {
+    fn flag_is_refused_without_unsafe_operations() {
         let hiidb = one_form_list([0x68; 16], "R", &[numeric_at(1, 0, 0x01)]);
+        let lifted = UnsafeOperation::ReadOnlyQuestion {
+            question: "R".to_owned(),
+            writable: IncludedStates::empty(),
+        };
         let cases = [
-            (IncludedStates::empty(), flag_refusal("R", ""), vec![]),
-            (IncludedStates::CONDITIONS, flag_refusal("R", ""), vec![]),
-            (IncludedStates::READ_ONLY, Ok(()), vec![(0, vec![9])]),
+            (
+                IncludedStates::empty(),
+                UnsafeOperations::Refuse,
+                Err(flag_refusal("R", "").unwrap_err()),
+                vec![],
+            ),
+            (
+                IncludedStates::CONDITIONS,
+                UnsafeOperations::Refuse,
+                Err(flag_refusal("R", "").unwrap_err()),
+                vec![],
+            ),
+            (
+                IncludedStates::empty(),
+                UnsafeOperations::Allow,
+                Ok(vec![lifted]),
+                vec![(0, vec![9])],
+            ),
         ];
-        for (include, want, want_writes) in cases {
-            let (got, writes) = set_to_9(&hiidb, "R", include);
-            assert_eq!(got, want, "set R --include {include}");
-            assert_eq!(writes, want_writes, "set R --include {include}: writes");
+        for (include, grant, want, want_writes) in cases {
+            let (got, writes) = set_to_9_lifting(&hiidb, "R", include, grant);
+            assert_eq!(got, want, "set R --include {include}, {grant:?}");
+            assert_eq!(
+                writes, want_writes,
+                "set R --include {include}, {grant:?}: writes"
+            );
         }
     }
 
     /// select ranks a read-only match after a writable one in any state: of "T" read-only at byte
     /// 0 and "T" grayed out at byte 1, set writes the grayed-out one once grayed-out is
-    /// included, read-only too or not; with neither, its refusal names both ways.
+    /// included, with UnsafeOperations::Allow or not, and else the read-only one with Allow;
+    /// with neither, its refusal names both ways.
     #[test]
     fn read_only_ranks_after_the_condition_states() {
         let hiidb = one_form_list(
@@ -4228,37 +4254,56 @@ mod tests {
             "T",
             &[numeric_at(1, 0, 0x01), grayed_out(&[numeric_at(2, 1, 0)])],
         );
-        let both = IncludedStates::GRAYED_OUT | IncludedStates::READ_ONLY;
         let cases = [
             (
                 IncludedStates::empty(),
-                flag_refusal("T", ", or grayed-out questions to select a writable one"),
+                UnsafeOperations::Refuse,
+                flag_refusal("T", GRAYED_OUT_TWIN),
                 vec![],
             ),
-            (IncludedStates::READ_ONLY, Ok(()), vec![(0, vec![9])]),
-            (IncludedStates::GRAYED_OUT, Ok(()), vec![(1, vec![9])]),
-            (both, Ok(()), vec![(1, vec![9])]),
+            (
+                IncludedStates::empty(),
+                UnsafeOperations::Allow,
+                Ok(()),
+                vec![(0, vec![9])],
+            ),
+            (
+                IncludedStates::GRAYED_OUT,
+                UnsafeOperations::Refuse,
+                Ok(()),
+                vec![(1, vec![9])],
+            ),
+            (
+                IncludedStates::GRAYED_OUT,
+                UnsafeOperations::Allow,
+                Ok(()),
+                vec![(1, vec![9])],
+            ),
         ];
-        for (include, want, want_writes) in cases {
-            let (got, writes) = set_to_9(&hiidb, "T", include);
-            assert_eq!(got, want, "set T --include {include}");
-            assert_eq!(writes, want_writes, "set T --include {include}: writes");
+        for (include, grant, want, want_writes) in cases {
+            let (got, writes) = set_to_9_with(&hiidb, "T", include, grant);
+            assert_eq!(got, want, "set T --include {include}, {grant:?}");
+            assert_eq!(
+                writes, want_writes,
+                "set T --include {include}, {grant:?}: writes"
+            );
         }
     }
 
     /// An EFI_IFR_VALUE makes a question read-only whatever set includes, EFI_IFR_FLAG_READ_ONLY
-    /// set or not; set writes a writable twin instead.
+    /// set or not, and UnsafeOperations::Allow does not lift it: its refusal names no flag. set
+    /// writes a writable twin instead.
     #[test]
     fn value_is_refused_whatever_is_included() {
         for flags in [0x00, 0x01] {
             let hiidb = one_form_list([0x6A; 16], "V", &[value_numeric(1, 0, flags)]);
-            for include in [
-                IncludedStates::empty(),
-                IncludedStates::READ_ONLY,
-                IncludedStates::all(),
+            for (include, grant) in [
+                (IncludedStates::empty(), UnsafeOperations::Refuse),
+                (IncludedStates::empty(), UnsafeOperations::Allow),
+                (IncludedStates::all(), UnsafeOperations::Allow),
             ] {
-                let (got, writes) = set_to_9(&hiidb, "V", include);
-                let case = format!("set V (Flags {flags:#04x}) --include {include}");
+                let (got, writes) = set_to_9_with(&hiidb, "V", include, grant);
+                let case = format!("set V (Flags {flags:#04x}) --include {include}, {grant:?}");
                 assert_eq!(got, value_refusal("V", ""), "{case}");
                 assert_eq!(writes, [], "{case}: writes");
             }
@@ -4275,30 +4320,29 @@ mod tests {
     }
 
     /// The refusal of a question that an EFI_IFR_VALUE makes read-only names the states to
-    /// include to select a twin that set writes, but not those that set includes: a grayed-out
-    /// writable one, or a grayed-out one that EFI_IFR_FLAG_READ_ONLY makes read-only, with
-    /// read-only too.
+    /// include to select a writable twin, as a grayed-out one, and those of a twin that
+    /// EFI_IFR_FLAG_READ_ONLY makes read-only only with UnsafeOperations::Allow, with which set
+    /// writes that twin; without it, set selects that twin with them and refuses it, naming the
+    /// flag.
     #[test]
     fn value_refusal_names_the_states_of_a_twin_that_set_writes() {
-        let refusal = |states: &str| {
-            value_refusal(
-                "V",
-                &format!("; also include {states} questions to select one that set writes"),
-            )
-        };
-        let both = IncludedStates::GRAYED_OUT | IncludedStates::READ_ONLY;
         let cases = [
             (
                 "a writable twin",
                 0x00,
                 IncludedStates::empty(),
-                refusal("grayed-out"),
+                UnsafeOperations::Refuse,
+                value_refusal(
+                    "V",
+                    "; also include grayed-out questions to select one that set writes",
+                ),
                 vec![],
             ),
             (
                 "a writable twin",
                 0x00,
                 IncludedStates::GRAYED_OUT,
+                UnsafeOperations::Refuse,
                 Ok(()),
                 vec![(1, vec![9])],
             ),
@@ -4306,19 +4350,39 @@ mod tests {
                 "a read-only twin",
                 0x01,
                 IncludedStates::empty(),
-                refusal("grayed-out,read-only"),
+                UnsafeOperations::Refuse,
+                value_refusal("V", ""),
                 vec![],
             ),
             (
                 "a read-only twin",
                 0x01,
-                IncludedStates::READ_ONLY,
-                refusal("grayed-out"),
+                IncludedStates::empty(),
+                UnsafeOperations::Allow,
+                value_refusal(
+                    "V",
+                    "; also include grayed-out questions to select one that set writes",
+                ),
                 vec![],
             ),
-            ("a read-only twin", 0x01, both, Ok(()), vec![(1, vec![9])]),
+            (
+                "a read-only twin",
+                0x01,
+                IncludedStates::GRAYED_OUT,
+                UnsafeOperations::Refuse,
+                flag_refusal("V", ""),
+                vec![],
+            ),
+            (
+                "a read-only twin",
+                0x01,
+                IncludedStates::GRAYED_OUT,
+                UnsafeOperations::Allow,
+                Ok(()),
+                vec![(1, vec![9])],
+            ),
         ];
-        for (case, flags, include, want, want_writes) in cases {
+        for (case, flags, include, grant, want, want_writes) in cases {
             let hiidb = one_form_list(
                 [0x73; 16],
                 "V",
@@ -4327,17 +4391,17 @@ mod tests {
                     grayed_out(&[numeric_at(2, 1, flags)]),
                 ],
             );
-            let (got, writes) = set_to_9(&hiidb, "V", include);
-            assert_eq!(got, want, "{case}: set V --include {include}");
+            let (got, writes) = set_to_9_with(&hiidb, "V", include, grant);
+            assert_eq!(got, want, "{case}: set V --include {include}, {grant:?}");
             assert_eq!(
                 writes, want_writes,
-                "{case}: set V --include {include}: writes"
+                "{case}: set V --include {include}, {grant:?}: writes"
             );
         }
     }
 
     /// Of a "V" that an EFI_IFR_VALUE makes read-only and a "V" that EFI_IFR_FLAG_READ_ONLY does,
-    /// select ranks the second first, which set writes with read-only included.
+    /// select ranks the second first, which set writes with UnsafeOperations::Allow.
     #[test]
     fn flag_ranks_before_value() {
         let hiidb = one_form_list(
@@ -4346,18 +4410,19 @@ mod tests {
             &[value_numeric(1, 0, 0), numeric_at(2, 1, 0x01)],
         );
         let cases = [
-            (IncludedStates::empty(), flag_refusal("V", ""), vec![]),
-            (IncludedStates::READ_ONLY, Ok(()), vec![(1, vec![9])]),
+            (UnsafeOperations::Refuse, flag_refusal("V", ""), vec![]),
+            (UnsafeOperations::Allow, Ok(()), vec![(1, vec![9])]),
         ];
-        for (include, want, want_writes) in cases {
-            let (got, writes) = set_to_9(&hiidb, "V", include);
-            assert_eq!(got, want, "set V --include {include}");
-            assert_eq!(writes, want_writes, "set V --include {include}: writes");
+        for (grant, want, want_writes) in cases {
+            let (got, writes) = set_to_9_with(&hiidb, "V", IncludedStates::empty(), grant);
+            assert_eq!(got, want, "set V, {grant:?}");
+            assert_eq!(writes, want_writes, "set V, {grant:?}: writes");
         }
     }
 
     /// Where one FormSet selects a writable "T" and another a read-only one, set refuses before
-    /// it writes either; with read-only included it writes both, in one write of their variable.
+    /// it writes either; with UnsafeOperations::Allow it writes both, in one write of their
+    /// variable, and lifts the write of the read-only one once.
     #[test]
     fn read_only_refusal_comes_before_any_write() {
         let hiidb = [
@@ -4369,13 +4434,21 @@ mod tests {
         assert_eq!(got, flag_refusal("T", ""), "set T");
         assert_eq!(writes, [], "set T: writes");
 
-        let (got, writes) = set_to_9(&hiidb, "T", IncludedStates::READ_ONLY);
-        assert_eq!(got, Ok(()), "set T --include read-only");
-        assert_eq!(
-            writes,
-            [(0, vec![9, 9])],
-            "set T --include read-only: writes"
+        let (got, writes) = set_to_9_lifting(
+            &hiidb,
+            "T",
+            IncludedStates::empty(),
+            UnsafeOperations::Allow,
         );
+        assert_eq!(
+            got,
+            Ok(vec![UnsafeOperation::ReadOnlyQuestion {
+                question: "T".to_owned(),
+                writable: IncludedStates::empty(),
+            }]),
+            "set T, Allow"
+        );
+        assert_eq!(writes, [(0, vec![9, 9])], "set T, Allow: writes");
     }
 
     /// get shows the writable twin that set writes rather than the read-only one before it, and
@@ -4468,8 +4541,9 @@ mod tests {
 
     /// Of a writable "T" grayed out and a "T" that EFI_IFR_FLAG_READ_ONLY makes read-only and
     /// that a SUPPRESS_IF on the unreadable question 3 may suppress, the likely match, set
-    /// refuses the second, naming the states that write it and those that select the first, and
-    /// writes either with its states included.
+    /// refuses the second as undetermined, which UnsafeOperations::Allow does not lift; with
+    /// suppressed included, for the read-only flag, naming the states that select the first;
+    /// and writes either with its states included, the second with Allow too.
     #[test]
     fn undetermined_read_only_refusal_names_a_grayed_out_writable_twin() {
         let hiidb = undetermined_list(
@@ -4479,27 +4553,43 @@ mod tests {
                 conditional(SUPPRESS_IF, eq_id_val_of(3, 1), &[numeric_at(1, 0, 0x01)]),
             ],
         );
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            let (got, writes) = set_to_9_with(&hiidb, "T", IncludedStates::empty(), grant);
+            assert!(
+                got.as_ref().is_err_and(|error| {
+                    error.starts_with("cannot tell whether question \"T\" is suppressed: ")
+                }),
+                "set T, {grant:?}: {got:?}"
+            );
+            assert_eq!(writes, [], "set T, {grant:?}: writes");
+        }
         let cases = [
             (
-                IncludedStates::empty(),
-                flag_refusal_with(
-                    "T",
-                    "read-only,suppressed",
-                    ", or grayed-out questions to select a writable one",
-                ),
+                IncludedStates::SUPPRESSED,
+                UnsafeOperations::Refuse,
+                flag_refusal("T", GRAYED_OUT_TWIN),
                 vec![],
             ),
             (
-                IncludedStates::READ_ONLY | IncludedStates::SUPPRESSED,
+                IncludedStates::SUPPRESSED,
+                UnsafeOperations::Allow,
                 Ok(()),
                 vec![(0, vec![9])],
             ),
-            (IncludedStates::GRAYED_OUT, Ok(()), vec![(1, vec![9])]),
+            (
+                IncludedStates::GRAYED_OUT,
+                UnsafeOperations::Refuse,
+                Ok(()),
+                vec![(1, vec![9])],
+            ),
         ];
-        for (include, want, want_writes) in cases {
-            let (got, writes) = set_to_9(&hiidb, "T", include);
-            assert_eq!(got, want, "set T --include {include}");
-            assert_eq!(writes, want_writes, "set T --include {include}: writes");
+        for (include, grant, want, want_writes) in cases {
+            let (got, writes) = set_to_9_with(&hiidb, "T", include, grant);
+            assert_eq!(got, want, "set T --include {include}, {grant:?}");
+            assert_eq!(
+                writes, want_writes,
+                "set T --include {include}, {grant:?}: writes"
+            );
         }
     }
 
@@ -4538,23 +4628,40 @@ mod tests {
         let cases = [
             (
                 IncludedStates::empty(),
-                flag_refusal("T", ", or grayed-out questions to select a writable one"),
+                UnsafeOperations::Refuse,
+                flag_refusal("T", GRAYED_OUT_TWIN),
                 vec![],
             ),
-            (IncludedStates::GRAYED_OUT, Ok(()), vec![(1, vec![9])]),
+            (
+                IncludedStates::empty(),
+                UnsafeOperations::Allow,
+                Ok(()),
+                vec![(0, vec![9])],
+            ),
+            (
+                IncludedStates::GRAYED_OUT,
+                UnsafeOperations::Refuse,
+                Ok(()),
+                vec![(1, vec![9])],
+            ),
         ];
-        for (include, want, want_writes) in cases {
-            let (got, writes) = set_to_9(&hiidb, "T", include);
-            assert_eq!(got, want, "set T --include {include}");
-            assert_eq!(writes, want_writes, "set T --include {include}: writes");
+        for (include, grant, want, want_writes) in cases {
+            let (got, writes) = set_to_9_with(&hiidb, "T", include, grant);
+            assert_eq!(got, want, "set T --include {include}, {grant:?}");
+            assert_eq!(
+                writes, want_writes,
+                "set T --include {include}, {grant:?}: writes"
+            );
         }
     }
 
-    /// The refusal of an undetermined match that EFI_IFR_FLAG_READ_ONLY makes read-only names
-    /// every state that writes it: set writes a "T" that a GRAY_OUT_IF on the unreadable question
-    /// 3 may gray out with read-only and grayed-out included, not with read-only alone.
+    /// set refuses an undetermined match that EFI_IFR_FLAG_READ_ONLY makes read-only as
+    /// undetermined, whose refusal names no flag, with UnsafeOperations::Allow or not, as
+    /// Allow does not lift it; with its states included, for the read-only
+    /// flag; and writes a "T" that a GRAY_OUT_IF on the unreadable question 3 may gray out with
+    /// grayed-out included and Allow.
     #[test]
-    fn undetermined_read_only_refusal_names_the_states_to_write_it() {
+    fn undetermined_read_only_match_is_refused_as_undetermined_first() {
         let hiidb = undetermined_list(
             [0x78; 16],
             &[conditional(
@@ -4563,27 +4670,30 @@ mod tests {
                 &[numeric_at(1, 0, 0x01)],
             )],
         );
-        let (got, writes) = set_to_9(&hiidb, "T", IncludedStates::empty());
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            let (got, writes) = set_to_9_with(&hiidb, "T", IncludedStates::empty(), grant);
+            assert!(
+                got.as_ref().is_err_and(|error| {
+                    error.starts_with("cannot tell whether question \"T\" is grayed-out: ")
+                        && !error.contains(UNSAFE_OPERATIONS_FLAG)
+                }),
+                "set T, {grant:?}: {got:?}"
+            );
+            assert_eq!(writes, [], "set T, {grant:?}: writes");
+        }
+
+        let grayed_out = IncludedStates::GRAYED_OUT;
+        let (got, writes) = set_to_9(&hiidb, "T", grayed_out);
+        assert_eq!(got, flag_refusal("T", ""), "set T --include {grayed_out}");
+        assert_eq!(writes, [], "set T --include {grayed_out}: writes");
+
+        let (got, writes) = set_to_9_with(&hiidb, "T", grayed_out, UnsafeOperations::Allow);
+        assert_eq!(got, Ok(()), "set T --include {grayed_out}, Allow");
         assert_eq!(
-            got,
-            flag_refusal_with("T", "read-only,grayed-out", ""),
-            "set T"
+            writes,
+            [(0, vec![9])],
+            "set T --include {grayed_out}, Allow: writes"
         );
-        assert_eq!(writes, [], "set T: writes");
-
-        let (got, writes) = set_to_9(&hiidb, "T", IncludedStates::READ_ONLY);
-        assert!(
-            got.as_ref().is_err_and(|error| {
-                error.starts_with("cannot tell whether question \"T\" is grayed-out: ")
-            }),
-            "set T --include read-only: {got:?}"
-        );
-        assert_eq!(writes, [], "set T --include read-only: writes");
-
-        let both = IncludedStates::READ_ONLY | IncludedStates::GRAYED_OUT;
-        let (got, writes) = set_to_9(&hiidb, "T", both);
-        assert_eq!(got, Ok(()), "set T --include {both}");
-        assert_eq!(writes, [(0, vec![9])], "set T --include {both}: writes");
     }
 
     /// An EFI_IFR_VALUE in an EFI_IFR_DEFAULT_2 of a question gives its default, not its value
@@ -4598,10 +4708,11 @@ mod tests {
         assert_eq!(writes, [(0, vec![9])], "set D: writes");
     }
 
-    /// set names the read-only flag of a question whose EFI variable is also missing, as it
-    /// refuses a read-only question before the efivar checks.
+    /// set names the missing EFI variable of a question that EFI_IFR_FLAG_READ_ONLY makes
+    /// read-only, with UnsafeOperations::Allow or not, as it refuses what Allow cannot lift before
+    /// what it lifts.
     #[test]
-    fn read_only_precedes_the_efivar_checks() {
+    fn efivar_checks_precede_the_read_only_flag() {
         let packages = [
             form_package(&[
                 var_store_efi(1, "Missing", NV_BS_RT, 3),
@@ -4611,9 +4722,65 @@ mod tests {
             END_PACKAGE.to_vec(),
         ];
         let hiidb = package_list_with_guid([0x72; 16], &packages.concat());
-        let (got, writes) = set_to_9(&hiidb, "R", IncludedStates::empty());
-        assert_eq!(got, flag_refusal("R", ""), "set R");
-        assert_eq!(writes, [], "set R: writes");
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            let (got, writes) = set_to_9_with(&hiidb, "R", IncludedStates::empty(), grant);
+            assert!(
+                got.as_ref().is_err_and(|error| {
+                    error.contains("Missing-00000000-0000-0000-0000-000000000000")
+                        && error.contains("the firmware has not created it or does not expose it")
+                        && !error.contains(UNSAFE_OPERATIONS_FLAG)
+                }),
+                "set R, {grant:?}: {got:?}"
+            );
+            assert_eq!(writes, [], "set R, {grant:?}: writes");
+        }
+    }
+
+    /// set refuses a value that a question of EFI_IFR_FLAG_READ_ONLY cannot take, 300 for a UINT8
+    /// NUMERIC, with the same refusal with and without UnsafeOperations::Allow, which names
+    /// neither the read-only flag nor --i-am-fine-to-brick-this-system: it checks the value
+    /// before what Allow lifts.
+    #[test]
+    fn value_checks_precede_the_read_only_flag() {
+        let hiidb = one_form_list([0x77; 16], "R", &[numeric_at(1, 0, 0x01)]);
+        let got = [UnsafeOperations::Refuse, UnsafeOperations::Allow].map(|grant| {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(setup(), NV_BS_RT, &[0; 3]);
+            let variables = Rc::new(variables);
+            let options = SetOptions {
+                unsafe_operations: grant,
+                ..SetOptions::default()
+            };
+            let got = set_responses(
+                &hiidb,
+                "R",
+                &SetValue::Text("300".to_owned()),
+                None,
+                &options,
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+            (got, variables.writes_to(&setup()))
+        });
+
+        let [(refused, refused_writes), (allowed, allowed_writes)] = got;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| !error.contains("EFI_IFR_FLAG_READ_ONLY")
+                    && !error.contains(UNSAFE_OPERATIONS_FLAG)),
+            "set R 300, Refuse: {refused:?}"
+        );
+        assert_eq!(allowed, refused, "set R 300: Allow as Refuse");
+        assert_eq!(
+            (refused_writes, allowed_writes),
+            (vec![], vec![]),
+            "set R 300: writes"
+        );
     }
 
     /// An EFI_IFR_VALUE anywhere in a question's scope makes it read-only, as edk2-stable202608
@@ -5062,18 +5229,43 @@ mod tests {
     /// What set does: its result, the error as text, and its writes to Setup, by offset.
     type SetOutcome = (Result<(), String>, Vec<(u16, Vec<u8>)>);
 
+    /// SetOutcome, its result the unsafe operations that set lifted.
+    type LiftingOutcome = (Result<Vec<UnsafeOperation>, String>, Vec<(u16, Vec<u8>)>);
+
     /// set of `question` to 9 in `hiidb`, selecting `include` too, with Setup of 3 bytes.
     fn set_to_9(hiidb: &[u8], question: &str, include: IncludedStates) -> SetOutcome {
+        set_to_9_with(hiidb, question, include, UnsafeOperations::Refuse)
+    }
+
+    /// set_to_9, with `grant` for its unsafe operations.
+    fn set_to_9_with(
+        hiidb: &[u8],
+        question: &str,
+        include: IncludedStates,
+        grant: UnsafeOperations,
+    ) -> SetOutcome {
+        let (got, writes) = set_to_9_lifting(hiidb, question, include, grant);
+        (got.map(drop), writes)
+    }
+
+    /// set_to_9_with, its result the unsafe operations that it lifted.
+    fn set_to_9_lifting(
+        hiidb: &[u8],
+        question: &str,
+        include: IncludedStates,
+        grant: UnsafeOperations,
+    ) -> LiftingOutcome {
         let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
         variables.insert(setup(), NV_BS_RT, &[0; 3]);
         let variables = Rc::new(variables);
-        let got = set_responses(
+        let got = HiiBackend::set_in(
             hiidb,
             question,
             &SetValue::Text("9".to_owned()),
             None,
             &SetOptions {
                 include,
+                unsafe_operations: grant,
                 ..SetOptions::default()
             },
             shared(&variables),
@@ -5081,7 +5273,8 @@ mod tests {
             None,
         );
         (
-            got.map(drop).map_err(|error| error.to_string()),
+            got.map(|(_, lifted)| lifted)
+                .map_err(|error| error.to_string()),
             variables.writes_to(&setup()),
         )
     }
@@ -5185,11 +5378,11 @@ mod tests {
     }
 
     /// set's response lists the flags of the question it wrote, and none for one without; Mixed
-    /// is EFI_IFR_FLAG_READ_ONLY, which set writes with read-only included.
+    /// is EFI_IFR_FLAG_READ_ONLY, which set writes with UnsafeOperations::Allow.
     #[test]
     fn set_names_the_question_flags() {
         let options = SetOptions {
-            include: IncludedStates::READ_ONLY,
+            unsafe_operations: UnsafeOperations::Allow,
             ..SetOptions::default()
         };
         for (prompt, want) in [("Mixed", want_flags(FLAGGED[0].names)), ("Plain", None)] {
@@ -8541,6 +8734,7 @@ mod tests {
                 &BTreeSet::from(["Q".to_string()]),
                 &options,
                 &[],
+                &mut PendingOperations::new(UnsafeOperations::Refuse),
                 &mut EfivarReader::new(EfivarSource::Directory(efivars.path().to_path_buf()))
                     .expect("create a reader of the efivars directory"),
             )

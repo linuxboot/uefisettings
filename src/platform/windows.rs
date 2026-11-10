@@ -30,7 +30,6 @@ use uefisettings::exports::QuestionSelector;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetValue;
 use uefisettings::exports::UnsafeOperation;
-use uefisettings::exports::UnsafeOperations;
 use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
@@ -46,7 +45,7 @@ use crate::HiiSourceArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
-use crate::SetIncludeState;
+use crate::READ_ONLY_WRITE;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -135,19 +134,10 @@ impl EfivarArgs {
     }
 }
 
-/// None: Windows writes through the firmware environment calls, which reach runtime
-/// variables like efivarfs, so set does no unsafe operation, as on Linux.
-#[derive(Debug, Args)]
-// no ArgGroup, which usage would name instead of the flag
-#[group(skip)]
-pub(super) struct SetUnsafeArgs {}
-
-impl SetUnsafeArgs {
-    /// The default, which set through the firmware environment calls does not consult.
-    pub(super) fn operations(&self) -> UnsafeOperations {
-        UnsafeOperations::default()
-    }
-}
+/// The unsafe operations of set, which its long help lists: Windows writes through the
+/// firmware environment calls, which reach runtime variables like efivarfs, so no setup password
+/// gates them, as on Linux.
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE];
 
 /// get, in this machine's HiiDB.
 pub(super) fn auto_get(
@@ -182,7 +172,7 @@ impl VolatileArgs {
 pub(super) fn auto_set(
     target: &SetArgs,
     json: bool,
-    _selection: &SelectionArgs<SetIncludeState>,
+    _selection: &SelectionArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
 ) -> Result<()> {

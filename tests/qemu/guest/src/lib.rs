@@ -69,6 +69,10 @@ pub const BACKEND_HII: i32 = 1;
 /// What comes before `get` or `set`: `["hii"]` for the HII commands, `[]` for the generic ones.
 pub const PREFIXES: [&[&str]; 2] = [&["hii"], &[]];
 
+/// The flag that makes a command do the unsafe operations that it otherwise refuses, such as a
+/// write of [`driver_sample::READ_ONLY_NUMERIC`].
+pub const UNSAFE_OPERATIONS: [&str; 1] = ["--i-am-fine-to-brick-this-system"];
+
 /// The variable that holds the answers of the main form of EDK2's DriverSample, which the
 /// HII scenarios load: `MyIfrNVData`, with the formset GUID as its vendor.
 pub const DRIVER_SAMPLE_VARIABLE: &str =
@@ -157,9 +161,6 @@ pub mod driver_sample {
     pub const READ_ONLY_NUMERIC: &str = "How old are you?(Readonly)";
     /// Offset of the 8-bit answer of [`READ_ONLY_NUMERIC`].
     pub const READ_ONLY_NUMERIC_OFFSET: usize = 82;
-    /// The flag that makes `set` write questions that EFI_IFR_FLAG_READ_ONLY makes read-only,
-    /// such as [`READ_ONLY_NUMERIC`]; `get` shows them regardless.
-    pub const INCLUDE_READ_ONLY: [&str; 2] = ["--include", "read-only"];
     /// The prompt of the DATE of the system time in the form that [`INCLUDE_SUPPRESSED`]
     /// selects.
     pub const SYSTEM_DATE: &str = "System Date";

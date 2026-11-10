@@ -24,7 +24,6 @@ use uefisettings_qemu_guest::driver_sample::BOOT_ORDER_OFFSET;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX;
 use uefisettings_qemu_guest::driver_sample::CHECK_BOX_OFFSET;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_GRAYED_OUT;
-use uefisettings_qemu_guest::driver_sample::INCLUDE_READ_ONLY;
 use uefisettings_qemu_guest::driver_sample::INCLUDE_SUPPRESSED;
 use uefisettings_qemu_guest::driver_sample::LOCKED;
 use uefisettings_qemu_guest::driver_sample::MATCH2;
@@ -43,14 +42,18 @@ use uefisettings_qemu_guest::driver_sample::SYSTEM_TIME;
 use uefisettings_qemu_guest::driver_sample::UPDATE_DEST;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
+use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::variable_bytes;
 use uefisettings_qemu_guest::variable_data;
 use uefisettings_qemu_guest::ErrorObject;
+use uefisettings_qemu_guest::Response;
+use uefisettings_qemu_guest::Responses;
 use uefisettings_qemu_guest::BACKEND_HII;
 use uefisettings_qemu_guest::DRIVER_SAMPLE_VARIABLE;
 use uefisettings_qemu_guest::MY_EFI_VAR;
 use uefisettings_qemu_guest::MY_EFI_VAR_QUESTION;
 use uefisettings_qemu_guest::PREFIXES;
+use uefisettings_qemu_guest::UNSAFE_OPERATIONS;
 
 #[track_caller]
 fn driver_sample_data() -> Vec<u8> {
@@ -343,33 +346,57 @@ fn set_of_a_question_in_a_locked_scope_is_refused() {
 }
 
 /// set, through hii set and set, refuses DriverSample's numeric that EFI_IFR_FLAG_READ_ONLY makes
-/// read-only and writes nothing, and writes it with read-only included; get, which shows
-/// read-only questions regardless, answers the new value.
+/// read-only and writes nothing, and writes it with --i-am-fine-to-brick-this-system, warning of
+/// the write on stderr; get, which shows read-only questions regardless, answers the new value.
 #[test]
-fn set_read_only_numeric_is_refused_unless_read_only_is_included() {
+fn set_read_only_numeric_is_refused_without_the_unsafe_flag() {
+    let read_only = format!(
+        "cannot set question {READ_ONLY_NUMERIC:?}: EFI_IFR_FLAG_READ_ONLY makes it read-only \
+         (UEFI 2.11 §33.3.8.2.2)"
+    );
     for prefix in PREFIXES {
         assert_eq!(
             refuse(prefix, READ_ONLY_NUMERIC, "30", &[]).error_message,
-            format!(
-                "cannot set question {READ_ONLY_NUMERIC:?}: EFI_IFR_FLAG_READ_ONLY makes it \
-                 read-only (UEFI 2.11 §33.3.8.2.2); also include read-only questions to write it"
-            ),
+            format!("{read_only}; pass --i-am-fine-to-brick-this-system to write it"),
             "{prefix:?}"
         );
     }
 
     for (prefix, answer) in PREFIXES.into_iter().zip(["30", "31"]) {
         let before = driver_sample_data();
-        let (set, modified) = single_response(
-            &[
-                prefix,
-                &["set", READ_ONLY_NUMERIC, answer, "--json"],
-                &INCLUDE_READ_ONLY,
-            ]
-            .concat(),
-            BACKEND_HII,
+        let args = [
+            prefix,
+            &["set", READ_ONLY_NUMERIC, answer, "--json"],
+            &UNSAFE_OPERATIONS,
+        ]
+        .concat();
+        let output = uefisettings(&args);
+        let Responses { responses } = output.json(0);
+        let [Response {
+            backend,
+            question: set,
+            modified,
+            ..
+        }] = <[Response; 1]>::try_from(responses)
+            .unwrap_or_else(|responses| panic!("{args:?}: expected one response: {responses:#?}"));
+        assert_eq!(
+            (backend, set.answer.as_str(), modified),
+            (BACKEND_HII, answer, true),
+            "{set:#?}"
         );
-        assert_eq!((set.answer.as_str(), modified), (answer, true), "{set:#?}");
+        let warnings: Vec<&str> = output
+            .stderr
+            .lines()
+            .filter(|line| line.starts_with("warning: "))
+            .collect();
+        assert_eq!(
+            warnings,
+            [format!(
+                "warning: {read_only}; --i-am-fine-to-brick-this-system lets uefisettings write it"
+            )],
+            "{args:?}: stderr {:?}",
+            output.stderr
+        );
         let (got, _) = single_response(
             &[prefix, &["get", READ_ONLY_NUMERIC, "--json"]].concat(),
             BACKEND_HII,
@@ -382,7 +409,7 @@ fn set_read_only_numeric_is_refused_unless_read_only_is_included() {
         assert_eq!(
             changed_bytes(&before, &driver_sample_data()),
             want,
-            "{prefix:?} {INCLUDE_READ_ONLY:?}"
+            "{prefix:?} {UNSAFE_OPERATIONS:?}"
         );
     }
 }

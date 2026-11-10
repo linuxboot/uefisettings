@@ -995,7 +995,7 @@ mod get_and_set_tests {
                         selection,
                         prompt,
                         &SetOptions::default(),
-                        IncludedStates::all(),
+                        ReadOnlyWriter::Set(&mut PendingOperations::new(UnsafeOperations::Refuse)),
                         &reader,
                     )
                     .map(|_| ())

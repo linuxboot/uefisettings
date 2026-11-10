@@ -84,6 +84,7 @@ use super::QuestionDescriptor;
 use super::QuestionFlags;
 use super::QuestionHeader;
 use super::Range as IfrRange;
+use super::ReadOnlyWriter;
 use super::SelectionError;
 use super::ShortVarStoreEfi;
 use super::StringOp;
@@ -137,11 +138,6 @@ pub(crate) const UEFI_CONFIG_LANG: &str = "x-UEFI";
 const CALLBACK_DEFAULT: &str = "its question has EFI_IFR_FLAG_CALLBACK, so its driver's \
      Callback() with EFI_BROWSER_ACTION_DEFAULT_STANDARD outranks the defaults that the IFR \
      declares (UEFI 2.11 §33.2.5.8)";
-
-/// The states that keyword set may include: not READ_ONLY, as EfiConfigKeywordHandlerSetData
-/// refuses every EFI_IFR_FLAG_READ_ONLY question (ConfigKeywordHandler.c:3033-3047).
-const KEYWORD_SET_LIFTABLE: IncludedStates =
-    IncludedStates::all().difference(IncludedStates::READ_ONLY);
 
 /// Why uefisettings reads or writes no keyword through the Keyword Handler.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -1402,7 +1398,8 @@ impl<'a> KeywordQuestion<'a> {
             volatile,
             ..SetOptions::default()
         };
-        match choice_for_set(selection, prompt, &options, KEYWORD_SET_LIFTABLE, reader)? {
+        let writer = ReadOnlyWriter::KeywordHandler;
+        match choice_for_set(selection, prompt, &options, writer, reader)? {
             Choice::Chosen(descriptor, _) => Ok(descriptor),
             Choice::Skipped(exclusion) if exclusion.is_empty() => Err(SelectionError::NotFound {
                 question: prompt.to_owned(),
@@ -2417,7 +2414,6 @@ mod tests {
                     error.downcast_ref::<ChangeValueError>(),
                     Some(ChangeValueError::ReadOnly {
                         cause: ReadOnlyCause::Flag,
-                        lifted_with: None,
                         ..
                     })
                 ),

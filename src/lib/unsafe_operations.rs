@@ -21,6 +21,9 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::hii::forms::IncludedStates;
+use crate::hii::forms::ReadOnlyCause;
+
 /// The flag of the CLI that grants UnsafeOperations::Allow, which every refusal of an
 /// UnsafeOperation names.
 pub const UNSAFE_OPERATIONS_FLAG: &str = "--i-am-fine-to-brick-this-system";
@@ -53,6 +56,12 @@ pub enum UnsafeOperation {
     /// A write, in the UEFI Shell, in a HiiDB that declares a setup password question, which no
     /// setup browser there asks for
     SetupPassword,
+    /// A write of `question`, which EFI_IFR_FLAG_READ_ONLY makes read-only; including the
+    /// condition states `writable` selects a writable question of its text instead
+    ReadOnlyQuestion {
+        question: String,
+        writable: IncludedStates,
+    },
 }
 
 impl UnsafeOperation {
@@ -60,6 +69,18 @@ impl UnsafeOperation {
     fn unlock(&self) -> &'static str {
         match self {
             Self::SetupPassword => "write without it",
+            Self::ReadOnlyQuestion { .. } => "write it",
+        }
+    }
+
+    /// What a refusal of the operation names besides the flag: another way to an operation
+    /// that is not unsafe, if any.
+    fn alternative(&self) -> String {
+        match self {
+            Self::ReadOnlyQuestion { writable, .. } if !writable.is_empty() => {
+                format!(", or also include {writable} questions to select a writable one")
+            }
+            Self::SetupPassword | Self::ReadOnlyQuestion { .. } => String::new(),
         }
     }
 
@@ -81,6 +102,11 @@ impl fmt::Display for UnsafeOperation {
                 "this HiiDB declares a setup password question, and the UEFI Shell runs no setup \
                  browser, so no password is asked or checked",
             ),
+            Self::ReadOnlyQuestion { question, .. } => write!(
+                f,
+                "cannot set question {question:?}: {}",
+                ReadOnlyCause::Flag
+            ),
         }
     }
 }
@@ -88,7 +114,11 @@ impl fmt::Display for UnsafeOperation {
 /// The refusal of `operation`, without UnsafeOperations::Allow.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{operation}; pass {UNSAFE_OPERATIONS_FLAG} to {}", .operation.unlock())]
+#[error(
+    "{operation}; pass {UNSAFE_OPERATIONS_FLAG} to {}{}",
+    .operation.unlock(),
+    .operation.alternative()
+)]
 pub struct UnsafeOperationRefused {
     /// What was refused
     pub operation: UnsafeOperation,
@@ -109,6 +139,11 @@ impl PendingOperations {
             grant,
             operations: Vec::new(),
         }
+    }
+
+    /// The grant that it checks against.
+    pub(crate) fn grant(&self) -> UnsafeOperations {
+        self.grant
     }
 
     /// Takes in `operation`, which the command does, once.
@@ -219,6 +254,44 @@ mod tests {
         );
     }
 
+    /// A write of a read-only question names the question and the flag, and the states that
+    /// select a writable question of its text where there are any; its warning names those of
+    /// neither.
+    #[test]
+    fn read_only_question_names_a_writable_one() {
+        let read_only = |writable| UnsafeOperation::ReadOnlyQuestion {
+            question: "R".to_owned(),
+            writable,
+        };
+        let cases = [
+            (IncludedStates::empty(), ""),
+            (
+                IncludedStates::GRAYED_OUT | IncludedStates::DISABLED,
+                ", or also include grayed-out,disabled questions to select a writable one",
+            ),
+        ];
+        for (writable, alternative) in cases {
+            let operation = read_only(writable);
+            assert_eq!(
+                UnsafeOperations::Refuse
+                    .check(operation.clone())
+                    .map_err(|refused| refused.to_string()),
+                Err(format!(
+                    "cannot set question \"R\": EFI_IFR_FLAG_READ_ONLY makes it read-only (UEFI \
+                     2.11 §33.3.8.2.2); pass --i-am-fine-to-brick-this-system to write \
+                     it{alternative}"
+                )),
+                "{writable:?}: the refusal"
+            );
+            assert_eq!(
+                operation.lifted_warning(),
+                "cannot set question \"R\": EFI_IFR_FLAG_READ_ONLY makes it read-only (UEFI 2.11 \
+                 §33.3.8.2.2); --i-am-fine-to-brick-this-system lets uefisettings write it",
+                "{writable:?}: the warning"
+            );
+        }
+    }
+
     /// PendingOperations refuses the first operation without Allow, returns each once with it,
     /// and checks nothing when it holds none.
     #[test]
@@ -249,9 +322,9 @@ mod tests {
     }
 
     /// attach gives an error LiftedOperations as its context, which later contexts keep and
-    /// which the error's own type still downcasts beside; it adds the operations of an earlier
-    /// step to those that the error already carries, in one context, and leaves an error without
-    /// operations as it is.
+    /// which the error's own type still downcasts beside; it puts the operations of an earlier
+    /// step before those that the error already carries, in one context, and leaves an error
+    /// without operations as it is.
     #[test]
     fn attach_keeps_every_lifted_operation_with_the_error() {
         let refused = UnsafeOperationRefused {
@@ -290,6 +363,20 @@ mod tests {
             merged.chain().count(),
             3,
             "one LiftedOperations context: {merged:#}"
+        );
+        let read_only = UnsafeOperation::ReadOnlyQuestion {
+            question: "R".to_owned(),
+            writable: IncludedStates::empty(),
+        };
+        let earlier = LiftedOperations::attach(vec![read_only.clone()], merged);
+        assert_eq!(
+            earlier.downcast_ref::<LiftedOperations>(),
+            Some(&LiftedOperations(vec![
+                read_only,
+                UnsafeOperation::SetupPassword,
+                UnsafeOperation::SetupPassword
+            ])),
+            "an earlier step's first"
         );
 
         let unchanged = LiftedOperations::attach(Vec::new(), anyhow::anyhow!("write failed"));

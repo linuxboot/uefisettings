@@ -18,13 +18,9 @@ use std::io::Write;
 #[cfg(all(system_hiidb, hiidb_files))]
 use std::path::Path;
 use std::process::ExitCode;
-#[cfg(all(system_hiidb, system_variables))]
-use std::sync::LazyLock;
 
 use anyhow::anyhow;
 use anyhow::Result;
-#[cfg(all(system_hiidb, system_variables))]
-use clap::builder::PossibleValue;
 #[cfg(all(system_hiidb, system_variables))]
 use clap::ArgGroup;
 use clap::Args;
@@ -52,7 +48,7 @@ use uefisettings::exports::SetValue;
 use uefisettings::exports::ShowIfrOptions;
 #[cfg(all(system_hiidb, system_variables))]
 use uefisettings::exports::UnsafeOperation;
-#[cfg(target_os = "uefi")]
+#[cfg(all(system_hiidb, system_variables))]
 use uefisettings::exports::UnsafeOperations;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
@@ -63,8 +59,6 @@ use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
 use platform::ListStringsHiiDbArgs;
 use platform::PlatformCommands;
-#[cfg(all(system_hiidb, system_variables))]
-use platform::SetUnsafeArgs;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::VolatileArgs;
 #[cfg(system_variables)]
@@ -175,19 +169,16 @@ enum Commands {
         .args(["question", "question_id", "keyword", "items"])
         .required(true)
         .multiple(true)))]
-    #[cfg_attr(
-        target_os = "uefi",
-        command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, platform::SET_UNSAFE_OPERATIONS)))
-    )]
+    #[command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, platform::SET_UNSAFE_OPERATIONS)))]
     Set {
         #[command(flatten)]
         target: SetArgs,
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
-        selection: SelectionArgs<SetIncludeState>,
+        selection: SelectionArgs,
         #[command(flatten)]
-        unsafe_operations: SetUnsafeArgs,
+        unsafe_operations: UnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
     },
@@ -241,19 +232,16 @@ enum HiiSubcommands {
         .args(["question", "question_id", "keyword", "items"])
         .required(true)
         .multiple(true)))]
-    #[cfg_attr(
-        target_os = "uefi",
-        command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, platform::SET_UNSAFE_OPERATIONS)))
-    )]
+    #[command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, platform::SET_UNSAFE_OPERATIONS)))]
     Set {
         #[command(flatten)]
         target: SetArgs,
         #[command(flatten)]
         output: JsonArgs,
         #[command(flatten)]
-        selection: SelectionArgs<SetIncludeState>,
+        selection: SelectionArgs,
         #[command(flatten)]
-        unsafe_operations: SetUnsafeArgs,
+        unsafe_operations: UnsafeArgs,
         #[command(flatten)]
         volatile: VolatileArgs,
     },
@@ -412,26 +400,18 @@ impl QuestionArgs {
 }
 
 /// The states of the questions and options that get, set, list-questions and the UEFI Shell
-/// build's hii keyword set select too, `S` as SelectionArgs takes it: keyword set takes
-/// IncludeState, as the Keyword Handler writes no read-only question.
+/// build's hii keyword set select too.
 #[derive(Debug, Args)]
-struct IncludeArgs<S = IncludeState>
-where
-    S: clap::ValueEnum + Clone + Send + Sync + 'static,
-{
+struct IncludeArgs {
     /// Also select questions that conditions gray out, suppress or disable. The edk2 setup
     /// browser (edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList) ranks
     /// DisableIf > SuppressIf > GrayOutIf, so a question that is both grayed out and suppressed
     /// counts as suppressed.
     #[arg(long, value_enum, value_delimiter = ',')]
-    include: Vec<S>,
+    include: Vec<IncludeState>,
 }
 
-impl<S> IncludeArgs<S>
-where
-    S: clap::ValueEnum + Copy + Send + Sync + 'static,
-    IncludedStates: From<S>,
-{
+impl IncludeArgs {
     fn states(&self) -> IncludedStates {
         self.include
             .iter()
@@ -441,16 +421,11 @@ where
     }
 }
 
-/// Which questions and options get, set and list-questions select. `S` is the value of
-/// --include: set's (SetIncludeState) also takes read-only, which get and list-questions refuse,
-/// as they show read-only questions regardless.
+/// Which questions and options get, set and list-questions select.
 #[derive(Debug, Args)]
-struct SelectionArgs<S = IncludeState>
-where
-    S: clap::ValueEnum + Clone + Send + Sync + 'static,
-{
+struct SelectionArgs {
     #[command(flatten)]
-    include: IncludeArgs<S>,
+    include: IncludeArgs,
     /// Evaluate the conditions that read the AMI Setup access level (VarStore SystemAccess
     /// E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User) at this level instead of
     /// the stored value. This states a Setup privilege; it is no password and authenticates
@@ -473,11 +448,7 @@ struct LanguageArgs {
     language: Option<String>,
 }
 
-impl<S> SelectionArgs<S>
-where
-    S: clap::ValueEnum + Copy + Send + Sync + 'static,
-    IncludedStates: From<S>,
-{
+impl SelectionArgs {
     fn states(&self) -> IncludedStates {
         self.include.states()
     }
@@ -498,8 +469,8 @@ impl From<&SelectionArgs> for GetOptions {
 }
 
 #[cfg(all(system_hiidb, system_variables))]
-impl From<&SelectionArgs<SetIncludeState>> for SetOptions {
-    fn from(args: &SelectionArgs<SetIncludeState>) -> Self {
+impl From<&SelectionArgs> for SetOptions {
+    fn from(args: &SelectionArgs) -> Self {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
@@ -520,16 +491,25 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
 
 /// The id of --i-am-fine-to-brick-this-system, under which each command's long help lists its own
 /// unsafe operations.
-#[cfg(target_os = "uefi")]
+#[cfg(all(system_hiidb, system_variables))]
 const UNSAFE_ARG: &str = "i_am_fine_to_brick_this_system";
 
 /// The help of --i-am-fine-to-brick-this-system, in every command that takes it.
-#[cfg(target_os = "uefi")]
+#[cfg(all(system_hiidb, system_variables))]
 const UNSAFE_HELP: &str = "Do what this command otherwise refuses because it can bypass this \
-                           machine's setup password; each refusal names what this flag does there";
+                           machine's setup password or write a value that its firmware declares \
+                           read-only; each refusal names what this flag does there";
+
+/// What set refuses without --i-am-fine-to-brick-this-system on every build.
+#[cfg(all(system_hiidb, system_variables))]
+const READ_ONLY_WRITE: &str = "a write of a question that EFI_IFR_FLAG_READ_ONLY makes read-only \
+                               (UEFI 2.11 §33.3.8.2.2), never one that an EFI_IFR_VALUE makes \
+                               read-only (§33.3.8.3.88); of questions with the same text, set \
+                               picks a writable one first among matches equally certain to be \
+                               selected";
 
 /// --i-am-fine-to-brick-this-system, which only the commands that have an unsafe operation take.
-#[cfg(target_os = "uefi")]
+#[cfg(all(system_hiidb, system_variables))]
 #[derive(Debug, Args)]
 // no ArgGroup, which usage would name instead of the flag
 #[group(skip)]
@@ -538,7 +518,7 @@ struct UnsafeArgs {
     i_am_fine_to_brick_this_system: bool,
 }
 
-#[cfg(target_os = "uefi")]
+#[cfg(all(system_hiidb, system_variables))]
 impl UnsafeArgs {
     fn operations(&self) -> UnsafeOperations {
         match self.i_am_fine_to_brick_this_system {
@@ -550,7 +530,7 @@ impl UnsafeArgs {
 
 /// `arg`, --i-am-fine-to-brick-this-system, with a long help that lists `operations`, the unsafe
 /// operations of its command.
-#[cfg(target_os = "uefi")]
+#[cfg(all(system_hiidb, system_variables))]
 fn unsafe_long_help(arg: clap::Arg, operations: &[&str]) -> clap::Arg {
     arg.long_help(format!(
         "{UNSAFE_HELP}. This command refuses without it: {}",
@@ -561,8 +541,8 @@ fn unsafe_long_help(arg: clap::Arg, operations: &[&str]) -> clap::Arg {
 /// The SetOptions of `selection`, `unsafe_operations` and `volatile`.
 #[cfg(all(system_hiidb, system_variables))]
 fn set_options(
-    selection: &SelectionArgs<SetIncludeState>,
-    unsafe_operations: &SetUnsafeArgs,
+    selection: &SelectionArgs,
+    unsafe_operations: &UnsafeArgs,
     volatile: &VolatileArgs,
 ) -> SetOptions {
     let mut options = SetOptions::from(selection);
@@ -629,50 +609,6 @@ impl From<IncludeState> for IncludedStates {
             IncludeState::GrayedOut => IncludedStates::GRAYED_OUT,
             IncludeState::Suppressed => IncludedStates::SUPPRESSED,
             IncludeState::Disabled => IncludedStates::DISABLED,
-        }
-    }
-}
-
-/// The values of set's --include: those of IncludeState, and read-only.
-#[cfg(all(system_hiidb, system_variables))]
-#[derive(Debug, Clone, Copy)]
-enum SetIncludeState {
-    Condition(IncludeState),
-    ReadOnly,
-}
-
-#[cfg(all(system_hiidb, system_variables))]
-impl clap::ValueEnum for SetIncludeState {
-    fn value_variants<'a>() -> &'a [Self] {
-        static VARIANTS: LazyLock<Vec<SetIncludeState>> = LazyLock::new(|| {
-            let conditions = IncludeState::value_variants().iter().copied();
-            conditions
-                .map(SetIncludeState::Condition)
-                .chain([SetIncludeState::ReadOnly])
-                .collect()
-        });
-        VARIANTS.as_slice()
-    }
-
-    fn to_possible_value(&self) -> Option<PossibleValue> {
-        match self {
-            SetIncludeState::Condition(state) => state.to_possible_value(),
-            SetIncludeState::ReadOnly => Some(PossibleValue::new("read-only").help(
-                "Also write questions that EFI_IFR_FLAG_READ_ONLY makes read-only (UEFI 2.11 \
-                 §33.3.8.2.2), never one that an EFI_IFR_VALUE makes read-only (§33.3.8.3.88). \
-                 Of questions with the same text, set picks a writable one first among matches \
-                 equally certain to be selected",
-            )),
-        }
-    }
-}
-
-#[cfg(all(system_hiidb, system_variables))]
-impl From<SetIncludeState> for IncludedStates {
-    fn from(state: SetIncludeState) -> Self {
-        match state {
-            SetIncludeState::Condition(state) => state.into(),
-            SetIncludeState::ReadOnly => IncludedStates::READ_ONLY,
         }
     }
 }
@@ -967,7 +903,7 @@ mod tests {
 
     /// The selection flags of `uefisettings hii set Q V` with `args` after it.
     #[cfg(all(system_hiidb, system_variables))]
-    fn set_selection_of(args: &[&str]) -> SelectionArgs<SetIncludeState> {
+    fn set_selection_of(args: &[&str]) -> SelectionArgs {
         let command = [&["set", "Q", "V"][..], args].concat();
         let parsed = hii(&command).unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
         let HiiSubcommands::Set { selection, .. } = parsed else {
@@ -1069,45 +1005,113 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "0");
     }
 
-    /// set's --include takes read-only, which lifts EFI_IFR_FLAG_READ_ONLY; get and
-    /// list-questions refuse it as a value they do not take, as they show read-only questions
-    /// regardless.
+    /// No command's --include takes read-only: get and list-questions show read-only questions
+    /// regardless, and set writes one with --i-am-fine-to-brick-this-system.
     #[test]
-    fn include_takes_read_only_only_on_set() {
-        let refusing: [&[&str]; 2] = [&["hii", "get", "Q"], &["hii", "list-questions"]];
-        let refusing = refusing.map(|command| [command, &OFFLINE_SOURCE].concat());
-        let commands = refusing.iter().map(|command| (&command[..], false));
+    fn include_takes_no_read_only() {
+        let reading: [&[&str]; 2] = [&["hii", "get", "Q"], &["hii", "list-questions"]];
+        let reading = reading.map(|command| [command, &OFFLINE_SOURCE].concat());
+        let commands = reading.iter().map(|command| &command[..]);
         #[cfg(all(system_hiidb, system_variables))]
         let commands = commands.chain([
-            (&["get", "Q"][..], false),
-            (&["hii", "set", "Q", "V"], true),
-            (&["set", "Q", "V"], true),
+            &["get", "Q"][..],
+            &["hii", "set", "Q", "V"],
+            &["set", "Q", "V"],
         ]);
-        for (command, takes) in commands {
+        for command in commands {
             let argv = [&["uefisettings"][..], command, &["--include", "read-only"]].concat();
             let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
-            match takes {
-                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
-                false => assert_eq!(
-                    parsed.err(),
-                    Some(clap::error::ErrorKind::InvalidValue),
-                    "{command:?}"
-                ),
-            }
+            assert_eq!(
+                parsed.err(),
+                Some(clap::error::ErrorKind::InvalidValue),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// --i-am-fine-to-brick-this-system is taken by set and hii set, which grant
+    /// UnsafeOperations::Allow with it and Refuse without, and whose long help lists their unsafe
+    /// operations; get, list-questions, show-ifr and variable get, which have none, refuse it.
+    #[test]
+    fn unsafe_flag_is_taken_where_an_operation_is_unsafe() {
+        let reading: [&[&str]; 3] = [
+            &["hii", "get", "Q"],
+            &["hii", "list-questions"],
+            &["hii", "show-ifr"],
+        ];
+        let reading = reading.map(|command| [command, &OFFLINE_SOURCE].concat());
+        let refusing = reading.iter().map(|command| &command[..]);
+        #[cfg(all(system_hiidb, system_variables))]
+        let refusing = refusing.chain([&["get", "Q"][..]]);
+        #[cfg(variable_data)]
+        let refusing = refusing.chain([&["variable", "get", "Timeout"][..]]);
+        for command in refusing {
+            let argv = [
+                &["uefisettings"][..],
+                command,
+                &["--i-am-fine-to-brick-this-system"],
+            ]
+            .concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            assert_eq!(
+                parsed.err(),
+                Some(clap::error::ErrorKind::UnknownArgument),
+                "{command:?}"
+            );
         }
 
         #[cfg(all(system_hiidb, system_variables))]
-        for (args, states) in [
-            (&["--include", "read-only"][..], IncludedStates::READ_ONLY),
+        for (args, want) in [
+            (&[][..], UnsafeOperations::Refuse),
             (
-                &["--include", "grayed-out,suppressed,disabled,read-only"],
-                IncludedStates::CONDITIONS | IncludedStates::READ_ONLY,
+                &["--i-am-fine-to-brick-this-system"],
+                UnsafeOperations::Allow,
             ),
         ] {
-            assert_eq!(
-                SetOptions::from(&set_selection_of(args)).include,
-                states,
-                "set {args:?}"
+            let command = [&["set", "Q", "V"][..], args].concat();
+            let parsed = hii(&command).unwrap_or_else(|error| panic!("parse {command:?}: {error}"));
+            let HiiSubcommands::Set {
+                unsafe_operations, ..
+            } = parsed
+            else {
+                panic!("{command:?} is no set: {parsed:?}");
+            };
+            assert_eq!(unsafe_operations.operations(), want, "hii {command:?}");
+
+            let argv = [&["uefisettings", "set", "Q", "V"][..], args].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
+            let Commands::Set {
+                unsafe_operations, ..
+            } = parsed.command
+            else {
+                panic!("{argv:?} is no set");
+            };
+            assert_eq!(unsafe_operations.operations(), want, "{argv:?}");
+        }
+
+        #[cfg(all(system_hiidb, system_variables))]
+        for path in [&["set"][..], &["hii", "set"]] {
+            let mut command = UefiSettingsToolArgs::command();
+            command.build();
+            let set = path.iter().fold(&command, |command, name| {
+                command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no subcommand {name}"))
+            });
+            let flag = set
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some("i-am-fine-to-brick-this-system"))
+                .unwrap_or_else(|| panic!("{path:?} takes no --i-am-fine-to-brick-this-system"));
+            let long_help = flag.get_long_help().map(ToString::to_string);
+            assert!(
+                long_help.as_deref().is_some_and(|help| {
+                    help.starts_with(UNSAFE_HELP)
+                        && platform::SET_UNSAFE_OPERATIONS
+                            .iter()
+                            .all(|operation| help.contains(operation))
+                }),
+                "{path:?}: {long_help:?}"
             );
         }
     }
@@ -1523,7 +1527,7 @@ mod tests {
     #[cfg(all(system_hiidb, system_variables))]
     #[test]
     fn removed_unsafe_flags_exit_2() {
-        let cases: [(&[&str], &[&str], clap::error::ErrorKind); 2] = [
+        let cases: [(&[&str], &[&str], clap::error::ErrorKind); 4] = [
             (
                 &["hii", "set", "Q", "V"],
                 &["--bypass-setup-password"],
@@ -1533,6 +1537,16 @@ mod tests {
                 &["set", "Q", "V"],
                 &["--bypass-setup-password"],
                 clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["hii", "set", "Q", "V"],
+                &["--include", "read-only"],
+                clap::error::ErrorKind::InvalidValue,
+            ),
+            (
+                &["set", "Q", "V"],
+                &["--include", "read-only"],
+                clap::error::ErrorKind::InvalidValue,
             ),
         ];
         for (command, flag, kind) in cases {

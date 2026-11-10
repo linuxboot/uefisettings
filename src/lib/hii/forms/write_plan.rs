@@ -806,19 +806,20 @@ mod tests {
                 IncludedStates::empty(),
             ),
         );
-        // set refuses a read-only question as it picks it, before it plans any write
+        // set takes in a read-only question as it picks it, and refuses it before any write
         let options = SetOptions {
             volatile,
             ..SetOptions::default()
         };
-        let descriptor =
-            match choice_for_set(selection, prompt, &options, IncludedStates::all(), &reader) {
-                Ok(Choice::Chosen(descriptor, _)) => descriptor,
-                Ok(Choice::Skipped(exclusion)) => {
-                    panic!("{prompt}: not picked, {}", exclusion.states)
-                }
-                Err(error) => return Err(format!("{error:#}")),
-            };
+        let mut pending = PendingOperations::new(UnsafeOperations::Refuse);
+        let writer = ReadOnlyWriter::Set(&mut pending);
+        let descriptor = match choice_for_set(selection, prompt, &options, writer, &reader) {
+            Ok(Choice::Chosen(descriptor, _)) => descriptor,
+            Ok(Choice::Skipped(exclusion)) => {
+                panic!("{prompt}: not picked, {}", exclusion.states)
+            }
+            Err(error) => return Err(format!("{error:#}")),
+        };
         set_questions(
             prompt,
             &[("selector", &descriptor)],
@@ -830,7 +831,7 @@ mod tests {
             &mut reader,
             None,
             volatile,
-            PendingOperations::new(UnsafeOperations::Refuse),
+            pending,
             &WithholdingVariables::new(writes, WithheldBytes::default()),
         )
         .map(|(written, _)| written.iter().map(|question| question.volatile).collect())

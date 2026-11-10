@@ -126,19 +126,16 @@ pub(crate) enum ChangeValueError {
          for a DATE or TIME"
     )]
     NumberOfNoDateTime { question: String },
-    /// A question that `cause` makes read-only, which set writes only with `lifted_with`, the
-    /// states that lift `cause` where its caller can include them, else never, and
-    /// `undetermined`, the states that it may be in where the selection is undetermined;
-    /// `ranked_before` selects a match that ranks before it
+    /// A question that `cause` makes read-only, which set never writes where an EFI_IFR_VALUE
+    /// gives its value, nor the Keyword Handler where EFI_IFR_FLAG_READ_ONLY makes it read-only;
+    /// `ranked_before` selects a writable match that ranks before it
     #[error(
         "cannot set question {question:?}: {}",
-        read_only_refusal(*.cause, *.lifted_with, *.undetermined, *.ranked_before)
+        read_only_refusal(*.cause, *.ranked_before)
     )]
     ReadOnly {
         question: String,
         cause: ReadOnlyCause,
-        lifted_with: Option<IncludedStates>,
-        undetermined: IncludedStates,
         ranked_before: IncludedStates,
     },
     /// A value, as of a ONE_OF option of a wider type, that the question's storage cannot hold
@@ -186,29 +183,12 @@ pub(crate) enum ChangeValueError {
     Other(#[from] anyhow::Error),
 }
 
-/// Why set refuses a question that `cause` makes read-only, with the states to include to write
-/// it, if any: `lifted_with`, then `undetermined`; or to select a match that ranks
-/// before it, `ranked_before`.
-fn read_only_refusal(
-    cause: ReadOnlyCause,
-    lifted_with: Option<IncludedStates>,
-    undetermined: IncludedStates,
-    ranked_before: IncludedStates,
-) -> String {
-    let to_write = lifted_with.map(|lifted_with| match undetermined.is_empty() {
-        true => lifted_with.to_string(),
-        false => format!("{lifted_with},{undetermined}"),
-    });
-    match (to_write, ranked_before.is_empty()) {
-        (Some(to_write), true) => {
-            format!("{cause}; also include {to_write} questions to write it")
-        }
-        (Some(to_write), false) => format!(
-            "{cause}; also include {to_write} questions to write it, or {ranked_before} \
-             questions to select a writable one"
-        ),
-        (None, true) => cause.to_string(),
-        (None, false) => {
+/// Why set refuses a question that `cause` makes read-only, with the states to include to
+/// select a writable match that ranks before it, `ranked_before`, if any.
+fn read_only_refusal(cause: ReadOnlyCause, ranked_before: IncludedStates) -> String {
+    match ranked_before.is_empty() {
+        true => cause.to_string(),
+        false => {
             format!("{cause}; also include {ranked_before} questions to select one that set writes")
         }
     }
@@ -1914,6 +1894,43 @@ mod set_questions_tests {
         }
     }
 
+    /// Through efivarfs, the refusal of two variables of one efivar file, which no grant lifts,
+    /// comes before the check of a pending unsafe operation, with UnsafeOperations::Refuse and
+    /// Allow alike, and writes neither.
+    #[test]
+    fn variables_of_one_efivar_file_are_refused_before_the_unsafe_check() {
+        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            let slash = checkbox_on_store(writable_var_store("A/B", &[0], &variables));
+            let bang = checkbox_on_store(writable_var_store("A!B", &[0], &variables));
+            let mut pending = PendingOperations::new(grant);
+            pending.add(UnsafeOperation::ReadOnlyQuestion {
+                question: PROMPT.to_owned(),
+                writable: IncludedStates::empty(),
+            });
+
+            let selected = [("slash", &slash), ("bang", &bang)];
+
+            let got = set_pending(&variables, &selected, ONE, pending)
+                .map(drop)
+                .map_err(|error| format!("{error:#}"));
+
+            assert_eq!(
+                got,
+                Err(format!(
+                    "the EFI variables named \"A/B\" and \"A!B\" are one efivarfs file, {}: set \
+                     writes neither",
+                    variable_key("A!B")
+                )),
+                "{grant:?}"
+            );
+            for name in ["A/B", "A!B"] {
+                assert_eq!(writes(&variables, name), [], "{grant:?}: writes of {name}");
+            }
+        }
+    }
+
     /// Two questions of one byte take one write, with the later question's value.
     #[test]
     fn the_later_of_two_questions_of_one_byte_wins() {
@@ -3526,14 +3543,14 @@ mod time_storage_write_tests {
         let chosen = super::super::choice_for_set(
             super::super::Selection::Picked {
                 picked: (picked, super::super::StateEvaluation::selectable()),
-                ranked_before: IncludedStates::empty(),
+                ranked_before: super::super::RankedBefore::default(),
             },
             PROMPT,
             &crate::exports::SetOptions {
                 volatile,
                 ..crate::exports::SetOptions::default()
             },
-            IncludedStates::all(),
+            super::super::ReadOnlyWriter::Set(&mut PendingOperations::new(UnsafeOperations::Allow)),
             &reader,
         )
         .map(drop)
