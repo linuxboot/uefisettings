@@ -40,6 +40,7 @@ use super::EFI_JSON_CAPSULE_ID_GUID;
 use super::EFI_TIME_SIZE;
 use crate::firmware_width::FirmwareWidth;
 use crate::hii::package::Guid;
+use crate::hii::package::MAX_ALLOWED_FILESIZE;
 use crate::hii::VariableKey;
 
 /// EFI_CAPSULE_REPORT_GUID, the vendor GUID of the result variables (UEFI 2.11 §8.5.6.1).
@@ -374,7 +375,8 @@ impl CapsuleResult {
     }
 
     /// The result of `table`, the JSON capsule result table: it reads the header of the width of
-    /// the firmware that lists the table, then the table's VariableTotalSize bytes.
+    /// the firmware that lists the table, then the table's VariableTotalSize bytes, at most
+    /// MAX_ALLOWED_FILESIZE.
     #[cfg(configuration_tables)]
     pub(crate) fn read(table: &impl VendorTable) -> Result<Self> {
         let width = table.firmware_width();
@@ -387,6 +389,9 @@ impl CapsuleResult {
             .variable_total_size;
         if usize::try_from(total_size)? < header {
             return Err(CapsuleResultError::TotalSizeShort { total_size, header }.into());
+        }
+        if u64::from(total_size) > MAX_ALLOWED_FILESIZE {
+            return Err(CapsuleResultError::TotalSizeLong { total_size }.into());
         }
 
         let bytes = table.read(usize::try_from(total_size)?).with_context(|| {
@@ -533,6 +538,11 @@ pub enum CapsuleResultError {
          its EFI_CAPSULE_RESULT_VARIABLE_HEADER (UEFI 2.11 section 8.5.6.1.1)"
     )]
     TotalSizeShort { total_size: u32, header: usize },
+    #[error(
+        "the capsule result's VariableTotalSize {total_size} is more than the \
+         {MAX_ALLOWED_FILESIZE} bytes that uefisettings reads"
+    )]
+    TotalSizeLong { total_size: u32 },
     #[error(
         "the capsule result's VariableTotalSize {total_size} is not its size, {size} bytes: \
          \"Size in bytes of the variable including any data beyond header\" (UEFI 2.11 section \
@@ -1813,8 +1823,9 @@ mod tests {
         }
     }
 
-    /// CapsuleResult::read refuses a VariableTotalSize under the header's size before reading
-    /// more, and reads that run past the table's memory, naming what it read.
+    /// CapsuleResult::read refuses a VariableTotalSize under the header's size or past the
+    /// largest table that uefisettings reads before reading more, and reads that run past the
+    /// table's memory, naming what it read.
     #[cfg(configuration_tables)]
     #[test]
     fn read_refuses_what_it_cannot_read() {
@@ -1847,6 +1858,16 @@ mod tests {
             assert_eq!(format!("{error:#}"), refusal, "{refusal}");
             assert_eq!(table.reads.borrow().clone(), reads, "{refusal}");
         }
+
+        let long = u32::try_from(MAX_ALLOWED_FILESIZE + 1).expect("a u32 size");
+        let table = TableInRegion::new(result(FirmwareWidth::Bits64, long, OTHER_GUID, 0, &[]));
+        let error = CapsuleResult::read(&table).expect_err("refuse the long table");
+        assert_eq!(
+            error.downcast_ref::<CapsuleResultError>(),
+            Some(&CapsuleResultError::TotalSizeLong { total_size: long }),
+            "{error:#}"
+        );
+        assert_eq!(table.reads.borrow().clone(), vec![48], "long: reads");
     }
 
     /// read_json_capsule_result names the GUID of a table that the firmware does not list.

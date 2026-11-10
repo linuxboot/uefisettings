@@ -106,7 +106,7 @@ fn config_data() -> Result<()> {
     Ok(())
 }
 
-/// Fails: only the UEFI Shell build reads the configuration tables.
+/// Fails: this build reads no configuration tables.
 #[cfg(not(configuration_tables))]
 fn config_data() -> Result<()> {
     Err(no_system_table())
@@ -134,21 +134,13 @@ fn result_table() -> Result<()> {
     Err(no_system_table())
 }
 
-/// What config-data and result-table fail with on Linux.
-#[cfg(all(target_os = "linux", not(configuration_tables)))]
-fn no_system_table() -> anyhow::Error {
-    anyhow!(
-        "reading this configuration table is not supported on Linux yet; run uefisettings.efi \
-         in the UEFI Shell"
-    )
-}
-
-/// What config-data and result-table fail with on macOS and Windows.
-#[cfg(all(not(target_os = "linux"), not(configuration_tables)))]
+/// What config-data and result-table fail with on macOS, Windows, and Linux where uefisettings
+/// reads no firmware memory map.
+#[cfg(not(configuration_tables))]
 fn no_system_table() -> anyhow::Error {
     anyhow!(
         "uefisettings reads the configuration tables of the EFI System Table only in the UEFI \
-         Shell with uefisettings.efi"
+         Shell with uefisettings.efi, and on Linux on x86, x86_64 and aarch64"
     )
 }
 
@@ -348,17 +340,15 @@ mod tests {
         }
     }
 
-    /// What config-data and result-table fail with on Linux.
-    #[cfg(all(target_os = "linux", not(configuration_tables)))]
-    const NO_SYSTEM_TABLE: &str = "reading this configuration table is not supported on Linux \
-                                   yet; run uefisettings.efi in the UEFI Shell";
-
-    /// What config-data and result-table fail with on macOS and Windows.
-    #[cfg(all(not(target_os = "linux"), not(configuration_tables)))]
+    /// What config-data and result-table fail with where uefisettings reads no configuration
+    /// tables.
+    #[cfg(not(configuration_tables))]
     const NO_SYSTEM_TABLE: &str = "uefisettings reads the configuration tables of the EFI System \
-                                   Table only in the UEFI Shell with uefisettings.efi";
+                                   Table only in the UEFI Shell with uefisettings.efi, and on \
+                                   Linux on x86, x86_64 and aarch64";
 
-    /// result-table refuses outside the UEFI Shell build, as config-data does.
+    /// result-table refuses where uefisettings reads no configuration tables, as config-data
+    /// does.
     #[cfg(not(configuration_tables))]
     #[test]
     fn result_table_refuses_without_a_system_table() {
@@ -367,7 +357,8 @@ mod tests {
         assert_eq!(error.to_string(), NO_SYSTEM_TABLE, "error");
     }
 
-    /// config-data refuses outside the UEFI Shell build, naming where it reads the table.
+    /// config-data refuses where uefisettings reads no configuration tables, naming where it
+    /// reads them.
     #[cfg(not(configuration_tables))]
     #[test]
     fn config_data_refuses_without_a_system_table() {

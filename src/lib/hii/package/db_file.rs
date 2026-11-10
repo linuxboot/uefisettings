@@ -22,9 +22,7 @@ use anyhow::Result;
 use log::debug;
 use thiserror::Error;
 
-/// The largest HiiDB file that read_db_bytes reads; the HiiDB efivar's length and
-/// `hiidb_driver.rs`'s cap on a read through the driver are bounded by it too.
-pub(crate) const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
+pub(crate) use super::MAX_ALLOWED_FILESIZE;
 
 /// The HiiDB in the file at `path`.
 pub(crate) fn read_db_file(path: &Path) -> Result<Vec<u8>> {

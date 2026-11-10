@@ -18,13 +18,13 @@
 //! aarch64, 44 on i686, whose guest is 32-bit as its firmware is. `capsule results` writes what
 //! it printed to the test log, for `tests/qemu/check-shell-log.sh` to compare with what
 //! `uefisettings.efi` prints in the UEFI Shell, the next boot of the scenario. And
-//! `capsule result-table`, which the Linux build refuses, though `publish-hiidb.efi
-//! json-capsule-result` installs the JSON capsule result table (§23.5.3).
+//! `capsule result-table`, which prints from physical memory the JSON capsule result table
+//! (§23.5.3) that `publish-hiidb.efi json-capsule-result` installs, with the header and the
+//! CapsuleStatus of the firmware's width.
 
+use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::write_for_the_shell;
-use uefisettings_qemu_guest::ErrorObject;
-use uefisettings_qemu_guest::NO_CONFIGURATION_TABLES_ON_LINUX;
 
 /// The size of the EFI_CAPSULE_RESULT_VARIABLE_HEADER of the firmware, of this guest's width.
 const HEADER_SIZE: u64 = 40 + usize::BITS as u64 / 8;
@@ -118,13 +118,37 @@ fn results_prints_the_result_variables() {
     write_for_the_shell("results", &output);
 }
 
+/// EFI_UNSUPPORTED, the CapsuleStatus of the table, a UINTN of the firmware's width.
+const UNSUPPORTED: u64 = 1 << (usize::BITS - 1) | 3;
+/// The Resp of the table's EFI_CAPSULE_RESULT_VARIABLE_JSON.
+const RESP: &str = "{\"uefisettings\":\"json-capsule-result\"}";
+/// The table's VariableTotalSize: the header, then the JSON result's Version, CapsuleId and
+/// RespLength, and Resp.
+const RESULT_TABLE_SIZE: u64 = HEADER_SIZE + 12 + RESP.len() as u64;
+
 #[test]
-fn result_table_refuses_on_linux() {
-    let output = uefisettings(&["capsule", "result-table"]);
-    let error: ErrorObject = output.json(1);
+fn result_table_prints_the_table() {
+    let report: serde_json::Value = json(&["capsule", "result-table"]);
 
     assert_eq!(
-        error.error_message, NO_CONFIGURATION_TABLES_ON_LINUX,
-        "{output:#?}"
+        report,
+        serde_json::json!({
+            "variable_total_size": RESULT_TABLE_SIZE,
+            "capsule_guid": "67D6F4CD-D6B8-4573-BF4A-DE5E252D61AE",
+            "capsule_processed": {
+                "year": 2026,
+                "month": 11,
+                "day": 7,
+                "hour": 1,
+                "minute": 2,
+                "second": 3,
+                "nanosecond": 0,
+                "time_zone": 2047,
+                "daylight": 0,
+            },
+            "capsule_status": status(UNSUPPORTED),
+            "json": { "capsule_id": 9, "resp": { "text": RESP } },
+        }),
+        "the table of publish-hiidb.efi json-capsule-result"
     );
 }

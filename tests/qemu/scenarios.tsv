@@ -44,7 +44,11 @@ shell-rng	-	-	shell:rng	devices=virtio-rng
 capsule	-	-	capsule	arch=x86_64,aarch64
 capsule-payload	-	-	capsule/deliver_refuses_an_empty_or_missing_payload	arch=i686
 shell-capsule	-	-	shell:capsule	-
-json-config-data	/publish-hiidb.efi json-config-data	-	capsule_config_data	-
+json-config-data	/publish-hiidb.efi json-config-data	-	capsule_config_data/prints_the_table	-
+json-config-data-vamap	/publish-hiidb.efi json-config-data	-	capsule_config_data/prints_the_table	kernel=vamap arch=aarch64
+json-config-data-past-region	/publish-hiidb.efi json-config-data-past-region	-	capsule_config_data/refuses_a_table_past_its_region	-
+json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services	-	capsule_config_data/refuses_a_table_in_boot_services_data	-
+json-config-data-mmio	/publish-hiidb.efi json-config-data-mmio	-	capsule_config_data/refuses_a_table_in_memory_mapped_io	-
 shell-json-config-data	/publish-hiidb.efi json-config-data	-	shell:json-config-data	-
 shell-json-config-data-past-region	/publish-hiidb.efi json-config-data-past-region	-	shell:json-config-data-refused	-
 shell-json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services	-	shell:json-config-data-refused	-

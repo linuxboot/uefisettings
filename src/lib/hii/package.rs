@@ -489,6 +489,12 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     })
 }
 
+/// The largest HiiDB file that read_db_bytes reads; the HiiDB efivar's length and
+/// `hiidb_driver.rs`'s cap on a read through the driver are bounded by it too. So are the JSON
+/// configuration and capsule result tables, which firmware sizes, on every build that reads
+/// them.
+pub(crate) const MAX_ALLOWED_FILESIZE: u64 = 16 * 1024 * 1024;
+
 #[cfg(hiidb_files)]
 pub(crate) mod db_file;
 #[cfg(test)]

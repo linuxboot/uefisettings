@@ -36,9 +36,14 @@ impl PhysicalRange {
         Self::new(start, end.checked_sub(start)?.checked_add(1)?)
     }
 
-    #[cfg(test)]
+    #[cfg(any(firmware_memory_maps, test))]
     pub(crate) fn start(self) -> u64 {
         self.start
+    }
+
+    #[cfg(any(firmware_memory_maps, test))]
+    pub(crate) fn size(self) -> u64 {
+        self.size
     }
 
     /// The end, exclusive.

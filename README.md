@@ -166,7 +166,8 @@ when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
 `variable list` and `variable storage` fail there: the firmware environment calls reach a
 variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
 reach EFI variables only. `capsule config-data` and `capsule result-table` fail too:
-`uefisettings` reads their configuration tables only in the UEFI Shell.
+`uefisettings` reads the configuration tables of the EFI System Table only in the UEFI Shell, and on
+Linux on x86, x86_64 and aarch64.
 
 ---
 
@@ -550,8 +551,13 @@ firmware asked for.
 configuration table, the EFI_JSON_CAPSULE_CONFIG_DATA of the configuration table of
 EFI_JSON_CONFIG_DATA_TABLE_GUID (§4.6.1.2, §23.5.2), as a JSON object of its own, with no `-j`:
 `items`, the ConfigData of each item in order, as `{"text": ...}` if it is UTF-8, else as
-`{"hex": ...}`. It fails where the firmware lists no such table. Reading the table is not
-supported on Linux yet: `uefisettings.efi` reads it in the UEFI Shell. The firmware reports
+`{"hex": ...}`. It fails where the firmware lists no such table. On Linux it reads the table
+from `/dev/mem`, as root, where the EFI System Table that Linux locates lists it (x86:
+`/sys/kernel/boot_params/data` and `/sys/firmware/efi/config_table`; aarch64: the FDT of
+`/sys/firmware/fdt`), and only inside one EFI runtime region of the firmware's memory map that is no
+memory-mapped I/O (x86: `/sys/firmware/efi/runtime-map`; aarch64: the FDT's, from `/proc/kcore`),
+once the kernel lockdown mode allows `/dev/mem`; it takes the table's address as virtual first, as
+SetVirtualAddressMap() converts it (§4.6.1.2), then as physical. The firmware reports
 cached configuration data unless OsIndications held JSON_CONFIG_DATA_REFRESH at boot, when it
 collects the current data and clears that bit (§8.5.4):
 `variable set OsIndications JSON_CONFIG_DATA_REFRESH` asks for current data at the next boot,

@@ -44,10 +44,18 @@ use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableInfoSource;
 use crate::efi_variables::VariableNames;
 use crate::efi_variables::VariableStorageInfo;
+#[cfg(configuration_tables)]
+use crate::efi_variables::VendorTable;
+#[cfg(configuration_tables)]
+use crate::efi_variables::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
+#[cfg(configuration_tables)]
+use crate::efi_variables::EFI_JSON_CONFIG_DATA_TABLE_GUID;
 use crate::firmware_width::read_fw_platform_size;
 use crate::firmware_width::FirmwareWidth;
 use crate::firmware_width::FW_PLATFORM_SIZE_PATH;
 use crate::hii::extract;
+#[cfg(configuration_tables)]
+use crate::hii::system_vendor_table;
 use crate::hii::EfivarDump;
 use crate::hii::EfivarFiles;
 use crate::hii::EfivarSource;
@@ -108,6 +116,22 @@ impl CapsuleBackend {
     /// The width of the firmware, as Linux tells it in fw_platform_size.
     pub(super) fn system_firmware_width() -> Result<FirmwareWidth> {
         read_fw_platform_size(Path::new(FW_PLATFORM_SIZE_PATH))
+    }
+}
+
+/// What the capsule commands read: the configuration tables of this machine's System Table, from
+/// physical memory.
+#[cfg(configuration_tables)]
+impl CapsuleBackend {
+    /// The JSON configuration table, whose VendorTable SetVirtualAddressMap() converts (UEFI 2.11
+    /// §4.6.1.2).
+    pub(super) fn system_json_config_data_table() -> Result<Option<impl VendorTable>> {
+        system_vendor_table(&EFI_JSON_CONFIG_DATA_TABLE_GUID)
+    }
+
+    /// The JSON capsule result table, whose VendorTable SetVirtualAddressMap() converts too.
+    pub(super) fn system_json_capsule_result_table() -> Result<Option<impl VendorTable>> {
+        system_vendor_table(&EFI_JSON_CAPSULE_RESULT_TABLE_GUID)
     }
 }
 

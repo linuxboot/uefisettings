@@ -192,22 +192,23 @@ Version 2, which no UEFI version defines and which Linux reads all the same.
 `publish-hiidb.efi json-config-data` publishes nothing: it installs an
 `EFI_JSON_CAPSULE_CONFIG_DATA` of two items, JSON text and bytes that are no UTF-8, as the EFI
 configuration table of `EFI_JSON_CONFIG_DATA_TABLE_GUID`, at an address that it never converts,
-as it does not run when `SetVirtualAddressMap()` does. The scenario `json-config-data` checks
-that the Linux build refuses `capsule config-data`, and `shell-json-config-data` that
-`uefisettings.efi` prints it in the UEFI Shell.
+as it does not run when `SetVirtualAddressMap()` does. The scenarios `json-config-data` and, on
+aarch64 with `kernel=vamap`, `json-config-data-vamap` check that the Linux build prints it with
+`capsule config-data`, and `shell-json-config-data` that `uefisettings.efi` prints it in the UEFI
+Shell.
 `publish-hiidb.efi json-config-data-past-region` installs the same
 table with a TotalLength of 16 MiB, past the runtime region that holds it,
 `json-config-data-boot-services` in boot services data, and `json-config-data-mmio` points the
-configuration table at runtime memory-mapped I/O; the scenarios
-`shell-json-config-data-past-region`, `-boot-services` and `-mmio` check that the UEFI Shell
-refuses each.
+configuration table at runtime memory-mapped I/O; the scenarios `json-config-data-past-region`,
+`-boot-services` and `-mmio` check that the Linux build refuses each, and
+`shell-json-config-data-past-region`, `-boot-services` and `-mmio` that the UEFI Shell does.
 
 `publish-hiidb.efi json-capsule-result` publishes nothing either: it installs the result of
 processing a JSON capsule, an `EFI_CAPSULE_RESULT_VARIABLE_HEADER` and an
 `EFI_CAPSULE_RESULT_VARIABLE_JSON`, as the EFI configuration table of
 `EFI_JSON_CAPSULE_RESULT_TABLE_GUID`, with a CapsuleStatus of the driver's width, at an address
 that it never converts. The scenarios `capsule-results` (x86_64, aarch64) and
-`capsule-results-i686` check that the Linux build refuses `capsule result-table`, and print
+`capsule-results-i686` check that the Linux build prints it with `capsule result-table`, and print
 with `capsule results` the variables of
 [`vars/capsule-results-64.json`](vars/capsule-results-64.json) or
 [`vars/capsule-results-32.json`](vars/capsule-results-32.json): three results, of a JSON capsule,

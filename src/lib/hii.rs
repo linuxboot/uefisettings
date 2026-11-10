@@ -51,6 +51,10 @@ mod lockdown;
 mod memory_access_denied;
 pub mod package;
 mod strings;
+// The EFI System Table and its configuration tables, which the Linux build reads from physical
+// memory where a firmware memory map bounds the reads.
+#[cfg(firmware_memory_maps)]
+mod system_table;
 #[cfg(target_os = "uefi")]
 mod variable_services;
 mod variables;
@@ -98,6 +102,10 @@ pub use memory_access_denied::MemoryAccessDenied;
 pub use memory_access_denied::MemoryDevice;
 #[cfg(target_os = "linux")]
 pub use memory_access_denied::MemoryOperation;
+#[cfg(firmware_memory_maps)]
+pub(crate) use system_table::system_vendor_table;
+#[cfg(firmware_memory_maps)]
+pub use system_table::SystemTableError;
 #[cfg(target_os = "uefi")]
 pub(crate) use variable_services::VariableServices;
 pub(crate) use variables::EfivarReader;

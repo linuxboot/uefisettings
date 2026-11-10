@@ -159,6 +159,9 @@ pub use crate::hii::MemoryType;
 /// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
 #[cfg(firmware_memory_maps)]
 pub use crate::hii::RangeRefusal;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use crate::hii::SystemTableError;
 #[cfg(any(variable_storage_info, variable_data))]
 pub use crate::hii::VariableAttributes;
 #[cfg(any(variable_names, variable_info))]

@@ -96,6 +96,11 @@ impl<M: PhysicalMemory> RuntimeMemory<M> {
     pub(in crate::hii) fn region_end(&self, address: u64, length: usize) -> Result<u64> {
         self.map.runtime_range_end(address, u64::try_from(length)?)
     }
+
+    /// The memory map that bounds the reads.
+    pub(in crate::hii) fn map(&self) -> &EfiMemoryMap {
+        &self.map
+    }
 }
 
 /// The firmware-reserved regions of `map` in `memory`: all that the efivar source reads with

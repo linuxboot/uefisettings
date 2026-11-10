@@ -177,6 +177,11 @@ pub enum RangeRefusal {
 struct RuntimeDescriptor {
     memory_type: MemoryType,
     range: PhysicalRange,
+    /// The addresses from VirtualStart on that SetVirtualAddressMap() gave the range, unless they
+    /// overflow, as from the U64_MAX with which arm64's EFI stub marks a failed call (Linux v6.11
+    /// drivers/firmware/efi/libstub/fdt.c:310-322).
+    #[cfg(any(firmware_memory_maps, test))]
+    virtual_range: Option<PhysicalRange>,
 }
 
 /// The runtime descriptors of an EFI memory map, in the order given to new.
@@ -194,14 +199,17 @@ impl EfiMemoryMap {
             .into_iter()
             .filter(|descriptor| descriptor.attribute & EFI_MEMORY_RUNTIME != 0)
             .map(|descriptor| {
+                let range = descriptor.physical_range().with_context(|| {
+                    format!(
+                        "the EFI runtime descriptor at {:#x} overflows",
+                        descriptor.physical_start
+                    )
+                })?;
                 Ok(RuntimeDescriptor {
                     memory_type: descriptor.memory_type,
-                    range: descriptor.physical_range().with_context(|| {
-                        format!(
-                            "the EFI runtime descriptor at {:#x} overflows",
-                            descriptor.physical_start
-                        )
-                    })?,
+                    range,
+                    #[cfg(any(firmware_memory_maps, test))]
+                    virtual_range: PhysicalRange::new(descriptor.virtual_start, range.size()),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -226,6 +234,23 @@ impl EfiMemoryMap {
             .ok_or(RangeRefusal::NotRuntime { address, length })?
             .range
             .end())
+    }
+
+    /// The physical address of `address`, a virtual address of the map that the OS gave
+    /// SetVirtualAddressMap() (UEFI 2.11 §8.4.1): the same offset in the first runtime descriptor
+    /// whose virtual range holds it, if any. Linux gives each runtime descriptor virtual addresses
+    /// of its own, and VirtualStart equal to PhysicalStart where its EFI stub calls no
+    /// SetVirtualAddressMap() (Linux v6.11 drivers/firmware/efi/libstub/efi-stub.c:248-249).
+    #[cfg(any(firmware_memory_maps, test))]
+    pub(crate) fn physical_address(&self, address: u64) -> Option<u64> {
+        self.runtime.iter().find_map(|descriptor| {
+            let virtual_range = descriptor.virtual_range?;
+            let offset = address.checked_sub(virtual_range.start())?;
+            virtual_range
+                .holds(address, 1)
+                .then_some(offset)
+                .and_then(|offset| descriptor.range.start().checked_add(offset))
+        })
     }
 
     /// Refuses `length` bytes at `address` that touch a runtime descriptor of memory-mapped I/O.
@@ -359,6 +384,38 @@ mod tests {
                 (got, want) => panic!("{address:#x}+{length:#x}: got {got:?}, want {want:?}"),
             }
         }
+    }
+
+    /// physical_address translates an address of a runtime descriptor's virtual range to the
+    /// same offset of its physical range, as after SetVirtualAddressMap() on eMAG; addresses of no
+    /// virtual range translate nothing, nor do those of a descriptor that is not runtime or whose
+    /// virtual range overflows, as after a failed call.
+    #[test]
+    fn physical_address_translates_through_the_virtual_ranges() {
+        let map = svam_map();
+        for (address, want) in [
+            (0x2058_fb18, Some(0x7ffd_fb18)),
+            (0x2058_0000, Some(0x7ffd_0000)),
+            (0x2058_ffff, Some(0x7ffd_ffff)),
+            (0x2050_1ff0, Some(0x7c75_1ff0)),
+            // past a virtual range's end, before its start, a physical address, and the virtual
+            // start of the descriptor that is not runtime
+            (0x2059_0000, None),
+            (0x204f_ffff, None),
+            (0x7ffd_fb18, None),
+            (0, None),
+        ] {
+            assert_eq!(map.physical_address(address), want, "{address:#x}");
+        }
+
+        let failed = runtime_map(&[(0x7ffd_0000, u64::MAX, 0x10, RUNTIME_DATA)]);
+        assert_eq!(failed.physical_address(u64::MAX), None, "U64_MAX");
+        let identity = runtime_map(&[(0x7ffd_0000, 0x7ffd_0000, 0x10, RUNTIME_DATA)]);
+        assert_eq!(
+            identity.physical_address(0x7ffd_fb18),
+            Some(0x7ffd_fb18),
+            "VirtualStart equal to PhysicalStart"
+        );
     }
 
     /// Runtime descriptors of memory-mapped I/O, of either type, are refused, as the map that

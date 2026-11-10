@@ -55,12 +55,6 @@ pub const EFIVARS: &str = "/sys/firmware/efi/efivars";
 pub const HIIDB_VARIABLE: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 
-/// What the Linux build says to `capsule config-data` and `capsule result-table`, as it does not
-/// read their configuration tables yet (`src/capsule_command.rs`).
-pub const NO_CONFIGURATION_TABLES_ON_LINUX: &str =
-    "reading this configuration table is not supported on Linux yet; run uefisettings.efi in \
-     the UEFI Shell";
-
 /// The variable in which publish-hiidb puts the CRC-32 of the HII database that
 /// [`HIIDB_VARIABLE`] points at.
 pub const HIIDB_CRC32_VARIABLE: &str =

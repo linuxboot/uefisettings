@@ -14,7 +14,7 @@
 //! initializes the uefi crate before std's efi_main runs.
 //!
 //! Each of CAPABILITIES is a cfg for what some builds lack, for shared modules to test instead of
-//! OS names.
+//! OS names; a cfg of two of them builds where either does.
 
 use std::env;
 use std::env::VarError;
@@ -27,7 +27,7 @@ struct Capability {
     target_arches: Option<&'static [&'static str]>,
 }
 
-const CAPABILITIES: [Capability; 11] = [
+const CAPABILITIES: [Capability; 12] = [
     // HiiBackend::system_hiidb: this machine's HiiDB
     Capability {
         cfg: "system_hiidb",
@@ -97,11 +97,17 @@ const CAPABILITIES: [Capability; 11] = [
         target_arches: None,
     },
     // VendorTable and CapsuleBackend::json_config_data: the configuration tables of the EFI
-    // System Table, which the UEFI Shell build reads in place
+    // System Table, which the UEFI Shell build reads in place, and the Linux build from physical
+    // memory where it reads a firmware memory map, which bounds those reads (firmware_memory_maps)
     Capability {
         cfg: "configuration_tables",
         target_oses: &["uefi"],
         target_arches: None,
+    },
+    Capability {
+        cfg: "configuration_tables",
+        target_oses: &["linux"],
+        target_arches: Some(&["x86", "x86_64", "aarch64"]),
     },
 ];
 

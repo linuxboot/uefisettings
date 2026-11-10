@@ -29,6 +29,8 @@ use super::VendorTable;
 use super::EFI_JSON_CAPSULE_ID_GUID;
 #[cfg(configuration_tables)]
 use crate::hii::package::Guid;
+#[cfg(configuration_tables)]
+use crate::hii::package::MAX_ALLOWED_FILESIZE;
 
 /// sizeof (EFI_CAPSULE_HEADER): CapsuleGuid, then the UINT32s HeaderSize, Flags and
 /// CapsuleImageSize (UEFI 2.11 §8.5.3.1). A JSON capsule's HeaderSize, as its
@@ -210,7 +212,8 @@ pub struct JsonConfigData {
 #[cfg(configuration_tables)]
 impl JsonConfigData {
     /// The configuration data of `table`, an EFI_JSON_CAPSULE_CONFIG_DATA: it reads its Version
-    /// and TotalLength, then its TotalLength bytes, which must hold its items whole.
+    /// and TotalLength, then its TotalLength bytes, at most MAX_ALLOWED_FILESIZE, which must hold
+    /// its items whole.
     pub(crate) fn read(table: &impl VendorTable) -> Result<Self> {
         let header = table
             .read(CONFIG_DATA_HEADER_SIZE)
@@ -231,6 +234,9 @@ impl JsonConfigData {
         let length = usize::try_from(total_length)?;
         if length < CONFIG_DATA_HEADER_SIZE {
             return Err(ConfigDataError::TotalLengthShort(total_length).into());
+        }
+        if u64::from(total_length) > MAX_ALLOWED_FILESIZE {
+            return Err(ConfigDataError::TotalLengthLong(total_length).into());
         }
 
         let table = table.read(length).with_context(|| {
@@ -290,6 +296,11 @@ pub(crate) enum ConfigDataError {
          bytes of its Version and TotalLength (UEFI 2.11 section 23.5.2)"
     )]
     TotalLengthShort(u32),
+    #[error(
+        "the JSON configuration table's TotalLength {0} is more than the {MAX_ALLOWED_FILESIZE} \
+         bytes that uefisettings reads"
+    )]
+    TotalLengthLong(u32),
     #[error(
         "the item at offset {offset} of the JSON configuration table has a ConfigDataLength of \
          {length}, which runs its ConfigData past the table's TotalLength {total_length} (UEFI \
@@ -568,6 +579,7 @@ mod tests {
     fn json_config_data_refuses_what_the_specification_does_not_lay_out() {
         let past_item = [&5u32.to_le_bytes()[..], b"abcde"].concat();
         let past_second = [fixture::item(b"x"), u32::MAX.to_le_bytes().to_vec()].concat();
+        let long = u32::try_from(MAX_ALLOWED_FILESIZE + 1).expect("a u32 length");
         for (case, region, want, reads) in [
             (
                 "Version 2",
@@ -591,6 +603,12 @@ mod tests {
                 "TotalLength 0",
                 fixture::config_data(1, 0, &[]),
                 ConfigDataError::TotalLengthShort(0),
+                &[8],
+            ),
+            (
+                "a TotalLength past the largest table that uefisettings reads",
+                fixture::config_data(1, long, &[]),
+                ConfigDataError::TotalLengthLong(long),
                 &[8],
             ),
             (
