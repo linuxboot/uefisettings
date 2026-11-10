@@ -17,7 +17,9 @@
 //! Where UEFI 2.11 and edk2 disagree, the ops here follow edk2, as the table says: conditions
 //! decide which questions a user sees and sets, as the platform's setup browser, mostly edk2's,
 //! shows them, and the spec would make every EQ_ID_VAL of a CHECKBOX, which holds a BOOLEAN,
-//! UNDEFINED. Where edk2 ASSERTs, the result is not evaluated. Lines are of edk2-stable202608.
+//! UNDEFINED. Where edk2 ASSERTs, the result is not evaluated; where a CONDITIONAL drops an
+//! UNDEFINED and the two results differ in effect, it is undetermined, naming both. Lines are of
+//! edk2-stable202608.
 //!
 //! | Operation | UEFI 2.11 | edk2 | Here |
 //! |---|---|---|---|
@@ -27,6 +29,7 @@
 //! | Two DATEs, TIMEs or buffers compared | UNDEFINED, as no strings, Booleans or unsigned integers (§33.2.5.7.4, §33.3.8.3.18) | by their bytes, then the longer greater (IsTypeInBuffer, Expression.c:985-1000, :2295-2319) | edk2 |
 //! | The right operand of MULTIPLY, DIVIDE and MODULO | 64 bits (§33.3.8.3.43, §33.3.8.3.15, §33.3.8.3.42) | its low 32 bits (Expression.c:3398-3406) | edk2 |
 //! | EQ_ID_VAL_LIST | the question's value in the list (§33.3.8.3.20) | its low 16 bits (Expression.c:2716) | edk2 |
+//! | An UNDEFINED that a CONDITIONAL drops | a value, which the CONDITIONAL drops, pushing the other one (§33.2.5.7.4, §33.3.8.3.10) | the end of the expression, whose result it is (Expression.c:3713-3715) | undetermined, but where both have one effect: a condition FALSE, a READ the stored value's value (no value only where the whole expression diverges), a match expression no match, an EFI_IFR_VALUE no UINT64, a WRITE the same SETs, where the spec goes on to the end with no SET, op not evaluated or malformed op past edk2's end, or that of an expression of a MAP in it; a return expression of a MAP that gives a value ends the expression at the MAP, which the spec's value goes on in |
 //! | A zero divisor; a shift of 64 bits or more | UNDEFINED, as DIVIDE and MODULO push (§33.3.8.3.15, §33.3.8.3.42); no limit (§33.3.8.3.67, §33.3.8.3.68) | an ASSERT (MdePkg/Library/BaseLib/DivU64x32.c:34, DivU64x32Remainder.c:38, LShiftU64.c:33, RShiftU64.c:33) | not evaluated |
 //! | A SET after an UNDEFINED | EFI_IFR_SET (§33.3.8.3.66) stores its value and pushes TRUE or FALSE | never reached, as the expression ends at the UNDEFINED (Expression.c:3713-3715) | edk2: no SET planned |
 
@@ -1350,23 +1353,18 @@ pub(crate) fn evaluate_condition(
 ) -> Truth {
     let mut evaluation = Evaluation::new(inputs, Role::Reads);
     match evaluation.run(scope) {
-        Ok(Operand::Boolean(Some(value))) => Truth::Known(value != 0),
-        Ok(Operand::Uint(Some(value))) => Truth::Known(value != 0),
-        Ok(Operand::Boolean(None) | Operand::Uint(None)) => {
-            Truth::Unknown(evaluation.into_unknown())
-        }
-        // edk2-stable202608 SetupBrowserDxe/Expression.c IsTrue takes a DATE, TIME, STRING or
-        // buffer as FALSE
-        Ok(Operand::Date(_) | Operand::Time(_) | Operand::String(_) | Operand::Buffer(_)) => {
-            Truth::Known(false)
-        }
+        Ok(operand) => match operand.is_true() {
+            Some(truth) => Truth::Known(truth),
+            None => Truth::Unknown(evaluation.into_unknown()),
+        },
         // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends at an
         // UNDEFINED, keeping it as the result, which IsTrue takes as FALSE
-        Ok(Operand::Undefined) | Err(Abort::Undefined) => Truth::Known(false),
+        Err(Abort::Undefined) => Truth::Known(false),
         // edk2-stable202608 SetupBrowserDxe/Presentation.c EvaluateFormExpressions refuses to
         // show the form
         Err(Abort::Malformed(reason)) => Truth::Unknown(format!("malformed condition: {reason}")),
         Err(Abort::NotEvaluated(reason)) => Truth::Unknown(reason),
+        Err(Abort::Diverged(divergence)) => divergence.truth(),
     }
 }
 
@@ -1448,11 +1446,15 @@ pub(crate) fn evaluate_value(
     let mut evaluation = Evaluation::new(inputs, Role::Reads);
     match evaluation.run(scope).and_then(|operand| operand.as_u64()) {
         Ok(value) => value.ok_or_else(|| evaluation.into_unknown()),
-        Err(Abort::Undefined) => Err("UNDEFINED result".to_string()),
+        Err(Abort::Undefined) => Err(UNDEFINED_RESULT.to_string()),
         Err(Abort::Malformed(reason)) => Err(format!("malformed expression: {reason}")),
         Err(Abort::NotEvaluated(reason)) => Err(reason),
+        Err(Abort::Diverged(divergence)) => Err(divergence.why_no_value()),
     }
 }
+
+/// Why an EFI_IFR_VALUE that gives UNDEFINED, or no UINT64, gives no value.
+const UNDEFINED_RESULT: &str = "UNDEFINED result";
 
 /// What the READ expression of a question gives.
 #[derive(Debug, PartialEq, Eq)]
@@ -1478,10 +1480,11 @@ pub(crate) fn evaluate_read(
     let Some(expression) = question_expression(question, QuestionExpression::Read) else {
         return ReadOutcome::NoRead;
     };
+    let stored = stored_operand(&this);
     let mut evaluation = Evaluation::new(inputs, Role::Read(this));
     match evaluation.run_ops(&expression) {
         Ok(Operand::Undefined) | Err(Abort::Undefined | Abort::Malformed(_)) => ReadOutcome::Stored,
-        Ok(operand) => match ExpressionValue::of(operand) {
+        Ok(operand) => match ExpressionValue::of(&operand) {
             Some(value) => ReadOutcome::Value(value),
             None => ReadOutcome::Refused(
                 evaluation.into_refusal(QuestionExpression::Read, "no value".to_string()),
@@ -1490,6 +1493,18 @@ pub(crate) fn evaluate_read(
         Err(Abort::NotEvaluated(reason)) => {
             ReadOutcome::Refused(evaluation.into_refusal(QuestionExpression::Read, reason))
         }
+        Err(Abort::Diverged(divergence)) => divergence.read(stored.as_ref()),
+    }
+}
+
+/// The stored value `this` of a question as an operand; None for one that cannot be read.
+fn stored_operand(this: &QuestionValue) -> Option<Operand> {
+    match this {
+        QuestionValue::Boolean(value) => Some(Operand::Boolean(Some(*value))),
+        QuestionValue::Uint(value) => Some(Operand::Uint(Some(*value))),
+        QuestionValue::Date(value) => Some(Operand::Date(Some(*value))),
+        QuestionValue::Time(value) => Some(Operand::Time(Some(*value))),
+        QuestionValue::Unreadable { .. } => None,
     }
 }
 
@@ -1523,6 +1538,13 @@ pub(crate) fn evaluate_write(
         }
         Err(Abort::NotEvaluated(reason)) => {
             return Err(evaluation.into_refusal(QuestionExpression::Write, reason))
+        }
+        Err(Abort::Diverged(divergence)) if divergence.keeps_sets() => {}
+        Err(Abort::Diverged(divergence)) => {
+            return Err(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Write,
+                reason: divergence.text(", after the SETs before it"),
+            })
         }
     }
     drop(evaluation);
@@ -1686,6 +1708,22 @@ impl Operand {
         }
     }
 
+    /// Returns the value as the truth of a condition, as edk2-stable202608
+    /// SetupBrowserDxe/Expression.c IsTrue takes it (:3760-3784): a BOOLEAN or integer TRUE if not
+    /// 0, a DATE, TIME, STRING, buffer or UNDEFINED FALSE; None for a BOOLEAN or integer that
+    /// cannot be read.
+    fn is_true(&self) -> Option<bool> {
+        match self {
+            Operand::Boolean(value) => value.map(|value| value != 0),
+            Operand::Uint(value) => value.map(|value| value != 0),
+            Operand::Date(_)
+            | Operand::Time(_)
+            | Operand::String(_)
+            | Operand::Buffer(_)
+            | Operand::Undefined => Some(false),
+        }
+    }
+
     /// The type of a STRING or buffer, which ops that do not evaluate it name, else None.
     fn unevaluated_type(&self) -> Option<&'static str> {
         match self {
@@ -1715,6 +1753,27 @@ impl Operand {
         };
         let kind = self.unevaluated_type()?;
         (length > MAX_OPERAND_LENGTH).then(|| format!("a {kind} of {length} {unit}"))
+    }
+
+    /// The value, as a divergence names it; None for one that cannot be read, or UNDEFINED.
+    fn shown(&self) -> Option<String> {
+        match self {
+            Operand::Boolean(value) => value.map(|value| match value {
+                0 => "FALSE".to_string(),
+                1 => "TRUE".to_string(),
+                other => format!("TRUE ({other})"),
+            }),
+            Operand::Uint(value) => value.map(|value| value.to_string()),
+            Operand::Date(value) => value.map(|bytes| format!("the EFI_HII_DATE {bytes:02X?}")),
+            Operand::Time(value) => value.map(|bytes| format!("the EFI_HII_TIME {bytes:02X?}")),
+            Operand::String(value) => value
+                .as_deref()
+                .map(|units| format!("{:?}", String::from_utf16_lossy(units))),
+            Operand::Buffer(value) => value
+                .as_deref()
+                .map(|bytes| format!("the buffer {bytes:02X?}")),
+            Operand::Undefined => None,
+        }
     }
 
     /// What edk2-stable202608 SetupBrowserDxe/Expression.c CompareHiiValue compares of it: an
@@ -1814,14 +1873,20 @@ pub(crate) enum ExpressionValue {
 
 impl ExpressionValue {
     /// Returns `operand` if its value can be read and is of a type that a READ gives here.
-    fn of(operand: Operand) -> Option<Self> {
-        match operand {
+    fn of(operand: &Operand) -> Option<Self> {
+        match *operand {
             Operand::Boolean(value) => value.map(Self::Boolean),
             Operand::Uint(value) => value.map(Self::Uint),
             Operand::Date(value) => value.map(Self::Date),
             Operand::Time(value) => value.map(Self::Time),
             Operand::String(_) | Operand::Buffer(_) | Operand::Undefined => None,
         }
+    }
+
+    /// The value that a READ giving `operand` gives its question, as retrieve_question_value takes
+    /// it, if any.
+    fn read_from(operand: &Operand) -> Option<u64> {
+        Self::of(operand).map(Self::as_u64)
     }
 
     /// Returns the value as edk2-stable202608 SetupBrowserDxe/Expression.c HiiValueToUINT64
@@ -1906,6 +1971,12 @@ pub(crate) enum ExpressionRefusal {
     /// A WRITE that edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue fails on
     #[error("its {expression} expression is malformed: {reason}")]
     Malformed {
+        expression: QuestionExpression,
+        reason: String,
+    },
+    /// edk2-stable202608 SetupBrowserDxe and UEFI 2.11 give it two results, which `reason` names
+    #[error("its {expression} expression is undetermined: {reason}")]
+    Undetermined {
         expression: QuestionExpression,
         reason: String,
     },
@@ -2142,6 +2213,181 @@ enum Abort {
     /// e.g. one on an empty stack
     Malformed(String),
     NotEvaluated(String),
+    /// edk2 and UEFI 2.11 give the expression two results
+    Diverged(Box<Divergence>),
+}
+
+/// Where edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends an expression at
+/// an UNDEFINED, while UEFI 2.11 makes UNDEFINED a value that later ops take (§33.2.5.7.4), which
+/// a CONDITIONAL drops (§33.3.8.3.10), and gives another result.
+#[derive(Debug, PartialEq, Eq)]
+struct Divergence {
+    /// The op that gives the UNDEFINED
+    ended: &'static str,
+    /// The expression that edk2 ends there
+    place: Place,
+    /// What UEFI 2.11 gives
+    spec: SpecResult,
+}
+
+impl Divergence {
+    /// Names both results: edk2's, with its `consequence` where it ends the whole expression, and
+    /// the spec's.
+    fn text(&self, consequence: &str) -> String {
+        let (place, consequence) = match self.place {
+            Place::Whole => ("the expression", consequence),
+            Place::Match => (
+                "a match expression of EFI_IFR_MAP",
+                ", taking the next pair",
+            ),
+            Place::Return => (
+                "a return expression of EFI_IFR_MAP",
+                ", which the MAP gives",
+            ),
+        };
+        format!(
+            "edk2-stable202608 SetupBrowserDxe ends {place} at the UNDEFINED of {}{consequence}, \
+             while UEFI 2.11 takes UNDEFINED as a value, which an EFI_IFR_CONDITIONAL drops \
+             (§33.2.5.7.4, §33.3.8.3.10), and gives {}",
+            self.ended, self.spec
+        )
+    }
+
+    /// The value that UEFI 2.11 gives the whole expression, if it can be read.
+    fn spec_value(&self) -> Option<&Operand> {
+        match (self.place, &self.spec) {
+            (Place::Whole, SpecResult::Value(value)) => Some(value),
+            (Place::Whole, SpecResult::Unread(_) | SpecResult::Failed(_))
+            | (
+                Place::Match | Place::Return,
+                SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_),
+            ) => None,
+        }
+    }
+
+    /// The truth of a condition that diverged: edk2 takes its UNDEFINED as FALSE, so it is FALSE
+    /// where IsTrue takes the value that UEFI 2.11 gives as FALSE too, else unknown.
+    fn truth(&self) -> Truth {
+        match self.spec_value().and_then(Operand::is_true) {
+            Some(false) => Truth::Known(false),
+            Some(true) | None => Truth::Unknown(self.text(", which it takes as FALSE")),
+        }
+    }
+
+    /// Why an EFI_IFR_VALUE that diverged gives no value: UNDEFINED, as edk2 gives it, where UEFI
+    /// 2.11 gives a STRING or buffer, which is no UINT64 either; else both results.
+    fn why_no_value(&self) -> String {
+        if self
+            .spec_value()
+            .is_some_and(|value| matches!(value.as_u64(), Err(Abort::Undefined)))
+        {
+            return UNDEFINED_RESULT.to_string();
+        }
+        self.text("")
+    }
+
+    /// The outcome of a READ that diverged, of a question whose stored value is `stored`, which
+    /// edk2 keeps where it ends the whole READ at the UNDEFINED (Setup.c GetQuestionValue
+    /// :1676-1700): that value where UEFI 2.11 gives the READ the same value, as
+    /// retrieve_question_value takes it, or where the whole expression diverges and neither can
+    /// be read, as the stored value then says why; else refused, naming both. So is a divergence
+    /// in a match or return expression of a MAP over a stored value that cannot be read: edk2
+    /// takes the next pair there (Expression.c:3664, CompareHiiValue :2338), and the spec's ops
+    /// after the MAP may drop its value.
+    fn read(&self, stored: Option<&Operand>) -> ReadOutcome {
+        let kept = match (self.spec_value(), stored) {
+            (Some(spec), Some(stored)) => ExpressionValue::read_from(spec)
+                .is_some_and(|spec| Some(spec) == ExpressionValue::read_from(stored)),
+            (None, None) => self.place == Place::Whole,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if kept {
+            return ReadOutcome::Stored;
+        }
+        let stored = stored
+            .and_then(Operand::shown)
+            .unwrap_or_else(|| "that cannot be read".to_string());
+        ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+            expression: QuestionExpression::Read,
+            reason: self.text(&format!(", keeping the stored value {stored}")),
+        })
+    }
+
+    /// Whether a match expression that diverged matches `checked` in neither result: edk2 matches
+    /// no UNDEFINED, and UEFI 2.11 a value that is not equal (§33.3.8.3.38), as CompareHiiValue
+    /// orders them.
+    fn misses(&self, checked: &Operand) -> bool {
+        let SpecResult::Value(value) = &self.spec else {
+            return false;
+        };
+        match order(checked, value) {
+            Order::Known(ordering) => ordering.is_ne(),
+            // CompareHiiValue compares neither
+            Order::Unsupported => true,
+            Order::Unknown => false,
+        }
+    }
+
+    /// Whether UEFI 2.11 makes the SETs that edk2 makes, which are all that a WRITE writes, as
+    /// its result writes nothing (§33.3.8.3.94) and only EFI_IFR_SET writes: where its evaluation
+    /// went on to the end of the whole expression with no SET, op not evaluated or malformed one
+    /// past edk2's end, or that of an expression of a MAP in it (Frame::skipped), whose failure
+    /// would skip the store too (Setup.c SetQuestionValue). A divergence in a match expression of
+    /// a MAP, or in a return expression of a value that cannot be read, is refused also where
+    /// neither makes another SET: the evaluation stops there, so what the spec does past it is not
+    /// looked up.
+    fn keeps_sets(&self) -> bool {
+        match (self.place, &self.spec) {
+            (Place::Whole, SpecResult::Value(_) | SpecResult::Unread(_)) => true,
+            (Place::Whole, SpecResult::Failed(_))
+            | (
+                Place::Match | Place::Return,
+                SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_),
+            ) => false,
+        }
+    }
+}
+
+/// The expression of a frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Place {
+    #[default]
+    Whole,
+    /// A match expression of a MAP
+    Match,
+    /// A return expression of a MAP
+    Return,
+}
+
+/// What UEFI 2.11 gives where edk2 gives UNDEFINED.
+#[derive(Debug, PartialEq, Eq)]
+enum SpecResult {
+    /// A value that can be read, which Operand::shown names
+    Value(Operand),
+    /// A value that cannot be read, and why, if noted
+    Unread(Option<String>),
+    /// An op that is not evaluated here, or malformed, in the expression or skipped past the end
+    /// of an expression of a MAP in it (Frame::skipped), and why
+    Failed(String),
+}
+
+impl fmt::Display for SpecResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SpecResult::Value(value) => match value.shown() {
+                Some(shown) => f.write_str(&shown),
+                // frame_value gives a value that cannot be read as Unread
+                None => fmt::Display::fmt(&SpecResult::Unread(None), f),
+            },
+            SpecResult::Unread(None) => f.write_str("a value that cannot be read"),
+            SpecResult::Unread(Some(reason)) => {
+                write!(f, "a value that cannot be read: {reason}")
+            }
+            SpecResult::Failed(reason) => {
+                write!(f, "a value that uefisettings cannot evaluate: {reason}")
+            }
+        }
+    }
 }
 
 /// Why `op` cannot be evaluated: its operands were not decoded.
@@ -2344,8 +2590,40 @@ struct Evaluation<'a, V> {
 #[derive(Default)]
 struct Frame {
     stack: Vec<Operand>,
-    /// The op that gave its first UNDEFINED, where EvaluateExpression ends it with that result
+    /// The expression that it is of
+    place: Place,
+    /// The op that gave its first UNDEFINED, where EvaluateExpression ends it with that result;
+    /// the evaluation goes on past it, as UEFI 2.11 §33.2.5.7.4 makes UNDEFINED a value that
+    /// later ops take
     ended: Option<&'static str>,
+    /// Whether EvaluateExpression ends an expression that holds this one before it gets here
+    within_ended: bool,
+    /// Whether a CONDITIONAL in it dropped an UNDEFINED, or may have
+    dropped: bool,
+    /// Why the first value in it that cannot be read, past where EvaluateExpression ends it or an
+    /// expression that holds it, cannot be
+    spec_unknown: Option<String>,
+    /// Why the first SET, op not evaluated or malformed op fails that UEFI 2.11 reaches past where
+    /// EvaluateExpression ends it, or an expression of a MAP in it, and that aborted() skips as no
+    /// CONDITIONAL there may drop that UNDEFINED: where this expression diverges, the spec's
+    /// result fails there
+    skipped: Option<String>,
+}
+
+impl Frame {
+    /// The frame of the expression of a MAP at `place` in the expression of `outer`.
+    fn nested(outer: &Frame, place: Place) -> Self {
+        Frame {
+            place,
+            within_ended: outer.past_end(),
+            ..Frame::default()
+        }
+    }
+
+    /// Whether EvaluateExpression never reaches the op that the evaluation is at.
+    fn past_end(&self) -> bool {
+        self.ended.is_some() || self.within_ended
+    }
 }
 
 impl<'a, V: QuestionValues> Evaluation<'a, V> {
@@ -2384,22 +2662,102 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             .map(|op| Pending::Op(Rc::clone(op)))
             .collect();
         while let Some(next) = pending.pop() {
-            match next {
+            let done = match next {
                 Pending::Op(op) => self.visit(&op, &mut pending),
                 Pending::Match(progress) => self.matched(progress, &mut pending),
-                Pending::Return { map, outer } => self.returned(&map, outer, &mut pending),
-            }?;
+                Pending::Return { map, outer } => self.returned(&map, outer),
+            };
+            if let Err(abort) = done {
+                self.aborted(abort, &mut pending)?;
+            }
         }
         self.frame_value()
     }
 
-    /// The value that the expression of the frame leaves: UNDEFINED where edk2-stable202608
-    /// SetupBrowserDxe/Expression.c EvaluateExpression ended it, else its one value.
-    fn frame_value(&mut self) -> Result<Operand, Abort> {
-        if self.frame.ended.is_some() {
-            return Ok(Operand::Undefined);
+    /// Takes `abort` of the op that the evaluation is at. Past where edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression ends an expression at an UNDEFINED, it
+    /// ends what UEFI 2.11 gives there: where no CONDITIONAL drops that UNDEFINED, before or in
+    /// the ops left, the expression gives it, as in edk2; else the results diverge. Elsewhere the
+    /// abort ends the evaluation.
+    fn aborted(&mut self, abort: Abort, pending: &mut Vec<Pending>) -> Result<(), Abort> {
+        if matches!(abort, Abort::Undefined | Abort::Diverged(_)) {
+            return Err(abort);
         }
-        self.sole_value()
+        // the frame that EvaluateExpression ends at an UNDEFINED, which holds the op
+        let ended = loop {
+            match (self.frame.ended, self.frame.within_ended) {
+                (Some(ended), false) => break ended,
+                (None, false) => return Err(abort),
+                (_, true) => match pending.pop() {
+                    None => return Err(abort),
+                    Some(Pending::Op(_)) => {}
+                    Some(Pending::Match(progress)) => self.frame = progress.outer,
+                    Some(Pending::Return { outer, .. }) => self.frame = outer,
+                },
+            }
+        };
+        let mut droppable = self.frame.dropped;
+        while let Some(Pending::Op(op)) = pending.last() {
+            droppable |= holds_conditional(op);
+            pending.pop();
+        }
+        match (abort, droppable) {
+            (Abort::NotEvaluated(reason) | Abort::Malformed(reason), false) => {
+                self.frame.skipped.get_or_insert(reason);
+                self.frame.stack = vec![Operand::Undefined];
+                Ok(())
+            }
+            (Abort::NotEvaluated(reason) | Abort::Malformed(reason), true) => {
+                Err(self.diverged(ended, SpecResult::Failed(reason)))
+            }
+            (abort, _) => Err(abort),
+        }
+    }
+
+    /// The value that the expression of the frame leaves: its one value; where edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression ended it, that UNDEFINED, if UEFI 2.11
+    /// gives UNDEFINED too, or leaves more values and no CONDITIONAL dropped an UNDEFINED; else
+    /// the results diverge.
+    fn frame_value(&mut self) -> Result<Operand, Abort> {
+        let value = self.sole_value();
+        let (Some(ended), false) = (self.frame.ended, self.frame.within_ended) else {
+            return value;
+        };
+        match (value, self.frame.dropped) {
+            (Ok(Operand::Undefined), _) | (Err(Abort::Malformed(_)), false) => {
+                Ok(Operand::Undefined)
+            }
+            (Err(Abort::Malformed(reason)), true) => {
+                Err(self.diverged(ended, SpecResult::Failed(reason)))
+            }
+            (Ok(spec), _) => {
+                let spec = match spec.shown() {
+                    Some(_) => SpecResult::Value(spec),
+                    None => SpecResult::Unread(
+                        self.frame
+                            .spec_unknown
+                            .take()
+                            .or_else(|| self.unknown.clone()),
+                    ),
+                };
+                Err(self.diverged(ended, spec))
+            }
+            (Err(abort), _) => Err(abort),
+        }
+    }
+
+    /// The divergence of the frame, which edk2 ended at the UNDEFINED of `ended`, where UEFI 2.11
+    /// gives `spec`, or fails at the op that the frame skipped first.
+    fn diverged(&mut self, ended: &'static str, spec: SpecResult) -> Abort {
+        let spec = match self.frame.skipped.take() {
+            Some(reason) => SpecResult::Failed(reason),
+            None => spec,
+        };
+        Abort::Diverged(Box::new(Divergence {
+            ended,
+            place: self.frame.place,
+            spec,
+        }))
     }
 
     /// Pops the one value that the stack holds, as an expression leaves it.
@@ -2437,10 +2795,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         }
         match self.step(&borrowed) {
             Ok(value) => self.push(&borrowed, value)?,
-            Err(Abort::Undefined) => {
-                self.end_at_undefined(&borrowed, pending);
-                return Ok(());
-            }
+            Err(Abort::Undefined) => self.push_undefined(&borrowed),
             Err(abort) => return Err(abort),
         }
         pending.extend(
@@ -2466,14 +2821,11 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         Ok(())
     }
 
-    /// Ends the expression of the frame at the UNDEFINED that `op` gives, as edk2-stable202608
-    /// SetupBrowserDxe/Expression.c EvaluateExpression does: the ops left in it are dropped, and
-    /// it gives UNDEFINED.
-    fn end_at_undefined(&mut self, op: &IFROperation, pending: &mut Vec<Pending>) {
-        self.frame.ended = Some(op.op_code.spec_name());
-        while let Some(Pending::Op(_)) = pending.last() {
-            pending.pop();
-        }
+    /// Pushes the UNDEFINED that `op` gives, where edk2-stable202608 SetupBrowserDxe/Expression.c
+    /// EvaluateExpression ends the expression of the frame, if it has not ended it before.
+    fn push_undefined(&mut self, op: &IFROperation) {
+        self.frame.ended.get_or_insert(op.op_code.spec_name());
+        self.frame.stack.push(Operand::Undefined);
     }
 
     /// Starts the match expression of the pair that `progress` is at, on a stack of its own, as
@@ -2485,24 +2837,49 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         progress: MapProgress,
         pending: &mut Vec<Pending>,
     ) -> Result<(), Abort> {
-        let Some(matched) = progress.match_expression()? else {
-            self.frame = progress.outer;
-            self.end_at_undefined(&progress.map.borrow(), pending);
-            return Ok(());
+        let matched = match progress.match_expression() {
+            Ok(Some(matched)) => matched,
+            Ok(None) => {
+                self.frame = progress.outer;
+                self.push_undefined(&progress.map.borrow());
+                return Ok(());
+            }
+            Err(abort) => {
+                self.frame = progress.outer;
+                return Err(abort);
+            }
         };
-        self.frame = Frame::default();
+        self.frame = Frame::nested(&progress.outer, Place::Match);
         pending.push(Pending::Match(progress));
         pending.push(Pending::Op(matched));
         Ok(())
     }
 
     /// Takes the value of the match expression of the pair that `progress` is at: if it equals
-    /// the value that the MAP compares, starts the pair's return expression, else the next pair.
-    fn matched(&mut self, progress: MapProgress, pending: &mut Vec<Pending>) -> Result<(), Abort> {
-        let candidate = self.frame_value()?;
+    /// the value that the MAP compares, starts the pair's return expression, else the next pair,
+    /// also where the expression diverged and neither result equals that value.
+    fn matched(
+        &mut self,
+        mut progress: MapProgress,
+        pending: &mut Vec<Pending>,
+    ) -> Result<(), Abort> {
+        let candidate = match self.frame_value() {
+            Ok(candidate) => candidate,
+            Err(Abort::Diverged(divergence)) if divergence.misses(&progress.checked) => {
+                return self.next_pair(progress.next(), pending);
+            }
+            Err(abort) => {
+                self.frame = progress.outer;
+                return Err(abort);
+            }
+        };
+        if let Some(reason) = self.frame.skipped.take() {
+            progress.outer.skipped.get_or_insert(reason);
+        }
         match order(&progress.checked, &candidate) {
             Order::Known(order) if order.is_eq() => {
                 let returned = progress.return_expression()?;
+                self.frame = Frame::nested(&progress.outer, Place::Return);
                 pending.push(Pending::Return {
                     map: progress.map,
                     outer: progress.outer,
@@ -2513,28 +2890,63 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             // edk2-stable202608 SetupBrowserDxe/Expression.c matches a pair only where
             // CompareHiiValue succeeds
             Order::Known(_) | Order::Unsupported => self.next_pair(progress.next(), pending),
-            Order::Unknown => Err(Abort::NotEvaluated(format!(
-                "{} on a value that cannot be read",
-                progress.map.borrow().op_code.spec_name()
-            ))),
+            Order::Unknown => {
+                let abort = Abort::NotEvaluated(format!(
+                    "{} on a value that cannot be read",
+                    progress.map.borrow().op_code.spec_name()
+                ));
+                self.frame = progress.outer;
+                Err(abort)
+            }
         }
     }
 
     /// Takes the value of the return expression of `map` as the MAP's, in `outer`, the frame of
-    /// the MAP.
-    fn returned(
-        &mut self,
-        map: &Rc<RefCell<IFROperation>>,
-        outer: Frame,
-        pending: &mut Vec<Pending>,
-    ) -> Result<(), Abort> {
-        let value = self.frame_value()?;
-        self.frame = outer;
-        match value {
-            Operand::Undefined => self.end_at_undefined(&map.borrow(), pending),
-            value => self.frame.stack.push(value),
+    /// the MAP; one that cannot be read carries why, if noted past the end, to `outer`. An op
+    /// skipped past the end goes there too, whatever the value, as from a match expression.
+    fn returned(&mut self, map: &Rc<RefCell<IFROperation>>, outer: Frame) -> Result<(), Abort> {
+        let value = self.frame_value();
+        let returned = std::mem::replace(&mut self.frame, outer);
+        if let Some(reason) = returned.skipped {
+            self.frame.skipped.get_or_insert(reason);
+        }
+        let value = match value {
+            Err(Abort::Diverged(divergence)) => self.diverged_return(&map.borrow(), *divergence),
+            value => value,
+        };
+        match value? {
+            Operand::Undefined => self.push_undefined(&map.borrow()),
+            value => {
+                if let (None, Some(reason)) = (value.shown(), returned.spec_unknown) {
+                    self.frame.spec_unknown.get_or_insert(reason);
+                }
+                self.frame.stack.push(value);
+            }
         }
         Ok(())
+    }
+
+    /// The value of the return expression of `map` that diverged, where UEFI 2.11 gives one that
+    /// can be read: edk2 gives the MAP's UNDEFINED, which ends the MAP's expression
+    /// (Expression.c:3713-3715), so that expression ends there, marked dropped, and takes the
+    /// spec's value, which its ops after the MAP may drop; else the divergence.
+    fn diverged_return(
+        &mut self,
+        map: &IFROperation,
+        divergence: Divergence,
+    ) -> Result<Operand, Abort> {
+        let Divergence { ended, place, spec } = divergence;
+        match (place, spec) {
+            (Place::Return, SpecResult::Value(value)) => {
+                self.frame.ended.get_or_insert(map.op_code.spec_name());
+                self.frame.dropped = true;
+                Ok(value)
+            }
+            (
+                Place::Whole | Place::Match | Place::Return,
+                spec @ (SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_)),
+            ) => Err(Abort::Diverged(Box::new(Divergence { ended, place, spec }))),
+        }
     }
 
     /// The refusal of the READ or WRITE `expression` that this evaluated, whose evaluation ended
@@ -2564,7 +2976,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// Notes that `what` is not evaluated here, and returns the Abort that says so.
     fn not_evaluated(&mut self, what: String) -> Abort {
         let abort = Abort::NotEvaluated(format!("{what} not evaluated"));
-        self.gap.get_or_insert(Gap::NotEvaluated(what));
+        self.note_gap(Gap::NotEvaluated(what));
         abort
     }
 
@@ -2582,14 +2994,32 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             "{} of VarStore {id:#06x} ({store}), {reason}",
             op.op_code.spec_name()
         );
-        self.unknown.get_or_insert_with(|| why.clone());
-        self.gap.get_or_insert(Gap::VarStore {
+        self.note_unknown(|| why.clone());
+        self.note_gap(Gap::VarStore {
             access,
             id,
             store,
             reason,
         });
         why
+    }
+
+    /// Notes why a value that the result may depend on cannot be read, if it is the first; past
+    /// where edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends the
+    /// expression, apart, for what UEFI 2.11 gives there.
+    fn note_unknown(&mut self, reason: impl FnOnce() -> String) {
+        let first = match self.frame.past_end() {
+            false => &mut self.unknown,
+            true => &mut self.frame.spec_unknown,
+        };
+        first.get_or_insert_with(reason);
+    }
+
+    /// Notes `gap`, if it is the first and EvaluateExpression reaches it.
+    fn note_gap(&mut self, gap: Gap) {
+        if !self.frame.past_end() {
+            self.gap.get_or_insert(gap);
+        }
     }
 
     /// Pops the operand of `op`.
@@ -2795,15 +3225,25 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     fn conditional(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
         let when_true = self.pop(op)?;
         let when_false = self.pop(op)?;
-        match self.pop(op)?.as_bool()? {
-            Some(true) => Ok(when_true),
-            Some(false) => Ok(when_false),
-            None if when_true == when_false => Ok(when_true),
-            None => Err(Abort::NotEvaluated(format!(
-                "{} on a value that cannot be read",
-                op.op_code.spec_name()
-            ))),
-        }
+        let (selected, other) = match self.pop(op)?.as_bool()? {
+            Some(true) => (when_true, when_false),
+            Some(false) => (when_false, when_true),
+            None if when_true == when_false => return Ok(when_true),
+            None => {
+                // UEFI 2.11 §33.3.8.3.10 drops one of them, maybe an UNDEFINED
+                self.frame.dropped |=
+                    when_true == Operand::Undefined || when_false == Operand::Undefined;
+                return Err(Abort::NotEvaluated(format!(
+                    "{} on a value that cannot be read",
+                    op.op_code.spec_name()
+                )));
+            }
+        };
+        // UEFI 2.11 §33.3.8.3.10 drops the other one, maybe the UNDEFINED where
+        // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ended the expression;
+        // an UNDEFINED selected over it drops none, as for a condition that cannot be read
+        self.frame.dropped |= other == Operand::Undefined && selected != Operand::Undefined;
+        Ok(selected)
     }
 
     /// Returns the value of question `id`, which `op` refers to; edk2-stable202608
@@ -2843,19 +3283,19 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         match kind {
             ValueKind::Boolean => {
-                self.unknown.get_or_insert(reason);
+                self.note_unknown(|| reason);
                 QuestionOperand::Value(Operand::Boolean(None))
             }
             ValueKind::Uint => {
-                self.unknown.get_or_insert(reason);
+                self.note_unknown(|| reason);
                 QuestionOperand::Value(Operand::Uint(None))
             }
             ValueKind::Date => {
-                self.unknown.get_or_insert(reason);
+                self.note_unknown(|| reason);
                 QuestionOperand::Value(Operand::Date(None))
             }
             ValueKind::Time => {
-                self.unknown.get_or_insert(reason);
+                self.note_unknown(|| reason);
                 QuestionOperand::Value(Operand::Time(None))
             }
             ValueKind::Other => QuestionOperand::Undecoded(reason),
@@ -2947,6 +3387,16 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             return Err(not_decoded(op));
         };
         let value = self.pop(op)?;
+        // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends the expression
+        // before a SET after an UNDEFINED, which UEFI 2.11 makes: set plans none, and aborted()
+        // keeps edk2's UNDEFINED where no CONDITIONAL may drop it
+        if self.frame.past_end() {
+            return Err(self.not_evaluated(format!(
+                "{} past where edk2-stable202608 SetupBrowserDxe ends the expression (UEFI 2.11 \
+                 stores its value and pushes TRUE or FALSE: EFI_IFR_SET, §33.3.8.3.66)",
+                op.op_code.spec_name()
+            )));
+        }
         let Role::Write { .. } = self.role else {
             return Err(self.not_evaluated(format!(
                 "{} outside a WRITE expression",
@@ -3115,7 +3565,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         match read {
             Ok(time) => Operand::Uint(Some(field_value(&time, field).into())),
             Err(reason) => {
-                self.unknown.get_or_insert_with(|| {
+                self.note_unknown(|| {
                     format!(
                         "{} of the {field} of the system time: {reason}",
                         op.op_code.spec_name()
@@ -3196,6 +3646,26 @@ impl MapProgress {
                 ))
             })
     }
+}
+
+/// Whether `op` or an op in its scope is a CONDITIONAL, which may drop an UNDEFINED of the
+/// expression that holds `op`; the expressions of a MAP have stacks of their own.
+fn holds_conditional(op: &Rc<RefCell<IFROperation>>) -> bool {
+    let mut ops = vec![Rc::clone(op)];
+    while let Some(op) = ops.pop() {
+        let op = op.borrow();
+        if skips_scope(&op) {
+            continue;
+        }
+        match OpRole::of(op.op_code) {
+            OpRole::Expression(ExpressionOp::Conditional) => return true,
+            OpRole::Map => {}
+            OpRole::Expression(_) | OpRole::Question | OpRole::Scope(_) | OpRole::Other => {
+                ops.extend(op.children.iter().cloned());
+            }
+        }
+    }
+    false
 }
 
 /// The leading expression ops of `ops`, each with the ops of its own scope, in IFR order: for
@@ -6778,6 +7248,7 @@ mod store_expression_tests {
     const UINT16: u8 = 0x43;
     const UINT32: u8 = 0x44;
     const TO_UINT: u8 = 0x48;
+    const LENGTH: u8 = 0x56;
     const TO_BOOLEAN: u8 = 0x4A;
     const CONDITIONAL: u8 = 0x50;
     const ZERO: u8 = 0x52;
@@ -7533,6 +8004,1335 @@ mod store_expression_tests {
                     .to_string()
             ),
             "reached"
+        );
+    }
+
+    /// The start of the refusal of an expression whose UNDEFINED, of EFI_IFR_UNDEFINED, a
+    /// CONDITIONAL drops, before the consequence that edk2 gives that UNDEFINED.
+    const EDK2_ENDS: &str = "edk2-stable202608 SetupBrowserDxe ends the expression at the \
+                             UNDEFINED of EFI_IFR_UNDEFINED";
+    /// EDK2_ENDS where a MAP gives the UNDEFINED.
+    const MAP_ENDS: &str =
+        "edk2-stable202608 SetupBrowserDxe ends the expression at the UNDEFINED of EFI_IFR_MAP";
+    /// EDK2_ENDS in a return expression of a MAP, which gives that UNDEFINED.
+    const RETURN_ENDS: &str = "edk2-stable202608 SetupBrowserDxe ends a return expression of \
+                               EFI_IFR_MAP at the UNDEFINED of EFI_IFR_UNDEFINED, which the MAP \
+                               gives";
+    /// What such refusals say of UEFI 2.11, before its result.
+    const SPEC_DROPS: &str = "while UEFI 2.11 takes UNDEFINED as a value, which an \
+                              EFI_IFR_CONDITIONAL drops (§33.2.5.7.4, §33.3.8.3.10), and gives";
+
+    /// Where a CONDITIONAL drops an UNDEFINED, edk2-stable202608 SetupBrowserDxe/Expression.c
+    /// EvaluateExpression has ended the expression at that UNDEFINED, while UEFI 2.11 takes it as
+    /// a value (§33.2.5.7.4) and the CONDITIONAL the other one (§33.3.8.3.10): a defined result of
+    /// the spec, or one that cannot be read, is undetermined, naming both. Where the spec gives
+    /// UNDEFINED too, or a condition that IsTrue takes as FALSE, as it takes edk2's UNDEFINED, or a
+    /// match expression whose value the MAP's does not match either, the result stays edk2's.
+    #[test]
+    fn a_conditional_that_drops_an_undefined_is_undetermined() {
+        let efivars = store_holding(&[0; 5]);
+        let conditional = |when_false: Vec<u8>, when_true: Vec<u8>| {
+            scoped_expression(&[ifr_true(), when_false, when_true, op(CONDITIONAL)], 0)
+        };
+        let name_value = get(NAME_VALUE, 0, EFI_IFR_TYPE_NUM_SIZE_8);
+        let map_undefined = [uint8(1), map(&[(uint8(1), op(UNDEFINED))])].concat();
+        let unread = "a value that cannot be read: EFI_IFR_GET of VarStore 0x0003 \
+                      (EFI_IFR_VARSTORE_NAME_VALUE), which only the driver's \
+                      EFI_HII_CONFIG_ACCESS_PROTOCOL reaches";
+        let and_of_one_after_a_drop = || {
+            scoped_expression(
+                &[ifr_true(), op(UNDEFINED), op(ONE), op(CONDITIONAL), op(AND)],
+                0,
+            )
+        };
+        let cases = [
+            (
+                "1 over UNDEFINED",
+                conditional(op(UNDEFINED), op(ONE)),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} 1"
+                )),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} 1")),
+            ),
+            (
+                "FALSE over UNDEFINED",
+                conditional(op(UNDEFINED), ifr_false()),
+                Truth::Known(false),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} FALSE")),
+            ),
+            (
+                "0 over UNDEFINED",
+                conditional(op(UNDEFINED), op(ZERO)),
+                Truth::Known(false),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} 0")),
+            ),
+            (
+                "2 over the UNDEFINED of a MAP",
+                conditional(map_undefined, uint8(2)),
+                Truth::Unknown(format!(
+                    "{MAP_ENDS}, which it takes as FALSE, {SPEC_DROPS} 2"
+                )),
+                Err(format!("{MAP_ENDS}, {SPEC_DROPS} 2")),
+            ),
+            (
+                "a value that cannot be read over UNDEFINED",
+                conditional(op(UNDEFINED), name_value.clone()),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} {unread}"
+                )),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} {unread}")),
+            ),
+            (
+                "an op not evaluated over UNDEFINED",
+                conditional(op(UNDEFINED), op(TO_UINT)),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_TO_UINT not evaluated"
+                )),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_TO_UINT not evaluated"
+                )),
+            ),
+            (
+                "UNDEFINED over UNDEFINED",
+                conditional(op(UNDEFINED), op(UNDEFINED)),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "UNDEFINED over UNDEFINED, then an op not evaluated",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        op(UNDEFINED),
+                        op(CONDITIONAL),
+                        op(TO_UINT),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "UNDEFINED over UNDEFINED, then an AND of one operand",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        op(UNDEFINED),
+                        op(CONDITIONAL),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "UNDEFINED over 1",
+                conditional(op(ONE), op(UNDEFINED)),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "an AND of UNDEFINED after a dropped UNDEFINED",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        ifr_true(),
+                        op(CONDITIONAL),
+                        op(UNDEFINED),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "an op not evaluated after UNDEFINED, without a CONDITIONAL",
+                scoped_expression(&[op(UNDEFINED), op(TO_UINT), op(AND)], 0),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "an op not evaluated after a dropped UNDEFINED",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        op(ONE),
+                        op(CONDITIONAL),
+                        op(TO_UINT),
+                    ],
+                    0,
+                ),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_TO_UINT not evaluated"
+                )),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_TO_UINT not evaluated"
+                )),
+            ),
+            (
+                "a CONDITIONAL on a value that cannot be read, over UNDEFINED",
+                scoped_expression(
+                    &[
+                        get(NAME_VALUE, 0, EFI_IFR_TYPE_BOOLEAN),
+                        op(UNDEFINED),
+                        op(ONE),
+                        op(CONDITIONAL),
+                    ],
+                    0,
+                ),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_CONDITIONAL on a value that cannot \
+                     be read"
+                )),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_CONDITIONAL on a value that cannot be read"
+                )),
+            ),
+            (
+                "a CONDITIONAL on a value that cannot be read, under UNDEFINED",
+                scoped_expression(
+                    &[
+                        get(NAME_VALUE, 0, EFI_IFR_TYPE_BOOLEAN),
+                        op(ONE),
+                        op(UNDEFINED),
+                        op(CONDITIONAL),
+                    ],
+                    0,
+                ),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_CONDITIONAL on a value that cannot \
+                     be read"
+                )),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_CONDITIONAL on a value that cannot be read"
+                )),
+            ),
+            (
+                "an AND of one operand after a dropped UNDEFINED",
+                and_of_one_after_a_drop(),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_AND without an operand"
+                )),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_AND without an operand"
+                )),
+            ),
+            (
+                "a value that cannot be read from before the UNDEFINED",
+                scoped_expression(
+                    &[
+                        ifr_false(),
+                        name_value.clone(),
+                        op(UNDEFINED),
+                        op(CONDITIONAL),
+                    ],
+                    0,
+                ),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} {unread}"
+                )),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} {unread}")),
+            ),
+            (
+                "a value that cannot be read from a MAP over UNDEFINED",
+                conditional(
+                    op(UNDEFINED),
+                    [uint8(1), map(&[(uint8(1), name_value.clone())])].concat(),
+                ),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} {unread}"
+                )),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} {unread}")),
+            ),
+            (
+                "FALSE over UNDEFINED in a return expression, then NOT",
+                scoped_expression(
+                    &[
+                        uint8(1),
+                        map(&[(uint8(1), conditional(op(UNDEFINED), ifr_false()))]),
+                        op(NOT),
+                    ],
+                    0,
+                ),
+                Truth::Unknown(format!(
+                    "{MAP_ENDS}, which it takes as FALSE, {SPEC_DROPS} TRUE"
+                )),
+                Err(format!("{MAP_ENDS}, {SPEC_DROPS} TRUE")),
+            ),
+            (
+                "1 over UNDEFINED, then 1 over the UNDEFINED of a MAP",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        op(ONE),
+                        op(CONDITIONAL),
+                        ifr_true(),
+                        uint8(1),
+                        map(&[(uint8(2), uint8(3))]),
+                        op(ONE),
+                        op(CONDITIONAL),
+                        op(ADD),
+                    ],
+                    0,
+                ),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} 2"
+                )),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} 2")),
+            ),
+            (
+                "a malformed match expression after UNDEFINED",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        uint8(1),
+                        map(&[(scoped_expression(&[op(ONE), op(ONE)], 0), uint8(10))]),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "a MAP without a return expression after UNDEFINED",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        uint8(2),
+                        [
+                            operation(MAP, true, &[]),
+                            uint8(1),
+                            uint8(10),
+                            uint8(2),
+                            END.to_vec(),
+                        ]
+                        .concat(),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "a MAP of a value that cannot be read after UNDEFINED",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        name_value.clone(),
+                        map(&[(uint8(1), uint8(10))]),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "a value left after UNDEFINED",
+                scoped_expression(&[op(UNDEFINED), op(ONE)], 0),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "a value left after a dropped UNDEFINED",
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), op(ONE), op(CONDITIONAL), op(ONE)],
+                    0,
+                ),
+                Truth::Unknown(format!(
+                    "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: 2 values left"
+                )),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     2 values left"
+                )),
+            ),
+            (
+                "an op not evaluated in a match expression after UNDEFINED",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        uint8(1),
+                        map(&[(op(TO_UINT), uint8(10))]),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "an op not evaluated in a return expression after UNDEFINED",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        uint8(1),
+                        map(&[(uint8(1), op(TO_UINT))]),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "a CONDITIONAL in a match expression after UNDEFINED",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        uint8(1),
+                        map(&[(conditional(op(UNDEFINED), uint8(1)), uint8(10))]),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "an op not evaluated after UNDEFINED, with a CONDITIONAL only in a later MAP",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        op(TO_UINT),
+                        uint8(1),
+                        map(&[(conditional(op(ZERO), uint8(1)), uint8(10))]),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+            (
+                "an op not evaluated after UNDEFINED, with a CONDITIONAL only in a scope left out",
+                scoped_expression(
+                    &[
+                        op(UNDEFINED),
+                        op(TO_UINT),
+                        [operation(0x70, true, &[]), op(CONDITIONAL), END.to_vec()].concat(),
+                        op(AND),
+                    ],
+                    0,
+                ),
+                Truth::Known(false),
+                Err("UNDEFINED result".to_string()),
+            ),
+        ];
+        for (name, expression, truth, value) in cases {
+            assert_eq!(
+                truth_in(expression.clone(), &efivars, &no_values()),
+                truth,
+                "condition of {name}"
+            );
+            assert_eq!(value_in(expression, &efivars), value, "value of {name}");
+        }
+        assert_eq!(
+            read_of(
+                &[op(READ), and_of_one_after_a_drop()],
+                QuestionValue::Uint(3),
+                &efivars
+            ),
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: format!(
+                    "{EDK2_ENDS}, keeping the stored value 3, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_AND without an operand"
+                ),
+            }),
+            "READ of an AND of one operand after a dropped UNDEFINED"
+        );
+        // the stored value that edk2 keeps cannot be read either: get gives why
+        let unreadable = || QuestionValue::Unreadable {
+            kind: ValueKind::Uint,
+            reason: "<ValueUnavailable: test>".to_string(),
+        };
+        assert_eq!(
+            read_of(
+                &[op(READ), and_of_one_after_a_drop()],
+                unreadable(),
+                &efivars
+            ),
+            ReadOutcome::Stored,
+            "READ of a stored value that cannot be read, of an AND of one operand after a \
+             dropped UNDEFINED"
+        );
+        assert_eq!(
+            read_of(
+                &[op(READ), conditional(op(UNDEFINED), op(ONE))],
+                unreadable(),
+                &efivars
+            ),
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: format!(
+                    "{EDK2_ENDS}, keeping the stored value that cannot be read, {SPEC_DROPS} 1"
+                ),
+            }),
+            "READ of a stored value that cannot be read, of 1 over UNDEFINED"
+        );
+
+        // edk2 takes the next pair at the UNDEFINED, and UEFI 2.11 too, whose 1 does not match 5
+        // (§33.3.8.3.38)
+        let matching_neither = [
+            uint8(5),
+            map(&[
+                (conditional(op(UNDEFINED), uint8(1)), uint8(10)),
+                (uint8(5), uint8(20)),
+            ]),
+        ]
+        .concat();
+        assert_eq!(
+            value_in(matching_neither, &efivars),
+            Ok(20),
+            "in a match expression that matches the value of the MAP in neither"
+        );
+        let of_another_type = [
+            uint8(5),
+            map(&[
+                (
+                    conditional(op(UNDEFINED), get(STORE, 0, EFI_IFR_TYPE_DATE)),
+                    uint8(10),
+                ),
+                (uint8(5), uint8(20)),
+            ]),
+        ]
+        .concat();
+        assert_eq!(
+            value_in(of_another_type, &efivars),
+            Ok(20),
+            "in a match expression of a DATE, which CompareHiiValue does not compare with 5"
+        );
+        let of_a_value_that_cannot_be_read = [
+            name_value.clone(),
+            map(&[(conditional(op(UNDEFINED), uint8(1)), uint8(10))]),
+        ]
+        .concat();
+        assert_eq!(
+            value_in(of_a_value_that_cannot_be_read, &efivars),
+            Err(format!(
+                "edk2-stable202608 SetupBrowserDxe ends a match expression of EFI_IFR_MAP at the \
+                 UNDEFINED of EFI_IFR_UNDEFINED, taking the next pair, {SPEC_DROPS} 1"
+            )),
+            "in a match expression of a MAP of a value that cannot be read"
+        );
+        let in_match = [
+            uint8(1),
+            map(&[
+                (conditional(op(UNDEFINED), uint8(1)), uint8(10)),
+                (uint8(1), uint8(20)),
+            ]),
+        ]
+        .concat();
+        let in_return = [
+            uint8(1),
+            map(&[(uint8(1), conditional(op(UNDEFINED), uint8(7)))]),
+        ]
+        .concat();
+        assert_eq!(
+            value_in(in_return, &efivars),
+            Err(format!("{MAP_ENDS}, {SPEC_DROPS} 7")),
+            "in a return expression"
+        );
+        assert_eq!(
+            value_in(in_match, &efivars),
+            Err(format!(
+                "edk2-stable202608 SetupBrowserDxe ends a match expression of EFI_IFR_MAP at the \
+                 UNDEFINED of EFI_IFR_UNDEFINED, taking the next pair, {SPEC_DROPS} 1"
+            )),
+            "in a match expression"
+        );
+    }
+
+    /// Where UEFI 2.11 gives a STRING or buffer, which no op evaluated here pushes yet, over a
+    /// dropped UNDEFINED, a condition is FALSE and an EFI_IFR_VALUE UNDEFINED, as with edk2's
+    /// UNDEFINED, while a READ, which gives no STRING or buffer, is refused, naming both.
+    #[test]
+    fn strings_and_buffers_that_the_spec_gives_take_the_effect_of_undefined() {
+        let spec_values = [
+            (
+                "STRING",
+                Operand::String(Some("1".encode_utf16().collect())),
+                "\"1\"",
+            ),
+            (
+                "buffer",
+                Operand::Buffer(Some([1].into())),
+                "the buffer [01]",
+            ),
+        ];
+        for (name, value, shown) in spec_values {
+            let divergence = Divergence {
+                ended: "EFI_IFR_UNDEFINED",
+                place: Place::Whole,
+                spec: SpecResult::Value(value),
+            };
+            assert_eq!(divergence.truth(), Truth::Known(false), "condition, {name}");
+            assert_eq!(
+                divergence.why_no_value(),
+                "UNDEFINED result",
+                "EFI_IFR_VALUE, {name}"
+            );
+            assert_eq!(
+                divergence.read(Some(&Operand::Uint(Some(1)))),
+                ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                    expression: QuestionExpression::Read,
+                    reason: format!(
+                        "{EDK2_ENDS}, keeping the stored value 1, {SPEC_DROPS} {shown}"
+                    ),
+                }),
+                "READ, {name}"
+            );
+        }
+    }
+
+    /// A READ that diverged keeps the stored value where UEFI 2.11 gives the READ the value that
+    /// get shows for the stored one, as retrieve_question_value takes a READ's value
+    /// (ExpressionValue::as_u64): a BOOLEAN 1 and a UINT 1 are one value; a BOOLEAN 2 and TRUE,
+    /// 2 and 1, or 0 and TRUE are not.
+    #[test]
+    fn a_diverged_read_compares_the_values_that_get_shows() {
+        let efivars = store_holding(&[0; 5]);
+        let over_undefined = |value: Vec<u8>| {
+            scoped_expression(&[ifr_true(), op(UNDEFINED), value, op(CONDITIONAL)], 0)
+        };
+        let refused = |stored: &str, spec: &str| {
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: format!(
+                    "{EDK2_ENDS}, keeping the stored value {stored}, {SPEC_DROPS} {spec}"
+                ),
+            })
+        };
+        let cases = [
+            (
+                "TRUE over UNDEFINED, stored UINT 1",
+                ifr_true(),
+                QuestionValue::Uint(1),
+                ReadOutcome::Stored,
+            ),
+            (
+                "1 over UNDEFINED, stored BOOLEAN 1",
+                op(ONE),
+                QuestionValue::Boolean(1),
+                ReadOutcome::Stored,
+            ),
+            (
+                "TRUE over UNDEFINED, stored BOOLEAN 2",
+                ifr_true(),
+                QuestionValue::Boolean(2),
+                refused("TRUE (2)", "TRUE"),
+            ),
+            (
+                "1 over UNDEFINED, stored BOOLEAN 2",
+                op(ONE),
+                QuestionValue::Boolean(2),
+                refused("TRUE (2)", "1"),
+            ),
+            (
+                "TRUE over UNDEFINED, stored UINT 0",
+                ifr_true(),
+                QuestionValue::Uint(0),
+                refused("0", "TRUE"),
+            ),
+        ];
+        for (name, value, stored, want) in cases {
+            assert_eq!(
+                read_of(&[op(READ), over_undefined(value)], stored, &efivars),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// A return expression of a MAP whose CONDITIONAL drops an UNDEFINED, where UEFI 2.11 gives a
+    /// value, ends the MAP's expression at the MAP, as edk2 gives the MAP's UNDEFINED there, and
+    /// the spec's value goes on: the whole expression decides, by its effect.
+    #[test]
+    fn a_return_expression_that_drops_an_undefined_hands_its_value_on() {
+        let efivars = store_holding(&[0; 5]);
+        let returning = |value: Vec<u8>, after: &[Vec<u8>]| {
+            let returned =
+                scoped_expression(&[ifr_true(), op(UNDEFINED), value, op(CONDITIONAL)], 0);
+            scoped_expression(
+                &[&[uint8(1), map(&[(uint8(1), returned)])][..], after].concat(),
+                0,
+            )
+        };
+        assert_eq!(
+            truth_in(returning(ifr_false(), &[]), &efivars, &no_values()),
+            Truth::Known(false),
+            "FALSE"
+        );
+        assert_eq!(
+            truth_in(returning(ifr_false(), &[op(NOT)]), &efivars, &no_values()),
+            Truth::Unknown(format!(
+                "{MAP_ENDS}, which it takes as FALSE, {SPEC_DROPS} TRUE"
+            )),
+            "FALSE, then NOT"
+        );
+        let read = |this| read_of(&[op(READ), returning(uint8(3), &[])], this, &efivars);
+        let refused = |stored: &str| {
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: format!("{MAP_ENDS}, keeping the stored value {stored}, {SPEC_DROPS} 3"),
+            })
+        };
+        assert_eq!(
+            read(QuestionValue::Uint(3)),
+            ReadOutcome::Stored,
+            "3, stored 3"
+        );
+        assert_eq!(read(QuestionValue::Uint(0)), refused("0"), "3, stored 0");
+        assert_eq!(
+            read(QuestionValue::Unreadable {
+                kind: ValueKind::Uint,
+                reason: "<ValueUnavailable: test>".to_string(),
+            }),
+            refused("that cannot be read"),
+            "3, stored that cannot be read"
+        );
+    }
+
+    /// A return expression of a MAP that gives a value past the end, with a value that cannot be
+    /// read noted in it, carries no reason out: the OR after it names its own value that cannot
+    /// be read.
+    #[test]
+    fn a_readable_return_value_past_the_end_carries_no_reason() {
+        const OR: u8 = 0x16;
+        let efivars = store_holding(&[0; 5]);
+        let masked = scoped_expression(
+            &[
+                get(NAME_VALUE, 0, EFI_IFR_TYPE_BOOLEAN),
+                ifr_false(),
+                op(AND),
+            ],
+            0,
+        );
+        let condition = scoped_expression(
+            &[
+                ifr_true(),
+                op(UNDEFINED),
+                uint8(1),
+                map(&[(uint8(1), masked)]),
+                op(CONDITIONAL),
+                get(BUFFER, 0, EFI_IFR_TYPE_BOOLEAN),
+                op(OR),
+            ],
+            0,
+        );
+        let truth = truth_in(condition, &efivars, &no_values());
+        let Truth::Unknown(reason) = &truth else {
+            panic!("unknown: {truth:?}");
+        };
+        assert!(
+            reason.contains("VarStore 0x0004") && !reason.contains("VarStore 0x0003"),
+            "names the OR's value that cannot be read: {reason}"
+        );
+    }
+
+    /// A CONDITIONAL that drops nothing, after one that dropped the UNDEFINED, leaves the drop
+    /// marked, so the two values left diverge.
+    #[test]
+    fn a_drop_stays_marked_after_a_conditional_that_drops_nothing() {
+        let efivars = store_holding(&[0; 5]);
+        let condition = scoped_expression(
+            &[
+                ifr_true(),
+                op(UNDEFINED),
+                op(ONE),
+                op(CONDITIONAL),
+                ifr_true(),
+                op(ZERO),
+                op(ONE),
+                op(CONDITIONAL),
+            ],
+            0,
+        );
+        let truth = truth_in(condition, &efivars, &no_values());
+        assert!(
+            matches!(&truth, Truth::Unknown(reason) if reason.contains("2 values left")),
+            "two values left after a dropped UNDEFINED and a CONDITIONAL that drops nothing: \
+             {truth:?}"
+        );
+    }
+
+    /// A value that cannot be read in a MAP's return expression past the end is noted for the
+    /// spec's result, not as the first one that edk2 reaches, which an AND before the end made
+    /// irrelevant.
+    #[test]
+    fn a_value_that_cannot_be_read_in_a_map_past_the_end_is_noted_for_the_spec() {
+        const OR: u8 = 0x16;
+        let efivars = store_holding(&[0; 5]);
+        let condition = scoped_expression(
+            &[
+                get(BUFFER, 0, EFI_IFR_TYPE_BOOLEAN),
+                ifr_false(),
+                op(AND),
+                ifr_true(),
+                op(UNDEFINED),
+                uint8(1),
+                map(&[(uint8(1), get(NAME_VALUE, 0, EFI_IFR_TYPE_BOOLEAN))]),
+                op(CONDITIONAL),
+                op(OR),
+            ],
+            0,
+        );
+        let truth = truth_in(condition, &efivars, &no_values());
+        let Truth::Unknown(reason) = &truth else {
+            panic!("unknown: {truth:?}");
+        };
+        assert!(
+            reason.contains("VarStore 0x0003") && !reason.contains("VarStore 0x0004"),
+            "names the return expression's value that cannot be read: {reason}"
+        );
+    }
+
+    /// Past where edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends an
+    /// expression at an UNDEFINED, a value that cannot be read, or an op that is not evaluated,
+    /// is not what a result that edk2 reaches names: here the first match expression ends at its
+    /// UNDEFINED, and the second pair's return expression decides. Nor is such a value of one
+    /// expression what a divergence of another names.
+    #[test]
+    fn notes_past_an_undefined_stay_apart() {
+        let efivars = store_holding(&[0; 5]);
+        let unknown = [
+            uint8(1),
+            map(&[
+                (
+                    scoped_expression(
+                        &[
+                            op(UNDEFINED),
+                            get(NAME_VALUE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                            op(AND),
+                        ],
+                        0,
+                    ),
+                    uint8(10),
+                ),
+                (uint8(1), get(BUFFER, 0, EFI_IFR_TYPE_NUM_SIZE_8)),
+            ]),
+        ]
+        .concat();
+        let got = value_in(unknown, &efivars);
+        assert!(
+            matches!(&got, Err(reason) if reason.starts_with("EFI_IFR_GET of VarStore 0x0004")),
+            "a value that cannot be read: {got:?}"
+        );
+
+        let not_evaluated = [
+            uint8(1),
+            map(&[
+                (
+                    scoped_expression(&[op(UNDEFINED), op(TO_UINT), op(AND)], 0),
+                    uint8(10),
+                ),
+                (uint8(1), op(LENGTH)),
+            ]),
+        ]
+        .concat();
+        assert_eq!(
+            read_of(&[op(READ), not_evaluated], QuestionValue::Uint(3), &efivars),
+            ReadOutcome::Refused(ExpressionRefusal::NotEvaluated {
+                expression: QuestionExpression::Read,
+                what: "EFI_IFR_LENGTH".to_string(),
+            }),
+            "an op that is not evaluated"
+        );
+
+        let past_its_own_undefined = scoped_expression(
+            &[
+                op(UNDEFINED),
+                get(NAME_VALUE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                op(AND),
+            ],
+            0,
+        );
+        let diverging = scoped_expression(
+            &[
+                ifr_true(),
+                op(UNDEFINED),
+                get(BUFFER, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                op(CONDITIONAL),
+            ],
+            0,
+        );
+        let divergence_after = [
+            uint8(1),
+            map(&[(past_its_own_undefined, uint8(10)), (diverging, uint8(20))]),
+        ]
+        .concat();
+        let got = value_in(divergence_after, &efivars);
+        let names = format!(
+            "edk2-stable202608 SetupBrowserDxe ends a match expression of EFI_IFR_MAP at the \
+             UNDEFINED of EFI_IFR_UNDEFINED, taking the next pair, {SPEC_DROPS} a value that \
+             cannot be read: EFI_IFR_GET of VarStore 0x0004 "
+        );
+        assert!(
+            matches!(&got, Err(reason) if reason.starts_with(&names)),
+            "a divergence after a match expression past its own UNDEFINED: {got:?}"
+        );
+    }
+
+    /// A SET past where edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends
+    /// the expression at an UNDEFINED is never planned. UEFI 2.11 makes it (§33.3.8.3.66), so a
+    /// WRITE where a CONDITIONAL may drop that UNDEFINED is refused before any SET, naming both;
+    /// without one, the expression gives edk2's UNDEFINED, after the SETs before it. So is a SET,
+    /// or an op not evaluated, past the UNDEFINED of a match or return expression of a MAP, of a
+    /// nested MAP too, where the expression that holds the MAP diverges, naming the first; where
+    /// it does not, edk2's SETs stay. With no SET past it, a WRITE where a CONDITIONAL drops it
+    /// makes the SETs before it, as both do, also where a return expression of a MAP drops it, or
+    /// the spec's value cannot be read. It is refused past an op not evaluated, whose failure
+    /// skips the store, and where the evaluation stops before what the spec does past the end, so
+    /// that is not looked up here: at a match expression of a MAP, after which the two take other
+    /// pairs, or a return expression of a value that cannot be read.
+    #[test]
+    fn a_set_past_an_undefined_refuses_a_write_where_a_conditional_may_drop_it() {
+        let efivars = store_holding(&[0; 5]);
+        let this_set = |offset| [op(THIS), set(STORE, offset, EFI_IFR_TYPE_NUM_SIZE_8)].concat();
+        let set_past_end = "EFI_IFR_SET past where edk2-stable202608 SetupBrowserDxe ends the \
+                            expression (UEFI 2.11 stores its value and pushes TRUE or FALSE: \
+                            EFI_IFR_SET, §33.3.8.3.66) not evaluated";
+        let undetermined = |reason: String| -> std::result::Result<_, ExpressionRefusal> {
+            Err(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Write,
+                reason,
+            })
+        };
+        let refused = undetermined(format!(
+            "{EDK2_ENDS}, after the SETs before it, {SPEC_DROPS} a value that uefisettings cannot \
+             evaluate: {set_past_end}"
+        ));
+        let dropping_undefined =
+            scoped_expression(&[ifr_true(), op(UNDEFINED), op(ONE), op(CONDITIONAL)], 0);
+        let returning = |returned: &[Vec<u8>]| map(&[(uint8(1), scoped_expression(returned, 0))]);
+        let skipping_match = || scoped_expression(&[op(UNDEFINED), this_set(0), op(AND)], 0);
+        let skipped = |reason: &str| {
+            undetermined(format!(
+                "{MAP_ENDS}, after the SETs before it, {SPEC_DROPS} a value that uefisettings \
+                 cannot evaluate: {reason}"
+            ))
+        };
+        let planned = |offsets: &[u16]| -> std::result::Result<_, ExpressionRefusal> {
+            Ok(Some(
+                offsets
+                    .iter()
+                    .map(|&offset| (STORE, "Store".to_string(), offset, vec![0x03]))
+                    .collect(),
+            ))
+        };
+        let cases = [
+            (
+                "a SET whose result a CONDITIONAL selects over the UNDEFINED",
+                vec![ifr_true(), op(UNDEFINED), this_set(0), op(CONDITIONAL)],
+                refused.clone(),
+            ),
+            (
+                "SETs before and after an UNDEFINED that a CONDITIONAL drops",
+                vec![
+                    this_set(0),
+                    ifr_true(),
+                    op(UNDEFINED),
+                    ifr_true(),
+                    op(CONDITIONAL),
+                    this_set(1),
+                    op(AND),
+                    op(AND),
+                ],
+                refused,
+            ),
+            (
+                "SETs before and after an UNDEFINED, without a CONDITIONAL",
+                vec![this_set(0), op(UNDEFINED), this_set(1), op(AND), op(AND)],
+                planned(&[0]),
+            ),
+            (
+                "a SET of the UNDEFINED",
+                vec![
+                    this_set(0),
+                    op(UNDEFINED),
+                    set(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8),
+                ],
+                planned(&[0]),
+            ),
+            (
+                "a SET in a return expression after an UNDEFINED",
+                vec![
+                    op(UNDEFINED),
+                    uint8(1),
+                    map(&[(uint8(1), scoped_expression(&[this_set(1)], 0))]),
+                    op(AND),
+                ],
+                planned(&[]),
+            ),
+            (
+                "a SET in a return expression after TRUE",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    map(&[(uint8(1), scoped_expression(&[this_set(1)], 0))]),
+                    op(AND),
+                ],
+                planned(&[1]),
+            ),
+            (
+                "a dropped UNDEFINED with SETs only before it",
+                vec![this_set(0), op(UNDEFINED), op(ONE), op(CONDITIONAL)],
+                planned(&[0]),
+            ),
+            (
+                "a dropped UNDEFINED with an op not evaluated after it",
+                vec![
+                    this_set(0),
+                    op(UNDEFINED),
+                    op(ONE),
+                    op(CONDITIONAL),
+                    op(TO_UINT),
+                ],
+                undetermined(format!(
+                    "{EDK2_ENDS}, after the SETs before it, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_TO_UINT not evaluated"
+                )),
+            ),
+            (
+                "a dropped UNDEFINED in a match expression",
+                vec![
+                    this_set(0),
+                    uint8(1),
+                    map(&[
+                        (dropping_undefined.clone(), uint8(10)),
+                        (uint8(1), uint8(20)),
+                    ]),
+                    op(AND),
+                ],
+                undetermined(format!(
+                    "edk2-stable202608 SetupBrowserDxe ends a match expression of EFI_IFR_MAP at \
+                     the UNDEFINED of EFI_IFR_UNDEFINED, taking the next pair, {SPEC_DROPS} 1"
+                )),
+            ),
+            (
+                "a dropped UNDEFINED in a return expression",
+                vec![
+                    this_set(0),
+                    uint8(1),
+                    map(&[(uint8(1), dropping_undefined.clone())]),
+                    op(AND),
+                ],
+                planned(&[0]),
+            ),
+            (
+                "a dropped UNDEFINED in a return expression, then a SET",
+                vec![
+                    this_set(0),
+                    uint8(1),
+                    map(&[(uint8(1), dropping_undefined)]),
+                    this_set(1),
+                    op(AND),
+                    op(AND),
+                ],
+                undetermined(format!(
+                    "{MAP_ENDS}, after the SETs before it, {SPEC_DROPS} a value that uefisettings \
+                     cannot evaluate: {set_past_end}"
+                )),
+            ),
+            (
+                "a dropped UNDEFINED in a return expression of a value that cannot be read",
+                vec![
+                    this_set(0),
+                    uint8(1),
+                    map(&[(
+                        uint8(1),
+                        scoped_expression(
+                            &[
+                                ifr_true(),
+                                op(UNDEFINED),
+                                get(NAME_VALUE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                                op(CONDITIONAL),
+                            ],
+                            0,
+                        ),
+                    )]),
+                    op(AND),
+                ],
+                undetermined(format!(
+                    "{RETURN_ENDS}, {SPEC_DROPS} a value that cannot be read: EFI_IFR_GET of \
+                     VarStore 0x0003 (EFI_IFR_VARSTORE_NAME_VALUE), which only the driver's \
+                     EFI_HII_CONFIG_ACCESS_PROTOCOL reaches"
+                )),
+            ),
+            (
+                "a dropped UNDEFINED for a value that cannot be read, with SETs only before it",
+                vec![
+                    this_set(0),
+                    op(UNDEFINED),
+                    get(NAME_VALUE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                    op(CONDITIONAL),
+                ],
+                planned(&[0]),
+            ),
+            (
+                "a SET past the UNDEFINED of a return expression, the MAP's UNDEFINED dropped",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[op(UNDEFINED), this_set(0), op(AND)]),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                skipped(set_past_end),
+            ),
+            (
+                "an op not evaluated, then a SET, past the UNDEFINED of a return expression, the \
+                 MAP's UNDEFINED dropped",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[op(UNDEFINED), op(TO_UINT), this_set(0), op(AND)]),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                skipped("EFI_IFR_TO_UINT not evaluated"),
+            ),
+            (
+                "a SET before the UNDEFINED of a return expression, the MAP's UNDEFINED dropped",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[this_set(0), op(UNDEFINED), op(AND)]),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                planned(&[0]),
+            ),
+            (
+                "a SET, then a SET past the UNDEFINED of a return expression, the MAP's UNDEFINED \
+                 dropped",
+                vec![
+                    this_set(1),
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[op(UNDEFINED), this_set(0), op(AND)]),
+                    ifr_true(),
+                    op(CONDITIONAL),
+                    op(AND),
+                ],
+                skipped(set_past_end),
+            ),
+            (
+                "a SET, then an op not evaluated past the UNDEFINED of a return expression, the \
+                 MAP's UNDEFINED dropped",
+                vec![
+                    this_set(1),
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[op(UNDEFINED), uint8(3), op(TO_UINT), op(AND)]),
+                    ifr_true(),
+                    op(CONDITIONAL),
+                    op(AND),
+                ],
+                skipped("EFI_IFR_TO_UINT not evaluated"),
+            ),
+            (
+                "a SET, then a SET past the UNDEFINED of a return expression, the MAP's UNDEFINED \
+                 kept",
+                vec![
+                    this_set(1),
+                    uint8(1),
+                    returning(&[op(UNDEFINED), this_set(0), op(AND)]),
+                    op(AND),
+                ],
+                planned(&[1]),
+            ),
+            (
+                "a SET past the UNDEFINED of a return expression of a nested MAP, the outer MAP's \
+                 UNDEFINED dropped",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[uint8(1), returning(&[op(UNDEFINED), this_set(0), op(AND)])]),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                skipped(set_past_end),
+            ),
+            (
+                "a SET past the UNDEFINED of a return expression, the MAP's UNDEFINED dropped in \
+                 an outer return expression",
+                vec![
+                    uint8(1),
+                    returning(&[
+                        ifr_true(),
+                        uint8(1),
+                        returning(&[op(UNDEFINED), this_set(0), op(AND)]),
+                        op(ONE),
+                        op(CONDITIONAL),
+                    ]),
+                ],
+                undetermined(format!(
+                    "edk2-stable202608 SetupBrowserDxe ends a return expression of EFI_IFR_MAP at \
+                     the UNDEFINED of EFI_IFR_MAP, which the MAP gives, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: {set_past_end}"
+                )),
+            ),
+            (
+                "a SET past the UNDEFINED of a match expression, then a dropped UNDEFINED",
+                vec![
+                    uint8(1),
+                    map(&[(skipping_match(), uint8(5)), (uint8(1), ifr_true())]),
+                    op(UNDEFINED),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                undetermined(format!(
+                    "{EDK2_ENDS}, after the SETs before it, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: {set_past_end}"
+                )),
+            ),
+            (
+                "a SET past the UNDEFINED of a match expression",
+                vec![
+                    uint8(1),
+                    map(&[(skipping_match(), uint8(5)), (uint8(1), ifr_true())]),
+                ],
+                planned(&[]),
+            ),
+            (
+                "a SET past the UNDEFINED of a match expression in a return expression of TRUE, \
+                 then a dropped UNDEFINED",
+                vec![
+                    uint8(1),
+                    returning(&[
+                        uint8(1),
+                        map(&[(skipping_match(), uint8(5)), (uint8(1), ifr_true())]),
+                    ]),
+                    op(UNDEFINED),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                undetermined(format!(
+                    "{EDK2_ENDS}, after the SETs before it, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: {set_past_end}"
+                )),
+            ),
+            (
+                "a SET past the UNDEFINED of a match expression, then an op not evaluated past \
+                 that of the return expression, the MAP's UNDEFINED dropped",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    map(&[
+                        (skipping_match(), uint8(5)),
+                        (
+                            uint8(1),
+                            scoped_expression(&[op(UNDEFINED), uint8(3), op(TO_UINT), op(AND)], 0),
+                        ),
+                    ]),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                skipped(set_past_end),
+            ),
+            (
+                "a SET past the UNDEFINED of a match expression, then an op not evaluated past \
+                 that of the next one, then a dropped UNDEFINED",
+                vec![
+                    uint8(1),
+                    map(&[
+                        (skipping_match(), uint8(5)),
+                        (
+                            scoped_expression(&[op(UNDEFINED), uint8(3), op(TO_UINT), op(AND)], 0),
+                            uint8(6),
+                        ),
+                        (uint8(1), ifr_true()),
+                    ]),
+                    op(UNDEFINED),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                undetermined(format!(
+                    "{EDK2_ENDS}, after the SETs before it, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: {set_past_end}"
+                )),
+            ),
+            (
+                "a SET past the UNDEFINED of a match expression in a return expression, then an \
+                 op not evaluated past that of the return expression, the MAP's UNDEFINED \
+                 dropped",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[
+                        uint8(1),
+                        map(&[(skipping_match(), uint8(5)), (uint8(1), ifr_true())]),
+                        op(UNDEFINED),
+                        op(TO_UINT),
+                        op(AND),
+                    ]),
+                    op(ONE),
+                    op(CONDITIONAL),
+                ],
+                skipped(set_past_end),
+            ),
+            (
+                "a SET past the UNDEFINED of a return expression, the MAP's UNDEFINED dropped, \
+                 then an op not evaluated",
+                vec![
+                    ifr_true(),
+                    uint8(1),
+                    returning(&[op(UNDEFINED), this_set(0), op(AND)]),
+                    op(ONE),
+                    op(CONDITIONAL),
+                    op(TO_UINT),
+                ],
+                skipped(set_past_end),
+            ),
+        ];
+        for (name, ops, want) in cases {
+            let write = scoped_expression(&ops, 0);
+            assert_eq!(
+                writes_of(&[op(WRITE), write], QuestionValue::Uint(3), &efivars),
+                want,
+                "{name}"
+            );
+        }
+
+        let condition = scoped_expression(
+            &[
+                ifr_true(),
+                op(UNDEFINED),
+                op(ONE),
+                set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                op(CONDITIONAL),
+            ],
+            0,
+        );
+        assert_eq!(
+            truth_in(condition, &efivars, &no_values()),
+            Truth::Unknown(format!(
+                "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that uefisettings \
+                 cannot evaluate: {set_past_end}"
+            )),
+            "a condition"
         );
     }
 
@@ -8451,9 +10251,10 @@ mod store_expression_tests {
 
     /// A READ as edk2-stable202608 VfrCompile builds one of the form cond(get(status) != 0 ?
     /// 0 : cond(((get(port) & 0xF00) >> 8) == get(line) - 1 ? UNDEFINED : map(get(port) : ...))):
-    /// the walk reaches its UNDEFINED, which ends the evaluation, as edk2 ends it, whatever the
-    /// CONDITIONAL would pick, so the stored value stays; without the UNDEFINED, its MAP gives the
-    /// value.
+    /// the walk reaches its UNDEFINED, where edk2 ends the evaluation, keeping the stored value,
+    /// while the CONDITIONALs of UEFI 2.11 pick 0 or the MAP's value; where that is the stored
+    /// value, the stored value stays, else the READ is undetermined; without the UNDEFINED, its
+    /// MAP gives the value.
     #[test]
     fn read_of_stored_fields_through_conditionals_and_map() {
         let port_map = map(&[
@@ -8486,15 +10287,36 @@ mod store_expression_tests {
             0,
         );
         let enabled = store_holding(&[0x03, 0x01, 0xE8, 0x03, 0x04]);
-        assert_eq!(
-            read_of(
-                &[op(READ), with_undefined],
-                QuestionValue::Uint(3),
-                &enabled
+        let disabled = store_holding(&[0x03, 0x00, 0xF8, 0x02, 0x03]);
+        let cases = [
+            ("with UNDEFINED", &enabled, 3, ReadOutcome::Stored),
+            (
+                "with UNDEFINED, disabled",
+                &disabled,
+                0,
+                ReadOutcome::Stored,
             ),
-            ReadOutcome::Stored,
-            "with UNDEFINED"
-        );
+            (
+                "with UNDEFINED, of another stored value",
+                &enabled,
+                0,
+                ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                    expression: QuestionExpression::Read,
+                    reason: format!("{EDK2_ENDS}, keeping the stored value 0, {SPEC_DROPS} 3"),
+                }),
+            ),
+        ];
+        for (name, efivars, stored, want) in cases {
+            assert_eq!(
+                read_of(
+                    &[op(READ), with_undefined.clone()],
+                    QuestionValue::Uint(stored),
+                    efivars
+                ),
+                want,
+                "{name}"
+            );
+        }
 
         let without_undefined = scoped_expression(
             &[
@@ -8508,7 +10330,6 @@ mod store_expression_tests {
             ],
             0,
         );
-        let disabled = store_holding(&[0x03, 0x00, 0xF8, 0x02, 0x03]);
         let cases = [("enabled", &enabled, 3), ("disabled", &disabled, 0)];
         for (name, efivars, want) in cases {
             assert_eq!(
@@ -8668,6 +10489,158 @@ mod store_expression_tests {
                 store_holding(&[1, 0, 0, 0, 0])
             ),
             (reason.to_string(), reason.to_string())
+        );
+    }
+
+    /// The answer that get and list-questions give, and the one that show-ifr gives, for the
+    /// first question of form_set_of(`questions`), reading through `reader`.
+    fn answers_read_through(
+        questions: &[Vec<u8>],
+        reader: impl Fn() -> EfivarReader,
+    ) -> (String, String) {
+        let (root, questions) = form_set_of(questions);
+        let question = &questions[0];
+        let id = value_question(&question.borrow()).map(|question| question.header().var_store_id);
+        let shown = display_answer(
+            question,
+            &find_corresponding_varstore(Rc::clone(question), id.unwrap_or_default()),
+            &mut ExpressionInputs {
+                reader: &mut reader(),
+                values: &VarStoreValues::new(&root, None),
+            },
+        );
+        let strings = strings();
+        let texts = ListTexts::new(&strings, &[]);
+        let listed = super::super::list_questions(
+            Rc::clone(&root),
+            &texts,
+            IncludedStates::all(),
+            None,
+            &mut reader(),
+        )
+        .into_iter()
+        .map(|(descriptor, _)| descriptor.value)
+        .next()
+        .expect("list the question");
+        (listed, shown)
+    }
+
+    /// A READ whose match expression of a MAP diverges is refused, naming both, over a stored
+    /// value that cannot be read too, and over the match expression's own value: edk2 takes the
+    /// next pair there (Expression.c:3664, CompareHiiValue :2338), which gives 3, and UEFI 2.11
+    /// the first, which gives 1. get, list-questions and show-ifr say so with the variable
+    /// missing, without efivars, and without a VarStore.
+    #[test]
+    fn a_read_that_diverges_in_a_match_expression_refuses_a_stored_value_that_cannot_be_read() {
+        let read = scoped_expression(
+            &[
+                uint8(1),
+                map(&[
+                    (
+                        scoped_expression(
+                            &[ifr_true(), op(UNDEFINED), uint8(1), op(CONDITIONAL)],
+                            0,
+                        ),
+                        uint8(1),
+                    ),
+                    (uint8(1), uint8(3)),
+                ]),
+            ],
+            0,
+        );
+        let reason = format!(
+            "edk2-stable202608 SetupBrowserDxe ends a match expression of EFI_IFR_MAP at the \
+             UNDEFINED of EFI_IFR_UNDEFINED, taking the next pair, {SPEC_DROPS} 1"
+        );
+        let stored = [
+            (
+                "a stored value that cannot be read",
+                QuestionValue::Unreadable {
+                    kind: ValueKind::Uint,
+                    reason: "<ValueUnavailable: test>".to_string(),
+                },
+            ),
+            ("the stored value 1", QuestionValue::Uint(1)),
+        ];
+        for (name, this) in stored {
+            assert_eq!(
+                read_of(&[op(READ), read.clone()], this, &store_holding(&[0; 5])),
+                ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                    expression: QuestionExpression::Read,
+                    reason: reason.clone(),
+                }),
+                "{name}"
+            );
+        }
+        let children = [op(READ), read];
+        let missing = Efivars::new();
+        let holding = store_holding(&[1, 0, 0, 0, 0]);
+        let undetermined =
+            format!("<ValueUnavailable: its READ expression is undetermined: {reason}>");
+        let cases = [
+            (
+                "the variable missing",
+                answers_read_through(&[one_of_with(1, STORE, &children)], || missing.reader()),
+            ),
+            (
+                "without efivars",
+                answers_read_through(&[one_of_with(1, STORE, &children)], disabled_reader),
+            ),
+            (
+                "without a VarStore",
+                answers_read_through(&[one_of_with(1, 0, &children)], || holding.reader()),
+            ),
+        ];
+        for (name, answers) in cases {
+            assert_eq!(
+                answers,
+                (undetermined.clone(), undetermined.clone()),
+                "{name}"
+            );
+        }
+    }
+
+    /// A READ whose return expression of a MAP diverges with a value that cannot be read is
+    /// refused over a stored value that cannot be read too: the spec's ops after the MAP may drop
+    /// that value, as the CONDITIONAL here does for 1, while edk2 keeps the stored value.
+    #[test]
+    fn a_read_that_diverges_in_a_return_expression_refuses_a_stored_value_that_cannot_be_read() {
+        let returned = scoped_expression(
+            &[
+                ifr_true(),
+                op(UNDEFINED),
+                get(NAME_VALUE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                op(CONDITIONAL),
+            ],
+            0,
+        );
+        let read = scoped_expression(
+            &[
+                ifr_true(),
+                uint8(1),
+                map(&[(uint8(1), returned)]),
+                op(ONE),
+                op(CONDITIONAL),
+            ],
+            0,
+        );
+        assert_eq!(
+            read_of(
+                &[op(READ), read],
+                QuestionValue::Unreadable {
+                    kind: ValueKind::Uint,
+                    reason: "<ValueUnavailable: test>".to_string(),
+                },
+                &store_holding(&[0; 5]),
+            ),
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: format!(
+                    "{RETURN_ENDS}, {SPEC_DROPS} a value that cannot be read: EFI_IFR_GET of \
+                     VarStore 0x0003 (EFI_IFR_VARSTORE_NAME_VALUE), which only the driver's \
+                     EFI_HII_CONFIG_ACCESS_PROTOCOL reaches"
+                ),
+            })
         );
     }
 
