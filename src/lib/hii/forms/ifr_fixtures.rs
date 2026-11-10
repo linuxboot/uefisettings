@@ -97,6 +97,9 @@ pub(crate) const VALUE: u8 = 0x5A;
 pub(super) const DEFAULT: u8 = 0x5B;
 pub(crate) const DEFAULT_STORE: u8 = 0x5C;
 pub(crate) const FORM_MAP: u8 = 0x5D;
+/// An opcode past EFI_IFR_MATCH2_OP, which edk2-stable202608 SetupBrowserDxe/IfrParse.c
+/// IsUnKnownOpCode takes for unknown (:1193)
+const UNKNOWN: u8 = 0xF0;
 
 pub(crate) const VAR_STORE: u8 = 0x24;
 const VAR_STORE_NAME_VALUE: u8 = 0x25;
@@ -370,6 +373,12 @@ pub(super) fn locked_scope() -> Vec<u8> {
 /// A LOCKED op.
 pub(crate) fn locked_op() -> Vec<u8> {
     operation(LOCKED, false, &[])
+}
+
+/// `body` in the scope of an unknown opcode, which edk2-stable202608 SetupBrowserDxe/IfrParse.c
+/// ParseOpCodes skips (:1358-1381).
+pub(crate) fn in_unknown_scope(body: &[u8]) -> Vec<u8> {
+    [&operation(UNKNOWN, true, &[])[..], body, &END[..]].concat()
 }
 
 pub(crate) fn operation(op_code: u8, open_scope: bool, data: &[u8]) -> Vec<u8> {

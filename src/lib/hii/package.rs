@@ -391,10 +391,10 @@ pub struct ParsedPackageList {
     pub forms: Vec<IFRNodeLink>,
     /// The IFR of its form packages that read_db ignores, whose PASSWORD questions are unknown
     pub ignored_ifr: Vec<forms::IgnoredIfr>,
-    /// The VarStores and statements of its form packages outside the FormSets that read_db parses
+    /// The VarStores and statements of its form packages outside the FormSets that read_db parses,
+    /// and the VarStores in the scope of an unknown opcode in those
     pub outside_ifr: Vec<forms::OutsideOp>,
-    /// The VarStores of its form packages outside the FormSets that read_db parses that do not
-    /// parse, whose VarStoreIds are unknown
+    /// Those VarStores that do not parse, whose VarStoreIds are unknown
     pub malformed_outside_stores: Vec<forms::IgnoredIfr>,
     /// The forms that read_db drops from `forms`, whose PASSWORD ops are kept and resolved where
     /// they parse

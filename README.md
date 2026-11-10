@@ -106,7 +106,9 @@ GUID, so they withhold those bytes too. A password question whose op ends before
 header keeps its password where edk2 reads that header, in the bytes after the op: from its offset
 on in each VarStore of its VarStoreId in its package list; one whose header runs past its form
 package may keep it in any variable of a VarStore of its package list, so they withhold every byte
-of each. IFR after an op that does not fit its form
+of each. A VarStore in the scope of an unknown opcode, which edk2's Forms Browser skips but its
+Config Keyword Handler takes, counts as one outside any FormSet, also for the password questions of
+FormSets of its VarStoreId. IFR after an op that does not fit its form
 package has no op boundary, so they read and write no variable of such a HiiDB, nor do
 `hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question whose VarStore
 uefisettings cannot find withholds no bytes, which they warn of. The UEFI Shell build reads and

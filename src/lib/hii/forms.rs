@@ -1798,7 +1798,10 @@ fn type_value_parser<R: Read + Seek>(
 /// returned undecoded, as FindQuestionFromStringId reads only their Prompt; a VarStore that does
 /// not parse, which hides only its VarStoreId, is returned apart. In the IFR that those records
 /// cover (declared_ifr), which already counts the PASSWORDs and malformed ops there, only the
-/// VarStores that parse and the PASSWORDs are, marked so (OutsideOp::in_ignored_ifr).
+/// VarStores that parse and the PASSWORDs are, marked so (OutsideOp::in_ignored_ifr). So are the
+/// VarStores in the scope of an unknown opcode in a FormSet that parses: SetupBrowserDxe/IfrParse.c
+/// ParseOpCodes skips that scope (:1358-1381), and FindStorageFromVarId reads them as any
+/// (OutsidePlace::UnknownScope).
 pub(super) fn parse_form_sets(
     package_cursor: &mut Cursor<&Vec<u8>>,
     package_list_guid: Guid,
@@ -1818,7 +1821,8 @@ pub(super) fn parse_form_sets(
     // FORM_SET ops without Scope, by offset, that a failed parse read outside every scope that it
     // opened, with its failure, which the parse from each gives too
     let mut failing_alike: BTreeMap<u64, Rc<FormSetFailure>> = BTreeMap::new();
-    // the ops outside a FormSet that the walk steps over, by offset
+    // the ops outside a FormSet that the walk steps over, and the VarStores in the scope of an
+    // unknown opcode in a FormSet that parses, by offset
     let mut walked = Vec::new();
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
@@ -1856,7 +1860,7 @@ pub(super) fn parse_form_sets(
                 "skipping {:?} outside a FormSet at offset {offset}",
                 op.op_code
             );
-            walked.push((offset, op));
+            walked.push((offset, op, OutsidePlace::NoFormSet));
             continue;
         }
         if let Some(start) = open_past_end.take() {
@@ -1876,6 +1880,10 @@ pub(super) fn parse_form_sets(
                         }
                         roots.push(parsed.root);
                         disabled_forms.extend(parsed.disabled_forms);
+                        for store in parsed.unknown_scope_stores {
+                            let op = op_at(package_cursor.get_ref(), store)?;
+                            walked.push((store, op, OutsidePlace::UnknownScope));
+                        }
                         continue;
                     }
                     Err(error) => {
@@ -1917,16 +1925,20 @@ pub(super) fn parse_form_sets(
     }
     let mut outside = Vec::new();
     let mut malformed_stores = Vec::new();
-    for (offset, op) in walked {
+    for (offset, op, place) in walked {
         let in_ignored_ifr = spans
             .get(spans.partition_point(|span| span.end <= offset))
             .is_some_and(|span| span.contains(&offset));
+        let at = OutsideAt {
+            offset,
+            place,
+            in_ignored_ifr,
+        };
         record_outside_op(
             op,
-            offset,
+            at,
             package,
             package_list_guid,
-            in_ignored_ifr,
             &mut outside,
             &mut malformed_stores,
         );
@@ -1940,32 +1952,52 @@ pub(super) fn parse_form_sets(
     })
 }
 
-/// Records the op `op` at `offset` of the form package `package` of the package list
-/// `package_list`, outside any FormSet, in `outside` if it is a VarStore that parses, a PASSWORD,
-/// or, unless it is in ignored IFR (`in_ignored_ifr`), another statement, and in
-/// `malformed_stores` if it is a VarStore that does not parse, with the storage that it may
-/// declare (DeclaredStorage::declare). A PASSWORD keeps the bytes after it that its question
-/// header may take (IFROperation::keep_header_past_length).
+/// Where an op that parse_form_sets records outside the FormSets that it parses sits.
+#[derive(Clone, Copy)]
+struct OutsideAt {
+    offset: u64,
+    place: OutsidePlace,
+    /// Whether it is in the IFR that IgnoredPasswords::Declared covers
+    in_ignored_ifr: bool,
+}
+
+impl OutsideAt {
+    /// The record of `op`, which sits here.
+    fn record(self, op: IFROperation) -> OutsideOp {
+        OutsideOp {
+            offset: self.offset,
+            op,
+            place: self.place,
+            in_ignored_ifr: self.in_ignored_ifr,
+        }
+    }
+}
+
+/// Records the op `op`, `at` an offset of the form package `package` of the package list
+/// `package_list`, in `outside` if it is a VarStore that parses, a PASSWORD, or, unless it is in
+/// ignored IFR, another statement, and in `malformed_stores` if it is a VarStore that does not
+/// parse, with the storage that it may declare (DeclaredStorage::declare). A PASSWORD keeps the
+/// bytes after it that its question header may take (IFROperation::keep_header_past_length).
 fn record_outside_op(
     mut op: IFROperation,
-    offset: u64,
+    at: OutsideAt,
     package: &[u8],
     package_list: Guid,
-    in_ignored_ifr: bool,
     outside: &mut Vec<OutsideOp>,
     malformed_stores: &mut Vec<IgnoredIfr>,
 ) {
+    let OutsideAt {
+        offset,
+        place,
+        in_ignored_ifr,
+    } = at;
     op.keep_header_past_length(package, offset);
     match op.op_code {
         IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue => {
             match handle_opcode(&mut op) {
-                Ok(()) => outside.push(OutsideOp {
-                    offset,
-                    op,
-                    in_ignored_ifr,
-                }),
+                Ok(()) => outside.push(at.record(op)),
                 Err(error) if in_ignored_ifr => debug!(
-                    "a malformed {} outside a FormSet, in ignored IFR: {error:#}",
+                    "a malformed {} {place}, in ignored IFR: {error:#}",
                     op.op_code.spec_name()
                 ),
                 Err(error) => {
@@ -1975,7 +2007,7 @@ fn record_outside_op(
                         package_list,
                         offset,
                         reason: format!(
-                            "a malformed {} outside a FormSet: {error:#}",
+                            "a malformed {} {place}: {error:#}",
                             op.op_code.spec_name()
                         ),
                         passwords: IgnoredPasswords::Declared(Arc::new(storage)),
@@ -1985,20 +2017,23 @@ fn record_outside_op(
         }
         // a statement that does not parse counts for the Keyword Handler, which reads its Prompt
         // alone; PasswordQuestions decodes a PASSWORD's question header
-        op_code if defaults::is_statement(op_code) && !in_ignored_ifr => outside.push(OutsideOp {
-            offset,
-            op,
-            in_ignored_ifr,
-        }),
+        op_code if defaults::is_statement(op_code) && !in_ignored_ifr => {
+            outside.push(at.record(op))
+        }
         // in ignored IFR too, as FindQuestionFromStringId finds it there and FindStorageFromVarId
         // takes the first VarStore of its VarStoreId in the form package
-        IFROpCode::Password => outside.push(OutsideOp {
-            offset,
-            op,
-            in_ignored_ifr,
-        }),
+        IFROpCode::Password => outside.push(at.record(op)),
         _ => {}
     }
+}
+
+/// The op at `offset` of the form package `package`.
+fn op_at(package: &[u8], offset: u64) -> Result<IFROperation> {
+    let mut cursor = Cursor::new(package);
+    cursor.set_position(offset);
+    cursor
+        .parse_ne()
+        .with_context(|| format!("failed to parse the IFR operation at offset {offset}"))
 }
 
 /// The IFR of a form package that IgnoredPasswords::Declared covers: its spans of offsets,
@@ -2263,7 +2298,8 @@ fn form_set_name(op: &IFROperation) -> String {
 
 /// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
 /// ignores, the forms that it drops from those roots, and the VarStores and statements outside the
-/// FormSets that it parses, malformed VarStores apart.
+/// FormSets that it parses, with the VarStores in the scope of an unknown opcode in those,
+/// malformed VarStores apart.
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
@@ -2273,12 +2309,35 @@ pub(super) struct FormSets {
 }
 
 /// A VarStore or statement op of a form package outside the FormSets that parse_form_sets
-/// parses, at `offset`, and whether it is in the IFR that IgnoredPasswords::Declared covers.
+/// parses, or a VarStore in the scope of an unknown opcode in one, at `offset`, and whether it is
+/// in the IFR that IgnoredPasswords::Declared covers.
 #[derive(Debug)]
 pub struct OutsideOp {
     pub offset: u64,
     pub op: IFROperation,
+    pub place: OutsidePlace,
     pub in_ignored_ifr: bool,
+}
+
+/// Where an op sits that edk2-stable202608 SetupBrowserDxe parses into no FormSet but
+/// ConfigKeywordHandler.c finds, as FindQuestionFromStringId (:1478) and FindStorageFromVarId
+/// (:1520) walk the whole form package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutsidePlace {
+    /// Outside any FormSet (UEFI 2.11 §33.2.5.1 declares variable stores within a form set)
+    NoFormSet,
+    /// In the scope of an unknown opcode in a FormSet, which SetupBrowserDxe/IfrParse.c
+    /// ParseOpCodes skips (:1358-1381)
+    UnknownScope,
+}
+
+impl fmt::Display for OutsidePlace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoFormSet => "outside a FormSet",
+            Self::UnknownScope => "in the scope of an unknown opcode",
+        })
+    }
 }
 
 /// A form that parse_form_sets drops from the tree of its FormSet, as UEFI 2.11 §33.2.5.10.1
@@ -2383,6 +2442,8 @@ pub(crate) fn handle_form_set(
 struct ParsedFormSet {
     root: Rc<RefCell<IFROperation>>,
     disabled_forms: Vec<DisabledForm>,
+    /// The offsets of the VarStore ops in the scopes of unknown opcodes, which are not decoded
+    unknown_scope_stores: Vec<u64>,
 }
 
 /// Parses the FormSet at `package_cursor`, failing with ScopesTooDeep at an op that opens more
@@ -2428,6 +2489,7 @@ fn handle_form_set_within(
     // The form whose ops up to its End are read undecoded
     let mut disabling: Option<DisabledForm> = None;
     let mut disabled_forms = Vec::new();
+    let mut unknown_scope_stores = Vec::new();
 
     // this loop will terminate when it sees the IFR:End opcode as a child of FormSet
     // if input data is malformed then it will exit on erroring out cause none of the magic bytes match
@@ -2533,6 +2595,9 @@ fn handle_form_set_within(
         if is_var_store && disabling.is_some() {
             return Err(var_store.into());
         }
+        if is_var_store && skipped_depth > 0 {
+            unknown_scope_stores.push(offset);
+        }
         if skipped_depth == 0 && disabling.is_none() {
             if let Err(failure) = decode_op(&current_node, offset) {
                 let (form, form_offset) = match (is_form, open_forms.last(), is_var_store) {
@@ -2586,6 +2651,7 @@ fn handle_form_set_within(
     Ok(ParsedFormSet {
         root,
         disabled_forms,
+        unknown_scope_stores,
     })
 }
 

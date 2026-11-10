@@ -69,6 +69,7 @@ use super::IgnoredIfr;
 use super::IncludedStates;
 use super::OptionTypeOp;
 use super::OutsideOp;
+use super::OutsidePlace;
 use super::ParsedOperation;
 use super::QuestionDescriptor;
 use super::QuestionFlags;
@@ -230,14 +231,12 @@ pub(crate) enum QuestionRefusal {
     PasswordBytes,
     #[error("has VarStoreId {0}, which another FormSet of its package list declares for {1}")]
     RedeclaredVarStore(u16, String),
-    #[error(
-        "has VarStoreId {0}, which a VarStore outside any FormSet of its package list declares \
-         for {1}"
-    )]
-    OutsideVarStore(u16, String),
+    #[error("has VarStoreId {0}, which a VarStore {1} of its package list declares for {2}")]
+    OutsideVarStore(u16, OutsidePlace, String),
+    /// One outside a FormSet or in the scope of an unknown opcode
     #[error(
         "may have the VarStoreId of the VarStore at offset {0} of a form package of its package \
-         list, outside any FormSet, which does not parse"
+         list, which does not parse"
     )]
     MalformedOutsideVarStore(u64),
 }
@@ -490,10 +489,10 @@ pub(crate) struct KeywordQuestion<'a, P = KeywordPath> {
     texts: ListTexts<'a>,
     /// The roots of the form packages of the package list
     roots: &'a [Rc<RefCell<IFROperation>>],
-    /// The VarStores and statements of the form packages of the package list outside any FormSet
+    /// The VarStores and statements of the form packages of the package list outside any FormSet,
+    /// and the VarStores in the scope of an unknown opcode in one
     outside: &'a [OutsideOp],
-    /// The VarStores of the form packages of the package list outside any FormSet that do not
-    /// parse
+    /// Those VarStores that do not parse
     malformed_stores: &'a [IgnoredIfr],
     /// The root of the form package of the statement
     root: &'a Rc<RefCell<IFROperation>>,
@@ -1105,10 +1104,12 @@ impl<'a> KeywordQuestion<'a> {
                 QuestionRefusal::RedeclaredVarStore(header.var_store_id, other),
             ));
         }
-        if let Some(other) = self.outside_declaration(header.var_store_id, &store.variable_key()) {
+        if let Some((place, other)) =
+            self.outside_declaration(header.var_store_id, &store.variable_key())
+        {
             return Err(self.question_refusal(
                 &header,
-                QuestionRefusal::OutsideVarStore(header.var_store_id, other),
+                QuestionRefusal::OutsideVarStore(header.var_store_id, place, other),
             ));
         }
         // FindStorageFromVarId reads the VarStoreId of such a VarStore as it reads any
@@ -1135,15 +1136,20 @@ impl<'a> KeywordQuestion<'a> {
             .find_map(|form_set| other_store(declared_var_store(&form_set.borrow(), id)?, variable))
     }
 
-    /// The store, as text, that a VarStore outside any FormSet of the package list declares for
-    /// VarStoreId `id`, unless it is the EFI variable `variable` too: FindStorageFromVarId walks
-    /// the whole form package.
-    fn outside_declaration(&self, id: u16, variable: &VariableKey) -> Option<String> {
+    /// The store, as text, that a VarStore outside any FormSet of the package list, or in the
+    /// scope of an unknown opcode, declares for VarStoreId `id`, unless it is the EFI variable
+    /// `variable` too, with where that VarStore sits: FindStorageFromVarId walks the whole form
+    /// package.
+    fn outside_declaration(
+        &self,
+        id: u16,
+        variable: &VariableKey,
+    ) -> Option<(OutsidePlace, String)> {
         self.outside
             .iter()
-            .filter_map(|outside| declared_store(&outside.op))
-            .filter(|&(declared, _)| declared == id)
-            .find_map(|(_, store)| other_store(store, variable))
+            .filter_map(|outside| Some((outside.place, declared_store(&outside.op)?)))
+            .filter(|&(_, (declared, _))| declared == id)
+            .find_map(|(place, (_, store))| Some((place, other_store(store, variable)?)))
     }
 
     /// The EFI_IFR_QUESTION_HEADER of `op`, the question's.
@@ -1444,6 +1450,7 @@ mod tests {
     use super::super::ifr_fixtures::ifr_default;
     use super::super::ifr_fixtures::ifr_false;
     use super::super::ifr_fixtures::ifr_true;
+    use super::super::ifr_fixtures::in_unknown_scope;
     use super::super::ifr_fixtures::locked_op;
     use super::super::ifr_fixtures::one_of_at;
     use super::super::ifr_fixtures::one_of_option;
@@ -2755,7 +2762,7 @@ mod tests {
         let refusal = |store: &str| {
             format!(
                 "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which a \
-                 VarStore outside any FormSet of its package list declares for {store}"
+                 VarStore outside a FormSet of its package list declares for {store}"
             )
         };
         let name_value = operation(
@@ -2818,6 +2825,53 @@ mod tests {
         }
     }
 
+    /// FindStorageFromVarId walks the whole form package, so a VarStore in the scope of an
+    /// unknown opcode, which edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes skips
+    /// (:1358-1381), declares the question's VarStoreId for another variable all the same:
+    /// check_get and check_set refuse it, and take one declared for the same variable.
+    #[test]
+    fn check_get_refuses_a_var_store_id_that_a_var_store_in_an_unknown_scope_declares() {
+        let refusal = "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which a \
+                       VarStore in the scope of an unknown opcode of its package list declares \
+                       for EFI variable Other-44444444-4444-4444-4444-444444444444"
+            .to_owned();
+        for (name, declaration, want) in [
+            (
+                "the variable Other",
+                var_store(1, [0x44; 16], "Other", 16),
+                Some(refusal),
+            ),
+            (
+                "the variable Store",
+                var_store(1, STORE_GUID, "Store", 16),
+                None,
+            ),
+        ] {
+            let lists = [list_read(store_form_set(&[
+                in_unknown_scope(&declaration),
+                one_of(1, 0),
+            ]))];
+            let question = question_of(&lists);
+
+            let get = question.check_get(&reader(1));
+            let set = question.check_set(
+                &resp("03"),
+                IncludedStates::empty(),
+                VolatileWrites::Refuse,
+                &mut reader(1),
+            );
+
+            assert_eq!(
+                (
+                    get.err().map(|error| error.to_string()),
+                    set.err().map(|error| error.to_string())
+                ),
+                (want.clone(), want),
+                "VarStore 1 of {name} in an unknown scope"
+            );
+        }
+    }
+
     /// A VarStore outside any FormSet that does not parse hides its VarStoreId, which may be the
     /// question's: check_get and check_set refuse the question.
     #[test]
@@ -2831,8 +2885,8 @@ mod tests {
         )];
         let question = question_of(&lists);
         let want = "keyword Keyword: question \"Keyword question\" may have the VarStoreId of the \
-                    VarStore at offset 0 of a form package of its package list, outside any \
-                    FormSet, which does not parse"
+                    VarStore at offset 0 of a form package of its package list, which does not \
+                    parse"
             .to_owned();
 
         let get = question.check_get(&reader(1));
