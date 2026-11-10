@@ -257,6 +257,19 @@ database as `rt-data` does. In the scenario `shell-outside-form-set-password`
 `hii-outside-form-set-password` Linux shows no byte of the password and `set` refuses the
 question over it, while the question beside it reads.
 
+`publish-hiidb.efi first-store-password-forms` creates the variables `FirstStore` and
+`PasswordStore` unless they exist and registers the forms of
+[`publish-hiidb/src/first_store_password_forms.rs`](publish-hiidb/src/first_store_password_forms.rs):
+a form set whose VARSTORE_EFI `FirstStore` is the first VarStore of its VarStoreId in the form
+package, with NUMERICs over and beside the bytes that keep a password, then a form set whose
+PASSWORD question of that VarStoreId is on its VARSTORE_EFI `PasswordStore`. edk2's Config
+Keyword Handler takes the first VarStore of a question's VarStoreId in the form package, so
+`FirstStore` keeps that password. `publish-hiidb.efi rt-data-first-store-password-forms` does the
+same, then publishes the database as `rt-data` does. In the scenarios
+`shell-first-store-password` and `hii-first-store-password` `uefisettings` shows no byte of the
+password in the UEFI Shell and from Linux and `set` refuses the question over it, while the
+question beside it reads, and in the UEFI Shell writes.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt

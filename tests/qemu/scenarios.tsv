@@ -41,6 +41,7 @@ hii-password	/publish-hiidb.efi rt-data-password-forms	amitse-setup.json	hii_pas
 hii-formset-skip	/publish-hiidb.efi formset-skip-forms;/publish-hiidb.efi rt-data	formset-skip.json	hii_formset_skip	-
 short-var-store	/publish-hiidb.efi rt-data-short-var-store-forms	short-var-store.json	hii_short_var_store	-
 hii-outside-form-set-password	/publish-hiidb.efi rt-data-outside-form-set-password-forms	-	hii_outside_form_set_password	arch=x86_64
+hii-first-store-password	/publish-hiidb.efi rt-data-first-store-password-forms	-	hii_first_store_password	arch=x86_64
 hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi/qhii::	-
 hii-acpi-hiid	/DriverSample.efi;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/hiid::	-
 hii-acpi-two-tables	/DriverSample.efi;/publish-hiidb.efi acpi-table-junk-qhii;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/two_tables::	-
@@ -53,6 +54,7 @@ shell-formset-skip	/publish-hiidb.efi formset-skip-forms	formset-skip.json	shell
 shell-short-var-store	/publish-hiidb.efi short-var-store-forms	short-var-store.json	shell:short-var-store	-
 shell-outside-form-set-password	/publish-hiidb.efi outside-form-set-password-forms	-	shell:outside-form-set-password	-
 shell-disabled-form	/publish-hiidb.efi disabled-form-forms	disabled-form.json	shell:disabled-form	-
+shell-first-store-password	/publish-hiidb.efi first-store-password-forms	-	shell:first-store-password	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 hii-auth87	/publish-hiidb.efi enhanced-auth-forms;/publish-hiidb.efi rt-data	enhanced-auth-87.json	hii_auth87	-
 shell-auth87	/publish-hiidb.efi enhanced-auth-forms	enhanced-auth-87.json	shell:auth87	-

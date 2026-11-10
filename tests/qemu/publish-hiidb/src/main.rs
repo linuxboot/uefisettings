@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|password-forms|rt-data-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -48,6 +48,11 @@
 //! after it does the same, so that Linux finds it too.
 //! `disabled-form-forms` registers, alone, the package list of [`formset_skip_forms`] with a form
 //! that `uefisettings` disables.
+//! `first-store-password-forms` creates the variables of [`first_store_password_forms`] if they
+//! are missing and registers its package list, whose PASSWORD's VarStoreId an earlier form set
+//! declares first, for `uefisettings.efi` in the UEFI Shell;
+//! `rt-data-first-store-password-forms` is `rt-data`, after it does the same, so that Linux
+//! finds it too.
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `string-blocks` does the same with the package list of [`string_blocks`].
@@ -96,6 +101,7 @@ mod auth_variables;
 mod dropped_password_forms;
 mod enhanced_auth_forms;
 mod exported_config;
+mod first_store_password_forms;
 mod formset_skip_forms;
 mod global_variable_forms;
 mod hii_package;
@@ -283,6 +289,16 @@ fn efi_main() -> Status {
                 );
                 })
         }
+        Some(Task::RegisterFirstStorePasswordForms) => register_first_store_password_forms()
+            .map(|()| println!("publish-hiidb: registered the first store password forms")),
+        Some(Task::PublishFirstStorePasswordForms) => register_first_store_password_forms()
+            .and_then(|()| publish(MemoryType::RUNTIME_SERVICES_DATA, Database::Exported))
+            .map(|(address, length)| {
+                println!(
+                    "publish-hiidb: first store password forms registered; {length} bytes at \
+                     {address:#x}"
+                );
+            }),
         Some(Task::RegisterPaddedStrings) => register_package_list(
             &padded_strings::package_list_bytes(),
             "registering the padded strings",
@@ -323,6 +339,7 @@ fn efi_main() -> Status {
                  |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
                  |disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms\
                  |outside-form-set-password-forms|rt-data-outside-form-set-password-forms\
+                 |first-store-password-forms|rt-data-first-store-password-forms\
                  |padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|export-config|rt-properties-no-set-variable\
                  |rt-properties-all\
@@ -371,6 +388,12 @@ enum Task {
     /// Do what RegisterOutsideFormSetPasswordForms does, then publish the database in
     /// runtime-data pages.
     PublishOutsideFormSetPasswordForms,
+    /// Create the variables of [`first_store_password_forms`] if missing and register its package
+    /// list in the HII database.
+    RegisterFirstStorePasswordForms,
+    /// Do what RegisterFirstStorePasswordForms does, then publish the database in runtime-data
+    /// pages.
+    PublishFirstStorePasswordForms,
     /// Register the package list of [`padded_strings`] in the HII database.
     RegisterPaddedStrings,
     /// Create the variable of [`readwrite_forms`] if missing, register its package list in the
@@ -450,6 +473,12 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("rt-data-outside-form-set-password-forms") => {
             Some(Task::PublishOutsideFormSetPasswordForms)
+        }
+        Ok(option) if option == cstr16!("first-store-password-forms") => {
+            Some(Task::RegisterFirstStorePasswordForms)
+        }
+        Ok(option) if option == cstr16!("rt-data-first-store-password-forms") => {
+            Some(Task::PublishFirstStorePasswordForms)
         }
         Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
         Ok(option) if option == cstr16!("string-blocks") => Some(Task::RegisterStringBlocks),
@@ -615,6 +644,35 @@ fn register_outside_form_set_password_forms() -> Result<(), Failure> {
     register_package_list(
         &outside_form_set_password_forms::package_list_bytes(),
         "registering the outside form set password forms",
+    )
+}
+
+/// Creates the variables of [`first_store_password_forms`] unless they exist, then registers its
+/// package list.
+fn register_first_store_password_forms() -> Result<(), Failure> {
+    create_missing_variable(
+        first_store_password_forms::FIRST_STORE_NAME,
+        first_store_password_forms::FIRST_STORE_VENDOR,
+        first_store_password_forms::STORE_ATTRIBUTES,
+        &first_store_password_forms::FIRST_STORE_DATA,
+        (
+            "reading the FirstStore variable",
+            "creating the FirstStore variable",
+        ),
+    )?;
+    create_missing_variable(
+        first_store_password_forms::PASSWORD_STORE_NAME,
+        first_store_password_forms::PASSWORD_STORE_VENDOR,
+        first_store_password_forms::STORE_ATTRIBUTES,
+        &first_store_password_forms::PASSWORD_STORE_DATA,
+        (
+            "reading the PasswordStore variable",
+            "creating the PasswordStore variable",
+        ),
+    )?;
+    register_package_list(
+        &first_store_password_forms::package_list_bytes(),
+        "registering the first store password forms",
     )
 }
 
