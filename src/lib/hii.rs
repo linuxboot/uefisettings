@@ -105,6 +105,8 @@ pub use memory_access_denied::MemoryOperation;
 #[cfg(firmware_memory_maps)]
 pub(crate) use system_table::system_vendor_table;
 #[cfg(firmware_memory_maps)]
+pub use system_table::HiiExportError;
+#[cfg(firmware_memory_maps)]
 pub(crate) use system_table::PointerSpace;
 #[cfg(firmware_memory_maps)]
 pub use system_table::SystemTableError;

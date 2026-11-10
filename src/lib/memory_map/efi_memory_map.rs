@@ -236,6 +236,14 @@ impl EfiMemoryMap {
             .end())
     }
 
+    /// Whether a runtime descriptor's physical range holds the byte at `address`.
+    #[cfg(any(firmware_memory_maps, test))]
+    pub(crate) fn holds(&self, address: u64) -> bool {
+        self.runtime
+            .iter()
+            .any(|descriptor| descriptor.range.holds(address, 1))
+    }
+
     /// The physical address of `address`, a virtual address of the map that the OS gave
     /// SetVirtualAddressMap() (UEFI 2.11 §8.4.1): the same offset in the first runtime descriptor
     /// whose virtual range holds it, if any. Linux gives each runtime descriptor virtual addresses
@@ -389,7 +397,7 @@ mod tests {
     /// physical_address translates an address of a runtime descriptor's virtual range to the
     /// same offset of its physical range, as after SetVirtualAddressMap() on eMAG; addresses of no
     /// virtual range translate nothing, nor do those of a descriptor that is not runtime or whose
-    /// virtual range overflows, as after a failed call.
+    /// virtual range overflows, as after a failed call. holds tells the physical ranges.
     #[test]
     fn physical_address_translates_through_the_virtual_ranges() {
         let map = svam_map();
@@ -406,6 +414,15 @@ mod tests {
             (0, None),
         ] {
             assert_eq!(map.physical_address(address), want, "{address:#x}");
+        }
+        for (address, want) in [
+            (0x7ffd_fb18, true),
+            (0x7c75_1fff, true),
+            (0x7c75_2000, false),
+            (0x4000_1000, false),
+            (0x2058_fb18, false),
+        ] {
+            assert_eq!(map.holds(address), want, "holds {address:#x}");
         }
 
         let failed = runtime_map(&[(0x7ffd_0000, u64::MAX, 0x10, RUNTIME_DATA)]);

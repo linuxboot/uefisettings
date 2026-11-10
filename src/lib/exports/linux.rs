@@ -36,6 +36,7 @@ use uefisettings_backend_thrift::SetResponseList;
 use super::CapsuleBackend;
 use super::DumpEfivarsOptions;
 use super::HiiBackend;
+use super::SetOptions;
 use super::SettingsBackend;
 use super::VariableBackend;
 use crate::capsule_loader::CapsuleLoader;
@@ -54,6 +55,7 @@ use crate::firmware_width::read_fw_platform_size;
 use crate::firmware_width::FirmwareWidth;
 use crate::firmware_width::FW_PLATFORM_SIZE_PATH;
 use crate::hii::extract;
+use crate::hii::extract::HiiSourceOptions;
 #[cfg(configuration_tables)]
 use crate::hii::system_vendor_table;
 use crate::hii::EfivarDump;
@@ -74,9 +76,9 @@ use crate::translation::translate_response;
 
 /// What set and get read and write when no file names them: this machine's HiiDB and efivarfs.
 impl HiiBackend {
-    /// This machine's HiiDB.
+    /// This machine's HiiDB, read in the automatic order.
     pub(super) fn system_hiidb() -> Result<Vec<u8>> {
-        extract::extract_db(extract::EfivarMemory::Runtime)
+        Ok(extract::extract_db_from(&HiiSourceOptions::default())?)
     }
 
     /// This machine's efivarfs.
@@ -140,11 +142,15 @@ impl CapsuleBackend {
 impl HiiBackend {
     /// extract_db extracts HiiDB from efivarfs and returns it in bytes (in HiiDatabase's db field which is `Vec<u8>`)
     pub fn extract_db() -> Result<HiiDatabase> {
-        let resp = HiiDatabase {
-            db: extract::extract_db(extract::EfivarMemory::Runtime)?,
+        Self::extract_db_from(&HiiSourceOptions::default())
+    }
+
+    /// This machine's HiiDB, read as `source` says.
+    pub fn extract_db_from(source: &HiiSourceOptions) -> Result<HiiDatabase> {
+        Ok(HiiDatabase {
+            db: extract::extract_db_from(source)?,
             ..Default::default()
-        };
-        Ok(resp)
+        })
     }
 
     /// Reads the HiiDB that get, list-questions and show-ifr read with `efivars`: the file
@@ -152,7 +158,38 @@ impl HiiBackend {
     /// machine's. A redacted dump refuses another `filename`, whose questions would read its
     /// zeros as values.
     pub fn read_hiidb(filename: Option<&Path>, efivars: &EfivarSource) -> Result<Vec<u8>> {
-        SavedDump::read_given_hiidb(filename, efivars)?.map_or_else(Self::system_hiidb, Ok)
+        Self::read_hiidb_from(filename, efivars, &HiiSourceOptions::default())
+    }
+
+    /// read_hiidb, which reads this machine's HiiDB as `source` says.
+    pub fn read_hiidb_from(
+        filename: Option<&Path>,
+        efivars: &EfivarSource,
+        source: &HiiSourceOptions,
+    ) -> Result<Vec<u8>> {
+        match SavedDump::read_given_hiidb(filename, efivars)? {
+            Some(db) => Ok(db),
+            None => Ok(extract::extract_db_from(source)?),
+        }
+    }
+
+    /// set_using, in this machine's HiiDB read as `source` says.
+    pub fn set_from(
+        question: &str,
+        new_value: &str,
+        selector: Option<&str>,
+        options: &SetOptions,
+        source: &HiiSourceOptions,
+    ) -> Result<SetResponseList> {
+        Self::set_in(
+            &extract::extract_db_from(source)?,
+            question,
+            new_value,
+            selector,
+            options,
+            EfivarSource::System.into_variables()?,
+            &Self::system_variables()?,
+        )
     }
 
     /// Copies the efivar files that the questions of the HiiDB `db_bytes` read into the new
@@ -421,9 +458,14 @@ impl SettingsBackend for IloBackend {
 
 /// auto-identify backend and get hardware/bios-information
 pub fn identify_machine() -> MachineInfo {
+    identify_machine_using(&HiiSourceOptions::default())
+}
+
+/// identify_machine, which looks for the HiiDB where `source` says.
+pub fn identify_machine_using(source: &HiiSourceOptions) -> MachineInfo {
     let mut backend = BTreeSet::new();
 
-    match extract::hii_db_published() {
+    match extract::hii_db_published_using(source) {
         Ok(true) => {
             debug!("Backend Identified: Hii");
             backend.insert(Backend::Hii);
@@ -431,7 +473,7 @@ pub fn identify_machine() -> MachineInfo {
         Ok(false) => {}
         // reading the database then reports the error
         Err(error) => {
-            warn!("Cannot tell whether the firmware publishes its HII database: {error}");
+            warn!("Cannot tell whether the firmware publishes its HII database: {error:#}");
             backend.insert(Backend::Hii);
         }
     }

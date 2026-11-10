@@ -123,6 +123,18 @@ use crate::efi_variables::VariableInfoSource;
 pub use crate::efi_variables::VariableStorage;
 #[cfg(target_os = "linux")]
 pub use crate::hii::extract::EfivarMemory;
+#[cfg(target_os = "linux")]
+pub use crate::hii::extract::HiiDbVariableAbsent;
+#[cfg(target_os = "linux")]
+pub use crate::hii::extract::HiiMethod;
+#[cfg(target_os = "linux")]
+pub use crate::hii::extract::HiiMethodError;
+#[cfg(target_os = "linux")]
+pub use crate::hii::extract::HiiSource;
+#[cfg(target_os = "linux")]
+pub use crate::hii::extract::HiiSourceOptions;
+#[cfg(target_os = "linux")]
+pub use crate::hii::extract::NoHiiDatabase;
 use crate::hii::forms;
 use crate::hii::forms::list_questions;
 use crate::hii::forms::Choice;
@@ -141,6 +153,9 @@ use crate::hii::EfivarReader;
 pub use crate::hii::EfivarRedaction;
 pub use crate::hii::EfivarSource;
 use crate::hii::FirmwareVariables;
+/// Only on Linux x86, x86_64 and aarch64, where uefisettings reads a firmware memory map.
+#[cfg(firmware_memory_maps)]
+pub use crate::hii::HiiExportError;
 #[cfg(target_os = "linux")]
 pub use crate::hii::LockdownMode;
 #[cfg(target_os = "linux")]
@@ -195,6 +210,8 @@ mod windows;
 pub use crate::efi_variables::VariableInfo;
 #[cfg(target_os = "linux")]
 pub use linux::identify_machine;
+#[cfg(target_os = "linux")]
+pub use linux::identify_machine_using;
 #[cfg(target_os = "linux")]
 pub use linux::IloBackend;
 

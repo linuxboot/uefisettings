@@ -42,8 +42,8 @@ disallowed-methods = [
     { path = "uefi::boot::exit", reason = "exits the image before std closes its ExitBootServices event, whose notify function then runs in freed memory", allow-invalid = true },
     # read_physical_memory_at reads any range of /dev/mem. The efivar source
     # reads only through RuntimeMemory or ReservedMemory, which check each range against a
-    # firmware memory map first: their DevMem is the only caller besides the configuration table
-    # source. Only the Linux build has hii::extract, hence allow-invalid.
+    # firmware memory map first: their DevMem is the only caller. Only the Linux build has
+    # hii::extract, hence allow-invalid.
     { path = "uefisettings::hii::extract::read_physical_memory_at", reason = "reads /dev/mem without RuntimeMemory's or ReservedMemory's check against a firmware memory map", allow-invalid = true },
     # rsa has no release that fixes RUSTSEC-2023-0071's timing leak; blinding is partial
     # hardening, and uefisettings runs as the advisory's workaround allows: local use on a

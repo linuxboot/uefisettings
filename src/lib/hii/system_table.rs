@@ -20,6 +20,7 @@
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", test))]
 pub(super) mod boot_params;
+mod hii_export;
 
 #[cfg(any(target_arch = "aarch64", test))]
 use std::fs;
@@ -58,6 +59,9 @@ use crate::hii::lockdown::LOCKDOWN_PATH;
 use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::package::Guid;
 use crate::memory_map::efi_memory_map::EfiMemoryMap;
+pub(in crate::hii) use hii_export::read_hii_export;
+pub use hii_export::HiiExportError;
+pub(in crate::hii) use hii_export::EFI_HII_DATABASE_PROTOCOL_GUID;
 
 /// EFI_SYSTEM_TABLE_SIGNATURE (UEFI 2.11 §4.3.1).
 const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
@@ -142,6 +146,31 @@ pub enum SystemTableError {
     /// A VendorTable that is NULL.
     #[error("the EFI Configuration Table's entry of {guid} has a NULL VendorTable")]
     NullVendorTable { guid: Guid },
+    /// A runtime region that holds a configuration table but ends before its address.
+    #[error(
+        "the runtime region that holds the configuration table at {address:#x} ends at {end:#x}, \
+         before it"
+    )]
+    RegionEndsBefore { address: u64, end: u64 },
+}
+
+impl SystemTableError {
+    /// Whether this says that Linux locates no System Table, so that the firmware publishes no
+    /// configuration table that Linux gives.
+    pub(in crate::hii) fn locates_no_system_table(&self) -> bool {
+        match self {
+            Self::NotBootedByEfi { .. } | Self::NoSystemTable | Self::NoUefiInFdt => true,
+            Self::XenUefiInFdt
+            | Self::BootParamsShort { .. }
+            | Self::Signature { .. }
+            | Self::HeaderSize { .. }
+            | Self::TooManyEntries { .. }
+            | Self::NullConfigurationTable { .. }
+            | Self::DuplicateEntry { .. }
+            | Self::NullVendorTable { .. }
+            | Self::RegionEndsBefore { .. } => false,
+        }
+    }
 }
 
 /// Whether firmware converts a pointer to a virtual address at SetVirtualAddressMap() (UEFI 2.11
@@ -153,6 +182,11 @@ pub(crate) enum PointerSpace {
     /// JSON configuration and capsule result tables (§4.6.1.2). Firmware that converts nothing,
     /// as where the OS calls no SetVirtualAddressMap(), leaves them physical.
     Virtual,
+    /// Left physical, though converted where no runtime region holds it physically: the HII
+    /// database export, which §33.2.11.1 leaves open and edk2 never converts ("UEFI don't
+    /// require System Configuration Tables Conversion", edk2-stable202608
+    /// MdeModulePkg/Core/RuntimeDxe/Runtime.c:358).
+    Physical,
     /// Never converted: EFI_RT_PROPERTIES_TABLE, which "will not be fixed up" (§4.6.2), so a
     /// virtual range that holds its address leads to other memory.
     PhysicalOnly,
@@ -163,7 +197,10 @@ pub(crate) enum PointerSpace {
 fn resolve(map: &EfiMemoryMap, pointer: u64, space: PointerSpace) -> u64 {
     match space {
         PointerSpace::PhysicalOnly => pointer,
-        PointerSpace::Virtual => map.physical_address(pointer).unwrap_or(pointer),
+        PointerSpace::Physical if map.holds(pointer) => pointer,
+        PointerSpace::Physical | PointerSpace::Virtual => {
+            map.physical_address(pointer).unwrap_or(pointer)
+        }
     }
 }
 
@@ -519,6 +556,18 @@ impl<M: PhysicalMemory> SystemVendorTable<M> {
             .checked_add(offset)
             .with_context(|| format!("{:#x}+{offset:#x} overflows", self.address))?;
         self.memory.read(address, length)
+    }
+
+    /// The bytes from the table's start to the end of the runtime region that holds its first
+    /// `length` bytes.
+    pub(in crate::hii) fn room(&self, length: usize) -> Result<u64> {
+        let end = self.memory.region_end(self.address, length)?;
+        Ok(end
+            .checked_sub(self.address)
+            .ok_or(SystemTableError::RegionEndsBefore {
+                address: self.address,
+                end,
+            })?)
     }
 }
 
@@ -1454,8 +1503,10 @@ mod tests {
     }
 
     /// resolve leaves a pointer of PointerSpace::PhysicalOnly as it is, though a virtual range
-    /// holds it, and translates one of PointerSpace::Virtual through the virtual ranges; it
-    /// leaves a pointer that no virtual range holds as it is, for the read to refuse.
+    /// holds it, takes one of PointerSpace::Physical as it is where a runtime region holds it
+    /// physically, else translates it through the virtual ranges, and one of
+    /// PointerSpace::Virtual through them first; it leaves a pointer that no range holds as it
+    /// is, for the read to refuse.
     #[test]
     fn resolve_tries_the_pointer_s_space_first() {
         // the virtual range of the first region is the physical range of the second
@@ -1475,11 +1526,14 @@ mod tests {
         ]);
         for (pointer, space, want) in [
             (0x7e00_0010, PointerSpace::PhysicalOnly, 0x7e00_0010),
+            (0x7e00_0010, PointerSpace::Physical, 0x7e00_0010),
             (0x7e00_0010, PointerSpace::Virtual, 0x7f00_0010),
             (0x2000_0010, PointerSpace::PhysicalOnly, 0x2000_0010),
+            (0x2000_0010, PointerSpace::Physical, 0x7e00_0010),
             (0x2000_0010, PointerSpace::Virtual, 0x7e00_0010),
             (0x7f00_0010, PointerSpace::Virtual, 0x7f00_0010),
             (0x9000_0000, PointerSpace::PhysicalOnly, 0x9000_0000),
+            (0x9000_0000, PointerSpace::Physical, 0x9000_0000),
             (0x9000_0000, PointerSpace::Virtual, 0x9000_0000),
         ] {
             assert_eq!(

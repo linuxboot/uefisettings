@@ -10,13 +10,17 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+mod source;
+
 use std::fmt;
 use std::fs::File;
+use std::io;
 use std::io::Read;
+#[cfg(any(firmware_memory_maps, test))]
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(any(firmware_memory_maps, test))]
 use std::ptr;
 
 use anyhow::bail;
@@ -37,24 +41,43 @@ use crate::hii::firmware_memory::runtime_memory::ReservedMemory;
 use crate::hii::firmware_memory::runtime_memory::RuntimeMemory;
 #[cfg(firmware_memory_maps)]
 use crate::hii::firmware_memory::MemoryMapFiles;
-#[cfg(not(firmware_memory_maps))]
 use crate::hii::firmware_memory::MemoryMapUnavailable;
 use crate::hii::lockdown::refuse_locked_down;
 use crate::hii::lockdown::LOCKDOWN_PATH;
+#[cfg(any(firmware_memory_maps, test))]
 use crate::hii::memory_access_denied::mark_refused_access;
+#[cfg(any(firmware_memory_maps, test))]
 use crate::hii::memory_access_denied::MemoryAccess;
 use crate::hii::memory_access_denied::MemoryDevice;
 use crate::hii::package;
 use crate::hii::package::db_file::read_db_bytes;
 use crate::hii::package::db_file::DbFileTooBig;
 use crate::hii::package::db_file::MAX_ALLOWED_FILESIZE;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::read_hii_export;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::ConfigurationTables;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::HiiExportError;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::PointerSpace;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::SystemTableError;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::SystemTableFiles;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::SystemTableLocator;
+#[cfg(firmware_memory_maps)]
+use crate::hii::system_table::EFI_HII_DATABASE_PROTOCOL_GUID;
 use crate::parse_error::ReadParsed;
+pub use source::HiiMethod;
+pub use source::HiiMethodError;
+pub use source::HiiSource;
+pub use source::HiiSourceOptions;
+pub use source::NoHiiDatabase;
 
 // TODO: build this path from EFIVARS_MOUNT_POINT and EfivarFileName and open it with
 // open_efivar, so efivarfs paths and missing-variable errors have one source.
-// A missing HiiDB variable fails every command that reads the live HII database with only
-// extract_db's open error; say instead that the firmware does not export its HII database, as
-// VariableNotExported says for a missing varstore variable.
 pub const OCP_HIIDB_PATH: &str =
     "/sys/firmware/efi/efivars/HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0";
 
@@ -76,36 +99,10 @@ const HIIDB_ACPI_SIGNATURES: [[u8; 4]; 2] = [*b"QHII", *b"HIID"];
 // prefixes the HII database bytes in the QHII or HIID table.
 const ACPI_HEADER_LEN: usize = 36;
 
-// Linux prints the physical address of the EFI System Table's ConfigurationTable
-// array here (an EFI_CONFIGURATION_TABLE[]). Not every kernel creates it (e.g.
-// NVIDIA aarch64 does not).
-pub const EFI_CONFIG_TABLE_PATH: &str = "/sys/firmware/efi/config_table";
-
-// gEfiHiiDatabaseProtocolGuid, EF9FC172-A1B2-4693-B327-6D32FC416042, in memory
-// byte order (the first three fields little-endian). HiiDatabaseDxe installs
-// the exported database under it when PcdHiiOsRuntimeSupport is TRUE.
-const HII_DATABASE_GUID: [u8; 16] = [
-    0x72, 0xc1, 0x9f, 0xef, 0xb2, 0xa1, 0x93, 0x46, 0xb3, 0x27, 0x6d, 0x32, 0xfc, 0x41, 0x60, 0x42,
-];
-
-// A 64-bit EFI_CONFIGURATION_TABLE entry: VendorGuid (16 bytes) + VendorTable
-// pointer (8 bytes).
-const CONFIG_TABLE_ENTRY_LEN: usize = 24;
-
-// The entry count lives in the EFI System Table, which Linux does not expose, so
-// stop after this many entries (firmware has a few dozen).
-const MAX_CONFIG_TABLE_ENTRIES: u64 = 256;
-
-// EFI_HII_PACKAGE_LIST_HEADER: PackageListGuid (16 bytes) + PackageLength (u32,
-// which includes this header).
-const PACKAGE_LIST_HEADER_LEN: usize = 20;
-
-// Upper bound for the database size found by walking its package lists.
-const MAX_HII_DB_LEN: usize = 64 * 1024 * 1024;
-
 pub(super) const DEV_MEM_PATH: &str = "/dev/mem";
 
 /// Below this address (1 MiB), x86 read() of /dev/mem may return zeros.
+#[cfg(any(firmware_memory_maps, test))]
 const X86_ZERO_FILL_END: u64 = 0x10_0000;
 
 /// The firmware memory that the efivar source reads, where the OCP HiiDB efivar's pointer may
@@ -126,12 +123,10 @@ pub enum EfivarMemory {
     FirmwareReserved,
 }
 
-/// Where extract_db reads the EFI configuration table, the vendor ACPI tables and the OCP
-/// HiiDB efivar, and the lockdown mode for the efivar; Default is this machine's.
+/// Where extract_db reads the vendor ACPI tables, the OCP HiiDB efivar and the files that locate
+/// the EFI System Table, and the lockdown mode for physical memory; Default is this machine's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HiiSourcePaths {
-    /// The address of the EFI configuration table, as Linux prints it.
-    efi_config_table: PathBuf,
     /// The OCP HiiDB efivar.
     ocp_hiidb: PathBuf,
     /// The directory of the vendor ACPI tables.
@@ -143,32 +138,65 @@ struct HiiSourcePaths {
     /// The firmware memory maps that bound the efivar source's read of physical memory.
     #[cfg(firmware_memory_maps)]
     maps: MemoryMapFiles,
+    /// Where Linux tells where the EFI System Table is, for HiiMethod::Systab.
+    #[cfg(firmware_memory_maps)]
+    system_table: SystemTableLocator,
 }
 
 impl Default for HiiSourcePaths {
     fn default() -> Self {
         Self {
-            efi_config_table: PathBuf::from(EFI_CONFIG_TABLE_PATH),
             ocp_hiidb: PathBuf::from(OCP_HIIDB_PATH),
             acpi_tables: PathBuf::from(HIIDB_ACPI_DIR),
             dev_mem: PathBuf::from(DEV_MEM_PATH),
             lockdown: PathBuf::from(LOCKDOWN_PATH),
             #[cfg(firmware_memory_maps)]
             maps: MemoryMapFiles::default(),
+            #[cfg(firmware_memory_maps)]
+            system_table: SystemTableLocator::default(),
         }
     }
 }
 
-/// Whether a file that extract_db reads exists: a vendor ACPI table or the OCP variable.
-pub fn hii_db_published() -> std::io::Result<bool> {
-    hii_db_published_at(&HiiSourcePaths::default())
+impl HiiSourcePaths {
+    /// The files from which HiiMethod::Systab reads, with the memory maps, physical memory and
+    /// lockdown mode of the efivar source.
+    #[cfg(firmware_memory_maps)]
+    fn system_table_files(&self) -> SystemTableFiles {
+        SystemTableFiles {
+            locator: self.system_table.clone(),
+            maps: self.maps.clone(),
+            dev_mem: self.dev_mem.clone(),
+            lockdown: self.lockdown.clone(),
+        }
+    }
 }
 
-/// hii_db_published, probing the vendor ACPI tables, then the efivar, at `paths`.
-fn hii_db_published_at(paths: &HiiSourcePaths) -> std::io::Result<bool> {
-    let acpi_tables = hiidb_acpi_tables(&paths.acpi_tables);
-    let acpi_paths = acpi_tables.iter().map(|(_, path)| path);
-    for path in acpi_paths.chain([&paths.ocp_hiidb]) {
+/// Whether the firmware publishes its HII database through one of the methods of `options`, in
+/// their order: a vendor ACPI table or the OCP variable exists, or the EFI System Table lists the
+/// HII database export, which only this reads from /dev/mem.
+pub fn hii_db_published_using(options: &HiiSourceOptions) -> Result<bool> {
+    hii_db_published_using_at(&HiiSourcePaths::default(), options)
+}
+
+/// hii_db_published_using, with the files at `paths`.
+fn hii_db_published_using_at(paths: &HiiSourcePaths, options: &HiiSourceOptions) -> Result<bool> {
+    for method in options.source.methods() {
+        let published = match method {
+            HiiMethod::Acpi => acpi_table_exists(&paths.acpi_tables)?,
+            HiiMethod::Efivar => paths.ocp_hiidb.try_exists()?,
+            HiiMethod::Systab => systab_probe_answer(systab_lists_hii_export(paths))?,
+        };
+        if published {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a vendor ACPI table exists in `dir`.
+fn acpi_table_exists(dir: &Path) -> io::Result<bool> {
+    for (_, path) in hiidb_acpi_tables(dir) {
         if path.try_exists()? {
             return Ok(true);
         }
@@ -176,46 +204,126 @@ fn hii_db_published_at(paths: &HiiSourcePaths) -> std::io::Result<bool> {
     Ok(false)
 }
 
-/// extract_db returns the raw HII database bytes: those that the EFI configuration table points
-/// to, else those of a vendor ACPI table, which needs no /dev/mem, else those that the OCP HiiDB
-/// efivar points to, read only inside `efivar_memory`.
-pub fn extract_db(efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
-    extract_db_at(&HiiSourcePaths::default(), efivar_memory)
+/// The configuration table's answer from `listed`, whether the System Table lists the HII
+/// database export: false where the method finds its source absent, or where this build reads no
+/// firmware memory map, so that the method reads nothing; the error where its source is refused
+/// or fails.
+fn systab_probe_answer(listed: Result<bool>) -> Result<bool> {
+    let error = match listed {
+        Ok(listed) => return Ok(listed),
+        Err(error) => error,
+    };
+    if matches!(
+        error.downcast_ref::<MemoryMapUnavailable>(),
+        Some(MemoryMapUnavailable::NoMapReader)
+    ) {
+        return Ok(false);
+    }
+    match classify_systab(error) {
+        HiiMethodError::Absent(_) => Ok(false),
+        HiiMethodError::Refused(error) | HiiMethodError::Failed(error) => Err(error),
+    }
 }
 
-/// extract_db, reading the EFI configuration table, the vendor ACPI tables, the OCP HiiDB efivar
-/// and physical memory at `paths`.
-fn extract_db_at(paths: &HiiSourcePaths, efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
-    // Prefer the spec-standard route (the HII database configuration table
-    // found through the EFI System Table), then a vendor ACPI table that
-    // carries the database content directly (read from sysfs, no /dev/mem), and
-    // fall back to the OCP variable + /dev/mem. Each fallback reason is logged
-    // at debug level so a failure here is not masked by the OCP error below.
-    match extract_db_efi_config_table(&paths.efi_config_table, &paths.dev_mem) {
-        Ok(bytes) => {
-            debug!(
-                "HII database source: EFI configuration table ({})",
-                paths.efi_config_table.display()
-            );
-            return Ok(bytes);
-        }
-        Err(e) => debug!(
-            "could not use the EFI configuration table ({}): {e:#}; \
-             falling back to the HII ACPI tables",
-            paths.efi_config_table.display()
-        ),
-    }
+/// Whether the System Table that the files at `paths` locate lists the HII database export.
+#[cfg(firmware_memory_maps)]
+fn systab_lists_hii_export(paths: &HiiSourcePaths) -> Result<bool> {
+    Ok(
+        ConfigurationTables::read(&paths.system_table_files(), DevMem::open)?
+            .into_table(&EFI_HII_DATABASE_PROTOCOL_GUID, PointerSpace::Physical)?
+            .is_some(),
+    )
+}
 
-    match extract_db_acpi(&paths.acpi_tables) {
-        Ok(bytes) => return Ok(bytes),
-        Err(e) => debug!(
-            "could not use the HII ACPI tables in {}: {e:#}; \
-             falling back to the OCP HiiDB variable + /dev/mem",
-            paths.acpi_tables.display()
-        ),
-    }
+/// Fails: no firmware memory map bounds the read of the System Table.
+#[cfg(not(firmware_memory_maps))]
+fn systab_lists_hii_export(_: &HiiSourcePaths) -> Result<bool> {
+    Err(MemoryMapUnavailable::NoMapReader.into())
+}
 
-    extract_db_efivar(paths, efivar_memory)
+/// The raw HII database bytes, read as `options` say.
+pub fn extract_db_from(options: &HiiSourceOptions) -> Result<Vec<u8>, NoHiiDatabase> {
+    extract_db_from_at(&HiiSourcePaths::default(), options)
+}
+
+/// extract_db_from, with the files at `paths`.
+fn extract_db_from_at(
+    paths: &HiiSourcePaths,
+    options: &HiiSourceOptions,
+) -> Result<Vec<u8>, NoHiiDatabase> {
+    source::read_through(&options.source, |method| {
+        read_by(paths, method, options.efivar_memory)
+    })
+}
+
+/// The HII database that `method` reads with the files at `paths`, or why not: each method finds
+/// its source absent only where the firmware does not publish it that way, which leaves the files
+/// that the method reads first missing, Linux locating no System Table, or the configuration
+/// table without its entry.
+fn read_by(
+    paths: &HiiSourcePaths,
+    method: HiiMethod,
+    efivar_memory: EfivarMemory,
+) -> Result<Vec<u8>, HiiMethodError> {
+    match method {
+        HiiMethod::Acpi => extract_db_acpi(&paths.acpi_tables).map_err(|error| {
+            match error.downcast_ref::<AcpiTablesInvalid>() {
+                Some(AcpiTablesInvalid(tried)) if tried.iter().all(is_missing_file) => {
+                    HiiMethodError::Absent(error)
+                }
+                _ => HiiMethodError::of_present(error),
+            }
+        }),
+        HiiMethod::Efivar => extract_db_efivar(paths, efivar_memory).map_err(|error| {
+            match error.is::<HiiDbVariableAbsent>() {
+                true => HiiMethodError::Absent(error),
+                false => HiiMethodError::of_present(error),
+            }
+        }),
+        HiiMethod::Systab => extract_db_systab(paths).map_err(classify_systab),
+    }
+}
+
+/// The error of HiiMethod::Systab: absent where Linux locates no System Table, as on a BIOS
+/// boot or an arm64 boot without UEFI, or the System Table lists no HII database export.
+#[cfg(firmware_memory_maps)]
+fn classify_systab(error: anyhow::Error) -> HiiMethodError {
+    match error.downcast_ref::<HiiExportError>() {
+        Some(HiiExportError::NotListed) => HiiMethodError::Absent(error),
+        Some(
+            HiiExportError::Empty
+            | HiiExportError::PackageLengthShort { .. }
+            | HiiExportError::PastRegion { .. }
+            | HiiExportError::Unterminated { .. }
+            | HiiExportError::TooLarge { .. },
+        ) => HiiMethodError::of_present(error),
+        None => match error
+            .downcast_ref::<SystemTableError>()
+            .is_some_and(SystemTableError::locates_no_system_table)
+        {
+            true => HiiMethodError::Absent(error),
+            false => HiiMethodError::of_present(error),
+        },
+    }
+}
+
+/// The error of HiiMethod::Systab, which reads no System Table on this architecture.
+#[cfg(not(firmware_memory_maps))]
+fn classify_systab(error: anyhow::Error) -> HiiMethodError {
+    HiiMethodError::of_present(error)
+}
+
+/// The HII database export that the System Table that the files at `paths` locate lists, read
+/// from paths.dev_mem.
+#[cfg(firmware_memory_maps)]
+fn extract_db_systab(paths: &HiiSourcePaths) -> Result<Vec<u8>> {
+    read_hii_export(&paths.system_table_files(), DevMem::open)
+}
+
+/// Fails: no firmware memory map bounds the read of the System Table.
+#[cfg(not(firmware_memory_maps))]
+fn extract_db_systab(_: &HiiSourcePaths) -> Result<Vec<u8>> {
+    Err(MemoryMapUnavailable::NoMapReader.into())
 }
 
 /// Whether `error` says only that a file does not exist.
@@ -319,6 +427,11 @@ enum HiiDbEfivarSizeInvalid {
 #[error("the HiiDB efivar gives a length of {0} bytes, not 1 to {MAX_ALLOWED_FILESIZE}")]
 struct HiiDbLengthInvalid(u32);
 
+/// The OCP HiiDB efivar does not exist: the firmware does not publish its HII database this way.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("the HiiDB variable {} does not exist", .0.display())]
+pub struct HiiDbVariableAbsent(pub PathBuf);
+
 /// The physical address and length of the HII database that the OCP HiiDB efivar at
 /// paths.ocp_hiidb locates, once the kernel lockdown mode in paths.lockdown allows /dev/mem.
 fn locate_efivar_database(paths: &HiiSourcePaths) -> Result<(u64, usize)> {
@@ -326,8 +439,16 @@ fn locate_efivar_database(paths: &HiiSourcePaths) -> Result<(u64, usize)> {
     // So this is directly based on what hiitool does.
 
     // try to read data from varstore
-    let efivar_file = File::open(&paths.ocp_hiidb)
-        .with_context(|| format!("Failed to open {}", paths.ocp_hiidb.display()))?;
+    let efivar_file = match File::open(&paths.ocp_hiidb) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(HiiDbVariableAbsent(paths.ocp_hiidb.clone()).into());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open {}", paths.ocp_hiidb.display()));
+        }
+    };
 
     let efivar_contents = read_hiidb_efivar(efivar_file)
         .with_context(|| format!("Failed to read efivar file, {}", paths.ocp_hiidb.display()))?;
@@ -379,90 +500,6 @@ fn extract_db_with<M: PhysicalMemory>(
     }
 }
 
-/// Reads the HII database through the EFI configuration table: the
-/// ConfigurationTable address from `config_table` (EFI_CONFIG_TABLE_PATH), the entry for
-/// gEfiHiiDatabaseProtocolGuid in it, then the database that entry points to.
-/// Every step reads physical memory, `dev_mem`.
-fn extract_db_efi_config_table(config_table: &Path, dev_mem: &Path) -> Result<Vec<u8>> {
-    let text = std::fs::read_to_string(config_table)
-        .with_context(|| format!("Failed to read {}", config_table.display()))?;
-    let table_address = parse_hex_address(&text)?;
-
-    let mem_file =
-        File::open(dev_mem).with_context(|| format!("Failed to open {}", dev_mem.display()))?;
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the configuration table source reads without a firmware memory map's check"
-    )]
-    let read = |address: u64, length: usize| {
-        read_physical_memory_at(&mem_file, address, length, FileExt::read_exact_at)
-    };
-
-    let mut db_address = None;
-    for index in 0..MAX_CONFIG_TABLE_ENTRIES {
-        let entry_address = table_address + index * CONFIG_TABLE_ENTRY_LEN as u64;
-        let entry = read(entry_address, CONFIG_TABLE_ENTRY_LEN)?;
-        if let Some(address) = parse_hii_config_table_entry(&entry) {
-            db_address = Some(address);
-            break;
-        }
-    }
-    let db_address = db_address.with_context(|| {
-        format!(
-            "No gEfiHiiDatabaseProtocolGuid entry in the first {MAX_CONFIG_TABLE_ENTRIES} \
-             configuration table entries (is PcdHiiOsRuntimeSupport FALSE?)"
-        )
-    })?;
-
-    let length = hii_db_length(|offset, len| read(db_address + offset as u64, len))?;
-    read(db_address, length)
-}
-
-/// Parses the address in `text`, as Linux prints it ("0x7fc2d198").
-fn parse_hex_address(text: &str) -> Result<u64> {
-    let text = text.trim();
-    let digits = text.strip_prefix("0x").unwrap_or(text);
-    u64::from_str_radix(digits, 16).with_context(|| format!("Not a hexadecimal address: {text:?}"))
-}
-
-/// Returns the VendorTable pointer of `entry` (an EFI_CONFIGURATION_TABLE) when
-/// it is the gEfiHiiDatabaseProtocolGuid entry with a non-NULL pointer.
-fn parse_hii_config_table_entry(entry: &[u8]) -> Option<u64> {
-    let (guid, pointer) = entry.split_at(16);
-    if guid != HII_DATABASE_GUID {
-        return None;
-    }
-    let address = u64::from_le_bytes(pointer.try_into().ok()?);
-    (address != 0).then_some(address)
-}
-
-/// Returns the size of the exported database, which the configuration table does
-/// not record: HiiDatabaseDxe over-allocates the buffer by 25% and zero-fills it
-/// (HiiGetDatabaseInfo), so the database is the run of package lists, walked by
-/// their PackageLength, that ends at the first zero PackageLength. `read(offset,
-/// length)` returns database bytes.
-fn hii_db_length(read: impl Fn(usize, usize) -> Result<Vec<u8>>) -> Result<usize> {
-    let mut total = 0;
-    loop {
-        let header = read(total, PACKAGE_LIST_HEADER_LEN)?;
-        let length = u32::from_le_bytes(header[16..20].try_into()?) as usize;
-        if length == 0 {
-            break;
-        }
-        if length < PACKAGE_LIST_HEADER_LEN {
-            bail!("HII package list at offset 0x{total:x} has a bad PackageLength: {length}");
-        }
-        total += length;
-        if total > MAX_HII_DB_LEN {
-            bail!("HII database is larger than {MAX_HII_DB_LEN} bytes");
-        }
-    }
-    if total == 0 {
-        bail!("HII database holds no package list");
-    }
-    Ok(total)
-}
-
 /// The bytes of the HiiDB efivar `file`; one longer than HiiDBEFIVar64::SIZE, which
 /// HiiDBEFIVar::parse would refuse, is refused without being read whole.
 fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
@@ -476,8 +513,8 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
     Ok(contents)
 }
 
-/// Returns `length` bytes at `address` of `mem_file`, physical memory, which only DevMem and
-/// the configuration table source read (clippy.toml); tests pass a fake `pread`.
+/// Returns `length` bytes at `address` of `mem_file`, physical memory, which only DevMem reads
+/// (clippy.toml); tests pass a fake `pread`.
 ///
 /// It reads /dev/mem with one pread(), so the kernel copies the whole range and
 /// the copy costs the same in unoptimized builds, unlike read_mapped()'s
@@ -489,6 +526,7 @@ fn read_hiidb_efivar(file: impl Read) -> Result<Vec<u8>> {
 /// MemoryAccessDenied (mark_refused_access).
 ///
 /// Ranges for which pread_may_zero_fill() holds go straight to read_mapped().
+#[cfg(any(firmware_memory_maps, test))]
 pub(super) fn read_physical_memory_at(
     mem_file: &File,
     address: u64,
@@ -535,6 +573,7 @@ pub(super) fn read_physical_memory_at(
 /// With CONFIG_STRICT_DEVMEM, Linux v7.2 x86 does so for System RAM below
 /// 1 MiB (devmem_is_allowed(), arch/x86/mm/init.c); other architectures never
 /// do. A range touching the first 1 MiB starts in it, so `address` suffices.
+#[cfg(any(firmware_memory_maps, test))]
 fn pread_may_zero_fill(address: u64) -> bool {
     cfg!(any(target_arch = "x86", target_arch = "x86_64")) && address < X86_ZERO_FILL_END
 }
@@ -544,6 +583,7 @@ fn pread_may_zero_fill(address: u64) -> bool {
 /// (mmap_mem_prepare(), drivers/char/mem.c). `file` must back the
 /// whole range: a load from a page past the end of a regular file raises
 /// SIGBUS (mmap(2)).
+#[cfg(any(firmware_memory_maps, test))]
 fn read_mapped(file: &File, offset: u64, dst: &mut [u8]) -> Result<()> {
     let length = dst.len();
     // Reject a range whose end overflows u64 before deriving the mapping from
@@ -564,6 +604,7 @@ fn read_mapped(file: &File, offset: u64, dst: &mut [u8]) -> Result<()> {
 /// Copies bytes from `offset` to the end of its page, at most `dst.len()`,
 /// through a one-page mapping; returns the count. `file` must back the copied
 /// range. Loads go through copy_from_mapping: the page may be Device memory.
+#[cfg(any(firmware_memory_maps, test))]
 fn copy_mapped_page(file: &File, offset: u64, dst: &mut [u8]) -> Result<usize> {
     let page_size = page_size()?;
     let page_base = offset - offset % u64::try_from(page_size)?;
@@ -608,6 +649,7 @@ fn copy_mapped_page(file: &File, offset: u64, dst: &mut [u8]) -> Result<usize> {
 }
 
 /// Returns the kernel page size, the granularity of mmap offsets.
+#[cfg(any(firmware_memory_maps, test))]
 fn page_size() -> Result<usize> {
     // SAFETY: sysconf has no memory-safety preconditions.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -619,6 +661,7 @@ fn page_size() -> Result<usize> {
 }
 
 /// The widest load copy_from_mapping issues.
+#[cfg(any(firmware_memory_maps, test))]
 type MappedWord = u64;
 
 /// Fills `dst` from `src` using only volatile loads from
@@ -633,6 +676,7 @@ type MappedWord = u64;
 ///
 /// `src` must be valid for volatile reads of `dst.len()` bytes and must not
 /// overlap `dst`.
+#[cfg(any(firmware_memory_maps, test))]
 unsafe fn copy_from_mapping(src: *const u8, dst: &mut [u8]) {
     const WORD: usize = std::mem::size_of::<MappedWord>();
     let len = dst.len();
@@ -819,6 +863,8 @@ mod tests {
     use crate::hii::package::hiidb_fixtures::en_strings_list;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     #[cfg(firmware_memory_maps)]
+    use crate::hii::system_table::boot_params::fixture::boot_params;
+    #[cfg(firmware_memory_maps)]
     use crate::memory_map::efi_memory_map::MemoryType;
     #[cfg(firmware_memory_maps)]
     use crate::memory_map::efi_memory_map::EFI_MEMORY_RUNTIME;
@@ -833,7 +879,6 @@ mod tests {
     /// memory maps.
     fn paths_in(dir: &Path) -> HiiSourcePaths {
         HiiSourcePaths {
-            efi_config_table: dir.join("config_table"),
             ocp_hiidb: dir.join("HiiDB"),
             acpi_tables: dir.to_owned(),
             dev_mem: dir.join("mem"),
@@ -843,6 +888,11 @@ mod tests {
             maps: MemoryMapFiles::Sysfs {
                 runtime_map: dir.join("runtime-map"),
                 firmware_memmap: dir.join("memmap"),
+            },
+            #[cfg(firmware_memory_maps)]
+            system_table: SystemTableLocator::BootParams {
+                boot_params: dir.join("boot_params"),
+                config_table: dir.join("config_table"),
             },
         }
     }
@@ -1202,21 +1252,22 @@ mod tests {
         );
     }
 
-    /// hii_db_published fails, rather than answers false, when it cannot check a file: a vendor
-    /// ACPI table or the OCP HiiDB efivar.
+    /// hii_db_published_using fails, rather than answers false, when it cannot check a file: a
+    /// vendor ACPI table or the OCP HiiDB efivar.
     #[test]
     fn hii_db_published_fails_when_a_file_cannot_be_checked() {
         let dir = tempfile::tempdir().expect("create a directory");
         let file = dir.path().join("file");
         std::fs::write(&file, b"").expect("create the file");
         // stat() of a path through a regular file fails with ENOTDIR, not ENOENT
-        for (case, paths) in [
+        for (case, paths, method) in [
             (
                 "the ACPI tables",
                 HiiSourcePaths {
                     acpi_tables: file.clone(),
                     ..paths_in(dir.path())
                 },
+                HiiMethod::Acpi,
             ),
             (
                 "the HiiDB efivar",
@@ -1224,40 +1275,60 @@ mod tests {
                     ocp_hiidb: file.join("HiiDB"),
                     ..paths_in(dir.path())
                 },
+                HiiMethod::Efivar,
             ),
         ] {
-            let error = hii_db_published_at(&paths).expect_err(case);
+            let options = HiiSourceOptions {
+                source: HiiSource::Method(method),
+                ..HiiSourceOptions::default()
+            };
+
+            let error = hii_db_published_using_at(&paths, &options).expect_err(case);
 
             assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::NotADirectory,
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::NotADirectory),
                 "{case}: not ENOTDIR: {error}"
             );
         }
     }
 
-    /// hii_db_published holds once any file exists, the OCP HiiDB efivar or a vendor ACPI
-    /// table, and not for another ACPI table.
+    /// hii_db_published_using holds for the acpi method once a vendor ACPI table exists, not
+    /// another ACPI table, and for the efivar method once the OCP HiiDB efivar does; the
+    /// automatic order holds once either does, on a BIOS boot, where Linux locates no System
+    /// Table, and answers false without either.
     #[test]
     fn hii_db_published_once_any_file_exists() {
         let each_table = HIIDB_ACPI_SIGNATURES.map(|signature| {
             let name = String::from_utf8_lossy(&signature).into_owned();
-            (format!("the {name} table only"), false, Some(name), true)
+            (
+                format!("the {name} table only"),
+                false,
+                Some(name),
+                [true, false],
+            )
         });
-        for (case, ocp_file, acpi_table, want) in [
-            ("no file".to_owned(), false, None, false),
+        for (case, ocp_file, acpi_table, [want_acpi, want_efivar]) in [
+            ("no file".to_owned(), false, None, [false, false]),
             (
                 "another ACPI table only".to_owned(),
                 false,
                 Some("XSDT".to_owned()),
-                false,
+                [false, false],
             ),
-            ("the HiiDB efivar only".to_owned(), true, None, true),
+            (
+                "the HiiDB efivar only".to_owned(),
+                true,
+                None,
+                [false, true],
+            ),
             (
                 "the HiiDB efivar and HIID".to_owned(),
                 true,
                 Some("HIID".to_owned()),
-                true,
+                [true, true],
             ),
         ]
         .into_iter()
@@ -1265,15 +1336,53 @@ mod tests {
         {
             let dir = tempfile::tempdir().expect("create a directory");
             let paths = paths_in(dir.path());
+            #[cfg(firmware_memory_maps)]
+            std::fs::write(dir.path().join("boot_params"), boot_params([0; 4], 0))
+                .expect("write a BIOS boot's boot_params");
             let acpi_path = acpi_table.map(|name| paths.acpi_tables.join(name));
             let ocp_path = ocp_file.then_some(&paths.ocp_hiidb);
             for path in [ocp_path, acpi_path.as_ref()].into_iter().flatten() {
                 std::fs::write(path, b"").expect("create the file");
             }
 
-            let got = hii_db_published_at(&paths).unwrap_or_else(|error| panic!("{case}: {error}"));
+            for (source, want) in [
+                (HiiSource::Method(HiiMethod::Acpi), want_acpi),
+                (HiiSource::Method(HiiMethod::Efivar), want_efivar),
+            ] {
+                let options = HiiSourceOptions {
+                    source,
+                    ..HiiSourceOptions::default()
+                };
+                let got = hii_db_published_using_at(&paths, &options)
+                    .unwrap_or_else(|error| panic!("{case}: {source:?}: {error:#}"));
+                assert_eq!(got, want, "{case}: {source:?}");
+            }
+            let got = hii_db_published_using_at(&paths, &HiiSourceOptions::default())
+                .unwrap_or_else(|error| panic!("{case}: auto: {error:#}"));
+            assert_eq!(got, want_acpi || want_efivar, "{case}: auto");
+        }
+    }
 
-            assert_eq!(got, want, "{case}");
+    /// The configuration-table probe answers what the System Table lists, and false where this
+    /// build reads no firmware memory map; it fails where its source is refused or fails.
+    #[test]
+    fn systab_probe_answers_false_only_without_its_source() {
+        for (case, listed, want) in [
+            ("listed", Ok(true), Some(true)),
+            ("not listed", Ok(false), Some(false)),
+            (
+                "no memory map reader",
+                Err(MemoryMapUnavailable::NoMapReader.into()),
+                Some(false),
+            ),
+            (
+                "refused",
+                Err(io::Error::from(io::ErrorKind::PermissionDenied).into()),
+                None,
+            ),
+            ("failed", Err(anyhow::anyhow!("the read failed")), None),
+        ] {
+            assert_eq!(systab_probe_answer(listed).ok(), want, "{case}");
         }
     }
 
@@ -1842,63 +1951,468 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_config_table_address() {
-        assert_eq!(parse_hex_address("0x7fc2d198\n").unwrap(), 0x7fc2d198);
-        assert_eq!(parse_hex_address("7fc2d198").unwrap(), 0x7fc2d198);
-        assert!(parse_hex_address("none").is_err());
-    }
+    /// Which methods read the HII database, and how each reports its source absent, refused or
+    /// failing otherwise.
+    mod sources {
+        use super::*;
+        use crate::hii::lockdown::LockdownMode;
+        use crate::hii::memory_access_denied::fixture::unreadable_file;
+        use crate::hii::memory_access_denied::MemoryDevice;
 
-    #[test]
-    fn finds_only_the_hii_database_config_table_entry() {
-        let mut entry = [0u8; CONFIG_TABLE_ENTRY_LEN];
-        entry[..16].copy_from_slice(&HII_DATABASE_GUID);
-        entry[16..].copy_from_slice(&0x7fc0_6018u64.to_le_bytes());
-        assert_eq!(parse_hii_config_table_entry(&entry), Some(0x7fc0_6018));
+        /// The lockdown mode integrity, which refuses /dev/mem.
+        const INTEGRITY: &str = "none [integrity] confidentiality\n";
 
-        entry[16..].fill(0);
-        assert_eq!(parse_hii_config_table_entry(&entry), None, "NULL pointer");
+        /// The options of `source`, with the default memory for the efivar method.
+        fn options(source: HiiSource) -> HiiSourceOptions {
+            HiiSourceOptions {
+                source,
+                ..HiiSourceOptions::default()
+            }
+        }
 
-        entry[16..].copy_from_slice(&0x7fc0_6018u64.to_le_bytes());
-        entry[0] ^= 1;
-        assert_eq!(parse_hii_config_table_entry(&entry), None, "other GUID");
-    }
+        /// The method's error of each method that extract_db_from_at tried with `paths` and
+        /// `source`, which reads no database.
+        fn tried(paths: &HiiSourcePaths, source: HiiSource) -> NoHiiDatabase {
+            extract_db_from_at(paths, &options(source)).expect_err("read no database")
+        }
 
-    /// A package list of `length` bytes: a header whose PackageLength is `length`.
-    fn package_list(length: u32) -> Vec<u8> {
-        let mut list = vec![0xaa; length as usize];
-        list[16..20].copy_from_slice(&length.to_le_bytes());
-        list
-    }
+        /// Whether `error` is the lockdown mode integrity's refusal of /dev/mem.
+        fn refused_by_integrity(error: &HiiMethodError) -> bool {
+            matches!(error, HiiMethodError::Refused(_)) && denied_by_integrity(error.error())
+        }
 
-    #[test]
-    fn hii_db_length_stops_at_zero_padding() {
-        let mut db = package_list(40);
-        db.extend(package_list(24));
-        db.extend([0u8; 30]); // the 25% over-allocation, zero-filled
-        let read = |offset: usize, len: usize| Ok(db[offset..offset + len].to_vec());
-        assert_eq!(hii_db_length(read).unwrap(), 64);
-    }
+        /// Whether `error` is the lockdown mode integrity's MemoryAccessDenied of /dev/mem.
+        fn denied_by_integrity(error: &anyhow::Error) -> bool {
+            error.downcast_ref::<MemoryAccessDenied>()
+                == Some(&MemoryAccessDenied {
+                    device: MemoryDevice::DevMem,
+                    operation: MemoryOperation::Open,
+                    cause: DenialCause::Lockdown(LockdownMode::Integrity),
+                })
+        }
 
-    #[test]
-    fn hii_db_length_rejects_bad_databases() {
-        let empty = [0u8; 32];
-        let read = |offset: usize, len: usize| Ok(empty[offset..offset + len].to_vec());
-        assert!(hii_db_length(read).is_err(), "no package list");
+        /// Without a vendor ACPI table or the HiiDB variable, the acpi and efivar methods find
+        /// their sources absent, the efivar method naming the variable.
+        #[test]
+        fn acpi_and_efivar_find_their_sources_absent_without_their_files() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let paths = paths_in(dir.path());
 
-        let mut short = package_list(20);
-        short[16..20].copy_from_slice(&19u32.to_le_bytes());
-        let read = |offset: usize, len: usize| Ok(short[offset..offset + len].to_vec());
-        assert!(
-            hii_db_length(read).is_err(),
-            "PackageLength below the header"
-        );
+            for method in [HiiMethod::Acpi, HiiMethod::Efivar] {
+                let error = tried(&paths, HiiSource::Method(method));
 
-        // Every list claims 16 MiB and the data never ends.
-        let endless = package_list(20);
-        let mut header = endless[..PACKAGE_LIST_HEADER_LEN].to_vec();
-        header[16..20].copy_from_slice(&(16u32 << 20).to_le_bytes());
-        let read = |_: usize, _: usize| Ok(header.clone());
-        assert!(hii_db_length(read).is_err(), "over the size cap");
+                let [(got, HiiMethodError::Absent(_))] = error.tried.as_slice() else {
+                    panic!("{method}: {error}");
+                };
+                assert_eq!(*got, method);
+            }
+            let error = tried(&paths, HiiSource::Method(HiiMethod::Efivar));
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "no HII database: efivar: absent: the HiiDB variable {} does not exist",
+                    paths.ocp_hiidb.display()
+                )
+            );
+        }
+
+        /// A vendor ACPI table that fails its checks, and a HiiDB variable of an implausible
+        /// length, are no absent sources.
+        #[test]
+        fn invalid_sources_fail_without_being_absent() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let paths = paths_in(dir.path());
+            std::fs::write(paths.acpi_tables.join("QHII"), b"no ACPI table").expect("write QHII");
+            write_efivar(&paths.ocp_hiidb, 0x7e00_0000, 0);
+
+            for method in [HiiMethod::Acpi, HiiMethod::Efivar] {
+                let error = tried(&paths, HiiSource::Method(method));
+
+                let [(_, HiiMethodError::Failed(_))] = error.tried.as_slice() else {
+                    panic!("{method}: {error}");
+                };
+            }
+        }
+
+        /// The efivar method is refused before /dev/mem under lockdown, and the acpi method by a
+        /// table that this user may not read; the automatic order stops at either.
+        #[test]
+        fn refused_methods_stop_the_automatic_order() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            let paths = paths_in(dir.path());
+            std::fs::write(&paths.lockdown, INTEGRITY).expect("write lockdown");
+            write_efivar(&paths.ocp_hiidb, 0x7e00_0000, 16);
+
+            let error = tried(&paths, HiiSource::Auto);
+            let [(HiiMethod::Acpi, HiiMethodError::Absent(_)), (HiiMethod::Efivar, efivar)] =
+                error.tried.as_slice()
+            else {
+                panic!("{error}");
+            };
+            assert!(refused_by_integrity(efivar), "{error}");
+
+            if !unreadable_file(&paths.acpi_tables.join("QHII")) {
+                // CAP_DAC_OVERRIDE reads it anyway
+                return;
+            }
+            let error = tried(&paths, HiiSource::Auto);
+            let [(HiiMethod::Acpi, HiiMethodError::Refused(_))] = error.tried.as_slice() else {
+                panic!("{error}");
+            };
+        }
+
+        /// The configuration-table method, through x86's files.
+        #[cfg(firmware_memory_maps)]
+        mod systab {
+            use super::*;
+            use crate::firmware_width::FirmwareWidth;
+            use crate::hii::firmware_memory::fdt_params::fixture::no_uefi_fdt;
+            use crate::hii::firmware_memory::fdt_params::fixture::xen_uefi_fdt;
+            use crate::hii::package::Guid;
+            use crate::hii::system_table::fixture::configuration_table;
+            use crate::hii::system_table::fixture::valid_system_table;
+            use crate::hii::system_table::fixture::x86_files;
+
+            /// The runtime data region of the tests, where the System Table, its entries and
+            /// the export are, unaligned.
+            const REGION_AT: u64 = 0x7e00_0000;
+            const SYSTEM_TABLE_AT: u64 = REGION_AT + 0x18;
+            const ENTRIES_AT: u64 = REGION_AT + 0x200;
+            const EXPORT_AT: u64 = REGION_AT + 0x1003;
+            /// A configuration table that is not the export.
+            const OTHER: Guid = Guid {
+                data1: 0x8c78_a505,
+                data2: 0xbaa0,
+                data3: 0x4c4a,
+                data4: [0x86, 0x9f, 0, 0, 0, 0, 0x17, 0x02],
+            };
+
+            /// The database that the tests export: two package lists.
+            fn database() -> Vec<u8> {
+                [
+                    en_strings_list([1; 16], b'a'),
+                    en_strings_list([2; 16], b'b'),
+                ]
+                .concat()
+            }
+
+            /// paths_in `dir`, with x86's files of firmware of `width` whose System Table lists
+            /// `entries`, and a fake /dev/mem that holds database() and zeros at EXPORT_AT,
+            /// under the lockdown mode `lockdown`.
+            fn systab_paths(
+                dir: &Path,
+                width: FirmwareWidth,
+                entries: &[(Guid, u64)],
+                lockdown: &str,
+            ) -> HiiSourcePaths {
+                let paths = paths_in(dir);
+                x86_files(
+                    dir,
+                    width,
+                    SYSTEM_TABLE_AT,
+                    ENTRIES_AT,
+                    &[(
+                        MemoryType::RUNTIME_SERVICES_DATA,
+                        REGION_AT,
+                        REGION_AT + 0x1000_0000,
+                        16,
+                    )],
+                );
+                std::fs::write(&paths.lockdown, lockdown).expect("write lockdown");
+                let count = u64::try_from(entries.len()).expect("a u64 count");
+                let mem = File::create(&paths.dev_mem).expect("create the fake /dev/mem");
+                for (address, bytes) in [
+                    (
+                        SYSTEM_TABLE_AT,
+                        valid_system_table(width, count, ENTRIES_AT),
+                    ),
+                    (ENTRIES_AT, configuration_table(width, entries)),
+                    (EXPORT_AT, [database(), vec![0; 0x40]].concat()),
+                ] {
+                    mem.write_all_at(&bytes, address)
+                        .expect("write physical memory");
+                }
+                paths
+            }
+
+            /// The configuration-table method reads exactly the export that the System Table
+            /// lists, of firmware of either width, named and in the automatic order, where the
+            /// other methods find their sources absent; identify finds it too.
+            #[test]
+            fn reads_the_export_that_the_system_table_lists() {
+                for width in [FirmwareWidth::Bits32, FirmwareWidth::Bits64] {
+                    let dir = tempfile::tempdir().expect("create a directory");
+                    let entries = [
+                        (OTHER, ENTRIES_AT),
+                        (EFI_HII_DATABASE_PROTOCOL_GUID, EXPORT_AT),
+                    ];
+                    let paths = systab_paths(dir.path(), width, &entries, NO_LOCKDOWN);
+
+                    for source in [HiiSource::Method(HiiMethod::Systab), HiiSource::Auto] {
+                        let db = extract_db_from_at(&paths, &options(source))
+                            .unwrap_or_else(|error| panic!("{width:?}: {source:?}: {error}"));
+                        assert_eq!(db, database(), "{width:?}: {source:?}");
+
+                        let published = hii_db_published_using_at(&paths, &options(source))
+                            .unwrap_or_else(|error| panic!("{width:?}: {source:?}: {error:#}"));
+                        assert!(published, "{width:?}: {source:?}: published");
+                    }
+                }
+            }
+
+            /// A System Table that does not list the export leaves the configuration-table
+            /// method's source absent, so that no method finds the database, and identify finds
+            /// none.
+            #[test]
+            fn finds_its_source_absent_where_the_system_table_does_not_list_it() {
+                let dir = tempfile::tempdir().expect("create a directory");
+                let paths = systab_paths(
+                    dir.path(),
+                    FirmwareWidth::Bits64,
+                    &[(OTHER, EXPORT_AT)],
+                    NO_LOCKDOWN,
+                );
+
+                let error = tried(&paths, HiiSource::Method(HiiMethod::Systab));
+                let [(HiiMethod::Systab, systab @ HiiMethodError::Absent(_))] =
+                    error.tried.as_slice()
+                else {
+                    panic!("{error}");
+                };
+                assert_eq!(
+                    systab.error().downcast_ref::<HiiExportError>(),
+                    Some(&HiiExportError::NotListed),
+                    "{error}"
+                );
+
+                let error = tried(&paths, HiiSource::Auto);
+                let methods: Vec<HiiMethod> = error
+                    .tried
+                    .iter()
+                    .filter(|(_, error)| matches!(error, HiiMethodError::Absent(_)))
+                    .map(|&(method, _)| method)
+                    .collect();
+                assert_eq!(methods, HiiMethod::AUTOMATIC_ORDER, "{error}");
+
+                let published = hii_db_published_using_at(&paths, &HiiSourceOptions::default())
+                    .expect("look for the database");
+                assert!(!published, "published");
+            }
+
+            /// Where Linux locates no System Table, on a BIOS boot or where it gives the address
+            /// 0, the configuration-table method finds its source absent without physical
+            /// memory, as the other methods find theirs without their files, and identify finds
+            /// no database.
+            #[test]
+            fn finds_its_source_absent_where_linux_locates_no_system_table() {
+                for (case, signature, address, want) in [
+                    (
+                        "BIOS",
+                        [0; 4],
+                        SYSTEM_TABLE_AT,
+                        SystemTableError::NotBootedByEfi { signature: [0; 4] },
+                    ),
+                    ("address 0", *b"EL64", 0, SystemTableError::NoSystemTable),
+                ] {
+                    let dir = tempfile::tempdir().expect("create a directory");
+                    let paths = paths_in(dir.path());
+                    std::fs::write(
+                        dir.path().join("boot_params"),
+                        boot_params(signature, address),
+                    )
+                    .expect("write boot_params");
+
+                    let error = tried(&paths, HiiSource::Method(HiiMethod::Systab));
+                    let [(HiiMethod::Systab, systab @ HiiMethodError::Absent(_))] =
+                        error.tried.as_slice()
+                    else {
+                        panic!("{case}: {error}");
+                    };
+                    assert_eq!(
+                        systab.error().downcast_ref::<SystemTableError>(),
+                        Some(&want),
+                        "{case}: {error}"
+                    );
+
+                    let error = tried(&paths, HiiSource::Auto);
+                    let methods: Vec<HiiMethod> = error
+                        .tried
+                        .iter()
+                        .filter(|(_, error)| matches!(error, HiiMethodError::Absent(_)))
+                        .map(|&(method, _)| method)
+                        .collect();
+                    assert_eq!(methods, HiiMethod::AUTOMATIC_ORDER, "{case}: {error}");
+
+                    for source in [HiiSource::Method(HiiMethod::Systab), HiiSource::Auto] {
+                        let published = hii_db_published_using_at(&paths, &options(source))
+                            .unwrap_or_else(|error| panic!("{case}: {source:?}: {error:#}"));
+                        assert!(!published, "{case}: {source:?}: published");
+                    }
+                }
+            }
+
+            /// Where arm64's FDT has no linux,uefi-system-table in /chosen and no /hypervisor/uefi
+            /// that holds xen,uefi-system-table, the configuration-table method finds its source
+            /// absent, as Linux finds no UEFI, and identify finds no database; where its
+            /// /hypervisor/uefi holds Xen's xen,uefi-system-table, which uefisettings does not
+            /// support, it fails, and identify cannot tell.
+            #[test]
+            fn finds_its_source_absent_where_the_fdt_gives_no_uefi() {
+                for (case, fdt, want) in [
+                    ("no UEFI", no_uefi_fdt(), SystemTableError::NoUefiInFdt),
+                    ("Xen", xen_uefi_fdt(), SystemTableError::XenUefiInFdt),
+                ] {
+                    let dir = tempfile::tempdir().expect("create a directory");
+                    let fdt_path = dir.path().join("fdt");
+                    std::fs::write(&fdt_path, fdt).expect("write the FDT");
+                    let paths = HiiSourcePaths {
+                        system_table: SystemTableLocator::Fdt {
+                            fdt: fdt_path,
+                            fw_platform_size: dir.path().join("fw_platform_size"),
+                        },
+                        ..paths_in(dir.path())
+                    };
+                    let absent = want == SystemTableError::NoUefiInFdt;
+
+                    let error = tried(&paths, HiiSource::Method(HiiMethod::Systab));
+                    let [(HiiMethod::Systab, systab)] = error.tried.as_slice() else {
+                        panic!("{case}: {error}");
+                    };
+                    match absent {
+                        true => assert!(matches!(systab, HiiMethodError::Absent(_)), "{error}"),
+                        false => assert!(matches!(systab, HiiMethodError::Failed(_)), "{error}"),
+                    }
+                    assert_eq!(
+                        systab.error().downcast_ref::<SystemTableError>(),
+                        Some(&want),
+                        "{case}: {error}"
+                    );
+
+                    let published = hii_db_published_using_at(
+                        &paths,
+                        &options(HiiSource::Method(HiiMethod::Systab)),
+                    );
+                    assert_eq!(published.ok(), absent.then_some(false), "{case}: published");
+                }
+            }
+
+            /// Under lockdown, the configuration-table method is refused before /dev/mem, and
+            /// identify cannot tell whether the firmware publishes the export.
+            #[test]
+            fn is_refused_under_lockdown() {
+                let dir = tempfile::tempdir().expect("create a directory");
+                let entries = [(EFI_HII_DATABASE_PROTOCOL_GUID, EXPORT_AT)];
+                let paths = systab_paths(dir.path(), FirmwareWidth::Bits64, &entries, INTEGRITY);
+
+                let error = tried(&paths, HiiSource::Method(HiiMethod::Systab));
+
+                let [(HiiMethod::Systab, systab)] = error.tried.as_slice() else {
+                    panic!("{error}");
+                };
+                assert!(refused_by_integrity(systab), "{error}");
+
+                for source in [HiiSource::Method(HiiMethod::Systab), HiiSource::Auto] {
+                    let error = hii_db_published_using_at(&paths, &options(source))
+                        .expect_err("look for the export under lockdown");
+                    assert!(denied_by_integrity(&error), "{source:?}: {error:#}");
+                }
+            }
+
+            /// The probe answers false where the configuration-table method finds its source
+            /// absent, and fails with the method's error where its source exists but holds no
+            /// export that it reads.
+            #[test]
+            fn probe_answers_false_where_the_source_is_absent() {
+                for (case, error, want) in [
+                    (
+                        "not listed",
+                        anyhow::Error::new(HiiExportError::NotListed),
+                        Some(false),
+                    ),
+                    (
+                        "BIOS",
+                        SystemTableError::NotBootedByEfi { signature: [0; 4] }.into(),
+                        Some(false),
+                    ),
+                    (
+                        "address 0",
+                        SystemTableError::NoSystemTable.into(),
+                        Some(false),
+                    ),
+                    (
+                        "no UEFI in the FDT",
+                        SystemTableError::NoUefiInFdt.into(),
+                        Some(false),
+                    ),
+                    ("Xen", SystemTableError::XenUefiInFdt.into(), None),
+                    ("empty", HiiExportError::Empty.into(), None),
+                    (
+                        "a short PackageLength",
+                        HiiExportError::PackageLengthShort {
+                            offset: 0,
+                            length: 19,
+                        }
+                        .into(),
+                        None,
+                    ),
+                    (
+                        "past the region",
+                        HiiExportError::PastRegion {
+                            offset: 0,
+                            length: 25,
+                            room: 24,
+                        }
+                        .into(),
+                        None,
+                    ),
+                    (
+                        "unterminated",
+                        HiiExportError::Unterminated {
+                            offset: 0,
+                            length: 28,
+                            at: 20,
+                        }
+                        .into(),
+                        None,
+                    ),
+                    (
+                        "too large",
+                        HiiExportError::TooLarge {
+                            length: MAX_ALLOWED_FILESIZE + 1,
+                        }
+                        .into(),
+                        None,
+                    ),
+                    (
+                        "another signature",
+                        SystemTableError::Signature {
+                            address: SYSTEM_TABLE_AT,
+                            signature: 0,
+                        }
+                        .into(),
+                        None,
+                    ),
+                ] {
+                    assert_eq!(systab_probe_answer(Err(error)).ok(), want, "{case}");
+                }
+            }
+
+            /// The automatic order moves past a vendor ACPI table that fails its checks and a
+            /// HiiDB variable of an implausible length to the configuration table.
+            #[test]
+            fn auto_moves_past_invalid_sources() {
+                let dir = tempfile::tempdir().expect("create a directory");
+                let entries = [(EFI_HII_DATABASE_PROTOCOL_GUID, EXPORT_AT)];
+                let paths = systab_paths(dir.path(), FirmwareWidth::Bits64, &entries, NO_LOCKDOWN);
+                std::fs::write(paths.acpi_tables.join("QHII"), b"no ACPI table")
+                    .expect("write QHII");
+                write_efivar(&paths.ocp_hiidb, EXPORT_AT, 0);
+
+                let db = extract_db_from_at(&paths, &HiiSourceOptions::default())
+                    .unwrap_or_else(|error| panic!("{error}"));
+
+                assert_eq!(db, database());
+            }
+        }
     }
 }
