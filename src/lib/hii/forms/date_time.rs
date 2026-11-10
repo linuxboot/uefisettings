@@ -325,7 +325,46 @@ impl DateTimeFormat {
         text: &str,
         stored: Result<u64, &str>,
     ) -> Result<TypeValue, DateTimeTextError> {
-        let given = self.parse(text)?;
+        let bytes = self.given_bytes(self.parse(text)?, stored)?;
+        Ok(self.typed(bytes))
+    }
+
+    /// set's value for `number`, a keyword VALUE: every field of the value, little-endian, which
+    /// SetData() writes as given. A field that the question does not suppress is taken as value
+    /// takes its digits; one that it suppresses must be what set writes there, as value keeps it
+    /// from `stored`, for a VALUE has no dashes.
+    pub(super) fn number_value(
+        self,
+        number: u64,
+        stored: Result<u64, &str>,
+    ) -> Result<TypeValue, DateTimeTextError> {
+        let value = value_bytes(number);
+        let mut fields = [None; 3];
+        for ((field, suppressed), slot) in self.fields().zip(&mut fields) {
+            *slot = (!suppressed).then(|| u32::from(field.value(&value)));
+        }
+        let bytes = self.given_bytes(fields, stored)?;
+        for (field, suppressed) in self.fields() {
+            let (given, written) = (field.value(&value), field.value(&bytes));
+            if suppressed && given != written {
+                return Err(DateTimeTextError::SuppressedChanged {
+                    kind: self.kind,
+                    field,
+                    given,
+                    written,
+                });
+            }
+        }
+        Ok(self.typed(bytes))
+    }
+
+    /// The bytes of set's value with `given`, the number in each field in text order, None for
+    /// each that the question suppresses (value).
+    fn given_bytes(
+        self,
+        given: [Option<u32>; 3],
+        stored: Result<u64, &str>,
+    ) -> Result<[u8; 4], DateTimeTextError> {
         let mut bytes = [0; 4];
         if self.fields().any(|(_, suppressed)| suppressed) {
             let stored = stored.map_err(|reason| DateTimeTextError::StoredUnreadable {
@@ -379,11 +418,15 @@ impl DateTimeFormat {
                 (false | true, _) => {}
             }
         }
-        let [first, second, third, fourth] = bytes;
-        Ok(match self.kind {
+        Ok(bytes)
+    }
+
+    /// The value of `bytes`, the fields of a value of its kind.
+    fn typed(self, [first, second, third, fourth]: [u8; 4]) -> TypeValue {
+        match self.kind {
             DateTimeKind::Date => TypeValue::Date(Date::from_bytes([first, second, third, fourth])),
             DateTimeKind::Time => TypeValue::Time(Time::from_bytes([first, second, third])),
-        })
+        }
     }
 
     /// The number in each field of `text`, in text order; None for dashes.
@@ -463,6 +506,14 @@ impl DateTimeInput {
         self.format
             .value(text, self.stored.as_ref().copied().map_err(String::as_str))
     }
+
+    /// The value that `number`, a keyword VALUE, sets (DateTimeFormat::number_value).
+    pub(super) fn number_value(&self, number: u64) -> Result<TypeValue, DateTimeTextError> {
+        self.format.number_value(
+            number,
+            self.stored.as_ref().copied().map_err(String::as_str),
+        )
+    }
 }
 
 /// Why set does not take the text of a DATE or TIME.
@@ -482,6 +533,18 @@ pub(crate) enum DateTimeTextError {
     Suppressed { kind: DateTimeKind, field: Field },
     #[error("the {field} of this {kind} is not suppressed: give its digits, not dashes")]
     NotSuppressed { kind: DateTimeKind, field: Field },
+    /// A keyword VALUE whose suppressed field differs from what set writes there
+    #[error(
+        "the {field} of this {kind} is suppressed (UEFI 2.11 {}), and set writes it as \
+         {written}, not {given}",
+        .kind.section()
+    )]
+    SuppressedChanged {
+        kind: DateTimeKind,
+        field: Field,
+        given: u16,
+        written: u16,
+    },
     #[error("{field} {value} is outside {} to {}", .range.start(), .range.end())]
     OutOfRange {
         field: Field,

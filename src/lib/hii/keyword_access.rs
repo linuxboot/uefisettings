@@ -905,6 +905,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::END;
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
+    use crate::hii::forms::ifr_fixtures::ORDERED_LIST;
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::ifr_fixtures::TIME;
@@ -1402,6 +1403,84 @@ mod tests {
                 "keyword {SECOND_KEYWORD}: VALUE=02 is no option of question \"Second question\""
             ),
             "the second keyword's refusal"
+        );
+        assert_eq!(handler.calls(), vec![], "no call");
+    }
+
+    /// A DATE of KEYWORD at VarOffset 8 and an ORDERED_LIST of SECOND_KEYWORD at VarOffset 12 of
+    /// VarStore 1, of at most 3 items of the UINT8 options 1, 2 and 3.
+    fn date_and_list() -> Vec<Vec<u8>> {
+        let date = [question_header_with(3, 3, 1, 8, 0), vec![0x00]].concat();
+        let list = [question_header_with(5, 5, 1, 12, 0), vec![3, 0x00]].concat();
+        vec![
+            operation(DATE, false, &date),
+            [
+                operation(ORDERED_LIST, true, &list),
+                flagged_option(5, 0, 1),
+                flagged_option(5, 0, 2),
+                flagged_option(5, 0, 3),
+                END.to_vec(),
+            ]
+            .concat(),
+        ]
+    }
+
+    /// set by keyword writes a DATE's and an ORDERED_LIST's VALUEs in one SetData(), as given,
+    /// and shows what GetData() reads back, as get shows it: text and JSON alike.
+    #[test]
+    fn set_writes_a_date_and_an_ordered_list_by_keyword() {
+        let lists = [list(PATH, &date_and_list())];
+        let handler = MemoryKeywordHandler::default();
+        let written = format!(
+            "{}&{}",
+            resp(PATH, KEYWORD, "1f0c07e9"),
+            resp(PATH, SECOND_KEYWORD, "000103")
+        );
+
+        let values =
+            set(&lists, &written, SetupPasswordPolicy::Refuse, &handler).expect("set by keyword");
+
+        assert_eq!(values.to_string(), written, "the values read back");
+        assert_eq!(
+            handler.calls(),
+            vec![
+                KeywordCall::SetData(written.clone()),
+                get_call(PATH, KEYWORD),
+                get_call(PATH, SECOND_KEYWORD),
+            ],
+            "one SetData(), then a GetData() per keyword"
+        );
+        let json = serde_json::to_value(&values).expect("serialize");
+        assert_eq!(
+            [&json[0]["value"], &json[1]["value"]],
+            ["1f0c07e9", "000103"],
+            "JSON VALUEs"
+        );
+    }
+
+    /// set by keyword refuses an ORDERED_LIST's VALUE that fills a container after an empty one
+    /// before any call, though the DATE's before it is one that set writes.
+    #[test]
+    fn set_refusing_an_ordered_list_after_a_date_makes_no_call() {
+        let lists = [list(PATH, &date_and_list())];
+        let handler = MemoryKeywordHandler::default();
+        let keywords = format!(
+            "{}&{}",
+            resp(PATH, KEYWORD, "1f0c07e9"),
+            resp(PATH, SECOND_KEYWORD, "010003")
+        );
+
+        let error = set(&lists, &keywords, SetupPasswordPolicy::Refuse, &handler)
+            .expect_err("a container after an empty one");
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "keyword {SECOND_KEYWORD}: VALUE=010003 of question \"Second question\": cannot \
+                 set question \"Second question\": a container after an empty one holds a value, \
+                 where set writes 0 after the last item (UEFI 2.11 §33.3.8.3.53)"
+            ),
+            "the ORDERED_LIST's refusal"
         );
         assert_eq!(handler.calls(), vec![], "no call");
     }

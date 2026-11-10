@@ -94,6 +94,16 @@ impl ContainerWidth {
             _ => 1,
         })
     }
+
+    /// The values of the containers of this width in `bytes`, up to the first empty one, which
+    /// holds 0 (UEFI 2.11 §33.3.8.3.53).
+    fn containers(self, bytes: &[u8]) -> Vec<u64> {
+        bytes
+            .chunks_exact(usize::from(self.0))
+            .map(stored_value)
+            .take_while(|&value| value != 0)
+            .collect()
+    }
 }
 
 /// An ORDERED_LIST and the width of its containers.
@@ -148,14 +158,8 @@ impl<'a> OrderedListQuestion<'a> {
     /// The values of the containers in `bytes`, the bytes of its location, up to the first empty
     /// one, which holds 0 (UEFI 2.11 §33.3.8.3.53).
     fn containers(self, bytes: &[u8]) -> Vec<u64> {
-        let Some(ContainerWidth(width)) = self.width else {
-            return Vec::new();
-        };
-        bytes
-            .chunks_exact(usize::from(width))
-            .map(stored_value)
-            .take_while(|&value| value != 0)
-            .collect()
+        self.width
+            .map_or_else(Vec::new, |width| width.containers(bytes))
     }
 
     /// The values of the containers that the default `buffer` fills from the first, the rest
@@ -264,6 +268,12 @@ pub(crate) enum ListRefusal {
     },
     #[error("its items cannot be read, so set cannot keep those of hidden options: {0}")]
     StoredUnread(String),
+    /// A keyword VALUE, which SetData() writes as given
+    #[error(
+        "a container after an empty one holds a value, where set writes 0 after the last item \
+         (UEFI 2.11 §33.3.8.3.53)"
+    )]
+    AfterEmpty,
     #[error("{0}")]
     Expression(BufferExpression),
 }
@@ -335,32 +345,72 @@ impl ListInput {
     }
 
     /// The write that sets `question`, the ORDERED_LIST of this input, to `items`, in order, each
-    /// the text of an option that select_option picks with `include`, and those options. It
-    /// refuses more items than MaxContainers, fewer under EFI_IFR_NO_EMPTY_SET, an option twice
-    /// under EFI_IFR_UNIQUE_SET, an option whose value no container holds, and a list that drops
-    /// a stored item whose option IFR conditions hide or may hide.
+    /// the text of an option that select_option picks with `include`, and those options
+    /// (write_options).
     pub(super) fn write<'q>(
         &self,
         question: &'q QuestionDescriptor,
         items: &[String],
         include: IncludedStates,
     ) -> anyhow::Result<(ListWrite, Vec<&'q AnswerOption>)> {
+        let options = items
+            .iter()
+            .map(|item| -> anyhow::Result<&'q AnswerOption> {
+                let option = question.select_option(&BTreeSet::from([item.clone()]), include)?;
+                Ok(option
+                    .ok_or_else(|| ListRefusal::NotAnOption { item: item.clone() }.of(question))?)
+            });
+        self.write_options(question, options)
+    }
+
+    /// The bytes of each of its containers (ContainerWidth::of); None without options.
+    pub(super) fn container_width(&self) -> Option<usize> {
+        self.width.map(|ContainerWidth(width)| usize::from(width))
+    }
+
+    /// The values of the containers in `bytes`, a keyword VALUE of every container, which
+    /// SetData() writes as given, up to the first empty one: refuses a VALUE that fills a
+    /// container after it.
+    pub(super) fn container_values(
+        &self,
+        question: &QuestionDescriptor,
+        bytes: &[u8],
+    ) -> Result<Vec<u64>, ChangeValueError> {
+        let Some(width) = self.width else {
+            return Err(ListRefusal::NoOptions.of(question));
+        };
+        let values = width.containers(bytes);
+        let filled = values.len() * usize::from(width.0);
+        if bytes.iter().skip(filled).any(|&byte| byte != 0) {
+            return Err(ListRefusal::AfterEmpty.of(question));
+        }
+        Ok(values)
+    }
+
+    /// The write that sets `question`, the ORDERED_LIST of this input, to `options`, in order,
+    /// and those options. It refuses more options than MaxContainers, fewer under
+    /// EFI_IFR_NO_EMPTY_SET, an option twice under EFI_IFR_UNIQUE_SET, an option whose value no
+    /// container holds, and a list that drops a stored item whose option IFR conditions hide or
+    /// may hide; it fails as `options` fails to give an option, in its order.
+    pub(super) fn write_options<'q>(
+        &self,
+        question: &'q QuestionDescriptor,
+        options: impl ExactSizeIterator<Item = anyhow::Result<&'q AnswerOption>>,
+    ) -> anyhow::Result<(ListWrite, Vec<&'q AnswerOption>)> {
         let Some(ContainerWidth(width)) = self.width else {
             return Err(ListRefusal::NoOptions.of(question).into());
         };
-        let (max, given) = (self.max_containers, items.len());
+        let (max, given) = (self.max_containers, options.len());
         if given > usize::from(max) {
             return Err(ListRefusal::TooMany { max, given }.of(question).into());
         }
         if self.flags & EFI_IFR_NO_EMPTY_SET != 0 && given < usize::from(max) {
             return Err(ListRefusal::Empty { max, given }.of(question).into());
         }
-        let mut options = Vec::new();
+        let mut written = Vec::new();
         let mut values = Vec::new();
-        for item in items {
-            let option = question
-                .select_option(&BTreeSet::from([item.clone()]), include)?
-                .ok_or_else(|| ListRefusal::NotAnOption { item: item.clone() }.of(question))?;
+        for option in options {
+            let option = option?;
             let text = || option.value.trim().to_string();
             let known =
                 option
@@ -398,7 +448,7 @@ impl ListInput {
                     .of(question)
                     .into());
             }
-            options.push(option);
+            written.push(option);
             values.push(value);
         }
         self.check_hidden_kept(&question.possible_options, &values)
@@ -415,7 +465,7 @@ impl ListInput {
                 offset: self.offset,
                 bytes,
             },
-            options,
+            written,
         ))
     }
 

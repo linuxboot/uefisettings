@@ -837,6 +837,15 @@ written, as a number. It never writes a read-only question, which the Keyword Ha
 its `--include` takes no `read-only`; else `--include`, `--bypass-setup-password` and
 `--allow-volatile` work as for `set`: the `<KeywordResp>` of a keyword whose variable is volatile
 ends with ` <volatile: lasts until the next reset or power cycle>`. `-j` prints JSON instead.
+A VALUE holds every byte that SetData() writes, last byte first, as edk2's GetValueOfNumber
+(ConfigRouting.c:518) and UEFI 2.11 §35.4.6's example read it, where §35.2.1.5 lists a
+`<Number>`'s bytes in memory order: of a DATE or TIME each field, which `set` takes as the digits
+of its text, so a field that the question suppresses must be the one that `set` keeps; of an
+ORDERED_LIST each container, whose options up to the first empty one `set` takes as `--item`s,
+every container after it empty. A container is as wide as the Type of the ONE_OF_OPTION right
+after the ORDERED_LIST, as edk2's GetWidth takes it, where UEFI 2.11 §33.2.5.4.8 gives it one
+byte; a VALUE is refused where `set` writes containers of another width, that of the first option
+that is no default. A REF, whose EFI_HII_REF `set` does not write, and a STRING are refused.
 
 ```plain
 FS0:\> uefisettings.efi hii keyword get --namespace x-UEFI-ns KEYWORD=<keyword>

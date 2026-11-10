@@ -117,6 +117,12 @@ pub(crate) enum ChangeValueError {
          cross-reference question, the target of its link (UEFI 2.11 §33.2.5.4.10)"
     )]
     CrossReference { question: String },
+    /// NewValue::Number for a question that is no DATE or TIME
+    #[error(
+        "cannot set question {question:?} to the number of a keyword VALUE, which set takes only \
+         for a DATE or TIME"
+    )]
+    NumberOfNoDateTime { question: String },
     /// A question that `cause` makes read-only, which set writes only with `lifted_with`, the
     /// states that lift `cause` where its caller can include them, else never, and
     /// `undetermined`, the states that it may be in where the selection is undetermined;
@@ -416,11 +422,12 @@ impl Written<'_> {
 }
 
 /// What set takes for a question: the text of its value, or of a ONE_OF the option that it
-/// picked.
+/// picked, or the number of a keyword VALUE of a DATE or TIME (number_value).
 #[derive(Clone, Copy)]
 pub(super) enum NewValue<'a> {
     Text(&'a str),
     Option(&'a AnswerOption),
+    Number(u64),
 }
 
 /// The value that sets `question` to `new_value`, and its write through variables of `reach` and
@@ -447,6 +454,7 @@ pub(super) fn own_write<'a>(
             option_value(question, option)?
         }
         NewValue::Text(text) => text_value(question, text)?,
+        NewValue::Number(number) => number_value(question, number)?,
     };
     let write = store
         .map(|store| VarStoreWrite::new(store, offset, size, value, interface))
@@ -471,6 +479,21 @@ fn option_value(
             question: question.question.clone(),
             option: option.value.clone(),
             reason,
+        }),
+    }
+}
+
+/// The value that `number`, a keyword VALUE, gives `question`, a DATE or TIME: its fields as
+/// DateTimeInput::number_value takes them. Refuses the number of any other question, whose
+/// keyword set passes an option or text.
+fn number_value(question: &QuestionDescriptor, number: u64) -> Result<TypeValue, ChangeValueError> {
+    match &question.input {
+        TextInput::DateTime(input) => Ok(input.number_value(number)?),
+        TextInput::Range(_)
+        | TextInput::Maximum(_)
+        | TextInput::OrderedList(_)
+        | TextInput::CrossReference => Err(ChangeValueError::NumberOfNoDateTime {
+            question: question.question.clone(),
         }),
     }
 }
@@ -2520,6 +2543,57 @@ mod date_time_write_tests {
                 set_to(&question, text, &variables),
                 (Ok(()), vec![(0, bytes)]),
                 "{text}"
+            );
+        }
+    }
+
+    /// set takes the number of a keyword VALUE of a DATE or TIME as DateTimeInput::number_value
+    /// takes it, its fields within their ranges, and writes its bytes; it refuses the number of a
+    /// ONE_OF, NUMERIC or CHECKBOX, whose keyword set passes an option or text.
+    #[test]
+    fn a_keyword_value_number_sets_only_a_date_or_time() {
+        let (date, variables) = date_time_on(DATE, 0x00, &[0xAA; 4]);
+        let write = |question: &QuestionDescriptor, number| {
+            own_write(
+                question,
+                NewValue::Number(number),
+                variables.reach(),
+                variables.interface(),
+            )
+            .map(|(_, write)| write.map(|write| write.patches))
+        };
+        assert_eq!(
+            write(&date, 0x1f0c_07e9).expect("2025-12-31"),
+            Some(vec![(0, vec![0xE9, 0x07, 0x0C, 0x1F])]),
+            "2025-12-31"
+        );
+        assert_eq!(
+            write(&date, 0x1f0d_07e9).map_err(|error| error.to_string()),
+            Err("month 13 is outside 1 to 12".to_string()),
+            "month 13"
+        );
+        let (time, _) = date_time_on(TIME, 0x00, &[0xAA; 3]);
+        assert_eq!(
+            write(&time, 0x3b_3b17).expect("23:59:59"),
+            Some(vec![(0, vec![23, 59, 59])]),
+            "23:59:59"
+        );
+        for (name, op_code, data, children) in [
+            (
+                "ONE_OF",
+                ONE_OF,
+                one_of_data(),
+                vec![one_of_option(4, 0x00, &[1])],
+            ),
+            ("NUMERIC", NUMERIC, uint8_numeric(0x10, 0, 3), vec![]),
+            ("CHECKBOX", CHECKBOX, checkbox(0, 0x00), vec![]),
+        ] {
+            let (_root, node) = parse_question(&[], op_code, &data, &children);
+            let question = question_descriptor(&node, var_store_of(&[0]));
+            let refused = write(&question, 1).err();
+            assert!(
+                matches!(refused, Some(ChangeValueError::NumberOfNoDateTime { .. })),
+                "{name}: {refused:?}"
             );
         }
     }

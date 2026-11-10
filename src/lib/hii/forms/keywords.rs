@@ -54,6 +54,7 @@ use super::defaults::DefaultId;
 use super::defaults::OptionVisibility;
 use super::defaults::TypedDefault;
 use super::find_corresponding_varstore;
+use super::ordered_list::ListInput;
 use super::question_values::describe_question;
 use super::question_values::value_question;
 use super::question_values::ListedQuestion;
@@ -62,8 +63,10 @@ use super::refers_to_bit_field;
 use super::set::own_write;
 use super::set::ChangeValueError;
 use super::set::NewValue;
+use super::set::VarStoreWrite;
 use super::try_walk_scopes;
 use super::walk_scopes;
+use super::write_plan::list_own_write;
 use super::AnswerOption;
 use super::Choice;
 use super::DeclaredStore;
@@ -206,6 +209,60 @@ pub(crate) enum KeywordRefusal {
     ReadOnlyResp(String),
     #[error("keyword {keyword}: uefisettings does not yet implement keyword set of {op}")]
     Unchecked { keyword: String, op: &'static str },
+    #[error(
+        "keyword {keyword}: SetData() writes VALUE={value} as given, where set writes {written} \
+         for question \"{question}\""
+    )]
+    Unwritten {
+        keyword: String,
+        value: String,
+        written: String,
+        question: String,
+    },
+    /// Unwritten where GetWidth, the VALUE's bytes, is not the StorageWidth that set writes: of
+    /// an ORDERED_LIST, edk2-stable202608 ConfigKeywordHandler.c GetWidth (:1613-1618) takes the
+    /// Type of the op right after it, and SetupBrowserDxe/IfrParse.c (:2370, :2492) that of its
+    /// first option that is no default
+    #[error(
+        "keyword {keyword}: SetData() writes VALUE={value} as given, {get_width} bytes \
+         (GetWidth), where set writes {written}, {storage_width} bytes (StorageWidth), for \
+         question \"{question}\""
+    )]
+    UnwrittenWidth {
+        keyword: String,
+        value: String,
+        get_width: usize,
+        written: String,
+        storage_width: usize,
+        question: String,
+    },
+    /// An ORDERED_LIST whose containers GetWidth takes as wide as the Type of the op right after
+    /// it, and set as that of its first option that is no default (UnwrittenWidth), with
+    /// different widths: SetData() writes no VALUE as set does, whatever its bytes
+    #[error(
+        "keyword {keyword}: SetData() writes VALUE={value} as given, in containers of \
+         {get_width} bytes as GetWidth takes them, where set writes containers of \
+         {storage_width} bytes as StorageWidth takes them, for question \"{question}\""
+    )]
+    ContainerWidths {
+        keyword: String,
+        value: String,
+        get_width: usize,
+        storage_width: usize,
+        question: String,
+    },
+    /// An ORDERED_LIST whose description holds no ListInput, which describe_question always
+    /// gives it (handle_ordered_list)
+    #[error(
+        "keyword {keyword}: internal inconsistency: question \"{question}\" is an \
+         EFI_IFR_ORDERED_LIST, but its description holds set's TextInput::{input}, not a \
+         ListInput"
+    )]
+    ListInputMismatch {
+        keyword: String,
+        question: String,
+        input: &'static str,
+    },
     #[error("keyword {keyword}: VALUE={value} {reason} question \"{question}\"")]
     Value {
         keyword: String,
@@ -313,6 +370,9 @@ pub(crate) enum ValueRefusal {
     Width,
     #[error("is no option of")]
     NoOption,
+    /// A value of an ORDERED_LIST's VALUE, in its `container`th container, the first being 1
+    #[error("holds {value} in container {container}, which is no option of")]
+    NoContainerOption { container: usize, value: u64 },
 }
 
 /// Why uefisettings builds no `<KeywordInfoResp>` item of a keyword from the IFR.
@@ -765,12 +825,17 @@ impl<'a> KeywordQuestion<'a> {
     }
 
     /// Refuses a set of `resp`, the question's keyword, that SetData() would write otherwise than
-    /// set: through no WRITE expression, Callback(), EFI Date/Time Storage or UEFI Storage 0x30;
-    /// else takes it through set's own checks, with `include`, `volatile` and the variables of
-    /// `reader`: the question's state, whether it is read-only, which no `include` lifts, its
-    /// option of the VALUE or the VALUE's range, the variable's, and whether the bytes written
-    /// overlap those that `reader` withholds, which hold a password
-    /// (ChangeValueError::PasswordBytes). Returns what SetData() writes.
+    /// set: through no WRITE expression, Callback(), EFI Date/Time Storage or UEFI Storage 0x30,
+    /// or with a VALUE not as wide as the GetWidth bytes (keyword_width) that SetData() writes as
+    /// given (edk2-stable202608 ConfigKeywordHandler.c ExtractConfigResp :2219-2220,
+    /// ConfigRouting.c HiiConfigToBlock :6353); else takes it through set's own checks, with
+    /// `include`, `volatile` and the variables of `reader`: the question's state, whether it is
+    /// read-only, which no `include` lifts, its option of the VALUE or the VALUE's range, the
+    /// fields of a DATE or TIME (DateTimeInput::number_value), the items of an ORDERED_LIST
+    /// (list_write), the EFI_HII_REF of a REF, which set does not write, the variable's, and
+    /// whether the bytes written overlap those that `reader` withholds, which hold a password
+    /// (ChangeValueError::PasswordBytes); and refuses a VALUE that is not the bytes that set
+    /// writes. Returns what SetData() writes.
     pub(crate) fn check_set(
         &self,
         resp: &KeywordResp,
@@ -783,47 +848,46 @@ impl<'a> KeywordQuestion<'a> {
             return Err(KeywordRefusal::ReadOnlyResp(self.keyword.to_string()).into());
         }
         let op = self.op.borrow();
-        // keyword set of a DATE or TIME is not implemented yet: SetData() would also write the
-        // fields that its Flags suppress, which set keeps
-        let question = match value_question(&op) {
-            Some(ValueQuestion::DateTime(_)) | None => return Err(self.unchecked(&op).into()),
-            Some(question) => question,
+        // set takes no STRING (ListedQuestion), and keyword set takes none yet
+        let Some(listed) = ListedQuestion::of(&op) else {
+            return Err(self.unchecked(&op).into());
         };
         let prompt = self.texts.display(header.prompt_string_id);
-        let number = value_number(question, resp.value.as_bytes())
-            .ok_or_else(|| self.value_refusal(resp, prompt, ValueRefusal::Width))?;
+        if keyword_width(&op) != Some(resp.value.as_bytes().len()) {
+            return Err(self.value_refusal(resp, prompt, ValueRefusal::Width).into());
+        }
         let descriptor = self
-            .chosen(question, prompt, include, volatile, reader)
+            .chosen(listed, prompt, include, volatile, reader)
             .with_context(|| format!("keyword {}", self.keyword))?;
-        let text;
-        let new_value = match question {
-            ValueQuestion::OneOf(_) => NewValue::Option(
-                option_of_value(&descriptor, number, include)
-                    .with_context(|| format!("keyword {}", self.keyword))?
-                    .ok_or_else(|| self.value_refusal(resp, prompt, ValueRefusal::NoOption))?,
-            ),
-            ValueQuestion::Numeric(_) | ValueQuestion::CheckBox(_) => {
-                // a CHECKBOX has no NumericRange, nor a NUMERIC bit field, which own_write refuses
-                text = match &descriptor.input {
-                    TextInput::Range(range) => range.format.decode(number).to_string(),
-                    TextInput::Maximum(_)
-                    | TextInput::DateTime(_)
-                    | TextInput::OrderedList(_)
-                    | TextInput::CrossReference => number.to_string(),
-                };
-                NewValue::Text(&text)
+        let write = match listed {
+            ListedQuestion::Value(question) => {
+                self.value_write(question, &descriptor, resp, prompt, include, reader)?
             }
-            ValueQuestion::DateTime(_) => return Err(self.unchecked(&op).into()),
+            ListedQuestion::OrderedList(_) => {
+                let TextInput::OrderedList(input) = &descriptor.input else {
+                    return Err(KeywordRefusal::ListInputMismatch {
+                        keyword: self.keyword.to_string(),
+                        question: descriptor.question.clone(),
+                        input: descriptor.input.kind(),
+                    }
+                    .into());
+                };
+                Some(self.list_write(input, &descriptor, resp, prompt, include, reader)?)
+            }
+            // as set refuses it, after its choice (plan_question)
+            ListedQuestion::Ref(_) => {
+                return Err(ChangeValueError::CrossReference {
+                    question: descriptor.question.clone(),
+                })
+                .with_context(|| format!("keyword {}", self.keyword));
+            }
         };
-        let (_, write) = own_write(&descriptor, new_value, reader.reach(), reader.interface())
-            .with_context(|| {
-                format!(
-                    "keyword {}: VALUE={} of question \"{prompt}\"",
-                    self.keyword, resp.value
-                )
-            })?;
         let write =
             write.ok_or_else(|| self.question_refusal(&header, QuestionRefusal::Storageless))?;
+        // SetData() writes the VALUE as given: only where set writes those very bytes
+        if write.patches != [(header.var_store_info, resp.value.as_bytes().to_vec())] {
+            return Err(self.unwritten(resp, prompt, &write.patches)?.into());
+        }
         let variable = write.store.variable_key();
         let bytes: Vec<Range<usize>> = write
             .patches
@@ -1320,7 +1384,7 @@ impl<'a> KeywordQuestion<'a> {
     /// or in a variable that set does not write.
     fn chosen(
         &self,
-        question: ValueQuestion<'_>,
+        question: ListedQuestion<'_>,
         prompt: &str,
         include: IncludedStates,
         volatile: VolatileWrites,
@@ -1330,9 +1394,8 @@ impl<'a> KeywordQuestion<'a> {
             let values = VarStoreValues::new(self.root, None);
             let mut walk = FormSetWalk::new(&self.texts, reader, &values, include);
             let state = question_state(&self.op.borrow(), &mut walk.inputs);
-            select(vec![(question, state)], include).map(|question| {
-                describe_question(&self.op, ListedQuestion::Value(question), &mut walk)
-            })
+            select(vec![(question, state)], include)
+                .map(|question| describe_question(&self.op, question, &mut walk))
         };
         let options = SetOptions {
             include,
@@ -1347,6 +1410,153 @@ impl<'a> KeywordQuestion<'a> {
             .into()),
             Choice::Skipped(exclusion) => Err(exclusion.question_error(prompt).into()),
         }
+    }
+
+    /// set's write of `resp`, a keyword VALUE, to `question`, of `descriptor`, prompted by
+    /// `prompt`, through variables of `reader`: of a ONE_OF its option of the VALUE that set
+    /// picks with `include`, of a NUMERIC or CHECKBOX the VALUE's number as set takes its text, of
+    /// a DATE or TIME the VALUE's number (NewValue::Number). None for a question whose WRITE
+    /// expression alone takes the value.
+    fn value_write<'d>(
+        &self,
+        question: ValueQuestion<'_>,
+        descriptor: &'d QuestionDescriptor,
+        resp: &KeywordResp,
+        prompt: &str,
+        include: IncludedStates,
+        reader: &EfivarReader,
+    ) -> Result<Option<VarStoreWrite<'d>>> {
+        let number = value_number(question, resp.value.as_bytes())
+            .ok_or_else(|| self.value_refusal(resp, prompt, ValueRefusal::Width))?;
+        let text;
+        let new_value = match question {
+            ValueQuestion::OneOf(_) => NewValue::Option(
+                option_of_value(descriptor, number, include)
+                    .with_context(|| format!("keyword {}", self.keyword))?
+                    .ok_or_else(|| self.value_refusal(resp, prompt, ValueRefusal::NoOption))?,
+            ),
+            ValueQuestion::DateTime(_) => NewValue::Number(number),
+            ValueQuestion::Numeric(_) | ValueQuestion::CheckBox(_) => {
+                // a CHECKBOX has no NumericRange, nor a NUMERIC bit field, which own_write refuses
+                text = match &descriptor.input {
+                    TextInput::Range(range) => range.format.decode(number).to_string(),
+                    TextInput::Maximum(_)
+                    | TextInput::DateTime(_)
+                    | TextInput::OrderedList(_)
+                    | TextInput::CrossReference => number.to_string(),
+                };
+                NewValue::Text(&text)
+            }
+        };
+        let (_, write) = own_write(descriptor, new_value, reader.reach(), reader.interface())
+            .with_context(|| self.value_context(resp, prompt))?;
+        Ok(write)
+    }
+
+    /// set's write of `resp`, a keyword VALUE of every container, to the ORDERED_LIST of
+    /// `descriptor`, of `input`, prompted by `prompt`, through variables of `reader`: the
+    /// options that set picks with `include` of the values of its containers up to the first
+    /// empty one, written as set writes options (ListInput::write_options, list_own_write).
+    /// Refuses any VALUE where GetWidth's containers are not as wide as set's (ContainerWidths),
+    /// and a VALUE that fills a container after that one (ListInput::container_values) or holds
+    /// a value of no option.
+    fn list_write<'d>(
+        &self,
+        input: &ListInput,
+        descriptor: &'d QuestionDescriptor,
+        resp: &KeywordResp,
+        prompt: &str,
+        include: IncludedStates,
+        reader: &EfivarReader,
+    ) -> Result<VarStoreWrite<'d>> {
+        // GetWidth has a width once check_set took the VALUE's; set has none without options,
+        // which container_values refuses
+        if let (Some(get_width), Some(storage_width)) = (
+            get_width_container_bytes(&self.op.borrow()),
+            input.container_width(),
+        ) {
+            if get_width != storage_width {
+                return Err(KeywordRefusal::ContainerWidths {
+                    keyword: self.keyword.to_string(),
+                    value: resp.value.to_string(),
+                    get_width,
+                    storage_width,
+                    question: prompt.to_owned(),
+                }
+                .into());
+            }
+        }
+        let values = input
+            .container_values(descriptor, resp.value.as_bytes())
+            .with_context(|| self.value_context(resp, prompt))?;
+        let mut options = Vec::new();
+        for (container, value) in (1..).zip(values) {
+            let option = option_of_value(descriptor, value, include)
+                .with_context(|| format!("keyword {}", self.keyword))?
+                .ok_or_else(|| {
+                    let reason = ValueRefusal::NoContainerOption { container, value };
+                    self.value_refusal(resp, prompt, reason)
+                })?;
+            options.push(option);
+        }
+        let (list, _) = input
+            .write_options(descriptor, options.into_iter().map(Ok))
+            .with_context(|| self.value_context(resp, prompt))?;
+        list_own_write(descriptor, list, reader.reach())
+            .with_context(|| self.value_context(resp, prompt))
+    }
+
+    /// What names `resp`, the keyword's VALUE, for the question prompted by `prompt`, in the errors
+    /// of set's checks of it.
+    fn value_context(&self, resp: &KeywordResp, prompt: &str) -> String {
+        format!(
+            "keyword {}: VALUE={} of question \"{prompt}\"",
+            self.keyword, resp.value
+        )
+    }
+
+    /// The refusal of `resp`, the keyword's VALUE, for the question prompted by `prompt`, where
+    /// set writes `patches`, each bytes at a VarOffset, which are not the VALUE at the question's
+    /// VarOffset: UnwrittenWidth where they hold another number of bytes than the VALUE.
+    fn unwritten(
+        &self,
+        resp: &KeywordResp,
+        prompt: &str,
+        patches: &[(u16, Vec<u8>)],
+    ) -> Result<KeywordRefusal, ConfigStringError> {
+        let written = patches
+            .iter()
+            .map(|(offset, bytes)| {
+                Ok(format!(
+                    "{} at VarOffset {offset}",
+                    Number::try_from(bytes.clone())?
+                ))
+            })
+            .collect::<Result<Vec<String>, ConfigStringError>>()?
+            .join(", ");
+        let (keyword, value, question) = (
+            self.keyword.to_string(),
+            resp.value.to_string(),
+            prompt.to_owned(),
+        );
+        let get_width = resp.value.as_bytes().len();
+        let storage_width = patches.iter().map(|(_, bytes)| bytes.len()).sum();
+        Ok(match get_width == storage_width {
+            true => KeywordRefusal::Unwritten {
+                keyword,
+                value,
+                written,
+                question,
+            },
+            false => KeywordRefusal::UnwrittenWidth {
+                keyword,
+                value,
+                get_width,
+                written,
+                storage_width,
+                question,
+            },
+        })
     }
 
     /// The refusal of a keyword set of `op`, which uefisettings does not implement yet.
@@ -1551,19 +1761,7 @@ fn keyword_width(op: &IFROperation) -> Option<usize> {
         }
         IFROpCode::OrderedList => {
             let list: OrderedListOp = data.parse_le().ok()?;
-            let first = op.children.first()?.borrow();
-            if first.op_code != IFROpCode::OneOfOption {
-                return None;
-            }
-            let option: OptionTypeOp = Cursor::new(&first.data).parse_le().ok()?;
-            let width = match option.option_type {
-                EFI_IFR_TYPE_NUM_SIZE_8 => 1,
-                EFI_IFR_TYPE_NUM_SIZE_16 => 2,
-                EFI_IFR_TYPE_NUM_SIZE_32 => 4,
-                EFI_IFR_TYPE_NUM_SIZE_64 => 8,
-                _ => return None,
-            };
-            Some(width * usize::from(list.max_containers))
+            Some(get_width_container_bytes(op)? * usize::from(list.max_containers))
         }
         IFROpCode::String => {
             let string: StringOp = data.parse_le().ok()?;
@@ -1572,6 +1770,24 @@ fn keyword_width(op: &IFROperation) -> Option<usize> {
         IFROpCode::Date => Some(EFI_HII_DATE_SIZE),
         IFROpCode::Time => Some(EFI_HII_TIME_SIZE),
         IFROpCode::Ref => Some(EFI_HII_REF_SIZE),
+        _ => None,
+    }
+}
+
+/// The bytes of each container of the ORDERED_LIST `op` that edk2-stable202608
+/// ConfigKeywordHandler.c GetWidth (:1613-1618) gives: those of the Type of the ONE_OF_OPTION
+/// that it starts with. None without such an option, where GetWidth asserts, or of another Type.
+fn get_width_container_bytes(op: &IFROperation) -> Option<usize> {
+    let first = op.children.first()?.borrow();
+    if first.op_code != IFROpCode::OneOfOption {
+        return None;
+    }
+    let option: OptionTypeOp = Cursor::new(&first.data).parse_le().ok()?;
+    match option.option_type {
+        EFI_IFR_TYPE_NUM_SIZE_8 => Some(1),
+        EFI_IFR_TYPE_NUM_SIZE_16 => Some(2),
+        EFI_IFR_TYPE_NUM_SIZE_32 => Some(4),
+        EFI_IFR_TYPE_NUM_SIZE_64 => Some(8),
         _ => None,
     }
 }
@@ -2429,7 +2645,8 @@ mod tests {
     }
 
     /// GetData() reads the EFI_HII_REF of a REF on a VarStore as stored, which check_get takes;
-    /// check_set refuses it, as set does.
+    /// check_set refuses a VALUE of its 22 bytes with set's error, and one of fewer bytes as not
+    /// as wide.
     #[test]
     fn check_get_takes_a_ref_and_check_set_refuses_it() {
         let op = || {
@@ -2438,13 +2655,22 @@ mod tests {
         };
         let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], op())];
         assert_eq!(question_of(&lists).check_get(&reader(1)), Ok(()), "get");
-        let error = check_set_of(op(), "03", IncludedStates::empty()).expect_err("set");
+        let error = check_set_of(op(), &"01".repeat(22), IncludedStates::empty())
+            .expect_err("set of 22 bytes");
         assert_eq!(
-            error.to_string(),
+            format!("{error:#}"),
             format!(
-                "keyword {KEYWORD}: uefisettings does not yet implement keyword set of EFI_IFR_REF"
+                "keyword {KEYWORD}: {}",
+                ChangeValueError::CrossReference {
+                    question: QUESTION.to_owned()
+                }
             ),
-            "set"
+            "set of 22 bytes"
+        );
+        assert_eq!(
+            refusal_of(check_set_of(op(), "03", IncludedStates::empty())),
+            Some(value_refusal("03", ValueRefusal::Width)),
+            "set of 1 byte"
         );
     }
 
@@ -2530,8 +2756,8 @@ mod tests {
     }
 
     /// GetData() reads a STRING, DATE, TIME or ORDERED_LIST as stored, which check_get takes;
-    /// check_set refuses them, as keyword set of them is not implemented yet; both refuse a
-    /// PASSWORD.
+    /// check_set refuses a STRING, as keyword set of it is not implemented yet, and a VALUE of a
+    /// byte for the others, which it takes as wide as GetWidth; both refuse a PASSWORD.
     #[test]
     fn check_get_takes_string_date_time_and_ordered_list_but_not_password() {
         let question = |op_code: u8| {
@@ -2542,11 +2768,27 @@ mod tests {
             .concat();
             operation(op_code, false, &data)
         };
-        for (op_code, op) in [
-            (STRING, "EFI_IFR_STRING"),
-            (DATE, "EFI_IFR_DATE"),
-            (TIME, "EFI_IFR_TIME"),
-            (ORDERED_LIST, "EFI_IFR_ORDERED_LIST"),
+        let unchecked = |op: &'static str| KeywordRefusal::Unchecked {
+            keyword: KEYWORD.to_owned(),
+            op,
+        };
+        for (op_code, op, refusal) in [
+            (STRING, "EFI_IFR_STRING", unchecked("EFI_IFR_STRING")),
+            (
+                DATE,
+                "EFI_IFR_DATE",
+                value_refusal("03", ValueRefusal::Width),
+            ),
+            (
+                TIME,
+                "EFI_IFR_TIME",
+                value_refusal("03", ValueRefusal::Width),
+            ),
+            (
+                ORDERED_LIST,
+                "EFI_IFR_ORDERED_LIST",
+                value_refusal("03", ValueRefusal::Width),
+            ),
         ] {
             let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], question(op_code))];
             assert_eq!(
@@ -2554,16 +2796,20 @@ mod tests {
                 Ok(()),
                 "{op}: get"
             );
-            let error =
-                check_set_of(question(op_code), "03", IncludedStates::empty()).expect_err(op);
             assert_eq!(
-                error.to_string(),
-                format!(
-                    "keyword {KEYWORD}: uefisettings does not yet implement keyword set of {op}"
-                ),
+                refusal_of(check_set_of(
+                    question(op_code),
+                    "03",
+                    IncludedStates::empty()
+                )),
+                Some(refusal),
                 "{op}: set"
             );
         }
+        assert_eq!(
+            unchecked("EFI_IFR_STRING").to_string(),
+            format!("keyword {KEYWORD}: uefisettings does not yet implement keyword set of EFI_IFR_STRING")
+        );
         let password = password_on(1, PROMPT, 1, 5);
         let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], password.clone())];
         assert_eq!(
@@ -2576,6 +2822,607 @@ mod tests {
             Some(question_refusal(QuestionRefusal::Password)),
             "PASSWORD: set"
         );
+    }
+
+    /// The variable Store, NV+BS+RT, through the UEFI Shell's variable services, holding `value`
+    /// at OFFSET and 0 elsewhere.
+    fn reader_of(value: &[u8]) -> EfivarReader {
+        let variables = MemoryVariables::new(
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let mut data = [0; 16];
+        data[OFFSET..OFFSET + value.len()].copy_from_slice(value);
+        variables.insert(store_key(), ATTRIBUTES, &data);
+        EfivarReader::with_variables(Box::new(variables))
+    }
+
+    /// check_set of `value` on the one question of KEYWORD in a list of `ops`, with the variable
+    /// Store of reader_of(`stored`): the VarOffsets that SetData() writes, or the error as the CLI
+    /// prints it.
+    fn keyword_set(ops: Vec<u8>, value: &str, stored: &[u8]) -> Result<Vec<Range<usize>>, String> {
+        let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
+        question_of(&lists)
+            .check_set(
+                &resp(value),
+                IncludedStates::empty(),
+                VolatileWrites::Refuse,
+                &mut reader_of(stored),
+            )
+            .map(|write| write.bytes)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// The error of check_set for `value` that set's check of its fields gives with `error`.
+    fn value_error(
+        value: &str,
+        error: impl std::fmt::Display,
+    ) -> Result<Vec<Range<usize>>, String> {
+        Err(format!(
+            "keyword {KEYWORD}: VALUE={value} of question \"{QUESTION}\": {error}"
+        ))
+    }
+
+    /// A DATE or TIME, `op_code`, of `flags` prompted by PROMPT at OFFSET of VarStore 1.
+    fn date_time(op_code: u8, flags: u8) -> Vec<u8> {
+        let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![flags]].concat();
+        operation(op_code, false, &data)
+    }
+
+    /// SetData() writes a DATE's or TIME's VALUE, its EFI_HII_DATE or EFI_HII_TIME last byte
+    /// first, as given, so check_set takes it as set takes the fields of its text: each within
+    /// edk2's ranges, and a field that the question suppresses only as set writes it, the stored
+    /// one, or for a day the one that a new month adjusts it to; at the question's GetWidth bytes.
+    #[test]
+    fn check_set_takes_the_fields_of_a_date_or_time_as_set_takes_them() {
+        use super::super::date_time::DateTimeKind;
+        use super::super::date_time::DateTimeTextError;
+        use super::super::date_time::Field;
+        const YEAR_SUPPRESS: u8 = 0x01;
+        const DAY_SUPPRESS: u8 = 0x04;
+        // 2024-03-31
+        let stored = [0xE8, 0x07, 3, 31];
+        let date = OFFSET..OFFSET + 4;
+        let time = OFFSET..OFFSET + 3;
+        let out_of_range = |field, value, range| DateTimeTextError::OutOfRange {
+            field,
+            value,
+            range,
+        };
+        let changed = |field, given, written| DateTimeTextError::SuppressedChanged {
+            kind: DateTimeKind::Date,
+            field,
+            given,
+            written,
+        };
+        for (name, op, value, want) in [
+            (
+                "2025-12-31",
+                date_time(DATE, 0),
+                "1f0c07e9",
+                Ok(vec![date.clone()]),
+            ),
+            (
+                "month 13",
+                date_time(DATE, 0),
+                "1f0d07e9",
+                value_error("1f0d07e9", out_of_range(Field::Month, 13, 1..=12)),
+            ),
+            (
+                "2023-02-29",
+                date_time(DATE, 0),
+                "1d0207e7",
+                value_error("1d0207e7", out_of_range(Field::Day, 29, 1..=28)),
+            ),
+            (
+                "year 0",
+                date_time(DATE, 0),
+                "01010000",
+                value_error("01010000", out_of_range(Field::Year, 0, 1..=u16::MAX)),
+            ),
+            (
+                "the suppressed year kept",
+                date_time(DATE, YEAR_SUPPRESS),
+                "010407e8",
+                Ok(vec![date.clone()]),
+            ),
+            (
+                "the suppressed year changed",
+                date_time(DATE, YEAR_SUPPRESS),
+                "010407e9",
+                value_error("010407e9", changed(Field::Year, 2025, 2024)),
+            ),
+            (
+                "the suppressed day kept in May",
+                date_time(DATE, DAY_SUPPRESS),
+                "1f0507e8",
+                Ok(vec![date.clone()]),
+            ),
+            (
+                "the suppressed day 31 kept in April",
+                date_time(DATE, DAY_SUPPRESS),
+                "1f0407e8",
+                value_error("1f0407e8", changed(Field::Day, 31, 30)),
+            ),
+            (
+                "the suppressed day adjusted to 30 in April",
+                date_time(DATE, DAY_SUPPRESS),
+                "1e0407e8",
+                Ok(vec![date.clone()]),
+            ),
+            ("23:59:59", date_time(TIME, 0), "3b3b17", Ok(vec![time])),
+            (
+                "hour 24",
+                date_time(TIME, 0),
+                "3b3b18",
+                value_error("3b3b18", out_of_range(Field::Hour, 24, 0..=23)),
+            ),
+        ] {
+            assert_eq!(keyword_set(op, value, &stored), want, "{name}");
+        }
+        assert_eq!(
+            changed(Field::Day, 31, 30).to_string(),
+            "the day of this DATE is suppressed (UEFI 2.11 §33.2.5.4.6), and set writes it as 30, \
+             not 31"
+        );
+    }
+
+    /// An ORDERED_LIST of at most 3 items and `flags` prompted by PROMPT at OFFSET of VarStore 1,
+    /// with `options` in its scope.
+    fn ordered_list_of(flags: u8, options: &[Vec<u8>]) -> Vec<u8> {
+        let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![3, flags]].concat();
+        [
+            operation(ORDERED_LIST, true, &data),
+            options.concat(),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// Options of Type UINT8 holding 1, 2 and 3, each of the text QUESTION.
+    fn uint8_options() -> Vec<Vec<u8>> {
+        (1..=3)
+            .map(|value| flagged_option(PROMPT, 0, value))
+            .collect()
+    }
+
+    /// SetData() writes an ORDERED_LIST's VALUE, its containers last byte first, as given, so
+    /// check_set takes the options of the containers up to the first empty one as set takes items:
+    /// with EFI_IFR_UNIQUE_SET each once, with EFI_IFR_NO_EMPTY_SET in every container; and
+    /// refuses a VALUE that fills a container after an empty one, holds a value of no option,
+    /// naming its container, or is not as wide as GetWidth's containers; and, where GetWidth takes
+    /// the Type of a first option that set takes as a default, every VALUE, whatever its bytes,
+    /// naming both containers' widths.
+    #[test]
+    fn check_set_takes_the_items_of_an_ordered_list_as_set_takes_them() {
+        use super::super::ordered_list::ListRefusal;
+        const UNIQUE: u8 = 0x01;
+        const NO_EMPTY: u8 = 0x02;
+        const OPTION_DEFAULT: u8 = 0x10;
+        let stored = [1, 2, 0];
+        let containers = OFFSET..OFFSET + 3;
+        let list = |refusal| {
+            ChangeValueError::OrderedList {
+                question: QUESTION.to_owned(),
+                refusal,
+            }
+            .to_string()
+        };
+        let uint16_after_a_uint8_default = [
+            vec![flagged_option(PROMPT, OPTION_DEFAULT, 1)],
+            (1..=3u16)
+                .map(|value| one_of_option(PROMPT, 0x01, &value.to_le_bytes()))
+                .collect(),
+        ]
+        .concat();
+        let uint8_after_a_uint16_default =
+            [vec![uint16_default_option()], uint8_options()].concat();
+        let widths = |value: &str, get_width, storage_width| {
+            Err(KeywordRefusal::ContainerWidths {
+                keyword: KEYWORD.to_owned(),
+                value: value.to_owned(),
+                get_width,
+                storage_width,
+                question: QUESTION.to_owned(),
+            }
+            .to_string())
+        };
+        for (name, op, value, want) in [
+            (
+                "items 3 and 1",
+                ordered_list_of(0, &uint8_options()),
+                "000103",
+                Ok(vec![containers]),
+            ),
+            (
+                "a container after an empty one",
+                ordered_list_of(0, &uint8_options()),
+                "010003",
+                value_error("010003", list(ListRefusal::AfterEmpty)),
+            ),
+            (
+                "a value of no option",
+                ordered_list_of(0, &uint8_options()),
+                "000004",
+                Err(value_refusal(
+                    "000004",
+                    ValueRefusal::NoContainerOption {
+                        container: 1,
+                        value: 4,
+                    },
+                )
+                .to_string()),
+            ),
+            (
+                "a value of no option in the second container",
+                ordered_list_of(0, &uint8_options()),
+                "000401",
+                Err(value_refusal(
+                    "000401",
+                    ValueRefusal::NoContainerOption {
+                        container: 2,
+                        value: 4,
+                    },
+                )
+                .to_string()),
+            ),
+            (
+                "an option twice, unique",
+                ordered_list_of(UNIQUE, &uint8_options()),
+                "000101",
+                value_error(
+                    "000101",
+                    list(ListRefusal::Duplicate {
+                        option: QUESTION.to_owned(),
+                    }),
+                ),
+            ),
+            (
+                "an empty container, no empty",
+                ordered_list_of(NO_EMPTY, &uint8_options()),
+                "000201",
+                value_error("000201", list(ListRefusal::Empty { max: 3, given: 2 })),
+            ),
+            (
+                "two bytes",
+                ordered_list_of(0, &uint8_options()),
+                "0103",
+                Err(value_refusal("0103", ValueRefusal::Width).to_string()),
+            ),
+            (
+                "1-byte GetWidth containers, 2-byte set containers",
+                ordered_list_of(0, &uint16_after_a_uint8_default),
+                "000001",
+                widths("000001", 1, 2),
+            ),
+            (
+                "1-byte GetWidth containers, 2-byte set containers, a byte after a set container",
+                ordered_list_of(0, &uint16_after_a_uint8_default),
+                "020001",
+                widths("020001", 1, 2),
+            ),
+            (
+                "2-byte GetWidth containers, 1-byte set containers, 4 of them",
+                ordered_list_of(0, &uint8_after_a_uint16_default),
+                "000001020301",
+                widths("000001020301", 2, 1),
+            ),
+        ] {
+            assert_eq!(keyword_set(op, value, &stored), want, "{name}");
+        }
+        assert_eq!(
+            value_refusal(
+                "000401",
+                ValueRefusal::NoContainerOption {
+                    container: 2,
+                    value: 4
+                }
+            )
+            .to_string(),
+            format!(
+                "keyword {KEYWORD}: VALUE=000401 holds 4 in container 2, which is no option of \
+                 question \"{QUESTION}\""
+            ),
+            "the refusal of a value of no option"
+        );
+        assert_eq!(
+            KeywordRefusal::UnwrittenWidth {
+                keyword: KEYWORD.to_owned(),
+                value: "000001".to_owned(),
+                get_width: 3,
+                written: format!("000000000001 at VarOffset {OFFSET}"),
+                storage_width: 6,
+                question: QUESTION.to_owned(),
+            }
+            .to_string(),
+            format!(
+                "keyword {KEYWORD}: SetData() writes VALUE=000001 as given, 3 bytes (GetWidth), \
+                 where set writes 000000000001 at VarOffset 5, 6 bytes (StorageWidth), for \
+                 question \"{QUESTION}\""
+            ),
+            "the refusal of a write of two widths"
+        );
+        assert_eq!(
+            widths("000001", 1, 2),
+            Err(format!(
+                "keyword {KEYWORD}: SetData() writes VALUE=000001 as given, in containers of 1 \
+                 bytes as GetWidth takes them, where set writes containers of 2 bytes as \
+                 StorageWidth takes them, for question \"{QUESTION}\""
+            )),
+            "the refusal of containers of two widths"
+        );
+    }
+
+    /// An option of Flags DEFAULT, Type UINT16 and Value 1.
+    fn uint16_default_option() -> Vec<u8> {
+        const OPTION_DEFAULT: u8 = 0x10;
+        operation(
+            ONE_OF_OPTION,
+            false,
+            &[
+                &PROMPT.to_le_bytes()[..],
+                &[OPTION_DEFAULT, 0x01],
+                &1u16.to_le_bytes(),
+            ]
+            .concat(),
+        )
+    }
+
+    /// check_set takes the containers of an ORDERED_LIST of UINT16 options, where GetWidth and set
+    /// take containers of 2 bytes each.
+    #[test]
+    fn check_set_takes_the_uint16_containers_of_an_ordered_list() {
+        let options: Vec<Vec<u8>> = [0x0101u16, 0x0202, 0x0303]
+            .iter()
+            .map(|value| one_of_option(PROMPT, 0x01, &value.to_le_bytes()))
+            .collect();
+        let containers = OFFSET..OFFSET + 6;
+        assert_eq!(
+            keyword_set(ordered_list_of(0, &options), "000002020101", &[0; 6]),
+            Ok(vec![containers]),
+            "items 0x0101 and 0x0202"
+        );
+    }
+
+    /// Where GetWidth takes the Type of a UINT16 option that set takes as a default, its
+    /// containers are wider than those of set's UINT8 options, so check_set refuses the VALUE,
+    /// which is not the bytes that set writes.
+    #[test]
+    fn check_set_refuses_a_get_width_wider_than_set_s_containers() {
+        let options = [vec![uint16_default_option()], uint8_options()].concat();
+        assert_eq!(
+            keyword_set(ordered_list_of(0, &options), "000000000103", &[1, 2, 0]),
+            Err(KeywordRefusal::ContainerWidths {
+                keyword: KEYWORD.to_owned(),
+                value: "000000000103".to_owned(),
+                get_width: 2,
+                storage_width: 1,
+                question: QUESTION.to_owned(),
+            }
+            .to_string()),
+            "GetWidth 6, set 3"
+        );
+    }
+
+    /// An ORDERED_LIST whose first op is an EFI_IFR_DEFAULT, whose Value's first byte reads as
+    /// Type UINT8 where a ONE_OF_OPTION has its Type, has no GetWidth (edk2-stable202608
+    /// ConfigKeywordHandler.c :1618 asserts), so check_set refuses any VALUE as not as wide.
+    #[test]
+    fn check_set_refuses_an_ordered_list_whose_first_op_is_no_option() {
+        let ops = ordered_list_of(
+            0,
+            &[
+                ifr_default(0, 0),
+                flagged_option(PROMPT, 0, 1),
+                flagged_option(PROMPT, 0, 2),
+                flagged_option(PROMPT, 0, 3),
+            ],
+        );
+        let got = keyword_set(ops, "000103", &[1, 2, 0]);
+        assert_eq!(
+            got,
+            Err(value_refusal("000103", ValueRefusal::Width).to_string()),
+            "a DEFAULT first"
+        );
+    }
+
+    /// set keeps a TIME's suppressed second, so check_set takes a VALUE only with that second;
+    /// and refuses an hour out of range.
+    #[test]
+    fn check_set_takes_a_suppressed_second_only_as_set_keeps_it() {
+        use super::super::date_time::DateTimeKind;
+        use super::super::date_time::DateTimeTextError;
+        use super::super::date_time::Field;
+        const SECOND_SUPPRESS: u8 = 0x04;
+        // 12:34:56
+        let stored = [12, 34, 56];
+        let time = OFFSET..OFFSET + 3;
+        assert_eq!(
+            keyword_set(date_time(TIME, SECOND_SUPPRESS), "38000d", &stored),
+            Ok(vec![time]),
+            "13:00 keeping second 56"
+        );
+        assert_eq!(
+            keyword_set(date_time(TIME, SECOND_SUPPRESS), "39000d", &stored),
+            value_error(
+                "39000d",
+                DateTimeTextError::SuppressedChanged {
+                    kind: DateTimeKind::Time,
+                    field: Field::Second,
+                    given: 57,
+                    written: 56,
+                }
+            ),
+            "second 57"
+        );
+        assert_eq!(
+            keyword_set(date_time(TIME, SECOND_SUPPRESS), "382218", &stored),
+            value_error(
+                "382218",
+                DateTimeTextError::OutOfRange {
+                    field: Field::Hour,
+                    value: 24,
+                    range: 0..=23,
+                }
+            ),
+            "hour 24"
+        );
+    }
+
+    /// set takes an option of an ORDERED_LIST that a SUPPRESS_IF of TRUE hides only with
+    /// --include, so check_set refuses a VALUE that holds it, unless included; and set drops no
+    /// stored item of such an option, so check_set refuses a VALUE without it, included or not.
+    #[test]
+    fn check_set_takes_a_suppressed_option_of_an_ordered_list_only_included() {
+        use super::super::ordered_list::ListRefusal;
+        let ops = ordered_list_of(
+            0,
+            &[
+                flagged_option(PROMPT, 0, 1),
+                flagged_option(PROMPT, 0, 2),
+                conditional(SUPPRESS_IF, ifr_true(), &[flagged_option(PROMPT, 0, 3)]),
+            ],
+        );
+        let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
+        let set = |value, stored: &[u8], include| {
+            question_of(&lists)
+                .check_set(
+                    &resp(value),
+                    include,
+                    VolatileWrites::Refuse,
+                    &mut reader_of(stored),
+                )
+                .map(|write| write.bytes)
+        };
+        let error =
+            set("000103", &[1, 2, 0], IncludedStates::empty()).expect_err("a suppressed option");
+        assert!(
+            matches!(
+                error.downcast_ref::<SelectionError>(),
+                Some(SelectionError::OptionExcluded { .. })
+            ),
+            "a suppressed option: {error:#}"
+        );
+        let containers = OFFSET..OFFSET + 3;
+        assert_eq!(
+            set("000103", &[1, 2, 0], IncludedStates::SUPPRESSED)
+                .map_err(|error| format!("{error:#}")),
+            Ok(vec![containers.clone()]),
+            "included"
+        );
+        // the suppressed option 3 stored first
+        let stored = [3, 1, 0];
+        for include in [IncludedStates::empty(), IncludedStates::SUPPRESSED] {
+            let error = set("000001", &stored, include).expect_err("a stored hidden item dropped");
+            assert!(
+                matches!(
+                    error.downcast_ref::<ChangeValueError>(),
+                    Some(ChangeValueError::OrderedList {
+                        refusal: ListRefusal::HiddenDropped { .. },
+                        ..
+                    })
+                ),
+                "a stored hidden item dropped, include {include:?}: {error:#}"
+            );
+        }
+        let error = set("000103", &stored, IncludedStates::empty())
+            .expect_err("a stored hidden item kept, not included");
+        assert!(
+            matches!(
+                error.downcast_ref::<SelectionError>(),
+                Some(SelectionError::OptionExcluded { .. })
+            ),
+            "a stored hidden item kept, not included: {error:#}"
+        );
+        assert_eq!(
+            set("000103", &stored, IncludedStates::SUPPRESSED)
+                .map_err(|error| format!("{error:#}")),
+            Ok(vec![containers]),
+            "a stored hidden item kept, included"
+        );
+    }
+
+    /// SetData() writes every byte of a DATE's, TIME's or ORDERED_LIST's storage, so check_set
+    /// refuses a VALUE whose bytes overlap those of a password, which the reader withholds, at
+    /// their first byte or at their last, and takes one beside them: through check_patches, or
+    /// where set reads the stored value first, as it cannot read it.
+    #[test]
+    fn check_set_refuses_a_date_time_or_ordered_list_over_the_bytes_of_a_password() {
+        use super::super::date_time::DateTimeKind;
+        use super::super::date_time::DateTimeTextError;
+        use super::super::ordered_list::ListRefusal;
+        const YEAR_SUPPRESS: u8 = 0x01;
+        const UNREAD: &str = "its bytes hold a password";
+        let patches = |password: &Range<usize>| {
+            Err(format!(
+                "keyword {KEYWORD}: cannot set question {QUESTION:?}: EFI variable {} holds a \
+                 password at bytes {password:?}, which set never writes",
+                store_key()
+            ))
+        };
+        let year_unread = |_: &Range<usize>| {
+            value_error(
+                "1f0c0001",
+                DateTimeTextError::StoredUnreadable {
+                    kind: DateTimeKind::Date,
+                    reason: UNREAD.to_owned(),
+                },
+            )
+        };
+        let items_unread = |_: &Range<usize>| {
+            value_error(
+                "000103",
+                ChangeValueError::OrderedList {
+                    question: QUESTION.to_owned(),
+                    refusal: ListRefusal::StoredUnread(UNREAD.to_owned()),
+                },
+            )
+        };
+        type Refusal<'f> = &'f dyn Fn(&Range<usize>) -> Result<Vec<Range<usize>>, String>;
+        let cases: [(&str, Vec<u8>, &str, usize, Refusal); 4] = [
+            ("DATE", date_time(DATE, 0), "1f0c07e9", 4, &patches),
+            // withholding's Store holds 1 at OFFSET: year 1
+            (
+                "DATE, year suppressed",
+                date_time(DATE, YEAR_SUPPRESS),
+                "1f0c0001",
+                4,
+                &year_unread,
+            ),
+            ("TIME", date_time(TIME, 0), "3b3b17", 3, &patches),
+            (
+                "ORDERED_LIST",
+                ordered_list_of(0, &uint8_options()),
+                "000103",
+                3,
+                &items_unread,
+            ),
+        ];
+        for (name, ops, value, width, refusal) in cases {
+            let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], ops)];
+            let question = question_of(&lists);
+            let bytes = OFFSET..OFFSET + width;
+            for (password, overlaps) in [
+                (OFFSET - 1..OFFSET + 1, true),
+                (OFFSET + width - 1..OFFSET + width + 1, true),
+                (OFFSET + width..OFFSET + width + 2, false),
+            ] {
+                let got = question
+                    .check_set(
+                        &resp(value),
+                        IncludedStates::empty(),
+                        VolatileWrites::Refuse,
+                        &mut withholding(password.clone()),
+                    )
+                    .map(|write| write.bytes)
+                    .map_err(|error| format!("{error:#}"));
+                let want = match overlaps {
+                    true => refusal(&password),
+                    false => Ok(vec![bytes.clone()]),
+                };
+                assert_eq!(got, want, "{name}, password {password:?}");
+            }
+        }
     }
 
     /// GetData() reads a question's GetWidth bytes from its VarOffset, so check_get refuses one

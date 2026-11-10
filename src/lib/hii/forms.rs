@@ -3466,6 +3466,19 @@ enum TextInput {
     CrossReference,
 }
 
+impl TextInput {
+    /// The name of its variant, which an internal inconsistency names.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Range(_) => "Range",
+            Self::Maximum(_) => "Maximum",
+            Self::DateTime(_) => "DateTime",
+            Self::OrderedList(_) => "OrderedList",
+            Self::CrossReference => "CrossReference",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AnswerOption {
     /// The option's text, as get shows it

@@ -125,30 +125,17 @@ impl<'a> WritePlan<'a> {
     }
 
     /// The plan that writes `write`, the containers of the ORDERED_LIST `question`, through
-    /// variables of `reach`: refuses one with a WRITE expression, which takes a buffer.
+    /// variables of `reach` (list_own_write).
     pub(super) fn of_list(
         question: &'a QuestionDescriptor,
-        ListWrite { offset, bytes }: ListWrite,
+        write: ListWrite,
         reach: VariableReach,
     ) -> Result<Self, ChangeValueError> {
-        let store = question.store(reach)?;
-        if question_expression(&question.node, QuestionExpression::Write).is_some() {
-            return Err(ListRefusal::Expression(BufferExpression::Write(
-                BufferQuestion::OrderedList,
-            ))
-            .of(question));
-        }
-        let Some(store) = store else {
-            return Err(ChangeValueError::Storageless {
-                question: question.question.clone(),
-                refusal: StoragelessRefusal::WriteSetsNothing,
-            });
-        };
         Ok(Self {
             question,
             time: Vec::new(),
             sets: PlannedSets::default(),
-            own: Some(VarStoreWrite::of_bytes(store, offset, bytes)?),
+            own: Some(list_own_write(question, write, reach)?),
         })
     }
 
@@ -231,6 +218,29 @@ impl<'a> WritePlan<'a> {
             variables,
         })
     }
+}
+
+/// The write of `write`, the containers of the ORDERED_LIST `question`, through variables of
+/// `reach`: refuses one with a WRITE expression, which takes a buffer, or without a VarStore.
+pub(super) fn list_own_write<'a>(
+    question: &'a QuestionDescriptor,
+    ListWrite { offset, bytes }: ListWrite,
+    reach: VariableReach,
+) -> Result<VarStoreWrite<'a>, ChangeValueError> {
+    let store = question.store(reach)?;
+    if question_expression(&question.node, QuestionExpression::Write).is_some() {
+        return Err(
+            ListRefusal::Expression(BufferExpression::Write(BufferQuestion::OrderedList))
+                .of(question),
+        );
+    }
+    let Some(store) = store else {
+        return Err(ChangeValueError::Storageless {
+            question: question.question.clone(),
+            refusal: StoragelessRefusal::WriteSetsNothing,
+        });
+    };
+    Ok(VarStoreWrite::of_bytes(store, offset, bytes)?)
 }
 
 /// The writes of EFI Date/Time Storage that set `question` to `value`, with the changes
