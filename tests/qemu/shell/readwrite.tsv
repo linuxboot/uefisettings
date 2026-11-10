@@ -62,7 +62,7 @@ dmpstore-after	status	any
 dmpstore-after	line	^  00000000: 02 05 05 00 05 01 09 64-11 05 00 
 # a WRITE that sets AbsentBuffer, which has no variable, refuses set before any write
 set-absent-target	status	aborted
-set-absent-target	json	. == {"error_message": "cannot set question \"Absent target\": its WRITE expression sets VarStore 0x0002 (EFI_IFR_VARSTORE \"AbsentBuffer\"), which set may not write: no EFI variable AbsentBuffer-8c78a505-baa0-4c4a-869f-000000000201: the firmware has not created it, and set never creates variables"}
+set-absent-target	json	. == {"error_message": "cannot set question \"Absent target\": its WRITE expression sets VarStore 0x0002 (EFI_IFR_VARSTORE \"AbsentBuffer\"), which set may not write: no EFI variable AbsentBuffer-8c78a505-baa0-4c4a-869f-000000000201: the firmware has not created it, and set creates only the per-question variables of an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1"}
 # its EFI_IFR_VALUE makes "Computed value" read-only: set refuses it before any write
 set-computed	status	aborted
 set-computed	json	(.error_message | gsub("§"; "?")) == "cannot set question \"Computed value\": its EFI_IFR_VALUE expression makes it read-only (UEFI 2.11 ?33.3.8.3.88)"

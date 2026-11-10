@@ -8109,28 +8109,21 @@ mod tests {
 
     /// get shows a missing per-question variable as missing, through variables that reach Runtime
     /// in the words of the runtime access that its VARSTORE_EFI declares: one declared without
-    /// EFI_VARIABLE_RUNTIME_ACCESS is not present at OS runtime. set refuses both.
+    /// EFI_VARIABLE_RUNTIME_ACCESS is not present at OS runtime.
     #[test]
     fn a_missing_per_question_variable_is_shown_as_its_var_store_declares_it() {
         let key = "ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01";
-        let boot_service_only = format!(
-            "EFI variable {key} is not present at OS runtime: efivarfs does not list it, and its \
-             form declares it boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)"
-        );
         let cases = [
+            (NV_BS_RT, format!("no EFI variable {key}")),
             (
-                NV_BS_RT,
-                format!("no EFI variable {key}"),
+                NV_BS,
                 format!(
-                    "no EFI variable {key}: the firmware has not created it or does not expose it \
-                     to the OS, so its questions cannot be set from Linux; change them in the \
-                     firmware setup, or ask the board vendor for firmware that exposes it; see \
-                     https://github.com/linuxboot/uefisettings/issues/2"
+                    "EFI variable {key} is not present at OS runtime: efivarfs does not list it, \
+                     and its form declares it boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)"
                 ),
             ),
-            (NV_BS, boot_service_only.clone(), boot_service_only),
         ];
-        for (attributes, why, refusal) in cases {
+        for (attributes, why) in cases {
             let hiidb = short_store_hiidb(attributes, &[short_numeric_a()]);
             let variables = Rc::new(MemoryVariables::default());
 
@@ -8139,10 +8132,240 @@ mod tests {
                 [format!("<ValueUnavailable: {why}>")],
                 "get, attributes {attributes:#x}"
             );
+        }
+    }
+
+    /// set creates a missing per-question variable with the Attributes of its VARSTORE_EFI, as
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue does ("This service can be used
+    /// to create a new variable", UEFI 2.11 §8.2.3 SetVariable), of its question's width, through
+    /// efivarfs and Variable Services; get then reads it. It refuses, creating nothing, through
+    /// variables that reach Runtime a store without EFI_VARIABLE_RUNTIME_ACCESS, whose variable no
+    /// SetVariable() sets once ExitBootServices() is performed (§8.2.3), the Attributes of a
+    /// volatile or authenticated variable, as of an existing one, and creation through the
+    /// firmware environment calls of Windows.
+    #[test]
+    fn set_creates_a_missing_per_question_variable_with_the_attributes_of_its_var_store() {
+        // EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+        const TIME_BASED_AUTHENTICATED: u32 = 0x20;
+        let linux = (VariableReach::Runtime, VariableInterface::Efivarfs);
+        let shell = (
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let windows = (
+            VariableReach::Runtime,
+            VariableInterface::FirmwareEnvironment,
+        );
+        let key = "ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01";
+        let created =
+            |attributes: u32, value: &[u8]| Ok([&attributes.to_ne_bytes()[..], value].concat());
+        let cases = [
+            (linux, NV_BS_RT, "A", "9", created(NV_BS_RT, &[9])),
+            (linux, NV_BS_RT, "D", "513", created(NV_BS_RT, &[1, 2])),
+            (shell, NV_BS, "A", "9", created(NV_BS, &[9])),
+            (shell, NV_BS_RT, "D", "513", created(NV_BS_RT, &[1, 2])),
+            (
+                linux,
+                NV_BS,
+                "A",
+                "9",
+                Err(format!(
+                    "EFI variable {key} is not present at OS runtime: efivarfs does not list it, \
+                     and its form declares it boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)"
+                )),
+            ),
+            (
+                linux,
+                BS_RT,
+                "A",
+                "9",
+                Err(format!(
+                    "EFI variable {key} is volatile (no EFI_VARIABLE_NON_VOLATILE) and cannot be \
+                     written through efivarfs"
+                )),
+            ),
+            (
+                linux,
+                NV_BS_RT | TIME_BASED_AUTHENTICATED,
+                "A",
+                "9",
+                Err(format!(
+                    "EFI variable {key} has authenticated access (attributes 0x27), which \
+                     uefisettings does not write"
+                )),
+            ),
+            (
+                windows,
+                NV_BS_RT,
+                "A",
+                "9",
+                Err(format!(
+                    "no EFI variable {key}: the firmware has not created it or does not expose it \
+                     to the OS, so its questions cannot be set from Windows; change them in the \
+                     firmware setup, or ask the board vendor for firmware that exposes it; see \
+                     https://github.com/linuxboot/uefisettings/issues/2"
+                )),
+            ),
+        ];
+        for ((reach, interface), attributes, question, value, want) in cases {
+            let hiidb = short_store_hiidb(attributes, &short_questions());
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
+            let name = match question {
+                "A" => "ShortVarA",
+                _ => "ShortVarD",
+            };
+            let case = format!("{interface:?}, attributes {attributes:#x}, set {question}");
+
+            let set = set_of(&hiidb, question, value, &variables);
+
+            assert_eq!(
+                set.map(|()| variables.bytes(&short_key(name))),
+                want.clone().map(Some),
+                "{case}"
+            );
+            if want.is_ok() {
+                assert_eq!(
+                    answers_of(&hiidb, question, &variables),
+                    [value],
+                    "{case}: get"
+                );
+            }
+            for other in SHORT_VAR_NAMES.into_iter().filter(|&other| other != name) {
+                assert_eq!(variables.bytes(&short_key(other)), None, "{case}: {other}");
+            }
+        }
+    }
+
+    /// set creates a missing per-question variable at one width: where a question's WRITE SETs
+    /// its own VarName at another width, set refuses to create it, as the variable would hold the
+    /// value of neither; where the variable holds the question's value, the SET of another width
+    /// stores nothing, as edk2-stable202608 would resize it, and set writes the question's value.
+    #[test]
+    fn set_creates_a_per_question_variable_at_one_width() {
+        const SET: u8 = 0x2C;
+        const WRITE: u8 = 0x2E;
+        const THIS: u8 = 0x58;
+        // the UINT8 NUMERIC A on ShortVarA, whose WRITE sets ShortVarA as a UINT16
+        // (EFI_IFR_TYPE_NUM_SIZE_16)
+        let set_as_uint16 = operation(
+            SET,
+            false,
+            &[&1u16.to_le_bytes()[..], &7u16.to_le_bytes(), &[0x01]].concat(),
+        );
+        let numeric_a = [
+            operation(
+                NUMERIC,
+                true,
+                &[
+                    question_header_with(1, 1, 1, 7, 0x00),
+                    // EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC, from 0 to 255, step 1
+                    vec![0x10, 0, 255, 1],
+                ]
+                .concat(),
+            ),
+            operation(WRITE, false, &[]),
+            [operation(THIS, true, &[]), set_as_uint16, END.to_vec()].concat(),
+            END.to_vec(),
+        ]
+        .concat();
+        let hiidb = short_store_hiidb(NV_BS_RT, &[numeric_a]);
+        let shell = (
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        for (reach, interface) in [(VariableReach::Runtime, VariableInterface::Efivarfs), shell] {
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
+
             assert_eq!(
                 set_of(&hiidb, "A", "9", &variables),
-                Err(refusal),
-                "set, attributes {attributes:#x}"
+                Err(
+                    "EFI variable ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01 holds the value \
+                     of one question, which set would write as 2 bytes and as 1"
+                        .to_string()
+                ),
+                "{interface:?}: set A without ShortVarA"
+            );
+            assert_eq!(
+                variables.bytes(&short_key("ShortVarA")),
+                None,
+                "{interface:?}: ShortVarA"
+            );
+
+            variables.insert(short_key("ShortVarA"), NV_BS_RT, &[5]);
+            assert_eq!(
+                set_of(&hiidb, "A", "9", &variables),
+                Ok(()),
+                "{interface:?}: set A"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key("ShortVarA")),
+                [(0, vec![9])],
+                "{interface:?}: writes of ShortVarA"
+            );
+        }
+    }
+
+    /// set of a question whose VARSTORE_EFI before UEFI 2.3.1 lacks EFI_VARIABLE_NON_VOLATILE
+    /// creates its volatile variable through Variable Services only with VolatileWrites::Allow,
+    /// and its answer says that the value is volatile.
+    #[test]
+    fn set_creates_a_volatile_per_question_variable_if_allowed() {
+        // EFI_VARIABLE_BOOTSERVICE_ACCESS alone
+        const BS: u32 = 0x02;
+        let hiidb = short_store_hiidb(BS, &[short_numeric_a()]);
+        let cases = [
+            (
+                VolatileWrites::Allow,
+                Ok(vec![format!("9{VOLATILE_ANNOTATION}")]),
+                Some([&BS.to_ne_bytes()[..], &[9]].concat()),
+            ),
+            (
+                VolatileWrites::Refuse,
+                Err(
+                    "EFI variable ShortVarA-8c78a505-baa0-4c4a-869f-000000000b01 is volatile (no \
+                     EFI_VARIABLE_NON_VOLATILE), so a write would not outlast a power cycle; pass \
+                     --allow-volatile to write it anyway"
+                        .to_string(),
+                ),
+                None,
+            ),
+        ];
+        for (volatile, want, bytes) in cases {
+            let variables = Rc::new(MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ));
+            let options = SetOptions {
+                volatile,
+                ..SetOptions::default()
+            };
+
+            let got = HiiBackend::set_in(
+                &hiidb,
+                "A",
+                "9",
+                None,
+                &options,
+                shared(&variables),
+                &*variables,
+                None,
+            );
+
+            let answers = got.map(|list| {
+                list.responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                answers.map_err(|error| format!("{error:#}")),
+                want,
+                "{volatile:?}: answers"
+            );
+            assert_eq!(
+                variables.bytes(&short_key("ShortVarA")),
+                bytes,
+                "{volatile:?}: ShortVarA"
             );
         }
     }
@@ -8470,7 +8693,9 @@ mod tests {
     /// VarNames through set, through variables of either reach: set refuses the CHECKBOX F, which
     /// a SUPPRESS_IF hides while the GET of ShortVarA gives 5, and sets it once set of A wrote 9
     /// there; that set writes ShortVarD by the SET of A's WRITE expression, then ShortVarA, and,
-    /// without ShortVarD, only ShortVarA, creating no variable.
+    /// without ShortVarD, creates it with the store's Attributes, as edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression does by SetVariable(). Through the firmware
+    /// environment calls of Windows, which create no variable, that SET stores nothing.
     #[test]
     fn get_and_set_of_a_short_var_store_reach_the_variables_of_their_var_names() {
         const GET: u8 = 0x2B;
@@ -8580,10 +8805,32 @@ mod tests {
             );
             assert_eq!(
                 variables.bytes(&short_key("ShortVarD")),
-                None,
+                Some([&NV_BS_RT.to_ne_bytes()[..], &[9, 0]].concat()),
                 "{reach:?}: set A without ShortVarD: ShortVarD"
             );
         }
+
+        let variables = MemoryVariables::new(
+            VariableReach::Runtime,
+            VariableInterface::FirmwareEnvironment,
+        );
+        variables.insert(short_key("ShortVarA"), NV_BS_RT, &[5]);
+        let variables = Rc::new(variables);
+        assert_eq!(
+            set_of(&hiidb, "A", "9", &variables),
+            Ok(()),
+            "Windows: set A without ShortVarD"
+        );
+        assert_eq!(
+            variables.writes_to(&short_key("ShortVarA")),
+            [(0, vec![9])],
+            "Windows: set A without ShortVarD: writes of ShortVarA"
+        );
+        assert_eq!(
+            variables.bytes(&short_key("ShortVarD")),
+            None,
+            "Windows: set A without ShortVarD: ShortVarD"
+        );
     }
 
     /// set writes an existing per-question variable at its question's width with the variable's

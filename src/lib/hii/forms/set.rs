@@ -27,6 +27,7 @@ use super::conditions::IncludedStates;
 use super::conditions::ReadOnlyCause;
 use super::conditions::SelectionError;
 use super::defaults::OptionValueError;
+use super::storage::created_attributes;
 use super::storage::ValueLocation;
 use super::storage::VariableNotExported;
 use super::storage::VariableStore;
@@ -44,7 +45,10 @@ use crate::hii::variables::is_volatile;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::MissingVariable;
 use crate::hii::variables::VariableInterface;
+use crate::hii::variables::VariableKey;
+use crate::hii::variables::VariableLayout;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
 use crate::hii::variables::VolatileWritingVariables;
@@ -112,6 +116,17 @@ pub(crate) enum ChangeValueError {
         question: String,
         option: String,
         reason: OptionValueError,
+    },
+    /// Writes of one variable, which holds the value of one question, at two widths: set creates
+    /// or rewrites it at one width only
+    #[error(
+        "EFI variable {key} holds the value of one question, which set would write as {first} \
+         bytes and as {second}"
+    )]
+    OneValueWidths {
+        key: VariableKey,
+        first: u16,
+        second: u16,
     },
     #[error(transparent)]
     Selection(#[from] SelectionError),
@@ -218,9 +233,10 @@ impl<'a> VarStoreWrite<'a> {
         })
     }
 
-    /// Writes `patches` through `variables`. choice_for_set and WritePlan::variable_writes are the
-    /// only checks of runtime access before a write: they refuse a variable without
-    /// EFI_VARIABLE_RUNTIME_ACCESS that the selection or the plan read, and set writes only
+    /// Writes `patches` through `variables`, creating the missing variable that created_attributes
+    /// gives attributes for. choice_for_set and WritePlan::variable_writes are the only checks of
+    /// runtime access before a write: they refuse a variable without EFI_VARIABLE_RUNTIME_ACCESS
+    /// that the selection or the plan read, or that set would create, and set writes only
     /// variables that they read. Firmware refuses such a write if the variable changed since that
     /// read (edk2-stable202608 VariableServiceSetVariable, EFI_WRITE_PROTECTED).
     pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<()> {
@@ -228,12 +244,18 @@ impl<'a> VarStoreWrite<'a> {
             return Err(anyhow!("a variable write without bytes"));
         }
         let patches = self.data_patches().collect::<Vec<_>>();
+        let missing = match created_attributes(self.store, variables.reach(), variables.interface())
+        {
+            Some(attributes) => MissingVariable::Create(attributes),
+            None => MissingVariable::Refuse,
+        };
         variables
             .write_patches(
                 &self.store.variable_key(),
                 self.store.size(),
                 &patches,
                 VolatileWrites::Refuse,
+                missing,
             )
             .map_err(|error| {
                 VariableNotExported::explain(
@@ -254,12 +276,24 @@ impl<'a> VarStoreWrite<'a> {
     }
 
     /// Adds the patches of `later`, a write of the same variable, after these, through the
-    /// larger of the two VarStores.
-    pub(super) fn merge(&mut self, later: Self) {
-        if later.store.size() > self.store.size() {
+    /// larger of the two VarStores; fails where either holds the value of one question and their
+    /// sizes differ, as the larger would grow it.
+    pub(super) fn merge(&mut self, later: Self) -> Result<(), ChangeValueError> {
+        let (first, second) = (self.store.size(), later.store.size());
+        let one_value =
+            [self.store.layout(), later.store.layout()].contains(&VariableLayout::OneValue);
+        if one_value && first != second {
+            return Err(ChangeValueError::OneValueWidths {
+                key: self.store.variable_key(),
+                first,
+                second,
+            });
+        }
+        if second > first {
             self.store = later.store;
         }
         self.patches.extend(later.patches);
+        Ok(())
     }
 }
 
@@ -366,7 +400,8 @@ fn numeric_value(
 }
 
 /// What set wrote for one question: the option that it picked, None for a value, and whether a
-/// variable that it wrote is volatile, as the reader read its attributes before the write.
+/// variable that it wrote is volatile, as the reader read its attributes before the write, or as
+/// set created it (created_attributes).
 pub(crate) struct WrittenQuestion<'a> {
     pub(crate) option: Option<&'a AnswerOption>,
     pub(crate) volatile: bool,
@@ -433,14 +468,17 @@ pub(crate) fn set_questions<'a>(
         .zip(&writes)
         .map(|((_, _, option), (_, question_writes))| WrittenQuestion {
             option: *option,
-            volatile: question_writes
-                .iter()
-                .any(|write| reader.attributes(write.store).is_some_and(is_volatile)),
+            volatile: question_writes.iter().any(|write| {
+                reader
+                    .attributes(write.store)
+                    .or_else(|| created_attributes(write.store, reach, interface))
+                    .is_some_and(is_volatile)
+            }),
         })
         .collect();
     let variables = VolatileWritingVariables::new(variables, volatile);
 
-    let batch = batched_writes(writes);
+    let batch = batched_writes(writes)?;
     check_efivar_files(&batch, interface)?;
     let mut written = Vec::new();
     let mut unwritten = batch.iter();
@@ -1122,8 +1160,10 @@ mod set_questions_tests {
             size: u16,
             patches: &[DataPatch<'_>],
             volatile: VolatileWrites,
+            missing: MissingVariable,
         ) -> Result<()> {
-            self.variables.write_patches(key, size, patches, volatile)
+            self.variables
+                .write_patches(key, size, patches, volatile, missing)
         }
     }
 
@@ -1250,6 +1290,7 @@ mod set_questions_tests {
             size: u16,
             patches: &[DataPatch<'_>],
             volatile: VolatileWrites,
+            missing: MissingVariable,
         ) -> Result<()> {
             let carries = |patch: &DataPatch<'_>| {
                 let carried =
@@ -1259,7 +1300,8 @@ mod set_questions_tests {
             if *key == self.key && patches.iter().any(carries) {
                 return Err(anyhow!("EFI_SECURITY_VIOLATION"));
             }
-            self.variables.write_patches(key, size, patches, volatile)
+            self.variables
+                .write_patches(key, size, patches, volatile, missing)
         }
     }
 

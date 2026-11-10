@@ -253,13 +253,27 @@ impl VariableInterface {
                  https://github.com/linuxboot/uefisettings/issues/2"
             }
             Self::VariableServices => {
-                "the firmware has not created it, and set never creates variables"
+                "the firmware has not created it, and set creates only the per-question variables \
+                 of an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1"
             }
             Self::FirmwareEnvironment => {
                 "the firmware has not created it or does not expose it to the OS, so its \
                  questions cannot be set from Windows; change them in the firmware setup, or ask \
                  the board vendor for firmware that exposes it; see \
                  https://github.com/linuxboot/uefisettings/issues/2"
+            }
+        }
+    }
+
+    /// Why set creates no missing per-question variable through this interface, after the
+    /// variable, if it does not: it creates one through efivarfs, where writing a new file creates
+    /// the variable (Linux v6.11 fs/efivarfs/inode.c efivarfs_create()), and through
+    /// SetVariable() (UEFI 2.11 §8.2.3), but not through SetFirmwareEnvironmentVariableExW.
+    pub(super) fn creation_refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Efivarfs | Self::VariableServices => None,
+            Self::FirmwareEnvironment => {
+                Some("which set does not create through SetFirmwareEnvironmentVariableExW")
             }
         }
     }
@@ -292,14 +306,25 @@ pub(crate) trait FirmwareVariables {
     /// bytes, in one write of the variable, keeping its attributes and the bytes that no patch
     /// changes as the variable holds them, a SetVariable() of a non-volatile variable saving all of
     /// its data or none (UEFI 2.11 §8.2.3); a volatile `key` only as `volatile` allows
-    /// (check_volatile_write).
+    /// (check_volatile_write); a missing `key` as `missing` says.
     fn write_patches(
         &self,
         key: &VariableKey,
         size: u16,
         patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
+        missing: MissingVariable,
     ) -> Result<()>;
+}
+
+/// What FirmwareVariables::write_patches does where its variable is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingVariable {
+    /// Fails with VariableNotFound
+    Refuse,
+    /// Creates it with these attributes, of the data bytes that the patches write
+    /// (created_variable_bytes)
+    Create(u32),
 }
 
 /// `bytes` that a write puts at data offset `offset` of a variable.
@@ -339,8 +364,9 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for &T {
         size: u16,
         patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
+        missing: MissingVariable,
     ) -> Result<()> {
-        (**self).write_patches(key, size, patches, volatile)
+        (**self).write_patches(key, size, patches, volatile, missing)
     }
 }
 
@@ -367,8 +393,9 @@ impl<T: FirmwareVariables + ?Sized> FirmwareVariables for Box<T> {
         size: u16,
         patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
+        missing: MissingVariable,
     ) -> Result<()> {
-        (**self).write_patches(key, size, patches, volatile)
+        (**self).write_patches(key, size, patches, volatile, missing)
     }
 }
 
@@ -425,6 +452,49 @@ pub(super) fn modify_variable_bytes(
     patches.iter().try_for_each(|patch| {
         update_efivarfs_bytes(interface, bytes, size, patch.offset, patch.bytes)
     })
+}
+
+/// The bytes of the efivar file that FirmwareVariables::write_patches creates for the missing
+/// variable `key` of `variables` with `attributes`: its `size` data bytes, each of which one of
+/// `patches` writes, so that the variable holds no byte that nobody set. It refuses `attributes`
+/// as modify_variable_bytes refuses those of an existing variable.
+// efivarfs and Variable Services create variables; the tests' MemoryVariables do on any build
+#[cfg(any(target_os = "linux", target_os = "uefi", test))]
+pub(super) fn created_variable_bytes(
+    variables: &dyn FirmwareVariables,
+    key: &VariableKey,
+    volatile: VolatileWrites,
+    attributes: u32,
+    size: u16,
+    patches: &[DataPatch<'_>],
+) -> Result<Vec<u8>> {
+    let mut bytes = [&attributes.to_ne_bytes()[..], &vec![0; usize::from(size)]].concat();
+    modify_variable_bytes(variables, key, volatile, &mut bytes, size, patches)?;
+    let unwritten = (0..usize::from(size))
+        .find(|byte| !patches.iter().any(|patch| patch.range().contains(byte)));
+    match unwritten {
+        Some(byte) => Err(UnwrittenCreation {
+            key: key.clone(),
+            byte,
+            size,
+        }
+        .into()),
+        None => Ok(bytes),
+    }
+}
+
+/// A variable that FirmwareVariables::write_patches does not create: no patch writes its data
+/// byte `byte`.
+#[cfg(any(target_os = "linux", target_os = "uefi", test))]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "EFI variable {key} is missing, and no patch writes its data byte {byte} of {size}, so set \
+     does not create it"
+)]
+struct UnwrittenCreation {
+    key: VariableKey,
+    byte: usize,
+    size: u16,
 }
 
 /// Writes `encoded` at VarOffset `offset` of the efivar file `bytes`, unless its payload is
@@ -774,6 +844,7 @@ impl FirmwareVariables for UnreadVariables {
         _size: u16,
         _patches: &[DataPatch<'_>],
         _volatile: VolatileWrites,
+        _missing: MissingVariable,
     ) -> Result<()> {
         Err(EfivarsNotRead.into())
     }
@@ -1065,11 +1136,13 @@ impl<V: FirmwareVariables> FirmwareVariables for WithholdingVariables<V> {
         size: u16,
         patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
+        missing: MissingVariable,
     ) -> Result<()> {
         // a data offset is a value offset: set writes no variable with metadata
         // (check_unauthenticated)
         self.withheld.check_patches(key, patches.iter().copied())?;
-        self.variables.write_patches(key, size, patches, volatile)
+        self.variables
+            .write_patches(key, size, patches, volatile, missing)
     }
 }
 
@@ -1113,9 +1186,10 @@ impl<V: FirmwareVariables> FirmwareVariables for VolatileWritingVariables<V> {
         size: u16,
         patches: &[DataPatch<'_>],
         _: VolatileWrites,
+        missing: MissingVariable,
     ) -> Result<()> {
         self.variables
-            .write_patches(key, size, patches, self.volatile)
+            .write_patches(key, size, patches, self.volatile, missing)
     }
 }
 
@@ -1279,6 +1353,7 @@ pub(crate) mod tests {
             size: u16,
             patches: &[DataPatch<'_>],
             volatile: VolatileWrites,
+            missing: MissingVariable,
         ) -> Result<()> {
             match self.failures.get(key) {
                 None => {}
@@ -1292,11 +1367,17 @@ pub(crate) mod tests {
                 }) => return Err(anyhow!(*cause).context(*context)),
             }
             let mut variables = self.variables.borrow_mut();
-            let bytes = variables
-                .get_mut(key)
-                .ok_or_else(|| VariableNotFound(key.clone()))?;
-            let mut modified = bytes.clone();
-            modify_variable_bytes(self, key, volatile, &mut modified, size, patches)?;
+            let modified = match (variables.get(key), missing) {
+                (Some(bytes), _) => {
+                    let mut modified = bytes.clone();
+                    modify_variable_bytes(self, key, volatile, &mut modified, size, patches)?;
+                    modified
+                }
+                (None, MissingVariable::Create(attributes)) => {
+                    created_variable_bytes(self, key, volatile, attributes, size, patches)?
+                }
+                (None, MissingVariable::Refuse) => return Err(VariableNotFound(key.clone()).into()),
+            };
             let start = patches.iter().map(|patch| patch.offset).min().unwrap_or(0);
             let end = patches
                 .iter()
@@ -1307,7 +1388,7 @@ pub(crate) mod tests {
                 .get(EFIVARFS_HEADER_SIZE + usize::from(start)..EFIVARFS_HEADER_SIZE + end)
                 .context("the written bytes")?
                 .to_vec();
-            *bytes = modified;
+            variables.insert(key.clone(), modified);
             self.writes.borrow_mut().push((key.clone(), start, written));
             Ok(())
         }
@@ -1337,8 +1418,10 @@ pub(crate) mod tests {
             size: u16,
             patches: &[DataPatch<'_>],
             volatile: VolatileWrites,
+            missing: MissingVariable,
         ) -> Result<()> {
-            self.as_ref().write_patches(key, size, patches, volatile)
+            self.as_ref()
+                .write_patches(key, size, patches, volatile, missing)
         }
     }
 
@@ -1353,7 +1436,13 @@ pub(crate) mod tests {
             offset: u16,
             encoded: &[u8],
         ) -> Result<()> {
-            self.write_patches(key, size, &[patch(offset, encoded)], VolatileWrites::Refuse)
+            self.write_patches(
+                key,
+                size,
+                &[patch(offset, encoded)],
+                VolatileWrites::Refuse,
+                MissingVariable::Refuse,
+            )
         }
     }
 
@@ -1460,6 +1549,96 @@ pub(crate) mod tests {
         }
     }
 
+    /// write_patches of a missing variable fails with VariableNotFound under
+    /// MissingVariable::Refuse, and under MissingVariable::Create makes it of those attributes,
+    /// its data the bytes that the patches write, every one of them: it refuses patches that leave
+    /// a data byte unwritten, and attributes that modify_variable_bytes refuses, creating nothing.
+    /// An existing variable keeps its own attributes.
+    #[test]
+    fn write_patches_creates_a_missing_variable_as_missing_says() {
+        // EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+        const TIME_BASED_AUTHENTICATED: u32 = 0x20;
+        let key = variable_key("Created");
+        let variable = "Created-00000000-0000-0000-0000-000000000000";
+        let created = |attributes: u32| Ok(Some([&attributes.to_ne_bytes()[..], &[1, 2]].concat()));
+        let cases = [
+            (
+                "refused",
+                None,
+                MissingVariable::Refuse,
+                vec![patch(0, &[1, 2])],
+                Err(format!("no EFI variable {variable}")),
+            ),
+            (
+                "created",
+                None,
+                MissingVariable::Create(NV_BS_RT),
+                vec![patch(0, &[1, 2])],
+                created(NV_BS_RT),
+            ),
+            (
+                "created of two patches",
+                None,
+                MissingVariable::Create(NV_BS_RT),
+                vec![patch(1, &[2]), patch(0, &[1])],
+                created(NV_BS_RT),
+            ),
+            (
+                "a byte unwritten",
+                None,
+                MissingVariable::Create(NV_BS_RT),
+                vec![patch(0, &[1])],
+                Err(format!(
+                    "EFI variable {variable} is missing, and no patch writes its data byte 1 of 2, \
+                     so set does not create it"
+                )),
+            ),
+            (
+                "volatile",
+                None,
+                MissingVariable::Create(BS_RT),
+                vec![patch(0, &[1, 2])],
+                Err(format!(
+                    "EFI variable {variable} is volatile (no EFI_VARIABLE_NON_VOLATILE) and cannot \
+                     be written through efivarfs"
+                )),
+            ),
+            (
+                "authenticated",
+                None,
+                MissingVariable::Create(NV_BS_RT | TIME_BASED_AUTHENTICATED),
+                vec![patch(0, &[1, 2])],
+                Err(format!(
+                    "EFI variable {variable} has authenticated access (attributes 0x27), which \
+                     uefisettings does not write"
+                )),
+            ),
+            (
+                "existing",
+                Some(&[5, 5][..]),
+                MissingVariable::Create(NV_BS_RT),
+                vec![patch(0, &[1, 2])],
+                created(NV_BS),
+            ),
+        ];
+        for (case, existing, missing, patches, want) in cases {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            if let Some(data) = existing {
+                variables.insert(key.clone(), NV_BS, data);
+            }
+
+            let written = variables
+                .write_patches(&key, 2, &patches, VolatileWrites::Refuse, missing)
+                .map_err(|error| format!("{error:#}"));
+
+            assert_eq!(written.map(|()| variables.bytes(&key)), want, "{case}");
+            if want.is_err() {
+                assert_eq!(variables.bytes(&key), None, "{case}: nothing created");
+            }
+        }
+    }
+
     /// set's refusal of a variable that does not exist follows its interface: efivarfs as on
     /// Linux, the firmware environment calls as on Windows, GetVariable() as in the UEFI Shell,
     /// whose variables reach every variable that the firmware has created.
@@ -1474,7 +1653,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             VariableInterface::VariableServices.not_found_refusal(),
-            "the firmware has not created it, and set never creates variables",
+            "the firmware has not created it, and set creates only the per-question variables of \
+             an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1",
             "VariableServices"
         );
         assert_eq!(
@@ -1706,6 +1886,7 @@ pub(crate) mod tests {
                             5,
                             &patches,
                             VolatileWrites::Refuse,
+                            MissingVariable::Refuse,
                         )
                         .map_err(|error| error.to_string()),
                     Err(
@@ -1728,6 +1909,7 @@ pub(crate) mod tests {
                     5,
                     &[patch(0, &[0]), patch(3, &[0, 0])],
                     VolatileWrites::Refuse,
+                    MissingVariable::Refuse,
                 )
                 .unwrap_or_else(|error| {
                     panic!("{interface:?}: write on both sides of the password: {error:#}")
@@ -2242,7 +2424,13 @@ pub(crate) mod tests {
                     );
                     variables.insert(key.clone(), BS_RT, &[1]);
                     let write = |stack: &dyn FirmwareVariables| {
-                        stack.write_patches(&key, 1, &[patch(0, &[0x2A])], passed)
+                        stack.write_patches(
+                            &key,
+                            1,
+                            &[patch(0, &[0x2A])],
+                            passed,
+                            MissingVariable::Refuse,
+                        )
                     };
 
                     let got = match stack {

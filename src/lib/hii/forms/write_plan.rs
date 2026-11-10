@@ -28,7 +28,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use thiserror::Error;
 
-use super::check_writable;
+use super::check_read;
 use super::conditions::evaluate_write;
 use super::conditions::ExpressionInputs;
 use super::conditions::PlannedSet;
@@ -39,7 +39,6 @@ use super::set::ChangeValueError;
 use super::set::NewValue;
 use super::set::VarStoreWrite;
 use super::storage::VariableStore;
-use super::unwritable;
 use super::AccessLevel;
 use super::EfivarReader;
 use super::IFROpCode;
@@ -118,17 +117,16 @@ impl<'a> WritePlan<'a> {
         reader: &mut EfivarReader,
         volatile: VolatileWrites,
     ) -> Result<Vec<VarStoreWrite<'_>>, ChangeValueError> {
-        let (reach, interface) = (reader.reach(), reader.interface());
+        let through = (reader.reach(), reader.interface());
         for set in &self.sets {
             let store = set.store.as_ref();
             let range = usize::from(set.offset)..usize::from(set.offset) + set.bytes.len();
-            let checked = match reader.read(EfivarRange::of(store), range) {
-                Ok(_) => check_writable(store, reader, volatile),
-                Err(error) => Err(unwritable(store, error, reach, interface)),
-            };
-            checked.map_err(|error| ChangeValueError::Expression {
-                question: self.question.question.clone(),
-                refusal: set.unwritable(format!("which set may not write: {error:#}")),
+            let read = reader.read(EfivarRange::of(store), range);
+            check_read(store, read, through, volatile).map_err(|error| {
+                ChangeValueError::Expression {
+                    question: self.question.question.clone(),
+                    refusal: set.unwritable(format!("which set may not write: {error:#}")),
+                }
             })?;
         }
         let patches = self
@@ -180,7 +178,7 @@ struct Patch<'p> {
 }
 
 /// The one write of `patches`, all of one variable, in order, through the largest of their
-/// VarStores.
+/// VarStores (VarStoreWrite::merge).
 fn merged_write<'p>(patches: &[Patch<'p>]) -> Result<VarStoreWrite<'p>, ChangeValueError> {
     let mut writes = patches.iter().map(|patch| VarStoreWrite {
         store: patch.store,
@@ -189,7 +187,9 @@ fn merged_write<'p>(patches: &[Patch<'p>]) -> Result<VarStoreWrite<'p>, ChangeVa
     let Some(mut merged) = writes.next() else {
         return Err(anyhow!("a variable write without bytes").into());
     };
-    writes.for_each(|write| merged.merge(write));
+    for write in writes {
+        merged.merge(write)?;
+    }
     Ok(merged)
 }
 
@@ -214,10 +214,10 @@ impl BatchedWrite<'_> {
 /// set's batch of `question_writes`, the writes of each question by its selector, in question
 /// order: one write per variable, in the order in which the questions first change each, with
 /// the patches of every question to it in question order, so that a later question's bytes win
-/// where they overlap, through the largest of its VarStores.
+/// where they overlap, through the largest of its VarStores (VarStoreWrite::merge).
 pub(super) fn batched_writes<'a>(
     question_writes: Vec<(&'a str, Vec<VarStoreWrite<'a>>)>,
-) -> Vec<BatchedWrite<'a>> {
+) -> Result<Vec<BatchedWrite<'a>>, ChangeValueError> {
     let mut batch: Vec<BatchedWrite<'a>> = Vec::new();
     for (selector, writes) in question_writes {
         for write in writes {
@@ -227,7 +227,7 @@ pub(super) fn batched_writes<'a>(
                 .find(|batched| batched.write.store.variable_key() == key)
             {
                 Some(batched) => {
-                    batched.write.merge(write);
+                    batched.write.merge(write)?;
                     if !batched.selectors.contains(&selector) {
                         batched.selectors.push(selector);
                     }
@@ -239,7 +239,7 @@ pub(super) fn batched_writes<'a>(
             }
         }
     }
-    batch
+    Ok(batch)
 }
 
 /// Refuses `batch` through efivarfs where two of its variables are one efivar file, their names

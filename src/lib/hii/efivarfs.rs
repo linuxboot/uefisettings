@@ -98,11 +98,13 @@ use crate::hii::system_table::ConfigurationTables;
 use crate::hii::system_table::PointerSpace;
 #[cfg(firmware_memory_maps)]
 use crate::hii::system_table::SystemTableFiles;
+use crate::hii::variables::created_variable_bytes;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::MissingVariable;
 use crate::hii::variables::UnreadVariables;
 use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
@@ -221,6 +223,7 @@ impl FirmwareVariables for EfivarFiles {
         size: u16,
         patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
+        missing: MissingVariable,
     ) -> Result<()> {
         // Steps:
         // * Read bytes
@@ -239,21 +242,36 @@ impl FirmwareVariables for EfivarFiles {
         let file_name = EfivarFileName::from(key);
         let path = self.dir.join(&file_name);
 
-        let file_ro = open_efivar(&self.dir, &file_name)
-            .map_err(|error| as_variable_not_found(key, error))?;
-
-        let mut file_contents = read_efivar_file_of(&file_ro)
-            .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
-
-        modify_variable_bytes(self, key, volatile, &mut file_contents, size, patches)?;
+        let file_ro =
+            open_efivar(&self.dir, &file_name).map_err(|error| as_variable_not_found(key, error));
+        // the write of a new file creates its variable (efivarfs_create)
+        let (file_contents, exists) = match (file_ro, missing) {
+            (Ok(file_ro), _) => {
+                let mut file_contents = read_efivar_file_of(&file_ro)
+                    .context(format!("Failed to read efivarfs file '{}'", path.display()))?;
+                modify_variable_bytes(self, key, volatile, &mut file_contents, size, patches)?;
+                (file_contents, true)
+            }
+            (Err(error), MissingVariable::Create(attributes)) if error.is::<VariableNotFound>() => {
+                let file_contents =
+                    created_variable_bytes(self, key, volatile, attributes, size, patches)?;
+                (file_contents, false)
+            }
+            (Err(error), MissingVariable::Create(_) | MissingVariable::Refuse) => {
+                return Err(error)
+            }
+        };
 
         let survives = self.survives()?;
         let _efifs = EfivarsMountGuard::new(&self.dir, survives)
             .context("Failed to create efivars fs mount guard")?;
 
         // Needed on kernel 4.6+ to make EFI vars the kernel doesn't know how to
-        // validate temporarily writable.
-        let _immutability_attribute_guard = EfivarsImmutabilityGuard::new(&path)
+        // validate temporarily writable; not for a file that the write creates, as open() checks
+        // no write permission of a file that it creates (Linux v6.11 fs/namei.c do_open()).
+        let _immutability_attribute_guard = exists
+            .then(|| EfivarsImmutabilityGuard::new(&path))
+            .transpose()
             .context("failed to create immutability attribute guard")?;
 
         // All checks passed, now we can try to write.
@@ -1076,6 +1094,7 @@ mod tests {
     use crate::hii::kallsyms::fixture::write_kallsyms;
     use crate::hii::kallsyms::fixture::FIXED_KALLSYMS;
     use crate::hii::kallsyms::fixture::UNFIXED_KALLSYMS;
+    use crate::hii::variables::tests::patch;
     use crate::hii::variables::tests::variable_key;
     use crate::hii::variables::tests::WriteAt;
     use crate::hii::variables::tests::BS_RT;
@@ -1182,6 +1201,58 @@ mod tests {
                 fs::read(dir.path().join(EfivarFileName::from(&key))).ok(),
                 bytes.cloned(),
                 "{name}: the efivar file"
+            );
+        }
+    }
+
+    /// write_patches of a missing variable under MissingVariable::Create refuses patches that
+    /// leave a data byte unwritten, and volatile attributes, before it remounts efivarfs, which
+    /// fails for a directory that no mount lists; patches that write every data byte reach the
+    /// remount. None creates a file.
+    #[test]
+    fn efivar_files_create_a_missing_variable_only_of_written_bytes() {
+        let ([dir, _lock, _evidence], files) = unmounted_efivar_files();
+        let key = variable_key("Created");
+        let cases = [
+            (
+                NV_BS_RT,
+                &[patch(0, &[1])][..],
+                "EFI variable Created-00000000-0000-0000-0000-000000000000 is missing, and no \
+                 patch writes its data byte 1 of 2, so set does not create it"
+                    .to_string(),
+            ),
+            (
+                BS_RT,
+                &[patch(0, &[1, 2])][..],
+                "EFI variable Created-00000000-0000-0000-0000-000000000000 is volatile (no \
+                 EFI_VARIABLE_NON_VOLATILE) and cannot be written through efivarfs"
+                    .to_string(),
+            ),
+            (
+                NV_BS_RT,
+                &[patch(0, &[1, 2])][..],
+                format!(
+                    "Failed to create efivars fs mount guard: mount {} is not in /proc/mounts",
+                    dir.path().display()
+                ),
+            ),
+        ];
+
+        for (attributes, patches, refusal) in cases {
+            let error = files
+                .write_patches(
+                    &key,
+                    2,
+                    patches,
+                    VolatileWrites::Refuse,
+                    MissingVariable::Create(attributes),
+                )
+                .expect_err("create without the remount");
+
+            assert_eq!(format!("{error:#}"), refusal, "{attributes:#x} {patches:?}");
+            assert!(
+                !dir.path().join(EfivarFileName::from(&key)).exists(),
+                "{attributes:#x} {patches:?}: no efivar file"
             );
         }
     }

@@ -32,6 +32,7 @@ use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::MissingVariable;
 #[cfg(variable_data)]
 use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
@@ -200,6 +201,8 @@ impl<C: FirmwareEnvironmentCalls> FirmwareVariables for FirmwareEnvironment<C> {
         size: u16,
         patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
+        // a missing variable stays VariableNotFound (VariableInterface::creation_refusal)
+        _missing: MissingVariable,
     ) -> Result<()> {
         // As VariableServices::write_patches (variable_services.rs): read the whole variable,
         // modify its bytes, and write the whole data back with the same attributes.
@@ -900,6 +903,7 @@ mod tests {
                     },
                 ],
                 VolatileWrites::Refuse,
+                MissingVariable::Refuse,
             )
             .expect("write two patches");
 

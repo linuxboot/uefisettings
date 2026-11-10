@@ -38,6 +38,7 @@ use crate::hii::strings::StringPackage;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
 use crate::hii::variables::check_volatile_write;
+use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarReader;
 use crate::hii::variables::EnhancedAuthenticatedVariable;
 use crate::hii::variables::VariableInterface;
@@ -81,6 +82,7 @@ pub use question_values::QuestionSelector;
 use set::ChangeValueError;
 use setup_password::password_storage_width;
 use setup_password::PasswordOp;
+use storage::created_attributes;
 use storage::storage_width;
 use storage::NameValueStore;
 use storage::ReadableLocation;
@@ -2593,20 +2595,40 @@ pub(crate) fn choice_for_set(
     Ok(selection.for_set(question)?)
 }
 
-/// Refuses `store` unless set may write its variable, which `reader` has read: one that the read
-/// failed for, or whose attributes set does not write, a volatile one unless `volatile` allows
-/// it (check_volatile_write), an authenticated, or, at OS runtime, boot-service-only variable.
+/// Refuses `store` unless set may write its variable, which `reader` has read (check_read).
 fn check_writable(
     store: &dyn VariableStore,
     reader: &EfivarReader,
     volatile: VolatileWrites,
 ) -> Result<()> {
-    let reach = reader.reach();
-    let interface = reader.interface();
-    if let Some(error) = reader.read_error(store) {
-        return Err(unwritable(store, error, reach, interface));
+    match reader.outcome(store) {
+        Some(read) => check_read(store, read, (reader.reach(), reader.interface()), volatile),
+        None => Ok(()),
     }
-    if let Some(attributes) = reader.attributes(store) {
+}
+
+/// Refuses `store` unless set may write its variable, whose read through variables of `reach`
+/// and `interface` gave `read`: one that the read failed for, unless it is missing and set
+/// creates it (created_attributes), or whose attributes, or those that set creates it with, set
+/// does not write, a volatile one unless `volatile` allows it (check_volatile_write), an
+/// authenticated, or, at OS runtime, boot-service-only variable.
+fn check_read(
+    store: &dyn VariableStore,
+    read: std::result::Result<&[u8], &anyhow::Error>,
+    (reach, interface): (VariableReach, VariableInterface),
+    volatile: VolatileWrites,
+) -> Result<()> {
+    let attributes = match read {
+        Ok(bytes) => efivar_attributes(bytes),
+        Err(error) => match (
+            error.is::<VariableNotFound>(),
+            created_attributes(store, reach, interface),
+        ) {
+            (true, Some(attributes)) => Some(attributes),
+            (true, None) | (false, _) => return Err(unwritable(store, error, reach, interface)),
+        },
+    };
+    if let Some(attributes) = attributes {
         let key = store.variable_key();
         check_volatile_write(&key, interface, reach, volatile, attributes)?;
         check_unauthenticated(&key, attributes)?;
@@ -3193,7 +3215,8 @@ mod choice_for_set_tests {
             (
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
-                ": the firmware has not created it, and set never creates variables",
+                ": the firmware has not created it, and set creates only the per-question \
+                 variables of an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1",
             ),
         ];
 
@@ -3259,7 +3282,7 @@ mod choice_for_set_tests {
             (
                 VariableInterface::VariableServices,
                 "GetVariable() does not find it",
-                "set never creates variables",
+                "set creates only the per-question variables",
             ),
             (
                 VariableInterface::FirmwareEnvironment,
@@ -4200,7 +4223,8 @@ mod tests {
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
                 "no EFI variable Setup-00000000-0000-0000-0000-000000000000: the firmware has \
-                 not created it, and set never creates variables",
+                 not created it, and set creates only the per-question variables of an \
+                 EFI_IFR_VARSTORE_EFI before UEFI 2.3.1",
             ),
         ];
         for (reach, interface, want) in cases {

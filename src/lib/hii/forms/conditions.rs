@@ -2515,9 +2515,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// Plans the SET `op` of a WRITE expression, and pushes TRUE, as edk2-stable202608
     /// SetupBrowserDxe/Expression.c EvaluateExpression does once it copies the value into the edit
     /// buffer of a Buffer or EFI variable VarStore, or SetVariable stores it in the variable of a
-    /// VarName. Where set does not write the variable of a VarName, as it is missing or of another
-    /// size, the SET pushes FALSE, as it does where its value cannot be stored (UEFI 2.11
-    /// §33.3.8.3.66). Elsewhere a SET, which changes a stored value, is not evaluated.
+    /// VarName, which SetVariable creates where it is missing. Where set does not write the
+    /// variable of a VarName, as it is of another size, or missing through an interface that set
+    /// creates none through, the SET pushes FALSE, as it does where its value cannot be stored
+    /// (UEFI 2.11 §33.3.8.3.66). Elsewhere a SET, which changes a stored value, is not evaluated.
     fn set(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
         let ParsedOperation::Set(operand) = &op.parsed_data else {
             return Err(not_decoded(op));
@@ -2550,8 +2551,16 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             VariableLayout::OneValue => {
                 match read_stored_bytes(store.as_ref(), range.clone(), self.reader) {
                     Ok(_) => {}
+                    // at OS runtime, a missing variable that the store declares without runtime
+                    // access reads as DeclaredBootServiceOnly, which refuses the WRITE below
                     Err(ValueUnavailable::Missing(missing)) => {
-                        return Ok(unstored(op, id, store.as_ref(), missing))
+                        match self.reader.interface().creation_refusal() {
+                            None => {}
+                            Some(refusal) => {
+                                let why = format!("{missing}, {refusal}");
+                                return Ok(unstored(op, id, store.as_ref(), why));
+                            }
+                        }
                     }
                     Err(ValueUnavailable::Size(mismatch)) => {
                         let why = format!(
@@ -7019,11 +7028,12 @@ mod store_expression_tests {
 
     /// A SET of a VARSTORE_EFI before UEFI 2.3.1 in a WRITE plans its value, as wide as its
     /// VarStoreType, at byte 0 of the EFI variable that its VarName names, and pushes TRUE, where
-    /// that variable holds a value of that width, through variables of either reach. Where the
-    /// variable is missing or of another size, which set does not write, it plans nothing and
-    /// pushes FALSE, as a SET that cannot store its value does (UEFI 2.11 §33.3.8.3.66), and warns
-    /// why. A VarName without a string, and at OS runtime a missing variable that the store
-    /// declares boot-service-only, refuse the WRITE.
+    /// that variable holds a value of that width, or is missing, which set creates, through
+    /// variables of either reach. Where the variable is of another size, which set does not
+    /// write, or missing through the firmware environment calls of Windows, which create none, it
+    /// plans nothing and pushes FALSE, as a SET that cannot store its value does (UEFI 2.11
+    /// §33.3.8.3.66), and warns why. A VarName without a string, and at OS runtime a missing
+    /// variable that the store declares boot-service-only, refuse the WRITE.
     #[test]
     fn set_of_a_short_var_store_plans_the_variable_of_its_var_name() {
         // the SET's result goes to ShortVarFlag, a BOOLEAN
@@ -7102,11 +7112,11 @@ mod store_expression_tests {
                 (
                     "ShortVarMissing",
                     set(SHORT_EFI, 10, EFI_IFR_TYPE_NUM_SIZE_8),
-                    Ok(Some(vec![flag(0)])),
-                    unstored(
-                        "ShortVarMissing",
-                        "no EFI variable ShortVarMissing-8c78a505-baa0-4c4a-869f-000000000b01",
-                    ),
+                    Ok(Some(vec![
+                        (SHORT_EFI, "ShortVarMissing".to_string(), 0, vec![3]),
+                        flag(1),
+                    ])),
+                    vec![],
                 ),
                 (
                     "a VarName without a string",
@@ -7141,8 +7151,31 @@ mod store_expression_tests {
         let (_, shell) = SHORT_REACHES[1];
         assert_eq!(
             writes_through(NV_BS, set(SHORT_EFI, 10, EFI_IFR_TYPE_NUM_SIZE_8), shell),
-            Ok(Some(vec![flag(0)])),
+            Ok(Some(vec![
+                (SHORT_EFI, "ShortVarMissing".to_string(), 0, vec![3]),
+                flag(1)
+            ])),
             "BootServices: ShortVarMissing of an NV|BS store"
+        );
+        let windows = (
+            VariableReach::Runtime,
+            VariableInterface::FirmwareEnvironment,
+        );
+        assert_eq!(
+            warnings_of(|| writes_through(
+                NV_BS_RT,
+                set(SHORT_EFI, 10, EFI_IFR_TYPE_NUM_SIZE_8),
+                windows
+            )),
+            (
+                Ok(Some(vec![flag(0)])),
+                unstored(
+                    "ShortVarMissing",
+                    "no EFI variable ShortVarMissing-8c78a505-baa0-4c4a-869f-000000000b01, which \
+                     set does not create through SetFirmwareEnvironmentVariableExW",
+                )
+            ),
+            "Windows: ShortVarMissing"
         );
     }
 

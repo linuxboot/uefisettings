@@ -61,6 +61,13 @@ pub(super) trait VariableStore {
         VariableLayout::Offsets
     }
 
+    /// The attributes that set creates its missing variable with, or None where set refuses a
+    /// missing variable: one that holds the values of other questions too would hold bytes that
+    /// set invents.
+    fn created_attributes(&self) -> Option<u32> {
+        None
+    }
+
     /// The variable that holds the values of this VarStore.
     fn variable_key(&self) -> VariableKey {
         VariableKey {
@@ -485,7 +492,8 @@ mod non_efi_varstore_tests {
                 missing("no EFI variable TestVarStore-00000000-0000-0000-0000-000000000000"),
                 Err(
                     "no EFI variable TestVarStore-00000000-0000-0000-0000-000000000000: the \
-                     firmware has not created it, and set never creates variables"
+                     firmware has not created it, and set creates only the per-question \
+                     variables of an EFI_IFR_VARSTORE_EFI before UEFI 2.3.1"
                         .to_string(),
                 ),
                 vec![],
@@ -1113,6 +1121,16 @@ impl EfivarReader {
     /// Why a read of the efivar of `store` failed, if one did.
     pub(super) fn read_error(&self, store: &dyn VariableStore) -> Option<&anyhow::Error> {
         self.outcomes.get(&EfivarRange::of(store))?.as_ref().err()
+    }
+
+    /// What the read of the efivar of `store` gave, if it was read: its bytes, or why it failed.
+    pub(super) fn outcome(
+        &self,
+        store: &dyn VariableStore,
+    ) -> Option<std::result::Result<&[u8], &anyhow::Error>> {
+        self.outcomes
+            .get(&EfivarRange::of(store))
+            .map(Result::as_deref)
     }
 
     /// The attribute word of the efivar of `store`, if a read of it succeeded; None skips set's
@@ -2331,6 +2349,32 @@ impl VariableStore for ShortEfiVariable {
     }
     fn layout(&self) -> VariableLayout {
         VariableLayout::OneValue
+    }
+    /// The store's Attributes, as edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue
+    /// creates the variable through SetVariable(): it holds that question's value alone.
+    fn created_attributes(&self) -> Option<u32> {
+        Some(self.attributes)
+    }
+}
+
+/// The attributes that set creates the missing variable of `store` with through variables of
+/// `reach` and `interface`, if it creates it: those of VariableStore::created_attributes, through
+/// an interface without a VariableInterface::creation_refusal, and at OS runtime only with
+/// EFI_VARIABLE_RUNTIME_ACCESS, as "Once ExitBootServices() is performed, only variables that
+/// have EFI_VARIABLE_RUNTIME_ACCESS and EFI_VARIABLE_NON_VOLATILE set can be set with
+/// SetVariable()" (UEFI 2.11 §8.2.3); check_volatile_write checks EFI_VARIABLE_NON_VOLATILE.
+pub(super) fn created_attributes(
+    store: &dyn VariableStore,
+    reach: VariableReach,
+    interface: VariableInterface,
+) -> Option<u32> {
+    let attributes = store.created_attributes()?;
+    if interface.creation_refusal().is_some() {
+        return None;
+    }
+    match reach {
+        VariableReach::Runtime if attributes & EFI_VARIABLE_RUNTIME_ACCESS == 0 => None,
+        VariableReach::Runtime | VariableReach::BootServices => Some(attributes),
     }
 }
 

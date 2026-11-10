@@ -49,6 +49,7 @@ use crate::efi_variables::VariableData;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarFileName;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::MissingVariable;
 #[cfg(variable_data)]
 use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
@@ -397,6 +398,7 @@ impl FirmwareVariables for EfivarCopy {
         _size: u16,
         _patches: &[DataPatch<'_>],
         _volatile: VolatileWrites,
+        _missing: MissingVariable,
     ) -> Result<()> {
         Err(CopyOfEfivars.into())
     }

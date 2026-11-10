@@ -38,10 +38,13 @@ use crate::efi_variables::VariableStorage;
 use crate::efi_variables::VariableStorageInfo;
 use crate::hii::package::Guid;
 use crate::hii::variables::attributes_and_data;
+use crate::hii::variables::created_variable_bytes;
+use crate::hii::variables::efivar_parts;
 use crate::hii::variables::modify_variable_bytes;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::MissingVariable;
 use crate::hii::variables::UnreadVariables;
 use crate::hii::variables::VariableAttributes;
 use crate::hii::variables::VariableInterface;
@@ -49,7 +52,6 @@ use crate::hii::variables::VariableKey;
 use crate::hii::variables::VariableNotFound;
 use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
-use crate::hii::variables::EFIVARFS_HEADER_SIZE;
 
 /// Attributes that no variable has, as GetVariable() never returns EFI_VARIABLE_APPEND_WRITE
 /// (UEFI 2.10 §8.2.1): variable_info's sign that the firmware left them unset.
@@ -114,17 +116,28 @@ impl FirmwareVariables for VariableServices {
         size: u16,
         patches: &[DataPatch<'_>],
         volatile: VolatileWrites,
+        missing: MissingVariable,
     ) -> Result<()> {
-        let (data, attributes) = get_variable(key)?;
-        let mut bytes = [&attributes.bits().to_ne_bytes()[..], &data].concat();
-        modify_variable_bytes(self, key, volatile, &mut bytes, size, patches)?;
-        let data = bytes
-            .get(EFIVARFS_HEADER_SIZE..)
-            .context("data after the attributes word")?;
+        let bytes = match (get_variable(key), missing) {
+            (Ok((data, attributes)), _) => {
+                let mut bytes = [&attributes.bits().to_ne_bytes()[..], &data].concat();
+                modify_variable_bytes(self, key, volatile, &mut bytes, size, patches)?;
+                bytes
+            }
+            (Err(error), MissingVariable::Create(attributes)) if error.is::<VariableNotFound>() => {
+                created_variable_bytes(self, key, volatile, attributes, size, patches)?
+            }
+            (Err(error), MissingVariable::Create(_) | MissingVariable::Refuse) => {
+                return Err(error)
+            }
+        };
+        let (attributes, data) = efivar_parts(&bytes).context("data after the attributes word")?;
+        let attributes = runtime::VariableAttributes::from_bits_retain(attributes);
         let (variable_name, vendor) = uefi_key(key)?;
         // GetVariable() never returns EFI_VARIABLE_APPEND_WRITE (UEFI 2.10 §8.2.1), and
         // modify_variable_bytes refuses authenticated access, so these attributes rewrite the
-        // whole variable.
+        // whole variable. With it, the Attributes of a VarStore create a missing one whole
+        // (UEFI 2.11 §8.2.3).
         runtime::set_variable(&variable_name, &vendor, attributes, data)
             .map_err(|error| anyhow!("SetVariable() of EFI variable {key}: {:?}", error.status()))
     }
