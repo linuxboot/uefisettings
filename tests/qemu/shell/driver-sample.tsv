@@ -123,6 +123,19 @@ keyword-set-second-no-option	status	aborted
 keyword-set-second-no-option	json	. == {"error_message": "keyword xUefiHiiOption: VALUE=02 is no option of question \"x-UEFI HII Option\""}
 keyword-dmpstore-second-refused	status	any
 keyword-dmpstore-second-refused	same	keyword-dmpstore-before
+# KEYWORDINFO (UEFI 2.11 §35.2.1.6), while VALUE is still 01: the IFR tells the question's
+# <KeywordInfoResp>, UINT8, of the options 0, 1 and 3 in their en-US texts, DEFAULT on 1, and
+# no manufacturing or safe default (edk2-stable202608 DriverSampleDxe Vfr.vfr:283-290,
+# VfrStrings.uni:55-74)
+keyword-info-get	status	0x0
+keyword-info-get	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=01&DATATYPE=Numeric:1&OPTIONVALUE=00&OPTIONSTRING=004d00790020006f006e0065002d006f006600200074006500780074002000230031&OPTIONVALUE=01&OPTIONSTRING=004d00790020006f006e0065002d006f006600200074006500780074002000230032&OPTIONVALUE=03&OPTIONSTRING=004d00790020006f006e0065002d006f006600200074006500780074002000230033&STANDARDDEFAULT=01&DISPLAYNAME=004d00790020004b006500790077006f007200640020004e0061006d00650073007000610063006500200054006500730074$
+keyword-info-json	status	0x0
+keyword-info-json	json	. == [{"namespace": "x-UEFI-ns", "path": "01041400f4274aa000df424db55239511302113d7fff0400", "keyword": "iSCSIBootEnable", "value": "01", "read_only": false, "data_type": "Numeric:1", "options": [{"value": "00", "string": "My one-of text #1"}, {"value": "01", "string": "My one-of text #2"}, {"value": "03", "string": "My one-of text #3"}], "standard_default": "01", "display_name": "My Keyword Namespace Test"}]
+keyword-info-bogus	status	aborted
+keyword-info-bogus	json	. == {"error_message": "KEYWORDINFO=\"Bogus\" is not <KeywordInfoFilter>: All, or DataType, ValueAttribute, Default and DisplayName in this order"}
+# GetData() of KEYWORDINFO, which edk2-stable202608 ConfigKeywordHandler.c refuses
+keyword-info-get-data	status	aborted
+keyword-info-get-data	json	.error_message | test("^GetData\\(\\): INVALID_PARAMETER, ProgressErr 0x2 \\(MALFORMED_STRING\\), Progress at ")
 keyword-set	status	0x0
 keyword-set	line	^NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=03$
 keyword-get-after	status	0x0
@@ -146,7 +159,8 @@ keyword-dmpstore-allow-volatile	line	^  00000050: 00 00 15 00 00 2A 00 00-.. .. 
 # the placeholders of the help texts, each check up to a space, where clap may wrap the line
 keyword-get-help	status	0x0
 keyword-get-help	line	\[PATH=<hex( |$)
-keyword-get-help	line	(^| )digits>&\]KEYWORD=<keyword>:
+keyword-get-help	line	(^| )digits>&\]KEYWORD=<keyword>\[&KEYWORDINFO=<filter>\]:
+keyword-get-help	line	--keyword-info-from-get-data
 keyword-set-help	status	0x0
 keyword-set-help	line	NAMESPACE=<language>&PATH=<hex( |$)
 keyword-set-help	line	(^| )digits>&KEYWORD=<keyword>&VALUE=<hex( |$)

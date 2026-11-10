@@ -47,6 +47,7 @@ use uefi_raw::table::system::SystemTable;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
+use uefisettings::exports::KeywordInfoSource;
 use uefisettings::exports::KeywordSetOptions;
 use uefisettings::exports::KeywordValues;
 use uefisettings::exports::QuestionSelector;
@@ -130,17 +131,22 @@ impl HiiPlatformCommands {
 /// checks of get and set.
 #[derive(Debug, Subcommand)]
 pub(super) enum KeywordCommands {
-    /// Get the value of a keyword, as GetData() returns it: a KeywordResp per package list
+    /// Get the value of a keyword, as GetData() returns it, with the KeywordInfoResp of a KEYWORDINFO built from the HiiDB's IFR, which GetData() is not sent: a KeywordResp per package list
+    ///
+    /// Its defaults are those the IFR declares (EFI_IFR_DEFAULT, flagged options, CHECKBOX flags), which a driver's Callback() with EFI_BROWSER_ACTION_DEFAULT_x and its ALTCFG response outrank (UEFI 2.11 §33.2.5.8), so a platform's default may differ; those of a question of EFI_IFR_FLAG_CALLBACK are refused.
     #[command(next_display_order = None)]
     Get {
         // a doc comment would make rustdoc take the placeholders for HTML tags
         #[arg(
-            help = "A KeywordRequest, [PATH=<hex digits>&]KEYWORD=<keyword>: an optional PATH, the device path of the keyword's package list, and the KEYWORD"
+            help = "A KeywordRequest, [PATH=<hex digits>&]KEYWORD=<keyword>[&KEYWORDINFO=<filter>]: an optional PATH, the device path of the keyword's package list, the KEYWORD, and an optional KEYWORDINFO, All or DataType, ValueAttribute, Default and DisplayName in this order"
         )]
         request: String,
         /// The configuration language of the keyword, such as x-UEFI-ns; else one of the prefix x-UEFI
         #[arg(long)]
         namespace: Option<String>,
+        /// Send GetData() the KEYWORDINFO unchanged and print its KeywordResps as returned, instead of building the KeywordInfoResp from the HiiDB's IFR
+        #[arg(long)]
+        keyword_info_from_get_data: bool,
         #[command(flatten)]
         output: JsonArgs,
     },
@@ -168,11 +174,18 @@ impl KeywordCommands {
             Self::Get {
                 request,
                 namespace,
+                keyword_info_from_get_data,
                 output,
-            } => (
-                HiiBackend::keyword_get(request, namespace.as_deref())?,
-                output,
-            ),
+            } => {
+                let info_source = match keyword_info_from_get_data {
+                    false => KeywordInfoSource::Ifr,
+                    true => KeywordInfoSource::GetData,
+                };
+                (
+                    HiiBackend::keyword_get(request, namespace.as_deref(), info_source)?,
+                    output,
+                )
+            }
             Self::Set {
                 keywords,
                 include,

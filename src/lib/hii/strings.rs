@@ -296,6 +296,17 @@ impl<'a> ListTexts<'a> {
         }
     }
 
+    /// The text of the string `id` that display shows, None unless a package of no configuration
+    /// language holds it: a text that a Forms Browser can show, never a keyword.
+    pub(crate) fn shown_text(&self, id: u16) -> Option<&'a str> {
+        self.chosen
+            .filter(|package| !package.language.is_configuration())
+            .into_iter()
+            .chain(self.shown.iter().copied())
+            .find_map(|package| package.strings.get(&id))
+            .map(AsRef::as_ref)
+    }
+
     /// The text of the string `id` in each package of no configuration language that holds it,
     /// with that package's language: the texts that QUESTION and VALUE match.
     pub(crate) fn matching(&self, id: u16) -> impl Iterator<Item = (&'a Language, &'a str)> + '_ {
@@ -751,6 +762,42 @@ mod tests {
                 package(language).language.is_configuration(),
                 want,
                 "language {language:?}"
+            );
+        }
+    }
+
+    /// shown_text gives what display shows from a package of a display language, the chosen
+    /// one first, and None where only a configuration language holds the string, even one that
+    /// `requested` picks, or none does; display shows the keyword or "" there.
+    #[test]
+    fn shown_text_is_display_from_a_display_language_alone() {
+        let with = |language: &str, strings: &[(u16, &str)]| StringPackage {
+            strings: strings
+                .iter()
+                .map(|&(id, text)| (id, Rc::from(text)))
+                .collect(),
+            ..package(language)
+        };
+        let packages = [
+            with("x-UEFI-ns", &[(1, "Keyword"), (2, "OnlyKeyword")]),
+            with("en-US", &[(1, "Prompt"), (3, "English")]),
+            with("fr-FR", &[(1, "Invite")]),
+        ];
+        let cases = [
+            ("fr-FR", 1, Some("Invite"), "Invite"),
+            ("fr-FR", 3, Some("English"), "English"),
+            ("en-US", 1, Some("Prompt"), "Prompt"),
+            ("x-UEFI", 1, Some("Prompt"), "Keyword"),
+            ("x-UEFI", 2, None, "OnlyKeyword"),
+            ("en-US", 2, None, ""),
+            ("en-US", 4, None, ""),
+        ];
+        for (requested, id, shown, displayed) in cases {
+            let texts = ListTexts::new(&packages, &[requested]);
+            assert_eq!(
+                (texts.shown_text(id), texts.display(id)),
+                (shown, displayed),
+                "string {id}, requested {requested:?}"
             );
         }
     }

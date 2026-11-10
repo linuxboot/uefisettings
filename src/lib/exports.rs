@@ -190,6 +190,8 @@ use crate::hii::FirmwareVariables;
 #[cfg(firmware_memory_maps)]
 pub use crate::hii::HiiExportError;
 #[cfg(target_os = "uefi")]
+pub use crate::hii::KeywordInfoSource;
+#[cfg(target_os = "uefi")]
 pub use crate::hii::KeywordValues;
 #[cfg(target_os = "linux")]
 pub use crate::hii::LockdownMode;

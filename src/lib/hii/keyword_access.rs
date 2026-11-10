@@ -27,6 +27,7 @@ use thiserror::Error;
 
 use super::config_string::Keyword;
 use super::config_string::KeywordInfo;
+use super::config_string::KeywordInfoFilter;
 use super::config_string::KeywordPath;
 use super::config_string::KeywordRequest;
 use super::config_string::KeywordResp;
@@ -34,6 +35,7 @@ use super::config_string::MultiKeywordResp;
 use super::config_string::Namespace;
 use super::config_string::Number;
 use super::config_string::Usage;
+use super::forms::keywords::KeywordInfoRefusal;
 use super::forms::keywords::KeywordQuestion;
 use super::forms::keywords::KeywordRefusal;
 use super::forms::keywords::KeywordWrite;
@@ -67,8 +69,8 @@ pub(crate) trait KeywordData {
 
 /// The keywords that get and set by keyword print: their `<MultiKeywordResp>`, as GetData()
 /// returns it, each that set wrote in a volatile variable followed by VOLATILE_ANNOTATION; or,
-/// serialized, an object of NAMESPACE, PATH, KEYWORD, VALUE and READONLY per keyword, and
-/// `volatile` for one that set wrote in a volatile variable.
+/// serialized, an object of NAMESPACE, PATH, KEYWORD, VALUE, READONLY and the items of its
+/// `<KeywordInfoResp>` per keyword, and `volatile` for one that set wrote in a volatile variable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeywordValues {
     resps: MultiKeywordResp,
@@ -98,19 +100,13 @@ impl Serialize for KeywordValues {
                 .as_slice()
                 .iter()
                 .enumerate()
-                .map(|(index, resp)| KeywordValue {
-                    namespace: resp.namespace.to_string(),
-                    path: resp.device_path.to_string(),
-                    keyword: resp.keyword.to_string(),
-                    value: resp.value.to_string(),
-                    read_only: resp.usage == Usage::ReadOnly,
-                    volatile: self.volatile.contains(&index),
-                }),
+                .map(|(index, resp)| KeywordValue::of(resp, self.volatile.contains(&index))),
         )
     }
 }
 
-/// A keyword of KeywordValues, serialized.
+/// A keyword of KeywordValues, serialized, with the items of its `<KeywordInfoResp>` that it
+/// has: numbers as VALUE, `<String>`s as text.
 #[derive(Serialize)]
 struct KeywordValue {
     namespace: String,
@@ -119,13 +115,90 @@ struct KeywordValue {
     /// The hex digits of VALUE, the first byte in memory last
     value: String,
     read_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    options: Vec<KeywordOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standard_default: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manufacturing_default: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safe_default: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
     /// Whether set wrote the keyword in a volatile variable, serialized only if it did
     #[serde(skip_serializing_if = "is_false")]
     volatile: bool,
 }
 
+impl KeywordValue {
+    fn of(resp: &KeywordResp, volatile: bool) -> Self {
+        let info = &resp.info;
+        let range = info.range.as_ref();
+        Self {
+            namespace: resp.namespace.to_string(),
+            path: resp.device_path.to_string(),
+            keyword: resp.keyword.to_string(),
+            value: resp.value.to_string(),
+            read_only: resp.usage == Usage::ReadOnly,
+            data_type: info.data_type.map(|data_type| data_type.to_string()),
+            max: range.map(|range| range.max.to_string()),
+            min: range.map(|range| range.min.to_string()),
+            step: range.and_then(|range| range.step.as_ref().map(ToString::to_string)),
+            options: info
+                .options
+                .iter()
+                .map(|option| KeywordOption {
+                    value: option.value.to_string(),
+                    string: String::from_utf16_lossy(&option.string),
+                    value_type: option.value_type.map(|value_type| value_type.to_string()),
+                })
+                .collect(),
+            standard_default: info.standard_default.as_ref().map(ToString::to_string),
+            manufacturing_default: info.manufacturing_default.as_ref().map(ToString::to_string),
+            safe_default: info.safe_default.as_ref().map(ToString::to_string),
+            display_name: info.display_name.as_deref().map(String::from_utf16_lossy),
+            volatile,
+        }
+    }
+}
+
+/// A `<ValueOption>` of a KeywordValue.
+#[derive(Serialize)]
+struct KeywordOption {
+    value: String,
+    string: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_type: Option<String>,
+}
+
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+/// Where get by keyword takes the `<KeywordInfoResp>` of a KEYWORDINFO from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KeywordInfoSource {
+    /// The HiiDB's IFR (KeywordQuestion::info); GetData() is sent no KEYWORDINFO
+    #[default]
+    Ifr,
+    /// GetData(), sent the KEYWORDINFO unchanged; its `<KeywordResp>`s are taken as returned
+    GetData,
+}
+
+/// Why get by keyword reads no value.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub(crate) enum KeywordGetError {
+    #[error("GetData() returned {0}, with a <KeywordInfoResp> that it was not asked for")]
+    UnaskedInfo(String),
 }
 
 /// Why set by keyword writes nothing, or reports a failed write.
@@ -143,39 +216,71 @@ pub(crate) enum KeywordSetError {
     ReadBackFailed(String, String, #[source] anyhow::Error),
 }
 
-/// The values of the keyword of `request`, a `<KeywordRequest>` of an optional PATH and a KEYWORD,
-/// in `namespace`, else in a language of the prefix "x-UEFI", in `lists`: GetData() of
-/// `handler` reads each question that KeywordQuestion::resolve finds, once each passes check_get
-/// with the bytes of the PASSWORD questions of `lists` in `variables` withheld, which it never
-/// reads.
+/// The values of the keyword of `request`, a `<KeywordRequest>` of an optional PATH, a KEYWORD
+/// and an optional KEYWORDINFO, in `namespace`, else in a language of the prefix "x-UEFI", in
+/// `lists`: GetData() of `handler` reads each question that KeywordQuestion::resolve finds, once
+/// each passes check_get with the bytes of the PASSWORD questions of `lists` in `variables`
+/// withheld, which it never reads. With `info_source` KeywordInfoSource::Ifr, each
+/// `<KeywordResp>` gets the `<KeywordInfoResp>` of KEYWORDINFO from the IFR, its texts in the
+/// language that `requested` picks (KeywordQuestion::info), built before any call; GetData()
+/// gets no KEYWORDINFO, which edk2-stable202608 GetData() fails with EFI_INVALID_PARAMETER and
+/// KEYWORD_HANDLER_MALFORMED_STRING (ConfigKeywordHandler.c ValidateFilter leaves it unread,
+/// ExtractDevicePath refuses it). With KeywordInfoSource::GetData, GetData() gets the KEYWORDINFO
+/// unchanged and its `<KeywordResp>`s are taken as returned. Whenever GetData() gets no
+/// KEYWORDINFO, a `<KeywordResp>` that holds a `<KeywordInfoResp>` is refused
+/// (KeywordGetError::UnaskedInfo).
 pub(crate) fn get_keyword(
     lists: &[ParsedPackageList],
     request: &str,
     namespace: Option<&str>,
+    requested: &[&str],
+    info_source: KeywordInfoSource,
     variables: Box<dyn FirmwareVariables>,
     handler: &impl KeywordData,
 ) -> Result<KeywordValues> {
     let request: KeywordRequest = request.parse()?;
     let namespace = namespace.map(Namespace::try_from).transpose()?;
-    let reader = PasswordQuestions::of_lists(lists).reader(variables)?;
+    let mut reader = PasswordQuestions::of_lists(lists).reader(variables)?;
     let questions = KeywordQuestion::resolve(
         lists,
         namespace.as_ref(),
         request.device_path.as_ref(),
         &request.keyword,
+        requested,
     )?;
     for question in &questions {
         question.check_get(&reader)?;
     }
+    let (infos, sent_info) = match (request.info, info_source) {
+        (Some(filter), KeywordInfoSource::Ifr) => (
+            questions
+                .iter()
+                .map(|question| question.info(filter, &mut reader).map(Some))
+                .collect::<Result<Vec<_>, KeywordInfoRefusal>>()?,
+            None,
+        ),
+        (sent_info, KeywordInfoSource::GetData) | (sent_info @ None, KeywordInfoSource::Ifr) => {
+            (vec![None; questions.len()], sent_info)
+        }
+    };
     let values = questions
         .iter()
-        .map(|question| {
-            read_keyword(
+        .zip(infos)
+        .map(|(question, info)| {
+            let mut resp = read_keyword(
                 handler,
                 question.namespace(),
                 question.path(),
                 &request.keyword,
-            )
+                sent_info,
+            )?;
+            if sent_info.is_none() && resp.info != KeywordInfo::default() {
+                return Err(KeywordGetError::UnaskedInfo(resp.to_string()).into());
+            }
+            if let Some(info) = info {
+                resp.info = info;
+            }
+            Ok(resp)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(KeywordValues {
@@ -213,6 +318,7 @@ pub(crate) fn set_keywords(
             Some(&resp.namespace),
             Some(&resp.device_path),
             &resp.keyword,
+            &[],
         )?;
         for question in questions {
             let write = question.check_set(resp, include, volatile, &mut reader)?;
@@ -308,23 +414,30 @@ fn significant(mut bytes: &[u8]) -> &[u8] {
 
 /// The `<KeywordResp>` of the keyword of `resp` that GetData() of `handler` reads.
 fn read_back(handler: &impl KeywordData, resp: &KeywordResp) -> Result<KeywordResp> {
-    read_keyword(handler, &resp.namespace, &resp.device_path, &resp.keyword)
+    read_keyword(
+        handler,
+        &resp.namespace,
+        &resp.device_path,
+        &resp.keyword,
+        None,
+    )
 }
 
 /// The `<KeywordResp>` of `keyword` in `namespace` of the package list of `path` that GetData() of
 /// `handler` returns, asked with all three: UEFI 2.11 §35.3.3 takes NamespaceId as the language
 /// alone, edk2-stable202608 ExtractNameSpace (ConfigKeywordHandler.c:202, from GetData() at
-/// :3251) as a `<NameSpaceId>`, which this sends.
+/// :3251) as a `<NameSpaceId>`, which this sends. The request holds KEYWORDINFO `info`, if any.
 fn read_keyword(
     handler: &impl KeywordData,
     namespace: &Namespace,
     path: &KeywordPath,
     keyword: &Keyword,
+    info: Option<KeywordInfoFilter>,
 ) -> Result<KeywordResp> {
     let request = KeywordRequest {
         device_path: Some(path.clone()),
         keyword: keyword.clone(),
-        info: None,
+        info,
         usage: None,
         data: None,
     };
@@ -384,6 +497,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::hii::forms::ifr_fixtures::checkbox_on;
+    use crate::hii::forms::ifr_fixtures::conditional;
+    use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::flagged_option;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::operation;
@@ -400,6 +516,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::NUMERIC;
     use crate::hii::forms::ifr_fixtures::ONE_OF;
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
+    use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::keywords::KeywordRefusal;
     use crate::hii::forms::resolve_short_var_names;
     use crate::hii::forms::IgnoredIfr;
@@ -645,6 +762,8 @@ mod tests {
             lists,
             &format!("KEYWORD={KEYWORD}"),
             None,
+            &[],
+            KeywordInfoSource::Ifr,
             variables(),
             handler,
         )
@@ -869,6 +988,8 @@ mod tests {
                 &lists,
                 &format!("KEYWORD={keyword}"),
                 None,
+                &[],
+                KeywordInfoSource::Ifr,
                 variables(),
                 handler,
             )
@@ -1086,6 +1207,42 @@ mod tests {
                 },
             ]),
             "the keywords"
+        );
+    }
+
+    /// A keyword's `<KeywordInfoResp>` serializes beside VALUE: numbers as VALUE, `<String>`s as
+    /// text, and VALUETYPE in its option.
+    #[test]
+    fn keyword_values_serialize_the_items_of_keyword_info() {
+        let info = format!(
+            "&DATATYPE=Buffer&MAX=0010&MIN=0001&STEP=0002&OPTIONVALUE=0100&OPTIONSTRING={}\
+             &VALUETYPE=Numeric:2&MFGDEFAULT=0001&SAFEDEFAULT=0002",
+            hex_string("A&B=C")
+        );
+        let values = KeywordValues {
+            resps: format!("{}{info}", resp(PATH, KEYWORD, "03"))
+                .parse()
+                .expect("a <MultiKeywordResp>"),
+            volatile: BTreeSet::new(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&values).expect("serialize"),
+            serde_json::json!([{
+                "namespace": NAMESPACE,
+                "path": PATH,
+                "keyword": KEYWORD,
+                "value": "03",
+                "read_only": false,
+                "data_type": "Buffer",
+                "max": "0010",
+                "min": "0001",
+                "step": "0002",
+                "options": [{"value": "0100", "string": "A&B=C", "value_type": "Numeric:2"}],
+                "manufacturing_default": "0001",
+                "safe_default": "0002",
+            }]),
+            "the keyword"
         );
     }
 
@@ -1319,6 +1476,8 @@ mod tests {
                 &lists,
                 &format!("KEYWORD={keyword}"),
                 None,
+                &[],
+                KeywordInfoSource::Ifr,
                 runtime(),
                 &handler,
             )
@@ -1497,6 +1656,8 @@ mod tests {
             &lists,
             &format!("PATH={OTHER_PATH}&KEYWORD={KEYWORD}"),
             None,
+            &[],
+            KeywordInfoSource::Ifr,
             variables(),
             &handler,
         )
@@ -1545,6 +1706,416 @@ mod tests {
             assert!(
                 format!("{error:#}").contains("not that keyword's <KeywordResp> alone"),
                 "{name}: {error:#}"
+            );
+        }
+    }
+
+    /// A UINT8 ONE_OF of KEYWORD at VarOffset 5 of VarStore 1 whose options hold 1, its standard
+    /// default, and 3, of strings 4 and 6.
+    fn defaulted_one_of() -> Vec<u8> {
+        let data = [
+            question_header_with(3, 3, 1, 5, 0),
+            vec![0x00, 0, 3, 1], // Flags UINT8, MinValue, MaxValue, Step
+        ]
+        .concat();
+        [
+            operation(ONE_OF, true, &data),
+            flagged_option(4, 0x10, 1), // EFI_IFR_OPTION_DEFAULT
+            flagged_option(6, 0, 3),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// A list of PATH holding `ops`, whose en-US strings package holds "One" and "Three" as
+    /// strings 4 and 6.
+    fn list_with_option_texts(ops: &[Vec<u8>]) -> ParsedPackageList {
+        with_option_texts(list(PATH, ops))
+    }
+
+    /// `list`, its en-US strings package given "One" and "Three" as strings 4 and 6.
+    fn with_option_texts(mut list: ParsedPackageList) -> ParsedPackageList {
+        let en_us = &mut list.strings.first_mut().expect("the en-US package").strings;
+        en_us.insert(4, "One".into());
+        en_us.insert(6, "Three".into());
+        list
+    }
+
+    /// `text` as a `<String>`: 4 hex digits per CHAR16.
+    fn hex_string(text: &str) -> String {
+        text.encode_utf16()
+            .map(|unit| format!("{unit:04x}"))
+            .collect()
+    }
+
+    /// KEYWORDINFO gets each `<KeywordResp>` the `<KeywordInfoResp>` that the IFR tells, which
+    /// GetData() is not asked for, a ONE_OF's without a `<ValueRange>`; JSON shows its items
+    /// beside VALUE.
+    #[test]
+    fn get_with_keyword_info_adds_the_ifr_info_and_sends_none() {
+        let lists = [list_with_option_texts(&[defaulted_one_of()])];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+
+        let values = get_keyword(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=All"),
+            None,
+            &[],
+            KeywordInfoSource::Ifr,
+            variables(),
+            &handler,
+        )
+        .expect("get with KEYWORDINFO");
+
+        assert_eq!(
+            values.to_string(),
+            format!(
+                "{}&DATATYPE=Numeric:1&OPTIONVALUE=01&OPTIONSTRING={}&OPTIONVALUE=03\
+                 &OPTIONSTRING={}&STANDARDDEFAULT=01&DISPLAYNAME={}",
+                resp(PATH, KEYWORD, "01"),
+                hex_string("One"),
+                hex_string("Three"),
+                hex_string("Keyword question"),
+            ),
+            "the <KeywordResp>"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![get_call(PATH, KEYWORD)],
+            "GetData() without KEYWORDINFO"
+        );
+        assert_eq!(
+            serde_json::to_value(&values).expect("serialize"),
+            serde_json::json!([{
+                "namespace": NAMESPACE,
+                "path": PATH,
+                "keyword": KEYWORD,
+                "value": "01",
+                "read_only": false,
+                "data_type": "Numeric:1",
+                "options": [
+                    {"value": "01", "string": "One"},
+                    {"value": "03", "string": "Three"},
+                ],
+                "standard_default": "01",
+                "display_name": "Keyword question",
+            }]),
+            "JSON"
+        );
+    }
+
+    /// An item that the IFR does not tell refuses the get before any GetData(): the texts of the
+    /// options, string 4, are in no display language.
+    #[test]
+    fn get_refuses_keyword_info_it_cannot_tell_before_any_call() {
+        let lists = [list(PATH, &questions())];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+
+        let error = get_keyword(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=ValueAttribute"),
+            None,
+            &[],
+            KeywordInfoSource::Ifr,
+            variables(),
+            &handler,
+        )
+        .expect_err("options without texts");
+
+        assert_eq!(
+            error.downcast_ref::<KeywordInfoRefusal>(),
+            Some(&KeywordInfoRefusal::NoText {
+                keyword: KEYWORD.to_owned(),
+                id: 4,
+            }),
+            "the refusal"
+        );
+        assert_eq!(handler.calls(), Vec::new(), "no GetData()");
+    }
+
+    /// From KeywordInfoSource::GetData, GetData() gets the KEYWORDINFO unchanged and its
+    /// `<KeywordResp>` is taken as returned, though the IFR tells otherwise or cannot tell; a
+    /// failed GetData() fails the get, which never turns to the IFR.
+    #[test]
+    fn get_from_get_data_sends_keyword_info_and_takes_the_resp_as_returned() {
+        let lists = [list(PATH, &questions())];
+        let request = format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataTypeValueAttribute");
+        let sent = format!("{KEYWORD}&KEYWORDINFO=DataTypeValueAttribute");
+        let handler = RewritingHandler {
+            inner: MemoryKeywordHandler::with(&[(PATH, &sent, "01")]),
+            from: "&KEYWORDINFO=DataTypeValueAttribute&VALUE=01".to_owned(),
+            to: "&VALUE=01&DATATYPE=Numeric:2".to_owned(),
+        };
+        fn get_from_get_data(
+            lists: &[ParsedPackageList],
+            request: &str,
+            handler: &impl KeywordData,
+        ) -> Result<KeywordValues> {
+            get_keyword(
+                lists,
+                request,
+                None,
+                &[],
+                KeywordInfoSource::GetData,
+                variables(),
+                handler,
+            )
+        }
+
+        let values = get_from_get_data(&lists, &request, &handler).expect("get from GetData()");
+
+        assert_eq!(
+            values.to_string(),
+            format!("{}&DATATYPE=Numeric:2", resp(PATH, KEYWORD, "01")),
+            "GetData()'s <KeywordResp>"
+        );
+        assert_eq!(
+            handler.inner.calls(),
+            vec![get_call(PATH, &sent)],
+            "GetData() of the KEYWORDINFO"
+        );
+
+        let error = get_from_get_data(&lists, &request, &MemoryKeywordHandler::default())
+            .expect_err("a failed GetData()");
+        assert_eq!(
+            format!("{error:#}"),
+            "KEYWORD_NOT_FOUND",
+            "GetData()'s error"
+        );
+    }
+
+    /// A `<KeywordInfoResp>` in GetData()'s `<KeywordResp>`, which was asked for none while the
+    /// IFR builds the KEYWORDINFO's, is refused rather than replaced.
+    #[test]
+    fn get_refuses_keyword_info_that_get_data_was_not_asked_for() {
+        let lists = [list(PATH, &questions())];
+        let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01&DATATYPE=Numeric:1")]);
+
+        let error = get_keyword(
+            &lists,
+            &format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType"),
+            None,
+            &[],
+            KeywordInfoSource::Ifr,
+            variables(),
+            &handler,
+        )
+        .expect_err("unasked info");
+
+        assert_eq!(
+            error.downcast_ref::<KeywordGetError>(),
+            Some(&KeywordGetError::UnaskedInfo(format!(
+                "{}&DATATYPE=Numeric:1",
+                resp(PATH, KEYWORD, "01")
+            ))),
+            "the refusal"
+        );
+        assert_eq!(
+            handler.calls(),
+            vec![get_call(PATH, KEYWORD)],
+            "GetData() without KEYWORDINFO"
+        );
+    }
+
+    /// A request without KEYWORDINFO sends GetData() none from either source: a `<KeywordResp>`
+    /// that holds a `<KeywordInfoResp>` is refused, one without it is taken as returned.
+    #[test]
+    fn get_refuses_keyword_info_to_a_request_without_keyword_info() {
+        let lists = [list(PATH, &questions())];
+        for source in [KeywordInfoSource::Ifr, KeywordInfoSource::GetData] {
+            let get = |value: &str| {
+                let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, value)]);
+                let got = get_keyword(
+                    &lists,
+                    &format!("KEYWORD={KEYWORD}"),
+                    None,
+                    &[],
+                    source,
+                    variables(),
+                    &handler,
+                );
+                assert_eq!(
+                    handler.calls(),
+                    vec![get_call(PATH, KEYWORD)],
+                    "{source:?}: GetData() without KEYWORDINFO"
+                );
+                got
+            };
+
+            let Err(error) = get("01&DATATYPE=Numeric:1") else {
+                panic!("{source:?}: the unasked info taken");
+            };
+            assert_eq!(
+                error.downcast_ref::<KeywordGetError>(),
+                Some(&KeywordGetError::UnaskedInfo(format!(
+                    "{}&DATATYPE=Numeric:1",
+                    resp(PATH, KEYWORD, "01")
+                ))),
+                "{source:?}: the refusal"
+            );
+            let values =
+                get("01").unwrap_or_else(|error| panic!("{source:?}: get without info: {error:#}"));
+            assert_eq!(
+                values.to_string(),
+                resp(PATH, KEYWORD, "01"),
+                "{source:?}: the resp without info"
+            );
+        }
+    }
+
+    /// Option 1 of KEYWORD, its standard default, is under a SUPPRESS_IF on question 11, a byte
+    /// of the variable that PASSWORD question 9 withholds, in the FormSet or outside any FormSet
+    /// (PasswordQuestions::of_lists): KEYWORDINFO answers the same whatever that byte holds,
+    /// while get of the keyword, whose bytes hold no password, passes.
+    #[test]
+    fn probe_keyword_info_shows_no_withheld_byte() {
+        const PASSWORD_GUID: [u8; 16] = [0x44; 16];
+        let keyword = [
+            operation(
+                ONE_OF,
+                true,
+                &[question_header_with(3, 3, 1, 5, 0), vec![0x00, 0, 3, 1]].concat(),
+            ),
+            flagged_option(4, 0, 0),
+            conditional(
+                SUPPRESS_IF,
+                eq_id_val_of(11, 1),
+                &[flagged_option(4, 0x10, 1)],
+            ),
+            flagged_option(4, 0, 3),
+            END.to_vec(),
+        ]
+        .concat();
+        let store = var_store(2, PASSWORD_GUID, "Password", 20);
+        let password = password_on(9, 9, 2, 0);
+        let question_11 = one_of(11, 15, 2);
+        let in_form_set = [
+            store.clone(),
+            password.clone(),
+            question_11.clone(),
+            keyword.clone(),
+        ];
+        let outside = list_with_outside(PATH, &[password], &[store, question_11, keyword]);
+
+        probe(
+            "in its FormSet",
+            &[list_with_option_texts(&in_form_set)],
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        probe(
+            "outside any FormSet",
+            &[with_option_texts(outside)],
+            VariableReach::Runtime,
+            VariableInterface::Efivarfs,
+        );
+
+        /// The probe on `lists`, whose PASSWORD is `placement`, through variables of `reach` and
+        /// `interface`.
+        fn probe(
+            placement: &str,
+            lists: &[ParsedPackageList],
+            reach: VariableReach,
+            interface: VariableInterface,
+        ) {
+            let answer = |byte: u8, request: &str| {
+                let memory = MemoryVariables::new(reach, interface);
+                let mut store = [0; 16];
+                store[5] = 1;
+                let key = |name: &str, guid: [u8; 16]| VariableKey {
+                    name: name.to_owned(),
+                    guid: Guid::from(guid),
+                };
+                memory.insert(key("Store", STORE_GUID), ATTRIBUTES, &store);
+                let mut password = [0; 20];
+                password[15] = byte;
+                memory.insert(key("Password", PASSWORD_GUID), ATTRIBUTES, &password);
+                let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+                match get_keyword(
+                    lists,
+                    request,
+                    None,
+                    &[],
+                    KeywordInfoSource::Ifr,
+                    Box::new(memory),
+                    &handler,
+                ) {
+                    Ok(values) => values.to_string(),
+                    Err(error) => format!("refused: {error:#}"),
+                }
+            };
+            let info = format!("KEYWORD={KEYWORD}&KEYWORDINFO=ValueAttributeDefault");
+
+            assert_eq!(
+                answer(0, &format!("KEYWORD={KEYWORD}")),
+                resp(PATH, KEYWORD, "01"),
+                "{placement}: get of the keyword"
+            );
+            let refused = answer(0, &info);
+            assert!(
+                refused.contains("its option of string 4 is unknown")
+                    && refused.contains("its bytes hold a password"),
+                "{placement}: the withheld byte refuses option 4: {refused}"
+            );
+            assert_eq!(
+                refused,
+                answer(1, &info),
+                "{placement}: the answers of a withheld byte 0 and 1"
+            );
+        }
+    }
+
+    /// KEYWORDINFO answers no keyword that get refuses for IFR outside any FormSet, and refuses
+    /// it as get does, before any call: one that also prompts a CHECKBOX outside any FormSet
+    /// (KeywordQuestion::resolve), one whose VarStoreId a VarStore outside any FormSet declares
+    /// for another variable (check_get), and any of a list with a PASSWORD outside any FormSet,
+    /// read through BootServices (PasswordQuestions::of_lists).
+    #[test]
+    fn get_with_keyword_info_refuses_as_get_does_for_ifr_outside_a_form_set() {
+        let get_of = |lists: &[ParsedPackageList], request: &str| {
+            let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]);
+            let got = get_keyword(
+                lists,
+                request,
+                None,
+                &[],
+                KeywordInfoSource::Ifr,
+                variables(),
+                &handler,
+            )
+            .map(|values| values.to_string())
+            .map_err(|error| format!("{error:#}"));
+            (got, handler.calls())
+        };
+        let info = format!("KEYWORD={KEYWORD}&KEYWORDINFO=DataType");
+
+        assert_eq!(
+            get_of(&[list_with_outside(PATH, &[], &questions())], &info),
+            (
+                Ok(format!("{}&DATATYPE=Numeric:1", resp(PATH, KEYWORD, "01"))),
+                vec![get_call(PATH, KEYWORD)]
+            ),
+            "no IFR outside the FormSet"
+        );
+        for (name, outside) in [
+            ("a CHECKBOX of KEYWORD", checkbox_on(9, 3, 1)),
+            (
+                "a VarStore 1 of the variable Other",
+                var_store(1, [0x44; 16], "Other", 16),
+            ),
+            ("a PASSWORD of VarStore 1", password_on(9, 9, 1, 6)),
+        ] {
+            let lists = [list_with_outside(PATH, &[outside], &questions())];
+            let (got, calls) = get_of(&lists, &format!("KEYWORD={KEYWORD}"));
+
+            assert!(
+                got.is_err() && calls.is_empty(),
+                "{name} outside the FormSet: get refuses before any call: {got:?}, {calls:?}"
+            );
+            assert_eq!(
+                get_of(&lists, &info),
+                (got, calls),
+                "{name} outside the FormSet: KEYWORDINFO refuses as get does"
             );
         }
     }

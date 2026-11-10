@@ -175,6 +175,7 @@ const EFI_IFR_TYPE_TIME: u8 = 0x05;
 const EFI_IFR_TYPE_DATE: u8 = 0x06;
 const EFI_IFR_TYPE_STRING: u8 = 0x07;
 const EFI_IFR_TYPE_OTHER: u8 = 0x08;
+const EFI_IFR_TYPE_BUFFER: u8 = 0x0B;
 const EFI_IFR_TYPE_REF: u8 = 0x0C;
 // edk2-stable202608 MdeModulePkg/Include/Guid/MdeModuleHii.h; the GUID is
 // 82DDD68B-9163-4187-9B27-20A8FD60A71D, here in its EFI_GUID byte order
@@ -1324,13 +1325,18 @@ pub struct IFRDefault {
 }
 
 /// The Value of an EFI_IFR_DEFAULT.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone)]
 enum IfrDefaultValue {
     Decoded(TypeValue),
+    /// Of Type EFI_IFR_TYPE_STRING: the string's identifier
+    String(u16),
+    /// Of Type EFI_IFR_TYPE_BUFFER: every byte after Type, as edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c:2335-2337 copies them
+    Buffer(Vec<u8>),
     /// Absent from EFI_IFR_DEFAULT_2 (Type EFI_IFR_TYPE_OTHER), whose value is a nested
     /// EFI_IFR_VALUE.
     InValueOp,
-    /// Of a Type other than numeric, boolean and EFI_IFR_TYPE_OTHER.
+    /// Of a Type other than numeric, boolean, string, buffer and EFI_IFR_TYPE_OTHER.
     NotDecoded,
     /// Length leaves no room for a value of Type.
     Missing,
@@ -1351,6 +1357,19 @@ fn default_value_parser<R: Read + Seek>(
             Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
             Err(error) => Err(error),
         },
+        EFI_IFR_TYPE_STRING => match u16::read_options(reader, endian, ()) {
+            Ok(id) => Ok(IfrDefaultValue::String(id)),
+            Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
+            Err(error) => Err(error),
+        },
+        EFI_IFR_TYPE_BUFFER => {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            Ok(match bytes.is_empty() {
+                true => IfrDefaultValue::Missing,
+                false => IfrDefaultValue::Buffer(bytes),
+            })
+        }
         EFI_IFR_TYPE_OTHER => Ok(IfrDefaultValue::InValueOp),
         _ => Ok(IfrDefaultValue::NotDecoded),
     }

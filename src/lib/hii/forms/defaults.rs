@@ -49,6 +49,9 @@ const EFI_IFR_CHECKBOX_DEFAULT: u8 = 0x01;
 const EFI_IFR_CHECKBOX_DEFAULT_MFG: u8 = 0x02;
 const EFI_IFR_OPTION_DEFAULT: u8 = 0x10;
 const EFI_IFR_OPTION_DEFAULT_MFG: u8 = 0x20;
+/// The offset of Value in an EFI_IFR_ONE_OF_OPTION's data, after Option, Flags and Type (UEFI
+/// 2.11 §33.3.8.3.51).
+const ONE_OF_OPTION_VALUE_OFFSET: usize = 4;
 
 /// The DEFAULTSTOREs of a question outside every FormSet.
 static NO_DEFAULT_STORES: DefaultStores = DefaultStores(BTreeMap::new());
@@ -59,9 +62,11 @@ static NO_DEFAULT_STORES: DefaultStores = DefaultStores(BTreeMap::new());
 pub struct DefaultId(pub u16);
 
 impl DefaultId {
-    // EFI_HII_DEFAULT_CLASS_STANDARD and EFI_HII_DEFAULT_CLASS_MANUFACTURING
-    const STANDARD: Self = Self(0x0000);
-    const MANUFACTURING: Self = Self(0x0001);
+    // EFI_HII_DEFAULT_CLASS_STANDARD, EFI_HII_DEFAULT_CLASS_MANUFACTURING and
+    // EFI_HII_DEFAULT_CLASS_SAFE (UEFI 2.11 §33.2.5.8)
+    pub(super) const STANDARD: Self = Self(0x0000);
+    pub(super) const MANUFACTURING: Self = Self(0x0001);
+    pub(super) const SAFE: Self = Self(0x0002);
 }
 
 impl fmt::Display for DefaultId {
@@ -105,11 +110,37 @@ impl DefaultStores {
     }
 }
 
+/// A question's default, as the IFR declares it (default_for_id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TypedDefault {
+    /// Of a numeric or BOOLEAN Type, an EFI_IFR_VALUE, a flagged option of a ONE_OF, or a
+    /// CHECKBOX's flags
+    Number(u64),
+    /// Of Type EFI_IFR_TYPE_STRING: the identifier of the string
+    String(u16),
+    /// Of Type EFI_IFR_TYPE_BUFFER, or the Value of a flagged option of an ORDERED_LIST, which
+    /// UEFI 2.11 §33.2.5.4.8 makes "the default value for all Containers"
+    Buffer(Vec<u8>),
+}
+
+impl TypedDefault {
+    /// The number, refused for a string or a buffer, which no numeric question stores.
+    fn number(self) -> Result<u64, DefaultError> {
+        match self {
+            Self::Number(number) => Ok(number),
+            Self::String(_) => Err(DefaultError::NotNumber("EFI_IFR_TYPE_STRING")),
+            Self::Buffer(_) => Err(DefaultError::NotNumber("EFI_IFR_TYPE_BUFFER")),
+        }
+    }
+}
+
 /// Why a question's default is not known.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(super) enum DefaultError {
     #[error("EFI_IFR_DEFAULT Type {0:#04x} value not decoded")]
     DefaultType(u8),
+    #[error("a default of {0} where the question stores a number")]
+    NotNumber(&'static str),
     #[error("EFI_IFR_DEFAULT value missing")]
     DefaultValueMissing,
     #[error("EFI_IFR_DEFAULT_2 without EFI_IFR_VALUE")]
@@ -297,7 +328,7 @@ pub(super) fn question_scope(question: &IFROperation) -> Vec<Rc<RefCell<IFROpera
 }
 
 /// Whether edk2-stable202608 SetupBrowserDxe shows an option.
-enum OptionVisibility {
+pub(super) enum OptionVisibility {
     Shown,
     /// A SUPPRESS_IF hides it
     Suppressed,
@@ -306,7 +337,7 @@ enum OptionVisibility {
 }
 
 /// Returns whether edk2-stable202608 SetupBrowserDxe shows the option `op`.
-fn option_visibility(
+pub(super) fn option_visibility(
     op: &IFROperation,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> OptionVisibility {
@@ -383,23 +414,28 @@ fn ifr_default_value(
     op: &IFROperation,
     default: &IFRDefault,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-) -> Result<u64, DefaultError> {
+) -> Result<TypedDefault, DefaultError> {
     let value = op
         .children
         .iter()
         .find(|child| child.borrow().op_code == IFROpCode::Value);
     let Some(value) = value else {
-        return match default.value {
+        return match &default.value {
             IfrDefaultValue::Decoded(value) => value
                 .as_u64()
+                .map(TypedDefault::Number)
                 .ok_or(DefaultError::DefaultType(default.value_type)),
+            IfrDefaultValue::String(id) => Ok(TypedDefault::String(*id)),
+            IfrDefaultValue::Buffer(bytes) => Ok(TypedDefault::Buffer(bytes.clone())),
             IfrDefaultValue::InValueOp => Err(DefaultError::ValueOpMissing),
             IfrDefaultValue::NotDecoded => Err(DefaultError::DefaultType(default.value_type)),
             IfrDefaultValue::Missing => Err(DefaultError::DefaultValueMissing),
         };
     };
     let value = value.borrow();
-    evaluate_value(&value, inputs).map_err(DefaultError::ValueExpression)
+    evaluate_value(&value, inputs)
+        .map(TypedDefault::Number)
+        .map_err(DefaultError::ValueExpression)
 }
 
 /// Returns the value of the EFI_IFR_ONE_OF_OPTION `op`, `option`, in the scope of `question`: its
@@ -461,6 +497,29 @@ pub(super) fn question_defaults<V: QuestionValues>(
     inputs: &mut ExpressionInputs<'_, V>,
     mut text: impl FnMut(u64, &mut ExpressionInputs<'_, V>) -> Result<String, DefaultError>,
 ) -> Vec<DeclaredDefault> {
+    question_default_values(question, stores, inputs)
+        .into_iter()
+        .map(|(default_id, value)| DeclaredDefault {
+            default_id,
+            store_name: stores
+                .0
+                .get(&default_id)
+                .map(|&name| texts.display(name).to_string()),
+            value: DefaultValue(
+                value
+                    .and_then(TypedDefault::number)
+                    .and_then(|value| text(value, inputs)),
+            ),
+        })
+        .collect()
+}
+
+/// The defaults of question_defaults, each as the IFR declares it or why it is unknown.
+pub(super) fn question_default_values(
+    question: &IFROperation,
+    stores: &DefaultStores,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Vec<(DefaultId, Result<TypedDefault, DefaultError>)> {
     let scope = question_scope(question);
     let mut default_ids: BTreeSet<DefaultId> = stores.0.keys().copied().collect();
     default_ids.insert(DefaultId::STANDARD);
@@ -478,18 +537,17 @@ pub(super) fn question_defaults<V: QuestionValues>(
     default_ids
         .into_iter()
         .filter_map(|default_id| {
-            let value = default_for_id(question, &scope, default_id, inputs)?
-                .and_then(|value| text(value, inputs));
-            Some(DeclaredDefault {
-                default_id,
-                store_name: stores
-                    .0
-                    .get(&default_id)
-                    .map(|&name| texts.display(name).to_string()),
-                value: DefaultValue(value),
-            })
+            let value = default_for_id(question, &scope, default_id, inputs)?;
+            Some((default_id, value))
         })
         .collect()
+}
+
+/// Whether `option`, in the scope of `question`, is a flagged option of an ORDERED_LIST, which
+/// edk2-stable202608 SetupBrowserDxe/IfrParse.c:2369-2402 makes a buffer default and no option.
+pub(super) fn is_ordered_list_default(question: &IFROperation, option: &OneOfOption) -> bool {
+    question.op_code == IFROpCode::OrderedList
+        && option.flags & (EFI_IFR_OPTION_DEFAULT | EFI_IFR_OPTION_DEFAULT_MFG) != 0
 }
 
 /// Whether the question, if a CHECKBOX, or one of its options has a manufacturing default flag
@@ -510,13 +568,18 @@ fn has_manufacturing_flag(question: &IFROperation, scope: &[Rc<RefCell<IFROperat
 }
 
 /// Returns the question's default for `default_id`: EFI_IFR_DEFAULT, then a flagged
-/// EFI_IFR_ONE_OF_OPTION, then CHECKBOX Flags (UEFI 2.10 §33.3.8.3.9, §33.3.8.3.47).
+/// EFI_IFR_ONE_OF_OPTION, then CHECKBOX Flags (UEFI 2.10 §33.3.8.3.9, §33.3.8.3.47). A flagged
+/// option of an ORDERED_LIST gives its Value's bytes, whatever SUPPRESS_IF is around it, as
+/// edk2-stable202608 SetupBrowserDxe/IfrParse.c:2369-2402 makes it a buffer default and no option.
+/// An EFI_IFR_DEFAULT still comes first for an ORDERED_LIST, by UEFI 2.11 §33.2.5.8, where
+/// edk2-stable202608 Setup.c GetQuestionDefault takes whichever of the two comes first in IFR
+/// order.
 fn default_for_id(
     question: &IFROperation,
     scope: &[Rc<RefCell<IFROperation>>],
     default_id: DefaultId,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-) -> Option<Result<u64, DefaultError>> {
+) -> Option<Result<TypedDefault, DefaultError>> {
     // EFI_IFR_DEFAULT, wherever it is in the question's scope
     let ifr_default = scope.iter().find_map(|op| {
         let op = op.borrow();
@@ -544,6 +607,20 @@ fn default_for_id(
         if option.flags & option_flag == 0 {
             return None;
         }
+        if is_ordered_list_default(question, option) {
+            // IfrParse.c:2383-2387 makes an option of both flags a standard default alone
+            if default_id == DefaultId::MANUFACTURING && option.flags & EFI_IFR_OPTION_DEFAULT != 0
+            {
+                return None;
+            }
+            return Some(
+                op.data
+                    .get(ONE_OF_OPTION_VALUE_OFFSET..)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| TypedDefault::Buffer(value.to_vec()))
+                    .ok_or(DefaultError::OptionType(option.value_type)),
+            );
+        }
         match option_visibility(&op, inputs) {
             OptionVisibility::Shown => Some(
                 option_value(question, &op, option, inputs)
@@ -551,6 +628,7 @@ fn default_for_id(
                     .and_then(|value| {
                         value
                             .as_u64()
+                            .map(TypedDefault::Number)
                             .ok_or(DefaultError::OptionType(option.value_type))
                     }),
             ),
@@ -571,7 +649,9 @@ fn default_for_id(
     let ParsedOperation::CheckBox(checkbox) = &question.parsed_data else {
         return None;
     };
-    Some(Ok(u64::from(checkbox.flags & checkbox_flag != 0)))
+    Some(Ok(TypedDefault::Number(u64::from(
+        checkbox.flags & checkbox_flag != 0,
+    ))))
 }
 
 /// Appends the question's default among `defaults`, those of question_defaults, to the reason

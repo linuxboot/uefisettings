@@ -56,8 +56,11 @@ const CONFIG_ELEMENT: &str = "<ConfigElement>: OFFSET= or <Label>=";
 const DATA_FILTER: &str =
     "<DataFilter>: Buffer, Numeric[:1|:2|:4|:8], String, Boolean, Date or Time";
 const NUMERIC_TYPE: &str = "Numeric[:1|:2|:4|:8]";
+const KEYWORD_INFO_FILTER: &str =
+    "<KeywordInfoFilter>: All, or DataType, ValueAttribute, Default and DisplayName in this order";
 const KEYWORD_RESP_END: &str = "the next <KeywordResp> or the end";
-const KEYWORD_REQUEST_END: &str = "the end of a <KeywordRequest> of PATH= and KEYWORD= alone";
+const KEYWORD_REQUEST_END: &str =
+    "the end of a <KeywordRequest> of PATH=, KEYWORD= and KEYWORDINFO= alone";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ConfigStringError {
@@ -799,6 +802,36 @@ bitflags! {
     }
 }
 
+impl KeywordInfoFilter {
+    /// The items and their names, in BNF order.
+    const NAMES: [(Self, &'static str); 4] = [
+        (Self::DATA_TYPE, "DataType"),
+        (Self::VALUE_ATTRIBUTE, "ValueAttribute"),
+        (Self::DEFAULT, "Default"),
+        (Self::DISPLAY_NAME, "DisplayName"),
+    ];
+
+    /// Parses what Display writes: 'All', else the items' names in BNF order, each at most once,
+    /// as UEFI 2.11 §35.2.1.6's `<KeywordInfoFilter>` concatenates them; none is an empty filter.
+    fn parse(text: &str) -> Result<Self, ConfigStringError> {
+        if text == "All" {
+            return Ok(Self::all());
+        }
+        let mut filter = Self::empty();
+        let mut rest = text;
+        for (item, name) in Self::NAMES {
+            if let Some(after) = rest.strip_prefix(name) {
+                filter |= item;
+                rest = after;
+            }
+        }
+        match rest.is_empty() {
+            true => Ok(filter),
+            false => Err(invalid_value("KEYWORDINFO", text, KEYWORD_INFO_FILTER)),
+        }
+    }
+}
+
 impl fmt::Display for KeywordInfoFilter {
     /// 'All' for every item, which means "all the supported information", else the items'
     /// names in BNF order.
@@ -806,15 +839,10 @@ impl fmt::Display for KeywordInfoFilter {
         if self.is_all() {
             return f.write_str("All");
         }
-        [
-            (Self::DATA_TYPE, "DataType"),
-            (Self::VALUE_ATTRIBUTE, "ValueAttribute"),
-            (Self::DEFAULT, "Default"),
-            (Self::DISPLAY_NAME, "DisplayName"),
-        ]
-        .into_iter()
-        .filter(|(item, _)| self.contains(*item))
-        .try_for_each(|(_, name)| f.write_str(name))
+        Self::NAMES
+            .into_iter()
+            .filter(|(item, _)| self.contains(*item))
+            .try_for_each(|(_, name)| f.write_str(name))
     }
 }
 
@@ -886,8 +914,8 @@ impl fmt::Display for KeywordRequest {
     }
 }
 
-/// A `<KeywordRequest>` of an optional PATH and a KEYWORD; KEYWORDINFO and the filters are
-/// refused.
+/// A `<KeywordRequest>` of an optional PATH, a KEYWORD and an optional KEYWORDINFO; the filters
+/// are refused.
 impl FromStr for KeywordRequest {
     type Err = ConfigStringError;
 
@@ -898,6 +926,10 @@ impl FromStr for KeywordRequest {
             .map(str::parse::<KeywordPath>)
             .transpose()?;
         let keyword = Keyword::try_from(elements.required_value("KEYWORD=")?)?;
+        let info = elements
+            .optional_value("KEYWORDINFO=")
+            .map(KeywordInfoFilter::parse)
+            .transpose()?;
         if let Some(found) = elements.next() {
             return Err(ConfigStringError::Unexpected {
                 expected: KEYWORD_REQUEST_END,
@@ -907,7 +939,7 @@ impl FromStr for KeywordRequest {
         Ok(Self {
             device_path,
             keyword,
-            info: None,
+            info,
             usage: None,
             data: None,
         })
@@ -2026,7 +2058,18 @@ mod tests {
             ),
             (
                 "KEYWORD=BIOSVendor&KEYWORDINFO=All",
-                Err(unexpected(KEYWORD_REQUEST_END, "KEYWORDINFO=All")),
+                Ok(KeywordRequest {
+                    info: Some(KeywordInfoFilter::all()),
+                    ..keyword_request("BIOSVendor")
+                }),
+            ),
+            (
+                "KEYWORD=BIOSVendor&KEYWORDINFO=All&KEYWORDINFO=Default",
+                Err(unexpected(KEYWORD_REQUEST_END, "KEYWORDINFO=Default")),
+            ),
+            (
+                "KEYWORD=BIOSVendor&KEYWORDINFO=All&ReadOnly",
+                Err(unexpected(KEYWORD_REQUEST_END, "ReadOnly")),
             ),
             (
                 "KEYWORD=BIOSVendor&ReadOnly",
@@ -2046,6 +2089,42 @@ mod tests {
         ];
         for (text, expected) in cases {
             assert_eq!(text.parse::<KeywordRequest>(), expected, "{text:?}");
+        }
+    }
+
+    /// KEYWORDINFO= takes what a KeywordInfoFilter prints: All, or the items in BNF order, each
+    /// at most once, none for an empty filter; other text, the items out of order or twice, is
+    /// refused.
+    #[test]
+    fn keyword_info_filter_parses_what_it_prints() {
+        for filter in [
+            KeywordInfoFilter::empty(),
+            KeywordInfoFilter::DATA_TYPE | KeywordInfoFilter::DEFAULT,
+            KeywordInfoFilter::VALUE_ATTRIBUTE | KeywordInfoFilter::DISPLAY_NAME,
+            KeywordInfoFilter::all(),
+        ] {
+            let text = format!("KEYWORD=BIOSVendor&KEYWORDINFO={filter}");
+            assert_eq!(
+                text.parse::<KeywordRequest>(),
+                Ok(KeywordRequest {
+                    info: Some(filter),
+                    ..keyword_request("BIOSVendor")
+                }),
+                "{text:?}"
+            );
+        }
+        for filter in [
+            "DefaultDataType",
+            "DataTypeDataType",
+            "AllDefault",
+            "all",
+            "Bogus",
+        ] {
+            assert_eq!(
+                format!("KEYWORD=BIOSVendor&KEYWORDINFO={filter}").parse::<KeywordRequest>(),
+                Err(invalid_value("KEYWORDINFO", filter, KEYWORD_INFO_FILTER)),
+                "{filter:?}"
+            );
         }
     }
 

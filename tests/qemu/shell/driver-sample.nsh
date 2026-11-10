@@ -91,6 +91,14 @@ uefisettings.efi hii keyword set "NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df4
 echo uefisettings-shell: step keyword-set-second-no-option %lasterror%
 dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
 echo uefisettings-shell: step keyword-dmpstore-second-refused %lasterror%
+uefisettings.efi hii keyword get --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&KEYWORDINFO=All"
+echo uefisettings-shell: step keyword-info-get %lasterror%
+uefisettings.efi hii keyword get --json --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&KEYWORDINFO=All"
+echo uefisettings-shell: step keyword-info-json %lasterror%
+uefisettings.efi hii keyword get --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&KEYWORDINFO=Bogus"
+echo uefisettings-shell: step keyword-info-bogus %lasterror%
+uefisettings.efi hii keyword get --keyword-info-from-get-data --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&KEYWORDINFO=All"
+echo uefisettings-shell: step keyword-info-get-data %lasterror%
 uefisettings.efi hii keyword set "NAMESPACE=x-UEFI-ns&PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable&VALUE=03"
 echo uefisettings-shell: step keyword-set %lasterror%
 uefisettings.efi hii keyword get --json --namespace x-UEFI-ns "PATH=01041400f4274aa000df424db55239511302113d7fff0400&KEYWORD=iSCSIBootEnable"

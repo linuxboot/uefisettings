@@ -109,6 +109,8 @@ pub(crate) use keyword_access::get_keyword;
 #[cfg(target_os = "uefi")]
 pub(crate) use keyword_access::set_keywords;
 #[cfg(target_os = "uefi")]
+pub use keyword_access::KeywordInfoSource;
+#[cfg(target_os = "uefi")]
 pub use keyword_access::KeywordValues;
 #[cfg(target_os = "uefi")]
 pub(crate) use keyword_handler::FirmwareKeywordHandler;

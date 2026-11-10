@@ -34,11 +34,22 @@ use super::conditions::question_expression;
 use super::conditions::question_state;
 use super::conditions::question_value_expression;
 use super::conditions::select;
+use super::conditions::ExpressionInputs;
 use super::conditions::QuestionExpression;
+use super::conditions::QuestionValues;
 use super::conditions::VarStoreValues;
 use super::declared_store;
 use super::declared_var_store;
+use super::defaults::is_ordered_list_default;
 use super::defaults::is_statement;
+use super::defaults::option_value;
+use super::defaults::option_visibility;
+use super::defaults::question_default_values;
+use super::defaults::question_scope;
+use super::defaults::DefaultError;
+use super::defaults::DefaultId;
+use super::defaults::OptionVisibility;
+use super::defaults::TypedDefault;
 use super::find_corresponding_varstore;
 use super::question_values::describe_question;
 use super::question_values::value_question;
@@ -57,22 +68,34 @@ use super::IFROperation;
 use super::IgnoredIfr;
 use super::IncludedStates;
 use super::OutsideOp;
+use super::ParsedOperation;
 use super::QuestionDescriptor;
 use super::QuestionFlags;
 use super::QuestionHeader;
+use super::Range as IfrRange;
 use super::SelectionError;
 use super::ShortVarStoreEfi;
+use super::TypeValue;
 use super::Walk;
 use super::EFI_IFR_TYPE_NUM_SIZE_16;
 use super::EFI_IFR_TYPE_NUM_SIZE_32;
 use super::EFI_IFR_TYPE_NUM_SIZE_64;
 use super::EFI_IFR_TYPE_NUM_SIZE_8;
 use crate::exports::SetOptions;
+use crate::hii::config_string::ConfigStringError;
+use crate::hii::config_string::DataFilter;
 use crate::hii::config_string::Keyword;
+use crate::hii::config_string::KeywordInfo;
+use crate::hii::config_string::KeywordInfoFilter;
 use crate::hii::config_string::KeywordPath;
 use crate::hii::config_string::KeywordResp;
 use crate::hii::config_string::Namespace;
+use crate::hii::config_string::Number;
+use crate::hii::config_string::Numeric as KeywordNumeric;
+use crate::hii::config_string::NumericWidth;
 use crate::hii::config_string::Usage;
+use crate::hii::config_string::ValueOption;
+use crate::hii::config_string::ValueRange;
 use crate::hii::package::ParsedPackageList;
 use crate::hii::strings::Language;
 use crate::hii::strings::ListTexts;
@@ -87,6 +110,11 @@ use crate::parse_error::ReadParsed;
 /// The language prefix that GetStringIdFromRecord searches without a NameSpaceId: edk2's
 /// UEFI_CONFIG_LANG (ConfigKeywordHandler.c:1383), where UEFI 2.11 §35.3.3 says "x-UEFI-".
 pub(crate) const UEFI_CONFIG_LANG: &str = "x-UEFI";
+
+/// Why the defaults of a question of EFI_IFR_FLAG_CALLBACK are unknown.
+const CALLBACK_DEFAULT: &str = "its question has EFI_IFR_FLAG_CALLBACK, so its driver's \
+     Callback() with EFI_BROWSER_ACTION_DEFAULT_STANDARD outranks the defaults that the IFR \
+     declares (UEFI 2.11 §33.2.5.8)";
 
 /// The states that keyword set may include: not READ_ONLY, as EfiConfigKeywordHandlerSetData
 /// refuses every EFI_IFR_FLAG_READ_ONLY question (ConfigKeywordHandler.c:3033-3047).
@@ -219,6 +247,178 @@ pub(crate) enum ValueRefusal {
     NoOption,
 }
 
+/// Why uefisettings builds no `<KeywordInfoResp>` item of a keyword from the IFR.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub(crate) enum KeywordInfoRefusal {
+    #[error(transparent)]
+    Question(#[from] KeywordRefusal),
+    #[error("keyword {keyword}: UEFI 2.11 §35.2.1.6 names no <DataType> of {op}")]
+    NoDataType { keyword: String, op: &'static str },
+    #[error("keyword {keyword}: its EFI_IFR_STRING has no MinSize and MaxSize: {reason}")]
+    StringSizes { keyword: String, reason: String },
+    #[error(
+        "keyword {keyword}: whether SetupBrowserDxe shows its option of string {option} is \
+         unknown: {reason}"
+    )]
+    OptionState {
+        keyword: String,
+        option: u16,
+        reason: String,
+    },
+    #[error("keyword {keyword}: its option of string {option} holds no numeric value: {reason}")]
+    OptionValue {
+        keyword: String,
+        option: u16,
+        reason: String,
+    },
+    #[error("keyword {keyword}: its default of DefaultId {default_id} is unknown: {reason}")]
+    Default {
+        keyword: String,
+        default_id: DefaultId,
+        reason: String,
+    },
+    #[error("keyword {keyword}: no strings package of a display language holds its string {id}")]
+    NoText { keyword: String, id: u16 },
+    #[error(transparent)]
+    ConfigString(#[from] ConfigStringError),
+}
+
+/// The `<DataType>` that UEFI 2.11 §35.2.1.6's table gives the question of an opcode.
+enum TableType {
+    /// Numeric, as wide as the value of the ONE_OF or NUMERIC
+    Numeric,
+    Fixed(FixedType),
+    /// None: the op is no question, or a PASSWORD, ACTION or REF, which the table leaves out
+    Untyped,
+}
+
+/// A `<DataType>` of the table that no width qualifies.
+#[derive(Clone, Copy)]
+enum FixedType {
+    Boolean,
+    String,
+    Buffer,
+    Date,
+    Time,
+}
+
+impl From<FixedType> for DataFilter {
+    fn from(fixed: FixedType) -> Self {
+        match fixed {
+            FixedType::Boolean => Self::Boolean,
+            FixedType::String => Self::String,
+            FixedType::Buffer => Self::Buffer,
+            FixedType::Date => Self::Date,
+            FixedType::Time => Self::Time,
+        }
+    }
+}
+
+impl TableType {
+    fn of(op_code: IFROpCode) -> Self {
+        match op_code {
+            IFROpCode::OneOf | IFROpCode::Numeric => Self::Numeric,
+            IFROpCode::CheckBox => Self::Fixed(FixedType::Boolean),
+            IFROpCode::String => Self::Fixed(FixedType::String),
+            IFROpCode::OrderedList => Self::Fixed(FixedType::Buffer),
+            IFROpCode::Date => Self::Fixed(FixedType::Date),
+            IFROpCode::Time => Self::Fixed(FixedType::Time),
+            IFROpCode::Password | IFROpCode::Action | IFROpCode::Ref => Self::Untyped,
+            IFROpCode::Form
+            | IFROpCode::Subtitle
+            | IFROpCode::Text
+            | IFROpCode::Image
+            | IFROpCode::OneOfOption
+            | IFROpCode::SuppressIf
+            | IFROpCode::Locked
+            | IFROpCode::ResetButton
+            | IFROpCode::FormSet
+            | IFROpCode::NoSubmitIf
+            | IFROpCode::InconsistentIf
+            | IFROpCode::EqIdVal
+            | IFROpCode::EqIdId
+            | IFROpCode::EqIdValList
+            | IFROpCode::And
+            | IFROpCode::Or
+            | IFROpCode::Not
+            | IFROpCode::Rule
+            | IFROpCode::GrayOutIf
+            | IFROpCode::Refresh
+            | IFROpCode::DisableIf
+            | IFROpCode::Animation
+            | IFROpCode::ToLower
+            | IFROpCode::ToUpper
+            | IFROpCode::Map
+            | IFROpCode::VarStore
+            | IFROpCode::VarStoreNameValue
+            | IFROpCode::VarStoreEfi
+            | IFROpCode::VarStoreDevice
+            | IFROpCode::Version
+            | IFROpCode::End
+            | IFROpCode::Match
+            | IFROpCode::Get
+            | IFROpCode::Set
+            | IFROpCode::Read
+            | IFROpCode::Write
+            | IFROpCode::Equal
+            | IFROpCode::NotEqual
+            | IFROpCode::GreaterThan
+            | IFROpCode::GreaterEqual
+            | IFROpCode::LessThan
+            | IFROpCode::LessEqual
+            | IFROpCode::BitwiseAnd
+            | IFROpCode::BitwiseOr
+            | IFROpCode::BitwiseNot
+            | IFROpCode::ShiftLeft
+            | IFROpCode::ShiftRight
+            | IFROpCode::Add
+            | IFROpCode::Subtract
+            | IFROpCode::Multiply
+            | IFROpCode::Divide
+            | IFROpCode::Modulo
+            | IFROpCode::RuleRef
+            | IFROpCode::QuestionRef1
+            | IFROpCode::QuestionRef2
+            | IFROpCode::Uint8
+            | IFROpCode::Uint16
+            | IFROpCode::Uint32
+            | IFROpCode::Uint64
+            | IFROpCode::True
+            | IFROpCode::False
+            | IFROpCode::ToUint
+            | IFROpCode::ToString
+            | IFROpCode::ToBoolean
+            | IFROpCode::Mid
+            | IFROpCode::Find
+            | IFROpCode::Token
+            | IFROpCode::StringRef1
+            | IFROpCode::StringRef2
+            | IFROpCode::Conditional
+            | IFROpCode::QuestionRef3
+            | IFROpCode::Zero
+            | IFROpCode::One
+            | IFROpCode::Ones
+            | IFROpCode::Undefined
+            | IFROpCode::Length
+            | IFROpCode::Dup
+            | IFROpCode::This
+            | IFROpCode::Span
+            | IFROpCode::Value
+            | IFROpCode::Default
+            | IFROpCode::DefaultStore
+            | IFROpCode::FormMap
+            | IFROpCode::Catenate
+            | IFROpCode::Guid
+            | IFROpCode::Security
+            | IFROpCode::ModalTag
+            | IFROpCode::RefreshId
+            | IFROpCode::WarningIf
+            | IFROpCode::Match2
+            | IFROpCode::Unknown(_) => Self::Untyped,
+        }
+    }
+}
+
 /// How a search for a keyword takes the strings packages of a package list whose language starts
 /// with a namespace prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,12 +510,14 @@ impl<'a, P> KeywordQuestion<'a, P> {
     /// IsStatementOpCode). Refuses a keyword that other strings packages of the list hold too,
     /// or that prompts other statements too, which firmware may take instead, or a statement
     /// outside any FormSet, and a list that `list_path`, given the list and the keyword, refuses
-    /// before its statements are searched.
+    /// before its statements are searched. Its texts show in the language that
+    /// ParsedPackageList::texts picks for `requested`.
     fn find(
         lists: &'a [ParsedPackageList],
         namespace: Option<&Namespace>,
         path: Option<&KeywordPath>,
         keyword: &Keyword,
+        requested: &[&str],
         list_path: impl Fn(&ParsedPackageList, &str) -> Result<P, KeywordRefusal>,
     ) -> Result<Vec<Self>, KeywordRefusal> {
         let prefix = namespace.map_or_else(|| UEFI_CONFIG_LANG.to_owned(), ToString::to_string);
@@ -335,7 +537,7 @@ impl<'a, P> KeywordQuestion<'a, P> {
                 continue;
             };
             match (
-                Self::in_list(list, string, &prefix, keyword, &list_path),
+                Self::in_list(list, string, &prefix, keyword, requested, &list_path),
                 path,
             ) {
                 (Ok(question), _) => questions.push(question),
@@ -362,6 +564,7 @@ impl<'a, P> KeywordQuestion<'a, P> {
         string: KeywordString<'_>,
         prefix: &str,
         keyword: &Keyword,
+        requested: &[&str],
         list_path: &impl Fn(&ParsedPackageList, &str) -> Result<P, KeywordRefusal>,
     ) -> Result<Self, KeywordRefusal> {
         let text = keyword.to_string();
@@ -404,7 +607,7 @@ impl<'a, P> KeywordQuestion<'a, P> {
             keyword: keyword.clone(),
             namespace,
             path,
-            texts: list.texts(&[]),
+            texts: list.texts(requested),
             roots: &list.forms,
             outside: &list.outside_ifr,
             malformed_stores: &list.malformed_outside_stores,
@@ -426,7 +629,7 @@ impl<'a> KeywordStatement<'a> {
         namespace: Option<&Namespace>,
         keyword: &Keyword,
     ) -> Result<Vec<Self>, KeywordRefusal> {
-        Self::find(lists, namespace, None, keyword, |_, _| Ok(()))
+        Self::find(lists, namespace, None, keyword, &[], |_, _| Ok(()))
     }
 
     /// The root of the form package of the statement
@@ -441,17 +644,24 @@ impl<'a> KeywordStatement<'a> {
 
 impl<'a> KeywordQuestion<'a> {
     /// The statements of find, for the Keyword Handler, each with the device path of its package
-    /// list: `path`, else the list's. Refuses a list without a device path, or with one that is no
-    /// KeywordPath, as a `<KeywordResp>` names it (edk2-stable202608 GetStringIdFromDatabase
-    /// asserts on such a list, ConfigKeywordHandler.c:2411).
+    /// list: `path`, else the list's, and their texts in the language that `requested` picks.
+    /// Refuses a list without a device path, or with one that is no KeywordPath, as a
+    /// `<KeywordResp>` names it (edk2-stable202608 GetStringIdFromDatabase asserts on such a list,
+    /// ConfigKeywordHandler.c:2411).
     pub(crate) fn resolve(
         lists: &'a [ParsedPackageList],
         namespace: Option<&Namespace>,
         path: Option<&KeywordPath>,
         keyword: &Keyword,
+        requested: &[&str],
     ) -> Result<Vec<Self>, KeywordRefusal> {
-        Self::find(lists, namespace, path, keyword, |list, text| {
-            match (path, &list.device_path) {
+        Self::find(
+            lists,
+            namespace,
+            path,
+            keyword,
+            requested,
+            |list, text| match (path, &list.device_path) {
                 (Some(path), _) => Ok(path.clone()),
                 (None, Some(device_path)) => {
                     KeywordPath::try_from(device_path.clone()).map_err(|error| {
@@ -462,8 +672,8 @@ impl<'a> KeywordQuestion<'a> {
                     })
                 }
                 (None, None) => Err(KeywordRefusal::NoDevicePath(text.to_owned())),
-            }
-        })
+            },
+        )
     }
 
     pub(crate) fn path(&self) -> &KeywordPath {
@@ -563,6 +773,261 @@ impl<'a> KeywordQuestion<'a> {
             bytes,
             volatile: reader.attributes(write.store).is_some_and(is_volatile),
         })
+    }
+
+    /// The `<KeywordInfoResp>` items of `filter` for the question, from its IFR alone, by UEFI
+    /// 2.11 §35.2.1.6: its `<DataType>` (data_type); its `<ValueRange>` and the `<ValueOption>`s
+    /// that SetupBrowserDxe shows (value_range, value_options); its defaults of the 3 standard
+    /// default stores, as question_default_values finds them (default_number); and its prompt,
+    /// as display shows it. Conditions and EFI_IFR_VALUEs read the variables of `reader`.
+    /// Refuses an item that the IFR does not tell, rather than leave it out. The defaults are
+    /// those the IFR declares (EFI_IFR_DEFAULT, flagged options, CHECKBOX flags), which a
+    /// driver's Callback() with EFI_BROWSER_ACTION_DEFAULT_x and its ALTCFG response outrank
+    /// (UEFI 2.11 §33.2.5.8), so a platform's default may differ; those of a question of
+    /// EFI_IFR_FLAG_CALLBACK, whose driver's Callback() may answer for them, are refused.
+    pub(crate) fn info(
+        &self,
+        filter: KeywordInfoFilter,
+        reader: &mut EfivarReader,
+    ) -> Result<KeywordInfo, KeywordInfoRefusal> {
+        let op = self.op.borrow();
+        let values = VarStoreValues::new(self.root, None);
+        let mut walk = FormSetWalk::new(&self.texts, reader, &values, IncludedStates::empty());
+        let mut info = KeywordInfo::default();
+        if filter.contains(KeywordInfoFilter::DATA_TYPE) {
+            info.data_type = Some(self.data_type(&op)?);
+        }
+        if filter.contains(KeywordInfoFilter::VALUE_ATTRIBUTE) {
+            info.range = self.value_range(&op)?;
+            info.options = self.value_options(&op, &mut walk.inputs)?;
+        }
+        if filter.contains(KeywordInfoFilter::DEFAULT) {
+            if is_question(op.op_code)
+                && self.header(&op)?.flags().contains(QuestionFlags::CALLBACK)
+            {
+                return Err(self.default_refusal(DefaultId::STANDARD, CALLBACK_DEFAULT.to_owned()));
+            }
+            let stores = walk.default_stores.of(&op, &mut walk.inputs);
+            for (default_id, value) in question_default_values(&op, stores, &mut walk.inputs) {
+                let default = match default_id {
+                    DefaultId::STANDARD => &mut info.standard_default,
+                    DefaultId::MANUFACTURING => &mut info.manufacturing_default,
+                    DefaultId::SAFE => &mut info.safe_default,
+                    // "Only the three standard defaults stores are supported" (UEFI 2.11
+                    // §35.2.1.6)
+                    _ => continue,
+                };
+                *default = Some(self.default_number(&op, default_id, value)?);
+            }
+        }
+        if filter.contains(KeywordInfoFilter::DISPLAY_NAME) {
+            info.display_name = Some(self.text(self.header(&op)?.prompt_string_id)?);
+        }
+        Ok(info)
+    }
+
+    /// The `<DataType>` of `op`, the question, by the table of UEFI 2.11 §35.2.1.6.
+    fn data_type(&self, op: &IFROperation) -> Result<DataFilter, KeywordInfoRefusal> {
+        let data_type = match TableType::of(op.op_code) {
+            TableType::Numeric => match value_question(op) {
+                Some(ValueQuestion::OneOf(one_of)) => Some(numeric_type(&one_of.data)),
+                Some(ValueQuestion::Numeric(numeric)) => Some(numeric_type(&numeric.data)),
+                Some(ValueQuestion::CheckBox(_)) | None => None,
+            },
+            TableType::Fixed(fixed) => Some(fixed.into()),
+            TableType::Untyped => None,
+        };
+        data_type.ok_or_else(|| KeywordInfoRefusal::NoDataType {
+            keyword: self.keyword.to_string(),
+            op: op.op_code.spec_name(),
+        })
+    }
+
+    /// The `<ValueRange>` of `op`: a NUMERIC's MinValue, MaxValue and Step, which a Step of 0
+    /// leaves out ("the input mechanism for the numeric value is to be free-form", UEFI 2.11
+    /// §33.3.8.3.47), or a STRING's MinSize and MaxSize (§33.3.8.3.70); none of another question.
+    fn value_range(&self, op: &IFROperation) -> Result<Option<ValueRange>, KeywordInfoRefusal> {
+        if let ParsedOperation::Numeric(numeric) = &op.parsed_data {
+            let (min, max, step) = match &numeric.data {
+                IfrRange::Range8(range) => (
+                    range.min_value.to_le_bytes().to_vec(),
+                    range.max_value.to_le_bytes().to_vec(),
+                    range.step.to_le_bytes().to_vec(),
+                ),
+                IfrRange::Range16(range) => (
+                    range.min_value.to_le_bytes().to_vec(),
+                    range.max_value.to_le_bytes().to_vec(),
+                    range.step.to_le_bytes().to_vec(),
+                ),
+                IfrRange::Range32(range) => (
+                    range.min_value.to_le_bytes().to_vec(),
+                    range.max_value.to_le_bytes().to_vec(),
+                    range.step.to_le_bytes().to_vec(),
+                ),
+                IfrRange::Range64(range) => (
+                    range.min_value.to_le_bytes().to_vec(),
+                    range.max_value.to_le_bytes().to_vec(),
+                    range.step.to_le_bytes().to_vec(),
+                ),
+            };
+            let step = match step.iter().all(|&byte| byte == 0) {
+                true => None,
+                false => Some(Number::try_from(step)?),
+            };
+            return Ok(Some(ValueRange {
+                max: Number::try_from(max)?,
+                min: Number::try_from(min)?,
+                step,
+            }));
+        }
+        if op.op_code != IFROpCode::String {
+            return Ok(None);
+        }
+        let string: StringOp =
+            Cursor::new(&op.data)
+                .parse_le()
+                .map_err(|error| KeywordInfoRefusal::StringSizes {
+                    keyword: self.keyword.to_string(),
+                    reason: error.to_string(),
+                })?;
+        Ok(Some(ValueRange {
+            max: Number::try_from(vec![string.max_size])?,
+            min: Number::try_from(vec![string.min_size])?,
+            step: None,
+        }))
+    }
+
+    /// The `<ValueOption>`s of `op`, if a ONE_OF or an ORDERED_LIST: the options in its scope that
+    /// SetupBrowserDxe shows, as `inputs` evaluate their SUPPRESS_IFs, but the flagged options of
+    /// an ORDERED_LIST, which are its defaults (is_ordered_list_default); each of an ORDERED_LIST
+    /// names its VALUETYPE, the type of the buffer's elements.
+    fn value_options(
+        &self,
+        op: &IFROperation,
+        inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+    ) -> Result<Vec<ValueOption>, KeywordInfoRefusal> {
+        if op.op_code != IFROpCode::OneOf && op.op_code != IFROpCode::OrderedList {
+            return Ok(Vec::new());
+        }
+        let mut options = Vec::new();
+        for option in question_scope(op) {
+            let option = option.borrow();
+            let ParsedOperation::OneOfOption(parsed) = &option.parsed_data else {
+                continue;
+            };
+            if is_ordered_list_default(op, parsed) {
+                continue;
+            }
+            let id = parsed.option_string_id;
+            match option_visibility(&option, inputs) {
+                OptionVisibility::Shown => {}
+                OptionVisibility::Suppressed => continue,
+                OptionVisibility::Unknown(reason) => {
+                    return Err(KeywordInfoRefusal::OptionState {
+                        keyword: self.keyword.to_string(),
+                        option: id,
+                        reason,
+                    })
+                }
+            }
+            let (bytes, width) = option_value(op, &option, parsed, inputs)
+                .map_err(|error| error.to_string())
+                .and_then(|value| numeric_bytes(value).ok_or_else(|| format!("{value:?}")))
+                .map_err(|reason| KeywordInfoRefusal::OptionValue {
+                    keyword: self.keyword.to_string(),
+                    option: id,
+                    reason,
+                })?;
+            options.push(ValueOption {
+                value: Number::try_from(bytes)?,
+                string: self.text(id)?,
+                value_type: (op.op_code == IFROpCode::OrderedList)
+                    .then_some(KeywordNumeric { width: Some(width) }),
+            });
+        }
+        Ok(options)
+    }
+
+    /// `value`, the question's default of `default_id`, as the `<Number>` of the question's value
+    /// bytes (keyword_width): a ONE_OF's, NUMERIC's or CHECKBOX's number; a STRING's string, in
+    /// the CHAR16s of display's language, zero-padded to MaxSize CHAR16s, as edk2-stable202608
+    /// SetupBrowserDxe/Setup.c:4501-4512 stores it in a storage of MaxSize × 2 bytes
+    /// (IfrParse.c:2225); an ORDERED_LIST's buffer (Setup.c:4493-4495), whose missing containers
+    /// are 0 (UEFI 2.11 §33.2.5.4.8). Refuses a default that does not fit, of another type, or of
+    /// a DATE or TIME, whose values uefisettings does not decode.
+    fn default_number(
+        &self,
+        op: &IFROperation,
+        default_id: DefaultId,
+        value: Result<TypedDefault, DefaultError>,
+    ) -> Result<Number, KeywordInfoRefusal> {
+        let value = value.map_err(|error| self.default_refusal(default_id, error.to_string()))?;
+        let name = op.op_code.spec_name();
+        let width = keyword_width(op).ok_or_else(|| {
+            self.default_refusal(default_id, format!("{name} has no value width"))
+        })?;
+        let mut bytes = match (TableType::of(op.op_code), value) {
+            (
+                TableType::Numeric | TableType::Fixed(FixedType::Boolean),
+                TypedDefault::Number(number),
+            ) => number.to_le_bytes().to_vec(),
+            (TableType::Fixed(FixedType::String), TypedDefault::String(id)) => self
+                .text(id)?
+                .iter()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect(),
+            (TableType::Fixed(FixedType::Buffer), TypedDefault::Buffer(bytes))
+                if !bytes.is_empty() =>
+            {
+                bytes
+            }
+            (
+                TableType::Numeric
+                | TableType::Fixed(FixedType::Boolean | FixedType::String | FixedType::Buffer),
+                value @ (TypedDefault::Number(_)
+                | TypedDefault::String(_)
+                | TypedDefault::Buffer(_)),
+            ) => {
+                let reason = format!("{name} holds no {value:?}");
+                return Err(self.default_refusal(default_id, reason));
+            }
+            (
+                TableType::Fixed(FixedType::Date | FixedType::Time) | TableType::Untyped,
+                TypedDefault::Number(_) | TypedDefault::String(_) | TypedDefault::Buffer(_),
+            ) => {
+                let reason = format!("uefisettings does not decode a default of {name}");
+                return Err(self.default_refusal(default_id, reason));
+            }
+        };
+        let past_width = bytes.split_off(width.min(bytes.len()));
+        if past_width.iter().any(|&byte| byte != 0) {
+            let reason = format!("it is wider than the question's {width} bytes");
+            return Err(self.default_refusal(default_id, reason));
+        }
+        bytes.resize(width, 0);
+        Ok(Number::try_from(bytes)?)
+    }
+
+    fn default_refusal(&self, default_id: DefaultId, reason: String) -> KeywordInfoRefusal {
+        KeywordInfoRefusal::Default {
+            keyword: self.keyword.to_string(),
+            default_id,
+            reason,
+        }
+    }
+
+    /// The text of string `id` that display shows, as a `<String>`'s CHAR16s, refused unless a
+    /// strings package of a display language holds it (ListTexts::shown_text), and if empty, as
+    /// `<String> ::= [<Char>]+` (UEFI 2.11 §35.2.1.2).
+    fn text(&self, id: u16) -> Result<Vec<u16>, KeywordInfoRefusal> {
+        self.texts
+            .shown_text(id)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.encode_utf16().collect())
+            .ok_or_else(|| KeywordInfoRefusal::NoText {
+                keyword: self.keyword.to_string(),
+                id,
+            })
     }
 
     /// The question header of the question, refused unless GetData() (`Read`) or SetData()
@@ -840,12 +1305,42 @@ fn value_width(question: ValueQuestion<'_>) -> u8 {
     }
 }
 
+/// `value`'s bytes in memory order and its width, if of a numeric Type.
+fn numeric_bytes(value: TypeValue) -> Option<(Vec<u8>, NumericWidth)> {
+    match value {
+        TypeValue::NumSize8(value) => Some((value.to_le_bytes().to_vec(), NumericWidth::One)),
+        TypeValue::NumSize16(value) => Some((value.to_le_bytes().to_vec(), NumericWidth::Two)),
+        TypeValue::NumSize32(value) => Some((value.to_le_bytes().to_vec(), NumericWidth::Four)),
+        TypeValue::NumSize64(value) => Some((value.to_le_bytes().to_vec(), NumericWidth::Eight)),
+        TypeValue::Boolean(_)
+        | TypeValue::Time(_)
+        | TypeValue::Date(_)
+        | TypeValue::StringID(_)
+        | TypeValue::Other
+        | TypeValue::Undefined
+        | TypeValue::Action(_)
+        | TypeValue::Ref(_)
+        | TypeValue::Unknown(_) => None,
+    }
+}
+
+/// The Numeric `<DataType>` of a ONE_OF or NUMERIC whose Range is `range`, as wide as its value.
+fn numeric_type(range: &IfrRange) -> DataFilter {
+    let width = match range {
+        IfrRange::Range8(_) => NumericWidth::One,
+        IfrRange::Range16(_) => NumericWidth::Two,
+        IfrRange::Range32(_) => NumericWidth::Four,
+        IfrRange::Range64(_) => NumericWidth::Eight,
+    };
+    DataFilter::Numeric(KeywordNumeric { width: Some(width) })
+}
+
 /// An EFI_IFR_STRING after its op header (UEFI 2.11 §33.3.8.3.70).
 #[derive(BinRead)]
 #[br(little)]
 struct StringOp {
     _question: QuestionHeader,
-    _min_size: u8,
+    min_size: u8,
     max_size: u8,
 }
 
@@ -953,23 +1448,29 @@ mod tests {
     use super::super::ifr_fixtures::checkbox_at;
     use super::super::ifr_fixtures::checkbox_on;
     use super::super::ifr_fixtures::conditional;
+    use super::super::ifr_fixtures::eq_id_val_of;
     use super::super::ifr_fixtures::flagged_option;
     use super::super::ifr_fixtures::form_set;
+    use super::super::ifr_fixtures::ifr_default;
     use super::super::ifr_fixtures::ifr_false;
     use super::super::ifr_fixtures::ifr_true;
     use super::super::ifr_fixtures::locked_op;
+    use super::super::ifr_fixtures::one_of_at;
     use super::super::ifr_fixtures::one_of_option;
     use super::super::ifr_fixtures::operation;
     use super::super::ifr_fixtures::parse_form_set;
     use super::super::ifr_fixtures::password_on;
     use super::super::ifr_fixtures::question_header_with;
     use super::super::ifr_fixtures::short_var_store_efi;
+    use super::super::ifr_fixtures::uint32_default;
     use super::super::ifr_fixtures::uint8;
     use super::super::ifr_fixtures::var_store;
     use super::super::ifr_fixtures::MemoryVariables;
     use super::super::ifr_fixtures::VariableInterface;
     use super::super::ifr_fixtures::VariableReach;
     use super::super::ifr_fixtures::BIT_VARSTORE_GUID;
+    use super::super::ifr_fixtures::CHECKBOX;
+    use super::super::ifr_fixtures::DEFAULT;
     use super::super::ifr_fixtures::DISABLE_IF;
     use super::super::ifr_fixtures::END;
     use super::super::ifr_fixtures::GRAY_OUT_IF;
@@ -1105,6 +1606,7 @@ mod tests {
             Some(&namespace(NAMESPACE)),
             path.map(path_of).as_ref(),
             &keyword(KEYWORD),
+            &[],
         )
     }
 
@@ -1237,6 +1739,7 @@ mod tests {
                 Some(&namespace(NAMESPACE)),
                 Some(&path_of(PATH)),
                 &keyword("Other"),
+                &[],
             )
             .err(),
             Some(KeywordRefusal::NotFound {
@@ -1361,12 +1864,12 @@ mod tests {
         let found = [list(PATH, &[("x-UEFI-AMI", KEYWORD)], one_of(1, 0))];
 
         assert_eq!(
-            KeywordQuestion::resolve(&missing, None, None, &keyword(KEYWORD)).err(),
+            KeywordQuestion::resolve(&missing, None, None, &keyword(KEYWORD), &[]).err(),
             Some(not_found("x-UEFI")),
             "the x-UEFI package comes first and lacks the keyword"
         );
         assert_eq!(
-            KeywordQuestion::resolve(&found, None, None, &keyword(KEYWORD))
+            KeywordQuestion::resolve(&found, None, None, &keyword(KEYWORD), &[])
                 .map(|questions| places(&questions)),
             Ok(vec![("x-UEFI-AMI".to_owned(), PATH.to_owned())]),
             "the language of the package that holds it"
@@ -1401,8 +1904,14 @@ mod tests {
             "x-UEFI-ns and x-UEFI-ns-v2 under x-UEFI-ns"
         );
         assert_eq!(
-            KeywordQuestion::resolve(&ns_and_ami, None, Some(&path_of(PATH)), &keyword(KEYWORD))
-                .err(),
+            KeywordQuestion::resolve(
+                &ns_and_ami,
+                None,
+                Some(&path_of(PATH)),
+                &keyword(KEYWORD),
+                &[]
+            )
+            .err(),
             Some(ambiguous(&[NAMESPACE, "x-UEFI-AMI"])),
             "x-UEFI-ns and x-UEFI-AMI under x-UEFI"
         );
@@ -2362,5 +2871,616 @@ mod tests {
             ),
             (Some(want.clone()), Some(want))
         );
+    }
+
+    /// EFI_IFR_OPTION_DEFAULT and EFI_IFR_OPTION_DEFAULT_MFG (UEFI 2.11 §33.3.8.3.51)
+    const OPTION_DEFAULT: u8 = 0x10;
+    const OPTION_DEFAULT_MFG: u8 = 0x20;
+    /// "Question du mot-clé", PROMPT in fr-FR
+    const FRENCH_QUESTION: &str = "Question du mot-cl\u{e9}";
+
+    /// A package list of PATH holding `ops` after VarStore 1 whose x-UEFI-ns strings package,
+    /// which comes first, names PROMPT KEYWORD and holds string 8 alone, and whose en-US and fr-FR
+    /// ones hold PROMPT and the option texts 4, 6 and 7, en-US also string 5, empty.
+    fn info_list(ops: Vec<u8>) -> ParsedPackageList {
+        let package = |language: &[u8], texts: &[(u16, &str)]| StringPackage {
+            language: Language(language.to_vec()),
+            strings: texts.iter().map(|&(id, text)| (id, text.into())).collect(),
+        };
+        let mut list = list(PATH, &[], ops);
+        list.strings = vec![
+            StringPackage {
+                language: Language(NAMESPACE.as_bytes().to_vec()),
+                strings: BTreeMap::from([(PROMPT, KEYWORD.into()), (8, "eight".into())]),
+            },
+            package(
+                b"en-US",
+                &[
+                    (PROMPT, QUESTION),
+                    (4, "Zero"),
+                    (5, ""),
+                    (6, "One"),
+                    (7, "Three"),
+                ],
+            ),
+            package(
+                b"fr-FR",
+                &[
+                    (PROMPT, FRENCH_QUESTION),
+                    (4, "Z\u{e9}ro"),
+                    (6, "Un"),
+                    (7, "Trois"),
+                ],
+            ),
+        ];
+        list
+    }
+
+    /// The info of `filter` of the question of KEYWORD in an info_list of `ops`, its texts in the
+    /// language that `requested` picks, reading variables(1).
+    fn info_in(
+        ops: Vec<u8>,
+        filter: KeywordInfoFilter,
+        requested: &[&str],
+    ) -> Result<KeywordInfo, KeywordInfoRefusal> {
+        let lists = [info_list(ops)];
+        let mut questions = KeywordQuestion::resolve(
+            &lists,
+            Some(&namespace(NAMESPACE)),
+            Some(&path_of(PATH)),
+            &keyword(KEYWORD),
+            requested,
+        )
+        .expect("the keyword");
+        assert_eq!(questions.len(), 1, "one question of PATH");
+        questions.remove(0).info(filter, &mut reader(1))
+    }
+
+    fn info_of(ops: Vec<u8>, filter: KeywordInfoFilter) -> Result<KeywordInfo, KeywordInfoRefusal> {
+        info_in(ops, filter, &[])
+    }
+
+    fn number(bytes: &[u8]) -> Number {
+        Number::try_from(bytes.to_vec()).expect("a <Number>")
+    }
+
+    fn text(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    fn option(value: &[u8], string: &str, value_type: Option<NumericWidth>) -> ValueOption {
+        ValueOption {
+            value: number(value),
+            string: text(string),
+            value_type: value_type.map(|width| KeywordNumeric { width: Some(width) }),
+        }
+    }
+
+    fn numeric_of(width: NumericWidth) -> Option<DataFilter> {
+        Some(DataFilter::Numeric(KeywordNumeric { width: Some(width) }))
+    }
+
+    /// The data of a question of `op_code` prompted by PROMPT at OFFSET of VarStore 1, `rest`
+    /// after its header.
+    fn question(op_code: u8, rest: &[u8]) -> Vec<u8> {
+        let data = [question_header_with(1, PROMPT, 1, 5, 0), rest.to_vec()].concat();
+        operation(op_code, false, &data)
+    }
+
+    /// An ORDERED_LIST of `containers` at OFFSET of VarStore 1 holding `scope`.
+    fn ordered_list(containers: u8, scope: &[Vec<u8>]) -> Vec<u8> {
+        let data = [
+            question_header_with(1, PROMPT, 1, 5, 0),
+            vec![containers, 0],
+        ]
+        .concat();
+        [
+            operation(ORDERED_LIST, true, &data),
+            scope.concat(),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// An EFI_IFR_DEFAULT of `default_id` of Type `value_type` (UEFI 2.11 §33.3.8.3.12) holding
+    /// `value`.
+    fn typed_default(default_id: u16, value_type: u8, value: &[u8]) -> Vec<u8> {
+        let data = [&default_id.to_le_bytes()[..], &[value_type], value].concat();
+        operation(DEFAULT, false, &data)
+    }
+
+    /// A NUMERIC's `<KeywordInfoResp>`: Numeric of its width, its MinValue, MaxValue and Step,
+    /// its defaults of DefaultIds 0 and 2, not that of a platform default store, and its prompt
+    /// in en-US, not the x-UEFI-ns keyword that comes first.
+    #[test]
+    fn info_of_a_numeric_holds_its_type_range_defaults_and_prompt() {
+        let numeric = [
+            operation(NUMERIC, true, &uint8_question(1, 0)),
+            ifr_default(0x0000, 2),
+            ifr_default(0x0002, 1),
+            // EFI_HII_DEFAULT_CLASS_PLATFORM_BEGIN (UEFI 2.11 §33.2.5.8)
+            ifr_default(0x4000, 3),
+            END.to_vec(),
+        ]
+        .concat();
+
+        assert_eq!(
+            info_of(numeric, KeywordInfoFilter::all()),
+            Ok(KeywordInfo {
+                data_type: numeric_of(NumericWidth::One),
+                range: Some(ValueRange {
+                    max: number(&[3]),
+                    min: number(&[0]),
+                    step: Some(number(&[1])),
+                }),
+                options: Vec::new(),
+                standard_default: Some(number(&[2])),
+                manufacturing_default: None,
+                safe_default: Some(number(&[1])),
+                display_name: Some(text(QUESTION)),
+            }),
+            "UINT8 NUMERIC from 0 to 3 by 1"
+        );
+    }
+
+    /// A UINT16 NUMERIC's bounds are 2 bytes each, and a Step of 0, free-form input, gives no
+    /// STEP.
+    #[test]
+    fn info_of_a_free_form_numeric_has_no_step() {
+        // Flags UINT16, MinValue 0x10, MaxValue 0x1234, Step 0
+        let numeric = question(NUMERIC, &[0x01, 0x10, 0x00, 0x34, 0x12, 0x00, 0x00]);
+
+        assert_eq!(
+            info_of(
+                numeric,
+                KeywordInfoFilter::DATA_TYPE | KeywordInfoFilter::VALUE_ATTRIBUTE
+            ),
+            Ok(KeywordInfo {
+                data_type: numeric_of(NumericWidth::Two),
+                range: Some(ValueRange {
+                    max: number(&[0x34, 0x12]),
+                    min: number(&[0x10, 0x00]),
+                    step: None,
+                }),
+                ..KeywordInfo::default()
+            }),
+            "UINT16 NUMERIC from 0x10 to 0x1234"
+        );
+    }
+
+    /// A ONE_OF's options are those SetupBrowserDxe shows, also under a GRAY_OUT_IF, which
+    /// edk2-stable202608 IfrParse.c applies to statements alone, with their en-US texts; its
+    /// flagged options give its standard and manufacturing defaults; items outside the filter
+    /// stay out.
+    #[test]
+    fn info_of_a_one_of_lists_the_options_shown_in_a_ui_language() {
+        let one_of = [
+            operation(ONE_OF, true, &uint8_question(1, 0)),
+            flagged_option(4, OPTION_DEFAULT, 0),
+            conditional(SUPPRESS_IF, ifr_true(), &[flagged_option(6, 0, 2)]),
+            conditional(GRAY_OUT_IF, ifr_true(), &[flagged_option(6, 0, 1)]),
+            flagged_option(7, OPTION_DEFAULT_MFG, 3),
+            END.to_vec(),
+        ]
+        .concat();
+
+        assert_eq!(
+            info_of(
+                one_of,
+                KeywordInfoFilter::VALUE_ATTRIBUTE | KeywordInfoFilter::DEFAULT
+            ),
+            Ok(KeywordInfo {
+                options: vec![
+                    option(&[0], "Zero", None),
+                    option(&[1], "One", None),
+                    option(&[3], "Three", None),
+                ],
+                standard_default: Some(number(&[0])),
+                manufacturing_default: Some(number(&[3])),
+                ..KeywordInfo::default()
+            }),
+            "UINT8 ONE_OF of options 0, 1 grayed out, and 3, 2 suppressed"
+        );
+    }
+
+    /// A CHECKBOX is Boolean, its default flag its standard default, and it has no
+    /// `<ValueAttribute>`.
+    #[test]
+    fn info_of_a_checkbox_is_boolean_with_its_flag_default() {
+        let checkbox = question(CHECKBOX, &[0x01]); // EFI_IFR_CHECKBOX_DEFAULT
+
+        assert_eq!(
+            info_of(
+                checkbox,
+                KeywordInfoFilter::DATA_TYPE
+                    | KeywordInfoFilter::VALUE_ATTRIBUTE
+                    | KeywordInfoFilter::DEFAULT
+            ),
+            Ok(KeywordInfo {
+                data_type: Some(DataFilter::Boolean),
+                standard_default: Some(number(&[1])),
+                ..KeywordInfo::default()
+            }),
+            "CHECKBOX of EFI_IFR_CHECKBOX_DEFAULT"
+        );
+    }
+
+    /// A STRING's `<ValueRange>` is its MinSize and MaxSize; DATE and TIME have a `<DataType>`
+    /// alone; an ORDERED_LIST is a Buffer whose options name their VALUETYPE, the width of their
+    /// values.
+    #[test]
+    fn info_of_strings_dates_times_and_ordered_lists_follows_the_type_table() {
+        let filter = KeywordInfoFilter::DATA_TYPE | KeywordInfoFilter::VALUE_ATTRIBUTE;
+        let uint16_options = ordered_list(
+            2,
+            &[
+                one_of_option(4, 0x01, &0x0001_u16.to_le_bytes()),
+                one_of_option(7, 0x01, &0x0103_u16.to_le_bytes()),
+            ],
+        );
+        let cases = [
+            (
+                "STRING",
+                question(STRING, &[1, 20, 0]),
+                KeywordInfo {
+                    data_type: Some(DataFilter::String),
+                    range: Some(ValueRange {
+                        max: number(&[20]),
+                        min: number(&[1]),
+                        step: None,
+                    }),
+                    ..KeywordInfo::default()
+                },
+            ),
+            (
+                "DATE",
+                question(DATE, &[0]),
+                KeywordInfo {
+                    data_type: Some(DataFilter::Date),
+                    ..KeywordInfo::default()
+                },
+            ),
+            (
+                "TIME",
+                question(TIME, &[0]),
+                KeywordInfo {
+                    data_type: Some(DataFilter::Time),
+                    ..KeywordInfo::default()
+                },
+            ),
+            (
+                "ORDERED_LIST of UINT16 options",
+                uint16_options,
+                KeywordInfo {
+                    data_type: Some(DataFilter::Buffer),
+                    options: vec![
+                        option(&[0x01, 0x00], "Zero", Some(NumericWidth::Two)),
+                        option(&[0x03, 0x01], "Three", Some(NumericWidth::Two)),
+                    ],
+                    ..KeywordInfo::default()
+                },
+            ),
+        ];
+        for (name, ops, expected) in cases {
+            assert_eq!(info_of(ops, filter), Ok(expected), "{name}");
+        }
+    }
+
+    /// A STRING's default is its string's CHAR16s in the texts' language, zero-padded to MaxSize
+    /// CHAR16s; an ORDERED_LIST's is its EFI_IFR_TYPE_BUFFER default or its flagged option's
+    /// value, which is no option then, zero-padded to MaxContainers, an option of both flags
+    /// giving the standard default alone; a longer one, or one of a DATE, refuses.
+    #[test]
+    fn info_of_string_and_ordered_list_defaults_is_their_value_bytes() {
+        // MinSize 1, MaxSize 4, Flags
+        let string = |default: Vec<u8>| {
+            let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![1, 4, 0]].concat();
+            [operation(STRING, true, &data), default, END.to_vec()].concat()
+        };
+        let one = typed_default(0x0000, 0x07, &6_u16.to_le_bytes()); // EFI_IFR_TYPE_STRING
+        let three = typed_default(0x0000, 0x07, &7_u16.to_le_bytes());
+        let options = [flagged_option(4, 0, 1), flagged_option(7, 0, 3)];
+        let buffer_default = ordered_list(
+            3,
+            &[
+                options.to_vec(),
+                vec![typed_default(0x0000, 0x0B, &[3, 1])], // EFI_IFR_TYPE_BUFFER
+            ]
+            .concat(),
+        );
+        let flagged_default = ordered_list(
+            3,
+            &[
+                flagged_option(4, OPTION_DEFAULT | OPTION_DEFAULT_MFG, 1),
+                flagged_option(7, OPTION_DEFAULT_MFG, 3),
+            ],
+        );
+        let standard = |value: &[u8]| {
+            Ok(KeywordInfo {
+                standard_default: Some(number(value)),
+                ..KeywordInfo::default()
+            })
+        };
+        let refusal = |reason: &str| {
+            Err(KeywordInfoRefusal::Default {
+                keyword: KEYWORD.to_owned(),
+                default_id: DefaultId::STANDARD,
+                reason: reason.to_owned(),
+            })
+        };
+        let cases: [(&str, Vec<u8>, &[&str], _); 6] = [
+            (
+                "STRING of \"One\"",
+                string(one.clone()),
+                &[],
+                standard(&[b'O', 0, b'n', 0, b'e', 0, 0, 0]),
+            ),
+            (
+                "STRING of \"Un\", in fr-FR",
+                string(one),
+                &["fr-FR"],
+                standard(&[b'U', 0, b'n', 0, 0, 0, 0, 0]),
+            ),
+            (
+                "STRING of \"Three\", 5 CHAR16s",
+                string(three),
+                &[],
+                refusal("it is wider than the question's 8 bytes"),
+            ),
+            (
+                "ORDERED_LIST of EFI_IFR_TYPE_BUFFER 3 1",
+                buffer_default,
+                &[],
+                standard(&[3, 1, 0]),
+            ),
+            (
+                "ORDERED_LIST of flagged options 1, standard, and 3, manufacturing",
+                flagged_default,
+                &[],
+                Ok(KeywordInfo {
+                    standard_default: Some(number(&[1, 0, 0])),
+                    manufacturing_default: Some(number(&[3, 0, 0])),
+                    ..KeywordInfo::default()
+                }),
+            ),
+            (
+                "DATE",
+                [
+                    operation(
+                        DATE,
+                        true,
+                        &[question_header_with(1, PROMPT, 1, 5, 0), vec![0]].concat(),
+                    ),
+                    ifr_default(0x0000, 1),
+                    END.to_vec(),
+                ]
+                .concat(),
+                &[],
+                refusal("uefisettings does not decode a default of EFI_IFR_DATE"),
+            ),
+        ];
+        for (name, ops, requested, expected) in cases {
+            assert_eq!(
+                info_in(ops, KeywordInfoFilter::DEFAULT, requested),
+                expected,
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            info_of(
+                ordered_list(
+                    3,
+                    &[
+                        flagged_option(4, 0, 1),
+                        flagged_option(7, OPTION_DEFAULT, 3),
+                    ]
+                ),
+                KeywordInfoFilter::VALUE_ATTRIBUTE
+            ),
+            Ok(KeywordInfo {
+                options: vec![option(&[1], "Zero", Some(NumericWidth::One))],
+                ..KeywordInfo::default()
+            }),
+            "the flagged option of an ORDERED_LIST is no option"
+        );
+    }
+
+    /// DISPLAYNAME and OPTIONSTRING come in the language that `requested` picks, never from a
+    /// configuration language's package, which holds keywords: a string that only such a package
+    /// holds refuses, and so does an empty one, which no `<String>` is.
+    #[test]
+    fn info_texts_show_in_the_requested_language_never_a_keyword() {
+        let one_of = |scope: &[Vec<u8>]| {
+            [
+                operation(ONE_OF, true, &uint8_question(1, 0)),
+                scope.concat(),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let filter = KeywordInfoFilter::VALUE_ATTRIBUTE | KeywordInfoFilter::DISPLAY_NAME;
+        let shown = one_of(&[flagged_option(4, 0, 0), flagged_option(6, 0, 1)]);
+        let cases = [
+            (
+                "fr-FR",
+                KeywordInfo {
+                    options: vec![option(&[0], "Z\u{e9}ro", None), option(&[1], "Un", None)],
+                    display_name: Some(text(FRENCH_QUESTION)),
+                    ..KeywordInfo::default()
+                },
+            ),
+            (
+                NAMESPACE,
+                KeywordInfo {
+                    options: vec![option(&[0], "Zero", None), option(&[1], "One", None)],
+                    display_name: Some(text(QUESTION)),
+                    ..KeywordInfo::default()
+                },
+            ),
+        ];
+        for (language, expected) in cases {
+            assert_eq!(
+                info_in(shown.clone(), filter, &[language]),
+                Ok(expected),
+                "texts of {language}"
+            );
+        }
+
+        assert_eq!(
+            info_in(one_of(&[flagged_option(8, 0, 0)]), filter, &["fr-FR"]),
+            Err(KeywordInfoRefusal::NoText {
+                keyword: KEYWORD.to_owned(),
+                id: 8,
+            }),
+            "an option of string 8, which x-UEFI-ns alone holds"
+        );
+        assert_eq!(
+            info_in(one_of(&[flagged_option(5, 0, 0)]), filter, &["fr-FR"]),
+            Err(KeywordInfoRefusal::NoText {
+                keyword: KEYWORD.to_owned(),
+                id: 5,
+            }),
+            "an option of string 5, which en-US holds empty"
+        );
+    }
+
+    /// What the IFR does not tell refuses the items that need it, and only those: a default
+    /// wider than the question; an option text in no display language, unless the option is
+    /// suppressed; an option under a SUPPRESS_IF on a question of a VarStore that no variable
+    /// holds, named by its string; the defaults of a question of EFI_IFR_FLAG_CALLBACK, which its
+    /// driver's Callback() outranks; the type of a PASSWORD or REF.
+    #[test]
+    fn info_refuses_what_the_ifr_does_not_tell() {
+        // Flags UINT16, 0 to 0xFFFF by 1
+        let uint16 = [
+            question_header_with(1, PROMPT, 1, 5, 0),
+            vec![0x01, 0x00, 0x00, 0xFF, 0xFF, 0x01, 0x00],
+        ]
+        .concat();
+        let wide_default = [
+            operation(NUMERIC, true, &uint16),
+            uint32_default(0x0000, 0x1_0000),
+            END.to_vec(),
+        ]
+        .concat();
+        assert_eq!(
+            info_of(wide_default.clone(), KeywordInfoFilter::DEFAULT),
+            Err(KeywordInfoRefusal::Default {
+                keyword: KEYWORD.to_owned(),
+                default_id: DefaultId::STANDARD,
+                reason: "it is wider than the question's 2 bytes".to_owned(),
+            }),
+            "a UINT32 default of a UINT16 NUMERIC"
+        );
+        assert!(
+            info_of(wide_default, KeywordInfoFilter::VALUE_ATTRIBUTE).is_ok(),
+            "its range alone"
+        );
+
+        let one_of = |scope: &[Vec<u8>]| {
+            [
+                var_store(2, [0x44; 16], "Unread", 16),
+                one_of_at(11, 9, 2, 0, &[(4, 1)]),
+                operation(ONE_OF, true, &uint8_question(1, 0)),
+                flagged_option(4, 0, 0),
+                scope.concat(),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let textless = one_of(&[flagged_option(9, 0, 1)]);
+        assert_eq!(
+            info_of(textless.clone(), KeywordInfoFilter::VALUE_ATTRIBUTE),
+            Err(KeywordInfoRefusal::NoText {
+                keyword: KEYWORD.to_owned(),
+                id: 9,
+            }),
+            "an option of string 9"
+        );
+        assert_eq!(
+            info_of(textless, KeywordInfoFilter::DATA_TYPE),
+            Ok(KeywordInfo {
+                data_type: numeric_of(NumericWidth::One),
+                ..KeywordInfo::default()
+            }),
+            "its type alone"
+        );
+        assert_eq!(
+            info_of(
+                one_of(&[conditional(
+                    SUPPRESS_IF,
+                    ifr_true(),
+                    &[flagged_option(9, 0, 1)]
+                )]),
+                KeywordInfoFilter::VALUE_ATTRIBUTE
+            ),
+            Ok(KeywordInfo {
+                options: vec![option(&[0], "Zero", None)],
+                ..KeywordInfo::default()
+            }),
+            "a suppressed option of string 9"
+        );
+
+        let unknown = one_of(&[conditional(
+            SUPPRESS_IF,
+            eq_id_val_of(11, 1),
+            &[flagged_option(9, 0, 1)],
+        )]);
+        assert!(
+            matches!(
+                info_of(unknown.clone(), KeywordInfoFilter::VALUE_ATTRIBUTE),
+                Err(KeywordInfoRefusal::OptionState { option: 9, .. })
+            ),
+            "an option under a SUPPRESS_IF on question 11 of an unread VarStore: {:?}",
+            info_of(unknown.clone(), KeywordInfoFilter::VALUE_ATTRIBUTE)
+        );
+        assert_eq!(
+            info_of(unknown, KeywordInfoFilter::DATA_TYPE),
+            Ok(KeywordInfo {
+                data_type: numeric_of(NumericWidth::One),
+                ..KeywordInfo::default()
+            }),
+            "its type alone, under that SUPPRESS_IF"
+        );
+
+        let callback = [
+            operation(NUMERIC, true, &uint8_question(1, 0x04)), // EFI_IFR_FLAG_CALLBACK
+            ifr_default(0x0000, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        assert_eq!(
+            info_of(callback.clone(), KeywordInfoFilter::DEFAULT),
+            Err(KeywordInfoRefusal::Default {
+                keyword: KEYWORD.to_owned(),
+                default_id: DefaultId::STANDARD,
+                reason: CALLBACK_DEFAULT.to_owned(),
+            }),
+            "the defaults of a question of EFI_IFR_FLAG_CALLBACK"
+        );
+        assert!(
+            info_of(
+                callback,
+                KeywordInfoFilter::all().difference(KeywordInfoFilter::DEFAULT)
+            )
+            .is_ok(),
+            "its other items"
+        );
+
+        let untyped = [
+            ("PASSWORD", password_on(1, PROMPT, 1, 5), "EFI_IFR_PASSWORD"),
+            ("REF", question(REF, &[1, 0]), "EFI_IFR_REF"),
+        ];
+        for (name, ops, op) in untyped {
+            assert_eq!(
+                info_of(ops, KeywordInfoFilter::DATA_TYPE),
+                Err(KeywordInfoRefusal::NoDataType {
+                    keyword: KEYWORD.to_owned(),
+                    op,
+                }),
+                "{name}"
+            );
+        }
     }
 }
