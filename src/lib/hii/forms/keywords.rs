@@ -1651,6 +1651,7 @@ mod tests {
     use super::super::ifr_fixtures::GUID;
     use super::super::ifr_fixtures::NUMERIC;
     use super::super::ifr_fixtures::ONE_OF;
+    use super::super::ifr_fixtures::PASSWORD;
     use super::super::ifr_fixtures::READ;
     use super::super::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use super::super::ifr_fixtures::SUPPRESS_IF;
@@ -3540,6 +3541,41 @@ mod tests {
             END.to_vec(),
         ]
         .concat()
+    }
+
+    /// A PASSWORD takes no default from a flagged EFI_IFR_ONE_OF_OPTION, as edk2-stable202608
+    /// HiiDatabaseDxe/ConfigRouting.c gives it none (:3135-3137), where a STRING takes that
+    /// option's default, whose number no STRING stores.
+    #[test]
+    fn info_of_a_password_takes_no_default_from_a_flagged_option() {
+        let question = |op_code, rest: Vec<u8>| {
+            let data = [question_header_with(1, PROMPT, 1, 5, 0), rest].concat();
+            [
+                operation(op_code, true, &data),
+                flagged_option(4, OPTION_DEFAULT, 1),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        // MinSize 1, MaxSize 4
+        let password = question(PASSWORD, vec![1, 0, 4, 0]);
+        // MinSize 1, MaxSize 4, Flags
+        let string = question(STRING, vec![1, 4, 0]);
+
+        assert_eq!(
+            info_of(password, KeywordInfoFilter::DEFAULT),
+            Ok(KeywordInfo::default()),
+            "PASSWORD"
+        );
+        assert_eq!(
+            info_of(string, KeywordInfoFilter::DEFAULT),
+            Err(KeywordInfoRefusal::Default {
+                keyword: KEYWORD.to_owned(),
+                default_id: DefaultId::STANDARD,
+                reason: "EFI_IFR_STRING holds no Number(1)".to_owned(),
+            }),
+            "STRING"
+        );
     }
 
     /// A NUMERIC's `<KeywordInfoResp>`: Numeric of its width, its MinValue, MaxValue and Step,

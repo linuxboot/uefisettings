@@ -46,6 +46,7 @@ use uefisettings_qemu_guest::read_dev_mem_byte;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::variable_data;
+use uefisettings_qemu_guest::ListedDefault;
 use uefisettings_qemu_guest::MachineInfo;
 use uefisettings_qemu_guest::Question;
 use uefisettings_qemu_guest::Responses;
@@ -173,14 +174,6 @@ struct ListedQuestion {
     // optional, so that a build without the field fails an assertion, not the parse
     flags: Option<Vec<String>>,
     defaults: Option<Vec<ListedDefault>>,
-}
-
-/// A default of a ListedQuestion.
-#[derive(Debug, Deserialize, PartialEq)]
-struct ListedDefault {
-    default_id: i32,
-    default_store_name: Option<String>,
-    value: String,
 }
 
 /// A ListedDefault of the default store `default_id` of DriverSample's formset: 0, which

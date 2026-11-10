@@ -420,6 +420,7 @@ fn list_options(
                 return None;
             };
             (!is_ordered_list_default(question, option)).then(|| AnswerOption {
+                value_type: option.value_type,
                 raw_value: option_value(question, &op, option, inputs),
                 // option_value evaluates the EFI_IFR_VALUE of an option of Type OTHER of a
                 // ONE_OF only, so no option of an ORDERED_LIST takes a snapshot value

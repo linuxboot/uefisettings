@@ -405,7 +405,13 @@ pub(crate) fn operation(op_code: u8, open_scope: bool, data: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn one_of_option(string_id: u16, value_type: u8, value: &[u8]) -> Vec<u8> {
-    let data = [&string_id.to_le_bytes()[..], &[0x00, value_type], value].concat();
+    typed_option(string_id, 0x00, value_type, value)
+}
+
+/// An EFI_IFR_ONE_OF_OPTION of Type `value_type` with `flags` whose Value is `value`, of any
+/// length.
+pub(super) fn typed_option(string_id: u16, flags: u8, value_type: u8, value: &[u8]) -> Vec<u8> {
+    let data = [&string_id.to_le_bytes()[..], &[flags, value_type], value].concat();
     operation(ONE_OF_OPTION, false, &data)
 }
 

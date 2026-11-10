@@ -367,6 +367,34 @@ mod tests {
         );
     }
 
+    /// A REF on a VarStore takes no default from a flagged EFI_IFR_ONE_OF_OPTION, which its grammar
+    /// does not nest (UEFI 2.11 §33.2.5.4.10), and still lists its EFI_IFR_DEFAULT of Type
+    /// EFI_IFR_TYPE_REF beside one.
+    #[test]
+    fn ref_takes_no_default_from_a_flagged_option() {
+        let default = [&[0x00, 0x00, 0x0C][..], &stored_ref(3)].concat();
+        let declared = format!(
+            "QuestionId 0x0005, FormId 0x0001, FormSetGuid {GUID_TEXT}, DevicePath \"Prompt\""
+        );
+        let cases = [
+            ("flagged option", vec![flagged_option(6, 0x10, 1)], vec![]),
+            (
+                "flagged option and EFI_IFR_DEFAULT",
+                vec![flagged_option(6, 0x10, 1), operation(0x5B, false, &default)],
+                vec![(DefaultId(0x0000), declared)],
+            ),
+        ];
+        for (name, children, want) in cases {
+            let (_root, node) = parse_question(&[], REF, &ref_data(1, &[2, 0]), &children);
+            let defaults: Vec<(DefaultId, String)> = question_descriptor(&node, unavailable())
+                .defaults
+                .iter()
+                .map(|default| (default.default_id, default.value.to_string()))
+                .collect();
+            assert_eq!(defaults, want, "{name}");
+        }
+    }
+
     /// A REF on a VarStore refuses an EFI_IFR_DEFAULT of a Type other than EFI_IFR_TYPE_REF, here
     /// UINT8, whose number is no EFI_HII_REF.
     #[test]

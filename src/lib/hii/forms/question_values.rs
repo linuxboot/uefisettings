@@ -972,6 +972,7 @@ pub(super) fn handle_oneof(
             let taken = walk.inputs.reader.snapshot_values_taken();
             let raw_value = option_value(current_node, &op, o, &mut walk.inputs);
             possible_options.push(AnswerOption {
+                value_type: o.value_type,
                 raw_value,
                 source: ValueSource::since(taken, walk.inputs.reader),
                 value: walk.texts.display(o.option_string_id).to_string(),

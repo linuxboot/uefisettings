@@ -299,6 +299,18 @@ pub struct Question {
     pub items: Option<Vec<String>>,
 }
 
+/// A default that `hii list-questions --json` and `get --json` list for a question
+/// (`QuestionDefault`).
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ListedDefault {
+    /// The DefaultId.
+    pub default_id: i32,
+    /// The DefaultName of the DEFAULTSTORE of the DefaultId, if the formset declares one.
+    pub default_store_name: Option<String>,
+    /// The default, as the answer shows a value.
+    pub value: String,
+}
+
 /// Output of `get --json` and `set --json` (`GetResponseList` and `SetResponseList`).
 #[derive(Debug, Deserialize)]
 pub struct Responses {

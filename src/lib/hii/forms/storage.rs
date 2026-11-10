@@ -1080,6 +1080,7 @@ mod non_efi_varstore_tests {
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 texts: vec![(Language(b"en-US".to_vec()), "Enabled".to_string())],
+                value_type: super::super::EFI_IFR_TYPE_NUM_SIZE_8,
                 raw_value: Ok(TypeValue::NumSize8(1)),
                 source: ValueSource::Current,
                 state: StateEvaluation::selectable(),

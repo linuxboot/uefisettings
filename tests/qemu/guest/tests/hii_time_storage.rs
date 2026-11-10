@@ -15,10 +15,13 @@
 //! EFI_HII_DATE and EFI_HII_TIME there (UEFI 2.11 §33.2.5.4.6, §33.2.5.4.11), and of a DATE and
 //! a TIME of the wake-up time, EFI Date/Time Storage (§33.2.5.6) that Linux does not reach.
 
+use serde::Deserialize;
 use uefisettings_qemu_guest::changed_bytes;
+use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::variable_data;
+use uefisettings_qemu_guest::ListedDefault;
 use uefisettings_qemu_guest::BACKEND_HII;
 
 /// The variable of the forms, which publish-hiidb creates with 2024-02-29 at byte 0 and
@@ -32,6 +35,22 @@ const STORED_TIME: &str = "Stored time";
 /// The DATE and TIME of the wake-up time, without a VarStore.
 const WAKEUP_DATE: &str = "Wake-up date";
 const WAKEUP_TIME: &str = "Wake-up time";
+
+/// `get --json`, with the defaults of its question.
+#[derive(Debug, Deserialize)]
+struct DefaultsResponses {
+    responses: Vec<DefaultsResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultsResponse {
+    question: DefaultsQuestion,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultsQuestion {
+    defaults: Option<Vec<ListedDefault>>,
+}
 
 #[track_caller]
 fn data() -> Vec<u8> {
@@ -112,6 +131,42 @@ fn stored_time_keeps_its_suppressed_second() {
         refuse(STORED_TIME, "23:01:02"),
         "the second of this TIME is suppressed (UEFI 2.11 §33.2.5.4.11): give dashes there, \
          which keep it"
+    );
+}
+
+/// The defaults that get lists for `question`.
+#[track_caller]
+fn defaults(question: &str) -> Option<Vec<ListedDefault>> {
+    let responses: DefaultsResponses = json(&["hii", "get", question, "--json"]);
+    let [response]: [DefaultsResponse; 1] = responses
+        .responses
+        .try_into()
+        .unwrap_or_else(|responses| panic!("get {question}: {responses:#?}"));
+    response.question.defaults
+}
+
+/// The DATE takes the manufacturing default of its EFI_IFR_ONE_OF_OPTION flagged DEFAULT_MFG,
+/// DefaultId 1 without a DEFAULTSTORE, and the TIME the standard default of its option flagged
+/// DEFAULT, without the second that it suppresses (UEFI 2.11 §33.2.5.8).
+#[test]
+fn date_and_time_options_give_their_defaults() {
+    assert_eq!(
+        defaults(STORED_DATE),
+        Some(vec![ListedDefault {
+            default_id: 1,
+            default_store_name: None,
+            value: "2004-01-02".to_owned(),
+        }]),
+        "defaults of {STORED_DATE}"
+    );
+    assert_eq!(
+        defaults(STORED_TIME),
+        Some(vec![ListedDefault {
+            default_id: 0,
+            default_store_name: None,
+            value: "15:33:--".to_owned(),
+        }]),
+        "defaults of {STORED_TIME}"
     );
 }
 

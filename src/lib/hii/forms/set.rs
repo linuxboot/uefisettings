@@ -149,6 +149,16 @@ pub(crate) enum ChangeValueError {
         option: String,
         reason: OptionValueError,
     },
+    /// A ONE_OF option whose value is no number
+    #[error(
+        "cannot set question {question:?} to option {option:?}: its EFI_IFR_ONE_OF_OPTION Type \
+         {value_type:#04x} value is no number of a ONE_OF (UEFI 2.11 §33.3.8.3.50)"
+    )]
+    OptionNotNumber {
+        question: String,
+        option: String,
+        value_type: u8,
+    },
     /// Writes of one variable, which holds the value of one question, at two widths: set creates
     /// or rewrites it at one width only
     #[error(
@@ -443,19 +453,25 @@ pub(super) fn own_write<'a>(
     Ok((value, write))
 }
 
-/// The value that set writes for `option` of the ONE_OF `question`, or why it has none.
+/// The value that set writes for `option` of the ONE_OF `question`, or why it has none: a number,
+/// which a ONE_OF stores.
 fn option_value(
     question: &QuestionDescriptor,
     option: &AnswerOption,
 ) -> Result<TypeValue, ChangeValueError> {
-    option
-        .raw_value
-        .clone()
-        .map_err(|reason| ChangeValueError::OptionValue {
+    match option.raw_value.clone() {
+        Ok(value) if value.as_u64().is_some() => Ok(value),
+        Ok(_) => Err(ChangeValueError::OptionNotNumber {
+            question: question.question.clone(),
+            option: option.value.clone(),
+            value_type: option.value_type,
+        }),
+        Err(reason) => Err(ChangeValueError::OptionValue {
             question: question.question.clone(),
             option: option.value.clone(),
             reason,
-        })
+        }),
+    }
 }
 
 /// The value that `new_value` gives `question`, which takes no option: of a NUMERIC or CHECKBOX
@@ -1097,7 +1113,8 @@ mod set_questions_tests {
             (
                 "B's option of Type STRING",
                 &string_option,
-                "unsupported value type for efivarfs write",
+                "cannot set question \"\" to option \"Enabled\": its EFI_IFR_ONE_OF_OPTION Type 0x07 \
+                 value is no number of a ONE_OF (UEFI 2.11 §33.3.8.3.50)",
                 "String",
             ),
             (
@@ -1130,30 +1147,20 @@ mod set_questions_tests {
         }
     }
 
-    /// set refuses an option of a type that it does not write in the words of the interface of
-    /// its variables, whatever their reach, and writes nothing.
+    /// set refuses an option of a ONE_OF whose Value is no number by name, whatever the reach and
+    /// the interface of its variables, and writes nothing.
     #[test]
-    fn unsupported_option_is_refused_in_the_words_of_its_interface() {
-        for (reach, interface, write) in [
-            (
-                VariableReach::Runtime,
-                VariableInterface::Efivarfs,
-                "efivarfs write",
-            ),
+    fn option_without_a_number_is_refused_whatever_the_interface() {
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
             (
                 VariableReach::Runtime,
                 VariableInterface::FirmwareEnvironment,
-                "SetFirmwareEnvironmentVariableExW write",
             ),
-            (
-                VariableReach::BootServices,
-                VariableInterface::Efivarfs,
-                "efivarfs write",
-            ),
+            (VariableReach::BootServices, VariableInterface::Efivarfs),
             (
                 VariableReach::BootServices,
                 VariableInterface::VariableServices,
-                "SetVariable() write",
             ),
         ] {
             let variables = MemoryVariables::new(reach, interface);
@@ -1166,10 +1173,43 @@ mod set_questions_tests {
 
             assert_eq!(
                 set_options(&variables, &[("B", &string_option)], "1", &["Enabled"]),
-                Err(format!("unsupported value type for {write}")),
+                Err(
+                    "cannot set question \"\" to option \"Enabled\": its EFI_IFR_ONE_OF_OPTION \
+                     Type 0x07 value is no number of a ONE_OF (UEFI 2.11 §33.3.8.3.50)"
+                        .to_string()
+                ),
                 "{case}"
             );
             assert_eq!(writes(&variables, "String"), [], "{case}: writes");
+        }
+    }
+
+    /// set refuses an option of a ONE_OF whose Value is an EFI_HII_DATE or an EFI_HII_TIME,
+    /// naming the question, the option and its Type, and writes nothing, also to a UINT32 ONE_OF,
+    /// whose storage an EFI_HII_DATE's bytes would fill.
+    #[test]
+    fn options_of_a_one_of_that_hold_no_number_are_refused_by_name() {
+        for (name, value_type, value) in [
+            ("Date", 0x06, &[0xD4, 0x07, 1, 2][..]),
+            ("Time", 0x05, &[15, 33, 34]),
+        ] {
+            let variables = MemoryVariables::default();
+            let one_of = sized_on_store(
+                ONE_OF,
+                4,
+                &[one_of_option(6, value_type, value)],
+                writable_var_store(name, &[0; 4], &variables),
+            );
+
+            assert_eq!(
+                set_options(&variables, &[("B", &one_of)], "1", &["Enabled"]),
+                Err(format!(
+                    "cannot set question \"\" to option \"Enabled\": its EFI_IFR_ONE_OF_OPTION \
+                     Type {value_type:#04x} value is no number of a ONE_OF (UEFI 2.11 §33.3.8.3.50)"
+                )),
+                "{name}"
+            );
+            assert_eq!(writes(&variables, name), [], "{name}: writes");
         }
     }
 

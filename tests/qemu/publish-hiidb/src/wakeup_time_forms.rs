@@ -15,7 +15,9 @@
 //! scenario `shell-time-storage` of `tests/qemu/scenarios.tsv`: a form set with a DATE and a
 //! TIME, which suppresses its second, on the VARSTORE_EFI DateTimeData, which the driver creates
 //! when it is missing, and a DATE and a TIME of the wake-up time, EFI Date/Time Storage without
-//! a VarStore (UEFI 2.11 §33.2.5.6), each with its own prompt.
+//! a VarStore (UEFI 2.11 §33.2.5.6), each with its own prompt. The stored DATE holds an
+//! EFI_IFR_ONE_OF_OPTION of Type DATE flagged DEFAULT_MFG, and the stored TIME one of Type TIME
+//! flagged DEFAULT.
 
 use alloc::vec::Vec;
 
@@ -34,6 +36,7 @@ use crate::hii_package::EFI_HII_PACKAGE_FORMS;
 use crate::hii_package::EFI_IFR_DATE_OP;
 use crate::hii_package::EFI_IFR_FORM_OP;
 use crate::hii_package::EFI_IFR_FORM_SET_OP;
+use crate::hii_package::EFI_IFR_ONE_OF_OPTION_OP;
 use crate::hii_package::EFI_IFR_TIME_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_EFI_OP;
 
@@ -59,7 +62,9 @@ const STORED_DATE: u16 = 4;
 const STORED_TIME: u16 = 5;
 const WAKEUP_DATE: u16 = 6;
 const WAKEUP_TIME: u16 = 7;
-const STRINGS: [&str; 7] = [
+const DATE_OPTION: u16 = 8;
+const TIME_OPTION: u16 = 9;
+const STRINGS: [&str; 9] = [
     "English",
     "uefisettings QEMU date and time forms",
     "Dates and times on a VarStore and of the wake-up time",
@@ -67,6 +72,8 @@ const STRINGS: [&str; 7] = [
     "Stored time",
     "Wake-up date",
     "Wake-up time",
+    "Manufacturing date",
+    "Standard time",
 ];
 
 // The VarStores
@@ -78,6 +85,13 @@ const NO_VAR_STORE: u16 = 0;
 const SECOND_SUPPRESS: u8 = 0x04;
 /// QF_DATE_STORAGE_WAKEUP and QF_TIME_STORAGE_WAKEUP (UEFI 2.11 §33.3.8.3.11, §33.3.8.3.78).
 const STORAGE_WAKEUP: u8 = 0x20;
+/// EFI_IFR_OPTION_DEFAULT and EFI_IFR_OPTION_DEFAULT_MFG (UEFI 2.11 §33.3.8.3.51).
+const OPTION_DEFAULT: u8 = 0x10;
+const OPTION_DEFAULT_MFG: u8 = 0x20;
+/// EFI_IFR_TYPE_TIME and EFI_IFR_TYPE_DATE, the Types of EFI_IFR_ONE_OF_OPTIONs (UEFI 2.11
+/// §33.3.8.3.51).
+const TYPE_TIME: u8 = 0x05;
+const TYPE_DATE: u8 = 0x06;
 
 /// The package list, as NewPackageList() takes it.
 pub(crate) fn package_list_bytes() -> Vec<u8> {
@@ -109,14 +123,41 @@ fn form_package() -> Vec<u8> {
         .concat(),
     );
     let questions = [
-        date_time(EFI_IFR_DATE_OP, 1, STORED_DATE, (STORE, 0), 0),
-        date_time(EFI_IFR_TIME_OP, 2, STORED_TIME, (STORE, 4), SECOND_SUPPRESS),
+        date_time(
+            EFI_IFR_DATE_OP,
+            1,
+            STORED_DATE,
+            (STORE, 0),
+            0,
+            // 2004-01-02
+            &[option(
+                DATE_OPTION,
+                OPTION_DEFAULT_MFG,
+                TYPE_DATE,
+                &[0xD4, 0x07, 1, 2],
+            )],
+        ),
+        date_time(
+            EFI_IFR_TIME_OP,
+            2,
+            STORED_TIME,
+            (STORE, 4),
+            SECOND_SUPPRESS,
+            // 15:33:33
+            &[option(
+                TIME_OPTION,
+                OPTION_DEFAULT,
+                TYPE_TIME,
+                &[15, 33, 33],
+            )],
+        ),
         date_time(
             EFI_IFR_DATE_OP,
             3,
             WAKEUP_DATE,
             (NO_VAR_STORE, 0),
             STORAGE_WAKEUP,
+            &[],
         ),
         date_time(
             EFI_IFR_TIME_OP,
@@ -124,6 +165,7 @@ fn form_package() -> Vec<u8> {
             WAKEUP_TIME,
             (NO_VAR_STORE, 0),
             STORAGE_WAKEUP,
+            &[],
         ),
     ];
     let form = [1u16.to_le_bytes(), TITLE.to_le_bytes()].concat();
@@ -140,13 +182,14 @@ fn form_package() -> Vec<u8> {
 }
 
 /// A DATE or TIME (`op_code`) of question `id` at `var_store`, `(VarStoreId, VarOffset)`, with
-/// the question flags 0 and `flags` (UEFI 2.11 §33.3.8.3.11, §33.3.8.3.78).
+/// the question flags 0 and `flags` (UEFI 2.11 §33.3.8.3.11, §33.3.8.3.78), holding `children`.
 fn date_time(
     op_code: u8,
     id: u16,
     prompt: u16,
     (var_store, offset): (u16, u16),
     flags: u8,
+    children: &[Vec<u8>],
 ) -> Vec<u8> {
     let data = [
         &prompt.to_le_bytes()[..],
@@ -157,5 +200,12 @@ fn date_time(
         &[0, flags],
     ]
     .concat();
-    [op(op_code, true, &data), end()].concat()
+    [op(op_code, true, &data), children.concat(), end()].concat()
+}
+
+/// An EFI_IFR_ONE_OF_OPTION of `text` with `flags` whose Value of Type `value_type` is `value`
+/// (UEFI 2.11 §33.3.8.3.51).
+fn option(text: u16, flags: u8, value_type: u8, value: &[u8]) -> Vec<u8> {
+    let data = [&text.to_le_bytes()[..], &[flags, value_type], value].concat();
+    op(EFI_IFR_ONE_OF_OPTION_OP, false, &data)
 }

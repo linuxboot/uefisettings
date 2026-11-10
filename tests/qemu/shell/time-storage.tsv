@@ -19,11 +19,16 @@ dmpstore-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000501:
 dmpstore-before	line	^  00000000: E8 07 02 1D 0C 22 38 EE-
 get-stored-date	status	0x0
 get-stored-date	json	.responses | length == 1 and .[0].question.answer == "2024-02-29"
+# its EFI_IFR_ONE_OF_OPTION flagged DEFAULT_MFG gives the DATE its manufacturing default
+get-stored-date	json	.responses[0].question.defaults == [{"default_id": 1, "value": "2004-01-02"}]
 set-stored-date	status	0x0
 set-stored-date	json	.responses | length == 1 and .[0].question.answer == "2025-03-01" and .[0].modified == true
 # the TIME suppresses its second: get shows dashes there, which set takes and keeps
 get-stored-time	status	0x0
 get-stored-time	json	.responses | length == 1 and .[0].question.answer == "12:34:--"
+# its EFI_IFR_ONE_OF_OPTION flagged DEFAULT gives the TIME its standard default, without the
+# second that it suppresses
+get-stored-time	json	.responses[0].question.defaults == [{"default_id": 0, "value": "15:33:--"}]
 set-stored-time	status	0x0
 set-stored-time	json	.responses | length == 1 and .[0].question.answer == "23:01:--" and .[0].modified == true
 set-stored-second	status	aborted

@@ -1596,18 +1596,10 @@ fn default_value_parser<R: Read + Seek>(
         | EFI_IFR_TYPE_NUM_SIZE_16
         | EFI_IFR_TYPE_NUM_SIZE_32
         | EFI_IFR_TYPE_NUM_SIZE_64
-        | EFI_IFR_TYPE_BOOLEAN => match type_value_parser(reader, endian, args) {
+        | EFI_IFR_TYPE_BOOLEAN
+        | EFI_IFR_TYPE_TIME
+        | EFI_IFR_TYPE_DATE => match type_value_parser(reader, endian, args) {
             Ok(value) => Ok(IfrDefaultValue::Decoded(value)),
-            Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
-            Err(error) => Err(error),
-        },
-        EFI_IFR_TYPE_DATE => match BinRead::read_options(reader, endian, ()) {
-            Ok(date) => Ok(IfrDefaultValue::Decoded(TypeValue::Date(date))),
-            Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
-            Err(error) => Err(error),
-        },
-        EFI_IFR_TYPE_TIME => match BinRead::read_options(reader, endian, ()) {
-            Ok(time) => Ok(IfrDefaultValue::Decoded(TypeValue::Time(time))),
             Err(error) if error.is_eof() => Ok(IfrDefaultValue::Missing),
             Err(error) => Err(error),
         },
@@ -1889,7 +1881,8 @@ impl TypeValue {
     }
 }
 
-/// A value of the type `args.0`, read in the endian that its derive passes.
+/// A value of the type `args.0`, read in the endian that its derive passes; an EFI_HII_DATE or
+/// EFI_HII_TIME little-endian, which its #[br(little)] struct always takes.
 fn type_value_parser<R: Read + Seek>(
     reader: &mut R,
     endian: binrw::Endian,
@@ -1920,7 +1913,9 @@ fn type_value_parser<R: Read + Seek>(
             Ok(TypeValue::Boolean(false))
         }
         EFI_IFR_TYPE_OTHER => Ok(TypeValue::Other),
-        // TODO: handle other types like Date, Time & Ref. We have already made structs for them.
+        EFI_IFR_TYPE_TIME => Ok(TypeValue::Time(BinRead::read_options(reader, endian, ())?)),
+        EFI_IFR_TYPE_DATE => Ok(TypeValue::Date(BinRead::read_options(reader, endian, ())?)),
+        // TODO: handle other types like Ref. We have already made structs for them.
         _ => {
             let r: u8 = BinRead::read_options(reader, endian, ())?;
             Ok(TypeValue::Unknown(r))
@@ -3480,6 +3475,8 @@ pub struct AnswerOption {
     /// The option's text in each strings package of no configuration language that holds it,
     /// with its language: those that VALUE matches
     texts: Vec<(Language, String)>,
+    /// The option's EFI_IFR_ONE_OF_OPTION Type
+    value_type: u8,
     /// The option's value, or why it is not known
     raw_value: Result<TypeValue, OptionValueError>,
     /// Snapshot if the EFI_IFR_VALUE of an option of Type OTHER took a value from there
@@ -7176,5 +7173,91 @@ mod expression_operand_tests {
                     && five.starts_with("the form 5 of")),
             "disabled: {reasons:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod option_value_tests {
+    use super::ifr_fixtures::*;
+    use super::*;
+
+    /// An EFI_IFR_ONE_OF_OPTION of Type DATE or TIME holds the EFI_HII_DATE or EFI_HII_TIME of its
+    /// first bytes. One shorter than its Type is malformed: it disables its form, whose reason
+    /// tells how short it is, and the FormSet stays (UEFI 2.11 §33.2.5.10.1).
+    #[test]
+    fn date_and_time_option_values_decode_and_short_ones_disable_their_form() {
+        let date = TypeValue::Date(Date::from_bytes([0xD4, 0x07, 1, 2]));
+        let decoded = [
+            ("DATE", EFI_IFR_TYPE_DATE, &[0xD4, 0x07, 1, 2][..], date),
+            (
+                "DATE of 5 bytes",
+                EFI_IFR_TYPE_DATE,
+                &[0xD4, 0x07, 1, 2, 0xEE],
+                date,
+            ),
+            (
+                "TIME",
+                EFI_IFR_TYPE_TIME,
+                &[15, 33, 34],
+                TypeValue::Time(Time::from_bytes([15, 33, 34])),
+            ),
+            (
+                "UINT8",
+                EFI_IFR_TYPE_NUM_SIZE_8,
+                &[7],
+                TypeValue::NumSize8(7),
+            ),
+        ];
+        for (name, value_type, value, want) in decoded {
+            let root = parse_form_set(&[form(1, &[one_of_option(5, value_type, value)])]);
+            let root = root.borrow();
+            let form_set = root.children[0].borrow();
+            let form = form_set.children[0].borrow();
+            let op = form.children[0].borrow();
+            let ParsedOperation::OneOfOption(option) = &op.parsed_data else {
+                panic!("{name}: option not decoded: {:?}", op.parsed_data);
+            };
+            assert_eq!(option.value, want, "{name}");
+        }
+
+        let short = [
+            (
+                "DATE of 3 bytes",
+                EFI_IFR_TYPE_DATE,
+                &[0xD4, 0x07, 1][..],
+                "9 bytes long, shorter than the 10",
+            ),
+            (
+                "DATE without bytes",
+                EFI_IFR_TYPE_DATE,
+                &[],
+                "6 bytes long, shorter than the 10",
+            ),
+            (
+                "TIME of 2 bytes",
+                EFI_IFR_TYPE_TIME,
+                &[15, 33],
+                "8 bytes long, shorter than the 9",
+            ),
+        ];
+        for (name, value_type, value, length) in short {
+            let (root, disabled) =
+                parse_form_set_dropping(&[form(1, &[one_of_option(5, value_type, value)])]);
+
+            let forms = root.borrow().children[0].borrow().children.len();
+            let reasons: Vec<&str> = disabled
+                .iter()
+                .map(|disabled| disabled.reason.as_str())
+                .collect();
+            assert!(
+                forms == 0
+                    && matches!(reasons.as_slice(), [reason] if reason.starts_with("the form 1 of")
+                    && reason.contains("EFI_IFR_ONE_OF_OPTION op at offset")
+                    && reason.ends_with(&format!(
+                        "{length} bytes required by its Type (UEFI 2.11 §33.3.8.3)"
+                    ))),
+                "{name}: {forms} forms, disabled: {reasons:?}"
+            );
+        }
     }
 }

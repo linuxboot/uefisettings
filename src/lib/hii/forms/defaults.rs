@@ -28,6 +28,7 @@ use super::conditions::ExpressionInputs;
 use super::conditions::QuestionValues;
 use super::conditions::Truth;
 use super::is_bit_varstore_guid;
+use super::question_values::QuestionKind;
 use super::storage::BufferQuestion;
 use super::storage::ValueLocation;
 use super::walk_scopes;
@@ -619,6 +620,29 @@ fn has_manufacturing_flag(question: &IFROperation, scope: &[Rc<RefCell<IFROperat
         })
 }
 
+/// Whether flagged EFI_IFR_ONE_OF_OPTIONs give a question of `op_code` a default: every question
+/// whose grammar nests `option` (question-option-list, UEFI 2.11 §33.2.5.4), as §33.2.5.8 lists
+/// them for any question and §33.2.5.5 makes a DEFAULT-flagged option "the option selected when
+/// the user asks for the defaults"; an ORDERED_LIST as "the default value for all Containers"
+/// (§33.2.5.4.8, is_ordered_list_default).
+fn takes_option_defaults(op_code: IFROpCode) -> bool {
+    match QuestionKind::of(op_code) {
+        Some(
+            QuestionKind::Value
+            | QuestionKind::Date
+            | QuestionKind::Time
+            | QuestionKind::String
+            | QuestionKind::OrderedList,
+        ) => true,
+        // its grammar nests options (§33.2.5.4.9), but edk2-stable202608
+        // HiiDatabaseDxe/ConfigRouting.c ParseIfrData gives it no default: "No default value for
+        // string." (:3135-3137)
+        Some(QuestionKind::Password) => false,
+        // their grammar nests no option (§33.2.5.4.10, §33.2.5.4.4)
+        Some(QuestionKind::Ref | QuestionKind::Action) | None => false,
+    }
+}
+
 /// Returns the question's default for `default_id`: EFI_IFR_DEFAULT, then a flagged
 /// EFI_IFR_ONE_OF_OPTION, then CHECKBOX Flags (UEFI 2.10 §33.3.8.3.9, §33.3.8.3.47). A flagged
 /// option of an ORDERED_LIST gives its Value's bytes, whatever SUPPRESS_IF is around it, as
@@ -651,7 +675,16 @@ fn default_for_id(
         DefaultId::MANUFACTURING => (EFI_IFR_OPTION_DEFAULT_MFG, EFI_IFR_CHECKBOX_DEFAULT_MFG),
         _ => return None,
     };
-    let option_default = scope.iter().find_map(|op| {
+    // As in edk2-stable202608: SetupBrowserDxe/Setup.c GetQuestionDefault takes the ALTCFG default
+    // first (:4449-4450) for storage other than EFI_HII_VARSTORE_EFI_VARIABLE (:4140), which
+    // HiiDatabaseDxe/ConfigRouting.c ParseIfrData builds from the flagged options of a DATE, TIME,
+    // NUMERIC, CHECKBOX, STRING or ONE_OF (:2929-3017, :3218-3235); only its fallback takes the
+    // options of a ONE_OF alone (:4525).
+    let option_scope = match takes_option_defaults(question.op_code) {
+        true => scope,
+        false => &[],
+    };
+    let option_default = option_scope.iter().find_map(|op| {
         let op = op.borrow();
         let ParsedOperation::OneOfOption(option) = &op.parsed_data else {
             return None;
@@ -678,8 +711,9 @@ fn default_for_id(
                 option_value(question, &op, option, inputs)
                     .map_err(DefaultError::OptionValue)
                     .and_then(|value| {
+                        // a DATE or TIME option's bytes, as an EFI_IFR_DEFAULT's
                         value
-                            .as_u64()
+                            .widened()
                             .map(TypedDefault::Number)
                             .ok_or(DefaultError::OptionType(option.value_type))
                     }),
@@ -1740,6 +1774,158 @@ mod tests {
                 [(DefaultId::STANDARD, want.map(str::to_owned))],
                 "{name}"
             );
+        }
+    }
+
+    /// A DATE and a TIME take the default of a flagged EFI_IFR_ONE_OF_OPTION, below an
+    /// EFI_IFR_DEFAULT, as UEFI 2.11 §33.2.5.8 lists them for any question, shown as the question
+    /// shows its value.
+    #[test]
+    fn flagged_date_and_time_options_give_defaults() {
+        // QF_TIME_SECOND_SUPPRESS
+        const SECOND_SUPPRESS: u8 = 0x04;
+        let date = |flags, value: &[u8]| typed_option(5, flags, 0x06, value);
+        let time = |flags| typed_option(5, flags, 0x05, &[15, 33, 34]);
+        let stores = [default_store(0x0000), default_store(0x0001)];
+        let cases = [
+            (
+                "DATE option",
+                DATE,
+                0x00,
+                vec![date(0x10, &[0xD4, 0x07, 1, 2])],
+                " <IFR default: 2004-01-02>",
+                vec![(DefaultId::STANDARD, "2004-01-02")],
+            ),
+            (
+                "manufacturing DATE option",
+                DATE,
+                0x00,
+                vec![date(0x20, &[0xE8, 0x07, 2, 0x1D])],
+                " <IFR default (DefaultId 0x0001): 2024-02-29>",
+                vec![(DefaultId::MANUFACTURING, "2024-02-29")],
+            ),
+            (
+                "DEFAULT beats DATE option",
+                DATE,
+                0x00,
+                vec![
+                    date(0x10, &[0xD4, 0x07, 1, 2]),
+                    typed_default(0x0000, 0x06, &[0xE8, 0x07, 2, 0x1D]),
+                ],
+                " <IFR default: 2024-02-29>",
+                vec![(DefaultId::STANDARD, "2024-02-29")],
+            ),
+            (
+                "TIME option",
+                TIME,
+                0x00,
+                vec![time(0x10)],
+                " <IFR default: 15:33:34>",
+                vec![(DefaultId::STANDARD, "15:33:34")],
+            ),
+            (
+                "manufacturing TIME option",
+                TIME,
+                0x00,
+                vec![time(0x20)],
+                " <IFR default (DefaultId 0x0001): 15:33:34>",
+                vec![(DefaultId::MANUFACTURING, "15:33:34")],
+            ),
+            (
+                "TIME option of a TIME that suppresses its second",
+                TIME,
+                SECOND_SUPPRESS,
+                vec![time(0x10)],
+                " <IFR default: 15:33:-->",
+                vec![(DefaultId::STANDARD, "15:33:--")],
+            ),
+            (
+                "DEFAULT beats TIME option",
+                TIME,
+                0x00,
+                vec![time(0x10), typed_default(0x0000, 0x05, &[1, 2, 3])],
+                " <IFR default: 01:02:03>",
+                vec![(DefaultId::STANDARD, "01:02:03")],
+            ),
+            (
+                "DEFAULT of a TIME beside its option of both flags",
+                TIME,
+                0x00,
+                vec![time(0x30), typed_default(0x0001, 0x05, &[1, 2, 3])],
+                " <IFR default: 15:33:34>",
+                vec![
+                    (DefaultId::STANDARD, "15:33:34"),
+                    (DefaultId::MANUFACTURING, "01:02:03"),
+                ],
+            ),
+        ];
+        for (name, op_code, flags, children, suffix, defaults) in cases {
+            let (_root, node) = parse_question(&stores, op_code, &date_time(0, flags), &children);
+            let question = question_descriptor(&node, unavailable());
+            let got: Vec<(DefaultId, String)> = question
+                .defaults
+                .iter()
+                .map(|default| (default.default_id, default.value.to_string()))
+                .collect();
+            let want: Vec<(DefaultId, String)> = defaults
+                .into_iter()
+                .map(|(default_id, value)| (default_id, value.to_string()))
+                .collect();
+
+            assert_eq!(question.value, format!("{UNAVAILABLE}{suffix}"), "{name}");
+            assert_eq!(got, want, "{name}: defaults");
+        }
+    }
+
+    /// A flagged EFI_IFR_ONE_OF_OPTION of another Type than its question's value gives the default
+    /// that an EFI_IFR_DEFAULT of its Type and Value gives (TypeValue::widened), as edk2-stable202608
+    /// HiiDatabaseDxe/ConfigRouting.c copies the option's Value bytes into a default (:3235).
+    #[test]
+    fn options_of_another_type_give_defaults_as_an_ifr_default_of_it() {
+        let date = (0x06, &[0xD4, 0x07, 1, 2][..]);
+        let time = (0x05, &[15, 33, 34][..]);
+        let cases = [
+            (
+                "UINT8 ONE_OF with a DATE option",
+                ONE_OF,
+                one_of_data(),
+                date,
+                "-44 (no matching option)",
+            ),
+            (
+                "CHECKBOX with a DATE option",
+                CHECKBOX,
+                checkbox(0, 0x00),
+                date,
+                "1",
+            ),
+            (
+                "DATE with a TIME option",
+                DATE,
+                date_time(0, 0x00),
+                time,
+                "8463-34-00",
+            ),
+        ];
+        for (name, op_code, data, (value_type, value), want) in cases {
+            let default_of = |children: &[Vec<u8>]| {
+                let (_root, node) = parse_question(&[], op_code, &data, children);
+                let defaults: Vec<(DefaultId, String)> = question_descriptor(&node, unavailable())
+                    .defaults
+                    .iter()
+                    .map(|default| (default.default_id, default.value.to_string()))
+                    .collect();
+                defaults
+            };
+
+            let flagged = default_of(&[typed_option(5, 0x10, value_type, value)]);
+            let declared = default_of(&[
+                typed_option(5, 0x00, value_type, value),
+                typed_default(0x0000, value_type, value),
+            ]);
+
+            assert_eq!(flagged, [(DefaultId::STANDARD, want.to_string())], "{name}");
+            assert_eq!(flagged, declared, "{name}: as an EFI_IFR_DEFAULT");
         }
     }
 }
