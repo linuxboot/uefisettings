@@ -25,13 +25,17 @@ use anyhow::Result;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
-use uefisettings::exports::identify_machine;
+use uefisettings::exports::identify_machine_using;
 use uefisettings::exports::DumpEfivarsOptions;
 use uefisettings::exports::EfivarDump;
+use uefisettings::exports::EfivarMemory;
 use uefisettings::exports::EfivarRedaction;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
+use uefisettings::exports::HiiMethod;
+use uefisettings::exports::HiiSource;
+use uefisettings::exports::HiiSourceOptions;
 use uefisettings::exports::IloBackend;
 use uefisettings::exports::SetOptions;
 use uefisettings::exports::SettingsBackend;
@@ -42,6 +46,7 @@ use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::MAX_SECRET_LEN;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
+use uefisettings_backend_thrift::SetResponseList;
 
 use crate::extract_db_report;
 use crate::hii_get;
@@ -49,6 +54,9 @@ use crate::hii_set;
 use crate::print_line;
 use crate::print_with_style;
 use crate::write_extracted_db;
+use crate::EfivarMemoryArg;
+use crate::HiiSourceArg;
+use crate::HiiSourceArgs;
 use crate::JsonArgs;
 use crate::SelectionArgs;
 use crate::SetIncludeState;
@@ -59,6 +67,29 @@ pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the
 pub(super) const GET_ABOUT: &str = "Auto-identify backend and get the current value of a question";
 /// The about of top-level set, which writes this machine's backend.
 pub(super) const SET_ABOUT: &str = "Auto-identify backend and set/change the value of a question";
+
+/// The help of --hii-source.
+pub(super) const HII_SOURCE_HELP: &str =
+    "Where the commands read this machine's HiiDB, where no HiiDB file or efivars dump gives one";
+/// The help of --efivar-memory.
+pub(super) const EFIVAR_MEMORY_HELP: &str =
+    "The memory that the efivar method of --hii-source may read";
+
+/// The HiiDB source that `args` name.
+fn hii_source_options(args: &HiiSourceArgs) -> HiiSourceOptions {
+    let mut options = HiiSourceOptions::default();
+    options.source = match args.hii_source {
+        HiiSourceArg::Auto => HiiSource::Auto,
+        HiiSourceArg::Efivar => HiiSource::Method(HiiMethod::Efivar),
+        HiiSourceArg::Acpi => HiiSource::Method(HiiMethod::Acpi),
+        HiiSourceArg::Systab => HiiSource::Method(HiiMethod::Systab),
+    };
+    options.efivar_memory = match args.efivar_memory {
+        EfivarMemoryArg::Runtime => EfivarMemory::Runtime,
+        EfivarMemoryArg::FirmwareReserved => EfivarMemory::FirmwareReserved,
+    };
+    options
+}
 
 /// Logs as RUST_LOG says.
 pub(super) fn init_logging() {
@@ -78,7 +109,7 @@ pub(super) enum PlatformCommands {
 }
 
 impl PlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, source: &HiiSourceArgs) -> Result<()> {
         match self {
             Self::Ilo(ilo_command) => match &ilo_command.command {
                 IloSubcommands::Get { question, output } => {
@@ -103,7 +134,7 @@ impl PlatformCommands {
                 }
             },
             Self::Identify { output } => {
-                let machine = identify_machine();
+                let machine = identify_machine_using(&hii_source_options(source));
                 print_with_style(machine, output.json)?;
             }
         }
@@ -173,10 +204,12 @@ pub(super) enum HiiPlatformCommands {
 }
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, source: &HiiSourceArgs) -> Result<()> {
         match self {
             Self::ExtractDB { filename } => {
-                write_extracted_db(filename, || HiiBackend::extract_db().map(|res| res.db))?;
+                write_extracted_db(filename, || {
+                    HiiBackend::extract_db_from(&hii_source_options(source)).map(|res| res.db)
+                })?;
 
                 print_line(format_args!("{}", extract_db_report(filename)))?;
             }
@@ -191,7 +224,7 @@ impl HiiPlatformCommands {
                     false => EfivarRedaction::DecodedBytes,
                 };
                 let dump = HiiBackend::dump_efivars(
-                    &hiidb.read(&EfivarSource::System)?,
+                    &hiidb.read(&EfivarSource::System, source)?,
                     directory,
                     &options,
                 )?;
@@ -221,9 +254,13 @@ pub(super) struct HiiDbArgs {
 
 impl HiiDbArgs {
     /// The HiiDB: the file, else the one in `efivars` if dump-efivars wrote it, else this
-    /// machine's.
-    pub(super) fn read(&self, efivars: &EfivarSource) -> Result<Vec<u8>> {
-        HiiBackend::read_hiidb(self.filename.as_deref(), efivars)
+    /// machine's, read as `source` says.
+    pub(super) fn read(&self, efivars: &EfivarSource, source: &HiiSourceArgs) -> Result<Vec<u8>> {
+        HiiBackend::read_hiidb_from(
+            self.filename.as_deref(),
+            efivars,
+            &hii_source_options(source),
+        )
     }
 }
 
@@ -286,9 +323,15 @@ where
     }
 }
 
-/// get, on this machine's backend.
-pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) -> Result<()> {
-    let machine = identify_machine();
+/// get, on this machine's backend, whose HiiDB it reads as `source` says.
+pub(super) fn auto_get(
+    question: &str,
+    json: bool,
+    selection: &SelectionArgs,
+    source: &HiiSourceArgs,
+) -> Result<()> {
+    let options = hii_source_options(source);
+    let machine = identify_machine_using(&options);
     if machine.backend.contains(&Backend::Unknown) {
         return Err(anyhow!("unknown backend"));
     }
@@ -298,7 +341,7 @@ pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) ->
         print_with_style(res, json)?;
     } else {
         hii_get(
-            &HiiBackend::read_hiidb(None, &EfivarSource::System)?,
+            &HiiBackend::read_hiidb_from(None, &EfivarSource::System, &options)?,
             question,
             &GetOptions::from(selection),
             json,
@@ -321,15 +364,16 @@ impl VolatileArgs {
     }
 }
 
-/// set, on this machine's backend.
+/// set, on this machine's backend, whose HiiDB it reads as `source` says.
 pub(super) fn auto_set(
     question: &str,
     value: &str,
     json: bool,
     selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
+    source: &HiiSourceArgs,
 ) -> Result<()> {
-    let machine = identify_machine();
+    let machine = identify_machine_using(&hii_source_options(source));
     if machine.backend.contains(&Backend::Unknown) {
         return Err(anyhow!("unknown backend"));
     }
@@ -338,9 +382,19 @@ pub(super) fn auto_set(
         let res = IloBackend::set(question, value, None)?;
         print_with_style(res, json)?;
     } else {
-        hii_set(question, value, options, json)?;
+        hii_set(question, value, options, json, source)?;
     }
     Ok(())
+}
+
+/// HiiBackend::set_using, in this machine's HiiDB read as `source` says.
+pub(super) fn set_using(
+    question: &str,
+    value: &str,
+    options: &SetOptions,
+    source: &HiiSourceArgs,
+) -> Result<SetResponseList> {
+    HiiBackend::set_from(question, value, None, options, &hii_source_options(source))
 }
 
 /// The bytes of the file `path`, the payload of capsule deliver or variable write-signed.
@@ -430,6 +484,51 @@ mod tests {
     use crate::tests::READING_COMMANDS;
     use crate::HiiSubcommands;
     use crate::UefiSettingsToolArgs;
+
+    /// The flags name the library's HiiDB source: the automatic order or one method, and the
+    /// memory of the efivar method, also after a hii command.
+    #[test]
+    fn hii_source_options_follow_the_flags() {
+        use EfivarMemory::FirmwareReserved;
+        use EfivarMemory::Runtime;
+        for (args, source, memory) in [
+            (vec![], HiiSource::Auto, Runtime),
+            (vec!["--hii-source", "auto"], HiiSource::Auto, Runtime),
+            (
+                vec!["--hii-source", "acpi"],
+                HiiSource::Method(HiiMethod::Acpi),
+                Runtime,
+            ),
+            (
+                vec![
+                    "--hii-source",
+                    "efivar",
+                    "--efivar-memory",
+                    "firmware-reserved",
+                ],
+                HiiSource::Method(HiiMethod::Efivar),
+                FirmwareReserved,
+            ),
+            (
+                vec!["--hii-source", "systab"],
+                HiiSource::Method(HiiMethod::Systab),
+                Runtime,
+            ),
+            (vec!["--efivar-memory", "runtime"], HiiSource::Auto, Runtime),
+        ] {
+            let argv = [&["uefisettings", "hii", "extract-db", "db.bin"][..], &args].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
+
+            let options = hii_source_options(&parsed.hii_source);
+
+            assert_eq!(
+                (options.source, options.efivar_memory),
+                (source, memory),
+                "{args:?}"
+            );
+        }
+    }
 
     /// refuse_on_ilo names the flags that apply to the HII backend only, of which Ilo attributes
     /// take none, and passes no flag.

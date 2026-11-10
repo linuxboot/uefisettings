@@ -49,6 +49,8 @@ json-config-data-vamap	/publish-hiidb.efi json-config-data	-	capsule_config_data
 json-config-data-past-region	/publish-hiidb.efi json-config-data-past-region	-	capsule_config_data/refuses_a_table_past_its_region	-
 json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services	-	capsule_config_data/refuses_a_table_in_boot_services_data	-
 json-config-data-mmio	/publish-hiidb.efi json-config-data-mmio	-	capsule_config_data/refuses_a_table_in_memory_mapped_io	-
+hii-systab	/DriverSample.efi;/publish-hiidb.efi install-config-tables	my-ifr-nv-data.json	hii_systab	-
+hii-systab-vamap	/DriverSample.efi;/publish-hiidb.efi install-config-tables	my-ifr-nv-data.json	hii_systab	kernel=vamap arch=aarch64
 shell-json-config-data	/publish-hiidb.efi json-config-data	-	shell:json-config-data	-
 shell-json-config-data-past-region	/publish-hiidb.efi json-config-data-past-region	-	shell:json-config-data-refused	-
 shell-json-config-data-boot-services	/publish-hiidb.efi json-config-data-boot-services	-	shell:json-config-data-refused	-

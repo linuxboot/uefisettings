@@ -23,10 +23,19 @@ use clap::Subcommand;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::HiiBackend;
 
+use crate::HiiSourceArgs;
+
 /// The about of hii, whose commands read a HiiDB file or an efivars dump, and no EFI variables of
 /// this machine.
 pub(super) const HII_ABOUT: &str =
     "Commands which read a UEFI HiiDB file or an efivars dump, and no EFI variables of this machine";
+
+/// The help of --hii-source, which this build ignores.
+pub(super) const HII_SOURCE_HELP: &str =
+    "Accepted as on Linux, and ignored: this build reads only HiiDB files and efivars dumps";
+/// The help of --efivar-memory, which this build ignores.
+pub(super) const EFIVAR_MEMORY_HELP: &str =
+    "Accepted as on Linux, and ignored: this build reads only HiiDB files and efivars dumps";
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
@@ -36,7 +45,7 @@ pub(super) fn init_logging() {}
 pub(super) enum PlatformCommands {}
 
 impl PlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
         match *self {}
     }
 }
@@ -46,7 +55,7 @@ impl PlatformCommands {
 pub(super) enum HiiPlatformCommands {}
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
         match *self {}
     }
 }
@@ -62,8 +71,9 @@ pub(super) struct HiiDbArgs {
 }
 
 impl HiiDbArgs {
-    /// The HiiDB: the file, else the one in `efivars` if dump-efivars wrote it.
-    pub(super) fn read(&self, efivars: &EfivarSource) -> Result<Vec<u8>> {
+    /// The HiiDB: the file, else the one in `efivars` if dump-efivars wrote it, whatever
+    /// `_source` names.
+    pub(super) fn read(&self, efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
         HiiBackend::read_hiidb(self.filename.as_deref(), efivars)
     }
 }
@@ -79,8 +89,8 @@ pub(super) struct ListStringsHiiDbArgs {
 }
 
 impl ListStringsHiiDbArgs {
-    /// The HiiDB in the file, whatever `_efivars` names.
-    pub(super) fn read(&self, _efivars: &EfivarSource) -> Result<Vec<u8>> {
+    /// The HiiDB in the file, whatever `_efivars` and `_source` name.
+    pub(super) fn read(&self, _efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
         HiiBackend::read_hiidb_file(&self.filename)
     }
 }
@@ -242,7 +252,7 @@ mod tests {
             let source = efivars.source().expect("name the source");
 
             let error = hiidb
-                .read(&source)
+                .read(&source, &HiiSourceArgs::default())
                 .expect_err("read the HiiDB of a directory that no dump wrote");
 
             let message = error.to_string();

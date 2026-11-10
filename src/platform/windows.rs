@@ -32,12 +32,14 @@ use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::MAX_SECRET_LEN;
+use uefisettings_backend_thrift::SetResponseList;
 
 use crate::extract_db_report;
 use crate::hii_get;
 use crate::hii_set;
 use crate::print_line;
 use crate::write_extracted_db;
+use crate::HiiSourceArgs;
 use crate::SelectionArgs;
 use crate::SetIncludeState;
 
@@ -48,6 +50,13 @@ pub(super) const GET_ABOUT: &str = "Get the current value of a question";
 /// The about of top-level set, which writes this machine's variables, as hii set does.
 pub(super) const SET_ABOUT: &str = "Set/change the value of a question";
 
+/// The help of --hii-source, which this build ignores.
+pub(super) const HII_SOURCE_HELP: &str =
+    "Accepted as on Linux, and ignored: this build reads the HiiDB through the HiiDB driver";
+/// The help of --efivar-memory, which this build ignores.
+pub(super) const EFIVAR_MEMORY_HELP: &str =
+    "Accepted as on Linux, and ignored: this build reads the HiiDB through the HiiDB driver";
+
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
 
@@ -56,7 +65,7 @@ pub(super) fn init_logging() {}
 pub(super) enum PlatformCommands {}
 
 impl PlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
         match *self {}
     }
 }
@@ -70,7 +79,7 @@ pub(super) enum HiiPlatformCommands {
 }
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
         match self {
             Self::ExtractDB { filename } => {
                 write_extracted_db(filename, HiiBackend::export_hiidb)?;
@@ -96,8 +105,9 @@ pub(super) struct HiiDbArgs {
 }
 
 impl HiiDbArgs {
-    /// The HiiDB: the file, else this machine's, through the HiiDB driver.
-    pub(super) fn read(&self, efivars: &EfivarSource) -> Result<Vec<u8>> {
+    /// The HiiDB: the file, else this machine's, through the HiiDB driver, whatever `_source`
+    /// names.
+    pub(super) fn read(&self, efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
         HiiBackend::read_hiidb(self.filename.as_deref(), efivars)
     }
 }
@@ -135,7 +145,12 @@ impl SetupPasswordArgs {
 }
 
 /// get, in this machine's HiiDB.
-pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) -> Result<()> {
+pub(super) fn auto_get(
+    question: &str,
+    json: bool,
+    selection: &SelectionArgs,
+    _source: &HiiSourceArgs,
+) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
         question,
@@ -165,8 +180,19 @@ pub(super) fn auto_set(
     json: bool,
     _selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
+    source: &HiiSourceArgs,
 ) -> Result<()> {
-    hii_set(question, value, options, json)
+    hii_set(question, value, options, json, source)
+}
+
+/// HiiBackend::set_using, whatever `_source` names.
+pub(super) fn set_using(
+    question: &str,
+    value: &str,
+    options: &SetOptions,
+    _source: &HiiSourceArgs,
+) -> Result<SetResponseList> {
+    HiiBackend::set_using(question, value, None, options)
 }
 
 /// The bytes of the file `path`, the payload of variable write-signed.

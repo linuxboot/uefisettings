@@ -58,10 +58,12 @@ use uefisettings::secret_file::ShellConsole;
 use uefisettings::secret_file::ShellStdin;
 use uefisettings::secret_file::StdinClaim;
 use uefisettings::secret_file::MAX_SECRET_LEN;
+use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii_get;
 use crate::hii_set;
 use crate::variable_command::print_info;
+use crate::HiiSourceArgs;
 use crate::SelectionArgs;
 use crate::SetIncludeState;
 
@@ -72,6 +74,13 @@ pub(super) const GET_ABOUT: &str = "Get the current value of a question";
 /// The about of top-level set, which writes this firmware's HII database, as hii set does.
 pub(super) const SET_ABOUT: &str = "Set/change the value of a question";
 
+/// The help of --hii-source, which this build ignores.
+pub(super) const HII_SOURCE_HELP: &str =
+    "Accepted as on Linux, and ignored: this build reads the HiiDB by the HII Database Protocol";
+/// The help of --efivar-memory, which this build ignores.
+pub(super) const EFIVAR_MEMORY_HELP: &str =
+    "Accepted as on Linux, and ignored: this build reads the HiiDB by the HII Database Protocol";
+
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
 
@@ -80,7 +89,7 @@ pub(super) fn init_logging() {}
 pub(super) enum PlatformCommands {}
 
 impl PlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
         match *self {}
     }
 }
@@ -99,7 +108,7 @@ pub(super) enum HiiPlatformCommands {
 }
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
         match self {
             Self::VariableInfo { name, guid } => print_info(name, guid),
         }
@@ -117,8 +126,8 @@ pub(super) type ListStringsHiiDbArgs = HiiDbArgs;
 pub(super) struct HiiDbArgs {}
 
 impl HiiDbArgs {
-    /// The HiiDB of this firmware, whatever `_efivars` names.
-    pub(super) fn read(&self, _efivars: &EfivarSource) -> Result<Vec<u8>> {
+    /// The HiiDB of this firmware, whatever `_efivars` and `_source` name.
+    pub(super) fn read(&self, _efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
         HiiBackend::export_hiidb()
     }
 }
@@ -180,7 +189,12 @@ impl VolatileArgs {
 }
 
 /// get, in this firmware's HII database.
-pub(super) fn auto_get(question: &str, json: bool, selection: &SelectionArgs) -> Result<()> {
+pub(super) fn auto_get(
+    question: &str,
+    json: bool,
+    selection: &SelectionArgs,
+    _source: &HiiSourceArgs,
+) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
         question,
@@ -196,8 +210,19 @@ pub(super) fn auto_set(
     json: bool,
     _selection: &SelectionArgs<SetIncludeState>,
     options: &SetOptions,
+    source: &HiiSourceArgs,
 ) -> Result<()> {
-    hii_set(question, value, options, json)
+    hii_set(question, value, options, json, source)
+}
+
+/// HiiBackend::set_using, whatever `_source` names.
+pub(super) fn set_using(
+    question: &str,
+    value: &str,
+    options: &SetOptions,
+    _source: &HiiSourceArgs,
+) -> Result<SetResponseList> {
+    HiiBackend::set_using(question, value, None, options)
 }
 
 /// The claim on standard input that every secret flag of the command shares.

@@ -93,3 +93,7 @@ required-features = ["test-vm"]
 [[test]]
 name = "capsule_results"
 required-features = ["test-vm"]
+
+[[test]]
+name = "hii_systab"
+required-features = ["test-vm"]

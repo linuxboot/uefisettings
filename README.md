@@ -137,7 +137,9 @@ Commands:
 
 `uefisettings.efi` runs `get`, `set`, `show-translations`, the `variable` and `capsule` commands
 and the `hii` commands but `extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots;
-it also reaches boot-service-only variables, and has no `-f` or `--efivars`.
+it also reaches boot-service-only variables, and has no `-f` or `--efivars`. It reads the HiiDB
+through the HII Database Protocol, and accepts `--hii-source` and `--efivar-memory` only to ignore
+them.
 
 ```sh
 rustup target add x86_64-unknown-uefi  # or i686-unknown-uefi, aarch64-unknown-uefi
@@ -162,7 +164,8 @@ environment calls, which enable the SeSystemEnvironmentPrivilege. The privilege 
 be assigned to the process token; running elevated alone does not guarantee it.
 Pass `--no-efivars` to read no variables. No driver is shipped with this repository,
 and none has been tested here. Without a driver, `-f` still reads a HiiDB file, and,
-when such a driver is installed, `hii extract-db` writes its HiiDB to a file.
+when such a driver is installed, `hii extract-db` writes its HiiDB to a file. `--hii-source` and
+`--efivar-memory` are accepted and ignored.
 `variable list` and `variable storage` fail there: the firmware environment calls reach a
 variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
 reach EFI variables only. `capsule config-data` and `capsule result-table` fail too:
@@ -178,7 +181,8 @@ and writes nothing: `hii get`, `hii list-questions` and `hii show-ifr` read ques
 an efivars dump that `hii dump-efivars` wrote on Linux (`--efivars DIR`, with its HiiDB unless
 `-f` names one) or from none (`--no-efivars`, with `-f`), and `hii list-strings` reads the HiiDB
 file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `variable`, `capsule`, `hii set`,
-`hii extract-db` or `hii dump-efivars`. Dumps: see the [appendix](#appendix).
+`hii extract-db` or `hii dump-efivars`; it accepts `--hii-source` and `--efivar-memory` and ignores
+them. Dumps: see the [appendix](#appendix).
 
 ---
 
@@ -198,9 +202,12 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
 
 ### For OCP hardware
 
-* Extract HiiDB. Linux exposes no file that holds it, and `/sys/firmware/efi/systab` does not list its address, so the OCP way is to read the physical address and length from the `HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0` efivar and then read that memory from `/dev/mem`, only from an EFI runtime region of the firmware's memory map, and only once the kernel lockdown mode, which needs securityfs mounted, allows `/dev/mem`.
-* If the firmware publishes a copy of the HiiDB as the vendor ACPI table `QHII` or `HIID`, `uefisettings` reads it from `/sys/firmware/acpi/tables/QHII`, else from `/sys/firmware/acpi/tables/HIID` (skip the 36-byte ACPI header), without `/dev/mem`, moving on past tables that are absent or fail their checks; it takes the OCP way only where no table gives the database. This is the way where `/dev/mem` cannot reach the database (e.g. aarch64, whose EFI runtime memory is `nomap`).
-* Where neither way gives the database, `uefisettings` reads, on x86, x86_64 and aarch64, the HII database export that the firmware lists as the EFI configuration table of `EFI_HII_DATABASE_PROTOCOL_GUID` (UEFI 2.11 §33.2.11.1), from `/dev/mem`.
+* Extract HiiDB. Linux exposes no file that holds it, and `/sys/firmware/efi/systab` does not list its address, so `uefisettings` reads it in one of three ways, which `--hii-source` names; by default (`--hii-source auto`) it tries them in this order:
+  * `acpi`: if the firmware publishes a copy of the HiiDB as the vendor ACPI table `QHII` or `HIID`, `uefisettings` reads it from `/sys/firmware/acpi/tables/QHII`, else from `/sys/firmware/acpi/tables/HIID` (skip the 36-byte ACPI header), without `/dev/mem`, moving on past tables that are absent or fail their checks. This is the way that needs no `/dev/mem`, so it reads under kernel lockdown too.
+  * `efivar`, the OCP way: read the physical address and length from the `HiiDB-1b838190-4625-4ead-abc9-cd5e6af18fe0` efivar and then read that memory from `/dev/mem`, only from an EFI runtime region of the firmware's memory map (with `--efivar-memory firmware-reserved`, from one firmware-reserved region of it instead: Reserved or ACPI Non-volatile Storage on x86, reserved, runtime services, ACPI NVS or PAL code memory on aarch64, never one that touches runtime memory-mapped I/O), and only once the kernel lockdown mode, which needs securityfs mounted, allows `/dev/mem`.
+  * `systab`, on x86, x86_64 and aarch64: read the HII database export that the firmware lists as the EFI configuration table of `EFI_HII_DATABASE_PROTOCOL_GUID` (UEFI 2.11 §33.2.11.1), as EDK2 does where `PcdHiiOsRuntimeSupport` is TRUE, from `/dev/mem`, as `capsule config-data` reads its table: the package lists from the buffer's start up to a package list header of zeros, which EDK2 leaves after them, refusing fewer zero bytes than a header before other bytes, which EDK2's export into its old buffer can leave, or up to the end of the buffer's EFI runtime region, each whole inside that region and ending with an EFI_HII_PACKAGE_END package exactly at its PackageLength (UEFI 2.11 §33.3.1.1), which the other ways do not require, at most 16 MiB in all. It takes the table's address as physical first, then as virtual. It does not support Xen: on aarch64, where `/chosen` has no `linux,uefi-system-table` and `/hypervisor/uefi` holds Xen's `xen,uefi-system-table`, it fails. On x86 it reads only where Linux exports /sys/firmware/efi/runtime-map (CONFIG_EFI_RUNTIME_MAP, which CONFIG_EFI selects with CONFIG_KEXEC_CORE: Linux v6.11 arch/x86/Kconfig:2001, :2054), which bounds its reads.
+
+  `auto` moves on while a way finds its source absent (no vendor ACPI table file, no `HiiDB` variable, no EFI System Table that Linux locates, as on a BIOS boot or an aarch64 boot without UEFI, or no such configuration table) or fails otherwise, such as a table that fails its checks or a missing memory map, and stops at a refusal: kernel lockdown, the kernel refusing `/dev/mem` or `/proc/kcore` (no `CAP_SYS_RAWIO`, `CONFIG_STRICT_DEVMEM`), or a file that the user may not read. Its error names each way that it tried, in order, with why, absent apart from refused; with `RUST_LOG=warn`, `uefisettings` logs each way that failed before the one that gave the HiiDB, and with `RUST_LOG=debug` also that way. A named way is the only one tried. `identify` checks the same ways for the HII backend: it finds none where each way finds its source absent, and assumes it, with a warning that `RUST_LOG=warn` shows, where a way's check fails or is refused, such as under kernel lockdown or without `CAP_SYS_RAWIO`. `--hii-source` and `--efivar-memory` may also follow the command; the UEFI Shell, Windows and macOS builds accept both and ignore them.
 * Library (`hii`) in Rust partially implements the UEFI Hii specification.
 * It parses the HiiDB op-codes into a DOM tree like representation which can be read by machines and humans.
 * It can ask questions about UEFI settings from HiiDB and get their answers.
@@ -283,8 +290,9 @@ uefisettings hii dump-efivars -f hiidb.bin efivars
 uefisettings hii list-questions --efivars efivars
 ```
 
-`extract-db` reads the HiiDB from the vendor ACPI table `QHII` or `HIID` or, failing that, from
-/dev/mem; either needs root (the table is root-only, /dev/mem needs CAP_SYS_RAWIO).
+`extract-db` reads the HiiDB as `--hii-source` says, by default from the vendor ACPI table `QHII`
+or `HIID` or, failing that, from /dev/mem; each needs root (the table is root-only, /dev/mem needs
+CAP_SYS_RAWIO).
 `dump-efivars -f` reads only efivarfs, whose files every user can read, so run it unprivileged:
 as root, it would leave a directory that only root can read.
 

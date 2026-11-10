@@ -180,7 +180,9 @@ creates, the second with a PASSWORD and an op shorter than its minimum, which UE
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
-set to FALSE. No scenario boots it.
+set to FALSE. The scenario `hii-systab` and, on aarch64 with `kernel=vamap`, `hii-systab-vamap`
+check that the Linux build reads it with `--hii-source systab` and in the automatic order, where
+the vendor ACPI tables and the `HiiDB` variable report their sources absent.
 
 `publish-hiidb.efi rt-properties-no-set-variable` publishes nothing: it installs an
 `EFI_RT_PROPERTIES_TABLE` that lists every runtime service but `SetVariable()`, as firmware
