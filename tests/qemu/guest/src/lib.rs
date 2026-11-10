@@ -182,6 +182,13 @@ pub mod driver_sample {
     /// Offset of the 22-byte EFI_HII_REF of [`UPDATE_DEST`], RefData in DriverSample's
     /// NVDataStruc.h.
     pub const REF_DATA_OFFSET: usize = 127;
+    /// A STRING of MinSize 6 and MaxSize 40 whose INCONSISTENT_IF takes the text "STRING" alone
+    /// (Vfr.vfr, VfrStrings.uni STR_STRING_CHECK, edk2-stable202608).
+    pub const STRING: &str = "String - Interactive";
+    /// Offset of the 40 CHAR16s of [`STRING`], MyStringData in DriverSample's NVDataStruc.h.
+    pub const STRING_OFFSET: usize = 0;
+    /// A STRING of MinSize 2 and MaxSize 20 on DriverSample's name/value store, of no default.
+    pub const NAME_VALUE_STRING: &str = "NameValueVar2";
 }
 
 /// How a `uefisettings` run exited, and what it printed.

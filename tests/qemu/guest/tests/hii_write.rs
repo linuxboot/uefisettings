@@ -29,6 +29,7 @@ use uefisettings_qemu_guest::driver_sample::LOCKED;
 use uefisettings_qemu_guest::driver_sample::MATCH2;
 use uefisettings_qemu_guest::driver_sample::MATCH2_OFFSET;
 use uefisettings_qemu_guest::driver_sample::MATCH2_REASON;
+use uefisettings_qemu_guest::driver_sample::NAME_VALUE_STRING;
 use uefisettings_qemu_guest::driver_sample::NUMERIC;
 use uefisettings_qemu_guest::driver_sample::NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::ONE_OF;
@@ -37,15 +38,19 @@ use uefisettings_qemu_guest::driver_sample::READ_ONLY_NUMERIC;
 use uefisettings_qemu_guest::driver_sample::READ_ONLY_NUMERIC_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT;
 use uefisettings_qemu_guest::driver_sample::SERIAL_PORT_OFFSET;
+use uefisettings_qemu_guest::driver_sample::STRING;
+use uefisettings_qemu_guest::driver_sample::STRING_OFFSET;
 use uefisettings_qemu_guest::driver_sample::SYSTEM_DATE;
 use uefisettings_qemu_guest::driver_sample::SYSTEM_TIME;
 use uefisettings_qemu_guest::driver_sample::UPDATE_DEST;
+use uefisettings_qemu_guest::json;
 use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::variable_bytes;
 use uefisettings_qemu_guest::variable_data;
 use uefisettings_qemu_guest::ErrorObject;
+use uefisettings_qemu_guest::Question;
 use uefisettings_qemu_guest::Response;
 use uefisettings_qemu_guest::Responses;
 use uefisettings_qemu_guest::BACKEND_HII;
@@ -134,6 +139,83 @@ fn set_bit_field_numeric_is_refused() {
             "{prefix:?}"
         );
     }
+}
+
+/// set writes "STRING" into DriverSample's STRING [`STRING`], from its empty text, as UCS-2
+/// NULL-padded to its MaxSize 40 CHAR16s, and list-questions lists it then; it refuses 3
+/// characters, fewer than MinSize 6, and 40, which leave no CHAR16 for the NULL (UEFI 2.11
+/// §33.2.5.4.9), without a write.
+#[test]
+fn set_string_is_stored() {
+    let (got, _) = single_response(&["hii", "get", STRING, "--json"], BACKEND_HII);
+    assert_eq!(got.answer, "", "get before set: {got:#?}");
+
+    let changed = set(
+        DRIVER_SAMPLE_VARIABLE,
+        &["hii"],
+        STRING,
+        "STRING",
+        SELECTABLE,
+    );
+
+    let field: Vec<u8> = "STRING"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .chain([0; 68])
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            (STRING_OFFSET, 0x53),
+            (STRING_OFFSET + 2, 0x54),
+            (STRING_OFFSET + 4, 0x52),
+            (STRING_OFFSET + 6, 0x49),
+            (STRING_OFFSET + 8, 0x4E),
+            (STRING_OFFSET + 10, 0x47)
+        ],
+        "changed bytes"
+    );
+    assert_eq!(
+        driver_sample_data().get(STRING_OFFSET..STRING_OFFSET + 80),
+        Some(&field[..]),
+        "the 40 CHAR16s of {STRING}"
+    );
+    let questions: Vec<Question> = json(&["hii", "list-questions", "--json"]);
+    let listed: Vec<&str> = questions
+        .iter()
+        .filter(|question| question.name == STRING)
+        .map(|question| question.answer.as_str())
+        .collect();
+    assert_eq!(listed, ["STRING"], "list-questions");
+
+    assert_eq!(
+        refuse(&["hii"], STRING, "abc", &[]).error_message,
+        format!(
+            "cannot set question \"{STRING}\": the STRING takes at least 6 characters (MinSize), \
+             not 3"
+        ),
+        "set abc"
+    );
+    assert_eq!(
+        refuse(&["hii"], STRING, &"S".repeat(40), &[]).error_message,
+        format!(
+            "cannot set question \"{STRING}\": the STRING takes at most 39 characters, its last \
+             CHAR16 of MaxSize 40 holding the NULL (UEFI 2.11 §33.2.5.4.9), not 40"
+        ),
+        "set 40 characters"
+    );
+}
+
+/// get shows no value of DriverSample's STRING [`NAME_VALUE_STRING`], which only its
+/// EFI_HII_CONFIG_ACCESS_PROTOCOL reaches on its name/value store.
+#[test]
+fn get_of_a_name_value_string_is_unavailable() {
+    let (got, _) = single_response(&["hii", "get", NAME_VALUE_STRING, "--json"], BACKEND_HII);
+    assert_eq!(
+        got.answer,
+        "<ValueUnavailable: HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+        "{got:#?}"
+    );
 }
 
 #[test]
@@ -313,12 +395,20 @@ fn set_of_an_unknown_question_is_refused() {
 
 #[test]
 fn set_of_a_question_without_a_varstore_is_refused() {
-    let cases = [(
-        LOCKED,
-        "1",
-        &INCLUDE_GRAYED_OUT[..],
-        "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
-    )];
+    let cases = [
+        (
+            LOCKED,
+            "1",
+            &INCLUDE_GRAYED_OUT[..],
+            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
+        ),
+        (
+            NAME_VALUE_STRING,
+            "abc",
+            &[][..],
+            "HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL",
+        ),
+    ];
     for (question, answer, flags, reason) in cases {
         for prefix in PREFIXES {
             assert_eq!(

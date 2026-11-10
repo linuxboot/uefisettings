@@ -37,6 +37,18 @@ uefisettings.efi hii extract-db hiidb.bin
 echo uefisettings-shell: step extract-db %lasterror%
 dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
 echo uefisettings-shell: step dmpstore-negatives %lasterror%
+uefisettings.efi hii get --json "String - Interactive"
+echo uefisettings-shell: step get-string %lasterror%
+uefisettings.efi hii set --json "String - Interactive" STRING
+echo uefisettings-shell: step set-string %lasterror%
+dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
+echo uefisettings-shell: step dmpstore-string %lasterror%
+uefisettings.efi hii set --json "String - Interactive" abc
+echo uefisettings-shell: step set-string-short %lasterror%
+uefisettings.efi hii set --json "String - Interactive" SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS
+echo uefisettings-shell: step set-string-long %lasterror%
+dmpstore MyIfrNVData -guid A04A27F4-DF00-4D42-B552-39511302113D
+echo uefisettings-shell: step dmpstore-string-negatives %lasterror%
 uefisettings.efi hii get --json "Activate this check box" >v captured
 echo uefisettings-shell: step capture %lasterror%
 set

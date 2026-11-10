@@ -9,5 +9,7 @@ uefisettings.efi hii get --json "Activate this check box"
 echo uefisettings-shell: step get-check-box %lasterror%
 uefisettings.efi hii get --json "How tall are you? (Hex)"
 echo uefisettings-shell: step get-efi-var %lasterror%
+uefisettings.efi hii get --json "String - Interactive"
+echo uefisettings-shell: step get-string %lasterror%
 echo uefisettings-shell: done
 reset -s

@@ -45,6 +45,25 @@ extract-db	line	^error: unrecognized subcommand 'extract-db'$
 # no failed set wrote
 dmpstore-negatives	status	any
 dmpstore-negatives	same	dmpstore-after
+# the STRING "String - Interactive" of MinSize 6 and MaxSize 40 at byte 0 (Vfr.vfr, NVDataStruc.h,
+# edk2-stable202608), whose INCONSISTENT_IF takes "STRING" alone: set writes it NULL-padded, and
+# refuses 3 characters and 40, which leave no CHAR16 for the NULL; the checks of that reason stop
+# before its §, which the aarch64 console prints as ?
+get-string	status	0x0
+get-string	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == ""
+set-string	status	0x0
+set-string	json	.responses | length == 1 and .[0].selector == "A04A27F4-DF00-4D42-B552-39511302113D" and .[0].question.answer == "STRING" and .[0].modified == true
+dmpstore-string	status	any
+dmpstore-string	line	^Variable NV\+BS 'A04A27F4-DF00-4D42-B552-39511302113D:MyIfrNVData' DataSize = 0xDC$
+dmpstore-string	line	^  00000000: 53 00 54 00 52 00 49 00-4E 00 47 00 00 00 00 00
+dmpstore-string	line	^  00000040: 00 00 00 00 00 00 00 00-00 00 00 00 00 00 00 00
+set-string-short	status	aborted
+set-string-short	json	. == {"error_message": "cannot set question \"String - Interactive\": the STRING takes at least 6 characters (MinSize), not 3"}
+set-string-long	status	aborted
+set-string-long	json	.error_message | startswith("cannot set question \"String - Interactive\": the STRING takes at most 39 characters, its last CHAR16 of MaxSize 40 holding the NULL (UEFI 2.11 ")
+# no refused set of the STRING wrote
+dmpstore-string-negatives	status	any
+dmpstore-string-negatives	same	dmpstore-string
 # >v captures what the console shows
 capture	status	0x0
 capture	none	.
