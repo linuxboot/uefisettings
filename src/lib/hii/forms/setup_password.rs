@@ -125,6 +125,17 @@ struct PasswordSizes {
 struct PasswordFields {
     question: QuestionHeader,
     max_size: Result<u16, ParseError>,
+    header: HeaderPlace,
+}
+
+/// Where a PASSWORD op's question header lies.
+#[derive(Clone, Copy)]
+enum HeaderPlace {
+    /// In the op
+    InOp,
+    /// Past the op's Length, in the bytes of its form package after it, where edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c CreateQuestion (:119-124) reads it all the same
+    PastOp,
 }
 
 /// The bytes of the storage of a password of `max_size` CHAR16s: MaxSize × 2.
@@ -140,13 +151,23 @@ pub(super) fn password_storage_width(max_size: u16) -> u16 {
 }
 
 impl PasswordFields {
-    /// Those of the PASSWORD `op`, or why its question header does not parse.
+    /// Those of the PASSWORD `op`, its question header read past its Length where the op ends
+    /// before it (IFROperation::keep_header_past_length), or why that header does not parse, as
+    /// it runs past the form package. MaxSize is read from the op alone: one past its Length is
+    /// unknown, as for an op that ends before its MaxSize, so every byte from the VarOffset on is
+    /// withheld.
     fn of(op: &IFROperation) -> Result<Self, ParseError> {
-        let mut data = Cursor::new(&op.data);
-        let question = data.parse_ne()?;
+        let mut fields = Cursor::new([op.data.as_slice(), &op.header_past_length].concat());
+        let question = fields.parse_ne()?;
         Ok(Self {
             question,
-            max_size: data.parse_ne::<PasswordSizes>().map(|sizes| sizes.max_size),
+            max_size: fields
+                .parse_ne::<PasswordSizes>()
+                .map(|sizes| sizes.max_size),
+            header: match op.header_past_length.is_empty() {
+                true => HeaderPlace::InOp,
+                false => HeaderPlace::PastOp,
+            },
         })
     }
 
@@ -348,6 +369,22 @@ impl VarStoreIds {
         });
     }
 
+    /// The storage of every VARSTORE and VARSTORE_EFI here: the variables that they name, and
+    /// the Guids of those before UEFI 2.3.1, any variable of which a VarName may name.
+    fn storage(&self) -> DeclaredStorage {
+        let mut storage = DeclaredStorage::default();
+        for stores in self.0.values() {
+            let shared = &stores.shared;
+            storage
+                .variables
+                .extend(shared.in_form_sets.iter().chain(&shared.outside).cloned());
+            for &guid in stores.short_in_form_sets.union(&stores.short_outside) {
+                storage.guids.insert(Some(guid));
+            }
+        }
+        storage
+    }
+
     /// The SharedPasswords of each VarStoreId whose variables hold a password.
     fn into_shared(self) -> impl Iterator<Item = SharedPasswords> {
         self.0
@@ -491,18 +528,54 @@ impl PasswordQuestions {
             let op = node.borrow();
             let form_set = form_set_guid(&op).or(form_set);
             if op.op_code == IFROpCode::Password {
-                self.declared = true;
-                let (password, unresolved) = password_questions(node, &op, form_set, ids);
-                if let Some(password) = password {
-                    self.add_in_form_set(password, ids, strings);
-                }
-                if let Some(unresolved) = unresolved {
-                    self.add_unresolved(unresolved);
-                    self.candidates.extend(candidate_questions(&op));
-                }
+                self.add_form_set_password(node, &op, form_set, ids, strings);
             }
             Walk::Enter(form_set)
         });
+    }
+
+    /// Adds the PASSWORD `op` at `node`, of the FormSet `form_set`, with the VarStores of each
+    /// VarStoreId of its package list, `ids`, and its strings packages, `strings`. One whose
+    /// question header lies past its op is found by the Forms Browser in the VarStore of its id
+    /// that its FormSet declares, and by the Config Keyword Handler in the first VarStore of that
+    /// id in the form package (edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId,
+    /// :1520), so it is added as one outside any FormSet is (add_in_package_list) and is
+    /// unresolved; one whose header runs past the form package names no VarStore, so every
+    /// variable of each VarStore of its package list is withheld whole.
+    fn add_form_set_password(
+        &mut self,
+        node: &Rc<RefCell<IFROperation>>,
+        op: &IFROperation,
+        form_set: Option<Guid>,
+        ids: &mut VarStoreIds,
+        strings: &[StringPackage],
+    ) {
+        self.declared = true;
+        let password = match PasswordFields::of(op) {
+            Ok(password) => password,
+            Err(error) => {
+                self.storage.extend(&ids.storage());
+                let reason = error.to_string();
+                self.add_unresolved(UnresolvedPassword::NoHeader { form_set, reason });
+                return;
+            }
+        };
+        if let HeaderPlace::PastOp = password.header {
+            self.add_in_package_list(&password, ids, strings);
+            self.add_unresolved(UnresolvedPassword::HeaderPastOp {
+                form_set,
+                question_id: password.question.question_id,
+            });
+            return;
+        }
+        let (password, unresolved) = password_questions(node, password, form_set, ids);
+        if let Some(password) = password {
+            self.add_in_form_set(password, ids, strings);
+        }
+        if let Some(unresolved) = unresolved {
+            self.add_unresolved(unresolved);
+            self.candidates.extend(candidate_questions(op));
+        }
     }
 
     /// Adds `password`, of a FormSet: on the VarStore of its FormSet alone, if it has one, unless
@@ -553,7 +626,9 @@ impl PasswordQuestions {
     /// Handler skips it (ExtractConfigRequest). One whose op ends before its MaxSize keeps every
     /// byte from its VarOffset on, and from byte 0 of each such variable. One in ignored IFR
     /// (OutsideOp::in_ignored_ifr) is withheld so too, as the Keyword Handler finds it there, and
-    /// its record counts it already.
+    /// its record counts it already. One whose question header lies past its op is read there
+    /// (PasswordFields::of); one whose header runs past the form package names no VarStore, so
+    /// every variable of each VarStore of `list` is withheld whole.
     fn add_outside(
         &mut self,
         list: &ParsedPackageList,
@@ -563,19 +638,14 @@ impl PasswordQuestions {
         self.declared = true;
         match PasswordFields::of(&outside.op) {
             Ok(password) if password.question.var_store_id == 0 => return,
-            Ok(password) => {
-                if let Some(stores) = ids.0.get_mut(&password.question.var_store_id) {
-                    stores.shared.outside_passwords.push(password.bytes());
-                    self.candidates.extend(password.on_var_names(
-                        stores.short_in_form_sets.union(&stores.short_outside),
-                        &list.strings,
-                    ));
-                }
+            Ok(password) => self.add_in_package_list(&password, ids, &list.strings),
+            Err(error) => {
+                debug!(
+                    "PASSWORD op outside a FormSet, at offset {}: {error}",
+                    outside.offset
+                );
+                self.storage.extend(&ids.storage());
             }
-            Err(error) => debug!(
-                "PASSWORD op outside a FormSet, at offset {}: {error}",
-                outside.offset
-            ),
         }
         if !outside.in_ignored_ifr {
             self.add_unresolved(UnresolvedPassword::OutsideFormSet {
@@ -583,6 +653,28 @@ impl PasswordQuestions {
                 offset: outside.offset,
             });
         }
+    }
+
+    /// Adds `password`, whose VarStore is unknown, at its VarOffset in each VARSTORE and
+    /// VARSTORE_EFI of its VarStoreId in the package list whose VarStores are `ids`, and from
+    /// byte 0 of each variable that its VarName may name on a VARSTORE_EFI before UEFI 2.3.1 of
+    /// that id by the list's strings packages `strings`; none for VarStoreId 0, which names no
+    /// VarStore.
+    fn add_in_package_list(
+        &mut self,
+        password: &PasswordFields,
+        ids: &mut VarStoreIds,
+        strings: &[StringPackage],
+    ) {
+        let id = password.question.var_store_id;
+        let Some(stores) = ids.0.get_mut(&id).filter(|_| id != 0) else {
+            return;
+        };
+        stores.shared.outside_passwords.push(password.bytes());
+        self.candidates.extend(password.on_var_names(
+            stores.short_in_form_sets.union(&stores.short_outside),
+            strings,
+        ));
     }
 
     /// Adds the PASSWORD op `unresolved`, whose VarStore is unknown.
@@ -734,25 +826,15 @@ fn form_set_guid(op: &IFROperation) -> Option<Guid> {
 /// keeps such a question's value through callbacks or READ/WRITE ops (§33.2.5.6), in no variable
 /// that the IFR names. A FormSet without a VarStore of that id that names a variable leaves the
 /// password unresolved, as does an outside VARSTORE_NAME_VALUE or VARSTORE_EFI before UEFI 2.3.1 of
-/// that id, which names none. Its question header is read first: an op that ends before MaxSize
-/// still names its VarStore and VarOffset, so its question takes every byte from there on, and it
-/// is unresolved too.
+/// that id, which names none. Its fields `password` are read from its op: one that ends before
+/// MaxSize still names its VarStore and VarOffset, so its question takes every byte from there on,
+/// and it is unresolved too.
 fn password_questions(
     node: &Rc<RefCell<IFROperation>>,
-    op: &IFROperation,
+    password: PasswordFields,
     form_set: Option<Guid>,
     ids: &VarStoreIds,
 ) -> (Option<FormSetPassword>, Option<UnresolvedPassword>) {
-    let password = match PasswordFields::of(op) {
-        Ok(password) => password,
-        Err(error) => {
-            let reason = error.to_string();
-            return (
-                None,
-                Some(UnresolvedPassword::NoHeader { form_set, reason }),
-            );
-        }
-    };
     let header = &password.question;
     let no_max_size = password
         .max_size
@@ -821,6 +903,8 @@ fn candidate_questions(op: &IFROperation) -> Vec<PasswordQuestion> {
 /// A PASSWORD op whose VarStore is unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum UnresolvedPassword {
+    /// Its question header runs past its form package, so every variable of each VarStore of its
+    /// package list is withheld
     #[error(
         "PASSWORD op without a question header in FormSet {}: {reason}",
         FormSetName(*.form_set)
@@ -828,6 +912,17 @@ pub(crate) enum UnresolvedPassword {
     NoHeader {
         form_set: Option<Guid>,
         reason: String,
+    },
+    /// Its question header, past its op, names its bytes from VarOffset on in each VarStore of
+    /// its VarStoreId, which are withheld
+    #[error(
+        "PASSWORD question {question_id:#06x} in FormSet {}: its op ends before its question \
+         header, which edk2 reads from the bytes of the form package after it",
+        FormSetName(*.form_set)
+    )]
+    HeaderPastOp {
+        form_set: Option<Guid>,
+        question_id: u16,
     },
     /// Its question header names its bytes from VarOffset on, which are withheld
     #[error(
@@ -1253,7 +1348,8 @@ mod tests {
     }
 
     /// A PASSWORD op whose question header does not parse gives its reason on one line: the
-    /// fields being parsed, without the Rust source locations of binrw's backtrace frames.
+    /// fields being parsed, without the Rust source locations of binrw's backtrace frames. Here
+    /// the header runs past the form package, after the 4 bytes of the Ends there.
     #[test]
     fn a_headless_password_gives_its_reason_on_one_line() {
         let headless = password_questions(&[operation(PASSWORD, false, &[3, 0, 4, 0])]);
@@ -1262,7 +1358,7 @@ mod tests {
         };
         assert_eq!(
             reason,
-            "failed to fill whole buffer (While parsing field 'question_id' in QuestionHeader)",
+            "failed to fill whole buffer (While parsing field 'var_store_info' in QuestionHeader)",
             "headless"
         );
     }
@@ -2620,5 +2716,183 @@ mod tests {
             Ok(usize::from(count)),
             "AMITSESetup's withheld bytes"
         );
+    }
+
+    /// A PASSWORD op shorter than its question header keeps its password where edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c CreateQuestion (:119-124) reads that header whatever the op's
+    /// Length: in the bytes of the form package after it, here those of the SUBTITLE that follows,
+    /// VarStoreId 2 (AMITSESetup) and VarOffset 0. Its MaxSize lies past the op too, so through
+    /// variables that reach Runtime every byte of AMITSESetup from that VarOffset on is withheld,
+    /// and no byte of Setup, in a disabled form and outside any FormSet; through those that reach
+    /// BootServices it fails closed. As edk2-stable202608 ConfigKeywordHandler.c
+    /// FindStorageFromVarId (:1520) takes the first VarStore of its id in the form package, one of
+    /// that id in another FormSet keeps it too. At VarOffset 5 it is withheld from byte 5 on. A
+    /// header of VarStoreId 0 names no VarStore (IfrParse.c CreateQuestion, :126), so through
+    /// variables that reach Runtime no byte is withheld, not even of a VarStore that declares
+    /// that id.
+    #[test]
+    fn a_password_op_short_of_its_question_header_keeps_its_password_past_the_op() {
+        // the SUBTITLE's data is the rest of that header: VarStoreId, VarOffset and Flags
+        let short_at = |var_store_id: u8, var_offset: u8| {
+            [
+                operation(PASSWORD, false, &[3, 0, 4, 0]),
+                operation(SUBTITLE, false, &[var_store_id, 0, var_offset, 0, 0]),
+            ]
+        };
+        let short = short_at(2, 0);
+        let mut want = WithheldBytes::default();
+        want.insert(amitse_setup(), 0..usize::MAX);
+        let mut with_other = want.clone();
+        with_other.insert(shadow(), 0..usize::MAX);
+        let mut from_byte_5 = WithheldBytes::default();
+        from_byte_5.insert(amitse_setup(), 5..usize::MAX);
+        let in_form: fn(&[UnresolvedPassword]) -> bool = |unresolved| {
+            matches!(
+                unresolved,
+                [UnresolvedPassword::HeaderPastOp {
+                    question_id: 0x0702,
+                    ..
+                }]
+            )
+        };
+        let outside: fn(&[UnresolvedPassword]) -> bool =
+            |unresolved| matches!(unresolved, [UnresolvedPassword::OutsideFormSet { .. }]);
+        for (case, ifr, unresolved, want) in [
+            (
+                "in a disabled form",
+                vec![form_set_with(&short)],
+                in_form,
+                want.clone(),
+            ),
+            (
+                "in a disabled form, its id in another FormSet too",
+                vec![
+                    form_set_with(&short),
+                    form_set(&[var_store(2, OTHER_GUID, "Shadow", 81), form(1, &[])]),
+                ],
+                in_form,
+                with_other,
+            ),
+            (
+                "in a disabled form, at VarOffset 5",
+                vec![form_set_with(&short_at(2, 5))],
+                in_form,
+                from_byte_5,
+            ),
+            (
+                "in a disabled form, of VarStoreId 0, which a VarStore declares",
+                vec![
+                    form_set(&[var_store(0, OTHER_GUID, "Shadow", 81), form(1, &[])]),
+                    form_set_with(&short_at(0, 5)),
+                ],
+                in_form,
+                WithheldBytes::default(),
+            ),
+            (
+                "outside any FormSet",
+                vec![short.concat(), form_set_with(&[checkbox_on(1, 3, 1)])],
+                outside,
+                want,
+            ),
+        ] {
+            let passwords = passwords_of(&ifr);
+
+            assert!(
+                unresolved(&passwords.unresolved),
+                "{case}: unresolved {:?}",
+                passwords.unresolved
+            );
+            assert!(
+                passwords
+                    .withheld(&reaching(VariableReach::BootServices))
+                    .is_err(),
+                "{case}: withheld through BootServices"
+            );
+            assert_eq!(
+                passwords
+                    .withheld(&reaching(VariableReach::Runtime))
+                    .map_err(|error| error.to_string()),
+                Ok(want),
+                "{case}: withheld through Runtime"
+            );
+        }
+    }
+
+    /// A PASSWORD op whose question header runs past the end of its form package may keep its
+    /// password in any VarStore of its package list: through variables that reach Runtime every
+    /// variable of each VARSTORE and VARSTORE_EFI of the list is withheld whole, those of its
+    /// FormSet and the one outside any, and every variable of the Guid of a VARSTORE_EFI before
+    /// UEFI 2.3.1, whose VarName may name any; through those that reach BootServices it fails
+    /// closed.
+    #[test]
+    fn a_password_whose_question_header_runs_past_the_package_withholds_every_var_store_whole() {
+        let headless = operation(PASSWORD, false, &[3, 0, 4, 0]);
+        let shadow_store = var_store(7, OTHER_GUID, "Shadow", 81);
+        let mut want = WithheldBytes::default();
+        for key in [setup(), amitse_setup()] {
+            want.insert(key, 0..usize::MAX);
+        }
+        let mut with_shadow = want.clone();
+        with_shadow.insert(shadow(), 0..usize::MAX);
+        let mut short_guid = VariableGuids::default();
+        short_guid.insert(Some(Guid::from(SHORT_VAR_STORE_GUID)));
+        let mut with_short_guid = want;
+        with_short_guid.insert_guids(&short_guid);
+        let in_form: fn(&[UnresolvedPassword]) -> bool =
+            |unresolved| matches!(unresolved, [UnresolvedPassword::NoHeader { .. }]);
+        let outside: fn(&[UnresolvedPassword]) -> bool =
+            |unresolved| matches!(unresolved, [UnresolvedPassword::OutsideFormSet { .. }]);
+        for (case, ifr, unresolved, want) in [
+            // the Ends of its form and FormSet are the last 4 bytes of the package
+            (
+                "in a disabled form",
+                vec![
+                    shadow_store.clone(),
+                    form_set_with(std::slice::from_ref(&headless)),
+                ],
+                in_form,
+                with_shadow.clone(),
+            ),
+            (
+                "outside any FormSet",
+                vec![
+                    shadow_store,
+                    form_set_with(&[checkbox_on(1, 3, 1)]),
+                    headless.clone(),
+                ],
+                outside,
+                with_shadow,
+            ),
+            (
+                "in a disabled form, beside a VARSTORE_EFI before UEFI 2.3.1",
+                vec![
+                    form_set(&[short_var_store_efi(7), form(1, &[])]),
+                    form_set_with(std::slice::from_ref(&headless)),
+                ],
+                in_form,
+                with_short_guid,
+            ),
+        ] {
+            let passwords = passwords_of(&ifr);
+
+            assert!(
+                unresolved(&passwords.unresolved),
+                "{case}: unresolved {:?}",
+                passwords.unresolved
+            );
+            assert!(
+                passwords
+                    .withheld(&reaching(VariableReach::BootServices))
+                    .is_err(),
+                "{case}: withheld through BootServices"
+            );
+            assert_eq!(
+                passwords
+                    .withheld(&reaching(VariableReach::Runtime))
+                    .map_err(|error| error.to_string()),
+                Ok(want),
+                "{case}: withheld through Runtime"
+            );
+        }
     }
 }

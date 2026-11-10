@@ -1045,6 +1045,7 @@ mod non_efi_varstore_tests {
             parent: None,
             children: Vec::new(),
             parsed_data: ParsedOperation::Placeholder,
+            header_past_length: Vec::new(),
         }));
 
         let error = find_corresponding_varstore(node, 0).err().unwrap();
@@ -1091,6 +1092,7 @@ mod non_efi_varstore_tests {
                 parent: None,
                 children: Vec::new(),
                 parsed_data: ParsedOperation::Placeholder,
+                header_past_length: Vec::new(),
             })),
         };
 

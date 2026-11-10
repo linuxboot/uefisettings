@@ -102,7 +102,11 @@ MaxSize, every byte of its variable from its offset on. A password question in I
 uefisettings ignores, or outside any FormSet, keeps its password at its offset in each variable of a
 VarStore of its VarStoreId in its package list too, which edk2's Config Keyword Handler may take,
 and a VarStore outside any FormSet that does not parse may hold a password in any variable of its
-GUID, so they withhold those bytes too. IFR after an op that does not fit its form
+GUID, so they withhold those bytes too. A password question whose op ends before its question
+header keeps its password where edk2 reads that header, in the bytes after the op: from its offset
+on in each VarStore of its VarStoreId in its package list; one whose header runs past its form
+package may keep it in any variable of a VarStore of its package list, so they withhold every byte
+of each. IFR after an op that does not fit its form
 package has no op boundary, so they read and write no variable of such a HiiDB, nor do
 `hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question whose VarStore
 uefisettings cannot find withholds no bytes, which they warn of. The UEFI Shell build reads and

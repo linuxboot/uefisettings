@@ -1666,6 +1666,7 @@ mod write_validation_tests {
             parent: None,
             children: Vec::new(),
             parsed_data: ParsedOperation::Numeric(parsed),
+            header_past_length: Vec::new(),
         }));
         let mut payload = vec![0; 42];
         let width = (bits / 8) as usize;

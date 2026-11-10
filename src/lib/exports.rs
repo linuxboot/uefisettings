@@ -6031,9 +6031,11 @@ mod tests {
         );
     }
 
-    /// A PASSWORD op of a disabled form without its question header is unresolved: through
-    /// variables that reach BootServices, get reads no variable; through those that reach
-    /// Runtime it reads the questions of the other forms, O too.
+    /// A PASSWORD op of a disabled form without its question header is unresolved: edk2 reads
+    /// that header from the bytes after the op, here those of its form's End and the next FORM,
+    /// QuestionId 0x0229 and VarStoreId 0x8601, which no VarStore declares. Through variables that
+    /// reach BootServices, get reads no variable; through those that reach Runtime it reads the
+    /// questions of the other forms, O too.
     #[test]
     fn a_headless_password_in_a_disabled_form_closes_boot_services() {
         let (hiidb, _) = disabled_form_hiidb(operation(PASSWORD, false, &[3, 0, 4, 0]));
@@ -6043,7 +6045,7 @@ mod tests {
             VariableInterface::VariableServices,
         );
         let want = format!(
-            "PASSWORD op without a question header in FormSet {}: ",
+            "PASSWORD question 0x0229 in FormSet {}: its op ends before its question header",
             Guid::from([0x11; 16])
         );
         for question in ["Q1", "Q3"] {

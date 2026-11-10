@@ -219,6 +219,9 @@ const VAR_STORE_GUID_OFFSET: u64 = 2;
 /// The offset of the Guid of an EFI_IFR_VARSTORE_EFI from the start of its op, after its op
 /// header and VarStoreId (UefiInternalFormRepresentation.h).
 const VAR_STORE_EFI_GUID_OFFSET: u64 = 4;
+/// sizeof (EFI_IFR_QUESTION_HEADER) under #pragma pack(1) (UefiInternalFormRepresentation.h): its
+/// EFI_IFR_STATEMENT_HEADER, QuestionId, VarStoreId, VarStoreInfo and Flags (QuestionHeader).
+const QUESTION_HEADER_SIZE: usize = 11;
 
 // UEFI 2.10 §33.3.8.3, Table 33.11 IFR Opcodes
 #[derive(BinRead, Debug, PartialEq, Copy, Clone)]
@@ -683,6 +686,10 @@ pub struct IFROperation {
     pub children: Vec<Rc<RefCell<IFROperation>>>,
     #[br(default)]
     pub parsed_data: ParsedOperation,
+    /// Of a PASSWORD op that ends before its question header, the bytes of its form package after
+    /// it up to the end of that header (keep_header_past_length)
+    #[br(default)]
+    header_past_length: Vec<u8>,
 }
 
 impl IFROperation {
@@ -693,6 +700,24 @@ impl IFROperation {
             .first_chunk()
             .filter(|_| matches!(self.op_code, IFROpCode::Form | IFROpCode::FormMap))
             .map(|form_id| u16::from_le_bytes(*form_id))
+    }
+
+    /// Keeps, of a PASSWORD op at `offset` of the form package `package` that ends before its
+    /// question header, the bytes of `package` after it up to the end of that header, those that
+    /// it holds: edk2-stable202608 SetupBrowserDxe/IfrParse.c CreateQuestion (:119-124) reads the
+    /// header there whatever the op's Length.
+    fn keep_header_past_length(&mut self, package: &[u8], offset: u64) {
+        if self.op_code != IFROpCode::Password {
+            return;
+        }
+        let missing = QUESTION_HEADER_SIZE.saturating_sub(self.data.len());
+        let after = usize::try_from(offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(usize::from(self.length)));
+        self.header_past_length = after
+            .and_then(|after| package.get(after..))
+            .map(|rest| rest.iter().take(missing).copied().collect())
+            .unwrap_or_default();
     }
 }
 
@@ -1919,7 +1944,8 @@ pub(super) fn parse_form_sets(
 /// `package_list`, outside any FormSet, in `outside` if it is a VarStore that parses, a PASSWORD,
 /// or, unless it is in ignored IFR (`in_ignored_ifr`), another statement, and in
 /// `malformed_stores` if it is a VarStore that does not parse, with the storage that it may
-/// declare (DeclaredStorage::declare).
+/// declare (DeclaredStorage::declare). A PASSWORD keeps the bytes after it that its question
+/// header may take (IFROperation::keep_header_past_length).
 fn record_outside_op(
     mut op: IFROperation,
     offset: u64,
@@ -1929,6 +1955,7 @@ fn record_outside_op(
     outside: &mut Vec<OutsideOp>,
     malformed_stores: &mut Vec<IgnoredIfr>,
 ) {
+    op.keep_header_past_length(package, offset);
     match op.op_code {
         IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue => {
             match handle_opcode(&mut op) {
@@ -2385,6 +2412,7 @@ fn handle_form_set_within(
         parent: None,
         children: Vec::new(),
         parsed_data: ParsedOperation::Placeholder,
+        header_past_length: Vec::new(),
     }));
 
     let mut current_scope = Rc::clone(&root);
@@ -2405,9 +2433,10 @@ fn handle_form_set_within(
     // if input data is malformed then it will exit on erroring out cause none of the magic bytes match
     loop {
         let offset = package_cursor.position();
-        let node: IFROperation = package_cursor
+        let mut node: IFROperation = package_cursor
             .parse_ne()
             .context("failed to parse IFR operation")?;
+        node.keep_header_past_length(package_cursor.get_ref(), offset);
         #[cfg(test)]
         OPS_PARSED.with(|parsed| parsed.set(parsed.get() + 1));
         if depth == 0 && offset != start && node.op_code == IFROpCode::FormSet && !node.open_scope {
