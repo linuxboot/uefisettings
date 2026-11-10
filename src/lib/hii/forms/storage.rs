@@ -28,6 +28,7 @@ use super::conditions::question_value_expression;
 use super::conditions::ExpressionRefusal;
 use super::conditions::QuestionExpression;
 use super::conditions::MAX_READ_DEPTH;
+use super::ordered_list::ListRefusal;
 use super::question_values::value_question;
 use super::question_values::ListedQuestion;
 use super::storageless::NoVarStore;
@@ -2383,17 +2384,28 @@ impl ShortVarStoreEfi {
         var_name: u16,
         size: u16,
     ) -> Result<ShortEfiVariable, UnresolvedVarName> {
-        let name = self
-            .var_names
-            .get(&var_name)
-            .cloned()
-            .unwrap_or(Err(UnresolvedVarName::NoString(var_name)))?;
         Ok(ShortEfiVariable {
-            name,
+            name: self.var_name(var_name)?,
             guid: self.guid,
             attributes: self.attributes,
             size,
         })
+    }
+
+    /// The EFI variable that VarName `var_name` names, of no width, or why it names none.
+    pub(super) fn variable_key(&self, var_name: u16) -> Result<VariableKey, UnresolvedVarName> {
+        Ok(VariableKey {
+            name: self.var_name(var_name)?.to_string(),
+            guid: self.guid,
+        })
+    }
+
+    /// The name of the EFI variable that VarName `var_name` names, or why it names none.
+    fn var_name(&self, var_name: u16) -> Result<Rc<str>, UnresolvedVarName> {
+        self.var_names
+            .get(&var_name)
+            .cloned()
+            .unwrap_or(Err(UnresolvedVarName::NoString(var_name)))
     }
 
     /// The EFI variables that VarName `var_name` may name where it names none: of each string
@@ -2544,4 +2556,8 @@ pub(super) enum ShortEfiReason {
     /// An op whose value uefisettings does not read, named by its spec name
     #[error("uefisettings reads no {0} on it")]
     NotRead(&'static str),
+    /// An ORDERED_LIST without options, to which edk2-stable202608 SetupBrowserDxe/IfrParse.c
+    /// gives no StorageWidth (:2466-2493)
+    #[error("{}", ListRefusal::NoOptions)]
+    NoOptions,
 }

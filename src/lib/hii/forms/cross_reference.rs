@@ -38,14 +38,18 @@ use super::QuestionIdentity;
 use super::Ref;
 use super::TextInput;
 use crate::hii::strings::ListTexts;
+use crate::hii::variables::VariableLayout;
 
 /// An EFI_IFR_REF of any of the lengths of EFI_IFR_REF to EFI_IFR_REF5 (UEFI 2.11 §33.3.8.3.59):
 /// their question header. The fields of the target after it, as many as its length holds, stay
-/// undecoded: get shows only the EFI_HII_REF that one on a VarStore holds.
+/// undecoded: get shows only the EFI_HII_REF that one on a VarStore holds. With the layout of the
+/// variable that it names, as the FormSet is parsed (parsed_layout).
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+#[br(little, import(layout: VariableLayout))]
 pub struct CrossReference {
     pub question_header: QuestionHeader,
+    #[br(calc = layout)]
+    pub(super) layout: VariableLayout,
 }
 
 impl Question for CrossReference {
@@ -55,11 +59,12 @@ impl Question for CrossReference {
 }
 
 impl CrossReference {
-    /// Where one on a VarStore keeps its value: an EFI_HII_REF from VarOffset, the StorageWidth of
-    /// every REF in edk2-stable202608 SetupBrowserDxe/IfrParse.c.
+    /// Where one on a VarStore keeps its value: an EFI_HII_REF, the StorageWidth of every REF in
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c, from VarOffset or from byte 0 of the
+    /// variable of its VarName.
     pub(super) fn location(&self) -> ValueLocation {
         ValueLocation::Bytes {
-            offset: self.question_header.var_store_info,
+            offset: self.layout.offset(self.question_header.var_store_info),
             size: Ref::SIZE,
         }
     }

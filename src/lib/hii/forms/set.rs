@@ -311,7 +311,8 @@ impl<'a> VarStoreWrite<'a> {
     /// variables that they read. Firmware refuses such a write if the variable changed since that
     /// read (edk2-stable202608 VariableServiceSetVariable, EFI_WRITE_PROTECTED).
     pub(super) fn write(&self, variables: &dyn FirmwareVariables) -> Result<()> {
-        if self.patches.is_empty() {
+        // a SetVariable() of DataSize 0 deletes the variable (UEFI 2.11 §8.2.3)
+        if self.patches.iter().all(|(_, bytes)| bytes.is_empty()) {
             return Err(anyhow!("a variable write without bytes"));
         }
         let patches = self.data_patches().collect::<Vec<_>>();

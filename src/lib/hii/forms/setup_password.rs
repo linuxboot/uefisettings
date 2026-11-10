@@ -30,9 +30,9 @@ use super::conditions::enclosing_form_set;
 use super::declared_store;
 use super::decoded_store;
 use super::named_records;
-use super::short_efi_variable;
 use super::storage::NameValueStore;
-use super::storage::VariableStore;
+use super::storage::ShortEfiReason;
+use super::storage::ShortEfiRefusal;
 use super::undeclared_var_store;
 use super::var_name_candidates;
 use super::walk_scopes;
@@ -94,27 +94,23 @@ struct PasswordQuestion {
     max_size: Option<u16>,
 }
 
-/// An EFI_IFR_PASSWORD after its op header (UEFI 2.11 §33.3.8.3.54): its question header and
-/// MaxSize.
-pub(super) struct PasswordOp {
-    pub(super) question: QuestionHeader,
-    pub(super) max_size: u16,
-}
-
-impl PasswordOp {
-    /// The PASSWORD `op`, if it is one and holds its question header, MinSize and MaxSize.
-    pub(super) fn of(op: &IFROperation) -> Option<Self> {
-        match op.op_code {
-            IFROpCode::Password => {
-                let fields = PasswordFields::of(op).ok()?;
-                Some(Self {
-                    question: fields.question,
-                    max_size: fields.max_size.ok()?,
-                })
-            }
-            _ => None,
-        }
+/// The EFI variable that the VarName of `password` names on the VARSTORE_EFI before UEFI 2.3.1
+/// `store`, whose bytes password_bytes takes from byte 0, or why it names none: one without MaxSize
+/// names none. Its StorageWidth in edk2-stable202608 SetupBrowserDxe/IfrParse.c, MaxSize CHAR16s
+/// cast to UINT16 (:2252), has no reader: uefisettings neither reads nor writes a PASSWORD, and
+/// keyword get and set refuse one before they look up its store (QuestionRefusal::Password).
+fn short_password_variable(
+    store: &ShortVarStoreEfi,
+    password: &PasswordFields,
+) -> Result<VariableKey, ShortEfiRefusal> {
+    let id = store.var_store_id;
+    if password.max_size.is_err() {
+        let reason = ShortEfiReason::NotRead(IFROpCode::Password.spec_name());
+        return Err(ShortEfiRefusal::new(id, reason));
     }
+    store
+        .variable_key(password.question.var_store_info)
+        .map_err(|unresolved| ShortEfiRefusal::new(id, unresolved.into()))
 }
 
 /// The MinSize and MaxSize of an EFI_IFR_PASSWORD, after its question header (UEFI 2.11
@@ -147,13 +143,6 @@ enum HeaderPlace {
 /// The bytes of the storage of a password of `max_size` CHAR16s: MaxSize × 2.
 pub(super) fn password_width(max_size: u16) -> usize {
     usize::from(max_size) * CHAR16_SIZE
-}
-
-/// The StorageWidth that edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes gives a
-/// PASSWORD of `max_size` CHAR16s, MaxSize × 2 cast to UINT16 (:2252), which drops the bits past
-/// 16 of the password_width of a MaxSize over 32767.
-pub(super) fn password_storage_width(max_size: u16) -> u16 {
-    max_size.wrapping_mul(2)
 }
 
 impl PasswordFields {
@@ -1105,8 +1094,8 @@ fn password_questions(
     let mut short = Vec::new();
     let mut candidates = Vec::new();
     for (at, store) in in_form_set.into_iter().flat_map(|stores| &stores.short) {
-        match short_efi_variable(store, op) {
-            Ok(variable) => short.push(password.on(variable.variable_key(), variable.layout())),
+        match short_password_variable(store, &password) {
+            Ok(key) => short.push(password.on(key, VariableLayout::OneValue)),
             Err(refusal) => {
                 unknown = first_unknown(
                     unknown,

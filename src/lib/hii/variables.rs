@@ -734,7 +734,10 @@ fn read_value_bytes(
 pub(super) struct VariableNotFound(pub(super) VariableKey);
 
 /// A variable of VariableLayout::OneValue whose value is not as wide as its question's, which get
-/// and set refuse.
+/// and set refuse. UEFI 2.11 §33.2.5.4.10 requires that size of a cross-reference question's
+/// EFI_HII_REF; for other questions edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue
+/// instead reads the bytes of a smaller one and ignores the EFI_BUFFER_TOO_SMALL (UEFI 2.11
+/// §8.2.1) of a larger one (:1772-1782).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("EFI variable {key} holds {held} bytes; the question takes {width}")]
 pub(super) struct VariableSizeMismatch {

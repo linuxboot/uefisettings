@@ -85,6 +85,7 @@ pub(crate) const NUMERIC: u8 = 0x07;
 pub(crate) const PASSWORD: u8 = 0x08;
 pub(crate) const DATE: u8 = 0x1A;
 pub(crate) const TIME: u8 = 0x1B;
+pub(super) const STRING: u8 = 0x1C;
 pub(crate) const ORDERED_LIST: u8 = 0x23;
 pub(crate) const REF: u8 = 0x0F;
 
@@ -457,6 +458,11 @@ pub(crate) fn one_of_at(
         END.to_vec(),
     ]
     .concat()
+}
+
+/// A UINT16 EFI_IFR_ONE_OF_OPTION without flags.
+pub(crate) fn uint16_option(string_id: u16, value: u16) -> Vec<u8> {
+    one_of_option(string_id, EFI_IFR_TYPE_NUM_SIZE_16, &value.to_le_bytes())
 }
 
 /// A UINT8 EFI_IFR_ONE_OF_OPTION with `flags`.

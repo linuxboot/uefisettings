@@ -98,8 +98,6 @@ pub(crate) use question_values::QuestionMatch;
 pub use question_values::QuestionSelector;
 use question_values::ValueQuestion;
 use set::ChangeValueError;
-use setup_password::password_storage_width;
-use setup_password::PasswordOp;
 use storage::created_attributes;
 use storage::storage_width;
 use storage::var_name_variables;
@@ -3403,12 +3401,12 @@ fn handle_opcode(node: &mut IFROperation) -> Result<()> {
             }
         }
         // likewise an ORDERED_LIST, which uefisettings did not decode before either
-        IFROpCode::OrderedList => match data_cursor.parse_ne() {
+        IFROpCode::OrderedList => match data_cursor.parse_ne_args((parsed_layout(node),)) {
             Ok(parsed) => node.parsed_data = ParsedOperation::OrderedList(parsed),
             Err(error) => debug!("leaving an OrderedList undecoded: {error}"),
         },
         // and a REF
-        IFROpCode::Ref => match data_cursor.parse_ne() {
+        IFROpCode::Ref => match data_cursor.parse_ne_args((parsed_layout(node),)) {
             Ok(parsed) => node.parsed_data = ParsedOperation::Ref(parsed),
             Err(error) => debug!("leaving a Ref undecoded: {error}"),
         },
@@ -5094,15 +5092,15 @@ fn undeclared_var_store(var_store_id: u16) -> anyhow::Error {
 
 /// The EFI variable of `question` on the VARSTORE_EFI before UEFI 2.3.1 `store`: of a ONE_OF,
 /// NUMERIC, CHECKBOX, DATE or TIME, whose value ValueEncoding::VarName places at byte 0, as wide
-/// as the value;
-/// of a PASSWORD, of its StorageWidth (password_storage_width), whatever its MaxSize.
+/// as the value; of a STRING, ORDERED_LIST or REF, as wide as its StorageWidth (buffer_var_name).
+/// That of a PASSWORD has no width (short_password_variable).
 fn short_efi_variable(
     store: &ShortVarStoreEfi,
     question: &IFROperation,
 ) -> Result<ShortEfiVariable, ShortEfiRefusal> {
     let id = store.var_store_id;
-    let (var_name, size) = match (value_question(question), PasswordOp::of(question)) {
-        (Some(value_question), _) => match (value_question.encoding(), value_question.location()) {
+    let (var_name, size) = match value_question(question) {
+        Some(value_question) => match (value_question.encoding(), value_question.location()) {
             (ValueEncoding::VarName, ValueLocation::Bytes { size, .. }) => {
                 (value_question.header().var_store_info, size)
             }
@@ -5115,20 +5113,110 @@ fn short_efi_variable(
                 return Err(ShortEfiRefusal::new(id, ShortEfiReason::DeclaredAfter))
             }
         },
-        (None, Some(password)) => (
-            password.question.var_store_info,
-            password_storage_width(password.max_size),
-        ),
-        (None, None) => {
-            return Err(ShortEfiRefusal::new(
-                id,
-                ShortEfiReason::NotRead(question.op_code.spec_name()),
-            ))
-        }
+        None => buffer_var_name(question).map_err(|reason| ShortEfiRefusal::new(id, reason))?,
     };
     store
         .variable(var_name, size)
         .map_err(|unresolved| ShortEfiRefusal::new(id, unresolved.into()))
+}
+
+/// The VarName of the STRING, ORDERED_LIST or REF `question` on a VARSTORE_EFI before UEFI 2.3.1,
+/// and the StorageWidth of edk2-stable202608 SetupBrowserDxe/IfrParse.c that its variable holds
+/// whole, as Setup.c GetQuestionValue and SetQuestionValue read and write it (:1764-1782,
+/// :2061-2077): the bytes of the location of an ORDERED_LIST, MaxContainers containers (:2492),
+/// or of a REF, an EFI_HII_REF (:2041); of a STRING, string_var_name's. An ORDERED_LIST without
+/// options has none. An ORDERED_LIST or REF parsed before the store took its VarStoreInfo for a
+/// VarOffset.
+fn buffer_var_name(question: &IFROperation) -> Result<(u16, u16), ShortEfiReason> {
+    let (header, layout, location) = match &question.parsed_data {
+        ParsedOperation::OrderedList(list) => {
+            let ordered_list = OrderedListQuestion::of(question, list);
+            if !ordered_list.has_options() {
+                return Err(ShortEfiReason::NoOptions);
+            }
+            (list.question_header, list.layout, ordered_list.location())
+        }
+        ParsedOperation::Ref(reference) => (
+            reference.question_header,
+            reference.layout,
+            reference.location(),
+        ),
+        // what handle_opcode does not decode, a STRING among them
+        ParsedOperation::Placeholder => return string_var_name(question),
+        ParsedOperation::FormSet(_)
+        | ParsedOperation::OneOf(_)
+        | ParsedOperation::CheckBox(_)
+        | ParsedOperation::OneOfOption(_)
+        | ParsedOperation::VarStore(_)
+        | ParsedOperation::VarStoreNameValue(_)
+        | ParsedOperation::VarStoreEfi(_)
+        | ParsedOperation::ShortVarStoreEfi(_)
+        | ParsedOperation::DefaultStore(_)
+        | ParsedOperation::IFRDefault(_)
+        | ParsedOperation::Form(_)
+        | ParsedOperation::Text(_)
+        | ParsedOperation::Subtitle(_)
+        | ParsedOperation::Numeric(_)
+        | ParsedOperation::QuestionRef1(_)
+        | ParsedOperation::EqIdVal(_)
+        | ParsedOperation::EqIdId(_)
+        | ParsedOperation::EqIdValList(_)
+        | ParsedOperation::Get(_)
+        | ParsedOperation::Set(_)
+        | ParsedOperation::FormMap(_)
+        | ParsedOperation::Date(_)
+        | ParsedOperation::Time(_) => return Err(not_read(question)),
+    };
+    let size = match location {
+        ValueLocation::Bytes { size, .. } => size,
+        // no ORDERED_LIST or REF is an EDKII bit varstore field
+        ValueLocation::Bits { .. } => return Err(not_read(question)),
+    };
+    match layout {
+        VariableLayout::OneValue => Ok((header.var_store_info, size)),
+        // the store was not declared yet when the question was parsed
+        VariableLayout::Offsets => Err(ShortEfiReason::DeclaredAfter),
+    }
+}
+
+/// The VarName of the STRING `question` on a VARSTORE_EFI before UEFI 2.3.1 and its StorageWidth,
+/// MaxSize CHAR16s (edk2-stable202608 SetupBrowserDxe/IfrParse.c:2225), wherever the store is, as
+/// only the Keyword Handler reaches it, whose FindStorageFromVarId (ConfigKeywordHandler.c:1520)
+/// finds the store so.
+fn string_var_name(question: &IFROperation) -> Result<(u16, u16), ShortEfiReason> {
+    if question.op_code != IFROpCode::String {
+        return Err(not_read(question));
+    }
+    // decode_op disables the form of a STRING shorter than its minimum_length, so none of a
+    // parsed form fails here
+    let string: StringOp = Cursor::new(&question.data)
+        .parse_le()
+        .map_err(|_| not_read(question))?;
+    Ok((
+        string.question.var_store_info,
+        char16_storage_width(string.max_size),
+    ))
+}
+
+/// Why get and set read no value of `question` on a VARSTORE_EFI before UEFI 2.3.1.
+fn not_read(question: &IFROperation) -> ShortEfiReason {
+    ShortEfiReason::NotRead(question.op_code.spec_name())
+}
+
+/// An EFI_IFR_STRING after its op header (UEFI 2.11 §33.3.8.3.70).
+#[derive(BinRead)]
+#[br(little)]
+pub(super) struct StringOp {
+    pub(super) question: QuestionHeader,
+    pub(super) min_size: u8,
+    pub(super) max_size: u8,
+}
+
+/// The StorageWidth that edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes gives a STRING
+/// of `max_size` CHAR16s, MaxSize × 2 (:2225), as HiiDatabaseDxe/ConfigKeywordHandler.c GetWidth
+/// does (:1644).
+pub(super) fn char16_storage_width(max_size: u8) -> u16 {
+    u16::from(max_size) * 2
 }
 
 /// A VarStore that a FormSet, or an op outside any, declares.
@@ -6457,6 +6545,35 @@ mod tests {
         assert!(
             format!("{error:#}").contains("is 23 bytes long, shorter than its minimum of 24"),
             "Length 23: {error:#}"
+        );
+    }
+
+    /// A STRING on a VARSTORE_EFI before UEFI 2.3.1 has the EFI variable of its VarName, as wide
+    /// as its StorageWidth, MaxSize CHAR16s (edk2-stable202608 SetupBrowserDxe/IfrParse.c:2225).
+    #[test]
+    fn a_string_on_a_short_var_store_has_a_variable_of_max_size_char16s() {
+        // QuestionId 1, prompt 3, VarStoreId 7, VarName 5; MinSize 1, MaxSize 4, Flags 0
+        let data = [question_header_with(1, 3, 7, 5, 0x00), vec![1, 4, 0x00]].concat();
+        let root = parse_form_set(&[
+            short_var_store_efi(7),
+            form(1, &[operation(STRING, false, &data)]),
+        ]);
+        resolve_short_var_names(
+            &[Rc::clone(&root)],
+            &[en_us_package(StringMap::from([(5, "ShortVarS".into())]))],
+        );
+        let string = find_op(&root, &data).expect("the STRING");
+
+        let store = find_corresponding_varstore(string, 7).expect("the variable of VarName 5");
+
+        let key = VariableKey {
+            name: "ShortVarS".to_string(),
+            guid: Guid::from(SHORT_VAR_STORE_GUID),
+        };
+        assert_eq!(
+            (store.variable_key(), store.size(), store.layout()),
+            (key, 8, VariableLayout::OneValue),
+            "STRING of MinSize 1 and MaxSize 4"
         );
     }
 

@@ -1492,6 +1492,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::short_var_store_efi;
     use crate::hii::forms::ifr_fixtures::short_var_store_efi_of;
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
+    use crate::hii::forms::ifr_fixtures::uint16_option;
     use crate::hii::forms::ifr_fixtures::uint8;
     use crate::hii::forms::ifr_fixtures::uint8_numeric_with;
     use crate::hii::forms::ifr_fixtures::value_of;
@@ -11241,10 +11242,13 @@ mod tests {
         }
     }
 
-    /// An ORDERED_LIST on a VARSTORE_EFI before UEFI 2.3.1 is refused by name, as a STRING there
-    /// is: uefisettings reads no ORDERED_LIST of the variable of a VarName, and set writes none.
+    /// An ORDERED_LIST on a VARSTORE_EFI before UEFI 2.3.1 reads and sets its MaxContainers
+    /// containers, of UINT8 or UINT16 options, as the whole EFI variable that its VarName names,
+    /// as edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionValue and SetQuestionValue do
+    /// through its BufferValue; a variable of another size is refused and not written. One before
+    /// the store took its VarStoreInfo for a VarOffset and is refused as a NUMERIC is.
     #[test]
-    fn ordered_lists_of_a_short_var_store_are_refused() {
+    fn ordered_lists_of_a_short_var_store_read_and_set_the_variables_of_their_var_names() {
         // prompt "L", string 1, on the VarName 4
         let list = [
             operation(
@@ -11257,42 +11261,453 @@ mod tests {
             END.to_vec(),
         ]
         .concat();
+        let strings = [en_strings_package_of(&["L", "A", "B", "ShortList"])];
+        let short_store = short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT);
+        let hiidb = short_store_list(
+            &[short_store.clone(), form(1, std::slice::from_ref(&list))],
+            &strings,
+        );
+        let variables = |value: &[u8]| {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(short_key("ShortList"), NV_BS_RT, value);
+            Rc::new(variables)
+        };
+        let set_items = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
+            HiiBackend::set_in(
+                hiidb,
+                "L",
+                &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+                None,
+                &SetOptions::default(),
+                shared(variables),
+                &**variables,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"))
+        };
+
+        let stored = variables(&[1, 2]);
+        assert_eq!(answers_of(&hiidb, "L", &stored), ["A, B"], "get");
+        assert_eq!(set_items(&hiidb, &stored), Ok(()), "set");
+        assert_eq!(
+            stored.writes_to(&short_key("ShortList")),
+            [(0, vec![2, 1])],
+            "writes of ShortList"
+        );
+        assert_eq!(answers_of(&hiidb, "L", &stored), ["B, A"], "get after set");
+
+        let wider = variables(&[1, 2, 0]);
+        let why = "EFI variable ShortList-8c78a505-baa0-4c4a-869f-000000000b01 holds 3 bytes; \
+                   the question takes 2";
+        assert_eq!(
+            answers_of(&hiidb, "L", &wider),
+            [format!("<ValueUnavailable: {why}>")],
+            "get of 3 bytes"
+        );
+        let set = set_items(&hiidb, &wider);
+        assert!(
+            set.as_ref().is_err_and(|error| error.ends_with(why)),
+            "set of 3 bytes: {set:?}"
+        );
+        assert_eq!(
+            wider.writes_to(&short_key("ShortList")),
+            [],
+            "writes of 3 bytes"
+        );
+
+        // 2 containers of EFI_IFR_TYPE_NUM_SIZE_16 options, 4 bytes
+        let wide_list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(1, 1, 1, 4, 0x00), vec![2, 0x00]].concat(),
+            ),
+            uint16_option(2, 1),
+            uint16_option(3, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let wide = short_store_list(&[short_store.clone(), form(1, &[wide_list])], &strings);
+        let stored = variables(&[1, 0, 2, 0]);
+        assert_eq!(
+            answers_of(&wide, "L", &stored),
+            ["A, B"],
+            "get of UINT16 items"
+        );
+        assert_eq!(set_items(&wide, &stored), Ok(()), "set of UINT16 items");
+        assert_eq!(
+            stored.writes_to(&short_key("ShortList")),
+            [(0, vec![2, 0, 1, 0])],
+            "writes of UINT16 items"
+        );
+
+        let declared_after = short_store_list(&[form(1, &[list]), short_store], &strings);
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): declared after the \
+                   question, which took its VarStoreInfo for a VarOffset; a question names a \
+                   previously declared VarStore (UEFI 2.11 §33.3.8.2.2 EFI_IFR_QUESTION_HEADER)";
+        let stored = variables(&[1, 2]);
+        assert_eq!(
+            answers_of(&declared_after, "L", &stored),
+            [format!("<ValueUnavailable: {why}>")],
+            "get of the ORDERED_LIST before its store"
+        );
+        assert_eq!(
+            set_items(&declared_after, &stored),
+            Err(format!("cannot set question \"L\": {why}")),
+            "set of the ORDERED_LIST before its store"
+        );
+    }
+
+    /// set of an ORDERED_LIST on a VARSTORE_EFI before UEFI 2.3.1 whose variable is missing
+    /// creates it with the store's Attributes, holding the new items and empty containers after
+    /// them, as edk2-stable202608 SetupBrowserDxe writes the zeroed BufferValue that it keeps
+    /// (IfrParse.c:2493; Setup.c:1779-1782, :5725-5727, :2069-2075), while get answers the
+    /// variable missing and lists no items. It creates none at OS runtime without
+    /// EFI_VARIABLE_RUNTIME_ACCESS, nor through Windows, and writes nothing then. A variable of
+    /// another size, and the missing variable of a VARSTORE_EFI of Name and Size, still refuse
+    /// set before any write.
+    #[test]
+    fn set_of_an_ordered_list_creates_its_missing_short_var_store_variable() {
+        // prompt "L", string 1, on the VarName 4: 3 containers of UINT8 options
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(1, 1, 1, 4, 0x00), vec![3, 0x00]].concat(),
+            ),
+            flagged_option(2, 0x00, 1),
+            flagged_option(3, 0x00, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let strings = [en_strings_package_of(&["L", "A", "B", "ShortList"])];
+        let short_store_hiidb = |attributes: u32| {
+            short_store_list(
+                &[
+                    short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, attributes),
+                    form(1, std::slice::from_ref(&list)),
+                ],
+                &strings,
+            )
+        };
+        let get = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
+            HiiBackend::get_in(
+                hiidb,
+                "L",
+                None,
+                &GetOptions::default(),
+                shared(variables),
+                None,
+                None,
+            )
+            .expect("get L")
+            .responses
+            .into_iter()
+            .map(|response| (response.question.answer, response.question.items))
+            .collect::<Vec<_>>()
+        };
+        let set_items = |hiidb: &[u8], variables: &Rc<MemoryVariables>| {
+            HiiBackend::set_in(
+                hiidb,
+                "L",
+                &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+                None,
+                &SetOptions::default(),
+                shared(variables),
+                &**variables,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"))
+        };
+        let linux = (VariableReach::Runtime, VariableInterface::Efivarfs);
+        let shell = (
+            VariableReach::BootServices,
+            VariableInterface::VariableServices,
+        );
+        let windows = (
+            VariableReach::Runtime,
+            VariableInterface::FirmwareEnvironment,
+        );
+        let key = "ShortList-8c78a505-baa0-4c4a-869f-000000000b01";
+        let missing = format!("<ValueUnavailable: no EFI variable {key}>");
+        let created = |attributes: u32| Ok([&attributes.to_ne_bytes()[..], &[2, 1, 0]].concat());
+        let cases = [
+            (linux, NV_BS_RT, missing.clone(), created(NV_BS_RT)),
+            (shell, NV_BS, missing.clone(), created(NV_BS)),
+            (
+                linux,
+                NV_BS,
+                format!(
+                    "<ValueUnavailable: EFI variable {key} is not present at OS runtime: \
+                     efivarfs does not list it, and its form declares it boot-service-only (no \
+                     EFI_VARIABLE_RUNTIME_ACCESS)>"
+                ),
+                Err(format!(
+                    "EFI variable {key} is not present at OS runtime: efivarfs does not list it, \
+                     and its form declares it boot-service-only (no EFI_VARIABLE_RUNTIME_ACCESS)"
+                )),
+            ),
+            (
+                windows,
+                NV_BS_RT,
+                missing,
+                Err(format!(
+                    "no EFI variable {key}: the firmware has not created it or does not expose it \
+                     to the OS, so its questions cannot be set from Windows; change them in the \
+                     firmware setup, or ask the board vendor for firmware that exposes it; see \
+                     https://github.com/linuxboot/uefisettings/issues/2"
+                )),
+            ),
+        ];
+        for ((reach, interface), attributes, answer, want) in cases {
+            let hiidb = short_store_hiidb(attributes);
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
+            let case = format!("{interface:?}, attributes {attributes:#x}");
+
+            assert_eq!(get(&hiidb, &variables), [(answer, None)], "{case}: get");
+            let set = set_items(&hiidb, &variables);
+
+            assert_eq!(
+                set.map(|()| variables.bytes(&short_key("ShortList"))),
+                want.clone().map(Some),
+                "{case}: set"
+            );
+            if want.is_ok() {
+                let items = Some(vec!["B".to_owned(), "A".to_owned()]);
+                assert_eq!(
+                    get(&hiidb, &variables),
+                    [("B, A".to_owned(), items)],
+                    "{case}: get after set"
+                );
+            }
+        }
+
+        let wider = Rc::new(MemoryVariables::new(linux.0, linux.1));
+        wider.insert(short_key("ShortList"), NV_BS_RT, &[1, 2, 0, 0]);
+        assert_eq!(
+            set_items(&short_store_hiidb(NV_BS_RT), &wider),
+            Err(format!(
+                "EFI variable {key} holds 4 bytes; the question takes 3"
+            )),
+            "set of 4 bytes"
+        );
+        assert_eq!(
+            wider.writes_to(&short_key("ShortList")),
+            [],
+            "writes of 4 bytes"
+        );
+
+        // the VARSTORE_EFI ShortList of Size 3, whose variable holds the containers at VarOffset 0
+        let named = short_store_list(
+            &[
+                var_store_efi_of(1, SHORT_VAR_STORE_GUID, "ShortList", NV_BS_RT, 3),
+                form(1, &[list]),
+            ],
+            &strings,
+        );
+        let variables = Rc::new(MemoryVariables::new(linux.0, linux.1));
+        assert_eq!(
+            set_items(&named, &variables),
+            Err(format!(
+                "no EFI variable {key}: the firmware has not created it or does not expose it to \
+                 the OS, so its questions cannot be set from Linux; change them in the firmware \
+                 setup, or ask the board vendor for firmware that exposes it; see \
+                 https://github.com/linuxboot/uefisettings/issues/2"
+            )),
+            "set of a missing variable of a VARSTORE_EFI of Name and Size"
+        );
+        assert_eq!(
+            variables.bytes(&short_key("ShortList")),
+            None,
+            "the variable of a VARSTORE_EFI of Name and Size"
+        );
+    }
+
+    /// An ORDERED_LIST without options on a VARSTORE_EFI before UEFI 2.3.1, to which
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c gives no StorageWidth, is refused for that
+    /// cause by get and set, whether the variable of its VarName exists or not, and set writes
+    /// nothing.
+    #[test]
+    fn ordered_lists_without_options_of_a_short_var_store_are_refused() {
+        // prompt "L", string 1, on the VarName 2: 2 containers, no option
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(1, 1, 1, 2, 0x00), vec![2, 0x00]].concat(),
+            ),
+            END.to_vec(),
+        ]
+        .concat();
         let hiidb = short_store_list(
             &[
                 short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
                 form(1, &[list]),
             ],
-            &[en_strings_package_of(&["L", "A", "B", "ShortList"])],
+            &[en_strings_package_of(&["L", "ShortList"])],
         );
-        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
-        variables.insert(short_key("ShortList"), NV_BS_RT, &[1, 2]);
-        let variables = Rc::new(variables);
-        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): uefisettings reads \
-                   no EFI_IFR_ORDERED_LIST on it";
+        let why = "VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): the ORDERED_LIST has \
+                   no option, so its containers have no width";
+        for stored in [Some(&[1, 2][..]), None] {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            if let Some(value) = stored {
+                variables.insert(short_key("ShortList"), NV_BS_RT, value);
+            }
+            let variables = Rc::new(variables);
 
-        assert_eq!(
-            answers_of(&hiidb, "L", &variables),
-            [format!("<ValueUnavailable: {why}>")],
-            "get"
+            assert_eq!(
+                answers_of(&hiidb, "L", &variables),
+                [format!("<ValueUnavailable: {why}>")],
+                "get, variable {stored:?}"
+            );
+            let set = HiiBackend::set_in(
+                &hiidb,
+                "L",
+                &SetValue::Items(vec![]),
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+            assert_eq!(
+                set,
+                Err(format!("cannot set question \"L\": {why}")),
+                "set, variable {stored:?}"
+            );
+            assert_eq!(
+                variables.writes_to(&short_key("ShortList")),
+                [],
+                "writes, variable {stored:?}"
+            );
+        }
+    }
+
+    /// set of an ORDERED_LIST of MaxContainers 0 on a VARSTORE_EFI before UEFI 2.3.1, whose
+    /// StorageWidth is 0, to no items refuses to create its missing variable of no bytes, as a
+    /// SetVariable() of DataSize 0 deletes a variable (UEFI 2.11 §8.2.3), and writes nothing,
+    /// through efivarfs and through GetVariable() and SetVariable().
+    #[test]
+    fn set_creates_no_short_var_store_variable_of_no_bytes() {
+        // prompt "L", string 1, on the VarName 3: no container, one UINT8 option
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(1, 1, 1, 3, 0x00), vec![0, 0x00]].concat(),
+            ),
+            flagged_option(2, 0x00, 1),
+            END.to_vec(),
+        ]
+        .concat();
+        let hiidb = short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, &[list]),
+            ],
+            &[en_strings_package_of(&["L", "A", "ShortList"])],
         );
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
+
+            let set = HiiBackend::set_in(
+                &hiidb,
+                "L",
+                &SetValue::Items(vec![]),
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"));
+
+            assert_eq!(
+                set,
+                Err("a variable write without bytes".to_owned()),
+                "{interface:?}: set"
+            );
+            assert_eq!(
+                variables.bytes(&short_key("ShortList")),
+                None,
+                "{interface:?}: ShortList"
+            );
+        }
+    }
+
+    /// An ORDERED_LIST on the VarName of a PASSWORD on a VARSTORE_EFI before UEFI 2.3.1 reads
+    /// none of the password's variable, which get and set withhold whole: get answers that its
+    /// bytes hold a password, and set refuses new items and writes nothing. The list is as wide
+    /// as the variable, and its VarName, read as a VarOffset, as large, so that only the
+    /// withholding of bytes 0..40 refuses it.
+    #[test]
+    fn an_ordered_list_on_the_var_name_of_a_short_var_store_password_keeps_it_withheld() {
+        // prompt "L", string 1, on the VarName 40 of the PASSWORD's prompt 4: 40 containers
+        let list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(1, 1, 1, 40, 0x00), vec![40, 0x00]].concat(),
+            ),
+            flagged_option(2, 0x00, 1),
+            flagged_option(3, 0x00, 2),
+            END.to_vec(),
+        ]
+        .concat();
+        let mut strings = vec!["L", "A", "B", "Password"];
+        strings.resize(39, "Unused");
+        strings.push("ShortVarPw");
+        let hiidb = short_store_list(
+            &[
+                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
+                form(1, &[password_on(6, 4, 1, 40), list]),
+            ],
+            &[en_strings_package_of(&strings)],
+        );
+        let password = short_key("ShortVarPw");
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(password.clone(), NV_BS_RT, &plaintext_password());
+        let variables = Rc::new(variables);
+
+        assert_eq!(answers_of(&hiidb, "L", &variables), [PASSWORD_BYTES], "get");
         let set = HiiBackend::set_in(
             &hiidb,
             "L",
             &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
             None,
-            &SetOptions::default(),
+            &SetOptions {
+                setup_password: SetupPasswordPolicy::Bypass,
+                ..SetOptions::default()
+            },
             shared(&variables),
             &*variables,
             None,
         )
         .map(drop)
         .map_err(|error| format!("{error:#}"));
-        assert_eq!(set, Err(format!("cannot set question \"L\": {why}")), "set");
         assert_eq!(
-            variables.writes_to(&short_key("ShortList")),
-            vec![],
-            "writes of ShortList"
+            set,
+            Err(
+                "cannot set question \"L\": its items cannot be read, so set cannot keep those of \
+                 hidden options: its bytes hold a password"
+                    .to_owned()
+            ),
+            "set"
         );
+        assert_eq!(variables.writes_to(&password), [], "writes of ShortVarPw");
     }
 
     /// An ORDERED_LIST over the bytes of a PASSWORD outside any FormSet of its VarStoreId keeps
@@ -11364,30 +11779,68 @@ mod tests {
         );
     }
 
-    /// A REF on a VARSTORE_EFI before UEFI 2.3.1 is refused by name, as a STRING there is:
-    /// uefisettings reads no EFI_HII_REF of the variable of a VarName.
+    /// A REF on a VARSTORE_EFI before UEFI 2.3.1 shows the EFI_HII_REF that the whole EFI
+    /// variable of its VarName holds, its StorageWidth in edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c, as Setup.c GetQuestionValue reads it there; a variable of
+    /// another size is refused, and set refuses the REF as on any VarStore, writing nothing. One
+    /// before the store took its VarStoreInfo for a VarOffset and is refused as a NUMERIC is.
     #[test]
-    fn cross_references_of_a_short_var_store_are_refused() {
+    fn cross_references_of_a_short_var_store_show_the_hii_refs_of_their_var_names() {
         // an EFI_IFR_REF5 of prompt "R", string 1, on the VarName 2
         let reference = operation(REF, false, &question_header_with(1, 1, 1, 2, 0x00));
+        let strings = [en_strings_package_of(&["R", "ShortRef"])];
+        let short_store = short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT);
         let hiidb = short_store_list(
             &[
-                short_var_store_efi_of(1, SHORT_VAR_STORE_GUID, NV_BS_RT),
-                form(1, &[reference]),
+                short_store.clone(),
+                form(1, std::slice::from_ref(&reference)),
             ],
-            &[en_strings_package_of(&["R", "ShortRef"])],
+            &strings,
         );
-        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
-        variables.insert(short_key("ShortRef"), NV_BS_RT, &[0; 22]);
-        let variables = Rc::new(variables);
+        let variables = |value: &[u8]| {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(short_key("ShortRef"), NV_BS_RT, value);
+            Rc::new(variables)
+        };
+        // QuestionId 5, FormId 1, FormSetGuid 0x11 × 16, DevicePath string 0
+        let stored = [&[5, 0, 1, 0][..], &[0x11; 16], &[0, 0]].concat();
 
+        let short = variables(&stored);
         assert_eq!(
-            answers_of(&hiidb, "R", &variables),
+            answers_of(&hiidb, "R", &short),
+            ["QuestionId 0x0005, FormId 0x0001, FormSetGuid \
+                 11111111-1111-1111-1111-111111111111, DevicePath none"],
+            "get"
+        );
+        let set = set_of(&hiidb, "R", "0", &short);
+        assert!(
+            set.as_ref()
+                .is_err_and(|error| error.contains("set does not write the EFI_HII_REF")),
+            "set: {set:?}"
+        );
+        assert_eq!(short.writes_to(&short_key("ShortRef")), [], "writes");
+
+        let longer = variables(&[stored.as_slice(), &[0]].concat());
+        assert_eq!(
+            answers_of(&hiidb, "R", &longer),
+            [
+                "<ValueUnavailable: EFI variable ShortRef-8c78a505-baa0-4c4a-869f-000000000b01 \
+                 holds 23 bytes; the question takes 22>"
+            ],
+            "get of 23 bytes"
+        );
+
+        let declared_after = short_store_list(&[form(1, &[reference]), short_store], &strings);
+        assert_eq!(
+            answers_of(&declared_after, "R", &short),
             [
                 "<ValueUnavailable: VarStore 0x0001 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): \
-              uefisettings reads no EFI_IFR_REF on it>"
+                 declared after the question, which took its VarStoreInfo for a VarOffset; a \
+                 question names a previously declared VarStore (UEFI 2.11 §33.3.8.2.2 \
+                 EFI_IFR_QUESTION_HEADER)>"
             ],
-            "get"
+            "get of the REF before its store"
         );
     }
 

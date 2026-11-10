@@ -29,6 +29,7 @@ use binrw::BinRead;
 use log::debug;
 use thiserror::Error;
 
+use super::char16_storage_width;
 use super::choice_for_set;
 use super::conditions::is_question;
 use super::conditions::question_expression;
@@ -82,6 +83,7 @@ use super::QuestionHeader;
 use super::Range as IfrRange;
 use super::SelectionError;
 use super::ShortVarStoreEfi;
+use super::StringOp;
 use super::TextInput;
 use super::TimeStorage;
 use super::TypeValue;
@@ -1520,15 +1522,6 @@ struct NumericFlagsOp {
     flags: u8,
 }
 
-/// An EFI_IFR_STRING after its op header (UEFI 2.11 §33.3.8.3.70).
-#[derive(BinRead)]
-#[br(little)]
-struct StringOp {
-    _question: QuestionHeader,
-    min_size: u8,
-    max_size: u8,
-}
-
 /// An EFI_IFR_ORDERED_LIST after its op header (UEFI 2.11 §33.3.8.3.53).
 #[derive(BinRead)]
 #[br(little)]
@@ -1574,7 +1567,7 @@ fn keyword_width(op: &IFROperation) -> Option<usize> {
         }
         IFROpCode::String => {
             let string: StringOp = data.parse_le().ok()?;
-            Some(usize::from(string.max_size) * std::mem::size_of::<u16>())
+            Some(usize::from(char16_storage_width(string.max_size)))
         }
         IFROpCode::Date => Some(EFI_HII_DATE_SIZE),
         IFROpCode::Time => Some(EFI_HII_TIME_SIZE),
@@ -1654,6 +1647,7 @@ mod tests {
     use super::super::ifr_fixtures::PASSWORD;
     use super::super::ifr_fixtures::READ;
     use super::super::ifr_fixtures::SHORT_VAR_STORE_GUID;
+    use super::super::ifr_fixtures::STRING;
     use super::super::ifr_fixtures::SUPPRESS_IF;
     use super::super::ifr_fixtures::VALUE;
     use super::super::ifr_fixtures::VAR_STORE;
@@ -1690,7 +1684,6 @@ mod tests {
     const OFFSET: usize = 5;
     /// NV+BS+RT
     const ATTRIBUTES: u32 = 0x07;
-    const STRING: u8 = 0x1C;
     const DATE: u8 = 0x1A;
     const TIME: u8 = 0x1B;
     const ORDERED_LIST: u8 = 0x23;
@@ -3041,6 +3034,75 @@ mod tests {
         );
     }
 
+    /// check_get and check_set refuse a STRING, an ORDERED_LIST and a REF on a VARSTORE_EFI before
+    /// UEFI 2.3.1 as they refuse a ONE_OF there, naming the store, before they look at the bytes
+    /// of the variable of its VarName, which here hold a password: the Keyword Handler sends each
+    /// to the driver with its VarName as a VarOffset, whatever its kind.
+    #[test]
+    fn check_get_and_set_refuse_strings_ordered_lists_and_refs_on_a_short_var_store() {
+        let header = question_header_with(1, PROMPT, 2, 5, 0);
+        let refusal = format!(
+            "keyword {KEYWORD}: question {QUESTION:?} is on an EFI_IFR_VARSTORE_EFI before UEFI \
+             2.3.1, whose VarName the Keyword Handler takes for a VarOffset in a request to its \
+             driver, not for the EFI variable that get and set reach"
+        );
+        let short_var = VariableKey {
+            name: "ShortVar".to_owned(),
+            guid: Guid::from(SHORT_VAR_STORE_GUID),
+        };
+        let withholding = || {
+            let mut withheld = WithheldBytes::default();
+            withheld.insert(short_var.clone(), 0..22);
+            EfivarReader::withholding(Box::new(variables(1)), withheld)
+        };
+        let cases = [
+            // MinSize 0, MaxSize 4, Flags 0
+            (
+                "STRING",
+                operation(STRING, false, &[header.clone(), vec![0, 4, 0]].concat()),
+            ),
+            (
+                "ORDERED_LIST",
+                [
+                    operation(ORDERED_LIST, true, &[header.clone(), vec![2, 0]].concat()),
+                    flagged_option(6, 0x00, 1),
+                    END.to_vec(),
+                ]
+                .concat(),
+            ),
+            ("REF", operation(REF, false, &header)),
+        ];
+
+        for (kind, question) in cases {
+            let mut lists = [list(
+                PATH,
+                &[(NAMESPACE, KEYWORD)],
+                [short_var_store_efi(2), question].concat(),
+            )];
+            // VarName 5, the question's VarStoreInfo, names the variable ShortVar
+            lists[0].strings[0].strings.insert(5, "ShortVar".into());
+            resolve_short_var_names(&lists[0].forms, &lists[0].strings);
+            let question = question_of(&lists);
+
+            let get = question.check_get(&withholding());
+            let set = question.check_set(
+                &resp("03"),
+                IncludedStates::empty(),
+                VolatileWrites::Refuse,
+                &mut withholding(),
+            );
+
+            assert_eq!(
+                (
+                    get.err().map(|error| error.to_string()),
+                    set.err().map(|error| error.to_string())
+                ),
+                (Some(refusal.clone()), Some(refusal.clone())),
+                "{kind}: get and set"
+            );
+        }
+    }
+
     /// check_get and check_set refuse a ONE_OF on a VARSTORE_EFI before UEFI 2.3.1 whose VarName
     /// names an existing variable, which get and set read and write: GetData() and SetData() take
     /// that VarName for a VarOffset in a request to the driver.
@@ -4275,9 +4337,8 @@ mod tests {
 
     /// check_get and check_set refuse a DATE, TIME or ORDERED_LIST where they refuse a ONE_OF, the
     /// refusal before check_set finds keyword set of them unimplemented: on a VARSTORE_EFI before
-    /// UEFI 2.3.1, whose variable get reads of a DATE or TIME and of no ORDERED_LIST; on a
-    /// VarStoreId that a VarStore outside any FormSet declares for another variable; and beside an
-    /// outside VarStore that does not parse.
+    /// UEFI 2.3.1, whose variable get reads; on a VarStoreId that a VarStore outside any FormSet
+    /// declares for another variable; and beside an outside VarStore that does not parse.
     #[test]
     fn check_get_and_set_refuse_dates_times_and_ordered_lists_where_they_refuse_a_one_of() {
         let question = |op_code: u8, var_store_id: u16| {
@@ -4286,7 +4347,16 @@ mod tests {
                 vec![0x00, 0x01, 0x02, 0x00],
             ]
             .concat();
-            operation(op_code, false, &data)
+            match op_code {
+                // with an option, whose Type gives the containers of an ORDERED_LIST a width
+                ORDERED_LIST => [
+                    operation(op_code, true, &data),
+                    flagged_option(6, 0x00, 1),
+                    END.to_vec(),
+                ]
+                .concat(),
+                _ => operation(op_code, false, &data),
+            }
         };
         let outside = "keyword Keyword: question \"Keyword question\" has VarStoreId 1, which a \
                        VarStore outside a FormSet of its package list declares for EFI \
@@ -4300,11 +4370,7 @@ mod tests {
             (
                 ORDERED_LIST,
                 "EFI_IFR_ORDERED_LIST",
-                QuestionRefusal::UnreadVarStore(
-                    "VarStore 0x0002 (EFI_IFR_VARSTORE_EFI before UEFI 2.3.1): uefisettings reads \
-                     no EFI_IFR_ORDERED_LIST on it"
-                        .to_owned(),
-                ),
+                QuestionRefusal::ShortVarStore,
             ),
         ] {
             let mut short_lists = [list(

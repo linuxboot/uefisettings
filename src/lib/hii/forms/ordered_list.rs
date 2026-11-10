@@ -38,6 +38,7 @@ use super::storage::BufferExpression;
 use super::storage::BufferQuestion;
 use super::storage::ValueLocation;
 use super::storage::ValueSource;
+use super::storage::ValueUnavailable;
 use super::storage::VariableStore;
 use super::AnswerOption;
 use super::FormSetWalk;
@@ -53,18 +54,22 @@ use super::EFI_IFR_TYPE_NUM_SIZE_16;
 use super::EFI_IFR_TYPE_NUM_SIZE_32;
 use super::EFI_IFR_TYPE_NUM_SIZE_64;
 use crate::hii::strings::ListTexts;
+use crate::hii::variables::VariableLayout;
 
 /// EFI_IFR_UNIQUE_SET and EFI_IFR_NO_EMPTY_SET (UEFI 2.11 §33.3.8.3.53).
 const EFI_IFR_UNIQUE_SET: u8 = 0x01;
 const EFI_IFR_NO_EMPTY_SET: u8 = 0x02;
 
-/// An EFI_IFR_ORDERED_LIST (UEFI 2.11 §33.3.8.3.53).
+/// An EFI_IFR_ORDERED_LIST (UEFI 2.11 §33.3.8.3.53), and the layout of the variable that it
+/// names, as the FormSet is parsed (parsed_layout).
 #[derive(BinRead, Debug, PartialEq)]
-#[br(little)]
+#[br(little, import(layout: VariableLayout))]
 pub struct OrderedList {
     pub question_header: QuestionHeader,
     pub max_containers: u8,
     pub flags: u8,
+    #[br(calc = layout)]
+    pub(super) layout: VariableLayout,
 }
 
 impl Question for OrderedList {
@@ -112,12 +117,25 @@ impl<'a> OrderedListQuestion<'a> {
         Self { list, width }
     }
 
-    /// Where it keeps its value: its containers from VarOffset.
+    /// Where it keeps its value: its containers from VarOffset, or from byte 0 of the variable of
+    /// its VarName.
     pub(super) fn location(self) -> ValueLocation {
         ValueLocation::Bytes {
-            offset: self.list.question_header.var_store_info,
+            offset: self.offset(),
             size: self.size(),
         }
+    }
+
+    /// Whether it has options, whose Type gives its containers their width.
+    pub(super) fn has_options(self) -> bool {
+        self.width.is_some()
+    }
+
+    /// Where its containers start in its variable.
+    fn offset(self) -> u16 {
+        self.list
+            .layout
+            .offset(self.list.question_header.var_store_info)
     }
 
     /// The bytes of its MaxContainers containers, the StorageWidth of edk2-stable202608
@@ -273,15 +291,41 @@ pub(super) struct ListInput {
     width: Option<ContainerWidth>,
     max_containers: u8,
     flags: u8,
-    /// The values of its containers up to the first empty one, or why they cannot be read
-    stored: Result<Vec<u64>, String>,
+    stored: StoredItems,
+}
+
+/// The values of the containers of an ORDERED_LIST up to the first empty one, whose items of
+/// hidden options set keeps.
+enum StoredItems {
+    Read(Vec<u64>),
+    /// None: the EFI variable of its VarName on a VARSTORE_EFI before UEFI 2.3.1 does not exist,
+    /// where edk2-stable202608 SetupBrowserDxe keeps the BufferValue that IfrParse.c zeroes
+    /// (:2493) as GetVariable() fails (Setup.c:1779-1782), loads no default into it
+    /// (Setup.c:5725-5727), and creates the variable through SetVariable() (Setup.c:2069-2075)
+    Missing,
+    /// Why they cannot be read
+    Unread(String),
+}
+
+impl StoredItems {
+    /// Those of `stored`, the values read from a variable of `layout`, if it has a VarStore.
+    fn of(stored: Result<Vec<u64>, ValueUnavailable>, layout: Option<VariableLayout>) -> Self {
+        match (stored, layout) {
+            (Ok(values), _) => Self::Read(values),
+            (Err(ValueUnavailable::Missing(_)), Some(VariableLayout::OneValue)) => Self::Missing,
+            (Err(reason), _) => Self::Unread(reason.to_string()),
+        }
+    }
 }
 
 impl ListInput {
     /// The texts of the options of its stored items, in order, as get shows them without their
     /// states; None if they cannot be read.
     pub(super) fn items(&self, options: &[AnswerOption]) -> Option<Vec<String>> {
-        let stored = self.stored.as_ref().ok()?;
+        let stored = match &self.stored {
+            StoredItems::Read(values) => values,
+            StoredItems::Missing | StoredItems::Unread(_) => return None,
+        };
         Some(
             stored
                 .iter()
@@ -382,10 +426,11 @@ impl ListInput {
         options: &[AnswerOption],
         values: &[u64],
     ) -> Result<(), ListRefusal> {
-        let stored = self
-            .stored
-            .as_ref()
-            .map_err(|reason| ListRefusal::StoredUnread(reason.clone()))?;
+        let stored = match &self.stored {
+            StoredItems::Read(values) => values,
+            StoredItems::Missing => return Ok(()),
+            StoredItems::Unread(reason) => return Err(ListRefusal::StoredUnread(reason.clone())),
+        };
         for &value in stored {
             if values.contains(&value) {
                 continue;
@@ -511,6 +556,7 @@ pub(super) fn handle_ordered_list(
         push_default(&mut answer, &defaults, stores);
     }
     let list = question.list;
+    let layout = varstore.as_ref().ok().map(|store| store.layout());
     QuestionDescriptor {
         question: prompt.trim().to_string(),
         value: answer,
@@ -522,11 +568,11 @@ pub(super) fn handle_ordered_list(
         varstore,
         location: question.location(),
         input: TextInput::OrderedList(ListInput {
-            offset: list.question_header.var_store_info,
+            offset: question.offset(),
             width: question.width,
             max_containers: list.max_containers,
             flags: list.flags,
-            stored: stored.map_err(|reason| reason.to_string()),
+            stored: StoredItems::of(stored, layout),
         }),
         opcode: current_node.op_code,
         flags,
@@ -946,8 +992,12 @@ mod write_tests {
     use super::super::EFI_IFR_TYPE_NUM_SIZE_32;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_64;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_8;
+    use super::StoredItems;
+    use super::ValueUnavailable;
+    use super::VariableLayout;
     use crate::hii::variables::EfivarReader;
     use crate::hii::variables::FirmwareVariables;
+    use crate::hii::variables::VariableNotFound;
     use crate::hii::variables::VolatileWrites;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
@@ -1488,5 +1538,35 @@ mod write_tests {
             ),
             "WRITE expression"
         );
+    }
+
+    /// set keeps no stored item of an ORDERED_LIST whose variable is missing only where that is
+    /// the variable of a VarName on a VARSTORE_EFI before UEFI 2.3.1, which edk2 creates; it
+    /// refuses any other value that it cannot read, the missing variable of a VarStore of offsets
+    /// too.
+    #[test]
+    fn stored_items_are_none_only_of_a_missing_one_value_variable() {
+        let missing = || ValueUnavailable::Missing(VariableNotFound(variable_key("List")));
+        let unread = "unread: no EFI variable List-00000000-0000-0000-0000-000000000000";
+        let cases = [
+            (Err(missing()), Some(VariableLayout::OneValue), "none"),
+            (Err(missing()), Some(VariableLayout::Offsets), unread),
+            (Err(missing()), None, unread),
+            (
+                Err(ValueUnavailable::PasswordBytes),
+                Some(VariableLayout::OneValue),
+                "unread: its bytes hold a password",
+            ),
+            (Ok(vec![1]), Some(VariableLayout::OneValue), "read [1]"),
+        ];
+        for (stored, layout, want) in cases {
+            let case = format!("{stored:?} of {layout:?}");
+            let items = match StoredItems::of(stored, layout) {
+                StoredItems::Read(values) => format!("read {values:?}"),
+                StoredItems::Missing => "none".to_owned(),
+                StoredItems::Unread(reason) => format!("unread: {reason}"),
+            };
+            assert_eq!(items, want, "{case}");
+        }
     }
 }
