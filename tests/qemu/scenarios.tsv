@@ -58,6 +58,7 @@ shell-short-var-store	/publish-hiidb.efi short-var-store-forms	short-var-store.j
 shell-outside-form-set-password	/publish-hiidb.efi outside-form-set-password-forms	-	shell:outside-form-set-password	-
 shell-disabled-form	/publish-hiidb.efi disabled-form-forms	disabled-form.json	shell:disabled-form	-
 shell-first-store-password	/publish-hiidb.efi first-store-password-forms	-	shell:first-store-password	-
+shell-keyword-kinds	/publish-hiidb.efi keyword-kinds-forms	-	shell:keyword-kinds	-
 shell-time-storage	/DriverSample.efi;/publish-hiidb.efi wakeup-time-forms	my-ifr-nv-data.json	shell:time-storage	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 hii-auth87	/publish-hiidb.efi enhanced-auth-forms;/publish-hiidb.efi rt-data	enhanced-auth-87.json	hii_auth87	-

@@ -33,23 +33,22 @@ use uefi::println;
 use uefi::proto::unsafe_protocol;
 use uefi::CStr16;
 use uefi::Guid;
-use uefi::Handle;
 use uefi::Status;
 use uefi::StatusExt;
-use uefi_raw::protocol::device_path::DevicePathProtocol;
 use uefi_raw::protocol::hii::config::HiiConfigRoutingProtocol;
 
+use crate::install_device_path;
 use crate::password_forms;
 use crate::register_package_list_for;
+use crate::vendor_device_path;
 use crate::Failure;
 
 /// The configuration table GUID of ExportConfig()'s results (UEFI 2.11 §33.2.11.1).
 static HII_CONFIG_ROUTING_GUID: Guid = HiiConfigRoutingProtocol::GUID;
 /// The Vendor_GUID of the Vendor Device Path node of [`DRIVER_PATH`].
 const DRIVER_VENDOR: Guid = guid!("8c78a505-baa0-4c4a-869f-000000001400");
-/// The device path of the handle that registers the password forms: a Hardware Vendor Device
-/// Path node of [`DRIVER_VENDOR`] (UEFI 2.11 §10.3.2.4), then the End of Entire Device Path node.
-static DRIVER_PATH: [u8; 24] = driver_path();
+/// The device path of the handle that registers the password forms.
+static DRIVER_PATH: [u8; 24] = vendor_device_path(DRIVER_VENDOR);
 /// The byte that the appended `<ConfigResp>` sets each password byte of AMITSESetup to.
 const MARKER: u8 = 0xA5;
 /// The value that the appended `<ConfigResp>` gives the ONE_OF of AMITSESetup: Enabled.
@@ -60,30 +59,10 @@ const QUIET_BOOT_ENABLED: u8 = 1;
 #[unsafe_protocol(HiiConfigRoutingProtocol::GUID)]
 struct RawConfigRouting(HiiConfigRoutingProtocol);
 
-/// [`DRIVER_PATH`]'s bytes.
-const fn driver_path() -> [u8; 24] {
-    let vendor = DRIVER_VENDOR.to_bytes();
-    let mut path = [0; 24];
-    // Type 1, Sub-Type 4, Length 20
-    path[0] = 0x01;
-    path[1] = 0x04;
-    path[2] = 20;
-    let mut index = 0;
-    while index < vendor.len() {
-        path[4 + index] = vendor[index];
-        index += 1;
-    }
-    // End of Entire Device Path: Type 0x7F, Sub-Type 0xFF, Length 4
-    path[20] = 0x7F;
-    path[21] = 0xFF;
-    path[22] = 4;
-    path
-}
-
 /// Registers the password forms for a handle of [`DRIVER_PATH`], then installs ExportConfig()'s
 /// results with the `<ConfigResp>` of AMITSESetup after them, and logs where.
 pub(crate) fn export_config() -> Result<(), Failure> {
-    let driver = install_driver_path()?;
+    let driver = install_device_path(&DRIVER_PATH)?;
     register_package_list_for(
         &password_forms::package_list_bytes(),
         Some(driver),
@@ -102,24 +81,6 @@ pub(crate) fn export_config() -> Result<(), Failure> {
          CHAR16s of ExportConfig(), then a <ConfigResp> of AMITSESetup"
     );
     Ok(())
-}
-
-/// A new handle with the device path [`DRIVER_PATH`].
-fn install_driver_path() -> Result<Handle, Failure> {
-    #[expect(
-        unsafe_code,
-        reason = "the uefi crate's InstallProtocolInterface() wrapper is unsafe"
-    )]
-    // SAFETY: DRIVER_PATH is a whole device path under the GUID of EFI_DEVICE_PATH_PROTOCOL, in
-    // a static that stays valid as long as the driver stays loaded, which it does.
-    unsafe {
-        boot::install_protocol_interface(
-            None,
-            &DevicePathProtocol::GUID,
-            DRIVER_PATH.as_ptr().cast(),
-        )
-    }
-    .map_err(|error| ("installing the device path of a handle", error.status()))
 }
 
 /// The CHAR16s of ExportConfig()'s results, without their NUL.

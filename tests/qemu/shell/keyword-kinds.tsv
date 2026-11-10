@@ -1,0 +1,52 @@
+# The checks of shell/keyword-kinds.nsh: hii keyword set of a DATE, a TIME and an ORDERED_LIST
+# through the Keyword Handler, which writes each VALUE as given (UEFI 2.11 §35.3.2), and refusals
+# before any call, which dmpstore shows wrote nothing. See check-shell-log.sh.
+# TerminalDxe prints a character outside ASCII as "?" unless the serial terminal is VT-UTF8, so
+# the checks of texts that cite "§" compare them with "?" in its place.
+# KindStore as publish-hiidb creates it: 2024-03-31 at byte 0, 12:34:56 at byte 4, the items 1, 2
+# and 3 at byte 8, and the EFI_HII_REF of QuestionId 4 and FormId 1 at byte 12
+dmpstore-before	status	any
+dmpstore-before	line	^Variable NV\+BS '8C78A505-BAA0-4C4A-869F-000000001E01:KindStore' DataSize = 0x22$
+dmpstore-before	line	^  00000000: E8 07 03 1F 0C 22 38 00-01 02 03 00 04 00 01 00
+# the DATE suppresses its year: a VALUE that keeps 2024 sets 2024-04-01
+set-date	status	0x0
+set-date	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindDate&VALUE=010407e8$
+dmpstore-date	status	any
+dmpstore-date	line	^  00000000: E8 07 04 01 0C 22 38 00-01 02 03 00 04 00 01 00
+set-date-suppressed-year	status	aborted
+set-date-suppressed-year	json	(.error_message | gsub("§"; "?")) == "keyword KindDate: VALUE=010407e9 of question \"Kind date\": the year of this DATE is suppressed (UEFI 2.11 ?33.2.5.4.6), and set writes it as 2024, not 2025"
+dmpstore-date-suppressed-year	status	any
+dmpstore-date-suppressed-year	same	dmpstore-date
+# the TIME suppresses its second: a VALUE that keeps 56 sets 13:00:56
+set-time	status	0x0
+set-time	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindTime&VALUE=38000d$
+dmpstore-time	status	any
+dmpstore-time	line	^  00000000: E8 07 04 01 0D 00 38 00-01 02 03 00 04 00 01 00
+set-time-hour-24	status	aborted
+set-time-hour-24	json	.error_message == "keyword KindTime: VALUE=382218 of question \"Kind time\": hour 24 is outside 0 to 23"
+dmpstore-time-hour-24	status	any
+dmpstore-time-hour-24	same	dmpstore-time
+# the ORDERED_LIST, last container first: the items 3, 2 and 1
+set-list	status	0x0
+set-list	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindList&VALUE=010203$
+dmpstore-list	status	any
+dmpstore-list	line	^  00000000: E8 07 04 01 0D 00 38 00-03 02 01 00 04 00 01 00
+set-list-after-empty	status	aborted
+set-list-after-empty	json	(.error_message | gsub("§"; "?")) == "keyword KindList: VALUE=010003 of question \"Kind list\": cannot set question \"Kind list\": a container after an empty one holds a value, where set writes 0 after the last item (UEFI 2.11 ?33.3.8.3.53)"
+dmpstore-list-after-empty	status	any
+dmpstore-list-after-empty	same	dmpstore-list
+# EFI_IFR_UNIQUE_SET
+set-list-twice	status	aborted
+set-list-twice	json	.error_message == "keyword KindList: VALUE=000101 of question \"Kind list\": cannot set question \"Kind list\": the ORDERED_LIST takes each option once (EFI_IFR_UNIQUE_SET): \"First\" is given twice"
+dmpstore-list-twice	status	any
+dmpstore-list-twice	same	dmpstore-list
+# set does not write the EFI_HII_REF of a REF, which keyword set refuses with set's error
+set-ref	status	aborted
+set-ref	json	(.error_message | gsub("§"; "?")) == "keyword KindRef: cannot set question \"Kind ref\": set does not write the EFI_HII_REF of a cross-reference question, the target of its link (UEFI 2.11 ?33.2.5.4.10)"
+dmpstore-ref	status	any
+dmpstore-ref	same	dmpstore-list
+# one SetData() of a DATE and an ORDERED_LIST: 2024-12-31 and the items 3 and 1
+set-date-and-list	status	0x0
+set-date-and-list	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindDate&VALUE=1f0c07e8&NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindList&VALUE=000103$
+dmpstore-date-and-list	status	any
+dmpstore-date-and-list	line	^  00000000: E8 07 0C 1F 0D 00 38 00-03 01 00 00 04 00 01 00

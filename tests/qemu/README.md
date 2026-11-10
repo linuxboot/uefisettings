@@ -301,6 +301,17 @@ same, then publishes the database as `rt-data` does. In the scenarios
 password in the UEFI Shell and from Linux and `set` refuses the question over it, while the
 question beside it reads, and in the UEFI Shell writes.
 
+`publish-hiidb.efi keyword-kinds-forms` creates the variable `KindStore` unless it exists, with
+its VarStore's Attributes and Size, and registers the forms of
+[`publish-hiidb/src/keyword_kinds_forms.rs`](publish-hiidb/src/keyword_kinds_forms.rs) for a
+new handle of a vendor device path: a DATE that suppresses its year, a TIME that suppresses its
+second, an ORDERED_LIST of at most 3 UINT8 options under EFI_IFR_UNIQUE_SET and a REF5 on
+`KindStore`, each with an x-UEFI-ns keyword. In the scenario `shell-keyword-kinds`,
+`uefisettings.efi hii keyword set` writes the DATE, the TIME and the ORDERED_LIST through edk2's
+Config Keyword Handler, one at a time and two in one SetData(), and refuses before any call a
+VALUE that changes a suppressed field, an hour out of range, a container after an empty one, an
+option twice and the REF, which `dmpstore` shows wrote nothing.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt

@@ -94,13 +94,27 @@ pub(crate) fn strings_package_with_header_padding<'a>(
     padding: &[u8],
     strings: impl IntoIterator<Item = &'a str>,
 ) -> Vec<u8> {
-    // EFI_HII_SIBT_STRING_UCS2 blocks, then EFI_HII_SIBT_END
-    let blocks: Vec<u8> = strings
+    strings_package_with_blocks(b"en-US\0", &[0; 16], padding, &ucs2_blocks(strings))
+}
+
+/// A strings package of Language `language`, null terminator included, of `strings`, from string
+/// ID [`LANGUAGE_NAME`]: such as the keywords of an x-UEFI configuration language
+/// (UEFI_CONFIG_LANG, UEFI 2.11 §33.3.6.1), each under the string ID of its question's prompt,
+/// where edk2-stable202608 ConfigKeywordHandler.c FindQuestionFromStringId (:1499) finds it.
+pub(crate) fn language_strings_package<'a>(
+    language: &[u8],
+    strings: impl IntoIterator<Item = &'a str>,
+) -> Vec<u8> {
+    strings_package_with_blocks(language, &[0; 16], &[], &ucs2_blocks(strings))
+}
+
+/// An EFI_HII_SIBT_STRING_UCS2 block of each of `strings`, then EFI_HII_SIBT_END.
+fn ucs2_blocks<'a>(strings: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
+    strings
         .into_iter()
         .flat_map(|string| [&[EFI_HII_SIBT_STRING_UCS2][..], &ucs2(string)].concat())
         .chain([EFI_HII_SIBT_END])
-        .collect();
-    strings_package_with_blocks(b"en-US\0", &[0; 16], padding, &blocks)
+        .collect()
 }
 
 /// A strings package of Language `language`, null terminator included, and LanguageWindow

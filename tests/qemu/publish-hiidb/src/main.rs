@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -64,6 +64,9 @@
 //! declares first, for `uefisettings.efi` in the UEFI Shell;
 //! `rt-data-first-store-password-forms` is `rt-data`, after it does the same, so that Linux
 //! finds it too.
+//! `keyword-kinds-forms` creates the variable of [`keyword_kinds_forms`] if it is missing and
+//! registers its package list for a handle of its device path, for `uefisettings.efi hii keyword`
+//! in the UEFI Shell, where the Keyword Handler finds its questions by their x-UEFI-ns keywords.
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `string-blocks` does the same with the package list of [`string_blocks`].
@@ -116,6 +119,7 @@ mod first_store_password_forms;
 mod formset_skip_forms;
 mod global_variable_forms;
 mod hii_package;
+mod keyword_kinds_forms;
 mod nested_password_forms;
 mod outside_form_set_password_forms;
 mod padded_strings;
@@ -153,6 +157,7 @@ use uefi::Guid;
 use uefi::Handle;
 use uefi::Status;
 use uefi::StatusExt;
+use uefi_raw::protocol::device_path::DevicePathProtocol;
 use uefi_raw::protocol::hii::database::HiiDatabaseProtocol;
 use uefi_raw::table::runtime::ResetType;
 use uefi_raw::table::runtime::RuntimeServices;
@@ -327,6 +332,8 @@ fn efi_main() -> Status {
                      {address:#x}"
                 );
             }),
+        Some(Task::RegisterKeywordKindsForms) => register_keyword_kinds_forms()
+            .map(|()| println!("publish-hiidb: registered the keyword kinds forms")),
         Some(Task::RegisterPaddedStrings) => register_package_list(
             &padded_strings::package_list_bytes(),
             "registering the padded strings",
@@ -376,7 +383,7 @@ fn efi_main() -> Status {
                  |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
                  |disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms\
                  |outside-form-set-password-forms|rt-data-outside-form-set-password-forms\
-                 |first-store-password-forms|rt-data-first-store-password-forms\
+                 |first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms\
                  |padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|export-config|rt-properties-no-set-variable\
                  |rt-properties-all\
@@ -437,6 +444,9 @@ enum Task {
     /// Do what RegisterFirstStorePasswordForms does, then publish the database in runtime-data
     /// pages.
     PublishFirstStorePasswordForms,
+    /// Create the variable of [`keyword_kinds_forms`] if missing and register its package list in
+    /// the HII database for a handle of its device path.
+    RegisterKeywordKindsForms,
     /// Register the package list of [`padded_strings`] in the HII database.
     RegisterPaddedStrings,
     /// Create the variable of [`readwrite_forms`] if missing, register its package list in the
@@ -534,6 +544,9 @@ fn load_option() -> Option<Task> {
         Ok(option) if option == cstr16!("rt-data-first-store-password-forms") => {
             Some(Task::PublishFirstStorePasswordForms)
         }
+        Ok(option) if option == cstr16!("keyword-kinds-forms") => {
+            Some(Task::RegisterKeywordKindsForms)
+        }
         Ok(option) if option == cstr16!("padded-strings") => Some(Task::RegisterPaddedStrings),
         Ok(option) if option == cstr16!("string-blocks") => Some(Task::RegisterStringBlocks),
         Ok(option) if option == cstr16!("acpi-table") => {
@@ -627,6 +640,41 @@ fn register_package_list_for(
         )
     };
     status.to_result().map_err(|error| (step, error.status()))
+}
+
+/// The bytes of a device path of a Hardware Vendor Device Path node of `vendor` (UEFI 2.11
+/// §10.3.2.4), then the End of Entire Device Path node.
+const fn vendor_device_path(vendor: Guid) -> [u8; 24] {
+    let vendor = vendor.to_bytes();
+    let mut path = [0; 24];
+    // Type 1, Sub-Type 4, Length 20
+    path[0] = 0x01;
+    path[1] = 0x04;
+    path[2] = 20;
+    let mut index = 0;
+    while index < vendor.len() {
+        path[4 + index] = vendor[index];
+        index += 1;
+    }
+    // End of Entire Device Path: Type 0x7F, Sub-Type 0xFF, Length 4
+    path[20] = 0x7F;
+    path[21] = 0xFF;
+    path[22] = 4;
+    path
+}
+
+/// A new handle with the device path `path`, for register_package_list_for.
+fn install_device_path(path: &'static [u8; 24]) -> Result<Handle, Failure> {
+    #[expect(
+        unsafe_code,
+        reason = "the uefi crate's InstallProtocolInterface() wrapper is unsafe"
+    )]
+    // SAFETY: `path` is a whole device path under the GUID of EFI_DEVICE_PATH_PROTOCOL, in a
+    // static that stays valid as long as the driver stays loaded, which it does.
+    unsafe {
+        boot::install_protocol_interface(None, &DevicePathProtocol::GUID, path.as_ptr().cast())
+    }
+    .map_err(|error| ("installing the device path of a handle", error.status()))
 }
 
 /// Creates the variable `name` of `vendor` with `attributes` and `data` unless it exists, as a
@@ -727,6 +775,27 @@ fn register_first_store_password_forms() -> Result<(), Failure> {
     register_package_list(
         &first_store_password_forms::package_list_bytes(),
         "registering the first store password forms",
+    )
+}
+
+/// Creates the variable of [`keyword_kinds_forms`] unless it exists, then registers its package
+/// list for a new handle of its device path.
+fn register_keyword_kinds_forms() -> Result<(), Failure> {
+    create_missing_variable(
+        keyword_kinds_forms::STORE_NAME,
+        keyword_kinds_forms::STORE_VENDOR,
+        keyword_kinds_forms::STORE_ATTRIBUTES,
+        &keyword_kinds_forms::store_data(),
+        (
+            "reading the KindStore variable",
+            "creating the KindStore variable",
+        ),
+    )?;
+    let driver = install_device_path(&keyword_kinds_forms::DRIVER_PATH)?;
+    register_package_list_for(
+        &keyword_kinds_forms::package_list_bytes(),
+        Some(driver),
+        "registering the keyword kinds forms",
     )
 }
 
