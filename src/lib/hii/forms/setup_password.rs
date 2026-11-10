@@ -3121,4 +3121,59 @@ mod tests {
             "withheld through Runtime"
         );
     }
+
+    /// The IFR that read_db ignores starts at the FORM_SET op of a FormSet that it ignores, or of
+    /// one without its Scope bit: a VarStore outside any FormSet before that op, of the VarStoreId
+    /// of a PASSWORD of a FormSet, keeps that password at its VarOffset, as any VarStore outside a
+    /// FormSet does, and is not withheld whole, through variables that reach Runtime.
+    #[test]
+    fn an_outside_var_store_before_ignored_ifr_keeps_a_password_at_its_var_offset() {
+        let mut want = WithheldBytes::default();
+        want.insert(amitse_setup(), 0..40);
+        want.insert(shadow(), 0..40);
+        for (case, ignored) in [
+            ("an ignored FormSet", ignored_form_set(&[form(1, &[])])),
+            (
+                "a FormSet without its Scope bit",
+                scopeless_form_set(&[form(1, &[])]),
+            ),
+        ] {
+            let ifr = [
+                var_store(2, OTHER_GUID, "Shadow", 81),
+                ignored,
+                form_set_with(&[password_on(2, 3, 2, 0)]),
+            ];
+
+            assert_eq!(
+                withheld_of(&ifr, VariableReach::Runtime),
+                Ok(want.clone()),
+                "before {case}"
+            );
+        }
+    }
+
+    /// A FORM_SET op without its Scope bit in a FormSet that read_db ignores, which it ignores too,
+    /// makes the IFR from the outer FORM_SET op on ignored up to the end of the walk, past the outer
+    /// FormSet's End, as edk2 parses a FormSet without Scope to the end of the form package: a
+    /// VarStore after that End, of the VarStoreId of a PASSWORD of a FormSet, is withheld whole
+    /// through variables that reach Runtime, and so is each variable that the FormSet after it
+    /// declares.
+    #[test]
+    fn the_ifr_of_a_form_set_without_its_scope_bit_in_an_ignored_one_runs_past_its_end() {
+        let ifr = [
+            ignored_form_set(&[scopeless_form_set(&[])]),
+            var_store(2, OTHER_GUID, "Shadow", 81),
+            form_set_with(&[password_on(2, 3, 2, 0)]),
+        ];
+        let withheld = withheld_of(&ifr, VariableReach::Runtime).expect("withheld through Runtime");
+
+        for key in [setup(), amitse_setup(), shadow()] {
+            let bytes: Vec<&Range<usize>> = withheld.of(&key).collect();
+            assert!(
+                bytes.contains(&&(0..usize::MAX)),
+                "{} withheld whole: {bytes:?}",
+                key.name
+            );
+        }
+    }
 }
