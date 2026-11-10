@@ -1951,6 +1951,117 @@ mod tests {
         }
     }
 
+    /// The order in which the vendor ACPI table method tries the tables, as the starting tree
+    /// implements it.
+    mod acpi_order {
+        use super::*;
+        use crate::hii::memory_access_denied::fixture::unreadable_file;
+
+        /// The database of each table: a package list of the table's own GUID.
+        fn database(signature: [u8; 4]) -> Vec<u8> {
+            let guid = [signature, signature, signature, signature].concat();
+            en_strings_list(guid.try_into().expect("16 bytes"), signature[0])
+        }
+
+        /// Writes into `dir` the table of `signature` that holds database(signature).
+        fn write_valid(dir: &Path, signature: [u8; 4]) {
+            let name = String::from_utf8_lossy(&signature).into_owned();
+            std::fs::write(
+                dir.join(name),
+                signed_table(signature, &database(signature)),
+            )
+            .expect("write the table");
+        }
+
+        /// Writes into `dir` a table of `signature` whose checksum fails.
+        fn write_invalid(dir: &Path, signature: [u8; 4]) {
+            let name = String::from_utf8_lossy(&signature).into_owned();
+            let mut table = signed_table(signature, &database(signature));
+            table[ACPI_CHECKSUM_OFFSET] = table[ACPI_CHECKSUM_OFFSET].wrapping_add(1);
+            std::fs::write(dir.join(name), table).expect("write the table");
+        }
+
+        /// It tries QHII first, then HIID: with both valid it reads QHII, with QHII absent or
+        /// invalid HIID.
+        #[test]
+        fn tries_qhii_then_hiid_past_absent_or_invalid_tables() {
+            for (case, qhii, want) in [
+                ("both valid", Some(true), *b"QHII"),
+                ("QHII absent", None, *b"HIID"),
+                ("QHII invalid", Some(false), *b"HIID"),
+            ] {
+                let dir = tempfile::tempdir().expect("create a directory");
+                match qhii {
+                    Some(true) => write_valid(dir.path(), *b"QHII"),
+                    Some(false) => write_invalid(dir.path(), *b"QHII"),
+                    None => {}
+                }
+                write_valid(dir.path(), *b"HIID");
+
+                let db =
+                    extract_db_acpi(dir.path()).unwrap_or_else(|error| panic!("{case}: {error:#}"));
+
+                assert_eq!(db, database(want), "{case}");
+            }
+        }
+
+        /// It stops at a table that it may not read, or cannot read as a file, and fails with that
+        /// table's error, though HIID holds the database.
+        #[test]
+        fn stops_at_a_table_that_it_may_not_read() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            write_valid(dir.path(), *b"HIID");
+            std::fs::create_dir(dir.path().join("QHII")).expect("create the directory QHII");
+
+            let error = extract_db_acpi(dir.path()).expect_err("read the directory QHII");
+            assert!(
+                format!("{error:#}").starts_with(&format!(
+                    "Failed to read ACPI table file, {}",
+                    dir.path().join("QHII").display()
+                )),
+                "a directory: {error:#}"
+            );
+
+            let dir = tempfile::tempdir().expect("create a directory");
+            write_valid(dir.path(), *b"HIID");
+            if !unreadable_file(&dir.path().join("QHII")) {
+                // CAP_DAC_OVERRIDE reads it anyway
+                return;
+            }
+            let error = extract_db_acpi(dir.path()).expect_err("read the unreadable QHII");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "an unreadable file: {error:#}"
+            );
+        }
+
+        /// With no table that gives the database, the error names each table's error, QHII's
+        /// first.
+        #[test]
+        fn names_each_table_s_error_in_order() {
+            let dir = tempfile::tempdir().expect("create a directory");
+            write_invalid(dir.path(), *b"QHII");
+
+            let error = extract_db_acpi(dir.path()).expect_err("read no table");
+
+            let qhii = dir.path().join("QHII");
+            let hiid = dir.path().join("HIID");
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "no vendor ACPI table holds an HII database ({} holds no HII database: the \
+                     table fails its checksum: its bytes sum to 0x01, not 0; Failed to open {}: \
+                     No such file or directory (os error 2))",
+                    qhii.display(),
+                    hiid.display()
+                )
+            );
+        }
+    }
+
     /// Which methods read the HII database, and how each reports its source absent, refused or
     /// failing otherwise.
     mod sources {
