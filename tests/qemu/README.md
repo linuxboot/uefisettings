@@ -184,11 +184,13 @@ refuses before it opens `/dev/mem`, naming lockdown, and that the automatic orde
 `publish-hiidb.efi reserved` and `publish-hiidb.efi acpi-nvs` put the copy in memory that the
 firmware reserves without the RUNTIME attribute, which `uefisettings` refuses by default, as it
 reads only EFI runtime regions. The scenario `hii-reserved` checks that refusal of extract-db
-and set, and that `--efivar-memory firmware-reserved` reads the copy. In the scenario
-`hii-acpi-nvs`, on x86_64 and i686, Linux marks the ACPI NVS copy busy, which `/dev/mem`
-refuses to map under `CONFIG_IO_STRICT_DEVMEM`, and on x86_64 to read (i686's Linux fails read()
-of it with EFAULT, past its low memory): with `--efivar-memory firmware-reserved`, the `HiiDB`
-variable method reports the kernel's refusal. The scenario skips aarch64 because arm64 Linux
+and set, and that `--efivar-memory firmware-reserved` reads the copy with
+`--i-am-fine-to-brick-this-system`, warning of the read, and refuses it without that flag. In
+the scenario `hii-acpi-nvs`, on x86_64 and i686, Linux marks the ACPI NVS copy busy, which
+`/dev/mem` refuses to map under `CONFIG_IO_STRICT_DEVMEM`, and on x86_64 to read (i686's Linux
+fails read() of it with EFAULT, past its low memory): with `--efivar-memory firmware-reserved`
+and `--i-am-fine-to-brick-this-system`, the `HiiDB` variable method reports the kernel's refusal
+after the read that the flag let through. The scenario skips aarch64 because arm64 Linux
 v6.11 registers nomap memory as a non-busy reserved resource, which devmem_is_allowed() admits
 (lib/devmem_is_allowed.c:21-28; arch/arm64/kernel/setup.c:227-229).
 The scenario `hii-devmem-guard` checks that the `HiiDB` variable method refuses a copy in loader

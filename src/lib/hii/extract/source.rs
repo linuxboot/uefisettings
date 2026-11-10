@@ -23,6 +23,7 @@ use thiserror::Error;
 
 use super::EfivarMemory;
 use crate::hii::memory_access_denied::MemoryAccessDenied;
+use crate::unsafe_operations::UnsafeOperationRefused;
 
 /// A way in which the Linux build reads this machine's HII database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,8 +98,9 @@ pub enum HiiMethodError {
     Absent(anyhow::Error),
     /// The kernel or a file's permissions refused a read that the method needs: kernel lockdown,
     /// the kernel's checks of /dev/mem or /proc/kcore (MemoryAccessDenied), or a file that this
-    /// user may not read. The automatic order stops here, so that no later method reads around
-    /// what the administrator or the kernel refused.
+    /// user may not read; or UnsafeOperations refused it (UnsafeOperationRefused). The automatic
+    /// order stops here, so that no later method reads around what the administrator or the
+    /// kernel refused.
     #[error("refused: {0:#}")]
     Refused(anyhow::Error),
     /// Anything else: the source holds no HII database that uefisettings reads, or what the
@@ -125,9 +127,11 @@ impl HiiMethodError {
 }
 
 /// Whether `error` says that the kernel or a file's permissions refused a read: a
-/// MemoryAccessDenied, or EACCES or EPERM in any of its layers.
+/// MemoryAccessDenied, or EACCES or EPERM in any of its layers; or that UnsafeOperations refused
+/// it, an UnsafeOperationRefused.
 fn is_refusal(error: &anyhow::Error) -> bool {
     error.is::<MemoryAccessDenied>()
+        || error.is::<UnsafeOperationRefused>()
         || error.chain().any(|cause| {
             cause
                 .downcast_ref::<io::Error>()
@@ -202,6 +206,7 @@ mod tests {
     use crate::hii::memory_access_denied::DenialCause;
     use crate::hii::memory_access_denied::MemoryDevice;
     use crate::hii::memory_access_denied::MemoryOperation;
+    use crate::unsafe_operations::UnsafeOperation;
 
     /// What a fake method gives.
     #[derive(Debug, Clone, Copy)]
@@ -401,7 +406,8 @@ mod tests {
     }
 
     /// A refusal is a MemoryAccessDenied, as kernel lockdown and the kernel's checks of /dev/mem
-    /// give, or EACCES or EPERM, under any context; other errors are not.
+    /// give, EACCES or EPERM, or an UnsafeOperationRefused, under any context; other errors are
+    /// not.
     #[test]
     fn of_present_tells_a_refusal() {
         let denied = || MemoryAccessDenied {
@@ -433,6 +439,14 @@ mod tests {
                 false,
             ),
             ("an invalid database", anyhow!("not an HII database"), false),
+            (
+                "an unsafe operation refused under a context",
+                anyhow::Error::new(UnsafeOperationRefused {
+                    operation: UnsafeOperation::SetupPassword,
+                })
+                .context("Failed to read"),
+                true,
+            ),
         ] {
             let got = HiiMethodError::of_present(error);
 

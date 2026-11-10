@@ -116,6 +116,13 @@ impl HiiDbArgs {
     }
 }
 
+/// None: this build reads no memory itself; the HiiDB driver maps the range that the HiiDB efivar
+/// names, whatever its memory type (hiidb_driver.rs:56-70), which this build cannot bound.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiSourceUnsafeArgs {}
+
 /// Where get, show-ifr and list-questions read question values.
 #[derive(Debug, Args)]
 pub(super) struct EfivarArgs {
@@ -144,6 +151,7 @@ pub(super) fn auto_get(
     question: &QuestionArgs,
     json: bool,
     selection: &SelectionArgs,
+    _unsafe_operations: &HiiSourceUnsafeArgs,
     _source: &HiiSourceArgs,
 ) -> Result<()> {
     hii_get(

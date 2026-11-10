@@ -36,11 +36,13 @@ use uefisettings_backend_thrift::SetResponseList;
 use super::CapsuleBackend;
 use super::DumpEfivarsOptions;
 use super::HiiBackend;
+use super::LiftedOperations;
 use super::QuestionSelector;
 use super::SetOptions;
 use super::SetValue;
 use super::SettingsBackend;
 use super::UnsafeOperation;
+use super::UnsafeOperations;
 use super::VariableBackend;
 use crate::capsule_loader::CapsuleLoader;
 use crate::efi_variables::CapsuleDelivery;
@@ -81,9 +83,12 @@ use crate::translation::translate_response;
 
 /// What set and get read and write when no file names them: this machine's HiiDB and efivarfs.
 impl HiiBackend {
-    /// This machine's HiiDB, read in the automatic order.
+    /// This machine's HiiDB, read in the automatic order, from runtime memory, which lifts no
+    /// unsafe operation.
     pub(super) fn system_hiidb() -> Result<Vec<u8>> {
-        Ok(extract::extract_db_from(&HiiSourceOptions::default())?)
+        let (db, _) =
+            extract::extract_db_from(&HiiSourceOptions::default(), UnsafeOperations::Refuse)?;
+        Ok(db)
     }
 
     /// This machine's efivarfs.
@@ -150,15 +155,26 @@ impl CapsuleBackend {
 impl HiiBackend {
     /// extract_db extracts HiiDB from efivarfs and returns it in bytes (in HiiDatabase's db field which is `Vec<u8>`)
     pub fn extract_db() -> Result<HiiDatabase> {
-        Self::extract_db_from(&HiiSourceOptions::default())
-    }
-
-    /// This machine's HiiDB, read as `source` says.
-    pub fn extract_db_from(source: &HiiSourceOptions) -> Result<HiiDatabase> {
         Ok(HiiDatabase {
-            db: extract::extract_db_from(source)?,
+            db: Self::system_hiidb()?,
             ..Default::default()
         })
+    }
+
+    /// This machine's HiiDB, read as `source` says, firmware-reserved memory only if
+    /// `unsafe_operations` allows it. Returns the unsafe operations that it lifted too.
+    pub fn extract_db_from(
+        source: &HiiSourceOptions,
+        unsafe_operations: UnsafeOperations,
+    ) -> Result<(HiiDatabase, Vec<UnsafeOperation>)> {
+        let (db, lifted) = extract::extract_db_from(source, unsafe_operations)?;
+        Ok((
+            HiiDatabase {
+                db,
+                ..Default::default()
+            },
+            lifted,
+        ))
     }
 
     /// Reads the HiiDB that get, list-questions and show-ifr read with `efivars`: the file
@@ -166,22 +182,34 @@ impl HiiBackend {
     /// machine's. A redacted dump refuses another `filename`, whose questions would read its
     /// zeros as values.
     pub fn read_hiidb(filename: Option<&Path>, efivars: &EfivarSource) -> Result<Vec<u8>> {
-        Self::read_hiidb_from(filename, efivars, &HiiSourceOptions::default())
+        let (db, _) = Self::read_hiidb_from(
+            filename,
+            efivars,
+            &HiiSourceOptions::default(),
+            UnsafeOperations::Refuse,
+        )?;
+        Ok(db)
     }
 
-    /// read_hiidb, which reads this machine's HiiDB as `source` says.
+    /// read_hiidb, which reads this machine's HiiDB as `source` says, firmware-reserved memory
+    /// only if `unsafe_operations` allows it. Returns the unsafe operations that it lifted too.
     pub fn read_hiidb_from(
         filename: Option<&Path>,
         efivars: &EfivarSource,
         source: &HiiSourceOptions,
-    ) -> Result<Vec<u8>> {
+        unsafe_operations: UnsafeOperations,
+    ) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
         match SavedDump::read_given_hiidb(filename, efivars)? {
-            Some(db) => Ok(db),
-            None => Ok(extract::extract_db_from(source)?),
+            Some(db) => Ok((db, Vec::new())),
+            None => extract::extract_db_from(source, unsafe_operations),
         }
     }
 
-    /// set_using, in this machine's HiiDB read as `source` says.
+    /// set_using, in this machine's HiiDB read as `source` says, firmware-reserved memory only if
+    /// options.unsafe_operations allows it, which it returns as lifted too, also with the error of
+    /// what fails after the read (LiftedOperations); except that set and hii set on Linux with
+    /// --efivar-memory firmware-reserved read the HiiDB, which their other checks need, before
+    /// those checks.
     pub fn set_from(
         question: impl Into<QuestionSelector>,
         value: &SetValue,
@@ -189,16 +217,20 @@ impl HiiBackend {
         options: &SetOptions,
         source: &HiiSourceOptions,
     ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
-        Self::set_in(
-            &extract::extract_db_from(source)?,
-            question,
-            value,
-            selector,
-            options,
-            EfivarSource::System.into_variables()?,
-            &Self::system_variables()?,
-            EfivarSource::System.platform_lang()?.as_deref(),
+        Self::set_after_read(
+            extract::extract_db_from(source, options.unsafe_operations)?,
+            |db| Self::set_in_system(db, question, value, selector, options),
         )
+    }
+
+    /// What set_from does after its read `(db, lifted)`: `set` in `db`, then the read's lifted
+    /// operations before set's, with set's error too (LiftedOperations).
+    pub(super) fn set_after_read(
+        (db, lifted): (Vec<u8>, Vec<UnsafeOperation>),
+        set: impl FnOnce(&[u8]) -> Result<(SetResponseList, Vec<UnsafeOperation>)>,
+    ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
+        let ((responses, set_lifted), lifted) = LiftedOperations::after(lifted, set(&db))?;
+        Ok((responses, [lifted, set_lifted].concat()))
     }
 
     /// Copies the efivar files that the questions of the HiiDB `db_bytes` read into the new

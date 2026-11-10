@@ -74,6 +74,9 @@ use crate::hii::system_table::SystemTableLocator;
 #[cfg(firmware_memory_maps)]
 use crate::hii::system_table::EFI_HII_DATABASE_PROTOCOL_GUID;
 use crate::parse_error::ReadParsed;
+use crate::unsafe_operations::LiftedOperations;
+use crate::unsafe_operations::UnsafeOperation;
+use crate::unsafe_operations::UnsafeOperations;
 pub use source::HiiMethod;
 pub use source::HiiMethodError;
 pub use source::HiiSource;
@@ -245,19 +248,39 @@ fn systab_lists_hii_export(_: &HiiSourcePaths) -> Result<bool> {
     Err(MemoryMapUnavailable::NoMapReader.into())
 }
 
-/// The raw HII database bytes, read as `options` say.
-pub fn extract_db_from(options: &HiiSourceOptions) -> Result<Vec<u8>, NoHiiDatabase> {
-    extract_db_from_at(&HiiSourcePaths::default(), options)
+/// The raw HII database bytes, read as `options` say, firmware-reserved memory only if
+/// `unsafe_operations` allows it, and the unsafe operations that it lifted.
+pub fn extract_db_from(
+    options: &HiiSourceOptions,
+    unsafe_operations: UnsafeOperations,
+) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
+    extract_db_from_at(&HiiSourcePaths::default(), options, unsafe_operations)
 }
 
-/// extract_db_from, with the files at `paths`.
+/// extract_db_from, with the files at `paths`. It lifted what each method that it read lifted,
+/// also one that failed after it (LiftedOperations); its NoHiiDatabase carries them too, as
+/// main()'s write_lifted_of reads only the top-level error.
 fn extract_db_from_at(
     paths: &HiiSourcePaths,
     options: &HiiSourceOptions,
-) -> Result<Vec<u8>, NoHiiDatabase> {
-    source::read_through(&options.source, |method| {
-        read_by(paths, method, options.efivar_memory)
-    })
+    unsafe_operations: UnsafeOperations,
+) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
+    let mut lifted = Vec::new();
+    let db = source::read_through(&options.source, |method| {
+        match read_by(paths, method, options.efivar_memory, unsafe_operations) {
+            Ok((db, operations)) => {
+                lifted.extend(operations);
+                Ok(db)
+            }
+            Err(error) => {
+                if let Some(LiftedOperations(operations)) = error.error().downcast_ref() {
+                    lifted.extend_from_slice(operations);
+                }
+                Err(error)
+            }
+        }
+    });
+    LiftedOperations::after(lifted, db.map_err(anyhow::Error::from))
 }
 
 /// The HII database that `method` reads with the files at `paths`, or why not: each method finds
@@ -268,23 +291,28 @@ fn read_by(
     paths: &HiiSourcePaths,
     method: HiiMethod,
     efivar_memory: EfivarMemory,
-) -> Result<Vec<u8>, HiiMethodError> {
+    unsafe_operations: UnsafeOperations,
+) -> Result<(Vec<u8>, Vec<UnsafeOperation>), HiiMethodError> {
     match method {
-        HiiMethod::Acpi => extract_db_acpi(&paths.acpi_tables).map_err(|error| {
-            match error.downcast_ref::<AcpiTablesInvalid>() {
+        HiiMethod::Acpi => extract_db_acpi(&paths.acpi_tables)
+            .map(|db| (db, Vec::new()))
+            .map_err(|error| match error.downcast_ref::<AcpiTablesInvalid>() {
                 Some(AcpiTablesInvalid(tried)) if tried.iter().all(is_missing_file) => {
                     HiiMethodError::Absent(error)
                 }
                 _ => HiiMethodError::of_present(error),
-            }
-        }),
-        HiiMethod::Efivar => extract_db_efivar(paths, efivar_memory).map_err(|error| {
-            match error.is::<HiiDbVariableAbsent>() {
-                true => HiiMethodError::Absent(error),
-                false => HiiMethodError::of_present(error),
-            }
-        }),
-        HiiMethod::Systab => extract_db_systab(paths).map_err(classify_systab),
+            }),
+        HiiMethod::Efivar => {
+            extract_db_efivar(paths, efivar_memory, unsafe_operations).map_err(|error| {
+                match error.is::<HiiDbVariableAbsent>() {
+                    true => HiiMethodError::Absent(error),
+                    false => HiiMethodError::of_present(error),
+                }
+            })
+        }
+        HiiMethod::Systab => extract_db_systab(paths)
+            .map(|db| (db, Vec::new()))
+            .map_err(classify_systab),
     }
 }
 
@@ -472,42 +500,58 @@ fn locate_efivar_database(paths: &HiiSourcePaths) -> Result<(u64, usize)> {
 }
 
 /// The HiiDB that the OCP HiiDB efivar at paths.ocp_hiidb points to in paths.dev_mem, read only
-/// inside `efivar_memory`, under the kernel lockdown mode in paths.lockdown.
+/// inside `efivar_memory`, under the kernel lockdown mode in paths.lockdown, and the unsafe
+/// operations of `unsafe_operations` that it lifted.
 #[cfg(firmware_memory_maps)]
-fn extract_db_efivar(paths: &HiiSourcePaths, efivar_memory: EfivarMemory) -> Result<Vec<u8>> {
-    extract_db_with(paths, efivar_memory, DevMem::open)
+fn extract_db_efivar(
+    paths: &HiiSourcePaths,
+    efivar_memory: EfivarMemory,
+    unsafe_operations: UnsafeOperations,
+) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
+    extract_db_with(paths, efivar_memory, unsafe_operations, DevMem::open)
 }
 
 /// extract_db_efivar on an architecture whose firmware memory maps uefisettings does not read,
 /// which refuses the read that nothing bounds.
 #[cfg(not(firmware_memory_maps))]
-fn extract_db_efivar(paths: &HiiSourcePaths, _: EfivarMemory) -> Result<Vec<u8>> {
+fn extract_db_efivar(
+    paths: &HiiSourcePaths,
+    _: EfivarMemory,
+    _: UnsafeOperations,
+) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
     locate_efivar_database(paths)?;
     Err(MemoryMapUnavailable::NoMapReader.into())
 }
 
 /// extract_db_efivar, reading physical memory that `open_memory` opens from paths.dev_mem and
 /// paths.lockdown: in that order, the efivar, its length, the lockdown mode, the memory map that
-/// bounds the read, /dev/mem, then the read that the map admits.
+/// bounds the read, the range that the map admits, then, in firmware-reserved memory, whether
+/// `unsafe_operations` allows the read, /dev/mem, and the read, whose errors carry the lifted read
+/// (LiftedOperations).
 #[cfg(firmware_memory_maps)]
 fn extract_db_with<M: PhysicalMemory>(
     paths: &HiiSourcePaths,
     efivar_memory: EfivarMemory,
+    unsafe_operations: UnsafeOperations,
     open_memory: impl FnOnce(&Path, &Path) -> Result<M>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
     let (address, length) = locate_efivar_database(paths)?;
 
     // Now that we have offset and size from the HiiDB efivar, use it to read DB from memory.
     match efivar_memory {
         EfivarMemory::Runtime => {
             let map = paths.maps.runtime_bound(&paths.lockdown)?;
-            RuntimeMemory::new(map, open_memory(&paths.dev_mem, &paths.lockdown)?)
-                .read(address, length)
+            let db = RuntimeMemory::new(map, open_memory(&paths.dev_mem, &paths.lockdown)?)
+                .read(address, length)?;
+            Ok((db, Vec::new()))
         }
         EfivarMemory::FirmwareReserved => {
             let map = paths.maps.firmware_reserved_bound(&paths.lockdown)?;
-            ReservedMemory::new(map, open_memory(&paths.dev_mem, &paths.lockdown)?)
-                .read(address, length)
+            map.reserved_range_end(address, u64::try_from(length)?)?;
+            let lifted = vec![unsafe_operations.check(UnsafeOperation::FirmwareReservedMemory)?];
+            let db = open_memory(&paths.dev_mem, &paths.lockdown)
+                .and_then(|memory| ReservedMemory::new(map, memory).read(address, length));
+            LiftedOperations::after(lifted, db)
         }
     }
 }
@@ -976,6 +1020,8 @@ mod tests {
         use crate::hii::firmware_memory::MemoryMapUnavailable;
         use crate::memory_map::efi_memory_map::fixture::descriptor;
         use crate::memory_map::efi_memory_map::RangeRefusal;
+        use crate::unsafe_operations::LiftedOperations;
+        use crate::unsafe_operations::UnsafeOperationRefused;
 
         /// The regions of the bound tests' memory maps: runtime data, reserved memory and ACPI NVS
         /// without the RUNTIME attribute, System RAM, ACPI tables, and a runtime descriptor of
@@ -1203,13 +1249,23 @@ mod tests {
                         None => address..address + length,
                     };
 
-                    let got = extract_db_with(&paths, memory, |path, _| {
-                        MemoryWithin::open(path, readable.start, readable.end)
-                    });
+                    let got =
+                        extract_db_with(&paths, memory, UnsafeOperations::Allow, |path, _| {
+                            MemoryWithin::open(path, readable.start, readable.end)
+                        });
 
                     match (got, refusal) {
-                        (Ok(db), None) => {
-                            assert_eq!(db, BOUNDED_DB, "{family}, {memory:?}: {case}")
+                        (Ok((db, lifted)), None) => {
+                            assert_eq!(db, BOUNDED_DB, "{family}, {memory:?}: {case}");
+                            let firmware_reserved = memory == FirmwareReserved;
+                            assert_eq!(
+                                lifted,
+                                firmware_reserved
+                                    .then_some(UnsafeOperation::FirmwareReservedMemory)
+                                    .into_iter()
+                                    .collect::<Vec<_>>(),
+                                "{family}, {memory:?}: {case}: lifted"
+                            );
                         }
                         (Err(error), Some(refusal)) => assert_eq!(
                             error.downcast_ref::<RangeRefusal>(),
@@ -1220,6 +1276,181 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// Without the flag, the efivar source refuses a database in firmware-reserved memory
+        /// before it opens /dev/mem, naming the flag, by x86's and by arm64's maps, and Auto stops
+        /// there; a range in no firmware-reserved region is refused as such with the flag and
+        /// without, as the flag lifts no refusal before its own; runtime memory needs no flag.
+        #[test]
+        fn efivar_refuses_firmware_reserved_memory_without_the_flag_before_opening_dev_mem() {
+            let length = u64::try_from(BOUNDED_DB.len()).expect("a u64 length");
+            for (family, write_maps) in [
+                ("x86", write_bound_sysfs_maps as fn(&Path) -> MemoryMapFiles),
+                ("arm64", write_bound_fdt_maps),
+            ] {
+                let dir = tempfile::tempdir().expect("create a directory");
+                let reserved =
+                    bounded_paths(dir.path(), write_maps(dir.path()), RESERVED_AT + DB_OFFSET);
+
+                let error = extract_db_with(
+                    &reserved,
+                    EfivarMemory::FirmwareReserved,
+                    UnsafeOperations::Refuse,
+                    unopened,
+                )
+                .expect_err("read reserved memory without the flag");
+
+                assert_eq!(
+                    error.downcast_ref::<UnsafeOperationRefused>(),
+                    Some(&UnsafeOperationRefused {
+                        operation: UnsafeOperation::FirmwareReservedMemory
+                    }),
+                    "{family}: {error:#}"
+                );
+                assert_eq!(
+                    error.to_string(),
+                    "the efivar source would read the HiiDB from memory that the firmware \
+                     reserves, which may be device memory, whose reads can have side effects: of \
+                     I/O memory, \"Accidental access to this is obviously disastrous\" (Linux \
+                     6.11 lib/Kconfig.debug:1911-1913), and EfiReservedMemoryType is \"Not \
+                     usable.\" (UEFI 2.11 §7.2 Table 7.6); pass --i-am-fine-to-brick-this-system \
+                     to read it",
+                    "{family}: refusal"
+                );
+                let auto = HiiSourceOptions {
+                    source: HiiSource::Auto,
+                    efivar_memory: EfivarMemory::FirmwareReserved,
+                };
+                let error = extract_db_from_at(&reserved, &auto, UnsafeOperations::Refuse)
+                    .expect_err("read reserved memory in the automatic order without the flag");
+                let Some(NoHiiDatabase { tried }) = error.downcast_ref() else {
+                    panic!("{family}: auto: {error:#}");
+                };
+                let [(HiiMethod::Acpi, HiiMethodError::Absent(_)), (HiiMethod::Efivar, HiiMethodError::Refused(efivar))] =
+                    tried.as_slice()
+                else {
+                    panic!("{family}: auto: {error:#}");
+                };
+                assert!(
+                    efivar.is::<UnsafeOperationRefused>(),
+                    "{family}: auto: {error:#}"
+                );
+
+                let dir = tempfile::tempdir().expect("create a directory");
+                let outside = bounded_paths(dir.path(), write_maps(dir.path()), RAM_AT + DB_OFFSET);
+                for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+                    let error =
+                        extract_db_with(&outside, EfivarMemory::FirmwareReserved, grant, unopened)
+                            .expect_err("read System RAM");
+
+                    assert_eq!(
+                        error.downcast_ref::<RangeRefusal>(),
+                        Some(&RangeRefusal::NotFirmwareReserved {
+                            address: RAM_AT + DB_OFFSET,
+                            length
+                        }),
+                        "{family}, {grant:?}: {error:#}"
+                    );
+                }
+
+                let dir = tempfile::tempdir().expect("create a directory");
+                let address = RUNTIME_DATA_AT + DB_OFFSET;
+                let runtime = bounded_paths(dir.path(), write_maps(dir.path()), address);
+                let (db, lifted) = extract_db_with(
+                    &runtime,
+                    EfivarMemory::Runtime,
+                    UnsafeOperations::Refuse,
+                    |path, _| MemoryWithin::open(path, address, address + length),
+                )
+                .unwrap_or_else(|error| panic!("{family}: runtime memory: {error:#}"));
+
+                assert_eq!(db, BOUNDED_DB, "{family}: runtime memory");
+                assert_eq!(lifted, [], "{family}: runtime memory: lifted");
+            }
+        }
+
+        /// Once the flag lifts the firmware-reserved read, a failing /dev/mem open or read is an
+        /// error after a lifted operation, which carries it (LiftedOperations), as set's failed
+        /// write does.
+        #[test]
+        fn a_failed_reserved_read_keeps_the_lifted_operation() {
+            let address = RESERVED_AT + DB_OFFSET;
+            let length = u64::try_from(BOUNDED_DB.len()).expect("a u64 length");
+            let dir = tempfile::tempdir().expect("create a directory");
+            let reserved = bounded_paths(dir.path(), write_bound_sysfs_maps(dir.path()), address);
+            let empty = dir.path().join("empty-memory");
+            std::fs::write(&empty, b"").expect("write an empty memory file");
+
+            let read = extract_db_with(
+                &reserved,
+                EfivarMemory::FirmwareReserved,
+                UnsafeOperations::Allow,
+                |_, _| MemoryWithin::open(&empty, address, address + length),
+            )
+            .expect_err("a read past the end of the memory file fails");
+            let open = extract_db_with(
+                &reserved,
+                EfivarMemory::FirmwareReserved,
+                UnsafeOperations::Allow,
+                |_, _| -> Result<MemoryWithin> { Err(anyhow::anyhow!("cannot open /dev/mem")) },
+            )
+            .expect_err("a failing open fails");
+
+            for (case, error) in [("read", read), ("open", open)] {
+                assert_eq!(
+                    error.downcast_ref::<LiftedOperations>(),
+                    Some(&LiftedOperations(vec![
+                        UnsafeOperation::FirmwareReservedMemory
+                    ])),
+                    "{case}: {error:#}"
+                );
+            }
+        }
+
+        /// HiiSource::Auto keeps what the efivar method lifted: with the database that it reads,
+        /// and after a read that fails, which it moves past, on its error, which still downcasts
+        /// to NoHiiDatabase, as main()'s write_lifted_of reads only the top-level error.
+        #[test]
+        fn auto_keeps_the_lifted_operations_of_the_methods_that_it_read() {
+            let address = RESERVED_AT + DB_OFFSET;
+            let auto = HiiSourceOptions {
+                source: HiiSource::Auto,
+                efivar_memory: EfivarMemory::FirmwareReserved,
+            };
+            let dir = tempfile::tempdir().expect("create a directory");
+            let paths = bounded_paths(dir.path(), write_bound_sysfs_maps(dir.path()), address);
+
+            let (db, lifted) = extract_db_from_at(&paths, &auto, UnsafeOperations::Allow)
+                .unwrap_or_else(|error| panic!("read reserved memory: {error:#}"));
+
+            assert_eq!(db, BOUNDED_DB, "read reserved memory");
+            assert_eq!(
+                lifted,
+                [UnsafeOperation::FirmwareReservedMemory],
+                "read reserved memory: lifted"
+            );
+
+            File::create(&paths.dev_mem).expect("empty the fake /dev/mem");
+            let error = extract_db_from_at(&paths, &auto, UnsafeOperations::Allow)
+                .expect_err("a read past the end of the fake /dev/mem fails");
+
+            assert_eq!(
+                error.downcast_ref::<LiftedOperations>(),
+                Some(&LiftedOperations(vec![
+                    UnsafeOperation::FirmwareReservedMemory
+                ])),
+                "failed read: {error:#}"
+            );
+            let Some(NoHiiDatabase { tried }) = error.downcast_ref() else {
+                panic!("failed read: {error:#}");
+            };
+            // whatever the configuration-table method finds in the test's files
+            let [(HiiMethod::Acpi, HiiMethodError::Absent(_)), (HiiMethod::Efivar, HiiMethodError::Failed(_)), (HiiMethod::Systab, _)] =
+                tried.as_slice()
+            else {
+                panic!("failed read: {error:#}");
+            };
         }
 
         /// Without the FDT or /proc/kcore, which give arm64's map, the efivar source refuses
@@ -1243,13 +1474,16 @@ mod tests {
                     let path = dir.path().join(missing);
                     std::fs::remove_file(&path).expect("remove a map file");
 
-                    let error = extract_db_with(&paths, memory, unopened).expect_err(missing);
+                    for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
+                        let error =
+                            extract_db_with(&paths, memory, grant, unopened).expect_err(missing);
 
-                    assert_eq!(
-                        error.downcast_ref::<MemoryMapUnavailable>(),
-                        Some(&unavailable(path)),
-                        "{memory:?}, no {missing}: {error:#}"
-                    );
+                        assert_eq!(
+                            error.downcast_ref::<MemoryMapUnavailable>(),
+                            Some(&unavailable(path.clone())),
+                            "{memory:?}, {grant:?}, no {missing}: {error:#}"
+                        );
+                    }
                 }
             }
         }
@@ -1608,7 +1842,7 @@ mod tests {
             };
             std::fs::write(&paths.ocp_hiidb, efivar).expect("write the HiiDB efivar");
 
-            let error = extract_db_efivar(&paths, EfivarMemory::Runtime)
+            let error = extract_db_efivar(&paths, EfivarMemory::Runtime, UnsafeOperations::Refuse)
                 .expect_err("read an implausible length");
 
             assert_eq!(
@@ -1654,10 +1888,12 @@ mod tests {
                 .write_all_at(&ocp, X86_ZERO_FILL_END)
                 .expect("write the database");
 
-            let got = extract_db_efivar(&paths, EfivarMemory::Runtime)
-                .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            let (got, lifted) =
+                extract_db_efivar(&paths, EfivarMemory::Runtime, UnsafeOperations::Refuse)
+                    .unwrap_or_else(|error| panic!("{case}: {error:#}"));
 
             assert!(got == ocp, "{case}: read {} bytes", got.len());
+            assert_eq!(lifted, [], "{case}: lifted");
         }
     }
 
@@ -2103,7 +2339,10 @@ mod tests {
         /// The method's error of each method that extract_db_from_at tried with `paths` and
         /// `source`, which reads no database.
         fn tried(paths: &HiiSourcePaths, source: HiiSource) -> NoHiiDatabase {
-            extract_db_from_at(paths, &options(source)).expect_err("read no database")
+            extract_db_from_at(paths, &options(source), UnsafeOperations::Refuse)
+                .expect_err("read no database")
+                .downcast()
+                .unwrap_or_else(|error| panic!("no NoHiiDatabase: {error:#}"))
         }
 
         /// Whether `error` is the lockdown mode integrity's refusal of /dev/mem.
@@ -2279,9 +2518,11 @@ mod tests {
                     let paths = systab_paths(dir.path(), width, &entries, NO_LOCKDOWN);
 
                     for source in [HiiSource::Method(HiiMethod::Systab), HiiSource::Auto] {
-                        let db = extract_db_from_at(&paths, &options(source))
-                            .unwrap_or_else(|error| panic!("{width:?}: {source:?}: {error}"));
+                        let (db, lifted) =
+                            extract_db_from_at(&paths, &options(source), UnsafeOperations::Refuse)
+                                .unwrap_or_else(|error| panic!("{width:?}: {source:?}: {error}"));
                         assert_eq!(db, database(), "{width:?}: {source:?}");
+                        assert_eq!(lifted, [], "{width:?}: {source:?}: lifted");
 
                         let published = hii_db_published_using_at(&paths, &options(source))
                             .unwrap_or_else(|error| panic!("{width:?}: {source:?}: {error:#}"));
@@ -2538,8 +2779,12 @@ mod tests {
                     .expect("write QHII");
                 write_efivar(&paths.ocp_hiidb, EXPORT_AT, 0);
 
-                let db = extract_db_from_at(&paths, &HiiSourceOptions::default())
-                    .unwrap_or_else(|error| panic!("{error}"));
+                let (db, _) = extract_db_from_at(
+                    &paths,
+                    &HiiSourceOptions::default(),
+                    UnsafeOperations::Refuse,
+                )
+                .unwrap_or_else(|error| panic!("{error}"));
 
                 assert_eq!(db, database());
             }

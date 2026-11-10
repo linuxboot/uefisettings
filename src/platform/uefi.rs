@@ -269,6 +269,12 @@ impl HiiDbArgs {
     }
 }
 
+/// None: this firmware's HII database is no read of memory that the firmware reserves.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiSourceUnsafeArgs {}
+
 /// Where get, show-ifr and list-questions read question values.
 #[derive(Debug, Args)]
 pub(super) struct EfivarArgs {
@@ -311,6 +317,7 @@ pub(super) fn auto_get(
     question: &QuestionArgs,
     json: bool,
     selection: &SelectionArgs,
+    _unsafe_operations: &HiiSourceUnsafeArgs,
     _source: &HiiSourceArgs,
 ) -> Result<()> {
     hii_get(

@@ -57,6 +57,8 @@ use capsule_command::CapsuleCommand;
 use platform::EfivarArgs;
 use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
+#[cfg(all(system_hiidb, system_variables))]
+use platform::HiiSourceUnsafeArgs;
 use platform::ListStringsHiiDbArgs;
 use platform::PlatformCommands;
 #[cfg(all(system_hiidb, system_variables))]
@@ -109,7 +111,7 @@ struct HiiSourceArgs {
 /// The values of --hii-source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 enum HiiSourceArg {
-    /// acpi, then efivar, then systab: the next while a method finds its source absent or fails, none after a refusal (kernel lockdown, /dev/mem or /proc/kcore refused)
+    /// acpi, then efivar, then systab: the next while a method finds its source absent or fails, none after a refusal (kernel lockdown, /dev/mem or /proc/kcore refused, or an unsafe operation without --i-am-fine-to-brick-this-system)
     #[default]
     Auto,
     /// The memory that the OCP HiiDB variable points to, from /dev/mem
@@ -156,6 +158,8 @@ enum Commands {
         output: JsonArgs,
         #[command(flatten)]
         selection: SelectionArgs,
+        #[command(flatten)]
+        unsafe_operations: HiiSourceUnsafeArgs,
     },
     // clap takes an optional QUESTION before the required VALUE with allow_missing_positional: a
     // lone positional is VALUE, so `set QUESTION` fails for its missing selector.
@@ -498,8 +502,8 @@ const UNSAFE_ARG: &str = "i_am_fine_to_brick_this_system";
 #[cfg(system_variables)]
 const UNSAFE_HELP: &str = "Do what this command otherwise refuses because it can bypass this \
                            machine's setup password, write a value that its firmware declares \
-                           read-only, weaken Secure Boot or change it irreversibly; each refusal \
-                           names what this flag does there";
+                           read-only, weaken Secure Boot, change it irreversibly or read device \
+                           memory; each refusal names what this flag does there";
 
 /// What set refuses without --i-am-fine-to-brick-this-system on every build.
 #[cfg(all(system_hiidb, system_variables))]
@@ -753,7 +757,8 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
             question,
             output,
             selection,
-        } => platform::auto_get(question, output.json, selection, source)?,
+            unsafe_operations,
+        } => platform::auto_get(question, output.json, selection, unsafe_operations, source)?,
         #[cfg(all(system_hiidb, system_variables))]
         Commands::Set {
             target,
@@ -1045,7 +1050,8 @@ mod tests {
 
     /// --i-am-fine-to-brick-this-system is taken by set and hii set, which grant
     /// UnsafeOperations::Allow with it and Refuse without, and whose long help lists their unsafe
-    /// operations; get, list-questions, show-ifr and variable get, which have none, refuse it.
+    /// operations; get, list-questions and show-ifr, which read this machine's HiiDB, take it on
+    /// Linux only, for --efivar-memory firmware-reserved; variable get, which has none, refuses it.
     #[test]
     fn unsafe_flag_is_taken_where_an_operation_is_unsafe() {
         let reading: [&[&str]; 3] = [
@@ -1054,12 +1060,15 @@ mod tests {
             &["hii", "show-ifr"],
         ];
         let reading = reading.map(|command| [command, &OFFLINE_SOURCE].concat());
-        let refusing = reading.iter().map(|command| &command[..]);
+        let commands = reading.iter().map(|command| (&command[..], false));
         #[cfg(all(system_hiidb, system_variables))]
-        let refusing = refusing.chain([&["get", "Q"][..]]);
+        let commands = commands.chain([(&["get", "Q"][..], false)]);
+        // the Linux build's readers take it, for --efivar-memory firmware-reserved
+        #[cfg(target_os = "linux")]
+        let commands = commands.map(|(command, _)| (command, true));
         #[cfg(variable_data)]
-        let refusing = refusing.chain([&["variable", "get", "Timeout"][..]]);
-        for command in refusing {
+        let commands = commands.chain([(&["variable", "get", "Timeout"][..], false)]);
+        for (command, takes) in commands {
             let argv = [
                 &["uefisettings"][..],
                 command,
@@ -1067,11 +1076,14 @@ mod tests {
             ]
             .concat();
             let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
-            assert_eq!(
-                parsed.err(),
-                Some(clap::error::ErrorKind::UnknownArgument),
-                "{command:?}"
-            );
+            match takes {
+                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
+                false => assert_eq!(
+                    parsed.err(),
+                    Some(clap::error::ErrorKind::UnknownArgument),
+                    "{command:?}"
+                ),
+            }
         }
 
         #[cfg(all(system_hiidb, system_variables))]

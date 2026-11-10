@@ -13,9 +13,10 @@
 //! The one grant that lets uefisettings do what it otherwise refuses because it can leave the
 //! machine unbootable, weaken Secure Boot or bypass its setup password: UnsafeOperations::Allow,
 //! which the CLI's --i-am-fine-to-brick-this-system gives. Each command checks it after every
-//! refusal that it cannot lift, so a refusal names the flag only where the flag lets the
-//! operation through, and returns the operations that it lifted, with its error too when it then
-//! fails (LiftedOperations).
+//! refusal that it cannot lift, except that set and hii set on Linux with --efivar-memory
+//! firmware-reserved read the HiiDB, which their other checks need, before those checks, so a
+//! refusal names the flag only where the flag lets the operation through, and returns the
+//! operations that it lifted, with its error too when it then fails (LiftedOperations).
 
 use std::fmt;
 
@@ -88,6 +89,10 @@ pub enum UnsafeOperation {
     /// deleting PK
     #[cfg(variable_data)]
     ModeTransition { transition: ModeTransition },
+    /// A read of the HiiDB that the OCP HiiDB efivar points to in memory that the firmware
+    /// reserves, which may be device memory
+    #[cfg(firmware_memory_maps)]
+    FirmwareReservedMemory,
 }
 
 impl UnsafeOperation {
@@ -102,6 +107,8 @@ impl UnsafeOperation {
             }
             #[cfg(variable_data)]
             Self::ModeTransition { .. } => "enter it",
+            #[cfg(firmware_memory_maps)]
+            Self::FirmwareReservedMemory => "read it",
         }
     }
 
@@ -117,6 +124,8 @@ impl UnsafeOperation {
             Self::SetupModePolicyWrite { .. }
             | Self::SetupModeDeviceDatabaseWrite { .. }
             | Self::ModeTransition { .. } => String::new(),
+            #[cfg(firmware_memory_maps)]
+            Self::FirmwareReservedMemory => String::new(),
         }
     }
 
@@ -175,6 +184,14 @@ impl fmt::Display for UnsafeOperation {
             ),
             #[cfg(variable_data)]
             Self::ModeTransition { transition } => write!(f, "{transition}"),
+            #[cfg(firmware_memory_maps)]
+            Self::FirmwareReservedMemory => f.write_str(
+                "the efivar source would read the HiiDB from memory that the firmware reserves, \
+                 which may be device memory, whose reads can have side effects: of I/O memory, \
+                 \"Accidental access to this is obviously disastrous\" (Linux 6.11 \
+                 lib/Kconfig.debug:1911-1913), and EfiReservedMemoryType is \"Not usable.\" (UEFI \
+                 2.11 §7.2 Table 7.6)",
+            ),
         }
     }
 }

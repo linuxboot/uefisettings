@@ -42,6 +42,7 @@ use uefisettings::exports::SetOptions;
 use uefisettings::exports::SetValue;
 use uefisettings::exports::SettingsBackend;
 use uefisettings::exports::UnsafeOperation;
+use uefisettings::exports::UnsafeOperations;
 use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
@@ -53,8 +54,10 @@ use uefisettings_backend_thrift::SetResponseList;
 use crate::extract_db_report;
 use crate::hii_get;
 use crate::hii_set;
+use crate::print_lifted;
 use crate::print_line;
 use crate::print_with_style;
+use crate::unsafe_long_help;
 use crate::write_extracted_db;
 use crate::EfivarMemoryArg;
 use crate::HiiSourceArg;
@@ -63,7 +66,9 @@ use crate::JsonArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
+use crate::UnsafeArgs;
 use crate::READ_ONLY_WRITE;
+use crate::UNSAFE_ARG;
 
 /// The about of hii, whose commands read this machine's HiiDB or a file.
 pub(super) const HII_ABOUT: &str = "Commands which work on machines exposing the UEFI HiiDB";
@@ -77,7 +82,8 @@ pub(super) const HII_SOURCE_HELP: &str =
     "Where the commands read this machine's HiiDB, where no HiiDB file or efivars dump gives one";
 /// The help of --efivar-memory.
 pub(super) const EFIVAR_MEMORY_HELP: &str =
-    "The memory that the efivar method of --hii-source may read";
+    "The memory that the efivar method of --hii-source may read; firmware-reserved is an unsafe \
+     operation, whose refusal names the flag that lifts it";
 
 /// The HiiDB source that `args` name.
 fn hii_source_options(args: &HiiSourceArgs) -> HiiSourceOptions {
@@ -192,7 +198,11 @@ enum IloSubcommands {
 pub(super) enum HiiPlatformCommands {
     /// Dump HiiDB into a file
     #[command(next_display_order = None)]
-    ExtractDB { filename: PathBuf },
+    ExtractDB {
+        filename: PathBuf,
+        #[command(flatten)]
+        unsafe_operations: HiiSourceUnsafeArgs,
+    },
     /// Copy the HiiDB and the EFI variables that its questions read into a new directory, for --efivars on another machine
     #[command(next_display_order = None)]
     DumpEfivars {
@@ -210,9 +220,17 @@ pub(super) enum HiiPlatformCommands {
 impl HiiPlatformCommands {
     pub(super) fn run(&self, source: &HiiSourceArgs) -> Result<()> {
         match self {
-            Self::ExtractDB { filename } => {
+            Self::ExtractDB {
+                filename,
+                unsafe_operations,
+            } => {
                 write_extracted_db(filename, || {
-                    HiiBackend::extract_db_from(&hii_source_options(source)).map(|res| res.db)
+                    let (res, lifted) = HiiBackend::extract_db_from(
+                        &hii_source_options(source),
+                        unsafe_operations.operations(),
+                    )?;
+                    print_lifted(&lifted)?;
+                    Ok(res.db)
                 })?;
 
                 print_line(format_args!("{}", extract_db_report(filename)))?;
@@ -254,17 +272,45 @@ pub(super) struct HiiDbArgs {
     /// If filename of HiiDB isn't specified then this tool will try to automatically extract it
     #[arg(short, long)]
     pub(super) filename: Option<PathBuf>,
+    #[command(flatten)]
+    unsafe_operations: HiiSourceUnsafeArgs,
 }
 
 impl HiiDbArgs {
     /// The HiiDB: the file, else the one in `efivars` if dump-efivars wrote it, else this
-    /// machine's, read as `source` says.
+    /// machine's, read as `source` says, after a warning per unsafe operation that it lifted.
     pub(super) fn read(&self, efivars: &EfivarSource, source: &HiiSourceArgs) -> Result<Vec<u8>> {
-        HiiBackend::read_hiidb_from(
+        let (db, lifted) = HiiBackend::read_hiidb_from(
             self.filename.as_deref(),
             efivars,
             &hii_source_options(source),
-        )
+            self.unsafe_operations.operations(),
+        )?;
+        print_lifted(&lifted)?;
+        Ok(db)
+    }
+}
+
+/// What a command that reads this machine's HiiDB through --hii-source refuses without
+/// --i-am-fine-to-brick-this-system, besides those of set.
+const FIRMWARE_RESERVED_READ: &str = "a read of the HiiDB with --efivar-memory firmware-reserved, \
+                                      which may read device memory, whose reads can have side \
+                                      effects";
+
+/// --i-am-fine-to-brick-this-system of a command that reads this machine's HiiDB through
+/// --hii-source, which --efivar-memory firmware-reserved needs.
+#[derive(Debug, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+#[command(mut_arg(UNSAFE_ARG, |arg| unsafe_long_help(arg, &[FIRMWARE_RESERVED_READ])))]
+pub(super) struct HiiSourceUnsafeArgs {
+    #[command(flatten)]
+    unsafe_operations: UnsafeArgs,
+}
+
+impl HiiSourceUnsafeArgs {
+    pub(super) fn operations(&self) -> UnsafeOperations {
+        self.unsafe_operations.operations()
     }
 }
 
@@ -292,8 +338,8 @@ impl EfivarArgs {
 }
 
 /// The unsafe operations of set, which its long help lists: efivarfs writes from Linux, which
-/// no setup password gates.
-pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE];
+/// no setup password gates, and the read of the HiiDB.
+pub(super) const SET_UNSAFE_OPERATIONS: &[&str] = &[READ_ONLY_WRITE, FIRMWARE_RESERVED_READ];
 
 /// The QUESTION of `question` for the Ilo backend; fails if a flag of the HII backend is given:
 /// Ilo attributes have no QuestionId, no keywords, no IFR conditions and no HII strings.
@@ -330,6 +376,7 @@ pub(super) fn auto_get(
     question: &QuestionArgs,
     json: bool,
     selection: &SelectionArgs,
+    unsafe_operations: &HiiSourceUnsafeArgs,
     source: &HiiSourceArgs,
 ) -> Result<()> {
     let options = hii_source_options(source);
@@ -341,8 +388,15 @@ pub(super) fn auto_get(
         let res = IloBackend::get(refuse_on_ilo(question, selection)?, None)?;
         print_with_style(res, json)?;
     } else {
+        let (db, lifted) = HiiBackend::read_hiidb_from(
+            None,
+            &EfivarSource::System,
+            &options,
+            unsafe_operations.operations(),
+        )?;
+        print_lifted(&lifted)?;
         hii_get(
-            &HiiBackend::read_hiidb_from(None, &EfivarSource::System, &options)?,
+            &db,
             question.selector()?,
             &GetOptions::from(selection),
             json,
@@ -484,12 +538,95 @@ fn dump_warning(dir: &Path, redaction: EfivarRedaction) -> String {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
     use crate::tests::hii;
     use crate::tests::READING_COMMANDS;
     use crate::Commands;
     use crate::HiiSubcommands;
     use crate::UefiSettingsToolArgs;
+
+    /// The grant of the HiiDB read of `uefisettings` and then `args`, a command that reads this
+    /// machine's HiiDB through --hii-source.
+    fn hii_source_grant(args: &[&str]) -> UnsafeOperations {
+        let argv = [&["uefisettings"][..], args].concat();
+        let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
+            .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
+        let unsafe_operations = match parsed.command {
+            Commands::Get {
+                unsafe_operations, ..
+            } => unsafe_operations,
+            Commands::Hii(hii) => match hii.command {
+                HiiSubcommands::Get { hiidb, .. }
+                | HiiSubcommands::ShowIFR { hiidb, .. }
+                | HiiSubcommands::ListStrings { hiidb, .. }
+                | HiiSubcommands::ListQuestions { hiidb, .. }
+                | HiiSubcommands::Platform(HiiPlatformCommands::DumpEfivars { hiidb, .. }) => {
+                    hiidb.unsafe_operations
+                }
+                HiiSubcommands::Platform(HiiPlatformCommands::ExtractDB {
+                    unsafe_operations,
+                    ..
+                }) => unsafe_operations,
+                other => panic!("{argv:?} reads no HiiDB: {other:?}"),
+            },
+            other => panic!("{argv:?} reads no HiiDB: {other:?}"),
+        };
+        unsafe_operations.operations()
+    }
+
+    /// Every Linux command that reads this machine's HiiDB through --hii-source grants its read
+    /// UnsafeOperations::Allow with --i-am-fine-to-brick-this-system and Refuse without, and
+    /// the flag's long help lists the read of firmware-reserved memory.
+    #[test]
+    fn hii_source_readers_take_the_unsafe_flag() {
+        let commands: [(&[&str], &[&str]); 7] = [
+            (&["get"], &["Q"]),
+            (&["hii", "get"], &["Q"]),
+            (&["hii", "show-ifr"], &[]),
+            (&["hii", "list-strings"], &[]),
+            (&["hii", "list-questions"], &[]),
+            (&["hii", "dump-efivars"], &["dir"]),
+            (&["hii", "extract-db"], &["hiidb.bin"]),
+        ];
+        let mut root = UefiSettingsToolArgs::command();
+        root.build();
+        for (path, positionals) in commands {
+            for (flag, want) in [
+                (&[][..], UnsafeOperations::Refuse),
+                (
+                    &["--i-am-fine-to-brick-this-system"],
+                    UnsafeOperations::Allow,
+                ),
+            ] {
+                assert_eq!(
+                    hii_source_grant(&[path, positionals, flag].concat()),
+                    want,
+                    "{path:?} {flag:?}"
+                );
+            }
+
+            let reader = path.iter().fold(&root, |command, name| {
+                command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no subcommand {name}"))
+            });
+            let long_help = reader
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some("i-am-fine-to-brick-this-system"))
+                .and_then(|flag| flag.get_long_help())
+                .map(ToString::to_string);
+            assert_eq!(
+                long_help,
+                Some(format!(
+                    "{}. This command refuses without it: {FIRMWARE_RESERVED_READ}",
+                    crate::UNSAFE_HELP
+                )),
+                "{path:?}"
+            );
+        }
+    }
 
     /// The flags name the library's HiiDB source: the automatic order or one method, and the
     /// memory of the efivar method, also after a hii command.

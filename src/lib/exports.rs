@@ -911,8 +911,21 @@ impl HiiBackend {
         selector: Option<&str>,
         options: &SetOptions,
     ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
+        Self::set_in_system(&Self::system_hiidb()?, question, value, selector, options)
+    }
+
+    /// set with `options`, in the HiiDB `db_bytes` and this machine's variables, as set_in does,
+    /// and the unsafe operations that it lifted.
+    #[cfg(all(system_hiidb, system_variables))]
+    fn set_in_system(
+        db_bytes: &[u8],
+        question: impl Into<QuestionSelector>,
+        value: &SetValue,
+        selector: Option<&str>,
+        options: &SetOptions,
+    ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
         Self::set_in(
-            &Self::system_hiidb()?,
+            db_bytes,
             question,
             value,
             selector,
@@ -5415,6 +5428,53 @@ mod tests {
                 .collect();
             assert_eq!(got, [want], "set {prompt}");
         }
+    }
+
+    /// set_from after a read of firmware-reserved memory (set_after_read): a set that
+    /// fails after it lifted the setup password keeps the read's operation, then set's
+    /// (LiftedOperations), beside set's error, and one that succeeds returns both.
+    #[cfg(firmware_memory_maps)]
+    #[test]
+    fn a_failed_set_after_a_lifted_read_keeps_both_operations() {
+        let read = || {
+            (
+                b"the HiiDB".to_vec(),
+                vec![UnsafeOperation::FirmwareReservedMemory],
+            )
+        };
+        let both = vec![
+            UnsafeOperation::FirmwareReservedMemory,
+            UnsafeOperation::SetupPassword,
+        ];
+
+        let error = HiiBackend::set_after_read(read(), |db| {
+            assert_eq!(db, b"the HiiDB", "the HiiDB that set reads");
+            Err(LiftedOperations::attach(
+                vec![UnsafeOperation::SetupPassword],
+                anyhow::anyhow!("write failed"),
+            ))
+        })
+        .expect_err("a failed set");
+        let set = HiiBackend::set_after_read(read(), |_| {
+            Ok((
+                SetResponseList::default(),
+                vec![UnsafeOperation::SetupPassword],
+            ))
+        })
+        .expect("a set that succeeds");
+
+        assert_eq!(
+            error.downcast_ref::<LiftedOperations>(),
+            Some(&LiftedOperations(both.clone())),
+            "failed set: lifted"
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "after 2 unsafe operation(s) that --i-am-fine-to-brick-this-system let through: \
+             write failed",
+            "failed set: the error"
+        );
+        assert_eq!(set, (SetResponseList::default(), both), "set");
     }
 
     /// Through variables of either reach, get, list-questions and show-ifr read the questions

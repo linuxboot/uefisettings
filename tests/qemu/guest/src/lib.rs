@@ -638,7 +638,19 @@ pub fn extract_db_error(flags: &[&str], path: &str) -> ErrorObject {
 /// given, with the CRC-32 of [`HIIDB_CRC32_VARIABLE`].
 #[track_caller]
 pub fn extract_db_matches(flags: &[&str], path: &str, published_length: Option<usize>) {
-    let args = [flags, &["hii", "extract-db", path]].concat();
+    extract_db_matches_with(flags, path, &[], published_length);
+}
+
+/// [`extract_db_matches`] with `command_flags` after the command, such as a flag of extract-db
+/// itself; returns its output.
+#[track_caller]
+pub fn extract_db_matches_with(
+    flags: &[&str],
+    path: &str,
+    command_flags: &[&str],
+    published_length: Option<usize>,
+) -> Output {
+    let args = [flags, &["hii", "extract-db", path], command_flags].concat();
     let output = uefisettings(&args);
     assert_eq!(output.code, Some(0), "{args:?}: {output:#?}");
     let database = fs::read(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
@@ -651,4 +663,5 @@ pub fn extract_db_matches(flags: &[&str], path: &str, published_length: Option<u
         "{args:?}: CRC-32 of {} bytes",
         database.len()
     );
+    output
 }
