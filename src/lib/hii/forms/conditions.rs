@@ -2485,20 +2485,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                     }
                 }
             }
-            ExpressionOp::EqIdValList => {
-                let ParsedOperation::EqIdValList(parsed) = &op.parsed_data else {
-                    return Err(not_decoded(op));
-                };
-                let question = self.question(op, parsed.question_id)?.decoded()?;
-                // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression compares
-                // HiiValue.Value.u16
-                Ok(boolean(question.as_u64().map(|value| {
-                    parsed
-                        .value_list
-                        .iter()
-                        .any(|&listed| u64::from(listed) == value & u64::from(u16::MAX))
-                })))
-            }
+            ExpressionOp::EqIdValList => self.eq_id_val_list(op),
             ExpressionOp::QuestionRef1 => {
                 let ParsedOperation::QuestionRef1(parsed) = &op.parsed_data else {
                     return Err(not_decoded(op));
@@ -2539,62 +2526,101 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 .ok_or_else(|| not_decoded(op)),
             ExpressionOp::Undefined => Err(Abort::Undefined),
             ExpressionOp::Not => Ok(boolean(self.pop(op)?.as_bool()?.map(|value| !value))),
-            ExpressionOp::ToBoolean => Ok(boolean(self.pop(op)?.as_u64().map(|value| value != 0))),
+            ExpressionOp::ToBoolean => self.convert_to_boolean(op),
             ExpressionOp::BitwiseNot => {
                 Ok(Operand::Uint(self.pop(op)?.as_u64().map(|value| !value)))
             }
             // edk2-stable202608 SetupBrowserDxe/Expression.c pops both operands of AND and OR
             // before it checks their types
-            ExpressionOp::And => {
-                let (right, left) = (self.pop(op)?, self.pop(op)?);
-                let (right, left) = (right.as_bool()?, left.as_bool()?);
-                Ok(boolean(match (left, right) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                }))
-            }
-            ExpressionOp::Or => {
-                let (right, left) = (self.pop(op)?, self.pop(op)?);
-                let (right, left) = (right.as_bool()?, left.as_bool()?);
-                Ok(boolean(match (left, right) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                }))
-            }
+            ExpressionOp::And => self.and(op),
+            ExpressionOp::Or => self.or(op),
             ExpressionOp::Compare(comparison) => {
-                let right = self.pop(op)?;
-                let left = self.pop(op)?;
+                let (left, right) = self.pop_pair(op)?;
                 compare(comparison, left, right)
             }
-            ExpressionOp::Arithmetic(arithmetic) => {
-                let right = self.pop(op)?.as_u64();
-                let left = self.pop(op)?.as_u64();
-                arithmetic.apply(left, right).map(Operand::Uint)
-            }
+            ExpressionOp::Arithmetic(arithmetic) => self.arithmetic(op, arithmetic),
             ExpressionOp::Dup => self.stack.last().copied().ok_or_else(|| {
                 Abort::Malformed(format!("{} without an operand", op.op_code.spec_name()))
             }),
-            ExpressionOp::Conditional => {
-                let when_true = self.pop(op)?;
-                let when_false = self.pop(op)?;
-                match self.pop(op)?.as_bool()? {
-                    Some(true) => Ok(when_true),
-                    Some(false) => Ok(when_false),
-                    None if when_true == when_false => Ok(when_true),
-                    None => Err(Abort::NotEvaluated(format!(
-                        "{} on a value that cannot be read",
-                        op.op_code.spec_name()
-                    ))),
-                }
-            }
+            ExpressionOp::Conditional => self.conditional(op),
             ExpressionOp::This => self.this(op),
             ExpressionOp::Get => self.get(op),
             ExpressionOp::Set => self.set(op),
             ExpressionOp::NotEvaluated => {
                 Err(self.not_evaluated(op.op_code.spec_name().to_string()))
             }
+        }
+    }
+
+    /// Returns whether the low 16 bits of the question's value are in the list of
+    /// EQ_ID_VAL_LIST `op`.
+    fn eq_id_val_list(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        let ParsedOperation::EqIdValList(parsed) = &op.parsed_data else {
+            return Err(not_decoded(op));
+        };
+        let question = self.question(op, parsed.question_id)?.decoded()?;
+        // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression compares
+        // HiiValue.Value.u16
+        Ok(boolean(question.as_u64().map(|value| {
+            parsed
+                .value_list
+                .iter()
+                .any(|&listed| u64::from(listed) == value & u64::from(u16::MAX))
+        })))
+    }
+
+    /// Returns the popped operand of TO_BOOLEAN as a BOOLEAN: FALSE for 0, else TRUE.
+    fn convert_to_boolean(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        Ok(boolean(self.pop(op)?.as_u64().map(|value| value != 0)))
+    }
+
+    /// Pops the operands of a binary op: the right one, then the left one.
+    fn pop_pair(&mut self, op: &IFROperation) -> Result<(Operand, Operand), Abort> {
+        let right = self.pop(op)?;
+        Ok((self.pop(op)?, right))
+    }
+
+    /// Returns the AND of two popped BOOLEANs, in Kleene logic for one that cannot be read.
+    fn and(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        let (left, right) = self.pop_pair(op)?;
+        Ok(boolean(match (left.as_bool()?, right.as_bool()?) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        }))
+    }
+
+    /// Returns the OR of two popped BOOLEANs, in Kleene logic for one that cannot be read.
+    fn or(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        let (left, right) = self.pop_pair(op)?;
+        Ok(boolean(match (left.as_bool()?, right.as_bool()?) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        }))
+    }
+
+    /// Returns `arithmetic` of the popped operands.
+    fn arithmetic(&mut self, op: &IFROperation, arithmetic: Arithmetic) -> Result<Operand, Abort> {
+        let (left, right) = self.pop_pair(op)?;
+        arithmetic
+            .apply(left.as_u64(), right.as_u64())
+            .map(Operand::Uint)
+    }
+
+    /// Returns the operand that the popped condition of CONDITIONAL selects; one that cannot be
+    /// read selects only two equal operands.
+    fn conditional(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        let when_true = self.pop(op)?;
+        let when_false = self.pop(op)?;
+        match self.pop(op)?.as_bool()? {
+            Some(true) => Ok(when_true),
+            Some(false) => Ok(when_false),
+            None if when_true == when_false => Ok(when_true),
+            None => Err(Abort::NotEvaluated(format!(
+                "{} on a value that cannot be read",
+                op.op_code.spec_name()
+            ))),
         }
     }
 
