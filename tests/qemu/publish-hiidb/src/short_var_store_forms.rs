@@ -17,8 +17,9 @@
 //! form before UEFI 2.3.1, which ends at Attributes, so that each question keeps its value alone
 //! in the EFI variable that its VarName names, of the store's Guid (edk2-stable202608
 //! SetupBrowserDxe/IfrParse.c CreateQuestion, Setup.c GetQuestionValue), and so do the GET and
-//! SET of its expressions. `tests/qemu/vars/short-var-store.json` creates the variables, but
-//! not ShortVarD, which set creates.
+//! SET of its expressions, and so does each ORDERED_LIST and REF, whose variable holds its
+//! StorageWidth whole (IfrParse.c, Setup.c:1764-1782). `tests/qemu/vars/short-var-store.json`
+//! creates the variables, but not ShortVarD and ShortVarN, which set creates.
 //!
 //! edk2-stable202608 IfrParse.c CreateStorage reads the Size and the Name of the 2.3.1 form past
 //! the 24 bytes of the short op, in the op after it. That op is the FORM of FormId [`FORM_ID`],
@@ -45,7 +46,9 @@ use crate::hii_package::EFI_IFR_GET_OP;
 use crate::hii_package::EFI_IFR_NUMERIC_OP;
 use crate::hii_package::EFI_IFR_ONE_OF_OP;
 use crate::hii_package::EFI_IFR_ONE_OF_OPTION_OP;
+use crate::hii_package::EFI_IFR_ORDERED_LIST_OP;
 use crate::hii_package::EFI_IFR_PASSWORD_OP;
+use crate::hii_package::EFI_IFR_REF_OP;
 use crate::hii_package::EFI_IFR_SET_OP;
 use crate::hii_package::EFI_IFR_SUPPRESS_IF_OP;
 use crate::hii_package::EFI_IFR_THIS_OP;
@@ -77,7 +80,23 @@ const SHORT_VAR_C: u16 = 12;
 const SHORT_VAR_PW: u16 = 13;
 const SHORT_CREATED: u16 = 14;
 const SHORT_VAR_D: u16 = 15;
-const STRINGS: [&str; 15] = [
+// The ORDERED_LISTs, their options and the REF
+const SHORT_LIST: u16 = 16;
+const FIRST: u16 = 17;
+const SECOND: u16 = 18;
+const THIRD: u16 = 19;
+const SHORT_REF: u16 = 20;
+const SHORT_WIDE_LIST: u16 = 21;
+const SHORT_MISMATCH_LIST: u16 = 22;
+const SHORT_PASSWORD_LIST: u16 = 23;
+const SHORT_MISSING_LIST: u16 = 24;
+// Their VarNames
+const SHORT_VAR_L: u16 = 25;
+const SHORT_VAR_R: u16 = 26;
+const SHORT_VAR_W: u16 = 27;
+const SHORT_VAR_M: u16 = 28;
+const SHORT_VAR_N: u16 = 29;
+const STRINGS: [&str; 29] = [
     "English",
     "uefisettings QEMU short VARSTORE_EFI forms",
     "Questions on a VARSTORE_EFI of the form before UEFI 2.3.1",
@@ -93,6 +112,20 @@ const STRINGS: [&str; 15] = [
     "ShortVarPw",
     "Short created",
     "ShortVarD",
+    "Short list",
+    "First",
+    "Second",
+    "Third",
+    "Short ref",
+    "Short wide list",
+    "Short mismatch list",
+    "Short password list",
+    "Short missing list",
+    "ShortVarL",
+    "ShortVarR",
+    "ShortVarW",
+    "ShortVarM",
+    "ShortVarN",
 ];
 
 /// The VarStoreId of the VARSTORE_EFI.
@@ -108,6 +141,8 @@ const _: () = assert!(
 const PASSWORD_MAX_SIZE: u16 = 10;
 /// EFI_IFR_TYPE_NUM_SIZE_8, the type of a UINT8 value.
 const NUM_SIZE_8: u8 = 0x00;
+/// EFI_IFR_TYPE_NUM_SIZE_16, the type of a UINT16 value.
+const NUM_SIZE_16: u8 = 0x01;
 /// EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.11 §33.3.8.3.47).
 const UINT16_DECIMAL: u8 = 0x11;
 /// The ShortVarA value that the SUPPRESS_IF hides "Short checkbox" for.
@@ -226,6 +261,22 @@ fn form_package() -> Vec<u8> {
         ]
         .concat(),
     );
+    // an EFI_IFR_REF5, whose question header alone holds a VarStore
+    let reference = op(
+        EFI_IFR_REF_OP,
+        false,
+        &question_header(SHORT_REF, HELP, 7, VAR_STORE, SHORT_VAR_R),
+    );
+    let lists = [
+        ordered_list(SHORT_LIST, 6, SHORT_VAR_L, 3, Container::Uint8),
+        ordered_list(SHORT_WIDE_LIST, 8, SHORT_VAR_W, 2, Container::Uint16),
+        // ShortVarM holds 3 bytes
+        ordered_list(SHORT_MISMATCH_LIST, 9, SHORT_VAR_M, 2, Container::Uint8),
+        // as wide as the 20 bytes of the PASSWORD's ShortVarPw
+        ordered_list(SHORT_PASSWORD_LIST, 10, SHORT_VAR_PW, 20, Container::Uint8),
+        // on ShortVarN, which no variable holds until set creates it
+        ordered_list(SHORT_MISSING_LIST, 11, SHORT_VAR_N, 3, Container::Uint8),
+    ];
     let form = [FORM_ID.to_le_bytes(), TITLE.to_le_bytes()].concat();
     let body = [
         op(EFI_IFR_FORM_SET_OP, true, &form_set),
@@ -236,11 +287,76 @@ fn form_package() -> Vec<u8> {
         checkbox,
         created,
         password,
+        reference,
+        lists.concat(),
         end(), // of the form
         end(), // of the form set
     ]
     .concat();
     package(EFI_HII_PACKAGE_FORMS, &body)
+}
+
+/// The Type of the options of an ORDERED_LIST, which its containers take.
+#[derive(Clone, Copy)]
+enum Container {
+    Uint8,
+    Uint16,
+}
+
+impl Container {
+    /// The Type of the options, an EFI_IFR_TYPE_NUM_SIZE_ value.
+    fn value_type(self) -> u8 {
+        match self {
+            Self::Uint8 => NUM_SIZE_8,
+            Self::Uint16 => NUM_SIZE_16,
+        }
+    }
+
+    /// The bytes of `value` in an option of this Type.
+    fn value(self, value: u8) -> Vec<u8> {
+        match self {
+            Self::Uint8 => [value].to_vec(),
+            Self::Uint16 => u16::from(value).to_le_bytes().to_vec(),
+        }
+    }
+}
+
+/// An ORDERED_LIST prompted `prompt`, of QuestionId `id`, on the variable of VarName `var_name`,
+/// of `max_containers` containers of `container` (UEFI 2.11 §33.3.8.3.53), with the options
+/// First, Second and Third of values 1, 2 and 3.
+fn ordered_list(
+    prompt: u16,
+    id: u16,
+    var_name: u16,
+    max_containers: u8,
+    container: Container,
+) -> Vec<u8> {
+    let options = [(FIRST, 1), (SECOND, 2), (THIRD, 3)].map(|(text, value)| {
+        op(
+            EFI_IFR_ONE_OF_OPTION_OP,
+            false,
+            &[
+                &text.to_le_bytes()[..],
+                &[0, container.value_type()],
+                &container.value(value),
+            ]
+            .concat(),
+        )
+    });
+    [
+        op(
+            EFI_IFR_ORDERED_LIST_OP,
+            true,
+            &[
+                question_header(prompt, HELP, id, VAR_STORE, var_name),
+                [max_containers, 0].to_vec(), // MaxContainers, Flags
+            ]
+            .concat(),
+        ),
+        options.concat(),
+        end(),
+    ]
+    .concat()
 }
 
 /// The operand of a GET or SET of the UINT8 in the variable of VarName `var_name` (UEFI 2.11

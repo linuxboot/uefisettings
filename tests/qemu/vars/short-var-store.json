@@ -24,6 +24,30 @@
       "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
       "attr": 7,
       "data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "name": "ShortVarL",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "030102"
+    },
+    {
+      "name": "ShortVarR",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "0100010005A5788CA0BA4A4C869F000000000B000000"
+    },
+    {
+      "name": "ShortVarW",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "01000200"
+    },
+    {
+      "name": "ShortVarM",
+      "guid": "8c78a505-baa0-4c4a-869f-000000000b01",
+      "attr": 7,
+      "data": "010200"
     }
   ]
 }

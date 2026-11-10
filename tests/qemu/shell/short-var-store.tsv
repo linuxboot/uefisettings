@@ -51,3 +51,45 @@ dmpstore-d-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01
 dmpstore-d-after	line	^  00000000: 01 02 
 get-created	status	0x0
 get-created	json	.responses | length == 1 and .[0].question.answer == "513"
+# An ORDERED_LIST reads the 3 containers of ShortVarL, and set writes the variable whole
+get-list	status	0x0
+get-list	json	.responses | length == 1 and .[0].question.answer == "Third, First, Second" and .[0].question.items == ["Third", "First", "Second"]
+set-list	status	0x0
+set-list	json	.responses | length == 1 and .[0].question.answer == "First, Third" and .[0].modified == true
+dmpstore-l-after	status	any
+dmpstore-l-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarL' DataSize = 0x03$
+dmpstore-l-after	line	^  00000000: 01 03 00 
+# A REF shows the EFI_HII_REF of ShortVarR, which set does not write; ArmVirt's console shows
+# "§" as "?", so the check of the refusal compares it with "?" in its place
+get-ref	status	0x0
+get-ref	json	.responses | length == 1 and .[0].question.answer == "QuestionId 0x0001, FormId 0x0001, FormSetGuid 8C78A505-BAA0-4C4A-869F-000000000B00, DevicePath none"
+dmpstore-r-before	status	any
+dmpstore-r-before	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarR' DataSize = 0x16$
+set-ref	status	aborted
+set-ref	json	(.error_message | gsub("§"; "?")) == "cannot set question \"Short ref\": set does not write the EFI_HII_REF of a cross-reference question, the target of its link (UEFI 2.11 ?33.2.5.4.10)"
+dmpstore-r-after	status	any
+dmpstore-r-after	same	dmpstore-r-before
+# The containers of UINT16 options take 2 bytes each, and a variable of another size than the
+# containers is refused
+get-wide-list	status	0x0
+get-wide-list	json	.responses | length == 1 and .[0].question.answer == "First, Second"
+get-mismatch	status	0x0
+get-mismatch	json	.responses | length == 1 and .[0].question.answer == "<ValueUnavailable: EFI variable ShortVarM-8c78a505-baa0-4c4a-869f-000000000b01 holds 3 bytes; the question takes 2>"
+# An ORDERED_LIST as wide as ShortVarPw reads and writes none of the password
+get-pw-list	status	0x0
+get-pw-list	json	.responses | length == 1 and .[0].question.answer == "<ValueUnavailable: its bytes hold a password>"
+set-pw-list	status	aborted
+set-pw-list	json	. == {"error_message": "cannot set question \"Short password list\": its items cannot be read, so set cannot keep those of hidden options: its bytes hold a password"}
+dmpstore-pw-list-after	status	any
+dmpstore-pw-list-after	same	dmpstore-pw-before
+# set creates the missing ShortVarN of an ORDERED_LIST with the store's Attributes, its item and
+# empty containers after it
+dmpstore-n-before	status	0xE
+dmpstore-n-before	none	ShortVarN' DataSize
+set-missing-list	status	0x0
+set-missing-list	json	.responses | length == 1 and .[0].question.answer == "Second" and .[0].modified == true
+dmpstore-n-after	status	any
+dmpstore-n-after	line	^Variable NV\+RT\+BS '8C78A505-BAA0-4C4A-869F-000000000B01:ShortVarN' DataSize = 0x03$
+dmpstore-n-after	line	^  00000000: 02 00 00 
+get-missing-list	status	0x0
+get-missing-list	json	.responses | length == 1 and .[0].question.answer == "Second"

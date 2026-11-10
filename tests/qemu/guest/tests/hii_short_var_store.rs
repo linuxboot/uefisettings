@@ -19,12 +19,15 @@
 //! of a SUPPRESS_IF and the SET of a WRITE expression reach the variables of their VarNames, the
 //! PASSWORD's variable is neither read nor written, and dump-efivars copies the variables that
 //! the questions read. set creates the missing ShortVarD of a UINT16 NUMERIC with the store's
-//! Attributes.
+//! Attributes. Each ORDERED_LIST and the REF read the whole variable of their VarName, which holds
+//! their StorageWidth, and refuse one of another size; set writes the items of an ORDERED_LIST,
+//! creating the missing ShortVarN, and neither the REF nor an ORDERED_LIST over the password.
 
 use std::fs;
 use std::path::Path;
 
 use serde::Deserialize;
+use uefisettings_qemu_guest::json_error;
 use uefisettings_qemu_guest::single_response;
 use uefisettings_qemu_guest::uefisettings;
 use uefisettings_qemu_guest::variable_bytes;
@@ -47,10 +50,26 @@ const SHORT_ONE_OF: &str = "Short one-of";
 const SHORT_CHECKBOX: &str = "Short checkbox";
 /// The UINT16 NUMERIC on ShortVarD, which no variable holds until set creates it.
 const SHORT_CREATED: &str = "Short created";
+/// The ORDERED_LIST of 3 UINT8 containers on ShortVarL, of the options First (1), Second (2) and
+/// Third (3), as are the other ORDERED_LISTs.
+const SHORT_LIST: &str = "Short list";
+/// The EFI_IFR_REF5 on ShortVarR.
+const SHORT_REF: &str = "Short ref";
+/// The ORDERED_LIST of 2 UINT16 containers on ShortVarW.
+const SHORT_WIDE_LIST: &str = "Short wide list";
+/// The ORDERED_LIST of 2 UINT8 containers on ShortVarM, which holds 3 bytes.
+const SHORT_MISMATCH_LIST: &str = "Short mismatch list";
+/// The ORDERED_LIST of 20 UINT8 containers on ShortVarPw, the PASSWORD's variable.
+const SHORT_PASSWORD_LIST: &str = "Short password list";
+/// The ORDERED_LIST of 3 UINT8 containers on ShortVarN, which no variable holds until set creates
+/// it.
+const SHORT_MISSING_LIST: &str = "Short missing list";
 /// The Attributes of the VARSTORE_EFI: non-volatile, boot service and runtime access.
 const NV_BS_RT: u32 = 0x07;
 /// The variables of the questions, then that of the PASSWORD.
 const VARIABLES: [&str; 4] = ["ShortVarA", "ShortVarB", "ShortVarC", "ShortVarPw"];
+/// The variables of the ORDERED_LISTs and the REF that vars/short-var-store.json creates.
+const LIST_VARIABLES: [&str; 4] = ["ShortVarL", "ShortVarR", "ShortVarW", "ShortVarM"];
 /// What would show a byte of the password: 0xAA in hex or decimal.
 const PASSWORD_TEXTS: [&str; 5] = ["aa aa", "AA AA", "aaaa", "AAAA", "170, 170"];
 
@@ -70,6 +89,30 @@ fn variables() -> Vec<Vec<u8>> {
     VARIABLES
         .map(|name| variable_data(&efivar(name)).unwrap_or_else(|| panic!("no {name}")))
         .to_vec()
+}
+
+/// The data of the variables of VARIABLES and LIST_VARIABLES, in their order.
+fn all_variables() -> Vec<Vec<u8>> {
+    [&VARIABLES[..], &LIST_VARIABLES]
+        .concat()
+        .into_iter()
+        .map(|name| variable_data(&efivar(name)).unwrap_or_else(|| panic!("no {name}")))
+        .collect()
+}
+
+/// Sets the ORDERED_LIST `question` to `items`; panics unless set answers them, joined by `, `.
+#[track_caller]
+fn set_items(question: &str, items: &[&str]) {
+    let args = [
+        &["hii", "set", "--json", question][..],
+        &items
+            .iter()
+            .flat_map(|&item| ["--item", item])
+            .collect::<Vec<_>>(),
+    ]
+    .concat();
+    let (set, _) = single_response(&args, BACKEND_HII);
+    assert_eq!(set.answer, items.join(", "), "{args:?}");
 }
 
 /// Sets `question` to `value`; panics unless set answers `value` and says whether it changed.
@@ -183,6 +226,117 @@ fn set_creates_the_missing_variable_of_its_var_name() {
     assert_eq!(variables(), before, "the other variables");
     let (got, _) = single_response(&["hii", "get", "--json", SHORT_CREATED], BACKEND_HII);
     assert_eq!(got.answer, "513", "get {SHORT_CREATED}");
+}
+
+/// get answers each ORDERED_LIST and the REF from the whole variable of its VarName, and refuses
+/// a variable of another size than the question's containers, and the ORDERED_LIST over the
+/// PASSWORD's variable.
+#[test]
+fn ordered_lists_and_a_ref_read_the_variables_of_their_var_names() {
+    let items = |items: &[&str]| Some(items.iter().map(|&item| item.to_owned()).collect());
+    for (question, answer, listed) in [
+        (
+            SHORT_LIST,
+            "Third, First, Second",
+            items(&["Third", "First", "Second"]),
+        ),
+        (
+            SHORT_REF,
+            "QuestionId 0x0001, FormId 0x0001, FormSetGuid 8C78A505-BAA0-4C4A-869F-000000000B00, \
+             DevicePath none",
+            None,
+        ),
+        (SHORT_WIDE_LIST, "First, Second", items(&["First", "Second"])),
+        (
+            SHORT_MISMATCH_LIST,
+            "<ValueUnavailable: EFI variable ShortVarM-8c78a505-baa0-4c4a-869f-000000000b01 holds 3 \
+             bytes; the question takes 2>",
+            None,
+        ),
+        (
+            SHORT_PASSWORD_LIST,
+            "<ValueUnavailable: its bytes hold a password>",
+            None,
+        ),
+    ] {
+        let (got, _) = single_response(&["hii", "get", "--json", question], BACKEND_HII);
+        assert_eq!(
+            (got.answer.as_str(), got.items),
+            (answer, listed),
+            "get {question}"
+        );
+    }
+}
+
+/// set writes the items of an ORDERED_LIST to the variable of its VarName whole, and no other
+/// variable.
+#[test]
+fn set_writes_the_items_of_a_list_to_the_variable_of_its_var_name_only() {
+    let before = all_variables();
+
+    set_items(SHORT_LIST, &["First", "Third"]);
+    let mut want = before.clone();
+    want[VARIABLES.len()] = vec![1, 3, 0];
+    assert_eq!(all_variables(), want, "after set {SHORT_LIST} First, Third");
+
+    set_items(SHORT_LIST, &["Third", "First", "Second"]);
+    assert_eq!(all_variables(), before, "after set {SHORT_LIST} back");
+}
+
+/// set refuses the REF, the target of its link, and the ORDERED_LIST over the password, and
+/// writes no variable.
+#[test]
+fn set_writes_neither_a_ref_nor_a_list_over_the_password() {
+    let before = all_variables();
+    let set_ref = ["hii", "set", "--json", SHORT_REF, "0"];
+    let set_list = [
+        "hii",
+        "set",
+        "--json",
+        SHORT_PASSWORD_LIST,
+        "--item",
+        "First",
+    ];
+    for (args, refusal) in [
+        (
+            &set_ref[..],
+            format!(
+                "cannot set question {SHORT_REF:?}: set does not write the EFI_HII_REF of a \
+                 cross-reference question, the target of its link (UEFI 2.11 §33.2.5.4.10)"
+            ),
+        ),
+        (
+            &set_list[..],
+            format!(
+                "cannot set question {SHORT_PASSWORD_LIST:?}: its items cannot be read, so set \
+                 cannot keep those of hidden options: its bytes hold a password"
+            ),
+        ),
+    ] {
+        assert_eq!(json_error(args).error_message, refusal, "{args:?}");
+        assert_eq!(all_variables(), before, "after {args:?}");
+    }
+}
+
+/// set creates the missing variable of an ORDERED_LIST's VarName through efivarfs, with the
+/// Attributes of its VARSTORE_EFI, its item and the empty containers after it, writing no other
+/// variable; get then reads it.
+#[test]
+fn set_creates_the_missing_variable_of_a_list() {
+    let created = efivar("ShortVarN");
+    assert_eq!(variable_bytes(&created), None, "{created} before set");
+    let before = all_variables();
+
+    set_items(SHORT_MISSING_LIST, &["Second"]);
+
+    assert_eq!(
+        variable_bytes(&created),
+        Some([&NV_BS_RT.to_le_bytes()[..], &[2, 0, 0]].concat()),
+        "{created} after set {SHORT_MISSING_LIST} Second"
+    );
+    assert_eq!(all_variables(), before, "the other variables");
+    let (got, _) = single_response(&["hii", "get", "--json", SHORT_MISSING_LIST], BACKEND_HII);
+    assert_eq!(got.answer, "Second", "get {SHORT_MISSING_LIST}");
 }
 
 /// get, list-questions and show-ifr show no byte of the password, which ShortVarPw keeps after
