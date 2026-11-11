@@ -51,6 +51,7 @@ use crate::hii::variables::VariableReach;
 use crate::hii::variables::VolatileWrites;
 use crate::parse_error::ParseError;
 use crate::parse_error::ReadParsed;
+use crate::terminal_text::TextLines;
 use crate::unsafe_operations::PendingOperations;
 use crate::unsafe_operations::UnsafeOperation;
 use crate::unsafe_operations::UnsafeOperations;
@@ -4909,7 +4910,7 @@ mod choice_for_set_tests {
     }
 }
 
-// display returns a String which is our tree like representation of a FormSet
+// display returns the lines of our tree like representation of a FormSet
 // TODO: show the default of an unreadable OneOf, Numeric or CheckBox, as list_questions does.
 // TODO: show the state that the conditions give each question and option, as list-questions
 // does.
@@ -4918,35 +4919,36 @@ pub(crate) fn display(
     level: usize,
     texts: &ListTexts<'_>,
     reader: &mut EfivarReader,
-) -> Result<String> {
-    let mut result = String::new();
+) -> Result<TextLines> {
+    let mut lines = Vec::new();
     let values = VarStoreValues::new(&node, None);
     let mut inputs = ExpressionInputs {
         reader,
         values: &values,
     };
     walk_scopes(std::slice::from_ref(&node), level, |node, &level| {
-        display_op(node, level, texts, &mut inputs, &mut result)
+        display_op(node, level, texts, &mut inputs, &mut lines)
     });
-    Ok(result)
+    Ok(TextLines(lines))
 }
 
-/// Appends the line of `node` that display shows `level` scopes down to `result`, and enters its
+/// Appends the lines of `node` that display shows `level` scopes down to `lines`, each on its
+/// own, so that a line break in a text that a line shows stays in that line; and enters its
 /// scope unless edk2 skips it.
 fn display_op(
     node: &Rc<RefCell<IFROperation>>,
     level: usize,
     texts: &ListTexts<'_>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
-    result: &mut String,
+    lines: &mut Vec<String>,
 ) -> Walk<usize> {
     let extra_spaces = "    ".repeat(level);
 
     let current_node = node.borrow();
     if let IFROpCode::Unknown(code) = current_node.op_code {
         if skips_scope(&current_node) {
-            result.push_str(&format!(
-                "{extra_spaces}OpCode: Unknown({code:#04x}) - skipped, as edk2 does\n"
+            lines.push(format!(
+                "{extra_spaces}OpCode: Unknown({code:#04x}) - skipped, as edk2 does"
             ));
             return Walk::Skip;
         }
@@ -4955,102 +4957,82 @@ fn display_op(
     match &current_node.parsed_data {
         // every op that handle_form_set parses has a parent; the root has none
         ParsedOperation::Placeholder if current_node.parent.is_none() => {
-            result.push_str(format!("{extra_spaces}OpCode: ROOT\n").as_str())
+            lines.push(format!("{extra_spaces}OpCode: ROOT"))
         }
-        ParsedOperation::Subtitle(parsed) => result.push_str(
-            format!(
-                "{extra_spaces}OpCode: {:?} - S: {}\n",
-                current_node.op_code,
-                texts.display(parsed.prompt_string_id),
-            )
-            .as_str(),
-        ),
-        ParsedOperation::FormSet(parsed) => result.push_str(
-            format!(
-                "{extra_spaces}OpCode: {:?} - {} - GUID {}{}\n",
-                current_node.op_code,
-                texts.display(parsed.title_string_id),
-                parsed.guid,
-                parsed
-                    .class_guids
-                    .iter()
-                    .map(|class_guid| format!(" - ClassGUID {class_guid}"))
-                    .collect::<String>(),
-            )
-            .as_str(),
-        ),
-        ParsedOperation::VarStore(parsed) => result.push_str(
-            format!(
-                "{extra_spaces}OpCode: {:?} - Name: {}\n",
-                current_node.op_code,
-                parsed.name,
-            )
-            .as_str(),
-        ),
-        ParsedOperation::VarStoreNameValue(parsed) => result.push_str(
-            format!(
-                "{extra_spaces}OpCode: {:?} - Id: {} - Guid: {}\n",
-                current_node.op_code, parsed.var_store_id, parsed.guid,
-            )
-            .as_str(),
-        ),
-        ParsedOperation::OneOfOption(parsed) => result.push_str(
-            format!(
-                "{extra_spaces}OpCode: {:?} - S: {}\n{extra_spaces}-ValueType:{}\n{extra_spaces}-Value:{:?}\n",
+        ParsedOperation::Subtitle(parsed) => lines.push(format!(
+            "{extra_spaces}OpCode: {:?} - S: {}",
+            current_node.op_code,
+            texts.display(parsed.prompt_string_id),
+        )),
+        ParsedOperation::FormSet(parsed) => lines.push(format!(
+            "{extra_spaces}OpCode: {:?} - {} - GUID {}{}",
+            current_node.op_code,
+            texts.display(parsed.title_string_id),
+            parsed.guid,
+            parsed
+                .class_guids
+                .iter()
+                .map(|class_guid| format!(" - ClassGUID {class_guid}"))
+                .collect::<String>(),
+        )),
+        ParsedOperation::VarStore(parsed) => lines.push(format!(
+            "{extra_spaces}OpCode: {:?} - Name: {}",
+            current_node.op_code, parsed.name,
+        )),
+        ParsedOperation::VarStoreNameValue(parsed) => lines.push(format!(
+            "{extra_spaces}OpCode: {:?} - Id: {} - Guid: {}",
+            current_node.op_code, parsed.var_store_id, parsed.guid,
+        )),
+        ParsedOperation::OneOfOption(parsed) => {
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - S: {}",
                 current_node.op_code,
                 texts.display(parsed.option_string_id),
-                parsed.value_type,
-                parsed.value
-            )
-            .as_str(),
-        ),
+            ));
+            lines.push(format!("{extra_spaces}-ValueType:{}", parsed.value_type));
+            lines.push(format!("{extra_spaces}-Value:{:?}", parsed.value));
+        }
 
         ParsedOperation::OneOf(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
             let answer_disp = display_answer(node, &varstore, inputs);
 
-            result.push_str(
-                format!(
-                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
-                    current_node.op_code,
-                    texts.display(parsed.question_header().prompt_string_id),
-                    texts.display(parsed.question_header().help_string_id),
-                    parsed.data
-                )
-                .as_str(),
-            );
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}",
+                current_node.op_code,
+                texts.display(parsed.question_header().prompt_string_id),
+                texts.display(parsed.question_header().help_string_id),
+            ));
+            lines.push(format!("{extra_spaces}-{:?}", parsed.data));
+            lines.push(format!("{extra_spaces}-Answer: {answer_disp}"));
         }
         ParsedOperation::Numeric(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
             let answer_disp = display_answer(node, &varstore, inputs);
 
-            result.push_str(
-                format!(
-                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-{:?}\n{extra_spaces}-Answer: {answer_disp}\n",
-                    current_node.op_code,
-                    texts.display(parsed.question_header().prompt_string_id),
-                    texts.display(parsed.question_header().help_string_id),
-                    parsed.data
-                )
-                .as_str(),
-            );
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}",
+                current_node.op_code,
+                texts.display(parsed.question_header().prompt_string_id),
+                texts.display(parsed.question_header().help_string_id),
+            ));
+            lines.push(format!("{extra_spaces}-{:?}", parsed.data));
+            lines.push(format!("{extra_spaces}-Answer: {answer_disp}"));
         }
         ParsedOperation::CheckBox(parsed) => {
             let varstore =
                 find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
             let answer_disp = display_answer(node, &varstore, inputs);
 
-            result.push_str(
-                format!(
-                    "{extra_spaces}OpCode: {:?} - Q: - {} - Help: - {}\n{extra_spaces}-Answer: {answer_disp}\n",
-                    current_node.op_code,
-                    texts.display(parsed.question_header().prompt_string_id),
-                    texts.display(parsed.question_header().help_string_id),
-                )
-                .as_str(),
-            );
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - Q: - {} - Help: - {}",
+                current_node.op_code,
+                texts.display(parsed.question_header().prompt_string_id),
+                texts.display(parsed.question_header().help_string_id),
+            ));
+            lines.push(format!("{extra_spaces}-Answer: {answer_disp}"));
         }
 
         ParsedOperation::Date(parsed) | ParsedOperation::Time(parsed) => {
@@ -5058,36 +5040,33 @@ fn display_op(
                 find_corresponding_varstore(Rc::clone(node), parsed.question_header().var_store_id);
             let answer_disp = display_answer(node, &varstore, inputs);
 
-            result.push_str(
-                format!(
-                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-Flags: {:#04x}\n{extra_spaces}-Answer: {answer_disp}\n",
-                    current_node.op_code,
-                    texts.display(parsed.question_header().prompt_string_id),
-                    texts.display(parsed.question_header().help_string_id),
-                    parsed.flags
-                )
-                .as_str(),
-            );
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}",
+                current_node.op_code,
+                texts.display(parsed.question_header().prompt_string_id),
+                texts.display(parsed.question_header().help_string_id),
+            ));
+            lines.push(format!("{extra_spaces}-Flags: {:#04x}", parsed.flags));
+            lines.push(format!("{extra_spaces}-Answer: {answer_disp}"));
         }
 
         ParsedOperation::OrderedList(parsed) => {
             let header = parsed.question_header();
             let varstore = find_corresponding_varstore(Rc::clone(node), header.var_store_id);
             let question = OrderedListQuestion::of(&current_node, parsed);
-            let answer_disp =
-                display_list_answer(node, question, &varstore, texts, inputs);
+            let answer_disp = display_list_answer(node, question, &varstore, texts, inputs);
 
-            result.push_str(
-                format!(
-                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-MaxContainers: {} - Flags: {:#04x}\n{extra_spaces}-Answer: {answer_disp}\n",
-                    current_node.op_code,
-                    texts.display(header.prompt_string_id),
-                    texts.display(header.help_string_id),
-                    parsed.max_containers,
-                    parsed.flags
-                )
-                .as_str(),
-            );
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}",
+                current_node.op_code,
+                texts.display(header.prompt_string_id),
+                texts.display(header.help_string_id),
+            ));
+            lines.push(format!(
+                "{extra_spaces}-MaxContainers: {} - Flags: {:#04x}",
+                parsed.max_containers, parsed.flags
+            ));
+            lines.push(format!("{extra_spaces}-Answer: {answer_disp}"));
         }
 
         ParsedOperation::Ref(parsed) if parsed.question_header.var_store_id != 0 => {
@@ -5095,15 +5074,13 @@ fn display_op(
             let varstore = find_corresponding_varstore(Rc::clone(node), header.var_store_id);
             let answer_disp = display_ref_answer(node, &varstore, texts, inputs);
 
-            result.push_str(
-                format!(
-                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-Answer: {answer_disp}\n",
-                    current_node.op_code,
-                    texts.display(header.prompt_string_id),
-                    texts.display(header.help_string_id),
-                )
-                .as_str(),
-            );
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}",
+                current_node.op_code,
+                texts.display(header.prompt_string_id),
+                texts.display(header.help_string_id),
+            ));
+            lines.push(format!("{extra_spaces}-Answer: {answer_disp}"));
         }
 
         ParsedOperation::String(parsed) => {
@@ -5111,24 +5088,22 @@ fn display_op(
             let varstore = find_corresponding_varstore(Rc::clone(node), header.var_store_id);
             let answer_disp = display_string_answer(node, &varstore, inputs);
 
-            result.push_str(
-                format!(
-                    "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}\n{extra_spaces}-MinSize: {} - MaxSize: {} - Flags: {:#04x}\n{extra_spaces}-Answer: {answer_disp}\n",
-                    current_node.op_code,
-                    texts.display(header.prompt_string_id),
-                    texts.display(header.help_string_id),
-                    parsed.min_size,
-                    parsed.max_size,
-                    parsed.flags
-                )
-                .as_str(),
-            );
+            lines.push(format!(
+                "{extra_spaces}OpCode: {:?} - Q: {} - Help: {}",
+                current_node.op_code,
+                texts.display(header.prompt_string_id),
+                texts.display(header.help_string_id),
+            ));
+            lines.push(format!(
+                "{extra_spaces}-MinSize: {} - MaxSize: {} - Flags: {:#04x}",
+                parsed.min_size, parsed.max_size, parsed.flags
+            ));
+            lines.push(format!("{extra_spaces}-Answer: {answer_disp}"));
         }
 
         // TODO: we have already made structs for the most popular opcodes so we should finish the display function for them
         // however display is only for debugging and a visual representation of the forms for humans
-        _ => result
-            .push_str(format!("{extra_spaces}OpCode: {:?}\n",  current_node.op_code).as_str()),
+        _ => lines.push(format!("{extra_spaces}OpCode: {:?}", current_node.op_code)),
     }
 
     Walk::Enter(level + 1)

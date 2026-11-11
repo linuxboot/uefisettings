@@ -149,9 +149,10 @@ impl fmt::Display for UnsafeOperation {
                 "this HiiDB declares a setup password question, and the UEFI Shell runs no setup \
                  browser, so no password is asked or checked",
             ),
+            // the name as it is: a warning escapes it once, as TerminalText
             Self::ReadOnlyQuestion { question, .. } => write!(
                 f,
-                "cannot set question {question:?}: {}",
+                "cannot set question \"{question}\": {}",
                 ReadOnlyCause::Flag
             ),
             #[cfg(variable_data)]
@@ -345,6 +346,23 @@ mod tests {
              browser, so no password is asked or checked; --i-am-fine-to-brick-this-system lets \
              uefisettings write without it",
             "the warning"
+        );
+    }
+
+    /// A read-only question's name shows as it is, in quotes: no Debug escape, which a warning's
+    /// TerminalText would escape again, and the JSON of a refusal keeps it exact.
+    #[test]
+    fn read_only_question_names_the_question_as_it_is() {
+        let operation = UnsafeOperation::ReadOnlyQuestion {
+            question: "C:\\A\u{1b}[2J".to_owned(),
+            writable: IncludedStates::empty(),
+        };
+
+        let shown = operation.to_string();
+
+        assert!(
+            shown.starts_with("cannot set question \"C:\\A\u{1b}[2J\": "),
+            "{shown:?}"
         );
     }
 

@@ -69,8 +69,8 @@ use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii_get;
 use crate::hii_set;
+use crate::print_display_or_json;
 use crate::print_lifted;
-use crate::print_line;
 use crate::unsafe_long_help;
 use crate::variable_command::print_info;
 use crate::HiiSourceArgs;
@@ -242,13 +242,11 @@ impl KeywordCommands {
     }
 }
 
-/// Prints `values` as their `<MultiKeywordResp>`, or as JSON if `json`, an object per keyword,
-/// outside the thrift IDL that the other hii commands print.
+/// Prints `values` as their `<MultiKeywordResp>`, as TerminalText since a KEYWORD may hold
+/// Bidi_Control characters, or as JSON if `json`, an object per keyword, outside the thrift IDL
+/// that the other hii commands print.
 fn print_keyword_values(values: &KeywordValues, json: bool) -> Result<()> {
-    match json {
-        true => print_line(format_args!("{}", serde_json::to_string(values)?))?,
-        false => print_line(format_args!("{values}"))?,
-    }
+    print_display_or_json(values, json)?;
     Ok(())
 }
 

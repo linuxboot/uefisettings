@@ -48,6 +48,7 @@ pub mod parse_error;
 #[cfg(target_os = "uefi")]
 mod runtime_time_services;
 pub mod secret_file;
+pub mod terminal_text;
 mod translation;
 #[cfg(target_os = "uefi")]
 mod uefi_config_table;

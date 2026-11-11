@@ -95,3 +95,36 @@ fn list_strings_does_not_warn_of_string_information_at_hdr_size() {
     assert!(stdout.contains(r#""A""#), "the string is listed: {stdout}");
     assert!(!stderr.contains("StringInfoOffset"), "stderr: {stderr}");
 }
+
+/// The warning's line keeps env_logger's default header, whatever uefisettings escapes in its
+/// message: a timestamp in seconds, the level padded to 5 columns and the target.
+#[test]
+fn list_strings_warning_keeps_the_default_log_header() {
+    let (_, stderr) = list_strings(&hiidb(3, 4));
+
+    let header = stderr
+        .lines()
+        .find(|line| line.contains("StringInfoOffset 56"))
+        .and_then(|line| line.strip_prefix('['))
+        .and_then(|line| line.split_once("] "))
+        .map(|(header, _)| header)
+        .unwrap_or_else(|| panic!("no warning line with a header: {stderr}"));
+    let (timestamp, rest) = header
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("no timestamp in {header:?}"));
+    let in_seconds = timestamp.len() == 20
+        && timestamp
+            .char_indices()
+            .all(|(index, character)| match index {
+                4 | 7 => character == '-',
+                10 => character == 'T',
+                13 | 16 => character == ':',
+                19 => character == 'Z',
+                _ => character.is_ascii_digit(),
+            });
+    assert!(in_seconds, "timestamp {timestamp:?} of {header:?}");
+    assert_eq!(
+        rest, "WARN  uefisettings::hii::strings",
+        "header {header:?}"
+    );
+}

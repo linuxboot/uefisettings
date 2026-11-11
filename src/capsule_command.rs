@@ -30,7 +30,7 @@ use uefisettings::exports::TextOrHex;
 
 #[cfg(capsule_delivery)]
 use crate::platform;
-use crate::print_line;
+use crate::print_json;
 
 #[derive(Debug, Parser)]
 #[command(next_display_order = None)]
@@ -81,9 +81,9 @@ impl CapsuleCommand {
 fn deliver(payload: &Path, capsule_id: u32) -> Result<()> {
     let payload = platform::read_payload(payload)?;
     let delivered = CapsuleBackend::deliver_json(&payload, capsule_id)?;
-    print_line(format_args!(
-        "{}",
-        delivery_report(delivered.capsule_size, delivered.capabilities)
+    print_json(&delivery_report(
+        delivered.capsule_size,
+        delivered.capabilities,
     ))?;
     Ok(())
 }
@@ -102,7 +102,7 @@ fn deliver(_payload: &Path, _capsule_id: u32) -> Result<()> {
 #[cfg(configuration_tables)]
 fn config_data() -> Result<()> {
     let data = CapsuleBackend::json_config_data()?;
-    print_line(format_args!("{}", config_data_report(&data.items)))?;
+    print_json(&config_data_report(&data.items))?;
     Ok(())
 }
 
@@ -115,7 +115,7 @@ fn config_data() -> Result<()> {
 /// Prints the results of capsule processing that the firmware reports in its result variables.
 fn results() -> Result<()> {
     let results = CapsuleBackend::results()?;
-    print_line(format_args!("{}", serde_json::to_value(&results)?))?;
+    print_json(&serde_json::to_value(&results)?)?;
     Ok(())
 }
 
@@ -124,7 +124,7 @@ fn results() -> Result<()> {
 #[cfg(configuration_tables)]
 fn result_table() -> Result<()> {
     let result = CapsuleBackend::json_capsule_result()?;
-    print_line(format_args!("{}", serde_json::to_value(&result)?))?;
+    print_json(&serde_json::to_value(&result)?)?;
     Ok(())
 }
 

@@ -35,10 +35,10 @@ use uefisettings::exports::VariableKey;
 #[cfg(variable_storage_info)]
 use uefisettings::exports::VariableStorage;
 
+#[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
+use crate::print_json;
 #[cfg(variable_data)]
 use crate::print_lifted;
-#[cfg(any(variable_names, variable_info, variable_storage_info, variable_data))]
-use crate::print_line;
 #[cfg(variable_data)]
 use crate::unsafe_long_help;
 #[cfg(variable_data)]
@@ -161,7 +161,7 @@ impl SetArgs {
                     self.unsafe_operations.operations(),
                 )?;
                 print_lifted(&lifted)?;
-                print_line(format_args!("{}", serde_json::to_string(&write)?))?;
+                print_json(&write)?;
                 Ok(())
             }
         }
@@ -224,7 +224,7 @@ impl VariableCommand {
 #[cfg(variable_names)]
 fn list(guid: Option<&str>) -> Result<()> {
     let keys = VariableBackend::list(guid)?;
-    print_line(format_args!("{}", list_report(&keys)))?;
+    print_json(&list_report(&keys))?;
     Ok(())
 }
 
@@ -255,7 +255,7 @@ pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
     let info = VariableBackend::info(name, guid)?;
     // its own JSON object, outside the thrift IDL that the hii commands print, and JSON always,
     // as info takes no -j
-    print_line(format_args!("{}", serde_json::to_value(info)?))?;
+    print_json(&serde_json::to_value(info)?)?;
     Ok(())
 }
 
@@ -269,7 +269,7 @@ fn print_global(name: &str, guid: Option<&str>) -> Result<()> {
 /// Prints `global` as one line of JSON, for print_global and set.
 #[cfg(variable_data)]
 fn print_global_variable(global: &GlobalVariable) -> Result<()> {
-    print_line(format_args!("{}", serde_json::to_string(global)?))?;
+    print_json(global)?;
     Ok(())
 }
 
@@ -286,7 +286,7 @@ fn storage(attributes: &[AttributeArg]) -> Result<()> {
         attributes: attributes.bits(),
         storage,
     };
-    print_line(format_args!("{}", serde_json::to_value(report)?))?;
+    print_json(&serde_json::to_value(report)?)?;
     Ok(())
 }
 

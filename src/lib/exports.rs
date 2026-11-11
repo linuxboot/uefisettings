@@ -11,7 +11,6 @@
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::collections::BTreeSet;
-use std::fmt::Write;
 use std::rc::Rc;
 
 use anyhow::Context;
@@ -226,6 +225,7 @@ pub use crate::hii::VariableKey;
 use crate::hii::VOLATILE_ANNOTATION;
 #[cfg(variable_data)]
 use crate::secret_file::Secret;
+use crate::terminal_text::TextLines;
 use crate::translation::get_qa_variations_hii;
 use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
@@ -656,6 +656,16 @@ pub struct DumpEfivarsOptions {
     pub redaction: EfivarRedaction,
 }
 
+/// show-ifr's text in thrift, its lines each ended with `\n`.
+impl From<TextLines> for HiiShowIfrResponse {
+    fn from(lines: TextLines) -> Self {
+        Self {
+            readable_representation: lines.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
 impl HiiBackend {
     /// show_ifr returns a human readable representation of the forms in Hii
     ///
@@ -670,6 +680,12 @@ impl HiiBackend {
     /// Under `EfivarSource::System`, on Linux it also reads the ExportConfig snapshot from
     /// physical memory.
     pub fn show_ifr_using(db_bytes: &[u8], options: &ShowIfrOptions) -> Result<HiiShowIfrResponse> {
+        Self::show_ifr_lines_using(db_bytes, options).map(HiiShowIfrResponse::from)
+    }
+
+    /// show_ifr_using's text in lines, which a text that a line shows may break itself: the CLI
+    /// prints each line escaped, so that such a break forges no line
+    pub fn show_ifr_lines_using(db_bytes: &[u8], options: &ShowIfrOptions) -> Result<TextLines> {
         Self::show_ifr_in(
             db_bytes,
             options,
@@ -688,11 +704,11 @@ impl HiiBackend {
         variables: Box<dyn FirmwareVariables>,
         exported: Option<ExportedConfig>,
         platform_lang: Option<&str>,
-    ) -> Result<HiiShowIfrResponse> {
+    ) -> Result<TextLines> {
         // We depend on the caller to provide us with the hiidb instead of calling extract here
         // because they might want to provide a file instead.
 
-        let mut readable_representation = String::new();
+        let mut lines = Vec::new();
 
         let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables, exported)?;
 
@@ -702,31 +718,21 @@ impl HiiBackend {
             if list.forms.is_empty() {
                 continue;
             }
-            writeln!(readable_representation, "Packagelist {}", list.guid)?;
+            lines.push(format!("Packagelist {}", list.guid));
             let texts = list.texts(&text_languages(options.language.as_deref(), platform_lang));
             reader.enter_package_list(&list, &texts);
             for root in &list.forms {
-                readable_representation.push_str(&forms::display(
-                    Rc::clone(root),
-                    0,
-                    &texts,
-                    &mut reader,
-                )?);
+                lines.extend(forms::display(Rc::clone(root), 0, &texts, &mut reader)?.0);
             }
             for disabled in &list.disabled_forms {
-                writeln!(
-                    readable_representation,
+                lines.push(format!(
                     "Disabled at offset {}: {}",
                     disabled.offset, disabled.reason
-                )?;
+                ));
             }
         }
 
-        let resp = HiiShowIfrResponse {
-            readable_representation,
-            ..Default::default()
-        };
-        Ok(resp)
+        Ok(TextLines(lines))
     }
 
     /// list all strings-id, string pairs in HiiDB
@@ -1792,6 +1798,90 @@ mod tests {
         );
     }
 
+    /// Each line of show_ifr_in holds no line break of its own: display_op pushes a line per
+    /// line of each of its arms, and show_ifr_in one per package list and disabled form, so that
+    /// the CLI, which escapes a line break inside a line, shows each on a line of its own.
+    #[test]
+    fn show_ifr_lines_hold_no_line_break() {
+        let header = |question_id, offset| question_header_with(question_id, 2, 1, offset, 0x00);
+        let questions = [
+            [subtitle_scope(2), END.to_vec()].concat(),
+            one_of_at(1, 2, 1, 0, &[(2, 0)]),
+            uint8_numeric_with(2, 2, 1, 0x00, &[]),
+            checkbox_at(3, 2, 1, 2),
+            operation(DATE, false, &[header(4, 3), vec![0x00]].concat()),
+            operation(TIME, false, &[header(5, 7), vec![0x00]].concat()),
+            [
+                operation(ORDERED_LIST, true, &[header(6, 10), vec![1, 0x00]].concat()),
+                flagged_option(2, 0x00, 1),
+                END.to_vec(),
+            ]
+            .concat(),
+            operation(REF, false, &header(7, 11)),
+            string_on(9, 2, (1, 12), (0, 4), &[]),
+            in_unknown_scope(&checkbox_at(8, 2, 1, 2)),
+            locked_op(),
+        ];
+        let packages = [
+            form_package(&[
+                var_store(1, [0x22; 16], "Store", 40),
+                var_store_name_value(2, [0x33; 16]),
+                form(1, &questions),
+                form(2, &[operation(CHECKBOX, false, &[0x00; 4])]),
+            ]),
+            en_strings_package_of(&["FormSet", "Text"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+
+        let shown = HiiBackend::show_ifr_in(
+            &hiidb,
+            &ShowIfrOptions::default(),
+            shared(&Rc::new(MemoryVariables::default())),
+            None,
+            None,
+        )
+        .expect("show the IFR");
+
+        let starts = [
+            "Packagelist ",
+            "OpCode: ROOT",
+            "OpCode: FormSet - ",
+            "OpCode: VarStore - Name: ",
+            "OpCode: VarStoreNameValue - Id: ",
+            "OpCode: Subtitle - S: ",
+            "OpCode: OneOf - Q: ",
+            "OpCode: OneOfOption - S: ",
+            "-ValueType:",
+            "-Value:",
+            "OpCode: Numeric - Q: ",
+            "OpCode: CheckBox - Q: - ",
+            "OpCode: Date - Q: ",
+            "OpCode: Time - Q: ",
+            "-Flags: ",
+            "OpCode: OrderedList - Q: ",
+            "-MaxContainers: ",
+            "OpCode: Ref - Q: ",
+            "OpCode: String - Q: ",
+            "-MinSize: ",
+            "-Answer: ",
+            "OpCode: Unknown(0xf0) - skipped",
+            "OpCode: Locked",
+            "Disabled at offset ",
+        ];
+        for start in starts {
+            assert!(
+                shown
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(start)),
+                "a line starts with {start:?}: {shown}"
+            );
+        }
+        for line in shown.lines() {
+            assert!(!line.contains(['\n', '\r']), "line {line:?} breaks");
+        }
+    }
+
     /// list_strings returns the strings packages in HiiDB order, duplicate
     /// GUIDs included.
     #[test]
@@ -2424,6 +2514,45 @@ mod tests {
         );
     }
 
+    /// set matches VALUE against raw option texts only: a VALUE that holds an escape, as pasted
+    /// from TerminalText's spelling of an option's text, names only an option whose raw text it
+    /// is, which a HiiDB may hold, and never the option that shows so.
+    #[test]
+    fn set_matches_value_against_raw_option_texts_only() {
+        let control = "A\u{1b}B";
+        let shown = crate::terminal_text::TerminalText(control).to_string();
+        let cases = [
+            ([control, shown.as_str()], shown.as_str(), Some(1)),
+            ([control, "Other"], shown.as_str(), None),
+            ([control, shown.as_str()], control, Some(0)),
+        ];
+        for (options, value, want) in cases {
+            let hiidb = mode_hiidb(
+                ["Mode", options[0], options[1]],
+                ["Mode", options[0], options[1]],
+            );
+            let variables = Rc::new(MemoryVariables::default());
+            variables.insert(setup(), 7, &[0]);
+
+            let set = HiiBackend::set_in(
+                &hiidb,
+                "Mode",
+                &SetValue::Text(value.to_owned()),
+                None,
+                &SetOptions::default(),
+                shared(&variables),
+                &*variables,
+                None,
+            );
+
+            let case = format!("options {options:?}, VALUE {value:?}");
+            assert_eq!(set.is_ok(), want.is_some(), "{case}: {set:?}");
+            let writes: Vec<(u16, Vec<u8>)> =
+                want.map(|option| (0, vec![option])).into_iter().collect();
+            assert_eq!(variables.writes_to(&setup()), writes, "{case}: writes");
+        }
+    }
+
     /// set refuses a VALUE that no one language holds as the text of every option it names,
     /// naming each, and writes nothing.
     #[test]
@@ -2978,7 +3107,7 @@ mod tests {
             platform_lang,
         )
         .expect("show the IFR")
-        .readable_representation;
+        .to_string();
         (listed, shown)
     }
 
@@ -5646,7 +5775,7 @@ mod tests {
                 None,
             )
             .expect("show the IFR")
-            .readable_representation;
+            .to_string();
 
             let answers: Vec<&str> = got
                 .responses
@@ -6115,7 +6244,7 @@ mod tests {
                 None,
             )
             .expect("show the IFR")
-            .readable_representation;
+            .to_string();
 
             let shown = format!("{answers:?} {listed:?} {ifr}").to_lowercase();
             let leaked: Vec<String> = groups
@@ -9557,14 +9686,16 @@ mod tests {
             outputs.push(format!("{question:#?}"));
             outputs.push(String::from_utf8_lossy(&simplejson_protocol::serialize(question)).into());
         }
-        let ifr = HiiBackend::show_ifr_in(
-            hiidb,
-            &ShowIfrOptions::default(),
-            shared(variables),
-            exported(),
-            None,
-        )
-        .expect("show the IFR");
+        let ifr = HiiShowIfrResponse::from(
+            HiiBackend::show_ifr_in(
+                hiidb,
+                &ShowIfrOptions::default(),
+                shared(variables),
+                exported(),
+                None,
+            )
+            .expect("show the IFR"),
+        );
         outputs.push(format!("{ifr:#?}"));
         outputs.push(String::from_utf8_lossy(&simplejson_protocol::serialize(&ifr)).into());
         (got, listed, ifr.readable_representation, outputs)
@@ -10182,7 +10313,7 @@ mod tests {
                 platform,
             )
             .unwrap_or_else(|error| panic!("{case}: show-ifr: {error:#}"))
-            .readable_representation;
+            .to_string();
 
             let answers = |questions: Vec<&Question>| {
                 questions
@@ -11091,7 +11222,7 @@ mod tests {
             None,
         )
         .expect("show the IFR")
-        .readable_representation;
+        .to_string();
 
         let listed: Vec<(&str, &str, [Option<serde_json::Value>; 3])> = listed
             .iter()

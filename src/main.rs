@@ -50,6 +50,9 @@ use uefisettings::exports::ShowIfrOptions;
 use uefisettings::exports::UnsafeOperation;
 #[cfg(system_variables)]
 use uefisettings::exports::UnsafeOperations;
+use uefisettings::terminal_text::JsonText;
+use uefisettings::terminal_text::TerminalText;
+use uefisettings::terminal_text::TextLines;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
 #[cfg(system_variables)]
@@ -659,13 +662,15 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
 
-        let _ = print_with_style(
+        if let Err(print_error) = print_with_style(
             uefisettings_backend_thrift::Error {
                 error_message: format!("{:#}", why),
                 ..Default::default()
             },
             true,
-        );
+        ) {
+            log::debug!("failed to print the error: {print_error}");
+        }
         return ExitCode::FAILURE;
     }
 
@@ -722,9 +727,11 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 options.language.clone_from(&language.language);
                 // before the HiiDB is read
                 options.efivars.validate()?;
-                let res =
-                    HiiBackend::show_ifr_using(&hiidb.read(&options.efivars, source)?, &options)?;
-                print_line(format_args!("{}", res.readable_representation))?;
+                let lines = HiiBackend::show_ifr_lines_using(
+                    &hiidb.read(&options.efivars, source)?,
+                    &options,
+                )?;
+                print_terminal_lines(&lines)?;
             }
             HiiSubcommands::ListStrings { hiidb, output } => {
                 let res = HiiBackend::list_strings(&hiidb.read(&EfivarSource::Disabled, source)?)?;
@@ -782,20 +789,73 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
     Ok(())
 }
 
+// the Linux build's ilo notes; the other text goes through TerminalText or Debug
+#[cfg(target_os = "linux")]
 fn print_line(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     writeln!(output, "{}", arguments)
 }
 
+/// Prints `value` as its JSON text, as JsonText.
+#[cfg(any(system_variables, all(system_hiidb, hiidb_files)))]
+fn print_json(value: &impl serde::Serialize) -> io::Result<()> {
+    let stdout = io::stdout();
+    write_json(&mut stdout.lock(), value)
+}
+
+/// Writes `value` to `output` as its JSON text, as JsonText.
+#[cfg(any(system_variables, all(system_hiidb, hiidb_files), test))]
+fn write_json(output: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+    let json = serde_json::to_string(value)?;
+    writeln!(output, "{}", JsonText(&json))
+}
+
+/// Prints `lines`, which may show the HiiDB's strings, each as TerminalText, so that a line break
+/// of a string shows as `\n` and starts no line, then an empty line, as show-ifr always has.
+fn print_terminal_lines(lines: &TextLines) -> io::Result<()> {
+    let stdout = io::stdout();
+    write_terminal_lines(&mut stdout.lock(), lines)
+}
+
+fn write_terminal_lines(output: &mut impl Write, lines: &TextLines) -> io::Result<()> {
+    lines
+        .lines()
+        .try_for_each(|line| writeln!(output, "{}", TerminalText(line)))?;
+    writeln!(output)
+}
+
+/// Prints the warning `arguments` on stderr as TerminalText, as it may name the HiiDB's strings.
 fn print_warning(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     let stderr = io::stderr();
-    let mut output = stderr.lock();
-    write_warning(&mut output, arguments)
+    write_warning(&mut stderr.lock(), arguments)
 }
 
 fn write_warning(output: &mut impl Write, arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
-    writeln!(output, "warning: {}", arguments)
+    writeln!(output, "warning: {}", TerminalText(&arguments.to_string()))
+}
+
+/// Prints `value` as TerminalText, or as its JSON text, as JsonText, if `json`.
+#[cfg(target_os = "uefi")]
+fn print_display_or_json(
+    value: &(impl std::fmt::Display + serde::Serialize),
+    json: bool,
+) -> io::Result<()> {
+    let stdout = io::stdout();
+    write_display_or_json(&mut stdout.lock(), value, json)
+}
+
+/// Writes `value` to `output` as TerminalText, or as its JSON text, as JsonText, if `json`.
+#[cfg(any(target_os = "uefi", test))]
+fn write_display_or_json(
+    output: &mut impl Write,
+    value: &(impl std::fmt::Display + serde::Serialize),
+    json: bool,
+) -> io::Result<()> {
+    match json {
+        true => write_json(output, value),
+        false => writeln!(output, "{}", TerminalText(&value.to_string())),
+    }
 }
 
 /// Prints a warning per unsafe operation in `lifted`, which --i-am-fine-to-brick-this-system let
@@ -848,7 +908,7 @@ where
 {
     if json {
         let buf = simplejson_protocol::serialize(result);
-        writeln!(output, "{}", String::from_utf8_lossy(&buf))
+        writeln!(output, "{}", JsonText(&String::from_utf8_lossy(&buf)))
     } else {
         writeln!(output, "{:#?}", result)
     }
@@ -1332,6 +1392,26 @@ mod tests {
                 UnsafeOperation::SetupPassword.lifted_warning()
             ),
             "SetupPassword"
+        );
+    }
+
+    /// A lifted warning shows a question's name escaped once, as show-ifr shows it: `\` as `\\`
+    /// and ESC as `\u{1b}`.
+    #[cfg(system_variables)]
+    #[test]
+    fn write_lifted_escapes_a_question_name_once() {
+        let lifted = [UnsafeOperation::ReadOnlyQuestion {
+            question: "C:\\A\u{1b}[2J".to_owned(),
+            writable: IncludedStates::empty(),
+        }];
+        let mut warned = Vec::new();
+
+        write_lifted(&mut warned, &lifted).expect("write the warning");
+
+        let warned = String::from_utf8(warned).expect("UTF-8");
+        assert!(
+            warned.starts_with("warning: cannot set question \"C:\\\\A\\u{1b}[2J\": "),
+            "{warned:?}"
         );
     }
 
@@ -2055,6 +2135,128 @@ mod tests {
             ])
             .expect_err("an unknown value");
             assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "{flag}");
+        }
+    }
+
+    /// show-ifr's text: each line as TerminalText, ended with its line break, so that a text's
+    /// own line break shows as `\n` inside its line and forges no line, such as an -Answer line
+    /// before the question's own; then the empty line that ends it.
+    #[test]
+    fn terminal_lines_escape_each_line_and_its_own_line_breaks() {
+        let forged = "    -Answer: 1";
+        let cases: [(&[&str], &str); 4] = [
+            (
+                &["FormSet - T\u{1b}[2J", "  -Prompt: A\r\u{202e}B"],
+                "FormSet - T\\u{1b}[2J\n  -Prompt: A\\r\\u{202e}B\n\n",
+            ),
+            (
+                &[
+                    "OpCode: CheckBox - Q: - Q - Help: - Real help\n    -Answer: 1",
+                    "    -Answer: 0",
+                ],
+                "OpCode: CheckBox - Q: - Q - Help: - Real help\\n    -Answer: 1\n    -Answer: 0\n\n",
+            ),
+            (&["Packagelist X", "OpCode: ROOT"], "Packagelist X\nOpCode: ROOT\n\n"),
+            (&[], "\n"),
+        ];
+        for (lines, want) in cases {
+            let lines = TextLines(lines.iter().map(|&line| line.to_owned()).collect());
+            let mut output = Vec::new();
+
+            write_terminal_lines(&mut output, &lines).expect("write the lines");
+
+            let shown = String::from_utf8(output).expect("UTF-8");
+            assert_eq!(shown, want, "{lines:?}");
+            assert!(
+                !shown.lines().any(|line| line == forged),
+                "{lines:?}: forged line"
+            );
+        }
+    }
+
+    #[test]
+    fn warnings_escape_control_characters() {
+        let mut output = Vec::new();
+
+        write_warning(
+            &mut output,
+            format_args!("questions may be in {}", "A\u{9b}2J\nB"),
+        )
+        .expect("write the warning");
+
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8"),
+            "warning: questions may be in A\\u{9b}2J\\nB\n"
+        );
+    }
+
+    /// The UEFI Shell build's keyword text: as TerminalText, so that a KEYWORD's Bidi_Control
+    /// character reorders nothing; its JSON keeps the value, through JsonText.
+    #[test]
+    fn display_or_json_escapes_the_text_and_keeps_the_json_value() {
+        struct Keywords(&'static str);
+        impl std::fmt::Display for Keywords {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "KEYWORD={}", self.0)
+            }
+        }
+        impl serde::Serialize for Keywords {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.0)
+            }
+        }
+        let keywords = Keywords("K\u{202e}K");
+        let cases = [(false, "KEYWORD=K\\u{202e}K\n"), (true, "\"K\\u202eK\"\n")];
+        for (json, want) in cases {
+            let mut output = Vec::new();
+
+            write_display_or_json(&mut output, &keywords, json).expect("write the keywords");
+
+            let shown = String::from_utf8(output).expect("UTF-8");
+            assert_eq!(shown, want, "json {json}");
+            if json {
+                let value: String = serde_json::from_str(&shown).expect("parse");
+                assert_eq!(value, keywords.0, "the JSON's value");
+            }
+        }
+    }
+
+    /// set takes VALUE and each --item as they are: nothing unescapes the `\\` of a text pasted
+    /// from TerminalText.
+    #[test]
+    #[cfg(all(system_hiidb, system_variables))]
+    fn set_takes_the_value_and_items_verbatim() {
+        let shown = TerminalText("A\\u{1b}B").to_string();
+        let items = SetValue::Items(vec![shown.clone(), "C\\\\D".to_owned()]);
+        let cases = [
+            (vec!["Q", shown.as_str()], SetValue::Text(shown.clone())),
+            (
+                vec!["Q", "--item", shown.as_str(), "--item", "C\\\\D"],
+                items.clone(),
+            ),
+            (
+                vec![
+                    "--keyword",
+                    "K:5",
+                    "--item",
+                    shown.as_str(),
+                    "--item",
+                    "C\\\\D",
+                ],
+                items,
+            ),
+        ];
+        for (args, want) in cases {
+            let argv = [&["uefisettings", "set"][..], &args].concat();
+            let target = match UefiSettingsToolArgs::try_parse_from(argv)
+                .expect("parse set")
+                .command
+            {
+                Commands::Set { target, .. } => target.target().expect("the target"),
+                other => panic!("{args:?}: {other:?}"),
+            };
+
+            assert_eq!(target.1, want, "{args:?}");
         }
     }
 }

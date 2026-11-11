@@ -39,7 +39,7 @@ use uefisettings_backend_thrift::SetResponseList;
 use crate::extract_db_report;
 use crate::hii_get;
 use crate::hii_set;
-use crate::print_line;
+use crate::print_json;
 use crate::write_extracted_db;
 use crate::HiiSourceArgs;
 use crate::QuestionArgs;
@@ -88,7 +88,7 @@ impl HiiPlatformCommands {
             Self::ExtractDB { filename } => {
                 write_extracted_db(filename, HiiBackend::export_hiidb)?;
 
-                print_line(format_args!("{}", extract_db_report(filename)))?;
+                print_json(&extract_db_report(filename))?;
             }
         }
         Ok(())

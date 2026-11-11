@@ -14,7 +14,10 @@
 //! dump-efivars, the flag --efivars, and the machine's identified backend for get and set; it
 //! shares hii extract-db and an optional -f/--filename with the Windows build.
 
+use std::fmt::Display;
 use std::fs;
+use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -25,6 +28,8 @@ use anyhow::Result;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use env_logger::fmt::Color;
+use env_logger::fmt::Formatter;
 use uefisettings::exports::identify_machine_using;
 use uefisettings::exports::DumpEfivarsOptions;
 use uefisettings::exports::EfivarDump;
@@ -47,6 +52,7 @@ use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::MAX_SECRET_LEN;
+use uefisettings::terminal_text::TerminalText;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 use uefisettings_backend_thrift::SetResponseList;
@@ -54,6 +60,7 @@ use uefisettings_backend_thrift::SetResponseList;
 use crate::extract_db_report;
 use crate::hii_get;
 use crate::hii_set;
+use crate::print_json;
 use crate::print_lifted;
 use crate::print_line;
 use crate::print_with_style;
@@ -101,9 +108,51 @@ fn hii_source_options(args: &HiiSourceArgs) -> HiiSourceOptions {
     options
 }
 
-/// Logs as RUST_LOG says.
+/// Logs as RUST_LOG says, each message as TerminalText, as a message may name the HiiDB's
+/// strings.
 pub(super) fn init_logging() {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .format(write_log_record)
+        .init();
+}
+
+/// Writes `record` with the header that env_logger 0.10.1's DefaultFormat writes under
+/// init_logging's defaults (src/fmt/mod.rs:155-158, :225-232): its timestamp in seconds, its
+/// styled level and its target, in subtle braces (:235-249).
+fn write_log_record(buf: &mut Formatter, record: &log::Record<'_>) -> io::Result<()> {
+    let mut brace = buf.style();
+    brace.set_color(Color::Black).set_intense(true);
+    let timestamp = buf.timestamp();
+    let level = buf.default_styled_level(record.level());
+    write_log_line(
+        buf,
+        (brace.value("["), brace.value("]")),
+        timestamp,
+        level,
+        record,
+    )
+}
+
+/// Writes `record` to `output` as DefaultFormat lays it out, `[{timestamp} {level:<5} {target}] `
+/// with `open` and `close` as the braces and without an empty target, and then its message as
+/// TerminalText.
+fn write_log_line(
+    output: &mut impl Write,
+    (open, close): (impl Display, impl Display),
+    timestamp: impl Display,
+    level: impl Display,
+    record: &log::Record<'_>,
+) -> io::Result<()> {
+    write!(output, "{open}{timestamp} {level:<5}")?;
+    match record.target() {
+        "" => {}
+        target => write!(output, " {target}")?,
+    }
+    writeln!(
+        output,
+        "{close} {}",
+        TerminalText(&record.args().to_string())
+    )
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,7 +282,7 @@ impl HiiPlatformCommands {
                     Ok(res.db)
                 })?;
 
-                print_line(format_args!("{}", extract_db_report(filename)))?;
+                print_json(&extract_db_report(filename))?;
             }
             Self::DumpEfivars {
                 hiidb,
@@ -251,10 +300,7 @@ impl HiiPlatformCommands {
                     &options,
                 )?;
                 eprintln!("{}", dump_warning(directory, options.redaction));
-                print_line(format_args!(
-                    "{}",
-                    dump_report(directory, options.redaction, dump)
-                ))?;
+                print_json(&dump_report(directory, options.redaction, dump))?;
             }
         }
         Ok(())
@@ -694,6 +740,71 @@ mod tests {
         refuse_on_ilo(&question, &selection)
             .map(str::to_owned)
             .map_err(|error| error.to_string())
+    }
+
+    /// A log line shows its message as TerminalText, as a warning may name the HiiDB's strings.
+    #[test]
+    fn log_records_escape_control_characters() {
+        let mut output = Vec::new();
+
+        write_log_line(
+            &mut output,
+            ("[", "]"),
+            "T",
+            log::Level::Warn,
+            &log::Record::builder()
+                .args(format_args!("no value of {}", "A\u{1b}[2J\u{202e}\nB"))
+                .level(log::Level::Warn)
+                .target("uefisettings::hii")
+                .build(),
+        )
+        .expect("write the record");
+
+        assert_eq!(
+            String::from_utf8(output).expect("UTF-8"),
+            "[T WARN  uefisettings::hii] no value of A\\u{1b}[2J\\u{202e}\\nB\n"
+        );
+    }
+
+    /// A log line keeps the header of env_logger's DefaultFormat: the level padded to 5 columns
+    /// and the target, which an empty one leaves out.
+    #[test]
+    fn log_lines_pad_the_level_and_keep_the_target() {
+        let cases = [
+            (
+                log::Level::Info,
+                "uefisettings::hii::strings",
+                "[T INFO  uefisettings::hii::strings] M\n",
+            ),
+            (
+                log::Level::Error,
+                "uefisettings",
+                "[T ERROR uefisettings] M\n",
+            ),
+            (log::Level::Warn, "", "[T WARN ] M\n"),
+        ];
+        for (level, target, want) in cases {
+            let mut output = Vec::new();
+
+            write_log_line(
+                &mut output,
+                ("[", "]"),
+                "T",
+                level,
+                &log::Record::builder()
+                    .args(format_args!("M"))
+                    .level(level)
+                    .target(target)
+                    .build(),
+            )
+            .expect("write the record");
+
+            assert_eq!(
+                String::from_utf8(output).expect("UTF-8"),
+                want,
+                "{level} {target:?}"
+            );
+        }
     }
 
     /// refuse_on_ilo names the flags that apply to the HII backend only, of which Ilo attributes
