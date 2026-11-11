@@ -16,7 +16,7 @@
 //! Linux scenarios `hii-name-value-password` and `hii-name-value-password-snapshot` of
 //! `tests/qemu/scenarios.tsv`. The first list's form set declares the buffer VARSTORE NvBacking,
 //! VarStoreId 1, with a UINT32 NUMERIC over its bytes 0..4, and the VARSTORE_NAME_VALUE of
-//! VarStoreId 3, with a UINT32 NUMERIC and a PASSWORD on its name "Pin"; the second list's form
+//! VarStoreId 3, with a UINT32 NUMERIC, a PASSWORD and a STRING on "Pin"; the second list's form
 //! set has a UINT16 NUMERIC over the buffer VARSTORE Other. A VARSTORE_NAME_VALUE is one whose
 //! values its driver exposes, as UEFI 2.11 §33.2.5.6 says, through EFI_HII_CONFIG_ACCESS_PROTOCOL,
 //! in storage of its own choosing, and one driver may serve several package lists
@@ -39,14 +39,15 @@ use crate::hii_package::op;
 use crate::hii_package::package;
 use crate::hii_package::package_list;
 use crate::hii_package::question_header;
+use crate::hii_package::string_op;
 use crate::hii_package::strings_package;
 use crate::hii_package::uint16_numeric;
 use crate::hii_package::uint32_numeric;
 use crate::hii_package::var_store;
+use crate::hii_package::var_store_name_value_op;
 use crate::hii_package::EFI_HII_PACKAGE_FORMS;
 use crate::hii_package::EFI_IFR_FORM_OP;
 use crate::hii_package::EFI_IFR_PASSWORD_OP;
-use crate::hii_package::EFI_IFR_VARSTORE_NAME_VALUE_OP;
 use crate::vendor_device_path;
 
 /// The GUID of the first package list and of its form set.
@@ -74,9 +75,11 @@ const HELP: u16 = 4;
 const PIN_NAME: u16 = 5;
 const PASSWORD: u16 = 6;
 const PIN_NUMBER: u16 = 7;
-/// The name of the VARSTORE_NAME_VALUE's value that the NUMERIC and the PASSWORD are on.
+const PIN_STRING: u16 = 8;
+/// The name of the VARSTORE_NAME_VALUE's value that the NUMERIC, the PASSWORD and the STRING are
+/// on.
 const PIN_LABEL: &str = "Pin";
-const STRINGS: [&str; 7] = [
+const STRINGS: [&str; 8] = [
     "English",
     "Backing setting",
     "uefisettings QEMU name value password forms",
@@ -84,6 +87,7 @@ const STRINGS: [&str; 7] = [
     PIN_LABEL,
     "Name value password",
     "Name value pin as a number",
+    "Name value pin as a string",
 ];
 /// The language and the strings, from string ID 1, of the first package list's x-UEFI-ns
 /// strings package: the keyword of "Backing setting" (UEFI 2.11 §35.2.1.6).
@@ -111,6 +115,8 @@ const OTHER_SIZE: u16 = 2;
 /// The MinSize and MaxSize of the PASSWORD, in characters.
 const PASSWORD_MIN_SIZE: u16 = 4;
 const PASSWORD_MAX_SIZE: u16 = 8;
+/// The MaxSize of the STRING, in characters: room for the 2 CHAR16s of [`PIN`]'s 8 digits.
+const PIN_STRING_MAX_SIZE: u8 = 4;
 
 /// The package lists, as NewPackageList() takes them.
 pub(crate) fn package_lists() -> [Vec<u8>; 2] {
@@ -140,7 +146,8 @@ pub(crate) fn pin_resp() -> String {
 }
 
 /// The first list's form package: its form set, NvBacking, the VARSTORE_NAME_VALUE and one form
-/// that holds the NUMERIC over NvBacking, the NUMERIC on "Pin" and the PASSWORD on "Pin".
+/// that holds the NUMERIC over NvBacking, the NUMERIC on "Pin", the PASSWORD on "Pin" and the
+/// STRING on "Pin".
 fn name_value_forms() -> Vec<u8> {
     let password = op(
         EFI_IFR_PASSWORD_OP,
@@ -164,15 +171,7 @@ fn name_value_forms() -> Vec<u8> {
             NV_BACKING_SIZE,
             b"NvBacking\0",
         ),
-        op(
-            EFI_IFR_VARSTORE_NAME_VALUE_OP,
-            false,
-            &[
-                &NAME_VALUE_ID.to_le_bytes()[..],
-                &NAME_VALUE_GUID.to_bytes(),
-            ]
-            .concat(),
-        ),
+        var_store_name_value_op(NAME_VALUE_ID, NAME_VALUE_GUID),
         op(EFI_IFR_FORM_OP, true, &form),
         uint32_numeric(question_header(BACKING_SETTING, HELP, 1, NV_BACKING_ID, 0)),
         uint32_numeric(question_header(
@@ -183,6 +182,11 @@ fn name_value_forms() -> Vec<u8> {
             PIN_NAME,
         )),
         password,
+        string_op(
+            question_header(PIN_STRING, HELP, 4, NAME_VALUE_ID, PIN_NAME),
+            0,
+            PIN_STRING_MAX_SIZE,
+        ),
         end(), // of the form
         end(), // of the form set
     ]

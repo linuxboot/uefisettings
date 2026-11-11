@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|control-text-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|storageless-password-forms|rt-data-storageless-password-forms|undeclared-password-forms|rt-data-undeclared-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|export-config-undeclared-password|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|control-text-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|rt-data-name-value-string-forms|storageless-password-forms|rt-data-storageless-password-forms|undeclared-password-forms|rt-data-undeclared-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|export-config-undeclared-password|export-config-name-value-string|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -81,6 +81,9 @@
 //! whose PASSWORD is of a VarStoreId that no VarStore declares, for a handle with a device path,
 //! for `uefisettings.efi` in the UEFI Shell; `rt-data-undeclared-password-forms` is `rt-data`,
 //! after it does the same, so that Linux finds them too.
+//! `rt-data-name-value-string-forms` is `rt-data`, after it registers the package list of
+//! [`name_value_string_forms`], whose STRINGs are on a VARSTORE_NAME_VALUE, for a handle with a
+//! device path.
 //! `padded-strings` publishes nothing either: it registers the package list of
 //! [`padded_strings`], which a later `publish-hiidb.efi` exports with the database.
 //! `string-blocks` does the same with the package list of [`string_blocks`].
@@ -101,8 +104,10 @@
 //! `export-config-name-value-password` does the same with the package lists of
 //! [`name_value_password_forms`] and a `<ConfigResp>` of their VARSTORE_NAME_VALUE,
 //! `export-config-storageless-password` with those of [`storageless_password_forms`] and a
-//! `<ConfigResp>` of their VARSTORE SlBacking, and `export-config-undeclared-password` with
-//! those of [`undeclared_password_forms`] and a `<ConfigResp>` of their VARSTORE UdBacking.
+//! `<ConfigResp>` of their VARSTORE SlBacking, `export-config-undeclared-password` with those
+//! of [`undeclared_password_forms`] and a `<ConfigResp>` of their VARSTORE UdBacking, and
+//! `export-config-name-value-string` with the package list of [`name_value_string_forms`] and a
+//! `<ConfigResp>` of its VARSTORE_NAME_VALUE.
 //! `rt-properties-no-set-variable` publishes nothing: it installs an EFI_RT_PROPERTIES_TABLE
 //! (UEFI 2.11 §4.6.2) whose RuntimeServicesSupported lists every runtime service but
 //! SetVariable(), as firmware that cannot write variables at runtime publishes, and
@@ -141,6 +146,7 @@ mod global_variable_forms;
 mod hii_package;
 mod keyword_kinds_forms;
 mod name_value_password_forms;
+mod name_value_string_forms;
 mod nested_password_forms;
 mod outside_form_set_password_forms;
 mod padded_strings;
@@ -392,6 +398,14 @@ fn efi_main() -> Status {
                      {address:#x}"
                 );
             }),
+        Some(Task::PublishNameValueStringForms) => register_name_value_string_forms()
+            .and_then(|()| publish(MemoryType::RUNTIME_SERVICES_DATA, Database::Exported))
+            .map(|(address, length)| {
+                println!(
+                    "publish-hiidb: name/value string forms registered; {length} bytes at \
+                     {address:#x}"
+                );
+            }),
         Some(Task::RegisterPaddedStrings) => register_package_list(
             &padded_strings::package_list_bytes(),
             "registering the padded strings",
@@ -428,6 +442,9 @@ fn efi_main() -> Status {
         Some(Task::ExportNameValueConfig) => exported_config::export_name_value_config(),
         Some(Task::ExportStoragelessConfig) => exported_config::export_storageless_config(),
         Some(Task::ExportUndeclaredConfig) => exported_config::export_undeclared_config(),
+        Some(Task::ExportNameValueStringConfig) => {
+            exported_config::export_name_value_string_config()
+        }
         Some(Task::InstallRtProperties(version, supported)) => {
             install_rt_properties(version, supported)
         }
@@ -449,9 +466,11 @@ fn efi_main() -> Status {
                  |name-value-password-forms|rt-data-name-value-password-forms\
                  |storageless-password-forms|rt-data-storageless-password-forms\
                  |undeclared-password-forms|rt-data-undeclared-password-forms\
+                 |rt-data-name-value-string-forms\
                  |padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii\
                  |install-config-tables|export-config|export-config-name-value-password\
                  |export-config-storageless-password|export-config-undeclared-password\
+                 |export-config-name-value-string\
                  |rt-properties-no-set-variable\
                  |rt-properties-all\
                  |rt-properties-version-2|rt-properties-version-2-all|json-config-data\
@@ -534,6 +553,9 @@ enum Task {
     /// Do what RegisterUndeclaredPasswordForms does, then publish the database in runtime-data
     /// pages.
     PublishUndeclaredPasswordForms,
+    /// Register the package list of [`name_value_string_forms`] in the HII database for a handle
+    /// with its device path, then publish the database in runtime-data pages.
+    PublishNameValueStringForms,
     /// Register the package list of [`padded_strings`] in the HII database.
     RegisterPaddedStrings,
     /// Create the variable of [`readwrite_forms`] if missing, register its package list in the
@@ -566,6 +588,10 @@ enum Task {
     /// a block of their VARSTORE UdBacking, as the HII Configuration Routing Protocol's
     /// configuration table.
     ExportUndeclaredConfig,
+    /// Register the package list of [`name_value_string_forms`] in the HII database for a handle
+    /// with its device path, then install ExportConfig()'s results, with the settings of its
+    /// VARSTORE_NAME_VALUE, as the HII Configuration Routing Protocol's configuration table.
+    ExportNameValueStringConfig,
     /// Install an EFI_RT_PROPERTIES_TABLE of this Version and RuntimeServicesSupported.
     InstallRtProperties(u16, u32),
     /// Install this JSON configuration table.
@@ -655,6 +681,9 @@ fn load_option() -> Option<Task> {
         Ok(option) if option == cstr16!("rt-data-name-value-password-forms") => {
             Some(Task::PublishNameValuePasswordForms)
         }
+        Ok(option) if option == cstr16!("rt-data-name-value-string-forms") => {
+            Some(Task::PublishNameValueStringForms)
+        }
         Ok(option) if option == cstr16!("storageless-password-forms") => {
             Some(Task::RegisterStoragelessPasswordForms)
         }
@@ -688,6 +717,9 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("export-config-undeclared-password") => {
             Some(Task::ExportUndeclaredConfig)
+        }
+        Ok(option) if option == cstr16!("export-config-name-value-string") => {
+            Some(Task::ExportNameValueStringConfig)
         }
         Ok(option) if option == cstr16!("rt-properties-no-set-variable") => {
             Some(Task::InstallRtProperties(
@@ -971,6 +1003,17 @@ fn register_undeclared_password_forms() -> Result<(), Failure> {
                 "registering the undeclared password forms",
             )
         })
+}
+
+/// Registers the package list of [`name_value_string_forms`] for a new handle with its device
+/// path.
+fn register_name_value_string_forms() -> Result<(), Failure> {
+    let driver = install_device_path(&name_value_string_forms::DRIVER_PATH)?;
+    register_package_list_for(
+        &name_value_string_forms::package_list_bytes(),
+        Some(driver),
+        "registering the name/value string forms",
+    )
 }
 
 /// Creates the variables of [`nested_password_forms`] unless they exist, then registers its

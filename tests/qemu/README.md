@@ -342,8 +342,22 @@ and `publish-hiidb.efi export-config-name-value-password` does it before it inst
 ExportConfig()'s results as `export-config` does, with a `<ConfigResp>` of the
 VARSTORE_NAME_VALUE. In the scenarios `shell-name-value-password`, `hii-name-value-password` and
 `hii-name-value-password-snapshot` `uefisettings` reads and writes no variable of that HiiDB, in
-the UEFI Shell and from Linux, and shows no byte of `NvBacking`, nor of the snapshot, while
-`hii list-questions --no-efivars` lists its questions from Linux.
+the UEFI Shell and from Linux, and shows no byte of `NvBacking`, nor of the snapshot, not even
+through a STRING on the PASSWORD's name, while `hii list-questions --no-efivars` lists its
+questions from Linux.
+
+`publish-hiidb.efi rt-data-name-value-string-forms` registers the forms of
+[`publish-hiidb/src/name_value_string_forms.rs`](publish-hiidb/src/name_value_string_forms.rs)
+for a handle with a device path of its own: STRING questions of MaxSize 4 and a CHECKBOX on the
+names of a VARSTORE_NAME_VALUE, beside no PASSWORD, then publishes the database as `rt-data`
+does. `publish-hiidb.efi export-config-name-value-string` registers them before it installs
+ExportConfig()'s results as `export-config` does, with a `<ConfigResp>` of the
+VARSTORE_NAME_VALUE that gives each STRING the digits of a string, 4 per CHAR16: shorter than
+MaxSize, with a NULL after it, of MaxSize characters, with and without a NULL, longer than
+MaxSize, with a CHAR16 of 2 digits, and empty. In the scenario `hii-name-value-string-snapshot`
+`get`, `hii list-questions` and `hii show-ifr` take each STRING's characters from the snapshot,
+or say why its setting holds none, and the CHECKBOX's number, while with `--no-efivars`, and in
+`hii-name-value-string`, which lists no snapshot, each question says why it has no value.
 
 `publish-hiidb.efi storageless-password-forms` registers the package lists of
 [`publish-hiidb/src/storageless_password_forms.rs`](publish-hiidb/src/storageless_password_forms.rs)

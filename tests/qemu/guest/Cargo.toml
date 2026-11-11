@@ -108,6 +108,10 @@ name = "hii_name_value_password"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_name_value_string"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_storageless_password"
 required-features = ["test-vm"]
 

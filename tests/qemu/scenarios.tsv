@@ -44,6 +44,8 @@ hii-outside-form-set-password	/publish-hiidb.efi rt-data-outside-form-set-passwo
 hii-first-store-password	/publish-hiidb.efi rt-data-first-store-password-forms	-	hii_first_store_password	arch=x86_64
 hii-name-value-password	/publish-hiidb.efi rt-data-name-value-password-forms	name-value-password.json	hii_name_value_password/without_snapshot::	-
 hii-name-value-password-snapshot	/publish-hiidb.efi export-config-name-value-password;/publish-hiidb.efi rt-data	name-value-password.json	hii_name_value_password/with_snapshot::	-
+hii-name-value-string	/publish-hiidb.efi rt-data-name-value-string-forms	-	hii_name_value_string/without_snapshot::	-
+hii-name-value-string-snapshot	/publish-hiidb.efi export-config-name-value-string;/publish-hiidb.efi rt-data	-	hii_name_value_string/with_snapshot::	-
 hii-storageless-password	/publish-hiidb.efi rt-data-storageless-password-forms	storageless-password.json	hii_storageless_password/without_snapshot::	-
 hii-storageless-password-snapshot	/publish-hiidb.efi export-config-storageless-password;/publish-hiidb.efi rt-data	storageless-password.json	hii_storageless_password/with_snapshot::	-
 hii-undeclared-password	/publish-hiidb.efi rt-data-undeclared-password-forms	undeclared-password.json	hii_undeclared_password/without_snapshot::	-

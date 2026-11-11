@@ -266,6 +266,25 @@ pub(crate) fn uint16_numeric(header: Vec<u8>) -> Vec<u8> {
     )
 }
 
+/// The VARSTORE_NAME_VALUE of `id` whose values are named in the space `guid`.
+pub(crate) fn var_store_name_value_op(id: u16, guid: Guid) -> Vec<u8> {
+    op(
+        EFI_IFR_VARSTORE_NAME_VALUE_OP,
+        false,
+        &[&id.to_le_bytes()[..], &guid.to_bytes()].concat(),
+    )
+}
+
+/// The STRING op (UEFI 2.11 §33.3.8.3.70) whose question header is `header`, of MinSize
+/// `min_size` and MaxSize `max_size` characters and no Flags.
+pub(crate) fn string_op(header: Vec<u8>, min_size: u8, max_size: u8) -> Vec<u8> {
+    op(
+        EFI_IFR_STRING_OP,
+        false,
+        &[&header[..], &[min_size, max_size, 0]].concat(),
+    )
+}
+
 /// EFI_IFR_END, which closes a scope.
 pub(crate) fn end() -> Vec<u8> {
     op(EFI_IFR_END_OP, false, &[])
