@@ -177,3 +177,55 @@ fn the_other_methods_report_their_sources_absent() {
         );
     }
 }
+
+/// --hii-source is refused, not ignored, before or after the command, where no HiiDB of this
+/// machine is read: in show-translations and ilo, and where -f gives the HiiDB, which the same
+/// commands read without it. --efivar-memory is refused with --hii-source systab, which never
+/// reads that memory.
+#[test]
+fn the_flags_are_refused_where_nothing_reads_them() {
+    let path = "/tmp/hiidb-given.bin";
+    let output = uefisettings(&["hii", "extract-db", path]);
+    assert_eq!(output.code, Some(0), "{output:#?}");
+    let given = ["hii", "list-strings", "-f", path];
+    for args in [&["show-translations"][..], &given] {
+        let output = uefisettings(args);
+        assert_eq!(
+            output.code,
+            Some(0),
+            "{args:?} without the flag: {output:#?}"
+        );
+    }
+
+    let flags = ["--hii-source", "systab"];
+    for (command, why) in [
+        (&["show-translations"][..], "show-translations reads none"),
+        (&["ilo", "show-attributes"], "ilo reads none"),
+        (&given, "--filename gives the HiiDB"),
+    ] {
+        for args in [[&flags[..], command].concat(), [command, &flags].concat()] {
+            assert_eq!(
+                json_error(&args).error_message,
+                format!("--hii-source names where this machine's HiiDB is read, and {why}"),
+                "{args:?}"
+            );
+        }
+    }
+
+    let args = [
+        "hii",
+        "get",
+        NUMERIC,
+        "--no-efivars",
+        "--hii-source",
+        "systab",
+        "--efivar-memory",
+        "runtime",
+    ];
+    assert_eq!(
+        json_error(&args).error_message,
+        "--efivar-memory names the memory of the efivar method, which --hii-source systab does \
+         not run",
+        "{args:?}"
+    );
+}

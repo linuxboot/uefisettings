@@ -410,7 +410,9 @@ database, in a zeroed runtime pool a quarter larger, as the EFI configuration ta
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt
 set to FALSE. The scenario `hii-systab` and, on aarch64 with `kernel=vamap`, `hii-systab-vamap`
 check that the Linux build reads it with `--hii-source systab` and in the automatic order, where
-the vendor ACPI tables and the `HiiDB` variable report their sources absent.
+the vendor ACPI tables and the `HiiDB` variable report their sources absent; and that it refuses
+`--hii-source` in `show-translations`, `ilo` and `hii list-strings -f`, and `--efivar-memory`
+with `--hii-source systab`.
 
 `publish-hiidb.efi export-config` installs the current configuration that EDK2 exports with
 `PcdHiiOsRuntimeSupport` too (UEFI 2.11 §33.2.11.1): `ExportConfig()`'s results, in a zeroed
