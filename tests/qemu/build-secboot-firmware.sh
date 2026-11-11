@@ -108,6 +108,22 @@ if [[ $head != "$commit" ]]; then
     exit 1
 fi
 git -C "$src" submodule update --quiet --init --depth 1 "${submodules[@]}"
+# The tag's EfiRom.c fails BaseTools' -Werror on ubuntu-26.04 (gcc 15, glibc 2.43): there,
+# strstr of a const string is a const char *, which it assigns to an unused CHAR8 *
+# (discarded-qualifiers). edk2 9af06ef3cbb0 ("BaseTools/EfiRom: fix compiler warning"), after
+# the tag, drops that assignment; pre and post are that commit's blobs of the file, and the
+# WORK of an earlier run may hold either.
+efirom=$src/BaseTools/Source/C/EfiRom/EfiRom.c
+pre=fa7bf0e62e6dd3438b6141d6bd70b7c123188698
+post=6e903b350411b7594c986212debc0c501d703962
+if [[ $(git -C "$src" hash-object --no-filters "$efirom") == "$pre" ]]; then
+    sed -i -e '/^  CHAR8     \*Ptr0;/d' \
+        -e 's/(Ptr0 = \(strstr (.*)\)) != NULL/\1 != NULL/' "$efirom"
+fi
+if [[ $(git -C "$src" hash-object --no-filters "$efirom") != "$post" ]]; then
+    echo "$efirom is not edk2 9af06ef3cbb0's: delete $src" >&2
+    exit 1
+fi
 make -C "$src/BaseTools/Source/C" -j "$jobs"
 rm -rf -- "$work/host"
 "$here/fetch-packages.sh" "$here/host-packages" "$work/packages" "$work/host"
