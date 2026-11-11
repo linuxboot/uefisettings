@@ -75,6 +75,10 @@ pub(crate) const EFI_IFR_THIS_OP: u8 = 0x58;
 pub(crate) const EFI_IFR_VALUE_OP: u8 = 0x5A;
 /// EFI_IFR_NUMERIC_SIZE_1 | EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.10 §33.3.8.3.47).
 pub(crate) const UINT8_DECIMAL: u8 = 0x10;
+/// EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC and EFI_IFR_NUMERIC_SIZE_4 |
+/// EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.11 §33.3.8.3.47).
+const UINT16_DECIMAL: u8 = 0x11;
+const UINT32_DECIMAL: u8 = 0x12;
 
 /// A package list of `guid`: EFI_HII_PACKAGE_LIST_HEADER (UEFI 2.10 §33.3.1.2), then
 /// `packages` and the End package.
@@ -177,15 +181,88 @@ pub(crate) fn question_header(
     var_store: u16,
     offset: u16,
 ) -> Vec<u8> {
+    question_header_with(prompt, help, id, var_store, offset, 0)
+}
+
+/// question_header with the question Flags `flags`.
+pub(crate) fn question_header_with(
+    prompt: u16,
+    help: u16,
+    id: u16,
+    var_store: u16,
+    offset: u16,
+    flags: u8,
+) -> Vec<u8> {
     [
         &prompt.to_le_bytes()[..],
         &help.to_le_bytes(),
         &id.to_le_bytes(),
         &var_store.to_le_bytes(),
         &offset.to_le_bytes(),
-        &[0],
+        &[flags],
     ]
     .concat()
+}
+
+/// The FORM_SET op of the form set `guid`, titled `title` and helped `help`, which opens its
+/// scope.
+pub(crate) fn form_set_op(guid: Guid, title: u16, help: u16) -> Vec<u8> {
+    let form_set = [
+        &guid.to_bytes()[..],
+        &title.to_le_bytes(),
+        &help.to_le_bytes(),
+        &[1],        // Flags: one ClassGuid
+        &[0x22; 16], // ClassGuid
+    ]
+    .concat();
+    op(EFI_IFR_FORM_SET_OP, true, &form_set)
+}
+
+/// The VARSTORE of `id` of the variable `name`, `vendor`, of `size` bytes.
+pub(crate) fn var_store(id: u16, vendor: Guid, size: u16, name: &[u8]) -> Vec<u8> {
+    op(
+        EFI_IFR_VARSTORE_OP,
+        false,
+        &[
+            &vendor.to_bytes()[..],
+            &id.to_le_bytes(),
+            &size.to_le_bytes(),
+            name,
+        ]
+        .concat(),
+    )
+}
+
+/// A NUMERIC of `flags` and the MinValue, MaxValue and Step `range`, whose question header is
+/// `header`, with its scope's End.
+fn numeric(header: Vec<u8>, flags: u8, range: &[u8]) -> Vec<u8> {
+    [
+        op(
+            EFI_IFR_NUMERIC_OP,
+            true,
+            &[&header[..], &[flags], range].concat(),
+        ),
+        end(),
+    ]
+    .concat()
+}
+
+/// A decimal UINT32 NUMERIC of the whole range whose question header is `header`.
+pub(crate) fn uint32_numeric(header: Vec<u8>) -> Vec<u8> {
+    numeric(
+        header,
+        UINT32_DECIMAL,
+        &[0, u32::MAX, 1].map(u32::to_le_bytes).concat(),
+    )
+}
+
+/// A decimal UINT16 NUMERIC of the whole range whose question header is `header`.
+pub(crate) fn uint16_numeric(header: Vec<u8>) -> Vec<u8> {
+    numeric(
+        header,
+        UINT16_DECIMAL,
+        &[0, u16::MAX, 1].map(u16::to_le_bytes).concat(),
+    )
 }
 
 /// EFI_IFR_END, which closes a scope.

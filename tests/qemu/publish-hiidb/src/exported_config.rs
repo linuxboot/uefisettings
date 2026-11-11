@@ -21,7 +21,9 @@
 //! export it: `uefisettings` shows the ONE_OF's value, and no byte of the passwords.
 //! `export-config-name-value-password` does the same with the package lists of
 //! [`name_value_password_forms`] and the `<ConfigResp>` of their VARSTORE_NAME_VALUE, which holds
-//! the value of the name that their PASSWORD is on.
+//! the value of the name that their PASSWORD is on. `export-config-storageless-password` does it
+//! with those of [`storageless_password_forms`] and the `<ConfigResp>` of their VARSTORE
+//! SlBacking, whose bytes stand for a password that their PASSWORDs of VarStoreId 0 keep there.
 
 use alloc::format;
 use alloc::string::String;
@@ -45,6 +47,8 @@ use crate::name_value_password_forms;
 use crate::password_forms;
 use crate::register_name_value_password_forms;
 use crate::register_package_list_for;
+use crate::register_storageless_password_forms;
+use crate::storageless_password_forms;
 use crate::vendor_device_path;
 use crate::Failure;
 
@@ -85,6 +89,14 @@ pub(crate) fn export_name_value_config() -> Result<(), Failure> {
         &name_value_password_forms::pin_resp(),
         "the VARSTORE_NAME_VALUE",
     )
+}
+
+/// Registers the package lists of [`storageless_password_forms`] for a handle of their device
+/// path, then installs ExportConfig()'s results with the `<ConfigResp>` of their VARSTORE
+/// SlBacking after them, and logs where.
+pub(crate) fn export_storageless_config() -> Result<(), Failure> {
+    register_storageless_password_forms()?;
+    export_config_with(&storageless_password_forms::backing_resp(), "SlBacking")
 }
 
 /// Installs ExportConfig()'s results with `resp`, the `<ConfigResp>` of `storage`, after them,

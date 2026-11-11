@@ -330,6 +330,23 @@ VARSTORE_NAME_VALUE. In the scenarios `shell-name-value-password`, `hii-name-val
 the UEFI Shell and from Linux, and shows no byte of `NvBacking`, nor of the snapshot, while
 `hii list-questions --no-efivars` lists its questions from Linux.
 
+`publish-hiidb.efi storageless-password-forms` registers the package lists of
+[`publish-hiidb/src/storageless_password_forms.rs`](publish-hiidb/src/storageless_password_forms.rs)
+for one device path: a form set with a NUMERIC, of the x-UEFI-ns keyword `StoragelessSetting`,
+over the variable `SlBacking`, which
+[`vars/storageless-password.json`](vars/storageless-password.json) creates, and two PASSWORD
+questions of VarStoreId 0, one with EFI_IFR_FLAG_CALLBACK and one without, then a form set with a
+NUMERIC over the variable `Other`. VarStoreId 0 names no VarStore (UEFI 2.11 §33.3.8.2.2), so the
+callbacks or READ and WRITE ops of such a question keep its password where `uefisettings` cannot
+tell, so in any variable. `publish-hiidb.efi rt-data-storageless-password-forms` does the same,
+then publishes the database as `rt-data` does, and `publish-hiidb.efi
+export-config-storageless-password` does it before it installs ExportConfig()'s results as
+`export-config` does, with a `<ConfigResp>` of `SlBacking`. In the scenarios
+`shell-storageless-password`, `hii-storageless-password` and `hii-storageless-password-snapshot`
+`uefisettings` reads and writes no variable of that HiiDB, in the UEFI Shell and from Linux, even
+with `--i-am-fine-to-brick-this-system`, and shows no byte of `SlBacking`, nor of the snapshot,
+while `hii list-questions --no-efivars` lists its questions from Linux.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt

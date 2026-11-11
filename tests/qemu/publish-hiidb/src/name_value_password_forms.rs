@@ -33,19 +33,20 @@ use uefi::guid;
 use uefi::Guid;
 
 use crate::hii_package::end;
+use crate::hii_package::form_set_op;
 use crate::hii_package::language_strings_package;
 use crate::hii_package::op;
 use crate::hii_package::package;
 use crate::hii_package::package_list;
 use crate::hii_package::question_header;
 use crate::hii_package::strings_package;
+use crate::hii_package::uint16_numeric;
+use crate::hii_package::uint32_numeric;
+use crate::hii_package::var_store;
 use crate::hii_package::EFI_HII_PACKAGE_FORMS;
 use crate::hii_package::EFI_IFR_FORM_OP;
-use crate::hii_package::EFI_IFR_FORM_SET_OP;
-use crate::hii_package::EFI_IFR_NUMERIC_OP;
 use crate::hii_package::EFI_IFR_PASSWORD_OP;
 use crate::hii_package::EFI_IFR_VARSTORE_NAME_VALUE_OP;
-use crate::hii_package::EFI_IFR_VARSTORE_OP;
 use crate::vendor_device_path;
 
 /// The GUID of the first package list and of its form set.
@@ -110,10 +111,6 @@ const OTHER_SIZE: u16 = 2;
 /// The MinSize and MaxSize of the PASSWORD, in characters.
 const PASSWORD_MIN_SIZE: u16 = 4;
 const PASSWORD_MAX_SIZE: u16 = 8;
-/// EFI_IFR_NUMERIC_SIZE_2 | EFI_IFR_DISPLAY_UINT_DEC and EFI_IFR_NUMERIC_SIZE_4 |
-/// EFI_IFR_DISPLAY_UINT_DEC (UEFI 2.11 §33.3.8.3.47).
-const UINT16_DECIMAL: u8 = 0x11;
-const UINT32_DECIMAL: u8 = 0x12;
 
 /// The package lists, as NewPackageList() takes them.
 pub(crate) fn package_lists() -> [Vec<u8>; 2] {
@@ -139,67 +136,6 @@ pub(crate) fn pin_resp() -> String {
         "GUID={}&NAME=&PATH={}&{PIN_LABEL}={PIN:08x}",
         hex(&NAME_VALUE_GUID.to_bytes()),
         hex(&DRIVER_PATH),
-    )
-}
-
-/// The FORM_SET op of the form set `guid`, titled `title` and helped `help`, which opens its
-/// scope.
-fn form_set_op(guid: Guid, title: u16, help: u16) -> Vec<u8> {
-    let form_set = [
-        &guid.to_bytes()[..],
-        &title.to_le_bytes(),
-        &help.to_le_bytes(),
-        &[1],        // Flags: one ClassGuid
-        &[0x22; 16], // ClassGuid
-    ]
-    .concat();
-    op(EFI_IFR_FORM_SET_OP, true, &form_set)
-}
-
-/// The VARSTORE of `id` of the variable `name`, `vendor`, of `size` bytes.
-fn var_store(id: u16, vendor: Guid, size: u16, name: &[u8]) -> Vec<u8> {
-    op(
-        EFI_IFR_VARSTORE_OP,
-        false,
-        &[
-            &vendor.to_bytes()[..],
-            &id.to_le_bytes(),
-            &size.to_le_bytes(),
-            name,
-        ]
-        .concat(),
-    )
-}
-
-/// A NUMERIC of `flags` and the MinValue, MaxValue and Step `range`, whose question header is
-/// `header`, with its scope's End.
-fn numeric(header: Vec<u8>, flags: u8, range: &[u8]) -> Vec<u8> {
-    [
-        op(
-            EFI_IFR_NUMERIC_OP,
-            true,
-            &[&header[..], &[flags], range].concat(),
-        ),
-        end(),
-    ]
-    .concat()
-}
-
-/// A decimal UINT32 NUMERIC of the whole range whose question header is `header`.
-fn uint32_numeric(header: Vec<u8>) -> Vec<u8> {
-    numeric(
-        header,
-        UINT32_DECIMAL,
-        &[0, u32::MAX, 1].map(u32::to_le_bytes).concat(),
-    )
-}
-
-/// A decimal UINT16 NUMERIC of the whole range whose question header is `header`.
-fn uint16_numeric(header: Vec<u8>) -> Vec<u8> {
-    numeric(
-        header,
-        UINT16_DECIMAL,
-        &[0, u16::MAX, 1].map(u16::to_le_bytes).concat(),
     )
 }
 
