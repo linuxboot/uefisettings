@@ -316,14 +316,18 @@ question beside it reads, and in the UEFI Shell writes.
 
 `publish-hiidb.efi keyword-kinds-forms` creates the variable `KindStore` unless it exists, with
 its VarStore's Attributes and Size, and registers the forms of
-[`publish-hiidb/src/keyword_kinds_forms.rs`](publish-hiidb/src/keyword_kinds_forms.rs) for a
-new handle of a vendor device path: a DATE that suppresses its year, a TIME that suppresses its
-second, an ORDERED_LIST of at most 3 UINT8 options under EFI_IFR_UNIQUE_SET and a REF5 on
-`KindStore`, each with an x-UEFI-ns keyword. In the scenario `shell-keyword-kinds`,
-`uefisettings.efi hii keyword set` writes the DATE, the TIME and the ORDERED_LIST through edk2's
-Config Keyword Handler, one at a time and two in one SetData(), and refuses before any call a
+[`publish-hiidb/src/keyword_kinds_forms.rs`](publish-hiidb/src/keyword_kinds_forms.rs) for a new
+handle of a vendor device path: a DATE that suppresses its year, a TIME that suppresses its
+second, an ORDERED_LIST of at most 3 UINT8 options under EFI_IFR_UNIQUE_SET, a REF5, and a
+STRING and a multi-line STRING of MaxSize 4 on `KindStore`, each with an x-UEFI-ns keyword. In
+the scenario `shell-keyword-kinds`, `uefisettings.efi hii keyword set` writes the DATE, the
+TIME, the ORDERED_LIST and the STRINGs through edk2's Config Keyword Handler, one at a time and
+two in one SetData(), and `hii keyword get` reads the STRING back. It refuses before any call a
 VALUE that changes a suppressed field, an hour out of range, a container after an empty one, an
-option twice and the REF, which `dmpstore` shows wrote nothing.
+option twice and the REF, and of a STRING a VALUE of 4 characters, of a character after the
+NULL, of a Private Use Area character, of a UTF-16 surrogate, of a line feed in the single-line
+STRING, of fewer bytes than MaxSize CHAR16s or with &READONLY, which `dmpstore` shows wrote
+nothing.
 
 `publish-hiidb.efi name-value-password-forms` registers the package lists of
 [`publish-hiidb/src/name_value_password_forms.rs`](publish-hiidb/src/name_value_password_forms.rs)

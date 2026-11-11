@@ -1,13 +1,16 @@
-# The checks of shell/keyword-kinds.nsh: hii keyword set of a DATE, a TIME and an ORDERED_LIST
-# through the Keyword Handler, which writes each VALUE as given (UEFI 2.11 §35.3.2), and refusals
-# before any call, which dmpstore shows wrote nothing. See check-shell-log.sh.
+# The checks of shell/keyword-kinds.nsh: hii keyword set of a DATE, a TIME, an ORDERED_LIST and
+# STRINGs through the Keyword Handler, which writes each VALUE as given (UEFI 2.11 §35.3.2), and
+# refusals before any call, which dmpstore shows wrote nothing. See check-shell-log.sh.
 # TerminalDxe prints a character outside ASCII as "?" unless the serial terminal is VT-UTF8, so
 # the checks of texts that cite "§" compare them with "?" in its place.
 # KindStore as publish-hiidb creates it: 2024-03-31 at byte 0, 12:34:56 at byte 4, the items 1, 2
-# and 3 at byte 8, and the EFI_HII_REF of QuestionId 4 and FormId 1 at byte 12
+# and 3 at byte 8, the EFI_HII_REF of QuestionId 4 and FormId 1 at byte 12, and the empty STRINGs
+# KindString at byte 34 and KindText at byte 42
 dmpstore-before	status	any
-dmpstore-before	line	^Variable NV\+BS '8C78A505-BAA0-4C4A-869F-000000001E01:KindStore' DataSize = 0x22$
+dmpstore-before	line	^Variable NV\+BS '8C78A505-BAA0-4C4A-869F-000000001E01:KindStore' DataSize = 0x32$
 dmpstore-before	line	^  00000000: E8 07 03 1F 0C 22 38 00-01 02 03 00 04 00 01 00
+dmpstore-before	line	^  00000020: 00 00 00 00 00 00 00 00-00 00 00 00 00 00 00 00 
+dmpstore-before	line	^  00000030: 00 00 +\*\.\.\*$
 # the DATE suppresses its year: a VALUE that keeps 2024 sets 2024-04-01
 set-date	status	0x0
 set-date	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindDate&VALUE=010407e8$
@@ -50,3 +53,51 @@ set-date-and-list	status	0x0
 set-date-and-list	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindDate&VALUE=1f0c07e8&NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindList&VALUE=000103$
 dmpstore-date-and-list	status	any
 dmpstore-date-and-list	line	^  00000000: E8 07 0C 1F 0D 00 38 00-03 01 00 00 04 00 01 00
+# a STRING's VALUE holds its MaxSize CHAR16s last byte first, NULL-padded: "AB"
+set-string	status	0x0
+set-string	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindString&VALUE=0000000000420041$
+dmpstore-string	status	any
+dmpstore-string	line	^  00000020: 00 00 41 00 42 00 00 00-00 00 00 00 00 00 00 00 
+get-string	status	0x0
+get-string	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindString&VALUE=0000000000420041$
+# the multi-line STRING takes a line feed: "A", LF, "B"
+set-text	status	0x0
+set-text	line	^NAMESPACE=x-UEFI-ns&PATH=0104140005a5788ca0ba4a4c869f000000001e027fff0400&KEYWORD=KindText&VALUE=00000042000a0041$
+dmpstore-text	status	any
+dmpstore-text	line	^  00000020: 00 00 41 00 42 00 00 00-00 00 41 00 0A 00 42 00 
+dmpstore-text	line	^  00000030: 00 00 +\*
+# 4 characters, where the last CHAR16 holds the NULL
+set-string-too-long	status	aborted
+set-string-too-long	json	(.error_message | gsub("§"; "?")) == "keyword KindString: VALUE=0044004300420041 of question \"Kind string\": cannot set question \"Kind string\": the STRING takes at most 3 characters, its last CHAR16 of MaxSize 4 holding the NULL (UEFI 2.11 ?33.2.5.4.9), not 4"
+dmpstore-string-too-long	status	any
+dmpstore-string-too-long	same	dmpstore-text
+# a character after the NULL, which set does not write
+set-string-unwritten	status	aborted
+set-string-unwritten	json	.error_message == "keyword KindString: SetData() writes VALUE=0000004200000041 as given, where set writes 0000000000000041 at VarOffset 34 for question \"Kind string\""
+dmpstore-string-unwritten	status	any
+dmpstore-string-unwritten	same	dmpstore-text
+# U+E000, of the Private Use Area
+set-string-private-use	status	aborted
+set-string-private-use	json	(.error_message | gsub("§"; "?")) == "keyword KindString: VALUE=000000000000e000 of question \"Kind string\": cannot set question \"Kind string\": '\\u{e000}' (U+E000) lies in the Private Use Area, U+E000..U+F8FF, which UEFI 2.11 ?33.2.6.2.1 prohibits"
+dmpstore-string-private-use	status	any
+dmpstore-string-private-use	same	dmpstore-text
+# a UTF-16 surrogate
+set-string-surrogate	status	aborted
+set-string-surrogate	json	(.error_message | gsub("§"; "?")) == "keyword KindString: VALUE=000000000000d800 of question \"Kind string\": its character 0 is CHAR16 0xd800, a UTF-16 surrogate, which UCS-2 has no character for (UEFI 2.11 ?33.2.6.2.2)"
+dmpstore-string-surrogate	status	any
+dmpstore-string-surrogate	same	dmpstore-text
+# a line feed in the single-line STRING
+set-string-line-break	status	aborted
+set-string-line-break	json	(.error_message | gsub("§"; "?")) == "keyword KindString: VALUE=00000042000a0041 of question \"Kind string\": cannot set question \"Kind string\": the STRING is single-line (no EFI_IFR_STRING_MULTI_LINE, UEFI 2.11 ?33.3.8.3.70), so it takes no line break"
+dmpstore-string-line-break	status	any
+dmpstore-string-line-break	same	dmpstore-text
+# 2 CHAR16s, where SetData() writes MaxSize 4
+set-string-width	status	aborted
+set-string-width	json	.error_message == "keyword KindString: VALUE=00420041 is not as wide as question \"Kind string\""
+dmpstore-string-width	status	any
+dmpstore-string-width	same	dmpstore-text
+# &READONLY
+set-string-read-only-resp	status	aborted
+set-string-read-only-resp	json	.error_message == "keyword KindString: its <KeywordResp> has &READONLY, and SetData() writes no read-only keyword"
+dmpstore-string-read-only-resp	status	any
+dmpstore-string-read-only-resp	same	dmpstore-text

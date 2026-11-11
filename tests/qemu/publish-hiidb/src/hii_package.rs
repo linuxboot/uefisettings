@@ -52,6 +52,7 @@ pub(crate) const EFI_IFR_REF_OP: u8 = 0x0F;
 pub(crate) const EFI_IFR_AND_OP: u8 = 0x15;
 pub(crate) const EFI_IFR_DATE_OP: u8 = 0x1A;
 pub(crate) const EFI_IFR_TIME_OP: u8 = 0x1B;
+pub(crate) const EFI_IFR_STRING_OP: u8 = 0x1C;
 pub(crate) const EFI_IFR_DISABLE_IF_OP: u8 = 0x1E;
 pub(crate) const EFI_IFR_MAP_OP: u8 = 0x22;
 pub(crate) const EFI_IFR_ORDERED_LIST_OP: u8 = 0x23;
