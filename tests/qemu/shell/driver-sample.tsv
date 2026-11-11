@@ -105,7 +105,7 @@ variable-storage-rt	status	aborted
 variable-storage-rt	json	. == {"error_message": "RUNTIME_ACCESS: runtime access implies boot service access (UEFI 2.10 section 8.2.3)"}
 # the help names no command or flag of the Linux build only
 help	status	0x0
-help	line	^Usage: uefisettings.efi \[OPTIONS\] <COMMAND>$
+help	line	^Usage: uefisettings.efi <COMMAND>$
 help	none	^  (identify|ilo) 
 # get and set use the HII database here, with no backend to identify
 help	line	^  get +Get the current value of a question$

@@ -43,7 +43,6 @@ use crate::hii_get;
 use crate::hii_set;
 use crate::print_json;
 use crate::write_extracted_db;
-use crate::HiiSourceArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
 use crate::SetArgs;
@@ -57,12 +56,13 @@ pub(super) const GET_ABOUT: &str = "Get the current value of a question";
 /// The about of top-level set, which writes this machine's variables, as hii set does.
 pub(super) const SET_ABOUT: &str = "Set/change the value of a question";
 
-/// The help of --hii-source, which this build ignores.
-pub(super) const HII_SOURCE_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB through the HiiDB driver";
-/// The help of --efivar-memory, which this build ignores.
-pub(super) const EFIVAR_MEMORY_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB through the HiiDB driver";
+/// None: this build reads this machine's HiiDB through the HiiDB driver alone, so it has no
+/// --hii-source or --efivar-memory, which clap refuses as unexpected arguments rather than ignore
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiSourceArgs {}
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}

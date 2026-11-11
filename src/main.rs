@@ -63,6 +63,7 @@ use capsule_command::CapsuleCommand;
 use platform::EfivarArgs;
 use platform::HiiDbArgs;
 use platform::HiiPlatformCommands;
+use platform::HiiSourceArgs;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::HiiSourceUnsafeArgs;
 use platform::ListStringsHiiDbArgs;
@@ -104,40 +105,6 @@ struct UefiSettingsToolArgs {
     command: Commands,
     #[command(flatten)]
     hii_source: HiiSourceArgs,
-}
-
-/// Where the commands read this machine's HiiDB; global, so that the flags may also follow the
-/// command. Only the Linux build reads it in more than one way.
-#[derive(Debug, Default, Args)]
-struct HiiSourceArgs {
-    #[arg(long, global = true, value_enum, default_value_t, help = platform::HII_SOURCE_HELP)]
-    hii_source: HiiSourceArg,
-    #[arg(long, global = true, value_enum, default_value_t, help = platform::EFIVAR_MEMORY_HELP)]
-    efivar_memory: EfivarMemoryArg,
-}
-
-/// The values of --hii-source.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-enum HiiSourceArg {
-    /// acpi, then efivar, then systab: the next while a method finds its source absent or fails, none after a refusal (kernel lockdown, /dev/mem or /proc/kcore refused, or an unsafe operation without --i-am-fine-to-brick-this-system)
-    #[default]
-    Auto,
-    /// The memory that the OCP HiiDB variable points to, from /dev/mem
-    Efivar,
-    /// The vendor ACPI table QHII or HIID, from /sys/firmware/acpi/tables, without /dev/mem
-    Acpi,
-    /// The HII database export that the EFI System Table lists as a configuration table, from /dev/mem
-    Systab,
-}
-
-/// The values of --efivar-memory.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
-enum EfivarMemoryArg {
-    /// One EFI runtime region of the firmware's memory map that is no memory-mapped I/O
-    #[default]
-    Runtime,
-    /// One firmware-reserved region of the firmware's memory map (x86: Reserved or ACPI Non-volatile Storage in /sys/firmware/memmap; aarch64: reserved, runtime services code or data, ACPI NVS or PAL code), never one that touches runtime memory-mapped I/O
-    FirmwareReserved,
 }
 
 #[derive(Debug, Subcommand)]
@@ -706,7 +673,52 @@ fn parse_error_exit_code(error: &clap::Error) -> ExitCode {
     u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
+/// How handle_cmds reads the HiiDB of a hii command, which its tests replace.
+trait HiiDbReader {
+    /// The HiiDB that `hiidb` names, with question values from `efivars`, as `source` says.
+    fn read(
+        &self,
+        hiidb: &HiiDbArgs,
+        efivars: &EfivarSource,
+        source: &HiiSourceArgs,
+    ) -> Result<Vec<u8>>;
+
+    /// The HiiDB that list-strings' `hiidb` names, as `source` says.
+    fn read_for_list_strings(
+        &self,
+        hiidb: &ListStringsHiiDbArgs,
+        source: &HiiSourceArgs,
+    ) -> Result<Vec<u8>>;
+}
+
+/// The reads of this build's platform.
+struct PlatformHiiDb;
+
+impl HiiDbReader for PlatformHiiDb {
+    fn read(
+        &self,
+        hiidb: &HiiDbArgs,
+        efivars: &EfivarSource,
+        source: &HiiSourceArgs,
+    ) -> Result<Vec<u8>> {
+        hiidb.read(efivars, source)
+    }
+
+    fn read_for_list_strings(
+        &self,
+        hiidb: &ListStringsHiiDbArgs,
+        source: &HiiSourceArgs,
+    ) -> Result<Vec<u8>> {
+        hiidb.read(&EfivarSource::Disabled, source)
+    }
+}
+
 fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
+    handle_cmds_with(args, &PlatformHiiDb)
+}
+
+/// handle_cmds, with the hii commands' HiiDB read by `reader`.
+fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Result<()> {
     let source = &args.hii_source;
     match &args.command {
         Commands::Hii(hii_command) => match &hii_command.command {
@@ -722,7 +734,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 hii_get(
-                    &hiidb.read(&options.efivars, source)?,
+                    &reader.read(hiidb, &options.efivars, source)?,
                     question.selector()?,
                     &options,
                     output.json,
@@ -752,13 +764,13 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let lines = HiiBackend::show_ifr_lines_using(
-                    &hiidb.read(&options.efivars, source)?,
+                    &reader.read(hiidb, &options.efivars, source)?,
                     &options,
                 )?;
                 print_terminal_lines(&lines)?;
             }
             HiiSubcommands::ListStrings { hiidb, output } => {
-                let res = HiiBackend::list_strings(&hiidb.read(&EfivarSource::Disabled, source)?)?;
+                let res = HiiBackend::list_strings(&reader.read_for_list_strings(hiidb, source)?)?;
                 print_with_style(res, output.json)?;
             }
             HiiSubcommands::ListQuestions {
@@ -772,7 +784,7 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let (res, ignored_ifr) = HiiBackend::list_questions_and_ignored_ifr_using(
-                    &hiidb.read(&options.efivars, source)?,
+                    &reader.read(hiidb, &options.efivars, source)?,
                     &options,
                 )?;
                 print_with_style(res, output.json)?;
@@ -2263,57 +2275,103 @@ mod tests {
         assert!(is_broken_pipe(&error.into()));
     }
 
-    /// The flags of the HiiDB source default to auto and runtime, take each of their values, are
-    /// global, so that they also follow the command, and refuse another value, on every build.
+    /// Each hii command that reads the HiiDB reads it from the source that --hii-source and
+    /// --efivar-memory name, before `hii`, between it and the command or after the command: a
+    /// reader that records the source it is given, then fails, stops each.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn hii_source_flags_default_and_follow_the_command() {
-        let parse = |args: &[&str]| {
-            let argv = [&["uefisettings"][..], args].concat();
-            let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
-                .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
-            (
-                parsed.hii_source.hii_source,
-                parsed.hii_source.efivar_memory,
-            )
+    fn hii_commands_read_the_hiidb_from_the_flags_source() {
+        #[derive(Default)]
+        struct RecordingReader(std::cell::RefCell<Vec<HiiSourceArgs>>);
+
+        impl RecordingReader {
+            fn record(&self, source: &HiiSourceArgs) -> Result<Vec<u8>> {
+                self.0.borrow_mut().push(source.clone());
+                Err(anyhow!("recorded"))
+            }
+        }
+
+        impl HiiDbReader for RecordingReader {
+            fn read(
+                &self,
+                _: &HiiDbArgs,
+                _: &EfivarSource,
+                source: &HiiSourceArgs,
+            ) -> Result<Vec<u8>> {
+                self.record(source)
+            }
+
+            fn read_for_list_strings(
+                &self,
+                _: &ListStringsHiiDbArgs,
+                source: &HiiSourceArgs,
+            ) -> Result<Vec<u8>> {
+                self.record(source)
+            }
+        }
+
+        let flags = [
+            "--hii-source",
+            "systab",
+            "--efivar-memory",
+            "firmware-reserved",
+        ];
+        let commands: [&[&str]; 4] = [
+            &["get", "Q", "--no-efivars"],
+            &["show-ifr", "--no-efivars"],
+            &["list-questions", "--no-efivars"],
+            &["list-strings"],
+        ];
+        for command in commands {
+            for argv in [
+                [&["uefisettings", "hii"][..], command, &flags].concat(),
+                [&["uefisettings", "hii"][..], &flags, command].concat(),
+                [&["uefisettings"][..], &flags, &["hii"], command].concat(),
+            ] {
+                let args = UefiSettingsToolArgs::try_parse_from(&argv)
+                    .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
+                let given = args.hii_source.clone();
+                let defaults =
+                    UefiSettingsToolArgs::try_parse_from(["uefisettings", "show-translations"])
+                        .expect("parse the defaults")
+                        .hii_source;
+                assert_ne!(given, defaults, "{argv:?}: the flags");
+                let reader = RecordingReader::default();
+
+                let error = handle_cmds_with(args, &reader).expect_err("the reader fails");
+
+                assert_eq!(error.to_string(), "recorded", "{argv:?}");
+                assert_eq!(reader.0.into_inner(), vec![given], "{argv:?}: read from");
+            }
+        }
+    }
+
+    /// --hii-source and --efivar-memory exist on the Linux build only, the one build that reads
+    /// this machine's HiiDB in more than one way: elsewhere clap refuses them as unexpected
+    /// arguments, before and after the command, so that no build accepts and ignores them.
+    #[test]
+    fn hii_source_flags_exist_on_linux_only() {
+        let takes = false;
+        #[cfg(target_os = "linux")]
+        let takes = !takes;
+        let want = match takes {
+            true => Ok(()),
+            false => Err(clap::error::ErrorKind::UnknownArgument),
         };
-        assert_eq!(
-            parse(&["show-translations"]),
-            (HiiSourceArg::Auto, EfivarMemoryArg::Runtime),
-            "the defaults"
-        );
-        for (value, want) in [
-            ("auto", HiiSourceArg::Auto),
-            ("efivar", HiiSourceArg::Efivar),
-            ("acpi", HiiSourceArg::Acpi),
-            ("systab", HiiSourceArg::Systab),
+        for (flag, value) in [
+            ("--hii-source", "efivar"),
+            ("--efivar-memory", "firmware-reserved"),
         ] {
             for args in [
-                &["--hii-source", value, "show-translations"][..],
-                &["show-translations", "--hii-source", value],
+                &[flag, value, "show-translations"][..],
+                &["show-translations", flag, value],
             ] {
-                assert_eq!(parse(args).0, want, "{args:?}");
+                let argv = [&["uefisettings"][..], args].concat();
+                let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
+                    .map(drop)
+                    .map_err(|error| error.kind());
+                assert_eq!(parsed, want, "{argv:?}");
             }
-        }
-        for (value, want) in [
-            ("runtime", EfivarMemoryArg::Runtime),
-            ("firmware-reserved", EfivarMemoryArg::FirmwareReserved),
-        ] {
-            for args in [
-                &["--efivar-memory", value, "show-translations"][..],
-                &["show-translations", "--efivar-memory", value],
-            ] {
-                assert_eq!(parse(args).1, want, "{args:?}");
-            }
-        }
-        for flag in ["--hii-source", "--efivar-memory"] {
-            let error = UefiSettingsToolArgs::try_parse_from([
-                "uefisettings",
-                flag,
-                "hiidb",
-                "show-translations",
-            ])
-            .expect_err("an unknown value");
-            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "{flag}");
         }
     }
 

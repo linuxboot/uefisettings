@@ -25,19 +25,17 @@ use uefisettings::exports::EfivarSource;
 use uefisettings::exports::HiiBackend;
 use uefisettings::terminal_text::UnicodeTerminal;
 
-use crate::HiiSourceArgs;
-
 /// The about of hii, whose commands read a HiiDB file or an efivars dump, and no EFI variables of
 /// this machine.
 pub(super) const HII_ABOUT: &str =
     "Commands which read a UEFI HiiDB file or an efivars dump, and no EFI variables of this machine";
 
-/// The help of --hii-source, which this build ignores.
-pub(super) const HII_SOURCE_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads only HiiDB files and efivars dumps";
-/// The help of --efivar-memory, which this build ignores.
-pub(super) const EFIVAR_MEMORY_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads only HiiDB files and efivars dumps";
+/// None: this build reads only HiiDB files and efivars dumps, so it has no --hii-source or
+/// --efivar-memory, which clap refuses as unexpected arguments rather than ignore them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiSourceArgs {}
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}

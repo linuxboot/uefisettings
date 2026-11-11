@@ -188,9 +188,9 @@ Commands:
 and the `hii` commands but `extract-db` and `dump-efivars` in the UEFI Shell, before an OS boots;
 it also reaches boot-service-only variables and the Time Services, which date and time questions
 of EFI Date/Time Storage read and write, and has no `-f` or `--efivars`. It reads the HiiDB
-through the HII Database Protocol, and accepts `--hii-source` and `--efivar-memory` only to ignore
-them. Its `apply-staged` applies a set that `set` staged from Linux or Windows for the next boot:
-see the [appendix](#appendix).
+through the HII Database Protocol, and refuses `--hii-source` and `--efivar-memory` as unexpected
+arguments. Its `apply-staged` applies a set that `set` staged from Linux or Windows for the next
+boot: see the [appendix](#appendix).
 
 ```sh
 rustup target add x86_64-unknown-uefi  # or i686-unknown-uefi, aarch64-unknown-uefi
@@ -216,7 +216,7 @@ be assigned to the process token; running elevated alone does not guarantee it.
 Pass `--no-efivars` to read no variables. No driver is shipped with this repository,
 and none has been tested here. Without a driver, `-f` still reads a HiiDB file, and,
 when such a driver is installed, `hii extract-db` writes its HiiDB to a file. `--hii-source` and
-`--efivar-memory` are accepted and ignored.
+`--efivar-memory` are refused as unexpected arguments.
 `variable list` and `variable storage` fail there: the firmware environment calls reach a
 variable by its name only, and have no QueryVariableInfo(). So does `capsule deliver`: those calls
 reach EFI variables only. `capsule config-data` and `capsule result-table` fail too:
@@ -233,8 +233,8 @@ and writes nothing: `hii get`, `hii list-questions` and `hii show-ifr` read ques
 an efivars dump that `hii dump-efivars` wrote on Linux (`--efivars DIR`, with its HiiDB unless
 `-f` names one) or from none (`--no-efivars`, with `-f`), and `hii list-strings` reads the HiiDB
 file of `-f`. It has no `get`, `set`, `identify`, `ilo`, `variable`, `capsule`, `hii set`,
-`hii extract-db` or `hii dump-efivars`; it accepts `--hii-source` and `--efivar-memory` and ignores
-them. Dumps: see the [appendix](#appendix).
+`hii extract-db` or `hii dump-efivars`; it refuses `--hii-source` and `--efivar-memory` as
+unexpected arguments. Dumps: see the [appendix](#appendix).
 
 ---
 
@@ -302,7 +302,7 @@ But this tool is an unified opensource approach to manipulate UEFI settings on a
   * `systab`, on x86, x86_64 and aarch64: read the HII database export that the firmware lists as the EFI configuration table of `EFI_HII_DATABASE_PROTOCOL_GUID` (UEFI 2.11 §33.2.11.1), as EDK2 does where `PcdHiiOsRuntimeSupport` is TRUE, from `/dev/mem`, as `capsule config-data` reads its table: the package lists from the buffer's start up to a package list header of zeros, which EDK2 leaves after them, refusing fewer zero bytes than a header before other bytes, which EDK2's export into its old buffer can leave, or up to the end of the buffer's EFI runtime region, each whole inside that region and ending with an EFI_HII_PACKAGE_END package exactly at its PackageLength (UEFI 2.11 §33.3.1.1), which the other ways do not require, at most 16 MiB in all. It takes the table's address as physical first, then as virtual. It does not support Xen: on aarch64, where `/chosen` has no `linux,uefi-system-table` and `/hypervisor/uefi` holds Xen's `xen,uefi-system-table`, it fails. On x86 it reads only where Linux exports /sys/firmware/efi/runtime-map (CONFIG_EFI_RUNTIME_MAP, which CONFIG_EFI selects with CONFIG_KEXEC_CORE: Linux v6.11 arch/x86/Kconfig:2001, :2054), which bounds its reads.
     The configuration that the firmware exports with HII ExportConfig() and lists as the EFI configuration table of `EFI_HII_CONFIG_ROUTING_PROTOCOL_GUID` (UEFI 2.11 §33.2.11.1) is read the same way: its text up to its first NUL CHAR16, inside the buffer's EFI runtime region.
 
-  `auto` moves on while a way finds its source absent (no vendor ACPI table file, no `HiiDB` variable, no EFI System Table that Linux locates, as on a BIOS boot or an aarch64 boot without UEFI, or no such configuration table) or fails otherwise, such as a table that fails its checks or a missing memory map, and stops at a refusal: kernel lockdown, the kernel refusing `/dev/mem` or `/proc/kcore` (no `CAP_SYS_RAWIO`, `CONFIG_STRICT_DEVMEM`), a file that the user may not read, or an unsafe operation without `--i-am-fine-to-brick-this-system`. Its error names each way that it tried, in order, with why, absent apart from refused; with `RUST_LOG=warn`, `uefisettings` logs each way that failed before the one that gave the HiiDB, and with `RUST_LOG=debug` also that way. A named way is the only one tried. `identify` checks the same ways for the HII backend: it finds none where each way finds its source absent, and assumes it, with a warning that `RUST_LOG=warn` shows, where a way's check fails or is refused, such as under kernel lockdown or without `CAP_SYS_RAWIO`. `--hii-source` and `--efivar-memory` may also follow the command; the UEFI Shell, Windows and macOS builds accept both and ignore them.
+  `auto` moves on while a way finds its source absent (no vendor ACPI table file, no `HiiDB` variable, no EFI System Table that Linux locates, as on a BIOS boot or an aarch64 boot without UEFI, or no such configuration table) or fails otherwise, such as a table that fails its checks or a missing memory map, and stops at a refusal: kernel lockdown, the kernel refusing `/dev/mem` or `/proc/kcore` (no `CAP_SYS_RAWIO`, `CONFIG_STRICT_DEVMEM`), a file that the user may not read, or an unsafe operation without `--i-am-fine-to-brick-this-system`. Its error names each way that it tried, in order, with why, absent apart from refused; with `RUST_LOG=warn`, `uefisettings` logs each way that failed before the one that gave the HiiDB, and with `RUST_LOG=debug` also that way. A named way is the only one tried. `identify` checks the same ways for the HII backend: it finds none where each way finds its source absent, and assumes it, with a warning that `RUST_LOG=warn` shows, where a way's check fails or is refused, such as under kernel lockdown or without `CAP_SYS_RAWIO`. `--hii-source` and `--efivar-memory` may also follow the command; the UEFI Shell, Windows and macOS builds refuse both as unexpected arguments.
 * Library (`hii`) in Rust partially implements the UEFI Hii specification.
 * It parses the HiiDB op-codes into a DOM tree like representation which can be read by machines and humans.
 * It can ask questions about UEFI settings from HiiDB and get their answers.

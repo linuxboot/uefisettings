@@ -67,9 +67,6 @@ use crate::print_line;
 use crate::print_with_style;
 use crate::unsafe_long_help;
 use crate::write_extracted_db;
-use crate::EfivarMemoryArg;
-use crate::HiiSourceArg;
-use crate::HiiSourceArgs;
 use crate::JsonArgs;
 use crate::QuestionArgs;
 use crate::SelectionArgs;
@@ -87,12 +84,46 @@ pub(super) const GET_ABOUT: &str = "Auto-identify backend and get the current va
 pub(super) const SET_ABOUT: &str = "Auto-identify backend and set/change the value of a question";
 
 /// The help of --hii-source.
-pub(super) const HII_SOURCE_HELP: &str =
+const HII_SOURCE_HELP: &str =
     "Where the commands read this machine's HiiDB, where no HiiDB file or efivars dump gives one";
 /// The help of --efivar-memory.
-pub(super) const EFIVAR_MEMORY_HELP: &str =
+const EFIVAR_MEMORY_HELP: &str =
     "The memory that the efivar method of --hii-source may read; firmware-reserved is an unsafe \
      operation, whose refusal names the flag that lifts it";
+
+/// Where the commands read this machine's HiiDB; global, so that the flags may also follow the
+/// command. Only this build reads it in more than one way, so only it has the flags.
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub(super) struct HiiSourceArgs {
+    #[arg(long, global = true, value_enum, default_value_t, help = HII_SOURCE_HELP)]
+    hii_source: HiiSourceArg,
+    #[arg(long, global = true, value_enum, default_value_t, help = EFIVAR_MEMORY_HELP)]
+    efivar_memory: EfivarMemoryArg,
+}
+
+/// The values of --hii-source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum HiiSourceArg {
+    /// acpi, then efivar, then systab: the next while a method finds its source absent or fails, none after a refusal (kernel lockdown, /dev/mem or /proc/kcore refused, or an unsafe operation without --i-am-fine-to-brick-this-system)
+    #[default]
+    Auto,
+    /// The memory that the OCP HiiDB variable points to, from /dev/mem
+    Efivar,
+    /// The vendor ACPI table QHII or HIID, from /sys/firmware/acpi/tables, without /dev/mem
+    Acpi,
+    /// The HII database export that the EFI System Table lists as a configuration table, from /dev/mem
+    Systab,
+}
+
+/// The values of --efivar-memory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum EfivarMemoryArg {
+    /// One EFI runtime region of the firmware's memory map that is no memory-mapped I/O
+    #[default]
+    Runtime,
+    /// One firmware-reserved region of the firmware's memory map (x86: Reserved or ACPI Non-volatile Storage in /sys/firmware/memmap; aarch64: reserved, runtime services code or data, ACPI NVS or PAL code), never one that touches runtime memory-mapped I/O
+    FirmwareReserved,
+}
 
 /// The HiiDB source that `args` name.
 fn hii_source_options(args: &HiiSourceArgs) -> HiiSourceOptions {
@@ -723,6 +754,60 @@ mod tests {
                 )),
                 "{path:?}"
             );
+        }
+    }
+
+    /// The flags of the HiiDB source default to auto and runtime, take each of their values, are
+    /// global, so that they also follow the command, and refuse another value.
+    #[test]
+    fn hii_source_flags_default_and_follow_the_command() {
+        let parse = |args: &[&str]| {
+            let argv = [&["uefisettings"][..], args].concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
+            (
+                parsed.hii_source.hii_source,
+                parsed.hii_source.efivar_memory,
+            )
+        };
+        assert_eq!(
+            parse(&["show-translations"]),
+            (HiiSourceArg::Auto, EfivarMemoryArg::Runtime),
+            "the defaults"
+        );
+        for (value, want) in [
+            ("auto", HiiSourceArg::Auto),
+            ("efivar", HiiSourceArg::Efivar),
+            ("acpi", HiiSourceArg::Acpi),
+            ("systab", HiiSourceArg::Systab),
+        ] {
+            for args in [
+                &["--hii-source", value, "show-translations"][..],
+                &["show-translations", "--hii-source", value],
+            ] {
+                assert_eq!(parse(args).0, want, "{args:?}");
+            }
+        }
+        for (value, want) in [
+            ("runtime", EfivarMemoryArg::Runtime),
+            ("firmware-reserved", EfivarMemoryArg::FirmwareReserved),
+        ] {
+            for args in [
+                &["--efivar-memory", value, "show-translations"][..],
+                &["show-translations", "--efivar-memory", value],
+            ] {
+                assert_eq!(parse(args).1, want, "{args:?}");
+            }
+        }
+        for flag in ["--hii-source", "--efivar-memory"] {
+            let error = UefiSettingsToolArgs::try_parse_from([
+                "uefisettings",
+                flag,
+                "hiidb",
+                "show-translations",
+            ])
+            .expect_err("an unknown value");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "{flag}");
         }
     }
 

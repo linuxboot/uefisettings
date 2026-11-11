@@ -81,7 +81,6 @@ use crate::print_display_or_json;
 use crate::print_lifted;
 use crate::unsafe_long_help;
 use crate::variable_command::print_info;
-use crate::HiiSourceArgs;
 use crate::IncludeArgs;
 use crate::JsonArgs;
 use crate::QuestionArgs;
@@ -105,12 +104,13 @@ pub(super) const SET_LONG_ABOUT: &str = "Set/change the value of a question.\n\n
      \"causes the system to wake up or power on at the set time\" (UEFI 2.11 §8.3.4), as \
      edk2-stable202608 SetupBrowserDxe/Setup.c:2051 does.";
 
-/// The help of --hii-source, which this build ignores.
-pub(super) const HII_SOURCE_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB by the HII Database Protocol";
-/// The help of --efivar-memory, which this build ignores.
-pub(super) const EFIVAR_MEMORY_HELP: &str =
-    "Accepted as on Linux, and ignored: this build reads the HiiDB by the HII Database Protocol";
+/// None: this build reads the HiiDB by the HII Database Protocol alone, so it has no
+/// --hii-source or --efivar-memory, which clap refuses as unexpected arguments rather than ignore
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+// no ArgGroup, which usage would name instead of the flag
+#[group(skip)]
+pub(super) struct HiiSourceArgs {}
 
 /// What set and keyword set refuse here without --i-am-fine-to-brick-this-system.
 const SETUP_PASSWORD_WRITE: &str = "a write in a HiiDB that declares a setup password question, \
