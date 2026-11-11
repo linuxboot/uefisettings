@@ -57,16 +57,15 @@ use crate::hii::form_set_stores::FormSetStore;
 use crate::hii::forms::DriverHeldQuestion;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::forms::QuestionDescriptor;
-use crate::hii::get_keywords;
+use crate::hii::get_keywords_witnessed;
 use crate::hii::package;
 use crate::hii::question_callbacks::change;
 use crate::hii::question_callbacks::retrieve;
 use crate::hii::question_callbacks::Call;
-use crate::hii::question_callbacks::ChangeOutcome;
 use crate::hii::question_callbacks::DriverQuestion;
 use crate::hii::question_callbacks::FormSetAccess;
 use crate::hii::question_callbacks::IfrValue;
-use crate::hii::set_keywords;
+use crate::hii::set_keywords_witnessed;
 use crate::hii::time_services::TimeServices;
 use crate::hii::FirmwareKeywordHandler;
 use crate::hii::FirmwareVariables;
@@ -172,7 +171,8 @@ impl HiiBackend {
     /// per package list of this firmware's HiiDB whose question of the keyword get would read as
     /// GetData() does and that passes the `<Filter>`, which `options.filter_by` applies, with the
     /// `<KeywordInfoResp>` of KEYWORDINFO from `options.info_source`: the HiiDB's IFR, its texts
-    /// in the language that PlatformLang picks, or GetData().
+    /// in the language that PlatformLang picks, or GetData(). It fails where GetData() changed
+    /// the bytes of a PASSWORD question in an EFI variable, which uefisettings never writes back.
     pub fn keyword_get(
         requests: &str,
         namespace: Option<&str>,
@@ -180,13 +180,13 @@ impl HiiBackend {
     ) -> Result<KeywordValues> {
         let lists = package::read_db(&Self::export_hiidb()?)?;
         let platform_lang = EfivarSource::System.platform_lang()?;
-        get_keywords(
+        get_keywords_witnessed(
             &lists,
             requests,
             namespace,
             &text_languages(None, platform_lang.as_deref()),
             options,
-            Box::new(VariableServices),
+            VariableServices,
             &FirmwareKeywordHandler,
         )
     }
@@ -195,19 +195,20 @@ impl HiiBackend {
     /// EFI_CONFIG_KEYWORD_HANDLER_PROTOCOL, unless set, with `options`, would refuse a keyword's
     /// question or value in this firmware's HiiDB and variables; then returns what GetData() reads
     /// back, which must hold each VALUE written, as a number, and the unsafe operations that it
-    /// lifted.
+    /// lifted. It fails where SetData() or that GetData() changed the bytes of a PASSWORD
+    /// question in an EFI variable, which uefisettings never writes back.
     pub fn keyword_set(
         keywords: &str,
         options: &KeywordSetOptions,
     ) -> Result<(KeywordValues, Vec<UnsafeOperation>)> {
         let lists = package::read_db(&Self::export_hiidb()?)?;
-        set_keywords(
+        set_keywords_witnessed(
             &lists,
             keywords,
             options.include,
             options.unsafe_operations,
             options.volatile,
-            Box::new(VariableServices),
+            VariableServices,
             &FirmwareKeywordHandler,
         )
     }
@@ -307,10 +308,10 @@ impl DriverHeldValues for DriverCallbacks<'_> {
         list: &QuestionList<'_>,
         question: &QuestionDescriptor,
         held: &DriverHeldQuestion,
-    ) -> String {
+    ) -> Result<String> {
         let reached = match self.reach(list, held) {
             Ok(reached) => reached,
-            Err(error) => return format!("<ValueUnavailable: {error:#}>"),
+            Err(error) => return Ok(format!("<ValueUnavailable: {error:#}>")),
         };
         let routing = RoutingProtocol::open();
         let access = FormSetAccess {
@@ -320,14 +321,7 @@ impl DriverHeldValues for DriverCallbacks<'_> {
         };
         let retrieval = retrieve(&reached.driver, driver_question(held), access);
         log_calls(&retrieval.calls);
-        let mut answer = match retrieval.value {
-            Ok(value) => shown(question, value),
-            Err(reason) => format!("<ValueUnavailable: {reason}>"),
-        };
-        for note in retrieval.notes {
-            answer.push_str(&format!(" <{note}>"));
-        }
-        answer
+        retrieval.answer(&question.question, |value| shown(question, value))
     }
 
     /// set reaches the question's driver, its stores and the variables, as `reach` finds them.
@@ -364,18 +358,7 @@ impl DriverHeldValues for DriverCallbacks<'_> {
         };
         let changed = change(&reached.driver, driver_question(held), new_value, access);
         log_calls(&changed.calls);
-        let outcome = changed.outcome.text(|value| shown(question, value));
-        let text = [outcome]
-            .into_iter()
-            .chain(changed.notes)
-            .collect::<Vec<_>>()
-            .join("; ");
-        match changed.outcome {
-            ChangeOutcome::Applied(_) => Ok(format!(" <{text}>")),
-            ChangeOutcome::Refused(_) | ChangeOutcome::NotApplied { .. } => {
-                Err(set_refusal(&question.question, text))
-            }
-        }
+        changed.annotation(&question.question, |value| shown(question, value))
     }
 }
 

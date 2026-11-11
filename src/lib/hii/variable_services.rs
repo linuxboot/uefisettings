@@ -23,6 +23,7 @@ use uefi::runtime;
 use uefi::runtime::VariableVendor;
 use uefi::CString16;
 use uefi::Status;
+use zeroize::Zeroizing;
 
 use crate::efi_variables::globals::platform_lang;
 use crate::efi_variables::walk_variable_names;
@@ -41,9 +42,11 @@ use crate::hii::variables::attributes_and_data;
 use crate::hii::variables::created_variable_bytes;
 use crate::hii::variables::efivar_parts;
 use crate::hii::variables::modify_variable_bytes;
+use crate::hii::variables::read_zeroing;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarSource;
 use crate::hii::variables::FirmwareVariables;
+use crate::hii::variables::GetVariableCall;
 use crate::hii::variables::MissingVariable;
 use crate::hii::variables::UnreadVariables;
 use crate::hii::variables::VariableAttributes;
@@ -82,6 +85,7 @@ impl EfivarSource {
 
 /// The variables of the firmware that the UEFI Shell runs on, every one of them, as boot
 /// services still run.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct VariableServices;
 
 impl VariableServices {
@@ -240,12 +244,12 @@ impl VariableData for VariableServices {
     }
 
     fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
-        let (data, attributes) = match get_variable(key) {
+        let (mut data, attributes) = match get_variable(key) {
             Err(error) if error.is::<VariableNotFound>() => return Ok(None),
             result => result?,
         };
         let attributes = VariableAttributes::from_bits_retain(attributes.bits());
-        VariableContents::new(attributes, data.into())
+        VariableContents::new(attributes, std::mem::take(&mut *data))
             .map(Some)
             .with_context(|| format!("GetVariable() of EFI variable {key}"))
     }
@@ -293,12 +297,22 @@ impl VariableStorageInfo for VariableServices {
     }
 }
 
-/// GetVariable() of `key`: its data and attributes, or VariableNotFound.
-fn get_variable(key: &VariableKey) -> Result<(Box<[u8]>, runtime::VariableAttributes)> {
+/// GetVariable() of `key`: its data, in a buffer that zeroes on drop (read_zeroing), and
+/// attributes, or VariableNotFound.
+fn get_variable(key: &VariableKey) -> Result<(Zeroizing<Vec<u8>>, runtime::VariableAttributes)> {
     let (name, vendor) = uefi_key(key)?;
-    runtime::get_variable_boxed(&name, &vendor).map_err(|error| match error.status() {
-        Status::NOT_FOUND => VariableNotFound(key.clone()).into(),
-        status => anyhow!("GetVariable() of EFI variable {key}: {status:?}"),
+    read_zeroing(key, |buffer| {
+        match runtime::get_variable(&name, &vendor, buffer) {
+            Ok((data, attributes)) => Ok(GetVariableCall::Read {
+                size: data.len(),
+                attributes,
+            }),
+            Err(error) => match (error.status(), *error.data()) {
+                (Status::BUFFER_TOO_SMALL, Some(size)) => Ok(GetVariableCall::TooSmall(size)),
+                (Status::NOT_FOUND, _) => Err(VariableNotFound(key.clone()).into()),
+                (status, _) => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),
+            },
+        }
     })
 }
 

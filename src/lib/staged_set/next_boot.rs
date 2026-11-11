@@ -190,8 +190,8 @@ impl DriverHeldValues for NextBootStaging {
         _list: &QuestionList<'_>,
         question: &QuestionDescriptor,
         held: &DriverHeldQuestion,
-    ) -> String {
-        Self::answer(system_variables(), question, held)
+    ) -> Result<String> {
+        Ok(Self::answer(system_variables(), question, held))
     }
 
     /// apply-staged would apply the set, set finds the ESP, through --esp if given, plan_stage

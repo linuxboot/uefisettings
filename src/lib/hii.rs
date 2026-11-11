@@ -122,9 +122,9 @@ pub use firmware_memory::MemoryMapUnavailable;
 #[cfg(target_os = "windows")]
 pub(crate) use hiidb_driver::read_hiidb;
 #[cfg(target_os = "uefi")]
-pub(crate) use keyword_access::get_keywords;
+pub(crate) use keyword_access::get_keywords_witnessed;
 #[cfg(target_os = "uefi")]
-pub(crate) use keyword_access::set_keywords;
+pub(crate) use keyword_access::set_keywords_witnessed;
 #[cfg(target_os = "uefi")]
 pub use keyword_access::KeywordFilterBy;
 #[cfg(target_os = "uefi")]
@@ -162,6 +162,8 @@ pub(crate) use variable_services::VariableServices;
 pub(crate) use variables::EfivarReader;
 pub use variables::EfivarSource;
 pub(crate) use variables::FirmwareVariables;
+#[cfg(all(variable_data, any(target_os = "uefi", test)))]
+pub(crate) use variables::PasswordBytesRefusal;
 pub use variables::VariableAttributes;
 #[cfg(variable_data)]
 pub(crate) use variables::VariableInterface;

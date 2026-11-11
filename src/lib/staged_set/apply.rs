@@ -35,6 +35,7 @@ use crate::efi_variables::globals::boot_next;
 use crate::efi_variables::VariableData;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::package::ParsedPackageList;
+use crate::hii::PasswordBytesRefusal;
 use crate::hii::VariableKey;
 use crate::hii::VariableReach;
 use crate::unsafe_operations::LiftedOperations;
@@ -121,7 +122,8 @@ pub(crate) fn apply_staged_withholding(
 /// after it still run, but no request is applied unless the start is recorded. A nonce that has an
 /// outcome applies nothing again: a recorded start becomes Interrupted. Without a staged set of
 /// `nonce`, nothing is applied or recorded, and BootCurrent's Boot#### goes only if it holds the
-/// command line of `nonce`.
+/// command line of `nonce`. Nor is any request applied after one refused as driver code changed
+/// password bytes (PasswordBytesRefusal), which uefisettings never restores.
 fn apply_staged(
     variables: &impl VariableData,
     nonce: &str,
@@ -208,7 +210,7 @@ fn staged_set_of(variables: &impl VariableData, nonce: &str) -> Result<StagedSet
 
 /// Records that uefisettings.efi started, applies each request of `set` through `driver` if that
 /// is recorded, then records Finished with each result, which it returns; a record that fails goes
-/// to `failures`.
+/// to `failures`. A request after one refused as driver code changed password bytes is not applied.
 fn apply_requests(
     variables: &impl VariableData,
     set: &StagedSet,
@@ -220,16 +222,26 @@ fn apply_requests(
         STAGED_OUTCOME,
         &Outcome::Started { nonce: set.nonce },
     );
+    let mut password_refused = false;
     let results: Vec<RequestOutcome> = set
         .requests
         .iter()
         .map(|request| {
-            let applied = match &started {
-                Ok(()) => driver.apply(request),
-                Err(error) => Err(anyhow!(
+            let applied = match (&started, password_refused) {
+                (Ok(()), false) => driver.apply(request),
+                (Ok(()), true) => Err(anyhow!(
+                    "not applied, as driver code changed password bytes while an earlier request \
+                     of this staged set was applied; uefisettings never writes a password byte"
+                )),
+                (Err(error), _) => Err(anyhow!(
                     "not applied, as recording that uefisettings.efi started failed: {error:#}"
                 )),
             };
+            if let Err(error) = &applied {
+                password_refused |= error
+                    .chain()
+                    .any(|cause| cause.is::<PasswordBytesRefusal>());
+            }
             request_outcome(request, applied)
         })
         .collect();
@@ -342,6 +354,16 @@ mod tests {
     struct StagedDriver<'a> {
         variables: &'a HeldVariables,
         asked: RefCell<Vec<(u64, Option<Outcome>)>>,
+        refusal: Refusal,
+    }
+
+    /// Why StagedDriver refuses a request.
+    #[derive(Clone, Copy)]
+    enum Refusal {
+        /// The driver refuses the value
+        Driver,
+        /// Driver code changed password bytes (PasswordBytesRefusal)
+        PasswordBytes,
     }
 
     impl<'a> StagedDriver<'a> {
@@ -349,6 +371,7 @@ mod tests {
             Self {
                 variables,
                 asked: RefCell::new(Vec::new()),
+                refusal: Refusal::Driver,
             }
         }
     }
@@ -372,11 +395,19 @@ mod tests {
                 UnsafeOperations::Refuse => Vec::new(),
                 UnsafeOperations::Allow => vec![read_only_write()],
             };
-            match request.value % 2 {
-                0 => Ok((format!("<applied {}>", request.value), lifted)),
-                _ => Err(LiftedOperations::attach(
+            match (request.value % 2, self.refusal) {
+                (0, _) => Ok((format!("<applied {}>", request.value), lifted)),
+                (_, Refusal::Driver) => Err(LiftedOperations::attach(
                     lifted,
                     anyhow!("the driver refused {}", request.value),
+                )),
+                (_, Refusal::PasswordBytes) => Err(LiftedOperations::attach(
+                    lifted,
+                    PasswordBytesRefusal(format!(
+                        "driver code changed password bytes for {}",
+                        request.value
+                    ))
+                    .into(),
                 )),
             }
         }
@@ -654,6 +685,85 @@ mod tests {
             }),
             "the outcome"
         );
+    }
+
+    /// After a request refused as driver code changed password bytes, also after it lifted an
+    /// unsafe operation, no request reaches the driver: its outcome says why, and the start and the
+    /// outcome are still recorded.
+    #[test]
+    fn apply_requests_applies_nothing_after_driver_code_changed_password_bytes() {
+        let not_applied = "not applied, as driver code changed password bytes while an earlier \
+                           request of this staged set was applied; uefisettings never writes a \
+                           password byte";
+        for (case, first, refusal, warnings) in [
+            (
+                "a refusal",
+                request(1),
+                "driver code changed password bytes for 1",
+                Vec::new(),
+            ),
+            (
+                "a refusal after a lifted operation",
+                StagedRequest {
+                    value: 3,
+                    ..including_request()
+                },
+                "after 1 unsafe operation(s) that --i-am-fine-to-brick-this-system let through: \
+                 driver code changed password bytes for 3",
+                vec![read_only_write().lifted_warning()],
+            ),
+        ] {
+            let variables = staged(None, None);
+            let set = StagedSet {
+                requests: vec![first.clone(), including_request()],
+                ..staged_set()
+            };
+            let driver = StagedDriver {
+                refusal: Refusal::PasswordBytes,
+                ..StagedDriver::new(&variables)
+            };
+            let mut failures = Vec::new();
+
+            let results = apply_requests(&variables, &set, &driver, &mut failures);
+
+            assert_eq!(
+                *driver.asked.borrow(),
+                [(first.value, Some(started(NONCE)))],
+                "{case}: the driver is asked once"
+            );
+            let want = vec![
+                RequestOutcome {
+                    request: first,
+                    applied: false,
+                    result: refusal.to_owned(),
+                    warnings,
+                },
+                RequestOutcome {
+                    request: including_request(),
+                    applied: false,
+                    result: not_applied.to_owned(),
+                    warnings: Vec::new(),
+                },
+            ];
+            assert_eq!(results, want, "{case}: the results");
+            assert_eq!(failures, Vec::<String>::new(), "{case}: the failures");
+            assert_eq!(
+                record(&variables, STAGED_OUTCOME),
+                Some(Outcome::Finished {
+                    nonce: NONCE,
+                    results: want,
+                }),
+                "{case}: the outcome"
+            );
+            assert_eq!(
+                *variables.set.borrow(),
+                [
+                    key(STAGED_OUTCOME, UEFISETTINGS_VENDOR_GUID),
+                    key(STAGED_OUTCOME, UEFISETTINGS_VENDOR_GUID),
+                ],
+                "{case}: the writes: started, then finished"
+            );
+        }
     }
 
     #[test]

@@ -430,6 +430,11 @@ impl VariableContents {
     pub(crate) fn data(&self) -> &[u8] {
         &self.data
     }
+
+    /// Its data, moved out.
+    pub(crate) fn into_data(self) -> Vec<u8> {
+        self.data
+    }
 }
 
 /// Data that VariableContents refuses.

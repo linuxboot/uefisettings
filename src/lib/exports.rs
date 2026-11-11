@@ -719,13 +719,13 @@ pub(crate) trait DriverHeldValues {
     /// package list: `its driver`, or where set puts the value instead.
     fn store_name(&self) -> &'static str;
 
-    /// get's answer for `question` of `list`.
+    /// get's answer for `question` of `list`, or why get fails.
     fn get(
         &self,
         list: &QuestionList<'_>,
         question: &QuestionDescriptor,
         held: &DriverHeldQuestion,
-    ) -> String;
+    ) -> Result<String>;
 
     /// Refuses what set of `question` of `list` would refuse before it reaches the driver, with
     /// set's refusal, so that set refuses it before its first write.
@@ -1282,7 +1282,7 @@ impl HiiBackend {
                             index,
                             device_path: list.device_path.as_ref(),
                         };
-                        held.get(&list, &question_descriptor, driver_held)
+                        held.get(&list, &question_descriptor, driver_held)?
                     }
                     None => question_descriptor.value.clone(),
                 };
@@ -8096,12 +8096,14 @@ mod tests {
         assert_eq!(variables.writes_to(&signed), vec![], "writes of Signed");
     }
 
-    /// A driver that records each get and set it is asked for, and refuses the QuestionId
-    /// `refused_check` before it reaches the driver, and `refused_set` when it sets it.
+    /// A driver that records each get and set it is asked for, and fails get of the QuestionId
+    /// `refused_get`, refuses the QuestionId `refused_check` before it reaches the driver, and
+    /// `refused_set` when it sets it.
     #[derive(Default)]
     struct RecordingDriver {
         gets: RefCell<Vec<u16>>,
         sets: RefCell<Vec<(u16, u64)>>,
+        refused_get: Option<u16>,
         refused_check: Option<u16>,
         refused_set: Option<u16>,
     }
@@ -8114,11 +8116,14 @@ mod tests {
         fn get(
             &self,
             _list: &QuestionList<'_>,
-            _question: &QuestionDescriptor,
+            question: &QuestionDescriptor,
             held: &DriverHeldQuestion,
-        ) -> String {
+        ) -> Result<String> {
             self.gets.borrow_mut().push(held.question_id);
-            "from the driver".to_string()
+            match self.refused_get == Some(held.question_id) {
+                true => Err(anyhow!("cannot get question {:?}", question.question)),
+                false => Ok("from the driver".to_string()),
+            }
         }
 
         fn check_set(
@@ -9548,6 +9553,39 @@ mod tests {
             "the refusal"
         );
         assert_eq!(*driver.sets.borrow(), [(8, 1)], "the driver asked");
+    }
+
+    /// get of a question whose driver fails get fails with that error, as where driver code
+    /// changed password bytes.
+    #[test]
+    fn get_of_a_driver_held_question_fails_with_its_driver_s_error() {
+        let hiidb = storageless_checkbox_list([0x77; 16], 8, 0x04);
+        let driver = RecordingDriver {
+            refused_get: Some(8),
+            ..RecordingDriver::default()
+        };
+        let variables = Rc::new(MemoryVariables::new(
+            VariableReach::Runtime,
+            VariableInterface::Efivarfs,
+        ));
+
+        let got = HiiBackend::get_in(
+            &hiidb,
+            "Q",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            None,
+            Some(&driver),
+        );
+
+        assert_eq!(
+            got.map(drop).map_err(|error| error.to_string()),
+            Err("cannot get question \"Q\"".to_string()),
+            "the error"
+        );
+        assert_eq!(*driver.gets.borrow(), [8], "the driver asked");
     }
 
     /// set answers each match that a driver holds with that driver's own annotation, in the order
@@ -13799,8 +13837,12 @@ mod tests {
             _list: &QuestionList<'_>,
             question: &QuestionDescriptor,
             held: &DriverHeldQuestion,
-        ) -> String {
-            crate::staged_set::next_boot::NextBootStaging::answer(Ok(self.0), question, held)
+        ) -> Result<String> {
+            Ok(crate::staged_set::next_boot::NextBootStaging::answer(
+                Ok(self.0),
+                question,
+                held,
+            ))
         }
 
         fn check_set(

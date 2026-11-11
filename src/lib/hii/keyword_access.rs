@@ -41,10 +41,18 @@ use super::forms::keywords::KeywordWrite;
 use super::forms::IncludedStates;
 use super::forms::PasswordQuestions;
 use super::package::ParsedPackageList;
+#[cfg(all(variable_data, variable_names))]
+use super::variable_changes::DriverCode;
+#[cfg(all(variable_data, variable_names))]
+use super::variable_changes::VariableSnapshot;
 use super::variables::EfivarReader;
 use super::variables::FirmwareVariables;
 use super::variables::VolatileWrites;
 use super::variables::VOLATILE_ANNOTATION;
+#[cfg(all(variable_data, variable_names))]
+use crate::efi_variables::VariableData;
+#[cfg(all(variable_data, variable_names))]
+use crate::efi_variables::VariableNames;
 use crate::unsafe_operations::LiftedOperations;
 use crate::unsafe_operations::PendingOperations;
 use crate::unsafe_operations::UnsafeOperation;
@@ -409,6 +417,44 @@ pub(crate) fn get_keywords(
     })
 }
 
+/// get_keywords through `variables`, with the bytes of the PASSWORD questions of `lists` in them
+/// compared across it, as the drivers that GetData() reaches may write them: a change, or bytes
+/// that cannot be compared, fail it (VariableSnapshot), with its own error as the cause.
+#[cfg(all(variable_data, variable_names))]
+pub(crate) fn get_keywords_witnessed<V>(
+    lists: &[ParsedPackageList],
+    requests: &str,
+    namespace: Option<&str>,
+    requested: &[&str],
+    options: KeywordGetOptions,
+    variables: V,
+    handler: &impl KeywordData,
+) -> Result<KeywordValues>
+where
+    V: FirmwareVariables + VariableData + VariableNames + Clone + 'static,
+{
+    let withholding = PasswordQuestions::of_lists(lists).withholding(variables.clone())?;
+    let before =
+        VariableSnapshot::take(&withholding, DriverCode::GetData).map_err(anyhow::Error::msg)?;
+    let got = get_keywords(
+        lists,
+        requests,
+        namespace,
+        requested,
+        options,
+        Box::new(variables),
+        handler,
+    );
+    match (
+        before.changes(&withholding).refusal(DriverCode::GetData),
+        got,
+    ) {
+        (None, got) => got,
+        (Some(refusal), Ok(_)) => Err(anyhow!(refusal)),
+        (Some(refusal), Err(error)) => Err(error.context(refusal)),
+    }
+}
+
 /// A question that get reads, the request that names it, and the `<KeywordInfoResp>` of its
 /// KEYWORDINFO from the IFR, if it takes one.
 struct KeywordRead<'q, 'a> {
@@ -652,6 +698,45 @@ pub(crate) fn set_keywords(
         .collect();
     let (resps, lifted) = LiftedOperations::after(lifted, write_keywords(&resps, handler))?;
     Ok((KeywordValues { resps, volatile }, lifted))
+}
+
+/// set_keywords through `variables`, with the bytes of the PASSWORD questions of `lists` in them
+/// compared across it, as the drivers that SetData() and its read-back reach may write them: a
+/// change, or bytes that cannot be compared, fail it (VariableSnapshot), with its own error as
+/// the cause.
+#[cfg(all(variable_data, variable_names))]
+pub(crate) fn set_keywords_witnessed<V>(
+    lists: &[ParsedPackageList],
+    keywords: &str,
+    include: IncludedStates,
+    unsafe_operations: UnsafeOperations,
+    volatile: VolatileWrites,
+    variables: V,
+    handler: &impl KeywordData,
+) -> Result<(KeywordValues, Vec<UnsafeOperation>)>
+where
+    V: FirmwareVariables + VariableData + VariableNames + Clone + 'static,
+{
+    let withholding = PasswordQuestions::of_lists(lists).withholding(variables.clone())?;
+    let before =
+        VariableSnapshot::take(&withholding, DriverCode::SetData).map_err(anyhow::Error::msg)?;
+    let set = set_keywords(
+        lists,
+        keywords,
+        include,
+        unsafe_operations,
+        volatile,
+        Box::new(variables),
+        handler,
+    );
+    match (
+        before.changes(&withholding).refusal(DriverCode::SetData),
+        set,
+    ) {
+        (None, set) => set,
+        (Some(refusal), Ok((_, lifted))) => Err(LiftedOperations::attach(lifted, anyhow!(refusal))),
+        (Some(refusal), Err(error)) => Err(error.context(refusal)),
+    }
 }
 
 /// Writes `resps` with one SetData() of `handler` and reads each keyword back with GetData(),
@@ -4583,5 +4668,263 @@ mod tests {
             Ok(resp(PATH, KEYWORD, "01")),
             "beside a password on Store"
         );
+    }
+
+    /// The bytes of a password compared across SetData() and GetData().
+    #[cfg(all(variable_data, variable_names))]
+    mod witnessed {
+        use super::*;
+
+        /// Which call of a PasswordOverwritingHandler writes the password of password().
+        #[derive(Clone, Copy)]
+        enum PasswordOverwrite {
+            InSetData,
+            InGetData,
+            Never,
+        }
+
+        /// A MemoryKeywordHandler whose SetData() or GetData(), as `overwrite` says, also writes
+        /// bytes 0 and 1 of the variable Password, which the PASSWORD question of password()
+        /// holds, as a driver's RouteConfig() or ExtractConfig() may write its variables.
+        struct PasswordOverwritingHandler {
+            inner: MemoryKeywordHandler,
+            variables: Rc<MemoryVariables>,
+            overwrite: PasswordOverwrite,
+        }
+
+        impl KeywordData for PasswordOverwritingHandler {
+            fn get_data(
+                &self,
+                namespace_id: &str,
+                keyword_string: &str,
+            ) -> Result<String, GetDataError> {
+                let got = self.inner.get_data(namespace_id, keyword_string);
+                if matches!(self.overwrite, PasswordOverwrite::InGetData) {
+                    overwrite_password(&self.variables);
+                }
+                got
+            }
+
+            fn set_data(&self, keyword_string: &str) -> Result<()> {
+                let set = self.inner.set_data(keyword_string);
+                if matches!(self.overwrite, PasswordOverwrite::InSetData) {
+                    overwrite_password(&self.variables);
+                }
+                set
+            }
+        }
+
+        /// The variable of the VarStore of password().
+        fn password_key() -> VariableKey {
+            VariableKey {
+                name: "Password".to_owned(),
+                guid: Guid::from([0x44; 16]),
+            }
+        }
+
+        fn overwrite_password(variables: &MemoryVariables) {
+            let mut data = [0; 40];
+            data[..2].copy_from_slice(&[0x5A, 0xA5]);
+            variables.insert(password_key(), ATTRIBUTES, &data);
+        }
+
+        /// The variables of variables(), and the variable of password() holding zeros.
+        fn variables_with_password() -> Rc<MemoryVariables> {
+            let variables = MemoryVariables::new(
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            );
+            let mut data = [0; 16];
+            data[5] = 1;
+            data[6] = 1;
+            let store = VariableKey {
+                name: "Store".to_owned(),
+                guid: Guid::from(STORE_GUID),
+            };
+            variables.insert(store, ATTRIBUTES, &data);
+            variables.insert(password_key(), ATTRIBUTES, &[0; 40]);
+            Rc::new(variables)
+        }
+
+        /// The handler of KEYWORD and SECOND_KEYWORD that overwrites the password as `overwrite`
+        /// says, in `variables`.
+        fn overwriting(
+            variables: &Rc<MemoryVariables>,
+            overwrite: PasswordOverwrite,
+        ) -> PasswordOverwritingHandler {
+            PasswordOverwritingHandler {
+                inner: MemoryKeywordHandler::with(&[
+                    (PATH, KEYWORD, "01"),
+                    (PATH, SECOND_KEYWORD, "01"),
+                ]),
+                variables: Rc::clone(variables),
+                overwrite,
+            }
+        }
+
+        #[test]
+        fn keyword_set_fails_where_set_data_changes_withheld_bytes() {
+            let lists = [list(PATH, &[questions(), password()].concat())];
+            let refusal = format!(
+                "SetData() changed the password bytes of EFI variable {}; they were not \
+                 restored, as uefisettings never writes a password byte",
+                password_key()
+            );
+            let failure = "EFI_DEVICE_ERROR";
+            let cases = [
+                (
+                    "overwritten by SetData()",
+                    PasswordOverwrite::InSetData,
+                    None,
+                    Some(vec![refusal.as_str()]),
+                ),
+                (
+                    "overwritten by the read-back",
+                    PasswordOverwrite::InGetData,
+                    None,
+                    Some(vec![refusal.as_str()]),
+                ),
+                (
+                    "overwritten by a SetData() that fails",
+                    PasswordOverwrite::InSetData,
+                    Some(failure),
+                    Some(vec![refusal.as_str(), failure]),
+                ),
+                (
+                    "kept by a SetData() that fails",
+                    PasswordOverwrite::Never,
+                    Some(failure),
+                    Some(vec![failure]),
+                ),
+                ("kept", PasswordOverwrite::Never, None, None),
+            ];
+            for (name, overwrite, set_failure, want) in cases {
+                let variables = variables_with_password();
+                let handler = PasswordOverwritingHandler {
+                    inner: MemoryKeywordHandler {
+                        set_failure,
+                        ..MemoryKeywordHandler::with(&[
+                            (PATH, KEYWORD, "01"),
+                            (PATH, SECOND_KEYWORD, "01"),
+                        ])
+                    },
+                    ..overwriting(&variables, overwrite)
+                };
+
+                let set = set_keywords_witnessed(
+                    &lists,
+                    &resp(PATH, KEYWORD, "03"),
+                    IncludedStates::empty(),
+                    UnsafeOperations::Allow,
+                    VolatileWrites::Refuse,
+                    Rc::clone(&variables),
+                    &handler,
+                )
+                .map(drop);
+                let lifted = set
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.downcast_ref::<LiftedOperations>())
+                    .cloned();
+                let set = set.map_err(|error| format!("{error:#}"));
+
+                match want {
+                    Some(parts) => {
+                        assert_eq!(
+                            lifted,
+                            Some(LiftedOperations(vec![UnsafeOperation::SetupPassword])),
+                            "{name}: the unsafe operation lifted before it, kept"
+                        );
+                        let error = set.expect_err(name);
+                        for part in &parts {
+                            assert!(error.contains(part), "{name}: {part}: {error}");
+                        }
+                        assert_eq!(
+                            error.contains("password bytes"),
+                            parts.contains(&refusal.as_str()),
+                            "{name}: the refusal where the password changed only: {error}"
+                        );
+                    }
+                    None => assert_eq!(set, Ok(()), "{name}"),
+                }
+            }
+        }
+
+        #[test]
+        fn keyword_get_fails_where_get_data_changes_withheld_bytes() {
+            let lists = [list(PATH, &[questions(), password()].concat())];
+            let cases = [
+                (
+                    "overwritten by GetData()",
+                    PasswordOverwrite::InGetData,
+                    Err(format!(
+                        "GetData() changed the password bytes of EFI variable {}; they were not \
+                         restored, as uefisettings never writes a password byte",
+                        password_key()
+                    )),
+                ),
+                (
+                    "kept",
+                    PasswordOverwrite::Never,
+                    Ok(resp(PATH, KEYWORD, "01")),
+                ),
+            ];
+            for (name, overwrite, want) in cases {
+                let variables = variables_with_password();
+                let handler = overwriting(&variables, overwrite);
+
+                let got = get_keywords_witnessed(
+                    &lists,
+                    &format!("KEYWORD={KEYWORD}"),
+                    None,
+                    &[],
+                    KeywordGetOptions::default(),
+                    Rc::clone(&variables),
+                    &handler,
+                )
+                .map(|values| values.to_string())
+                .map_err(|error| format!("{error:#}"));
+
+                match want {
+                    Err(refusal) => assert!(
+                        matches!(&got, Err(error) if error.contains(&refusal)),
+                        "{name}: {got:?}"
+                    ),
+                    Ok(value) => assert_eq!(got, Ok(value), "{name}"),
+                }
+            }
+        }
+
+        #[test]
+        fn keyword_get_that_fails_still_refuses_where_get_data_changes_withheld_bytes() {
+            let lists = [list(PATH, &[questions(), password()].concat())];
+            let variables = variables_with_password();
+            let handler = PasswordOverwritingHandler {
+                inner: MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01")]),
+                ..overwriting(&variables, PasswordOverwrite::InGetData)
+            };
+
+            let got = get_keywords_witnessed(
+                &lists,
+                &format!("KEYWORD={SECOND_KEYWORD}"),
+                None,
+                &[],
+                KeywordGetOptions::default(),
+                Rc::clone(&variables),
+                &handler,
+            )
+            .map(|values| values.to_string())
+            .map_err(|error| format!("{error:#}"));
+
+            let refusal = format!(
+                "GetData() changed the password bytes of EFI variable {}; they were not \
+                 restored, as uefisettings never writes a password byte",
+                password_key()
+            );
+            assert!(
+                matches!(&got, Err(error) if error.contains(&refusal) && error.contains("KEYWORD_NOT_FOUND")),
+                "the refusal beside GetData()'s own error: {got:?}"
+            );
+        }
     }
 }

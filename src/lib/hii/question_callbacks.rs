@@ -27,9 +27,12 @@
 
 use std::fmt;
 
+use anyhow::Result;
+
 use crate::efi_status::EfiStatus;
 use crate::efi_variables::VariableData;
 use crate::efi_variables::VariableNames;
+use crate::exports::set_refusal;
 use crate::hii::config_routing::ConfigRouting;
 use crate::hii::form_set_stores::Baseline;
 use crate::hii::form_set_stores::FormSetStore;
@@ -38,7 +41,11 @@ use crate::hii::forms::ExpressionBesideCallback;
 pub(crate) use crate::hii::forms::IfrValueType;
 use crate::hii::forms::QuestionExpression;
 use crate::hii::forms::StoragelessRefusal;
+use crate::hii::variable_changes::DriverCode;
+use crate::hii::variable_changes::VariableChanges;
 use crate::hii::variable_changes::VariableSnapshot;
+use crate::hii::PasswordBytesRefusal;
+use crate::hii::WithholdingVariables;
 
 /// EFI_BROWSER_ACTION (UEFI 2.11 §35.5.4): what a Callback() is told happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,11 +200,11 @@ pub(crate) struct DriverQuestion {
 }
 
 /// What the sequence reads and writes besides the driver: the FormSet's stores and the EFI
-/// variables.
+/// variables, without the bytes of PASSWORD questions.
 pub(crate) struct FormSetAccess<'a, R, V> {
     pub(crate) stores: Vec<FormSetStore>,
     pub(crate) routing: &'a R,
-    pub(crate) variables: &'a V,
+    pub(crate) variables: &'a WithholdingVariables<V>,
 }
 
 /// One Callback() of a sequence, as logs and outcomes list it.
@@ -328,6 +335,8 @@ impl<'a, D: DriverCallback> Sequence<'a, D> {
 pub(crate) struct Retrieval {
     /// The value RETRIEVE gave, or why there is none
     pub(crate) value: Result<IfrValue, String>,
+    /// Whether driver code changed password bytes, or they could not be compared across it
+    pub(crate) password_refused: bool,
     /// Notes on ActionRequests, settings left out and changed variables, each a phrase
     pub(crate) notes: Vec<String>,
     pub(crate) calls: Vec<Call>,
@@ -337,6 +346,8 @@ pub(crate) struct Retrieval {
 #[derive(Debug)]
 pub(crate) struct Change {
     pub(crate) outcome: ChangeOutcome,
+    /// Whether driver code changed password bytes, or they could not be compared across it
+    pub(crate) password_refused: bool,
     /// Notes on ActionRequests, the reconnection, settings left out and changed variables,
     /// each a phrase
     pub(crate) notes: Vec<String>,
@@ -355,6 +366,9 @@ pub(crate) enum ChangeOutcome {
         reason: String,
         last_action: BrowserAction,
     },
+    /// Applied, with the read-back; then the reconnection that a Callback() asked for did what
+    /// refuses it: why
+    AppliedThenRefused { read_back: ReadBack, reason: String },
 }
 
 /// What the read-back after an applied change gave.
@@ -374,15 +388,9 @@ impl ChangeOutcome {
     /// The outcome in words, each value as `show` writes it.
     pub(crate) fn text(&self, show: impl Fn(IfrValue) -> String) -> String {
         match self {
-            Self::Applied(ReadBack::Same) => "applied".to_string(),
-            Self::Applied(ReadBack::Other(value)) => {
-                format!("applied; the driver now reports {}", show(*value))
-            }
-            Self::Applied(ReadBack::NotOffered) => {
-                "applied; the driver offers no read-back".to_string()
-            }
-            Self::Applied(ReadBack::Failed(status)) => {
-                format!("applied; the driver's read-back Callback(RETRIEVE) returned {status}")
+            Self::Applied(read_back) => read_back.applied(show),
+            Self::AppliedThenRefused { read_back, reason } => {
+                format!("{}; then {reason}", read_back.applied(show))
             }
             Self::Refused(reason) => reason.clone(),
             Self::NotApplied {
@@ -392,6 +400,72 @@ impl ChangeOutcome {
                 "not applied: {reason}; the driver's Callback({last_action}) had already run, and \
                  any effect outside the FormSet's stores stays"
             ),
+        }
+    }
+}
+
+impl ReadBack {
+    /// An applied change with this read-back in words, each value as `show` writes it.
+    fn applied(&self, show: impl Fn(IfrValue) -> String) -> String {
+        match self {
+            Self::Same => "applied".to_string(),
+            Self::Other(value) => format!("applied; the driver now reports {}", show(*value)),
+            Self::NotOffered => "applied; the driver offers no read-back".to_string(),
+            Self::Failed(status) => {
+                format!("applied; the driver's read-back Callback(RETRIEVE) returned {status}")
+            }
+        }
+    }
+}
+
+impl Retrieval {
+    /// get's answer for `question`, its value as `show` writes it, with the notes; get fails where
+    /// driver code changed password bytes.
+    pub(crate) fn answer(
+        self,
+        question: &str,
+        show: impl Fn(IfrValue) -> String,
+    ) -> Result<String> {
+        let mut answer = match self.value {
+            Ok(value) => show(value),
+            Err(reason) if self.password_refused => {
+                return Err(PasswordBytesRefusal(format!(
+                    "cannot get question {question:?}: {reason}"
+                ))
+                .into())
+            }
+            Err(reason) => format!("<ValueUnavailable: {reason}>"),
+        };
+        for note in self.notes {
+            answer.push_str(&format!(" <{note}>"));
+        }
+        Ok(answer)
+    }
+}
+
+impl Change {
+    /// set's annotation of `question` where the change applied, each value as `show` writes it;
+    /// else set's refusal, a PasswordBytesRefusal where driver code changed password bytes.
+    pub(crate) fn annotation(
+        self,
+        question: &str,
+        show: impl Fn(IfrValue) -> String,
+    ) -> Result<String> {
+        let outcome = self.outcome.text(show);
+        let text = [outcome]
+            .into_iter()
+            .chain(self.notes)
+            .collect::<Vec<_>>()
+            .join("; ");
+        match (self.outcome, self.password_refused) {
+            (_, true) => Err(PasswordBytesRefusal(set_refusal(question, text).to_string()).into()),
+            (ChangeOutcome::Applied(_), false) => Ok(format!(" <{text}>")),
+            (
+                ChangeOutcome::Refused(_)
+                | ChangeOutcome::NotApplied { .. }
+                | ChangeOutcome::AppliedThenRefused { .. },
+                false,
+            ) => Err(set_refusal(question, text)),
         }
     }
 }
@@ -408,12 +482,17 @@ where
     R: ConfigRouting,
     V: VariableData + VariableNames,
 {
-    let before = VariableSnapshot::take(access.variables);
-    let baseline = match Baseline::take(access.stores, access.routing, access.variables) {
-        Ok(baseline) => baseline,
+    let FormSetAccess {
+        stores,
+        routing,
+        variables,
+    } = access;
+    let (before, baseline) = match snapshots(stores, routing, variables) {
+        Ok(snapshots) => snapshots,
         Err(refusal) => {
             return Retrieval {
-                value: Err(refusal.to_string()),
+                value: Err(refusal.reason),
+                password_refused: refusal.password_refused,
                 notes: Vec::new(),
                 calls: Vec::new(),
             }
@@ -421,11 +500,17 @@ where
     };
     let mut sequence = Sequence::new(driver, question);
     let retrieved = sequence.retrieve(question.initial);
-    let check = baseline.check(access.routing, access.variables);
+    let check = baseline.check(routing, variables);
+    let changes = before.changes(variables);
+    let password_refused = changes.refusal(DriverCode::CallbackSequence).is_some();
     let mut notes = sequence.request_notes();
     notes.extend(dynamic_note(&baseline));
-    notes.extend(variable_notes(before, access.variables));
-    let value = match (check.refusal(), sequence.request_refusal(), retrieved) {
+    notes.extend(variable_note(&changes.listed));
+    let value = match (
+        effect_refusal(&check, &changes),
+        sequence.request_refusal(),
+        retrieved,
+    ) {
         (Some(reason), _, _) | (None, Some(reason), _) => Err(reason),
         (None, None, Ok(value)) => Ok(value),
         // without RETRIEVE's value, a forms browser keeps READ's
@@ -439,6 +524,7 @@ where
     };
     Retrieval {
         value,
+        password_refused,
         notes,
         calls: sequence.calls,
     }
@@ -446,7 +532,8 @@ where
 
 /// Runs set's sequence for `question` with `new_value`: FORM_OPEN, RETRIEVE, CHANGING, CHANGED,
 /// FORM_CLOSE, then FORM_OPEN, RETRIEVE, FORM_CLOSE to read the value back, between the reads
-/// of the FormSet's stores; then the reconnection, if a Callback() asked for one.
+/// of the FormSet's stores; then the reconnection, if a Callback() asked for one, across which
+/// the EFI variables are compared again.
 pub(crate) fn change<D, R, V>(
     driver: &D,
     question: DriverQuestion,
@@ -462,20 +549,30 @@ where
     // before CHANGED (edk2-stable202608 SetupBrowserDxe Presentation.c
     // ProcessCallBackFunction, Setup.c SetQuestionValue)
     if question.write_expression {
-        return refused(ExpressionBesideCallback(QuestionExpression::Write).to_string());
+        return refused(NoCallback {
+            reason: ExpressionBesideCallback(QuestionExpression::Write).to_string(),
+            password_refused: false,
+        });
     }
-    let before = VariableSnapshot::take(access.variables);
-    let baseline = match Baseline::take(access.stores, access.routing, access.variables) {
-        Ok(baseline) => baseline,
-        Err(refusal) => return refused(refusal.to_string()),
+    let FormSetAccess {
+        stores,
+        routing,
+        variables,
+    } = access;
+    let (before, baseline) = match snapshots(stores, routing, variables) {
+        Ok(snapshots) => snapshots,
+        Err(refusal) => return refused(refusal),
     };
     let mut sequence = Sequence::new(driver, question);
     let sent = send_change(&mut sequence, new_value);
-    let check = baseline.check(access.routing, access.variables);
-    let outcome = change_outcome(&sequence, sent, &check);
+    let check = baseline.check(routing, variables);
+    let changes = before.changes(variables);
+    let mut outcome = change_outcome(&sequence, sent, effect_refusal(&check, &changes));
+    let mut password_refused = changes.refusal(DriverCode::CallbackSequence).is_some();
+    let mut listed = changes.listed;
 
     let mut notes = sequence.request_notes();
-    if matches!(outcome, ChangeOutcome::Applied(_)) && sequence.reconnect_requested() {
+    if let (ChangeOutcome::Applied(read_back), true) = (&outcome, sequence.reconnect_requested()) {
         notes.push(match driver.reconnect() {
             Ok(()) => format!(
                 "reconnected the driver's controller ({})",
@@ -486,20 +583,86 @@ where
                 ActionRequest::RECONNECT
             ),
         });
+        // a failed reconnection may have run driver code too; against the same snapshot, the
+        // listing holds the writes of both
+        let reconnected = before.changes(variables);
+        if let Some(reason) = reconnected.refusal(DriverCode::Reconnection) {
+            outcome = ChangeOutcome::AppliedThenRefused {
+                read_back: read_back.clone(),
+                reason,
+            };
+            password_refused = true;
+        }
+        listed = reconnected.listed;
     }
     notes.extend(dynamic_note(&baseline));
-    notes.extend(variable_notes(before, access.variables));
+    notes.extend(variable_note(&listed));
     Change {
         outcome,
+        password_refused,
         notes,
         calls: sequence.calls,
     }
 }
 
+/// Why no Callback() runs.
+struct NoCallback {
+    reason: String,
+    /// Whether driver code changed password bytes, or they could not be compared across it
+    password_refused: bool,
+}
+
+/// The variables and the stores before the first Callback(), which the sequence compares
+/// against; or why no Callback() runs, with the password bytes compared across the stores'
+/// reads that ran, as ExtractConfig() is driver code.
+fn snapshots<R, V>(
+    stores: Vec<FormSetStore>,
+    routing: &R,
+    variables: &WithholdingVariables<V>,
+) -> Result<(VariableSnapshot, Baseline), NoCallback>
+where
+    R: ConfigRouting,
+    V: VariableData + VariableNames,
+{
+    let before =
+        VariableSnapshot::take(variables, DriverCode::CallbackSequence).map_err(|reason| {
+            NoCallback {
+                reason,
+                password_refused: false,
+            }
+        })?;
+    match Baseline::take(stores, routing, variables) {
+        Ok(baseline) => Ok((before, baseline)),
+        Err(refusal) => {
+            let changed = before
+                .changes(variables)
+                .refusal(DriverCode::CallbackSequence);
+            let password_refused = changed.is_some();
+            let reasons: Vec<String> = [refusal.to_string()].into_iter().chain(changed).collect();
+            Err(NoCallback {
+                reason: reasons.join("; "),
+                password_refused,
+            })
+        }
+    }
+}
+
+/// Why the effects of the Callback()s refuse get's value or set's change, if they do: changed
+/// stores, then changed or unreadable password bytes of variables.
+fn effect_refusal(check: &StoresCheck, changes: &VariableChanges) -> Option<String> {
+    let reasons: Vec<String> = check
+        .refusal()
+        .into_iter()
+        .chain(changes.refusal(DriverCode::CallbackSequence))
+        .collect();
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
 /// set's outcome when no Callback() ran.
-fn refused(refusal: String) -> Change {
+fn refused(refusal: NoCallback) -> Change {
     Change {
-        outcome: ChangeOutcome::Refused(refusal),
+        outcome: ChangeOutcome::Refused(refusal.reason),
+        password_refused: refusal.password_refused,
         notes: Vec::new(),
         calls: Vec::new(),
     }
@@ -564,17 +727,17 @@ fn send_change<D: DriverCallback>(sequence: &mut Sequence<'_, D>, new_value: Ifr
     }
 }
 
-/// set's outcome from what the Callback()s did and what the stores' check found.
+/// set's outcome from what the Callback()s did and why their effects refuse it (effect_refusal).
 fn change_outcome<D: DriverCallback>(
     sequence: &Sequence<'_, D>,
     sent: Sent,
-    check: &StoresCheck,
+    effect_refusal: Option<String>,
 ) -> ChangeOutcome {
     let last_action = sequence
         .calls
         .last()
         .map_or(BrowserAction::FormClose, |call| call.action);
-    let reason = match (check.refusal(), sequence.request_refusal(), sent) {
+    let reason = match (effect_refusal, sequence.request_refusal(), sent) {
         (Some(reason), _, _) | (None, Some(reason), _) => reason,
         (None, None, Sent::RetrieveFailed(status)) => format!(
             "its driver's CallBack(EFI_BROWSER_ACTION_RETRIEVE) returned {status}, which ends a \
@@ -610,25 +773,27 @@ fn dynamic_note(baseline: &Baseline) -> Option<String> {
     })
 }
 
-/// The note listing the EFI variables that changed since `before`, if any.
-fn variable_notes(
-    before: VariableSnapshot,
-    variables: &(impl VariableData + VariableNames),
-) -> Option<String> {
-    let changes = before.changes(variables);
-    (!changes.is_empty()).then(|| format!("EFI variables changed: {}", changes.join(", ")))
+/// The note listing the changed EFI variables `listed` (VariableChanges::listed), if any.
+fn variable_note(listed: &[String]) -> Option<String> {
+    (!listed.is_empty()).then(|| format!("EFI variables changed: {}", listed.join(", ")))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::ops::Range;
 
     use super::*;
     use crate::efi_variables::globals::tests::key;
     use crate::efi_variables::globals::tests::HeldVariables;
     use crate::efi_variables::globals::tests::NV_BS_RT;
     use crate::efi_variables::VariableContents;
+    use crate::hii::config_routing::ConfigRoutingError;
+    use crate::hii::config_string::ConfigRequest;
+    use crate::hii::config_string::ConfigResp;
+    use crate::hii::config_string::MultiConfigAltResp;
     use crate::hii::form_set_stores::tests::buffer_declaration;
     use crate::hii::form_set_stores::tests::efi_declaration;
     use crate::hii::form_set_stores::tests::header_of;
@@ -638,6 +803,7 @@ mod tests {
     use crate::hii::forms::StoreDeclaration;
     use crate::hii::variables::WithheldBytes;
     use crate::hii::variables::WithholdingVariables;
+    use crate::hii::VariableAttributes;
 
     const QUESTION: u16 = 0x0201;
     const U8: IfrValueType = IfrValueType::NumSize8;
@@ -659,6 +825,8 @@ mod tests {
         Buffer,
         /// writes the EFI variable store
         Variable,
+        /// writes bytes 1 and 2 of the EFI variable store, keeping its size
+        Password,
         /// writes a variable outside the stores
         Outside,
     }
@@ -681,6 +849,7 @@ mod tests {
         variables: &'a HeldVariables,
         reconnects: RefCell<usize>,
         reconnect_status: Option<EfiStatus>,
+        reconnect_effect: Effect,
     }
 
     impl<'a> ScriptedDriver<'a> {
@@ -692,6 +861,7 @@ mod tests {
                 variables,
                 reconnects: RefCell::new(0),
                 reconnect_status: None,
+                reconnect_effect: Effect::None,
             }
         }
 
@@ -735,7 +905,24 @@ mod tests {
             if let Some(written) = step.writes {
                 value.value = written;
             }
-            match step.effect {
+            self.run(step.effect);
+            CallbackReturn {
+                status: step.status,
+                request: step.request,
+            }
+        }
+
+        fn reconnect(&self) -> Result<(), EfiStatus> {
+            *self.reconnects.borrow_mut() += 1;
+            self.run(self.reconnect_effect);
+            self.reconnect_status.map_or(Ok(()), Err)
+        }
+    }
+
+    impl ScriptedDriver<'_> {
+        /// Runs `effect` on the stores of `routing` and `variables`.
+        fn run(&self, effect: Effect) {
+            match effect {
                 Effect::None => {}
                 Effect::Buffer => {
                     let header = self
@@ -758,6 +945,7 @@ mod tests {
                         VariableContents::new(NV_BS_RT, vec![1, 2]).expect("data"),
                     );
                 }
+                Effect::Password => overwrite_store_password(self.variables),
                 Effect::Outside => {
                     self.variables.variables.borrow_mut().insert(
                         key("Elsewhere", STORE_GUID),
@@ -765,16 +953,15 @@ mod tests {
                     );
                 }
             }
-            CallbackReturn {
-                status: step.status,
-                request: step.request,
-            }
         }
+    }
 
-        fn reconnect(&self) -> Result<(), EfiStatus> {
-            *self.reconnects.borrow_mut() += 1;
-            self.reconnect_status.map_or(Ok(()), Err)
-        }
+    /// Writes bytes 1 and 2 of the EFI variable store of `variables`, keeping its size.
+    fn overwrite_store_password(variables: &HeldVariables) {
+        variables.variables.borrow_mut().insert(
+            key("Store", STORE_GUID),
+            VariableContents::new(NV_BS_RT, vec![0x5A, 0xA5, 0xA5, 0x5A]).expect("data"),
+        );
     }
 
     struct Fixture {
@@ -811,12 +998,21 @@ mod tests {
         }
     }
 
-    fn access(fixture: &Fixture) -> FormSetAccess<'_, FakeRouting, HeldVariables> {
+    /// The stores and routing of `fixture`, with `variables`, its variables as withheld.
+    fn access<'a>(
+        fixture: &'a Fixture,
+        variables: &'a WithholdingVariables<&'a HeldVariables>,
+    ) -> FormSetAccess<'a, FakeRouting, &'a HeldVariables> {
         FormSetAccess {
             stores: fixture.stores.clone(),
             routing: &fixture.routing,
-            variables: &fixture.variables,
+            variables,
         }
+    }
+
+    /// The variables of `fixture` with no byte withheld.
+    fn nothing_withheld(fixture: &Fixture) -> WithholdingVariables<&HeldVariables> {
+        WithholdingVariables::new(&fixture.variables, WithheldBytes::default())
     }
 
     fn value(value: u64) -> IfrValue {
@@ -826,8 +1022,26 @@ mod tests {
         }
     }
 
+    fn get(driver: &ScriptedDriver<'_>, fixture: &Fixture, question: DriverQuestion) -> Retrieval {
+        retrieve(
+            driver,
+            question,
+            access(fixture, &nothing_withheld(fixture)),
+        )
+    }
+
+    fn set_of(
+        driver: &ScriptedDriver<'_>,
+        fixture: &Fixture,
+        question: DriverQuestion,
+        new: u64,
+    ) -> Change {
+        let variables = nothing_withheld(fixture);
+        change(driver, question, value(new), access(fixture, &variables))
+    }
+
     fn set(driver: &ScriptedDriver<'_>, fixture: &Fixture, new: u64) -> Change {
-        change(driver, question(true), value(new), access(fixture))
+        set_of(driver, fixture, question(true), new)
     }
 
     /// A value as the tests show it: its number.
@@ -852,7 +1066,7 @@ mod tests {
             },
         );
 
-        let got = retrieve(&driver, question(true), access(&fixture));
+        let got = get(&driver, &fixture, question(true));
 
         assert_eq!(got.value, Ok(value(2)), "RETRIEVE's value: {got:?}");
         assert_eq!(
@@ -888,7 +1102,7 @@ mod tests {
         for (status, want, want_actions) in cases {
             let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables)
                 .on(Retrieve, step(status));
-            let got = retrieve(&driver, question(true), access(&fixture));
+            let got = get(&driver, &fixture, question(true));
             assert_eq!(
                 got.value,
                 Err(want.to_string()),
@@ -919,8 +1133,8 @@ mod tests {
         let unsupported = ScriptedDriver::new(&fixture.routing, &fixture.variables)
             .on(Retrieve, step(EfiStatus::UNSUPPORTED));
 
-        let got = retrieve(&retrieved, with_read, access(&fixture));
-        let missing = retrieve(&unsupported, with_read, access(&fixture));
+        let got = get(&retrieved, &fixture, with_read);
+        let missing = get(&unsupported, &fixture, with_read);
 
         assert_eq!(got.value, Ok(value(2)), "RETRIEVE overrides READ");
         assert_eq!(
@@ -954,7 +1168,7 @@ mod tests {
                 },
             );
 
-            let got = retrieve(&driver, question(true), access(&fixture));
+            let got = get(&driver, &fixture, question(true));
 
             assert_eq!(
                 got.value,
@@ -963,6 +1177,10 @@ mod tests {
                      verified"
                 )),
                 "a RETRIEVE that writes {store}"
+            );
+            assert!(
+                !got.password_refused,
+                "a RETRIEVE that writes {store}: no password refusal"
             );
             assert_eq!(
                 fixture.routing.buffer(&header_of(&fixture.stores[0])),
@@ -995,7 +1213,7 @@ mod tests {
             },
         );
 
-        let got = retrieve(&driver, question(true), access(&fixture));
+        let got = get(&driver, &fixture, question(true));
 
         assert_eq!(got.value, Ok(value(3)), "a reset request keeps the value");
         assert_eq!(
@@ -1030,7 +1248,7 @@ mod tests {
         fixture.routing.extract_fails_from.set(Some(0));
         let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables);
 
-        let got = retrieve(&driver, question(true), access(&fixture));
+        let got = get(&driver, &fixture, question(true));
 
         assert!(
             got.value
@@ -1039,6 +1257,7 @@ mod tests {
             "the refusal: {got:?}"
         );
         assert!(driver.actions().is_empty(), "no Callback()");
+        assert!(!got.password_refused, "no password refusal");
     }
 
     #[test]
@@ -1048,7 +1267,7 @@ mod tests {
         fixture.routing.ticking.borrow_mut().push(1);
         let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables);
 
-        let got = retrieve(&driver, question(true), access(&fixture));
+        let got = get(&driver, &fixture, question(true));
 
         assert_eq!(got.value, Ok(value(0)), "a ticking setting is no change");
         assert_eq!(
@@ -1109,7 +1328,7 @@ mod tests {
                 },
             );
 
-            let got = retrieve(&driver, question(has_stores), access(&fixture));
+            let got = get(&driver, &fixture, question(has_stores));
 
             let case = format!("{request}, the FormSet declaring stores: {has_stores}");
             assert_eq!(got.value, want, "{case}");
@@ -1297,7 +1516,7 @@ mod tests {
                     ..step(EfiStatus::SUCCESS)
                 },
             );
-            let without = change(&driver, question(false), value(1), access(&fixture));
+            let without = set_of(&driver, &fixture, question(false), 1);
             assert!(
                 matches!(without.outcome, ChangeOutcome::Applied(_)),
                 "{request} without stores: {:?}",
@@ -1432,6 +1651,7 @@ mod tests {
             ),
             "the caught change"
         );
+        assert!(!changed.password_refused, "no password refusal");
         assert_eq!(
             fixture
                 .variables
@@ -1472,13 +1692,17 @@ mod tests {
 
         let changed = change(&driver, question(true), value(1), access);
 
+        // the driver's write cuts the withheld bytes off too
         assert_eq!(
             changed.outcome.text(show),
-            "not applied: the Callback sequence changed VarStore 0x0001, which holds a PASSWORD \
-             question; it was not restored, because SetVariable() writes every byte of the \
-             variable, the password's too, which uefisettings never writes; the driver's \
-             Callback(FORM_CLOSE) had already run, and any effect outside the FormSet's stores \
-             stays",
+            format!(
+                "not applied: the Callback sequence changed VarStore 0x0001, which holds a \
+                 PASSWORD question; it was not restored, because SetVariable() writes every byte \
+                 of the variable, the password's too, which uefisettings never writes; {}; the \
+                 driver's Callback(FORM_CLOSE) had already run, and any effect outside the \
+                 FormSet's stores stays",
+                overwritten("Store")
+            ),
             "the caught change"
         );
         assert!(
@@ -1498,6 +1722,383 @@ mod tests {
         );
     }
 
+    /// The variables of `fixture` with `bytes` of `name` withheld, as a PASSWORD question's.
+    fn withholding<'a>(
+        fixture: &'a Fixture,
+        name: &str,
+        bytes: Range<usize>,
+    ) -> WithholdingVariables<&'a HeldVariables> {
+        let mut withheld = WithheldBytes::default();
+        withheld.insert(key(name, STORE_GUID), bytes);
+        WithholdingVariables::new(&fixture.variables, withheld)
+    }
+
+    /// The refusal of a Callback sequence that changed the withheld bytes of `name`.
+    fn overwritten(name: &str) -> String {
+        format!(
+            "the Callback sequence changed the password bytes of EFI variable {}; they were not \
+             restored, as uefisettings never writes a password byte",
+            key(name, STORE_GUID)
+        )
+    }
+
+    #[test]
+    fn set_refuses_a_callback_that_overwrites_withheld_bytes_only() {
+        let cases = [
+            (
+                "withheld bytes overwritten",
+                Effect::Password,
+                format!(
+                    "not applied: {}; the driver's Callback(FORM_CLOSE) had already run, and any \
+                     effect outside the FormSet's stores stays",
+                    overwritten("Store")
+                ),
+            ),
+            ("withheld bytes kept", Effect::None, "applied".to_string()),
+        ];
+        for (name, effect, want) in cases {
+            let password = matches!(effect, Effect::Password);
+            let fixture = fixture();
+            let variables = withholding(&fixture, "Store", 1..3);
+            let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables).on(
+                Changed,
+                Step {
+                    effect,
+                    ..step(EfiStatus::SUCCESS)
+                },
+            );
+
+            let changed = change(
+                &driver,
+                question(true),
+                value(1),
+                access(&fixture, &variables),
+            );
+
+            assert_eq!(changed.outcome.text(show), want, "{name}: the outcome");
+            assert_eq!(
+                changed.password_refused, password,
+                "{name}: the password refusal"
+            );
+            assert!(
+                changed.notes.is_empty(),
+                "{name}: no note, as no byte that a read shows changed: {:?}",
+                changed.notes
+            );
+            assert!(
+                fixture.variables.set.borrow().is_empty()
+                    && fixture.variables.deleted.borrow().is_empty(),
+                "{name}: no SetVariable() or deletion"
+            );
+        }
+    }
+
+    #[test]
+    fn get_refuses_a_retrieve_that_overwrites_withheld_bytes() {
+        let fixture = fixture();
+        let variables = withholding(&fixture, "Store", 1..3);
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables).on(
+            Retrieve,
+            Step {
+                writes: Some(3),
+                effect: Effect::Password,
+                ..step(EfiStatus::SUCCESS)
+            },
+        );
+
+        let got = retrieve(&driver, question(true), access(&fixture, &variables));
+
+        assert_eq!(got.value, Err(overwritten("Store")), "the caught overwrite");
+        assert!(got.password_refused, "a password refusal");
+        assert_eq!(
+            driver.actions(),
+            [FormOpen, Retrieve, FormClose],
+            "the whole sequence ran"
+        );
+    }
+
+    #[test]
+    fn set_refuses_a_callback_that_creates_a_withheld_variable() {
+        let fixture = fixture();
+        let variables = withholding(&fixture, "Elsewhere", 0..usize::MAX);
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables).on(
+            Changed,
+            Step {
+                effect: Effect::Outside,
+                ..step(EfiStatus::SUCCESS)
+            },
+        );
+
+        let changed = change(
+            &driver,
+            question(true),
+            value(1),
+            access(&fixture, &variables),
+        );
+
+        assert_eq!(
+            changed.outcome.text(show),
+            format!(
+                "not applied: {}; the driver's Callback(FORM_CLOSE) had already run, and any \
+                 effect outside the FormSet's stores stays",
+                overwritten("Elsewhere")
+            ),
+            "the caught creation"
+        );
+        assert_eq!(
+            changed.notes,
+            [format!(
+                "EFI variables changed: {} (created)",
+                key("Elsewhere", STORE_GUID)
+            )],
+            "the listed variable"
+        );
+    }
+
+    #[test]
+    fn a_withheld_variable_that_cannot_be_read_refuses_before_any_callback() {
+        let fixture = fixture();
+        // metadata that metadata_end refuses hides where the value, and its password, starts
+        fixture.variables.variables.borrow_mut().insert(
+            key("Elsewhere", STORE_GUID),
+            VariableContents::new(
+                NV_BS_RT | VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS,
+                vec![0x5A],
+            )
+            .expect("data"),
+        );
+        let variables = withholding(&fixture, "Elsewhere", 0..1);
+        let refusal = format!(
+            "cannot compare the password bytes of EFI variable {} across the Callback sequence: ",
+            key("Elsewhere", STORE_GUID)
+        );
+
+        let setter = ScriptedDriver::new(&fixture.routing, &fixture.variables);
+        let changed = change(
+            &setter,
+            question(true),
+            value(1),
+            access(&fixture, &variables),
+        );
+        let getter = ScriptedDriver::new(&fixture.routing, &fixture.variables);
+        let got = retrieve(&getter, question(true), access(&fixture, &variables));
+
+        assert!(
+            matches!(&changed.outcome, ChangeOutcome::Refused(reason)
+                if reason.starts_with(&refusal)),
+            "set: {}",
+            changed.outcome.text(show)
+        );
+        assert!(
+            matches!(&got.value, Err(reason) if reason.starts_with(&refusal)),
+            "get: {:?}",
+            got.value
+        );
+        assert!(
+            setter.actions().is_empty() && getter.actions().is_empty(),
+            "no Callback()"
+        );
+        assert!(
+            !changed.password_refused && !got.password_refused,
+            "no password refusal, as no driver code ran"
+        );
+    }
+
+    #[test]
+    fn a_reconnection_is_compared_again_and_listed() {
+        let reconnect = Step {
+            request: ActionRequest::RECONNECT,
+            ..step(EfiStatus::SUCCESS)
+        };
+        let reconnected =
+            "reconnected the driver's controller (EFI_BROWSER_ACTION_REQUEST_RECONNECT)"
+                .to_string();
+        let failed = "the reconnection that EFI_BROWSER_ACTION_REQUEST_RECONNECT asks for failed: \
+                      EFI_NOT_FOUND"
+            .to_string();
+        let overwritten_by_reconnection = format!(
+            "applied; then the reconnection that EFI_BROWSER_ACTION_REQUEST_RECONNECT asks for \
+             changed the password bytes of EFI variable {}; they were not restored, as \
+             uefisettings never writes a password byte",
+            key("Store", STORE_GUID)
+        );
+        let created = format!(
+            "EFI variables changed: {} (created)",
+            key("Elsewhere", STORE_GUID)
+        );
+        let cases = [
+            (
+                "withheld bytes overwritten",
+                Effect::Password,
+                None,
+                overwritten_by_reconnection.clone(),
+                vec![reconnected.clone()],
+            ),
+            (
+                "withheld bytes overwritten by a failed reconnection",
+                Effect::Password,
+                Some(EfiStatus::NOT_FOUND),
+                overwritten_by_reconnection,
+                vec![failed],
+            ),
+            (
+                "a variable created",
+                Effect::Outside,
+                None,
+                "applied".to_string(),
+                vec![reconnected.clone(), created],
+            ),
+            (
+                "nothing written",
+                Effect::None,
+                None,
+                "applied".to_string(),
+                vec![reconnected],
+            ),
+        ];
+        for (name, effect, status, want, want_notes) in cases {
+            let password = matches!(effect, Effect::Password);
+            let fixture = fixture();
+            let variables = withholding(&fixture, "Store", 1..3);
+            let driver = ScriptedDriver {
+                reconnect_effect: effect,
+                reconnect_status: status,
+                ..ScriptedDriver::new(&fixture.routing, &fixture.variables).on(Changed, reconnect)
+            };
+
+            let changed = change(
+                &driver,
+                question(true),
+                value(1),
+                access(&fixture, &variables),
+            );
+
+            assert_eq!(
+                *driver.reconnects.borrow(),
+                1,
+                "{name}: the reconnection ran"
+            );
+            assert_eq!(changed.outcome.text(show), want, "{name}: the outcome");
+            assert_eq!(
+                changed.password_refused, password,
+                "{name}: the password refusal"
+            );
+            assert_eq!(changed.notes, want_notes, "{name}: the notes");
+        }
+    }
+
+    /// The routing of a fixture whose ExtractConfig()s but the first `skipped` also write bytes 1
+    /// and 2 of its EFI variable store, as a driver's ExtractConfig() may write its variables.
+    struct VariableWritingRouting<'a> {
+        routing: &'a FakeRouting,
+        variables: &'a HeldVariables,
+        skipped: Cell<usize>,
+    }
+
+    impl ConfigRouting for VariableWritingRouting<'_> {
+        fn extract_config(
+            &self,
+            request: &ConfigRequest,
+        ) -> Result<MultiConfigAltResp, ConfigRoutingError> {
+            match self.skipped.get() {
+                0 => overwrite_store_password(self.variables),
+                skipped => self.skipped.set(skipped - 1),
+            }
+            self.routing.extract_config(request)
+        }
+
+        fn route_config(&self, resp: &ConfigResp) -> Result<(), ConfigRoutingError> {
+            self.routing.route_config(resp)
+        }
+    }
+
+    #[test]
+    fn set_refuses_an_extract_config_that_overwrites_withheld_bytes() {
+        let fixture = fixture();
+        let variables = withholding(&fixture, "Store", 1..3);
+        let routing = VariableWritingRouting {
+            routing: &fixture.routing,
+            variables: &fixture.variables,
+            skipped: Cell::new(0),
+        };
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables);
+        let access = FormSetAccess {
+            stores: fixture.stores.clone(),
+            routing: &routing,
+            variables: &variables,
+        };
+
+        let changed = change(&driver, question(true), value(1), access);
+
+        assert_eq!(
+            changed.outcome.text(show),
+            format!(
+                "not applied: {}; the driver's Callback(FORM_CLOSE) had already run, and any \
+                 effect outside the FormSet's stores stays",
+                overwritten("Store")
+            ),
+            "the overwrite by the stores' first read"
+        );
+    }
+
+    /// Baseline::take reads the Buffer store of fixture() twice, so that its check reads it the
+    /// third time, after the Callback()s.
+    const BASELINE_READS: usize = 2;
+
+    #[test]
+    fn set_refuses_an_overwrite_by_the_stores_check() {
+        let fixture = fixture();
+        let variables = withholding(&fixture, "Store", 1..3);
+        let routing = VariableWritingRouting {
+            routing: &fixture.routing,
+            variables: &fixture.variables,
+            skipped: Cell::new(BASELINE_READS),
+        };
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables);
+        let access = FormSetAccess {
+            stores: fixture.stores.clone(),
+            routing: &routing,
+            variables: &variables,
+        };
+
+        let changed = change(&driver, question(true), value(1), access);
+
+        assert_eq!(
+            changed.outcome.text(show),
+            format!(
+                "not applied: {}; the driver's Callback(FORM_CLOSE) had already run, and any \
+                 effect outside the FormSet's stores stays",
+                overwritten("Store")
+            ),
+            "the overwrite by the check's read, after the Callback()s"
+        );
+    }
+
+    #[test]
+    fn get_refuses_an_overwrite_by_the_stores_check() {
+        let fixture = fixture();
+        let variables = withholding(&fixture, "Store", 1..3);
+        let routing = VariableWritingRouting {
+            routing: &fixture.routing,
+            variables: &fixture.variables,
+            skipped: Cell::new(BASELINE_READS),
+        };
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables);
+        let access = FormSetAccess {
+            stores: fixture.stores.clone(),
+            routing: &routing,
+            variables: &variables,
+        };
+
+        let got = retrieve(&driver, question(true), access);
+
+        assert_eq!(
+            got.value,
+            Err(overwritten("Store")),
+            "the overwrite by the check's read, after the Callback()s"
+        );
+    }
+
     #[test]
     fn set_refuses_before_any_callback_when_a_store_is_unreadable() {
         let fixture = fixture();
@@ -1513,6 +2114,185 @@ mod tests {
             changed.outcome
         );
         assert!(driver.actions().is_empty(), "no Callback()");
+        assert!(!changed.password_refused, "no password refusal");
+    }
+
+    /// The access of `fixture` through `routing`, whose ExtractConfig()s overwrite the withheld
+    /// bytes of Store, and whose second ExtractConfig() fails, so that Baseline::take fails after
+    /// driver code changed a password.
+    fn baseline_failing_access<'a>(
+        fixture: &'a Fixture,
+        routing: &'a VariableWritingRouting<'a>,
+        variables: &'a WithholdingVariables<&'a HeldVariables>,
+    ) -> FormSetAccess<'a, VariableWritingRouting<'a>, &'a HeldVariables> {
+        fixture.routing.extract_fails_from.set(Some(1));
+        FormSetAccess {
+            stores: fixture.stores.clone(),
+            routing,
+            variables,
+        }
+    }
+
+    /// set, whose stores' first read overwrites withheld bytes and whose second read fails,
+    /// refuses, and its refusal names the password change.
+    #[test]
+    fn set_names_a_password_change_when_the_baseline_fails() {
+        let fixture = fixture();
+        let variables = withholding(&fixture, "Store", 1..3);
+        let routing = VariableWritingRouting {
+            routing: &fixture.routing,
+            variables: &fixture.variables,
+            skipped: Cell::new(0),
+        };
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables);
+
+        let changed = change(
+            &driver,
+            question(true),
+            value(1),
+            baseline_failing_access(&fixture, &routing, &variables),
+        );
+
+        let text = changed.outcome.text(show);
+        assert!(
+            matches!(changed.outcome, ChangeOutcome::Refused(_)),
+            "set refuses: {text}"
+        );
+        assert!(driver.actions().is_empty(), "no Callback()");
+        assert!(
+            text.contains(&overwritten("Store")),
+            "the refusal names the password change: {text}"
+        );
+        assert!(changed.password_refused, "a password refusal");
+    }
+
+    /// get, as set_names_a_password_change_when_the_baseline_fails sets up, gives no value, and its
+    /// reason names the password change.
+    #[test]
+    fn get_names_a_password_change_when_the_baseline_fails() {
+        let fixture = fixture();
+        let variables = withholding(&fixture, "Store", 1..3);
+        let routing = VariableWritingRouting {
+            routing: &fixture.routing,
+            variables: &fixture.variables,
+            skipped: Cell::new(0),
+        };
+        let driver = ScriptedDriver::new(&fixture.routing, &fixture.variables);
+
+        let got = retrieve(
+            &driver,
+            question(true),
+            baseline_failing_access(&fixture, &routing, &variables),
+        );
+
+        assert!(got.value.is_err(), "get gives no value: {:?}", got.value);
+        assert!(driver.actions().is_empty(), "no Callback()");
+        assert!(
+            matches!(&got.value, Err(reason) if reason.contains(&overwritten("Store"))),
+            "the reason names the password change: {:?}",
+            got.value
+        );
+        assert!(got.password_refused, "a password refusal");
+    }
+
+    /// get's answer is the value, or ValueUnavailable with why there is none, then the notes; get
+    /// fails, naming the question, where driver code changed password bytes.
+    #[test]
+    fn get_fails_where_driver_code_changed_password_bytes() {
+        let refusal = overwritten("Store");
+        let cases = [
+            ("a value", Ok(value(1)), false, Ok("1 <a note>".to_owned())),
+            (
+                "no value",
+                Err("a store changed".to_owned()),
+                false,
+                Ok("<ValueUnavailable: a store changed> <a note>".to_owned()),
+            ),
+            (
+                "changed password bytes",
+                Err(refusal.clone()),
+                true,
+                Err(format!("cannot get question \"Q\": {refusal}")),
+            ),
+        ];
+        for (case, value, password_refused, want) in cases {
+            let retrieval = Retrieval {
+                value,
+                password_refused,
+                notes: vec!["a note".to_owned()],
+                calls: Vec::new(),
+            };
+
+            let answer = retrieval.answer("Q", show);
+
+            let refused = answer
+                .as_ref()
+                .is_err_and(|error| error.is::<PasswordBytesRefusal>());
+            assert_eq!(
+                answer.map_err(|error| error.to_string()),
+                want,
+                "{case}: the answer"
+            );
+            assert_eq!(refused, password_refused, "{case}: a PasswordBytesRefusal");
+        }
+    }
+
+    /// set's annotation where the change applied; else set's refusal, a PasswordBytesRefusal where
+    /// driver code changed password bytes, also after an applied change.
+    #[test]
+    fn set_refuses_as_password_bytes_changed_where_driver_code_changed_them() {
+        let refusal = overwritten("Store");
+        let cases = [
+            (
+                "applied",
+                ChangeOutcome::Applied(ReadBack::Same),
+                false,
+                Ok(" <applied; a note>".to_owned()),
+            ),
+            (
+                "refused",
+                ChangeOutcome::Refused("a store changed".to_owned()),
+                false,
+                Err("cannot set question \"Q\": a store changed; a note".to_owned()),
+            ),
+            (
+                "changed password bytes",
+                ChangeOutcome::Refused(refusal.clone()),
+                true,
+                Err(format!("cannot set question \"Q\": {refusal}; a note")),
+            ),
+            (
+                "password bytes changed after an applied change",
+                ChangeOutcome::AppliedThenRefused {
+                    read_back: ReadBack::Same,
+                    reason: refusal.clone(),
+                },
+                true,
+                Err(format!(
+                    "cannot set question \"Q\": applied; then {refusal}; a note"
+                )),
+            ),
+        ];
+        for (case, outcome, password_refused, want) in cases {
+            let changed = Change {
+                outcome,
+                password_refused,
+                notes: vec!["a note".to_owned()],
+                calls: Vec::new(),
+            };
+
+            let annotation = changed.annotation("Q", show);
+
+            let refused = annotation
+                .as_ref()
+                .is_err_and(|error| error.is::<PasswordBytesRefusal>());
+            assert_eq!(
+                annotation.map_err(|error| error.to_string()),
+                want,
+                "{case}: the annotation"
+            );
+            assert_eq!(refused, password_refused, "{case}: a PasswordBytesRefusal");
+        }
     }
 
     #[test]
@@ -1524,7 +2304,7 @@ mod tests {
             ..question(true)
         };
 
-        let changed = change(&driver, with_write, value(1), access(&fixture));
+        let changed = set_of(&driver, &fixture, with_write, 1);
 
         assert_eq!(
             changed.outcome,
