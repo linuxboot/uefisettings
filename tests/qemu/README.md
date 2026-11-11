@@ -528,6 +528,17 @@ refuses them before any write, as its efivarfs lacks the attribute, and the firm
 EFI_INVALID_PARAMETER, as EDK2's variable driver takes no such attribute; the variable stays
 absent.
 
+`shell-auth3-checks`, with `devices=virtio-rng`, seeds the variables of
+[`vars/enhanced-auth-87.json`](vars/enhanced-auth-87.json) on the User Mode firmware, among them
+`EnhancedAuthNonce`, whose metadata holds a nonce, and checks that `uefisettings.efi variable
+write-signed` refuses, before it seeds or writes, what the firmware would refuse against the stored
+metadata (UEFI 2.11 §8.2.3, §8.2.5): a TimeStamp that is not later, other attributes, another Type,
+metadata of Version 2, the variable's own nonce, a `--current-nonce` other than its own, and one for
+a variable that does not exist. A later TimeStamp, and another nonce, which signs the variable's own
+as the current one, reach SetVariable(), which refuses them with EFI_INVALID_PARAMETER as above;
+every variable stays as seeded. `variable info` shows the metadata of `EnhancedAuthNonce` and the
+refusal of that of `EnhancedAuthRefused`.
+
 `shell-devdb-setup` checks, in Setup Mode, that `uefisettings.efi` refuses an append to devdb, the
 device signature database of UEFI 2.11 §32.6.3, signed with PK's key, before any write, and
 appends with `--i-am-fine-to-brick-this-system`, which creates devdb; that the firmware then refuses

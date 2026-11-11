@@ -154,5 +154,6 @@ shell-sign-user	-	-	shell:sign-user	firmware=secboot-user devices=virtio-rng
 shell-sign-no-rng	-	-	shell:sign-no-rng	firmware=secboot-user
 sign-setup	-	-	write_signed/signing_in_setup	firmware=secboot-setup
 shell-sign-setup	-	-	shell:sign-setup	firmware=secboot-setup devices=virtio-rng
+shell-auth3-checks	-	enhanced-auth-87.json	shell:auth3-checks	firmware=secboot-user devices=virtio-rng
 shell-devdb-setup	-	-	shell:devdb-setup,write_signed/devdb_appended_by_the_shell	firmware=secboot-setup devices=virtio-rng
 staged-set	/publish-hiidb.efi callback-forms;/publish-hiidb.efi rt-data	-	staged_set/stage_two_sets,rebooting-shell:staged-set-applied,staged_set/after_the_applied_boot,rebooting-shell:staged-set-not-started,staged_set/after_the_boot_without_its_image,rebooting-shell:staged-set-interrupted,staged_set/after_the_interrupted_boot	devices=esp-disk
