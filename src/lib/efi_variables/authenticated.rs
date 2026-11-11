@@ -30,6 +30,7 @@ pub(crate) mod signing;
 
 use std::fmt;
 
+use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
@@ -41,8 +42,12 @@ pub use self::signing::SignatureDigest;
 use self::signing::Signer;
 pub use self::signing::TimeStamp;
 pub use self::signing::TimeStampError;
+use super::enhanced_authenticated::authentication_3_metadata;
 use super::enhanced_authenticated::authentication_3_value;
 use super::enhanced_authenticated::Freshness;
+use super::enhanced_authenticated::MetadataRefusal;
+use super::enhanced_authenticated::Nonce;
+use super::enhanced_authenticated::StoredFreshness;
 use super::globals::EFI_DEVICE_SECURITY_DATABASE;
 use super::globals::EFI_GLOBAL_VARIABLE;
 use super::globals::EFI_IMAGE_SECURITY_DATABASE;
@@ -196,7 +201,8 @@ pub(crate) struct EnhancedSignedWrite<'a> {
 
 /// Signs `write` with `signer` into an EFI_VARIABLE_AUTHENTICATION_3 (UEFI 2.11 §8.2.5) that
 /// carries the NewCert of `new_authority` if given, blinded over a ChaCha20Rng that `seed` seeds,
-/// and writes it, then the data. It refuses what write_enhanced refuses before it seeds, but its
+/// and writes it, then the data. It refuses what write_enhanced refuses, and what
+/// checked_freshness refuses against the variable, before it seeds, but its
 /// unsafe operations, which it checks after it signs, and returns as write_enhanced does; a
 /// failing seed source refuses before any write.
 pub(crate) fn sign_and_write_enhanced(
@@ -213,12 +219,16 @@ pub(crate) fn sign_and_write_enhanced(
     )?;
     refuse_enhanced_write(variables, write.key)?;
     refuse_enhanced_deletion(write.key, write.data, new_authority.is_some())?;
+    let stored = variables
+        .variable_data(write.key)
+        .with_context(|| format!("cannot check the write against EFI variable {}", write.key))?;
+    let freshness = checked_freshness(write.key, attributes, write.freshness, stored.as_ref())?;
     let mut rng = seeded_rng(seed)?;
     let payload = signer.authentication_3(
         &EnhancedWrite {
             key: write.key,
             attributes,
-            freshness: write.freshness,
+            freshness: &freshness,
             data: write.data,
         },
         new_authority,
@@ -226,6 +236,81 @@ pub(crate) fn sign_and_write_enhanced(
     )?;
     let contents = VariableContents::new(attributes, payload)?;
     write_checked(variables, write.key, &contents, write.unsafe_operations)
+}
+
+/// `freshness`, checked against `stored`, the variable `key` as GetVariable() returns it (UEFI
+/// 2.11 §8.2.1), before a write with `attributes`, as the firmware checks it: the same attributes
+/// but EFI_VARIABLE_APPEND_WRITE (§8.2.3), the same Type, a later TimeStamp and a nonce other
+/// than the variable's, unless all zero (§8.2.5). A nonce update signs the variable's nonce, the
+/// current one if not given (§8.2.5 step 3c); a create signs none.
+fn checked_freshness(
+    key: &VariableKey,
+    attributes: VariableAttributes,
+    freshness: &Freshness,
+    stored: Option<&VariableContents>,
+) -> Result<Freshness> {
+    let Some(stored) = stored else {
+        return match freshness.current_nonce() {
+            Some(_) => Err(SignedWriteRefusal::CurrentNonceOfCreate(key.clone()).into()),
+            None => Ok(freshness.clone()),
+        };
+    };
+    let held = stored
+        .attributes()
+        .difference(VariableAttributes::APPEND_WRITE);
+    let written = attributes.difference(VariableAttributes::APPEND_WRITE);
+    if held != written {
+        return Err(SignedWriteRefusal::OtherAttributes {
+            key: key.clone(),
+            held,
+            written,
+        }
+        .into());
+    }
+    let metadata = authentication_3_metadata(stored.data()).map_err(|refusal| {
+        SignedWriteRefusal::StoredMetadata {
+            key: key.clone(),
+            refusal,
+        }
+    })?;
+    match (freshness, metadata.freshness) {
+        (Freshness::TimeStamp(time_stamp), StoredFreshness::TimeStamp(time)) => {
+            let held =
+                TimeStamp::from_efi_time(time).ok_or(SignedWriteRefusal::StoredMetadata {
+                    key: key.clone(),
+                    refusal: MetadataRefusal::TimeStamp,
+                })?;
+            match *time_stamp > held {
+                true => Ok(freshness.clone()),
+                false => Err(SignedWriteRefusal::NotLater {
+                    key: key.clone(),
+                    held,
+                    written: *time_stamp,
+                }
+                .into()),
+            }
+        }
+        (Freshness::Nonce { nonce, current }, StoredFreshness::Nonce(held)) => {
+            let asks_the_firmware = nonce.as_ref().iter().all(|&byte| byte == 0);
+            if nonce.as_ref() == held.as_slice() && !asks_the_firmware {
+                return Err(SignedWriteRefusal::HeldNonce(key.clone()).into());
+            }
+            match current {
+                None => Ok(Freshness::Nonce {
+                    nonce: nonce.clone(),
+                    current: Some(Nonce::new(held)?),
+                }),
+                Some(current) if current.as_ref() == held.as_slice() => Ok(freshness.clone()),
+                Some(_) => Err(SignedWriteRefusal::OtherCurrentNonce(key.clone()).into()),
+            }
+        }
+        (Freshness::Nonce { .. }, StoredFreshness::TimeStamp(_)) => {
+            Err(SignedWriteRefusal::HeldTimeStampType(key.clone()).into())
+        }
+        (Freshness::TimeStamp(_), StoredFreshness::Nonce(_)) => {
+            Err(SignedWriteRefusal::HeldNonceType(key.clone()).into())
+        }
+    }
 }
 
 /// Refuses an EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS write of `key` through Linux's
@@ -404,6 +489,58 @@ enum SignedWriteRefusal {
     )]
     EnhancedDelete(VariableKey),
     #[error(
+        "EFI variable {key} has the attributes {held}, not {written}: SetVariable() refuses a \
+         rewrite with attributes other than these but APPEND_WRITE with EFI_INVALID_PARAMETER \
+         (UEFI 2.11 section 8.2.3)"
+    )]
+    OtherAttributes {
+        key: VariableKey,
+        held: VariableAttributes,
+        written: VariableAttributes,
+    },
+    #[error(
+        "EFI variable {key} holds EFI_VARIABLE_AUTHENTICATION_3 metadata that uefisettings does \
+         not take, so it cannot check the write against it: {refusal}"
+    )]
+    StoredMetadata {
+        key: VariableKey,
+        refusal: MetadataRefusal,
+    },
+    #[error(
+        "EFI variable {0} holds an EFI_VARIABLE_AUTHENTICATION_3 of Type TIMESTAMP (1), not NONCE \
+         (2), and the firmware verifies that the Types match (UEFI 2.11 section 8.2.5)"
+    )]
+    HeldTimeStampType(VariableKey),
+    #[error(
+        "EFI variable {0} holds an EFI_VARIABLE_AUTHENTICATION_3 of Type NONCE (2), not TIMESTAMP \
+         (1), and the firmware verifies that the Types match (UEFI 2.11 section 8.2.5)"
+    )]
+    HeldNonceType(VariableKey),
+    #[error(
+        "the TimeStamp {written} is not later than {held}, that of EFI variable {key}, as the \
+         firmware requires (UEFI 2.11 section 8.2.5)"
+    )]
+    NotLater {
+        key: VariableKey,
+        held: TimeStamp,
+        written: TimeStamp,
+    },
+    #[error(
+        "the nonce is the one that EFI variable {0} holds, for which SetVariable() returns \
+         EFI_INVALID_PARAMETER (UEFI 2.11 sections 8.2.3 and 8.2.5)"
+    )]
+    HeldNonce(VariableKey),
+    #[error(
+        "the current nonce given is not the one that EFI variable {0} holds, so the firmware \
+         would not verify the signature over it (UEFI 2.11 section 8.2.5)"
+    )]
+    OtherCurrentNonce(VariableKey),
+    #[error(
+        "EFI variable {0} does not exist, so its create signs no current nonce (UEFI 2.11 section \
+         8.2.5), and the firmware would not verify the signature over the one given"
+    )]
+    CurrentNonceOfCreate(VariableKey),
+    #[error(
         "the payload holds {0} bytes, fewer than the {} of the TimeStamp and the AuthInfo header \
          of an EFI_VARIABLE_AUTHENTICATION_2 (UEFI 2.11 section 8.2.3)",
         EFI_TIME_SIZE + CERTIFICATE_HEADER_SIZE
@@ -547,6 +684,9 @@ mod tests {
 
     use super::*;
     use crate::efi_variables::enhanced_authenticated::authentication_3_payload;
+    use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata;
+    use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata_of;
+    use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
     use crate::efi_variables::enhanced_authenticated::fixture::win_certificate_of;
     use crate::efi_variables::enhanced_authenticated::Nonce;
     use crate::efi_variables::globals::tests::key;
@@ -1247,16 +1387,20 @@ mod tests {
         }
     }
 
-    /// VariableData whose every read fails, and which hold what is set.
-    struct UnreadableVariables(HeldVariables);
+    /// VariableData that hold what HeldVariables hold, but whose read of the variable named the
+    /// second field fails.
+    struct UnreadableVariable(HeldVariables, &'static str);
 
-    impl VariableData for UnreadableVariables {
+    impl VariableData for UnreadableVariable {
         fn interface(&self) -> VariableInterface {
             self.0.interface()
         }
 
         fn variable_data(&self, key: &VariableKey) -> Result<Option<VariableContents>> {
-            Err(anyhow::anyhow!("cannot read EFI variable {key}"))
+            match key.name == self.1 {
+                true => Err(anyhow::anyhow!("cannot read EFI variable {key}")),
+                false => self.0.variable_data(key),
+            }
         }
 
         fn set_variable(&self, key: &VariableKey, contents: &VariableContents) -> Result<()> {
@@ -1268,7 +1412,7 @@ mod tests {
         }
     }
 
-    impl RecordsSets for UnreadableVariables {
+    impl RecordsSets for UnreadableVariable {
         fn sets(&self) -> Vec<VariableKey> {
             self.0.sets()
         }
@@ -1286,7 +1430,7 @@ mod tests {
             key("devdb", DEVDB_VENDOR),
         ] {
             check_setup_mode_writes(
-                || UnreadableVariables(HeldVariables::default()),
+                || UnreadableVariable(HeldVariables::default(), SETUP_MODE),
                 &key,
                 SetupModeReading::Unreadable(reason.to_owned()),
                 "SetupMode could not be read",
@@ -1913,7 +2057,8 @@ mod tests {
 
     /// sign_and_write_enhanced writes, with ENHANCED_AUTHENTICATED_ACCESS added, the
     /// EFI_VARIABLE_AUTHENTICATION_3 that the key signs, with the NewCert of a new authority if
-    /// given, and then the data, which a certificate-only update leaves empty.
+    /// given, and then the data, which a certificate-only update leaves empty; a nonce update
+    /// updates a variable that holds the current nonce.
     #[test]
     fn sign_and_write_enhanced_writes_what_the_key_signs() {
         let signed = key("Signed", VENDOR);
@@ -1931,14 +2076,32 @@ mod tests {
             SignatureDigest::Sha256,
         )
         .expect("the new authority");
+        let current = nonce_metadata_of(&[7; 3], &[0], 60);
         let cases = [
-            ("timestamp", &timestamp, VALUE, None),
-            ("nonce update", &update, VALUE, None),
-            ("new authority", &update, VALUE, Some(&authority)),
-            ("certificate only", &update, &[][..], Some(&authority)),
+            ("timestamp", &timestamp, None, VALUE, None),
+            ("nonce update", &update, Some(&current), VALUE, None),
+            (
+                "new authority",
+                &update,
+                Some(&current),
+                VALUE,
+                Some(&authority),
+            ),
+            (
+                "certificate only",
+                &update,
+                Some(&current),
+                &[][..],
+                Some(&authority),
+            ),
         ];
-        for (case, freshness, data, new_authority) in cases {
-            let variables = firmware(Some(&[0]));
+        for (case, freshness, stored, data, new_authority) in cases {
+            let variables = match stored {
+                Some(metadata) => {
+                    holding(firmware(Some(&[0])), &signed, NV_BS_RT_ENHANCED, metadata)
+                }
+                None => firmware(Some(&[0])),
+            };
 
             sign_and_write_enhanced(
                 &variables,
@@ -2058,6 +2221,411 @@ mod tests {
         }
     }
 
+    /// `variables` holding, as `key` with `attributes`, `metadata` and then VALUE, as GetVariable()
+    /// returns a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 §8.2.1).
+    fn holding(
+        variables: HeldVariables,
+        key: &VariableKey,
+        attributes: VariableAttributes,
+        metadata: &[u8],
+    ) -> HeldVariables {
+        let contents =
+            VariableContents::new(attributes, [metadata, VALUE].concat()).expect("hold data");
+        variables
+            .variables
+            .borrow_mut()
+            .insert(key.clone(), contents);
+        variables
+    }
+
+    /// The test nonce of `bytes`.
+    fn test_nonce(bytes: &[u8]) -> Nonce {
+        Nonce::new(bytes.to_vec()).expect("a test nonce")
+    }
+
+    /// The metadata of a nonce-type variable whose current nonce is 8 bytes of 0xA5.
+    fn stored_nonce_metadata() -> Vec<u8> {
+        nonce_metadata()
+    }
+
+    /// sign_and_write_enhanced checks the write against the variable before it seeds, as
+    /// GetVariable() returns its attributes and metadata (UEFI 2.11 §8.2.1): it refuses other
+    /// attributes than the variable's but EFI_VARIABLE_APPEND_WRITE (§8.2.3), metadata that it does
+    /// not take, another Type, a TimeStamp that is not later, with APPEND_WRITE too, which §8.2.5
+    /// does not exempt, and a nonce that is the variable's unless all zero (§8.2.5), a current
+    /// nonce other than the variable's, and one for a variable that does not exist; a write that it
+    /// takes, APPEND_WRITE too, then fails at the seed, and nothing is written.
+    #[test]
+    fn sign_and_write_enhanced_checks_the_stored_variable_before_seeding() {
+        let signed = key("Signed", VENDOR);
+        let time = |text: &str| Freshness::TimeStamp(text.parse().expect("a test TimeStamp"));
+        let nonce = |bytes: &[u8], current: Option<&[u8]>| Freshness::Nonce {
+            nonce: test_nonce(bytes),
+            current: current.map(test_nonce),
+        };
+        let stored_time = timestamp_metadata();
+        let stored_nonce = stored_nonce_metadata();
+        let stored_zero = nonce_metadata_of(&[0; 8], &[], 64);
+        let stored_part_zero = nonce_metadata_of(&[0, 0xA5, 0, 0], &[], 60);
+        let mut other_version = timestamp_metadata();
+        *other_version.first_mut().expect("a Version") = 2;
+        let nv_bs_enhanced = VariableAttributes::NON_VOLATILE
+            | VariableAttributes::BOOTSERVICE_ACCESS
+            | VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS;
+        let unseeded =
+            "cannot seed RSA blinding from EFI_RNG_PROTOCOL: no handle has it: NOT_FOUND"
+                .to_owned();
+        let cases = [
+            (
+                "a create",
+                None,
+                time(signing::tests::TIME),
+                unseeded.clone(),
+            ),
+            (
+                "a later TimeStamp",
+                Some((NV_BS_RT_ENHANCED, &stored_time)),
+                time(signing::tests::TIME),
+                unseeded.clone(),
+            ),
+            (
+                "another nonce, the current one by default",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[9; 5], None),
+                unseeded.clone(),
+            ),
+            (
+                "another nonce and the current one",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[9; 5], Some(&[0xA5; 8])),
+                unseeded.clone(),
+            ),
+            (
+                "an all-zero nonce of the current one's size",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[0; 8], None),
+                unseeded.clone(),
+            ),
+            (
+                "an all-zero nonce, which asks the firmware for one, as the variable's",
+                Some((NV_BS_RT_ENHANCED, &stored_zero)),
+                nonce(&[0; 8], None),
+                unseeded.clone(),
+            ),
+            (
+                "the start of the variable's nonce",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[0xA5; 4], None),
+                unseeded.clone(),
+            ),
+            (
+                "other attributes",
+                Some((nv_bs_enhanced, &stored_time)),
+                time(signing::tests::TIME),
+                format!(
+                    "EFI variable {signed} has the attributes NON_VOLATILE | BOOTSERVICE_ACCESS | \
+                     ENHANCED_AUTHENTICATED_ACCESS, not NON_VOLATILE | BOOTSERVICE_ACCESS | \
+                     RUNTIME_ACCESS | ENHANCED_AUTHENTICATED_ACCESS: SetVariable() refuses a \
+                     rewrite with attributes other than these but APPEND_WRITE with \
+                     EFI_INVALID_PARAMETER (UEFI 2.11 section 8.2.3)"
+                ),
+            ),
+            (
+                "metadata that it does not take",
+                Some((NV_BS_RT_ENHANCED, &other_version)),
+                time(signing::tests::TIME),
+                format!(
+                    "EFI variable {signed} holds EFI_VARIABLE_AUTHENTICATION_3 metadata that \
+                     uefisettings does not take, so it cannot check the write against it: \
+                     EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1"
+                ),
+            ),
+            (
+                "a nonce for a timestamp-type variable",
+                Some((NV_BS_RT_ENHANCED, &stored_time)),
+                nonce(&[9; 5], None),
+                format!(
+                    "EFI variable {signed} holds an EFI_VARIABLE_AUTHENTICATION_3 of Type \
+                     TIMESTAMP (1), not NONCE (2), and the firmware verifies that the Types match \
+                     (UEFI 2.11 section 8.2.5)"
+                ),
+            ),
+            (
+                "a TimeStamp for a nonce-type variable",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                time(signing::tests::TIME),
+                format!(
+                    "EFI variable {signed} holds an EFI_VARIABLE_AUTHENTICATION_3 of Type NONCE \
+                     (2), not TIMESTAMP (1), and the firmware verifies that the Types match (UEFI \
+                     2.11 section 8.2.5)"
+                ),
+            ),
+            (
+                "the variable's TimeStamp",
+                Some((NV_BS_RT_ENHANCED, &stored_time)),
+                time("2026-11-06T12:00:00Z"),
+                format!(
+                    "the TimeStamp 2026-11-06T12:00:00Z is not later than \
+                     2026-11-06T12:00:00Z, that of EFI variable {signed}, as the firmware \
+                     requires (UEFI 2.11 section 8.2.5)"
+                ),
+            ),
+            (
+                "an earlier TimeStamp",
+                Some((NV_BS_RT_ENHANCED, &stored_time)),
+                time("2026-11-06T11:59:59Z"),
+                format!(
+                    "the TimeStamp 2026-11-06T11:59:59Z is not later than \
+                     2026-11-06T12:00:00Z, that of EFI variable {signed}, as the firmware \
+                     requires (UEFI 2.11 section 8.2.5)"
+                ),
+            ),
+            (
+                "the variable's nonce",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[0xA5; 8], None),
+                format!(
+                    "the nonce is the one that EFI variable {signed} holds, for which \
+                     SetVariable() returns EFI_INVALID_PARAMETER (UEFI 2.11 sections 8.2.3 and \
+                     8.2.5)"
+                ),
+            ),
+            (
+                "the variable's nonce, of zero and nonzero bytes",
+                Some((NV_BS_RT_ENHANCED, &stored_part_zero)),
+                nonce(&[0, 0xA5, 0, 0], None),
+                format!(
+                    "the nonce is the one that EFI variable {signed} holds, for which \
+                     SetVariable() returns EFI_INVALID_PARAMETER (UEFI 2.11 sections 8.2.3 and \
+                     8.2.5)"
+                ),
+            ),
+            (
+                "another current nonce",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[9; 5], Some(&[1; 8])),
+                format!(
+                    "the current nonce given is not the one that EFI variable {signed} holds, so \
+                     the firmware would not verify the signature over it (UEFI 2.11 section \
+                     8.2.5)"
+                ),
+            ),
+            (
+                "the start of the current nonce",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[9; 5], Some(&[0xA5; 4])),
+                format!(
+                    "the current nonce given is not the one that EFI variable {signed} holds, so \
+                     the firmware would not verify the signature over it (UEFI 2.11 section \
+                     8.2.5)"
+                ),
+            ),
+            (
+                "another nonce of the current one's size",
+                Some((NV_BS_RT_ENHANCED, &stored_nonce)),
+                nonce(&[0x5A; 8], None),
+                unseeded.clone(),
+            ),
+            (
+                "a current nonce for a create",
+                None,
+                nonce(&[9; 5], Some(&[0xA5; 8])),
+                format!(
+                    "EFI variable {signed} does not exist, so its create signs no current nonce \
+                     (UEFI 2.11 section 8.2.5), and the firmware would not verify the signature \
+                     over the one given"
+                ),
+            ),
+        ];
+        let signer = signing::tests::test_signer();
+        for (case, stored, freshness, refusal) in cases {
+            let variables = match stored {
+                Some((attributes, metadata)) => {
+                    holding(firmware(Some(&[0])), &signed, attributes, metadata)
+                }
+                None => firmware(Some(&[0])),
+            };
+
+            let error = sign_and_write_enhanced(
+                &variables,
+                &enhanced_signed_write(&signed, NV_BS_RT, VALUE, &freshness),
+                &signer,
+                None,
+                &mut signing::tests::FakeSeed(None),
+            )
+            .expect_err(case);
+
+            assert_eq!(format!("{error:#}"), refusal, "{case}");
+            assert_eq!(*variables.set.borrow(), [], "{case}: writes");
+        }
+
+        let appended = holding(
+            firmware(Some(&[0])),
+            &signed,
+            NV_BS_RT_ENHANCED,
+            &stored_time,
+        );
+        let error = sign_and_write_enhanced(
+            &appended,
+            &enhanced_signed_write(
+                &signed,
+                NV_BS_RT | VariableAttributes::APPEND_WRITE,
+                VALUE,
+                &time(signing::tests::TIME),
+            ),
+            &signer,
+            None,
+            &mut signing::tests::FakeSeed(None),
+        )
+        .expect_err("APPEND_WRITE");
+        assert_eq!(
+            format!("{error:#}"),
+            unseeded,
+            "APPEND_WRITE besides the variable's attributes"
+        );
+
+        let error = sign_and_write_enhanced(
+            &appended,
+            &enhanced_signed_write(
+                &signed,
+                NV_BS_RT | VariableAttributes::APPEND_WRITE,
+                VALUE,
+                &time("2026-11-06T12:00:00Z"),
+            ),
+            &signer,
+            None,
+            &mut signing::tests::FakeSeed(None),
+        )
+        .expect_err("APPEND_WRITE with the variable's TimeStamp");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "the TimeStamp 2026-11-06T12:00:00Z is not later than 2026-11-06T12:00:00Z, that \
+                 of EFI variable {signed}, as the firmware requires (UEFI 2.11 section 8.2.5)"
+            ),
+            "APPEND_WRITE with the variable's TimeStamp, which section 8.2.5 does not exempt"
+        );
+
+        let error = sign_and_write_enhanced(
+            &appended,
+            &enhanced_signed_write(
+                &signed,
+                VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS,
+                VALUE,
+                &time(signing::tests::TIME),
+            ),
+            &signer,
+            None,
+            &mut signing::tests::FakeSeed(None),
+        )
+        .expect_err("fewer attributes");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "EFI variable {signed} has the attributes NON_VOLATILE | BOOTSERVICE_ACCESS | \
+                 RUNTIME_ACCESS | ENHANCED_AUTHENTICATED_ACCESS, not NON_VOLATILE | \
+                 BOOTSERVICE_ACCESS | ENHANCED_AUTHENTICATED_ACCESS: SetVariable() refuses a \
+                 rewrite with attributes other than these but APPEND_WRITE with \
+                 EFI_INVALID_PARAMETER (UEFI 2.11 section 8.2.3)"
+            ),
+            "attributes of the variable that the write lacks"
+        );
+        assert_eq!(*appended.set.borrow(), [], "fewer attributes: writes");
+    }
+
+    /// sign_and_write_enhanced refuses a write of a variable that it cannot read, as it checks
+    /// the write against it, with the flag too, and writes nothing.
+    #[test]
+    fn sign_and_write_enhanced_refuses_a_variable_that_it_cannot_read() {
+        let signed = key("Signed", VENDOR);
+        let freshness =
+            Freshness::TimeStamp(signing::tests::TIME.parse().expect("the test TimeStamp"));
+        let signer = signing::tests::test_signer();
+        for grant in GRANTS {
+            let variables = UnreadableVariable(firmware(Some(&[0])), "Signed");
+
+            let error = sign_and_write_enhanced(
+                &variables,
+                &EnhancedSignedWrite {
+                    unsafe_operations: grant,
+                    ..enhanced_signed_write(&signed, NV_BS_RT, VALUE, &freshness)
+                },
+                &signer,
+                None,
+                &mut signing::tests::FakeSeed(Some(1)),
+            )
+            .expect_err("an unreadable variable");
+
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "cannot check the write against EFI variable {signed}: cannot read EFI \
+                     variable {signed}"
+                ),
+                "{grant:?}"
+            );
+            assert_eq!(variables.sets(), [], "{grant:?}: writes");
+        }
+    }
+
+    /// sign_and_write_enhanced signs, after the data of a nonce-type update without a current
+    /// nonce, the one that the variable holds (UEFI 2.11 §8.2.5 step 3c), as its metadata gives it
+    /// (§8.2.1), not none.
+    #[test]
+    fn sign_and_write_enhanced_signs_the_stored_nonce_by_default() {
+        let signed = key("Signed", VENDOR);
+        let signer = signing::tests::test_signer();
+        let variables = holding(
+            firmware(Some(&[0])),
+            &signed,
+            NV_BS_RT_ENHANCED,
+            &stored_nonce_metadata(),
+        );
+        let given = Freshness::Nonce {
+            nonce: test_nonce(&[9; 5]),
+            current: None,
+        };
+
+        sign_and_write_enhanced(
+            &variables,
+            &enhanced_signed_write(&signed, NV_BS_RT, VALUE, &given),
+            &signer,
+            None,
+            &mut signing::tests::FakeSeed(Some(1)),
+        )
+        .expect("the update");
+
+        let signed_with = |current: Option<&[u8]>| {
+            let freshness = Freshness::Nonce {
+                nonce: test_nonce(&[9; 5]),
+                current: current.map(test_nonce),
+            };
+            signer
+                .authentication_3(
+                    &EnhancedWrite {
+                        key: &signed,
+                        attributes: NV_BS_RT_ENHANCED,
+                        freshness: &freshness,
+                        data: VALUE,
+                    },
+                    None,
+                    &mut rand_chacha::ChaCha20Rng::seed_from_u64(0),
+                )
+                .expect("sign")
+        };
+        let held_payload = held(&variables, &signed);
+        assert_eq!(
+            held_payload,
+            written(0x87, &signed_with(Some(&[0xA5; 8]))),
+            "signed over the current nonce"
+        );
+        assert_ne!(
+            held_payload,
+            written(0x87, &signed_with(None)),
+            "not signed without it"
+        );
+    }
+
     /// The refusal of a write of `key`, a device signature database, while SetupMode is 1.
     fn device_database_refusal(key: &VariableKey) -> String {
         format!(
@@ -2132,7 +2700,8 @@ mod tests {
 
     /// sign_and_write_enhanced refuses devdb while SetupMode is 1 unless allowed, after it signs,
     /// as write_signed does: the firmware may not check the signature (UEFI 2.11 §32.6.3).
-    /// Without a seed source it fails at the seed, with the flag and without, reading no
+    /// Without a seed source it fails at the seed, with the flag and without, reading devdb, which
+    /// it checks the write against, and no
     /// SetupMode. It writes devdb when SetupMode is 0 or absent, lifting nothing, or when
     /// allowed, lifting the write.
     #[test]
@@ -2175,7 +2744,7 @@ mod tests {
             );
             assert_eq!(
                 *unseeded.read.borrow(),
-                [],
+                std::slice::from_ref(&devdb),
                 "{grant:?} without a seed source: reads"
             );
         }

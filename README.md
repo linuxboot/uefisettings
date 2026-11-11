@@ -759,11 +759,17 @@ certificate a WIN_CERTIFICATE_UEFI_GUID of PKCS #7 on a 4-byte boundary after ze
 the structures out, and MetadataSize their size, then the data. With `--data-file`, KEY signs over
 SHA-256 or the `--digest`, as above, and `--timestamp TIME` or `--nonce HEX` gives the Type; the
 firmware takes only a TimeStamp later than the variable's, or a nonce other than its own, and makes
-one for an all-zero nonce where it can. `--current-nonce HEX`, the variable's nonce, is required to
+one for an all-zero nonce where it can. `--current-nonce HEX`, the variable's nonce, which by
+default is the one that its metadata holds (§8.2.1), is signed to
 update a NONCE variable, and `--new-signing-key-file KEY2 --new-signing-certificate-file
 CERTIFICATES2` adds a NewCert, which KEY2 signs over the same digest and which hands the variable
-to KEY2; with it, the data may be empty, to change the certificate alone. uefisettings does not
-compare these with the stored variable: the firmware does. Before it seeds or writes, it refuses a
+to KEY2; with it, the data may be empty, to change the certificate alone. With `--data-file`,
+uefisettings reads the variable first and refuses, as the firmware would, attributes other than
+its own but `append` (§8.2.3), another Type, a TimeStamp not later than its own, its own nonce
+unless all zero, and a `--current-nonce` other than its nonce or for a variable that does not
+exist (§8.2.5); it checks neither the payload of `--payload-file` against the variable nor the
+signer: the firmware does. A variable that it cannot read, or whose metadata it does not take, it
+does not write. Before it seeds or writes, it also refuses a
 write without data or NewCert, which would delete the variable, a Secure Boot policy variable,
 which takes only an EFI_VARIABLE_AUTHENTICATION_2, a device signature database while SetupMode is
 1, as above, and on Linux every such write, as efivarfs lacks the attribute (EFI_VARIABLE_MASK in

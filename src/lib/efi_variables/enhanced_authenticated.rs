@@ -145,16 +145,50 @@ pub(crate) fn has_metadata(attributes: u32) -> Result<bool, MetadataRefusal> {
 /// after its metadata (has_metadata), else at 0.
 pub(crate) fn metadata_end(attributes: u32, data: &[u8]) -> Result<usize, MetadataRefusal> {
     match has_metadata(attributes)? {
-        true => authentication_3_metadata_size(data),
+        true => authentication_3_metadata(data).map(|metadata| metadata.size),
         false => Ok(0),
     }
 }
 
-/// The size of the metadata that starts `data`, checked strictly: Version 1, Flags 0, a
+/// The EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable, as GetVariable() returns it before
+/// the value (UEFI 2.11 §8.2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Metadata {
+    /// Its size: where the value starts
+    pub(crate) size: usize,
+    /// Its Secondary Descriptor, of its Type
+    #[cfg_attr(
+        not(variable_data),
+        allow(
+            dead_code,
+            reason = "only the signed writes of builds with VariableData read it"
+        )
+    )]
+    pub(crate) freshness: StoredFreshness,
+}
+
+/// The Secondary Descriptor in the metadata of a variable (UEFI 2.11 §8.2.1), against which the
+/// firmware checks the next write (§8.2.5).
+#[cfg_attr(
+    not(variable_data),
+    allow(
+        dead_code,
+        reason = "only the signed writes of builds with VariableData read it"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoredFreshness {
+    /// EFI_VARIABLE_AUTHENTICATION_3_TIMESTAMP_TYPE: the variable's EFI_TIME, in GMT
+    TimeStamp([u8; EFI_TIME_SIZE]),
+    /// EFI_VARIABLE_AUTHENTICATION_3_NONCE_TYPE: the variable's current nonce, of 1 byte or more
+    Nonce(Vec<u8>),
+}
+
+/// The metadata that starts `data`, checked strictly: Version 1, Flags 0, a
 /// TimeStamp in GMT or a NonceSize other than 0, CERT_ID_SHA256 with IdSize 32, and a
 /// MetadataSize where these descriptors end, as GetVariable() returns no
 /// WIN_CERTIFICATE_UEFI_GUID (UEFI 2.11 §8.2.1).
-fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal> {
+pub(crate) fn authentication_3_metadata(data: &[u8]) -> Result<Metadata, MetadataRefusal> {
     match byte(data, 0)? {
         AUTHENTICATION_3_VERSION => {}
         version => return Err(MetadataRefusal::Version(version)),
@@ -165,7 +199,7 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
         0 => {}
         flags => return Err(MetadataRefusal::Flags(flags)),
     }
-    let cert_id = match type_ {
+    let (cert_id, freshness) = match type_ {
         AUTHENTICATION_3_TIMESTAMP_TYPE => {
             let time_stamp = data
                 .get(AUTHENTICATION_3_SIZE..)
@@ -174,7 +208,10 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
             if !is_gmt_time_stamp(time_stamp) {
                 return Err(MetadataRefusal::TimeStamp);
             }
-            AUTHENTICATION_3_SIZE + EFI_TIME_SIZE
+            (
+                AUTHENTICATION_3_SIZE + EFI_TIME_SIZE,
+                StoredFreshness::TimeStamp(*time_stamp),
+            )
         }
         AUTHENTICATION_3_NONCE_TYPE => {
             let nonce_size = match le_u32(data, AUTHENTICATION_3_SIZE)? {
@@ -194,7 +231,10 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
             if padding.iter().any(|&byte| byte != 0) {
                 return Err(MetadataRefusal::NoncePadding);
             }
-            cert_id
+            let nonce = data
+                .get(AUTHENTICATION_3_SIZE + NONCE_HEADER_SIZE..nonce_end)
+                .ok_or(MetadataRefusal::truncated(data))?;
+            (cert_id, StoredFreshness::Nonce(nonce.to_vec()))
         }
         type_ => return Err(MetadataRefusal::Type(type_)),
     };
@@ -218,7 +258,10 @@ fn authentication_3_metadata_size(data: &[u8]) -> Result<usize, MetadataRefusal>
     if data.len() < computed {
         return Err(MetadataRefusal::truncated(data));
     }
-    Ok(computed)
+    Ok(Metadata {
+        size: computed,
+        freshness,
+    })
 }
 
 /// The little-endian UINT32 at `at` of `data`.
@@ -621,7 +664,7 @@ pub(crate) mod fixture {
     /// EFI_VARIABLE_AUTHENTICATION_3 of MetadataSize `metadata_size` ‖
     /// EFI_VARIABLE_AUTHENTICATION_3_NONCE with `nonce` ‖ `padding` ‖
     /// EFI_VARIABLE_AUTHENTICATION_3_CERT_ID.
-    #[cfg(efivar_dumps)]
+    #[cfg(any(efivar_dumps, variable_data))]
     pub(crate) fn nonce_metadata_of(nonce: &[u8], padding: &[u8], metadata_size: u32) -> Vec<u8> {
         let nonce_size = u32::try_from(nonce.len()).expect("test nonce fits NonceSize");
         [
@@ -637,7 +680,7 @@ pub(crate) mod fixture {
     }
 
     /// nonce_metadata_of 8 Nonce bytes, which need no padding: 64 bytes.
-    #[cfg(efivar_dumps)]
+    #[cfg(any(efivar_dumps, variable_data))]
     pub(crate) fn nonce_metadata() -> Vec<u8> {
         nonce_metadata_of(&[0xA5; 8], &[], 64)
     }
@@ -670,6 +713,38 @@ mod tests {
     /// EFI variable Attributes: non-volatile, boot service and runtime access, and enhanced
     /// authenticated access.
     const NV_BS_RT_ENHANCED: u32 = 0x87;
+
+    /// authentication_3_metadata gives the Secondary Descriptor: the EFI_TIME, or the Nonce
+    /// without its NonceSize and padding.
+    #[test]
+    #[cfg(any(efivar_dumps, variable_data))]
+    fn authentication_3_metadata_gives_the_secondary_descriptor() {
+        use super::fixture::nonce_metadata_of;
+
+        let cases = [
+            (
+                "timestamp",
+                timestamp_metadata(),
+                68,
+                StoredFreshness::TimeStamp([
+                    0xEA, 0x07, 11, 6, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ]),
+            ),
+            (
+                "a nonce of 3 bytes and 1 padding byte",
+                nonce_metadata_of(&[7; 3], &[0], 60),
+                60,
+                StoredFreshness::Nonce(vec![7; 3]),
+            ),
+        ];
+        for (case, data, size, freshness) in cases {
+            assert_eq!(
+                authentication_3_metadata(&data),
+                Ok(Metadata { size, freshness }),
+                "{case}"
+            );
+        }
+    }
 
     /// metadata_end takes metadata that ends the data, and refuses data that ends inside it.
     #[test]
