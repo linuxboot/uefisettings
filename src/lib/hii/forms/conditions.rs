@@ -18,9 +18,11 @@
 //! decide which questions a user sees and sets, as the platform's setup browser, mostly edk2's,
 //! shows them, and the spec would make every EQ_ID_VAL of a CHECKBOX, which holds a BOOLEAN,
 //! UNDEFINED. Where edk2 ASSERTs, the result is not evaluated; where a CONDITIONAL drops an
-//! UNDEFINED and the two results differ in effect, or QUESTION_REF3 takes a question from another
-//! FormSet or, without a Guid in the WRITE of that question, its value before the write, it is
-//! undetermined, naming both. Lines are of edk2-stable202608.
+//! UNDEFINED and the two results differ in effect, QUESTION_REF3 takes a question from another
+//! FormSet or, without a Guid in the WRITE of that question, its value before the write, RULE_REF
+//! one of two rules or, in a SUPPRESS_IF around FORMs, a FORM's rule, or THIS in a rule another
+//! statement than the current question, it is undetermined, naming both. Lines are of
+//! edk2-stable202608.
 //!
 //! | Operation | UEFI 2.11 | edk2 | Here |
 //! |---|---|---|---|
@@ -30,10 +32,13 @@
 //! | Two DATEs, TIMEs or buffers compared | UNDEFINED, as no strings, Booleans or unsigned integers (§33.2.5.7.4, §33.3.8.3.18) | by their bytes, then the longer greater (IsTypeInBuffer, Expression.c:985-1000, :2295-2319) | edk2 |
 //! | The right operand of MULTIPLY, DIVIDE and MODULO | 64 bits (§33.3.8.3.43, §33.3.8.3.15, §33.3.8.3.42) | its low 32 bits (Expression.c:3398-3406) | edk2 |
 //! | EQ_ID_VAL_LIST | the question's value in the list (§33.3.8.3.20) | its low 16 bits (Expression.c:2716) | edk2 |
-//! | An UNDEFINED that a CONDITIONAL drops | a value, which the CONDITIONAL drops, pushing the other one (§33.2.5.7.4, §33.3.8.3.10) | the end of the expression, whose result it is (Expression.c:3713-3715) | undetermined, but where both have one effect: a condition FALSE, a READ the stored value's value (no value only where the whole expression diverges), a match expression no match, an EFI_IFR_VALUE no UINT64, a WRITE the same SETs, where the spec goes on to the end with no SET, op not evaluated or malformed op past edk2's end, or that of an expression of a MAP in it; a return expression of a MAP that gives a value ends the expression at the MAP, which the spec's value goes on in |
+//! | An UNDEFINED that a CONDITIONAL drops | a value, which the CONDITIONAL drops, pushing the other one (§33.2.5.7.4, §33.3.8.3.10) | the end of the expression, whose result it is (Expression.c:3713-3715) | undetermined, but where both have one effect: a condition FALSE, a READ the stored value's value (no value only where the whole expression diverges), a match expression no match, an EFI_IFR_VALUE no UINT64, a WRITE the same SETs, where the spec goes on to the end with no SET, op not evaluated or malformed op past edk2's end, or that of an expression of a MAP or rule in it; a return expression of a MAP, or the expression of a rule, that gives a value ends the expression at the MAP or RULE_REF, which the spec's value goes on in |
 //! | QUESTION_REF3 with the Guid of another FormSet and DevicePath 0 | the question of that FormSet (§33.3.8.3.57) | that of the current FormSet (Expression.c:2924-2934) | undetermined |
 //! | QUESTION_REF3 without a Guid and DevicePath 0, in a FormSet that its package list does not start with | the question of the current FormSet (§33.3.8.3.57) | that of the package list's first FormSet (Expression.c:2917-2923, Setup.c:6075) | undetermined |
 //! | QUESTION_REF3 without a Guid and DevicePath 0, in the WRITE of the question that it takes | the question of the current FormSet (§33.3.8.3.57), whose value is THIS in its WRITE (§33.3.8.3.94) | the question's value retrieved anew, before the WRITE writes it (Expression.c:2561-2567, Setup.c:1995-1998) | undetermined |
+//! | Two RULEs of one RuleId in a form, which a RULE_REF refers to | none: the form is invalid (§33.3.8.3.63) | the first's (Expression.c RuleIdToExpression :907-916) | undetermined |
+//! | THIS in a rule | the current question's value (§33.3.8.3.77), that of the expression that holds the outermost RULE_REF, as rules are sub-expressions of the form's expressions (§33.2.5.7.3) | that of the innermost statement whose scope holds the THIS op, which IfrParse.c ParseOpCodes binds as it parses the rule, which fails where it has no QuestionId (Expression.c:808-813, :2733-2738); an ASSERT where none holds it (IfrParse.c:1461-1466) | not evaluated where no statement holds it; else undetermined, but where both take one question |
+//! | A RULE_REF in a SUPPRESS_IF around FORMs, which no FORM holds | UNDEFINED: rules are of the expressions within a form's scope (§33.2.5.7.3, §33.3.8.3.64) | the RULE of that RuleId of each FORM, whose SuppressExpression the SUPPRESS_IF is, evaluated with that FORM (IfrParse.c:2592, :1758-1774; Presentation.c:1522-1523, :2511-2512) | undetermined where the FORM has such a RULE |
 //! | A zero divisor; a shift of 64 bits or more | UNDEFINED, as DIVIDE and MODULO push (§33.3.8.3.15, §33.3.8.3.42); no limit (§33.3.8.3.67, §33.3.8.3.68) | an ASSERT (MdePkg/Library/BaseLib/DivU64x32.c:34, DivU64x32Remainder.c:38, LShiftU64.c:33, RShiftU64.c:33) | not evaluated |
 //! | A SET after an UNDEFINED | EFI_IFR_SET (§33.3.8.3.66) stores its value and pushes TRUE or FALSE | never reached, as the expression ends at the UNDEFINED (Expression.c:3713-3715) | edk2: no SET planned |
 
@@ -123,6 +128,12 @@ const EFI_IFR_MATCH2_OP: u8 = 0x64;
 /// the value of the question that it refers to in a nested call, and the 128 KiB stack of UEFI
 /// DXE (edk2-stable202608 MdeModulePkg/Core/DxeIplPeim/DxeIpl.h STACK_SIZE) holds 8 of them.
 pub(super) const MAX_READ_DEPTH: usize = 8;
+
+/// The rules that RULE_REFs start in one expression at most: each evaluates its rule anew, so
+/// rules that each refer twice to the one before double the work per rule. Each READ that an
+/// expression retrieves a value through is an expression of its own, up to MAX_READ_DEPTH deep,
+/// so one chain of them starts at most (MAX_READ_DEPTH + 1) × MAX_RULE_EVALUATIONS.
+const MAX_RULE_EVALUATIONS: usize = 4096;
 
 /// What its conditions leave of a question in the setup browser, lowest priority first, as
 /// edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpressionList ranks them:
@@ -415,15 +426,20 @@ impl StateEvaluation {
     }
 
     /// Takes in the condition of the SUPPRESS_IF, GRAY_OUT_IF or DISABLE_IF `scope`, which gives
-    /// `state` when true, with where the values that it takes come from.
+    /// `state` when true, with where the values that it takes come from: a SUPPRESS_IF around
+    /// FORMs as the SuppressExpression of `form`, if given.
     fn evaluate(
         &mut self,
         state: QuestionState,
         scope: &IFROperation,
+        form: Option<Rc<RefCell<IFROperation>>>,
         inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
     ) {
         let taken = inputs.reader.snapshot_values_taken();
-        let truth = evaluate_condition(scope, inputs);
+        let truth = match form {
+            Some(form) => evaluate_suppression_of(form, scope, inputs),
+            None => evaluate_condition(scope, inputs),
+        };
         self.add(state, truth, ValueSource::since(taken, inputs.reader));
     }
 
@@ -888,15 +904,24 @@ pub(crate) fn question_state(
             ValueSource::Current,
         );
     }
-    let mut in_form = enclosing_form(question).is_some();
+    let form = enclosing_form(question);
+    let mut in_form = form.is_some();
     let mut scope = question.parent.as_ref().and_then(Weak::upgrade);
     while let Some(op) = scope {
         let op = op.borrow();
         match OpRole::of(op.op_code) {
             // a DISABLE_IF outside forms, which FormSetParse takes in
             OpRole::Scope(QuestionState::Disabled) if !in_form => {}
-            OpRole::Scope(state) => evaluation.evaluate(state, &op, inputs),
-            OpRole::Question | OpRole::Expression(_) | OpRole::Map | OpRole::Other => {}
+            OpRole::Scope(state) => {
+                let around_forms =
+                    op.op_code == IFROpCode::SuppressIf && enclosing_form(&op).is_none();
+                evaluation.evaluate(state, &op, form.clone().filter(|_| around_forms), inputs);
+            }
+            OpRole::Question
+            | OpRole::Expression(_)
+            | OpRole::Map
+            | OpRole::RuleRef
+            | OpRole::Other => {}
         }
         in_form &= !matches!(op.op_code, IFROpCode::Form | IFROpCode::FormMap);
         scope = op.parent.as_ref().and_then(Weak::upgrade);
@@ -1035,13 +1060,14 @@ pub(crate) fn option_state(
         match OpRole::of(op.op_code) {
             OpRole::Question => break,
             OpRole::Scope(state @ QuestionState::Suppressed) => {
-                evaluation.evaluate(state, &op, inputs);
+                evaluation.evaluate(state, &op, None, inputs);
             }
             OpRole::Scope(
                 QuestionState::Selectable | QuestionState::GrayedOut | QuestionState::Disabled,
             )
             | OpRole::Expression(_)
             | OpRole::Map
+            | OpRole::RuleRef
             | OpRole::Other => {}
         }
         scope = op.parent.as_ref().and_then(Weak::upgrade);
@@ -1145,6 +1171,25 @@ pub(super) fn enclosing_form_set(op: &IFROperation) -> Option<Rc<RefCell<IFROper
             return Some(op);
         }
         parent = op.borrow().parent.as_ref().and_then(Weak::upgrade);
+    }
+    None
+}
+
+/// Returns the QuestionId that edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes gives
+/// THIS `op` (:1461-1466), with the opcode of the statement it takes it from: that of
+/// ParentStatement, the innermost statement whose scope holds `op` (IsStatementOpCode
+/// :1154-1176; :3082-3090), 0 for a SUBTITLE, TEXT, RESET_BUTTON or GUID op, which
+/// CreateStatement gives no QuestionId (:1960-1990, :2932-2933), but for the GUID op of an EDKII
+/// bit varstore field, whose Scope ParseOpCodes clears (:2934-2937); None where no statement
+/// holds it.
+fn this_binding(op: &IFROperation) -> Option<(u16, IFROpCode)> {
+    let mut parent = op.parent.as_ref().and_then(Weak::upgrade);
+    while let Some(op) = parent {
+        let statement = op.borrow();
+        if is_parent_statement(&statement) {
+            return Some((question_id(&statement).unwrap_or(0), statement.op_code));
+        }
+        parent = statement.parent.as_ref().and_then(Weak::upgrade);
     }
     None
 }
@@ -1490,7 +1535,28 @@ pub(crate) fn evaluate_condition(
     scope: &IFROperation,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> Truth {
+    condition_truth(Evaluation::new(inputs, Role::Reads), scope)
+}
+
+/// Returns the truth of the condition of `scope`, a SUPPRESS_IF around FORMs, as the
+/// SuppressExpression of `form`, one of those FORMs, that edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes makes it (:2592, :1758-1774): Presentation.c evaluates
+/// it with that FORM (:1522-1523, :2511-2512), whose RULEs its RULE_REFs take.
+fn evaluate_suppression_of(
+    form: Rc<RefCell<IFROperation>>,
+    scope: &IFROperation,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> Truth {
     let mut evaluation = Evaluation::new(inputs, Role::Reads);
+    evaluation.suppression_form = Some(form);
+    condition_truth(evaluation, scope)
+}
+
+/// Returns the truth of the condition of `scope` that `evaluation` evaluates.
+fn condition_truth(
+    mut evaluation: Evaluation<'_, impl QuestionValues>,
+    scope: &IFROperation,
+) -> Truth {
     match evaluation.run(scope) {
         Ok(operand) => match operand.is_true() {
             Some(truth) => Truth::Known(truth),
@@ -1501,7 +1567,9 @@ pub(crate) fn evaluate_condition(
         Err(Abort::Undefined) => Truth::Known(false),
         // edk2-stable202608 SetupBrowserDxe/Presentation.c EvaluateFormExpressions refuses to
         // show the form
-        Err(Abort::Malformed(reason)) => Truth::Unknown(format!("malformed condition: {reason}")),
+        Err(Abort::Malformed(reason) | Abort::RuleCycle(reason)) => {
+            Truth::Unknown(format!("malformed condition: {reason}"))
+        }
         Err(Abort::NotEvaluated(reason)) => Truth::Unknown(reason),
         Err(Abort::Diverged(divergence)) => divergence.truth(),
     }
@@ -1588,7 +1656,9 @@ pub(crate) fn evaluate_value(
     match evaluation.run(scope).and_then(|operand| operand.as_u64()) {
         Ok(value) => value.ok_or_else(|| evaluation.into_unknown()),
         Err(Abort::Undefined) => Err(UNDEFINED_RESULT.to_string()),
-        Err(Abort::Malformed(reason)) => Err(format!("malformed expression: {reason}")),
+        Err(Abort::Malformed(reason) | Abort::RuleCycle(reason)) => {
+            Err(format!("malformed expression: {reason}"))
+        }
         Err(Abort::NotEvaluated(reason)) => Err(reason),
         Err(Abort::Diverged(divergence)) => Err(divergence.why_no_value()),
     }
@@ -1642,6 +1712,11 @@ pub(crate) fn evaluate_read(
         Err(Abort::NotEvaluated(reason)) => {
             ReadOutcome::Refused(evaluation.into_refusal(QuestionExpression::Read, reason))
         }
+        // edk2 recurses without end, so it keeps no stored value either
+        Err(Abort::RuleCycle(reason)) => ReadOutcome::Refused(ExpressionRefusal::Malformed {
+            expression: QuestionExpression::Read,
+            reason,
+        }),
         Err(Abort::Diverged(divergence)) => divergence.read(stored.as_ref()),
     }
 }
@@ -1681,7 +1756,7 @@ pub(crate) fn evaluate_write(
     );
     match evaluation.run_ops(&expression) {
         Ok(_) | Err(Abort::Undefined) => {}
-        Err(Abort::Malformed(reason)) => {
+        Err(Abort::Malformed(reason) | Abort::RuleCycle(reason)) => {
             return Err(ExpressionRefusal::Malformed {
                 expression: QuestionExpression::Write,
                 reason,
@@ -2119,7 +2194,8 @@ pub(crate) enum ExpressionRefusal {
         expression: QuestionExpression,
         reason: String,
     },
-    /// A WRITE that edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue fails on
+    /// A WRITE that edk2-stable202608 SetupBrowserDxe/Setup.c SetQuestionValue fails on, or a
+    /// READ or WRITE with a RULE_REF within the evaluation of its own rule
     #[error("its {expression} expression is malformed: {reason}")]
     Malformed {
         expression: QuestionExpression,
@@ -2392,6 +2468,10 @@ enum Abort {
     NotEvaluated(String),
     /// edk2 and UEFI 2.11 give the expression two results
     Diverged(Box<Divergence>),
+    /// A RULE_REF within the evaluation of its own rule, where edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression recurses without end: malformed, also
+    /// inside a rule
+    RuleCycle(String),
 }
 
 /// Where edk2-stable202608 SetupBrowserDxe and UEFI 2.11 give an expression two results.
@@ -2479,6 +2559,10 @@ impl DroppedUndefined {
                 "a return expression of EFI_IFR_MAP",
                 ", which the MAP gives",
             ),
+            Place::Rule => (
+                "the expression of an EFI_IFR_RULE",
+                ", which the RULE_REF gives",
+            ),
         };
         format!(
             "edk2-stable202608 SetupBrowserDxe ends {place} at the UNDEFINED of {}{consequence}, \
@@ -2494,7 +2578,7 @@ impl DroppedUndefined {
             (Place::Whole, SpecResult::Value(value)) => Some(value),
             (Place::Whole, SpecResult::Unread(_) | SpecResult::Failed(_))
             | (
-                Place::Match | Place::Return,
+                Place::Match | Place::Return | Place::Rule,
                 SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_),
             ) => None,
         }
@@ -2526,9 +2610,9 @@ impl DroppedUndefined {
     /// :1676-1700): that value where UEFI 2.11 gives the READ the same value, as
     /// retrieve_question_value takes it, or where the whole expression diverges and neither can
     /// be read, as the stored value then says why; else refused, naming both. So is a divergence
-    /// in a match or return expression of a MAP over a stored value that cannot be read: edk2
-    /// takes the next pair there (Expression.c:3664, CompareHiiValue :2338), and the spec's ops
-    /// after the MAP may drop its value.
+    /// in a match or return expression of a MAP, or in a rule, over a stored value that cannot be
+    /// read: edk2 takes the next pair there (Expression.c:3664, CompareHiiValue :2338), and the
+    /// spec's ops after the MAP or RULE_REF may drop its value.
     fn read(&self, stored: Option<&Operand>) -> ReadOutcome {
         let kept = match (self.spec_value(), stored) {
             (Some(spec), Some(stored)) => ExpressionValue::read_from(spec)
@@ -2576,7 +2660,7 @@ impl DroppedUndefined {
             (Place::Whole, SpecResult::Value(_) | SpecResult::Unread(_)) => true,
             (Place::Whole, SpecResult::Failed(_))
             | (
-                Place::Match | Place::Return,
+                Place::Match | Place::Return | Place::Rule,
                 SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_),
             ) => false,
         }
@@ -2592,6 +2676,8 @@ enum Place {
     Match,
     /// A return expression of a MAP
     Return,
+    /// The expression of a rule
+    Rule,
 }
 
 /// What UEFI 2.11 gives where edk2 gives UNDEFINED.
@@ -2637,6 +2723,8 @@ enum OpRole {
     Expression(ExpressionOp),
     /// EFI_IFR_MAP, the expression op whose scope holds expressions that it evaluates itself
     Map,
+    /// EFI_IFR_RULE_REF, the expression op that evaluates the expression of a rule of the form
+    RuleRef,
     /// An op with an EFI_IFR_QUESTION_HEADER
     Question,
     /// A SUPPRESS_IF, GRAY_OUT_IF or DISABLE_IF, and the state its true condition gives
@@ -2745,8 +2833,8 @@ impl OpRole {
             IFROpCode::Get => Self::Expression(E::Get),
             IFROpCode::Set => Self::Expression(E::Set),
             IFROpCode::Map => Self::Map,
+            IFROpCode::RuleRef => Self::RuleRef,
             IFROpCode::Match
-            | IFROpCode::RuleRef
             | IFROpCode::ToUint
             | IFROpCode::ToString
             | IFROpCode::Mid
@@ -2819,6 +2907,13 @@ struct Evaluation<'a, V> {
     unknown: Option<String>,
     /// The first VarStore that it cannot reach, or op that is not evaluated
     gap: Option<Gap>,
+    /// The FORM whose SuppressExpression a SUPPRESS_IF around FORMs is evaluated as, whose RULEs
+    /// edk2-stable202608 SetupBrowserDxe takes for the RULE_REFs in it, which no FORM holds
+    suppression_form: Option<Rc<RefCell<IFROperation>>>,
+    /// The rules that RULE_REFs started, up to MAX_RULE_EVALUATIONS
+    rules_started: usize,
+    /// The RULEs of the form that the last RULE_REF looked its rule up in
+    form_rules: Option<FormRules>,
 }
 
 /// The stack of an expression that an evaluation is in: the whole one, or an expression of a MAP,
@@ -2841,18 +2936,31 @@ struct Frame {
     /// expression that holds it, cannot be
     spec_unknown: Option<String>,
     /// Why the first SET, op not evaluated or malformed op fails that UEFI 2.11 reaches past where
-    /// EvaluateExpression ends it, or an expression of a MAP in it, and that aborted() skips as no
-    /// CONDITIONAL there may drop that UNDEFINED: where this expression diverges, the spec's
-    /// result fails there
+    /// EvaluateExpression ends it, or an expression of a MAP or rule in it, and that aborted()
+    /// skips as no CONDITIONAL there may drop that UNDEFINED: where this expression diverges, the
+    /// spec's result fails there
     skipped: Option<String>,
+    /// The outermost RULE_REF whose rule it is of, or within: UEFI 2.11 takes THIS in the rule
+    /// as of the question of that RULE_REF's expression
+    in_rule: Option<Rc<RefCell<IFROperation>>>,
+    /// Whether a match expression of a MAP holds it, within the innermost rule that holds it:
+    /// edk2-stable202608 SetupBrowserDxe/Expression.c fails a MAP whose match expression fails
+    /// (:3656-3658), where an UNDEFINED one takes the next pair
+    in_match: bool,
 }
 
 impl Frame {
-    /// The frame of the expression of a MAP at `place` in the expression of `outer`.
+    /// The frame of the expression of a MAP or rule at `place` in the expression of `outer`.
     fn nested(outer: &Frame, place: Place) -> Self {
         Frame {
             place,
             within_ended: outer.past_end(),
+            in_rule: outer.in_rule.clone(),
+            in_match: match place {
+                Place::Match => true,
+                Place::Return => outer.in_match,
+                Place::Whole | Place::Rule => false,
+            },
             ..Frame::default()
         }
     }
@@ -2872,6 +2980,9 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             frame: Frame::default(),
             unknown: None,
             gap: None,
+            suppression_form: None,
+            rules_started: 0,
+            form_rules: None,
         }
     }
 
@@ -2903,6 +3014,9 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 Pending::Op(op) => self.visit(&op, &mut pending),
                 Pending::Match(progress) => self.matched(progress, &mut pending),
                 Pending::Return { map, outer } => self.returned(&map, outer),
+                Pending::Rule {
+                    rule_ref, outer, ..
+                } => self.rule_returned(&rule_ref, outer),
             };
             if let Err(abort) = done {
                 self.aborted(abort, &mut pending)?;
@@ -2914,8 +3028,9 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// Takes `abort` of the op that the evaluation is at. Past where edk2-stable202608
     /// SetupBrowserDxe/Expression.c EvaluateExpression ends an expression at an UNDEFINED, it
     /// ends what UEFI 2.11 gives there: where no CONDITIONAL drops that UNDEFINED, before or in
-    /// the ops left, the expression gives it, as in edk2; else the results diverge. Elsewhere the
-    /// abort ends the evaluation.
+    /// the ops left, the expression gives it, as in edk2; else the results diverge. Inside a
+    /// rule, a malformed expression gives UNDEFINED in both readings (edk2 Expression.c:2952-2956).
+    /// Elsewhere the abort ends the evaluation.
     fn aborted(&mut self, abort: Abort, pending: &mut Vec<Pending>) -> Result<(), Abort> {
         if matches!(abort, Abort::Undefined | Abort::Diverged(_)) {
             return Err(abort);
@@ -2924,12 +3039,21 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         let ended = loop {
             match (self.frame.ended, self.frame.within_ended) {
                 (Some(ended), false) => break ended,
-                (None, false) => return Err(abort),
+                (None, false) => return self.reached_failure(abort, pending),
                 (_, true) => match pending.pop() {
                     None => return Err(abort),
                     Some(Pending::Op(_)) => {}
                     Some(Pending::Match(progress)) => self.frame = progress.outer,
                     Some(Pending::Return { outer, .. }) => self.frame = outer,
+                    Some(Pending::Rule {
+                        rule_ref, outer, ..
+                    }) => {
+                        self.frame = outer;
+                        if let Abort::Malformed(_) = abort {
+                            self.push_undefined(&rule_ref.borrow());
+                            return Ok(());
+                        }
+                    }
                 },
             }
         };
@@ -2939,16 +3063,52 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             pending.pop();
         }
         match (abort, droppable) {
-            (Abort::NotEvaluated(reason) | Abort::Malformed(reason), false) => {
+            (Abort::Malformed(_), _) if self.frame.place == Place::Rule => {
+                self.frame.stack = vec![Operand::Undefined];
+                Ok(())
+            }
+            (
+                Abort::NotEvaluated(reason) | Abort::Malformed(reason) | Abort::RuleCycle(reason),
+                false,
+            ) => {
                 self.frame.skipped.get_or_insert(reason);
                 self.frame.stack = vec![Operand::Undefined];
                 Ok(())
             }
-            (Abort::NotEvaluated(reason) | Abort::Malformed(reason), true) => {
-                Err(self.diverged(ended, SpecResult::Failed(reason)))
-            }
+            (
+                Abort::NotEvaluated(reason) | Abort::Malformed(reason) | Abort::RuleCycle(reason),
+                true,
+            ) => Err(self.diverged(ended, SpecResult::Failed(reason))),
             (abort, _) => Err(abort),
         }
+    }
+
+    /// Takes `abort` of an op that edk2-stable202608 SetupBrowserDxe/Expression.c
+    /// EvaluateExpression reaches: inside a rule, a malformed expression ends the rule, whose
+    /// RULE_REF gives UNDEFINED (:2952-2956), with the first op skipped in the frames it leaves;
+    /// else the abort ends the evaluation.
+    fn reached_failure(&mut self, abort: Abort, pending: &mut Vec<Pending>) -> Result<(), Abort> {
+        if let Abort::Malformed(_) = abort {
+            let mut skipped = self.frame.skipped.take();
+            while let Some(next) = pending.pop() {
+                match next {
+                    Pending::Op(_) => {}
+                    Pending::Match(progress) => skipped = progress.outer.skipped.or(skipped),
+                    Pending::Return { outer, .. } => skipped = outer.skipped.or(skipped),
+                    Pending::Rule {
+                        rule_ref, outer, ..
+                    } => {
+                        self.frame = outer;
+                        if let Some(reason) = skipped {
+                            self.frame.skipped.get_or_insert(reason);
+                        }
+                        self.push_undefined(&rule_ref.borrow());
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(abort)
     }
 
     /// The value that the expression of the frame leaves: its one value; where edk2-stable202608
@@ -2957,6 +3117,12 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// the results diverge.
     fn frame_value(&mut self) -> Result<Operand, Abort> {
         let value = self.sole_value();
+        self.resolved(value)
+    }
+
+    /// The value that the expression of the frame leaves, as frame_value takes it, where it leaves
+    /// `value` alone.
+    fn resolved(&mut self, value: Result<Operand, Abort>) -> Result<Operand, Abort> {
         let (Some(ended), false) = (self.frame.ended, self.frame.within_ended) else {
             return value;
         };
@@ -3029,6 +3195,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 outer: std::mem::take(&mut self.frame),
             };
             return self.next_pair(progress, pending);
+        }
+        if let OpRole::RuleRef = OpRole::of(borrowed.op_code) {
+            drop(borrowed);
+            return self.rule_ref(op, pending);
         }
         match self.step(&borrowed) {
             Ok(value) => self.push(&borrowed, value)?,
@@ -3139,22 +3309,34 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     }
 
     /// Takes the value of the return expression of `map` as the MAP's, in `outer`, the frame of
-    /// the MAP; one that cannot be read carries why, if noted past the end, to `outer`. An op
-    /// skipped past the end goes there too, whatever the value, as from a match expression.
+    /// the MAP.
     fn returned(&mut self, map: &Rc<RefCell<IFROperation>>, outer: Frame) -> Result<(), Abort> {
         let value = self.frame_value();
-        let returned = std::mem::replace(&mut self.frame, outer);
-        if let Some(reason) = returned.skipped {
+        self.leave_frame(&map.borrow(), value, outer)
+    }
+
+    /// Pushes `value`, which the frame that the evaluation is in gives `op`, on `outer`, the frame
+    /// of `op`, as diverged_return takes a divergence; one that cannot be read carries why, if
+    /// noted past the end, to `outer`. An op skipped past the end goes there too, whatever the
+    /// value, as from a match expression.
+    fn leave_frame(
+        &mut self,
+        op: &IFROperation,
+        value: Result<Operand, Abort>,
+        outer: Frame,
+    ) -> Result<(), Abort> {
+        let left = std::mem::replace(&mut self.frame, outer);
+        if let Some(reason) = left.skipped {
             self.frame.skipped.get_or_insert(reason);
         }
         let value = match value {
-            Err(Abort::Diverged(divergence)) => self.diverged_return(&map.borrow(), *divergence),
+            Err(Abort::Diverged(divergence)) => self.diverged_return(op, *divergence),
             value => value,
         };
         match value? {
-            Operand::Undefined => self.push_undefined(&map.borrow()),
+            Operand::Undefined => self.push_undefined(op),
             value => {
-                if let (None, Some(reason)) = (value.shown(), returned.spec_unknown) {
+                if let (None, Some(reason)) = (value.shown(), left.spec_unknown) {
                     self.frame.spec_unknown.get_or_insert(reason);
                 }
                 self.frame.stack.push(value);
@@ -3163,32 +3345,153 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         Ok(())
     }
 
-    /// The value of the return expression of `map` that diverged, where UEFI 2.11 gives one that
-    /// can be read: edk2 gives the MAP's UNDEFINED, which ends the MAP's expression
-    /// (Expression.c:3713-3715), so that expression ends there, marked dropped, and takes the
-    /// spec's value, which its ops after the MAP may drop; else the divergence.
+    /// The value of the return expression of MAP `op`, or of the expression of the rule of RULE_REF
+    /// `op`, that diverged, where UEFI 2.11 gives one that can be read: edk2 gives `op` UNDEFINED
+    /// (for RULE_REF, Expression.c:2952-2956), which ends the expression that holds `op`
+    /// (:3713-3715), so that expression ends there, marked dropped, and takes the spec's value,
+    /// which its ops after `op` may drop; else the divergence.
     fn diverged_return(
         &mut self,
-        map: &IFROperation,
+        op: &IFROperation,
         divergence: Divergence,
     ) -> Result<Operand, Abort> {
         match divergence {
             Divergence::Dropped(DroppedUndefined {
-                place: Place::Return,
+                place: Place::Return | Place::Rule,
                 spec: SpecResult::Value(value),
                 ..
             }) => {
-                self.frame.ended.get_or_insert(map.op_code.spec_name());
+                self.frame.ended.get_or_insert(op.op_code.spec_name());
                 self.frame.dropped = true;
                 Ok(value)
             }
             divergence @ (Divergence::Dropped(DroppedUndefined {
-                place: Place::Whole | Place::Match | Place::Return,
+                place: Place::Whole | Place::Match | Place::Return | Place::Rule,
                 spec: SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_),
                 ..
             })
             | Divergence::Op(_)) => Err(Abort::Diverged(Box::new(divergence))),
         }
+    }
+
+    /// Starts the expression of the rule that RULE_REF `op` refers to, of the FORM or FORM_MAP
+    /// that holds it, on a stack of its own, as edk2-stable202608 SetupBrowserDxe/Expression.c
+    /// EvaluateExpression evaluates it (:2939-2959), then the ops in the RULE_REF's scope; without
+    /// the rule, the RULE_REF gives UNDEFINED, as UEFI 2.11 §33.3.8.3.64 says. Past
+    /// MAX_RULE_EVALUATIONS rules, it is not evaluated.
+    fn rule_ref(
+        &mut self,
+        op: &Rc<RefCell<IFROperation>>,
+        pending: &mut Vec<Pending>,
+    ) -> Result<(), Abort> {
+        let borrowed = op.borrow();
+        let name = borrowed.op_code.spec_name();
+        let &rule_id = borrowed
+            .data
+            .first()
+            .ok_or_else(|| not_decoded(&borrowed))?;
+        let rules = match (enclosing_form(&borrowed), &self.suppression_form) {
+            (Some(form), _) => FormRules::of(&mut self.form_rules, &form, rule_id),
+            (None, Some(form)) => {
+                if !FormRules::of(&mut self.form_rules, form, rule_id).is_empty() {
+                    let form = form.borrow();
+                    let text = format!(
+                        "{name} of RuleId {rule_id} in a SUPPRESS_IF around FORMs: \
+                         edk2-stable202608 SetupBrowserDxe/Presentation.c evaluates it as the \
+                         SuppressExpression of {} {}, with that FORM (:1522-1523, :2511-2512), \
+                         whose RULE of that RuleId Expression.c RuleIdToExpression takes \
+                         (:895-919), while UEFI 2.11 keeps rules to the expressions within a \
+                         form's scope (§33.2.5.7.3) and pushes UNDEFINED without the rule \
+                         (§33.3.8.3.64)",
+                        form.op_code.spec_name(),
+                        form.data.first_chunk().map_or(
+                            "with no FormId".to_string(),
+                            |&id| format!("{:#06x}", u16::from_le_bytes(id))
+                        ),
+                    );
+                    return Err(match self.frame.past_end() {
+                        false => Abort::Diverged(Box::new(Divergence::Op(text))),
+                        true => Abort::NotEvaluated(text),
+                    });
+                }
+                &[]
+            }
+            (None, None) => &[],
+        };
+        let rule = match rules {
+            [] => None,
+            [rule] => Some(Rc::clone(rule)),
+            rules @ [_, _, ..] => {
+                let text = format!(
+                    "{name} of RuleId {rule_id}, which {} EFI_IFR_RULEs of its form have: \
+                     edk2-stable202608 SetupBrowserDxe/Expression.c RuleIdToExpression takes the \
+                     first (:907-916), while UEFI 2.11 marks the form invalid (§33.3.8.3.63)",
+                    rules.len()
+                );
+                return Err(match self.frame.past_end() {
+                    false => Abort::Diverged(Box::new(Divergence::Op(text))),
+                    true => Abort::NotEvaluated(text),
+                });
+            }
+        };
+        let evaluating = |rule: &Rc<RefCell<IFROperation>>| {
+            pending.iter().any(|next| {
+                matches!(next, Pending::Rule { rule: active, .. } if Rc::ptr_eq(active, rule))
+            })
+        };
+        if rule.as_ref().is_some_and(evaluating) {
+            return Err(Abort::RuleCycle(format!(
+                "{name} of RuleId {rule_id} within the evaluation of that rule"
+            )));
+        }
+        if rule.is_some() {
+            if self.rules_started == MAX_RULE_EVALUATIONS {
+                return Err(self.not_evaluated(format!(
+                    "{name} of RuleId {rule_id} past {MAX_RULE_EVALUATIONS} rules in one \
+                     expression"
+                )));
+            }
+            self.rules_started += 1;
+        }
+        pending.extend(
+            borrowed
+                .children
+                .iter()
+                .rev()
+                .map(|child| Pending::Op(Rc::clone(child))),
+        );
+        let Some(rule) = rule else {
+            self.push_undefined(&borrowed);
+            return Ok(());
+        };
+        let expression = leading_expression(&rule.borrow().children);
+        let outer = std::mem::take(&mut self.frame);
+        self.frame = Frame::nested(&outer, Place::Rule);
+        self.frame.in_rule.get_or_insert_with(|| Rc::clone(op));
+        pending.push(Pending::Rule {
+            rule_ref: Rc::clone(op),
+            rule,
+            outer,
+        });
+        pending.extend(expression.iter().rev().map(|op| Pending::Op(Rc::clone(op))));
+        Ok(())
+    }
+
+    /// Takes the value of the expression of the rule of `rule_ref` as the RULE_REF's, in `outer`,
+    /// the frame of the RULE_REF: a malformed expression gives UNDEFINED, as edk2-stable202608
+    /// SetupBrowserDxe/Expression.c gives for a rule that fails (:2952-2956), in UEFI 2.11's
+    /// reading too.
+    fn rule_returned(
+        &mut self,
+        rule_ref: &Rc<RefCell<IFROperation>>,
+        outer: Frame,
+    ) -> Result<(), Abort> {
+        let value = match self.sole_value() {
+            Err(Abort::Malformed(_)) => Ok(Operand::Undefined),
+            value => value,
+        };
+        let value = self.resolved(value);
+        self.leave_frame(&rule_ref.borrow(), value, outer)
     }
 
     /// The refusal of the READ or WRITE `expression` that this evaluated, whose evaluation ended
@@ -3339,7 +3642,15 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 let ParsedOperation::QuestionRef1(parsed) = &op.parsed_data else {
                     return Err(not_decoded(op));
                 };
-                self.referenced_question(op, parsed.question_id)?.decoded()
+                // in a rule, edk2-stable202608 SetupBrowserDxe/Expression.c gives the RULE_REF
+                // UNDEFINED where the rule fails as where it gives UNDEFINED (:2952-2956), and
+                // UEFI 2.11 pushes UNDEFINED without the question (§33.3.8.3.55); but not in a
+                // match expression of a MAP
+                match (&self.frame.in_rule, self.frame.in_match) {
+                    (Some(_), false) => self.question(op, parsed.question_id)?.decoded(),
+                    (Some(_), true) => self.question_in_match(op, parsed.question_id),
+                    (None, _) => self.referenced_question(op, parsed.question_id)?.decoded(),
+                }
             }
             ExpressionOp::QuestionRef2 => self.question_ref2(op),
             ExpressionOp::QuestionRef3 => self.question_ref3(op),
@@ -3667,6 +3978,32 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         })
     }
 
+    /// Returns the value of question `id`, which QUESTION_REF1 `op` in a match expression of a
+    /// MAP in a rule refers to. Without the question, edk2-stable202608
+    /// SetupBrowserDxe/Expression.c fails (:2733-2738), and with it the MAP (:3656-3658) and the
+    /// rule, whose RULE_REF gives UNDEFINED (:2952-2956), while UEFI 2.11 pushes UNDEFINED without
+    /// the question (§33.3.8.3.55), and the MAP goes on to its next pair: the two readings are not
+    /// evaluated apart here, so it is undetermined, and past where edk2 ends the expression, not
+    /// evaluated.
+    fn question_in_match(&mut self, op: &IFROperation, id: u16) -> Result<Operand, Abort> {
+        match self.question(op, id) {
+            Err(Abort::Undefined) => {}
+            found => return found?.decoded(),
+        }
+        let text = format!(
+            "{} of missing question {id:#06x} in a match expression of EFI_IFR_MAP in a rule: \
+             edk2-stable202608 SetupBrowserDxe/Expression.c fails it (:2733-2738), and with it the \
+             MAP (:3656-3658) and the rule, whose RULE_REF gives UNDEFINED (:2952-2956), while UEFI \
+             2.11 pushes UNDEFINED without the question (§33.3.8.3.55), and the MAP goes on to its \
+             next pair",
+            op.op_code.spec_name()
+        );
+        Err(match self.frame.past_end() {
+            false => Abort::Diverged(Box::new(Divergence::Op(text))),
+            true => Abort::NotEvaluated(text),
+        })
+    }
+
     /// Returns `value` as an operand; for one that cannot be read, notes why, after `subject`.
     fn operand_of(
         &mut self,
@@ -3711,14 +4048,23 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         }
     }
 
-    /// Returns the value of THIS: the one that the role gives, else that of the question that
-    /// holds `op`, which edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes reads as a
-    /// QUESTION_REF1 of it.
+    /// Returns the value of THIS `op`: outside rules, of the current question; in a rule, as
+    /// this_in_rule says.
     fn this(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        match self.frame.in_rule.clone() {
+            None => self.current_this(op, op),
+            Some(rule_ref) => self.this_in_rule(op, &rule_ref.borrow()),
+        }
+    }
+
+    /// Returns the value of the current question at `at`, which THIS `op` takes: the one that the
+    /// role gives, else that of the question that holds `at`, which edk2-stable202608
+    /// SetupBrowserDxe/IfrParse.c ParseOpCodes reads as a QUESTION_REF1 of it.
+    fn current_this(&mut self, op: &IFROperation, at: &IFROperation) -> Result<Operand, Abort> {
         let value = match &self.role {
             Role::Read { this, .. } | Role::Write { this, .. } => this.clone(),
             Role::Reads => {
-                let id = enclosing_question_id(op).ok_or_else(|| {
+                let id = enclosing_question_id(at).ok_or_else(|| {
                     Abort::Malformed(format!("{} outside a question", op.op_code.spec_name()))
                 })?;
                 return self.referenced_question(op, id)?.decoded();
@@ -3726,6 +4072,58 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         };
         self.operand_of(value, || op.op_code.spec_name().to_string())
             .decoded()
+    }
+
+    /// Returns the value of THIS `op` in a rule that `rule_ref`, the outermost RULE_REF, refers
+    /// to. edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes binds it, as it parses the
+    /// rule, to the innermost statement whose scope holds the THIS op, which fails where it has
+    /// no QuestionId, and ASSERTs where none does (:1461-1466); UEFI 2.11 takes the current
+    /// question (§33.3.8.3.77), that of the expression that holds `rule_ref`, as rules are
+    /// sub-expressions of the form's expressions (§33.2.5.7.3). Without a statement that holds
+    /// it, it is not evaluated; where that statement is the current question, it is that
+    /// question's value; else undetermined, naming both.
+    fn this_in_rule(
+        &mut self,
+        op: &IFROperation,
+        rule_ref: &IFROperation,
+    ) -> Result<Operand, Abort> {
+        let name = op.op_code.spec_name();
+        let Some((holder, statement)) = this_binding(op) else {
+            return Err(self.not_evaluated(format!(
+                "{name} in a rule that no statement holds (an ASSERT of edk2-stable202608 \
+                 SetupBrowserDxe/IfrParse.c ParseOpCodes, :1461-1466)"
+            )));
+        };
+        let current = enclosing_question_id(rule_ref);
+        if holder != 0 && current == Some(holder) {
+            return self.current_this(op, rule_ref);
+        }
+        let edk2 = match holder {
+            0 => format!(
+                "{} holds: edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes binds it to \
+                 that statement (:1461-1466), of QuestionId 0, which Expression.c IdToQuestion2 \
+                 never finds (:808-813), so it fails (:2733-2738) and the RULE_REF gives \
+                 UNDEFINED (:2952-2956)",
+                statement.spec_name()
+            ),
+            holder => format!(
+                "question {holder:#06x} holds: edk2-stable202608 SetupBrowserDxe/IfrParse.c \
+                 ParseOpCodes binds it to that question (:1461-1466), which gives {}",
+                self.reading(op, holder)?
+            ),
+        };
+        let spec = match current {
+            None => "but no question holds the RULE_REF".to_string(),
+            Some(id) => format!("question {id:#06x}, which gives {}", self.reading(op, id)?),
+        };
+        let text = format!(
+            "{name} in a rule that {edk2}, while UEFI 2.11 takes the current question \
+             (§33.3.8.3.77), {spec}"
+        );
+        Err(match self.frame.past_end() {
+            false => Abort::Diverged(Box::new(Divergence::Op(text))),
+            true => Abort::NotEvaluated(text),
+        })
     }
 
     /// Returns the value that the GET `op` reads from its VarStore (edk2-stable202608
@@ -3998,6 +4396,13 @@ enum Pending {
         map: Rc<RefCell<IFROperation>>,
         outer: Frame,
     },
+    /// `rule_ref`, which awaits the value of the expression of `rule`; `outer` is the frame of
+    /// the RULE_REF
+    Rule {
+        rule_ref: Rc<RefCell<IFROperation>>,
+        rule: Rc<RefCell<IFROperation>>,
+        outer: Frame,
+    },
 }
 
 /// A MAP partway through its pairs.
@@ -4069,12 +4474,63 @@ fn holds_conditional(op: &Rc<RefCell<IFROperation>>) -> bool {
         match OpRole::of(op.op_code) {
             OpRole::Expression(ExpressionOp::Conditional) => return true,
             OpRole::Map => {}
-            OpRole::Expression(_) | OpRole::Question | OpRole::Scope(_) | OpRole::Other => {
+            OpRole::Expression(_)
+            | OpRole::RuleRef
+            | OpRole::Question
+            | OpRole::Scope(_)
+            | OpRole::Other => {
                 ops.extend(op.children.iter().cloned());
             }
         }
     }
     false
+}
+
+/// The RULEs of a FORM or FORM_MAP by RuleId, each in IFR order, which edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes attaches to that form (:2712-2724).
+struct FormRules {
+    form: Rc<RefCell<IFROperation>>,
+    by_id: BTreeMap<u8, Vec<Rc<RefCell<IFROperation>>>>,
+}
+
+impl FormRules {
+    fn new(form: &Rc<RefCell<IFROperation>>) -> Self {
+        let mut by_id: BTreeMap<u8, Vec<_>> = BTreeMap::new();
+        walk_scopes(&form.borrow().children, (), |node, ()| {
+            let op = node.borrow();
+            if skips_scope(&op) {
+                return Walk::Skip;
+            }
+            if let (IFROpCode::Rule, Some(&rule_id)) = (op.op_code, op.data.first()) {
+                by_id.entry(rule_id).or_default().push(Rc::clone(node));
+            }
+            Walk::Enter(())
+        });
+        FormRules {
+            form: Rc::clone(form),
+            by_id,
+        }
+    }
+
+    /// The RULEs of RuleId `rule_id` of `form`, from `index`, which is built anew where it is of
+    /// another form: a walk of the form per RULE_REF would grow with the form, not with the rules
+    /// started.
+    fn of<'a>(
+        index: &'a mut Option<FormRules>,
+        form: &Rc<RefCell<IFROperation>>,
+        rule_id: u8,
+    ) -> &'a [Rc<RefCell<IFROperation>>] {
+        let rules = match index.take() {
+            Some(rules) if Rc::ptr_eq(&rules.form, form) => rules,
+            Some(_) | None => FormRules::new(form),
+        };
+        index
+            .insert(rules)
+            .by_id
+            .get(&rule_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
 }
 
 /// The leading expression ops of `ops`, each with the ops of its own scope, in IFR order: for
@@ -4089,7 +4545,7 @@ fn leading_expression(ops: &[Rc<RefCell<IFROperation>>]) -> Vec<Rc<RefCell<IFROp
         .take_while(|op| {
             matches!(
                 OpRole::of(op.borrow().op_code),
-                OpRole::Expression(_) | OpRole::Map
+                OpRole::Expression(_) | OpRole::Map | OpRole::RuleRef
             )
         })
         .cloned()
@@ -8123,8 +8579,17 @@ mod store_expression_tests {
         efivars: &Efivars,
     ) -> std::result::Result<Option<Vec<ComparedSet>>, ExpressionRefusal> {
         let (_root, question) = question_holding(children);
+        question_writes(&question, this, efivars)
+    }
+
+    /// The SETs of the WRITE of `question`, with THIS `this`, reading `efivars`.
+    fn question_writes(
+        question: &Rc<RefCell<IFROperation>>,
+        this: QuestionValue,
+        efivars: &Efivars,
+    ) -> std::result::Result<Option<Vec<ComparedSet>>, ExpressionRefusal> {
         let sets = evaluate_write(
-            &question,
+            question,
             this,
             &mut ExpressionInputs {
                 reader: &mut efivars.reader(),
@@ -8768,6 +9233,13 @@ mod store_expression_tests {
     const RETURN_ENDS: &str = "edk2-stable202608 SetupBrowserDxe ends a return expression of \
                                EFI_IFR_MAP at the UNDEFINED of EFI_IFR_UNDEFINED, which the MAP \
                                gives";
+    /// EDK2_ENDS where a RULE_REF gives the UNDEFINED.
+    const RULE_REF_ENDS: &str = "edk2-stable202608 SetupBrowserDxe ends the expression at the \
+                                 UNDEFINED of EFI_IFR_RULE_REF";
+    /// EDK2_ENDS in the expression of a rule, whose RULE_REF gives that UNDEFINED.
+    const RULE_ENDS: &str = "edk2-stable202608 SetupBrowserDxe ends the expression of an \
+                             EFI_IFR_RULE at the UNDEFINED of EFI_IFR_UNDEFINED, which the \
+                             RULE_REF gives";
     /// What such refusals say of UEFI 2.11, before its result.
     const SPEC_DROPS: &str = "while UEFI 2.11 takes UNDEFINED as a value, which an \
                               EFI_IFR_CONDITIONAL drops (§33.2.5.7.4, §33.3.8.3.10), and gives";
@@ -12165,6 +12637,1559 @@ mod store_expression_tests {
             Ok(Some(Vec::new())),
             "a WRITE, no Guid and the written question past an UNDEFINED that a CONDITIONAL \
              drops, the first FormSet"
+        );
+    }
+
+    const RULE: u8 = 0x18;
+    const RULE_REF: u8 = 0x3F;
+
+    /// An EFI_IFR_RULE of `rule_id` whose expression is `expression`.
+    fn rule(rule_id: u8, expression: Vec<u8>) -> Vec<u8> {
+        [operation(RULE, true, &[rule_id]), expression, END.to_vec()].concat()
+    }
+
+    fn rule_ref(rule_id: u8) -> Vec<u8> {
+        operation(RULE_REF, false, &[rule_id])
+    }
+
+    /// The value of `expression` in an EFI_IFR_VALUE of FORM 1, after `rules`, with `values`.
+    fn value_in_form(
+        rules: &[Vec<u8>],
+        expression: Vec<u8>,
+        values: &impl QuestionValues,
+    ) -> std::result::Result<u64, String> {
+        let root = parse_form_set(&[form(1, &[rules.concat(), value_of(expression)])]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let form = Rc::clone(&form_set.borrow().children[0]);
+        let scope = Rc::clone(&form.borrow().children[rules.len()]);
+        let scope = scope.borrow();
+        evaluate_value(
+            &scope,
+            &mut ExpressionInputs {
+                reader: &mut Efivars::new().reader(),
+                values,
+            },
+        )
+    }
+
+    /// RULE_REF pushes the value of the expression of the rule of its RuleId in the form that holds
+    /// it, evaluated on a stack of its own (UEFI 2.11 §33.3.8.3.64; edk2-stable202608
+    /// SetupBrowserDxe/Expression.c:2939-2959); without the rule, UNDEFINED. Inside a rule, a
+    /// malformed expression gives UNDEFINED, also past the rule's own UNDEFINED, as edk2 gives for
+    /// a rule that fails (:2952-2956), while an op that is not evaluated and a value that cannot be
+    /// read are as elsewhere; a RULE_REF within the evaluation of its own rule, where edk2 recurses
+    /// without end, is malformed, also past where edk2 ends the expression. Two rules of one
+    /// RuleId, where UEFI 2.11 §33.3.8.3.63 marks the form invalid and edk2 takes the first, are
+    /// undetermined, a READ of them refused; past where edk2 ends the expression, the spec's result
+    /// is not evaluated. A rule in the scope of an opcode above EFI_IFR_MATCH2_OP, which edk2
+    /// SetupBrowserDxe/IfrParse.c ParseOpCodes skips (:1374-1381), is no rule of the form.
+    #[test]
+    fn rule_ref_pushes_the_value_of_its_rule() {
+        let values = MapValues(BTreeMap::from([(
+            4,
+            QuestionValue::Unreadable {
+                kind: ValueKind::Uint,
+                reason: "<ValueUnavailable: test>".to_string(),
+            },
+        )]));
+        let rules = [
+            rule(1, uint8(5)),
+            rule(2, scoped_expression(&[rule_ref(1), uint8(1), op(ADD)], 0)),
+            rule(3, op(UNDEFINED)),
+            rule(4, scoped_expression(&[op(ONE), op(ONE)], 0)),
+            rule(5, rule_ref(5)),
+            rule(6, rule_ref(7)),
+            rule(7, rule_ref(6)),
+            rule(8, op(TO_UINT)),
+            rule(9, operation(QUESTION_REF1, false, &4u16.to_le_bytes())),
+            rule(
+                10,
+                scoped_expression(&[ifr_true(), op(UNDEFINED), op(ONE), op(CONDITIONAL)], 0),
+            ),
+            rule(11, uint8(1)),
+            rule(11, uint8(2)),
+            rule(12, op(THIS)),
+            rule(13, scoped_expression(&[op(ONE), op(ADD)], 0)),
+            rule(
+                14,
+                scoped_expression(
+                    &[
+                        uint8(1),
+                        map(&[(scoped_expression(&[op(ONE), op(ONE)], 0), uint8(10))]),
+                    ],
+                    0,
+                ),
+            ),
+            [operation(0x70, true, &[]), rule(15, uint8(3)), END.to_vec()].concat(),
+            rule(17, scoped_expression(&[op(UNDEFINED), op(ADD)], 0)),
+            rule(
+                18,
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), op(ONE), op(CONDITIONAL), op(ADD)],
+                    0,
+                ),
+            ),
+            [operation(0x00, true, &[]), rule(16, uint8(4)), END.to_vec()].concat(),
+        ];
+        let undefined = Err("UNDEFINED result".to_string());
+        let cycle = |rule_id: u8| {
+            Err(format!(
+                "malformed expression: EFI_IFR_RULE_REF of RuleId {rule_id} within the \
+                 evaluation of that rule"
+            ))
+        };
+        let two_rules = "EFI_IFR_RULE_REF of RuleId 11, which 2 EFI_IFR_RULEs of its form have: \
+                         edk2-stable202608 SetupBrowserDxe/Expression.c RuleIdToExpression takes \
+                         the first (:907-916), while UEFI 2.11 marks the form invalid \
+                         (§33.3.8.3.63)";
+        let cases = [
+            ("a rule", rule_ref(1), Ok(5)),
+            (
+                "a rule in the scope of the expression's first op",
+                scoped_expression(&[rule_ref(1), uint8(2), op(ADD)], 0),
+                Ok(7),
+            ),
+            ("a rule of a rule", rule_ref(2), Ok(6)),
+            ("no rule", rule_ref(99), undefined.clone()),
+            (
+                "a rule in the scope of opcode 0x70",
+                rule_ref(15),
+                undefined.clone(),
+            ),
+            ("a rule in the scope of opcode 0x00", rule_ref(16), Ok(4)),
+            ("a rule of UNDEFINED", rule_ref(3), undefined.clone()),
+            ("a rule of two values", rule_ref(4), undefined.clone()),
+            (
+                "a rule of an op on an empty stack",
+                rule_ref(13),
+                undefined.clone(),
+            ),
+            (
+                "a rule of a MAP with a malformed match expression",
+                rule_ref(14),
+                undefined.clone(),
+            ),
+            (
+                "a rule of THIS, in no question",
+                rule_ref(12),
+                Err(format!("{THIS_WITHOUT_STATEMENT} not evaluated")),
+            ),
+            ("a rule of itself", rule_ref(5), cycle(5)),
+            (
+                "a rule of itself past an UNDEFINED that a CONDITIONAL may drop",
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), rule_ref(5), op(CONDITIONAL)],
+                    0,
+                ),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_RULE_REF of RuleId 5 within the evaluation of that rule"
+                )),
+            ),
+            ("rules of each other", rule_ref(6), cycle(6)),
+            (
+                "a rule of an op that is not evaluated",
+                rule_ref(8),
+                Err("EFI_IFR_TO_UINT not evaluated".to_string()),
+            ),
+            (
+                "a rule of a value that cannot be read",
+                rule_ref(9),
+                Err(
+                    "EFI_IFR_QUESTION_REF1 of question 0x0004: <ValueUnavailable: test>"
+                        .to_string(),
+                ),
+            ),
+            (
+                "a rule whose CONDITIONAL drops an UNDEFINED",
+                rule_ref(10),
+                Err(format!("{RULE_REF_ENDS}, {SPEC_DROPS} 1")),
+            ),
+            (
+                "two rules of one RuleId",
+                rule_ref(11),
+                Err(two_rules.to_string()),
+            ),
+            (
+                "two rules of one RuleId past an UNDEFINED that a CONDITIONAL may drop",
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), rule_ref(11), op(CONDITIONAL)],
+                    0,
+                ),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     {two_rules}"
+                )),
+            ),
+            (
+                "a CONDITIONAL that drops the UNDEFINED of a rule",
+                scoped_expression(&[ifr_true(), rule_ref(3), op(ONE), op(CONDITIONAL)], 0),
+                Err(format!("{RULE_REF_ENDS}, {SPEC_DROPS} 1")),
+            ),
+            (
+                "a CONDITIONAL that drops the UNDEFINED of a rule malformed past it",
+                scoped_expression(&[ifr_true(), rule_ref(17), op(ONE), op(CONDITIONAL)], 0),
+                Err(format!("{RULE_REF_ENDS}, {SPEC_DROPS} 1")),
+            ),
+            (
+                "a rule malformed past an UNDEFINED that its CONDITIONAL drops",
+                rule_ref(18),
+                undefined.clone(),
+            ),
+            (
+                "a rule past an UNDEFINED that a CONDITIONAL drops",
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), rule_ref(1), op(CONDITIONAL)],
+                    0,
+                ),
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} 5")),
+            ),
+            (
+                "a rule of an op on an empty stack past an UNDEFINED, both UNDEFINED",
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), rule_ref(13), op(CONDITIONAL)],
+                    0,
+                ),
+                undefined.clone(),
+            ),
+            (
+                "a rule of an op not evaluated past an UNDEFINED that a CONDITIONAL may drop",
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), rule_ref(8), op(CONDITIONAL)],
+                    0,
+                ),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_TO_UINT not evaluated"
+                )),
+            ),
+            (
+                "an op not evaluated past an UNDEFINED that a CONDITIONAL in the scope of a \
+                 later RULE_REF may drop",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        op(TO_UINT),
+                        rule_ref(1),
+                        op(ONE),
+                        op(CONDITIONAL),
+                    ],
+                    3,
+                ),
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_TO_UINT not evaluated"
+                )),
+            ),
+        ];
+        for (name, expression, want) in cases {
+            assert_eq!(value_in_form(&rules, expression, &values), want, "{name}");
+        }
+        let in_form = |children: &[Vec<u8>]| {
+            question_in(|body| form(1, &[body, &rules[..]].concat()), children)
+        };
+        let read = |rule_id: u8| {
+            let (_root, question) = in_form(&[op(READ), rule_ref(rule_id)]);
+            evaluate_read(
+                &question,
+                QuestionValue::Uint(1),
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            )
+        };
+        assert_eq!(
+            read(11),
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: two_rules.to_string(),
+            }),
+            "a READ of two rules of one RuleId"
+        );
+        let itself = "EFI_IFR_RULE_REF of RuleId 5 within the evaluation of that rule";
+        assert_eq!(
+            read(5),
+            ReadOutcome::Refused(ExpressionRefusal::Malformed {
+                expression: QuestionExpression::Read,
+                reason: itself.to_string(),
+            }),
+            "a READ of a rule of itself"
+        );
+        let (_root, question) = in_form(&[op(WRITE), rule_ref(5)]);
+        assert_eq!(
+            question_writes(&question, QuestionValue::Uint(1), &Efivars::new()),
+            Err(ExpressionRefusal::Malformed {
+                expression: QuestionExpression::Write,
+                reason: itself.to_string(),
+            }),
+            "a WRITE of a rule of itself"
+        );
+        let (_root, suppress_if) = op_in_form(
+            &[
+                &[conditional(
+                    SUPPRESS_IF,
+                    scoped_expression(&[rule_ref(5)], 0),
+                    &[one_of_holding(2, &[])],
+                )][..],
+                &rules[..],
+            ]
+            .concat(),
+            &[0],
+        );
+        assert_eq!(
+            evaluate_condition(
+                &suppress_if.borrow(),
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            ),
+            Truth::Unknown(format!("malformed condition: {itself}")),
+            "a SUPPRESS_IF of a rule of itself"
+        );
+
+        assert_eq!(
+            value_in(rule_ref(1), &Efivars::new()),
+            undefined,
+            "outside forms"
+        );
+    }
+
+    /// A RULE_REF evaluates its rule anew each time, so rules that each refer twice to the one
+    /// before double the rules that an expression starts per rule: past MAX_RULE_EVALUATIONS of
+    /// them, the RULE_REF that would start one more is not evaluated, also in a chain of 256. A
+    /// RULE_REF of no rule starts none.
+    #[test]
+    fn an_expression_starts_at_most_max_rule_evaluations_rules() {
+        let rules = |depth: u8| {
+            let mut rules = vec![rule(0, op(ONE))];
+            rules.extend((1..=depth).map(|id| {
+                rule(
+                    id,
+                    scoped_expression(&[rule_ref(id - 1), rule_ref(id - 1), op(ADD)], 0),
+                )
+            }));
+            rules
+        };
+        let chain = |depth: u8| value_in_form(&rules(depth), rule_ref(depth), &no_values());
+        // rule 11 starts 2^12 - 1 = 4095 rules
+        assert_eq!(chain(11), Ok(2048), "a chain of 12 rules");
+        // rule 12 starts rule 11, which starts 4095, then the second RULE_REF of rule 11
+        assert_eq!(
+            chain(12),
+            Err(format!(
+                "EFI_IFR_RULE_REF of RuleId 11 past {MAX_RULE_EVALUATIONS} rules in one \
+                 expression not evaluated"
+            )),
+            "a chain of 13 rules"
+        );
+        let got = chain(255);
+        assert!(
+            got.as_ref().is_err_and(|reason| reason.ends_with(&format!(
+                " past {MAX_RULE_EVALUATIONS} rules in one expression not evaluated"
+            ))),
+            "a chain of 256 rules: {got:?}"
+        );
+        let no_rule = map(&[(rule_ref(99), uint8(5)), (rule_ref(99), uint8(6))]);
+        assert_eq!(
+            value_in_form(
+                &rules(11),
+                scoped_expression(&[op(ZERO), rule_ref(11), op(ADD), no_rule], 0),
+                &no_values()
+            ),
+            Err("UNDEFINED result".to_string()),
+            "two RULE_REFs of no rule after a chain of 12 rules"
+        );
+    }
+
+    /// The expression of a rule whose CONDITIONAL drops an UNDEFINED, where UEFI 2.11 gives a
+    /// value, ends the expression that holds the RULE_REF at the RULE_REF, as edk2 gives the
+    /// RULE_REF's UNDEFINED there (SetupBrowserDxe/Expression.c:2952-2956), and the spec's value
+    /// goes on: the whole expression decides, by its effect, as past a return expression of a
+    /// MAP. Where the spec's value cannot be read, the divergence stays the rule's.
+    #[test]
+    fn a_rule_that_drops_an_undefined_hands_its_value_on() {
+        let efivars = store_holding(&[0; 5]);
+        let in_form = |value: Vec<u8>, children: &[Vec<u8>]| {
+            let dropping = scoped_expression(
+                &[ifr_true(), op(UNDEFINED), value.clone(), op(CONDITIONAL)],
+                0,
+            );
+            question_in(
+                |body| form(1, &[body, &[rule(1, dropping.clone())][..]].concat()),
+                children,
+            )
+        };
+        let unreadable = || get(NAME_VALUE, 0, EFI_IFR_TYPE_NUM_SIZE_8);
+        let unreadable_reason = "a value that cannot be read: EFI_IFR_GET of VarStore 0x0003 \
+                                 (EFI_IFR_VARSTORE_NAME_VALUE), which only the driver's \
+                                 EFI_HII_CONFIG_ACCESS_PROTOCOL reaches";
+
+        let truth = |value: Vec<u8>, condition: Vec<u8>| {
+            let (_root, question) = in_form(
+                value,
+                &[conditional(
+                    SUPPRESS_IF,
+                    condition,
+                    &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[0])],
+                )],
+            );
+            let scope = Rc::clone(&question.borrow().children[0]);
+            let scope = scope.borrow();
+            evaluate_condition(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &no_values(),
+                },
+            )
+        };
+        assert_eq!(
+            truth(ifr_false(), rule_ref(1)),
+            Truth::Known(false),
+            "FALSE"
+        );
+        assert_eq!(
+            truth(ifr_false(), scoped_expression(&[rule_ref(1), op(NOT)], 0)),
+            Truth::Unknown(format!(
+                "{RULE_REF_ENDS}, which it takes as FALSE, {SPEC_DROPS} TRUE"
+            )),
+            "FALSE, then NOT"
+        );
+
+        let read = |value: Vec<u8>, this| {
+            let (_root, question) = in_form(value, &[op(READ), rule_ref(1)]);
+            evaluate_read(
+                &question,
+                this,
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &no_values(),
+                },
+            )
+        };
+        let unreadable_this = || QuestionValue::Unreadable {
+            kind: ValueKind::Uint,
+            reason: "<ValueUnavailable: test>".to_string(),
+        };
+        let refused = |reason: String| {
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason,
+            })
+        };
+        let refused_3 = |stored: &str| {
+            refused(format!(
+                "{RULE_REF_ENDS}, keeping the stored value {stored}, {SPEC_DROPS} 3"
+            ))
+        };
+        assert_eq!(
+            read(uint8(3), QuestionValue::Uint(3)),
+            ReadOutcome::Stored,
+            "3, stored 3"
+        );
+        assert_eq!(
+            read(uint8(3), QuestionValue::Uint(0)),
+            refused_3("0"),
+            "3, stored 0"
+        );
+        assert_eq!(
+            read(uint8(3), unreadable_this()),
+            refused_3("that cannot be read"),
+            "3, stored that cannot be read"
+        );
+        assert_eq!(
+            read(unreadable(), unreadable_this()),
+            refused(format!("{RULE_ENDS}, {SPEC_DROPS} {unreadable_reason}")),
+            "a value that cannot be read, stored that cannot be read"
+        );
+
+        let this_set = |offset| [op(THIS), set(STORE, offset, EFI_IFR_TYPE_NUM_SIZE_8)].concat();
+        let write = |value: Vec<u8>, ops: &[Vec<u8>]| {
+            let (_root, question) = in_form(value, &[op(WRITE), scoped_expression(ops, 0)]);
+            question_writes(&question, QuestionValue::Uint(3), &efivars)
+        };
+        let undetermined = |reason: String| -> std::result::Result<_, ExpressionRefusal> {
+            Err(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Write,
+                reason,
+            })
+        };
+        assert_eq!(
+            write(op(ONE), &[this_set(0), rule_ref(1), op(AND)]),
+            Ok(Some(vec![(STORE, "Store".to_string(), 0, vec![0x03])])),
+            "SETs only before it"
+        );
+        assert_eq!(
+            write(
+                op(ONE),
+                &[this_set(0), rule_ref(1), this_set(1), op(AND), op(AND)]
+            ),
+            undetermined(format!(
+                "{RULE_REF_ENDS}, after the SETs before it, {SPEC_DROPS} a value that uefisettings \
+                 cannot evaluate: EFI_IFR_SET past where edk2-stable202608 SetupBrowserDxe ends \
+                 the expression (UEFI 2.11 stores its value and pushes TRUE or FALSE: \
+                 EFI_IFR_SET, §33.3.8.3.66) not evaluated"
+            )),
+            "then a SET"
+        );
+        assert_eq!(
+            write(unreadable(), &[this_set(0), rule_ref(1), op(AND)]),
+            undetermined(format!("{RULE_ENDS}, {SPEC_DROPS} {unreadable_reason}")),
+            "a value that cannot be read"
+        );
+    }
+
+    /// QUESTION_REF1 of a missing question in a rule gives UNDEFINED, which a CONDITIONAL may
+    /// drop: edk2-stable202608 SetupBrowserDxe/Expression.c fails it (:2733-2738), and gives the
+    /// RULE_REF UNDEFINED where the rule fails as where it gives UNDEFINED (:2952-2956), while UEFI
+    /// 2.11 pushes UNDEFINED without the question (§33.3.8.3.55). Outside rules, it stays
+    /// malformed.
+    #[test]
+    fn question_ref1_of_a_missing_question_in_a_rule_gives_undefined() {
+        let efivars = store_holding(&[0; 5]);
+        let dropping = |kept: Vec<u8>| {
+            scoped_expression(&[ifr_true(), question_ref1(0x99), kept, op(CONDITIONAL)], 0)
+        };
+        let truth = |rules: Vec<Vec<u8>>, condition: Vec<u8>| {
+            let suppressed = conditional(
+                SUPPRESS_IF,
+                condition,
+                &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[0])],
+            );
+            let mut body = rules;
+            body.push(one_of_holding(1, &[suppressed]));
+            let path = [body.len() - 1, 0];
+            let (root, scope) = op_in_form(&body, &path);
+            let values = VarStoreValues::new(&root, None);
+            let scope = scope.borrow();
+            evaluate_condition(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            )
+        };
+        assert_eq!(
+            truth(vec![rule(1, dropping(ifr_true()))], rule_ref(1)),
+            Truth::Unknown(format!(
+                "{RULE_REF_ENDS}, which it takes as FALSE, {SPEC_DROPS} TRUE"
+            )),
+            "a SUPPRESS_IF of a rule of TRUE QUESTION_REF1 of a missing question TRUE CONDITIONAL"
+        );
+        assert_eq!(
+            truth(vec![rule(1, question_ref1(0x99))], rule_ref(1)),
+            Truth::Known(false),
+            "a SUPPRESS_IF of a rule of QUESTION_REF1 of a missing question"
+        );
+        assert_eq!(
+            truth(vec![], dropping(ifr_true())),
+            Truth::Unknown(
+                "malformed condition: EFI_IFR_QUESTION_REF1 of missing question 0x0099".to_string()
+            ),
+            "a SUPPRESS_IF of TRUE QUESTION_REF1 of a missing question TRUE CONDITIONAL"
+        );
+
+        let in_question = |children: Vec<Vec<u8>>| {
+            let body = vec![one_of_holding(1, &children)];
+            op_in_form(&body, &[0])
+        };
+        let (root, question) =
+            in_question(vec![rule(1, dropping(uint8(7))), op(READ), rule_ref(1)]);
+        let values = VarStoreValues::new(&root, None);
+        assert_eq!(
+            evaluate_read(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            ),
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: format!("{RULE_REF_ENDS}, keeping the stored value 3, {SPEC_DROPS} 7"),
+            }),
+            "a READ, stored 3, of a rule of TRUE QUESTION_REF1 of a missing question UINT8 7 \
+             CONDITIONAL"
+        );
+        let (root, question) = in_question(vec![
+            rule(1, dropping(uint8(7))),
+            op(WRITE),
+            scoped_expression(
+                &[
+                    uint8(5),
+                    set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8),
+                    rule_ref(1),
+                    set(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8),
+                    op(AND),
+                ],
+                0,
+            ),
+        ]);
+        let values = VarStoreValues::new(&root, None);
+        assert_eq!(
+            evaluate_write(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            )
+            .map(|sets| sets.map(|sets| sets.var_store.len())),
+            Err(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Write,
+                reason: format!(
+                    "{RULE_REF_ENDS}, after the SETs before it, {SPEC_DROPS} a value that \
+                     uefisettings cannot evaluate: EFI_IFR_SET past where edk2-stable202608 \
+                     SetupBrowserDxe ends the expression (UEFI 2.11 stores its value and pushes \
+                     TRUE or FALSE: EFI_IFR_SET, §33.3.8.3.66) not evaluated"
+                ),
+            }),
+            "a WRITE of UINT8 5 SET, then a SET of that rule"
+        );
+    }
+
+    /// Why QUESTION_REF1 of missing question 0x0099 in a match expression of a MAP in a rule is
+    /// undetermined.
+    const REF1_IN_MATCH: &str = "EFI_IFR_QUESTION_REF1 of missing question 0x0099 in a match \
+                                 expression of EFI_IFR_MAP in a rule: edk2-stable202608 \
+                                 SetupBrowserDxe/Expression.c fails it (:2733-2738), and with it \
+                                 the MAP (:3656-3658) and the rule, whose RULE_REF gives UNDEFINED \
+                                 (:2952-2956), while UEFI 2.11 pushes UNDEFINED without the \
+                                 question (§33.3.8.3.55), and the MAP goes on to its next pair";
+
+    /// In a match expression of a MAP in a rule, also in a return expression of a MAP there,
+    /// QUESTION_REF1 of a missing question is undetermined: edk2-stable202608
+    /// SetupBrowserDxe/Expression.c fails it (:2733-2738), and with it the MAP (:3656-3658) and
+    /// the rule, whose RULE_REF gives UNDEFINED (:2952-2956), while UEFI 2.11 pushes UNDEFINED
+    /// without the question (§33.3.8.3.55), and the MAP takes the next pair; past where edk2 ends
+    /// the rule, it is not evaluated. In a return expression of a MAP in a rule, and in a rule
+    /// that a match expression holds, the failure and UNDEFINED have one effect, as elsewhere in
+    /// a rule.
+    #[test]
+    fn question_ref1_of_a_missing_question_in_a_match_expression_in_a_rule_is_undetermined() {
+        let efivars = store_holding(&[0; 5]);
+        // UINT8 1 MAP of (`matched`, `returned`), then (UINT8 1, `other`)
+        let pairs = |matched: Vec<u8>, returned: Vec<u8>, other: Vec<u8>| {
+            map(&[(matched, returned), (uint8(1), other)])
+        };
+        let missing_first = |returned: Vec<u8>, other: Vec<u8>| {
+            scoped_expression(&[uint8(1), pairs(question_ref1(0x99), returned, other)], 0)
+        };
+        let read = |children: Vec<Vec<u8>>| {
+            let (root, question) = op_in_form(&[one_of_holding(1, &children)], &[0]);
+            let values = VarStoreValues::new(&root, None);
+            evaluate_read(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            )
+        };
+        let read_of_rule =
+            |expression: Vec<u8>| read(vec![rule(1, expression), op(READ), rule_ref(1)]);
+        let undetermined = |reason: String| {
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason,
+            })
+        };
+        assert_eq!(
+            read_of_rule(missing_first(uint8(5), uint8(7))),
+            undetermined(REF1_IN_MATCH.to_string()),
+            "a READ, stored 3, of a rule of UINT8 1 MAP of (QUESTION_REF1 of a missing question, \
+             5), then (1, 7)"
+        );
+        let in_return = scoped_expression(&[uint8(2), map(&[(uint8(2), question_ref1(0x99))])], 0);
+        assert_eq!(
+            read_of_rule(scoped_expression(
+                &[uint8(1), pairs(in_return, uint8(5), uint8(7))],
+                0
+            )),
+            undetermined(REF1_IN_MATCH.to_string()),
+            "a READ, stored 3, of a rule of UINT8 1 MAP of (UINT8 2 MAP of (2, QUESTION_REF1 of a \
+             missing question), 5), then (1, 7)"
+        );
+        let past_end = scoped_expression(
+            &[
+                ifr_true(),
+                op(UNDEFINED),
+                missing_first(uint8(5), uint8(7)),
+                op(CONDITIONAL),
+            ],
+            0,
+        );
+        assert_eq!(
+            read_of_rule(past_end),
+            undetermined(format!(
+                "{RULE_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                 {REF1_IN_MATCH}"
+            )),
+            "a READ, stored 3, of a rule of TRUE UNDEFINED (that MAP) CONDITIONAL"
+        );
+        let dropping = scoped_expression(
+            &[ifr_true(), question_ref1(0x99), uint8(7), op(CONDITIONAL)],
+            0,
+        );
+        assert_eq!(
+            read_of_rule(scoped_expression(
+                &[uint8(1), map(&[(uint8(1), dropping)])],
+                0
+            )),
+            undetermined(format!(
+                "{RULE_REF_ENDS}, keeping the stored value 3, {SPEC_DROPS} 7"
+            )),
+            "a READ, stored 3, of a rule of UINT8 1 MAP of (1, TRUE QUESTION_REF1 of a missing \
+             question UINT8 7 CONDITIONAL)"
+        );
+        assert_eq!(
+            read(vec![
+                rule(1, question_ref1(0x99)),
+                op(READ),
+                scoped_expression(&[uint8(1), pairs(rule_ref(1), uint8(5), uint8(7))], 0),
+            ]),
+            ReadOutcome::Value(ExpressionValue::Uint(7)),
+            "a READ of UINT8 1 MAP of (RULE_REF 1, 5), then (1, 7), RULE 1 QUESTION_REF1 of a \
+             missing question"
+        );
+
+        let suppressed = conditional(
+            SUPPRESS_IF,
+            rule_ref(1),
+            &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[0])],
+        );
+        let body = [
+            rule(1, missing_first(ifr_false(), ifr_true())),
+            one_of_holding(1, &[suppressed]),
+        ];
+        let (root, scope) = op_in_form(&body, &[1, 0]);
+        let values = VarStoreValues::new(&root, None);
+        let scope = scope.borrow();
+        assert_eq!(
+            evaluate_condition(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            ),
+            Truth::Unknown(REF1_IN_MATCH.to_string()),
+            "a SUPPRESS_IF of a rule of UINT8 1 MAP of (QUESTION_REF1 of a missing question, \
+             FALSE), then (1, TRUE)"
+        );
+    }
+
+    /// A SET past the end of a rule's expression, or of an expression of a MAP in it, goes out
+    /// with the RULE_REF's UNDEFINED, as out of a return expression of a MAP: also where a
+    /// malformed op ends the rule, which gives UNDEFINED in both readings. Where a CONDITIONAL
+    /// drops that UNDEFINED, the WRITE is refused before any SET, naming the first op skipped;
+    /// else edk2's SETs stay.
+    #[test]
+    fn a_set_skipped_in_a_rule_goes_out_with_its_rule_ref() {
+        let efivars = store_holding(&[0; 5]);
+        let constant_set = [uint8(7), set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8)].concat();
+        let skipping = scoped_expression(&[op(UNDEFINED), constant_set.clone(), op(AND)], 0);
+        // ends where an op is skipped in a match expression of a MAP in it
+        let malformed_past_a_skip = scoped_expression(
+            &[
+                uint8(1),
+                map(&[
+                    (
+                        scoped_expression(&[op(UNDEFINED), op(TO_UINT)], 0),
+                        uint8(5),
+                    ),
+                    (uint8(1), uint8(1)),
+                ]),
+                op(ADD),
+            ],
+            0,
+        );
+        let rules = [
+            rule(1, skipping.clone()),
+            rule(
+                2,
+                scoped_expression(
+                    &[
+                        uint8(1),
+                        map(&[(skipping.clone(), uint8(5)), (uint8(1), ifr_true())]),
+                        op(AND),
+                    ],
+                    0,
+                ),
+            ),
+            rule(
+                3,
+                scoped_expression(
+                    &[
+                        uint8(1),
+                        map(&[
+                            (skipping.clone(), uint8(5)),
+                            (malformed_past_a_skip.clone(), uint8(6)),
+                        ]),
+                    ],
+                    0,
+                ),
+            ),
+            rule(
+                4,
+                scoped_expression(
+                    &[
+                        uint8(1),
+                        map(&[(skipping, uint8(5)), (uint8(1), malformed_past_a_skip)]),
+                    ],
+                    0,
+                ),
+            ),
+        ];
+        let write = |ops: &[Vec<u8>]| {
+            let (_root, question) = question_in(
+                |body| form(1, &[body, &rules[..]].concat()),
+                &[op(WRITE), scoped_expression(ops, 0)],
+            );
+            question_writes(&question, QuestionValue::Uint(3), &efivars)
+        };
+        let this_set = [op(THIS), set(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8)].concat();
+        let refused = Err(ExpressionRefusal::Undetermined {
+            expression: QuestionExpression::Write,
+            reason: format!(
+                "{RULE_REF_ENDS}, after the SETs before it, {SPEC_DROPS} a value that \
+                 uefisettings cannot evaluate: EFI_IFR_SET past where edk2-stable202608 \
+                 SetupBrowserDxe ends the expression (UEFI 2.11 stores its value and pushes TRUE \
+                 or FALSE: EFI_IFR_SET, §33.3.8.3.66) not evaluated"
+            ),
+        });
+        assert_eq!(
+            write(&[ifr_true(), rule_ref(1), op(ONE), op(CONDITIONAL)]),
+            refused,
+            "past the end of the rule, the RULE_REF's UNDEFINED dropped"
+        );
+        assert_eq!(
+            write(&[ifr_true(), rule_ref(2), op(ONE), op(CONDITIONAL)]),
+            refused,
+            "past the end of a match expression in a rule that a malformed op ends, the \
+             RULE_REF's UNDEFINED dropped"
+        );
+        assert_eq!(
+            write(&[ifr_true(), rule_ref(3), op(ONE), op(CONDITIONAL)]),
+            refused,
+            "a SET skipped before a match expression that a malformed op ends, with an op \
+             skipped in that expression"
+        );
+        assert_eq!(
+            write(&[ifr_true(), rule_ref(4), op(ONE), op(CONDITIONAL)]),
+            refused,
+            "a SET skipped before a return expression that a malformed op ends, with an op \
+             skipped in that expression"
+        );
+        assert_eq!(
+            write(&[this_set.clone(), rule_ref(1), op(AND)]),
+            Ok(Some(vec![(STORE, "Store".to_string(), 1, vec![0x03])])),
+            "past the end of the rule, the RULE_REF's UNDEFINED kept"
+        );
+        assert_eq!(
+            write(&[this_set, rule_ref(2), op(AND)]),
+            Ok(Some(vec![(STORE, "Store".to_string(), 1, vec![0x03])])),
+            "past the end of a match expression in a rule that a malformed op ends, the \
+             RULE_REF's UNDEFINED kept"
+        );
+    }
+
+    /// A RULE_REF in a SUPPRESS_IF around FORMs, which no FORM holds: edk2-stable202608
+    /// SetupBrowserDxe makes the SUPPRESS_IF each FORM's SuppressExpression (IfrParse.c:2592,
+    /// :1758-1774) and evaluates it with that FORM (Presentation.c:1522-1523, :2511-2512), so
+    /// Expression.c RuleIdToExpression takes that FORM's rule, while UEFI 2.11 keeps rules to the
+    /// expressions within a form's scope (§33.2.5.7.3) and pushes UNDEFINED without the rule
+    /// (§33.3.8.3.64). Where the FORM has a RULE of the RuleId, the suppression is undetermined;
+    /// without one, both give UNDEFINED. A GRAY_OUT_IF around FORMs takes no FORM's rule.
+    #[test]
+    fn a_rule_ref_in_a_suppress_if_around_forms_is_undetermined_where_the_form_has_the_rule() {
+        let question = checkbox_op(9, 0);
+        let state_of = |root: Rc<RefCell<IFROperation>>| {
+            let found = find_op(&root, &question[2..]).expect("find the CHECKBOX");
+            let state = question_state(
+                &found.borrow(),
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &no_values(),
+                },
+            );
+            state
+        };
+        let around = |scope: u8, condition: Vec<u8>, body: Vec<Vec<u8>>| {
+            parse_form_set(&[conditional(
+                scope,
+                condition,
+                &[form(1, &[body, vec![question.clone()]].concat())],
+            )])
+        };
+        let form_rule = "EFI_IFR_RULE_REF of RuleId 1 in a SUPPRESS_IF around FORMs: \
+                         edk2-stable202608 SetupBrowserDxe/Presentation.c evaluates it as the \
+                         SuppressExpression of EFI_IFR_FORM 0x0001, with that FORM (:1522-1523, \
+                         :2511-2512), whose RULE of that RuleId Expression.c RuleIdToExpression \
+                         takes (:895-919), while UEFI 2.11 keeps rules to the expressions within \
+                         a form's scope (§33.2.5.7.3) and pushes UNDEFINED without the rule \
+                         (§33.3.8.3.64)";
+        let unknown = |reason: String| StateEvaluation {
+            unknown: vec![(QuestionState::Suppressed, reason)],
+            ..StateEvaluation::selectable()
+        };
+        assert_eq!(
+            state_of(around(SUPPRESS_IF, rule_ref(1), vec![rule(1, ifr_true())])),
+            unknown(form_rule.to_string()),
+            "a SUPPRESS_IF around a FORM whose rule 1 is TRUE"
+        );
+        assert_eq!(
+            state_of(around(SUPPRESS_IF, rule_ref(1), vec![rule(2, ifr_true())])),
+            StateEvaluation::selectable(),
+            "a SUPPRESS_IF around a FORM without rule 1"
+        );
+        assert_eq!(
+            state_of(around(
+                SUPPRESS_IF,
+                scoped_expression(
+                    &[ifr_true(), op(UNDEFINED), rule_ref(1), op(CONDITIONAL)],
+                    0
+                ),
+                vec![rule(1, ifr_true())]
+            )),
+            unknown(format!(
+                "{EDK2_ENDS}, which it takes as FALSE, {SPEC_DROPS} a value that uefisettings \
+                 cannot evaluate: {form_rule}"
+            )),
+            "a SUPPRESS_IF around a FORM whose rule 1 is TRUE, past an UNDEFINED that a \
+             CONDITIONAL may drop"
+        );
+        assert_eq!(
+            state_of(around(GRAY_OUT_IF, rule_ref(1), vec![rule(1, ifr_true())])),
+            StateEvaluation::selectable(),
+            "a GRAY_OUT_IF around a FORM whose rule 1 is TRUE"
+        );
+        assert_eq!(
+            state_of(parse_form_set(&[form(
+                1,
+                &[
+                    rule(1, ifr_true()),
+                    conditional(SUPPRESS_IF, rule_ref(1), std::slice::from_ref(&question)),
+                ],
+            )])),
+            StateEvaluation {
+                current: QuestionState::Suppressed,
+                ..StateEvaluation::selectable()
+            },
+            "a SUPPRESS_IF in the FORM whose rule 1 is TRUE"
+        );
+    }
+
+    /// QuestionId 0 is reserved (UEFI 2.11 §33.3.8.2.2), so edk2-stable202608
+    /// SetupBrowserDxe/Expression.c IdToQuestion2 finds no question of it (:808-813), also in the
+    /// READ or WRITE of a question of QuestionId 0: QUESTION_REF2 and QUESTION_REF3 of the current
+    /// FormSet's Guid give UNDEFINED, which ends the WRITE before its SET and keeps the READ's
+    /// stored value, and QUESTION_REF1 fails (:2733-2738).
+    #[test]
+    fn a_reference_to_question_id_0_finds_no_question() {
+        let values = MapValues(BTreeMap::new());
+        let efivars = store_holding(&[0; 5]);
+        let ref3 = || {
+            let data = [&[0, 0][..], &[0x11; 16]].concat();
+            [uint8(0), operation(QUESTION_REF3, false, &data)].concat()
+        };
+        let missing = "EFI_IFR_QUESTION_REF1 of missing question 0x0000";
+        let cases = [
+            (
+                "QUESTION_REF2",
+                [uint8(0), op(QUESTION_REF2)].concat(),
+                Ok(Some(vec![])),
+                ReadOutcome::Stored,
+            ),
+            (
+                "QUESTION_REF3 of the current FormSet's Guid",
+                ref3(),
+                Ok(Some(vec![])),
+                ReadOutcome::Stored,
+            ),
+            (
+                "QUESTION_REF1",
+                question_ref1(0),
+                Err(ExpressionRefusal::Malformed {
+                    expression: QuestionExpression::Write,
+                    reason: missing.to_string(),
+                }),
+                ReadOutcome::Stored,
+            ),
+        ];
+        for (name, reference, write_want, read_want) in cases {
+            let set_by_reference = scoped_expression(
+                &[
+                    ifr_true(),
+                    reference.clone(),
+                    set(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8),
+                    op(AND),
+                ],
+                0,
+            );
+            let body = [one_of_holding(0, &[op(WRITE), set_by_reference])];
+            let (_root, question) = op_in_form(&body, &[0]);
+            let written = evaluate_write(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            )
+            .map(|sets| {
+                sets.map(|sets| {
+                    sets.var_store
+                        .into_iter()
+                        .map(|set| set.bytes)
+                        .collect::<Vec<_>>()
+                })
+            });
+            assert_eq!(written, write_want, "a WRITE, {name}");
+            let read_by_reference = scoped_expression(&[op(ONE), reference, op(ADD)], 0);
+            let body = [one_of_holding(0, &[op(READ), read_by_reference])];
+            let (_root, question) = op_in_form(&body, &[0]);
+            let read = evaluate_read(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            );
+            assert_eq!(read, read_want, "a READ, {name}");
+        }
+    }
+
+    /// In the READ or WRITE of a question of QuestionId 0, which UEFI 2.11 reserves
+    /// (§33.3.8.2.2) and edk2-stable202608 SetupBrowserDxe/Expression.c IdToQuestion2 never finds
+    /// (:808-813), a QUESTION_REF1, QUESTION_REF2 or EQ_ID_VAL of 0 takes no THIS, and THIS in a
+    /// rule that the question holds is undetermined; in a question of QuestionId 1, each takes
+    /// THIS.
+    #[test]
+    fn references_in_a_question_of_question_id_0_find_no_question() {
+        let efivars = store_holding(&[0; 5]);
+        let in_question = |id: u16, children: Vec<Vec<u8>>| {
+            let body = vec![one_of_holding(id, &children)];
+            op_in_form(&body, &[0])
+        };
+        let write = |id: u16, expression: Vec<u8>, rules: Vec<Vec<u8>>| {
+            let (root, question) = in_question(id, [rules, vec![op(WRITE), expression]].concat());
+            let values = VarStoreValues::new(&root, None);
+            evaluate_write(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            )
+            .map(|sets| {
+                sets.map(|sets| {
+                    sets.var_store
+                        .into_iter()
+                        .map(|set| set.bytes)
+                        .collect::<Vec<_>>()
+                })
+            })
+        };
+        let read = |id: u16, expression: Vec<u8>| {
+            let (root, question) = in_question(id, vec![op(READ), expression]);
+            let values = VarStoreValues::new(&root, None);
+            evaluate_read(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            )
+        };
+        let set_0 = || set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8);
+        let undetermined = |reason: String| -> std::result::Result<_, ExpressionRefusal> {
+            Err(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Write,
+                reason,
+            })
+        };
+        let cases = [
+            (
+                0,
+                Err(ExpressionRefusal::Malformed {
+                    expression: QuestionExpression::Write,
+                    reason: "EFI_IFR_QUESTION_REF1 of missing question 0x0000".to_string(),
+                }),
+                Ok(Some(vec![])),
+                undetermined(this_of_question_id_0(
+                    "EFI_IFR_ONE_OF",
+                    "question 0x0000, which gives UNDEFINED",
+                )),
+                ReadOutcome::Stored,
+                ReadOutcome::Stored,
+            ),
+            (
+                1,
+                Ok(Some(vec![vec![3]])),
+                Ok(Some(vec![vec![3]])),
+                Ok(Some(vec![vec![3]])),
+                ReadOutcome::Value(ExpressionValue::Uint(4)),
+                ReadOutcome::Value(ExpressionValue::Boolean(1)),
+            ),
+        ];
+        for (id, by_ref1, by_ref2, by_rule, read_by_ref1, read_by_eq) in cases {
+            let byte = u8::try_from(id).expect("a UINT8 QuestionId");
+            assert_eq!(
+                write(
+                    id,
+                    scoped_expression(&[question_ref1(id), set_0()], 0),
+                    vec![]
+                ),
+                by_ref1,
+                "question {id}: a WRITE of QUESTION_REF1 {id}, then SET"
+            );
+            assert_eq!(
+                write(
+                    id,
+                    scoped_expression(&[uint8(byte), op(QUESTION_REF2), set_0()], 0),
+                    vec![]
+                ),
+                by_ref2,
+                "question {id}: a WRITE of UINT8 {id} QUESTION_REF2, then SET"
+            );
+            assert_eq!(
+                write(
+                    id,
+                    scoped_expression(&[ifr_true(), rule_ref(1), set_0(), op(AND)], 0),
+                    vec![rule(1, op(THIS))]
+                ),
+                by_rule,
+                "question {id}: a WRITE of TRUE, RULE_REF 1, SET, AND, with RULE 1 THIS in it"
+            );
+            assert_eq!(
+                read(
+                    id,
+                    scoped_expression(&[question_ref1(id), op(ONE), op(ADD)], 0)
+                ),
+                read_by_ref1,
+                "question {id}: a READ of QUESTION_REF1 {id} ONE ADD"
+            );
+            assert_eq!(
+                read(id, eq_id_val_of(id, 3)),
+                read_by_eq,
+                "question {id}: a READ of EQ_ID_VAL {id} 3"
+            );
+        }
+    }
+
+    /// Why THIS in a rule that no statement holds is not evaluated.
+    const THIS_WITHOUT_STATEMENT: &str = "EFI_IFR_THIS in a rule that no statement holds (an \
+                                          ASSERT of edk2-stable202608 \
+                                          SetupBrowserDxe/IfrParse.c ParseOpCodes, :1461-1466)";
+
+    /// Why THIS in a rule that question `holder` holds, which gives `edk2`, is undetermined
+    /// where UEFI 2.11 takes the current question `current`.
+    fn this_of_another_question(holder: u16, edk2: &str, current: &str) -> String {
+        format!(
+            "EFI_IFR_THIS in a rule that question {holder:#06x} holds: edk2-stable202608 \
+             SetupBrowserDxe/IfrParse.c ParseOpCodes binds it to that question (:1461-1466), \
+             which gives {edk2}, while UEFI 2.11 takes the current question (§33.3.8.3.77), \
+             {current}"
+        )
+    }
+
+    /// Why THIS in a rule that `statement`, of QuestionId 0, holds is undetermined where UEFI 2.11
+    /// takes the current question `current`.
+    fn this_of_question_id_0(statement: &str, current: &str) -> String {
+        format!(
+            "EFI_IFR_THIS in a rule that {statement} holds: edk2-stable202608 \
+             SetupBrowserDxe/IfrParse.c ParseOpCodes binds it to that statement (:1461-1466), of \
+             QuestionId 0, which Expression.c IdToQuestion2 never finds (:808-813), so it fails \
+             (:2733-2738) and the RULE_REF gives UNDEFINED (:2952-2956), while UEFI 2.11 takes the \
+             current question (§33.3.8.3.77), {current}"
+        )
+    }
+
+    /// A storage-less UINT8 ONE_OF of QuestionId `id`, holding `children`.
+    fn one_of_holding(id: u16, children: &[Vec<u8>]) -> Vec<u8> {
+        [
+            operation(
+                ONE_OF,
+                true,
+                &[question_header_on(id, 3, 0, 0), vec![0x00, 0, 4, 1]].concat(),
+            ),
+            children.concat(),
+            END.to_vec(),
+        ]
+        .concat()
+    }
+
+    /// The root of a FormSet of declarations() and FORM 1 holding `body`, and the op at `path`,
+    /// the indexes of the children that lead to it from that FORM.
+    fn op_in_form(body: &[Vec<u8>], path: &[usize]) -> RootAndQuestion {
+        let declarations = declarations();
+        let root = parse_form_set(&[declarations.concat(), form(1, body)]);
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        let mut op = Rc::clone(&form_set.borrow().children[declarations.len()]);
+        for &index in path {
+            let child = Rc::clone(&op.borrow().children[index]);
+            op = child;
+        }
+        (root, op)
+    }
+
+    /// THIS in a rule has two readings. edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes
+    /// binds it, as it parses the rule, to the innermost statement whose scope holds the THIS
+    /// op, which fails where it has no QuestionId, and ASSERTs where none does (:1461-1466);
+    /// UEFI 2.11 takes the current question (§33.3.8.3.77), that of the expression that holds
+    /// the RULE_REF, as rules are sub-expressions of the form's expressions (§33.2.5.7.3). Where
+    /// no statement holds it, THIS is not evaluated, also in a MAP in the rule; where the
+    /// statement that holds it is the current question, it is that question's value, THIS of
+    /// the READ or WRITE of that question, as is a QUESTION_REF1, QUESTION_REF2 or QUESTION_REF3
+    /// of the current FormSet's Guid of it in a rule; else it is undetermined, naming both, also
+    /// where a SUBTITLE or a GUID op in the current question holds it, but for the GUID op of an
+    /// EDKII bit varstore field, and past where edk2 ends the expression, the spec's result is
+    /// not evaluated. So in a READ, a WRITE and a SUPPRESS_IF. Where the READ's THIS cannot be
+    /// read, the reason names THIS, as outside rules.
+    #[test]
+    fn this_in_a_rule_is_of_the_current_question_where_edk2_binds_the_same() {
+        let without_statement = format!("{THIS_WITHOUT_STATEMENT} not evaluated");
+        let in_map = |value: Vec<u8>| scoped_expression(&[uint8(1), map(&[(uint8(1), value)])], 0);
+
+        let ref2 = |id: u8| scoped_expression(&[uint8(id), op(QUESTION_REF2)], 0);
+        let current_ref3 = |id: u8| {
+            let data = [&[0, 0][..], &[0x11; 16]].concat();
+            scoped_expression(&[uint8(id), operation(QUESTION_REF3, false, &data)], 0)
+        };
+        // THIS of the READ or WRITE of question 1 is 3; elsewhere, question 1 has 2, question 2 9
+        let values = MapValues(BTreeMap::from([
+            (1, QuestionValue::Uint(2)),
+            (2, QuestionValue::Uint(9)),
+        ]));
+        // where RULE 1 is
+        #[derive(Clone, Copy)]
+        enum Holder {
+            // before question 1, in no statement
+            Nothing,
+            // in the scope of the question of this QuestionId
+            Question(u16),
+            // in the scope of an op of this opcode and data, in question 1
+            InCurrent(u8, &'static [u8]),
+        }
+        // RULE 1 of `expression` where `holder` says, then question 1 holding `children`
+        let body = |holder: Holder, expression: Vec<u8>, children: &[Vec<u8>]| {
+            let rule = rule(1, expression);
+            match holder {
+                Holder::Nothing => vec![rule, one_of_holding(1, children)],
+                Holder::Question(1) => vec![one_of_holding(1, &[&[rule][..], children].concat())],
+                Holder::Question(id) => {
+                    vec![one_of_holding(id, &[rule]), one_of_holding(1, children)]
+                }
+                Holder::InCurrent(op_code, data) => {
+                    let scope = [operation(op_code, true, data), rule, END.to_vec()].concat();
+                    vec![one_of_holding(1, &[&[scope][..], children].concat())]
+                }
+            }
+        };
+        let read_of = |this: QuestionValue, holder: Holder, expression: Vec<u8>| {
+            let read_by_rule = scoped_expression(&[op(ONE), rule_ref(1), op(ADD)], 0);
+            let body = body(holder, expression, &[op(READ), read_by_rule]);
+            let (_root, question) = op_in_form(&body, &[body.len() - 1]);
+            evaluate_read(
+                &question,
+                this,
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            )
+        };
+        let read = |holder: Holder, expression: Vec<u8>| {
+            read_of(QuestionValue::Uint(3), holder, expression)
+        };
+        let efivars = store_holding(&[0; 5]);
+        let write = |holder: Holder, expression: Vec<u8>| {
+            let set_by_rule = scoped_expression(
+                &[
+                    ifr_true(),
+                    rule_ref(1),
+                    set(STORE, 1, EFI_IFR_TYPE_NUM_SIZE_8),
+                    op(AND),
+                ],
+                0,
+            );
+            let body = body(holder, expression, &[op(WRITE), set_by_rule]);
+            let (_root, question) = op_in_form(&body, &[body.len() - 1]);
+            let sets = evaluate_write(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            );
+            sets.map(|sets| {
+                sets.map(|sets| sets.var_store.into_iter().map(|set| set.bytes).collect())
+            })
+        };
+        let truth = |holder: Holder, expression: Vec<u8>| {
+            let suppressed_by_rule = conditional(
+                SUPPRESS_IF,
+                scoped_expression(&[uint8(2), rule_ref(1), op(EQUAL)], 0),
+                &[one_of_option(5, EFI_IFR_TYPE_NUM_SIZE_8, &[0])],
+            );
+            let body = body(holder, expression, &[suppressed_by_rule]);
+            let in_current = matches!(holder, Holder::Question(1) | Holder::InCurrent(..));
+            let path = [body.len() - 1, usize::from(in_current)];
+            let (_root, scope) = op_in_form(&body, &path);
+            let scope = scope.borrow();
+            evaluate_condition(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            )
+        };
+        let not_evaluated = || {
+            (
+                ReadOutcome::Refused(ExpressionRefusal::NotEvaluated {
+                    expression: QuestionExpression::Read,
+                    what: THIS_WITHOUT_STATEMENT.to_string(),
+                }),
+                Err(ExpressionRefusal::NotEvaluated {
+                    expression: QuestionExpression::Write,
+                    what: THIS_WITHOUT_STATEMENT.to_string(),
+                }),
+                Truth::Unknown(without_statement.clone()),
+            )
+        };
+        // the rule gives `value` in a READ and a WRITE, and is 2 in a SUPPRESS_IF if `equal`
+        let taken = |value: u8, equal: bool| {
+            (
+                ReadOutcome::Value(ExpressionValue::Uint(u64::from(value) + 1)),
+                Ok(Some(vec![vec![value]])),
+                Truth::Known(equal),
+            )
+        };
+        // undetermined for the reason that `reason` gives with the current question's value
+        let undetermined = |reason: &dyn Fn(&str) -> String| {
+            (
+                ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                    expression: QuestionExpression::Read,
+                    reason: reason("question 0x0001, which gives 3"),
+                }),
+                Err(ExpressionRefusal::Undetermined {
+                    expression: QuestionExpression::Write,
+                    reason: reason("question 0x0001, which gives 3"),
+                }),
+                Truth::Unknown(reason("question 0x0001, which gives 2")),
+            )
+        };
+        let cases = [
+            (
+                "THIS in a rule that no question holds",
+                Holder::Nothing,
+                op(THIS),
+                not_evaluated(),
+            ),
+            (
+                "THIS in a MAP in a rule that no question holds",
+                Holder::Nothing,
+                in_map(op(THIS)),
+                not_evaluated(),
+            ),
+            (
+                "THIS in a rule that the current question holds",
+                Holder::Question(1),
+                op(THIS),
+                taken(3, true),
+            ),
+            (
+                "THIS in a MAP in a rule that the current question holds",
+                Holder::Question(1),
+                in_map(op(THIS)),
+                taken(3, true),
+            ),
+            (
+                "QUESTION_REF1 of the current question in a rule",
+                Holder::Nothing,
+                question_ref1(1),
+                taken(3, true),
+            ),
+            (
+                "QUESTION_REF2 of the current question in a rule",
+                Holder::Nothing,
+                ref2(1),
+                taken(3, true),
+            ),
+            (
+                "QUESTION_REF3 of the current FormSet's Guid and question in a rule",
+                Holder::Nothing,
+                current_ref3(1),
+                taken(3, true),
+            ),
+            (
+                "QUESTION_REF2 of another question in a rule",
+                Holder::Nothing,
+                ref2(2),
+                taken(9, false),
+            ),
+            (
+                "THIS in a rule that another question holds",
+                Holder::Question(2),
+                op(THIS),
+                undetermined(&|current| this_of_another_question(2, "9", current)),
+            ),
+            (
+                "THIS in a rule in a SUBTITLE scope of the current question",
+                Holder::InCurrent(SUBTITLE, &[2, 0, 0, 0, 0]),
+                op(THIS),
+                undetermined(&|current| this_of_question_id_0("EFI_IFR_SUBTITLE", current)),
+            ),
+            (
+                "THIS in a rule in a GUID op scope of the current question",
+                Holder::InCurrent(GUID, &OTHER_GUID),
+                op(THIS),
+                undetermined(&|current| this_of_question_id_0("EFI_IFR_GUID", current)),
+            ),
+            (
+                "THIS in a rule in the scope of the GUID op of an EDKII bit varstore field of the \
+                 current question",
+                Holder::InCurrent(GUID, &BIT_VARSTORE_GUID),
+                op(THIS),
+                taken(3, true),
+            ),
+        ];
+        for (name, holder, expression, (read_want, write_want, truth_want)) in cases {
+            assert_eq!(
+                read(holder, expression.clone()),
+                read_want,
+                "a READ, {name}"
+            );
+            assert_eq!(
+                write(holder, expression.clone()),
+                write_want,
+                "a WRITE, {name}"
+            );
+            assert_eq!(
+                truth(holder, expression),
+                truth_want,
+                "a SUPPRESS_IF, {name}"
+            );
+        }
+        let unreadable = QuestionValue::Unreadable {
+            kind: ValueKind::Uint,
+            reason: "<ValueUnavailable: test>".to_string(),
+        };
+        assert_eq!(
+            read_of(unreadable, Holder::Question(1), op(THIS)),
+            ReadOutcome::Refused(ExpressionRefusal::Unread {
+                expression: QuestionExpression::Read,
+                reason: "EFI_IFR_THIS: <ValueUnavailable: test>".to_string(),
+            }),
+            "a READ whose THIS cannot be read, THIS in a rule that the current question holds"
+        );
+
+        let value = |body: &[Vec<u8>], path: &[usize]| {
+            let (_root, scope) = op_in_form(body, path);
+            let scope = scope.borrow();
+            evaluate_value(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &MapValues(BTreeMap::from([
+                        (1, QuestionValue::Uint(5)),
+                        (2, QuestionValue::Uint(9)),
+                    ])),
+                },
+            )
+        };
+        assert_eq!(
+            value(
+                &[
+                    rule(1, op(THIS)),
+                    one_of_holding(1, &[value_of(rule_ref(1))])
+                ],
+                &[1, 0]
+            ),
+            Err(without_statement.clone()),
+            "an EFI_IFR_VALUE, THIS in a rule that no question holds"
+        );
+        assert_eq!(
+            value(
+                &[one_of_holding(
+                    1,
+                    &[rule(1, op(THIS)), value_of(rule_ref(1))]
+                )],
+                &[0, 1]
+            ),
+            Ok(5),
+            "an EFI_IFR_VALUE, THIS in a rule that its question holds"
+        );
+        assert_eq!(
+            value(
+                &[
+                    rule(2, rule_ref(1)),
+                    one_of_holding(1, &[rule(1, op(THIS)), value_of(rule_ref(2))]),
+                ],
+                &[1, 1]
+            ),
+            Ok(5),
+            "an EFI_IFR_VALUE, THIS in a rule that its question holds, through a rule that no \
+             question holds"
+        );
+        let held_by_1 = one_of_holding(1, &[rule(1, op(THIS))]);
+        assert_eq!(
+            value(
+                &[
+                    held_by_1.clone(),
+                    one_of_holding(2, &[value_of(rule_ref(1))])
+                ],
+                &[1, 0]
+            ),
+            Err(this_of_another_question(
+                1,
+                "5",
+                "question 0x0002, which gives 9"
+            )),
+            "an EFI_IFR_VALUE, THIS in a rule that another question holds"
+        );
+        assert_eq!(
+            value(&[held_by_1.clone(), value_of(rule_ref(1))], &[1]),
+            Err(this_of_another_question(
+                1,
+                "5",
+                "but no question holds the RULE_REF"
+            )),
+            "an EFI_IFR_VALUE in no question, THIS in a rule that a question holds"
+        );
+        assert_eq!(
+            value(
+                &[
+                    held_by_1,
+                    one_of_holding(
+                        2,
+                        &[value_of(scoped_expression(
+                            &[ifr_true(), op(UNDEFINED), rule_ref(1), op(CONDITIONAL)],
+                            0
+                        ))]
+                    ),
+                ],
+                &[1, 0]
+            ),
+            Err(format!(
+                "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: {}",
+                this_of_another_question(1, "5", "question 0x0002, which gives 9")
+            )),
+            "an EFI_IFR_VALUE, THIS in a rule that another question holds, past an UNDEFINED \
+             that a CONDITIONAL may drop"
         );
     }
 }
