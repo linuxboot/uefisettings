@@ -52,7 +52,7 @@ use super::time_storage::value_changes;
 use super::time_storage::FieldChange;
 use super::time_storage::TimeStorage;
 use super::time_storage::TimeWrite;
-use super::AccessLevel;
+use super::CheckedVarStores;
 use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
@@ -86,19 +86,20 @@ pub(super) struct QuestionWrites<'p> {
 impl<'a> WritePlan<'a> {
     /// The plan that sets `question` to `new_value` through variables of `reach` and
     /// `interface`, evaluating its WRITE expression with values read through `reader`, whose
-    /// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL.
+    /// conditions read the VarStore bytes that `assumed` states in place of those their variables
+    /// hold.
     pub(super) fn new(
         question: &'a QuestionDescriptor,
         new_value: NewValue<'_>,
         (reach, interface): (VariableReach, VariableInterface),
         reader: &mut EfivarReader,
-        access_level: Option<AccessLevel>,
+        assumed: CheckedVarStores<'_>,
     ) -> Result<Self, ChangeValueError> {
         let (value, own) = own_write(question, new_value, reach, interface)?;
         let Some(this) = this_value(question.opcode, value) else {
             return Err(anyhow!("unsupported value type for {}", interface.write()).into());
         };
-        let values = VarStoreValues::new(&root_of(&question.node), access_level);
+        let values = VarStoreValues::new(&root_of(&question.node), assumed);
         let sets = evaluate_write(
             &question.node,
             this,
@@ -851,7 +852,7 @@ mod tests {
     ) -> Result<Vec<bool>, String> {
         let through = (writes.reach(), writes.interface());
         let mut reader = EfivarReader::with_variables(Box::new(variables(through)));
-        let values = VarStoreValues::new(root, None);
+        let values = VarStoreValues::new(root, CheckedVarStores::NONE);
         let selection = find_question_in(
             root,
             &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
@@ -885,7 +886,7 @@ mod tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             volatile,
             pending,
             &WithholdingVariables::new(writes, WithheldBytes::default()),
@@ -1033,7 +1034,7 @@ mod tests {
             let mut reader = passwords
                 .reader(Box::new(variables(through)))
                 .expect("resolve the VarStore of the PASSWORD question");
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             let selection = find_question_in(
                 &root,
                 &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
@@ -1073,7 +1074,7 @@ mod tests {
                 },
                 IncludedStates::empty(),
                 &mut reader,
-                None,
+                CheckedVarStores::NONE,
                 VolatileWrites::Refuse,
                 PendingOperations::new(UnsafeOperations::Refuse),
                 &passwords
@@ -1164,7 +1165,7 @@ mod tests {
         let mut reader = passwords
             .reader(Box::new(variables(through)))
             .expect("resolve the VarStore of the PASSWORD question");
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let selection = find_question_in(
             &root,
             &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
@@ -1192,7 +1193,7 @@ mod tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &passwords
@@ -1314,7 +1315,7 @@ mod tests {
         strings: &[StringPackage],
         reader: &mut EfivarReader,
     ) -> QuestionDescriptor {
-        let values = VarStoreValues::new(root, None);
+        let values = VarStoreValues::new(root, CheckedVarStores::NONE);
         let selection = find_question_in(
             root,
             &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
@@ -1355,7 +1356,7 @@ mod tests {
             answer,
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &passwords
@@ -1723,7 +1724,7 @@ mod tests {
         let mut reader = EfivarReader::with_variables(Box::new(variables(EFIVARFS)));
         let mut selections = Vec::new();
         for root in &roots {
-            let values = VarStoreValues::new(root, None);
+            let values = VarStoreValues::new(root, CheckedVarStores::NONE);
             selections.push(find_question_in(
                 root,
                 &QuestionMatch::Prompt(&BTreeSet::from(["Dup"])),
@@ -1757,7 +1758,7 @@ mod tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&writes, WithheldBytes::default()),

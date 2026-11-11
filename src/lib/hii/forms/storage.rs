@@ -23,12 +23,14 @@ use std::num::NonZeroUsize;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Range;
 use std::rc::Rc;
 
 use anyhow::Result;
 use binrw::BinRead;
 use thiserror::Error;
 
+use super::assumed_var_store::StoreStatements;
 use super::bit_field_bits;
 use super::conditions::question_expression;
 use super::conditions::question_value_expression;
@@ -1319,6 +1321,27 @@ pub(super) enum ValueUnavailable {
          characters"
     )]
     SnapshotStringLength { max_size: usize },
+    /// A value of which --assume-var-store states the bytes `stated` of the variable `key` but
+    /// not `unstated`, which `reason` keeps from being read
+    #[error(
+        "{reason}; bytes {} of {key} stated, {} not",
+        byte_ranges(.stated),
+        byte_ranges(.unstated)
+    )]
+    PartlyStated {
+        reason: Box<ValueUnavailable>,
+        key: VariableKey,
+        stated: Vec<Range<usize>>,
+        unstated: Vec<Range<usize>>,
+    },
+    /// Why a condition cannot read the `bytes` of the variable `key`, which --assume-var-store
+    /// states in place of them; answers keep `reason`, since stated bytes reach only conditions
+    #[error("{reason}{}", stating(.key, .bytes))]
+    Unstated {
+        reason: Box<ValueUnavailable>,
+        key: VariableKey,
+        bytes: Vec<Range<usize>>,
+    },
     /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
     /// level replaces it only in conditions
     #[error(
@@ -1350,6 +1373,45 @@ impl ValueUnavailable {
         }
     }
 
+    /// The bytes of a value at `location` that --assume-var-store would state in place of those
+    /// its variable cannot give, as this says: those that a PartlyStated value lacks, else the
+    /// location's; None where its variable is not why it has no value. PasswordBytes is None:
+    /// stating them would put a password on a command line.
+    pub(super) fn stateable_bytes(&self, location: ValueLocation) -> Option<Vec<Range<usize>>> {
+        match self {
+            Self::PartlyStated {
+                reason, unstated, ..
+            } => reason.stateable_bytes(location).map(|_| unstated.clone()),
+            Self::DeclaredBootServiceOnly(_)
+            | Self::EnhancedAuthenticated(_)
+            | Self::NotRead(_)
+            | Self::Missing(_)
+            | Self::Size(_)
+            | Self::MissingBuffer(_)
+            | Self::ReadError(_)
+            | Self::Truncated { .. } => Some(vec![location.bytes()]),
+            Self::NoVarStore(_)
+            | Self::Storageless(_)
+            | Self::Expression(_)
+            | Self::ReadCycle(_)
+            | Self::ReadDepth(_)
+            | Self::ValueExpression(_)
+            | Self::PasswordBytes
+            | Self::BitField(_)
+            | Self::NotDecoded(_)
+            | Self::CheckboxOverByte(_)
+            | Self::SnapshotNumber { .. }
+            | Self::TimeStorageUnread(_)
+            | Self::TimeService(_)
+            | Self::BufferExpression(_)
+            | Self::StoredString(_)
+            | Self::SnapshotStringDigits
+            | Self::SnapshotStringLength { .. }
+            | Self::Unstated { .. }
+            | Self::AmiAccessLevel(_) => None,
+        }
+    }
+
     /// The text that get, list-questions and show-ifr show for the value: the reason, tagged
     /// VStoreError for a read error, ExtractEFIDataError for a short variable, else
     /// ValueUnavailable.
@@ -1362,7 +1424,9 @@ impl ValueUnavailable {
         match self {
             Self::ReadError(_) => "VStoreError",
             Self::Truncated { .. } => "ExtractEFIDataError",
-            Self::AmiAccessLevel(reason) => reason.tag(),
+            Self::AmiAccessLevel(reason)
+            | Self::PartlyStated { reason, .. }
+            | Self::Unstated { reason, .. } => reason.tag(),
             Self::NoVarStore(_)
             | Self::Storageless(_)
             | Self::Expression(_)
@@ -1436,7 +1500,7 @@ pub(super) enum ValueLocation {
 
 impl ValueLocation {
     /// The payload bytes that hold the value: for Bits, the StorageWidth bytes of IfrParse.c.
-    fn bytes(self) -> std::ops::Range<usize> {
+    pub(super) fn bytes(self) -> Range<usize> {
         match self {
             Self::Bytes { offset, size } => {
                 usize::from(offset)..usize::from(offset) + usize::from(size)
@@ -1599,6 +1663,113 @@ pub(super) fn read_question_value(
         value: location.read(&bytes),
         source,
     })
+}
+
+/// read_question_value, with the bytes of `stated`, statements of `varstore`, in place of those
+/// its variable holds: a value of EFI Date/Time Storage reads none of them. Where they state only
+/// some bytes of the value, the others come from read_sourced_bytes, and if it fails, the value
+/// is PartlyStated.
+pub(super) fn read_stated_question_value(
+    question: &IFROperation,
+    varstore: &Result<Box<dyn VariableStore>>,
+    stated: &StoreStatements<'_>,
+    reader: &mut EfivarReader,
+) -> std::result::Result<RetrievedValue, ValueUnavailable> {
+    let Some(value_question) = value_question(question) else {
+        return Err(ValueUnavailable::NotDecoded(question.op_code));
+    };
+    let location = value_question
+        .location()
+        .check()
+        .map_err(ValueUnavailable::BitField)?;
+    let range = location.0.bytes();
+    let patch = stated.bytes(range.clone());
+    let (Ok(store), None) = (varstore, value_question.time_storage()) else {
+        return read_question_value(question, varstore, reader);
+    };
+    if patch.iter().all(Option::is_none) {
+        return read_question_value(question, varstore, reader);
+    }
+    let (bytes, source) = match patch.iter().copied().collect::<Option<Vec<u8>>>() {
+        Some(bytes) => (bytes, ValueSource::Current),
+        None => {
+            let (read, source) =
+                read_sourced_bytes(question, varstore, reader).map_err(|reason| {
+                    let (stated, unstated) = stated_ranges(&patch, range.start);
+                    ValueUnavailable::PartlyStated {
+                        reason: Box::new(reason),
+                        key: store.variable_key(),
+                        stated,
+                        unstated,
+                    }
+                })?;
+            let bytes = patch
+                .iter()
+                .zip(read)
+                .map(|(stated, read)| stated.unwrap_or(read))
+                .collect();
+            (bytes, source)
+        }
+    };
+    Ok(RetrievedValue {
+        location,
+        value: location.read(&bytes),
+        source,
+    })
+}
+
+/// The ranges of payload bytes that `patch`, the stated bytes from byte `start` on, states, and
+/// those it does not.
+pub(super) fn stated_ranges(
+    patch: &[Option<u8>],
+    start: usize,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let mut stated: Vec<Range<usize>> = Vec::new();
+    let mut unstated: Vec<Range<usize>> = Vec::new();
+    for (at, byte) in (start..).zip(patch) {
+        let ranges = match byte {
+            Some(_) => &mut stated,
+            None => &mut unstated,
+        };
+        match ranges.last_mut() {
+            Some(last) if last.end == at => last.end = at + 1,
+            Some(_) | None => ranges.push(at..at + 1),
+        }
+    }
+    (stated, unstated)
+}
+
+/// "; " and the --assume-var-store of each of `ranges` of the variable `key`, which states the
+/// bytes there; nothing for no range.
+fn stating(key: &VariableKey, ranges: &[Range<usize>]) -> String {
+    let flags: Vec<String> = ranges
+        .iter()
+        .map(|range| {
+            let unit = match range.len() {
+                1 => "byte",
+                _ => "bytes",
+            };
+            format!(
+                "--assume-var-store {key}+{}=<HEX of {} {unit}>",
+                range.start,
+                range.len()
+            )
+        })
+        .collect();
+    match flags.as_slice() {
+        [flag] => format!("; {flag} states it"),
+        [first @ .., last] => format!("; {} and {last} state them", first.join(", ")),
+        [] => String::new(),
+    }
+}
+
+/// `ranges` of payload bytes as A..B, in order, separated by ", ".
+pub(super) fn byte_ranges(ranges: &[Range<usize>]) -> String {
+    ranges
+        .iter()
+        .map(|range| format!("{}..{}", range.start, range.end))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Returns the value_bytes of the question and where they come from, or why they cannot be read:
@@ -1790,6 +1961,7 @@ mod efivar_reader_tests {
     use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::CheckedVarStores;
     use super::super::EFI_IFR_NUMERIC_SIZE_2;
     use super::super::EFI_IFR_NUMERIC_SIZE_4;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
@@ -2008,7 +2180,7 @@ mod efivar_reader_tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut disabled_reader(),
         )
         .into_iter()
@@ -2041,7 +2213,7 @@ mod efivar_reader_tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::CONDITIONS,
-            None,
+            CheckedVarStores::NONE,
             reader,
         )
         .into_iter()
@@ -2053,7 +2225,8 @@ mod efivar_reader_tests {
     fn disabled_source_leaves_value_conditions_undetermined() {
         let efivars = Efivars::new();
         let undetermined = " <selectable or suppressed: EFI_IFR_EQ_ID_VAL of question 0x0002: \
-            <ValueUnavailable: EFI variables not read>>";
+            <ValueUnavailable: EFI variables not read; --assume-var-store \
+            Setup-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> states it>>";
 
         efivars.write(&efi_variable("Setup", 2), &[1, 0]);
         assert_eq!(
@@ -2101,7 +2274,7 @@ mod efivar_reader_tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut reader,
         )
         .into_iter()
@@ -2268,7 +2441,7 @@ mod efivar_reader_tests {
                     Rc::clone(&root),
                     &ListTexts::new(&strings(), &[]),
                     IncludedStates::empty(),
-                    None,
+                    CheckedVarStores::NONE,
                     &mut reader,
                 )
                 .into_iter()

@@ -526,6 +526,29 @@ fn set_with_an_access_level_is_refused_without_system_access() {
     }
 }
 
+/// set, through hii set and set, refuses --assume-var-store of a VarStore that no FormSet of the
+/// HiiDB declares, and writes nothing.
+#[test]
+fn set_with_bytes_of_an_undeclared_var_store_is_refused() {
+    for prefix in PREFIXES {
+        assert_eq!(
+            refuse(
+                prefix,
+                ONE_OF,
+                "My one-of text #3",
+                &[
+                    "--assume-var-store",
+                    "Undeclared-00000000-0000-0000-0000-000000000001=00"
+                ]
+            )
+            .error_message,
+            "no FormSet of this HiiDB declares a VarStore \
+             Undeclared-00000000-0000-0000-0000-000000000001",
+            "{prefix:?}"
+        );
+    }
+}
+
 /// "System Time" selects the first of DriverSample's two TIMEs of that prompt, of one state: that
 /// of the system time. Linux reaches no Time Services (UEFI 2.11 §8.3), so set refuses it before
 /// any write, and the variable, whose EFI_HII_TIME the other TIME holds, stays. get shows the

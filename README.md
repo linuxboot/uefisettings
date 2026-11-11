@@ -427,6 +427,50 @@ they would create absent variables and overwrite writable ones, such as BootOrde
 </details>
 
 <details>
+<summary>Stated VarStore bytes</summary>
+
+Conditions that read bytes the OS cannot read, such as those of a buffer VarStore that only its
+driver's `EFI_HII_CONFIG_ACCESS_PROTOCOL` holds, or of an EFI variable without runtime access, are
+undetermined, and `set` refuses the questions they may gray out or hide unless `--include` selects
+those states. The reason names the bytes:
+
+```text
+<ValueUnavailable: no EFI variable Setup-8be4df61-93ca-11d2-aa0d-00e098032b8c; HII buffer varstore
+requires EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store
+Setup-8be4df61-93ca-11d2-aa0d-00e098032b8c+5=<HEX of 1 byte> states it>
+```
+
+`--assume-var-store NAME-GUID[+OFFSET]=HEX`, on `get`, `set`, `hii get`, `hii set` and
+`hii list-questions`, evaluates conditions as if that VarStore held the bytes HEX, two hex digits
+each, from byte OFFSET of its payload on (decimal, or hexadecimal after `0x`; default 0). NAME-GUID
+is the name of the variable's efivar file, as the reason prints it. Repeat it to state more bytes.
+It refuses a VarStore that no FormSet of the HiiDB declares, bytes past its Size, and bytes stated
+twice.
+
+Stated bytes change states, and the option lists and defaults that conditions pick, never a write:
+the questions on those bytes still answer with what their variable holds, or why it cannot be
+read, and `set` writes the variable, never the stated bytes. A question whose `EFI_IFR_VALUE` or
+`READ` expression reads them answers with what it computes from them, and the `EFI_IFR_WRITE`
+expression of a question that `set` writes reads them as conditions do, as does an `EFI_IFR_GET`.
+
+For example, AMI firmware's Setup grays out or hides some questions by the access level of its
+session, which it keeps at byte 0 of the VarStore `SystemAccess`
+(E770BB69-BCB4-4D04-9E97-23FF9456FEAC: 0 Administrator, 1 User). To list the questions of an
+Administrator session:
+
+```sh
+uefisettings hii list-questions \
+  --assume-var-store SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac=00
+```
+
+uefisettings never takes, checks or circumvents a firmware password, because UEFI variable writes
+carry none. With an Administrator password installed, stating `00` there lets root select from the
+OS the questions that the firmware's Setup reserves for Administrator sessions, as
+`--include grayed-out` already does more broadly.
+
+</details>
+
+<details>
 <summary>AMI Setup access level</summary>
 
 AMI firmware's Setup grays out or hides some questions by the access level of its session, which

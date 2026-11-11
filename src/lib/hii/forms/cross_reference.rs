@@ -185,6 +185,7 @@ mod tests {
     use super::super::set::NewAnswer;
     use super::super::set_questions;
     use super::super::storageless::StoragelessQuestion;
+    use super::super::CheckedVarStores;
     use super::super::DefaultId;
     use super::hii_ref;
     use super::ref_text;
@@ -238,7 +239,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::all(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         .into_iter()
@@ -517,7 +518,7 @@ mod tests {
                 answer,
                 IncludedStates::empty(),
                 &mut reader,
-                None,
+                CheckedVarStores::NONE,
                 VolatileWrites::Refuse,
                 PendingOperations::new(UnsafeOperations::Refuse),
                 &WithholdingVariables::new(&variables, WithheldBytes::default()),

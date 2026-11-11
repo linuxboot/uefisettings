@@ -1044,7 +1044,11 @@ pub(super) fn question_descriptor(
     node: &Rc<RefCell<IFROperation>>,
     var_store: VarStoreFixture,
 ) -> QuestionDescriptor {
-    question_descriptor_with(node, var_store, &VarStoreValues::new(&root_of(node), None))
+    question_descriptor_with(
+        node,
+        var_store,
+        &VarStoreValues::new(&root_of(node), CheckedVarStores::NONE),
+    )
 }
 
 /// Returns the root of the tree of `node`.
@@ -1077,7 +1081,7 @@ pub(super) fn question_descriptor_timed(
     VarStoreFixture { store, efivars }: VarStoreFixture,
     time_services: Option<Rc<dyn TimeServices>>,
 ) -> QuestionDescriptor {
-    let values = VarStoreValues::new(&root_of(node), None);
+    let values = VarStoreValues::new(&root_of(node), CheckedVarStores::NONE);
     let mut reader = efivars.reader().with_time_services(time_services);
     describe(node, store, &values, &mut reader)
 }

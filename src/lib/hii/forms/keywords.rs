@@ -71,6 +71,7 @@ use super::walk_scopes;
 use super::write_plan::list_own_write;
 use super::write_plan::string_own_write;
 use super::AnswerOption;
+use super::CheckedVarStores;
 use super::Choice;
 use super::DeclaredStore;
 use super::DisabledForm;
@@ -940,7 +941,7 @@ impl<'a> KeywordQuestion<'a> {
         reader: &mut EfivarReader,
     ) -> Result<KeywordInfo, KeywordInfoRefusal> {
         let op = self.op.borrow();
-        let values = VarStoreValues::new(self.root, None);
+        let values = VarStoreValues::new(self.root, CheckedVarStores::NONE);
         let mut walk = FormSetWalk::new(&self.texts, reader, &values, IncludedStates::empty());
         let mut info = KeywordInfo::default();
         if filter.contains(KeywordInfoFilter::DATA_TYPE) {
@@ -1401,7 +1402,7 @@ impl<'a> KeywordQuestion<'a> {
         reader: &mut EfivarReader,
     ) -> Result<QuestionDescriptor> {
         let selection = {
-            let values = VarStoreValues::new(self.root, None);
+            let values = VarStoreValues::new(self.root, CheckedVarStores::NONE);
             let mut walk = FormSetWalk::new(&self.texts, reader, &values, include);
             let state = question_state(&self.op.borrow(), &mut walk.inputs);
             select(vec![(question, state)], include)
@@ -5191,7 +5192,7 @@ mod tests {
             Rc::clone(&lists[0].forms[0]),
             &texts,
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut reader(1),
         )
         .into_iter()
@@ -5244,7 +5245,7 @@ mod tests {
             Rc::clone(&lists[0].forms[0]),
             &texts,
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut reader(1),
         )
         .into_iter()

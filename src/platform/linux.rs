@@ -586,6 +586,7 @@ fn refuse_on_ilo<'a>(question: &'a QuestionArgs, selection: &SelectionArgs) -> R
         ("--keyword-namespace", question.keyword_namespace.is_some()),
         ("--include", !selection.include.include.is_empty()),
         ("--access-level", selection.access_level.is_some()),
+        ("--assume-var-store", !selection.assume_var_store.is_empty()),
         ("--language", selection.language.language.is_some()),
     ]
     .into_iter()
@@ -1497,6 +1498,30 @@ mod tests {
                 Err(
                     "--access-level applies to the HII backend, not to the Ilo backend of this \
                      machine",
+                ),
+            ),
+            (
+                "--assume-var-store",
+                vec![
+                    "--assume-var-store",
+                    "Mode-11111111-1111-1111-1111-111111111111=01",
+                ],
+                Err(
+                    "--assume-var-store applies to the HII backend, not to the Ilo backend of \
+                     this machine",
+                ),
+            ),
+            (
+                "--include and --assume-var-store",
+                vec![
+                    "--include",
+                    "grayed-out",
+                    "--assume-var-store",
+                    "Mode-11111111-1111-1111-1111-111111111111=01",
+                ],
+                Err(
+                    "--include and --assume-var-store apply to the HII backend, not to the Ilo \
+                     backend of this machine",
                 ),
             ),
             (

@@ -610,7 +610,7 @@ impl HiiBackend {
                 image: None,
                 esp: None,
                 include: IncludedStates::empty(),
-                access_level: None,
+                assume_var_stores: Vec::new(),
                 unsafe_operations: UnsafeOperations::Refuse,
                 // get writes nothing
                 passwords: PasswordQuestions::default(),

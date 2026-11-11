@@ -328,6 +328,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
     use crate::hii::forms::list_questions;
+    use crate::hii::forms::CheckedVarStores;
     use crate::hii::forms::IFROperation;
     use crate::hii::package::hiidb_fixtures::en_strings_package_of;
     use crate::hii::package::hiidb_fixtures::form_package;
@@ -643,7 +644,7 @@ mod tests {
             Rc::clone(root),
             &ListTexts::new(&[], &[]),
             IncludedStates::CONDITIONS,
-            None,
+            CheckedVarStores::NONE,
             &mut EfivarReader::new(source).expect("create a reader of the efivars directory"),
         )
         .into_iter()

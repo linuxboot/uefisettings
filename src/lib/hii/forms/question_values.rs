@@ -1244,6 +1244,7 @@ mod question_value_tests {
     use super::super::default_value_parser;
     use super::super::display_answer;
     use super::super::ifr_fixtures::*;
+    use super::super::CheckedVarStores;
     use super::super::DefaultId;
     use super::super::IfrDefaultValue;
     use super::super::Range16;
@@ -1408,7 +1409,7 @@ mod question_value_tests {
                 root,
                 &ListTexts::new(&strings(), &[]),
                 IncludedStates::all(),
-                None,
+                CheckedVarStores::NONE,
                 &mut efivars.reader(),
             );
             assert_eq!(questions.len(), listed, "{name}");
@@ -1481,7 +1482,7 @@ mod question_value_tests {
                 root,
                 &ListTexts::new(&strings(), &[]),
                 IncludedStates::all(),
-                None,
+                CheckedVarStores::NONE,
                 &mut disabled_reader(),
             );
             assert_eq!(questions.len(), 1, "{op_code:#04x}: the CHECKBOX");

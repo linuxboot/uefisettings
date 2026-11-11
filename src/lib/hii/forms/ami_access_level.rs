@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
+use super::assumed_var_store::AssumedVarStore;
 use super::form_set_list_var_stores;
 use super::storage::VarStoreVariable;
 use super::Creation;
@@ -25,6 +26,7 @@ use super::Guid;
 use super::IFROpCode;
 use super::IFROperation;
 use super::ParsedOperation;
+use crate::hii::variables::VariableKey;
 
 /// Where AMI firmware's setup browser keeps the access level of its session: its IFR shows
 /// Access Level Administrator at 0 and User at 1.
@@ -52,6 +54,27 @@ impl From<AccessLevel> for u8 {
     fn from(level: AccessLevel) -> Self {
         level as u8
     }
+}
+
+/// `assumed` after the statement of `access_level`, if any: its byte at byte 0 of
+/// AMI_ACCESS_LEVEL.
+pub(crate) fn with_access_level(
+    access_level: Option<AccessLevel>,
+    assumed: &[AssumedVarStore],
+) -> Vec<AssumedVarStore> {
+    access_level
+        .map(|level| {
+            AssumedVarStore::first_byte(
+                VariableKey {
+                    name: AMI_ACCESS_LEVEL.name.to_owned(),
+                    guid: AMI_ACCESS_LEVEL.guid,
+                },
+                u8::from(level),
+            )
+        })
+        .into_iter()
+        .chain(assumed.iter().cloned())
+        .collect()
 }
 
 /// An AccessLevel stated for a HiiDB whose FormSets declare no AMI_ACCESS_LEVEL.

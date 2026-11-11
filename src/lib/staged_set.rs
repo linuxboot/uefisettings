@@ -52,7 +52,7 @@ use crate::efi_variables::load_option::Ucs2String;
 use crate::efi_variables::VariableContents;
 use crate::efi_variables::VariableData;
 use crate::efi_variables::UEFISETTINGS_VENDOR_GUID;
-use crate::hii::forms::AccessLevel;
+use crate::hii::forms::AssumedVarStore;
 use crate::hii::forms::IfrValueType;
 use crate::hii::forms::IncludedStates;
 use crate::hii::package::Guid;
@@ -171,8 +171,9 @@ fn lowercase_digit(byte: u8) -> Option<u8> {
 }
 
 /// A request that set staged: to set the question `question_id` of the FormSet `form_set`, which
-/// its driver holds, to `value`, selected with `include` and `access_level` as set selected it,
-/// with set's grant of `unsafe_operations`.
+/// its driver holds, to `value`, selected with `include` and `assume_var_stores` as set selected
+/// it, with set's grant of `unsafe_operations`. A request that an older uefisettings staged has
+/// "access_level" instead of "assume_var_stores", which deny_unknown_fields refuses by name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StagedRequest {
@@ -187,9 +188,10 @@ pub(crate) struct StagedRequest {
     /// The states of questions that set selected too, as --include names them
     #[serde(with = "included_states")]
     pub(crate) include: IncludedStates,
-    /// The access level that set's conditions read instead of the stored one, if stated
-    #[serde(with = "access_level")]
-    pub(crate) access_level: Option<AccessLevel>,
+    /// The VarStore bytes that set's conditions read in place of those their variables hold, as
+    /// --assume-var-store states them
+    #[serde(with = "assumed_var_stores")]
+    pub(crate) assume_var_stores: Vec<AssumedVarStore>,
     /// Whether set had --i-am-fine-to-brick-this-system, which apply-staged checks the unsafe
     /// operations of applying the request against
     #[serde(with = "unsafe_operations")]
@@ -831,43 +833,29 @@ mod unsafe_operations {
     }
 }
 
-/// An access level as --access-level names it, or null.
-mod access_level {
+/// Stated VarStore bytes as --assume-var-store takes them, NAME-GUID+OFFSET=HEX, in order.
+mod assumed_var_stores {
     use serde::de::Error;
     use serde::Deserialize;
     use serde::Deserializer;
     use serde::Serializer;
 
-    use super::AccessLevel;
-
-    fn name(level: AccessLevel) -> &'static str {
-        match level {
-            AccessLevel::Administrator => "administrator",
-            AccessLevel::User => "user",
-        }
-    }
+    use super::AssumedVarStore;
 
     pub(super) fn serialize<S: Serializer>(
-        level: &Option<AccessLevel>,
+        assumed: &[AssumedVarStore],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        match level {
-            Some(level) => serializer.serialize_some(name(*level)),
-            None => serializer.serialize_none(),
-        }
+        serializer.collect_seq(assumed.iter().map(ToString::to_string))
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<AccessLevel>, D::Error> {
-        Option::<String>::deserialize(deserializer)?
-            .map(|text| {
-                [AccessLevel::Administrator, AccessLevel::User]
-                    .into_iter()
-                    .find(|&level| name(level) == text)
-                    .ok_or_else(|| D::Error::custom(format!("{text:?} is no access level")))
-            })
-            .transpose()
+    ) -> Result<Vec<AssumedVarStore>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .iter()
+            .map(|text| text.parse().map_err(D::Error::custom))
+            .collect()
     }
 }
 
@@ -943,17 +931,19 @@ mod tests {
             value_type: IfrValueType::NumSize8,
             value,
             include: IncludedStates::empty(),
-            access_level: None,
+            assume_var_stores: Vec::new(),
             unsafe_operations: UnsafeOperations::Refuse,
         }
     }
 
-    /// request(2), selected with every state and access level of a user, staged with
-    /// --i-am-fine-to-brick-this-system.
+    /// request(2), selected with every state and the bytes 01 ff stated at byte 3 of the VarStore
+    /// Mode, staged with --i-am-fine-to-brick-this-system.
     pub(super) fn including_request() -> StagedRequest {
         StagedRequest {
             include: IncludedStates::all(),
-            access_level: Some(AccessLevel::User),
+            assume_var_stores: vec!["Mode-11111111-1111-1111-1111-111111111111+3=01ff"
+                .parse()
+                .expect("a statement")],
             unsafe_operations: UnsafeOperations::Allow,
             ..request(2)
         }
@@ -1155,8 +1145,8 @@ mod tests {
 
     #[test]
     fn records_are_json_with_their_ids_and_digests_as_text() {
-        let set = r#"{"nonce":"00112233445566778899aabbccddeeff","boot_option":7,"image":{"path":"\\EFI\\uefisettings\\uefisettings.efi","sha256":"4242424242424242424242424242424242424242424242424242424242424242"},"requests":[{"question":"Generic Question","form_set":"8C78A505-BAA0-4C4A-869F-000000001A09","question_id":513,"value_type":"EFI_IFR_TYPE_NUM_SIZE_8","value":1,"include":[],"access_level":null,"unsafe_operations":"refuse"},{"question":"Generic Question","form_set":"8C78A505-BAA0-4C4A-869F-000000001A09","question_id":513,"value_type":"EFI_IFR_TYPE_NUM_SIZE_8","value":2,"include":["grayed-out","suppressed","disabled"],"access_level":"user","unsafe_operations":"allow"}]}"#;
-        let request_json = r#"{"question":"Generic Question","form_set":"8C78A505-BAA0-4C4A-869F-000000001A09","question_id":513,"value_type":"EFI_IFR_TYPE_NUM_SIZE_8","value":1,"include":[],"access_level":null,"unsafe_operations":"refuse"}"#;
+        let set = r#"{"nonce":"00112233445566778899aabbccddeeff","boot_option":7,"image":{"path":"\\EFI\\uefisettings\\uefisettings.efi","sha256":"4242424242424242424242424242424242424242424242424242424242424242"},"requests":[{"question":"Generic Question","form_set":"8C78A505-BAA0-4C4A-869F-000000001A09","question_id":513,"value_type":"EFI_IFR_TYPE_NUM_SIZE_8","value":1,"include":[],"assume_var_stores":[],"unsafe_operations":"refuse"},{"question":"Generic Question","form_set":"8C78A505-BAA0-4C4A-869F-000000001A09","question_id":513,"value_type":"EFI_IFR_TYPE_NUM_SIZE_8","value":2,"include":["grayed-out","suppressed","disabled"],"assume_var_stores":["Mode-11111111-1111-1111-1111-111111111111+3=01ff"],"unsafe_operations":"allow"}]}"#;
+        let request_json = r#"{"question":"Generic Question","form_set":"8C78A505-BAA0-4C4A-869F-000000001A09","question_id":513,"value_type":"EFI_IFR_TYPE_NUM_SIZE_8","value":1,"include":[],"assume_var_stores":[],"unsafe_operations":"refuse"}"#;
         let outcomes = [
             (
                 started(NONCE),
@@ -1276,8 +1266,15 @@ mod tests {
                 ),
             ),
             (
-                "an unknown access level",
-                set.replace(r#""access_level":"user""#, r#""access_level":"root""#),
+                "a statement that --assume-var-store refuses",
+                set.replace(
+                    "Mode-11111111-1111-1111-1111-111111111111+3=01ff",
+                    "Mode-11111111-1111-1111-1111-111111111111+3=0",
+                ),
+            ),
+            (
+                "the access_level of an older uefisettings, in place of assume_var_stores",
+                set.replace(r#""assume_var_stores":[]"#, r#""access_level":null"#),
             ),
             (
                 "an unknown grant of unsafe operations",
@@ -1302,6 +1299,25 @@ mod tests {
             r#"{"state":"started","nonce":"00112233445566778899aabbccddeeff","extra":1}"#,
         ] {
             assert!(serde_json::from_str::<Outcome>(text).is_err(), "{text}");
+        }
+    }
+
+    /// A request that an older uefisettings staged, with "access_level", is refused by that name,
+    /// null too, never read as one that states no VarStore bytes.
+    #[test]
+    fn a_request_of_an_older_uefisettings_is_refused_by_its_access_level() {
+        for level in ["null", r#""user""#] {
+            let text = format!(
+                r#"{{"question":"Generic Question","form_set":"8C78A505-BAA0-4C4A-869F-000000001A09","question_id":513,"value_type":"EFI_IFR_TYPE_NUM_SIZE_8","value":1,"include":[],"access_level":{level},"unsafe_operations":"refuse"}}"#
+            );
+            let error = serde_json::from_str::<StagedRequest>(&text)
+                .expect_err("a request with access_level");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("unknown field `access_level`"),
+                "{level}: {error}"
+            );
         }
     }
 

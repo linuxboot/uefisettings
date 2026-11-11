@@ -30,6 +30,7 @@ use fbthrift::simplejson_protocol;
 use fbthrift::simplejson_protocol::Serializable;
 use log::info;
 use uefisettings::exports::AccessLevel;
+use uefisettings::exports::AssumedVarStore;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
@@ -416,6 +417,15 @@ struct SelectionArgs {
     /// nothing (UEFI variable writes carry no password).
     #[arg(long, value_enum, value_name = "LEVEL")]
     access_level: Option<AccessLevelArg>,
+    /// Evaluate conditions as if the VarStore whose efivar file is NAME-GUID held the bytes HEX,
+    /// two hex digits each, from byte OFFSET of its payload on (decimal, or hexadecimal after 0x;
+    /// default 0), whatever its variable holds; the reason of an unreadable value names
+    /// NAME-GUID+OFFSET. States, the options that conditions hide and the defaults they pick
+    /// follow these bytes; the questions on them still answer with what their variable holds,
+    /// and writes write the variable. This states what a setup browser holds; it is no password
+    /// and authenticates nothing (UEFI variable writes carry no password).
+    #[arg(long, value_name = "NAME-GUID[+OFFSET]=HEX")]
+    assume_var_store: Vec<AssumedVarStore>,
     #[command(flatten)]
     language: LanguageArgs,
 }
@@ -447,6 +457,7 @@ impl From<&SelectionArgs> for GetOptions {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
+        options.assume_var_stores.clone_from(&args.assume_var_store);
         options.language.clone_from(&args.language.language);
         options
     }
@@ -458,6 +469,7 @@ impl From<&SelectionArgs> for SetOptions {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
+        options.assume_var_stores.clone_from(&args.assume_var_store);
         options.language.clone_from(&args.language.language);
         options
     }
@@ -468,6 +480,7 @@ impl From<&SelectionArgs> for ListQuestionsOptions {
         let mut options = Self::default();
         options.include = args.states();
         options.access_level = args.access_level();
+        options.assume_var_stores.clone_from(&args.assume_var_store);
         options.language.clone_from(&args.language.language);
         options
     }
@@ -1197,6 +1210,115 @@ mod tests {
         .concat())
         .expect_err("parse --access-level 0");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "0");
+    }
+
+    /// --assume-var-store, repeatable, gives get, set and list-questions its statements in order;
+    /// a value that is no NAME-GUID[+OFFSET]=HEX is refused before any command runs.
+    #[test]
+    fn assume_var_store_maps_to_its_flag() {
+        const MODE: &str = "Mode-11111111-1111-1111-1111-111111111111";
+        let cases = [
+            ("no flag", vec![], vec![]),
+            (
+                "one",
+                vec!["--assume-var-store".to_string(), format!("{MODE}=01")],
+                vec![format!("{MODE}+0=01")],
+            ),
+            (
+                "two",
+                vec![
+                    "--assume-var-store".to_string(),
+                    format!("{MODE}+2=0a0b"),
+                    "--assume-var-store".to_string(),
+                    format!("{MODE}+0x10=ff"),
+                ],
+                vec![format!("{MODE}+2=0a0b"), format!("{MODE}+16=ff")],
+            ),
+        ];
+        for (name, args, want) in cases {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let shown = |assumed: &[AssumedVarStore]| -> Vec<String> {
+                assumed.iter().map(ToString::to_string).collect()
+            };
+            let selection = selection_of(&args);
+            assert_eq!(
+                shown(&GetOptions::from(&selection).assume_var_stores),
+                want,
+                "{name}: get"
+            );
+            #[cfg(all(system_hiidb, system_variables))]
+            assert_eq!(
+                shown(&SetOptions::from(&set_selection_of(&args)).assume_var_stores),
+                want,
+                "{name}: set"
+            );
+            assert_eq!(
+                shown(&ListQuestionsOptions::from(&selection).assume_var_stores),
+                want,
+                "{name}: list-questions"
+            );
+        }
+
+        for value in [MODE, &format!("{MODE}=0"), &format!("{MODE}+x=00")] {
+            let error = hii(&[
+                &["list-questions"][..],
+                &OFFLINE_SOURCE,
+                &["--assume-var-store", value],
+            ]
+            .concat())
+            .expect_err("parse --assume-var-store");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
+    }
+
+    /// --assume-var-store comes with --include: on hii get, set and list-questions and on get and
+    /// set, not on show-ifr, which evaluates no conditions, nor on ilo.
+    #[test]
+    fn assume_var_store_is_taken_where_include_is() {
+        let reading: [(&[&str], bool); 3] = [
+            (&["hii", "get", "Q"], true),
+            (&["hii", "list-questions"], true),
+            (&["hii", "show-ifr"], false),
+        ];
+        let reading = reading.map(|(command, takes)| ([command, &OFFLINE_SOURCE].concat(), takes));
+        let commands = reading
+            .iter()
+            .map(|(command, takes)| (&command[..], *takes));
+        #[cfg(all(system_hiidb, system_variables))]
+        let commands = commands.into_iter().chain([
+            (&["hii", "set", "Q", "V"][..], true),
+            (&["get", "Q"], true),
+            (&["set", "Q", "V"], true),
+        ]);
+        // the Linux build's own command
+        #[cfg(target_os = "linux")]
+        let commands = commands
+            .into_iter()
+            .chain([(&["ilo", "get", "Q"][..], false)]);
+        for (command, takes) in commands {
+            let argv = [
+                &["uefisettings"][..],
+                command,
+                &[
+                    "--assume-var-store",
+                    "Mode-11111111-1111-1111-1111-111111111111=01",
+                ],
+            ]
+            .concat();
+            let parsed = UefiSettingsToolArgs::try_parse_from(argv).map_err(|error| error.kind());
+            match takes {
+                true => assert!(parsed.is_ok(), "{command:?}: {parsed:?}"),
+                false => assert_eq!(
+                    parsed.err(),
+                    Some(clap::error::ErrorKind::UnknownArgument),
+                    "{command:?}"
+                ),
+            }
+        }
     }
 
     /// No command's --include takes read-only: get and list-questions show read-only questions

@@ -1053,7 +1053,7 @@ mod get_and_set_tests {
                 Rc::clone(&root),
                 &ListTexts::new(&strings, &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut reader,
             )
             .into_iter()
@@ -1095,7 +1095,7 @@ mod get_and_set_tests {
             for (prompt, callback, read, write) in QUESTIONS {
                 let refusal = refusal((callback, read, write), QuestionExpression::Write, reach);
                 let mut reader = reader_reaching(reach);
-                let values = VarStoreValues::new(&root, None);
+                let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                 let selection = find_question_in(
                     &root,
                     &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
@@ -1123,7 +1123,7 @@ mod get_and_set_tests {
                     },
                     IncludedStates::empty(),
                     &mut reader,
-                    None,
+                    CheckedVarStores::NONE,
                     VolatileWrites::Refuse,
                     PendingOperations::new(UnsafeOperations::Refuse),
                     &WithholdingVariables::new(&variables, WithheldBytes::default()),
@@ -1199,7 +1199,7 @@ mod get_and_set_tests {
                 Rc::clone(&root),
                 &ListTexts::new(&strings, &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut reader,
             )
             .into_iter()
@@ -1226,7 +1226,7 @@ mod get_and_set_tests {
                     "{prompt} through {reach:?}: defaults"
                 );
 
-                let values = VarStoreValues::new(&root, None);
+                let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                 let selection = find_question_in(
                     &root,
                     &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
@@ -1254,7 +1254,7 @@ mod get_and_set_tests {
                     },
                     IncludedStates::empty(),
                     &mut reader,
-                    None,
+                    CheckedVarStores::NONE,
                     VolatileWrites::Refuse,
                     PendingOperations::new(UnsafeOperations::Refuse),
                     &WithholdingVariables::new(&variables, WithheldBytes::default()),

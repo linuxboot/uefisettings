@@ -55,6 +55,9 @@ use log::warn;
 use thiserror::Error;
 
 use super::ami_access_level::AMI_ACCESS_LEVEL;
+use super::assumed_var_store::statements_of;
+use super::assumed_var_store::CheckedVarStores;
+use super::assumed_var_store::StoreStatements;
 use super::date_time::widened_date;
 use super::date_time::widened_time;
 use super::date_time::DateTimeKind;
@@ -71,8 +74,9 @@ use super::question_values::OptionMatch;
 use super::question_values::PromptMatch;
 use super::question_values::ValueQuestion;
 use super::storage::read_current_value_bytes;
-use super::storage::read_question_value;
+use super::storage::read_stated_question_value;
 use super::storage::read_stored_bytes;
+use super::storage::stated_ranges;
 use super::storage::stored_value;
 use super::storage::RetrievedValue;
 use super::storage::ShortVarStoreEfi;
@@ -89,7 +93,6 @@ use super::time_storage::FieldChange;
 use super::time_storage::TimeStorage;
 use super::time_storage::TimeStorageUnread;
 use super::walk_scopes;
-use super::AccessLevel;
 use super::Creation;
 use super::DeclaredStore;
 use super::EfivarReader;
@@ -1232,30 +1235,30 @@ pub(super) fn is_question(op_code: IFROpCode) -> bool {
 
 /// Reads the values of the questions that conditions refer to from their VarStores, as get
 /// does.
-pub(crate) struct VarStoreValues {
+pub(crate) struct VarStoreValues<'a> {
     index: QuestionIndex,
-    /// What conditions read from AMI_ACCESS_LEVEL instead of its value, if stated
-    access_level: Option<AccessLevel>,
+    /// The VarStore bytes that conditions read in place of those their variables hold
+    assumed: CheckedVarStores<'a>,
     /// The questions whose values are being retrieved, innermost last: a READ expression that
     /// refers to one of them needs the value that it is to give
     retrieving: RefCell<Vec<Rc<RefCell<IFROperation>>>>,
     parse: FormSetParse,
 }
 
-impl VarStoreValues {
-    /// Finds the questions in the FormSet of `root`, reading `access_level`, if stated, for
-    /// AMI_ACCESS_LEVEL instead of its value.
-    pub(crate) fn new(root: &Rc<RefCell<IFROperation>>, access_level: Option<AccessLevel>) -> Self {
+impl<'a> VarStoreValues<'a> {
+    /// Finds the questions in the FormSet of `root`, reading the bytes that `assumed` states in
+    /// place of those their variables hold.
+    pub(crate) fn new(root: &Rc<RefCell<IFROperation>>, assumed: CheckedVarStores<'a>) -> Self {
         VarStoreValues {
             index: QuestionIndex::new(root),
-            access_level,
+            assumed,
             retrieving: RefCell::default(),
             parse: FormSetParse::default(),
         }
     }
 }
 
-impl QuestionValues for VarStoreValues {
+impl QuestionValues for VarStoreValues<'_> {
     fn value(
         &self,
         referrer: &IFROperation,
@@ -1306,7 +1309,7 @@ impl QuestionValues for VarStoreValues {
             question,
             value_question,
             &varstore,
-            self.access_level,
+            self.assumed,
             &mut ExpressionInputs {
                 reader,
                 values: self,
@@ -1318,6 +1321,10 @@ impl QuestionValues for VarStoreValues {
 
     fn parse_skips(&self, question: &IFROperation) -> Truth {
         self.parse.skips(question)
+    }
+
+    fn assumed(&self) -> CheckedVarStores<'_> {
+        self.assumed
     }
 }
 
@@ -1340,10 +1347,23 @@ fn value_kind(value_question: ValueQuestion) -> ValueKind {
 /// question without a VarStore has none then. A question with an EFI_IFR_VALUE has the value of
 /// its expression instead, which GetQuestionValue takes before any READ or storage. The value of
 /// an EFI_IFR_VALUE or READ expression comes from the snapshot if THIS or a value that the
-/// expression took does.
+/// expression took does. Stated VarStore bytes never reach THIS: conditions read them
+/// (retrieve_stated_question_value), writes do not; an EFI_IFR_VALUE or READ expression reads
+/// those of the questions it refers to through `inputs`, as conditions do.
 pub(super) fn retrieve_question_value(
     question: &Rc<RefCell<IFROperation>>,
     varstore: &Result<Box<dyn VariableStore>>,
+    inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
+) -> std::result::Result<RetrievedValue, ValueUnavailable> {
+    retrieve_stated_question_value(question, varstore, &StoreStatements::default(), inputs)
+}
+
+/// retrieve_question_value, with the bytes of `stated`, statements of `varstore`, as its payload
+/// in place of those its variable holds (read_stated_question_value).
+fn retrieve_stated_question_value(
+    question: &Rc<RefCell<IFROperation>>,
+    varstore: &Result<Box<dyn VariableStore>>,
+    stated: &StoreStatements<'_>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> std::result::Result<RetrievedValue, ValueUnavailable> {
     let op = question.borrow();
@@ -1364,7 +1384,7 @@ pub(super) fn retrieve_question_value(
             })
             .map_err(ValueUnavailable::ValueExpression);
     }
-    let stored = read_question_value(&op, varstore, inputs.reader);
+    let stored = read_stated_question_value(&op, varstore, stated, inputs.reader);
     let storageless = varstore
         .as_ref()
         .err()
@@ -1406,12 +1426,12 @@ pub(super) fn retrieve_question_value(
 
 /// Returns the value of `question`, which is `value_question`, as retrieve_question_value
 /// retrieves it from `varstore`, typed as edk2-stable202608 SetupBrowserDxe/IfrParse.c
-/// ParseOpCodes types it: on AMI_ACCESS_LEVEL, `access_level` instead, if stated.
+/// ParseOpCodes types it, with the bytes that `assumed` states for `varstore` as its payload.
 fn question_value(
     question: &Rc<RefCell<IFROperation>>,
     value_question: ValueQuestion,
     varstore: &Result<Box<dyn VariableStore>>,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
     inputs: &mut ExpressionInputs<'_, impl QuestionValues>,
 ) -> QuestionValue {
     let kind = value_kind(value_question);
@@ -1419,25 +1439,48 @@ fn question_value(
     let on_access_level = value_question.location()
         == (ValueLocation::Bytes { offset: 0, size: 1 })
         && matches!(varstore, Ok(store) if AMI_ACCESS_LEVEL.identifies(store.as_ref()));
-    let value = match (on_access_level, access_level) {
-        // AMI IFR also compares the level with 85, of unknown meaning, in a SUPPRESS_IF NOT
-        // around a REF, which either stated level suppresses
-        (true, Some(level)) => Ok(u64::from(u8::from(level))),
-        (true, None) | (false, Some(_) | None) => {
-            retrieve_question_value(question, varstore, inputs).map(|retrieved| retrieved.value)
-        }
+    let stated = match varstore {
+        Ok(store) => statements_of(assumed, store.as_ref()),
+        Err(_) => StoreStatements::default(),
     };
+    let value = retrieve_stated_question_value(question, varstore, &stated, inputs)
+        .map(|retrieved| retrieved.value);
     let reason = match value.and_then(|value| typed_value(value_question, value)) {
         Ok(value) => return value,
         Err(reason) => reason,
     };
     let reason = match on_access_level {
         true => ValueUnavailable::AmiAccessLevel(Box::new(reason)),
-        false => reason,
+        false => unstated(reason, varstore, value_question.location()),
     };
     QuestionValue::Unreadable {
         kind,
         reason: reason.to_answer(),
+    }
+}
+
+/// `reason`, why a condition reads no value at `location` of `varstore`, with the bytes that
+/// --assume-var-store would state there where the store's variable is why (stateable_bytes); a
+/// store whose variable holds one value takes no statement (statements_of).
+fn unstated(
+    reason: ValueUnavailable,
+    varstore: &Result<Box<dyn VariableStore>>,
+    location: ValueLocation,
+) -> ValueUnavailable {
+    let Ok(store) = varstore else {
+        return reason;
+    };
+    match store.layout() {
+        VariableLayout::Offsets => {}
+        VariableLayout::OneValue => return reason,
+    }
+    match reason.stateable_bytes(location) {
+        Some(bytes) => ValueUnavailable::Unstated {
+            reason: Box::new(reason),
+            key: store.variable_key(),
+            bytes,
+        },
+        None => reason,
     }
 }
 
@@ -1520,6 +1563,12 @@ pub(crate) trait QuestionValues {
     /// question.
     fn parse_skips(&self, question: &IFROperation) -> Truth {
         FormSetParse::default().skips(question)
+    }
+
+    /// The VarStore bytes that a GET reads in place of those their variables hold, as `value`
+    /// reads them for the questions on them.
+    fn assumed(&self) -> CheckedVarStores<'_> {
+        CheckedVarStores::NONE
     }
 }
 
@@ -4137,7 +4186,11 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// SetupBrowserDxe/Expression.c EvaluateExpression); one that this backend cannot read is
     /// unknown. A missing variable of a VarName, or one of another size, gives UNDEFINED, as a
     /// value that could not be retrieved (UEFI 2.11 §33.3.8.3.27): edk2 gives it where
-    /// GetVariable fails, and reads a smaller variable zero-extended.
+    /// GetVariable fails, and reads a smaller variable zero-extended. Bytes that
+    /// --assume-var-store states replace those of the variable, as edk2 reads the edit buffer of
+    /// a buffer or EFI variable VarStore (Expression.c:2756-2763); where they state only some,
+    /// the others come from the variable, and if it cannot give them, the value is unknown and
+    /// PartlyStated.
     fn get(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
         let ParsedOperation::Get(operand) = &op.parsed_data else {
             return Err(not_decoded(op));
@@ -4158,17 +4211,41 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         let layout = store.layout();
         let range = operand_range(op, operand, kind, store.as_ref())?;
         let offset = range.start;
+        let patch = statements_of(self.values.assumed(), store.as_ref()).bytes(range.clone());
+        if let Some(bytes) = patch.iter().copied().collect::<Option<Vec<u8>>>() {
+            return Ok(kind.operand(&bytes));
+        }
+        let key = store.variable_key();
         let varstore = Ok(store);
-        let read =
-            read_current_value_bytes(&varstore, range.clone(), self.reader).and_then(|bytes| {
+        let read = read_current_value_bytes(&varstore, range.clone(), self.reader)
+            .and_then(|bytes| {
                 bytes
                     .get(EFIVARFS_HEADER_SIZE..)
-                    .and_then(|payload| payload.get(range))
+                    .and_then(|payload| payload.get(range.clone()))
                     .map(<[u8]>::to_vec)
                     .ok_or(ValueUnavailable::Truncated {
                         offset,
                         len: bytes.len(),
                     })
+            })
+            .map(|read| {
+                patch
+                    .iter()
+                    .zip(read)
+                    .map(|(stated, read)| stated.unwrap_or(read))
+                    .collect::<Vec<u8>>()
+            })
+            .map_err(|reason| match patch.iter().any(Option::is_some) {
+                true => {
+                    let (stated, unstated) = stated_ranges(&patch, range.start);
+                    ValueUnavailable::PartlyStated {
+                        reason: Box::new(reason),
+                        key,
+                        stated,
+                        unstated,
+                    }
+                }
+                false => reason,
             });
         match (read, layout) {
             (Ok(bytes), _) => Ok(kind.operand(&bytes)),
@@ -4660,11 +4737,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
+    use super::super::check_assumed;
     use super::super::find_question_in;
     use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
     use super::super::storage::ValueLocation;
+    use super::super::with_access_level;
+    use super::super::AccessLevel;
+    use super::super::AssumedVarStore;
     use super::super::Cursor;
     use super::super::FormSetWalk;
     use super::super::QuestionDescriptor;
@@ -7294,7 +7375,7 @@ mod tests {
             let root = parse_form_set(&[form(1, &[body, referrer.clone()])]);
             let referrer = find_op(&root, &referrer[2..])
                 .unwrap_or_else(|| panic!("{name}: find the referrer"));
-            let value = VarStoreValues::new(&root, None).value(
+            let value = VarStoreValues::new(&root, CheckedVarStores::NONE).value(
                 &referrer.borrow(),
                 1,
                 &mut Efivars::new().reader(),
@@ -7328,7 +7409,7 @@ mod tests {
                 Rc::clone(&root),
                 &ListTexts::new(&strings(), &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut Efivars::new().reader(),
             )
             .into_iter()
@@ -7517,7 +7598,7 @@ mod tests {
         ] {
             let root = parse_form_set(&ifr);
             let found = find_op(&root, &referrer[2..]).expect("find the referrer");
-            let value = VarStoreValues::new(&root, None).value(
+            let value = VarStoreValues::new(&root, CheckedVarStores::NONE).value(
                 &found.borrow(),
                 7,
                 &mut Efivars::new().reader(),
@@ -7559,7 +7640,7 @@ mod tests {
                 root,
                 &ListTexts::new(&[], &[]),
                 IncludedStates::all(),
-                None,
+                CheckedVarStores::NONE,
                 &mut Efivars::new().reader(),
             );
             (
@@ -7582,7 +7663,7 @@ mod tests {
         let referrer = checkbox_op(1, 1);
         let root = parse_form_set(&[form(1, &[checkbox_op(0, 0), referrer.clone()])]);
         let referrer = find_op(&root, &referrer[2..]).expect("find the referrer");
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let mut reader = Efivars::new().reader();
         assert_eq!(
             values.value(&referrer.borrow(), 0, &mut reader),
@@ -7627,7 +7708,7 @@ mod tests {
                     &scope.borrow(),
                     &mut ExpressionInputs {
                         reader: &mut Efivars::new().reader(),
-                        values: &VarStoreValues::new(&root, None),
+                        values: &VarStoreValues::new(&root, CheckedVarStores::NONE),
                     },
                 ),
                 Truth::Known(false),
@@ -7642,7 +7723,7 @@ mod tests {
         let root = two_forms();
         let referrer = find_op(&root, &eq_id_val_of(7, 1)[2..]).expect("find the referrer");
         let referrer = referrer.borrow();
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
 
         assert_eq!(
             values.value(&referrer, 9, &mut Efivars::new().reader()),
@@ -7682,7 +7763,7 @@ mod tests {
         let efivars = Efivars::new();
         efivars.write(store.as_ref(), &[1, 0]);
         let mut reader = efivars.reader();
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let referrer = question.borrow();
 
         assert_eq!(
@@ -7741,26 +7822,29 @@ mod tests {
                 var_store(1, [0; 16], "SystemAccess", 1),
                 "<ValueUnavailable: no EFI variable \
                  SystemAccess-00000000-0000-0000-0000-000000000000; HII buffer varstore requires \
-                 EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+                 EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+                 SystemAccess-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> states it>",
             ),
             (
                 "buffer Setup of the SystemAccess Guid",
                 var_store(1, SYSTEM_ACCESS_GUID, "Setup", 1),
                 "<ValueUnavailable: no EFI variable Setup-e770bb69-bcb4-4d04-9e97-23ff9456feac; \
-                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+                 Setup-e770bb69-bcb4-4d04-9e97-23ff9456feac+0=<HEX of 1 byte> states it>",
             ),
             (
                 "buffer Setup of NIL_GUID",
                 var_store(1, [0; 16], "Setup", 1),
                 "<ValueUnavailable: no EFI variable Setup-00000000-0000-0000-0000-000000000000; \
-                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+                 HII buffer varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+                 Setup-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> states it>",
             ),
         ];
         for (name, declaration, want) in cases {
             let root = parse_form_set(&[declaration, form(1, &[checkbox_op(1, 0)])]);
             let question = find_op(&root, &checkbox_op(1, 0)[2..]).expect("find question 1");
             assert_eq!(
-                VarStoreValues::new(&root, None).value(
+                VarStoreValues::new(&root, CheckedVarStores::NONE).value(
                     &question.borrow(),
                     1,
                     &mut Efivars::new().reader()
@@ -7793,28 +7877,32 @@ mod tests {
                 &checkbox_at_1,
                 1,
                 ValueKind::Boolean,
+                "+1=<HEX of 1 byte>",
             ),
             (
                 "UINT16 NUMERIC at VarOffset 0 of a 2-byte buffer SystemAccess",
                 &uint16_at_0,
                 2,
                 ValueKind::Uint,
+                "+0=<HEX of 2 bytes>",
             ),
         ];
-        for (name, op, id, kind) in others {
+        for (name, op, id, kind, flag) in others {
             let question = find_op(&root, &op[2..]).expect("find the question");
             assert_eq!(
-                VarStoreValues::new(&root, None).value(
+                VarStoreValues::new(&root, CheckedVarStores::NONE).value(
                     &question.borrow(),
                     id,
                     &mut Efivars::new().reader()
                 ),
                 Some(QuestionValue::Unreadable {
                     kind,
-                    reason: "<ValueUnavailable: no EFI variable \
-                             SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer \
-                             varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>"
-                        .to_string(),
+                    reason: format!(
+                        "<ValueUnavailable: no EFI variable \
+                         SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore \
+                         requires EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+                         SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac{flag} states it>"
+                    ),
                 }),
                 "{name}"
             );
@@ -7825,7 +7913,7 @@ mod tests {
             form(1, &[checkbox_op(1, 0)]),
         ]);
         let question = find_op(&root, &checkbox_op(1, 0)[2..]).expect("find question 1");
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         assert_eq!(
             values.value(&question.borrow(), 1, &mut disabled_reader()),
             Some(QuestionValue::Unreadable {
@@ -7879,7 +7967,10 @@ mod tests {
             &question,
             &mut ExpressionInputs {
                 reader: &mut efivars.reader(),
-                values: &VarStoreValues::new(&root, stated),
+                values: &VarStoreValues::new(
+                    &root,
+                    checked_in(&root, &with_access_level(stated, &[])),
+                ),
             },
         )
     }
@@ -7985,46 +8076,30 @@ mod tests {
             false,
             &[question_header_on(2, 5, 2, 1), vec![0x00]].concat(),
         );
-        let uint16_at_0 = operation(
-            NUMERIC,
-            false,
-            &[
-                question_header_on(3, 5, 2, 0),
-                vec![0x01, 0, 0, 0xFF, 0xFF, 1, 0],
-            ]
-            .concat(),
-        );
         let root = parse_form_set(&[
             var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
-            form(1, &[checkbox_at_1.clone(), uint16_at_0.clone()]),
+            form(1, std::slice::from_ref(&checkbox_at_1)),
         ]);
-        let others = [
-            (
-                "CHECKBOX at VarOffset 1",
-                &checkbox_at_1,
-                2,
-                ValueKind::Boolean,
-                "<ExtractEFIDataError: failed to fill whole buffer (offset: 1; buflen: 5)>",
-            ),
-            (
-                "UINT16 NUMERIC at VarOffset 0",
-                &uint16_at_0,
-                3,
-                ValueKind::Uint,
-                "<ExtractEFIDataError: failed to fill whole buffer (offset: 0; buflen: 5)>",
-            ),
-        ];
+        let others = [(
+            "CHECKBOX at VarOffset 1",
+            &checkbox_at_1,
+            2,
+            ValueKind::Boolean,
+            "<ExtractEFIDataError: failed to fill whole buffer (offset: 1; buflen: 5); \
+             --assume-var-store SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac+1=<HEX of 1 \
+             byte> states it>",
+        )];
         for (name, op, id, kind, reason) in others {
             let question = find_op(&root, &op[2..]).expect("find the question");
             let store = find_corresponding_varstore(Rc::clone(&question), 2);
             let efivars = Efivars::new();
             efivars.write(store.as_ref().expect("find VarStore 2").as_ref(), &[1]);
             assert_eq!(
-                VarStoreValues::new(&root, Some(AccessLevel::User)).value(
-                    &question.borrow(),
-                    id,
-                    &mut efivars.reader()
-                ),
+                VarStoreValues::new(
+                    &root,
+                    checked_in(&root, &with_access_level(Some(AccessLevel::User), &[]))
+                )
+                .value(&question.borrow(), id, &mut efivars.reader()),
                 Some(QuestionValue::Unreadable {
                     kind,
                     reason: reason.to_string(),
@@ -8074,7 +8149,10 @@ mod tests {
                     &question,
                     &mut ExpressionInputs {
                         reader: &mut efivars.reader(),
-                        values: &VarStoreValues::new(&root, level),
+                        values: &VarStoreValues::new(
+                            &root,
+                            checked_in(&root, &with_access_level(level, &[]))
+                        ),
                     },
                 ),
                 known(QuestionState::Suppressed),
@@ -8118,7 +8196,10 @@ mod tests {
                     &question.borrow(),
                     &mut ExpressionInputs {
                         reader: &mut efivars.reader(),
-                        values: &VarStoreValues::new(&root, level),
+                        values: &VarStoreValues::new(
+                            &root,
+                            checked_in(&root, &with_access_level(level, &[]))
+                        ),
                     },
                 ),
                 StateEvaluation {
@@ -8132,11 +8213,644 @@ mod tests {
         }
     }
 
-    /// The value of a parsed question in `var_store`.
+    /// 11111111-1111-1111-1111-111111111111, as stored: the GUID of the VarStores that tests of
+    /// stated bytes declare.
+    const MODE_GUID: [u8; 16] = [0x11; 16];
+    /// The efivar file of the buffer VarStore Mode of MODE_GUID.
+    const MODE: &str = "Mode-11111111-1111-1111-1111-111111111111";
+
+    /// The reason that a question on an EFI variable VarStore has no value, its variable having
+    /// enhanced authenticated access with metadata that uefisettings refuses, names the flag that
+    /// states its bytes.
+    #[test]
+    fn an_enhanced_authenticated_var_store_value_names_the_flag() {
+        let root = parse_form_set(&[
+            var_store_efi_of(1, MODE_GUID, "Mode", NV_BS_RT, 1),
+            form(1, &[checkbox_op(1, 0)]),
+        ]);
+        let question = find_op(&root, &checkbox_op(1, 0)[2..]).expect("find question 1");
+        let store = find_corresponding_varstore(Rc::clone(&question), 1);
+        let efivars = Efivars::new();
+        efivars.write_attributed(
+            store.as_ref().expect("find VarStore 1").as_ref(),
+            NV_BS_RT | 0x80,
+            &[1],
+        );
+        let value = VarStoreValues::new(&root, CheckedVarStores::NONE).value(
+            &question.borrow(),
+            1,
+            &mut efivars.reader(),
+        );
+        let Some(QuestionValue::Unreadable { reason, .. }) = value else {
+            panic!("a value of a refused enhanced authenticated variable: {value:?}");
+        };
+        assert!(
+            reason.starts_with(&format!(
+                "<ValueUnavailable: EFI variable {MODE} has enhanced authenticated access"
+            )),
+            "{reason}"
+        );
+        assert!(
+            reason.ends_with(&format!(
+                "; --assume-var-store {MODE}+0=<HEX of 1 byte> states it>"
+            )),
+            "{reason}"
+        );
+    }
+
+    /// `texts` as --assume-var-store takes them.
+    fn statements(texts: &[String]) -> Vec<AssumedVarStore> {
+        texts
+            .iter()
+            .map(|text| {
+                text.parse()
+                    .unwrap_or_else(|error| panic!("parse {text:?}: {error}"))
+            })
+            .collect()
+    }
+
+    /// `assumed`, as check_assumed takes it in the FormSet of `root`.
+    fn checked_in<'s>(
+        root: &Rc<RefCell<IFROperation>>,
+        assumed: &'s [AssumedVarStore],
+    ) -> CheckedVarStores<'s> {
+        check_assumed([root], assumed)
+            .unwrap_or_else(|refused| panic!("check {assumed:?}: {refused}"))
+    }
+
+    /// The state of question 1 in the scope of a SUPPRESS_IF on question 2, `on_mode`, which is on
+    /// byte 0 of the 2-byte buffer VarStore Mode, whose efivar holds `stored` if any, with
+    /// conditions reading the bytes that `stated` states. The FormSet declares the VarStores of
+    /// another GUID and of other names too, for check_assumed to take their statements.
+    fn mode_state(on_mode: &[u8], stored: Option<&[u8]>, stated: &[String]) -> StateEvaluation {
+        let question = checkbox_on(1, 3, 1);
+        let root = parse_form_set(&[
+            var_store_efi(1, "Present", NV_BS_RT, 1),
+            var_store(2, MODE_GUID, "Mode", 2),
+            var_store(3, [0x22; 16], "Mode", 1),
+            var_store(4, MODE_GUID, "Other", 1),
+            var_store(5, MODE_GUID, "mode", 1),
+            form(
+                1,
+                &[
+                    on_mode.to_vec(),
+                    conditional(
+                        SUPPRESS_IF,
+                        eq_id_val_of(2, 1),
+                        std::slice::from_ref(&question),
+                    ),
+                ],
+            ),
+        ]);
+        let question = find_op(&root, &question[2..]).expect("find question 1");
+        let efivars = Efivars::new();
+        if let Some(stored) = stored {
+            let store = find_corresponding_varstore(Rc::clone(&question), 2);
+            efivars.write(store.as_ref().expect("find VarStore 2").as_ref(), stored);
+        }
+        let assumed = statements(stated);
+        let question = question.borrow();
+        question_state(
+            &question,
+            &mut ExpressionInputs {
+                reader: &mut efivars.reader(),
+                values: &VarStoreValues::new(&root, checked_in(&root, &assumed)),
+            },
+        )
+    }
+
+    /// Bytes stated for a VarStore decide a condition on a question on them, whether or not its
+    /// efivar can be read; statements of other bytes, another GUID or another name leave the
+    /// condition on the efivar, and one that cannot be read names the flag that states it.
+    #[test]
+    fn stated_var_store_bytes_decide_conditions() {
+        const UNREAD: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: no EFI \
+            variable Mode-11111111-1111-1111-1111-111111111111; HII buffer varstore requires \
+            EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+            Mode-11111111-1111-1111-1111-111111111111+0=<HEX of 1 byte> states it>";
+        let undetermined = StateEvaluation {
+            current: QuestionState::Selectable,
+            unknown: vec![(QuestionState::Suppressed, UNREAD.to_string())],
+            read_only: None,
+            from_snapshot: Vec::new(),
+        };
+        let mode = |rest: &str| format!("{MODE}{rest}");
+        let one: &[u8] = &[1, 0];
+        let zero: &[u8] = &[0, 0];
+        let cases = [
+            ("no efivar, none stated", None, vec![], undetermined.clone()),
+            (
+                "stored 1, none stated",
+                Some(one),
+                vec![],
+                known(QuestionState::Suppressed),
+            ),
+            (
+                "stored 0, none stated",
+                Some(zero),
+                vec![],
+                known(QuestionState::Selectable),
+            ),
+            (
+                "stored 1, 00 stated",
+                Some(one),
+                vec![mode("=00")],
+                known(QuestionState::Selectable),
+            ),
+            (
+                "stored 1, 0000 stated",
+                Some(one),
+                vec![mode("=0000")],
+                known(QuestionState::Selectable),
+            ),
+            (
+                "stored 0, 01 stated",
+                Some(zero),
+                vec![mode("=01")],
+                known(QuestionState::Suppressed),
+            ),
+            (
+                "no efivar, 00 stated",
+                None,
+                vec![mode("=00")],
+                known(QuestionState::Selectable),
+            ),
+            (
+                "no efivar, 01 stated",
+                None,
+                vec![mode("=01")],
+                known(QuestionState::Suppressed),
+            ),
+            (
+                "stored 1, 00 stated at byte 1",
+                Some(one),
+                vec![mode("+1=00")],
+                known(QuestionState::Suppressed),
+            ),
+            (
+                "no efivar, 01 stated at byte 1",
+                None,
+                vec![mode("+1=01")],
+                undetermined,
+            ),
+            (
+                "stored 1, 00 stated for another GUID",
+                Some(one),
+                vec!["Mode-22222222-2222-2222-2222-222222222222=00".to_string()],
+                known(QuestionState::Suppressed),
+            ),
+            (
+                "stored 1, 00 stated for another name",
+                Some(one),
+                vec!["Other-11111111-1111-1111-1111-111111111111=00".to_string()],
+                known(QuestionState::Suppressed),
+            ),
+            (
+                "stored 1, 00 stated for another case of the name",
+                Some(one),
+                vec!["mode-11111111-1111-1111-1111-111111111111=00".to_string()],
+                known(QuestionState::Suppressed),
+            ),
+        ];
+        let on_mode = [
+            ("CHECKBOX", checkbox_on(2, 5, 2)),
+            ("UINT8 NUMERIC", uint8_numeric_on(2, 5, 2)),
+        ];
+        for (kind, on_mode) in &on_mode {
+            for (name, stored, stated, want) in cases.clone() {
+                assert_eq!(mode_state(on_mode, stored, &stated), want, "{kind}: {name}");
+            }
+        }
+    }
+
+    /// The value that a condition reads of `question`, of QuestionId `id`, on the 4-byte buffer
+    /// VarStore Mode, whose efivar holds `stored` if any, with the bytes that `stated` states.
+    fn mode_value(
+        question: &[u8],
+        id: u16,
+        stored: Option<&[u8]>,
+        stated: &[String],
+    ) -> Option<QuestionValue> {
+        let root = parse_form_set(&[
+            var_store(2, MODE_GUID, "Mode", 4),
+            form(1, &[question.to_vec()]),
+        ]);
+        let found = find_op(&root, &question[2..]).expect("find the question");
+        let efivars = Efivars::new();
+        if let Some(stored) = stored {
+            let store = find_corresponding_varstore(Rc::clone(&found), 2);
+            efivars.write(store.as_ref().expect("find VarStore 2").as_ref(), stored);
+        }
+        let assumed = statements(stated);
+        let question = found.borrow();
+        VarStoreValues::new(&root, checked_in(&root, &assumed)).value(
+            &question,
+            id,
+            &mut efivars.reader(),
+        )
+    }
+
+    /// Stated bytes patch the bytes of a value read from its efivar, those of one statement or
+    /// of several; a value they state whole needs no efivar, and one of whose bytes the efivar
+    /// cannot give the others is unreadable, naming the bytes stated, those not and the flag
+    /// that states them.
+    #[test]
+    fn stated_bytes_patch_a_straddling_value() {
+        let mode = |rest: &str| format!("{MODE}{rest}");
+        let uint16_at_1 = operation(
+            NUMERIC,
+            false,
+            &[
+                question_header_on(2, 5, 2, 1),
+                vec![0x01, 0, 0, 0xFF, 0xFF, 1, 0],
+            ]
+            .concat(),
+        );
+        let stored: &[u8] = &[0x10, 0x20, 0x30, 0x40];
+        let unread = |stated: &str, unstated: &str, flags: &str| QuestionValue::Unreadable {
+            kind: ValueKind::Uint,
+            reason: format!(
+                "<ValueUnavailable: no EFI variable {MODE}; HII buffer varstore requires \
+                 EFI_HII_CONFIG_ACCESS_PROTOCOL; bytes {stated} of {MODE} stated, {unstated} not; \
+                 {flags}>"
+            ),
+        };
+        let cases = [
+            (
+                "none stated",
+                Some(stored),
+                vec![],
+                QuestionValue::Uint(0x3020),
+            ),
+            (
+                "byte 1 stated",
+                Some(stored),
+                vec![mode("+1=aa")],
+                QuestionValue::Uint(0x30AA),
+            ),
+            (
+                "byte 2 stated",
+                Some(stored),
+                vec![mode("+2=bb")],
+                QuestionValue::Uint(0xBB20),
+            ),
+            (
+                "bytes 1 and 2 stated",
+                Some(stored),
+                vec![mode("+1=aabb")],
+                QuestionValue::Uint(0xBBAA),
+            ),
+            (
+                "bytes 0 and 1 stated",
+                Some(stored),
+                vec![mode("=00aa")],
+                QuestionValue::Uint(0x30AA),
+            ),
+            (
+                "bytes 2 and 3 stated",
+                Some(stored),
+                vec![mode("+2=bbcc")],
+                QuestionValue::Uint(0xBB20),
+            ),
+            (
+                "byte 1 and byte 2 stated apart",
+                Some(stored),
+                vec![mode("=0011"), mode("+2=22")],
+                QuestionValue::Uint(0x2211),
+            ),
+            (
+                "byte 3 stated",
+                Some(stored),
+                vec![mode("+3=cc")],
+                QuestionValue::Uint(0x3020),
+            ),
+            (
+                "no efivar, bytes 1 and 2 stated",
+                None,
+                vec![mode("+1=aabb")],
+                QuestionValue::Uint(0xBBAA),
+            ),
+            (
+                "no efivar, byte 1 and byte 2 stated apart",
+                None,
+                vec![mode("=00aa"), mode("+2=bb")],
+                QuestionValue::Uint(0xBBAA),
+            ),
+            (
+                "no efivar, byte 1 stated",
+                None,
+                vec![mode("+1=aa")],
+                unread(
+                    "1..2",
+                    "2..3",
+                    &format!("--assume-var-store {MODE}+2=<HEX of 1 byte> states it"),
+                ),
+            ),
+            (
+                "no efivar, byte 2 stated",
+                None,
+                vec![mode("+2=bb")],
+                unread(
+                    "2..3",
+                    "1..2",
+                    &format!("--assume-var-store {MODE}+1=<HEX of 1 byte> states it"),
+                ),
+            ),
+        ];
+        for (name, stored, stated, want) in cases {
+            assert_eq!(
+                mode_value(&uint16_at_1, 2, stored, &stated),
+                Some(want),
+                "UINT16 at VarOffset 1: {name}"
+            );
+        }
+
+        let uint32_at_0 = operation(
+            NUMERIC,
+            false,
+            &[
+                question_header_on(3, 5, 2, 0),
+                vec![0x02],
+                0u32.to_le_bytes().to_vec(),
+                u32::MAX.to_le_bytes().to_vec(),
+                1u32.to_le_bytes().to_vec(),
+            ]
+            .concat(),
+        );
+        let cases = [
+            (
+                "none stated",
+                vec![],
+                QuestionValue::Unreadable {
+                    kind: ValueKind::Uint,
+                    reason: format!(
+                        "<ValueUnavailable: no EFI variable {MODE}; HII buffer varstore requires \
+                         EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+                         {MODE}+0=<HEX of 4 bytes> states it>"
+                    ),
+                },
+            ),
+            (
+                "bytes 1 and 3 stated",
+                vec![mode("+1=aa"), mode("+3=cc")],
+                unread(
+                    "1..2, 3..4",
+                    "0..1, 2..3",
+                    &format!(
+                        "--assume-var-store {MODE}+0=<HEX of 1 byte> and --assume-var-store \
+                         {MODE}+2=<HEX of 1 byte> state them"
+                    ),
+                ),
+            ),
+            (
+                "every byte stated",
+                vec![mode("+1=aabbcc"), mode("=dd")],
+                QuestionValue::Uint(0xCCBB_AADD),
+            ),
+        ];
+        for (name, stated, want) in cases {
+            assert_eq!(
+                mode_value(&uint32_at_0, 3, None, &stated),
+                Some(want),
+                "UINT32 at VarOffset 0, no efivar: {name}"
+            );
+        }
+        let Some(QuestionValue::Unreadable {
+            kind: ValueKind::Uint,
+            reason,
+        }) = mode_value(&uint32_at_0, 3, Some(&[0x10, 0x20]), &[mode("=aa")])
+        else {
+            panic!("UINT32 at VarOffset 0, a 2-byte efivar, byte 0 stated: a value");
+        };
+        assert!(
+            reason.ends_with(&format!(
+                "; bytes 0..1 of {MODE} stated, 1..4 not; --assume-var-store {MODE}+1=<HEX of 3 \
+                 bytes> states it>"
+            )),
+            "UINT32 at VarOffset 0, a 2-byte efivar, byte 0 stated: {reason}"
+        );
+
+        // a UINT16 at VarOffset 1 of an EFI variable VarStore whose efivar holds 2 bytes
+        let uint16_one_of = [&question_header(1)[..], &[0x01], &[0x00; 6]].concat();
+        let cases = [
+            (
+                "byte 1 stated",
+                "+1=aa",
+                QuestionValue::Unreadable {
+                    kind: ValueKind::Uint,
+                    reason:
+                        "<ExtractEFIDataError: failed to fill whole buffer (offset: 1; buflen: \
+                             6); bytes 1..2 of VarStore-00000000-0000-0000-0000-000000000000 \
+                             stated, 2..3 not; --assume-var-store \
+                             VarStore-00000000-0000-0000-0000-000000000000+2=<HEX of 1 byte> \
+                             states it>"
+                            .to_string(),
+                },
+            ),
+            (
+                "bytes 1 and 2 stated",
+                "+1=aabb",
+                QuestionValue::Uint(0xBBAA),
+            ),
+        ];
+        for (name, stated, want) in cases {
+            assert_eq!(
+                value_in(
+                    ONE_OF,
+                    &uint16_one_of,
+                    var_store_of(&[0x00, 0x34]),
+                    &statements(&[format!(
+                        "VarStore-00000000-0000-0000-0000-000000000000{stated}"
+                    )]),
+                ),
+                want,
+                "UINT16 past a 2-byte efivar: {name}"
+            );
+        }
+    }
+
+    /// A condition reads only the bits of an EDKII bit varstore field from stated bytes, as from
+    /// its efivar: each case's efivar holds the stated byte's complement, or its other bytes.
+    #[test]
+    fn stated_bit_field_reads_only_its_bits() {
+        let key = "VarStore-00000000-0000-0000-0000-000000000000";
+        let cases = [
+            (
+                "bit-field CHECKBOX set",
+                CHECKBOX,
+                checkbox(1, 0x00),
+                vec![0xFD],
+                format!("{key}=02"),
+                QuestionValue::Boolean(1),
+            ),
+            (
+                "bit-field CHECKBOX clear",
+                CHECKBOX,
+                checkbox(1, 0x00),
+                vec![0x02],
+                format!("{key}=fd"),
+                QuestionValue::Boolean(0),
+            ),
+            (
+                "3-bit NUMERIC at bit 2",
+                NUMERIC,
+                uint32_range_question(2, 0x43),
+                vec![0b0000_1000],
+                format!("{key}=f7"),
+                QuestionValue::Uint(0b101),
+            ),
+            (
+                "12-bit NUMERIC at bit 4, its second byte stated",
+                NUMERIC,
+                uint32_range_question(4, 0x4C),
+                vec![0x0F, 0xF0],
+                format!("{key}+1=ab"),
+                QuestionValue::Uint(0xAB0),
+            ),
+        ];
+        for (name, op_code, data, stored, stated, want) in cases {
+            let (_root, node) = parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &[]);
+            let bit_field = node.borrow();
+            let value_question = value_question(&bit_field).expect("a NUMERIC or CHECKBOX");
+            let VarStoreFixture { store, efivars } = var_store_of(&stored);
+            let assumed = statements(&[stated]);
+            assert_eq!(
+                question_value(
+                    &node,
+                    value_question,
+                    &store,
+                    CheckedVarStores::unchecked(&assumed),
+                    &mut ExpressionInputs {
+                        reader: &mut efivars.reader(),
+                        values: &MapValues(BTreeMap::new()),
+                    },
+                ),
+                want,
+                "{name}"
+            );
+        }
+
+        // the flag names the StorageWidth bytes of a bit field
+        let cases = [
+            (
+                "bit 1",
+                checkbox(1, 0x00),
+                CHECKBOX,
+                1,
+                "+0=<HEX of 1 byte>",
+            ),
+            (
+                "3 bits at bit 10",
+                uint32_range_question(10, 0x43),
+                NUMERIC,
+                2,
+                "+1=<HEX of 1 byte>",
+            ),
+            (
+                "8 bits at bit 4",
+                uint32_range_question(4, 0x48),
+                NUMERIC,
+                2,
+                "+0=<HEX of 2 bytes>",
+            ),
+        ];
+        for (name, data, op_code, size, flag) in cases {
+            let (_root, node) = parse_question_in_guid(BIT_VARSTORE_GUID, op_code, &data, &[]);
+            let bit_field = node.borrow();
+            let value_question = value_question(&bit_field).expect("a NUMERIC or CHECKBOX");
+            let store: Result<Box<dyn VariableStore>> =
+                Ok(Box::new(efi_variable("VarStore", size)));
+            let QuestionValue::Unreadable { reason, .. } = question_value(
+                &node,
+                value_question,
+                &store,
+                CheckedVarStores::NONE,
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &MapValues(BTreeMap::new()),
+                },
+            ) else {
+                panic!("{name}: a value without an efivar");
+            };
+            assert!(
+                reason.ends_with(&format!("; --assume-var-store {key}{flag} states it>")),
+                "{name}: {reason}"
+            );
+        }
+    }
+
+    /// Stated bytes change the states that list_questions lists, never an answer: the question
+    /// on them answers with its efivar's value, or with why it has none, without the flag.
+    #[test]
+    fn stated_bytes_leave_answers_as_stored() {
+        let mode = |rest: &str| format!("{MODE}{rest}");
+        let question = checkbox_on(1, 3, 1);
+        let root = parse_form_set(&[
+            var_store_efi(1, "Present", NV_BS_RT, 1),
+            var_store(2, MODE_GUID, "Mode", 2),
+            form(
+                1,
+                &[
+                    checkbox_on(2, 7, 2),
+                    conditional(
+                        SUPPRESS_IF,
+                        eq_id_val_of(2, 1),
+                        std::slice::from_ref(&question),
+                    ),
+                ],
+            ),
+        ]);
+        let found = find_op(&root, &question[2..]).expect("find question 1");
+        let stored = Efivars::new();
+        let store = find_corresponding_varstore(Rc::clone(&found), 2);
+        stored.write(store.as_ref().expect("find VarStore 2").as_ref(), &[1, 0]);
+        stored.write(&efi_variable("Present", 1), &[0]);
+        let unread = Efivars::new();
+        let listed = |efivars: &Efivars, stated: &[String]| -> Vec<(String, String)> {
+            let assumed = statements(stated);
+            list_questions(
+                Rc::clone(&root),
+                &ListTexts::new(&strings(), &[]),
+                IncludedStates::empty(),
+                checked_in(&root, &assumed),
+                &mut efivars.reader(),
+            )
+            .into_iter()
+            .map(|(question, _)| (question.question, question.value))
+            .collect()
+        };
+        assert_eq!(
+            listed(&stored, &[]),
+            [("AllOnes".to_string(), "1".to_string())],
+            "stored 1, none stated"
+        );
+        assert_eq!(
+            listed(&stored, &[mode("=00")]),
+            [
+                ("AllOnes".to_string(), "1".to_string()),
+                (PROMPT.to_string(), "0".to_string())
+            ],
+            "stored 1, 00 stated: the question on Mode answers 1"
+        );
+        let unread_answer = format!(
+            "<ValueUnavailable: no EFI variable {MODE}; HII buffer varstore requires \
+             EFI_HII_CONFIG_ACCESS_PROTOCOL> <IFR default: 0>"
+        );
+        let unlisted = listed(&unread, &[mode("=00")]);
+        assert_eq!(
+            unlisted.first(),
+            Some(&("AllOnes".to_string(), unread_answer)),
+            "no efivar, 00 stated: the question on Mode has no answer"
+        );
+    }
+
+    /// The value of a parsed question in `var_store`, with the bytes that `assumed` states,
+    /// unchecked: no FormSet declares `var_store`.
     fn value_in(
         op_code: u8,
         data: &[u8],
         VarStoreFixture { store, efivars }: VarStoreFixture,
+        assumed: &[AssumedVarStore],
     ) -> QuestionValue {
         let (_root, node) = parse_question(&[], op_code, data, &[]);
         let question = node.borrow();
@@ -8145,7 +8859,7 @@ mod tests {
             &node,
             value_question,
             &store,
-            None,
+            CheckedVarStores::unchecked(assumed),
             &mut ExpressionInputs {
                 reader: &mut efivars.reader(),
                 values: &MapValues(BTreeMap::new()),
@@ -8159,7 +8873,12 @@ mod tests {
         let cases = [
             (
                 "CHECKBOX byte as is",
-                value_in(CHECKBOX, &checkbox(1, 0x00), var_store_of(&[0x00, 0x02])),
+                value_in(
+                    CHECKBOX,
+                    &checkbox(1, 0x00),
+                    var_store_of(&[0x00, 0x02]),
+                    &[],
+                ),
                 QuestionValue::Boolean(2),
             ),
             (
@@ -8168,6 +8887,7 @@ mod tests {
                     ONE_OF,
                     &uint16_one_of,
                     var_store_of(&[0x00, 0x34, 0x12, 0xFF]),
+                    &[],
                 ),
                 QuestionValue::Uint(0x1234),
             ),
@@ -8177,22 +8897,25 @@ mod tests {
                     NUMERIC,
                     &uint32_range_question(1, 0x12),
                     var_store_of(&[0xFF, 0x01, 0x00, 0x00, 0x80, 0xFF]),
+                    &[],
                 ),
                 QuestionValue::Uint(0x8000_0001),
             ),
             (
                 "UINT16 ONE_OF past the VarStore",
-                value_in(ONE_OF, &uint16_one_of, var_store_of(&[0x00, 0x34])),
+                value_in(ONE_OF, &uint16_one_of, var_store_of(&[0x00, 0x34]), &[]),
                 QuestionValue::Unreadable {
                     kind: ValueKind::Uint,
                     reason: "<ExtractEFIDataError: failed to fill whole buffer (offset: 1; \
-                             buflen: 6)>"
+                             buflen: 6); --assume-var-store \
+                             VarStore-00000000-0000-0000-0000-000000000000+1=<HEX of 2 bytes> \
+                             states it>"
                         .to_string(),
                 },
             ),
             (
                 "CHECKBOX without a VarStore",
-                value_in(CHECKBOX, &checkbox(0, 0x00), unavailable()),
+                value_in(CHECKBOX, &checkbox(0, 0x00), unavailable(), &[]),
                 QuestionValue::Unreadable {
                     kind: ValueKind::Boolean,
                     reason: UNAVAILABLE.to_string(),
@@ -8237,7 +8960,7 @@ mod tests {
                     &node,
                     value_question,
                     &store,
-                    None,
+                    CheckedVarStores::NONE,
                     &mut ExpressionInputs {
                         reader: &mut efivars.reader(),
                         values: &MapValues(BTreeMap::new()),
@@ -8387,10 +9110,12 @@ mod tests {
 mod store_expression_tests {
     use std::collections::BTreeMap;
 
+    use super::super::check_assumed;
     use super::super::display_answer;
     use super::super::ifr_fixtures::*;
     use super::super::resolve_short_var_names;
     use super::super::setup_password::PasswordQuestions;
+    use super::super::AssumedVarStore;
     use super::super::PackageListFirst;
     use super::super::MAX_SCOPE_NESTING;
     use super::*;
@@ -8815,6 +9540,113 @@ mod store_expression_tests {
         );
     }
 
+    /// A GET reads the bytes that --assume-var-store states of its VarStore in place of those of
+    /// the variable, as edk2-stable202608 SetupBrowserDxe/Expression.c reads the edit buffer of a
+    /// buffer VarStore; of a value that they state in part, the other bytes come from the
+    /// variable, and one that cannot give them leaves the value unknown, naming the bytes stated
+    /// and those not.
+    #[test]
+    fn get_reads_the_stated_var_store_bytes() {
+        const KEY: &str = "Buffer-00000000-0000-0000-0000-000000000000";
+        let byte_is_1 = scoped_expression(
+            &[get(BUFFER, 0, EFI_IFR_TYPE_NUM_SIZE_8), uint8(1), op(EQUAL)],
+            0,
+        );
+        let word_is_0x0201 = scoped_expression(
+            &[
+                get(BUFFER, 0, EFI_IFR_TYPE_NUM_SIZE_16),
+                uint16(0x0201),
+                op(EQUAL),
+            ],
+            0,
+        );
+        let stored = Efivars::new();
+        stored.write(&buffer_store("Buffer", 2), &[1, 2]);
+        let missing = Efivars::new();
+        let root = parse_form_set(&declarations());
+        let truth = |condition: &[u8], efivars: &Efivars, stated: &[&str]| {
+            let assumed: Vec<AssumedVarStore> = stated
+                .iter()
+                .map(|rest| format!("{KEY}{rest}").parse().expect("a statement"))
+                .collect();
+            let assumed = check_assumed([&root], &assumed).expect("check the statements");
+            truth_in(
+                condition.to_vec(),
+                efivars,
+                &VarStoreValues::new(&root, assumed),
+            )
+        };
+        let cases = [
+            (
+                "stored 01 02, none stated",
+                &byte_is_1,
+                &stored,
+                vec![],
+                true,
+            ),
+            (
+                "stored 01 02, 00 stated",
+                &byte_is_1,
+                &stored,
+                vec!["=00"],
+                false,
+            ),
+            (
+                "no efivar, 01 stated",
+                &byte_is_1,
+                &missing,
+                vec!["=01"],
+                true,
+            ),
+            (
+                "stored 01 02, 01 stated at byte 1",
+                &byte_is_1,
+                &stored,
+                vec!["+1=01"],
+                true,
+            ),
+            (
+                "stored 01 02, word, 00 stated at byte 1",
+                &word_is_0x0201,
+                &stored,
+                vec!["+1=00"],
+                false,
+            ),
+            (
+                "stored 01 02, word, 02 stated at byte 1",
+                &word_is_0x0201,
+                &stored,
+                vec!["+1=02"],
+                true,
+            ),
+            (
+                "no efivar, word, 0102 stated",
+                &word_is_0x0201,
+                &missing,
+                vec!["=0102"],
+                true,
+            ),
+        ];
+        for (name, condition, efivars, stated, want) in cases {
+            assert_eq!(
+                truth(condition, efivars, &stated),
+                Truth::Known(want),
+                "{name}"
+            );
+        }
+
+        let Truth::Unknown(reason) = truth(&word_is_0x0201, &missing, &["+1=02"]) else {
+            panic!("no efivar, word, 02 stated at byte 1: a value");
+        };
+        assert!(
+            reason.starts_with(
+                "EFI_IFR_GET of VarStore 0x0004 (EFI_IFR_VARSTORE \"Buffer\"), which cannot be \
+                 read: "
+            ) && reason.ends_with(&format!("; bytes 1..2 of {KEY} stated, 0..1 not")),
+            "no efivar, word, 02 stated at byte 1: {reason}"
+        );
+    }
+
     /// A GET reads no byte of the password of a PASSWORD question, through variables of either
     /// reach; a GET of the other bytes of its VarStore, or of another VarStore, reads them.
     #[test]
@@ -8876,6 +9708,73 @@ mod store_expression_tests {
                 "{name}: another VarStore"
             );
         }
+    }
+
+    /// The reason that a condition cannot read bytes that hold a password names no
+    /// --assume-var-store, which would put the password on a command line, nor does that of a
+    /// question on a VARSTORE_EFI before UEFI 2.3.1, whose variable holds that question's value
+    /// alone; that of a byte beside the password names it.
+    #[test]
+    fn unstateable_values_name_no_flag() {
+        let root = parse_form_set(&[
+            declarations().concat(),
+            form(
+                1,
+                &[
+                    password_on(9, 3, STORE, 1),
+                    checkbox_at(1, 1, STORE, 0),
+                    checkbox_at(2, 2, STORE, 1),
+                ],
+            ),
+        ]);
+        let mut reader = PasswordQuestions::of([&root])
+            .reader(Box::new(MemoryVariables::new(
+                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
+            )))
+            .expect("resolve the VarStore of the PASSWORD question");
+        let referrer = find_op(&root, &checkbox_at(1, 1, STORE, 0)[2..]).expect("find question 1");
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
+        let unreadable = |reason: &str| {
+            Some(QuestionValue::Unreadable {
+                kind: ValueKind::Boolean,
+                reason: reason.to_string(),
+            })
+        };
+        assert_eq!(
+            values.value(&referrer.borrow(), 1, &mut reader),
+            unreadable(
+                "<ValueUnavailable: no EFI variable Store-00000000-0000-0000-0000-000000000000; \
+                 --assume-var-store Store-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> \
+                 states it>"
+            ),
+            "byte 0, before the password"
+        );
+        assert_eq!(
+            values.value(&referrer.borrow(), 2, &mut reader),
+            unreadable("<ValueUnavailable: its bytes hold a password>"),
+            "byte 1, of the password"
+        );
+
+        let missing = checkbox_at(1, 1, SHORT_EFI, 10);
+        let root = short_store_root(NV_BS_RT, &[form(1, std::slice::from_ref(&missing))]);
+        let referrer = find_op(&root, &missing[2..]).expect("find the question on ShortVarMissing");
+        let value = VarStoreValues::new(&root, CheckedVarStores::NONE).value(
+            &referrer.borrow(),
+            1,
+            &mut EfivarReader::with_variables(Box::new(short_variables(
+                VariableReach::Runtime,
+                VariableInterface::Efivarfs,
+            ))),
+        );
+        assert!(
+            matches!(
+                &value,
+                Some(QuestionValue::Unreadable { reason, .. })
+                    if reason.contains("ShortVarMissing") && !reason.contains("--assume-var-store")
+            ),
+            "ShortVarMissing: {value:?}"
+        );
     }
 
     /// edk2 fails the FormSet of a GET of an undeclared VarStore or of a type that names no
@@ -10861,7 +11760,7 @@ mod store_expression_tests {
         )]);
         let referrer = questions[0].borrow();
         assert_eq!(
-            VarStoreValues::new(&root, None).value(
+            VarStoreValues::new(&root, CheckedVarStores::NONE).value(
                 &referrer,
                 1,
                 &mut store_holding(&[5, 0, 0, 0, 0]).reader()
@@ -10871,7 +11770,10 @@ mod store_expression_tests {
         );
         let of_question_0 = |expression: &[Vec<u8>]| {
             let (root, questions) = form_set_of(&[one_of_with(0, STORE, expression)]);
-            (VarStoreValues::new(&root, None), Rc::clone(&questions[0]))
+            (
+                VarStoreValues::new(&root, CheckedVarStores::NONE),
+                Rc::clone(&questions[0]),
+            )
         };
         let (values_of_0, question) = of_question_0(&[op(READ), plus_one(question_ref1(0))]);
         assert_eq!(
@@ -11861,7 +12763,7 @@ mod store_expression_tests {
         let question = &questions[0];
         let id = value_question(&question.borrow()).map(|question| question.header().var_store_id);
         let store = || find_corresponding_varstore(Rc::clone(question), id.unwrap_or_default());
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let shown = display_answer(
             question,
             &store(),
@@ -11956,7 +12858,7 @@ mod store_expression_tests {
             &find_corresponding_varstore(Rc::clone(question), id.unwrap_or_default()),
             &mut ExpressionInputs {
                 reader: &mut reader(),
-                values: &VarStoreValues::new(&root, None),
+                values: &VarStoreValues::new(&root, CheckedVarStores::NONE),
             },
         );
         let strings = strings();
@@ -11965,7 +12867,7 @@ mod store_expression_tests {
             Rc::clone(&root),
             &texts,
             IncludedStates::all(),
-            None,
+            CheckedVarStores::NONE,
             &mut reader(),
         )
         .into_iter()
@@ -12183,7 +13085,7 @@ mod store_expression_tests {
             one_of_with(2, 0, &[op(READ), question_ref1(3)]),
             one_of_with(3, 0, &[op(READ), question_ref1(2)]),
         ]);
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let efivars = store_holding(&[0, 3, 0, 0, 0]);
         let mut reader = efivars.reader();
         let referrer = questions[0].borrow();
@@ -12228,7 +13130,7 @@ mod store_expression_tests {
                         })
                         .collect();
                     let (root, questions) = form_set_of(&questions);
-                    let values = VarStoreValues::new(&root, None);
+                    let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                     let efivars = store_holding(&[0, 3, 0, 0, 0]);
                     let referrer = questions[0].borrow();
                     values.value(&referrer, 1, &mut efivars.reader())
@@ -12284,7 +13186,7 @@ mod store_expression_tests {
                 &scope,
                 &mut ExpressionInputs {
                     reader: &mut store_holding(&[7, 9, 0, 0, 0]).reader(),
-                    values: &VarStoreValues::new(&root, None),
+                    values: &VarStoreValues::new(&root, CheckedVarStores::NONE),
                 },
             )
         };
@@ -13182,7 +14084,7 @@ mod store_expression_tests {
             body.push(one_of_holding(1, &[suppressed]));
             let path = [body.len() - 1, 0];
             let (root, scope) = op_in_form(&body, &path);
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             let scope = scope.borrow();
             evaluate_condition(
                 &scope,
@@ -13218,7 +14120,7 @@ mod store_expression_tests {
         };
         let (root, question) =
             in_question(vec![rule(1, dropping(uint8(7))), op(READ), rule_ref(1)]);
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         assert_eq!(
             evaluate_read(
                 &question,
@@ -13249,7 +14151,7 @@ mod store_expression_tests {
                 0,
             ),
         ]);
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         assert_eq!(
             evaluate_write(
                 &question,
@@ -13302,7 +14204,7 @@ mod store_expression_tests {
         };
         let read = |children: Vec<Vec<u8>>| {
             let (root, question) = op_in_form(&[one_of_holding(1, &children)], &[0]);
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             evaluate_read(
                 &question,
                 QuestionValue::Uint(3),
@@ -13389,7 +14291,7 @@ mod store_expression_tests {
             one_of_holding(1, &[suppressed]),
         ];
         let (root, scope) = op_in_form(&body, &[1, 0]);
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let scope = scope.borrow();
         assert_eq!(
             evaluate_condition(
@@ -13701,7 +14603,7 @@ mod store_expression_tests {
         };
         let write = |id: u16, expression: Vec<u8>, rules: Vec<Vec<u8>>| {
             let (root, question) = in_question(id, [rules, vec![op(WRITE), expression]].concat());
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             evaluate_write(
                 &question,
                 QuestionValue::Uint(3),
@@ -13721,7 +14623,7 @@ mod store_expression_tests {
         };
         let read = |id: u16, expression: Vec<u8>| {
             let (root, question) = in_question(id, vec![op(READ), expression]);
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             evaluate_read(
                 &question,
                 QuestionValue::Uint(3),

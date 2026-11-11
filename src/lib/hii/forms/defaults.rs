@@ -903,6 +903,7 @@ mod tests {
     use super::super::handle_form_set;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::CheckedVarStores;
     use super::super::IncludedStates;
     use super::super::QuestionMatch;
     use super::super::Selection;
@@ -1225,7 +1226,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         );
         let Selection::Picked {
@@ -1235,7 +1236,7 @@ mod tests {
             &ListTexts::new(&strings(), &[]),
             &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         else {
@@ -1266,7 +1267,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
 
@@ -1309,7 +1310,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
 
@@ -1352,7 +1353,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
 

@@ -129,11 +129,16 @@ use time_storage::TimeStorage;
 use time_storage::TimeStorageOnly;
 
 pub use ami_access_level::AccessLevel;
+pub use assumed_var_store::AssumedVarStore;
+pub use assumed_var_store::AssumedVarStoreError;
 pub use conditions::IncludedStates;
 pub use conditions::QuestionState;
 pub use conditions::SelectionError;
 
 pub(crate) use ami_access_level::check_access_level;
+pub(crate) use ami_access_level::with_access_level;
+pub(crate) use assumed_var_store::check_assumed;
+pub(crate) use assumed_var_store::CheckedVarStores;
 pub(crate) use conditions::Choice;
 pub(crate) use conditions::Exclusion;
 pub(crate) use conditions::QuestionExpression;
@@ -160,6 +165,7 @@ pub(crate) use storage::StoreDeclaration;
 pub(crate) use storageless::StoragelessRefusal;
 
 mod ami_access_level;
+mod assumed_var_store;
 mod conditions;
 mod cross_reference;
 mod date_time;
@@ -3860,15 +3866,15 @@ impl QuestionDescriptor {
 // list_questions returns a list of QuestionDescriptors in a FormSet
 // with their states, of the questions in a state that `include` may allow
 // node should be the root of a FormSet
-// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value
+// conditions read the VarStore bytes that `assumed` states in place of those their variables hold
 pub(crate) fn list_questions(
     node: Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     include: IncludedStates,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
     reader: &mut EfivarReader,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
-    let values = VarStoreValues::new(&node, access_level);
+    let values = VarStoreValues::new(&node, assumed);
     list_questions_in(
         &node,
         skips_questions,
@@ -3887,7 +3893,7 @@ pub(crate) fn list_reachable_questions(
     include: IncludedStates,
     reader: &mut EfivarReader,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
-    let values = VarStoreValues::new(&node, None);
+    let values = VarStoreValues::new(&node, CheckedVarStores::NONE);
     list_questions_in(
         &node,
         skips_scope,
@@ -3957,20 +3963,20 @@ fn listed_question(
 /// find_question accepts the root node, texts and what to match questions by: by prompt, a set
 /// of strings which represent variations of the same question, so if a single phrase matches
 /// then we assume that we have the answer; or by QuestionId or keyword (QuestionMatch).
-/// Of the matching questions, it selects one as select does, with conditions reading
-/// `access_level`, if stated, for AMI_ACCESS_LEVEL instead of its value.
+/// Of the matching questions, it selects one as select does, with conditions reading the
+/// VarStore bytes that `assumed` states in place of those their variables hold.
 pub(crate) fn find_question<T>(
     node: Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     matching: &QuestionMatch<'_, T>,
     include: IncludedStates,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
     reader: &mut EfivarReader,
 ) -> Selection<QuestionDescriptor>
 where
     T: AsRef<str>,
 {
-    let values = VarStoreValues::new(&node, access_level);
+    let values = VarStoreValues::new(&node, assumed);
     find_question_in(
         &node,
         matching,
@@ -4319,7 +4325,8 @@ mod choice_for_set_tests {
     const MISSING_NOT_FOUND: &str = "no EFI variable Missing-00000000-0000-0000-0000-000000000000";
     /// Why the EQ_ID_VAL on question 2, on the efivar Missing, is not evaluated.
     const MISSING_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: no EFI \
-        variable Missing-00000000-0000-0000-0000-000000000000>";
+        variable Missing-00000000-0000-0000-0000-000000000000; --assume-var-store \
+        Missing-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> states it>";
     /// Why the EQ_ID_VAL on question 2, on AMI firmware's buffer VarStore SystemAccess without
     /// an efivar, is not evaluated.
     const SYSTEM_ACCESS_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: \
@@ -4367,7 +4374,9 @@ mod choice_for_set_tests {
         mut reader: EfivarReader,
         access_level: Option<AccessLevel>,
     ) -> Result<Choice<QuestionDescriptor>> {
-        let values = VarStoreValues::new(root, access_level);
+        let assumed = with_access_level(access_level, &[]);
+        let assumed = check_assumed([root], &assumed).expect("check the access level");
+        let values = VarStoreValues::new(root, assumed);
         let selection = find_question_in(
             root,
             &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
@@ -5081,7 +5090,7 @@ pub(crate) fn display(
     reader: &mut EfivarReader,
 ) -> Result<TextLines> {
     let mut lines = Vec::new();
-    let values = VarStoreValues::new(&node, None);
+    let values = VarStoreValues::new(&node, CheckedVarStores::NONE);
     let mut inputs = ExpressionInputs {
         reader,
         values: &values,
@@ -6029,7 +6038,7 @@ mod tests {
                 root,
                 &ListTexts::new(&[], &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut Efivars::new().reader(),
             );
 
@@ -6051,7 +6060,7 @@ mod tests {
     #[test]
     fn questions_are_found_by_their_listed_name() {
         let root = parse_form_set(&[form(1, &[checkbox_op(1, 0)])]);
-        let values = VarStoreValues::new(&root, None);
+        let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let prompted = |prompt: &str| vec![en_us_package(StringMap::from([(3, prompt.into())]))];
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
@@ -6070,7 +6079,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&prompted("  Prompt "), &[]),
             IncludedStates::empty(),
-            None,
+            CheckedVarStores::NONE,
             &mut Efivars::new().reader(),
         );
         let name = &listed[0].0.question;
@@ -6859,7 +6868,7 @@ mod tests {
                 root,
                 &ListTexts::new(&strings(), &[]),
                 IncludedStates::empty(),
-                None,
+                CheckedVarStores::NONE,
                 &mut disabled_reader(),
             );
 
@@ -7123,7 +7132,7 @@ mod nesting_tests {
         on_small_stack("VarStoreValues::new", || {
             let root = parse_deep(DEEP, DEEP, false);
             let deep = op_like(&root, &deep_checkbox());
-            let values = VarStoreValues::new(&root, None);
+            let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             let mut reader = disabled_reader();
             for (id, indexed) in [(1, true), (9, false)] {
                 assert_eq!(
@@ -7145,7 +7154,7 @@ mod nesting_tests {
                     parse_deep(DEEP, DEEP, false),
                     &ListTexts::new(&deep_strings(), &[]),
                     include,
-                    None,
+                    CheckedVarStores::NONE,
                     &mut disabled_reader(),
                 );
                 let names: Vec<String> = listed
@@ -7163,7 +7172,7 @@ mod nesting_tests {
                     &ListTexts::new(&deep_strings(), &[]),
                     &QuestionMatch::Prompt(&BTreeSet::from([name])),
                     IncludedStates::GRAYED_OUT,
-                    None,
+                    CheckedVarStores::NONE,
                     &mut disabled_reader(),
                 );
                 assert_eq!(
@@ -7212,7 +7221,7 @@ mod nesting_tests {
                     .as_ref()
                     .and_then(Weak::upgrade)
                     .expect("the SUPPRESS_IF");
-                let values = VarStoreValues::new(&root, None);
+                let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                 let mut reader = disabled_reader();
                 let mut inputs = ExpressionInputs {
                     reader: &mut reader,

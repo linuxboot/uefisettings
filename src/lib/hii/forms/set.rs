@@ -21,7 +21,7 @@ use anyhow::Context;
 use anyhow::Result;
 use thiserror::Error;
 
-use super::ami_access_level::AccessLevel;
+use super::assumed_var_store::CheckedVarStores;
 use super::conditions::ExpressionRefusal;
 use super::conditions::IncludedStates;
 use super::conditions::ReadOnlyCause;
@@ -573,8 +573,8 @@ pub(crate) trait DriverStore {
 /// of `drivers`' answers, in theirs; fails with SelectionError::NotFound when nothing is selected,
 /// and with MixedKinds for questions of more than one QuestionKind.
 /// It builds the WritePlan of every question before the first write, reading with `reader`, whose
-/// conditions read `access_level`, if stated, for AMI_ACCESS_LEVEL, so that a value or a SET that
-/// one question refuses leaves every variable unchanged; then it writes the system or wake-up time
+/// conditions read the VarStore bytes that `assumed` states, so that a value or a SET that one
+/// question refuses leaves every variable unchanged; then it writes the system or wake-up time
 /// of each question of EFI Date/Time Storage, in question order, then each variable once, with
 /// the changes of every question to it (batched_writes), in order, then applies each of the
 /// `drivers`' values, and stops at the first store that fails, with its error unchanged if it is
@@ -596,7 +596,7 @@ pub(crate) fn set_questions<'a>(
     answer: NewAnswer<'_>,
     include: IncludedStates,
     reader: &mut EfivarReader,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
     volatile: VolatileWrites,
     unsafe_operations: PendingOperations,
     variables: &WithholdingVariables<impl FirmwareVariables>,
@@ -613,8 +613,7 @@ pub(crate) fn set_questions<'a>(
     let mut plans = Vec::new();
     let mut given = Vec::new();
     for &(selector, descriptor) in selected {
-        let (plan, written) =
-            plan_question(descriptor, answer, include, through, reader, access_level)?;
+        let (plan, written) = plan_question(descriptor, answer, include, through, reader, assumed)?;
         plans.push((selector, plan));
         given.push(written);
     }
@@ -697,7 +696,7 @@ fn plan_question<'a>(
     include: IncludedStates,
     through: (VariableReach, VariableInterface),
     reader: &mut EfivarReader,
-    access_level: Option<AccessLevel>,
+    assumed: CheckedVarStores<'_>,
 ) -> Result<(WritePlan<'a>, Written<'a>)> {
     match (&question.input, answer) {
         (TextInput::CrossReference, NewAnswer::Items(_) | NewAnswer::Text { .. }) => {
@@ -739,7 +738,7 @@ fn plan_question<'a>(
                     (NewValue::Option(option), Written::Option(option))
                 }
             };
-            let plan = WritePlan::new(question, value, through, reader, access_level)?;
+            let plan = WritePlan::new(question, value, through, reader, assumed)?;
             Ok((plan, written))
         }
     }
@@ -991,7 +990,7 @@ mod set_questions_tests {
             answer,
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             pending,
             &WithholdingVariables::new(variables, WithheldBytes::default()),
@@ -1737,7 +1736,7 @@ mod set_questions_tests {
                 },
                 IncludedStates::empty(),
                 &mut reader,
-                None,
+                CheckedVarStores::NONE,
                 VolatileWrites::Refuse,
                 PendingOperations::new(UnsafeOperations::Refuse),
                 &WithholdingVariables::new(&variables, withheld),
@@ -3067,7 +3066,7 @@ mod date_time_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, WithheldBytes::default()),
@@ -3100,7 +3099,7 @@ mod date_time_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, WithheldBytes::default()),
@@ -3226,7 +3225,7 @@ mod time_storage_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(variables, WithheldBytes::default()),
@@ -3659,7 +3658,7 @@ mod time_storage_write_tests {
             },
             IncludedStates::empty(),
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             volatile,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(&variables, withheld),

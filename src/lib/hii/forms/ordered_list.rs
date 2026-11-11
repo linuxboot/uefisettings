@@ -645,6 +645,7 @@ mod tests {
     use super::super::display;
     use super::super::ifr_fixtures::*;
     use super::super::list_questions;
+    use super::super::CheckedVarStores;
     use super::super::DefaultId;
     use super::super::EFI_IFR_TYPE_BOOLEAN;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
@@ -689,7 +690,7 @@ mod tests {
             Rc::clone(&root),
             &ListTexts::new(&strings(), &[]),
             IncludedStates::all(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         .into_iter()
@@ -1011,7 +1012,7 @@ mod tests {
             root,
             &ListTexts::new(&strings(), &[]),
             IncludedStates::all(),
-            None,
+            CheckedVarStores::NONE,
             &mut efivars.reader(),
         )
         .into_iter()
@@ -1038,6 +1039,7 @@ mod write_tests {
     use super::super::ifr_fixtures::*;
     use super::super::set::NewAnswer;
     use super::super::set_questions;
+    use super::super::CheckedVarStores;
     use super::super::IFROperation;
     use super::super::QuestionDescriptor;
     use super::super::EFI_IFR_TYPE_NUM_SIZE_16;
@@ -1118,7 +1120,7 @@ mod write_tests {
             answer,
             include,
             &mut reader,
-            None,
+            CheckedVarStores::NONE,
             VolatileWrites::Refuse,
             PendingOperations::new(UnsafeOperations::Refuse),
             &WithholdingVariables::new(variables, WithheldBytes::default()),
