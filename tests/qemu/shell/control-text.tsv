@@ -1,0 +1,29 @@
+# The checks of shell/control-text.nsh. See check-shell-log.sh.
+# show-ifr shows the control characters, the Bidi_Control character and U+2028 of the prompts
+# escaped, P04's backslash doubled and H05's line break inside its line. Raw, a terminal would
+# take ESC[2J and U+009B as commands, U+202E as a reordering of the text and the line breaks as
+# lines of their own; on the console, check-shell-log.sh deletes the control sequences and CR.
+show-ifr	status	0x0
+show-ifr	line	P00<\\u\{1b\}\[2J>Q
+show-ifr	line	P01<\\r>Q
+show-ifr	line	P02<\\u\{9b\}>Q
+show-ifr	line	P03<\\u\{202e\}>Q
+show-ifr	line	P04<\\\\u\{1b\}>Q
+show-ifr	line	P06<\\u\{2028\}>Q
+show-ifr	line	Help: - H05\\n +-Answer: forged
+show-ifr	none	^ +-Answer: forged
+# A console whose TestString() takes U+010D and U+200D, such as OVMF's VT-UTF8 terminal, shows
+# them as they are; on one that refuses them, such as a VT100 or PC-ANSI terminal of
+# edk2-stable202608 TerminalDxe, uefisettings shows them escaped, as \u{10d} and \u{200d}.
+# Raw there, each would reach the terminal as its low byte, CR, which check-shell-log.sh
+# deletes, leaving P07<>Q and P08<>Q. The P08 checks hold U+200D, which shows as nothing.
+show-ifr	line	P07<(č|\\u\{10d\})>Q
+show-ifr	line	P08<(‍|\\u\{200d\})>Q
+show-ifr	none	P0[78]<>Q
+# JSON escapes U+009B and U+202E, which it would carry raw, and jq reads the very prompts. A
+# bracketed backslash, [\], is literal in an extended regular expression.
+list-questions	status	0x0
+list-questions	line	P02<[\]u009b>Q
+list-questions	line	P03<[\]u202e>Q
+list-questions	json	any(.[]; .name == "P02<" + ([155] | implode) + ">Q") and any(.[]; .name == "P03<" + ([8238] | implode) + ">Q") and any(.[]; .name == "P06<" + ([8232] | implode) + ">Q") and any(.[]; .name == "P07<" + ([269] | implode) + ">Q") and any(.[]; .name == "P08<" + ([8205] | implode) + ">Q")
+list-questions	none	P0[78]<>Q

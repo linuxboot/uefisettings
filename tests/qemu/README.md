@@ -248,6 +248,17 @@ creates, the second with a PASSWORD and an op shorter than its minimum, which UE
 §33.2.5.10.1 calls malformed. `uefisettings` ignores that form set, so in the scenario
 `shell-dropped-password` `uefisettings.efi` reads and writes no variable.
 
+`publish-hiidb.efi control-text-forms` registers those of
+[`publish-hiidb/src/control_text_forms.rs`](publish-hiidb/src/control_text_forms.rs): CHECKBOXes on
+no variable whose prompts and a help hold what a terminal would take as commands, as a reordering
+of the text or as line breaks, a text that spells an escape, and U+010D and U+200D, whose low byte
+is CR. In the scenario `hii-control-text`, whose later `publish-hiidb.efi rt-data` exports the
+database, `hii show-ifr` shows each such character escaped and the help's line break inside its
+line, and `hii list-questions --json` keeps each text exact, with none of them raw in its output.
+`shell-control-text` checks the same in the UEFI Shell, where `uefisettings.efi` also escapes
+U+010D and U+200D, which the aarch64 firmware's VT100 terminal refuses, while the VT-UTF8
+terminal of the x86_64 and i686 firmware takes them, so those boots show them raw.
+
 `publish-hiidb.efi formset-skip-forms` registers those of
 [`publish-hiidb/src/formset_skip_forms.rs`](publish-hiidb/src/formset_skip_forms.rs): two package
 lists on the variables that [`vars/formset-skip.json`](vars/formset-skip.json) creates, one of four

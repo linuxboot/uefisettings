@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|storageless-password-forms|rt-data-storageless-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|control-text-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|storageless-password-forms|rt-data-storageless-password-forms|padded-strings|string-blocks|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -49,6 +49,8 @@
 //! `rt-data`, after it does the same, so that Linux finds it too.
 //! `enhanced-auth-forms` does the same with the package list of [`enhanced_auth_forms`].
 //! `dropped-password-forms` does the same with the package list of [`dropped_password_forms`].
+//! `control-text-forms` does the same with the package list of [`control_text_forms`], which a
+//! later `publish-hiidb.efi rt-data` exports with the database for Linux.
 //! `formset-skip-forms` registers the package lists of [`formset_skip_forms`] too, which a later
 //! `publish-hiidb.efi rt-data` exports with the database for Linux.
 //! `short-var-store-forms` does the same with the package list of [`short_var_store_forms`], and
@@ -124,6 +126,7 @@
 extern crate alloc;
 
 mod auth_variables;
+mod control_text_forms;
 mod dropped_password_forms;
 mod enhanced_auth_forms;
 mod exported_config;
@@ -303,6 +306,11 @@ fn efi_main() -> Status {
             "registering the dropped password forms",
         )
         .map(|()| println!("publish-hiidb: registered the dropped password forms")),
+        Some(Task::RegisterControlTextForms) => register_package_list(
+            &control_text_forms::package_list_bytes(),
+            "registering the control text forms",
+        )
+        .map(|()| println!("publish-hiidb: registered the control text forms")),
         Some(Task::RegisterFormSetSkipForms) => formset_skip_forms::package_lists()
             .iter()
             .try_for_each(|list| register_package_list(list, "registering the formset skip forms"))
@@ -416,7 +424,8 @@ fn efi_main() -> Status {
                  [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms\
                  |rt-data-readwrite-forms|wakeup-time-forms|password-forms\
                  |rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms\
-                 |enhanced-auth-forms|dropped-password-forms|formset-skip-forms\
+                 |enhanced-auth-forms|dropped-password-forms|control-text-forms\
+                 |formset-skip-forms\
                  |disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms\
                  |outside-form-set-password-forms|rt-data-outside-form-set-password-forms\
                  |first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms\
@@ -463,6 +472,8 @@ enum Task {
     RegisterEnhancedAuthForms,
     /// Register the package list of [`dropped_password_forms`] in the HII database.
     RegisterDroppedPasswordForms,
+    /// Register the package list of [`control_text_forms`] in the HII database.
+    RegisterControlTextForms,
     /// Register the package lists of [`formset_skip_forms`] in the HII database.
     RegisterFormSetSkipForms,
     /// Register the package list of a disabled form of [`formset_skip_forms`] in the HII
@@ -579,6 +590,9 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("dropped-password-forms") => {
             Some(Task::RegisterDroppedPasswordForms)
+        }
+        Ok(option) if option == cstr16!("control-text-forms") => {
+            Some(Task::RegisterControlTextForms)
         }
         Ok(option) if option == cstr16!("formset-skip-forms") => {
             Some(Task::RegisterFormSetSkipForms)

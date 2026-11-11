@@ -92,6 +92,10 @@ name = "hii_readwrite"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_control_text"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_outside_form_set_password"
 required-features = ["test-vm"]
 

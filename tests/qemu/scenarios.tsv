@@ -57,6 +57,8 @@ hii-nested-password	/publish-hiidb.efi rt-data-nested-password-forms	-	hii_neste
 shell-nested-password	/publish-hiidb.efi nested-password-forms	-	shell:nested-password	-
 shell-readwrite	/DriverSample.efi;/publish-hiidb.efi rt-data-readwrite-forms	-	shell:readwrite	-
 shell-dropped-password	/publish-hiidb.efi dropped-password-forms	dropped-password.json	shell:dropped-password	-
+hii-control-text	/publish-hiidb.efi control-text-forms;/publish-hiidb.efi rt-data	-	hii_control_text	-
+shell-control-text	/publish-hiidb.efi control-text-forms	-	shell:control-text	-
 shell-formset-skip	/publish-hiidb.efi formset-skip-forms	formset-skip.json	shell:formset-skip	-
 shell-short-var-store	/publish-hiidb.efi short-var-store-forms	short-var-store.json	shell:short-var-store	-
 shell-outside-form-set-password	/publish-hiidb.efi outside-form-set-password-forms	-	shell:outside-form-set-password	-
