@@ -489,6 +489,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                     outside: outside_before..outside_before + form_sets.outside.len(),
                     declared_by: form_sets.first_var_stores,
                     name_value_first: form_sets.name_value_first,
+                    declared: form_sets.declared,
                 });
                 roots.extend(form_sets.roots);
                 ignored_ifr.extend(form_sets.ignored);

@@ -4495,4 +4495,93 @@ mod tests {
             "beside a password on Store"
         );
     }
+
+    /// Beside a PASSWORD whose VarStoreId 9 no VarStore declares, whose password may be in any
+    /// variable, get and set by keyword refuse the HiiDB before any call through variables of
+    /// either reach, set with UnsafeOperations::Allow too; beside one on Store they read the
+    /// question.
+    #[test]
+    fn get_and_set_refuse_beside_a_password_of_an_undeclared_var_store_id() {
+        let lists = |var_store_id| {
+            let password = [
+                question_header_with(9, 9, var_store_id, 6, 0x00),
+                [&1u16.to_le_bytes()[..], &20u16.to_le_bytes()].concat(), // MinSize, MaxSize
+            ]
+            .concat();
+            let password = operation(crate::hii::forms::ifr_fixtures::PASSWORD, false, &password);
+            [list(PATH, &[questions(), vec![password]].concat())]
+        };
+        let variables_of = |reach, interface| -> Box<dyn FirmwareVariables> {
+            let variables = MemoryVariables::new(reach, interface);
+            let mut data = [0; 16];
+            data[5] = 1;
+            data[6] = 1;
+            let key = VariableKey {
+                name: "Store".to_owned(),
+                guid: Guid::from(STORE_GUID),
+            };
+            variables.insert(key, ATTRIBUTES, &data);
+            Box::new(variables)
+        };
+        let get_through =
+            |lists: &[ParsedPackageList], variables, handler: &MemoryKeywordHandler| {
+                get_keywords(
+                    lists,
+                    &format!("KEYWORD={KEYWORD}"),
+                    None,
+                    &[],
+                    KeywordGetOptions::default(),
+                    variables,
+                    handler,
+                )
+                .map(|values| values.to_string())
+                .map_err(|error| format!("{error:#}"))
+            };
+        let handler =
+            || MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (PATH, SECOND_KEYWORD, "01")]);
+        let record = "PASSWORD question 0x0009 in FormSet 11111111-1111-1111-1111-111111111111: \
+                      no supported varstore with matching id 0x0009 found; ";
+
+        for (reach, interface) in [
+            (VariableReach::Runtime, VariableInterface::Efivarfs),
+            (
+                VariableReach::BootServices,
+                VariableInterface::VariableServices,
+            ),
+        ] {
+            let refused = handler();
+            let got = get_through(&lists(9), variables_of(reach, interface), &refused);
+            assert!(
+                got.as_ref().is_err_and(|error| error.starts_with(record)),
+                "{reach:?}: get: {got:?}"
+            );
+            let written = set_keywords(
+                &lists(9),
+                &resp(PATH, KEYWORD, "03"),
+                IncludedStates::empty(),
+                UnsafeOperations::Allow,
+                VolatileWrites::Refuse,
+                variables_of(reach, interface),
+                &refused,
+            )
+            .map(|(values, _)| values.to_string())
+            .map_err(|error| format!("{error:#}"));
+            assert!(
+                written
+                    .as_ref()
+                    .is_err_and(|error| error.starts_with(record)),
+                "{reach:?}: set: {written:?}"
+            );
+            assert_eq!(refused.calls(), vec![], "{reach:?}: calls");
+        }
+        assert_eq!(
+            get_through(
+                &lists(1),
+                variables_of(VariableReach::Runtime, VariableInterface::Efivarfs),
+                &handler()
+            ),
+            Ok(resp(PATH, KEYWORD, "01")),
+            "beside a password on Store"
+        );
+    }
 }

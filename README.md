@@ -113,8 +113,16 @@ write no variable of a HiiDB with one, nor do `hii list-questions` and `hii show
 its Config Keyword Handler takes, counts as one outside any FormSet, also for the password questions
 of FormSets of its VarStoreId. IFR after an op that does not fit its form
 package has no op boundary, so they read and write no variable of such a HiiDB, nor do
-`hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question whose VarStore
-uefisettings cannot find withholds no bytes, which they warn of. A password question that edk2 may
+`hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question of a VarStoreId
+that no VarStore of its form package that decodes declares names no VarStore (UEFI 2.11
+§33.3.8.2.2 asks for "a previously declared variable store"), and edk2's Forms Browser finds none
+for it but a VarStore op of its FormSet, outside an unknown opcode's scope, that does not decode,
+whose fields it reads past the op's end, so they read and write no variable of a HiiDB with one,
+nor do `hii list-questions` and
+`hii show-ifr` but with `--no-efivars`; one whose FormSet declares no VarStore of its VarStoreId,
+which another VarStore of its form package declares, keeps its password at its offset in the first
+of those, which edk2's Config Keyword Handler takes, where `get` withholds it, and they warn of it.
+A password question that edk2 may
 route to a VARSTORE_NAME_VALUE, whose values its driver exposes, as UEFI 2.11 §33.2.5.6 says,
 through EFI_HII_CONFIG_ACCESS_PROTOCOL, in storage of its own choosing, may keep its password in any
 variable, so they read and write no variable of a HiiDB with one, as for IFR without an op boundary,

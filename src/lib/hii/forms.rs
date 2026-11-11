@@ -2121,7 +2121,7 @@ pub(super) fn parse_form_sets(
             &mut malformed_stores,
         );
     }
-    let (first_var_stores, name_value_first) = first_var_stores(&var_stores, &outside);
+    let (first_var_stores, name_value_first, declared) = first_var_stores(&var_stores, &outside);
     Ok(FormSets {
         roots,
         ignored,
@@ -2130,6 +2130,7 @@ pub(super) fn parse_form_sets(
         malformed_stores,
         first_var_stores,
         name_value_first,
+        declared,
     })
 }
 
@@ -2142,11 +2143,16 @@ pub(super) fn parse_form_sets(
 /// the package, as it walks the package op by op (:1520-1567), FORM_SET ops or not, so a FormSet
 /// nested in another is another FormSet, and steps into the scope of an unknown opcode as into any
 /// (:1566). An id whose first VarStore is outside any FormSet or in such a scope has no FormSet's:
-/// PasswordQuestions withholds those as VarStores outside any FormSet.
+/// PasswordQuestions withholds those as VarStores outside any FormSet. Every id of those
+/// VarStores comes third: for a question of the package of an id of none, the Forms Browser and
+/// FindStorageFromVarId find none but a VarStore op that does not decode, which each reads
+/// whatever the op's Length: the Forms Browser one of the question's FormSet outside an unknown
+/// opcode's scope (SetupBrowserDxe/IfrParse.c ParseOpCodes, :1873-1918), FindStorageFromVarId the
+/// first in the package (:1538-1555).
 fn first_var_stores(
     var_stores: &[(u64, Rc<RefCell<IFROperation>>)],
     outside: &[OutsideOp],
-) -> (BTreeMap<u16, FirstVarStore>, BTreeSet<u16>) {
+) -> (BTreeMap<u16, FirstVarStore>, BTreeSet<u16>, BTreeSet<u16>) {
     let in_form_sets = var_stores.iter().filter_map(|(offset, store)| {
         let (var_store_id, declared) = declared_store(&store.borrow().parsed_data)?;
         Some((*offset, var_store_id, declared, Some(store)))
@@ -2175,11 +2181,12 @@ fn first_var_stores(
         });
         first.insert(var_store_id, declared_by);
     }
+    let declared = first.keys().copied().collect();
     let first = first
         .into_iter()
         .filter_map(|(var_store_id, first)| Some((var_store_id, first?)))
         .collect();
-    (first, name_value_first)
+    (first, name_value_first, declared)
 }
 
 /// Where an op that parse_form_sets records outside the FormSets that it parses sits.
@@ -2565,8 +2572,9 @@ fn form_set_name(op: &IFROperation) -> String {
 /// The FormSets of a form package: a root for each that parse_form_sets parses, the IFR that it
 /// ignores, the forms that it drops from those roots, the VarStores and statements outside the
 /// FormSets that it parses, with the VarStores in the scope of an unknown opcode in those,
-/// malformed VarStores apart, the first VarStore of each VarStoreId that a FormSet declares, and
-/// the VarStoreIds whose first VarStore is a VARSTORE_NAME_VALUE (first_var_stores).
+/// malformed VarStores apart, the first VarStore of each VarStoreId that a FormSet declares, the
+/// VarStoreIds whose first VarStore is a VARSTORE_NAME_VALUE, and every VarStoreId that a VarStore
+/// that decodes declares (first_var_stores).
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
@@ -2575,6 +2583,7 @@ pub(super) struct FormSets {
     pub(super) malformed_stores: Vec<IgnoredIfr>,
     pub(super) first_var_stores: BTreeMap<u16, FirstVarStore>,
     pub(super) name_value_first: BTreeSet<u16>,
+    pub(super) declared: BTreeSet<u16>,
 }
 
 /// The FormSets of a form package of a package list, by index in its forms, which the forms that
@@ -2591,6 +2600,8 @@ pub(crate) struct FirstVarStores {
     /// The VarStoreIds whose first VarStore in the package, in a FormSet or not, is a
     /// VARSTORE_NAME_VALUE
     pub(crate) name_value_first: BTreeSet<u16>,
+    /// Every VarStoreId that a VarStore of the package that decodes declares, in a FormSet or not
+    pub(crate) declared: BTreeSet<u16>,
 }
 
 /// The first VarStore op of a VarStoreId of a form package, `store`, and the FORM_SET op nearest
