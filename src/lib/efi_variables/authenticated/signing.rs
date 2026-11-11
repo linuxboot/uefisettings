@@ -78,6 +78,7 @@ use super::WIN_CERT_TYPE_EFI_GUID;
 use crate::efi_variables::enhanced_authenticated::authentication_3_payload;
 use crate::efi_variables::enhanced_authenticated::Freshness;
 use crate::efi_variables::enhanced_authenticated::MetadataTooLarge;
+use crate::efi_variables::GmtTime;
 use crate::hii::VariableAttributes;
 use crate::hii::VariableKey;
 use crate::secret_file::Secret;
@@ -138,17 +139,9 @@ impl TimeStamp {
         &self.0
     }
 
-    /// Its Year, Month, Day, Hour, Minute and Second, the fields that a time in GMT sets.
-    fn fields(&self) -> (u16, u8, u8, u8, u8, u8) {
-        let [y0, y1, month, day, hour, minute, second, ..] = self.0;
-        (
-            u16::from_le_bytes([y0, y1]),
-            month,
-            day,
-            hour,
-            minute,
-            second,
-        )
+    /// The EFI_TIME, in GMT.
+    fn gmt_time(&self) -> GmtTime<'_> {
+        GmtTime(&self.0)
     }
 
     /// The EFI_TIME of `year` and its month, day, hour, minute and second, in GMT.
@@ -208,11 +201,12 @@ impl FromStr for TimeStamp {
 }
 
 /// Chronological, as SetVariable() wants a TimeStamp "chronologically greater" than the variable's
-/// (UEFI 2.11 §8.2.5). It compares fields() only, while the derived Eq compares all 16 bytes: the
-/// two agree because every constructor (of, ZERO, from_efi_time) leaves Pad1 through Pad2 zero.
+/// (UEFI 2.11 §8.2.5). It compares GmtTime::fields only, while the derived Eq compares all 16
+/// bytes: the two agree because every constructor (of, ZERO, from_efi_time) leaves Pad1 through
+/// Pad2 zero.
 impl Ord for TimeStamp {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.fields().cmp(&other.fields())
+        self.gmt_time().fields().cmp(&other.gmt_time().fields())
     }
 }
 
@@ -224,11 +218,7 @@ impl PartialOrd for TimeStamp {
 
 impl fmt::Display for TimeStamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (year, month, day, hour, minute, second) = self.fields();
-        write!(
-            f,
-            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-        )
+        self.gmt_time().fmt(f)
     }
 }
 

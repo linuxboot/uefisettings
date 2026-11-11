@@ -163,7 +163,7 @@ fn apply_staged(nonce: &str) -> ! {
 /// files, which this build does not.
 #[derive(Debug, Subcommand)]
 pub(super) enum HiiPlatformCommands {
-    /// Show the attributes and the size of an EFI variable, never its data
+    /// Show the attributes and the size of an EFI variable, and the EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access, never its data
     #[command(next_display_order = None)]
     VariableInfo {
         name: String,

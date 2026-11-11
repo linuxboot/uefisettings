@@ -926,11 +926,11 @@ fn efivar_info(key: &VariableKey, bytes: &[u8]) -> Result<VariableInfo> {
                 bytes.len()
             )
         })?;
-    Ok(VariableInfo {
-        variable: key.to_string(),
-        attributes: u32::from_ne_bytes(*attributes),
-        size: data.len(),
-    })
+    Ok(VariableInfo::from_data(
+        key,
+        u32::from_ne_bytes(*attributes),
+        data,
+    ))
 }
 
 impl VariableData for EfivarFiles {
@@ -1545,6 +1545,7 @@ mod tests {
                 variable: "Setup-00000000-0000-0000-0000-000000000000".to_string(),
                 attributes: NV_BS_RT,
                 size: SETUP.len() - EFIVARFS_HEADER_SIZE,
+                metadata: None,
             },
             "info"
         );
@@ -1562,6 +1563,113 @@ mod tests {
             let error = efivar_info(&key, bytes).expect_err("tell an empty or short file");
 
             assert_eq!(error.to_string(), refusal, "{} bytes", bytes.len());
+        }
+    }
+
+    /// efivar_info shows the EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable with
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 §8.2.1), of either Type, or why it
+    /// does not take it, but none of a variable without that attribute, and none of the data.
+    #[test]
+    fn efivar_info_shows_the_metadata_of_enhanced_authenticated_access() {
+        use crate::efi_variables::enhanced_authenticated::fixture::nonce_metadata_of;
+        use crate::efi_variables::enhanced_authenticated::fixture::timestamp_metadata;
+
+        const VALUE: &[u8] = b"value";
+        const CERT_ID: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let key = variable_key("Setup");
+        let variable = "Setup-00000000-0000-0000-0000-000000000000";
+        let mut other_version = timestamp_metadata();
+        *other_version.first_mut().expect("a Version") = 2;
+        let cases = [
+            (
+                "TimeStamp",
+                0x87,
+                [&timestamp_metadata()[..], VALUE].concat(),
+                serde_json::json!({
+                    "variable": variable,
+                    "attributes": 0x87,
+                    "size": 73,
+                    "metadata": {
+                        "version": 1,
+                        "type": 1,
+                        "metadata_size": 68,
+                        "flags": 0,
+                        "time_stamp": "2026-11-06T12:00:00Z",
+                        "cert_id": {"type": 1, "id": {"hex": CERT_ID}},
+                    },
+                }),
+            ),
+            (
+                "nonce",
+                0x87,
+                [&nonce_metadata_of(&[7, 8, 9], &[0], 60)[..], VALUE].concat(),
+                serde_json::json!({
+                    "variable": variable,
+                    "attributes": 0x87,
+                    "size": 65,
+                    "metadata": {
+                        "version": 1,
+                        "type": 2,
+                        "metadata_size": 60,
+                        "flags": 0,
+                        "nonce": {"hex": "070809"},
+                        "cert_id": {"type": 1, "id": {"hex": CERT_ID}},
+                    },
+                }),
+            ),
+            (
+                "Version 2",
+                0x87,
+                [&other_version[..], VALUE].concat(),
+                serde_json::json!({
+                    "variable": variable,
+                    "attributes": 0x87,
+                    "size": 73,
+                    "metadata": {"refused": "EFI_VARIABLE_AUTHENTICATION_3 Version 2, not 1"},
+                }),
+            ),
+            (
+                "data ending inside the metadata",
+                0x87,
+                timestamp_metadata()[..67].to_vec(),
+                serde_json::json!({
+                    "variable": variable,
+                    "attributes": 0x87,
+                    "size": 67,
+                    "metadata": {"refused": "its 67 bytes of data end inside its metadata"},
+                }),
+            ),
+            (
+                "time-based too",
+                0xA7,
+                [&timestamp_metadata()[..], VALUE].concat(),
+                serde_json::json!({
+                    "variable": variable,
+                    "attributes": 0xA7,
+                    "size": 73,
+                    "metadata": {
+                        "refused": "it also has EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, \
+                                    which SetVariable() refuses with it (UEFI 2.11 section 8.2.3)",
+                    },
+                }),
+            ),
+            (
+                "no enhanced authenticated access",
+                0x07,
+                [&timestamp_metadata()[..], VALUE].concat(),
+                serde_json::json!({"variable": variable, "attributes": 0x07, "size": 73}),
+            ),
+        ];
+        for (case, attributes, data, want) in cases {
+            let bytes = [&u32::to_ne_bytes(attributes)[..], &data].concat();
+
+            let info = efivar_info(&key, &bytes).expect("tell the variable");
+
+            assert_eq!(
+                serde_json::to_value(&info).expect("serialize the info"),
+                want,
+                "{case}"
+            );
         }
     }
 
@@ -1604,6 +1712,7 @@ mod tests {
                 variable: "Setup-00000000-0000-0000-0000-000000000000".to_string(),
                 attributes: NV_BS_RT,
                 size: SETUP.len() - EFIVARFS_HEADER_SIZE,
+                metadata: None,
             },
             "Setup"
         );

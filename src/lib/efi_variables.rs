@@ -29,8 +29,11 @@ mod capsule_delivery;
 #[cfg(variable_data)]
 mod capsule_result;
 pub(crate) mod enhanced_authenticated;
-#[cfg(variable_data)]
+#[cfg(any(variable_data, variable_info))]
 mod json_bytes;
+
+#[cfg(any(variable_data, variable_info))]
+use std::fmt;
 
 #[cfg(all(variable_names, any(target_os = "uefi", test)))]
 use anyhow::anyhow;
@@ -93,6 +96,8 @@ pub use capsule_result::ResultName;
 pub use capsule_result::Undecoded;
 #[cfg(configuration_tables)]
 pub(crate) use capsule_result::EFI_JSON_CAPSULE_RESULT_TABLE_GUID;
+#[cfg(variable_info)]
+pub use enhanced_authenticated::MetadataInfo;
 #[cfg(variable_data)]
 pub use json_bytes::TextOrHex;
 
@@ -137,6 +142,41 @@ fn is_gmt_time_stamp(time_stamp: &[u8; EFI_TIME_SIZE]) -> bool {
     // Pad2 (UEFI 2.11 §8.3.1)
     let [_, _, _, _, _, _, _, gmt_fields @ ..] = *time_stamp;
     gmt_fields.iter().all(|&byte| byte == 0)
+}
+
+/// An EFI_TIME in GMT (is_gmt_time_stamp), as the TimeStamp of an authentication descriptor holds
+/// it.
+#[cfg(any(variable_data, variable_info))]
+#[derive(Debug, Clone, Copy)]
+struct GmtTime<'a>(&'a [u8; EFI_TIME_SIZE]);
+
+#[cfg(any(variable_data, variable_info))]
+impl GmtTime<'_> {
+    /// Its Year, Month, Day, Hour, Minute and Second, the fields that a time in GMT sets, in the
+    /// order that orders them chronologically.
+    fn fields(self) -> (u16, u8, u8, u8, u8, u8) {
+        let [y0, y1, month, day, hour, minute, second, ..] = *self.0;
+        (
+            u16::from_le_bytes([y0, y1]),
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        )
+    }
+}
+
+/// As YYYY-MM-DDTHH:MM:SSZ.
+#[cfg(any(variable_data, variable_info))]
+impl fmt::Display for GmtTime<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (year, month, day, hour, minute, second) = self.fields();
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+        )
+    }
 }
 
 /// EFI_JSON_CAPSULE_ID_GUID, the CapsuleGuid of a JSON capsule (UEFI 2.11 §23.5.1), which the
@@ -277,6 +317,25 @@ pub struct VariableInfo {
     pub attributes: u32,
     /// The size of its data, in bytes
     pub size: usize,
+    /// The EFI_VARIABLE_AUTHENTICATION_3 metadata before its data, if it has
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (UEFI 2.11 §8.2.1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MetadataInfo>,
+}
+
+#[cfg(variable_info)]
+impl VariableInfo {
+    /// The VariableInfo of `key` from the `attributes` and `data` that GetVariable() returns
+    /// (UEFI 2.10 §8.2.1): their size, and the metadata that starts `data` if `attributes` say so
+    /// (MetadataInfo::of), but never `data`.
+    pub(crate) fn from_data(key: &VariableKey, attributes: u32, data: &[u8]) -> Self {
+        Self {
+            variable: key.to_string(),
+            attributes,
+            size: data.len(),
+            metadata: MetadataInfo::of(attributes, data),
+        }
+    }
 }
 
 /// GetVariable() (UEFI 2.10 §8.2.1) with the data, and SetVariable() (§8.2.3): a variable that a
@@ -810,6 +869,7 @@ mod tests {
             variable: "MyIfrNVData-a04a27f4-df00-4d42-b552-39511302113d".to_string(),
             attributes: 7,
             size: 220,
+            metadata: None,
         };
 
         assert_eq!(

@@ -159,8 +159,8 @@ impl HiiBackend {
     }
 
     /// The VariableInfo of the EFI variable `name` of the vendor GUID `vendor`, such as
-    /// "8C78A505-BAA0-4C4A-869F-000000000101", whose data it never reads: as
-    /// VariableBackend::info.
+    /// "8C78A505-BAA0-4C4A-869F-000000000101", whose data it reads only for the metadata of a
+    /// variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS: as VariableBackend::info.
     pub fn variable_info(name: &str, vendor: &str) -> Result<VariableInfo> {
         VariableBackend::info(name, vendor)
     }

@@ -66,7 +66,7 @@ enum VariableSubcommands {
         #[arg(long)]
         guid: Option<String>,
     },
-    /// Show the attributes and the size of an EFI variable, never its data
+    /// Show the attributes and the size of an EFI variable, and the EFI_VARIABLE_AUTHENTICATION_3 metadata of one with enhanced-authenticated-access, never its data
     #[cfg(variable_info)]
     #[command(next_display_order = None)]
     Info {
@@ -248,8 +248,9 @@ fn list_report(keys: &[VariableKey]) -> serde_json::Value {
         .collect()
 }
 
-/// Prints the attributes and the size of the EFI variable `name` of the vendor GUID `guid`: info,
-/// and hii variable-info of the UEFI Shell build.
+/// Prints the attributes and the size of the EFI variable `name` of the vendor GUID `guid`, and
+/// its EFI_VARIABLE_AUTHENTICATION_3 metadata if it has any: info, and hii variable-info of the
+/// UEFI Shell build.
 #[cfg(variable_info)]
 pub(super) fn print_info(name: &str, guid: &str) -> Result<()> {
     let info = VariableBackend::info(name, guid)?;

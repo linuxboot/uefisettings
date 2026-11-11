@@ -600,6 +600,13 @@ of the file only when it lists or writes the variable but reads the variable fro
 each read; a variable without runtime access is missing there, and so is one that the firmware
 dropped after efivarfs listed it. On Windows it reads all of the data through
 GetFirmwareEnvironmentVariableExW, which tells the size no other way, and prints none of it.
+Of a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, it also prints `metadata`, the
+EFI_VARIABLE_AUTHENTICATION_3 headers that GetVariable() returns before the data (UEFI 2.11 §8.2.1),
+which `size` counts: `version`, `type`, 1 for a TimeStamp or 2 for a nonce, `metadata_size`,
+`flags`, then `time_stamp` as YYYY-MM-DDTHH:MM:SSZ, or `nonce`, the current nonce, which the next
+update signs (§8.2.5), as `{"hex": ...}`, then `cert_id`, its `type` and `id`; metadata that
+uefisettings does not take shows as `{"refused": WHY}`. In the UEFI Shell it reads the data of such
+a variable for it, and of no other.
 `uefisettings.efi` keeps `hii variable-info` for it.
 
 ```plain

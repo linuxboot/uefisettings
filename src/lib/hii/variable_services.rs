@@ -184,6 +184,8 @@ impl VariableInfoSource for VariableServices {
     /// of its data: as every variable holds one at least (UEFI 2.10 §8.2.3), the firmware
     /// returns EFI_BUFFER_TOO_SMALL with the attributes and the size (§8.2.1), and
     /// uefi::runtime::get_variable drops the attributes then.
+    /// Of a variable with EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS, it then reads the data, whose
+    /// metadata only the data holds (UEFI 2.11 §8.2.1), for VariableInfo::from_data.
     fn variable_info(&self, key: &VariableKey) -> Result<VariableInfo> {
         let (variable_name, variable_vendor) = uefi_key(key)?;
         let system_table = uefi::table::system_table_raw().context("no system table")?;
@@ -213,10 +215,18 @@ impl VariableInfoSource for VariableServices {
                      attributes"
                 ))
             }
+            Status::BUFFER_TOO_SMALL | Status::SUCCESS
+                if VariableAttributes::from_bits_retain(attributes.bits())
+                    .contains(VariableAttributes::ENHANCED_AUTHENTICATED_ACCESS) =>
+            {
+                let (data, attributes) = get_variable(key)?;
+                Ok(VariableInfo::from_data(key, attributes.bits(), &data))
+            }
             Status::BUFFER_TOO_SMALL | Status::SUCCESS => Ok(VariableInfo {
                 variable: key.to_string(),
                 attributes: attributes.bits(),
                 size,
+                metadata: None,
             }),
             Status::NOT_FOUND => Err(VariableNotFound(key.clone()).into()),
             status => Err(anyhow!("GetVariable() of EFI variable {key}: {status:?}")),

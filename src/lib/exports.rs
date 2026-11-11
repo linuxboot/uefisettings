@@ -273,6 +273,8 @@ mod uefi;
 mod windows;
 
 #[cfg(variable_info)]
+pub use crate::efi_variables::MetadataInfo;
+#[cfg(variable_info)]
 pub use crate::efi_variables::VariableInfo;
 #[cfg(target_os = "linux")]
 pub use linux::identify_machine;
@@ -311,8 +313,9 @@ impl VariableBackend {
 #[cfg(variable_info)]
 impl VariableBackend {
     /// The VariableInfo of the EFI variable `name` of the vendor GUID `vendor`, such as
-    /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C", without its data, which only the Windows build
-    /// reads.
+    /// "8BE4DF61-93CA-11D2-AA0D-00E098032B8C", without its data, of which it shows only the
+    /// EFI_VARIABLE_AUTHENTICATION_3 metadata of a variable with
+    /// EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS (VariableInfo::metadata).
     pub fn info(name: &str, vendor: &str) -> Result<VariableInfo> {
         let key = VariableKey {
             name: name.to_owned(),
