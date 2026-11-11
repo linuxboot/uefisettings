@@ -1058,6 +1058,20 @@ pub struct FormSet {
     /// declared_var_store refuses a lookup of such an id
     #[br(default)]
     pub(super) var_stores_in_disabled_forms: BTreeSet<u16>,
+    /// The FORM_SET op that its package list starts with, which edk2-stable202608
+    /// SetupBrowserDxe/Setup.c GetIfrBinaryData takes for a Nil FormSet GUID (:6075):
+    /// read_package_list marks it, else None
+    #[br(default)]
+    pub(super) package_list_first: Option<PackageListFirst>,
+}
+
+/// The FORM_SET op that a package list starts with, as one of its FormSets sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PackageListFirst {
+    /// Its own
+    Own,
+    /// Another, of this GUID, if the op holds one
+    Other(Option<Guid>),
 }
 
 impl FormSet {
@@ -2006,6 +2020,7 @@ pub(super) fn parse_form_sets(
     // the ops outside a FormSet that the walk steps over, and the VarStores in the scope of an
     // unknown opcode in a FormSet that parses, by offset
     let mut walked = Vec::new();
+    let mut first_form_set = None;
     let package_length = u64::try_from(package_cursor.get_ref().len())
         .context("failed to convert form package length into u64")?;
     while package_cursor.position() < package_length {
@@ -2048,6 +2063,14 @@ pub(super) fn parse_form_sets(
         if let Some(start) = open_past_end.take() {
             past_end.push(start..offset);
         }
+        // GetIfrBinaryData takes the first FORM_SET op for a Nil GUID, whether it parses or not
+        let first_op = first_form_set.is_none();
+        if first_op {
+            first_form_set = Some(FirstFormSet {
+                guid: op.data.first_chunk().map(|&guid| Guid::from(guid)),
+                parses: false,
+            });
+        }
         let failure = match failing_alike.remove(&offset) {
             Some(failure) => failure,
             None => {
@@ -2063,6 +2086,9 @@ pub(super) fn parse_form_sets(
                         var_stores.extend(parsed.var_stores);
                         let roots_before = roots.len();
                         roots.push(parsed.root);
+                        if let (true, Some(first)) = (first_op, &mut first_form_set) {
+                            first.parses = true;
+                        }
                         disabled_forms.extend(
                             parsed
                                 .disabled_forms
@@ -2142,6 +2168,7 @@ pub(super) fn parse_form_sets(
         first_var_stores,
         name_value_first,
         declared,
+        first_form_set,
     })
 }
 
@@ -2585,7 +2612,7 @@ fn form_set_name(op: &IFROperation) -> String {
 /// FormSets that it parses, with the VarStores in the scope of an unknown opcode in those,
 /// malformed VarStores apart, the first VarStore of each VarStoreId that a FormSet declares, the
 /// VarStoreIds whose first VarStore is a VARSTORE_NAME_VALUE, and every VarStoreId that a VarStore
-/// that decodes declares (first_var_stores).
+/// that decodes declares (first_var_stores), and its first FORM_SET op (first_form_set).
 pub(super) struct FormSets {
     pub(super) roots: Vec<Rc<RefCell<IFROperation>>>,
     pub(super) ignored: Vec<IgnoredIfr>,
@@ -2595,6 +2622,38 @@ pub(super) struct FormSets {
     pub(super) first_var_stores: BTreeMap<u16, FirstVarStore>,
     pub(super) name_value_first: BTreeSet<u16>,
     pub(super) declared: BTreeSet<u16>,
+    pub(super) first_form_set: Option<FirstFormSet>,
+}
+
+/// The first FORM_SET op of a form package.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FirstFormSet {
+    /// Its GUID, if the op holds one
+    pub(super) guid: Option<Guid>,
+    /// Whether its FormSet parses, as the first of FormSets::roots
+    pub(super) parses: bool,
+}
+
+/// Marks the FormSet of each of `roots`, those of one package list, with the FORM_SET op that the
+/// list starts with: `first`, of the form package whose roots start at the index it pairs with.
+pub(super) fn mark_package_list_first(
+    roots: &[Rc<RefCell<IFROperation>>],
+    first: Option<(usize, FirstFormSet)>,
+) {
+    let Some((at, first)) = first else {
+        return;
+    };
+    for (index, root) in roots.iter().enumerate() {
+        let mark = match (first.parses, index == at) {
+            (true, true) => PackageListFirst::Own,
+            (true, false) | (false, _) => PackageListFirst::Other(first.guid),
+        };
+        for child in &root.borrow().children {
+            if let ParsedOperation::FormSet(form_set) = &mut child.borrow_mut().parsed_data {
+                form_set.package_list_first = Some(mark);
+            }
+        }
+    }
 }
 
 /// The FormSets of a form package of a package list, by index in its forms, which the forms that

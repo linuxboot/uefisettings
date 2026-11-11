@@ -466,6 +466,8 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
     let mut disabled_forms = Vec::new();
     let mut first_var_stores = Vec::new();
     let mut device_path = None;
+    // the first FORM_SET op of the list, with the index of the first root of its form package
+    let mut first_form_set = None;
 
     for package in get_packages(package_list)? {
         let mut package_cursor = Cursor::new(&package.data);
@@ -484,6 +486,9 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
                     .context("failed to parse a form package")?;
                 let roots_before = roots.len();
                 let outside_before = outside_ifr.len();
+                if first_form_set.is_none() {
+                    first_form_set = form_sets.first_form_set.map(|first| (roots_before, first));
+                }
                 first_var_stores.push(forms::FirstVarStores {
                     form_sets: roots_before..roots_before + form_sets.roots.len(),
                     outside: outside_before..outside_before + form_sets.outside.len(),
@@ -517,6 +522,7 @@ fn read_package_list(package_list: &PackageList) -> Result<ParsedPackageList> {
         }
     }
 
+    forms::mark_package_list_first(&roots, first_form_set);
     // the PASSWORD ops of disabled forms keep their passwords in the variables of their VarNames
     let named: Vec<IFRNodeLink> = roots
         .iter()
@@ -568,6 +574,8 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::subtitle_scope;
     use crate::hii::forms::ifr_fixtures::CHECKBOX;
     use crate::hii::forms::ifr_fixtures::END;
+    use crate::hii::forms::PackageListFirst;
+    use crate::hii::forms::ParsedOperation;
     use crate::hii::forms::MAX_SCOPE_NESTING;
     use crate::hii::scsu::tests::EDK2_LANGUAGE_WINDOW;
     use crate::hii::strings::StringMap;
@@ -1274,6 +1282,67 @@ mod tests {
                 "roots and IFR ignored (offset, reason as expected) of {name}: {:?}",
                 list.ignored_ifr
             );
+        }
+    }
+
+    /// read_db marks each FormSet with the FORM_SET op that its package list starts with, which
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c GetIfrBinaryData takes for a Nil FormSet GUID
+    /// (:6075): the first FormSet its own, the others that one, also in a later form package, and
+    /// every FormSet one that does not parse.
+    #[test]
+    fn read_db_marks_the_form_set_that_each_package_list_starts_with() {
+        let short_checkbox = [CHECKBOX, 0x03, 0x00]; // 1 of its data bytes
+        let form_sets = |guids: &[u8]| -> Vec<u8> {
+            guids
+                .iter()
+                .flat_map(|&guid| form_set_of_guid(guid, &[]))
+                .collect()
+        };
+        let marks = |packages: Vec<Vec<u8>>| -> Vec<Option<PackageListFirst>> {
+            let hiidb = package_list_with_guid(
+                [0x22; 16],
+                &[packages.concat(), END_PACKAGE.to_vec()].concat(),
+            );
+            let lists = read_db(&hiidb).expect("read the HiiDB");
+            lists[0]
+                .forms
+                .iter()
+                .map(|root| {
+                    let form_set = Rc::clone(&root.borrow().children[0]);
+                    let form_set = form_set.borrow();
+                    match &form_set.parsed_data {
+                        ParsedOperation::FormSet(form_set) => form_set.package_list_first,
+                        other => panic!("a FORM_SET op first: {other:?}"),
+                    }
+                })
+                .collect()
+        };
+        let own = Some(PackageListFirst::Own);
+        let other = |guid: u8| Some(PackageListFirst::Other(Some(Guid::from([guid; 16]))));
+        let cases = [
+            (
+                "two FormSets of one form package",
+                vec![form_package_of(&form_sets(&[0xA0, 0xB0]))],
+                vec![own, other(0xA0)],
+            ),
+            (
+                "a FormSet in each of two form packages",
+                vec![
+                    form_package_of(&form_sets(&[0xA0])),
+                    form_package_of(&form_sets(&[0xB0, 0xC0])),
+                ],
+                vec![own, other(0xA0), other(0xA0)],
+            ),
+            (
+                "a first FormSet that does not parse",
+                vec![form_package_of(
+                    &[form_set_of_guid(0xA0, &short_checkbox), form_sets(&[0xB0])].concat(),
+                )],
+                vec![other(0xA0)],
+            ),
+        ];
+        for (name, packages, want) in cases {
+            assert_eq!(marks(packages), want, "{name}");
         }
     }
 

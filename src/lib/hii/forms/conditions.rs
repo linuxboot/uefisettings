@@ -18,8 +18,9 @@
 //! decide which questions a user sees and sets, as the platform's setup browser, mostly edk2's,
 //! shows them, and the spec would make every EQ_ID_VAL of a CHECKBOX, which holds a BOOLEAN,
 //! UNDEFINED. Where edk2 ASSERTs, the result is not evaluated; where a CONDITIONAL drops an
-//! UNDEFINED and the two results differ in effect, it is undetermined, naming both. Lines are of
-//! edk2-stable202608.
+//! UNDEFINED and the two results differ in effect, or QUESTION_REF3 takes a question from another
+//! FormSet or, without a Guid in the WRITE of that question, its value before the write, it is
+//! undetermined, naming both. Lines are of edk2-stable202608.
 //!
 //! | Operation | UEFI 2.11 | edk2 | Here |
 //! |---|---|---|---|
@@ -30,6 +31,9 @@
 //! | The right operand of MULTIPLY, DIVIDE and MODULO | 64 bits (§33.3.8.3.43, §33.3.8.3.15, §33.3.8.3.42) | its low 32 bits (Expression.c:3398-3406) | edk2 |
 //! | EQ_ID_VAL_LIST | the question's value in the list (§33.3.8.3.20) | its low 16 bits (Expression.c:2716) | edk2 |
 //! | An UNDEFINED that a CONDITIONAL drops | a value, which the CONDITIONAL drops, pushing the other one (§33.2.5.7.4, §33.3.8.3.10) | the end of the expression, whose result it is (Expression.c:3713-3715) | undetermined, but where both have one effect: a condition FALSE, a READ the stored value's value (no value only where the whole expression diverges), a match expression no match, an EFI_IFR_VALUE no UINT64, a WRITE the same SETs, where the spec goes on to the end with no SET, op not evaluated or malformed op past edk2's end, or that of an expression of a MAP in it; a return expression of a MAP that gives a value ends the expression at the MAP, which the spec's value goes on in |
+//! | QUESTION_REF3 with the Guid of another FormSet and DevicePath 0 | the question of that FormSet (§33.3.8.3.57) | that of the current FormSet (Expression.c:2924-2934) | undetermined |
+//! | QUESTION_REF3 without a Guid and DevicePath 0, in a FormSet that its package list does not start with | the question of the current FormSet (§33.3.8.3.57) | that of the package list's first FormSet (Expression.c:2917-2923, Setup.c:6075) | undetermined |
+//! | QUESTION_REF3 without a Guid and DevicePath 0, in the WRITE of the question that it takes | the question of the current FormSet (§33.3.8.3.57), whose value is THIS in its WRITE (§33.3.8.3.94) | the question's value retrieved anew, before the WRITE writes it (Expression.c:2561-2567, Setup.c:1995-1998) | undetermined |
 //! | A zero divisor; a shift of 64 bits or more | UNDEFINED, as DIVIDE and MODULO push (§33.3.8.3.15, §33.3.8.3.42); no limit (§33.3.8.3.67, §33.3.8.3.68) | an ASSERT (MdePkg/Library/BaseLib/DivU64x32.c:34, DivU64x32Remainder.c:38, LShiftU64.c:33, RShiftU64.c:33) | not evaluated |
 //! | A SET after an UNDEFINED | EFI_IFR_SET (§33.3.8.3.66) stores its value and pushes TRUE or FALSE | never reached, as the expression ends at the UNDEFINED (Expression.c:3713-3715) | edk2: no SET planned |
 
@@ -87,6 +91,7 @@ use super::EfivarReader;
 use super::IFROpCode;
 use super::IFROperation;
 use super::IgnoredIfr;
+use super::PackageListFirst;
 use super::ParsedOperation;
 use super::QuestionFlags;
 use super::QuestionHeader;
@@ -101,6 +106,7 @@ use super::EFI_IFR_TYPE_NUM_SIZE_8;
 use super::EFI_IFR_TYPE_REF;
 use super::EFI_IFR_TYPE_STRING;
 use super::EFI_IFR_TYPE_TIME;
+use crate::hii::package::Guid;
 use crate::hii::variables::UnreadVariables;
 use crate::hii::variables::VariableInterface;
 use crate::hii::variables::VariableLayout;
@@ -1528,6 +1534,7 @@ pub(crate) fn constant_condition(scope: &IFROperation) -> Truth {
             | ExpressionOp::EqIdValList
             | ExpressionOp::QuestionRef1
             | ExpressionOp::QuestionRef2
+            | ExpressionOp::QuestionRef3
             | ExpressionOp::This
             | ExpressionOp::Get
             | ExpressionOp::Set,
@@ -2201,6 +2208,14 @@ impl Role<'_> {
             }
         }
     }
+
+    /// Whether this is the WRITE of question `id`.
+    fn writes(&self, id: u16) -> bool {
+        match self {
+            Self::Write { question, .. } => *question == Some(id),
+            Self::Reads | Self::Read { .. } => false,
+        }
+    }
 }
 
 /// The kind of value that a GET reads or a SET writes.
@@ -2379,11 +2394,69 @@ enum Abort {
     Diverged(Box<Divergence>),
 }
 
+/// Where edk2-stable202608 SetupBrowserDxe and UEFI 2.11 give an expression two results.
+#[derive(Debug, PartialEq, Eq)]
+enum Divergence {
+    Dropped(DroppedUndefined),
+    /// The two evaluate an op apart, as the text names both results; one of them is not looked
+    /// up here, so no effect is known to both
+    Op(String),
+}
+
+impl Divergence {
+    /// Names both results, with edk2's `consequence` where it ends the whole expression at an
+    /// UNDEFINED.
+    fn text(&self, consequence: &str) -> String {
+        match self {
+            Divergence::Dropped(dropped) => dropped.text(consequence),
+            Divergence::Op(text) => text.clone(),
+        }
+    }
+
+    fn truth(&self) -> Truth {
+        match self {
+            Divergence::Dropped(dropped) => dropped.truth(),
+            Divergence::Op(text) => Truth::Unknown(text.clone()),
+        }
+    }
+
+    fn why_no_value(&self) -> String {
+        match self {
+            Divergence::Dropped(dropped) => dropped.why_no_value(),
+            Divergence::Op(text) => text.clone(),
+        }
+    }
+
+    fn read(&self, stored: Option<&Operand>) -> ReadOutcome {
+        match self {
+            Divergence::Dropped(dropped) => dropped.read(stored),
+            Divergence::Op(text) => ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: text.clone(),
+            }),
+        }
+    }
+
+    fn misses(&self, checked: &Operand) -> bool {
+        match self {
+            Divergence::Dropped(dropped) => dropped.misses(checked),
+            Divergence::Op(_) => false,
+        }
+    }
+
+    fn keeps_sets(&self) -> bool {
+        match self {
+            Divergence::Dropped(dropped) => dropped.keeps_sets(),
+            Divergence::Op(_) => false,
+        }
+    }
+}
+
 /// Where edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression ends an expression at
 /// an UNDEFINED, while UEFI 2.11 makes UNDEFINED a value that later ops take (§33.2.5.7.4), which
 /// a CONDITIONAL drops (§33.3.8.3.10), and gives another result.
 #[derive(Debug, PartialEq, Eq)]
-struct Divergence {
+struct DroppedUndefined {
     /// The op that gives the UNDEFINED
     ended: &'static str,
     /// The expression that edk2 ends there
@@ -2392,7 +2465,7 @@ struct Divergence {
     spec: SpecResult,
 }
 
-impl Divergence {
+impl DroppedUndefined {
     /// Names both results: edk2's, with its `consequence` where it ends the whole expression, and
     /// the spec's.
     fn text(&self, consequence: &str) -> String {
@@ -2579,6 +2652,7 @@ enum ExpressionOp {
     EqIdValList,
     QuestionRef1,
     QuestionRef2,
+    QuestionRef3,
     Constant(Operand),
     Uint8,
     Uint16,
@@ -2634,6 +2708,7 @@ impl OpRole {
             IFROpCode::EqIdValList => Self::Expression(E::EqIdValList),
             IFROpCode::QuestionRef1 => Self::Expression(E::QuestionRef1),
             IFROpCode::QuestionRef2 => Self::Expression(E::QuestionRef2),
+            IFROpCode::QuestionRef3 => Self::Expression(E::QuestionRef3),
             IFROpCode::True => Self::Expression(E::Constant(Operand::Boolean(Some(1)))),
             IFROpCode::False => Self::Expression(E::Constant(Operand::Boolean(Some(0)))),
             IFROpCode::One => Self::Expression(E::Constant(Operand::Uint(Some(1)))),
@@ -2672,7 +2747,6 @@ impl OpRole {
             IFROpCode::Map => Self::Map,
             IFROpCode::Match
             | IFROpCode::RuleRef
-            | IFROpCode::QuestionRef3
             | IFROpCode::ToUint
             | IFROpCode::ToString
             | IFROpCode::Mid
@@ -2916,11 +2990,11 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             Some(reason) => SpecResult::Failed(reason),
             None => spec,
         };
-        Abort::Diverged(Box::new(Divergence {
+        Abort::Diverged(Box::new(Divergence::Dropped(DroppedUndefined {
             ended,
             place: self.frame.place,
             spec,
-        }))
+        })))
     }
 
     /// Pops the one value that the stack holds, as an expression leaves it.
@@ -3098,17 +3172,22 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         map: &IFROperation,
         divergence: Divergence,
     ) -> Result<Operand, Abort> {
-        let Divergence { ended, place, spec } = divergence;
-        match (place, spec) {
-            (Place::Return, SpecResult::Value(value)) => {
+        match divergence {
+            Divergence::Dropped(DroppedUndefined {
+                place: Place::Return,
+                spec: SpecResult::Value(value),
+                ..
+            }) => {
                 self.frame.ended.get_or_insert(map.op_code.spec_name());
                 self.frame.dropped = true;
                 Ok(value)
             }
-            (
-                Place::Whole | Place::Match | Place::Return,
-                spec @ (SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_)),
-            ) => Err(Abort::Diverged(Box::new(Divergence { ended, place, spec }))),
+            divergence @ (Divergence::Dropped(DroppedUndefined {
+                place: Place::Whole | Place::Match | Place::Return,
+                spec: SpecResult::Value(_) | SpecResult::Unread(_) | SpecResult::Failed(_),
+                ..
+            })
+            | Divergence::Op(_)) => Err(Abort::Diverged(Box::new(divergence))),
         }
     }
 
@@ -3263,6 +3342,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 self.referenced_question(op, parsed.question_id)?.decoded()
             }
             ExpressionOp::QuestionRef2 => self.question_ref2(op),
+            ExpressionOp::QuestionRef3 => self.question_ref3(op),
             ExpressionOp::Constant(value) => Ok(value),
             ExpressionOp::Uint8 => op
                 .data
@@ -3404,6 +3484,130 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     fn question_ref2(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
         let id = self.popped_question_id(op)?;
         self.question(op, id)?.decoded()
+    }
+
+    /// Returns the value of the question of the id that QUESTION_REF3 `op` pops, from the FormSet
+    /// that its DevicePath and Guid name (UEFI 2.11 §33.3.8.3.57; edk2-stable202608
+    /// SetupBrowserDxe/Expression.c:2881-2937), as UEFI 2.11 and edk2 agree on it. Without a Guid,
+    /// the spec takes the current FormSet, edk2 the first of the package list; with the Guid of
+    /// another FormSet, the spec takes that one, edk2 the current one; without a Guid, in the
+    /// WRITE of the question of the popped id, edk2 retrieves it anew, before the write, the spec
+    /// takes THIS: where they differ, the result is undetermined, naming both, but past where
+    /// edk2 ends the expression, it is the spec's. Another FormSet is not looked up here, nor is
+    /// a DevicePath.
+    fn question_ref3(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        let id = self.popped_question_id(op)?;
+        let name = op.op_code.spec_name();
+        // EFI_IFR_QUESTION_REF3_2 adds DevicePath, _3 then Guid (edk2 IfrParse.c:1566-1573)
+        let device_path = op
+            .data
+            .first_chunk()
+            .map_or(0, |&bytes| u16::from_le_bytes(bytes));
+        let guid = op
+            .data
+            .get(2..)
+            .and_then(<[u8]>::first_chunk)
+            .map(|&bytes| Guid::from(bytes))
+            .filter(|&guid| guid != Guid::from([0; 16]));
+        if device_path != 0 {
+            return Err(self.not_evaluated(format!(
+                "{name} with a DevicePath (a device path converted from text)"
+            )));
+        }
+        let form_set = enclosing_form_set(op)
+            .ok_or_else(|| Abort::Malformed(format!("{name} outside a FormSet")))?;
+        let (current, first) = {
+            let form_set = form_set.borrow();
+            let ParsedOperation::FormSet(parsed) = &form_set.parsed_data else {
+                return Err(not_decoded(&form_set));
+            };
+            (parsed.guid, parsed.package_list_first)
+        };
+        match (guid, first) {
+            (Some(guid), _) if guid == current => self.question(op, id)?.decoded(),
+            (Some(guid), _) if self.frame.past_end() => Err(Abort::NotEvaluated(format!(
+                "{name} of question {id:#06x} of FormSet {guid}, another FormSet"
+            ))),
+            (Some(guid), _) => {
+                let edk2 = self.reading(op, id)?;
+                Err(Abort::Diverged(Box::new(Divergence::Op(format!(
+                    "{name} of question {id:#06x} of FormSet {guid}: edk2-stable202608 \
+                     SetupBrowserDxe/Expression.c takes it from the current FormSet (:2924-2934), \
+                     which gives {edk2}, while UEFI 2.11 takes it from FormSet {guid} \
+                     (§33.3.8.3.57)"
+                )))))
+            }
+            (None, Some(PackageListFirst::Own)) if !self.role.writes(id) => self
+                .form_set_question(op, &form_set.borrow(), id)?
+                .decoded(),
+            (None, Some(PackageListFirst::Own)) if self.frame.past_end() => {
+                self.question(op, id)?.decoded()
+            }
+            (None, Some(PackageListFirst::Own)) => {
+                let edk2 = named(self.form_set_question(op, &form_set.borrow(), id))?;
+                let spec = self.reading(op, id)?;
+                Err(Abort::Diverged(Box::new(Divergence::Op(format!(
+                    "{name} of question {id:#06x} without a FormSet GUID, in the WRITE of that \
+                     question: edk2-stable202608 SetupBrowserDxe/Expression.c \
+                     GetQuestionValueFromForm retrieves it anew (:2561-2567) before Setup.c \
+                     SetQuestionValue writes it (:1995-1998), which gives {edk2}, while UEFI 2.11 \
+                     takes the question of the current FormSet (§33.3.8.3.57), whose value is THIS \
+                     in its WRITE (§33.3.8.3.94), which gives {spec}"
+                )))))
+            }
+            (None, Some(PackageListFirst::Other(_))) if self.frame.past_end() => {
+                self.question(op, id)?.decoded()
+            }
+            (None, Some(PackageListFirst::Other(first))) => {
+                let first = match first {
+                    Some(first) => format!("FormSet {first}"),
+                    None => "a FORM_SET op too short for a GUID".to_string(),
+                };
+                let spec = self.reading(op, id)?;
+                Err(Abort::Diverged(Box::new(Divergence::Op(format!(
+                    "{name} of question {id:#06x} without a FormSet GUID: edk2-stable202608 \
+                     SetupBrowserDxe/Expression.c GetQuestionValueFromForm takes it from {first}, \
+                     the first of the package list (:2917-2923; Setup.c:6075), while UEFI 2.11 \
+                     takes it from the current FormSet (§33.3.8.3.57), which gives {spec}"
+                )))))
+            }
+            (None, None) => {
+                // read_package_list marks each FORM_SET op of a package list, but for one in
+                // another's scope
+                let place = match enclosing_form_set(&form_set.borrow()) {
+                    Some(_) => "nested in another FormSet",
+                    None => "of an unknown package list",
+                };
+                Err(self.not_evaluated(format!(
+                    "{name} without a FormSet GUID in a FormSet {place}"
+                )))
+            }
+        }
+    }
+
+    /// Returns the value of question `id` of `form_set`, which `op` refers to, as
+    /// edk2-stable202608 SetupBrowserDxe/Expression.c GetQuestionValueFromForm finds it with
+    /// IdToQuestion (FormSet, NULL, ...) (:2524): in FormSet order, as `form_set`, in no form,
+    /// refers to it; UNDEFINED without the question.
+    fn form_set_question(
+        &mut self,
+        op: &IFROperation,
+        form_set: &IFROperation,
+        id: u16,
+    ) -> Result<QuestionOperand, Abort> {
+        let value = self
+            .values
+            .value(form_set, id, self.reader)
+            .ok_or(Abort::Undefined)?;
+        Ok(self.operand_of(value, || {
+            format!("{} of question {id:#06x}", op.op_code.spec_name())
+        }))
+    }
+
+    /// Names the value of question `id` of the current FormSet, which `op` refers to, for a
+    /// divergence: UNDEFINED without the question.
+    fn reading(&mut self, op: &IFROperation, id: u16) -> Result<String, Abort> {
+        named(self.question(op, id))
     }
 
     /// Pops the question id of `op`: an unsigned integer up to 0xFFFF, else UNDEFINED, as
@@ -3900,6 +4104,20 @@ enum QuestionOperand {
     Undecoded(String),
 }
 
+/// Names `operand`, the value of a question, for a divergence: UNDEFINED without the question.
+fn named(operand: Result<QuestionOperand, Abort>) -> Result<String, Abort> {
+    Ok(match operand {
+        Ok(QuestionOperand::Value(value)) => value
+            .shown()
+            .unwrap_or_else(|| "a value that cannot be read".to_string()),
+        Ok(QuestionOperand::Undecoded(reason)) => {
+            format!("a value that uefisettings cannot evaluate: {reason}")
+        }
+        Err(Abort::Undefined) => "UNDEFINED".to_string(),
+        Err(abort) => return Err(abort),
+    })
+}
+
 impl QuestionOperand {
     /// Returns the value, or NotEvaluated if not decoded.
     fn decoded(self) -> Result<Operand, Abort> {
@@ -4020,6 +4238,7 @@ mod tests {
     const UNDEFINED: u8 = 0x55;
     const DUP: u8 = 0x57;
     const QUESTION_REF2: u8 = 0x41;
+    const QUESTION_REF3: u8 = 0x51;
     const UINT32: u8 = 0x44;
 
     fn unreadable(kind: ValueKind) -> QuestionValue {
@@ -7671,6 +7890,11 @@ mod tests {
                 relies_on("QUESTION_REF2"),
             ),
             (
+                "QUESTION_REF3",
+                scoped_expression(&[uint8(1), op(QUESTION_REF3)], 0),
+                relies_on("QUESTION_REF3"),
+            ),
+            (
                 "QUESTION_REF1",
                 question_ref1(1),
                 relies_on("QUESTION_REF1"),
@@ -7692,6 +7916,7 @@ mod store_expression_tests {
     use super::super::ifr_fixtures::*;
     use super::super::resolve_short_var_names;
     use super::super::setup_password::PasswordQuestions;
+    use super::super::PackageListFirst;
     use super::super::MAX_SCOPE_NESTING;
     use super::*;
     use crate::hii::config_snapshot::tests::warned_by;
@@ -9107,11 +9332,11 @@ mod store_expression_tests {
             ),
         ];
         for (name, value, shown) in spec_values {
-            let divergence = Divergence {
+            let divergence = Divergence::Dropped(DroppedUndefined {
                 ended: "EFI_IFR_UNDEFINED",
                 place: Place::Whole,
                 spec: SpecResult::Value(value),
-            };
+            });
             assert_eq!(divergence.truth(), Truth::Known(false), "condition, {name}");
             assert_eq!(
                 divergence.why_no_value(),
@@ -10134,6 +10359,10 @@ mod store_expression_tests {
             operation(EQ_ID_VAL_LIST, false, &data)
         };
         let plus_one = |reference: Vec<u8>| scoped_expression(&[reference, op(ONE), op(ADD)], 0);
+        let current_ref3 = |id: u8| {
+            let data = [&[0, 0][..], &[0x11; 16]].concat();
+            [uint8(id), operation(QUESTION_REF3, false, &data)].concat()
+        };
         let (root, questions) = form_set_of(&[one_of_with(
             1,
             STORE,
@@ -10251,6 +10480,16 @@ mod store_expression_tests {
                 scoped_expression(&[uint8(2), op(QUESTION_REF2), op(ONE), op(ADD)], 0),
                 ExpressionValue::Uint(10),
             ),
+            (
+                "QUESTION_REF3 of the current FormSet's Guid and the read question",
+                scoped_expression(&[current_ref3(1), op(ONE), op(ADD)], 0),
+                ExpressionValue::Uint(4),
+            ),
+            (
+                "QUESTION_REF3 of the current FormSet's Guid and another question",
+                scoped_expression(&[current_ref3(2), op(ONE), op(ADD)], 0),
+                ExpressionValue::Uint(10),
+            ),
         ];
         for (name, expression, want) in cases {
             assert_eq!(read(expression), ReadOutcome::Value(want), "a READ, {name}");
@@ -10292,6 +10531,16 @@ mod store_expression_tests {
             write([uint8(2), op(QUESTION_REF2)].concat()),
             Ok(Some(vec![vec![9]])),
             "a WRITE, QUESTION_REF2 of another question"
+        );
+        assert_eq!(
+            write(current_ref3(1)),
+            Ok(Some(vec![vec![3]])),
+            "a WRITE, QUESTION_REF3 of the current FormSet's Guid and the written question"
+        );
+        assert_eq!(
+            write(current_ref3(2)),
+            Ok(Some(vec![vec![9]])),
+            "a WRITE, QUESTION_REF3 of the current FormSet's Guid and another question"
         );
     }
 
@@ -11509,6 +11758,413 @@ mod store_expression_tests {
         assert!(
             reason.contains(&ValueUnavailable::ReadDepth(depth + 1).to_string()),
             "reason of a chain of 50: {reason}"
+        );
+    }
+
+    const QUESTION_REF3: u8 = 0x51;
+
+    /// Without a FormSet GUID, edk2-stable202608 SetupBrowserDxe/Expression.c
+    /// GetQuestionValueFromForm takes the question in FormSet order, with IdToQuestion (FormSet,
+    /// NULL, ...) (:2524), while with the Guid of the current FormSet it takes it from the
+    /// referrer's form first (:2925), as QUESTION_REF1 does (:2735); UEFI 2.11 gives each
+    /// question of a FormSet its own QuestionId (§33.2.5.4).
+    #[test]
+    fn question_ref3_without_a_guid_takes_the_question_in_form_set_order() {
+        let numeric = |offset: u16| {
+            let data = [
+                question_header_on(1, 3, STORE, offset),
+                vec![0x00, 0, 255, 1],
+            ]
+            .concat();
+            operation(NUMERIC, false, &data)
+        };
+        let value = |expression: Vec<u8>| {
+            let declarations = declarations();
+            let root = parse_form_set(&[
+                declarations.concat(),
+                form(1, &[numeric(0)]),
+                form(2, &[numeric(1), value_of(expression)]),
+            ]);
+            let form_set = marked(&root, Some(PackageListFirst::Own));
+            let form = Rc::clone(&form_set.borrow().children[declarations.len() + 1]);
+            let scope = Rc::clone(&form.borrow().children[1]);
+            let scope = scope.borrow();
+            evaluate_value(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut store_holding(&[7, 9, 0, 0, 0]).reader(),
+                    values: &VarStoreValues::new(&root, None),
+                },
+            )
+        };
+        let ref3 =
+            |data: &[u8]| scoped_expression(&[uint8(1), operation(QUESTION_REF3, false, data)], 0);
+        assert_eq!(value(ref3(&[])), Ok(7), "QUESTION_REF3 without a Guid");
+        assert_eq!(
+            value(ref3(&[&[0, 0][..], &[0x11; 16]].concat())),
+            Ok(9),
+            "QUESTION_REF3 with the Guid of the current FormSet"
+        );
+        assert_eq!(
+            value(operation(QUESTION_REF1, false, &1u16.to_le_bytes())),
+            Ok(9),
+            "QUESTION_REF1"
+        );
+    }
+
+    /// The FORM_SET op of `root`, marked with `first`, as read_package_list would mark it.
+    fn marked(
+        root: &Rc<RefCell<IFROperation>>,
+        first: Option<PackageListFirst>,
+    ) -> Rc<RefCell<IFROperation>> {
+        let form_set = Rc::clone(&root.borrow().children[0]);
+        {
+            let mut borrowed = form_set.borrow_mut();
+            let ParsedOperation::FormSet(parsed) = &mut borrowed.parsed_data else {
+                panic!("a FORM_SET op first");
+            };
+            parsed.package_list_first = first;
+        }
+        form_set
+    }
+
+    /// The value of `expression` in an EFI_IFR_VALUE of a FormSet of Guid 0x11 bytes, which
+    /// read_package_list would mark with `first`, with `values`.
+    fn value_in_form_set(
+        expression: Vec<u8>,
+        first: Option<PackageListFirst>,
+        values: &impl QuestionValues,
+    ) -> std::result::Result<u64, String> {
+        let root = parse_form_set(&[value_of(expression)]);
+        let form_set = marked(&root, first);
+        let scope = Rc::clone(&form_set.borrow().children[0]);
+        let scope = scope.borrow();
+        evaluate_value(
+            &scope,
+            &mut ExpressionInputs {
+                reader: &mut Efivars::new().reader(),
+                values,
+            },
+        )
+    }
+
+    /// QUESTION_REF3 pushes the value of the question whose id it pops, from the FormSet that its
+    /// DevicePath and Guid name. Without them, UEFI 2.11 §33.3.8.3.57 takes the current FormSet,
+    /// edk2-stable202608 SetupBrowserDxe/Expression.c (:2917-2923) the first of the package list;
+    /// with the Guid of another FormSet, the spec takes that one, edk2 the current one
+    /// (:2924-2934); without them, in the WRITE of the question, edk2 retrieves it anew, before
+    /// the write (:2561-2567; Setup.c:1995-1998), the spec takes THIS, which EFI_IFR_WRITE sets
+    /// (§33.3.8.3.94). Where they differ, the result is undetermined, naming both: a condition is
+    /// unknown, a READ and a WRITE are refused, the WRITE before any SET; past where edk2 ends the
+    /// expression, it is the spec's. A DevicePath is not evaluated.
+    #[test]
+    fn question_ref3_takes_the_question_from_the_form_set_that_it_names() {
+        let values = MapValues(BTreeMap::from([
+            (1, QuestionValue::Uint(3)),
+            (
+                4,
+                QuestionValue::Unreadable {
+                    kind: ValueKind::Uint,
+                    reason: "<ValueUnavailable: test>".to_string(),
+                },
+            ),
+        ]));
+        let ref3 = |id: Vec<u8>, data: &[u8]| {
+            scoped_expression(&[id, operation(QUESTION_REF3, false, data)], 0)
+        };
+        let path = |device_path: u16| device_path.to_le_bytes().to_vec();
+        let path_and_guid = |guid: u8| [path(0), vec![guid; 16]].concat();
+        let own = Some(PackageListFirst::Own);
+        let first_other = Some(PackageListFirst::Other(Some(Guid::from([0x22; 16]))));
+        let first_other_guid = "FormSet 22222222-2222-2222-2222-222222222222";
+        let without_guid = |id: u16, first: &str, spec: &str| {
+            Err(format!(
+                "EFI_IFR_QUESTION_REF3 of question {id:#06x} without a FormSet GUID: \
+                 edk2-stable202608 SetupBrowserDxe/Expression.c GetQuestionValueFromForm takes it \
+                 from {first}, the first of the package list (:2917-2923; Setup.c:6075), while \
+                 UEFI 2.11 takes it from the current FormSet (§33.3.8.3.57), which gives {spec}"
+            ))
+        };
+        let other_guid = |id: u16, edk2: &str| {
+            Err(format!(
+                "EFI_IFR_QUESTION_REF3 of question {id:#06x} of FormSet \
+                 33333333-3333-3333-3333-333333333333: edk2-stable202608 \
+                 SetupBrowserDxe/Expression.c takes it from the current FormSet (:2924-2934), \
+                 which gives {edk2}, while UEFI 2.11 takes it from FormSet \
+                 33333333-3333-3333-3333-333333333333 (§33.3.8.3.57)"
+            ))
+        };
+        let undefined = Err("UNDEFINED result".to_string());
+        let cases = [
+            (
+                "no DevicePath, the first FormSet",
+                ref3(uint8(1), &[]),
+                own,
+                Ok(3),
+            ),
+            (
+                "DevicePath 0, the first FormSet",
+                ref3(uint8(1), &path(0)),
+                own,
+                Ok(3),
+            ),
+            (
+                "DevicePath 0, a Nil Guid, the first FormSet",
+                ref3(uint8(1), &path_and_guid(0)),
+                own,
+                Ok(3),
+            ),
+            (
+                "the Guid of the current FormSet, not the first",
+                ref3(uint8(1), &path_and_guid(0x11)),
+                first_other,
+                Ok(3),
+            ),
+            (
+                "no DevicePath, not the first FormSet",
+                ref3(uint8(1), &[]),
+                first_other,
+                without_guid(1, first_other_guid, "3"),
+            ),
+            (
+                "no DevicePath, after a FORM_SET op without a GUID",
+                ref3(uint8(1), &[]),
+                Some(PackageListFirst::Other(None)),
+                without_guid(1, "a FORM_SET op too short for a GUID", "3"),
+            ),
+            (
+                "no DevicePath, not the first FormSet, no question",
+                ref3(uint8(9), &[]),
+                first_other,
+                without_guid(9, first_other_guid, "UNDEFINED"),
+            ),
+            (
+                "the Guid of another FormSet",
+                ref3(uint8(1), &path_and_guid(0x33)),
+                own,
+                other_guid(1, "3"),
+            ),
+            (
+                "the Guid of another FormSet, no question",
+                ref3(uint8(9), &path_and_guid(0x33)),
+                own,
+                other_guid(9, "UNDEFINED"),
+            ),
+            (
+                "the Guid of another FormSet, a question that cannot be read",
+                ref3(uint8(4), &path_and_guid(0x33)),
+                own,
+                other_guid(4, "a value that cannot be read"),
+            ),
+            (
+                "a DevicePath",
+                ref3(uint8(1), &path(5)),
+                own,
+                Err(
+                    "EFI_IFR_QUESTION_REF3 with a DevicePath (a device path converted from \
+                     text) not evaluated"
+                        .to_string(),
+                ),
+            ),
+            (
+                "a DevicePath, id 0x10001",
+                ref3(
+                    operation(UINT32, false, &0x1_0001u32.to_le_bytes()),
+                    &path(5),
+                ),
+                own,
+                undefined.clone(),
+            ),
+            ("no question", ref3(uint8(9), &[]), own, undefined.clone()),
+            (
+                "a BOOLEAN id",
+                ref3(ifr_true(), &[]),
+                own,
+                undefined.clone(),
+            ),
+            (
+                "an id that cannot be read",
+                ref3(operation(QUESTION_REF1, false, &4u16.to_le_bytes()), &[]),
+                own,
+                Err("EFI_IFR_QUESTION_REF3 on a value that cannot be read".to_string()),
+            ),
+            (
+                "no DevicePath, a FormSet of an unknown package list",
+                ref3(uint8(1), &[]),
+                None,
+                Err(
+                    "EFI_IFR_QUESTION_REF3 without a FormSet GUID in a FormSet of an unknown \
+                     package list not evaluated"
+                        .to_string(),
+                ),
+            ),
+            (
+                "not the first FormSet, past an UNDEFINED that a CONDITIONAL drops",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        uint8(1),
+                        operation(QUESTION_REF3, false, &[]),
+                        op(CONDITIONAL),
+                    ],
+                    0,
+                ),
+                first_other,
+                Err(format!("{EDK2_ENDS}, {SPEC_DROPS} 3")),
+            ),
+            (
+                "the Guid of another FormSet, past an UNDEFINED that a CONDITIONAL drops",
+                scoped_expression(
+                    &[
+                        ifr_true(),
+                        op(UNDEFINED),
+                        uint8(1),
+                        operation(QUESTION_REF3, false, &path_and_guid(0x33)),
+                        op(CONDITIONAL),
+                    ],
+                    0,
+                ),
+                own,
+                Err(format!(
+                    "{EDK2_ENDS}, {SPEC_DROPS} a value that uefisettings cannot evaluate: \
+                     EFI_IFR_QUESTION_REF3 of question 0x0001 of FormSet \
+                     33333333-3333-3333-3333-333333333333, another FormSet"
+                )),
+            ),
+        ];
+        for (name, expression, first, want) in cases {
+            assert_eq!(
+                value_in_form_set(expression, first, &values),
+                want,
+                "{name}"
+            );
+        }
+        let root = parse_form_set(&[form_set_with_guid(
+            [0xB0; 16],
+            &[value_of(ref3(uint8(1), &[]))],
+        )]);
+        let nested = Rc::clone(&root.borrow().children[0].borrow().children[0]);
+        let scope = Rc::clone(&nested.borrow().children[0]);
+        assert_eq!(
+            evaluate_value(
+                &scope.borrow(),
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            ),
+            Err(
+                "EFI_IFR_QUESTION_REF3 without a FormSet GUID in a FormSet nested in another \
+                 FormSet not evaluated"
+                    .to_string()
+            ),
+            "no DevicePath, a FormSet nested in another FormSet"
+        );
+
+        assert_eq!(
+            read_of(
+                &[op(READ), ref3(uint8(1), &path_and_guid(0x33))],
+                QuestionValue::Uint(3),
+                &Efivars::new()
+            ),
+            ReadOutcome::Refused(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Read,
+                reason: other_guid(1, "3").expect_err("a refusal"),
+            }),
+            "a READ, the Guid of another FormSet"
+        );
+        assert_eq!(
+            truth_in(
+                ref3(uint8(1), &path_and_guid(0x33)),
+                &Efivars::new(),
+                &no_values()
+            ),
+            Truth::Unknown(other_guid(1, "UNDEFINED").expect_err("a divergence")),
+            "a condition, the Guid of another FormSet"
+        );
+
+        let write = |first: Option<PackageListFirst>, this: u8, ops: &[Vec<u8>]| {
+            let (root, question) = question_holding(&[op(WRITE), scoped_expression(ops, 0)]);
+            marked(&root, first);
+            let sets = evaluate_write(
+                &question,
+                QuestionValue::Uint(this.into()),
+                &mut ExpressionInputs {
+                    reader: &mut store_holding(&[0; 5]).reader(),
+                    values: &values,
+                },
+            );
+            sets.map(|sets| {
+                sets.map(|sets| {
+                    let sets = sets.var_store.into_iter();
+                    sets.map(|set| (set.offset, set.bytes)).collect::<Vec<_>>()
+                })
+            })
+        };
+        let this_set = [op(THIS), set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8)].concat();
+        let set_of = |id: Vec<u8>, data: &[u8]| {
+            [
+                this_set.clone(),
+                id,
+                operation(QUESTION_REF3, false, data),
+                op(AND),
+            ]
+        };
+        let refused = |reason: String| {
+            Err(ExpressionRefusal::Undetermined {
+                expression: QuestionExpression::Write,
+                reason,
+            })
+        };
+        assert_eq!(
+            write(own, 3, &set_of(uint8(1), &path_and_guid(0x33))),
+            refused(other_guid(1, "3").expect_err("a divergence")),
+            "a WRITE, a SET, then the Guid of another FormSet"
+        );
+        assert_eq!(
+            write(own, 3, &set_of(uint8(1), &path_and_guid(0x11))),
+            Ok(Some(vec![(0, vec![3])])),
+            "a WRITE, a SET, then the Guid of the current FormSet"
+        );
+        assert_eq!(
+            write(own, 5, &set_of(uint8(1), &[])),
+            refused(
+                "EFI_IFR_QUESTION_REF3 of question 0x0001 without a FormSet GUID, in the WRITE of \
+                 that question: edk2-stable202608 SetupBrowserDxe/Expression.c \
+                 GetQuestionValueFromForm retrieves it anew (:2561-2567) before Setup.c \
+                 SetQuestionValue writes it (:1995-1998), which gives 3, while UEFI 2.11 takes \
+                 the question of the current FormSet (§33.3.8.3.57), whose value is THIS in its \
+                 WRITE (§33.3.8.3.94), which gives 5"
+                    .to_string()
+            ),
+            "a WRITE, a SET, then no Guid and the written question, the first FormSet"
+        );
+        assert_eq!(
+            write(own, 5, &set_of(uint8(2), &[])),
+            Ok(Some(vec![(0, vec![5])])),
+            "a WRITE, a SET, then no Guid and another question, the first FormSet"
+        );
+        assert_eq!(
+            write(first_other, 5, &set_of(uint8(1), &[])),
+            refused(without_guid(1, first_other_guid, "5").expect_err("a divergence")),
+            "a WRITE, a SET, then no Guid and the written question, not the first FormSet"
+        );
+        assert_eq!(
+            write(
+                own,
+                5,
+                &[
+                    ifr_true(),
+                    op(UNDEFINED),
+                    uint8(1),
+                    operation(QUESTION_REF3, false, &[]),
+                    op(CONDITIONAL),
+                ]
+            ),
+            Ok(Some(Vec::new())),
+            "a WRITE, no Guid and the written question past an UNDEFINED that a CONDITIONAL \
+             drops, the first FormSet"
         );
     }
 }
