@@ -9850,7 +9850,8 @@ mod tests {
         const REFUSED: &str = "; as the VarStore of that password is unknown, uefisettings \
             cannot withhold its bytes, so no value is shown from the ExportConfig snapshot";
         // the forms of snapshot_hiidb, with W and the PASSWORD in a form 2 that a CHECKBOX op
-        // ending after 4 of the 12 bytes of its data disables
+        // ending after 4 of the 12 bytes of its data disables, whose first 2 give VarStoreId 2 to
+        // the question header of a PASSWORD op that runs on into it
         let hiidb_with = |password: Vec<u8>| {
             let packages = [
                 device_path_package(&DRIVER_PATH),
@@ -9870,7 +9871,7 @@ mod tests {
                         &[
                             uint16_numeric(2, 2, 1, 1),
                             password,
-                            operation(CHECKBOX, false, &[0x00; 4]),
+                            operation(CHECKBOX, false, &[0x02, 0x00, 0x00, 0x00]),
                         ],
                     ),
                 ]),
@@ -14180,78 +14181,264 @@ mod tests {
             ),
         ];
         for (case, ifr, record) in cases {
-            let hiidb = name_value_hiidb(&ifr);
-            let runtime = name_value_variables(VariableReach::Runtime);
-            let refused = |error: Option<&String>| {
-                error.is_some_and(|error| error.contains(record) && error.ends_with(ANY_VARIABLE))
-            };
-
-            for question in ["B", "O"] {
-                let got = name_value_get(&hiidb, question, &runtime, None);
-                assert!(
-                    refused(got.as_ref().err()),
-                    "{case}: Runtime: get {question}: {got:?}"
-                );
-                let snapshot = name_value_snapshot();
-                let got = name_value_get(&hiidb, question, &runtime, Some(&snapshot));
-                assert!(
-                    refused(got.as_ref().err())
-                        && got.as_ref().is_err_and(|error| !error.contains("31323")),
-                    "{case}: Runtime, with the snapshot: get {question}: {got:?}"
-                );
-            }
-            let set = set_bypassing(&hiidb, "O", "5", &runtime);
-            assert!(
-                refused(set.as_ref().err())
-                    && set
-                        .as_ref()
-                        .is_err_and(|error| !error.contains(UNSAFE_OPERATIONS_FLAG)),
-                "{case}: Runtime, with UnsafeOperations::Allow: set O: {set:?}"
-            );
-            for (name, guid) in [("Backing", P_GUID), ("Other", OTHER_GUID)] {
-                let key = VariableKey {
-                    name: name.to_owned(),
-                    guid: Guid::from(guid),
-                };
-                assert_eq!(runtime.writes_to(&key), [], "{case}: writes to {name}");
-            }
-            let listed = HiiBackend::list_questions_in(
-                &hiidb,
-                &ListQuestionsOptions::default(),
-                EfivarSource::Disabled
-                    .into_variables()
-                    .expect("variables that read nothing"),
-                None,
-                None,
-            )
-            .map(|questions| {
-                questions
-                    .into_iter()
-                    .map(|question| question.name)
-                    .filter(|name| ["B", "O"].contains(&name.as_str()))
-                    .collect::<Vec<_>>()
-            })
-            .map_err(|error| format!("{error:#}"));
-            assert_eq!(
-                listed,
-                Ok(vec!["B".to_owned(), "O".to_owned()]),
-                "{case}: list-questions without efivars"
-            );
-            let boot_services = name_value_variables(VariableReach::BootServices);
-            let got = name_value_get(&hiidb, "O", &boot_services, None);
-            assert!(
-                got.as_ref()
-                    .is_err_and(|error| error.ends_with(BOOT_SERVICES_REFUSAL)),
-                "{case}: BootServices: get O: {got:?}"
-            );
+            assert_closes_every_variable(case, &ifr, record);
         }
     }
 
+    /// Through Runtime, get of B and O of the name_value_hiidb of `ifr`, from the snapshot too, and
+    /// set of O with UnsafeOperations::Allow refuse the HiiDB with AnyVariablePasswords naming
+    /// `record`, set writing nothing; list-questions reads without efivars; through BootServices
+    /// get refuses it as for a PASSWORD whose VarStore is unknown.
+    fn assert_closes_every_variable(case: &str, ifr: &[Vec<u8>], record: &str) {
+        let hiidb = name_value_hiidb(ifr);
+        let runtime = name_value_variables(VariableReach::Runtime);
+        let refused = |error: Option<&String>| {
+            error.is_some_and(|error| error.contains(record) && error.ends_with(ANY_VARIABLE))
+        };
+
+        for question in ["B", "O"] {
+            let got = name_value_get(&hiidb, question, &runtime, None);
+            assert!(
+                refused(got.as_ref().err()),
+                "{case}: Runtime: get {question}: {got:?}"
+            );
+            let snapshot = name_value_snapshot();
+            let got = name_value_get(&hiidb, question, &runtime, Some(&snapshot));
+            assert!(
+                refused(got.as_ref().err())
+                    && got.as_ref().is_err_and(|error| !error.contains("31323")),
+                "{case}: Runtime, with the snapshot: get {question}: {got:?}"
+            );
+        }
+        let set = set_bypassing(&hiidb, "O", "5", &runtime);
+        assert!(
+            refused(set.as_ref().err())
+                && set
+                    .as_ref()
+                    .is_err_and(|error| !error.contains(UNSAFE_OPERATIONS_FLAG)),
+            "{case}: Runtime, with UnsafeOperations::Allow: set O: {set:?}"
+        );
+        for (name, guid) in [("Backing", P_GUID), ("Other", OTHER_GUID)] {
+            let key = VariableKey {
+                name: name.to_owned(),
+                guid: Guid::from(guid),
+            };
+            assert_eq!(runtime.writes_to(&key), [], "{case}: writes to {name}");
+        }
+        let listed = HiiBackend::list_questions_in(
+            &hiidb,
+            &ListQuestionsOptions::default(),
+            EfivarSource::Disabled
+                .into_variables()
+                .expect("variables that read nothing"),
+            None,
+            None,
+        )
+        .map(|questions| {
+            questions
+                .into_iter()
+                .map(|question| question.name)
+                .filter(|name| ["B", "O"].contains(&name.as_str()))
+                .collect::<Vec<_>>()
+        })
+        .map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            listed,
+            Ok(vec!["B".to_owned(), "O".to_owned()]),
+            "{case}: list-questions without efivars"
+        );
+        let boot_services = name_value_variables(VariableReach::BootServices);
+        let got = name_value_get(&hiidb, "O", &boot_services, None);
+        assert!(
+            got.as_ref()
+                .is_err_and(|error| error.ends_with(BOOT_SERVICES_REFUSAL)),
+            "{case}: BootServices: get O: {got:?}"
+        );
+    }
+
+    /// The middle of the record of a PASSWORD of VarStoreId 0 (UnresolvedPassword::OwnDriver).
+    const OWN_DRIVER: &str =
+        "VarStoreId 0 names no VarStore, so its callbacks or READ and WRITE ops \
+         keep its password where uefisettings cannot tell";
+
+    /// A PASSWORD of VarStoreId 0 names no VarStore (UEFI 2.11 §33.3.8.2.2): its callbacks or READ
+    /// and WRITE ops (§33.2.5.6) keep its password where uefisettings cannot tell, so in any
+    /// variable, EFI_IFR_FLAG_CALLBACK or not, with no VARSTORE_NAME_VALUE in the HiiDB. So get,
+    /// set and the snapshot refuse the whole HiiDB as for a PASSWORD that edk2 may route to a
+    /// VARSTORE_NAME_VALUE: one in a form or a disabled form of its FormSet, one without MaxSize,
+    /// outside any FormSet, in a FormSet that uefisettings ignores, one whose question header past
+    /// its op names VarStoreId 0, and one without a question header, whose VarStoreId may be 0,
+    /// also in a FormSet that uefisettings ignores. Each names its record.
+    #[test]
+    fn passwords_of_var_store_id_0_close_every_variable() {
+        type I = NameValueIfr;
+        let password_of = |flags: u8, sizes: &[u16]| {
+            let sizes = sizes.iter().flat_map(|size| size.to_le_bytes());
+            let data = [question_header_with(3, 3, 0, 0, flags), sizes.collect()].concat();
+            operation(PASSWORD, false, &data)
+        };
+        // a CHECKBOX op ending after 4 of the 12 bytes of its data, which disables its form
+        let disabler = || operation(CHECKBOX, false, &[0x00; 4]);
+        // a PASSWORD op of Prompt 3 and Help 4 whose question header runs on into the SUBTITLE
+        // after it, VarStoreId 0 and VarStoreInfo 4 (QuestionId 0x0702: the SUBTITLE's header)
+        let header_past_op = [
+            operation(PASSWORD, false, &[3, 0, 4, 0]),
+            operation(SUBTITLE, false, &[0, 0, 4, 0, 0]),
+        ]
+        .concat();
+        let backing_with = |forms: &[Vec<u8>]| {
+            let first = form(1, &[I::b(), I::p()]);
+            form_set(&[[I::backing(), first].as_slice(), forms].concat())
+        };
+        // a FormSet that uefisettings ignores, for its short DEFAULTSTORE op, with `password`
+        let ignored_with = |password: Vec<u8>| {
+            form_set_with_guid(
+                [0x12; 16],
+                &[
+                    operation(DEFAULT_STORE, false, &[0x00, 0x00]),
+                    form(2, &[password]),
+                ],
+            )
+        };
+        let in_its_form_set: &str = &format!(
+            "PASSWORD question 0x0003 in FormSet 11111111-1111-1111-1111-111111111111: {OWN_DRIVER}"
+        );
+        let outside: &str = &format!("PASSWORD question 0x0003 in FormSet ?: {OWN_DRIVER}");
+        let cases = [
+            (
+                "in its form",
+                vec![form_set(&[
+                    I::backing(),
+                    form(1, &[I::b(), I::p(), I::password(0)]),
+                ])],
+                in_its_form_set,
+            ),
+            (
+                "of EFI_IFR_FLAG_CALLBACK",
+                vec![backing_with(&[form(2, &[password_of(0x04, &[1, 20])])])],
+                in_its_form_set,
+            ),
+            (
+                "without MaxSize",
+                vec![backing_with(&[form(2, &[password_of(0x00, &[1])])])],
+                in_its_form_set,
+            ),
+            (
+                "in a disabled form",
+                vec![backing_with(&[form(2, &[I::password(0), disabler()])])],
+                in_its_form_set,
+            ),
+            (
+                "outside any FormSet",
+                vec![I::password(0), backing_with(&[])],
+                outside,
+            ),
+            (
+                "in a FormSet that uefisettings ignores",
+                vec![backing_with(&[]), ignored_with(I::password(0))],
+                outside,
+            ),
+            (
+                "its question header past its op",
+                vec![backing_with(&[form(2, &[header_past_op])])],
+                "PASSWORD question 0x0702 in FormSet 11111111-1111-1111-1111-111111111111: its \
+                 op ends before its question header",
+            ),
+            (
+                "without its question header",
+                vec![backing_with(&[form(
+                    2,
+                    &[operation(PASSWORD, false, &[3, 0, 4, 0])],
+                )])],
+                "PASSWORD op without a question header in FormSet \
+                 11111111-1111-1111-1111-111111111111",
+            ),
+            (
+                "without its question header, in a FormSet that uefisettings ignores",
+                vec![
+                    backing_with(&[]),
+                    ignored_with(operation(PASSWORD, false, &[3, 0, 4, 0])),
+                ],
+                "the PASSWORD op there, whose question header does not parse, so whose \
+                 VarStoreId may be 0, which names no VarStore",
+            ),
+        ];
+        for (case, ifr, record) in cases {
+            assert_closes_every_variable(case, &ifr, record);
+        }
+    }
+
+    /// A STRING beside a PASSWORD of VarStoreId 0, EFI_IFR_FLAG_CALLBACK or not, is refused like the
+    /// NUMERICs: get, also with the ExportConfig snapshot, and set with UnsafeOperations::Allow
+    /// fail before any variable read, through Runtime naming the PASSWORD's record and through
+    /// BootServices as for a PASSWORD whose VarStore is unknown; beside a PASSWORD on Backing that
+    /// ends before it, get reads it.
+    #[test]
+    fn a_string_beside_a_password_of_var_store_id_0_reads_no_variable() {
+        type I = NameValueIfr;
+        // the STRING P at bytes 4..8 of Backing, of 0 to 2 characters
+        let string = || string_on(8, 8, (1, 4), (0, 2), &[]);
+        let hiidb_beside = |var_store_id: u16, flags: u8| {
+            let password = [
+                question_header_with(3, 3, var_store_id, 0, flags),
+                [1u16, 2]
+                    .iter()
+                    .flat_map(|size| size.to_le_bytes())
+                    .collect(), // MinSize, MaxSize
+            ]
+            .concat();
+            let password = operation(PASSWORD, false, &password);
+            name_value_hiidb(&[form_set(&[
+                I::backing(),
+                form(1, &[I::b(), string(), password]),
+            ])])
+        };
+        let record = format!(
+            "PASSWORD question 0x0003 in FormSet 11111111-1111-1111-1111-111111111111: {OWN_DRIVER}"
+        );
+
+        for flags in [0x00, 0x04] {
+            let hiidb = hiidb_beside(0, flags);
+            for (reach, end) in [
+                (VariableReach::Runtime, ANY_VARIABLE),
+                (VariableReach::BootServices, BOOT_SERVICES_REFUSAL),
+            ] {
+                let case = format!("Flags {flags:#04x}, {reach:?}");
+                let refused = |error: Option<&String>| {
+                    error.is_some_and(|error| error.contains(&record) && error.ends_with(end))
+                };
+                let variables = name_value_variables(reach);
+                let got = name_value_get(&hiidb, "P", &variables, None);
+                assert!(refused(got.as_ref().err()), "{case}: get P: {got:?}");
+                let snapshot = name_value_snapshot();
+                let got = name_value_get(&hiidb, "P", &variables, Some(&snapshot));
+                assert!(
+                    refused(got.as_ref().err()),
+                    "{case}, with the snapshot: get P: {got:?}"
+                );
+                let set = set_bypassing(&hiidb, "P", "ab", &variables);
+                assert!(refused(set.as_ref().err()), "{case}: set P: {set:?}");
+                assert_eq!(variables.reads(), [], "{case}: reads");
+                for (name, guid) in [("Backing", P_GUID), ("Other", OTHER_GUID)] {
+                    let key = VariableKey {
+                        name: name.to_owned(),
+                        guid: Guid::from(guid),
+                    };
+                    assert_eq!(variables.writes_to(&key), [], "{case}: writes to {name}");
+                }
+            }
+        }
+
+        let variables = name_value_variables(VariableReach::Runtime);
+        assert_eq!(
+            name_value_get(&hiidb_beside(1, 0x00), "P", &variables, None),
+            Ok(vec!["\u{2211}".to_owned()]),
+            "beside a password on Backing: get P"
+        );
+    }
+
     /// A PASSWORD that edk2 does not route to a VARSTORE_NAME_VALUE keeps its password where its
-    /// IFR says, so through Runtime its bytes alone are withheld, beside one: a PASSWORD of
-    /// VarStoreId 0, which names no VarStore (UEFI 2.11 §33.3.8.2.2), also one whose question
-    /// header lies past its op beside a VARSTORE_NAME_VALUE of VarStoreId 0, which is invalid
-    /// there (§33.3.8.3.90); one on its FormSet's
+    /// IFR says, so through Runtime its bytes alone are withheld, beside one: one on its FormSet's
     /// VARSTORE of an id that a VARSTORE_NAME_VALUE of a later FormSet declares (VarStoreIds are
     /// unique within a form set, §33.3.8.3.90), which edk2 takes first, or one outside any FormSet
     /// after it: edk2-stable202608 SetupBrowserDxe/IfrParse.c gives a question the VarStore of its
@@ -14270,13 +14457,6 @@ mod tests {
         let unavailable = "<ValueUnavailable: HII name/value varstore requires \
                            EFI_HII_CONFIG_ACCESS_PROTOCOL>";
         let shown = "31323 <snapshot>";
-        // a PASSWORD op of Prompt 3 and Help 4 whose question header runs on into the SUBTITLE
-        // after it, VarStoreId 0 and VarStoreInfo 4
-        let header_past_op = [
-            operation(PASSWORD, false, &[3, 0, 4, 0]),
-            operation(SUBTITLE, false, &[0, 0, 4, 0, 0]),
-        ]
-        .concat();
         // FormSet 0x11 with the PASSWORD of VarStoreId 3 on its VARSTORE 3, Backing too
         let own_var_store = || {
             form_set(&[
@@ -14286,28 +14466,6 @@ mod tests {
             ])
         };
         let cases = [
-            (
-                "a PASSWORD of VarStoreId 0",
-                name_value_hiidb(&[form_set(&[
-                    I::name_value(),
-                    I::backing(),
-                    form(1, &[I::c(), I::w(), I::b(), I::p(), I::password(0)]),
-                ])]),
-                ["31323", "8721"],
-                Some(shown),
-            ),
-            (
-                "a PASSWORD of VarStoreId 0 past its op, a VARSTORE_NAME_VALUE of VarStoreId 0",
-                name_value_hiidb(&[form_set(&[
-                    var_store_name_value(0, [0x77; 16]),
-                    I::name_value(),
-                    I::backing(),
-                    form(1, &[I::c(), I::w(), I::b(), I::p()]),
-                    form(2, &[header_past_op]),
-                ])]),
-                ["31323", "8721"],
-                Some(unavailable),
-            ),
             (
                 "its FormSet's VARSTORE first, a later FormSet's VARSTORE_NAME_VALUE",
                 name_value_hiidb(&[

@@ -107,17 +107,24 @@ and a VarStore outside any FormSet that does not parse may hold a password in an
 GUID, so they withhold those bytes too. A password question whose op ends before its question
 header keeps its password where edk2 reads that header, in the bytes after the op: from its offset
 on in each VarStore of its VarStoreId in its package list; one whose header runs past its form
-package may keep it in any variable of a VarStore of its package list, so they withhold every byte
-of each. A VarStore in the scope of an unknown opcode, which edk2's Forms Browser skips but its
-Config Keyword Handler takes, counts as one outside any FormSet, also for the password questions of
-FormSets of its VarStoreId. IFR after an op that does not fit its form
+package, or whose header past its op names VarStoreId 0, may name no VarStore, so they read and
+write no variable of a HiiDB with one, nor do `hii list-questions` and `hii show-ifr` but with
+`--no-efivars`. A VarStore in the scope of an unknown opcode, which edk2's Forms Browser skips but
+its Config Keyword Handler takes, counts as one outside any FormSet, also for the password questions
+of FormSets of its VarStoreId. IFR after an op that does not fit its form
 package has no op boundary, so they read and write no variable of such a HiiDB, nor do
 `hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question whose VarStore
 uefisettings cannot find withholds no bytes, which they warn of. A password question that edk2 may
 route to a VARSTORE_NAME_VALUE, whose values its driver exposes, as UEFI 2.11 §33.2.5.6 says,
 through EFI_HII_CONFIG_ACCESS_PROTOCOL, in storage of its own choosing, may keep its password in any
 variable, so they read and write no variable of a HiiDB with one, as for IFR without an op boundary,
-nor do `hii list-questions` and `hii show-ifr` but with `--no-efivars`.
+nor do `hii list-questions` and `hii show-ifr` but with `--no-efivars`. A password question of
+VarStoreId 0 names no VarStore (UEFI 2.11 §33.3.8.2.2): with EFI_IFR_FLAG_CALLBACK its driver keeps
+the password where it chooses (edk2-stable202608 SetupBrowserDxe/Setup.c:6468-6498,
+Presentation.c:1695-1701); without it edk2 keeps it only where the SET ops of its WRITE say, or
+nowhere (Setup.c:1997-2002, :2009-2056), which uefisettings does not follow, so it refuses alike, a
+departure that fails closed: they read and write no variable of a HiiDB with one either, nor do
+`hii list-questions` and `hii show-ifr` but with `--no-efivars`.
 The UEFI Shell build reads and
 writes no variable of a HiiDB with such a password question or with IFR that it ignores.
 

@@ -85,7 +85,8 @@ pub(crate) fn dump_efivars(
 /// uefisettings finds holds, nor any of a variable that an ignored FormSet declares. One whose
 /// VarStore is unknown withholds no bytes: of_lists warns of each. IFR past an op where the walk
 /// for FormSets ends, or the driver of a VARSTORE_NAME_VALUE that edk2 may route a PASSWORD to,
-/// may keep a password in any variable, so a HiiDB with either fails (check_bounded).
+/// or the callbacks or READ and WRITE ops of a PASSWORD of VarStoreId 0, may keep a password in
+/// any variable, so a HiiDB with any of them fails (check_bounded).
 fn decoded_bytes(
     package_lists: Vec<ParsedPackageList>,
 ) -> Result<BTreeMap<EfivarFileName, Vec<DecodedValue>>> {
@@ -477,19 +478,28 @@ mod tests {
         );
     }
 
-    /// A PASSWORD on a VARSTORE_NAME_VALUE, whose driver may keep its password in any variable,
-    /// has the dump fail before it copies any; one of VarStoreId 0, which names no VarStore,
-    /// leaves the CHECKBOX B on Backing to copy.
+    /// A PASSWORD on a VARSTORE_NAME_VALUE, or of VarStoreId 0, which names no VarStore,
+    /// EFI_IFR_FLAG_CALLBACK or not, whose password may be in any variable, has the dump fail
+    /// before it copies any; one on Backing, at bytes past its size, leaves the CHECKBOX B on
+    /// Backing to copy.
     #[test]
-    fn dump_refuses_a_hiidb_with_a_password_on_a_name_value_var_store() {
-        let hiidb = |var_store_id| {
+    fn dump_refuses_a_hiidb_with_a_password_that_a_driver_may_hold() {
+        let hiidb = |var_store_id, flags| {
+            let password = [
+                question_header_with(3, 3, var_store_id, 4, flags),
+                [&1u16.to_le_bytes()[..], &20u16.to_le_bytes()].concat(), // MinSize, MaxSize
+            ]
+            .concat();
             let packages = [
                 form_package(&[
                     var_store(1, [0x44; 16], "Backing", 4),
                     var_store_name_value(3, [0x66; 16]),
                     form(
                         1,
-                        &[checkbox_at(1, 1, 1, 0), password_on(3, 3, var_store_id, 4)],
+                        &[
+                            checkbox_at(1, 1, 1, 0),
+                            operation(PASSWORD, false, &password),
+                        ],
                     ),
                 ]),
                 en_strings_package_of(&["B", "x", "Password", "Pin"]),
@@ -497,26 +507,28 @@ mod tests {
             ];
             package_list_with_guid([0x55; 16], &packages.concat())
         };
-        let decoded = |var_store_id| {
-            decoded_bytes(read_db(&hiidb(var_store_id)).expect("read the HiiDB"))
+        let decoded = |var_store_id, flags| {
+            decoded_bytes(read_db(&hiidb(var_store_id, flags)).expect("read the HiiDB"))
                 .map(|decoded| decoded.keys().map(ToString::to_string).collect::<Vec<_>>())
                 .map_err(|error| format!("{error:#}"))
         };
 
-        let refused = decoded(3);
-        assert!(
-            refused.as_ref().is_err_and(|error| error.ends_with(
-                "; as a PASSWORD there may keep its password in any variable, uefisettings \
-                 reads and writes no variable of this HiiDB"
-            )),
-            "VarStoreId 3: {refused:?}"
-        );
+        for (var_store_id, flags) in [(3, 0x00), (0, 0x00), (0, 0x04)] {
+            let refused = decoded(var_store_id, flags);
+            assert!(
+                refused.as_ref().is_err_and(|error| error.ends_with(
+                    "; as a PASSWORD there may keep its password in any variable, uefisettings \
+                     reads and writes no variable of this HiiDB"
+                )),
+                "VarStoreId {var_store_id}, Flags {flags:#04x}: {refused:?}"
+            );
+        }
         assert_eq!(
-            decoded(0),
+            decoded(1, 0x00),
             Ok(vec![
                 "Backing-44444444-4444-4444-4444-444444444444".to_owned()
             ]),
-            "VarStoreId 0"
+            "VarStoreId 1"
         );
     }
 

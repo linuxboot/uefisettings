@@ -897,6 +897,7 @@ pub(super) fn call_error(
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     use super::*;
@@ -4230,5 +4231,151 @@ mod tests {
                 assert_eq!(handler.calls(), calls, "{case}: {reach:?}: calls");
             }
         }
+    }
+
+    /// Get by keyword of a STRING beside a PASSWORD of VarStoreId 0, EFI_IFR_FLAG_CALLBACK or not,
+    /// fails before any variable read or call through variables of either reach, as get does;
+    /// beside a PASSWORD on Store that ends before it, the STRING is read through GetData().
+    #[test]
+    fn get_refuses_a_string_beside_a_password_of_var_store_id_0() {
+        let password_of = |var_store_id: u16, flags: u8| {
+            let data = [
+                question_header_with(9, 9, var_store_id, 0, flags),
+                [&1u16.to_le_bytes()[..], &20u16.to_le_bytes()].concat(), // MinSize, MaxSize
+            ]
+            .concat();
+            operation(crate::hii::forms::ifr_fixtures::PASSWORD, false, &data)
+        };
+        let get_of = |password: Vec<u8>, reach| {
+            let ifr = form_set(&[
+                var_store(1, STORE_GUID, "Store", 48),
+                password,
+                string_on(7, 3, (1, 40), (0, 4), &[]),
+            ]);
+            let interface = match reach {
+                VariableReach::BootServices => VariableInterface::VariableServices,
+                VariableReach::Runtime => VariableInterface::Efivarfs,
+            };
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
+            let key = VariableKey {
+                name: "Store".to_owned(),
+                guid: Guid::from(STORE_GUID),
+            };
+            variables.insert(key, ATTRIBUTES, &[0; 48]);
+            let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "4100420000000000")]);
+            let got = get_keywords(
+                &[list_of_ifr(PATH, &ifr)],
+                &format!("KEYWORD={KEYWORD}"),
+                None,
+                &[],
+                KeywordGetOptions::default(),
+                Box::new(Rc::clone(&variables)),
+                &handler,
+            )
+            .map(|values| values.to_string())
+            .map_err(|error| format!("{error:#}"));
+            (got, variables.reads().len(), handler.calls())
+        };
+        let record = "PASSWORD question 0x0009 in FormSet 11111111-1111-1111-1111-111111111111: \
+                      VarStoreId 0 names no VarStore";
+
+        for flags in [0x00, 0x04] {
+            for (reach, end) in [
+                (
+                    VariableReach::BootServices,
+                    "; as the variable of that password is unknown, the UEFI Shell build reads \
+                     and writes no variable of this HiiDB",
+                ),
+                (
+                    VariableReach::Runtime,
+                    "; as a PASSWORD there may keep its password in any variable, uefisettings \
+                     reads and writes no variable of this HiiDB",
+                ),
+            ] {
+                let (got, reads, calls) = get_of(password_of(0, flags), reach);
+                assert!(
+                    got.as_ref()
+                        .is_err_and(|error| error.contains(record) && error.ends_with(end)),
+                    "Flags {flags:#04x}, {reach:?}: {got:?}"
+                );
+                assert_eq!(reads, 0, "Flags {flags:#04x}, {reach:?}: reads");
+                assert_eq!(calls, vec![], "Flags {flags:#04x}, {reach:?}: calls");
+            }
+        }
+        let (got, _, calls) = get_of(password_of(1, 0x00), VariableReach::BootServices);
+        assert_eq!(
+            got,
+            Ok(resp(PATH, KEYWORD, "4100420000000000")),
+            "beside a password on Store"
+        );
+        assert_eq!(
+            calls,
+            vec![get_call(PATH, KEYWORD)],
+            "beside a password on Store: calls"
+        );
+    }
+
+    /// Beside a PASSWORD of VarStoreId 0, whose password may be in any variable,
+    /// EFI_IFR_FLAG_CALLBACK or not, get and set by keyword refuse the HiiDB before any call, as
+    /// get and set do, set with UnsafeOperations::Allow too; beside one on Store they read the
+    /// question beside its bytes.
+    #[test]
+    fn get_and_set_refuse_beside_a_password_of_var_store_id_0() {
+        let lists = |var_store_id, flags| {
+            let password = [
+                question_header_with(9, 9, var_store_id, 6, flags),
+                [&1u16.to_le_bytes()[..], &20u16.to_le_bytes()].concat(), // MinSize, MaxSize
+            ]
+            .concat();
+            let password = operation(crate::hii::forms::ifr_fixtures::PASSWORD, false, &password);
+            [list(PATH, &[questions(), vec![password]].concat())]
+        };
+        let get_of = |lists: &[ParsedPackageList], handler: &MemoryKeywordHandler| {
+            get_keywords(
+                lists,
+                &format!("KEYWORD={KEYWORD}"),
+                None,
+                &[],
+                KeywordGetOptions::default(),
+                variables(),
+                handler,
+            )
+            .map(|values| values.to_string())
+            .map_err(|error| format!("{error:#}"))
+        };
+        let handler =
+            || MemoryKeywordHandler::with(&[(PATH, KEYWORD, "01"), (PATH, SECOND_KEYWORD, "01")]);
+        let refusal = "; as the variable of that password is unknown, the UEFI Shell build reads \
+                       and writes no variable of this HiiDB";
+
+        for flags in [0x00, 0x04] {
+            let lists = lists(0, flags);
+            let refused = handler();
+            let got = get_of(&lists, &refused);
+            assert!(
+                got.as_ref().is_err_and(|error| error.ends_with(refusal)),
+                "Flags {flags:#04x}: get: {got:?}"
+            );
+            let written = set(
+                &lists,
+                &resp(PATH, KEYWORD, "03"),
+                UnsafeOperations::Allow,
+                &refused,
+            )
+            .map(|values| values.to_string())
+            .map_err(|error| format!("{error:#}"));
+            assert!(
+                written
+                    .as_ref()
+                    .is_err_and(|error| error.ends_with(refusal)),
+                "Flags {flags:#04x}: set: {written:?}"
+            );
+            assert_eq!(refused.calls(), vec![], "Flags {flags:#04x}: calls");
+        }
+        assert_eq!(
+            get_of(&lists(1, 0x00), &handler()),
+            Ok(resp(PATH, KEYWORD, "01")),
+            "beside a password on Store"
+        );
     }
 }

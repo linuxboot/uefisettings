@@ -78,7 +78,9 @@ pub(crate) struct PasswordQuestions {
     unresolved: Vec<UnresolvedPassword>,
     /// The records of the PASSWORDs that edk2 may route to a VARSTORE_NAME_VALUE, whose values
     /// its driver exposes, as UEFI 2.11 §33.2.5.6 says, through EFI_HII_CONFIG_ACCESS_PROTOCOL,
-    /// in storage of its own choosing, so in any variable (Keeper::NameValueDriver)
+    /// in storage of its own choosing, so in any variable (Keeper::NameValueDriver), and of those
+    /// of VarStoreId 0, whose callbacks or READ and WRITE ops keep their passwords where
+    /// uefisettings cannot tell (Keeper::OwnDriver)
     driver_held: Vec<UnresolvedPassword>,
     candidates: Vec<PasswordQuestion>,
     /// The storage that IFR that read_db ignores, or a VarStore outside any FormSet that does not
@@ -524,38 +526,30 @@ impl VarStoreIds {
     }
 
     /// Who keeps the password of a PASSWORD of this package list whose VarStore is unknown, of
-    /// VarStoreId `id`, or of any for one without a question header (None), in the FormSet of
-    /// root `root` if any, of the form package of the FirstVarStores `package`: the driver of a
-    /// VARSTORE_NAME_VALUE that edk2 may route it to, else its IFR. The Forms Browser gives a
+    /// VarStoreId `id`, in the FormSet of root `root` if any, of the form package of the
+    /// FirstVarStores `package`: Keeper::OwnDriver for VarStoreId 0, which names no VarStore
+    /// (UEFI 2.11 §33.3.8.2.2), as for one without a question header, whose callers take it;
+    /// else the driver of a VARSTORE_NAME_VALUE that edk2 may route it to, else its IFR. The
+    /// Forms Browser gives a
     /// question of a FormSet the VarStore of its id there (SetupBrowserDxe/IfrParse.c
     /// CreateQuestion, :136-146), so a VARSTORE_NAME_VALUE of that id there counts, which
     /// IfrParse.c creates whatever its Length (:1885-1895), as does a VarStore op there that does
     /// not decode and is one; the Config Keyword Handler the first VarStore of the id in the
     /// question's form package (ConfigKeywordHandler.c FindStorageFromVarId, :1520-1567), so the
     /// first that is a VARSTORE_NAME_VALUE counts, in a FormSet or not, and none of another form
-    /// package. VarStoreId 0 names no VarStore (UEFI 2.11 §33.3.8.2.2).
-    fn keeper(
-        &self,
-        id: Option<u16>,
-        root: Option<usize>,
-        package: Option<&FirstVarStores>,
-    ) -> Keeper {
+    /// package.
+    fn keeper(&self, id: u16, root: Option<usize>, package: Option<&FirstVarStores>) -> Keeper {
+        if id == 0 {
+            return Keeper::OwnDriver;
+        }
         let undecoded = root
             .and_then(|root| self.undecoded.get(&root))
             .is_some_and(|undecoded| undecoded.name_value);
-        let (form_set, first) = match id {
-            Some(0) => return Keeper::Ifr,
-            Some(id) => (
-                self.ids
-                    .get(&id)
-                    .is_some_and(|stores| stores.name_value_in(root)),
-                package.is_some_and(|package| package.name_value_first.contains(&id)),
-            ),
-            None => (
-                self.ids.values().any(|stores| stores.name_value_in(root)),
-                package.is_some_and(|package| !package.name_value_first.is_empty()),
-            ),
-        };
+        let form_set = self
+            .ids
+            .get(&id)
+            .is_some_and(|stores| stores.name_value_in(root));
+        let first = package.is_some_and(|package| package.name_value_first.contains(&id));
         Keeper::of(form_set || undecoded || first)
     }
 
@@ -770,14 +764,15 @@ impl PasswordQuestions {
     /// form package (edk2-stable202608 ConfigKeywordHandler.c FindStorageFromVarId, :1520), so it
     /// is added as one outside any FormSet is (add_in_package_list) and is unresolved; one whose
     /// header runs past the form package names no VarStore, so every variable of each VarStore of
-    /// its package list is withheld whole. Either way, what is withheld covers the first VarStore
+    /// its package list is withheld whole, and, as its VarStoreId may be 0, it is driver-held
+    /// (Keeper::OwnDriver). Either way, what is withheld covers the first VarStore
     /// of its id in its form package, which password_questions adds for one whose header is in its
     /// op: each VARSTORE and VARSTORE_EFI of the id in the package list keeps the password from its
     /// VarOffset on, and the variables of the VarNames on those before UEFI 2.3.1 are withheld.
     /// Only one that passes those checks is added in the FormSet of its root (password_questions),
     /// with the storage of its VarStore ops that do not decode (withhold_undecoded). An unresolved
     /// one that edk2 may route to a VARSTORE_NAME_VALUE, in its FormSet or as the first VarStore
-    /// of its id, or of any id for one without a header, in its form package, is driver-held
+    /// of its id in its form package, is driver-held, and so is one of VarStoreId 0
     /// (VarStoreIds::keeper).
     fn add_form_set_password(
         &mut self,
@@ -795,7 +790,7 @@ impl PasswordQuestions {
                 self.storage.extend(&ids.storage());
                 let reason = error.to_string();
                 let unresolved = UnresolvedPassword::NoHeader { form_set, reason };
-                self.add_unresolved(unresolved, ids.keeper(None, Some(root), package));
+                self.add_unresolved(unresolved, Keeper::OwnDriver);
                 return;
             }
         };
@@ -805,7 +800,7 @@ impl PasswordQuestions {
                 form_set,
                 question_id: password.question.question_id,
             };
-            let id = Some(password.question.var_store_id);
+            let id = password.question.var_store_id;
             self.add_unresolved(unresolved, ids.keeper(id, Some(root), package));
             return;
         }
@@ -903,15 +898,16 @@ impl PasswordQuestions {
     /// and VARSTORE_EFI of that id in `list`, which `ids` holds, and through Runtime from byte 0
     /// of each variable that its VarName may name on a VARSTORE_EFI before UEFI 2.3.1 of that id.
     /// One of VarStoreId 0 names no VarStore, as one in a FormSet does not, and the Keyword
-    /// Handler skips it (ExtractConfigRequest). One whose op ends before its MaxSize keeps every
+    /// Handler skips it (ExtractConfigRequest): it is driver-held (Keeper::OwnDriver), with a
+    /// record of its own in ignored IFR. One whose op ends before its MaxSize keeps every
     /// byte from its VarOffset on, and from byte 0 of each such variable. One in ignored IFR
     /// (OutsideOp::in_ignored_ifr) is withheld so too, as the Keyword Handler finds it there, and
     /// its record counts it already. One whose question header lies past its op is read there
     /// (PasswordFields::of); one whose header runs past the form package names no VarStore, so
-    /// every variable of each VarStore of `list` is withheld whole. One that edk2 may route to a
-    /// VARSTORE_NAME_VALUE, the first VarStore of its id, or of any id for one without a header,
-    /// in its form package (VarStoreIds::keeper), is driver-held, with a record of its own in
-    /// ignored IFR.
+    /// every variable of each VarStore of `list` is withheld whole, and, as its VarStoreId may be
+    /// 0, it is driver-held. One that edk2 may route to a VARSTORE_NAME_VALUE, the first VarStore
+    /// of its id in its form package (VarStoreIds::keeper), is driver-held too. Either is so with
+    /// a record of its own in ignored IFR.
     fn add_outside(
         &mut self,
         list: &ParsedPackageList,
@@ -921,10 +917,20 @@ impl PasswordQuestions {
     ) {
         self.declared = true;
         let keeper = match PasswordFields::of(&outside.op) {
-            Ok(password) if password.question.var_store_id == 0 => return,
+            Ok(password) if password.question.var_store_id == 0 => {
+                let unresolved = UnresolvedPassword::OwnDriver {
+                    form_set: None,
+                    question_id: password.question.question_id,
+                };
+                match outside.in_ignored_ifr {
+                    false => self.add_unresolved(unresolved, Keeper::OwnDriver),
+                    true => self.driver_held.push(unresolved),
+                }
+                return;
+            }
             Ok(password) => {
                 self.add_in_package_list(&password, ids, &list.strings);
-                ids.keeper(Some(password.question.var_store_id), None, package)
+                ids.keeper(password.question.var_store_id, None, package)
             }
             Err(error) => {
                 debug!(
@@ -932,7 +938,7 @@ impl PasswordQuestions {
                     outside.offset
                 );
                 self.storage.extend(&ids.storage());
-                ids.keeper(None, None, package)
+                Keeper::OwnDriver
             }
         };
         let (package_list, offset) = (list.guid, outside.offset);
@@ -954,6 +960,13 @@ impl PasswordQuestions {
                         .to_owned(),
                 })
             }
+            (true, Keeper::OwnDriver) => self.driver_held.push(UnresolvedPassword::InIgnoredIfr {
+                package_list,
+                offset,
+                reason: "the PASSWORD op there, whose question header does not parse, so whose \
+                         VarStoreId may be 0, which names no VarStore"
+                    .to_owned(),
+            }),
         }
     }
 
@@ -985,7 +998,9 @@ impl PasswordQuestions {
         warn!("{unresolved}");
         match keeper {
             Keeper::Ifr => {}
-            Keeper::NameValueDriver => self.driver_held.push(unresolved.clone()),
+            Keeper::NameValueDriver | Keeper::OwnDriver => {
+                self.driver_held.push(unresolved.clone())
+            }
         }
         self.unresolved.push(unresolved);
     }
@@ -999,8 +1014,9 @@ impl PasswordQuestions {
     /// Runtime it withholds the bytes of the others, and those of the variables that may hold its
     /// password, where they are known, unless IFR past an op where the walk for FormSets ends may
     /// hold one, as read_db failed for such IFR before the first FormSet, or the driver of a
-    /// VARSTORE_NAME_VALUE may keep one (driver_held): AnyVariablePasswords; variables that read
-    /// nothing are not refused so.
+    /// VARSTORE_NAME_VALUE, or the callbacks or READ and WRITE ops of a PASSWORD of VarStoreId 0,
+    /// may keep one (driver_held): AnyVariablePasswords; variables that read nothing are not
+    /// refused so.
     fn withheld(
         &self,
         variables: &dyn FirmwareVariables,
@@ -1026,7 +1042,8 @@ impl PasswordQuestions {
 
     /// Refuses a HiiDB with IFR past an op where the walk for FormSets ends, whose PASSWORD ops,
     /// with no op boundary, may keep their passwords in any variable, or with a PASSWORD that edk2
-    /// may route to a VARSTORE_NAME_VALUE, whose driver may keep it in any variable (driver_held).
+    /// may route to a VARSTORE_NAME_VALUE, whose driver may keep it in any variable, or of
+    /// VarStoreId 0, whose callbacks or READ and WRITE ops may (driver_held).
     pub(crate) fn check_bounded(&self) -> Result<(), AnyVariablePasswords> {
         let unbounded: Vec<UnresolvedPassword> = self
             .unresolved
@@ -1157,7 +1174,8 @@ fn package_of(
 /// all; outside any FormSet or in the scope of an unknown opcode, a VARSTORE_NAME_VALUE or
 /// VARSTORE_EFI before UEFI 2.3.1 of that id, which names none. None for VarStoreId 0, which
 /// names no VarStore (UEFI 2.10 §33.3.8.2.2): its driver keeps such a question's value through
-/// callbacks or READ/WRITE ops (§33.2.5.6), in no variable that the IFR names. Its fields
+/// callbacks or READ/WRITE ops (§33.2.5.6), where uefisettings cannot tell, the reason
+/// UnresolvedPassword::OwnDriver says (Keeper::OwnDriver). Its fields
 /// `password` are read from its op: one that ends before MaxSize still names its VarStore and
 /// VarOffset, so its questions take every byte from there on, and it is unresolved too.
 /// The first VarStore of that id in its form package, which FindStorageFromVarId takes
@@ -1182,6 +1200,13 @@ fn password_questions(
     Option<(UnresolvedPassword, Keeper)>,
 ) {
     let header = &password.question;
+    if header.var_store_id == 0 {
+        let unresolved = UnresolvedPassword::OwnDriver {
+            form_set,
+            question_id: header.question_id,
+        };
+        return (None, Some((unresolved, Keeper::OwnDriver)));
+    }
     let no_max_size = password
         .max_size
         .as_ref()
@@ -1191,12 +1216,6 @@ fn password_questions(
             question_id: header.question_id,
             reason: error.to_string(),
         });
-    if header.var_store_id == 0 {
-        return (
-            None,
-            no_max_size.map(|unresolved| (unresolved, Keeper::Ifr)),
-        );
-    }
     let stores = ids.ids.get(&header.var_store_id);
     let in_form_set = stores.and_then(|stores| stores.form_sets.get(&root));
     let mut unknown = ids
@@ -1281,7 +1300,7 @@ fn password_questions(
     }) {
         unresolved.get_or_insert(reason);
     }
-    let keeper = ids.keeper(Some(header.var_store_id), Some(root), package);
+    let keeper = ids.keeper(header.var_store_id, Some(root), package);
     let first = first.map(|(variable, _)| variable);
     let password = FormSetPassword {
         password,
@@ -1310,6 +1329,16 @@ enum Keeper {
     /// exposes, as UEFI 2.11 §33.2.5.6 says, through EFI_HII_CONFIG_ACCESS_PROTOCOL, in storage
     /// of its own choosing, so in any variable
     NameValueDriver,
+    /// Its own callbacks or READ and WRITE ops (UEFI 2.11 §33.2.5.6), as its VarStoreId 0 names no
+    /// VarStore (§33.3.8.2.2): with EFI_IFR_FLAG_CALLBACK its driver keeps the password where it
+    /// chooses (edk2-stable202608 SetupBrowserDxe/Setup.c:6468-6498, Presentation.c:1695-1701);
+    /// without it edk2 keeps it only where the SET ops of its WRITE say, or nowhere
+    /// (Setup.c:1997-2002, :2009-2056), which uefisettings does not follow, so it refuses alike, a
+    /// departure that fails closed. So in any variable. A PASSWORD with a VarStore stays bounded by
+    /// its VarStore, CALLBACK or not, though edk2 hands every CALLBACK password to its driver
+    /// (Setup.c:6468-6498): §33.3.8.2.2 makes VarStoreId the store "to use when storing the
+    /// question's value".
+    OwnDriver,
 }
 
 impl Keeper {
@@ -1327,7 +1356,8 @@ impl Keeper {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum UnresolvedPassword {
     /// Its question header runs past its form package, so every variable of each VarStore of its
-    /// package list is withheld
+    /// package list is withheld, and, as its VarStoreId may be 0, it is driver-held
+    /// (Keeper::OwnDriver)
     #[error(
         "PASSWORD op without a question header in FormSet {}: {reason}",
         FormSetName(*.form_set)
@@ -1365,6 +1395,16 @@ pub(crate) enum UnresolvedPassword {
         form_set: Option<Guid>,
         question_id: u16,
         reason: String,
+    },
+    /// One of VarStoreId 0 (Keeper::OwnDriver)
+    #[error(
+        "PASSWORD question {question_id:#06x} in FormSet {}: VarStoreId 0 names no VarStore, so \
+         its callbacks or READ and WRITE ops keep its password where uefisettings cannot tell",
+        FormSetName(*.form_set)
+    )]
+    OwnDriver {
+        form_set: Option<Guid>,
+        question_id: u16,
     },
     #[error(
         "PASSWORD questions of package list {package_list} may be in the IFR that uefisettings \
@@ -1476,7 +1516,8 @@ impl std::fmt::Display for FormSetName {
 pub(crate) struct UnresolvedPasswords(Vec<UnresolvedPassword>);
 
 /// The refusal, through variables of either reach, of a HiiDB with IFR past an op where the walk
-/// for FormSets ends, or with a PASSWORD that edk2 may route to a VARSTORE_NAME_VALUE.
+/// for FormSets ends, or with a PASSWORD that edk2 may route to a VARSTORE_NAME_VALUE or of
+/// VarStoreId 0.
 #[derive(Debug, Error)]
 #[error(
     "{}; as a PASSWORD there may keep its password in any variable, uefisettings reads and \
@@ -1652,12 +1693,6 @@ mod tests {
                 }],
             ),
             (
-                "a password without a VarStore",
-                vec![password_on(2, 3, 0, 0)],
-                true,
-                vec![],
-            ),
-            (
                 "no password",
                 vec![checkbox_on(1, 3, 1), checkbox_at(4, 3, 2, 80)],
                 false,
@@ -1812,7 +1847,6 @@ mod tests {
             password_on(3, 3, 2, 40),
             password_with(4, 1, 0, QuestionFlags::CALLBACK, 4),
             password_with(5, 2, 80, QuestionFlags::empty(), 0),
-            password_on(6, 3, 0, 0),
         ]);
         let mut want = WithheldBytes::default();
         want.insert(amitse_setup(), 0..40);
@@ -1826,6 +1860,60 @@ mod tests {
                     .map_err(|error| error.to_string()),
                 Ok(want.clone()),
                 "{reach:?}"
+            );
+        }
+    }
+
+    /// The middle of the record of a PASSWORD of VarStoreId 0 (UnresolvedPassword::OwnDriver).
+    const OWN_DRIVER: &str =
+        "VarStoreId 0 names no VarStore, so its callbacks or READ and WRITE ops \
+         keep its password where uefisettings cannot tell";
+
+    /// A PASSWORD of VarStoreId 0, EFI_IFR_FLAG_CALLBACK or not, names no VarStore (UEFI 2.11
+    /// §33.3.8.2.2), so its callbacks or READ and WRITE ops keep its password where uefisettings
+    /// cannot tell (§33.2.5.6): through variables of either reach that read anything, withheld
+    /// fails for the whole HiiDB, and so does the snapshot; variables that read nothing withhold
+    /// the bytes of the password on AMITSESetup.
+    #[test]
+    fn a_password_of_var_store_id_0_closes_every_variable() {
+        let record = format!(
+            "PASSWORD question 0x0004 in FormSet 11111111-1111-1111-1111-111111111111: {OWN_DRIVER}"
+        );
+        let boot_services_refusal = "; as the variable of that password is unknown, the UEFI \
+                                     Shell build reads and writes no variable of this HiiDB";
+        let unread = UnreadVariables {
+            reach: VariableReach::Runtime,
+            interface: VariableInterface::Efivarfs,
+        };
+        let mut known = WithheldBytes::default();
+        known.insert(amitse_setup(), 0..40);
+
+        for flags in [QuestionFlags::empty(), QuestionFlags::CALLBACK] {
+            let passwords =
+                password_questions(&[password_with(4, 0, 0, flags, 4), password_on(2, 3, 2, 0)]);
+            for (reach, end) in [
+                (VariableReach::Runtime, ANY_VARIABLE),
+                (VariableReach::BootServices, boot_services_refusal),
+            ] {
+                let got = passwords
+                    .withheld(&reaching(reach))
+                    .map_err(|error| error.to_string());
+                assert!(
+                    got.as_ref()
+                        .is_err_and(|error| error.starts_with(&record) && error.ends_with(end)),
+                    "{flags:?}, {reach:?}: {got:?}"
+                );
+            }
+            assert_eq!(
+                passwords
+                    .withheld(&unread)
+                    .map_err(|error| error.to_string()),
+                Ok(known.clone()),
+                "{flags:?}: variables that read nothing"
+            );
+            assert!(
+                passwords.withheld_from_snapshot().is_err(),
+                "{flags:?}: the snapshot"
             );
         }
     }
@@ -2279,27 +2367,35 @@ mod tests {
     }
 
     /// A PASSWORD outside any FormSet of VarStoreId 0 names no variable, as one in a FormSet does
-    /// not, and edk2-stable202608 ExtractConfigRequest skips it (ConfigKeywordHandler.c:2104): it
-    /// only declares a password, so set refuses through variables that reach BootServices, which
-    /// read the variables of the HiiDB.
+    /// not, and edk2-stable202608 ExtractConfigRequest skips it (ConfigKeywordHandler.c:2104): its
+    /// callbacks or READ and WRITE ops keep its password where uefisettings cannot tell, as for
+    /// one in a FormSet, so it is driver-held, with no question, shared password, candidate or
+    /// storage, and set refuses through variables that reach BootServices, which read the
+    /// variables of the HiiDB.
     #[test]
-    fn a_password_outside_a_form_set_without_a_var_store_only_declares_a_password() {
+    fn a_password_outside_a_form_set_without_a_var_store_is_driver_held() {
         let passwords = passwords_of(&[
             password_on(9, 3, 0, 0),
             form_set_with(&[checkbox_on(1, 3, 2)]),
         ]);
+        let records = |records: &[UnresolvedPassword]| {
+            records.iter().map(ToString::to_string).collect::<Vec<_>>()
+        };
+        let record = [format!(
+            "PASSWORD question 0x0009 in FormSet ?: {OWN_DRIVER}"
+        )];
 
+        assert_eq!(records(&passwords.unresolved), record, "unresolved");
+        assert_eq!(records(&passwords.driver_held), record, "driver-held");
         assert_eq!(
             passwords,
             PasswordQuestions {
                 declared: true,
-                questions: vec![],
-                shared: vec![],
-                unresolved: vec![],
-                driver_held: vec![],
-                candidates: vec![],
-                storage: DeclaredStorage::default(),
-            }
+                unresolved: passwords.unresolved.clone(),
+                driver_held: passwords.driver_held.clone(),
+                ..PasswordQuestions::default()
+            },
+            "the rest"
         );
         assert!(
             passwords
@@ -2358,7 +2454,7 @@ mod tests {
         }
         let (driver_held, runtime) = match keeper {
             Keeper::Ifr => (vec![], Ok(known)),
-            Keeper::NameValueDriver => (
+            Keeper::NameValueDriver | Keeper::OwnDriver => (
                 vec![unresolved.clone()],
                 Err(format!("{unresolved}{ANY_VARIABLE}")),
             ),
@@ -2801,7 +2897,9 @@ mod tests {
             .collect();
         let (driver_held, runtime) = match keeper {
             Keeper::Ifr => (0, Ok(runtime)),
-            Keeper::NameValueDriver => (1, Err(format!("{reason}{ANY_VARIABLE}"))),
+            Keeper::NameValueDriver | Keeper::OwnDriver => {
+                (1, Err(format!("{reason}{ANY_VARIABLE}")))
+            }
         };
 
         assert_eq!(reasons, [reason], "unresolved");
@@ -3474,6 +3572,39 @@ mod tests {
         );
     }
 
+    /// A PASSWORD of VarStoreId 0 in a FormSet that read_db ignores is driver-held, and unresolved
+    /// holds the ignored IFR's record alone: that record refuses the HiiDB through variables that
+    /// reach BootServices and refuses the snapshot already, so the PASSWORD's own record joins
+    /// driver_held alone.
+    #[test]
+    fn a_password_of_var_store_id_0_in_an_ignored_form_set_is_driver_held_alone() {
+        let passwords = passwords_of(&[
+            ignored_form_set(&[form(1, &[password_on(2, 3, 0, 0)])]),
+            form_set_with(&[checkbox_on(1, 3, 1)]),
+        ]);
+        let driver_held: Vec<String> = passwords
+            .driver_held
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert!(
+            matches!(
+                passwords.unresolved.as_slice(),
+                [UnresolvedPassword::InIgnoredIfr { offset: 0, .. }]
+            ),
+            "unresolved: {:?}",
+            passwords.unresolved
+        );
+        assert_eq!(
+            driver_held,
+            [format!(
+                "PASSWORD question 0x0002 in FormSet ?: {OWN_DRIVER}"
+            )],
+            "driver-held"
+        );
+    }
+
     /// The walk leaves a FormSet that read_db ignores at its End: a PASSWORD after it, outside
     /// any FormSet, fails closed through variables that reach BootServices and keeps its password
     /// in each VarStore of its VarStoreId through those that reach Runtime.
@@ -3970,9 +4101,9 @@ mod tests {
     /// BootServices it fails closed. As edk2-stable202608 ConfigKeywordHandler.c
     /// FindStorageFromVarId (:1520) takes the first VarStore of its id in the form package, one of
     /// that id in another FormSet keeps it too. At VarOffset 5 it is withheld from byte 5 on. A
-    /// header of VarStoreId 0 names no VarStore (IfrParse.c CreateQuestion, :126), so through
-    /// variables that reach Runtime no byte is withheld, not even of a VarStore that declares
-    /// that id.
+    /// header of VarStoreId 0 names no VarStore (IfrParse.c CreateQuestion, :126), not even one
+    /// that declares that id, so its callbacks or READ and WRITE ops keep the password where
+    /// uefisettings cannot tell, and through variables that reach Runtime withheld fails too.
     #[test]
     fn a_password_op_short_of_its_question_header_keeps_its_password_past_the_op() {
         // the SUBTITLE's data is the rest of that header: VarStoreId, VarOffset and Flags
@@ -4000,12 +4131,16 @@ mod tests {
         };
         let outside: fn(&[UnresolvedPassword]) -> bool =
             |unresolved| matches!(unresolved, [UnresolvedPassword::OutsideFormSet { .. }]);
+        let own_driver = Err(format!(
+            "PASSWORD question 0x0702 in FormSet {FORM_SET_GUID}: its op ends before its question \
+             header, which edk2 reads from the bytes of the form package after it{ANY_VARIABLE}"
+        ));
         for (case, ifr, unresolved, want) in [
             (
                 "in a disabled form",
                 vec![form_set_with(&short)],
                 in_form,
-                want.clone(),
+                Ok(want.clone()),
             ),
             (
                 "in a disabled form, its id in another FormSet too",
@@ -4014,13 +4149,13 @@ mod tests {
                     form_set(&[var_store(2, OTHER_GUID, "Shadow", 81), form(1, &[])]),
                 ],
                 in_form,
-                with_other,
+                Ok(with_other),
             ),
             (
                 "in a disabled form, at VarOffset 5",
                 vec![form_set_with(&short_at(2, 5))],
                 in_form,
-                from_byte_5,
+                Ok(from_byte_5),
             ),
             (
                 "in a disabled form, of VarStoreId 0, which a VarStore declares",
@@ -4029,13 +4164,13 @@ mod tests {
                     form_set_with(&short_at(0, 5)),
                 ],
                 in_form,
-                WithheldBytes::default(),
+                own_driver,
             ),
             (
                 "outside any FormSet",
                 vec![short.concat(), form_set_with(&[checkbox_on(1, 3, 1)])],
                 outside,
-                want,
+                Ok(want),
             ),
         ] {
             let passwords = passwords_of(&ifr);
@@ -4055,20 +4190,21 @@ mod tests {
                 passwords
                     .withheld(&reaching(VariableReach::Runtime))
                     .map_err(|error| error.to_string()),
-                Ok(want),
+                want,
                 "{case}: withheld through Runtime"
             );
         }
     }
 
     /// A PASSWORD op whose question header runs past the end of its form package may keep its
-    /// password in any VarStore of its package list: through variables that reach Runtime every
+    /// password in any VarStore of its package list: through variables that read nothing every
     /// variable of each VARSTORE and VARSTORE_EFI of the list is withheld whole, those of its
     /// FormSet and the one outside any, and every variable of the Guid of a VARSTORE_EFI before
-    /// UEFI 2.3.1, whose VarName may name any; through those that reach BootServices it fails
-    /// closed.
+    /// UEFI 2.3.1, whose VarName may name any. Its VarStoreId may be 0, which names no VarStore,
+    /// so its password may be in any variable: through variables that read anything it fails
+    /// closed, whatever their reach.
     #[test]
-    fn a_password_whose_question_header_runs_past_the_package_withholds_every_var_store_whole() {
+    fn a_password_whose_question_header_runs_past_the_package_closes_every_variable() {
         let headless = operation(PASSWORD, false, &[3, 0, 4, 0]);
         let shadow_store = var_store(7, OTHER_GUID, "Shadow", 81);
         let mut want = WithheldBytes::default();
@@ -4129,12 +4265,25 @@ mod tests {
                     .is_err(),
                 "{case}: withheld through BootServices"
             );
+            let runtime = passwords
+                .withheld(&reaching(VariableReach::Runtime))
+                .map_err(|error| error.to_string());
+            assert!(
+                runtime
+                    .as_ref()
+                    .is_err_and(|error| error.ends_with(ANY_VARIABLE)),
+                "{case}: withheld through Runtime: {runtime:?}"
+            );
+            let unread = UnreadVariables {
+                reach: VariableReach::Runtime,
+                interface: VariableInterface::Efivarfs,
+            };
             assert_eq!(
                 passwords
-                    .withheld(&reaching(VariableReach::Runtime))
+                    .withheld(&unread)
                     .map_err(|error| error.to_string()),
                 Ok(want),
-                "{case}: withheld through Runtime"
+                "{case}: withheld through variables that read nothing"
             );
         }
     }
@@ -4869,7 +5018,7 @@ mod tests {
             }
             let runtime = match keeper {
                 Keeper::Ifr => Ok(known),
-                Keeper::NameValueDriver => Err(found
+                Keeper::NameValueDriver | Keeper::OwnDriver => Err(found
                     .unresolved
                     .iter()
                     .map(|unresolved| format!("{unresolved}{ANY_VARIABLE}"))
