@@ -14,6 +14,7 @@
 //! --efivars and --no-efivars, of which get, show-ifr and list-questions take exactly one, as this
 //! build reads no HiiDB or EFI variables of the machine it runs on.
 
+use std::io;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
@@ -22,6 +23,7 @@ use clap::Args;
 use clap::Subcommand;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::HiiBackend;
+use uefisettings::terminal_text::UnicodeTerminal;
 
 use crate::HiiSourceArgs;
 
@@ -39,6 +41,17 @@ pub(super) const EFIVAR_MEMORY_HELP: &str =
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
+
+/// The terminal of stdout, which renders every character: TerminalText and JsonText do all the
+/// escaping.
+pub(super) fn stdout_output() -> io::Result<UnicodeTerminal> {
+    Ok(UnicodeTerminal)
+}
+
+/// The terminal of stderr, as stdout_output's.
+pub(super) fn stderr_output() -> io::Result<UnicodeTerminal> {
+    Ok(UnicodeTerminal)
+}
 
 /// None: ilo and identify need Linux.
 #[derive(Debug, Subcommand)]

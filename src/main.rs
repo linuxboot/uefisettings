@@ -50,9 +50,12 @@ use uefisettings::exports::ShowIfrOptions;
 use uefisettings::exports::UnsafeOperation;
 #[cfg(system_variables)]
 use uefisettings::exports::UnsafeOperations;
+use uefisettings::terminal_text::escape_unrendered;
 use uefisettings::terminal_text::JsonText;
+use uefisettings::terminal_text::OutputSyntax;
 use uefisettings::terminal_text::TerminalText;
 use uefisettings::terminal_text::TextLines;
+use uefisettings::terminal_text::TextOutput;
 use uefisettings_spellings_db_thrift::consts::translation_db;
 
 #[cfg(system_variables)]
@@ -793,46 +796,90 @@ fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn print_line(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     let stdout = io::stdout();
-    let mut output = stdout.lock();
-    writeln!(output, "{}", arguments)
+    write_lines(
+        &mut stdout.lock(),
+        &mut platform::stdout_output()?,
+        OutputSyntax::Text,
+        &arguments.to_string(),
+    )
 }
 
 /// Prints `value` as its JSON text, as JsonText.
 #[cfg(any(system_variables, all(system_hiidb, hiidb_files)))]
 fn print_json(value: &impl serde::Serialize) -> io::Result<()> {
     let stdout = io::stdout();
-    write_json(&mut stdout.lock(), value)
+    write_json(&mut stdout.lock(), &mut platform::stdout_output()?, value)
 }
 
 /// Writes `value` to `output` as its JSON text, as JsonText.
 #[cfg(any(system_variables, all(system_hiidb, hiidb_files), test))]
-fn write_json(output: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+fn write_json(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    value: &impl serde::Serialize,
+) -> io::Result<()> {
     let json = serde_json::to_string(value)?;
-    writeln!(output, "{}", JsonText(&json))
+    write_lines(
+        output,
+        console,
+        OutputSyntax::Json,
+        &JsonText(&json).to_string(),
+    )
+}
+
+/// Writes `text`, of `syntax`, to `output` line by line, each with what `console` cannot render
+/// escaped (escape_unrendered), and ended with `\n`. Its line breaks are the ones that
+/// uefisettings writes: TerminalText, JSON and Debug escape those of the texts that it prints.
+fn write_lines(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    syntax: OutputSyntax,
+    text: &str,
+) -> io::Result<()> {
+    text.split('\n')
+        .try_for_each(|line| writeln!(output, "{}", escape_unrendered(line, syntax, console)?))
 }
 
 /// Prints `lines`, which may show the HiiDB's strings, each as TerminalText, so that a line break
 /// of a string shows as `\n` and starts no line, then an empty line, as show-ifr always has.
 fn print_terminal_lines(lines: &TextLines) -> io::Result<()> {
     let stdout = io::stdout();
-    write_terminal_lines(&mut stdout.lock(), lines)
+    write_terminal_lines(&mut stdout.lock(), &mut platform::stdout_output()?, lines)
 }
 
-fn write_terminal_lines(output: &mut impl Write, lines: &TextLines) -> io::Result<()> {
-    lines
-        .lines()
-        .try_for_each(|line| writeln!(output, "{}", TerminalText(line)))?;
+fn write_terminal_lines(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    lines: &TextLines,
+) -> io::Result<()> {
+    lines.lines().try_for_each(|line| {
+        write_lines(
+            output,
+            console,
+            OutputSyntax::Text,
+            &TerminalText(line).to_string(),
+        )
+    })?;
     writeln!(output)
 }
 
 /// Prints the warning `arguments` on stderr as TerminalText, as it may name the HiiDB's strings.
 fn print_warning(arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
     let stderr = io::stderr();
-    write_warning(&mut stderr.lock(), arguments)
+    write_warning(
+        &mut stderr.lock(),
+        &mut platform::stderr_output()?,
+        arguments,
+    )
 }
 
-fn write_warning(output: &mut impl Write, arguments: std::fmt::Arguments<'_>) -> io::Result<()> {
-    writeln!(output, "warning: {}", TerminalText(&arguments.to_string()))
+fn write_warning(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    arguments: std::fmt::Arguments<'_>,
+) -> io::Result<()> {
+    let warning = format!("warning: {}", TerminalText(&arguments.to_string()));
+    write_lines(output, console, OutputSyntax::Text, &warning)
 }
 
 /// Prints `value` as TerminalText, or as its JSON text, as JsonText, if `json`.
@@ -842,19 +889,28 @@ fn print_display_or_json(
     json: bool,
 ) -> io::Result<()> {
     let stdout = io::stdout();
-    write_display_or_json(&mut stdout.lock(), value, json)
+    write_display_or_json(
+        &mut stdout.lock(),
+        &mut platform::stdout_output()?,
+        value,
+        json,
+    )
 }
 
 /// Writes `value` to `output` as TerminalText, or as its JSON text, as JsonText, if `json`.
 #[cfg(any(target_os = "uefi", test))]
 fn write_display_or_json(
     output: &mut impl Write,
+    console: &mut impl TextOutput,
     value: &(impl std::fmt::Display + serde::Serialize),
     json: bool,
 ) -> io::Result<()> {
     match json {
-        true => write_json(output, value),
-        false => writeln!(output, "{}", TerminalText(&value.to_string())),
+        true => write_json(output, console, value),
+        false => {
+            let text = TerminalText(&value.to_string()).to_string();
+            write_lines(output, console, OutputSyntax::Text, &text)
+        }
     }
 }
 
@@ -863,14 +919,21 @@ fn write_display_or_json(
 #[cfg(system_variables)]
 fn print_lifted(lifted: &[UnsafeOperation]) -> io::Result<()> {
     let stderr = io::stderr();
-    let mut output = stderr.lock();
-    write_lifted(&mut output, lifted)
+    write_lifted(&mut stderr.lock(), &mut platform::stderr_output()?, lifted)
 }
 
 #[cfg(system_variables)]
-fn write_lifted(output: &mut impl Write, lifted: &[UnsafeOperation]) -> io::Result<()> {
+fn write_lifted(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    lifted: &[UnsafeOperation],
+) -> io::Result<()> {
     lifted.iter().try_for_each(|operation| {
-        write_warning(output, format_args!("{}", operation.lifted_warning()))
+        write_warning(
+            output,
+            console,
+            format_args!("{}", operation.lifted_warning()),
+        )
     })
 }
 
@@ -879,14 +942,17 @@ fn write_lifted(output: &mut impl Write, lifted: &[UnsafeOperation]) -> io::Resu
 #[cfg(system_variables)]
 fn print_lifted_of(error: &anyhow::Error) -> io::Result<()> {
     let stderr = io::stderr();
-    let mut output = stderr.lock();
-    write_lifted_of(&mut output, error)
+    write_lifted_of(&mut stderr.lock(), &mut platform::stderr_output()?, error)
 }
 
 #[cfg(system_variables)]
-fn write_lifted_of(output: &mut impl Write, error: &anyhow::Error) -> io::Result<()> {
+fn write_lifted_of(
+    output: &mut impl Write,
+    console: &mut impl TextOutput,
+    error: &anyhow::Error,
+) -> io::Result<()> {
     match error.downcast_ref::<LiftedOperations>() {
-        Some(lifted) => write_lifted(output, &lifted.0),
+        Some(lifted) => write_lifted(output, console, &lifted.0),
         None => Ok(()),
     }
 }
@@ -898,19 +964,30 @@ where
 {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    write_with_style(&mut output, result, json)
+    write_with_style(&mut output, &mut platform::stdout_output()?, result, json)
 }
 
-fn write_with_style<W, T>(output: &mut W, result: T, json: bool) -> io::Result<()>
+fn write_with_style<W, T>(
+    output: &mut W,
+    console: &mut impl TextOutput,
+    result: T,
+    json: bool,
+) -> io::Result<()>
 where
     W: Write,
     T: Serializable + Debug,
 {
     if json {
         let buf = simplejson_protocol::serialize(result);
-        writeln!(output, "{}", JsonText(&String::from_utf8_lossy(&buf)))
+        let json = JsonText(&String::from_utf8_lossy(&buf)).to_string();
+        write_lines(output, console, OutputSyntax::Json, &json)
     } else {
-        writeln!(output, "{:#?}", result)
+        write_lines(
+            output,
+            console,
+            OutputSyntax::Text,
+            &format!("{:#?}", result),
+        )
     }
 }
 
@@ -926,6 +1003,7 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use uefisettings::terminal_text::UnicodeTerminal;
 
     use super::*;
 
@@ -1379,12 +1457,12 @@ mod tests {
     #[test]
     fn write_lifted_warns_per_operation() {
         let mut none = Vec::new();
-        write_lifted(&mut none, &[]).expect("write no warning");
+        write_lifted(&mut none, &mut UnicodeTerminal, &[]).expect("write no warning");
         assert_eq!(String::from_utf8_lossy(&none), "", "none");
 
         let mut warned = Vec::new();
         let lifted = [UnsafeOperation::SetupPassword];
-        write_lifted(&mut warned, &lifted).expect("write the warning");
+        write_lifted(&mut warned, &mut UnicodeTerminal, &lifted).expect("write the warning");
         assert_eq!(
             String::from_utf8_lossy(&warned),
             format!(
@@ -1406,7 +1484,7 @@ mod tests {
         }];
         let mut warned = Vec::new();
 
-        write_lifted(&mut warned, &lifted).expect("write the warning");
+        write_lifted(&mut warned, &mut UnicodeTerminal, &lifted).expect("write the warning");
 
         let warned = String::from_utf8(warned).expect("UTF-8");
         assert!(
@@ -1426,7 +1504,7 @@ mod tests {
         )
         .context("set failed");
         let mut warned = Vec::new();
-        write_lifted_of(&mut warned, &error).expect("write the warning");
+        write_lifted_of(&mut warned, &mut UnicodeTerminal, &error).expect("write the warning");
         assert_eq!(
             String::from_utf8_lossy(&warned),
             format!(
@@ -1437,7 +1515,8 @@ mod tests {
         );
 
         let mut none = Vec::new();
-        write_lifted_of(&mut none, &anyhow!("write failed")).expect("write no warning");
+        write_lifted_of(&mut none, &mut UnicodeTerminal, &anyhow!("write failed"))
+            .expect("write no warning");
         assert_eq!(String::from_utf8_lossy(&none), "", "none lifted");
     }
 
@@ -2075,6 +2154,7 @@ mod tests {
         let mut output = BrokenPipeWriter;
         let error = write_with_style(
             &mut output,
+            &mut UnicodeTerminal,
             uefisettings_backend_thrift::Error::default(),
             false,
         )
@@ -2138,6 +2218,16 @@ mod tests {
         }
     }
 
+    /// A text output that renders U+0020-U+007E only, as edk2-stable202608 TerminalDxe's PC-ANSI
+    /// and VT100 types do but for their controls and text graphics (Ansi.c:61-72).
+    struct AsciiConsole;
+
+    impl TextOutput for AsciiConsole {
+        fn test_string(&mut self, text: &str) -> io::Result<bool> {
+            Ok(text.chars().all(|character| matches!(character, ' '..='~')))
+        }
+    }
+
     /// show-ifr's text: each line as TerminalText, ended with its line break, so that a text's
     /// own line break shows as `\n` inside its line and forges no line, such as an -Answer line
     /// before the question's own; then the empty line that ends it.
@@ -2163,7 +2253,8 @@ mod tests {
             let lines = TextLines(lines.iter().map(|&line| line.to_owned()).collect());
             let mut output = Vec::new();
 
-            write_terminal_lines(&mut output, &lines).expect("write the lines");
+            write_terminal_lines(&mut output, &mut UnicodeTerminal, &lines)
+                .expect("write the lines");
 
             let shown = String::from_utf8(output).expect("UTF-8");
             assert_eq!(shown, want, "{lines:?}");
@@ -2174,12 +2265,70 @@ mod tests {
         }
     }
 
+    /// Text and JSON through a console that renders ASCII only: each other character escaped as
+    /// its syntax spells it, and each line break that uefisettings writes kept.
+    #[test]
+    fn write_lines_escape_what_the_console_refuses() {
+        let cases = [
+            (
+                OutputSyntax::Text,
+                "P07<\u{10d}>Q\nP08<\u{200d}>Q",
+                "P07<\\u{10d}>Q\nP08<\\u{200d}>Q\n",
+            ),
+            (
+                OutputSyntax::Json,
+                "{\"a\":\"K\u{10d}\u{1f60a}K\"}",
+                "{\"a\":\"K\\u010d\\ud83d\\ude0aK\"}\n",
+            ),
+        ];
+        for (syntax, text, want) in cases {
+            let mut output = Vec::new();
+
+            write_lines(&mut output, &mut AsciiConsole, syntax, text).expect("write the lines");
+
+            assert_eq!(
+                String::from_utf8(output).expect("UTF-8"),
+                want,
+                "{syntax:?}"
+            );
+        }
+    }
+
+    /// print_json's and write_with_style's JSON through a console that renders ASCII only: a
+    /// refused character in a string is spelled as a JSON escape, which parses back to the same
+    /// string.
+    #[test]
+    fn json_through_an_ascii_console_parses_back() {
+        let text = "K\u{10d}K";
+        let mut json = Vec::new();
+
+        write_json(&mut json, &mut AsciiConsole, &text).expect("write the JSON");
+
+        let json = String::from_utf8(json).expect("UTF-8");
+        let value: String = serde_json::from_str(&json).expect("parse write_json's JSON");
+        assert_eq!(value, text, "write_json: {json:?}");
+
+        let error = uefisettings_backend_thrift::Error {
+            error_message: text.to_string(),
+            ..Default::default()
+        };
+        let mut styled = Vec::new();
+
+        write_with_style(&mut styled, &mut AsciiConsole, error, true).expect("write the error");
+
+        let styled = String::from_utf8(styled).expect("UTF-8");
+        let value: serde_json::Value =
+            serde_json::from_str(&styled).expect("parse write_with_style's JSON");
+        assert_eq!(value["error_message"], text, "write_with_style: {styled:?}");
+    }
+
     #[test]
     fn warnings_escape_control_characters() {
         let mut output = Vec::new();
 
         write_warning(
             &mut output,
+            &mut UnicodeTerminal,
             format_args!("questions may be in {}", "A\u{9b}2J\nB"),
         )
         .expect("write the warning");
@@ -2210,7 +2359,8 @@ mod tests {
         for (json, want) in cases {
             let mut output = Vec::new();
 
-            write_display_or_json(&mut output, &keywords, json).expect("write the keywords");
+            write_display_or_json(&mut output, &mut UnicodeTerminal, &keywords, json)
+                .expect("write the keywords");
 
             let shown = String::from_utf8(output).expect("UTF-8");
             assert_eq!(shown, want, "json {json}");

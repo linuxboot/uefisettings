@@ -12,8 +12,11 @@
 
 //! Text that a HiiDB or an EFI variable holds, as uefisettings prints it on a terminal.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write;
+use std::io;
 use std::ops::RangeInclusive;
 
 /// The Bidi_Control characters (Unicode 17.0 PropList.txt), which reorder the text after them.
@@ -23,6 +26,10 @@ const BIDI_CONTROLS: [RangeInclusive<char>; 4] = [
     '\u{202a}'..='\u{202e}',
     '\u{2066}'..='\u{2069}',
 ];
+
+/// edk2's NARROW_CHAR and WIDE_CHAR (edk2-stable202608 MdeModuleHii.h:11-12), glyph width marks
+/// that its consoles skip as "not displayable" (TerminalConOut.c:221-225).
+const GLYPH_WIDTH_MARKS: RangeInclusive<char> = '\u{fff0}'..='\u{fff1}';
 
 /// A text as uefisettings shows it to people: each control character (Unicode Cc: U+0000-U+001F
 /// and U+007F-U+009F), each Bidi_Control character, U+2028 and U+2029 and `\` escaped as
@@ -105,6 +112,123 @@ fn write_json_escape(output: &mut impl Write, character: char) -> fmt::Result {
         .encode_utf16(&mut [0; 2])
         .iter()
         .try_for_each(|unit| write!(output, "\\u{unit:04x}"))
+}
+
+/// What a text that uefisettings prints is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputSyntax {
+    /// Text, which spells an escaped character as `char::escape_unicode` does: `\u{10d}`.
+    Text,
+    /// A JSON text, which can escape a character only inside a string, as write_json_escape
+    /// spells it.
+    Json,
+}
+
+/// Where uefisettings prints, which may render only some characters: what
+/// EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL's TestString() "Verifies that all characters in a string can
+/// be output to the target device" for (edk2-stable202608 SimpleTextOut.h:196-208).
+pub trait TextOutput {
+    /// Whether this output renders each character of `text`, which holds no NUL and no glyph
+    /// width mark.
+    fn test_string(&mut self, text: &str) -> io::Result<bool>;
+}
+
+/// A terminal that takes UTF-8 and renders every character, as on Linux, macOS and Windows,
+/// where TerminalText and JsonText are all the escaping that a text needs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct UnicodeTerminal;
+
+impl TextOutput for UnicodeTerminal {
+    fn test_string(&mut self, _text: &str) -> io::Result<bool> {
+        Ok(true)
+    }
+}
+
+/// `line`, a line of `syntax`, with each character that `output` does not render escaped, so that
+/// no other character is written in its place: edk2-stable202608 TerminalDxe writes the low byte
+/// of a character that its PC-ANSI and VT100 types lack (TerminalConOut.c:237-241), such as CR
+/// for U+010D. It tests `line` whole, then each distinct character of a line that `output`
+/// refuses. NUL, which ends the string that TestString() reads, and the glyph width marks are
+/// escaped untested: edk2's GraphicsConsole takes WIDE_CHAR as a lasting EFI_WIDE_ATTRIBUTE
+/// change (GraphicsConsole.c:978-983), and its TestString() never returns for either mark
+/// (:1098-1105). A refused character outside the strings of a JSON text, where no escape exists,
+/// is an error.
+pub fn escape_unrendered<'a>(
+    line: &'a str,
+    syntax: OutputSyntax,
+    output: &mut impl TextOutput,
+) -> io::Result<Cow<'a, str>> {
+    if line.is_empty() || !line.contains(is_escaped_untested) && output.test_string(line)? {
+        return Ok(Cow::Borrowed(line));
+    }
+
+    let mut rendered = BTreeMap::new();
+    let mut shown = String::with_capacity(line.len());
+    let mut position = JsonPosition::Outside;
+    for character in line.chars() {
+        let renders = match character {
+            character if is_escaped_untested(character) => false,
+            character => match rendered.get(&character) {
+                Some(&renders) => renders,
+                None => {
+                    let renders = output.test_string(character.encode_utf8(&mut [0; 4]))?;
+                    rendered.insert(character, renders);
+                    renders
+                }
+            },
+        };
+        match (renders, syntax) {
+            (true, _) => shown.push(character),
+            (false, OutputSyntax::Text) => {
+                write!(shown, "{}", character.escape_unicode()).map_err(io::Error::other)?
+            }
+            (false, OutputSyntax::Json) => match position.escapes(character) {
+                true => write_json_escape(&mut shown, character).map_err(io::Error::other)?,
+                false => {
+                    return Err(io::Error::other(format!(
+                        "the console cannot render {character:?}, which is outside the strings of \
+                         this JSON text"
+                    )))
+                }
+            },
+        }
+        position = position.after(character);
+    }
+    Ok(Cow::Owned(shown))
+}
+
+/// Whether escape_unrendered escapes `character` without a test: NUL and the glyph width marks.
+fn is_escaped_untested(character: char) -> bool {
+    character == '\0' || GLYPH_WIDTH_MARKS.contains(&character)
+}
+
+/// Where a character of a JSON text is, as far as escaping goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum JsonPosition {
+    /// Outside every string
+    Outside,
+    /// In a string, not after its `\`
+    InString,
+    /// Right after a string's `\`, which starts an escape
+    AfterBackslash,
+}
+
+impl JsonPosition {
+    /// Where the character after `character`, which is here, is.
+    fn after(self, character: char) -> Self {
+        match (self, character) {
+            (Self::Outside, '"') | (Self::AfterBackslash, _) => Self::InString,
+            (Self::Outside, _) => Self::Outside,
+            (Self::InString, '"') => Self::Outside,
+            (Self::InString, '\\') => Self::AfterBackslash,
+            (Self::InString, _) => Self::InString,
+        }
+    }
+
+    /// Whether `character`, which is here, can be spelled as its escape.
+    fn escapes(self, character: char) -> bool {
+        self == Self::InString && !matches!(character, '"' | '\\')
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +343,156 @@ mod tests {
         for (json, want) in cases {
             assert_eq!(JsonText(json).to_string(), want, "{json:?}");
         }
+    }
+
+    /// A model of edk2-stable202608 TerminalDxe's AnsiTestString() (Ansi.c:61-72) without its
+    /// text graphics: it renders U+0020-U+007F and the controls of TerminalIsValidEfiCntlChar()
+    /// (TerminalConOut.c:966-980). It records each string tested, and refuses those in `refused`
+    /// besides.
+    #[derive(Default)]
+    struct AnsiTerminal {
+        tested: Vec<String>,
+        refused: Vec<char>,
+    }
+
+    impl TextOutput for AnsiTerminal {
+        fn test_string(&mut self, text: &str) -> io::Result<bool> {
+            assert!(
+                !text.contains(
+                    |character| character == '\0' || GLYPH_WIDTH_MARKS.contains(&character)
+                ),
+                "tested {text:?}"
+            );
+            self.tested.push(text.to_owned());
+            Ok(text.chars().all(|character| {
+                matches!(
+                    character,
+                    '\u{20}'..='\u{7f}' | '\u{8}' | '\t' | '\n' | '\r'
+                ) && !self.refused.contains(&character)
+            }))
+        }
+    }
+
+    #[test]
+    fn escape_unrendered_escapes_what_the_output_refuses() {
+        let cases = [
+            (OutputSyntax::Text, "P07<\u{10d}>Q", "P07<\\u{10d}>Q"),
+            (OutputSyntax::Text, "P08<\u{200d}>Q", "P08<\\u{200d}>Q"),
+            (
+                OutputSyntax::Text,
+                "A\u{1f60a}\u{ff0a}B",
+                "A\\u{1f60a}\\u{ff0a}B",
+            ),
+            (OutputSyntax::Text, "A\0B", "A\\u{0}B"),
+            (OutputSyntax::Text, "a\u{10d}a\u{10d}", "a\\u{10d}a\\u{10d}"),
+            (
+                OutputSyntax::Text,
+                "A\u{fff1}\u{10d}\u{fff0}",
+                "A\\u{fff1}\\u{10d}\\u{fff0}",
+            ),
+            (
+                OutputSyntax::Json,
+                "{\"name\":\"P07<\u{10d}>Q\"}",
+                r#"{"name":"P07<\u010d>Q"}"#,
+            ),
+            (
+                OutputSyntax::Json,
+                "[\"\\\"\u{1f60a}\\\\\",\"\u{200d}\"]",
+                r#"["\"\ud83d\ude0a\\","\u200d"]"#,
+            ),
+        ];
+        for (syntax, line, want) in cases {
+            let mut output = AnsiTerminal::default();
+
+            let shown = escape_unrendered(line, syntax, &mut output).expect("escape");
+
+            assert_eq!(shown, want, "{syntax:?} {line:?}");
+            if syntax == OutputSyntax::Json {
+                let value: serde_json::Value = serde_json::from_str(&shown).expect("parse");
+                let raw: serde_json::Value = serde_json::from_str(line).expect("parse");
+                assert_eq!(value, raw, "{line:?}: the JSON's values");
+            }
+        }
+    }
+
+    /// A line that the output renders is tested once, whole, and stays borrowed; an empty line
+    /// is not tested; a refused line is tested once more per distinct character.
+    #[test]
+    fn escape_unrendered_tests_a_line_whole_then_each_distinct_character() {
+        let cases: [(&str, &[&str]); 3] = [
+            ("OpCode: CheckBox", &["OpCode: CheckBox"]),
+            ("", &[]),
+            ("a\u{10d}a\u{10d}", &["a\u{10d}a\u{10d}", "a", "\u{10d}"]),
+        ];
+        for (line, want) in cases {
+            let mut output = AnsiTerminal::default();
+
+            let shown = escape_unrendered(line, OutputSyntax::Text, &mut output).expect("escape");
+
+            assert_eq!(output.tested, want, "{line:?}: tested");
+            assert_eq!(
+                matches!(shown, Cow::Borrowed(_)),
+                line.is_ascii(),
+                "{line:?}: borrowed"
+            );
+        }
+    }
+
+    /// A JSON text holds no escape outside its strings, also after one, nor for a string's own
+    /// `"` and `\`, nor for the character after a string's `\`, which the escape it starts holds.
+    #[test]
+    fn escape_unrendered_refuses_json_that_it_cannot_escape() {
+        let cases = [
+            ("{\"a\":1}", '{'),
+            ("{\"a\":1}", '1'),
+            ("{\"a\":1}", '"'),
+            // fails at its first `\`, the string's own (its second, after the first, would too)
+            ("[\"\\\\\"]", '\\'),
+            // fails at its `\`, the string's own
+            ("[\"\\n\"]", '\\'),
+            // fails at its `n`, after the string's `\`
+            ("[\"\\n\"]", 'n'),
+        ];
+        for (line, refused) in cases {
+            let mut output = AnsiTerminal {
+                refused: vec![refused],
+                ..AnsiTerminal::default()
+            };
+
+            let escaped = escape_unrendered(line, OutputSyntax::Json, &mut output);
+
+            assert!(
+                escaped.is_err(),
+                "{line:?} without {refused:?}: {escaped:?}"
+            );
+        }
+    }
+
+    /// A text output that fails fails the escape: no character is written unchecked.
+    #[test]
+    fn escape_unrendered_fails_with_the_output() {
+        struct FailingOutput;
+        impl TextOutput for FailingOutput {
+            fn test_string(&mut self, _text: &str) -> io::Result<bool> {
+                Err(io::Error::other("TestString(): DEVICE_ERROR"))
+            }
+        }
+
+        let escaped = escape_unrendered("A\u{10d}", OutputSyntax::Text, &mut FailingOutput)
+            .map_err(|error| error.to_string());
+
+        assert_eq!(escaped, Err("TestString(): DEVICE_ERROR".to_string()));
+    }
+
+    #[test]
+    fn a_unicode_terminal_renders_every_character() {
+        let line = "\u{10d}\u{200d}\u{1f60a}";
+
+        let shown = escape_unrendered(line, OutputSyntax::Text, &mut UnicodeTerminal);
+
+        assert!(
+            matches!(shown, Ok(Cow::Borrowed(shown)) if shown == line),
+            "{shown:?}"
+        );
     }
 }

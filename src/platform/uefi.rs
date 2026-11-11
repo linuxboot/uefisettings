@@ -39,11 +39,13 @@ use uefi::CStr16;
 use uefi::CString16;
 use uefi::Handle;
 use uefi::StatusExt;
+use uefi_raw::protocol::console::SimpleTextOutputProtocol;
 use uefi_raw::protocol::file_system::FileMode;
 use uefi_raw::protocol::shell::ShellProtocol;
 use uefi_raw::protocol::shell_params::ShellFileHandle;
 use uefi_raw::protocol::shell_params::ShellParametersProtocol;
 use uefi_raw::table::system::SystemTable;
+use uefi_raw::Status;
 use uefisettings::exports::EfivarSource;
 use uefisettings::exports::GetOptions;
 use uefisettings::exports::HiiBackend;
@@ -65,6 +67,7 @@ use uefisettings::secret_file::ShellConsole;
 use uefisettings::secret_file::ShellStdin;
 use uefisettings::secret_file::StdinClaim;
 use uefisettings::secret_file::MAX_SECRET_LEN;
+use uefisettings::terminal_text::TextOutput;
 use uefisettings_backend_thrift::SetResponseList;
 
 use crate::hii_get;
@@ -623,6 +626,43 @@ impl ShellConsole for FirmwareConsole {
             NonNull::new(system_table()?.stdin).ok_or_else(|| io::Error::other("no gST->ConIn"))?;
         // Input is an EFI_SIMPLE_TEXT_INPUT_PROTOCOL under repr(transparent).
         Ok(ConsoleKeystrokes(con_in.cast::<Input>()))
+    }
+}
+
+/// gST->ConOut, which std's stdout writes to (Rust 1.93.1 library/std/src/sys/stdio/uefi.rs
+/// Stdout::write).
+pub(super) fn stdout_output() -> io::Result<FirmwareTextOutput> {
+    NonNull::new(system_table()?.stdout)
+        .map(FirmwareTextOutput)
+        .ok_or_else(|| io::Error::other("no gST->ConOut"))
+}
+
+/// gST->StdErr, which std's stderr writes to (Stderr::write).
+pub(super) fn stderr_output() -> io::Result<FirmwareTextOutput> {
+    NonNull::new(system_table()?.stderr)
+        .map(FirmwareTextOutput)
+        .ok_or_else(|| io::Error::other("no gST->StdErr"))
+}
+
+/// An EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL of the system table, which std writes UTF-16 to: a
+/// character that its TestString() refuses, edk2-stable202608 TerminalDxe writes as its low byte
+/// (TerminalConOut.c:237-241), which can be a control such as CR, so uefisettings escapes it.
+/// A redirect of the UEFI Shell takes every character (ConsoleWrappers.c:258-264).
+pub(super) struct FirmwareTextOutput(NonNull<SimpleTextOutputProtocol>);
+
+impl TextOutput for FirmwareTextOutput {
+    /// TestString() of `text`: Ok(false) for EFI_UNSUPPORTED, and an error for any status but
+    /// that and EFI_SUCCESS, so that nothing is written unchecked.
+    fn test_string(&mut self, text: &str) -> io::Result<bool> {
+        let string: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        // SAFETY: gST->ConOut or gST->StdErr, which boot services keep
+        let test_string = unsafe { self.0.as_ref() }.test_string;
+        // SAFETY: TestString() reads `string` up to the NUL that ends it
+        match unsafe { test_string(self.0.as_ptr(), string.as_ptr()) } {
+            Status::SUCCESS => Ok(true),
+            Status::UNSUPPORTED => Ok(false),
+            status => Err(io::Error::other(format!("TestString(): {status:?}"))),
+        }
     }
 }
 

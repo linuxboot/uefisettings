@@ -15,6 +15,7 @@
 //! for a HiiDB file.
 
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -34,6 +35,7 @@ use uefisettings::exports::VolatileWrites;
 use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::MAX_SECRET_LEN;
+use uefisettings::terminal_text::UnicodeTerminal;
 use uefisettings_backend_thrift::SetResponseList;
 
 use crate::extract_db_report;
@@ -63,6 +65,17 @@ pub(super) const EFIVAR_MEMORY_HELP: &str =
 
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
+
+/// The terminal of stdout, which renders every character: TerminalText and JsonText do all the
+/// escaping.
+pub(super) fn stdout_output() -> io::Result<UnicodeTerminal> {
+    Ok(UnicodeTerminal)
+}
+
+/// The terminal of stderr, as stdout_output's.
+pub(super) fn stderr_output() -> io::Result<UnicodeTerminal> {
+    Ok(UnicodeTerminal)
+}
 
 /// None: ilo and identify need Linux.
 #[derive(Debug, Subcommand)]

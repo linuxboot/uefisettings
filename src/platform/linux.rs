@@ -53,6 +53,7 @@ use uefisettings::secret_file;
 use uefisettings::secret_file::Secret;
 use uefisettings::secret_file::MAX_SECRET_LEN;
 use uefisettings::terminal_text::TerminalText;
+use uefisettings::terminal_text::UnicodeTerminal;
 use uefisettings_backend_thrift::Backend;
 use uefisettings_backend_thrift::MachineInfo;
 use uefisettings_backend_thrift::SetResponseList;
@@ -153,6 +154,17 @@ fn write_log_line(
         "{close} {}",
         TerminalText(&record.args().to_string())
     )
+}
+
+/// The terminal of stdout, which renders every character: TerminalText and JsonText do all the
+/// escaping.
+pub(super) fn stdout_output() -> io::Result<UnicodeTerminal> {
+    Ok(UnicodeTerminal)
+}
+
+/// The terminal of stderr, as stdout_output's.
+pub(super) fn stderr_output() -> io::Result<UnicodeTerminal> {
+    Ok(UnicodeTerminal)
 }
 
 #[derive(Debug, Subcommand)]
