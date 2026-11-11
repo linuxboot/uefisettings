@@ -1527,6 +1527,7 @@ pub(crate) fn constant_condition(scope: &IFROperation) -> Truth {
             | ExpressionOp::EqIdId
             | ExpressionOp::EqIdValList
             | ExpressionOp::QuestionRef1
+            | ExpressionOp::QuestionRef2
             | ExpressionOp::This
             | ExpressionOp::Get
             | ExpressionOp::Set,
@@ -2577,6 +2578,7 @@ enum ExpressionOp {
     EqIdId,
     EqIdValList,
     QuestionRef1,
+    QuestionRef2,
     Constant(Operand),
     Uint8,
     Uint16,
@@ -2631,6 +2633,7 @@ impl OpRole {
             IFROpCode::EqIdId => Self::Expression(E::EqIdId),
             IFROpCode::EqIdValList => Self::Expression(E::EqIdValList),
             IFROpCode::QuestionRef1 => Self::Expression(E::QuestionRef1),
+            IFROpCode::QuestionRef2 => Self::Expression(E::QuestionRef2),
             IFROpCode::True => Self::Expression(E::Constant(Operand::Boolean(Some(1)))),
             IFROpCode::False => Self::Expression(E::Constant(Operand::Boolean(Some(0)))),
             IFROpCode::One => Self::Expression(E::Constant(Operand::Uint(Some(1)))),
@@ -2669,7 +2672,6 @@ impl OpRole {
             IFROpCode::Map => Self::Map,
             IFROpCode::Match
             | IFROpCode::RuleRef
-            | IFROpCode::QuestionRef2
             | IFROpCode::QuestionRef3
             | IFROpCode::ToUint
             | IFROpCode::ToString
@@ -3271,6 +3273,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                     })?
                     .decoded()
             }
+            ExpressionOp::QuestionRef2 => self.question_ref2(op),
             ExpressionOp::Constant(value) => Ok(value),
             ExpressionOp::Uint8 => op
                 .data
@@ -3405,6 +3408,35 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         // an UNDEFINED selected over it drops none, as for a condition that cannot be read
         self.frame.dropped |= other == Operand::Undefined && selected != Operand::Undefined;
         Ok(selected)
+    }
+
+    /// Returns the value of the question of the id that QUESTION_REF2 `op` pops (UEFI 2.11
+    /// §33.3.8.3.56; edk2-stable202608 SetupBrowserDxe/Expression.c:3029-3053).
+    fn question_ref2(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
+        let id = self.popped_question_id(op)?;
+        self.question(op, id)?.decoded()
+    }
+
+    /// Pops the question id of `op`: an unsigned integer up to 0xFFFF, else UNDEFINED, as
+    /// edk2-stable202608 SetupBrowserDxe/Expression.c takes no type above
+    /// EFI_IFR_TYPE_NUM_SIZE_64 (:2894, :3041).
+    fn popped_question_id(&mut self, op: &IFROperation) -> Result<u16, Abort> {
+        match self.pop(op)? {
+            // above 0xFFFF
+            Operand::Uint(Some(value)) => {
+                u16::try_from(value).map_err(|_: std::num::TryFromIntError| Abort::Undefined)
+            }
+            Operand::Uint(None) => Err(Abort::NotEvaluated(format!(
+                "{} on a value that cannot be read",
+                op.op_code.spec_name()
+            ))),
+            Operand::Boolean(_)
+            | Operand::Date(_)
+            | Operand::Time(_)
+            | Operand::String(_)
+            | Operand::Buffer(_)
+            | Operand::Undefined => Err(Abort::Undefined),
+        }
     }
 
     /// Returns the value of question `id`, which `op` refers to: THIS for the question whose READ
@@ -3981,6 +4013,8 @@ mod tests {
     const ONE: u8 = 0x53;
     const UNDEFINED: u8 = 0x55;
     const DUP: u8 = 0x57;
+    const QUESTION_REF2: u8 = 0x41;
+    const UINT32: u8 = 0x44;
 
     fn unreadable(kind: ValueKind) -> QuestionValue {
         QuestionValue::Unreadable {
@@ -7526,6 +7560,121 @@ mod tests {
             );
         }
     }
+
+    /// The value of the EFI_IFR_VALUE expression `expression` with `values`.
+    fn value_with(
+        expression: Vec<u8>,
+        values: &impl QuestionValues,
+    ) -> std::result::Result<u64, String> {
+        let data = [operation(VALUE, true, &[]), expression, END.to_vec()].concat();
+        let root = handle_form_set(&mut Cursor::new(&[data, END.to_vec()].concat()))
+            .expect("parse the VALUE");
+        let scope = Rc::clone(&root.borrow().children[0]);
+        let scope = scope.borrow();
+        evaluate_value(
+            &scope,
+            &mut ExpressionInputs {
+                reader: &mut Efivars::new().reader(),
+                values,
+            },
+        )
+    }
+
+    /// values(), with question 8 the DATE 2026-11-10.
+    fn values_with_a_date() -> MapValues {
+        let MapValues(mut values) = values();
+        values.insert(8, QuestionValue::Date([0xEA, 0x07, 11, 10]));
+        MapValues(values)
+    }
+
+    /// QUESTION_REF2 pushes the value of the question whose id it pops; an id that is no
+    /// unsigned integer up to 0xFFFF, or no question's, gives UNDEFINED, as both UEFI 2.11
+    /// §33.3.8.3.56 and edk2-stable202608 SetupBrowserDxe/Expression.c:3029-3053 say.
+    #[test]
+    fn question_ref2_pushes_the_value_of_the_question_of_the_popped_id() {
+        let undefined = Err("UNDEFINED result".to_string());
+        let unread = |id: u16| {
+            Err(format!(
+                "EFI_IFR_QUESTION_REF2 of question {id:#06x}: <ValueUnavailable: test>"
+            ))
+        };
+        let ref2 = |id: Vec<u8>| scoped_expression(&[id, op(QUESTION_REF2)], 0);
+        let cases = [
+            ("id 1, a UINT", ref2(uint8(1)), Ok(1)),
+            ("id 3, a BOOLEAN", ref2(uint8(3)), Ok(2)),
+            ("id 8, a DATE", ref2(uint8(8)), Ok(0x0A0B_07EA)),
+            (
+                "id 4, a UINT that cannot be read",
+                ref2(uint8(4)),
+                unread(4),
+            ),
+            ("id 6, of another type", ref2(uint8(6)), unread(6)),
+            ("id 9, of no question", ref2(uint8(9)), undefined.clone()),
+            ("id 0, reserved", ref2(uint8(0)), undefined.clone()),
+            (
+                "id 0x10001, over 0xFFFF",
+                ref2(operation(UINT32, false, &0x1_0001u32.to_le_bytes())),
+                undefined.clone(),
+            ),
+            (
+                "the UINT 0x10001 of question 2",
+                ref2(question_ref1(2)),
+                undefined.clone(),
+            ),
+            ("a BOOLEAN", ref2(ifr_true()), undefined.clone()),
+            ("a DATE", ref2(question_ref1(8)), undefined.clone()),
+            ("UNDEFINED", ref2(op(UNDEFINED)), undefined.clone()),
+            (
+                "an id that cannot be read",
+                ref2(question_ref1(4)),
+                Err("EFI_IFR_QUESTION_REF2 on a value that cannot be read".to_string()),
+            ),
+        ];
+        for (name, expression, want) in cases {
+            assert_eq!(
+                value_with(expression, &values_with_a_date()),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// A DISABLE_IF outside forms that relies on a question's value is not known, as UEFI 2.11
+    /// §33.3.8.3.14 allows it constants only; one of constants is.
+    #[test]
+    fn a_disable_if_outside_forms_is_not_known_where_it_relies_on_a_question() {
+        let constant = |condition: Vec<u8>| {
+            let body = operation(CHECKBOX, false, &checkbox(0, 0x00));
+            let data = conditional(DISABLE_IF, condition, &[body]);
+            let root = handle_form_set(&mut Cursor::new(&[data, END.to_vec()].concat()))
+                .expect("parse the DISABLE_IF");
+            let scope = Rc::clone(&root.borrow().children[0]);
+            let scope = scope.borrow();
+            constant_condition(&scope)
+        };
+        let relies_on = |name: &str| {
+            Truth::Unknown(format!(
+                "it relies on EFI_IFR_{name}, where a DISABLE_IF outside forms must only rely on \
+                 constants (UEFI 2.11 §33.3.8.3.14)"
+            ))
+        };
+        let cases = [
+            (
+                "QUESTION_REF2",
+                scoped_expression(&[uint8(1), op(QUESTION_REF2)], 0),
+                relies_on("QUESTION_REF2"),
+            ),
+            (
+                "QUESTION_REF1",
+                question_ref1(1),
+                relies_on("QUESTION_REF1"),
+            ),
+            ("TRUE", ifr_true(), Truth::Known(true)),
+        ];
+        for (name, condition, want) in cases {
+            assert_eq!(constant(condition), want, "{name}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7571,6 +7720,7 @@ mod store_expression_tests {
     const LESS_THAN: u8 = 0x33;
     const EQ_ID_ID: u8 = 0x13;
     const EQ_ID_VAL_LIST: u8 = 0x14;
+    const QUESTION_REF2: u8 = 0x41;
 
     /// The VARSTORE_EFI of the tests, of 5 bytes.
     const STORE: u16 = 2;
@@ -10029,6 +10179,16 @@ mod store_expression_tests {
                 eq_id_val_list(2, 3),
                 ExpressionValue::Boolean(0),
             ),
+            (
+                "QUESTION_REF2 of the read question",
+                scoped_expression(&[uint8(1), op(QUESTION_REF2), op(ONE), op(ADD)], 0),
+                ExpressionValue::Uint(4),
+            ),
+            (
+                "QUESTION_REF2 of another question",
+                scoped_expression(&[uint8(2), op(QUESTION_REF2), op(ONE), op(ADD)], 0),
+                ExpressionValue::Uint(10),
+            ),
         ];
         for (name, expression, want) in cases {
             assert_eq!(read(expression), ReadOutcome::Value(want), "a READ, {name}");
@@ -10060,6 +10220,16 @@ mod store_expression_tests {
             write(question_ref1(2)),
             Ok(Some(vec![vec![9]])),
             "a WRITE, QUESTION_REF1 of another question"
+        );
+        assert_eq!(
+            write([uint8(1), op(QUESTION_REF2)].concat()),
+            Ok(Some(vec![vec![3]])),
+            "a WRITE, QUESTION_REF2 of the written question"
+        );
+        assert_eq!(
+            write([uint8(2), op(QUESTION_REF2)].concat()),
+            Ok(Some(vec![vec![9]])),
+            "a WRITE, QUESTION_REF2 of another question"
         );
     }
 
