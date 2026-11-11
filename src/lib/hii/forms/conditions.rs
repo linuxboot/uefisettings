@@ -3260,18 +3260,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 let ParsedOperation::QuestionRef1(parsed) = &op.parsed_data else {
                     return Err(not_decoded(op));
                 };
-                // edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression fails,
-                // rather than gives UNDEFINED, without the question
-                self.question(op, parsed.question_id)
-                    .map_err(|abort| match abort {
-                        Abort::Undefined => Abort::Malformed(format!(
-                            "{} of missing question {:#06x}",
-                            op.op_code.spec_name(),
-                            parsed.question_id
-                        )),
-                        abort => abort,
-                    })?
-                    .decoded()
+                self.referenced_question(op, parsed.question_id)?.decoded()
             }
             ExpressionOp::QuestionRef2 => self.question_ref2(op),
             ExpressionOp::Constant(value) => Ok(value),
@@ -3457,6 +3446,23 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         }))
     }
 
+    /// Returns question `id`, which QUESTION_REF1 or THIS `op` refers to: edk2-stable202608
+    /// SetupBrowserDxe/Expression.c EvaluateExpression fails, rather than gives UNDEFINED, without
+    /// the question (:2733-2738).
+    fn referenced_question(
+        &mut self,
+        op: &IFROperation,
+        id: u16,
+    ) -> Result<QuestionOperand, Abort> {
+        self.question(op, id).map_err(|abort| match abort {
+            Abort::Undefined => Abort::Malformed(format!(
+                "{} of missing question {id:#06x}",
+                op.op_code.spec_name()
+            )),
+            abort => abort,
+        })
+    }
+
     /// Returns `value` as an operand; for one that cannot be read, notes why, after `subject`.
     fn operand_of(
         &mut self,
@@ -3511,7 +3517,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
                 let id = enclosing_question_id(op).ok_or_else(|| {
                     Abort::Malformed(format!("{} outside a question", op.op_code.spec_name()))
                 })?;
-                return self.question(op, id)?.decoded();
+                return self.referenced_question(op, id)?.decoded();
             }
         };
         self.operand_of(value, || op.op_code.spec_name().to_string())
@@ -7940,6 +7946,62 @@ mod store_expression_tests {
             Truth::Unknown("EFI_IFR_THIS of question 0x0001: <ValueUnavailable: test>".to_string()),
             "unreadable"
         );
+    }
+
+    /// THIS in the EFI_IFR_VALUE of a question pushes that question's value, of each kind that
+    /// a question gives (UEFI 2.11 §33.3.8.3.77); without the question, edk2-stable202608
+    /// SetupBrowserDxe/Expression.c:2733-2738 fails.
+    #[test]
+    fn this_pushes_each_kind_of_question_value() {
+        let value = |values: MapValues| {
+            let (_root, question) = question_holding(&[value_of(op(THIS))]);
+            let scope = Rc::clone(&question.borrow().children[0]);
+            let scope = scope.borrow();
+            evaluate_value(
+                &scope,
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            )
+        };
+        let of = |value: QuestionValue| MapValues(BTreeMap::from([(1, value)]));
+        let unreadable = |kind: ValueKind| QuestionValue::Unreadable {
+            kind,
+            reason: "<ValueUnavailable: test>".to_string(),
+        };
+        let cases = [
+            ("a UINT", of(QuestionValue::Uint(3)), Ok(3)),
+            ("a BOOLEAN", of(QuestionValue::Boolean(1)), Ok(1)),
+            (
+                "a DATE",
+                of(QuestionValue::Date([0xEA, 0x07, 11, 10])),
+                Ok(0x0A0B_07EA),
+            ),
+            (
+                "a TIME",
+                of(QuestionValue::Time([23, 59, 58])),
+                Ok(0x3A_3B17),
+            ),
+            (
+                "a UINT that cannot be read",
+                of(unreadable(ValueKind::Uint)),
+                Err("EFI_IFR_THIS of question 0x0001: <ValueUnavailable: test>".to_string()),
+            ),
+            (
+                "a value of another kind",
+                of(unreadable(ValueKind::Other)),
+                Err("EFI_IFR_THIS of question 0x0001: <ValueUnavailable: test>".to_string()),
+            ),
+            (
+                "no question",
+                MapValues(BTreeMap::new()),
+                Err("malformed expression: EFI_IFR_THIS of missing question 0x0001".to_string()),
+            ),
+        ];
+        for (name, values, want) in cases {
+            assert_eq!(value(values), want, "{name}");
+        }
     }
 
     /// THIS outside a question has no question to push, which edk2 fails on.
