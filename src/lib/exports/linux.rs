@@ -204,10 +204,20 @@ impl HiiBackend {
         source: &HiiSourceOptions,
         unsafe_operations: UnsafeOperations,
     ) -> Result<(Vec<u8>, Vec<UnsafeOperation>)> {
-        match SavedDump::read_given_hiidb(filename, efivars)? {
+        match Self::read_given_hiidb(filename, efivars)? {
             Some(db) => Ok((db, Vec::new())),
             None => extract::extract_db_from(source, unsafe_operations),
         }
+    }
+
+    /// The HiiDB that read_hiidb reads without this machine: the file `filename` if given, else
+    /// the one that an efivars dump in `efivars` saved; None if neither gives one. A redacted dump
+    /// refuses another `filename`, as in read_hiidb.
+    pub fn read_given_hiidb(
+        filename: Option<&Path>,
+        efivars: &EfivarSource,
+    ) -> Result<Option<Vec<u8>>> {
+        SavedDump::read_given_hiidb(filename, efivars)
     }
 
     /// set_using, in this machine's HiiDB read as `source` says, firmware-reserved memory only if

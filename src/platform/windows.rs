@@ -64,6 +64,22 @@ pub(super) const SET_ABOUT: &str = "Set/change the value of a question";
 #[group(skip)]
 pub(super) struct HiiSourceArgs {}
 
+impl HiiSourceArgs {
+    /// Ok: neither flag exists here.
+    pub(super) fn refuse_given(&self, _why: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The Linux build's seam to the HII backend, which its tests replace; empty, as the commands
+/// here reach the HiiDB driver directly.
+pub(super) trait MachineHii {}
+
+/// This machine's firmware.
+pub(super) struct Firmware;
+
+impl MachineHii for Firmware {}
+
 /// Installs no logger, so that log's macros write nothing.
 pub(super) fn init_logging() {}
 
@@ -83,7 +99,7 @@ pub(super) fn stderr_output() -> io::Result<UnicodeTerminal> {
 pub(super) enum PlatformCommands {}
 
 impl PlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
         match *self {}
     }
 }
@@ -97,7 +113,7 @@ pub(super) enum HiiPlatformCommands {
 }
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
         match self {
             Self::ExtractDB { filename } => {
                 write_extracted_db(filename, HiiBackend::export_hiidb)?;
@@ -125,7 +141,12 @@ pub(super) struct HiiDbArgs {
 impl HiiDbArgs {
     /// The HiiDB: the file, else this machine's, through the HiiDB driver, whatever `_source`
     /// names.
-    pub(super) fn read(&self, efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
+    pub(super) fn read(
+        &self,
+        efivars: &EfivarSource,
+        _source: &HiiSourceArgs,
+        _hii: &impl MachineHii,
+    ) -> Result<Vec<u8>> {
         HiiBackend::read_hiidb(self.filename.as_deref(), efivars)
     }
 }
@@ -190,6 +211,7 @@ pub(super) fn auto_get(
     selection: &SelectionArgs,
     _unsafe_operations: &HiiSourceUnsafeArgs,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
@@ -221,9 +243,10 @@ pub(super) fn auto_set(
     _staging: &StagingArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
+    hii: &impl MachineHii,
 ) -> Result<()> {
     let (question, value) = target.target()?;
-    hii_set(question, &value, options, json, source)
+    hii_set(question, &value, options, json, source, hii)
 }
 
 /// HiiBackend::set_using, whatever `_source` names.
@@ -232,6 +255,7 @@ pub(super) fn set_using(
     value: &SetValue,
     options: &SetOptions,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
     HiiBackend::set_using(question, value, None, options)
 }

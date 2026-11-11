@@ -67,6 +67,7 @@ use platform::HiiSourceArgs;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::HiiSourceUnsafeArgs;
 use platform::ListStringsHiiDbArgs;
+use platform::MachineHii;
 use platform::PlatformCommands;
 #[cfg(all(system_hiidb, system_variables))]
 use platform::StagingArgs;
@@ -570,8 +571,9 @@ fn hii_set(
     options: &SetOptions,
     json: bool,
     source: &HiiSourceArgs,
+    hii: &impl MachineHii,
 ) -> Result<()> {
-    let (res, lifted) = platform::set_using(question, value, options, source)?;
+    let (res, lifted) = platform::set_using(question, value, options, source, hii)?;
     print_lifted(&lifted)?;
     print_with_style(res, json)?;
     Ok(())
@@ -673,52 +675,12 @@ fn parse_error_exit_code(error: &clap::Error) -> ExitCode {
     u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
-/// How handle_cmds reads the HiiDB of a hii command, which its tests replace.
-trait HiiDbReader {
-    /// The HiiDB that `hiidb` names, with question values from `efivars`, as `source` says.
-    fn read(
-        &self,
-        hiidb: &HiiDbArgs,
-        efivars: &EfivarSource,
-        source: &HiiSourceArgs,
-    ) -> Result<Vec<u8>>;
-
-    /// The HiiDB that list-strings' `hiidb` names, as `source` says.
-    fn read_for_list_strings(
-        &self,
-        hiidb: &ListStringsHiiDbArgs,
-        source: &HiiSourceArgs,
-    ) -> Result<Vec<u8>>;
-}
-
-/// The reads of this build's platform.
-struct PlatformHiiDb;
-
-impl HiiDbReader for PlatformHiiDb {
-    fn read(
-        &self,
-        hiidb: &HiiDbArgs,
-        efivars: &EfivarSource,
-        source: &HiiSourceArgs,
-    ) -> Result<Vec<u8>> {
-        hiidb.read(efivars, source)
-    }
-
-    fn read_for_list_strings(
-        &self,
-        hiidb: &ListStringsHiiDbArgs,
-        source: &HiiSourceArgs,
-    ) -> Result<Vec<u8>> {
-        hiidb.read(&EfivarSource::Disabled, source)
-    }
-}
-
 fn handle_cmds(args: UefiSettingsToolArgs) -> Result<()> {
-    handle_cmds_with(args, &PlatformHiiDb)
+    handle_cmds_with(args, &platform::Firmware)
 }
 
-/// handle_cmds, with the hii commands' HiiDB read by `reader`.
-fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Result<()> {
+/// handle_cmds, with this machine's HII backend reached through `hii`.
+fn handle_cmds_with(args: UefiSettingsToolArgs, hii: &impl MachineHii) -> Result<()> {
     let source = &args.hii_source;
     match &args.command {
         Commands::Hii(hii_command) => match &hii_command.command {
@@ -734,7 +696,7 @@ fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Re
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 hii_get(
-                    &reader.read(hiidb, &options.efivars, source)?,
+                    &hiidb.read(&options.efivars, source, hii)?,
                     question.selector()?,
                     &options,
                     output.json,
@@ -751,7 +713,7 @@ fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Re
             } => {
                 let (question, value) = target.target()?;
                 let options = set_options(selection, unsafe_operations, volatile, staging);
-                hii_set(question, &value, &options, output.json, source)?
+                hii_set(question, &value, &options, output.json, source, hii)?
             }
             HiiSubcommands::ShowIFR {
                 hiidb,
@@ -764,13 +726,14 @@ fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Re
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let lines = HiiBackend::show_ifr_lines_using(
-                    &reader.read(hiidb, &options.efivars, source)?,
+                    &hiidb.read(&options.efivars, source, hii)?,
                     &options,
                 )?;
                 print_terminal_lines(&lines)?;
             }
             HiiSubcommands::ListStrings { hiidb, output } => {
-                let res = HiiBackend::list_strings(&reader.read_for_list_strings(hiidb, source)?)?;
+                let res =
+                    HiiBackend::list_strings(&hiidb.read(&EfivarSource::Disabled, source, hii)?)?;
                 print_with_style(res, output.json)?;
             }
             HiiSubcommands::ListQuestions {
@@ -784,7 +747,7 @@ fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Re
                 // before the HiiDB is read
                 options.efivars.validate()?;
                 let (res, ignored_ifr) = HiiBackend::list_questions_and_ignored_ifr_using(
-                    &reader.read(hiidb, &options.efivars, source)?,
+                    &hiidb.read(&options.efivars, source, hii)?,
                     &options,
                 )?;
                 print_with_style(res, output.json)?;
@@ -793,7 +756,7 @@ fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Re
                     print_warning(format_args!("questions may be in {ignored}"))?;
                 }
             }
-            HiiSubcommands::Platform(command) => command.run(source)?,
+            HiiSubcommands::Platform(command) => command.run(source, hii)?,
         },
         #[cfg(all(system_hiidb, system_variables))]
         Commands::Get {
@@ -801,7 +764,14 @@ fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Re
             output,
             selection,
             unsafe_operations,
-        } => platform::auto_get(question, output.json, selection, unsafe_operations, source)?,
+        } => platform::auto_get(
+            question,
+            output.json,
+            selection,
+            unsafe_operations,
+            source,
+            hii,
+        )?,
         #[cfg(all(system_hiidb, system_variables))]
         Commands::Set {
             target,
@@ -812,16 +782,31 @@ fn handle_cmds_with(args: UefiSettingsToolArgs, reader: &impl HiiDbReader) -> Re
             staging,
         } => {
             let options = set_options(selection, unsafe_operations, volatile, staging);
-            platform::auto_set(target, output.json, selection, staging, &options, source)?
+            platform::auto_set(
+                target,
+                output.json,
+                selection,
+                staging,
+                &options,
+                source,
+                hii,
+            )?
         }
         Commands::ShowTranslations { output } => {
+            source.refuse_given("show-translations reads none")?;
             print_with_style(&*translation_db, output.json)?;
         }
         #[cfg(system_variables)]
-        Commands::Variable(command) => command.run()?,
+        Commands::Variable(command) => {
+            source.refuse_given("variable reads none")?;
+            command.run()?
+        }
         #[cfg(system_variables)]
-        Commands::Capsule(command) => command.run()?,
-        Commands::Platform(command) => command.run(source)?,
+        Commands::Capsule(command) => {
+            source.refuse_given("capsule reads none")?;
+            command.run()?
+        }
+        Commands::Platform(command) => command.run(source, hii)?,
     }
     Ok(())
 }
@@ -2273,77 +2258,6 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(is_broken_pipe(&error.into()));
-    }
-
-    /// Each hii command that reads the HiiDB reads it from the source that --hii-source and
-    /// --efivar-memory name, before `hii`, between it and the command or after the command: a
-    /// reader that records the source it is given, then fails, stops each.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn hii_commands_read_the_hiidb_from_the_flags_source() {
-        #[derive(Default)]
-        struct RecordingReader(std::cell::RefCell<Vec<HiiSourceArgs>>);
-
-        impl RecordingReader {
-            fn record(&self, source: &HiiSourceArgs) -> Result<Vec<u8>> {
-                self.0.borrow_mut().push(source.clone());
-                Err(anyhow!("recorded"))
-            }
-        }
-
-        impl HiiDbReader for RecordingReader {
-            fn read(
-                &self,
-                _: &HiiDbArgs,
-                _: &EfivarSource,
-                source: &HiiSourceArgs,
-            ) -> Result<Vec<u8>> {
-                self.record(source)
-            }
-
-            fn read_for_list_strings(
-                &self,
-                _: &ListStringsHiiDbArgs,
-                source: &HiiSourceArgs,
-            ) -> Result<Vec<u8>> {
-                self.record(source)
-            }
-        }
-
-        let flags = [
-            "--hii-source",
-            "systab",
-            "--efivar-memory",
-            "firmware-reserved",
-        ];
-        let commands: [&[&str]; 4] = [
-            &["get", "Q", "--no-efivars"],
-            &["show-ifr", "--no-efivars"],
-            &["list-questions", "--no-efivars"],
-            &["list-strings"],
-        ];
-        for command in commands {
-            for argv in [
-                [&["uefisettings", "hii"][..], command, &flags].concat(),
-                [&["uefisettings", "hii"][..], &flags, command].concat(),
-                [&["uefisettings"][..], &flags, &["hii"], command].concat(),
-            ] {
-                let args = UefiSettingsToolArgs::try_parse_from(&argv)
-                    .unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
-                let given = args.hii_source.clone();
-                let defaults =
-                    UefiSettingsToolArgs::try_parse_from(["uefisettings", "show-translations"])
-                        .expect("parse the defaults")
-                        .hii_source;
-                assert_ne!(given, defaults, "{argv:?}: the flags");
-                let reader = RecordingReader::default();
-
-                let error = handle_cmds_with(args, &reader).expect_err("the reader fails");
-
-                assert_eq!(error.to_string(), "recorded", "{argv:?}");
-                assert_eq!(reader.0.into_inner(), vec![given], "{argv:?}: read from");
-            }
-        }
     }
 
     /// --hii-source and --efivar-memory exist on the Linux build only, the one build that reads

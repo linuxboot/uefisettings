@@ -112,6 +112,22 @@ pub(super) const SET_LONG_ABOUT: &str = "Set/change the value of a question.\n\n
 #[group(skip)]
 pub(super) struct HiiSourceArgs {}
 
+impl HiiSourceArgs {
+    /// Ok: neither flag exists here.
+    pub(super) fn refuse_given(&self, _why: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The Linux build's seam to the HII backend, which its tests replace; empty, as the commands
+/// here reach the HII Database Protocol directly.
+pub(super) trait MachineHii {}
+
+/// This firmware.
+pub(super) struct Firmware;
+
+impl MachineHii for Firmware {}
+
 /// What set and keyword set refuse here without --i-am-fine-to-brick-this-system.
 const SETUP_PASSWORD_WRITE: &str = "a write in a HiiDB that declares a setup password question, \
                                     which the UEFI Shell, running no setup browser, neither asks \
@@ -134,7 +150,7 @@ pub(super) enum PlatformCommands {
 }
 
 impl PlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
         match self {
             Self::ApplyStaged { nonce } => apply_staged(nonce),
         }
@@ -176,7 +192,7 @@ pub(super) enum HiiPlatformCommands {
 }
 
 impl HiiPlatformCommands {
-    pub(super) fn run(&self, _source: &HiiSourceArgs) -> Result<()> {
+    pub(super) fn run(&self, _source: &HiiSourceArgs, _hii: &impl MachineHii) -> Result<()> {
         match self {
             Self::VariableInfo { name, guid } => print_info(name, guid),
             Self::Keyword(command) => command.run(),
@@ -297,7 +313,12 @@ pub(super) struct HiiDbArgs {}
 
 impl HiiDbArgs {
     /// The HiiDB of this firmware, whatever `_efivars` and `_source` name.
-    pub(super) fn read(&self, _efivars: &EfivarSource, _source: &HiiSourceArgs) -> Result<Vec<u8>> {
+    pub(super) fn read(
+        &self,
+        _efivars: &EfivarSource,
+        _source: &HiiSourceArgs,
+        _hii: &impl MachineHii,
+    ) -> Result<Vec<u8>> {
         HiiBackend::export_hiidb()
     }
 }
@@ -368,6 +389,7 @@ pub(super) fn auto_get(
     selection: &SelectionArgs,
     _unsafe_operations: &HiiSourceUnsafeArgs,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<()> {
     hii_get(
         &HiiBackend::export_hiidb()?,
@@ -385,9 +407,10 @@ pub(super) fn auto_set(
     _staging: &StagingArgs,
     options: &SetOptions,
     source: &HiiSourceArgs,
+    hii: &impl MachineHii,
 ) -> Result<()> {
     let (question, value) = target.target()?;
-    hii_set(question, &value, options, json, source)
+    hii_set(question, &value, options, json, source, hii)
 }
 
 /// HiiBackend::set_using, whatever `_source` names.
@@ -396,6 +419,7 @@ pub(super) fn set_using(
     value: &SetValue,
     options: &SetOptions,
     _source: &HiiSourceArgs,
+    _hii: &impl MachineHii,
 ) -> Result<(SetResponseList, Vec<UnsafeOperation>)> {
     HiiBackend::set_using(question, value, None, options)
 }
