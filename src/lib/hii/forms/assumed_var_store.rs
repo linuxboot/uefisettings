@@ -64,17 +64,6 @@ pub enum AssumedVarStoreError {
     Size { offset: u16, bytes: usize },
 }
 
-impl AssumedVarStore {
-    /// `byte` at byte 0 of the payload of the VarStore of `variable`.
-    pub(super) fn first_byte(variable: VariableKey, byte: u8) -> Self {
-        Self {
-            variable: efivar_file_named(variable),
-            offset: 0,
-            bytes: vec![byte],
-        }
-    }
-}
-
 /// `variable` named as its efivar file names it: '!' for each '/'.
 fn efivar_file_named(variable: VariableKey) -> VariableKey {
     VariableKey {

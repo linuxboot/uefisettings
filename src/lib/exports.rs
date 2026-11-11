@@ -243,7 +243,6 @@ use crate::translation::translate_response;
 use crate::translation::HiiTranslation;
 use crate::unsafe_operations::PendingOperations;
 
-pub use crate::hii::forms::AccessLevel;
 pub use crate::hii::forms::AssumedVarStore;
 pub use crate::hii::forms::AssumedVarStoreError;
 pub use crate::hii::forms::IgnoredIfr;
@@ -605,8 +604,6 @@ pub struct GetOptions {
     pub include: IncludedStates,
     /// Where to read question values
     pub efivars: EfivarSource,
-    /// The AMI Setup access level that conditions read instead of the stored one, if stated
-    pub access_level: Option<AccessLevel>,
     /// The VarStore bytes that conditions read in place of those their variables hold, as
     /// --assume-var-store states them
     pub assume_var_stores: Vec<AssumedVarStore>,
@@ -630,8 +627,6 @@ pub enum SetValue {
 pub struct SetOptions {
     /// The states of the questions and options to select too
     pub include: IncludedStates,
-    /// The AMI Setup access level that conditions read instead of the stored one, if stated
-    pub access_level: Option<AccessLevel>,
     /// The VarStore bytes that conditions read in place of those their variables hold, as
     /// --assume-var-store states them
     pub assume_var_stores: Vec<AssumedVarStore>,
@@ -661,8 +656,6 @@ pub struct ListQuestionsOptions {
     pub include: IncludedStates,
     /// Where to read question values
     pub efivars: EfivarSource,
-    /// The AMI Setup access level that conditions read instead of the stored one, if stated
-    pub access_level: Option<AccessLevel>,
     /// The VarStore bytes that conditions read in place of those their variables hold, as
     /// --assume-var-store states them
     pub assume_var_stores: Vec<AssumedVarStore>,
@@ -958,12 +951,10 @@ impl HiiBackend {
             .iter()
             .flat_map(package::ParsedPackageList::ignored_records)
             .collect();
-        forms::check_access_level(
+        let assumed = forms::check_assumed(
             parsed_db.iter().flat_map(|list| &list.forms),
-            options.access_level,
+            &options.assume_var_stores,
         )?;
-        let stated = forms::with_access_level(options.access_level, &options.assume_var_stores);
-        let assumed = forms::check_assumed(parsed_db.iter().flat_map(|list| &list.forms), &stated)?;
         let requested = text_languages(options.language.as_deref(), platform_lang);
         for list in parsed_db {
             list.check_form_strings()?;
@@ -1113,13 +1104,11 @@ impl HiiBackend {
         let (question_variations, new_value_variations, is_translated) =
             spellings(&question, new_value);
 
-        let stated = forms::with_access_level(options.access_level, &options.assume_var_stores);
         let (selected, assumed) = select_for_set(
             &parsed_db,
             &question,
             &question_variations,
             options,
-            &stated,
             &text_languages(options.language.as_deref(), platform_lang),
             &mut unsafe_operations,
             &mut reader,
@@ -1254,12 +1243,10 @@ impl HiiBackend {
         let (question_variations, _, is_translated) = spellings(&question, "");
 
         let (parsed_db, mut reader) = read_db_withholding(db_bytes, variables, exported)?;
-        forms::check_access_level(
+        let assumed = forms::check_assumed(
             parsed_db.iter().flat_map(|list| &list.forms),
-            options.access_level,
+            &options.assume_var_stores,
         )?;
-        let stated = forms::with_access_level(options.access_level, &options.assume_var_stores);
-        let assumed = forms::check_assumed(parsed_db.iter().flat_map(|list| &list.forms), &stated)?;
         let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
         check_unambiguous(&parsed_db, &question, &question_variations)?;
         let statements = keyword_statements(&parsed_db, &question)?;
@@ -1504,12 +1491,12 @@ struct Selected<'a> {
 }
 
 /// set's phase before its first write, so that no error follows a write: checks every package
-/// list of `parsed_db`, the stated access level, the VarStore bytes that `stated` states
-/// (check_assumed) and that `question` is unambiguous (check_unambiguous), then
+/// list of `parsed_db`, the stated VarStore bytes (check_assumed) and that `question` is
+/// unambiguous (check_unambiguous), then
 /// selects, in each FormSet, the question of `question` that set writes, by prompt any of
 /// `question_variations`, its texts shown in the languages `requested` takes
 /// (ParsedPackageList::texts), reading each range once with `reader`; returns them with their
-/// package list, and `stated` checked, or SelectionError::Excluded for `question` if each
+/// package list, and those bytes checked, or SelectionError::Excluded for `question` if each
 /// FormSet skips it for its states, or else MaybeInIgnoredIfr if none holds it and read_db
 /// ignores IFR of `parsed_db`. It takes the write of each that EFI_IFR_FLAG_READ_ONLY makes
 /// read-only into `unsafe_operations`.
@@ -1518,22 +1505,20 @@ struct Selected<'a> {
     reason = "select's inputs, the unsafe operations it takes in, and the driver that holds the \
               values of the others"
 )]
-fn select_for_set<'a, 's>(
+fn select_for_set<'a, 'o>(
     parsed_db: &'a [package::ParsedPackageList],
     question: &QuestionSelector,
     question_variations: &BTreeSet<String>,
-    options: &SetOptions,
-    stated: &'s [AssumedVarStore],
+    options: &'o SetOptions,
     requested: &[&str],
     unsafe_operations: &mut PendingOperations,
     reader: &mut EfivarReader,
     held: Option<&dyn DriverHeldValues>,
-) -> Result<(Vec<Selected<'a>>, forms::CheckedVarStores<'s>)> {
-    forms::check_access_level(
+) -> Result<(Vec<Selected<'a>>, forms::CheckedVarStores<'o>)> {
+    let assumed = forms::check_assumed(
         parsed_db.iter().flat_map(|list| &list.forms),
-        options.access_level,
+        &options.assume_var_stores,
     )?;
-    let assumed = forms::check_assumed(parsed_db.iter().flat_map(|list| &list.forms), stated)?;
     parsed_db
         .iter()
         .try_for_each(package::ParsedPackageList::check_form_strings)?;
@@ -2006,7 +1991,6 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::SHORT_VAR_STORE_GUID;
     use crate::hii::forms::ifr_fixtures::SUBTITLE;
     use crate::hii::forms::ifr_fixtures::SUPPRESS_IF;
-    use crate::hii::forms::ifr_fixtures::SYSTEM_ACCESS_GUID;
     use crate::hii::forms::ifr_fixtures::THIS;
     use crate::hii::forms::ifr_fixtures::TIME;
     use crate::hii::forms::ifr_fixtures::VALUE;
@@ -9671,7 +9655,6 @@ mod tests {
             &BTreeSet::from(["Q".to_string()]),
             &SetOptions::default(),
             &[],
-            &[],
             &mut PendingOperations::new(UnsafeOperations::Refuse),
             &mut EfivarReader::with_variables(Box::new(MemoryVariables::default())),
             Some(&staging),
@@ -9778,7 +9761,6 @@ mod tests {
                 "from an OS, with every other option",
                 [callback.clone(), password_hiidb()].concat(),
                 VariableReach::Runtime,
-                // --access-level needs AMI's SystemAccess VarStore, which this HiiDB lacks
                 SetOptions {
                     include: IncludedStates::all(),
                     assume_var_stores: statements(&[
@@ -11519,13 +11501,20 @@ mod tests {
         );
     }
 
+    /// 11111111-1111-1111-1111-111111111111, as stored: the GUID of the VarStore Mode of
+    /// stated_var_store_hiidb.
+    const MODE_GUID: [u8; 16] = [0x11; 16];
+    /// The efivar file of the VarStore Mode of stated_var_store_hiidb.
+    const MODE: &str = "Mode-11111111-1111-1111-1111-111111111111";
+
     /// A HiiDB of two package lists: one whose FormSet declares no VarStore, then one whose
-    /// question Q, on the EFI variable Setup, is grayed out when question 2, on `var_store`, is 1.
-    fn access_level_hiidb(var_store: Vec<u8>) -> Vec<u8> {
+    /// question Q, at byte 0 of the EFI variable Setup, a GRAY_OUT_IF grays out while question 2,
+    /// at byte 0 of the 1-byte buffer VarStore Mode, is 1.
+    fn stated_var_store_hiidb() -> Vec<u8> {
         let packages = [
             form_package(&[
                 var_store_efi(1, "Setup", NV_BS_RT, 1),
-                var_store,
+                var_store(2, MODE_GUID, "Mode", 1),
                 form(
                     1,
                     &[
@@ -11542,174 +11531,6 @@ mod tests {
             package_list_with_guid([0x55; 16], &packages.concat()),
         ]
         .concat()
-    }
-
-    /// set selects at a stated access level, before any write, and refuses one for a HiiDB that
-    /// declares no SystemAccess.
-    #[cfg(efivar_dumps)]
-    #[test]
-    fn set_selects_at_the_stated_access_level() {
-        let ami = access_level_hiidb(var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1));
-        let other = access_level_hiidb(var_store(2, [0; 16], "SystemAccess", 1));
-        let efivars = tempfile::tempdir().expect("create efivars directory");
-        fs::write(
-            efivars
-                .path()
-                .join("Setup-00000000-0000-0000-0000-000000000000"),
-            [7, 0, 0, 0, 1],
-        )
-        .expect("write efivar file");
-        let select = |hiidb: &[u8], access_level| {
-            let options = SetOptions {
-                access_level,
-                ..SetOptions::default()
-            };
-            select_for_set(
-                &package::read_db(hiidb).expect("parse the HiiDB"),
-                &QuestionSelector::from("Q"),
-                &BTreeSet::from(["Q".to_string()]),
-                &options,
-                &forms::with_access_level(access_level, &[]),
-                &[],
-                &mut PendingOperations::new(UnsafeOperations::Refuse),
-                &mut EfivarReader::new(EfivarSource::Directory(efivars.path().to_path_buf()))
-                    .expect("create a reader of the efivars directory"),
-                None,
-            )
-            .map(|(selected, _)| {
-                selected
-                    .into_iter()
-                    .map(|selected| selected.descriptor.question)
-                    .collect::<Vec<_>>()
-            })
-        };
-
-        assert_eq!(
-            select(&ami, Some(AccessLevel::Administrator)).expect("select as Administrator"),
-            ["Q"],
-            "Administrator"
-        );
-        let user = select(&ami, Some(AccessLevel::User)).expect_err("select as User");
-        assert_eq!(
-            user.downcast_ref::<SelectionError>(),
-            Some(&SelectionError::Excluded {
-                question: "Q".to_string(),
-                states: IncludedStates::GRAYED_OUT,
-            }),
-            "User: {user:#}"
-        );
-        let no_level = select(&ami, None).expect_err("select without a level");
-        assert!(
-            matches!(
-                no_level.downcast_ref::<SelectionError>(),
-                Some(SelectionError::Undetermined { states, .. })
-                    if *states == IncludedStates::GRAYED_OUT
-            ),
-            "no level: {no_level:#}"
-        );
-        for level in [AccessLevel::Administrator, AccessLevel::User] {
-            assert_eq!(
-                select(&other, Some(level)).map_err(|error| error.to_string()),
-                Err(
-                    "--access-level applies to AMI firmware whose HiiDB declares the \
-                     SystemAccess VarStore; this HiiDB declares none"
-                        .to_string()
-                ),
-                "{level:?}, SystemAccess of NIL_GUID"
-            );
-        }
-    }
-
-    /// get and list-questions evaluate the conditions on AMI firmware's SystemAccess at a
-    /// stated access level, and refuse one for a HiiDB that declares no SystemAccess.
-    #[test]
-    fn options_state_the_access_level() {
-        let ami = access_level_hiidb(var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1));
-        let other = access_level_hiidb(var_store(2, [0; 16], "SystemAccess", 1));
-        let get = |hiidb: &[u8], access_level| {
-            let options = GetOptions {
-                efivars: EfivarSource::Disabled,
-                access_level,
-                ..GetOptions::default()
-            };
-            HiiBackend::get_using(hiidb, "Q", None, &options).map(|got| {
-                got.responses
-                    .into_iter()
-                    .map(|response| response.question.answer)
-                    .collect::<Vec<_>>()
-            })
-        };
-        let list = |hiidb: &[u8], access_level| {
-            let options = ListQuestionsOptions {
-                efivars: EfivarSource::Disabled,
-                access_level,
-                ..ListQuestionsOptions::default()
-            };
-            HiiBackend::list_questions_using(hiidb, &options).map(|listed| {
-                listed
-                    .into_iter()
-                    .filter(|question| question.name == "Q")
-                    .map(|question| question.answer)
-                    .collect::<Vec<_>>()
-            })
-        };
-        let not_read = "<ValueUnavailable: EFI variables not read> <IFR default: 0>";
-
-        let administrator = Some(AccessLevel::Administrator);
-        assert_eq!(
-            get(&ami, administrator).expect("get as Administrator"),
-            [not_read],
-            "get as Administrator"
-        );
-        assert_eq!(
-            list(&ami, administrator).expect("list as Administrator"),
-            [not_read],
-            "list-questions as Administrator"
-        );
-        let user = Some(AccessLevel::User);
-        let error = get(&ami, user).expect_err("get as User");
-        assert_eq!(
-            error.downcast_ref::<SelectionError>(),
-            Some(&SelectionError::Excluded {
-                question: "Q".to_string(),
-                states: IncludedStates::GRAYED_OUT,
-            }),
-            "get as User: {error:#}"
-        );
-        assert_eq!(
-            list(&ami, user).expect("list as User"),
-            Vec::<String>::new(),
-            "list-questions as User"
-        );
-
-        let refusal = "--access-level applies to AMI firmware whose HiiDB declares the \
-                       SystemAccess VarStore; this HiiDB declares none";
-        for level in [administrator, user] {
-            assert_eq!(
-                get(&other, level).map_err(|error| error.to_string()),
-                Err(refusal.to_string()),
-                "get, {level:?}, SystemAccess of NIL_GUID"
-            );
-            assert_eq!(
-                list(&other, level).map_err(|error| error.to_string()),
-                Err(refusal.to_string()),
-                "list-questions, {level:?}, SystemAccess of NIL_GUID"
-            );
-        }
-        assert!(get(&other, None).is_ok(), "get, no level");
-        assert!(list(&other, None).is_ok(), "list-questions, no level");
-    }
-
-    /// 11111111-1111-1111-1111-111111111111, as stored: the GUID of the VarStore Mode of
-    /// stated_var_store_hiidb.
-    const MODE_GUID: [u8; 16] = [0x11; 16];
-    /// The efivar file of the VarStore Mode of stated_var_store_hiidb.
-    const MODE: &str = "Mode-11111111-1111-1111-1111-111111111111";
-
-    /// A HiiDB whose Q, at byte 0 of Setup, a GRAY_OUT_IF grays out while question 2, at byte 0
-    /// of the 1-byte buffer VarStore Mode, is 1.
-    fn stated_var_store_hiidb() -> Vec<u8> {
-        access_level_hiidb(var_store(2, MODE_GUID, "Mode", 1))
     }
 
     /// `texts` as --assume-var-store takes them.
@@ -11747,7 +11568,6 @@ mod tests {
                 &QuestionSelector::from("Q"),
                 &BTreeSet::from(["Q".to_string()]),
                 &options,
-                &options.assume_var_stores,
                 &[],
                 &mut PendingOperations::new(UnsafeOperations::Refuse),
                 &mut EfivarReader::new(EfivarSource::Directory(efivars.path().to_path_buf()))

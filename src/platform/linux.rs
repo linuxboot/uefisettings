@@ -585,7 +585,6 @@ fn refuse_on_ilo<'a>(question: &'a QuestionArgs, selection: &SelectionArgs) -> R
         ("--keyword", question.selector.keyword.is_some()),
         ("--keyword-namespace", question.keyword_namespace.is_some()),
         ("--include", !selection.include.include.is_empty()),
-        ("--access-level", selection.access_level.is_some()),
         ("--assume-var-store", !selection.assume_var_store.is_empty()),
         ("--language", selection.language.language.is_some()),
     ]
@@ -1311,7 +1310,7 @@ mod tests {
 
     /// get and set refuse --hii-source and --efivar-memory where they take the Ilo backend, which
     /// reads no HiiDB, after identify only; without them, the Ilo branch runs (its refusal of
-    /// --access-level shows it, before the BMC is reached). identify refuses --efivar-memory,
+    /// --assume-var-store shows it, before the BMC is reached). identify refuses --efivar-memory,
     /// whose memory its efivar method never reads, before it identifies.
     #[test]
     fn the_flags_are_refused_where_only_identify_would_see_them() {
@@ -1323,11 +1322,22 @@ mod tests {
         };
         for (command, why) in [
             (
-                &["get", "Q", "--access-level", "user"][..],
+                &[
+                    "get",
+                    "Q",
+                    "--assume-var-store",
+                    "Mode-11111111-1111-1111-1111-111111111111=01",
+                ][..],
                 "get takes the Ilo backend of this machine, which reads none",
             ),
             (
-                &["set", "Q", "V", "--access-level", "user"],
+                &[
+                    "set",
+                    "Q",
+                    "V",
+                    "--assume-var-store",
+                    "Mode-11111111-1111-1111-1111-111111111111=01",
+                ],
                 "set takes the Ilo backend of this machine, which reads none",
             ),
         ] {
@@ -1345,8 +1355,8 @@ mod tests {
             assert_eq!(
                 run(command, &hii),
                 Err(
-                    "--access-level applies to the HII backend, not to the Ilo backend of this \
-                     machine"
+                    "--assume-var-store applies to the HII backend, not to the Ilo backend of \
+                     this machine"
                         .to_owned()
                 ),
                 "{command:?} without flags"
@@ -1493,14 +1503,6 @@ mod tests {
                 Err("--include applies to the HII backend, not to the Ilo backend of this machine"),
             ),
             (
-                "--access-level",
-                vec!["--access-level", "user"],
-                Err(
-                    "--access-level applies to the HII backend, not to the Ilo backend of this \
-                     machine",
-                ),
-            ),
-            (
                 "--assume-var-store",
                 vec![
                     "--assume-var-store",
@@ -1525,14 +1527,6 @@ mod tests {
                 ),
             ),
             (
-                "--include and --access-level",
-                vec!["--include", "grayed-out", "--access-level", "user"],
-                Err(
-                    "--include and --access-level apply to the HII backend, not to the Ilo \
-                     backend of this machine",
-                ),
-            ),
-            (
                 "--language",
                 vec!["--language", "fr-FR"],
                 Err(
@@ -1540,18 +1534,18 @@ mod tests {
                 ),
             ),
             (
-                "--include, --access-level and --language",
+                "--include, --assume-var-store and --language",
                 vec![
                     "--include",
                     "grayed-out",
-                    "--access-level",
-                    "user",
+                    "--assume-var-store",
+                    "Mode-11111111-1111-1111-1111-111111111111=01",
                     "--language",
                     "fr-FR",
                 ],
                 Err(
-                    "--include, --access-level and --language apply to the HII backend, not to \
-                     the Ilo backend of this machine",
+                    "--include, --assume-var-store and --language apply to the HII backend, not \
+                     to the Ilo backend of this machine",
                 ),
             ),
         ];

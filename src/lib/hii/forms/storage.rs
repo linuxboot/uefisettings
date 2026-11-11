@@ -201,19 +201,6 @@ pub(super) enum VariableStoreKind {
     EfiVariable,
 }
 
-/// The Name and Guid of a VarStore, which name its variable whatever its kind.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(super) struct VarStoreVariable {
-    pub(super) name: &'static str,
-    pub(super) guid: Guid,
-}
-
-impl VarStoreVariable {
-    pub(super) fn identifies(self, store: &dyn VariableStore) -> bool {
-        store.guid() == self.guid && store.name() == self.name
-    }
-}
-
 #[cfg(test)]
 #[cfg(efivar_dumps)]
 mod non_efi_varstore_tests {
@@ -997,20 +984,33 @@ mod non_efi_varstore_tests {
                 "<ValueUnavailable: CHECKBOX value 256 over a byte>",
             ),
             (
-                ValueUnavailable::AmiAccessLevel(Box::new(ValueUnavailable::NotRead(
-                    EfivarsNotRead,
-                ))),
-                "<ValueUnavailable: EFI variables not read; the AMI setup browser keeps its \
-                 access level there (0 Administrator, 1 User); \
-                 --access-level administrator|user states one>",
+                ValueUnavailable::Unstated {
+                    reason: Box::new(ValueUnavailable::ReadError(
+                        "failed to read bytes: entity not found".into(),
+                    )),
+                    key: variable_key("Setup"),
+                    bytes: vec![Range { start: 2, end: 4 }],
+                },
+                "<VStoreError: failed to read bytes: entity not found; --assume-var-store \
+                 Setup-00000000-0000-0000-0000-000000000000+2=<HEX of 2 bytes> states it>",
             ),
             (
-                ValueUnavailable::AmiAccessLevel(Box::new(ValueUnavailable::ReadError(
-                    "failed to read bytes: entity not found".into(),
-                ))),
-                "<VStoreError: failed to read bytes: entity not found; the AMI setup browser \
-                 keeps its access level there (0 Administrator, 1 User); \
-                 --access-level administrator|user states one>",
+                ValueUnavailable::Unstated {
+                    reason: Box::new(ValueUnavailable::PartlyStated {
+                        reason: Box::new(ValueUnavailable::Truncated { offset: 0, len: 6 }),
+                        key: variable_key("a/b"),
+                        stated: vec![1..2, 3..4],
+                        unstated: vec![0..1, 2..3, 4..5],
+                    }),
+                    key: variable_key("a/b"),
+                    bytes: vec![0..1, 2..3, 4..5],
+                },
+                "<ExtractEFIDataError: failed to fill whole buffer (offset: 0; buflen: 6); bytes \
+                 1..2, 3..4 of a!b-00000000-0000-0000-0000-000000000000 stated, 0..1, 2..3, 4..5 \
+                 not; --assume-var-store a!b-00000000-0000-0000-0000-000000000000+0=<HEX of 1 \
+                 byte>, --assume-var-store a!b-00000000-0000-0000-0000-000000000000+2=<HEX of 1 \
+                 byte> and --assume-var-store a!b-00000000-0000-0000-0000-000000000000+4=<HEX of \
+                 1 byte> state them>",
             ),
         ];
         for (reason, want) in cases {
@@ -1342,13 +1342,6 @@ pub(super) enum ValueUnavailable {
         key: VariableKey,
         bytes: Vec<Range<usize>>,
     },
-    /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
-    /// level replaces it only in conditions
-    #[error(
-        "{0}; the AMI setup browser keeps its access level there (0 Administrator, 1 User); \
-         --access-level administrator|user states one"
-    )]
-    AmiAccessLevel(Box<ValueUnavailable>),
 }
 
 impl ValueUnavailable {
@@ -1407,8 +1400,7 @@ impl ValueUnavailable {
             | Self::StoredString(_)
             | Self::SnapshotStringDigits
             | Self::SnapshotStringLength { .. }
-            | Self::Unstated { .. }
-            | Self::AmiAccessLevel(_) => None,
+            | Self::Unstated { .. } => None,
         }
     }
 
@@ -1419,14 +1411,12 @@ impl ValueUnavailable {
         format!("<{}: {self}>", self.tag())
     }
 
-    /// to_answer's tag: AmiAccessLevel keeps the tag of its reason.
+    /// to_answer's tag: PartlyStated and Unstated keep the tag of their reason.
     fn tag(&self) -> &'static str {
         match self {
             Self::ReadError(_) => "VStoreError",
             Self::Truncated { .. } => "ExtractEFIDataError",
-            Self::AmiAccessLevel(reason)
-            | Self::PartlyStated { reason, .. }
-            | Self::Unstated { reason, .. } => reason.tag(),
+            Self::PartlyStated { reason, .. } | Self::Unstated { reason, .. } => reason.tag(),
             Self::NoVarStore(_)
             | Self::Storageless(_)
             | Self::Expression(_)

@@ -504,28 +504,6 @@ fn set_read_only_numeric_is_refused_without_the_unsafe_flag() {
     }
 }
 
-/// set, through hii set and set, refuses --access-level on a HiiDB that declares no SystemAccess
-/// VarStore, and writes nothing.
-#[test]
-fn set_with_an_access_level_is_refused_without_system_access() {
-    for prefix in PREFIXES {
-        for level in ["administrator", "user"] {
-            assert_eq!(
-                refuse(
-                    prefix,
-                    ONE_OF,
-                    "My one-of text #3",
-                    &["--access-level", level]
-                )
-                .error_message,
-                "--access-level applies to AMI firmware whose HiiDB declares the SystemAccess \
-                 VarStore; this HiiDB declares none",
-                "{prefix:?} {level}"
-            );
-        }
-    }
-}
-
 /// set, through hii set and set, refuses --assume-var-store of a VarStore that no FormSet of the
 /// HiiDB declares, and writes nothing.
 #[test]

@@ -42,7 +42,6 @@ use crate::exports::set_refusal;
 use crate::exports::DriverHeldValues;
 use crate::exports::QuestionList;
 use crate::exports::SetOptions;
-use crate::hii::forms::with_access_level;
 use crate::hii::forms::AssumedVarStore;
 use crate::hii::forms::DriverHeldQuestion;
 use crate::hii::forms::IncludedStates;
@@ -77,7 +76,7 @@ impl NextBootStaging {
             image: options.staging_image.clone(),
             esp: options.staging_esp.clone(),
             include: options.include,
-            assume_var_stores: with_access_level(options.access_level, &options.assume_var_stores),
+            assume_var_stores: options.assume_var_stores.clone(),
             unsafe_operations: options.unsafe_operations,
             passwords: PasswordQuestions::of_lists(lists),
         }
@@ -340,7 +339,6 @@ mod tests {
     use crate::esp::tests::booted_from;
     use crate::esp::tests::gpt_512_esp;
     use crate::esp::windows::tests::FakeWindows;
-    use crate::hii::forms::AccessLevel;
     use crate::hii::forms::IfrValueType;
     use crate::hii::VolatileWrites;
     use crate::staged_set::StagedSet;
@@ -368,15 +366,14 @@ mod tests {
     /// The bytes 01 ff stated at byte 3 of the VarStore Mode.
     const STATED: &str = "Mode-11111111-1111-1111-1111-111111111111+3=01ff";
 
-    /// set stages a request of the question and value with the states, the VarStore bytes stated,
-    /// --access-level's among them, and the grant of unsafe operations that it selected the
-    /// question with, and the image and ESP mount point that it names.
+    /// set stages a request of the question and value with the states, the VarStore bytes stated
+    /// and the grant of unsafe operations that it selected the question with, and the image and
+    /// ESP mount point that it names.
     #[test]
     fn set_stages_what_it_selected() {
         for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
             let options = SetOptions {
                 include: IncludedStates::GRAYED_OUT,
-                access_level: Some(AccessLevel::User),
                 assume_var_stores: vec![STATED.parse().expect("a statement")],
                 unsafe_operations: grant,
                 // no request takes it: a driver, not a variable, keeps a staged value
@@ -405,12 +402,7 @@ mod tests {
                     value_type: IfrValueType::Boolean,
                     value: 1,
                     include: IncludedStates::GRAYED_OUT,
-                    assume_var_stores: [
-                        "SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac=01",
-                        STATED
-                    ]
-                    .map(|text| text.parse().expect("a statement"))
-                    .to_vec(),
+                    assume_var_stores: vec![STATED.parse().expect("a statement")],
                     unsafe_operations: grant,
                 },
                 "{grant:?}"

@@ -128,15 +128,12 @@ use string_question::StringQuestion;
 use time_storage::TimeStorage;
 use time_storage::TimeStorageOnly;
 
-pub use ami_access_level::AccessLevel;
 pub use assumed_var_store::AssumedVarStore;
 pub use assumed_var_store::AssumedVarStoreError;
 pub use conditions::IncludedStates;
 pub use conditions::QuestionState;
 pub use conditions::SelectionError;
 
-pub(crate) use ami_access_level::check_access_level;
-pub(crate) use ami_access_level::with_access_level;
 pub(crate) use assumed_var_store::check_assumed;
 pub(crate) use assumed_var_store::CheckedVarStores;
 pub(crate) use conditions::Choice;
@@ -164,7 +161,6 @@ pub(crate) use storage::DeclaredKind;
 pub(crate) use storage::StoreDeclaration;
 pub(crate) use storageless::StoragelessRefusal;
 
-mod ami_access_level;
 mod assumed_var_store;
 mod conditions;
 mod cross_reference;
@@ -4327,12 +4323,12 @@ mod choice_for_set_tests {
     const MISSING_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: no EFI \
         variable Missing-00000000-0000-0000-0000-000000000000; --assume-var-store \
         Missing-00000000-0000-0000-0000-000000000000+0=<HEX of 1 byte> states it>";
-    /// Why the EQ_ID_VAL on question 2, on AMI firmware's buffer VarStore SystemAccess without
-    /// an efivar, is not evaluated.
-    const SYSTEM_ACCESS_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: \
-        no EFI variable SystemAccess-e770bb69-bcb4-4d04-9e97-23ff9456feac; HII buffer varstore \
-        requires EFI_HII_CONFIG_ACCESS_PROTOCOL; the AMI setup browser keeps its access level \
-        there (0 Administrator, 1 User); --access-level administrator|user states one>";
+    /// Why the EQ_ID_VAL on question 2, on the buffer VarStore Mode without an efivar, is not
+    /// evaluated.
+    const MODE_INPUT: &str = "EFI_IFR_EQ_ID_VAL of question 0x0002: <ValueUnavailable: no EFI \
+        variable Mode-11111111-1111-1111-1111-111111111111; HII buffer varstore requires \
+        EFI_HII_CONFIG_ACCESS_PROTOCOL; --assume-var-store \
+        Mode-11111111-1111-1111-1111-111111111111+0=<HEX of 1 byte> states it>";
 
     /// set's choice for PROMPT in the FormSet `root`, where only the efivar Present, of
     /// 1 byte, exists.
@@ -4355,27 +4351,25 @@ mod choice_for_set_tests {
         root: &Rc<RefCell<IFROperation>>,
         efivars: &Efivars,
     ) -> Result<Choice<QuestionDescriptor>> {
-        choice_reading(root, efivars, None)
+        choice_reading(root, efivars, &[])
     }
 
-    /// choice_with, with conditions reading `access_level`, if stated, for SystemAccess instead of
-    /// its value.
+    /// choice_with, with conditions reading the VarStore bytes that `assumed` states.
     fn choice_reading(
         root: &Rc<RefCell<IFROperation>>,
         efivars: &Efivars,
-        access_level: Option<AccessLevel>,
+        assumed: &[AssumedVarStore],
     ) -> Result<Choice<QuestionDescriptor>> {
-        choice_by(root, efivars.reader(), access_level)
+        choice_by(root, efivars.reader(), assumed)
     }
 
     /// choice_reading, with `reader` instead of a reader of efivar files.
     fn choice_by(
         root: &Rc<RefCell<IFROperation>>,
         mut reader: EfivarReader,
-        access_level: Option<AccessLevel>,
+        assumed: &[AssumedVarStore],
     ) -> Result<Choice<QuestionDescriptor>> {
-        let assumed = with_access_level(access_level, &[]);
-        let assumed = check_assumed([root], &assumed).expect("check the access level");
+        let assumed = check_assumed([root], assumed).expect("check the statements");
         let values = VarStoreValues::new(root, assumed);
         let selection = find_question_in(
             root,
@@ -4471,12 +4465,12 @@ mod choice_for_set_tests {
         );
     }
 
-    /// The FormSet of PROMPT, question 1 on VarStore 1, which AMI firmware grays out for a
-    /// User session: SystemAccess, question 2, being 1.
-    fn grayed_out_for_users() -> Rc<RefCell<IFROperation>> {
+    /// The FormSet of PROMPT, question 1 on VarStore 1, which a GRAY_OUT_IF grays out while
+    /// question 2, at byte 0 of the buffer VarStore Mode, is 1.
+    fn grayed_out_by_mode() -> Rc<RefCell<IFROperation>> {
         parse_form_set(&[
             var_store_efi(1, "Present", NV_BS_RT, 1),
-            var_store(2, SYSTEM_ACCESS_GUID, "SystemAccess", 1),
+            var_store(2, [0x11; 16], "Mode", 1),
             form(
                 1,
                 &[
@@ -4487,42 +4481,46 @@ mod choice_for_set_tests {
         ])
     }
 
-    /// set's refusal of a question that AMI firmware grays out for a User session names where
-    /// the access level is kept.
+    /// set's refusal of a question that a condition on an unreadable buffer VarStore may gray out
+    /// names the flag that states the byte it reads.
     #[test]
-    fn undetermined_match_on_the_ami_access_level_names_it() {
-        let error = choice_in(&grayed_out_for_users()).expect_err("set refuses question 1");
+    fn undetermined_match_on_a_buffer_var_store_names_the_flag() {
+        let error = choice_in(&grayed_out_by_mode()).expect_err("set refuses question 1");
         assert_eq!(
             error.downcast_ref::<SelectionError>(),
             Some(&SelectionError::Undetermined {
                 question: PROMPT.to_string(),
                 states: IncludedStates::GRAYED_OUT,
-                reasons: vec![SYSTEM_ACCESS_INPUT.to_string()],
+                reasons: vec![MODE_INPUT.to_string()],
             }),
-            "question 1 under a GRAY_OUT_IF on the access level: {error:#}"
+            "question 1 under a GRAY_OUT_IF on Mode: {error:#}"
         );
     }
 
-    /// set chooses a question that AMI firmware grays out for a User session at a stated
-    /// Administrator level, and skips it as grayed out at a stated User level.
+    /// set chooses a question by the VarStore bytes stated: with 00 stated for the byte that its
+    /// GRAY_OUT_IF reads, and skips it as grayed out with 01.
     #[test]
-    fn stated_access_level_decides_the_choice() {
-        let root = grayed_out_for_users();
+    fn stated_var_store_bytes_decide_the_choice() {
+        let root = grayed_out_by_mode();
         let efivars = Efivars::new();
         efivars.write(&efi_variable("Present", 1), &[0]);
+        let stated = |text: &str| {
+            let assumed: AssumedVarStore = text.parse().expect("a statement");
+            choice_reading(&root, &efivars, &[assumed])
+        };
 
-        let administrator = choice_reading(&root, &efivars, Some(AccessLevel::Administrator));
+        let selectable = stated("Mode-11111111-1111-1111-1111-111111111111=00");
         assert!(
-            matches!(administrator, Ok(Choice::Chosen(..))),
-            "Administrator: {administrator:?}"
+            matches!(selectable, Ok(Choice::Chosen(..))),
+            "00 stated: {selectable:?}"
         );
-        let user = choice_reading(&root, &efivars, Some(AccessLevel::User));
+        let grayed_out = stated("Mode-11111111-1111-1111-1111-111111111111=01");
         assert!(
             matches!(
-                user,
+                grayed_out,
                 Ok(Choice::Skipped(exclusion)) if exclusion.states == IncludedStates::GRAYED_OUT
             ),
-            "User: {user:?}"
+            "01 stated: {grayed_out:?}"
         );
     }
 
@@ -4674,7 +4672,7 @@ mod choice_for_set_tests {
             let variables = Rc::new(MemoryVariables::new(reach, interface));
             variables.insert(variable_key("Present"), NV_BS, &[0]);
             let reader = EfivarReader::with_variables(Box::new(Rc::clone(&variables)));
-            (choice_by(&root, reader, None), variables.reads())
+            (choice_by(&root, reader, &[]), variables.reads())
         };
 
         let (choice, reads) = choose(
@@ -4716,11 +4714,7 @@ mod choice_for_set_tests {
                 VariableInterface::FirmwareEnvironment,
             );
             variables.insert(variable_key("Present"), attributes, &[0]);
-            choice_by(
-                root,
-                EfivarReader::with_variables(Box::new(variables)),
-                None,
-            )
+            choice_by(root, EfivarReader::with_variables(Box::new(variables)), &[])
         };
         let refusal = |choice: Result<Choice<QuestionDescriptor>>| {
             choice.map_err(|error| error.to_string()).err()
@@ -4808,7 +4802,7 @@ mod choice_for_set_tests {
             let read = read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut reader)
                 .map(<[u8]>::to_vec)
                 .map_err(|reason| reason.to_answer());
-            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+            let error = choice_by(&root, reader, &[]).expect_err("set refuses the ONE_OF");
 
             let not_exported = error
                 .downcast_ref::<VariableNotExported>()
@@ -4859,7 +4853,7 @@ mod choice_for_set_tests {
         for (reach, interface, refusal) in cases {
             let reader =
                 EfivarReader::with_variables(Box::new(MemoryVariables::new(reach, interface)));
-            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+            let error = choice_by(&root, reader, &[]).expect_err("set refuses the ONE_OF");
 
             let text = error.to_string();
             assert!(
@@ -4890,7 +4884,7 @@ mod choice_for_set_tests {
                 let choice = choice_by(
                     &root,
                     EfivarReader::with_variables(Box::new(variables)),
-                    None,
+                    &[],
                 );
 
                 let chosen = matches!(choice, Ok(Choice::Chosen(..)));
@@ -4945,7 +4939,7 @@ mod choice_for_set_tests {
             let read = read_current_value_bytes(&Ok(Box::new(store)), 0..1, &mut reader)
                 .map(<[u8]>::to_vec)
                 .map_err(|reason| reason.to_answer());
-            let error = choice_by(&root, reader, None).expect_err("set refuses the ONE_OF");
+            let error = choice_by(&root, reader, &[]).expect_err("set refuses the ONE_OF");
 
             match reach {
                 VariableReach::Runtime => {
@@ -5005,7 +4999,7 @@ mod choice_for_set_tests {
                 let reader = EfivarReader::with_variables(Box::new(variables));
 
                 let error =
-                    choice_by(&root, reader, None).expect_err("set refuses a volatile efivar");
+                    choice_by(&root, reader, &[]).expect_err("set refuses a volatile efivar");
 
                 assert_eq!(
                     error.to_string(),

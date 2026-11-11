@@ -124,12 +124,6 @@ pub(crate) const VAR_STORE_EFI: u8 = 0x26;
 pub(crate) const READ: u8 = 0x2D;
 pub(crate) const WRITE: u8 = 0x2E;
 
-/// The Guid E770BB69-BCB4-4D04-9E97-23FF9456FEAC of AMI firmware's VarStore SystemAccess, as
-/// stored.
-pub(crate) const SYSTEM_ACCESS_GUID: [u8; 16] = [
-    0x69, 0xBB, 0x70, 0xE7, 0xB4, 0xBC, 0x04, 0x4D, 0x9E, 0x97, 0x23, 0xFF, 0x94, 0x56, 0xFE, 0xAC,
-];
-
 pub(crate) const GUID: u8 = 0x5F;
 
 /// EDKII_IFR_BIT_VARSTORE_GUID 82DDD68B-9163-4187-9B27-20A8FD60A71D as stored.
