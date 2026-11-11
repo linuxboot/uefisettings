@@ -2759,6 +2759,9 @@ enum ExpressionOp {
     This,
     Get,
     Set,
+    /// The version of UEFI that the Forms Processor conforms to (UEFI 2.11 §33.3.8.3.93), from
+    /// the revision of the EFI System Table, which is not read here
+    Version,
     /// Evaluated by edk2-stable202608 SetupBrowserDxe/Expression.c EvaluateExpression but not
     /// here
     NotEvaluated,
@@ -2832,6 +2835,7 @@ impl OpRole {
             IFROpCode::This => Self::Expression(E::This),
             IFROpCode::Get => Self::Expression(E::Get),
             IFROpCode::Set => Self::Expression(E::Set),
+            IFROpCode::Version => Self::Expression(E::Version),
             IFROpCode::Map => Self::Map,
             IFROpCode::RuleRef => Self::RuleRef,
             IFROpCode::Match
@@ -2847,7 +2851,6 @@ impl OpRole {
             | IFROpCode::Catenate
             | IFROpCode::ToLower
             | IFROpCode::ToUpper
-            | IFROpCode::Version
             | IFROpCode::Security
             | IFROpCode::Match2 => Self::Expression(E::NotEvaluated),
             IFROpCode::Form
@@ -3697,6 +3700,10 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
             ExpressionOp::This => self.this(op),
             ExpressionOp::Get => self.get(op),
             ExpressionOp::Set => self.set(op),
+            ExpressionOp::Version => Err(self.not_evaluated(format!(
+                "{} (the revision of the EFI System Table)",
+                op.op_code.spec_name()
+            ))),
             ExpressionOp::NotEvaluated => {
                 Err(self.not_evaluated(op.op_code.spec_name().to_string()))
             }
@@ -8259,6 +8266,18 @@ mod tests {
                 values,
             },
         )
+    }
+
+    /// EFI_IFR_VERSION, the version of UEFI that the Forms Processor conforms to, comes from the
+    /// revision of the EFI System Table (UEFI 2.11 §33.3.8.3.93), which this does not read yet:
+    /// not evaluated, naming it.
+    #[test]
+    fn version_is_not_evaluated_naming_what_it_needs() {
+        const VERSION: u8 = 0x28;
+        assert_eq!(
+            value_with(op(VERSION), &values()),
+            Err("EFI_IFR_VERSION (the revision of the EFI System Table) not evaluated".to_string())
+        );
     }
 
     /// values(), with question 8 the DATE 2026-11-10.
