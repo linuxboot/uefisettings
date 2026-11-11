@@ -27,7 +27,7 @@ use thiserror::Error;
 use super::conditions::enclosing_form_set;
 use super::conditions::option_state;
 use super::conditions::retrieve_question_value;
-use super::conditions::skips_scope;
+use super::conditions::skips_questions;
 use super::conditions::IncludedStates;
 use super::conditions::QuestionValues;
 use super::conditions::StateEvaluation;
@@ -424,7 +424,7 @@ fn visit_listed_questions(
 ) {
     walk_scopes(std::slice::from_ref(node), None, |node, &form_set| {
         let op = node.borrow();
-        if skips_scope(&op) {
+        if skips_questions(&op) {
             return Walk::Skip;
         }
         let form_set = match &op.parsed_data {

@@ -32,6 +32,7 @@ use thiserror::Error;
 use super::bit_field_bits;
 use super::conditions::question_expression;
 use super::conditions::question_value_expression;
+use super::conditions::skips_questions;
 use super::conditions::skips_scope;
 use super::conditions::ExpressionRefusal;
 use super::conditions::QuestionExpression;
@@ -2682,7 +2683,10 @@ pub(crate) enum DeclaredKind {
 /// question's bytes or name are withheld: no setting that covers them is requested, and its store
 /// holds a password. In place of a VARSTORE_EFI before UEFI 2.3.1, each EFI variable that the
 /// VarName of one of its questions names (ShortVarStoreEfi::candidate_variables), once, which
-/// holds a password if a PASSWORD question names it.
+/// holds a password if a PASSWORD question names it. It leaves out what IfrParse.c ParseOpCodes
+/// skips with a DISABLE_IF outside forms (skips_questions): the VarStore ops there, whose stores
+/// it never creates, and the settings of the questions there, but the bytes of a PASSWORD there
+/// stay withheld. What ParseOpCodes may skip counts as parsed.
 pub(crate) fn store_declarations(
     form_set: &IFROperation,
     texts: &ListTexts<'_>,
@@ -2694,14 +2698,27 @@ pub(crate) fn store_declarations(
         ShortEfi(ShortVarStoreEfi),
     }
 
+    /// Where an op is: in a form, and in the scope of a DISABLE_IF that skips_questions names
+    #[derive(Clone, Copy)]
+    struct Place {
+        in_form: bool,
+        skipped: bool,
+    }
+
     let mut declared = Vec::new();
     let mut storages = Vec::new();
-    walk_scopes(&form_set.children, false, |child, &in_form| {
+    let root = Place {
+        in_form: false,
+        skipped: false,
+    };
+    walk_scopes(&form_set.children, root, |child, &place| {
         let op = child.borrow();
         if skips_scope(&op) {
             return Walk::Skip;
         }
         match &op.parsed_data {
+            _ if place.skipped => storages
+                .extend(question_storage(&op).filter(|storage| place.in_form && storage.password)),
             ParsedOperation::VarStore(store) => {
                 declared.push(Declared::Store(StoreDeclaration::new(
                     store.var_store_id,
@@ -2731,10 +2748,13 @@ pub(crate) fn store_declarations(
             ParsedOperation::ShortVarStoreEfi(store) => {
                 declared.push(Declared::ShortEfi(store.clone()));
             }
-            _ if in_form => storages.extend(question_storage(&op)),
+            _ if place.in_form => storages.extend(question_storage(&op)),
             _ => {}
         }
-        Walk::Enter(in_form || matches!(op.op_code, IFROpCode::Form | IFROpCode::FormMap))
+        Walk::Enter(Place {
+            in_form: place.in_form || matches!(op.op_code, IFROpCode::Form | IFROpCode::FormMap),
+            skipped: place.skipped || skips_questions(&op),
+        })
     });
     let stores = declared.iter_mut().filter_map(|declared| match declared {
         Declared::Store(declaration) => Some(declaration),
@@ -3128,6 +3148,61 @@ mod store_request_tests {
                 .collect::<Vec<_>>(),
             [(2, true), (3, true), (4, false)],
             "the stores that PASSWORD questions name hold a password, the other not"
+        );
+    }
+
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes skips a DISABLE_IF outside forms
+    /// whose condition is TRUE to its END (:1390-1413), with the VarStore ops and questions in
+    /// it: no setting of those questions is requested and no store of those VarStore ops
+    /// declared, but the bytes of a PASSWORD there stay withheld and mark its store. A DISABLE_IF
+    /// whose condition is FALSE or not known leaves its questions requested.
+    #[test]
+    fn a_true_form_set_disable_if_requests_no_setting_and_declares_no_store_in_it() {
+        let body = [
+            var_store(2, [0x22; 16], "Buffer", 0x60),
+            form(1, &[checkbox_at(0x10, 7, 2, 0x00)]),
+            conditional(
+                DISABLE_IF,
+                ifr_true(),
+                &[
+                    var_store(3, [0x33; 16], "Hidden", 1),
+                    form(
+                        2,
+                        &[
+                            checkbox_at(0x11, 7, 2, 0x01),
+                            checkbox_at(0x12, 7, 3, 0),
+                            // a PASSWORD of 20 CHAR16 at bytes 0x10-0x37
+                            password_on(0x13, 4, 2, 0x10),
+                        ],
+                    ),
+                ],
+            ),
+            form(3, &[checkbox_at(0x14, 7, 2, 0x20)]),
+            conditional(
+                DISABLE_IF,
+                ifr_false(),
+                &[form(4, &[checkbox_at(0x15, 7, 2, 0x02)])],
+            ),
+            conditional(
+                DISABLE_IF,
+                eq_id_val_of(0x10, 1),
+                &[form(5, &[checkbox_at(0x16, 7, 2, 0x03)])],
+            ),
+        ];
+
+        assert_eq!(
+            declarations(&body),
+            [StoreDeclaration {
+                id: 2,
+                guid: [0x22; 16].into(),
+                kind: DeclaredKind::Buffer {
+                    name: "Buffer".into(),
+                    blocks: vec![(0x00, width(1)), (0x02, width(1)), (0x03, width(1))],
+                },
+                holds_password: true,
+            }],
+            "bytes 0x00, 0x02 and 0x03, of the questions outside the TRUE DISABLE_IF; none of \
+             its questions, nor its VarStore 3, nor byte 0x20, a byte of the PASSWORD in it"
         );
     }
 

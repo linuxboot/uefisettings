@@ -54,6 +54,7 @@ use super::declared_var_store;
 use super::defaults::is_parent_statement;
 use super::defaults::question_scope;
 use super::find_corresponding_varstore;
+use super::list_creations;
 use super::named_records;
 use super::question_values::value_question;
 use super::question_values::ListedQuestion;
@@ -80,6 +81,7 @@ use super::time_storage::TimeStorage;
 use super::time_storage::TimeStorageUnread;
 use super::walk_scopes;
 use super::AccessLevel;
+use super::Creation;
 use super::DeclaredStore;
 use super::EfivarReader;
 use super::IFROpCode;
@@ -880,15 +882,95 @@ pub(crate) fn question_state(
             ValueSource::Current,
         );
     }
+    let mut in_form = enclosing_form(question).is_some();
     let mut scope = question.parent.as_ref().and_then(Weak::upgrade);
     while let Some(op) = scope {
         let op = op.borrow();
-        if let OpRole::Scope(state) = OpRole::of(op.op_code) {
-            evaluation.evaluate(state, &op, inputs);
+        match OpRole::of(op.op_code) {
+            // a DISABLE_IF outside forms, which FormSetParse takes in
+            OpRole::Scope(QuestionState::Disabled) if !in_form => {}
+            OpRole::Scope(state) => evaluation.evaluate(state, &op, inputs),
+            OpRole::Question | OpRole::Expression(_) | OpRole::Map | OpRole::Other => {}
         }
+        in_form &= !matches!(op.op_code, IFROpCode::Form | IFROpCode::FormMap);
         scope = op.parent.as_ref().and_then(Weak::upgrade);
     }
+    evaluation.add(
+        QuestionState::Disabled,
+        inputs.values.parse_skips(question),
+        ValueSource::Current,
+    );
     evaluation
+}
+
+/// The ops of the form-set-list of the FormSet of the last question asked about, with whether
+/// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes parses each (list_creations):
+/// questions come FormSet by FormSet, so that a FormSet's conditions are evaluated once per run
+/// of its questions.
+#[derive(Default)]
+struct FormSetParse(RefCell<Option<FormSetCreations>>);
+
+/// list_creations of a FormSet.
+struct FormSetCreations {
+    form_set: Rc<RefCell<IFROperation>>,
+    creations: Vec<(Rc<RefCell<IFROperation>>, Creation)>,
+}
+
+impl FormSetParse {
+    /// Whether ParseOpCodes skips `question` in the scope of a DISABLE_IF outside forms, which
+    /// it evaluates once, as it parses the FormSet, and never again (UEFI 2.11 §33.2.5.2.1),
+    /// as form_set_list_ops finds: with the FORM or FORM_MAP that holds it, else alone. FALSE
+    /// outside the scope of any; not known where no FormSet holds it.
+    fn skips(&self, question: &IFROperation) -> Truth {
+        let form = enclosing_form(question);
+        let held = match &form {
+            Some(form) => in_form_set_disable_if(&form.borrow()),
+            None => in_form_set_disable_if(question),
+        };
+        if !held {
+            return Truth::Known(false);
+        }
+        let Some(form_set) = enclosing_form_set(question) else {
+            return Truth::Unknown("no FormSet holds it".to_owned());
+        };
+        let parsed: *const IFROperation = match &form {
+            Some(form) => form.as_ptr(),
+            None => question,
+        };
+        let mut cache = self.0.borrow_mut();
+        let known = match cache.take() {
+            Some(last) if Rc::ptr_eq(&last.form_set, &form_set) => cache.insert(last),
+            _ => {
+                let creations = list_creations(&form_set.borrow());
+                cache.insert(FormSetCreations {
+                    form_set,
+                    creations,
+                })
+            }
+        };
+        let creation = known
+            .creations
+            .iter()
+            .find(|(op, _)| std::ptr::eq(op.as_ptr(), parsed))
+            .map(|(_, creation)| creation);
+        match creation {
+            None => Truth::Known(true),
+            Some(Creation::Created) => Truth::Known(false),
+            Some(Creation::Undetermined(undetermined)) => Truth::Unknown(undetermined.reason()),
+        }
+    }
+}
+
+/// Whether a DISABLE_IF holds `op`, an op outside forms or a FORM or FORM_MAP.
+fn in_form_set_disable_if(op: &IFROperation) -> bool {
+    let mut scope = op.parent.as_ref().and_then(Weak::upgrade);
+    while let Some(op) = scope {
+        if op.borrow().op_code == IFROpCode::DisableIf {
+            return true;
+        }
+        scope = op.borrow().parent.as_ref().and_then(Weak::upgrade);
+    }
+    false
 }
 
 /// Why set refuses to write `question`, if it does: an EFI_IFR_VALUE gives its value
@@ -974,14 +1056,13 @@ struct IndexedQuestion {
 }
 
 impl QuestionIndex {
-    // TODO: leave out the questions under a true DISABLE_IF outside forms, which
-    // edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes does not parse, so that a
-    // reference to one gives UNDEFINED.
+    /// Leaves out the questions that edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes
+    /// does not parse (skips_questions), so that a reference to one gives UNDEFINED.
     pub(crate) fn new(root: &Rc<RefCell<IFROperation>>) -> Self {
         let mut index: BTreeMap<u16, Vec<IndexedQuestion>> = BTreeMap::new();
         walk_scopes(std::slice::from_ref(root), None, |node, form| {
             let op = node.borrow();
-            if skips_scope(&op) {
+            if skips_questions(&op) {
                 return Walk::Skip;
             }
             // reserved (UEFI 2.10 §33.3.8.2.2)
@@ -1025,6 +1106,17 @@ impl QuestionIndex {
 pub(super) fn skips_scope(op: &IFROperation) -> bool {
     op.parent.is_some()
         && matches!(op.op_code, IFROpCode::Unknown(code) if code > EFI_IFR_MATCH2_OP)
+}
+
+/// Whether edk2 skips `op` with its scope, and so every question in it: skips_scope, or a
+/// DISABLE_IF outside forms whose condition is TRUE, which edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes evaluates as it parses the FormSet (:1690-1704,
+/// :3045-3059) and skips to its END (:1390-1413).
+pub(super) fn skips_questions(op: &IFROperation) -> bool {
+    skips_scope(op)
+        || (op.op_code == IFROpCode::DisableIf
+            && enclosing_form(op).is_none()
+            && constant_condition(op) == Truth::Known(true))
 }
 
 /// Returns the FORM or FORM_MAP that holds `op`.
@@ -1096,6 +1188,7 @@ pub(crate) struct VarStoreValues {
     /// The questions whose values are being retrieved, innermost last: a READ expression that
     /// refers to one of them needs the value that it is to give
     retrieving: RefCell<Vec<Rc<RefCell<IFROperation>>>>,
+    parse: FormSetParse,
 }
 
 impl VarStoreValues {
@@ -1106,6 +1199,7 @@ impl VarStoreValues {
             index: QuestionIndex::new(root),
             access_level,
             retrieving: RefCell::default(),
+            parse: FormSetParse::default(),
         }
     }
 }
@@ -1125,6 +1219,18 @@ impl QuestionValues for VarStoreValues {
                 reason: ValueUnavailable::NotDecoded(op.op_code).to_answer(),
             });
         };
+        // IdToQuestion finds no question where ParseOpCodes skips it, and EQ_ID_VAL gives
+        // UNDEFINED (Expression.c:2659-2663); ParseOpCodes parses it with the referrer if both
+        // are in one form
+        let same_form = enclosing_form(referrer)
+            .zip(enclosing_form(&op))
+            .is_some_and(|(a, b)| Rc::ptr_eq(&a, &b));
+        if let (Truth::Unknown(reason), false) = (self.parse_skips(&op), same_form) {
+            return Some(QuestionValue::Unreadable {
+                kind: value_kind(value_question),
+                reason: format!("edk2 may not parse it: {reason}"),
+            });
+        }
         if self.retrieving.borrow().len() >= MAX_READ_DEPTH {
             return Some(QuestionValue::Unreadable {
                 kind: value_kind(value_question),
@@ -1157,6 +1263,10 @@ impl QuestionValues for VarStoreValues {
         );
         self.retrieving.borrow_mut().pop();
         Some(value)
+    }
+
+    fn parse_skips(&self, question: &IFROperation) -> Truth {
+        self.parse.skips(question)
     }
 }
 
@@ -1344,7 +1454,7 @@ pub(crate) enum QuestionValue {
     },
 }
 
-/// Finds the values of the questions that conditions refer to.
+/// Finds the values of the questions that conditions refer to, and whether edk2 parses them.
 pub(crate) trait QuestionValues {
     /// Returns the value of question `id` as `referrer` sees it, read through `reader`, or None
     /// if no question has `id`.
@@ -1354,6 +1464,12 @@ pub(crate) trait QuestionValues {
         id: u16,
         reader: &mut EfivarReader,
     ) -> Option<QuestionValue>;
+
+    /// FormSetParse::skips of `question`, which an implementation may keep from question to
+    /// question.
+    fn parse_skips(&self, question: &IFROperation) -> Truth {
+        FormSetParse::default().skips(question)
+    }
 }
 
 /// What expressions take the values of questions from: `values` finds the question that an
@@ -6557,6 +6673,150 @@ mod tests {
             form(2, &[checkbox_op(7, 2)]),
         ]);
         assert_eq!(found_offset(&root, &referrer, 7), Some(0), "question 7");
+    }
+
+    /// QuestionIndex leaves out a question that edk2-stable202608 SetupBrowserDxe/IfrParse.c
+    /// ParseOpCodes skips under a true DISABLE_IF outside forms, so that a reference to it gives
+    /// UNDEFINED, and keeps one under a false one, or under a true one in its form, which
+    /// ParseOpCodes parses.
+    #[test]
+    fn question_index_leaves_out_questions_that_edk2_does_not_parse() {
+        let referrer = eq_id_val_of(7, 1);
+        for (case, ifr, want) in [
+            (
+                "a true DISABLE_IF outside forms",
+                conditional(DISABLE_IF, ifr_true(), &[form(1, &[checkbox_op(7, 0)])]),
+                None,
+            ),
+            (
+                "a false DISABLE_IF outside forms",
+                conditional(DISABLE_IF, ifr_false(), &[form(1, &[checkbox_op(7, 0)])]),
+                Some(0),
+            ),
+            (
+                "a true DISABLE_IF in its form",
+                form(
+                    1,
+                    &[conditional(DISABLE_IF, ifr_true(), &[checkbox_op(7, 0)])],
+                ),
+                Some(0),
+            ),
+        ] {
+            let root = parse_form_set(&[ifr, form(2, std::slice::from_ref(&referrer))]);
+            assert_eq!(found_offset(&root, &referrer, 7), want, "{case}");
+        }
+    }
+
+    /// A question that ParseOpCodes may skip, in the scope of a DISABLE_IF outside forms whose
+    /// condition is not known or after a true SUPPRESS_IF there, has no known value: IdToQuestion
+    /// finds no question where ParseOpCodes skips it. After a false SUPPRESS_IF, its value is read,
+    /// and so it is from its own form, which ParseOpCodes parses with it.
+    #[test]
+    fn a_question_that_edk2_may_not_parse_has_no_known_value() {
+        let referrer = eq_id_val_of(7, 1);
+        let question = || form(1, &[checkbox_op(7, 0)]);
+        let elsewhere = || form(2, std::slice::from_ref(&referrer));
+        for (case, ifr, may_be_skipped) in [
+            (
+                "a DISABLE_IF that is not constant",
+                vec![
+                    conditional(DISABLE_IF, eq_id_val_of(9, 1), &[question()]),
+                    elsewhere(),
+                ],
+                true,
+            ),
+            (
+                "after a true SUPPRESS_IF",
+                vec![
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[conditional(SUPPRESS_IF, ifr_true(), &[]), question()],
+                    ),
+                    elsewhere(),
+                ],
+                true,
+            ),
+            (
+                "after a false SUPPRESS_IF",
+                vec![
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[conditional(SUPPRESS_IF, ifr_false(), &[]), question()],
+                    ),
+                    elsewhere(),
+                ],
+                false,
+            ),
+            (
+                "a DISABLE_IF that is not constant, the referrer in the question's form",
+                vec![conditional(
+                    DISABLE_IF,
+                    eq_id_val_of(9, 1),
+                    &[form(1, &[checkbox_op(7, 0), referrer.clone()])],
+                )],
+                false,
+            ),
+        ] {
+            let root = parse_form_set(&ifr);
+            let found = find_op(&root, &referrer[2..]).expect("find the referrer");
+            let value = VarStoreValues::new(&root, None).value(
+                &found.borrow(),
+                7,
+                &mut Efivars::new().reader(),
+            );
+            let skipped = matches!(
+                &value,
+                Some(QuestionValue::Unreadable { kind: ValueKind::Boolean, reason })
+                    if reason.starts_with("edk2 may not parse it: ")
+            );
+            assert_eq!(skipped, may_be_skipped, "{case}: {value:?}");
+            assert!(value.is_some(), "{case}: question 7 is found");
+        }
+    }
+
+    /// The conditions of a FormSet's form-set-list are evaluated as many times for 40 questions
+    /// in the scope of a DISABLE_IF there, each grayed out by a question in another form in that
+    /// scope, as for one: FormSetParse keeps the walk of the form-set-list from question to
+    /// question. Their VarStore comes first, so that its lookups evaluate none.
+    #[test]
+    fn form_set_conditions_are_evaluated_as_often_whatever_the_questions() {
+        let evaluated = |questions: u16| {
+            let grayed_out: Vec<Vec<u8>> = (1..=questions)
+                .map(|id| conditional(GRAY_OUT_IF, eq_id_val_of(500, 1), &[checkbox_op(id, 0)]))
+                .collect();
+            let root = parse_form_set(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                conditional(
+                    DISABLE_IF,
+                    eq_id_val_of(600, 1),
+                    &[
+                        conditional(SUPPRESS_IF, eq_id_val_of(600, 1), &[]),
+                        form(1, &grayed_out),
+                        form(2, &[checkbox_op(500, 1)]),
+                    ],
+                ),
+            ]);
+            let before = CONSTANT_CONDITIONS.with(std::cell::Cell::get);
+            let listed = list_questions(
+                root,
+                &ListTexts::new(&[], &[]),
+                IncludedStates::all(),
+                None,
+                &mut Efivars::new().reader(),
+            );
+            (
+                listed.len(),
+                CONSTANT_CONDITIONS.with(std::cell::Cell::get) - before,
+            )
+        };
+
+        let (listed_of_1, for_1) = evaluated(1);
+        let (listed_of_40, for_40) = evaluated(40);
+
+        assert_eq!((listed_of_1, listed_of_40), (2, 41), "questions listed");
+        assert_eq!(for_40, for_1, "conditions evaluated");
     }
 
     /// QuestionId 0 is reserved (UEFI 2.10 §33.3.8.2.2): edk2-stable202608

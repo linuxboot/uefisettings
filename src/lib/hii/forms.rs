@@ -61,6 +61,7 @@ use conditions::parse_question_header;
 use conditions::question_state;
 use conditions::retrieve_question_value;
 use conditions::select;
+use conditions::skips_questions;
 use conditions::skips_scope;
 use conditions::ExpressionInputs;
 use conditions::QuestionValues;
@@ -3811,6 +3812,26 @@ pub(crate) fn list_questions(
     let values = VarStoreValues::new(&node, access_level);
     list_questions_in(
         &node,
+        skips_questions,
+        &mut FormSetWalk::new(texts, reader, &values, include),
+    )
+}
+
+/// Lists questions as list_questions does, those in forms that edk2-stable202608
+/// SetupBrowserDxe/IfrParse.c ParseOpCodes does not parse too, where --keyword finds statements,
+/// as the edk2 keyword handler does.
+// for dump-efivars, which only Linux and the tests build
+#[cfg(all(efivar_dumps, any(target_os = "linux", test)))]
+pub(crate) fn list_reachable_questions(
+    node: Rc<RefCell<IFROperation>>,
+    texts: &ListTexts<'_>,
+    include: IncludedStates,
+    reader: &mut EfivarReader,
+) -> Vec<(QuestionDescriptor, StateEvaluation)> {
+    let values = VarStoreValues::new(&node, None);
+    list_questions_in(
+        &node,
+        skips_scope,
         &mut FormSetWalk::new(texts, reader, &values, include),
     )
 }
@@ -3840,14 +3861,16 @@ impl<'a, V> FormSetWalk<'a, V> {
     }
 }
 
-/// Lists questions as list_questions does, with `walk`.
+/// Lists questions as list_questions does, with `walk`, but those in the scopes that `skips`
+/// skips.
 fn list_questions_in(
     node: &Rc<RefCell<IFROperation>>,
+    skips: impl Fn(&IFROperation) -> bool,
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> Vec<(QuestionDescriptor, StateEvaluation)> {
     let mut res = Vec::new();
     walk_scopes(std::slice::from_ref(node), (), |node, ()| {
-        if skips_scope(&node.borrow()) {
+        if skips(&node.borrow()) {
             return Walk::Skip;
         }
         res.extend(listed_question(node, walk));
@@ -5430,14 +5453,9 @@ fn declared_var_store(form_set: &IFROperation, var_store_id: u16) -> Result<Opti
             "VarStore {var_store_id:#06x} is declared in the scope of a DISABLE_IF of its FormSet \
              whose condition is not known: {reason}"
         )),
-        Creation::Undetermined(Undetermined::Hiding(hiding)) => Err(anyhow!(
-            "VarStore {var_store_id:#06x} follows an {} in the scope of a DISABLE_IF of its \
-             FormSet, whose condition is {}: edk2-stable202608 SetupBrowserDxe/IfrParse.c takes \
-             that condition for the DISABLE_IF's, which may skip the rest of its scope \
-             (:1690-1704, :3045-3059), where UEFI 2.11 §33.3.8.3.75 has it only hide",
-            hiding.op,
-            hiding.condition()
-        )),
+        Creation::Undetermined(Undetermined::Hiding(hiding)) => {
+            Err(anyhow!("VarStore {var_store_id:#06x} follows {hiding}"))
+        }
     }
 }
 
@@ -5552,34 +5570,46 @@ fn decoded_store(op: &IFROperation) -> Result<Option<(u16, DeclaredStore)>> {
     Ok(decode_var_store(op)?.and_then(|parsed| declared_store(&parsed)))
 }
 
-/// Whether edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes creates the store of a
-/// VarStore op of a form-set-list (CreateStorage, :1873-1913); form_set_list_var_stores never meets
-/// one that it skips.
+/// Whether edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes parses an op of a
+/// form-set-list, as it creates the store of a VarStore op (CreateStorage, :1873-1913);
+/// form_set_list_ops never meets one that it skips.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Creation {
     Created,
     Undetermined(Undetermined),
 }
 
-/// Why ParseOpCodes may skip a VarStore op of a form-set-list.
+/// Why ParseOpCodes may skip an op of a form-set-list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Undetermined {
     /// In the scope of a DISABLE_IF whose condition is not known: why
     DisableIf(Rc<str>),
-    /// After a SUPPRESS_IF or GRAY_OUT_IF in the scope of a DISABLE_IF, whose condition is TRUE or
-    /// not known
+    /// After an op of hiding_role in the scope of a DISABLE_IF, whose condition is TRUE or not
+    /// known
     Hiding(Hiding),
 }
 
-/// A SUPPRESS_IF or GRAY_OUT_IF of a form-set-list in the scope of a DISABLE_IF, whose condition
+/// An op of hiding_role of a form-set-list in the scope of a DISABLE_IF, whose condition
 /// ParseOpCodes takes for the DISABLE_IF's (:1690-1704, :3045-3059): TRUE skips the rest of that
 /// DISABLE_IF's scope (:1390-1413).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hiding {
     /// Its spec name
     op: &'static str,
+    /// What UEFI 2.11 has it do instead
+    role: &'static str,
     /// Why its condition is not known; None if it is TRUE
     unknown: Option<Rc<str>>,
+}
+
+impl Undetermined {
+    /// Why ParseOpCodes may skip an op that this leaves undetermined, for a question there.
+    fn reason(&self) -> String {
+        match self {
+            Undetermined::DisableIf(reason) => reason.to_string(),
+            Undetermined::Hiding(hiding) => format!("it is after {hiding}"),
+        }
+    }
 }
 
 impl Hiding {
@@ -5592,19 +5622,37 @@ impl Hiding {
     }
 }
 
-/// The scopes around an op of a form-set-list, as form_set_list_var_stores walks them.
+impl fmt::Display for Hiding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "an {} in the scope of a DISABLE_IF of its FormSet, whose condition is {}: \
+             edk2-stable202608 SetupBrowserDxe/IfrParse.c takes that condition for the \
+             DISABLE_IF's, which may skip the rest of its scope (:1690-1704, :3045-3059), where \
+             UEFI 2.11 {}",
+            self.op,
+            self.condition(),
+            self.role
+        )
+    }
+}
+
+/// The scopes around an op of a form-set-list, as form_set_list_ops walks them.
 #[derive(Clone, Default)]
 struct ListScopes {
     /// Why the first DISABLE_IF around, outermost first, whose condition is not known, may skip it
     unknown_disable_if: Option<Rc<str>>,
-    /// In the scope of a DISABLE_IF: the first SUPPRESS_IF or GRAY_OUT_IF met so far in the scope
-    /// of the outermost one whose condition is TRUE or not known, shared by every op in that scope
+    /// In the scope of a DISABLE_IF: the first op of hiding_role whose condition is TRUE or not
+    /// known met so far in its scope before any DISABLE_IF ends there, or in those around it
+    /// before it, shared by every op in its scope but those in DISABLE_IFs that it nests:
+    /// ParseOpCodes skips to the END of the innermost DISABLE_IF around, counting those nested in
+    /// it (:1395-1410)
     hiding: Option<Rc<RefCell<Option<Hiding>>>>,
 }
 
 impl ListScopes {
-    /// Whether ParseOpCodes creates the store of a VarStore op in these scopes: the DISABLE_IFs
-    /// first, then the SUPPRESS_IFs and GRAY_OUT_IFs.
+    /// Whether ParseOpCodes parses an op in these scopes: the DISABLE_IFs first, then the ops of
+    /// hiding_role.
     fn creation(&self) -> Creation {
         let hiding = self
             .hiding
@@ -5619,39 +5667,82 @@ impl ListScopes {
 }
 
 /// Visits the VarStore ops in the form-set-list of `form_set` (UEFI 2.11 §33.2.5.1), where
-/// VfrCompile declares VarStores, in IFR order, each with whether edk2-stable202608
-/// SetupBrowserDxe/IfrParse.c ParseOpCodes creates its store and the FORMs and FORM_MAPs before
-/// it, until `visit` gives Some. It meets none in the scope of a FORM or FORM_MAP, outside the
-/// form-set-list, nor of an unknown op (IsUnKnownOpCode), nor of a DISABLE_IF whose condition is
-/// TRUE, which ParseOpCodes skips whatever DISABLE_IFs it nests (:1390-1413). It evaluates each
-/// DISABLE_IF, SUPPRESS_IF and GRAY_OUT_IF of the form-set-list once, the latter only in the scope
-/// of a DISABLE_IF.
+/// VfrCompile declares VarStores, as form_set_list_ops meets them, until `visit` gives Some.
 fn form_set_list_var_stores<T>(
     form_set: &IFROperation,
     mut visit: impl FnMut(&IFROperation, &Creation, &[Rc<RefCell<IFROperation>>]) -> Option<T>,
 ) -> Option<T> {
+    form_set_list_ops(form_set, |node, creation, forms| {
+        let op = node.borrow();
+        let var_store = matches!(
+            op.op_code,
+            IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue
+        );
+        var_store.then(|| visit(&op, creation, forms)).flatten()
+    })
+}
+
+/// The ops of the form-set-list of `form_set` and its FORMs and FORM_MAPs, each with whether
+/// ParseOpCodes parses it, with its scope, as form_set_list_ops meets them; it skips the others.
+fn list_creations(form_set: &IFROperation) -> Vec<(Rc<RefCell<IFROperation>>, Creation)> {
+    let mut met = Vec::new();
+    form_set_list_ops(form_set, |node, creation, _| -> Option<Infallible> {
+        met.push((Rc::clone(node), creation.clone()));
+        None
+    });
+    met
+}
+
+/// Visits the ops in the form-set-list of `form_set` and its FORMs and FORM_MAPs, in IFR order,
+/// each with whether edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes parses it, as it
+/// creates the store of a VarStore op, and the FORMs and FORM_MAPs before it, until `visit` gives
+/// Some. It meets none in the scope of a FORM or FORM_MAP, outside the form-set-list, nor of an
+/// unknown op (IsUnKnownOpCode), nor of a DISABLE_IF whose condition is TRUE, which ParseOpCodes
+/// skips whatever DISABLE_IFs it nests (:1390-1413). It evaluates each DISABLE_IF and each op of
+/// hiding_role of the form-set-list once, the latter only in the scope of a DISABLE_IF.
+fn form_set_list_ops<T>(
+    form_set: &IFROperation,
+    mut visit: impl FnMut(
+        &Rc<RefCell<IFROperation>>,
+        &Creation,
+        &[Rc<RefCell<IFROperation>>],
+    ) -> Option<T>,
+) -> Option<T> {
     let mut forms = Vec::new();
+    // the hiding of the DISABLE_IF met last, None after one that ParseOpCodes leaves before the
+    // next op: it takes a condition for a DISABLE_IF's only until the END of any DISABLE_IF, in a
+    // FORM too (:2654-2655, :3007-3014)
+    let mut open_hiding: Option<Rc<RefCell<Option<Hiding>>>> = None;
     let walked = try_walk_scopes(&form_set.children, ListScopes::default(), |node, scopes| {
         let op = node.borrow();
         if skips_scope(&op) {
             return Ok(Walk::Skip);
         }
+        if let Some(found) = visit(node, &scopes.creation(), &forms) {
+            return Err(found);
+        }
         match op.op_code {
-            IFROpCode::VarStore | IFROpCode::VarStoreEfi | IFROpCode::VarStoreNameValue => {
-                match visit(&op, &scopes.creation(), &forms) {
-                    Some(found) => Err(found),
-                    None => Ok(Walk::Enter(scopes.clone())),
-                }
-            }
             IFROpCode::Form | IFROpCode::FormMap => {
                 forms.push(Rc::clone(node));
+                if holds_disable_if(node) {
+                    open_hiding = None;
+                }
                 Ok(Walk::Skip)
             }
             IFROpCode::DisableIf => {
                 let mut inner = scopes.clone();
-                inner.hiding.get_or_insert_with(Rc::default);
+                let start = scopes
+                    .hiding
+                    .as_ref()
+                    .and_then(|hiding| hiding.borrow().clone());
+                let hiding = Rc::new(RefCell::new(start));
+                open_hiding = Some(Rc::clone(&hiding));
+                inner.hiding = Some(hiding);
                 match constant_condition(&op) {
-                    Truth::Known(true) => return Ok(Walk::Skip),
+                    Truth::Known(true) => {
+                        open_hiding = None;
+                        return Ok(Walk::Skip);
+                    }
                     Truth::Known(false) => {}
                     Truth::Unknown(reason) => {
                         inner.unknown_disable_if.get_or_insert(reason.into());
@@ -5659,8 +5750,13 @@ fn form_set_list_var_stores<T>(
                 }
                 Ok(Walk::Enter(inner))
             }
-            IFROpCode::SuppressIf | IFROpCode::GrayOutIf => {
-                if let Some(hiding) = &scopes.hiding {
+            code => {
+                let open = scopes.hiding.as_ref().filter(|hiding| {
+                    open_hiding
+                        .as_ref()
+                        .is_some_and(|open| Rc::ptr_eq(open, hiding))
+                });
+                if let (Some(hiding), Some(role)) = (open, hiding_role(code)) {
                     let unknown = match constant_condition(&op) {
                         Truth::Known(true) => Some(None),
                         Truth::Known(false) => None,
@@ -5669,16 +5765,51 @@ fn form_set_list_var_stores<T>(
                     if let Some(unknown) = unknown {
                         hiding.borrow_mut().get_or_insert(Hiding {
                             op: op.op_code.spec_name(),
+                            role,
                             unknown,
                         });
                     }
                 }
                 Ok(Walk::Enter(scopes.clone()))
             }
-            _ => Ok(Walk::Enter(scopes.clone())),
         }
     });
     walked.err()
+}
+
+/// Whether ParseOpCodes meets a DISABLE_IF in the scope of `form`, outside an unknown op's.
+fn holds_disable_if(form: &Rc<RefCell<IFROperation>>) -> bool {
+    let mut held = false;
+    walk_scopes(&form.borrow().children, (), |node, ()| {
+        let op = node.borrow();
+        held |= op.op_code == IFROpCode::DisableIf;
+        if skips_scope(&op) {
+            Walk::Skip
+        } else {
+            Walk::Enter(())
+        }
+    });
+    held
+}
+
+/// What UEFI 2.11 has `code` do, if ParseOpCodes opens an expression for an op of it outside
+/// forms, which it takes for the condition of the DISABLE_IF around (:1690-1704, :3045-3059):
+/// edk2-stable202608 IfrParse.c opens one for NO_SUBMIT_IF and INCONSISTENT_IF at :2515,
+/// WARNING_IF at :2548, SUPPRESS_IF at :2574, GRAY_OUT_IF at :2609, VALUE at :2670, RULE at
+/// :2713, READ at :2736 and WRITE at :2767.
+fn hiding_role(code: IFROpCode) -> Option<&'static str> {
+    match code {
+        IFROpCode::SuppressIf => Some("§33.3.8.3.75 has it only hide"),
+        IFROpCode::GrayOutIf => Some("§33.3.8.3.28 has it only gray out"),
+        IFROpCode::Value => Some("§33.3.8.3.88 has it only give a value"),
+        IFROpCode::Read => Some("§33.3.8.3.58 has it only give a value"),
+        IFROpCode::Write => Some("§33.3.8.3.94 has it only change a value"),
+        IFROpCode::Rule => Some("§33.3.8.3.63 has it only name a rule"),
+        IFROpCode::InconsistentIf => Some("§33.3.8.3.33 has it only validate a question"),
+        IFROpCode::NoSubmitIf => Some("§33.3.8.3.46 has it only validate a question"),
+        IFROpCode::WarningIf => Some("§33.3.8.3.96 has it only validate a question"),
+        _ => None,
+    }
 }
 
 /// Fills the VarName strings of the VARSTORE_EFIs before UEFI 2.3.1 of the FormSets of `roots`,

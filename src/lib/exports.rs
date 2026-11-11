@@ -18073,4 +18073,814 @@ mod tests {
             }
         }
     }
+
+    /// A HiiDB whose FormSet holds the VARSTORE_EFI Setup of id 1, over 4 bytes, and then the ops
+    /// `list` of its form-set-list; its strings are Hidden, Shown, Gate, After, First and Outside.
+    fn form_set_list_hiidb(list: &[Vec<u8>]) -> Vec<u8> {
+        let children = [vec![var_store_efi(1, "Setup", NV_BS_RT, 4)], list.to_vec()].concat();
+        let packages = [
+            form_package(&children),
+            en_strings_package_of(&["Hidden", "Shown", "Gate", "After", "First", "Outside"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// The names and answers of the questions that list-questions lists in `hiidb` with
+    /// `include` through `variables`.
+    fn names_and_answers(
+        hiidb: &[u8],
+        include: IncludedStates,
+        variables: &Rc<MemoryVariables>,
+    ) -> Vec<(String, String)> {
+        let options = ListQuestionsOptions {
+            include,
+            ..ListQuestionsOptions::default()
+        };
+        HiiBackend::list_questions_in(hiidb, &options, shared(variables), None, None)
+            .expect("list the questions")
+            .into_iter()
+            .map(|question| (question.name, question.answer))
+            .collect()
+    }
+
+    /// What get of `question` in `hiidb` gives with `include` through `variables`.
+    fn got_with(
+        hiidb: &[u8],
+        question: &str,
+        include: IncludedStates,
+        variables: &Rc<MemoryVariables>,
+    ) -> Result<Vec<String>, String> {
+        let options = GetOptions {
+            include,
+            ..GetOptions::default()
+        };
+        HiiBackend::get_in(
+            hiidb,
+            question,
+            None,
+            &options,
+            shared(variables),
+            None,
+            None,
+            None,
+        )
+        .map(|got| {
+            got.responses
+                .into_iter()
+                .map(|response| response.question.answer)
+                .collect()
+        })
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    /// What set of `question` in `hiidb` to 1 gives with `include` and UnsafeOperations::Allow
+    /// through `variables`, as the CLI prints an error.
+    fn set_with(
+        hiidb: &[u8],
+        question: &str,
+        include: IncludedStates,
+        variables: &Rc<MemoryVariables>,
+    ) -> Result<(), String> {
+        let options = SetOptions {
+            include,
+            unsafe_operations: UnsafeOperations::Allow,
+            ..SetOptions::default()
+        };
+        set_responses(
+            hiidb,
+            question,
+            &SetValue::Text("1".to_owned()),
+            None,
+            &options,
+            SetAccess {
+                reads: shared(variables),
+                writes: &**variables,
+                held: None,
+            },
+            None,
+        )
+        .map(drop)
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    /// edk2-stable202608 SetupBrowserDxe/IfrParse.c ParseOpCodes skips a FORM under a true
+    /// DISABLE_IF outside forms, so no --include and no unsafe operation offers its question
+    /// Hidden: get and set answer as for Absent, which the FormSet does not have. Shown, in a form
+    /// after it, stays a question.
+    #[test]
+    fn questions_under_a_true_form_set_disable_if_are_none_of_its_questions() {
+        let hiidb = form_set_list_hiidb(&[
+            conditional(
+                DISABLE_IF,
+                ifr_true(),
+                &[form(1, &[checkbox_at(1, 1, 1, 0)])],
+            ),
+            form(2, &[checkbox_at(2, 2, 1, 1)]),
+        ]);
+        for include in [IncludedStates::empty(), IncludedStates::all()] {
+            let variables = setup_holding(&[0; 4]);
+
+            assert_eq!(
+                names_and_answers(&hiidb, include, &variables),
+                [("Shown".to_owned(), "0".to_owned())],
+                "{include:?}: list-questions"
+            );
+            assert_eq!(
+                got_with(&hiidb, "Hidden", include, &variables),
+                got_with(&hiidb, "Absent", include, &variables),
+                "{include:?}: get Hidden"
+            );
+            assert_eq!(
+                got_with(&hiidb, "Shown", include, &variables),
+                Ok(vec!["0".to_owned()]),
+                "{include:?}: get Shown"
+            );
+            let set = set_with(&hiidb, "Hidden", include, &variables);
+            assert!(set.is_err(), "{include:?}: set Hidden: {set:?}");
+            assert_eq!(
+                set.map_err(|error| error.replace("Hidden", "Absent")),
+                set_with(&hiidb, "Absent", include, &variables),
+                "{include:?}: set Hidden"
+            );
+            assert_eq!(
+                variables.writes_to(&setup()),
+                [],
+                "{include:?}: writes of set Hidden"
+            );
+            assert_eq!(
+                set_with(&hiidb, "Shown", include, &variables),
+                Ok(()),
+                "{include:?}: set Shown"
+            );
+            assert_eq!(
+                variables.writes_to(&setup()),
+                [(1, vec![1])],
+                "{include:?}: writes of set Shown"
+            );
+        }
+    }
+
+    /// --keyword finds a statement in a form under a true DISABLE_IF outside forms, also in a
+    /// false SUPPRESS_IF there, as edk2-stable202608 HiiDatabaseDxe/ConfigKeywordHandler.c, which
+    /// evaluates no condition, finds it: get and set select it as a disabled question.
+    #[test]
+    fn a_keyword_selects_a_question_under_a_true_form_set_disable_if_as_disabled() {
+        let hidden = || form(1, &[checkbox_at(1, 1, 1, 0)]);
+        for (shape, held) in [
+            ("in the DISABLE_IF", hidden()),
+            (
+                "in a false SUPPRESS_IF in the DISABLE_IF",
+                conditional(SUPPRESS_IF, ifr_false(), &[hidden()]),
+            ),
+        ] {
+            let packages = [
+                form_package(&[
+                    var_store_efi(1, "Setup", NV_BS_RT, 4),
+                    conditional(DISABLE_IF, ifr_true(), &[held]),
+                ]),
+                en_strings_package_of(&["Hidden"]),
+                strings_package_of(b"x-UEFI-ns", &["HiddenKeyword"]),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+            for (include, selected) in [
+                (IncludedStates::empty(), false),
+                (IncludedStates::DISABLED, true),
+            ] {
+                let variables = setup_holding(&[0; 4]);
+                let options = GetOptions {
+                    include,
+                    ..GetOptions::default()
+                };
+                let got = HiiBackend::get_in(
+                    &hiidb,
+                    by_keyword("HiddenKeyword", None),
+                    None,
+                    &options,
+                    shared(&variables),
+                    None,
+                    None,
+                    None,
+                )
+                .map(|got| {
+                    got.responses
+                        .into_iter()
+                        .map(|response| response.question.answer)
+                        .collect::<Vec<_>>()
+                });
+                let options = SetOptions {
+                    include,
+                    ..SetOptions::default()
+                };
+                let set = set_responses(
+                    &hiidb,
+                    by_keyword("HiddenKeyword", None),
+                    &SetValue::Text("1".to_owned()),
+                    None,
+                    &options,
+                    SetAccess {
+                        reads: shared(&variables),
+                        writes: &*variables,
+                        held: None,
+                    },
+                    None,
+                );
+                match selected {
+                    true => {
+                        assert_eq!(
+                            got.map_err(|error| format!("{error:#}")),
+                            Ok(vec!["0 <disabled>".to_owned()]),
+                            "{shape}: {include:?}: get"
+                        );
+                        assert!(set.is_ok(), "{shape}: {include:?}: set: {set:?}");
+                        assert_eq!(
+                            variables.writes_to(&setup()),
+                            [(0, vec![1])],
+                            "{shape}: {include:?}: writes"
+                        );
+                    }
+                    false => {
+                        assert!(got.is_err(), "{shape}: {include:?}: get: {got:?}");
+                        assert!(set.is_err(), "{shape}: {include:?}: set: {set:?}");
+                        assert_eq!(
+                            variables.writes_to(&setup()),
+                            [],
+                            "{shape}: {include:?}: writes"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A condition on a question that ParseOpCodes skips under a true DISABLE_IF outside forms
+    /// gives UNDEFINED, as edk2-stable202608 SetupBrowserDxe/Expression.c IdToQuestion finds no
+    /// such question, which IsTrue takes as FALSE: Shown is not suppressed, though Hidden's
+    /// variable holds 1. Under a false DISABLE_IF, Hidden is a question and Shown suppressed.
+    #[test]
+    fn a_reference_to_a_question_under_a_true_form_set_disable_if_is_undefined() {
+        for (case, disable_if, want_listed) in [
+            ("a true DISABLE_IF", ifr_true(), vec![("Shown", "1")]),
+            ("a false DISABLE_IF", ifr_false(), vec![("Hidden", "1")]),
+        ] {
+            let hiidb = form_set_list_hiidb(&[
+                conditional(
+                    DISABLE_IF,
+                    disable_if,
+                    &[form(1, &[checkbox_at(1, 1, 1, 0)])],
+                ),
+                form(
+                    2,
+                    &[conditional(
+                        SUPPRESS_IF,
+                        eq_id_val_of(1, 1),
+                        &[checkbox_at(2, 2, 1, 1)],
+                    )],
+                ),
+            ]);
+            let variables = setup_holding(&[1, 1, 0, 0]);
+
+            let want: Vec<(String, String)> = want_listed
+                .iter()
+                .map(|&(name, answer)| (name.to_owned(), answer.to_owned()))
+                .collect();
+            assert_eq!(
+                names_and_answers(&hiidb, IncludedStates::empty(), &variables),
+                want,
+                "{case}: list-questions"
+            );
+        }
+    }
+
+    /// Why a DISABLE_IF outside forms on Gate, by an EQ_ID_VAL, may skip the questions in it.
+    const NOT_CONSTANT: &str = "it relies on EFI_IFR_EQ_ID_VAL, where a DISABLE_IF outside forms \
+                                must only rely on constants (UEFI 2.11 §33.3.8.3.14)";
+
+    /// The refusal of set of After, which conditions may disable for `reason`.
+    fn after_undetermined(reason: &str) -> String {
+        undetermined_refusal("After", reason)
+    }
+
+    /// The refusal of set of `question`, which conditions may disable for `reason`.
+    fn undetermined_refusal(question: &str, reason: &str) -> String {
+        format!(
+            "cannot tell whether question {question:?} is disabled: {reason}; also include \
+             disabled questions to select it regardless"
+        )
+    }
+
+    /// UEFI 2.11 §33.3.8.3.14 has a DISABLE_IF outside forms rely on constants only, and
+    /// ParseOpCodes evaluates one on a question before it reads any value: whatever Gate holds,
+    /// whether a browser parses After, in a form, Outside, outside forms, or First, in a form in a
+    /// false SUPPRESS_IF there, is not known, so set refuses to write any of them unless --include
+    /// names the disabled state, and get shows both states.
+    #[test]
+    fn a_form_set_disable_if_that_is_not_constant_leaves_its_questions_undetermined() {
+        let hiidb = form_set_list_hiidb(&[
+            form(1, &[checkbox_at(3, 3, 1, 0)]),
+            conditional(
+                DISABLE_IF,
+                eq_id_val_of(3, 1),
+                &[
+                    form(2, &[checkbox_at(4, 4, 1, 1)]),
+                    checkbox_at(6, 6, 1, 2),
+                    conditional(
+                        SUPPRESS_IF,
+                        ifr_false(),
+                        &[form(3, &[checkbox_at(5, 5, 1, 3)])],
+                    ),
+                ],
+            ),
+        ]);
+        for gate in [0, 1] {
+            for (question, offset) in [("After", 1), ("Outside", 2), ("First", 3)] {
+                let variables = setup_holding(&[gate, 0, 0, 0]);
+
+                assert_eq!(
+                    set_with(&hiidb, question, IncludedStates::empty(), &variables),
+                    Err(undetermined_refusal(question, NOT_CONSTANT)),
+                    "Gate {gate}: set {question}"
+                );
+                assert_eq!(
+                    variables.writes_to(&setup()),
+                    [],
+                    "Gate {gate}: writes of set {question}"
+                );
+                assert_eq!(
+                    got_with(&hiidb, question, IncludedStates::empty(), &variables),
+                    Ok(vec![format!("0 <selectable or disabled: {NOT_CONSTANT}>")]),
+                    "Gate {gate}: get {question}"
+                );
+                assert_eq!(
+                    set_with(&hiidb, question, IncludedStates::DISABLED, &variables),
+                    Ok(()),
+                    "Gate {gate}: set {question}, including disabled questions"
+                );
+                assert_eq!(
+                    variables.writes_to(&setup()),
+                    [(offset, vec![1])],
+                    "Gate {gate}: writes of set {question}, including disabled questions"
+                );
+            }
+        }
+    }
+
+    /// A condition in a form that ParseOpCodes may skip reads a question of that form, which
+    /// ParseOpCodes parses with it: After, grayed out where First holds 1, is undetermined by the
+    /// DISABLE_IF around its form alone, as where First is in a form before it, and set writes it
+    /// with disabled questions included.
+    #[test]
+    fn a_condition_in_an_undetermined_form_reads_a_question_of_that_form() {
+        for (case, same_form) in [
+            ("First in After's form", true),
+            ("First in the form before", false),
+        ] {
+            let gate = checkbox_at(3, 3, 1, 0);
+            let first = checkbox_at(5, 5, 1, 2);
+            let after = conditional(GRAY_OUT_IF, eq_id_val_of(5, 1), &[checkbox_at(4, 4, 1, 1)]);
+            let (gate_form, after_form) = match same_form {
+                true => (form(1, &[gate]), form(2, &[first, after])),
+                false => (form(1, &[gate, first]), form(2, &[after])),
+            };
+            let hiidb = form_set_list_hiidb(&[
+                gate_form,
+                conditional(DISABLE_IF, eq_id_val_of(3, 1), &[after_form]),
+            ]);
+            let variables = setup_holding(&[0; 4]);
+
+            assert_eq!(
+                got_with(&hiidb, "After", IncludedStates::empty(), &variables),
+                Ok(vec![format!("0 <selectable or disabled: {NOT_CONSTANT}>")]),
+                "{case}: get After"
+            );
+            assert_eq!(
+                set_with(&hiidb, "After", IncludedStates::DISABLED, &variables),
+                Ok(()),
+                "{case}: set After, including disabled questions"
+            );
+            assert_eq!(
+                variables.writes_to(&setup()),
+                [(1, vec![1])],
+                "{case}: writes"
+            );
+        }
+    }
+
+    /// Why After may be skipped after a true `op`, which UEFI 2.11 has do `role` instead.
+    fn after_true(op: &str, role: &str) -> String {
+        after_hiding(op, "TRUE", role)
+    }
+
+    /// Why After may be skipped after an `op` whose condition is `condition`, which UEFI 2.11 has
+    /// do `role` instead.
+    fn after_hiding(op: &str, condition: &str, role: &str) -> String {
+        format!(
+            "it is after an {op} in the scope of a DISABLE_IF of its FormSet, whose condition is \
+             {condition}: edk2-stable202608 SetupBrowserDxe/IfrParse.c takes that condition for \
+             the DISABLE_IF's, which may skip the rest of its scope (:1690-1704, :3045-3059), \
+             where UEFI 2.11 {role}"
+        )
+    }
+
+    /// ParseOpCodes takes the condition of a SUPPRESS_IF, GRAY_OUT_IF or VALUE in the scope of a
+    /// DISABLE_IF outside forms for the DISABLE_IF's, so a true one skips the rest of that scope,
+    /// After, in the DISABLE_IFs nested there too, unless a DISABLE_IF ends between them
+    /// (:2654-2655, :3007-3014), where UEFI 2.11 has it only hide, gray out or give a value; so
+    /// may one whose condition is not known: whether a browser parses After is not known, so set
+    /// refuses to write it. First, before it, is a question, as After is after a false
+    /// SUPPRESS_IF, without one, and after a DISABLE_IF that holds a true one, as ParseOpCodes
+    /// skips to that DISABLE_IF's END only (:1395-1410).
+    #[test]
+    fn a_suppress_if_in_a_form_set_disable_if_leaves_the_forms_after_it_undetermined() {
+        let first = || form(1, &[checkbox_at(5, 5, 1, 0)]);
+        let after = || form(2, &[checkbox_at(4, 4, 1, 1)]);
+        let after_suppress_if = after_true("EFI_IFR_SUPPRESS_IF", "§33.3.8.3.75 has it only hide");
+        let after_value = after_true("EFI_IFR_VALUE", "§33.3.8.3.88 has it only give a value");
+        // Outside, a CHECKBOX outside forms whose scope holds a VALUE of TRUE
+        let outside_with_value = || {
+            let mut outside = checkbox_at(6, 6, 1, 2);
+            outside[1] |= 0x80;
+            [outside, value_of(ifr_true()), END.to_vec()].concat()
+        };
+        for (case, list, want_set) in [
+            (
+                "after a true SUPPRESS_IF",
+                vec![first(), conditional(SUPPRESS_IF, ifr_true(), &[]), after()],
+                Err(after_undetermined(&after_suppress_if)),
+            ),
+            (
+                "after a true GRAY_OUT_IF",
+                vec![first(), conditional(GRAY_OUT_IF, ifr_true(), &[]), after()],
+                Err(after_undetermined(&after_true(
+                    "EFI_IFR_GRAY_OUT_IF",
+                    "§33.3.8.3.28 has it only gray out",
+                ))),
+            ),
+            (
+                "a true SUPPRESS_IF, then After in an inner DISABLE_IF",
+                vec![
+                    first(),
+                    conditional(SUPPRESS_IF, ifr_true(), &[]),
+                    conditional(DISABLE_IF, ifr_false(), &[after()]),
+                ],
+                Err(after_undetermined(&after_suppress_if)),
+            ),
+            (
+                "a true SUPPRESS_IF in an inner DISABLE_IF, then After",
+                vec![
+                    first(),
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[conditional(SUPPRESS_IF, ifr_true(), &[])],
+                    ),
+                    after(),
+                ],
+                Ok(()),
+            ),
+            (
+                "a DISABLE_IF ends, then a true SUPPRESS_IF, then After",
+                vec![
+                    conditional(DISABLE_IF, ifr_false(), &[first()]),
+                    conditional(SUPPRESS_IF, ifr_true(), &[]),
+                    after(),
+                ],
+                Ok(()),
+            ),
+            (
+                "a DISABLE_IF in First's form ends, then a true SUPPRESS_IF, then After",
+                vec![
+                    form(
+                        1,
+                        &[conditional(
+                            DISABLE_IF,
+                            ifr_false(),
+                            &[checkbox_at(5, 5, 1, 0)],
+                        )],
+                    ),
+                    conditional(SUPPRESS_IF, ifr_true(), &[]),
+                    after(),
+                ],
+                Ok(()),
+            ),
+            (
+                "a true DISABLE_IF ends, then a true SUPPRESS_IF, then After",
+                vec![
+                    first(),
+                    conditional(
+                        DISABLE_IF,
+                        ifr_true(),
+                        &[form(3, &[checkbox_at(1, 1, 1, 2)])],
+                    ),
+                    conditional(SUPPRESS_IF, ifr_true(), &[]),
+                    after(),
+                ],
+                Ok(()),
+            ),
+            (
+                "a true SUPPRESS_IF, then a DISABLE_IF ends, then After",
+                vec![
+                    first(),
+                    conditional(SUPPRESS_IF, ifr_true(), &[]),
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[form(3, &[checkbox_at(1, 1, 1, 2)])],
+                    ),
+                    after(),
+                ],
+                Err(after_undetermined(&after_suppress_if)),
+            ),
+            (
+                "a DISABLE_IF ends, then After after a true SUPPRESS_IF in another",
+                vec![
+                    first(),
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[form(3, &[checkbox_at(1, 1, 1, 2)])],
+                    ),
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[conditional(SUPPRESS_IF, ifr_true(), &[]), after()],
+                    ),
+                ],
+                Err(after_undetermined(&after_suppress_if)),
+            ),
+            (
+                "after a VALUE of TRUE in a question outside forms",
+                vec![first(), outside_with_value(), after()],
+                Err(after_undetermined(&after_value)),
+            ),
+            (
+                "after a VALUE of TRUE outside forms",
+                vec![first(), value_of(ifr_true()), after()],
+                Err(after_undetermined(&after_value)),
+            ),
+            (
+                "a DISABLE_IF ends, then a VALUE of TRUE outside forms, then After",
+                vec![
+                    first(),
+                    conditional(
+                        DISABLE_IF,
+                        ifr_false(),
+                        &[form(3, &[checkbox_at(1, 1, 1, 2)])],
+                    ),
+                    value_of(ifr_true()),
+                    after(),
+                ],
+                Ok(()),
+            ),
+            (
+                "after a SUPPRESS_IF that is not constant",
+                vec![
+                    first(),
+                    conditional(SUPPRESS_IF, eq_id_val_of(5, 1), &[]),
+                    after(),
+                ],
+                Err(after_undetermined(&after_hiding(
+                    "EFI_IFR_SUPPRESS_IF",
+                    &format!("not known: {NOT_CONSTANT}"),
+                    "§33.3.8.3.75 has it only hide",
+                ))),
+            ),
+            (
+                "after a false SUPPRESS_IF",
+                vec![first(), conditional(SUPPRESS_IF, ifr_false(), &[]), after()],
+                Ok(()),
+            ),
+            ("without a SUPPRESS_IF", vec![first(), after()], Ok(())),
+        ] {
+            let hiidb = form_set_list_hiidb(&[conditional(DISABLE_IF, ifr_false(), &list)]);
+            let variables = setup_holding(&[0; 4]);
+
+            assert_eq!(
+                set_with(&hiidb, "First", IncludedStates::empty(), &variables),
+                Ok(()),
+                "{case}: set First"
+            );
+            let want_writes = match want_set {
+                Ok(()) => vec![(0, vec![1]), (1, vec![1])],
+                Err(_) => vec![(0, vec![1])],
+            };
+            assert_eq!(
+                set_with(&hiidb, "After", IncludedStates::empty(), &variables),
+                want_set,
+                "{case}: set After"
+            );
+            assert_eq!(variables.writes_to(&setup()), want_writes, "{case}: writes");
+        }
+    }
+
+    /// A HiiDB with a PASSWORD on AMITSESetup at bytes 0..40 in a form under a true DISABLE_IF
+    /// outside forms, and Q, P at byte 80 and O at byte 10, inside the password's bytes, in a form
+    /// after it. `password_store` declares AMITSESetup as VarStore 2 in that DISABLE_IF's scope,
+    /// or before it if None; then VarStore 5 declares it again after the DISABLE_IF, for P. O is
+    /// on VarStore `o_store`. Its keywords are its prompts with "Key" after them.
+    fn disabled_password_hiidb(password_store: Option<PasswordStore>, o_store: u16) -> Vec<u8> {
+        let amitse_setup = |id| var_store(id, [0x44; 16], "AMITSESetup", 81);
+        let password_form = form(2, &[password_on(3, 3, 2, 0)]);
+        let (before, disabled, after, p_store) = match password_store {
+            None => (
+                vec![amitse_setup(2)],
+                conditional(DISABLE_IF, ifr_true(), &[password_form]),
+                vec![],
+                2,
+            ),
+            Some(PasswordStore::InTheDisableIf) => (
+                vec![],
+                conditional(DISABLE_IF, ifr_true(), &[amitse_setup(2), password_form]),
+                vec![amitse_setup(5)],
+                5,
+            ),
+            Some(PasswordStore::InANestedDisableIf) => (
+                vec![],
+                conditional(
+                    DISABLE_IF,
+                    ifr_false(),
+                    &[conditional(
+                        DISABLE_IF,
+                        ifr_true(),
+                        &[amitse_setup(2), password_form],
+                    )],
+                ),
+                vec![amitse_setup(5)],
+                5,
+            ),
+        };
+        let questions = form(
+            1,
+            &[
+                checkbox_on(1, 1, 1),
+                checkbox_at(2, 2, p_store, 80),
+                checkbox_at(4, 4, o_store, 10),
+            ],
+        );
+        let ifr = [
+            vec![var_store_efi(1, "Setup", NV_BS_RT, 1)],
+            before,
+            vec![disabled],
+            after,
+            vec![questions],
+        ]
+        .concat();
+        let packages = [
+            form_package(&ifr),
+            en_strings_package_of(&["Q", "P", "Password", "O"]),
+            strings_package_of(b"x-UEFI-ns", &["QKey", "PKey", "PasswordKey", "OKey"]),
+            END_PACKAGE.to_vec(),
+        ];
+        package_list_with_guid([0x55; 16], &packages.concat())
+    }
+
+    /// Where disabled_password_hiidb declares the PASSWORD's VarStore.
+    #[derive(Debug, Clone, Copy)]
+    enum PasswordStore {
+        /// In the true DISABLE_IF's scope
+        InTheDisableIf,
+        /// In the scope of a true DISABLE_IF nested in a false one
+        InANestedDisableIf,
+    }
+
+    /// A PASSWORD in a form under a true DISABLE_IF outside forms keeps its bytes withheld,
+    /// whatever the reach and wherever its VarStore is declared: O, whose bytes overlap them, is
+    /// read and written by no prompt and no keyword, with every --include and
+    /// UnsafeOperations::Allow, while P is.
+    #[test]
+    fn a_password_under_a_true_form_set_disable_if_stays_withheld() {
+        let withheld = format!("{PASSWORD_BYTES} <IFR default: 0>");
+        let no_store_2 = "<ValueUnavailable: no supported varstore with matching id 0x0002 found> \
+                          <IFR default: 0>";
+        let password_bytes = "holds a password at bytes 0..40, which set never writes";
+        let no_var_store = "no supported varstore with matching id 0x0002";
+        for (case, password_store, o_store, want_o, want_refusal) in [
+            (
+                "its VarStore before the DISABLE_IF",
+                None,
+                2,
+                withheld.as_str(),
+                password_bytes,
+            ),
+            (
+                "its VarStore in the DISABLE_IF, O on the later one",
+                Some(PasswordStore::InTheDisableIf),
+                5,
+                withheld.as_str(),
+                password_bytes,
+            ),
+            (
+                "its VarStore in the DISABLE_IF, O on it",
+                Some(PasswordStore::InTheDisableIf),
+                2,
+                no_store_2,
+                no_var_store,
+            ),
+            (
+                "its VarStore in a nested DISABLE_IF, O on the later one",
+                Some(PasswordStore::InANestedDisableIf),
+                5,
+                withheld.as_str(),
+                password_bytes,
+            ),
+            (
+                "its VarStore in a nested DISABLE_IF, O on it",
+                Some(PasswordStore::InANestedDisableIf),
+                2,
+                no_store_2,
+                no_var_store,
+            ),
+        ] {
+            let hiidb = disabled_password_hiidb(password_store, o_store);
+            for (reach, interface) in [
+                (VariableReach::Runtime, VariableInterface::Efivarfs),
+                (
+                    VariableReach::BootServices,
+                    VariableInterface::VariableServices,
+                ),
+            ] {
+                let variables = password_variables(reach, interface);
+                let options = GetOptions {
+                    include: IncludedStates::all(),
+                    ..GetOptions::default()
+                };
+                let keyword_got = HiiBackend::get_in(
+                    &hiidb,
+                    by_keyword("OKey", None),
+                    None,
+                    &options,
+                    shared(&variables),
+                    None,
+                    None,
+                    None,
+                )
+                .map(|got| {
+                    got.responses
+                        .into_iter()
+                        .map(|response| response.question.answer)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| format!("{error:#}"));
+                let options = SetOptions {
+                    include: IncludedStates::all(),
+                    unsafe_operations: UnsafeOperations::Allow,
+                    ..SetOptions::default()
+                };
+                let keyword_set = set_responses(
+                    &hiidb,
+                    by_keyword("OKey", None),
+                    &SetValue::Text("1".to_owned()),
+                    None,
+                    &options,
+                    SetAccess {
+                        reads: shared(&variables),
+                        writes: &*variables,
+                        held: None,
+                    },
+                    None,
+                )
+                .map(drop)
+                .map_err(|error| format!("{error:#}"));
+
+                assert_eq!(
+                    got_with(&hiidb, "O", IncludedStates::all(), &variables),
+                    Ok(vec![want_o.to_owned()]),
+                    "{case}, {reach:?}: get O"
+                );
+                assert_eq!(
+                    keyword_got,
+                    Ok(vec![want_o.to_owned()]),
+                    "{case}, {reach:?}: get OKey"
+                );
+                let listed = names_and_answers(&hiidb, IncludedStates::all(), &variables);
+                assert!(
+                    listed.contains(&("O".to_owned(), want_o.to_owned())),
+                    "{case}, {reach:?}: list-questions O: {listed:?}"
+                );
+                let set = set_with(&hiidb, "O", IncludedStates::all(), &variables);
+                assert!(
+                    set.as_ref()
+                        .is_err_and(|error| error.contains(want_refusal)),
+                    "{case}, {reach:?}: set O: {set:?}"
+                );
+                assert!(
+                    keyword_set
+                        .as_ref()
+                        .is_err_and(|error| error.contains(want_refusal)),
+                    "{case}, {reach:?}: set OKey: {keyword_set:?}"
+                );
+                assert_eq!(
+                    set_with(&hiidb, "P", IncludedStates::all(), &variables),
+                    Ok(()),
+                    "{case}, {reach:?}: set P"
+                );
+                assert_eq!(
+                    variables.bytes(&amitse_setup()),
+                    Some([&NV_BS_RT.to_ne_bytes()[..], &[0xAA; 80], &[1]].concat()),
+                    "{case}, {reach:?}: AMITSESetup keeps its password bytes"
+                );
+            }
+        }
+    }
 }
