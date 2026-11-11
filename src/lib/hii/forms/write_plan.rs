@@ -257,7 +257,7 @@ pub(super) fn list_own_write<'a>(
 
 /// The write of `write`, the CHAR16s of the STRING `question`, through variables of `reach`:
 /// refuses one with a WRITE expression, which takes its characters, or without a VarStore.
-fn string_own_write<'a>(
+pub(super) fn string_own_write<'a>(
     question: &'a QuestionDescriptor,
     StringWrite { offset, bytes }: StringWrite,
     reach: VariableReach,

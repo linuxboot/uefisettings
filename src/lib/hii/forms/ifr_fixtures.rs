@@ -791,8 +791,19 @@ pub(crate) fn password_on(
     var_store_id: u16,
     offset: u16,
 ) -> Vec<u8> {
+    flagged_password_on(question_id, prompt, var_store_id, offset, 0x00)
+}
+
+/// password_on, with the question Flags `flags`: 0x04 is EFI_IFR_FLAG_CALLBACK.
+pub(crate) fn flagged_password_on(
+    question_id: u16,
+    prompt: u16,
+    var_store_id: u16,
+    offset: u16,
+    flags: u8,
+) -> Vec<u8> {
     let data = [
-        question_header_on(question_id, prompt, var_store_id, offset),
+        question_header_with(question_id, prompt, var_store_id, offset, flags),
         [&1u16.to_le_bytes()[..], &20u16.to_le_bytes()].concat(), // MinSize, MaxSize
     ]
     .concat();

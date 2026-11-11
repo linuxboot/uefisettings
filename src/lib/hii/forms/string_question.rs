@@ -135,7 +135,7 @@ fn stored_units(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
 }
 
 /// The text of `bytes`, the CHAR16s of a STRING that stored_units takes.
-fn stored_text(bytes: &[u8]) -> Result<String, NotUcs2> {
+pub(super) fn stored_text(bytes: &[u8]) -> Result<String, NotUcs2> {
     stored_units(bytes)
         .enumerate()
         .map(|(index, unit)| char::from_u32(u32::from(unit)).ok_or(NotUcs2 { index, unit }))

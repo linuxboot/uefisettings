@@ -904,7 +904,14 @@ ORDERED_LIST each container, whose options up to the first empty one `set` takes
 every container after it empty. A container is as wide as the Type of the ONE_OF_OPTION right
 after the ORDERED_LIST, as edk2's GetWidth takes it, where UEFI 2.11 §33.2.5.4.8 gives it one
 byte; a VALUE is refused where `set` writes containers of another width, that of the first option
-that is no default. A REF, whose EFI_HII_REF `set` does not write, and a STRING are refused.
+that is no default. A REF, whose EFI_HII_REF `set` does not write, is refused. Of a STRING, a
+VALUE holds all MaxSize CHAR16s, as edk2's GetWidth takes them, so `AB` of MaxSize 4 is
+`0000000000420041`; UEFI 2.11 §33.2.5.4.9 represents a STRING's result as "hex dump of the
+string, including the terminating NULL character", but a VALUE of fewer bytes is refused, as
+edk2-stable202608 ConfigRouting.c HiiConfigToBlock copies the question's width (:6353) from a
+buffer of half the VALUE's digits (:508-509): `set`'s checks take its text up to the first NULL,
+and a VALUE that is not the bytes that `set` writes for that text, NULL-padded (UEFI 2.11
+§33.2.5.4.9), or that holds a UTF-16 surrogate is refused.
 
 ```plain
 FS0:\> uefisettings.efi hii keyword get --namespace x-UEFI-ns KEYWORD=<keyword>

@@ -906,6 +906,7 @@ mod tests {
     use crate::hii::forms::ifr_fixtures::conditional;
     use crate::hii::forms::ifr_fixtures::eq_id_val_of;
     use crate::hii::forms::ifr_fixtures::flagged_option;
+    use crate::hii::forms::ifr_fixtures::flagged_password_on;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::form_set_with_guid;
     use crate::hii::forms::ifr_fixtures::in_unknown_scope;
@@ -1712,37 +1713,75 @@ mod tests {
         assert_eq!(got, Ok(vec![]), "no password: lifted");
     }
 
-    /// In a HiiDB that declares a PASSWORD question, set refuses a keyword of a STRING, whose
-    /// keyword set uefisettings does not implement yet, before the setup password, with and
-    /// without UnsafeOperations::Allow, and calls no SetData().
+    /// keyword set of a STRING in a HiiDB that declares a PASSWORD question takes UnsafeOperations
+    /// as the other kinds do: set's refusal of the VALUE's text, a character of the Private Use
+    /// Area, comes before the setup password's, which refuses before any call unless
+    /// UnsafeOperations allows it; then SetData() writes the VALUE as given, GetData() reads it
+    /// back and UnsafeOperation::SetupPassword returns, lifted.
     #[test]
-    fn set_refuses_a_string_before_the_setup_password() {
+    fn set_of_a_string_with_a_declared_password_needs_the_flag() {
         let lists = [list(
             PATH,
             &[vec![string_on(3, 3, (1, 8), (0, 4), &[])], password()].concat(),
         )];
-        for grant in [UnsafeOperations::Refuse, UnsafeOperations::Allow] {
-            let handler = MemoryKeywordHandler::with(&[(PATH, KEYWORD, "4100000000000000")]);
+        let written = resp(PATH, KEYWORD, "0000000000420041");
+        let private_use = resp(PATH, KEYWORD, "000000000000e000");
 
-            let got = set(
-                &lists,
-                &resp(PATH, KEYWORD, "4100420000000000"),
-                grant,
-                &handler,
-            )
-            .map(|values| values.to_string())
-            .map_err(|error| format!("{error:#}"));
+        let refused = MemoryKeywordHandler::default();
+        let password = set(&lists, &written, UnsafeOperations::Refuse, &refused)
+            .expect_err("a declared setup password");
+        let string = set(&lists, &private_use, UnsafeOperations::Allow, &refused)
+            .expect_err("the Private Use Area");
+        let string_refused = set(&lists, &private_use, UnsafeOperations::Refuse, &refused)
+            .expect_err("the Private Use Area, refused");
+        assert_eq!(
+            format!("{string_refused:#}"),
+            format!("{string:#}"),
+            "the STRING's refusal before the setup password's"
+        );
+        let allowed = MemoryKeywordHandler::default();
+        let (values, lifted) = set_keywords(
+            &lists,
+            &written,
+            IncludedStates::empty(),
+            UnsafeOperations::Allow,
+            VolatileWrites::Refuse,
+            variables(),
+            &allowed,
+        )
+        .expect("allowed");
 
-            assert_eq!(
-                got,
-                Err(format!(
-                    "keyword {KEYWORD}: uefisettings does not yet implement keyword set of \
-                     EFI_IFR_STRING"
-                )),
-                "{grant:?}"
-            );
-            assert_eq!(handler.calls(), [], "{grant:?}: calls");
-        }
+        assert_eq!(
+            format!("{password:#}"),
+            "this HiiDB declares a setup password question, and the UEFI Shell runs no setup \
+             browser, so no password is asked or checked; pass --i-am-fine-to-brick-this-system \
+             to write without it",
+            "refused"
+        );
+        assert_eq!(
+            format!("{string:#}"),
+            format!(
+                "keyword {KEYWORD}: VALUE=000000000000e000 of question \"Keyword question\": \
+                 cannot set question \"Keyword question\": '\\u{{e000}}' (U+E000) lies in the \
+                 Private Use Area, U+E000..U+F8FF, which UEFI 2.11 §33.2.6.2.1 prohibits"
+            ),
+            "the STRING's refusal, whatever the grant"
+        );
+        assert_eq!(refused.calls(), vec![], "no call when refused");
+        assert_eq!(values.to_string(), written, "allowed: the value read back");
+        assert_eq!(
+            lifted,
+            vec![UnsafeOperation::SetupPassword],
+            "allowed: lifted"
+        );
+        assert_eq!(
+            allowed.calls(),
+            vec![
+                KeywordCall::SetData(written.clone()),
+                get_call(PATH, KEYWORD)
+            ],
+            "allowed: one SetData(), then a GetData()"
+        );
     }
 
     /// set refuses a keyword whose question EFI_IFR_FLAG_READ_ONLY makes read-only, under a
@@ -4311,6 +4350,84 @@ mod tests {
         assert_eq!(
             calls,
             vec![get_call(PATH, KEYWORD)],
+            "beside a password on Store: calls"
+        );
+    }
+
+    /// Set by keyword of a STRING beside a PASSWORD of VarStoreId 0, EFI_IFR_FLAG_CALLBACK or not,
+    /// fails before any variable read or call through variables of either reach, with
+    /// UnsafeOperations::Allow too, as set does; beside a PASSWORD on Store that ends before it,
+    /// SetData() writes the STRING's VALUE.
+    #[test]
+    fn set_refuses_a_string_beside_a_password_of_var_store_id_0() {
+        let written = resp(PATH, KEYWORD, "0000000000420041");
+        let set_of = |password: Vec<u8>, reach| {
+            let ifr = form_set(&[
+                var_store(1, STORE_GUID, "Store", 48),
+                password,
+                string_on(7, 3, (1, 40), (0, 4), &[]),
+            ]);
+            let interface = match reach {
+                VariableReach::BootServices => VariableInterface::VariableServices,
+                VariableReach::Runtime => VariableInterface::Efivarfs,
+            };
+            let variables = Rc::new(MemoryVariables::new(reach, interface));
+            let key = VariableKey {
+                name: "Store".to_owned(),
+                guid: Guid::from(STORE_GUID),
+            };
+            variables.insert(key, ATTRIBUTES, &[0; 48]);
+            let handler = MemoryKeywordHandler::default();
+            let got = set_keywords(
+                &[list_of_ifr(PATH, &ifr)],
+                &written,
+                IncludedStates::empty(),
+                UnsafeOperations::Allow,
+                VolatileWrites::Refuse,
+                Box::new(Rc::clone(&variables)),
+                &handler,
+            )
+            .map(|(values, _)| values.to_string())
+            .map_err(|error| format!("{error:#}"));
+            (got, variables.reads().len(), handler.calls())
+        };
+        let record = "PASSWORD question 0x0009 in FormSet 11111111-1111-1111-1111-111111111111: \
+                      VarStoreId 0 names no VarStore";
+
+        for flags in [0x00, 0x04] {
+            for (reach, end) in [
+                (
+                    VariableReach::BootServices,
+                    "; as the variable of that password is unknown, the UEFI Shell build reads \
+                     and writes no variable of this HiiDB",
+                ),
+                (
+                    VariableReach::Runtime,
+                    "; as a PASSWORD there may keep its password in any variable, uefisettings \
+                     reads and writes no variable of this HiiDB",
+                ),
+            ] {
+                let (got, reads, calls) = set_of(flagged_password_on(9, 9, 0, 0, flags), reach);
+                assert!(
+                    got.as_ref()
+                        .is_err_and(|error| error.contains(record) && error.ends_with(end)),
+                    "Flags {flags:#04x}, {reach:?}: {got:?}"
+                );
+                assert_eq!(reads, 0, "Flags {flags:#04x}, {reach:?}: reads");
+                assert_eq!(calls, vec![], "Flags {flags:#04x}, {reach:?}: calls");
+            }
+        }
+        let (got, _, calls) = set_of(
+            flagged_password_on(9, 9, 1, 0, 0x00),
+            VariableReach::BootServices,
+        );
+        assert_eq!(got, Ok(written.clone()), "beside a password on Store");
+        assert_eq!(
+            calls,
+            vec![
+                KeywordCall::SetData(written.clone()),
+                get_call(PATH, KEYWORD)
+            ],
             "beside a password on Store: calls"
         );
     }

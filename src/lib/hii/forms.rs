@@ -3516,16 +3516,41 @@ enum TextInput {
 }
 
 impl TextInput {
-    /// The name of its variant, which an internal inconsistency names.
-    fn kind(&self) -> &'static str {
+    /// Its variant, which an internal inconsistency names.
+    fn kind(&self) -> TextInputKind {
         match self {
-            Self::Range(_) => "Range",
-            Self::Maximum(_) => "Maximum",
-            Self::DateTime(_) => "DateTime",
-            Self::OrderedList(_) => "OrderedList",
-            Self::CrossReference => "CrossReference",
-            Self::String(_) => "String",
+            Self::Range(_) => TextInputKind::Range,
+            Self::Maximum(_) => TextInputKind::Maximum,
+            Self::DateTime(_) => TextInputKind::DateTime,
+            Self::OrderedList(_) => TextInputKind::OrderedList,
+            Self::CrossReference => TextInputKind::CrossReference,
+            Self::String(_) => TextInputKind::String,
         }
+    }
+}
+
+/// The variant of a TextInput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextInputKind {
+    Range,
+    Maximum,
+    DateTime,
+    OrderedList,
+    CrossReference,
+    String,
+}
+
+impl fmt::Display for TextInputKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Range => "Range",
+            Self::Maximum => "Maximum",
+            Self::DateTime => "DateTime",
+            Self::OrderedList => "OrderedList",
+            Self::CrossReference => "CrossReference",
+            Self::String => "String",
+        };
+        write!(f, "TextInput::{name}")
     }
 }
 

@@ -12901,6 +12901,63 @@ mod tests {
         }
     }
 
+    /// set --keyword selects a STRING by its keyword as set by its prompt does, and writes its
+    /// text with set's checks: NULL-padded to MaxSize CHAR16s, and nothing for a text that set
+    /// refuses.
+    #[test]
+    fn strings_set_by_keyword_as_by_prompt() {
+        let string = flagged_string_on(1, 1, (1, 0), (0, 4), (0x00, 0x00), &[]);
+        let packages = [
+            form_package(&[var_store_efi(1, "Setup", NV_BS_RT, 8), form(1, &[string])]),
+            en_strings_package_of(&["S"]),
+            strings_package_of(b"x-UEFI-ns", &["KString"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x62; 16], &packages.concat());
+        let set = |text: &str, variables: &Rc<MemoryVariables>| {
+            let by_keyword = QuestionSelector::Keyword {
+                keyword: "KString".parse().expect("parse the keyword"),
+                namespace: None,
+            };
+            set_responses(
+                &hiidb,
+                by_keyword,
+                &SetValue::Text(text.to_owned()),
+                None,
+                &SetOptions::default(),
+                shared(variables),
+                &**variables,
+                None,
+            )
+            .map(drop)
+            .map_err(|error| format!("{error:#}"))
+        };
+
+        let variables = setup_holding(&[0; 8]);
+        assert_eq!(set("AB", &variables), Ok(()), "set AB");
+        assert_eq!(
+            variables.writes_to(&setup()),
+            [(0, vec![0x41, 0, 0x42, 0, 0, 0, 0, 0])],
+            "writes of AB"
+        );
+
+        let refused = setup_holding(&[0; 8]);
+        assert_eq!(
+            set("ABCD", &refused),
+            Err(
+                "cannot set question \"S\": the STRING takes at most 3 characters, its last \
+                 CHAR16 of MaxSize 4 holding the NULL (UEFI 2.11 §33.2.5.4.9), not 4"
+                    .to_owned()
+            ),
+            "set ABCD"
+        );
+        assert_eq!(
+            refused.writes_to(&setup()),
+            Vec::<(u16, Vec<u8>)>::new(),
+            "writes of ABCD"
+        );
+    }
+
     /// set of a STRING through `hiidb`'s variables with `value`, as the CLI prints an error, and
     /// what it wrote to Setup, which held `stored`.
     fn string_set(hiidb: &[u8], value: &SetValue, stored: &[u8]) -> SetOutcome {

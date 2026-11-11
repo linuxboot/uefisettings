@@ -64,9 +64,12 @@ use super::set::own_write;
 use super::set::ChangeValueError;
 use super::set::NewValue;
 use super::set::VarStoreWrite;
+use super::string_question::stored_text;
+use super::string_question::StringInput;
 use super::try_walk_scopes;
 use super::walk_scopes;
 use super::write_plan::list_own_write;
+use super::write_plan::string_own_write;
 use super::AnswerOption;
 use super::Choice;
 use super::DeclaredStore;
@@ -88,6 +91,7 @@ use super::ReadOnlyWriter;
 use super::SelectionError;
 use super::ShortVarStoreEfi;
 use super::TextInput;
+use super::TextInputKind;
 use super::TimeStorage;
 use super::TypeValue;
 use super::Walk;
@@ -246,17 +250,18 @@ pub(crate) enum KeywordRefusal {
         storage_width: usize,
         question: String,
     },
-    /// An ORDERED_LIST whose description holds no ListInput, which describe_question always
-    /// gives it (handle_ordered_list)
+    /// An ORDERED_LIST or STRING whose description holds another TextInput than its own, which
+    /// describe_question always gives it (handle_ordered_list, handle_string)
     #[error(
-        "keyword {keyword}: internal inconsistency: question \"{question}\" is an \
-         EFI_IFR_ORDERED_LIST, but its description holds set's TextInput::{input}, not a \
-         ListInput"
+        "keyword {keyword}: internal inconsistency: question \"{question}\" is an {op}, but its \
+         description holds set's {input}, not {expected}"
     )]
-    ListInputMismatch {
+    InputMismatch {
         keyword: String,
         question: String,
-        input: &'static str,
+        op: &'static str,
+        input: TextInputKind,
+        expected: TextInputKind,
     },
     #[error("keyword {keyword}: VALUE={value} {reason} question \"{question}\"")]
     Value {
@@ -829,10 +834,10 @@ impl<'a> KeywordQuestion<'a> {
     /// `include`, `volatile` and the variables of `reader`: the question's state, whether it is
     /// read-only, which no `include` lifts, its option of the VALUE or the VALUE's range, the
     /// fields of a DATE or TIME (DateTimeInput::number_value), the items of an ORDERED_LIST
-    /// (list_write), the EFI_HII_REF of a REF, which set does not write, the variable's, and
-    /// whether the bytes written overlap those that `reader` withholds, which hold a password
-    /// (ChangeValueError::PasswordBytes); and refuses a VALUE that is not the bytes that set
-    /// writes. Returns what SetData() writes.
+    /// (list_write), the text of a STRING (string_write), the EFI_HII_REF of a REF, which set
+    /// does not write, the variable's, and whether the bytes written overlap those that `reader`
+    /// withholds, which hold a password (ChangeValueError::PasswordBytes); and refuses a VALUE
+    /// that is not the bytes that set writes. Returns what SetData() writes.
     pub(crate) fn check_set(
         &self,
         resp: &KeywordResp,
@@ -848,10 +853,6 @@ impl<'a> KeywordQuestion<'a> {
         let Some(listed) = ListedQuestion::of(&op) else {
             return Err(self.unchecked(&op).into());
         };
-        // set takes a STRING, but keyword set takes none yet: refused before its VALUE
-        if let ListedQuestion::String(_) = listed {
-            return Err(self.unchecked(&op).into());
-        }
         let prompt = self.texts.display(header.prompt_string_id);
         if keyword_width(&op) != Some(resp.value.as_bytes().len()) {
             return Err(self.value_refusal(resp, prompt, ValueRefusal::Width).into());
@@ -865,14 +866,19 @@ impl<'a> KeywordQuestion<'a> {
             }
             ListedQuestion::OrderedList(_) => {
                 let TextInput::OrderedList(input) = &descriptor.input else {
-                    return Err(KeywordRefusal::ListInputMismatch {
-                        keyword: self.keyword.to_string(),
-                        question: descriptor.question.clone(),
-                        input: descriptor.input.kind(),
-                    }
-                    .into());
+                    return Err(self
+                        .input_mismatch(&op, &descriptor, TextInputKind::OrderedList)
+                        .into());
                 };
                 Some(self.list_write(input, &descriptor, resp, prompt, include, reader)?)
+            }
+            ListedQuestion::String(_) => {
+                let TextInput::String(input) = &descriptor.input else {
+                    return Err(self
+                        .input_mismatch(&op, &descriptor, TextInputKind::String)
+                        .into());
+                };
+                Some(self.string_write(input, &descriptor, resp, prompt, reader)?)
             }
             // as set refuses it, after its choice (plan_question)
             ListedQuestion::Ref(_) => {
@@ -881,8 +887,6 @@ impl<'a> KeywordQuestion<'a> {
                 })
                 .with_context(|| format!("keyword {}", self.keyword));
             }
-            // refused before its VALUE, above
-            ListedQuestion::String(_) => return Err(self.unchecked(&op).into()),
         };
         let write =
             write.ok_or_else(|| self.question_refusal(&header, QuestionRefusal::Storageless))?;
@@ -1514,6 +1518,29 @@ impl<'a> KeywordQuestion<'a> {
             .with_context(|| self.value_context(resp, prompt))
     }
 
+    /// set's write of `resp`, a keyword VALUE of every CHAR16 of the STRING of `descriptor`, of
+    /// `input`, prompted by `prompt`, through variables of `reader`: the text of the VALUE up to
+    /// its first NULL, as get reads it (stored_text), written as set writes a text
+    /// (StringInput::write, string_own_write), so that set's refusals of it apply. Refuses a VALUE
+    /// that holds a UTF-16 surrogate there, which get does not read either.
+    fn string_write<'d>(
+        &self,
+        input: &StringInput,
+        descriptor: &'d QuestionDescriptor,
+        resp: &KeywordResp,
+        prompt: &str,
+        reader: &EfivarReader,
+    ) -> Result<VarStoreWrite<'d>> {
+        let text =
+            stored_text(resp.value.as_bytes()).with_context(|| self.value_context(resp, prompt))?;
+        let write = input
+            .write(&text)
+            .map_err(|refusal| refusal.of(descriptor))
+            .with_context(|| self.value_context(resp, prompt))?;
+        string_own_write(descriptor, write, reader.reach())
+            .with_context(|| self.value_context(resp, prompt))
+    }
+
     /// What names `resp`, the keyword's VALUE, for the question prompted by `prompt`, in the errors
     /// of set's checks of it.
     fn value_context(&self, resp: &KeywordResp, prompt: &str) -> String {
@@ -1572,6 +1599,23 @@ impl<'a> KeywordQuestion<'a> {
         KeywordRefusal::Unchecked {
             keyword: self.keyword.to_string(),
             op: op.op_code.spec_name(),
+        }
+    }
+
+    /// The refusal of the question `op` of `descriptor`, whose description holds another
+    /// TextInput than its `expected` one.
+    fn input_mismatch(
+        &self,
+        op: &IFROperation,
+        descriptor: &QuestionDescriptor,
+        expected: TextInputKind,
+    ) -> KeywordRefusal {
+        KeywordRefusal::InputMismatch {
+            keyword: self.keyword.to_string(),
+            question: descriptor.question.clone(),
+            op: op.op_code.spec_name(),
+            input: descriptor.input.kind(),
+            expected,
         }
     }
 
@@ -1838,6 +1882,7 @@ mod tests {
     use super::super::ifr_fixtures::conditional;
     use super::super::ifr_fixtures::eq_id_val_of;
     use super::super::ifr_fixtures::flagged_option;
+    use super::super::ifr_fixtures::flagged_string_on;
     use super::super::ifr_fixtures::form;
     use super::super::ifr_fixtures::form_set;
     use super::super::ifr_fixtures::form_set_with_guid;
@@ -2821,8 +2866,8 @@ mod tests {
     }
 
     /// GetData() reads a STRING, DATE, TIME or ORDERED_LIST as stored, which check_get takes;
-    /// check_set refuses a STRING, as keyword set of it is not implemented yet, and a VALUE of a
-    /// byte for the others, which it takes as wide as GetWidth; both refuse a PASSWORD.
+    /// check_set refuses a VALUE of a byte for each, which it takes as wide as GetWidth; both
+    /// refuse a PASSWORD.
     #[test]
     fn check_get_takes_string_date_time_and_ordered_list_but_not_password() {
         let question = |op_code: u8| {
@@ -2833,12 +2878,12 @@ mod tests {
             .concat();
             operation(op_code, false, &data)
         };
-        let unchecked = |op: &'static str| KeywordRefusal::Unchecked {
-            keyword: KEYWORD.to_owned(),
-            op,
-        };
         for (op_code, op, refusal) in [
-            (STRING, "EFI_IFR_STRING", unchecked("EFI_IFR_STRING")),
+            (
+                STRING,
+                "EFI_IFR_STRING",
+                value_refusal("03", ValueRefusal::Width),
+            ),
             (
                 DATE,
                 "EFI_IFR_DATE",
@@ -2871,10 +2916,6 @@ mod tests {
                 "{op}: set"
             );
         }
-        assert_eq!(
-            unchecked("EFI_IFR_STRING").to_string(),
-            format!("keyword {KEYWORD}: uefisettings does not yet implement keyword set of EFI_IFR_STRING")
-        );
         let password = password_on(1, PROMPT, 1, 5);
         let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], password.clone())];
         assert_eq!(
@@ -3556,6 +3597,222 @@ mod tests {
             Some(question_refusal(QuestionRefusal::PasswordBytes)),
             "an ORDERED_LIST of no width"
         );
+    }
+
+    /// A STRING of MaxSize 4, of MinSize `min_size`, question Flags `question_flags` and STRING
+    /// Flags `flags`, prompted by PROMPT at OFFSET of VarStore 1.
+    fn string_of(min_size: u8, question_flags: u8, flags: u8) -> Vec<u8> {
+        flagged_string_on(
+            1,
+            PROMPT,
+            (1, 5),
+            (min_size, 4),
+            (question_flags, flags),
+            &[],
+        )
+    }
+
+    /// SetData() writes a STRING's VALUE, its MaxSize CHAR16s last byte first, as given, so
+    /// check_set takes the text that the VALUE holds up to its first NULL, as get reads it, as
+    /// set takes that text, where the VALUE is the bytes that set writes for it: NULL-padded.
+    #[test]
+    fn check_set_takes_a_string_value_as_set_takes_its_text() {
+        const MULTI_LINE: u8 = 0x01;
+        let string = OFFSET..OFFSET + 8;
+        for (name, ops, value) in [
+            ("no character", string_of(0, 0, 0), "0000000000000000"),
+            ("AB", string_of(0, 0, 0), "0000000000420041"),
+            (
+                "MaxSize - 1 characters",
+                string_of(0, 0, 0),
+                "0000004300420041",
+            ),
+            (
+                "a line feed, multi-line",
+                string_of(0, 0, MULTI_LINE),
+                "00000042000a0041",
+            ),
+            (
+                "a Common Control Code",
+                string_of(0, 0, 0),
+                "000000000000f620",
+            ),
+            ("spaces", string_of(0, 0, 0), "0000002000410020"),
+        ] {
+            assert_eq!(
+                keyword_set(ops, value, &[0; 8]),
+                Ok(vec![string.clone()]),
+                "{name}"
+            );
+        }
+    }
+
+    /// check_set refuses a STRING's VALUE whose text set refuses, with set's refusal, one whose
+    /// text holds a UTF-16 surrogate, which get does not read either, one that is not the bytes
+    /// that set writes for its text, one of fewer bytes than MaxSize CHAR16s (GetWidth), a
+    /// read-only STRING, one of EFI_IFR_FLAG_CALLBACK, one whose <KeywordResp> has &READONLY, one
+    /// with a WRITE expression, and one of name/value storage, which no variable holds.
+    #[test]
+    fn check_set_refuses_a_string_value_that_set_refuses_or_would_not_write() {
+        use super::super::string_question::StringRefusal;
+        use std::num::NonZeroU8;
+        let refused = |value: &str, refusal: StringRefusal| {
+            value_error(
+                value,
+                ChangeValueError::String {
+                    question: QUESTION.to_owned(),
+                    refusal,
+                },
+            )
+        };
+        let max_size = NonZeroU8::new(4).expect("MaxSize 4");
+        let private_use = char::from_u32(0xE000).expect("U+E000");
+        let cases = [
+            (
+                "no NULL",
+                string_of(0, 0, 0),
+                "0044004300420041",
+                refused(
+                    "0044004300420041",
+                    StringRefusal::TooLong { max_size, given: 4 },
+                ),
+            ),
+            (
+                "fewer characters than MinSize",
+                string_of(2, 0, 0),
+                "0000000000000041",
+                refused(
+                    "0000000000000041",
+                    StringRefusal::TooShort { min: 2, given: 1 },
+                ),
+            ),
+            (
+                "a line feed, single-line",
+                string_of(0, 0, 0),
+                "00000042000a0041",
+                refused("00000042000a0041", StringRefusal::LineBreak),
+            ),
+            (
+                "the Private Use Area",
+                string_of(0, 0, 0),
+                "000000000000e000",
+                refused("000000000000e000", StringRefusal::PrivateUse(private_use)),
+            ),
+            (
+                "a surrogate",
+                string_of(0, 0, 0),
+                "000000000000d800",
+                value_error(
+                    "000000000000d800",
+                    "its character 0 is CHAR16 0xd800, a UTF-16 surrogate, which UCS-2 has no \
+                     character for (UEFI 2.11 §33.2.6.2.2)",
+                ),
+            ),
+            (
+                "a character after the NULL",
+                string_of(0, 0, 0),
+                "0000004200000041",
+                Err(KeywordRefusal::Unwritten {
+                    keyword: KEYWORD.to_owned(),
+                    value: "0000004200000041".to_owned(),
+                    written: "0000000000000041 at VarOffset 5".to_owned(),
+                    question: QUESTION.to_owned(),
+                }
+                .to_string()),
+            ),
+            (
+                "fewer bytes than MaxSize CHAR16s",
+                string_of(0, 0, 0),
+                "00420041",
+                Err(value_refusal("00420041", ValueRefusal::Width).to_string()),
+            ),
+            (
+                "read-only",
+                string_of(0, QuestionFlags::READ_ONLY.bits(), 0),
+                "0000000000420041",
+                Err(format!(
+                    "keyword {KEYWORD}: cannot set question {QUESTION:?}: EFI_IFR_FLAG_READ_ONLY \
+                     makes it read-only (UEFI 2.11 §33.3.8.2.2)"
+                )),
+            ),
+            (
+                "EFI_IFR_FLAG_CALLBACK",
+                string_of(0, QuestionFlags::CALLBACK.bits(), 0),
+                "0000000000420041",
+                Err(question_refusal(QuestionRefusal::Callback).to_string()),
+            ),
+            (
+                "&READONLY",
+                string_of(0, 0, 0),
+                "0000000000420041&READONLY",
+                Err(KeywordRefusal::ReadOnlyResp(KEYWORD.to_owned()).to_string()),
+            ),
+            (
+                "a WRITE expression",
+                flagged_string_on(
+                    1,
+                    PROMPT,
+                    (1, 5),
+                    (0, 4),
+                    (0x00, 0x00),
+                    &[operation(WRITE, true, &[]), uint8(1), END.to_vec()],
+                ),
+                "0000000000420041",
+                Err(question_refusal(QuestionRefusal::Write).to_string()),
+            ),
+        ];
+        for (name, ops, value, want) in cases {
+            assert_eq!(keyword_set(ops, value, &[0; 8]), want, "{name}");
+        }
+        let name_value = [
+            operation(
+                VAR_STORE_NAME_VALUE,
+                false,
+                &[2_u16.to_le_bytes().to_vec(), vec![0x55; 16]].concat(),
+            ),
+            flagged_string_on(1, PROMPT, (2, 7), (0, 4), (0x00, 0x00), &[]),
+        ]
+        .concat();
+        assert_eq!(
+            keyword_set(name_value, "0000000000420041", &[0; 8]),
+            Err(format!(
+                "keyword {KEYWORD}: question {QUESTION:?} has no VarStore that uefisettings reads: \
+                 HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL"
+            )),
+            "name/value storage"
+        );
+    }
+
+    /// SetData() writes every byte of a STRING's MaxSize CHAR16s, so check_set refuses a STRING
+    /// whose CHAR16s overlap the bytes of a password, which the reader withholds, at their last
+    /// byte, and takes one beside them.
+    #[test]
+    fn check_set_refuses_a_string_over_the_bytes_of_a_password() {
+        let lists = [list(PATH, &[(NAMESPACE, KEYWORD)], string_of(0, 0, 0))];
+        let question = question_of(&lists);
+        let set = |password: Range<usize>| {
+            question
+                .check_set(
+                    &resp("0000000000420041"),
+                    IncludedStates::empty(),
+                    VolatileWrites::Refuse,
+                    &mut withholding(password),
+                )
+                .map(|write| write.bytes)
+                .map_err(|error| format!("{error:#}"))
+        };
+
+        assert_eq!(
+            set(OFFSET + 7..OFFSET + 9),
+            Err(format!(
+                "keyword {KEYWORD}: cannot set question {QUESTION:?}: EFI variable {} holds a \
+                 password at bytes 12..14, which set never writes",
+                store_key()
+            )),
+            "the last byte"
+        );
+        let string = OFFSET..OFFSET + 8;
+        assert_eq!(set(OFFSET + 8..OFFSET + 10), Ok(vec![string]), "beside");
     }
 
     /// SetData() writes every byte of a question's storage, so check_set refuses a write over
