@@ -10261,11 +10261,32 @@ mod tests {
         }
     }
 
-    /// A STRING of name/value storage takes no value from the snapshot, whose settings of that
-    /// storage uefisettings keeps as numbers only, while a CHECKBOX there takes its number; one
-    /// whose setting the snapshot lacks says why it has no value, as a CHECKBOX does.
+    /// A STRING of name/value storage, of MaxSize 4, takes its characters from its snapshot
+    /// setting, 4 hex digits each, as edk2-stable202608 SetupBrowserDxe/Setup.c BufferToValue
+    /// reads them (:1564-1579), while a CHECKBOX there takes its number: up to a NULL, as UEFI
+    /// 2.11 §33.2.5.4.9 ends the hex dump, or MaxSize characters, as Setup.c sets its own
+    /// (:2139-2148), and NULLs past them; an empty setting is an empty string, as Setup.c writes
+    /// one. A setting of digits that are no `<String>` (UEFI 2.11 §35.2.1.2) or of more than
+    /// MaxSize characters gives none, where Setup.c would cut them (:1557-1561); one that the
+    /// snapshot lacks says why it has no value, as a CHECKBOX does, and so does a CHECKBOX of an
+    /// empty setting, whose number Setup.c would not write (:1580-1590). An ORDERED_LIST there
+    /// takes its setting as a number, least significant byte first, as BufferToValue reads every
+    /// question that holds no string (:1505, :1580-1590).
     #[test]
-    fn name_value_strings_take_no_snapshot_value() {
+    fn name_value_strings_take_their_characters_from_the_snapshot() {
+        let ordered_list = [
+            operation(
+                ORDERED_LIST,
+                true,
+                &[question_header_with(21, 21, 3, 22, 0x00), vec![4, 0x00]].concat(),
+            ),
+            flagged_option(23, 0x00, 1),
+            flagged_option(24, 0x00, 2),
+            flagged_option(25, 0x00, 3),
+            flagged_option(26, 0x00, 4),
+            END.to_vec(),
+        ]
+        .concat();
         let packages = [
             device_path_package(&DRIVER_PATH),
             form_package(&[
@@ -10276,29 +10297,414 @@ mod tests {
                         string_on(1, 1, (3, 3), (0, 4), &[]),
                         checkbox_at(2, 2, 3, 4),
                         string_on(5, 5, (3, 6), (0, 4), &[]),
+                        string_on(7, 7, (3, 8), (0, 4), &[]),
+                        string_on(9, 9, (3, 10), (0, 4), &[]),
+                        string_on(11, 11, (3, 12), (0, 4), &[]),
+                        string_on(13, 13, (3, 14), (0, 4), &[]),
+                        string_on(15, 15, (3, 16), (0, 4), &[]),
+                        string_on(17, 17, (3, 18), (0, 4), &[]),
+                        checkbox_at(19, 19, 3, 20),
+                        ordered_list,
                     ],
                 ),
             ]),
-            en_strings_package_of(&["S", "C", "Text", "Flag", "Unset", "Gone"]),
+            en_strings_package_of(&[
+                "S",
+                "C",
+                "Text",
+                "Flag",
+                "Unset",
+                "Gone",
+                "Nul",
+                "NulText",
+                "Odd",
+                "OddText",
+                "Long",
+                "LongText",
+                "Full",
+                "FullText",
+                "Padded",
+                "PaddedText",
+                "Empty",
+                "EmptyText",
+                "Cl",
+                "Cleared",
+                "L",
+                "Order",
+                "One",
+                "Two",
+                "Three",
+                "Four",
+            ]),
             END_PACKAGE.to_vec(),
         ];
         let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
         let text = format!(
-            "{}&Text=00410042&Flag=01",
+            "{}&Text=00410042&Flag=01&NulText=004100420000&OddText=004100\
+             &LongText=00410042004300440045&FullText=0041004200430044\
+             &PaddedText=00410042004300440000&EmptyText=&Cleared=&Order=01020304",
             config_hdr(N_GUID, "", &DRIVER_PATH)
         );
+        let names = [
+            "S", "C", "Unset", "Nul", "Odd", "Long", "Full", "Padded", "Empty", "Cl", "L",
+        ];
 
-        let (got, listed, _, _) =
-            answers_with_snapshot(&hiidb, &["S", "C", "Unset"], &no_variables(), &text);
+        let (got, listed, ifr, _) = answers_with_snapshot(&hiidb, &names, &no_variables(), &text);
 
         let want = [
-            "<ValueUnavailable: uefisettings keeps the ExportConfig snapshot's settings of a \
-             VARSTORE_NAME_VALUE as numbers only, so it takes no string from them>",
+            "AB <snapshot>",
             "1 <snapshot>",
             "<ValueUnavailable: HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>",
+            "AB <snapshot>",
+            "<ValueUnavailable: its setting in the ExportConfig snapshot is no <String>: 4 hex \
+             digits per CHAR16>",
+            "<ValueUnavailable: its setting in the ExportConfig snapshot holds more than its \
+             MaxSize of 4 characters>",
+            "ABCD <snapshot>",
+            "ABCD <snapshot>",
+            " <snapshot>",
+            "<ValueUnavailable: HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL> \
+             <IFR default: 0>",
+            "Four, Three, Two, One <snapshot>",
         ];
         assert_eq!(got, want, "get");
         assert_eq!(listed, want, "list-questions");
+        for shown in [
+            "AB <snapshot>",
+            "ABCD <snapshot>",
+            "Four, Three, Two, One <snapshot>",
+        ] {
+            assert!(
+                ifr.contains(&format!("-Answer: {shown}\n")),
+                "show-ifr lacks {shown:?}: {ifr}"
+            );
+        }
+    }
+
+    /// A STRING of name/value storage shows its snapshot characters, in get, list-questions and
+    /// show-ifr, only where a PASSWORD lets the snapshot be read: beside none, or one on the
+    /// buffer VarStore Backing, it shows them through variables of either kind, also on a second
+    /// VARSTORE_NAME_VALUE and on Pin, the name that the PASSWORD is on; beside one that edk2 may
+    /// route to a VARSTORE_NAME_VALUE, also in another package list of its driver, through
+    /// variables that read anything the HiiDB is refused, and through those that read
+    /// nothing it takes nothing from the snapshot, which stays off: on that VARSTORE_NAME_VALUE,
+    /// on the PASSWORD's own name there, and on a second VARSTORE_NAME_VALUE, as its driver may
+    /// keep the password in any of its settings; so it does beside a PASSWORD of VarStoreId 0, in
+    /// its form or outside any FormSet, whose callbacks or READ and WRITE ops may keep it in any of
+    /// them, and beside one whose VarStoreId no VarStore declares, which refuses the HiiDB through
+    /// variables that read anything too; through BootServices the HiiDB is refused.
+    #[test]
+    fn name_value_strings_keep_to_the_password_refusals() {
+        type I = NameValueIfr;
+        /// The GUID of the second VARSTORE_NAME_VALUE, VarStoreId 4.
+        const SECOND_NAME_VALUE_GUID: [u8; 16] = [0x57; 16];
+        /// The labels Pin and Flag: strings 4 and 5 of NAME_VALUE_STRINGS.
+        const PIN: u16 = 4;
+        const FLAG: u16 = 5;
+        /// Where the PASSWORD on Pin of a VarStoreId is.
+        enum Password {
+            Absent,
+            InForm(u16),
+            BeforeFormSet(u16),
+            /// In a FormSet of the first VARSTORE_NAME_VALUE in a third package list of the driver
+            InAnotherList(u16),
+        }
+        /// What get of W gives through variables of either kind.
+        enum Want {
+            /// Its snapshot characters
+            Shown,
+            /// A refusal through variables that read anything, no value through those that read
+            /// nothing
+            Refused,
+        }
+        // a package list of the driver whose FormSet holds the PASSWORD on Pin of VarStoreId `id`
+        // beside the first VARSTORE_NAME_VALUE
+        let another_list = |id: u16| {
+            let form_set =
+                form_set_with_guid([0x59; 16], &[I::name_value(), form(1, &[I::password(id)])]);
+            package_list_with_guid(
+                [0x58; 16],
+                &[
+                    device_path_package(&DRIVER_PATH),
+                    form_package_of(&form_set),
+                    en_strings_package_of(&NAME_VALUE_STRINGS),
+                    END_PACKAGE.to_vec(),
+                ]
+                .concat(),
+            )
+        };
+        // the STRING W, of MaxSize 4, on the label `label` of the VARSTORE_NAME_VALUE
+        // `var_store_id`: 3, which the PASSWORD's VarStoreId 3 names, or the second, 4
+        let hiidb = |(var_store_id, label): (u16, u16), password: &Password| {
+            let string = string_on(9, 2, (var_store_id, label), (0, 4), &[]);
+            let (in_form, outside, other_list) = match *password {
+                Password::Absent => (vec![], vec![], vec![]),
+                Password::InForm(id) => (vec![I::password(id)], vec![], vec![]),
+                Password::BeforeFormSet(id) => (vec![], vec![I::password(id)], vec![]),
+                Password::InAnotherList(id) => (vec![], vec![], another_list(id)),
+            };
+            let questions = [vec![I::b(), I::p(), string], in_form].concat();
+            let forms = form_set(&[
+                I::name_value(),
+                var_store_name_value(4, SECOND_NAME_VALUE_GUID),
+                I::backing(),
+                form(1, &questions),
+            ]);
+            [
+                name_value_hiidb(&[outside, vec![forms]].concat()),
+                other_list,
+            ]
+            .concat()
+        };
+        let snapshot = format!(
+            "{}&Flag=00410042&Pin=7a5b&{}&Flag=00410042",
+            config_hdr(N_GUID, "", &DRIVER_PATH),
+            config_hdr(SECOND_NAME_VALUE_GUID, "", &DRIVER_PATH)
+        );
+        let pin_snapshot = format!("{}&Pin=00410042", config_hdr(N_GUID, "", &DRIVER_PATH));
+        let unread = |hiidb: &[u8], snapshot: &str| {
+            HiiBackend::get_in(
+                hiidb,
+                "W",
+                None,
+                &GetOptions::default(),
+                EfivarSource::Disabled
+                    .into_variables()
+                    .expect("variables that read nothing"),
+                Some(ExportedConfig::new(snapshot.to_owned())),
+                None,
+            )
+            .map(|response| {
+                response
+                    .responses
+                    .into_iter()
+                    .map(|response| response.question.answer)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| format!("{error:#}"))
+        };
+        // list-questions' answers of W through `variables`, or the error
+        let listed = |hiidb: &[u8], variables: Box<dyn FirmwareVariables>, snapshot: &str| {
+            HiiBackend::list_questions_in(
+                hiidb,
+                &ListQuestionsOptions::default(),
+                variables,
+                Some(ExportedConfig::new(snapshot.to_owned())),
+                None,
+            )
+            .map(|questions| {
+                questions
+                    .into_iter()
+                    .filter(|question| question.name == "W")
+                    .map(|question| question.answer)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| format!("{error:#}"))
+        };
+        // what show-ifr shows through `variables`, or the error
+        let shown_ifr = |hiidb: &[u8], variables: Box<dyn FirmwareVariables>, snapshot: &str| {
+            HiiBackend::show_ifr_in(
+                hiidb,
+                &ShowIfrOptions::default(),
+                variables,
+                Some(ExportedConfig::new(snapshot.to_owned())),
+                None,
+            )
+            .map(|ifr| HiiShowIfrResponse::from(ifr).readable_representation)
+            .map_err(|error| format!("{error:#}"))
+        };
+        let read_nothing = || {
+            EfivarSource::Disabled
+                .into_variables()
+                .expect("variables that read nothing")
+        };
+        let shown = Ok(vec!["AB <snapshot>".to_owned()]);
+        let no_value_text =
+            "<ValueUnavailable: HII name/value varstore requires EFI_HII_CONFIG_ACCESS_PROTOCOL>";
+        let no_value = Ok(vec![no_value_text.to_owned()]);
+        let runtime = name_value_variables(VariableReach::Runtime);
+        let boot_services = name_value_variables(VariableReach::BootServices);
+
+        for (case, location, password, snapshot, want) in [
+            (
+                "no PASSWORD",
+                (3, FLAG),
+                Password::Absent,
+                &snapshot,
+                Want::Shown,
+            ),
+            (
+                "on Backing",
+                (3, FLAG),
+                Password::InForm(1),
+                &snapshot,
+                Want::Shown,
+            ),
+            (
+                "the second VARSTORE_NAME_VALUE, no PASSWORD",
+                (4, FLAG),
+                Password::Absent,
+                &snapshot,
+                Want::Shown,
+            ),
+            (
+                "on Pin, the PASSWORD on Backing",
+                (3, PIN),
+                Password::InForm(1),
+                &pin_snapshot,
+                Want::Shown,
+            ),
+            (
+                "on the VARSTORE_NAME_VALUE",
+                (3, FLAG),
+                Password::InForm(3),
+                &snapshot,
+                Want::Refused,
+            ),
+            (
+                "the second VARSTORE_NAME_VALUE, on the first",
+                (4, FLAG),
+                Password::InForm(3),
+                &snapshot,
+                Want::Refused,
+            ),
+            (
+                "on Pin, the PASSWORD's own name",
+                (3, PIN),
+                Password::InForm(3),
+                &pin_snapshot,
+                Want::Refused,
+            ),
+            (
+                "of VarStoreId 0 in the form",
+                (3, FLAG),
+                Password::InForm(0),
+                &snapshot,
+                Want::Refused,
+            ),
+            (
+                "of VarStoreId 0 outside any FormSet",
+                (3, FLAG),
+                Password::BeforeFormSet(0),
+                &snapshot,
+                Want::Refused,
+            ),
+            (
+                "in another package list of the driver",
+                (3, FLAG),
+                Password::InAnotherList(3),
+                &snapshot,
+                Want::Refused,
+            ),
+        ] {
+            let hiidb = hiidb(location, &password);
+            let got = name_value_get(&hiidb, "W", &runtime, Some(snapshot));
+            let unread_got = unread(&hiidb, snapshot);
+            let runtime_listed = listed(&hiidb, shared(&runtime), snapshot);
+            let unread_listed = listed(&hiidb, read_nothing(), snapshot);
+            let runtime_ifr = shown_ifr(&hiidb, shared(&runtime), snapshot);
+            let unread_ifr = shown_ifr(&hiidb, read_nothing(), snapshot);
+            match want {
+                Want::Shown => {
+                    assert_eq!(got, shown, "{case}: Runtime");
+                    assert_eq!(unread_got, shown, "{case}: variables that read nothing");
+                    assert_eq!(runtime_listed, shown, "{case}: list-questions, Runtime");
+                    assert_eq!(
+                        unread_listed, shown,
+                        "{case}: list-questions, variables that read nothing"
+                    );
+                    for (variables, ifr) in [
+                        ("Runtime", &runtime_ifr),
+                        ("variables that read nothing", &unread_ifr),
+                    ] {
+                        assert!(
+                            ifr.as_ref()
+                                .is_ok_and(|ifr| ifr.contains("-Answer: AB <snapshot>\n")),
+                            "{case}: show-ifr, {variables}: {ifr:?}"
+                        );
+                    }
+                }
+                Want::Refused => {
+                    assert!(
+                        got.as_ref()
+                            .is_err_and(|error| error.ends_with(ANY_VARIABLE)),
+                        "{case}: Runtime: {got:?}"
+                    );
+                    assert_eq!(unread_got, no_value, "{case}: variables that read nothing");
+                    assert!(
+                        runtime_listed
+                            .as_ref()
+                            .is_err_and(|error| error.ends_with(ANY_VARIABLE)),
+                        "{case}: list-questions, Runtime: {runtime_listed:?}"
+                    );
+                    assert_eq!(
+                        unread_listed, no_value,
+                        "{case}: list-questions, variables that read nothing"
+                    );
+                    assert!(
+                        runtime_ifr
+                            .as_ref()
+                            .is_err_and(|error| error.ends_with(ANY_VARIABLE)),
+                        "{case}: show-ifr, Runtime: {runtime_ifr:?}"
+                    );
+                    assert!(
+                        unread_ifr.as_ref().is_ok_and(|ifr| {
+                            ifr.contains(&format!("-Answer: {no_value_text}\n"))
+                                && !ifr.contains("AB <snapshot>")
+                        }),
+                        "{case}: show-ifr, variables that read nothing: {unread_ifr:?}"
+                    );
+                }
+            }
+        }
+
+        let routed = hiidb((3, FLAG), &Password::InForm(3));
+        let got = name_value_get(&routed, "W", &boot_services, Some(&snapshot));
+        assert!(
+            got.as_ref()
+                .is_err_and(|error| error.ends_with(BOOT_SERVICES_REFUSAL)),
+            "on the VARSTORE_NAME_VALUE: BootServices: {got:?}"
+        );
+
+        let unknown = hiidb((3, FLAG), &Password::InForm(9));
+        let got = name_value_get(&unknown, "W", &runtime, Some(&snapshot));
+        assert!(
+            got.as_ref()
+                .is_err_and(|error| error.contains(UNDECLARED_9) && error.ends_with(ANY_VARIABLE)),
+            "of an undeclared VarStoreId: Runtime: {got:?}"
+        );
+        assert_eq!(
+            unread(&unknown, &snapshot),
+            no_value,
+            "of an undeclared VarStoreId: variables that read nothing"
+        );
+        let runtime_listed = listed(&unknown, shared(&runtime), &snapshot);
+        assert!(
+            runtime_listed
+                .as_ref()
+                .is_err_and(|error| error.contains(UNDECLARED_9) && error.ends_with(ANY_VARIABLE)),
+            "of an undeclared VarStoreId: list-questions, Runtime: {runtime_listed:?}"
+        );
+        assert_eq!(
+            listed(&unknown, read_nothing(), &snapshot),
+            no_value,
+            "of an undeclared VarStoreId: list-questions, variables that read nothing"
+        );
+        let runtime_ifr = shown_ifr(&unknown, shared(&runtime), &snapshot);
+        assert!(
+            runtime_ifr
+                .as_ref()
+                .is_err_and(|error| error.contains(UNDECLARED_9) && error.ends_with(ANY_VARIABLE)),
+            "of an undeclared VarStoreId: show-ifr, Runtime: {runtime_ifr:?}"
+        );
+        let unread_ifr = shown_ifr(&unknown, read_nothing(), &snapshot);
+        assert!(
+            unread_ifr
+                .as_ref()
+                .is_ok_and(|ifr| ifr.contains(&format!("-Answer: {no_value_text}\n"))
+                    && !ifr.contains("AB <snapshot>")),
+            "of an undeclared VarStoreId: show-ifr, variables that read nothing: {unread_ifr:?}"
+        );
     }
 
     /// A name/value question takes its snapshot number by the label that its VarName string

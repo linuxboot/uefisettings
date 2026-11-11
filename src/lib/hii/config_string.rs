@@ -45,7 +45,7 @@ const MIN_DEVICE_PATH_LEN: usize = 4;
 
 // What a value or an element should have been, for ConfigStringError
 const GUID: &str = "<Guid>: 32 hex digits";
-const STRING: &str = "<String>: 4 hex digits per CHAR16";
+pub(crate) const STRING: &str = "<String>: 4 hex digits per CHAR16";
 const DEVICE_PATH: &str = "a device path: 2 hex digits per byte";
 const NUMBER: &str = "<Number>: hex digits";
 const SIZE_NUMBER: &str = "<Number>: hex digits of a value that fits usize";
@@ -423,6 +423,13 @@ impl NvConfig {
     /// BufferToValue reads that of a question that holds no string: None if it is empty.
     pub(crate) fn number(&self) -> Option<Number> {
         hex_number(&self.value).map(Number)
+    }
+
+    /// The value as a `<String>`'s CHAR16s, as edk2-stable202608 SetupBrowserDxe/Setup.c
+    /// BufferToValue reads that of a string question (:1564-1579): none if the digits are no
+    /// `<String>`, no CHAR16 if it is empty.
+    pub(crate) fn string(&self) -> Option<Vec<u16>> {
+        string_units(&self.value)
     }
 }
 
@@ -1444,12 +1451,13 @@ fn parse_optional_number(
 
 /// The CHAR16s of a `<String>`, 4 hex digits each.
 fn parse_string(name: &str, digits: &str) -> Result<Vec<u16>, ConfigStringError> {
-    digits
-        .as_bytes()
-        .chunks(4)
-        .map(hex_unit)
-        .collect::<Option<_>>()
-        .ok_or_else(|| invalid_value(name, digits, STRING))
+    string_units(digits).ok_or_else(|| invalid_value(name, digits, STRING))
+}
+
+/// The CHAR16s of a `<String>`'s `digits`, 4 hex digits each, most significant first: none if
+/// they are no `<String>`.
+fn string_units(digits: &str) -> Option<Vec<u16>> {
+    digits.as_bytes().chunks(4).map(hex_unit).collect()
 }
 
 fn write_string(f: &mut fmt::Formatter<'_>, units: &[u16]) -> fmt::Result {
@@ -1829,6 +1837,23 @@ mod tests {
             Ok(text.clone()),
             "{text:?}"
         );
+    }
+
+    /// A setting reads as a string 4 hex digits per CHAR16, most significant first, a surrogate
+    /// too, and empty as no CHAR16; digits that no `<Char>`s fill read as none.
+    #[test]
+    fn nv_config_reads_its_digits_as_a_string() {
+        for (digits, want) in [
+            ("", Some(vec![])),
+            ("00410042", Some(vec![0x41, 0x42])),
+            ("00410042000000", None),
+            ("d8000041", Some(vec![0xD800, 0x41])),
+            ("004", None),
+            ("0041004", None),
+        ] {
+            let config = NvConfig::new(label("fred"), digits).expect("hex digits");
+            assert_eq!(config.string(), want, "{digits:?}");
+        }
     }
 
     #[test]

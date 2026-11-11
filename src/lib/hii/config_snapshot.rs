@@ -27,7 +27,7 @@ use crate::hii::config_string::BlockConfig;
 use crate::hii::config_string::ConfigAltResp;
 use crate::hii::config_string::ConfigElement;
 use crate::hii::config_string::MultiConfigAltResp;
-use crate::hii::config_string::Number;
+use crate::hii::config_string::NvConfig;
 use crate::hii::forms::PasswordQuestions;
 use crate::hii::forms::UnresolvedPassword;
 use crate::hii::package::DevicePath;
@@ -77,8 +77,9 @@ struct StorageKey {
 struct StorageValues {
     /// The bytes of its `<BlockConfig>`s
     buffer: SnapshotBuffer,
-    /// The number of each `<NvConfig>` that holds one, by label
-    numbers: BTreeMap<String, Number>,
+    /// Its last `<NvConfig>` of each label, whose digits a question reads as a number or, for a
+    /// string question, as a string
+    settings: BTreeMap<String, NvConfig>,
 }
 
 /// The bytes of buffer storage that `<BlockConfig>`s set, by offset, and only those: a block
@@ -152,10 +153,7 @@ impl ConfigSnapshot {
                     ConfigElement::Block(block) => values.buffer.write(block, &passwords),
                     ConfigElement::Nv(setting) => {
                         let label = setting.label().to_string();
-                        match setting.number() {
-                            Some(number) => values.numbers.insert(label, number),
-                            None => values.numbers.remove(&label),
-                        };
+                        values.settings.insert(label, setting.clone());
                     }
                 }
             }
@@ -185,22 +183,22 @@ impl ConfigSnapshot {
             .get(range)
     }
 
-    /// The number that the name/value storage of `guid` of the driver at `device_path` holds
+    /// The setting that the name/value storage of `guid` of the driver at `device_path` holds
     /// under `label`, if any.
-    fn number(&self, device_path: &DevicePath, guid: Guid, label: &str) -> Option<&Number> {
+    fn setting(&self, device_path: &DevicePath, guid: Guid, label: &str) -> Option<&NvConfig> {
         let variable = VariableKey {
             name: String::new(),
             guid,
         };
-        self.storage(device_path, variable)?.numbers.get(label)
+        self.storage(device_path, variable)?.settings.get(label)
     }
 
-    /// The labels of the numbers of the name/value storages of the driver at `device_path`.
+    /// The labels of the settings of the name/value storages of the driver at `device_path`.
     fn labels(&self, device_path: &DevicePath) -> BTreeSet<&str> {
         self.storages
             .iter()
             .filter(|(key, _)| key.device_path == *device_path && key.variable.name.is_empty())
-            .flat_map(|(_, values)| values.numbers.keys().map(String::as_str))
+            .flat_map(|(_, values)| values.settings.keys().map(String::as_str))
             .collect()
     }
 }
@@ -290,12 +288,12 @@ impl SnapshotLookup {
         self.snapshot.buffer(device_path, variable, range)
     }
 
-    /// The number of the setting that the string `name` of the package list being read labels in
-    /// its name/value storage of `guid`, if the snapshot holds one.
-    pub(crate) fn number(&self, guid: Guid, name: u16) -> Option<&Number> {
+    /// The setting that the string `name` of the package list being read labels in its
+    /// name/value storage of `guid`, if the snapshot holds one.
+    pub(crate) fn setting(&self, guid: Guid, name: u16) -> Option<&NvConfig> {
         let device_path = self.device_path.as_ref()?;
         self.snapshot
-            .number(device_path, guid, self.labels.get(&name)?)
+            .setting(device_path, guid, self.labels.get(&name)?)
     }
 }
 
@@ -327,6 +325,7 @@ pub(crate) mod tests {
     use std::sync::Once;
 
     use super::*;
+    use crate::hii::config_string::Number;
     use crate::hii::forms::ifr_fixtures::en_us_package;
     use crate::hii::strings::Language;
     use crate::hii::strings::StringMap;
@@ -599,13 +598,17 @@ pub(crate) mod tests {
         let guid = Guid::from(N_GUID);
         assert_eq!(
             snapshot
-                .number(&driver_path(), guid, "Var0")
+                .setting(&driver_path(), guid, "Var0")
+                .and_then(NvConfig::number)
+                .as_ref()
                 .map(Number::as_bytes),
             Some(&[2, 1][..]),
             "Var0"
         );
         assert_eq!(
-            snapshot.number(&driver_path(), guid, "Gone"),
+            snapshot
+                .setting(&driver_path(), guid, "Gone")
+                .and_then(NvConfig::number),
             None,
             "Gone, emptied"
         );
@@ -679,11 +682,15 @@ pub(crate) mod tests {
 
             assert_eq!(lookup.buffer(&store, 0..1), want_buffer, "{case}: NStore");
             assert_eq!(
-                lookup.number(guid, 1).map(Number::as_bytes),
+                lookup
+                    .setting(guid, 1)
+                    .and_then(NvConfig::number)
+                    .as_ref()
+                    .map(Number::as_bytes),
                 want_var0,
                 "{case}: string 1"
             );
-            assert_eq!(lookup.number(guid, 2), None, "{case}: string 2");
+            assert_eq!(lookup.setting(guid, 2), None, "{case}: string 2");
         }
     }
 
@@ -700,7 +707,11 @@ pub(crate) mod tests {
         lookup.enter(&list, &list.texts(&[]));
 
         assert_eq!(
-            lookup.number(Guid::from(N_GUID), 1).map(Number::as_bytes),
+            lookup
+                .setting(Guid::from(N_GUID), 1)
+                .and_then(NvConfig::number)
+                .as_ref()
+                .map(Number::as_bytes),
             Some(&[8][..]),
             "string 1"
         );

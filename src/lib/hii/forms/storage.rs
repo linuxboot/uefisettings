@@ -42,6 +42,7 @@ use super::NumericFormatError;
 use super::DECLARED_BOOT_SERVICE_ONLY;
 use super::EDKII_BIT_FIELD_VALUE_BITS;
 use crate::hii::config_string::Number;
+use crate::hii::config_string::STRING;
 use crate::hii::package::Guid;
 use crate::hii::variables::efivar_attributes;
 use crate::hii::variables::EfivarRange;
@@ -1277,12 +1278,17 @@ pub(super) enum ValueUnavailable {
     /// The CHAR16s of a STRING, one of which no UCS-2 character is
     #[error("{0}")]
     StoredString(NotUcs2),
-    /// A STRING of a VARSTORE_NAME_VALUE, whose setting ConfigSnapshot keeps as a number only
+    /// The setting of a STRING of a VARSTORE_NAME_VALUE in the ExportConfig snapshot, whose
+    /// digits are no `<String>` (UEFI 2.11 §35.2.1.2)
+    #[error("its setting in the ExportConfig snapshot is no {}", STRING)]
+    SnapshotStringDigits,
+    /// The setting of a STRING of a VARSTORE_NAME_VALUE in the ExportConfig snapshot, which holds
+    /// characters other than NULL past the question's MaxSize
     #[error(
-        "uefisettings keeps the ExportConfig snapshot's settings of a VARSTORE_NAME_VALUE as \
-         numbers only, so it takes no string from them"
+        "its setting in the ExportConfig snapshot holds more than its MaxSize of {max_size} \
+         characters"
     )]
-    NameValueString,
+    SnapshotStringLength { max_size: usize },
     /// Why a condition cannot read AMI_ACCESS_LEVEL; answers keep the plain reason, since a stated
     /// level replaces it only in conditions
     #[error(
@@ -1348,7 +1354,8 @@ impl ValueUnavailable {
             | Self::TimeService(_)
             | Self::BufferExpression(_)
             | Self::StoredString(_)
-            | Self::NameValueString => "ValueUnavailable",
+            | Self::SnapshotStringDigits
+            | Self::SnapshotStringLength { .. } => "ValueUnavailable",
         }
     }
 }
@@ -1622,16 +1629,23 @@ fn snapshot_bytes(
             let Some(NameValueStore { guid }) = error.downcast_ref() else {
                 return Err(unread);
             };
-            let number = snapshot
-                .number(*guid, question.header().var_store_info)
-                .ok_or(unread)?;
+            let Some(setting) = snapshot.setting(*guid, question.header().var_store_info) else {
+                return Err(unread);
+            };
             match question {
-                ListedQuestion::String(_) => return Err(ValueUnavailable::NameValueString),
+                ListedQuestion::String(_) => {
+                    let units = setting
+                        .string()
+                        .ok_or(ValueUnavailable::SnapshotStringDigits)?;
+                    string_bytes(&units, value.len())
+                }
                 ListedQuestion::Value(_)
                 | ListedQuestion::OrderedList(_)
-                | ListedQuestion::Ref(_) => {}
+                | ListedQuestion::Ref(_) => match setting.number() {
+                    Some(number) => number_bytes(&number, value.len()),
+                    None => Err(unread),
+                },
             }
-            number_bytes(number, value.len())
         }
     }
 }
@@ -1647,6 +1661,24 @@ fn number_bytes(number: &Number, size: usize) -> std::result::Result<Vec<u8>, Va
         });
     }
     let mut bytes = bytes.to_vec();
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
+/// The `size` bytes of the STRING whose CHAR16s are `units`, NULL-padded, as EDK2's
+/// SetupBrowserDxe BufferToValue takes them (edk2-stable202608 Setup.c:1557-1579), or why they
+/// cannot hold them: where it drops the CHAR16s past MaxSize, `size` / 2, this refuses those that
+/// are not NULL.
+fn string_bytes(units: &[u16], size: usize) -> std::result::Result<Vec<u8>, ValueUnavailable> {
+    let max_size = size / 2;
+    if units.iter().skip(max_size).any(|unit| *unit != 0) {
+        return Err(ValueUnavailable::SnapshotStringLength { max_size });
+    }
+    let mut bytes: Vec<u8> = units
+        .iter()
+        .take(max_size)
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
     bytes.resize(size, 0);
     Ok(bytes)
 }
