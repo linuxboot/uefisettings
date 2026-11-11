@@ -277,6 +277,19 @@ variable that [`vars/disabled-form.json`](vars/disabled-form.json) creates: in t
 `shell-disabled-form`, `uefisettings.efi` reads and writes the questions of its other form, and
 no byte of that PASSWORD.
 
+`publish-hiidb.efi form-set-disable-if-forms` registers those of
+[`publish-hiidb/src/form_set_disable_if_forms.rs`](publish-hiidb/src/form_set_disable_if_forms.rs):
+a form set on the variable that [`vars/form-set-disable-if.json`](vars/form-set-disable-if.json)
+creates, whose forms but the first are in DISABLE_IFs outside forms. A true one holds the form of
+Hidden and of a PASSWORD, which a question of the first form overlaps; one on a question holds the
+form of After; and a false one holds a true SUPPRESS_IF, then the form of Later. In the scenario
+`hii-form-set-disable-if`, whose later `publish-hiidb.efi rt-data` exports the database, and in
+`shell-form-set-disable-if`, Hidden and the PASSWORD are no questions with any `--include`, a
+SUPPRESS_IF on Hidden does not suppress, no byte of the password shows or is written, and After and
+Later may be disabled, so `set` writes them only with disabled questions included. From Linux, the
+x-UEFI-ns keyword of Hidden selects it as a disabled question, and `hii dump-efivars` keeps its byte
+for that keyword, but no byte of the password.
+
 `publish-hiidb.efi short-var-store-forms` registers those of
 [`publish-hiidb/src/short_var_store_forms.rs`](publish-hiidb/src/short_var_store_forms.rs):
 questions on a VARSTORE_EFI of the form before UEFI 2.3.1, each on the EFI variable of its

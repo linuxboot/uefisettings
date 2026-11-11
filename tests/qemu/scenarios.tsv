@@ -69,6 +69,8 @@ shell-formset-skip	/publish-hiidb.efi formset-skip-forms	formset-skip.json	shell
 shell-short-var-store	/publish-hiidb.efi short-var-store-forms	short-var-store.json	shell:short-var-store	-
 shell-outside-form-set-password	/publish-hiidb.efi outside-form-set-password-forms	-	shell:outside-form-set-password	-
 shell-disabled-form	/publish-hiidb.efi disabled-form-forms	disabled-form.json	shell:disabled-form	-
+hii-form-set-disable-if	/publish-hiidb.efi form-set-disable-if-forms;/publish-hiidb.efi rt-data	form-set-disable-if.json	hii_form_set_disable_if	-
+shell-form-set-disable-if	/publish-hiidb.efi form-set-disable-if-forms	form-set-disable-if.json	shell:form-set-disable-if	-
 shell-first-store-password	/publish-hiidb.efi first-store-password-forms	-	shell:first-store-password	-
 shell-keyword-kinds	/publish-hiidb.efi keyword-kinds-forms	-	shell:keyword-kinds	-
 shell-name-value-password	/publish-hiidb.efi name-value-password-forms	name-value-password.json	shell:name-value-password	-

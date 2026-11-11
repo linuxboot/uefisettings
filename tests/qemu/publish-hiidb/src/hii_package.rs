@@ -49,6 +49,7 @@ pub(crate) const EFI_IFR_ONE_OF_OPTION_OP: u8 = 0x09;
 pub(crate) const EFI_IFR_SUPPRESS_IF_OP: u8 = 0x0A;
 pub(crate) const EFI_IFR_FORM_SET_OP: u8 = 0x0E;
 pub(crate) const EFI_IFR_REF_OP: u8 = 0x0F;
+pub(crate) const EFI_IFR_EQ_ID_VAL_OP: u8 = 0x12;
 pub(crate) const EFI_IFR_AND_OP: u8 = 0x15;
 pub(crate) const EFI_IFR_DATE_OP: u8 = 0x1A;
 pub(crate) const EFI_IFR_TIME_OP: u8 = 0x1B;

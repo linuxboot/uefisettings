@@ -12,7 +12,7 @@
 
 //! UEFI driver for the QEMU tests of the `uefisettings` HII backend, which a
 //! `Driver####` load option runs as
-//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|control-text-forms|formset-skip-forms|disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|rt-data-name-value-string-forms|storageless-password-forms|rt-data-storageless-password-forms|undeclared-password-forms|rt-data-undeclared-password-forms|padded-strings|string-blocks|callback-forms|callback-forms-password|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|export-config-undeclared-password|export-config-name-value-string|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
+//! `publish-hiidb.efi [rt-data|reserved|acpi-nvs|loader-data|rt-data-global-variable-forms|rt-data-readwrite-forms|wakeup-time-forms|password-forms|rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms|enhanced-auth-forms|dropped-password-forms|control-text-forms|formset-skip-forms|disabled-form-forms|form-set-disable-if-forms|short-var-store-forms|rt-data-short-var-store-forms|outside-form-set-password-forms|rt-data-outside-form-set-password-forms|first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms|name-value-password-forms|rt-data-name-value-password-forms|rt-data-name-value-string-forms|storageless-password-forms|rt-data-storageless-password-forms|undeclared-password-forms|rt-data-undeclared-password-forms|padded-strings|string-blocks|callback-forms|callback-forms-password|acpi-table|acpi-table-hiid|acpi-table-junk-qhii|install-config-tables|export-config|export-config-name-value-password|export-config-storageless-password|export-config-undeclared-password|export-config-name-value-string|rt-properties-no-set-variable|rt-properties-all|rt-properties-version-2|rt-properties-version-2-all|json-config-data|json-config-data-past-region|json-config-data-boot-services|json-config-data-mmio|json-capsule-result|set-auth-variables=PATH[,PATH]...]`:
 //! it copies the HII database into pages of that memory type, one byte in, and points
 //! the volatile `HiiDB` variable at the copy as `{ u32 length; u64 address }`, the way
 //! OCP firmware does for `src/lib/hii/extract.rs`. The x86 EFI stub reports
@@ -61,6 +61,8 @@
 //! after it does the same, so that Linux finds it too.
 //! `disabled-form-forms` registers, alone, the package list of [`formset_skip_forms`] with a form
 //! that `uefisettings` disables.
+//! `form-set-disable-if-forms` registers the package list of [`form_set_disable_if_forms`], which
+//! a later `publish-hiidb.efi rt-data` exports with the database for Linux.
 //! `first-store-password-forms` creates the variables of [`first_store_password_forms`] if they
 //! are missing and registers its package list, whose PASSWORD's VarStoreId an earlier form set
 //! declares first, for `uefisettings.efi` in the UEFI Shell;
@@ -147,6 +149,7 @@ mod dropped_password_forms;
 mod enhanced_auth_forms;
 mod exported_config;
 mod first_store_password_forms;
+mod form_set_disable_if_forms;
 mod formset_skip_forms;
 mod global_variable_forms;
 mod hii_package;
@@ -338,6 +341,11 @@ fn efi_main() -> Status {
             "registering the disabled form forms",
         )
         .map(|()| println!("publish-hiidb: registered the disabled form forms")),
+        Some(Task::RegisterFormSetDisableIfForms) => register_package_list(
+            &form_set_disable_if_forms::package_list_bytes(),
+            "registering the form set DISABLE_IF forms",
+        )
+        .map(|()| println!("publish-hiidb: registered the form set DISABLE_IF forms")),
         Some(Task::RegisterShortVarStoreForms) => register_short_var_store_forms()
             .map(|()| println!("publish-hiidb: registered the short VARSTORE_EFI forms")),
         Some(Task::PublishShortVarStoreForms) => register_short_var_store_forms()
@@ -468,7 +476,8 @@ fn efi_main() -> Status {
                  |rt-data-password-forms|nested-password-forms|rt-data-nested-password-forms\
                  |enhanced-auth-forms|dropped-password-forms|control-text-forms\
                  |formset-skip-forms\
-                 |disabled-form-forms|short-var-store-forms|rt-data-short-var-store-forms\
+                 |disabled-form-forms|form-set-disable-if-forms|short-var-store-forms\
+                 |rt-data-short-var-store-forms\
                  |outside-form-set-password-forms|rt-data-outside-form-set-password-forms\
                  |first-store-password-forms|rt-data-first-store-password-forms|keyword-kinds-forms\
                  |name-value-password-forms|rt-data-name-value-password-forms\
@@ -525,6 +534,8 @@ enum Task {
     /// Register the package list of a disabled form of [`formset_skip_forms`] in the HII
     /// database.
     RegisterDisabledFormForms,
+    /// Register the package list of [`form_set_disable_if_forms`] in the HII database.
+    RegisterFormSetDisableIfForms,
     /// Register the package list of [`short_var_store_forms`] in the HII database.
     RegisterShortVarStoreForms,
     /// Do what RegisterShortVarStoreForms does, then publish the database in runtime-data pages.
@@ -664,6 +675,9 @@ fn load_option() -> Option<Task> {
         }
         Ok(option) if option == cstr16!("disabled-form-forms") => {
             Some(Task::RegisterDisabledFormForms)
+        }
+        Ok(option) if option == cstr16!("form-set-disable-if-forms") => {
+            Some(Task::RegisterFormSetDisableIfForms)
         }
         Ok(option) if option == cstr16!("short-var-store-forms") => {
             Some(Task::RegisterShortVarStoreForms)
