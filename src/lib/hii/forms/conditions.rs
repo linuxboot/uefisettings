@@ -1614,7 +1614,15 @@ pub(crate) fn evaluate_read(
         return ReadOutcome::NoRead;
     };
     let stored = stored_operand(&this);
-    let mut evaluation = Evaluation::new(inputs, Role::Read(this));
+    let mut evaluation = Evaluation::new(
+        inputs,
+        Role::Read {
+            // reserved (UEFI 2.11 §33.3.8.2.2): edk2-stable202608 SetupBrowserDxe/Expression.c
+            // IdToQuestion2 finds no question of it (:808-813)
+            question: question_id(&question.borrow()).filter(|&id| id != 0),
+            this,
+        },
+    );
     match evaluation.run_ops(&expression) {
         Ok(Operand::Undefined) | Err(Abort::Undefined | Abort::Malformed(_)) => ReadOutcome::Stored,
         Ok(operand) => match ExpressionValue::of(&operand) {
@@ -1657,6 +1665,8 @@ pub(crate) fn evaluate_write(
     let mut evaluation = Evaluation::new(
         inputs,
         Role::Write {
+            // reserved, as for a READ
+            question: question_id(&question.borrow()).filter(|&id| id != 0),
             this,
             sets: &mut sets,
         },
@@ -2165,13 +2175,31 @@ enum Role<'a> {
     /// A condition, a default or an EFI_IFR_VALUE: THIS is the value of the question that holds
     /// it, and a SET is not evaluated
     Reads,
-    /// The READ of a question: THIS is its stored value (UEFI 2.11 §33.2.5.4.1)
-    Read(QuestionValue),
-    /// The WRITE of a question: THIS is its new value, and each SET joins `sets`
+    /// The READ of the question of QuestionId `question`: THIS is its stored value (UEFI 2.11
+    /// §33.2.5.4.1)
+    Read {
+        question: Option<u16>,
+        this: QuestionValue,
+    },
+    /// The WRITE of the question of QuestionId `question`: THIS is its new value, and each SET
+    /// joins `sets`
     Write {
+        question: Option<u16>,
         this: QuestionValue,
         sets: &'a mut PlannedSets,
     },
+}
+
+impl Role<'_> {
+    /// THIS, where question `id` is the one whose READ or WRITE is evaluated.
+    fn this_of(&self, id: u16) -> Option<&QuestionValue> {
+        match self {
+            Self::Reads => None,
+            Self::Read { question, this } | Self::Write { question, this, .. } => {
+                (*question == Some(id)).then_some(this)
+            }
+        }
+    }
 }
 
 /// The kind of value that a GET reads or a SET writes.
@@ -3379,13 +3407,19 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
         Ok(selected)
     }
 
-    /// Returns the value of question `id`, which `op` refers to; edk2-stable202608
-    /// SetupBrowserDxe/Expression.c EvaluateExpression gives UNDEFINED without the question.
+    /// Returns the value of question `id`, which `op` refers to: THIS for the question whose READ
+    /// or WRITE is evaluated, as edk2-stable202608 SetupBrowserDxe/Expression.c IdToQuestion finds
+    /// it in the form first (:853), so `op` pushes the HiiValue that THIS pushes (:2733-2741), and
+    /// UEFI 2.11 sets THIS to the question's value before a READ (§33.3.8.3.58) or a WRITE
+    /// (§33.3.8.3.94); EvaluateExpression gives UNDEFINED without the question.
     fn question(&mut self, op: &IFROperation, id: u16) -> Result<QuestionOperand, Abort> {
-        let value = self
-            .values
-            .value(op, id, self.reader)
-            .ok_or(Abort::Undefined)?;
+        let value = match self.role.this_of(id) {
+            Some(this) => this.clone(),
+            None => self
+                .values
+                .value(op, id, self.reader)
+                .ok_or(Abort::Undefined)?,
+        };
         Ok(self.operand_of(value, || {
             format!("{} of question {id:#06x}", op.op_code.spec_name())
         }))
@@ -3440,7 +3474,7 @@ impl<'a, V: QuestionValues> Evaluation<'a, V> {
     /// QUESTION_REF1 of it.
     fn this(&mut self, op: &IFROperation) -> Result<Operand, Abort> {
         let value = match &self.role {
-            Role::Read(this) | Role::Write { this, .. } => this.clone(),
+            Role::Read { this, .. } | Role::Write { this, .. } => this.clone(),
             Role::Reads => {
                 let id = enclosing_question_id(op).ok_or_else(|| {
                     Abort::Malformed(format!("{} outside a question", op.op_code.spec_name()))
@@ -7535,6 +7569,8 @@ mod store_expression_tests {
     const VALUE: u8 = 0x5A;
     const GREATER_THAN: u8 = 0x31;
     const LESS_THAN: u8 = 0x33;
+    const EQ_ID_ID: u8 = 0x13;
+    const EQ_ID_VAL_LIST: u8 = 0x14;
 
     /// The VARSTORE_EFI of the tests, of 5 bytes.
     const STORE: u16 = 2;
@@ -9863,6 +9899,170 @@ mod store_expression_tests {
         );
     }
 
+    /// A reference to the question whose READ or WRITE is evaluated pushes THIS: its stored value
+    /// in a READ, its new value in a WRITE, not the value that the question has elsewhere, as THIS
+    /// and that reference push the same HiiValue in edk2-stable202608 SetupBrowserDxe/Expression.c
+    /// (:853, :2733-2741) and UEFI 2.11 sets THIS to the question's value before the READ
+    /// (§33.3.8.3.58) or WRITE (§33.3.8.3.94). A reference to another question pushes that one's
+    /// value. QuestionId 0 is reserved (UEFI 2.11 §33.3.8.2.2), so in the READ or WRITE of a
+    /// question of QuestionId 0 a reference to that id finds no question (Expression.c:808-813).
+    #[test]
+    fn a_reference_to_the_question_that_is_read_or_written_pushes_this() {
+        let values = MapValues(BTreeMap::from([
+            (1, QuestionValue::Uint(2)),
+            (2, QuestionValue::Uint(9)),
+            (3, QuestionValue::Uint(3)),
+        ]));
+        let eq_id_id = |first: u16, second: u16| {
+            let data = [first.to_le_bytes(), second.to_le_bytes()].concat();
+            operation(EQ_ID_ID, false, &data)
+        };
+        let eq_id_val_list = |id: u16, value: u16| {
+            let data = [id.to_le_bytes(), 1u16.to_le_bytes(), value.to_le_bytes()].concat();
+            operation(EQ_ID_VAL_LIST, false, &data)
+        };
+        let plus_one = |reference: Vec<u8>| scoped_expression(&[reference, op(ONE), op(ADD)], 0);
+        let (root, questions) = form_set_of(&[one_of_with(
+            1,
+            STORE,
+            &[op(READ), plus_one(question_ref1(1))],
+        )]);
+        let referrer = questions[0].borrow();
+        assert_eq!(
+            VarStoreValues::new(&root, None).value(
+                &referrer,
+                1,
+                &mut store_holding(&[5, 0, 0, 0, 0]).reader()
+            ),
+            Some(QuestionValue::Uint(6)),
+            "the value of a question of 5 whose READ is QUESTION_REF1 of itself plus 1"
+        );
+        let of_question_0 = |expression: &[Vec<u8>]| {
+            let (root, questions) = form_set_of(&[one_of_with(0, STORE, expression)]);
+            (VarStoreValues::new(&root, None), Rc::clone(&questions[0]))
+        };
+        let (values_of_0, question) = of_question_0(&[op(READ), plus_one(question_ref1(0))]);
+        assert_eq!(
+            evaluate_read(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values_of_0,
+                },
+            ),
+            ReadOutcome::Stored,
+            "a READ of a question of QuestionId 0, QUESTION_REF1 of QuestionId 0"
+        );
+        let (values_of_0, question) = of_question_0(&[
+            op(WRITE),
+            scoped_expression(
+                &[question_ref1(0), set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8)],
+                0,
+            ),
+        ]);
+        assert_eq!(
+            evaluate_write(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut store_holding(&[0; 5]).reader(),
+                    values: &values_of_0,
+                },
+            )
+            .map(|sets| sets.map(|sets| sets.var_store.len())),
+            Err(ExpressionRefusal::Malformed {
+                expression: QuestionExpression::Write,
+                reason: "EFI_IFR_QUESTION_REF1 of missing question 0x0000".to_string(),
+            }),
+            "a WRITE of a question of QuestionId 0, QUESTION_REF1 of QuestionId 0"
+        );
+        let read = |expression: Vec<u8>| {
+            let (_root, question) = question_holding(&[op(READ), expression]);
+            evaluate_read(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut Efivars::new().reader(),
+                    values: &values,
+                },
+            )
+        };
+        let cases = [
+            (
+                "QUESTION_REF1 of the read question",
+                plus_one(question_ref1(1)),
+                ExpressionValue::Uint(4),
+            ),
+            (
+                "QUESTION_REF1 of another question",
+                plus_one(question_ref1(2)),
+                ExpressionValue::Uint(10),
+            ),
+            (
+                "EQ_ID_VAL of the read question",
+                eq_id_val_of(1, 3),
+                ExpressionValue::Boolean(1),
+            ),
+            (
+                "EQ_ID_VAL of another question",
+                eq_id_val_of(2, 3),
+                ExpressionValue::Boolean(0),
+            ),
+            (
+                "EQ_ID_ID of the read question",
+                eq_id_id(1, 3),
+                ExpressionValue::Boolean(1),
+            ),
+            (
+                "EQ_ID_ID of another question",
+                eq_id_id(2, 3),
+                ExpressionValue::Boolean(0),
+            ),
+            (
+                "EQ_ID_VAL_LIST of the read question",
+                eq_id_val_list(1, 3),
+                ExpressionValue::Boolean(1),
+            ),
+            (
+                "EQ_ID_VAL_LIST of another question",
+                eq_id_val_list(2, 3),
+                ExpressionValue::Boolean(0),
+            ),
+        ];
+        for (name, expression, want) in cases {
+            assert_eq!(read(expression), ReadOutcome::Value(want), "a READ, {name}");
+        }
+
+        let efivars = store_holding(&[0; 5]);
+        let write = |reference: Vec<u8>| {
+            let expression =
+                scoped_expression(&[reference, set(STORE, 0, EFI_IFR_TYPE_NUM_SIZE_8)], 0);
+            let (_root, question) = question_holding(&[op(WRITE), expression]);
+            let sets = evaluate_write(
+                &question,
+                QuestionValue::Uint(3),
+                &mut ExpressionInputs {
+                    reader: &mut efivars.reader(),
+                    values: &values,
+                },
+            );
+            sets.map(|sets| {
+                sets.map(|sets| sets.var_store.into_iter().map(|set| set.bytes).collect())
+            })
+        };
+        assert_eq!(
+            write(question_ref1(1)),
+            Ok(Some(vec![vec![3]])),
+            "a WRITE, QUESTION_REF1 of the written question"
+        );
+        assert_eq!(
+            write(question_ref1(2)),
+            Ok(Some(vec![vec![9]])),
+            "a WRITE, QUESTION_REF1 of another question"
+        );
+    }
+
     /// What `run` gives of the first op of the WRITE expression `write`, with THIS 3, on a stack
     /// that holds `operands`; with the refusal that the evaluation leaves, and the number of SETs
     /// that it plans.
@@ -9886,6 +10086,7 @@ mod store_expression_tests {
         let mut evaluation = Evaluation::new(
             &mut inputs,
             Role::Write {
+                question: Some(1),
                 this: QuestionValue::Uint(3),
                 sets: &mut sets,
             },
