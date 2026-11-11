@@ -2430,6 +2430,62 @@ mod tests {
         }
     }
 
+    /// set's own checks refuse an ORDERED_LIST that EFI_IFR_FLAG_READ_ONLY makes read-only
+    /// whatever `include`, as they refuse a ONE_OF, and take the same VALUE of a writable one.
+    #[test]
+    fn check_set_refuses_a_read_only_ordered_list_whatever_include() {
+        let list_of = |flags: u8| {
+            let data = [question_header_with(1, PROMPT, 1, 5, flags), vec![3, 0]].concat();
+            [
+                operation(ORDERED_LIST, true, &data),
+                uint8_options().concat(),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        assert!(
+            check_set_of(list_of(0), "000103", IncludedStates::empty()).is_ok(),
+            "writable"
+        );
+        for include in [IncludedStates::empty(), IncludedStates::all()] {
+            let got = check_set_of(list_of(QuestionFlags::READ_ONLY.bits()), "000103", include)
+                .map_err(|error| format!("{error:#}"));
+            assert_eq!(
+                got,
+                Err(format!(
+                    "keyword {KEYWORD}: cannot set question {QUESTION:?}: EFI_IFR_FLAG_READ_ONLY \
+                     makes it read-only (UEFI 2.11 §33.3.8.2.2)"
+                )),
+                "--include {include}"
+            );
+        }
+    }
+
+    /// set's own checks refuse a REF on a VarStore that EFI_IFR_FLAG_READ_ONLY makes read-only as
+    /// read-only, before set's refusal of the EFI_HII_REF of every REF.
+    #[test]
+    fn check_set_refuses_a_read_only_ref_as_read_only_first() {
+        let data = [
+            question_header_with(1, PROMPT, 1, 5, QuestionFlags::READ_ONLY.bits()),
+            vec![1, 0],
+        ]
+        .concat();
+        let error = check_set_of(
+            operation(REF, false, &data),
+            &"01".repeat(22),
+            IncludedStates::empty(),
+        )
+        .expect_err("set of 22 bytes");
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "keyword {KEYWORD}: cannot set question {QUESTION:?}: EFI_IFR_FLAG_READ_ONLY \
+                 makes it read-only (UEFI 2.11 §33.3.8.2.2)"
+            ),
+            "set of 22 bytes"
+        );
+    }
+
     /// check_set takes the question through set's own checks, which refuse a variable that set
     /// cannot write, as a missing one.
     #[test]

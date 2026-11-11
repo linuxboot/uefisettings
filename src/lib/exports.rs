@@ -4266,6 +4266,130 @@ mod tests {
         }
     }
 
+    /// set refuses an ORDERED_LIST that EFI_IFR_FLAG_READ_ONLY makes read-only before any write,
+    /// as it does a NUMERIC, and writes its items with UnsafeOperations::Allow, which it returns
+    /// as lifted.
+    #[test]
+    fn ordered_list_flag_is_refused_without_unsafe_operations() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 2),
+                form(
+                    1,
+                    &[
+                        operation(
+                            ORDERED_LIST,
+                            true,
+                            &[question_header_with(1, 1, 1, 0, 0x01), vec![2, 0x00]].concat(),
+                        ),
+                        flagged_option(2, 0x00, 1),
+                        flagged_option(3, 0x00, 2),
+                        END.to_vec(),
+                    ],
+                ),
+            ]),
+            en_strings_package_of(&["L", "A", "B"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x5C; 16], &packages.concat());
+        let lifted = UnsafeOperation::ReadOnlyQuestion {
+            question: "L".to_owned(),
+            writable: IncludedStates::empty(),
+        };
+        let cases = [
+            (
+                UnsafeOperations::Refuse,
+                Err(flag_refusal("L", "").unwrap_err()),
+                vec![],
+            ),
+            (
+                UnsafeOperations::Allow,
+                Ok(vec![lifted]),
+                vec![(0, vec![2, 1])],
+            ),
+        ];
+        for (grant, want, want_writes) in cases {
+            let variables =
+                MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+            variables.insert(setup(), NV_BS_RT, &[1, 2]);
+            let variables = Rc::new(variables);
+
+            let got = HiiBackend::set_in(
+                &hiidb,
+                "L",
+                &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+                None,
+                &SetOptions {
+                    unsafe_operations: grant,
+                    ..SetOptions::default()
+                },
+                shared(&variables),
+                &*variables,
+                None,
+            )
+            .map(|(_, lifted)| lifted)
+            .map_err(|error| error.to_string());
+
+            assert_eq!(got, want, "set L B A, {grant:?}");
+            assert_eq!(
+                variables.writes_to(&setup()),
+                want_writes,
+                "set L B A, {grant:?}: writes"
+            );
+        }
+    }
+
+    /// Of two ORDERED_LISTs "L", the first read-only at byte 0 and the second writable at byte 2,
+    /// set without UnsafeOperations::Allow writes the writable one alone, as select ranks a
+    /// read-only match after a writable one, and lifts nothing.
+    #[test]
+    fn set_ranks_a_read_only_ordered_list_after_a_writable_twin() {
+        let list = |offset: u16, flags: u8| {
+            vec![
+                operation(
+                    ORDERED_LIST,
+                    true,
+                    &[question_header_with(1, 1, 1, offset, flags), vec![2, 0x00]].concat(),
+                ),
+                flagged_option(2, 0x00, 1),
+                flagged_option(3, 0x00, 2),
+                END.to_vec(),
+            ]
+        };
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 4),
+                form(1, &[list(0, 0x01), list(2, 0x00)].concat()),
+            ]),
+            en_strings_package_of(&["L", "A", "B"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x5E; 16], &packages.concat());
+        let variables = MemoryVariables::new(VariableReach::Runtime, VariableInterface::Efivarfs);
+        variables.insert(setup(), NV_BS_RT, &[1, 2, 1, 2]);
+        let variables = Rc::new(variables);
+
+        let got = HiiBackend::set_in(
+            &hiidb,
+            "L",
+            &SetValue::Items(vec!["B".to_owned(), "A".to_owned()]),
+            None,
+            &SetOptions::default(),
+            shared(&variables),
+            &*variables,
+            None,
+        )
+        .map(|(_, lifted)| lifted)
+        .map_err(|error| error.to_string());
+
+        assert_eq!(got, Ok(vec![]), "set L B A");
+        assert_eq!(
+            variables.writes_to(&setup()),
+            [(2, vec![2, 1])],
+            "set L B A: writes"
+        );
+    }
+
     /// select ranks a read-only match after a writable one in any state: of "T" read-only at byte
     /// 0 and "T" grayed out at byte 1, set writes the grayed-out one once grayed-out is
     /// included, with UnsafeOperations::Allow or not, and else the read-only one with Allow;

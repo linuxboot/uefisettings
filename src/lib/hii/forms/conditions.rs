@@ -37,6 +37,7 @@ use super::defaults::question_scope;
 use super::find_corresponding_varstore;
 use super::named_records;
 use super::question_values::value_question;
+use super::question_values::ListedQuestion;
 use super::question_values::OptionMatch;
 use super::question_values::PromptMatch;
 use super::question_values::ValueQuestion;
@@ -860,7 +861,7 @@ fn read_only(question: &IFROperation) -> Option<ReadOnlyCause> {
     if question_value_expression(question).is_some() {
         return Some(ReadOnlyCause::ValueExpression);
     }
-    value_question(question)?
+    ListedQuestion::of(question)?
         .header()
         .flags()
         .contains(QuestionFlags::READ_ONLY)
