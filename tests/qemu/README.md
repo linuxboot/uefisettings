@@ -362,6 +362,22 @@ export-config-storageless-password` does it before it installs ExportConfig()'s 
 with `--i-am-fine-to-brick-this-system`, and shows no byte of `SlBacking`, nor of the snapshot,
 while `hii list-questions --no-efivars` lists its questions from Linux.
 
+`publish-hiidb.efi undeclared-password-forms` registers the package lists of
+[`publish-hiidb/src/undeclared_password_forms.rs`](publish-hiidb/src/undeclared_password_forms.rs)
+for one device path: a form set with a NUMERIC, of the x-UEFI-ns keyword `UndeclaredSetting`, over
+the variable `UdBacking`, which [`vars/undeclared-password.json`](vars/undeclared-password.json)
+creates, and a PASSWORD question of VarStoreId 9, which no VarStore of its form package declares,
+then a form set with a NUMERIC over the variable `Other`. Such a VarStoreId names no VarStore (UEFI
+2.11 §33.3.8.2.2 asks for "a previously declared variable store"), so the password may be in any
+variable. `publish-hiidb.efi rt-data-undeclared-password-forms` does the same, then publishes the
+database as `rt-data` does, and `publish-hiidb.efi export-config-undeclared-password` does it
+before it installs ExportConfig()'s results as `export-config` does, with a `<ConfigResp>` of
+`UdBacking`. In the scenarios `shell-undeclared-password`, `hii-undeclared-password` and
+`hii-undeclared-password-snapshot` `uefisettings` reads and writes no variable of that HiiDB, in the
+UEFI Shell and from Linux, even with `--i-am-fine-to-brick-this-system`, and shows no byte of
+`UdBacking`, nor of the snapshot, while `hii list-questions --no-efivars` lists its questions from
+Linux.
+
 `publish-hiidb.efi install-config-tables` sets no `HiiDB`: it installs a copy of the HII
 database, in a zeroed runtime pool a quarter larger, as the EFI configuration table of the HII
 database protocol's GUID, as EDK2 does with `PcdHiiOsRuntimeSupport`, which OVMF and ArmVirt

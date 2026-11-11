@@ -46,6 +46,8 @@ hii-name-value-password	/publish-hiidb.efi rt-data-name-value-password-forms	nam
 hii-name-value-password-snapshot	/publish-hiidb.efi export-config-name-value-password;/publish-hiidb.efi rt-data	name-value-password.json	hii_name_value_password/with_snapshot::	-
 hii-storageless-password	/publish-hiidb.efi rt-data-storageless-password-forms	storageless-password.json	hii_storageless_password/without_snapshot::	-
 hii-storageless-password-snapshot	/publish-hiidb.efi export-config-storageless-password;/publish-hiidb.efi rt-data	storageless-password.json	hii_storageless_password/with_snapshot::	-
+hii-undeclared-password	/publish-hiidb.efi rt-data-undeclared-password-forms	undeclared-password.json	hii_undeclared_password/without_snapshot::	-
+hii-undeclared-password-snapshot	/publish-hiidb.efi export-config-undeclared-password;/publish-hiidb.efi rt-data	undeclared-password.json	hii_undeclared_password/with_snapshot::	-
 hii-time-storage	/DriverSample.efi;/publish-hiidb.efi wakeup-time-forms	my-ifr-nv-data.json	hii_time_storage	-
 hii-acpi	/DriverSample.efi;/publish-hiidb.efi acpi-table	my-ifr-nv-data.json	hii_acpi/qhii::	-
 hii-acpi-hiid	/DriverSample.efi;/publish-hiidb.efi acpi-table-hiid	my-ifr-nv-data.json	hii_acpi/hiid::	-
@@ -67,6 +69,7 @@ shell-first-store-password	/publish-hiidb.efi first-store-password-forms	-	shell
 shell-keyword-kinds	/publish-hiidb.efi keyword-kinds-forms	-	shell:keyword-kinds	-
 shell-name-value-password	/publish-hiidb.efi name-value-password-forms	name-value-password.json	shell:name-value-password	-
 shell-storageless-password	/publish-hiidb.efi storageless-password-forms	storageless-password.json	shell:storageless-password	-
+shell-undeclared-password	/publish-hiidb.efi undeclared-password-forms	undeclared-password.json	shell:undeclared-password	-
 shell-time-storage	/DriverSample.efi;/publish-hiidb.efi wakeup-time-forms	my-ifr-nv-data.json	shell:time-storage	-
 shell-auth27	/DriverSample.efi	my-ifr-nv-data-auth27.json	shell:auth27	-
 hii-auth87	/publish-hiidb.efi enhanced-auth-forms;/publish-hiidb.efi rt-data	enhanced-auth-87.json	hii_auth87	-

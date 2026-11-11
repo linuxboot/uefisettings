@@ -112,6 +112,10 @@ name = "hii_storageless_password"
 required-features = ["test-vm"]
 
 [[test]]
+name = "hii_undeclared_password"
+required-features = ["test-vm"]
+
+[[test]]
 name = "hii_nested_password"
 required-features = ["test-vm"]
 
