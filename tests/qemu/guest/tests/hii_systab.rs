@@ -140,20 +140,40 @@ fn the_automatic_order_logs_the_method_at_debug_level() {
 }
 
 /// Named, the vendor ACPI table method and the `HiiDB` variable method report their sources
-/// absent, as errors apart.
+/// absent, as errors apart. So do the hii commands that read the database, with the vendor ACPI
+/// table method named before or after the command, rather than read the configuration table as
+/// the automatic order would.
 #[test]
 fn the_other_methods_report_their_sources_absent() {
+    let mut runs = Vec::new();
     for method in ["acpi", "efivar"] {
-        let error = json_error(&["--hii-source", method, "hii", "extract-db", "/tmp/none.bin"]);
+        runs.push((
+            method,
+            vec!["--hii-source", method, "hii", "extract-db", "/tmp/none.bin"],
+        ));
+    }
+    let flags = ["--hii-source", "acpi"];
+    let commands: [&[&str]; 4] = [
+        &["hii", "show-ifr", "--no-efivars"],
+        &["hii", "get", NUMERIC, "--no-efivars"],
+        &["hii", "list-questions", "--no-efivars"],
+        &["hii", "list-strings"],
+    ];
+    for command in commands {
+        runs.push(("acpi", [&flags[..], command].concat()));
+        runs.push(("acpi", [command, &flags].concat()));
+    }
+    for (method, args) in runs {
+        let error = json_error(&args);
         assert!(
             error
                 .error_message
                 .starts_with(&format!("no HII database: {method}: absent: ")),
-            "{method}: {error:?}"
+            "{args:?}: {error:?}"
         );
         assert!(
             !error.error_message.contains("systab"),
-            "{method}: tried only the named method: {error:?}"
+            "{args:?}: tried only the named method: {error:?}"
         );
     }
 }
