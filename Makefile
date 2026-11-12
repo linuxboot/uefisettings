@@ -69,14 +69,16 @@ unexport CARGO_ENCODED_RUSTFLAGS
 TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi,i686-unknown-linux-musl,i686-unknown-uefi,aarch64-unknown-linux-musl,aarch64-unknown-uefi,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
 comma := ,
 
-# CI runs LINTS as one check, lint: a new check joins LINTS, or a job entry of its own runs it.
-LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi clippy-macos clippy-windows doc
+# CI runs LINTS as one check, lint: a new check joins LINTS, or ci-jobs fails until the workflow names it.
+LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi clippy-macos clippy-windows doc ci-jobs
 QEMU_LINUX_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
 QEMU_SHELL_TESTS := test-e2e-qemu-shell-x86_64 test-e2e-qemu-shell-i686 test-e2e-qemu-shell-aarch64
 QEMU_TESTS := $(QEMU_LINUX_TESTS) $(QEMU_SHELL_TESTS)
 # The scenarios of tests/qemu/scenarios.tsv: those named shell-* boot the UEFI Shell.
 SCENARIOS := $(shell awk -F '\t' '$$1 ~ /^[a-z]/ { print $$1 }' tests/qemu/scenarios.tsv)
 CHECKS := $(LINTS) test test-i686 test-e2e-qemu
+# The checks that CI runs as make -k <check>, each in a job or job entry of its own.
+CI_CHECKS := lint $(filter-out $(LINTS) test-e2e-qemu,$(CHECKS)) $(QEMU_TESTS)
 
 .PHONY: check lint help setup toolchain $(CHECKS) $(QEMU_TESTS)
 
@@ -137,6 +139,11 @@ clippy-macos: toolchain
 clippy-windows: toolchain
 	cargo clippy --locked -p uefisettings --lib --bins --all-targets --target x86_64-pc-windows-msvc \
 		--target aarch64-pc-windows-msvc -- -D warnings
+
+# The workflow names every check of CI_CHECKS and no other, as scripts/check-ci-jobs.sh reads
+# it; which systems run a check is the workflow's alone. Needs no toolchain.
+ci-jobs:
+	scripts/check-ci-jobs.sh .github/workflows/checks.yml $(CI_CHECKS)
 
 test: toolchain
 	scripts/assert-tests-ran.sh cargo test --locked
