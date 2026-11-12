@@ -10,9 +10,9 @@
 #
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# The checks of uefisettings. They need GNU make and bash, rustup while
-# RUST_TOOLCHAIN is set, as it is by default, for test-i686 an x86 host with
-# gcc's 32-bit libraries, which README.md names, and for test-e2e-qemu an
+# The checks of uefisettings. They need GNU make 3.82 or newer and bash, rustup
+# while RUST_TOOLCHAIN is set, as it is by default, for test-i686 an x86 host
+# with gcc's 32-bit libraries, which README.md names, and for test-e2e-qemu an
 # x86_64 host with /dev/kvm and what tests/qemu/README.md lists:
 #   make                 every check of CHECKS, stopping at the first that fails
 #   make -k              every check of CHECKS, even after one fails
@@ -39,6 +39,10 @@
 
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
+# GNU make 3.81, macOS's make, ignores .SHELLFLAGS, which came with .ONESHELL in 3.82.
+ifeq ($(filter oneshell,$(.FEATURES)),)
+$(error GNU make 3.82 or newer runs the checks, e.g. Homebrew's gmake on macOS)
+endif
 
 # The Rust release that the checks run on: newer releases bring lints that the
 # code does not satisfy yet. make setup installs it; while RUST_TOOLCHAIN is set,
@@ -65,8 +69,7 @@ unexport CARGO_ENCODED_RUSTFLAGS
 TARGETS := x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,i686-unknown-linux-gnu,x86_64-unknown-linux-musl,x86_64-unknown-uefi,i686-unknown-linux-musl,i686-unknown-uefi,aarch64-unknown-linux-musl,aarch64-unknown-uefi,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
 comma := ,
 
-# CI runs lint test test-i686 and test-e2e-qemu, and test on macOS and Windows: a
-# new check joins LINTS or QEMU_TESTS or CI runs it too.
+# CI runs LINTS as one check, lint: a new check joins LINTS, or a job entry of its own runs it.
 LINTS := fmt clippy-x86_64 clippy-aarch64 clippy-i686 clippy-uefi clippy-macos clippy-windows doc
 QEMU_LINUX_TESTS := test-e2e-qemu-x86_64 test-e2e-qemu-i686 test-e2e-qemu-aarch64
 QEMU_SHELL_TESTS := test-e2e-qemu-shell-x86_64 test-e2e-qemu-shell-i686 test-e2e-qemu-shell-aarch64

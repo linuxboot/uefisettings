@@ -390,7 +390,7 @@ make help            # lists the checks
 
 On macOS, whose make 3.81 ignores the `Makefile`'s `.SHELLFLAGS`, `brew install make` installs GNU make as `gmake`: `gmake setup test` runs the unit tests.
 
-GitHub Actions runs the checks, and the unit tests on arm64 and Intel Macs and on x86_64 Windows, on every pull request and every push to main, as [`.github/workflows/checks.yml`](.github/workflows/checks.yml) describes.
+GitHub Actions runs the checks on every pull request and every push to main, as [`.github/workflows/checks.yml`](.github/workflows/checks.yml) describes: `lint`, and each system's tests as a check of its own, named after the system: the unit tests on x86_64, i686 and aarch64 Linux, arm64 and Intel Macs and x86_64 and aarch64 Windows, and the QEMU tests of Linux and of the UEFI Shell on each of their 3 architectures.
 
 ## QEMU tests
 
