@@ -274,7 +274,8 @@ pub(crate) struct ListTexts<'a> {
 
 /// Which texts a QUESTION or VALUE matches: those as stored, then, where they name nothing, those
 /// that display shows. So an input that names a text as stored never selects another whose text
-/// reads alike only once the reader has replaced a character of it.
+/// reads alike only once the reader has replaced a character of it, or display has taken out its
+/// common control codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MatchTier {
     /// The texts as stored (ListTexts::matching)
@@ -317,24 +318,44 @@ impl<'a> ListTexts<'a> {
     /// configuration language that holds it, else "" (edk2-stable202608 SetupBrowserDxe
     /// GetToken shows "!"), as a firmware may leave a string untranslated or out. Unlike
     /// shown_text, it takes the chosen package also where it is of a configuration language,
-    /// as for --language x-UEFI-ns, whose prompts are the keywords.
-    pub(crate) fn display(&self, id: u16) -> &'a str {
-        let text = self
-            .chosen
-            .into_iter()
-            .chain(self.shown.iter().copied())
-            .find_map(|package| package.strings.get(&id));
-        match text {
-            Some(text) => text,
-            None => {
-                debug!("string id: {id} not found");
-                ""
-            }
+    /// as for --language x-UEFI-ns, whose prompts are the keywords. It shows a text without its
+    /// common control codes (displayed), and a keyword as stored.
+    pub(crate) fn display(&self, id: u16) -> Cow<'a, str> {
+        match self.find(id) {
+            Some((language, text)) if language.is_configuration() => Cow::Borrowed(text),
+            Some((_, text)) => displayed(text),
+            None => Cow::Borrowed(""),
         }
     }
 
-    /// The text of the string `id` that display shows, None unless a package of no configuration
-    /// language holds it: a text that a Forms Browser can show, never a keyword.
+    /// The text of the string `id` that display shows, as stored, else "": for a name, such as
+    /// that of a name/value storage, which must match the firmware's own.
+    pub(crate) fn stored(&self, id: u16) -> &'a str {
+        self.find(id).map_or("", |(_, text)| text)
+    }
+
+    /// The text of the string `id` that display shows, as stored, and the language of its
+    /// package: the chosen package's, else that of the first package of no configuration language
+    /// that holds it.
+    fn find(&self, id: u16) -> Option<(&'a Language, &'a str)> {
+        let found = self
+            .chosen
+            .into_iter()
+            .chain(self.shown.iter().copied())
+            .find_map(|package| {
+                package
+                    .strings
+                    .get(&id)
+                    .map(|text| (&package.language, text.as_ref()))
+            });
+        if found.is_none() {
+            debug!("string id: {id} not found");
+        }
+        found
+    }
+
+    /// The stored text of the string `id` that display shows, None unless a package of no
+    /// configuration language holds it: a text that a Forms Browser can show, never a keyword.
     pub(crate) fn shown_text(&self, id: u16) -> Option<&'a str> {
         self.shown_package(id)
             .and_then(|package| package.strings.get(&id))
@@ -383,8 +404,9 @@ impl<'a> ListTexts<'a> {
     }
 
     /// The text of the string `id` that display shows, in each package of no configuration
-    /// language that holds it, replaced characters included, with that package's language: the
-    /// texts that QUESTION and VALUE match where none as stored does (MatchTier::Displayed).
+    /// language that holds it, replaced characters included, without its common control codes
+    /// (displayed), with that package's language: the texts that QUESTION and VALUE match where
+    /// none as stored does (MatchTier::Displayed).
     pub(crate) fn matching_displayed(
         &self,
         id: u16,
@@ -393,7 +415,7 @@ impl<'a> ListTexts<'a> {
             package
                 .strings
                 .get(&id)
-                .map(|text| (&package.language, Cow::Borrowed(text.as_ref())))
+                .map(|text| (&package.language, displayed(text)))
         })
     }
 
@@ -873,6 +895,23 @@ pub(crate) fn is_control_code(code_point: u32) -> bool {
     matches!(code_point, 0xF620..=0xF62B | 0xF700..=0xF8FF)
 }
 
+/// Whether `character` is a common control code (is_control_code).
+pub(crate) fn is_control_character(character: char) -> bool {
+    is_control_code(u32::from(character))
+}
+
+/// `text` without its common control codes, display hints that "different platforms may ignore"
+/// (UEFI 2.11 §33.2.6.2.4): the text that get, set, list-questions and show-ifr show, and that
+/// QUESTION and VALUE match where no text as stored names a question or option (MatchTier).
+/// Texts equal only after this stripping are then equal prompts, which select resolves to the
+/// first selectable match in IFR order.
+fn displayed(text: &str) -> Cow<'_, str> {
+    match text.contains(is_control_character) {
+        true => Cow::Owned(text.replace(is_control_character, "")),
+        false => Cow::Borrowed(text),
+    }
+}
+
 /// The character of the CHAR16 `unit` of a string, or why UEFI rules it out. The common control
 /// codes lie in the private use area and between 0xF000 and 0xFCFF, yet strings may hold them
 /// (UEFI 2.11 §33.2.6.2.4), so they are taken first.
@@ -1006,11 +1045,73 @@ mod tests {
         for (requested, id, shown, displayed) in cases {
             let texts = ListTexts::new(&packages, &[requested]);
             assert_eq!(
-                (texts.shown_text(id), texts.display(id)),
+                (texts.shown_text(id), texts.display(id).as_ref()),
                 (shown, displayed),
                 "string {id}, requested {requested:?}"
             );
         }
+    }
+
+    /// display and matching_displayed take the common control codes out of a text, wherever they
+    /// lie, but not out of a keyword, which display shows as stored, as keywords gives it, while a
+    /// text that display falls back on for --language x-UEFI loses them; stored, shown_text and
+    /// matching give the text as stored.
+    #[test]
+    fn texts_show_and_match_without_control_codes_and_keywords_with_them() {
+        let packages = [
+            StringPackage {
+                strings: StringMap::from([(1, Rc::from("\u{F620}Keyword"))]),
+                ..package("x-UEFI-ns")
+            },
+            StringPackage {
+                strings: StringMap::from([
+                    (1, Rc::from("\u{F620}Pr\u{F7AB}ompt\u{F621}")),
+                    (2, Rc::from("Q\u{F7AB}")),
+                ]),
+                ..package("en-US")
+            },
+        ];
+        let stored = "\u{F620}Pr\u{F7AB}ompt\u{F621}";
+
+        let texts = ListTexts::new(&packages, &["en-US"]);
+        assert_eq!(texts.display(1), "Prompt", "display");
+        assert_eq!(texts.display(2), "Q", "display of a trailing control code");
+        assert_eq!(texts.stored(1), stored, "stored");
+        assert_eq!(texts.shown_text(1), Some(stored), "shown_text");
+        let matching: Vec<(String, String)> = MatchTier::ALL
+            .into_iter()
+            .flat_map(|tier| texts.matching_in(1, tier))
+            .map(|(language, text)| (language.to_string(), text.into_owned()))
+            .collect();
+        assert_eq!(
+            matching,
+            [
+                ("en-US".to_string(), stored.to_string()),
+                ("en-US".to_string(), "Prompt".to_string())
+            ],
+            "matching, then matching_displayed"
+        );
+        let keywords: Vec<(String, &str)> = texts
+            .keywords(1)
+            .map(|(language, text)| (language.to_string(), text))
+            .collect();
+        assert_eq!(
+            keywords,
+            [("x-UEFI-ns".to_string(), "\u{F620}Keyword")],
+            "keywords"
+        );
+
+        let texts = ListTexts::new(&packages, &["x-UEFI"]);
+        assert_eq!(
+            texts.display(1),
+            "\u{F620}Keyword",
+            "display of --language x-UEFI"
+        );
+        assert_eq!(
+            texts.display(2),
+            "Q",
+            "display of --language x-UEFI, falling back on en-US"
+        );
     }
 
     /// character takes each rule up to its bounds, the common control codes first, which lie in

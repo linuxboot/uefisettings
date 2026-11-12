@@ -10,6 +10,7 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -3831,8 +3832,9 @@ impl QuestionDescriptor {
     /// names any, or None if none does: of the texts as stored, then of those that display shows
     /// (MatchTier), each ignoring ASCII case, then ignoring surrounding whitespace too (get shows
     /// the text trimmed). So a text as stored never picks an option that differs from it only by
-    /// such whitespace, or that reads alike only once a character of it is replaced. Refuses with
-    /// SelectionError::AmbiguousOption options that no one language names all.
+    /// such whitespace, or that reads alike only once a character of it is replaced or its common
+    /// control codes are taken out. Refuses with SelectionError::AmbiguousOption options that no
+    /// one language names all.
     pub(crate) fn select_option(
         &self,
         texts: &BTreeSet<String>,
@@ -4114,7 +4116,7 @@ pub(crate) fn check_address_unique(
                 ListedQuestion::of(&op)
                     .map(|question| texts.display(question.header().prompt_string_id))
             })
-            .map(str::to_owned)
+            .map(Cow::into_owned)
             .collect(),
     })
 }

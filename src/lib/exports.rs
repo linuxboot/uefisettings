@@ -2989,6 +2989,234 @@ mod tests {
         assert_eq!(names, ["Boot"], "get Start shows its fr-FR prompt");
     }
 
+    /// The prompts of the questions that list-questions lists from `hiidb`, without EFI
+    /// variables.
+    fn listed_prompts(hiidb: &[u8]) -> Vec<String> {
+        let options = ListQuestionsOptions {
+            efivars: EfivarSource::Disabled,
+            ..ListQuestionsOptions::default()
+        };
+        HiiBackend::list_questions_using(hiidb, &options)
+            .expect("list the questions")
+            .into_iter()
+            .map(|question| question.name)
+            .collect()
+    }
+
+    /// get and list-questions show and match a prompt without the common control codes that it
+    /// holds, display hints that "different platforms may ignore" (UEFI 2.11 §33.2.6.2.4);
+    /// list-strings shows the string as it is.
+    #[test]
+    fn texts_show_and_match_without_their_control_codes() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                form(1, &[checkbox_on(1, 1, 1)]),
+            ]),
+            en_strings_package_of(&["\u{F620}Q\u{F621}"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+
+        let get_options = GetOptions {
+            efivars: EfivarSource::Disabled,
+            ..GetOptions::default()
+        };
+        let got = HiiBackend::get_using(&hiidb, "Q", None, &get_options).map(|got| {
+            got.responses
+                .into_iter()
+                .map(|response| response.question.name)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            (
+                listed_prompts(&hiidb),
+                got.map_err(|error| error.to_string())
+            ),
+            (vec!["Q".to_string()], Ok(vec!["Q".to_string()])),
+            "list-questions, and get Q"
+        );
+
+        let strings = HiiBackend::list_strings(&hiidb).expect("list the strings");
+        let listed: Vec<&str> = strings
+            .iter()
+            .flat_map(|package| package.string_package.values())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(listed, ["\u{F620}Q\u{F621}"], "list-strings");
+    }
+
+    /// Prompts that differ only in private use characters (UEFI 2.11 §33.2.6.2.1), which read as
+    /// U+FFFD, or only in common control codes (§33.2.6.2.4), show the same text. Where no prompt
+    /// as stored is that text, set writes the first match in IFR order, as select takes the first
+    /// on a tie, and the other question is no longer addressable by its prompt; where one is, set
+    /// writes its question.
+    #[test]
+    fn prompts_that_differ_only_in_ruled_out_characters_collide() {
+        let cases = [
+            (
+                "private use",
+                ["A\u{E000}", "A\u{E001}"],
+                "A\u{FFFD}",
+                (0, vec![1]),
+            ),
+            (
+                "control codes",
+                ["\u{F620}Q\u{F621}", "Q"],
+                "Q",
+                (1, vec![1]),
+            ),
+        ];
+        for (case, prompts, shown, written) in cases {
+            let packages = [
+                two_checkboxes(),
+                en_strings_package_of(&prompts),
+                END_PACKAGE.to_vec(),
+            ];
+            let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+            assert_eq!(
+                listed_prompts(&hiidb),
+                [shown, shown],
+                "{case}: list-questions"
+            );
+
+            assert_eq!(
+                writes_of_set(&packages, &[0, 0], shown, "1"),
+                Ok(vec![written]),
+                "{case}: set writes the first match, or the question of the stored prompt"
+            );
+        }
+    }
+
+    /// Of the prompts "<Bold On>Q<Bold Off>" and "Q", `set Q 1` writes the question whose prompt
+    /// as stored is "Q", byte 1, never the one that reads so only once display has taken out its
+    /// common control codes (UEFI 2.11 §33.2.6.2.4).
+    #[test]
+    fn set_q_writes_the_question_whose_stored_prompt_is_q() {
+        let packages = [
+            two_checkboxes(),
+            en_strings_package_of(&["\u{F620}Q\u{F621}", "Q"]),
+            END_PACKAGE.to_vec(),
+        ];
+
+        assert_eq!(
+            writes_of_set(&packages, &[0, 0], "Q", "1"),
+            Ok(vec![(1, vec![1])]),
+            "set Q writes byte 1"
+        );
+    }
+
+    /// Of the ONE_OF options "<Bold On>Enabled<Bold Off>" (1) and "Enabled" (2), `set Q Enabled`
+    /// writes 2, the option whose text as stored is "Enabled".
+    #[test]
+    fn set_enabled_writes_the_option_whose_stored_text_is_enabled() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                form(1, &[one_of_at(1, 1, 1, 0, &[(2, 1), (3, 2)])]),
+            ]),
+            en_strings_package_of(&["Q", "\u{F620}Enabled\u{F621}", "Enabled", "Help"]),
+            END_PACKAGE.to_vec(),
+        ];
+
+        assert_eq!(
+            writes_of_set(&packages, &[0], "Q", "Enabled"),
+            Ok(vec![(0, vec![2])]),
+            "set Q Enabled writes 2"
+        );
+    }
+
+    /// FormSet 11..11 prompts "Q" at byte 0 and FormSet 12..12 "<Bold On>Q<Bold Off>" at byte 1,
+    /// in one package list: `set Q 1` writes byte 0 alone, as the prompt as stored of a question of
+    /// FormSet 11..11 is "Q", so no FormSet selects a prompt that reads so only once display has
+    /// taken out its common control codes.
+    #[test]
+    fn set_q_writes_no_form_set_whose_prompt_only_reads_alike() {
+        let form_set = |guid, prompt| {
+            form_package_with_guid(
+                guid,
+                &[
+                    var_store_efi(1, "Setup", NV_BS_RT, 2),
+                    form(1, &[checkbox_at(1, prompt, 1, prompt - 1)]),
+                ],
+            )
+        };
+        let packages = [
+            form_set([0x11; 16], 1),
+            form_set([0x12; 16], 2),
+            en_strings_package_of(&["Q", "\u{F620}Q\u{F621}"]),
+            END_PACKAGE.to_vec(),
+        ];
+
+        assert_eq!(
+            writes_of_set(&packages, &[0, 0], "Q", "1"),
+            Ok(vec![(0, vec![1])]),
+            "set Q writes byte 0 of FormSet 11..11 alone"
+        );
+    }
+
+    /// ONE_OF option texts and help texts show and match without their common control codes, as
+    /// prompts do: list-questions shows both stripped, and set takes the stripped option text.
+    #[test]
+    fn option_and_help_texts_without_control_codes() {
+        let packages = [
+            form_package(&[
+                var_store_efi(1, "Setup", NV_BS_RT, 1),
+                // one_of_at's help is string 4
+                form(1, &[one_of_at(1, 1, 1, 0, &[(2, 1), (3, 0)])]),
+            ]),
+            en_strings_package_of(&[
+                "Q",
+                "\u{F620}Enabled\u{F621}",
+                "Disabled",
+                "\u{F622}Help\u{F623}",
+            ]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let options = ListQuestionsOptions {
+            efivars: EfivarSource::Disabled,
+            ..ListQuestionsOptions::default()
+        };
+        let listed: Vec<(String, Vec<String>, String)> =
+            HiiBackend::list_questions_using(&hiidb, &options)
+                .expect("list the questions")
+                .into_iter()
+                .map(|question| (question.name, question.options, question.help))
+                .collect();
+        assert_eq!(
+            listed,
+            [(
+                "Q".to_string(),
+                vec!["Enabled".to_string(), "Disabled".to_string()],
+                "Help".to_string()
+            )],
+            "list-questions options and help"
+        );
+
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), NV_BS_RT, &[0]);
+        let set = set_responses(
+            &hiidb,
+            "Q",
+            &SetValue::Text("Enabled".to_owned()),
+            None,
+            &SetOptions::default(),
+            SetAccess {
+                reads: shared(&variables),
+                writes: &*variables,
+                held: None,
+            },
+            None,
+        );
+        assert_eq!(
+            set.map(drop).map_err(|error| format!("{error:#}")),
+            Ok(()),
+            "set Q Enabled"
+        );
+        assert_eq!(variables.writes_to(&setup()), [(0, vec![1])], "writes");
+    }
+
     /// A HiiDB whose ONE_OF "Mode" at byte 0 of Setup has the options 0 and 1, of strings 2 and
     /// 3, which `en_us` and `fr_fr` translate.
     fn mode_hiidb(en_us: [&str; 3], fr_fr: [&str; 3]) -> Vec<u8> {

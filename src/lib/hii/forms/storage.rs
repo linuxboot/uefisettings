@@ -2949,7 +2949,7 @@ pub(crate) fn store_declarations(
                     }
                 }
                 DeclaredKind::NameValue { names } => {
-                    let name = texts.display(storage.var_store_info).to_owned();
+                    let name = texts.stored(storage.var_store_info).to_owned();
                     if !names.contains(&name) {
                         names.push(name);
                     }
@@ -3165,6 +3165,40 @@ mod store_request_tests {
         )
     }
 
+    /// The VarName of a name/value storage keeps the common control codes of its string, which
+    /// only the texts that questions show drop: it must match the firmware's own name.
+    #[test]
+    fn name_value_names_keep_their_control_codes() {
+        let named = operation(0x06, false, &[header(0x15, 3, 5, 0), vec![0x00]].concat());
+        let body = [
+            operation(
+                0x25,
+                false,
+                &[&3u16.to_le_bytes()[..], &[0x33; 16]].concat(),
+            ),
+            form(1, &[named]),
+        ];
+        let strings = [en_us_package(StringMap::from([(5, "\u{F620}Name".into())]))];
+
+        let stores = store_declarations(
+            &parse_form_set(&body).borrow(),
+            &ListTexts::new(&strings, &[]),
+        );
+
+        assert_eq!(
+            stores,
+            [StoreDeclaration {
+                id: 3,
+                guid: [0x33; 16].into(),
+                kind: DeclaredKind::NameValue {
+                    names: vec!["\u{F620}Name".to_string()]
+                },
+                holds_password: false,
+            }],
+            "the VarName as stored"
+        );
+    }
+
     #[test]
     fn store_settings_follow_the_widths_a_forms_browser_requests() {
         let string = operation(
@@ -3219,7 +3253,7 @@ mod store_request_tests {
                     id: 3,
                     guid: [0x33; 16].into(),
                     kind: DeclaredKind::NameValue {
-                        names: vec![ListTexts::new(&strings(), &[]).display(5).to_owned()]
+                        names: vec![ListTexts::new(&strings(), &[]).stored(5).to_owned()]
                     },
                     holds_password: false,
                 },
@@ -3301,7 +3335,7 @@ mod store_request_tests {
         assert_eq!(
             stores[1].kind,
             DeclaredKind::NameValue {
-                names: vec![ListTexts::new(&strings(), &[]).display(6).to_owned()]
+                names: vec![ListTexts::new(&strings(), &[]).stored(6).to_owned()]
             },
             "only the VarName that no PASSWORD names"
         );

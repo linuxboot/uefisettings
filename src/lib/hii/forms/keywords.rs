@@ -860,7 +860,7 @@ impl<'a> KeywordQuestion<'a> {
         let Some(listed) = ListedQuestion::of(&op) else {
             return Err(self.unchecked(&op).into());
         };
-        let prompt = self.texts.display(header.prompt_string_id);
+        let prompt: &str = &self.texts.display(header.prompt_string_id);
         if keyword_width(&op) != Some(resp.value.as_bytes().len()) {
             return Err(self.value_refusal(resp, prompt, ValueRefusal::Width).into());
         }
@@ -1633,7 +1633,7 @@ impl<'a> KeywordQuestion<'a> {
     fn question_refusal(&self, header: &QuestionHeader, reason: QuestionRefusal) -> KeywordRefusal {
         KeywordRefusal::Question {
             keyword: self.keyword.to_string(),
-            question: self.texts.display(header.prompt_string_id).to_owned(),
+            question: self.texts.display(header.prompt_string_id).into_owned(),
             reason,
         }
     }

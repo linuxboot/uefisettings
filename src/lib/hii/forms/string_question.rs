@@ -42,7 +42,7 @@ use super::QuestionFlags;
 use super::QuestionHeader;
 use super::QuestionIdentity;
 use super::TextInput;
-use crate::hii::strings::is_control_code;
+use crate::hii::strings::is_control_character;
 use crate::hii::strings::PRIVATE_USE_AREA;
 use crate::hii::variables::VariableLayout;
 
@@ -283,7 +283,7 @@ impl StringInput {
             }
             character
                 if PRIVATE_USE_AREA.contains(&u32::from(character))
-                    && !is_control_code(u32::from(character)) =>
+                    && !is_control_character(character) =>
             {
                 Err(StringRefusal::PrivateUse(character))
             }

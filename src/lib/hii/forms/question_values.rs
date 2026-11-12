@@ -839,7 +839,7 @@ pub(super) fn describe_question(
     walk: &mut FormSetWalk<'_, impl QuestionValues>,
 ) -> QuestionDescriptor {
     let header = listed.header();
-    let prompt = walk.texts.display(header.prompt_string_id);
+    let prompt: &str = &walk.texts.display(header.prompt_string_id);
     let flags = header.flags() | class_question_flags(&question.borrow());
     let varstore = find_corresponding_varstore(Rc::clone(question), header.var_store_id);
     match listed {

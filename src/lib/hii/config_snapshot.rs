@@ -252,7 +252,7 @@ impl SnapshotLookup {
     }
 
     /// Looks up the storages of `list` from now on: those of the driver at its device path, and
-    /// the labels that its strings give in `texts`, the texts that its questions show, as
+    /// the labels that its strings give in `texts`, the stored texts that its questions show, as
     /// edk2-stable202608 SetupBrowserDxe IfrParse.c takes a VarName through GetToken, as
     /// DisplayEngineDxe FormDisplay.c takes a prompt.
     fn enter(&mut self, list: &ParsedPackageList, texts: &ListTexts<'_>) {
@@ -270,7 +270,7 @@ impl SnapshotLookup {
             .collect();
         self.labels = ids
             .into_iter()
-            .map(|id| (id, texts.display(id)))
+            .map(|id| (id, texts.stored(id)))
             .filter(|&(_, text)| labels.contains(text))
             .map(|(id, text)| (id, Rc::from(text)))
             .collect();
@@ -716,6 +716,22 @@ pub(crate) mod tests {
             Some(&[8][..]),
             "string 1"
         );
+    }
+
+    /// A name/value setting takes the label of its string as stored, with the common control
+    /// codes that only the texts that questions show drop: a string that holds them labels no
+    /// setting of the label without them.
+    #[test]
+    fn lookup_labels_settings_by_their_stored_texts() {
+        let text = format!("{}&Var0=07", config_hdr(N_GUID, "", &DRIVER_PATH));
+        let mut lookup =
+            SnapshotLookup::new(&ExportedConfig::new(text), &PasswordQuestions::default())
+                .expect("look up the snapshot");
+        let list = labelled_list(&[(b"en-US", "\u{F620}Var0")]);
+
+        lookup.enter(&list, &list.texts(&[]));
+
+        assert!(lookup.setting(Guid::from(N_GUID), 1).is_none(), "string 1");
     }
 
     thread_local! {
