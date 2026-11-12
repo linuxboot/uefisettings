@@ -951,6 +951,9 @@ written, as a number. It never writes a read-only question, which the Keyword Ha
 even with `--i-am-fine-to-brick-this-system`; else `--include`, that flag and `--allow-volatile`
 work as for `set`: the `<KeywordResp>` of a keyword whose variable is volatile
 ends with ` <volatile: lasts until the next reset or power cycle>`. `-j` prints JSON instead.
+`get` and `set` fail where GetData(), or SetData() and its read-back, changed the bytes of a
+password question, which uefisettings never writes back, or where it cannot compare those bytes
+across them, as it compares them across a Callback() sequence (below).
 A VALUE holds every byte that SetData() writes, last byte first, as edk2's GetValueOfNumber
 (ConfigRouting.c:518) and UEFI 2.11 §35.4.6's example read it, where §35.2.1.5 lists a
 `<Number>`'s bytes in memory order: of a DATE or TIME each field, which `set` takes as the digits
@@ -995,9 +998,15 @@ the first Callback(). Settings that change between two reads before it, as a tim
 listed and not compared. A store that the Callback()s changed is restored, a Buffer or Name/Value
 store by one RouteConfig() of all its settings, and the answer is refused: the driver has already
 acted on the change, and any effect outside the FormSet's stores stays. The reads never request the
-bytes of a PASSWORD question, and read them as zero in an EFI variable store, so a Callback() that
-changes only them goes unnoticed, and a changed store that holds one is not restored, as a
-RouteConfig() without the password bytes may clear it and SetVariable() would write zeros over them.
+bytes of a PASSWORD question, and read them as zero in an EFI variable store, so a changed store
+that holds one is not restored, as a RouteConfig() without the password bytes may clear it and
+SetVariable() would write zeros over them. uefisettings compares those bytes apart, without showing
+them: in each EFI variable that holds one, listed by GetNextVariableName() or not, it reads them
+before the stores' first reads, refusing the answer where they cannot be read or listed, and again
+after the sequence, or after the reads that ran where a store cannot be read, and after a
+reconnection that a Callback() asks for. As uefisettings never writes a password byte, a change,
+or bytes that cannot be compared, then fails `get`, and `set` reports the change not applied, or
+applied and then refused by the reconnection.
 `get` of a question with a READ expression shows RETRIEVE's value, as a forms browser does. Where
 RETRIEVE fails, a forms browser keeps READ's value, but uefisettings does not evaluate READ beside
 a driver's Callback()s, so `get` refuses and says so. A Callback() that asks the forms browser to
@@ -1080,7 +1089,8 @@ does not find, it writes nothing, so `set` refuses to stage that set.
 
 Before the OS, `uefisettings.efi apply-staged <nonce>` records in `UefisettingsStagedOutcome` that
 it started, before the first Callback(), then sets each request's question through its driver's
-Callback()s and records each result. It checks each request as `set` does, against
+Callback()s, but none after one refused as driver code changed password bytes, or they could not
+be compared across it, and records each result. It checks each request as `set` does, against
 `--i-am-fine-to-brick-this-system` as `set` recorded it with the request (see
 [Unsafe operations](#unsafe-operations)): a question that `EFI_IFR_FLAG_READ_ONLY` makes read-only
 by then, or a HiiDB that declares a setup password question, is applied only with it, and the
