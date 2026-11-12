@@ -35,6 +35,7 @@ use crate::hii::package::is_padding;
 use crate::hii::package::Guid;
 use crate::hii::strings::Language;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::MatchTier;
 use crate::hii::strings::StringPackage;
 use crate::hii::variables::check_runtime_writable;
 use crate::hii::variables::check_unauthenticated;
@@ -3658,13 +3659,38 @@ impl fmt::Display for TextInputKind {
     }
 }
 
+/// How a VALUE matches the text of an option (QuestionDescriptor::select_option).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextMatch {
+    /// Ignoring ASCII case
+    Exact,
+    /// Ignoring ASCII case and surrounding whitespace, as get shows the text trimmed
+    Trimmed,
+}
+
+impl TextMatch {
+    /// The ways, in the order that select_option tries them.
+    const ALL: [Self; 2] = [Self::Exact, Self::Trimmed];
+
+    /// Whether `named`, a VALUE, names `text` this way.
+    fn matches(self, named: &str, text: &str) -> bool {
+        match self {
+            Self::Exact => named.eq_ignore_ascii_case(text),
+            Self::Trimmed => named.trim().eq_ignore_ascii_case(text.trim()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AnswerOption {
     /// The option's text, as get shows it
     pub value: String,
-    /// The option's text in each strings package of no configuration language that holds it,
-    /// with its language: those that VALUE matches
+    /// The option's text as stored in each strings package of no configuration language that
+    /// holds it, with its language (ListTexts::matching): those that VALUE matches first
     texts: Vec<(Language, String)>,
+    /// The option's text that display shows in those packages (ListTexts::matching_displayed):
+    /// those that VALUE matches where no text as stored of an option does
+    displayed_texts: Vec<(Language, String)>,
     /// The option's EFI_IFR_ONE_OF_OPTION Type
     value_type: u8,
     /// The option's value, or why it is not known
@@ -3682,6 +3708,16 @@ impl AnswerOption {
             .ok()
             .copied()
             .and_then(TypeValue::as_u64)
+    }
+
+    /// The texts of the option string `id` in `texts` that VALUE matches in `tier`, with their
+    /// languages: AnswerOption's texts or displayed_texts.
+    fn texts_in(texts: &ListTexts<'_>, id: u16, tier: MatchTier) -> Vec<(Language, String)> {
+        texts
+            .matching_in(id, tier)
+            .into_iter()
+            .map(|(language, text)| (language.clone(), text.into_owned()))
+            .collect()
     }
 }
 
@@ -3748,16 +3784,24 @@ impl QuestionDescriptor {
             .ok_or_else(|| ChangeValueError::InvalidOption.into())
     }
 
-    /// The options of a text in a language of no configuration language that `names` takes,
-    /// each with those languages.
-    fn options_named(&self, names: impl Fn(&str) -> bool) -> Vec<(&AnswerOption, OptionMatch)> {
+    /// The options of a text, as `tier` takes the texts, in a language of no configuration
+    /// language that `text_match` takes for one of `texts`, each with those languages.
+    fn options_named(
+        &self,
+        tier: MatchTier,
+        text_match: TextMatch,
+        texts: &BTreeSet<String>,
+    ) -> Vec<(&AnswerOption, OptionMatch)> {
         self.possible_options
             .iter()
             .filter_map(|option| {
-                let languages: Vec<String> = option
-                    .texts
+                let option_texts = match tier {
+                    MatchTier::Stored => &option.texts,
+                    MatchTier::Displayed => &option.displayed_texts,
+                };
+                let languages: Vec<String> = option_texts
                     .iter()
-                    .filter(|(_, text)| names(text))
+                    .filter(|(_, text)| texts.iter().any(|named| text_match.matches(named, text)))
                     .map(|(language, _)| language.to_string())
                     .collect();
                 let named = OptionMatch {
@@ -3783,27 +3827,23 @@ impl QuestionDescriptor {
     }
 
     /// Returns the option that select() picks with `include` among those whose text in a
-    /// language of no configuration language is one of `texts` ignoring ASCII case, or, if there
-    /// are none, among those whose text is one of `texts` ignoring surrounding whitespace too
-    /// (get shows the text trimmed), or None if there are none either. So a text as stored never
-    /// picks an option that differs from it only by such whitespace. Refuses with
+    /// language of no configuration language is one of `texts`, in the first of these ways that
+    /// names any, or None if none does: of the texts as stored, then of those that display shows
+    /// (MatchTier), each ignoring ASCII case, then ignoring surrounding whitespace too (get shows
+    /// the text trimmed). So a text as stored never picks an option that differs from it only by
+    /// such whitespace, or that reads alike only once a character of it is replaced. Refuses with
     /// SelectionError::AmbiguousOption options that no one language names all.
     pub(crate) fn select_option(
         &self,
         texts: &BTreeSet<String>,
         include: IncludedStates,
     ) -> std::result::Result<Option<&AnswerOption>, SelectionError> {
-        let stored =
-            self.options_named(|text| texts.iter().any(|named| named.eq_ignore_ascii_case(text)));
-        let candidates = if stored.is_empty() {
-            self.options_named(|text| {
-                texts
-                    .iter()
-                    .any(|named| named.trim().eq_ignore_ascii_case(text.trim()))
-            })
-        } else {
-            stored
-        };
+        let candidates = MatchTier::ALL
+            .into_iter()
+            .flat_map(|tier| TextMatch::ALL.map(|text_match| (tier, text_match)))
+            .map(|(tier, text_match)| self.options_named(tier, text_match, texts))
+            .find(|candidates| !candidates.is_empty())
+            .unwrap_or_default();
         let language_sets: Vec<&[String]> = candidates
             .iter()
             .map(|(_, named)| named.languages.as_slice())
@@ -4005,18 +4045,19 @@ where
         .map(|(question, listed)| describe_question(question, listed, walk))
 }
 
-/// The questions under the root `node` of a FormSet whose prompt is one of
+/// The questions under the root `node` of a FormSet whose prompt, as `tier` takes it, is one of
 /// `possible_question_phrases` in a language of `texts`, as find_question finds them, for
-/// check_prompt_language.
+/// check_prompt_language and the choice of the tier.
 pub(crate) fn prompt_matches<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     possible_question_phrases: &BTreeSet<T>,
+    tier: MatchTier,
 ) -> Vec<PromptMatch>
 where
     T: AsRef<str>,
 {
-    questions_named(node, texts, possible_question_phrases)
+    questions_named(node, texts, possible_question_phrases, tier)
         .into_iter()
         .map(|named| named.prompt)
         .collect()
@@ -4373,7 +4414,7 @@ mod choice_for_set_tests {
         let values = VarStoreValues::new(root, assumed);
         let selection = find_question_in(
             root,
-            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
+            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings(), &[]),
                 &mut reader,
@@ -6059,7 +6100,7 @@ mod tests {
         let find = |prompt: &str, phrase: &str| {
             find_question_in(
                 &root,
-                &QuestionMatch::Prompt(&BTreeSet::from([phrase])),
+                &QuestionMatch::Prompt(&BTreeSet::from([phrase]), MatchTier::Stored),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&prompted(prompt), &[]),
                     &mut Efivars::new().reader(),
@@ -7164,7 +7205,7 @@ mod nesting_tests {
                 let selection = find_question(
                     parse_deep(DEEP, DEEP, false),
                     &ListTexts::new(&deep_strings(), &[]),
-                    &QuestionMatch::Prompt(&BTreeSet::from([name])),
+                    &QuestionMatch::Prompt(&BTreeSet::from([name]), MatchTier::Stored),
                     IncludedStates::GRAYED_OUT,
                     CheckedVarStores::NONE,
                     &mut disabled_reader(),

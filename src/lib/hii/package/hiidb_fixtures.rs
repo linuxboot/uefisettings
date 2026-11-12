@@ -115,7 +115,7 @@ pub(crate) fn strings_package_of(language: &[u8], strings: &[&str]) -> Vec<u8> {
 }
 
 /// An "en" strings package whose string blocks are `blocks`, valid or not.
-pub(super) fn en_strings_package_with_blocks(blocks: &[u8]) -> Vec<u8> {
+pub(crate) fn en_strings_package_with_blocks(blocks: &[u8]) -> Vec<u8> {
     strings_package_with_blocks(b"en", blocks)
 }
 

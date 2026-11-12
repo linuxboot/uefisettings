@@ -1242,6 +1242,7 @@ mod tests {
         let strings = |language: &[u8], first: &str, second: &str| StringPackage {
             language: Language(language.to_vec()),
             strings: BTreeMap::from([(3, first.into()), (5, second.into())]),
+            replaced: Default::default(),
         };
         let device_path = path.parse::<KeywordPath>().expect("a device path");
         ParsedPackageList {

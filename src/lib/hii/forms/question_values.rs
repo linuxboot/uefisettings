@@ -82,6 +82,7 @@ use crate::hii::config_string::Namespace;
 use crate::hii::package::Guid;
 use crate::hii::strings::is_configuration_language;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::MatchTier;
 
 /// A question whose value get reads and set writes.
 #[derive(Clone, Copy)]
@@ -381,12 +382,13 @@ pub(super) struct NamedQuestion {
 }
 
 /// Returns the ListedQuestions under `node`, in IFR order, whose prompt in a language of `texts`
-/// of no configuration language is one of `phrases`, ignoring ASCII case and surrounding
-/// whitespace, with those languages.
+/// of no configuration language, as `tier` takes it, is one of `phrases`, ignoring ASCII case and
+/// surrounding whitespace, with those languages.
 pub(super) fn questions_named<T>(
     node: &Rc<RefCell<IFROperation>>,
     texts: &ListTexts<'_>,
     phrases: &BTreeSet<T>,
+    tier: MatchTier,
 ) -> Vec<NamedQuestion>
 where
     T: AsRef<str>,
@@ -394,7 +396,8 @@ where
     let mut found = Vec::new();
     visit_listed_questions(node, |node, form_set, header| {
         let languages: Vec<String> = texts
-            .matching(header.prompt_string_id)
+            .matching_in(header.prompt_string_id, tier)
+            .into_iter()
             .filter(|(_, prompt)| {
                 phrases
                     .iter()
@@ -441,8 +444,9 @@ fn visit_listed_questions(
 
 /// What find_question selects questions by, in one FormSet.
 pub(crate) enum QuestionMatch<'a, T> {
-    /// The questions whose prompt is one of these phrases, as questions_named finds them
-    Prompt(&'a BTreeSet<T>),
+    /// The questions whose prompt, as the tier takes it, is one of these phrases, as
+    /// questions_named finds them
+    Prompt(&'a BTreeSet<T>, MatchTier),
     /// The question of this address
     Address(&'a QuestionAddress),
     /// The questions of these statements of a keyword, those of the FormSet
@@ -460,7 +464,7 @@ where
     T: AsRef<str>,
 {
     match *matching {
-        QuestionMatch::Prompt(phrases) => questions_named(node, texts, phrases)
+        QuestionMatch::Prompt(phrases, tier) => questions_named(node, texts, phrases, tier)
             .into_iter()
             .map(|named| named.node)
             .collect(),
@@ -645,15 +649,16 @@ pub enum QuestionSelector {
 }
 
 impl QuestionSelector {
-    /// What find_question selects by: by Prompt, any of `variations`, the spellings of its text;
-    /// by Keyword, `statements`, its statements in the HiiDB.
+    /// What find_question selects by: by Prompt, any of `variations`, the spellings of its text,
+    /// as `tier` takes the prompts; by Keyword, `statements`, its statements in the HiiDB.
     pub(crate) fn matching<'a, T>(
         &'a self,
         variations: &'a BTreeSet<T>,
+        tier: MatchTier,
         statements: &'a [KeywordStatement<'a>],
     ) -> QuestionMatch<'a, T> {
         match self {
-            Self::Prompt(_) => QuestionMatch::Prompt(variations),
+            Self::Prompt(_) => QuestionMatch::Prompt(variations, tier),
             Self::Address(address) => QuestionMatch::Address(address),
             Self::Keyword { .. } => QuestionMatch::Keyword(statements),
         }
@@ -997,11 +1002,12 @@ pub(super) fn handle_oneof(
                 raw_value,
                 source: ValueSource::since(taken, walk.inputs.reader),
                 value: walk.texts.display(o.option_string_id).to_string(),
-                texts: walk
-                    .texts
-                    .matching(o.option_string_id)
-                    .map(|(language, text)| (language.clone(), text.to_string()))
-                    .collect(),
+                texts: AnswerOption::texts_in(walk.texts, o.option_string_id, MatchTier::Stored),
+                displayed_texts: AnswerOption::texts_in(
+                    walk.texts,
+                    o.option_string_id,
+                    MatchTier::Displayed,
+                ),
                 state: option_state(&op, &mut walk.inputs),
             });
         }

@@ -1114,6 +1114,7 @@ mod non_efi_varstore_tests {
             possible_options: vec![AnswerOption {
                 value: "Enabled".to_string(),
                 texts: vec![(Language(b"en-US".to_vec()), "Enabled".to_string())],
+                displayed_texts: vec![(Language(b"en-US".to_vec()), "Enabled".to_string())],
                 value_type: super::super::EFI_IFR_TYPE_NUM_SIZE_8,
                 raw_value: Ok(TypeValue::NumSize8(1)),
                 source: ValueSource::Current,
@@ -3400,6 +3401,7 @@ mod store_request_tests {
                     (11, Rc::from("Password")),
                     (12, Rc::from(differs)),
                 ]),
+                replaced: Default::default(),
             });
         resolve_short_var_names(&[Rc::clone(&root)], &packages);
         let variable = |id, guid: [u8; 16], name: &str, holds_password| StoreDeclaration {

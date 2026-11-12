@@ -54,6 +54,7 @@ use super::EFI_IFR_TYPE_NUM_SIZE_16;
 use super::EFI_IFR_TYPE_NUM_SIZE_32;
 use super::EFI_IFR_TYPE_NUM_SIZE_64;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::MatchTier;
 use crate::hii::variables::VariableLayout;
 
 /// EFI_IFR_UNIQUE_SET and EFI_IFR_NO_EMPTY_SET (UEFI 2.11 §33.3.8.3.53).
@@ -521,10 +522,12 @@ fn list_options(
                 // ONE_OF only, so no option of an ORDERED_LIST takes a snapshot value
                 source: ValueSource::Current,
                 value: texts.display(option.option_string_id).to_string(),
-                texts: texts
-                    .matching(option.option_string_id)
-                    .map(|(language, text)| (language.clone(), text.to_string()))
-                    .collect(),
+                texts: AnswerOption::texts_in(texts, option.option_string_id, MatchTier::Stored),
+                displayed_texts: AnswerOption::texts_in(
+                    texts,
+                    option.option_string_id,
+                    MatchTier::Displayed,
+                ),
                 state: option_state(&op, inputs),
             })
         })

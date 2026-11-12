@@ -126,6 +126,7 @@ use crate::hii::config_string::ValueRange;
 use crate::hii::package::ParsedPackageList;
 use crate::hii::strings::Language;
 use crate::hii::strings::ListTexts;
+use crate::hii::strings::ScsuRuledOut;
 use crate::hii::variables::is_volatile;
 use crate::hii::variables::DataPatch;
 use crate::hii::variables::EfivarReader;
@@ -410,6 +411,11 @@ pub(crate) enum KeywordInfoRefusal {
     },
     #[error("keyword {keyword}: no strings package of a display language holds its string {id}")]
     NoText { keyword: String, id: u16 },
+    #[error(
+        "keyword {keyword}: its string {id} is SCSU text with a character that UEFI rules out of \
+         strings, which holds no CHAR16s to copy"
+    )]
+    RuledOutText { keyword: String, id: u16 },
     #[error(transparent)]
     ConfigString(#[from] ConfigStringError),
 }
@@ -1220,18 +1226,22 @@ impl<'a> KeywordQuestion<'a> {
         }
     }
 
-    /// The text of string `id` that display shows, as a `<String>`'s CHAR16s, refused unless a
-    /// strings package of a display language holds it (ListTexts::shown_text), and if empty, as
-    /// `<String> ::= [<Char>]+` (UEFI 2.11 §35.2.1.2).
+    /// The CHAR16s of string `id` that display shows, as the firmware holds them, as a
+    /// `<String>`'s (ListTexts::shown_units), refused unless a strings package of a display
+    /// language holds it, and if empty, as `<String> ::= [<Char>]+` (UEFI 2.11 §35.2.1.2), or if
+    /// it is SCSU text with a character that UEFI rules out of strings, which holds none.
     fn text(&self, id: u16) -> Result<Vec<u16>, KeywordInfoRefusal> {
-        self.texts
-            .shown_text(id)
-            .filter(|text| !text.is_empty())
-            .map(|text| text.encode_utf16().collect())
-            .ok_or_else(|| KeywordInfoRefusal::NoText {
+        match self.texts.shown_units(id) {
+            Some(Ok(units)) if !units.is_empty() => Ok(units),
+            Some(Err(ScsuRuledOut)) => Err(KeywordInfoRefusal::RuledOutText {
                 keyword: self.keyword.to_string(),
                 id,
-            })
+            }),
+            Some(Ok(_)) | None => Err(KeywordInfoRefusal::NoText {
+                keyword: self.keyword.to_string(),
+                id,
+            }),
+        }
     }
 
     /// The question header of the question, refused unless GetData() (`Read`) or SetData()
@@ -1931,6 +1941,7 @@ mod tests {
     use super::super::PasswordQuestions;
     use super::*;
     use crate::hii::config_string::MultiKeywordResp;
+    use crate::hii::package::hiidb_fixtures::en_strings_package_with_blocks;
     use crate::hii::package::hiidb_fixtures::form_package_of;
     use crate::hii::package::hiidb_fixtures::package_list_with_guid;
     use crate::hii::package::hiidb_fixtures::END_PACKAGE;
@@ -1997,11 +2008,13 @@ mod tests {
         let mut strings = vec![StringPackage {
             language: Language(b"en-US".to_vec()),
             strings: BTreeMap::from([(PROMPT, QUESTION.into())]),
+            replaced: Default::default(),
         }];
         for (language, text) in keywords {
             strings.push(StringPackage {
                 language: Language(language.as_bytes().to_vec()),
                 strings: BTreeMap::from([(PROMPT, (*text).into())]),
+                replaced: Default::default(),
             });
         }
         ParsedPackageList {
@@ -4679,12 +4692,14 @@ mod tests {
         let package = |language: &[u8], texts: &[(u16, &str)]| StringPackage {
             language: Language(language.to_vec()),
             strings: texts.iter().map(|&(id, text)| (id, text.into())).collect(),
+            replaced: Default::default(),
         };
         let mut list = list(PATH, &[], ops);
         list.strings = vec![
             StringPackage {
                 language: Language(NAMESPACE.as_bytes().to_vec()),
                 strings: BTreeMap::from([(PROMPT, KEYWORD.into()), (8, "eight".into())]),
+                replaced: Default::default(),
             },
             package(
                 b"en-US",
@@ -5370,6 +5385,107 @@ mod tests {
                 id: 5,
             }),
             "an option of string 5, which en-US holds empty"
+        );
+    }
+
+    /// A STRING's default and an OPTIONSTRING are the CHAR16s that their strings held, as
+    /// edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault copies a string from
+    /// HiiGetString, also where a character of it reads as U+FFFD: string 6, "A" and a surrogate
+    /// pair. String 7, SCSU text of SQU U+E000, holds no CHAR16s, so its default and its option
+    /// refuse.
+    #[test]
+    fn info_takes_the_char16s_that_strings_held() {
+        let blocks = [
+            // EFI_HII_SIBT_SKIP1 of 5: string 6 next
+            &[0x22, 0x05][..],
+            // EFI_HII_SIBT_STRING_UCS2 "A", U+D83D U+DE00: 6
+            &[0x14, 0x41, 0x00, 0x3D, 0xD8, 0x00, 0xDE, 0x00, 0x00],
+            // EFI_HII_SIBT_STRING_SCSU of SQU U+E000, then U+0000: 7
+            &[0x10, 0x0E, 0xE0, 0x00, 0x00],
+            // EFI_HII_SIBT_END
+            &[0x00],
+        ]
+        .concat();
+        let hiidb = package_list_with_guid(
+            [0x22; 16],
+            &[
+                en_strings_package_with_blocks(&blocks),
+                END_PACKAGE.to_vec(),
+            ]
+            .concat(),
+        );
+        let read = read_db(&hiidb).expect("read the HiiDB");
+        let [read] = read.as_slice() else {
+            panic!("{} package lists, not 1", read.len());
+        };
+        // info_in with the en-US package of info_list in place of one read from `blocks`
+        let info = |ops: Vec<u8>, filter: KeywordInfoFilter| {
+            let mut list = info_list(ops);
+            list.strings[1] = read.strings[0].clone();
+            let lists = [list];
+            let mut questions = KeywordQuestion::resolve(
+                &lists,
+                Some(&namespace(NAMESPACE)),
+                Some(&path_of(PATH)),
+                &keyword(KEYWORD),
+                &[],
+            )
+            .expect("the keyword");
+            questions.remove(0).info(filter, &mut reader(1))
+        };
+        // MinSize 1, MaxSize 4, Flags, the default of Type EFI_IFR_TYPE_STRING of `id`
+        let string = |id: u16| {
+            let data = [question_header_with(1, PROMPT, 1, 5, 0), vec![1, 4, 0]].concat();
+            [
+                operation(STRING, true, &data),
+                typed_default(0x0000, 0x07, &id.to_le_bytes()),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+        let one_of = |string_id: u16| {
+            [
+                operation(ONE_OF, true, &uint8_question(1, 0)),
+                flagged_option(string_id, 0, 0),
+                END.to_vec(),
+            ]
+            .concat()
+        };
+
+        assert_eq!(
+            info(string(6), KeywordInfoFilter::DEFAULT),
+            Ok(KeywordInfo {
+                standard_default: Some(number(&[0x41, 0x00, 0x3D, 0xD8, 0x00, 0xDE, 0x00, 0x00])),
+                ..KeywordInfo::default()
+            }),
+            "the default of string 6"
+        );
+        assert_eq!(
+            info(one_of(6), KeywordInfoFilter::VALUE_ATTRIBUTE),
+            Ok(KeywordInfo {
+                options: vec![option(&[0], "A\u{1F600}", None)],
+                ..KeywordInfo::default()
+            }),
+            "the option of string 6"
+        );
+        assert_eq!(
+            info(string(7), KeywordInfoFilter::DEFAULT),
+            Err(KeywordInfoRefusal::Default {
+                keyword: KEYWORD.to_owned(),
+                default_id: DefaultId::STANDARD,
+                reason: "EFI_IFR_TYPE_STRING default: string 0x0007 is SCSU text with a character \
+                         that UEFI rules out of strings, which holds no CHAR16s to copy"
+                    .to_owned(),
+            }),
+            "the default of string 7"
+        );
+        assert_eq!(
+            info(one_of(7), KeywordInfoFilter::VALUE_ATTRIBUTE),
+            Err(KeywordInfoRefusal::RuledOutText {
+                keyword: KEYWORD.to_owned(),
+                id: 7,
+            }),
+            "the option of string 7"
         );
     }
 

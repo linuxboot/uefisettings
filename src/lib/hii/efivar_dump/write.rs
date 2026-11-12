@@ -626,6 +626,7 @@ mod tests {
             strings: vec![StringPackage {
                 language: Language::default(),
                 strings: BTreeMap::new(),
+                replaced: Default::default(),
             }],
             forms: vec![Rc::clone(root)],
             ignored_ifr: Vec::new(),

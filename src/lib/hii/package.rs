@@ -566,6 +566,7 @@ mod tests {
 
     use super::hiidb_fixtures::*;
     use super::*;
+    use crate::hii::config_snapshot::tests::logged_by;
     use crate::hii::forms::ifr_fixtures::form;
     use crate::hii::forms::ifr_fixtures::form_set;
     use crate::hii::forms::ifr_fixtures::nested;
@@ -2232,6 +2233,7 @@ mod tests {
         let want = [strings::StringPackage {
             language: strings::Language(b"en-\xe9".to_vec()),
             strings: StringMap::from([(1, "A".into())]),
+            replaced: Default::default(),
         }];
         assert_eq!(list.strings, want, "the strings packages");
     }
@@ -3147,6 +3149,32 @@ mod tests {
         );
     }
 
+    /// read_db reads a FontName as it reads strings, a private use character (UEFI 2.11
+    /// §33.2.6.2.1) as U+FFFD, which only its debug log shows.
+    #[test]
+    fn font_names_read_ruled_out_characters_as_replacement_characters() {
+        // FONT_1 of Length 17 with FontName "A", U+E000, then EFI_HII_SIBT_END
+        let blocks = [
+            &[0x31, 0x40, 0x11, 0x00][..],
+            &FONT_1[4..11],
+            &[0x41, 0x00, 0x00, 0xE0, 0x00, 0x00],
+            &[0x00],
+        ]
+        .concat();
+        let mut got = Vec::new();
+
+        let logged = logged_by(|| {
+            got = strings_packages_of(&[en_strings_package_with_blocks(&blocks)]);
+        });
+
+        assert_eq!(got, [(language("en"), StringMap::new())], "strings");
+        let font = format!("EFI_HII_SIBT_FONT FontId 1: {:?}, ", "A\u{FFFD}");
+        assert!(
+            logged.iter().any(|message| message.starts_with(&font)),
+            "the FontName as read: {logged:?}"
+        );
+    }
+
     /// read_db shares the text of a DUPLICATE's string with the string that it names, "a
     /// previously defined string with the exact same string text" (UEFI 2.11 §33.3.6.2.1),
     /// copying none.
@@ -3673,5 +3701,77 @@ mod tests {
                 "{block_name} without EFI_HII_SIBT_END"
             );
         }
+    }
+
+    /// The string blocks of an EFI_HII_SIBT_STRING_UCS2 of the CHAR16s `units`, string 1.
+    fn ucs2_string_block(units: &[u16]) -> Vec<u8> {
+        let text: Vec<u8> = units
+            .iter()
+            .chain(&[0])
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        [&[0x14][..], &text].concat()
+    }
+
+    /// read_db reads as U+FFFD each character that UEFI 2.11 rules out of a string: a surrogate,
+    /// paired or not (§33.2.6.2.2 "UEFI does not support surrogate characters"), a private use
+    /// character (§33.2.6.2.1 "UEFI prohibits use of this area") and one between 0xF000 and
+    /// 0xFCFF (§33.3.6.3.2 "should be rejected"), in UCS-2 and SCSU strings alike. It keeps the
+    /// common control codes 0xF620-0xF62B, 0xF7zz and 0xF8zz (§33.2.6.2.4, Table 33.3) and a
+    /// U+FFFD that the string holds.
+    #[test]
+    fn characters_that_uefi_rules_out_read_as_replacement_characters() {
+        let blocks = [
+            // EFI_HII_SIBT_STRING_UCS2: 1
+            &ucs2_string_block(&[
+                0x0041, 0xE000, 0xD83D, 0xDE00, 0xDC00, 0xF900, 0xF62C, 0xF620, 0xF7AB, 0xF801,
+                0xFFFD, 0x0042,
+            ])[..],
+            // EFI_HII_SIBT_STRING_SCSU of SQU U+E000, then U+0000: 2
+            &[0x10, 0x0E, 0xE0, 0x00, 0x00],
+            // EFI_HII_SIBT_END
+            &[0x00],
+        ]
+        .concat();
+
+        let want = StringMap::from([
+            (
+                1,
+                "A\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{F620}\u{F7AB}\u{F801}\u{FFFD}B"
+                    .into(),
+            ),
+            (2, "\u{FFFD}".into()),
+        ]);
+        assert_eq!(
+            strings_packages_of(&[en_strings_package_with_blocks(&blocks)]),
+            [(language("en"), want)],
+            "a surrogate pair, a lone surrogate, private use, 0xF900 and 0xF62C read as U+FFFD"
+        );
+    }
+
+    /// Each rule ends at its bounds: 0xD7FF, 0xF62B, 0xF700, 0xF8FF, 0xFD00 and 0xFDFF stay;
+    /// 0xEFFF, 0xF000, 0xF61F, 0xF6FF, 0xFBFF, 0xFC00 and 0xFCFF read as U+FFFD.
+    #[test]
+    fn rule_bounds() {
+        let blocks = [
+            &ucs2_string_block(&[
+                0xD7FF, 0xEFFF, 0xF000, 0xF61F, 0xF62B, 0xF6FF, 0xF700, 0xF8FF, 0xFBFF, 0xFC00,
+                0xFCFF, 0xFD00, 0xFDFF,
+            ])[..],
+            &[0x00],
+        ]
+        .concat();
+
+        let want = StringMap::from([(
+            1,
+            "\u{D7FF}\u{FFFD}\u{FFFD}\u{FFFD}\u{F62B}\u{FFFD}\u{F700}\u{F8FF}\u{FFFD}\u{FFFD}\
+             \u{FFFD}\u{FD00}\u{FDFF}"
+                .into(),
+        )]);
+        assert_eq!(
+            strings_packages_of(&[en_strings_package_with_blocks(&blocks)]),
+            [(language("en"), want)],
+            "rule bounds"
+        );
     }
 }

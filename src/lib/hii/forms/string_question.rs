@@ -15,7 +15,6 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroU8;
-use std::ops::RangeInclusive;
 use std::rc::Rc;
 
 use binrw::BinRead;
@@ -43,6 +42,8 @@ use super::QuestionFlags;
 use super::QuestionHeader;
 use super::QuestionIdentity;
 use super::TextInput;
+use crate::hii::strings::is_control_code;
+use crate::hii::strings::PRIVATE_USE_AREA;
 use crate::hii::variables::VariableLayout;
 
 /// The bytes of a CHAR16, a character of a string (UEFI 2.11 §33.2.6).
@@ -51,15 +52,6 @@ const CHAR16_SIZE: u16 = 2;
 /// The Flags bit EFI_IFR_STRING_MULTI_LINE, without which "multi-line editing should not be
 /// allowed" (UEFI 2.11 §33.3.8.3.70).
 const EFI_IFR_STRING_MULTI_LINE: u8 = 0x01;
-
-/// The Private Use Area of the BMP, of which UEFI 2.11 §33.2.6.2.1 says "UEFI prohibits use of
-/// this area in a UEFI environment."
-const PRIVATE_USE_AREA: RangeInclusive<char> = '\u{E000}'..='\u{F8FF}';
-
-/// The double-byte Common Control Codes of UEFI 2.11 §33.2.6.2.4 Table 33.3, font display hints
-/// that strings may hold, which lie in the Private Use Area.
-const COMMON_CONTROL_CODES: [RangeInclusive<char>; 2] =
-    ['\u{F620}'..='\u{F62B}', '\u{F700}'..='\u{F8FF}'];
 
 /// The Mandatory Breaks of UEFI 2.11 §33.2.6.2.5 Table 33.4, which force a line break.
 const MANDATORY_BREAKS: [char; 5] = ['\u{A}', '\u{C}', '\u{D}', '\u{2028}', '\u{2029}'];
@@ -290,10 +282,8 @@ impl StringInput {
                 Err(StringRefusal::LineBreak)
             }
             character
-                if PRIVATE_USE_AREA.contains(&character)
-                    && !COMMON_CONTROL_CODES
-                        .iter()
-                        .any(|codes| codes.contains(&character)) =>
+                if PRIVATE_USE_AREA.contains(&u32::from(character))
+                    && !is_control_code(u32::from(character)) =>
             {
                 Err(StringRefusal::PrivateUse(character))
             }

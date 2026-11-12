@@ -255,6 +255,7 @@ pub use crate::hii::KeywordValues;
 pub use crate::hii::LockdownMode;
 #[cfg(target_os = "linux")]
 pub use crate::hii::LockdownUnknown;
+use crate::hii::MatchTier;
 #[cfg(target_os = "linux")]
 pub use crate::hii::MemoryAccessDenied;
 #[cfg(target_os = "linux")]
@@ -1348,7 +1349,8 @@ impl HiiBackend {
             &options.assume_var_stores,
         )?;
         let ignored_ifr = listed_ignored_ifr(&parsed_db)?;
-        check_unambiguous(&parsed_db, &question, &question_variations)?;
+        let tier = prompt_tier(&parsed_db, &question_variations);
+        check_unambiguous(&parsed_db, &question, &question_variations, tier)?;
         let statements = keyword_statements(&parsed_db, &question)?;
 
         let requested = text_languages(options.language.as_deref(), platform_lang);
@@ -1362,7 +1364,7 @@ impl HiiBackend {
                 let selection = forms::find_question(
                     Rc::clone(root),
                     &texts,
-                    &question.matching(&question_variations, &statements),
+                    &question.matching(&question_variations, tier, &statements),
                     include,
                     assumed,
                     &mut reader,
@@ -1513,14 +1515,35 @@ fn spellings(
     }
 }
 
+/// The tier in which a prompt of `variations` selects questions in `parsed_db`: Stored where the
+/// prompt as stored of a listed question of any FormSet is one of them, else Displayed. So a
+/// text that reads otherwise than the firmware holds it never selects a question, in any FormSet,
+/// where a text as stored selects one.
+fn prompt_tier(
+    parsed_db: &[package::ParsedPackageList],
+    variations: &BTreeSet<String>,
+) -> MatchTier {
+    let stored = parsed_db.iter().any(|list| {
+        let texts = list.texts(&[]);
+        list.forms.iter().any(|root| {
+            !forms::prompt_matches(root, &texts, variations, MatchTier::Stored).is_empty()
+        })
+    });
+    match stored {
+        true => MatchTier::Stored,
+        false => MatchTier::Displayed,
+    }
+}
+
 /// Refuses a `question` that names questions ambiguously in `parsed_db`: by prompt, unless one
-/// language holds it as the prompt of every question that its `variations` name
-/// (forms::check_prompt_language); by address, if two questions of one FormSet hold it
+/// language holds it as the prompt, as `tier` takes it, of every question that its `variations`
+/// name (forms::check_prompt_language); by address, if two questions of one FormSet hold it
 /// (forms::check_address_unique). keyword_statements refuses a keyword's.
 fn check_unambiguous(
     parsed_db: &[package::ParsedPackageList],
     question: &QuestionSelector,
     variations: &BTreeSet<String>,
+    tier: MatchTier,
 ) -> Result<()> {
     let mut matches = Vec::new();
     for list in parsed_db {
@@ -1529,7 +1552,7 @@ fn check_unambiguous(
         for root in &list.forms {
             match question {
                 QuestionSelector::Prompt(_) => {
-                    matches.extend(forms::prompt_matches(root, &texts, variations));
+                    matches.extend(forms::prompt_matches(root, &texts, variations, tier));
                 }
                 QuestionSelector::Address(address) => {
                     forms::check_address_unique(root, &texts, address)?;
@@ -1622,7 +1645,8 @@ fn select_for_set<'a, 'o>(
     parsed_db
         .iter()
         .try_for_each(package::ParsedPackageList::check_form_strings)?;
-    check_unambiguous(parsed_db, question, question_variations)?;
+    let tier = prompt_tier(parsed_db, question_variations);
+    check_unambiguous(parsed_db, question, question_variations, tier)?;
     let statements = keyword_statements(parsed_db, question)?;
 
     // Every FormSet selects its question and option before the first write, so that a
@@ -1636,7 +1660,7 @@ fn select_for_set<'a, 'o>(
             let selection = forms::find_question(
                 Rc::clone(root),
                 &texts,
-                &question.matching(question_variations, &statements),
+                &question.matching(question_variations, tier, &statements),
                 options.include,
                 assumed,
                 reader,
@@ -16123,12 +16147,11 @@ mod tests {
     /// A STRING without a value shows its default of Type STRING, the text of that string, cut to
     /// MaxSize characters, as edk2-stable202608 SetupBrowserDxe/Setup.c:4507-4511
     /// GetQuestionDefault copies at most StorageWidth bytes of it; a string that the package list
-    /// lacks, or one with a character beyond UCS-2 (UEFI 2.11 §33.2.6.2.2), gives no default.
+    /// lacks gives no default, and neither do the surrogates of a character beyond UCS-2, which
+    /// UEFI 2.11 §33.2.6.2.2 rules out of strings: the default holds them as the string did, and
+    /// shows as a STRING value of them does.
     #[test]
     fn strings_without_a_variable_show_their_string_default() {
-        let unknown_text = "unknown (EFI_IFR_TYPE_STRING default: string 0x0002 holds \
-                            '\u{1F600}' (U+1F600), which UCS-2 has no character for (UEFI 2.11 \
-                            §33.2.6.2.2))";
         let cases = [
             ("MaxSize 8", 8, 2, ["S", "Hello"], "Hello"),
             ("MaxSize 4", 4, 2, ["S", "Hello"], "Hell"),
@@ -16140,7 +16163,14 @@ mod tests {
                 ["S", "Hello"],
                 "unknown (EFI_IFR_TYPE_STRING default: string 0x0009 not found)",
             ),
-            ("beyond UCS-2", 8, 2, ["S", "A\u{1F600}"], unknown_text),
+            (
+                "beyond UCS-2",
+                8,
+                2,
+                ["S", "A\u{1F600}"],
+                "unknown (EFI_IFR_TYPE_STRING default: its character 1 is CHAR16 0xd83d, a \
+                 UTF-16 surrogate, which UCS-2 has no character for (UEFI 2.11 §33.2.6.2.2))",
+            ),
         ];
         for (case, max_size, string_id, strings, default) in cases {
             let hiidb = string_list_of(
@@ -16159,6 +16189,152 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// The writes of `set <question> <value>` to Setup, which holds `stored`, in the HiiDB of
+    /// `packages`, each FormSet of which declares Setup, and the strings packages that follow.
+    fn writes_of_set(
+        packages: &[Vec<u8>],
+        stored: &[u8],
+        question: &str,
+        value: &str,
+    ) -> Result<Vec<(u16, Vec<u8>)>, String> {
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), NV_BS_RT, stored);
+        set_responses(
+            &hiidb,
+            question,
+            &SetValue::Text(value.to_owned()),
+            None,
+            &SetOptions::default(),
+            SetAccess {
+                reads: shared(&variables),
+                writes: &*variables,
+                held: None,
+            },
+            None,
+        )
+        .map(|_| variables.writes_to(&setup()))
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    /// The form package of the CHECKBOXes 1 and 2 at bytes 0 and 1 of Setup, prompted by strings
+    /// 1 and 2.
+    fn two_checkboxes() -> Vec<u8> {
+        form_package(&[
+            var_store_efi(1, "Setup", NV_BS_RT, 2),
+            form(1, &[checkbox_at(1, 1, 1, 0), checkbox_at(2, 2, 1, 1)]),
+        ])
+    }
+
+    /// Of the prompts "A<U+E000>", private use (UEFI 2.11 §33.2.6.2.1), which reads as
+    /// "A<U+FFFD>", and "A<U+FFFD>", whose U+FFFD is a character that strings may hold, `set
+    /// A<U+FFFD>` writes the question whose prompt is so stored: a text as stored names a question
+    /// before one that reads alike only once a character of it is replaced, in any FormSet. With
+    /// no such stored prompt, it writes the question whose prompt reads so.
+    #[test]
+    fn set_of_a_stored_replacement_character_writes_its_question() {
+        let cases = [
+            ("stored second", ["A\u{E000}", "A\u{FFFD}"], (1, vec![1])),
+            ("replaced alone", ["A\u{E000}", "B"], (0, vec![1])),
+        ];
+        for (case, prompts, written) in cases {
+            let packages = [
+                two_checkboxes(),
+                en_strings_package_of(&prompts),
+                END_PACKAGE.to_vec(),
+            ];
+
+            assert_eq!(
+                writes_of_set(&packages, &[0, 0], "A\u{FFFD}", "1"),
+                Ok(vec![written]),
+                "{case}: set A<U+FFFD>"
+            );
+        }
+    }
+
+    /// Of the prompts "A<U+E000>", which reads as "A<U+FFFD>", and "A<U+FFFD>", `get A<U+FFFD>`
+    /// answers the question whose prompt is so stored alone, as set selects it.
+    #[test]
+    fn get_of_a_stored_replacement_character_answers_its_question() {
+        let packages = [
+            two_checkboxes(),
+            en_strings_package_of(&["A\u{E000}", "A\u{FFFD}"]),
+            END_PACKAGE.to_vec(),
+        ];
+        let hiidb = package_list_with_guid([0x55; 16], &packages.concat());
+        let variables = Rc::new(MemoryVariables::default());
+        variables.insert(setup(), NV_BS_RT, &[0, 0]);
+
+        let got = HiiBackend::get_in(
+            &hiidb,
+            "A\u{FFFD}",
+            None,
+            &GetOptions::default(),
+            shared(&variables),
+            None,
+            None,
+            None,
+        )
+        .expect("get A<U+FFFD>");
+
+        let question_ids: Vec<Option<serde_json::Value>> = got
+            .responses
+            .iter()
+            .map(|response| json_field(&response.question, "question_id"))
+            .collect();
+        assert_eq!(
+            question_ids,
+            [Some(serde_json::json!(2))],
+            "get A<U+FFFD> answers question 2"
+        );
+    }
+
+    /// Of the ONE_OF options "A<U+E000>" (1), which reads as "A<U+FFFD>", and "A<U+FFFD>" (2), `set
+    /// Q A<U+FFFD>` writes 2, the option whose text is so stored; with no such stored option, it
+    /// writes the option whose text reads so.
+    #[test]
+    fn set_of_a_stored_replacement_character_writes_its_option() {
+        let cases = [
+            ("stored second", ["A\u{E000}", "A\u{FFFD}"], 2),
+            ("replaced alone", ["A\u{E000}", "B"], 1),
+        ];
+        for (case, [first, second], written) in cases {
+            let packages = [
+                form_package(&[
+                    var_store_efi(1, "Setup", NV_BS_RT, 1),
+                    form(1, &[one_of_at(1, 1, 1, 0, &[(2, 1), (3, 2)])]),
+                ]),
+                en_strings_package_of(&["Q", first, second, "Help"]),
+                END_PACKAGE.to_vec(),
+            ];
+
+            assert_eq!(
+                writes_of_set(&packages, &[0], "Q", "A\u{FFFD}"),
+                Ok(vec![(0, vec![written])]),
+                "{case}: set Q A<U+FFFD>"
+            );
+        }
+    }
+
+    /// The prompt "A<U+FFFD>" of question 1 in "en" is no ambiguous QUESTION beside the "fr"
+    /// prompt "A<U+E000>" of question 2, which reads alike only once its private use character is
+    /// replaced: set takes the stored prompt alone, of one language.
+    #[test]
+    fn a_stored_prompt_is_unambiguous_beside_a_replaced_one_of_another_language() {
+        let packages = [
+            two_checkboxes(),
+            en_strings_package_of(&["A\u{FFFD}", "Two"]),
+            strings_package_of(b"fr", &["Un", "A\u{E000}"]),
+            END_PACKAGE.to_vec(),
+        ];
+
+        assert_eq!(
+            writes_of_set(&packages, &[0, 0], "A\u{FFFD}", "1"),
+            Ok(vec![(0, vec![1])]),
+            "set A<U+FFFD> writes byte 0"
+        );
     }
 
     /// A STRING without a value shows the default of a flagged EFI_IFR_ONE_OF_OPTION of Type

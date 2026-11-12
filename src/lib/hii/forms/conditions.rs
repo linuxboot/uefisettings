@@ -4740,6 +4740,7 @@ mod tests {
     use super::super::QuestionDescriptor;
     use super::super::QuestionMatch;
     use super::*;
+    use crate::hii::strings::MatchTier;
 
     const EQ_ID_ID: u8 = 0x13;
     const EQ_ID_VAL_LIST: u8 = 0x14;
@@ -6695,7 +6696,7 @@ mod tests {
         let root = parse_form_set(forms);
         find_question_in(
             &root,
-            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT])),
+            &QuestionMatch::Prompt(&BTreeSet::from([PROMPT]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings(), &[]),
                 &mut Efivars::new().reader(),

@@ -351,6 +351,7 @@ pub(crate) fn en_us_package(strings: StringMap) -> StringPackage {
     StringPackage {
         language: Language(b"en-US".to_vec()),
         strings,
+        replaced: Default::default(),
     }
 }
 

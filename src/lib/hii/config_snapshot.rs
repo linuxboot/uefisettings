@@ -431,6 +431,7 @@ pub(crate) mod tests {
             .map(|(language, label)| StringPackage {
                 language: Language(language.to_vec()),
                 strings: StringMap::from([(1, Rc::from(*label))]),
+                replaced: Default::default(),
             })
             .collect();
         list

@@ -10,12 +10,14 @@
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::ffi::FromBytesUntilNulError;
 use std::fmt;
 use std::num::TryFromIntError;
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 
 use anyhow::anyhow;
@@ -54,6 +56,11 @@ const MAX_CHARACTERS_PER_LENGTH_BYTE: u64 = 16;
 
 /// The prefix of a private-use language (Language::is_configuration).
 const PRIVATE_USE_PREFIX: &[u8] = b"x-";
+
+/// Unicode's private use area of the BMP, which UEFI 2.11 §33.2.6.2.1 counts as "6500
+/// characters": "UEFI prohibits use of this area in a UEFI environment." The common control codes
+/// lie in it (is_control_code).
+pub(crate) const PRIVATE_USE_AREA: RangeInclusive<u32> = 0xE000..=0xF8FF;
 
 // UEFI 2.10 §33.3.6.1
 #[derive(BinRead, Debug, PartialEq)]
@@ -123,11 +130,18 @@ const EFI_HII_SIBT_FONT: u8 = 0x40;
 /// §33.3.8.2.1). A DUPLICATE's string shares the text of the string it names.
 pub(crate) type StringMap = BTreeMap<u16, Rc<str>>;
 
+/// The strings of a strings package that held a character that UEFI rules out, which reads as
+/// U+FFFD, by id: with the CHAR16s that a UCS-2 string held, which a firmware copies as they are
+/// (edk2-stable202608 SetupBrowserDxe/Setup.c GetQuestionDefault), None for an SCSU string, whose
+/// block holds no CHAR16s.
+pub(crate) type Replaced = BTreeMap<u16, Option<Rc<[u16]>>>;
+
 /// A strings package (UEFI 2.11 §33.3.6): the strings by id, in the language its header names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringPackage {
     pub language: Language,
     pub strings: StringMap,
+    pub replaced: Replaced,
 }
 
 /// StringIdCurrent (UEFI 2.11 §33.3.6.2): the string identifier that the next string block
@@ -258,6 +272,27 @@ pub(crate) struct ListTexts<'a> {
     shown: Vec<&'a StringPackage>,
 }
 
+/// Which texts a QUESTION or VALUE matches: those as stored, then, where they name nothing, those
+/// that display shows. So an input that names a text as stored never selects another whose text
+/// reads alike only once the reader has replaced a character of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MatchTier {
+    /// The texts as stored (ListTexts::matching)
+    Stored,
+    /// The texts that display shows (ListTexts::matching_displayed)
+    Displayed,
+}
+
+impl MatchTier {
+    /// The tiers, in the order that a match tries them.
+    pub(crate) const ALL: [Self; 2] = [Self::Stored, Self::Displayed];
+}
+
+/// A string of an SCSU block that held a character that UEFI rules out, which reads as U+FFFD:
+/// it holds no CHAR16s that a firmware copies (ListTexts::shown_units).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScsuRuledOut;
+
 impl<'a> ListTexts<'a> {
     /// The texts of `packages`, those of one package list, from the package that best_language
     /// picks for the first of `requested` that it picks one for, else from the first package of
@@ -301,23 +336,80 @@ impl<'a> ListTexts<'a> {
     /// The text of the string `id` that display shows, None unless a package of no configuration
     /// language holds it: a text that a Forms Browser can show, never a keyword.
     pub(crate) fn shown_text(&self, id: u16) -> Option<&'a str> {
+        self.shown_package(id)
+            .and_then(|package| package.strings.get(&id))
+            .map(AsRef::as_ref)
+    }
+
+    /// The CHAR16s of the string `id` that shown_text gives, as the firmware holds them: those
+    /// that it held where a character of it reads as U+FFFD (StringPackage::replaced), else those
+    /// of its text; Err(ScsuRuledOut) for such an SCSU string, which held none; None as
+    /// shown_text.
+    pub(crate) fn shown_units(&self, id: u16) -> Option<Result<Vec<u16>, ScsuRuledOut>> {
+        let package = self.shown_package(id)?;
+        match package.replaced.get(&id) {
+            Some(Some(units)) => Some(Ok(units.to_vec())),
+            Some(None) => Some(Err(ScsuRuledOut)),
+            None => package
+                .strings
+                .get(&id)
+                .map(|text| Ok(text.encode_utf16().collect())),
+        }
+    }
+
+    /// The package of the string `id` that shown_text gives.
+    fn shown_package(&self, id: u16) -> Option<&'a StringPackage> {
         self.chosen
             .filter(|package| !package.language.is_configuration())
             .into_iter()
             .chain(self.shown.iter().copied())
-            .find_map(|package| package.strings.get(&id))
-            .map(AsRef::as_ref)
+            .find(|package| package.strings.contains_key(&id))
     }
 
-    /// The text of the string `id` in each package of no configuration language that holds it,
-    /// with that package's language: the texts that QUESTION and VALUE match.
+    /// The text of the string `id` in each package of no configuration language that holds it as
+    /// stored, with that package's language: the texts that QUESTION and VALUE match first
+    /// (MatchTier::Stored). A text with a character that reads as U+FFFD
+    /// (StringPackage::replaced) is left out, as the firmware holds another.
     pub(crate) fn matching(&self, id: u16) -> impl Iterator<Item = (&'a Language, &'a str)> + '_ {
+        self.shown
+            .iter()
+            .filter(move |package| !package.replaced.contains_key(&id))
+            .filter_map(move |package| {
+                package
+                    .strings
+                    .get(&id)
+                    .map(|text| (&package.language, text.as_ref()))
+            })
+    }
+
+    /// The text of the string `id` that display shows, in each package of no configuration
+    /// language that holds it, replaced characters included, with that package's language: the
+    /// texts that QUESTION and VALUE match where none as stored does (MatchTier::Displayed).
+    pub(crate) fn matching_displayed(
+        &self,
+        id: u16,
+    ) -> impl Iterator<Item = (&'a Language, Cow<'a, str>)> + '_ {
         self.shown.iter().filter_map(move |package| {
             package
                 .strings
                 .get(&id)
-                .map(|text| (&package.language, text.as_ref()))
+                .map(|text| (&package.language, Cow::Borrowed(text.as_ref())))
         })
+    }
+
+    /// The texts of the string `id` that QUESTION and VALUE match in `tier`, with their languages.
+    pub(crate) fn matching_in(
+        &self,
+        id: u16,
+        tier: MatchTier,
+    ) -> Vec<(&'a Language, Cow<'a, str>)> {
+        match tier {
+            MatchTier::Stored => self
+                .matching(id)
+                .map(|(language, text)| (language, Cow::Borrowed(text)))
+                .collect(),
+            MatchTier::Displayed => self.matching_displayed(id).collect(),
+        }
     }
 
     /// The text of the string `id` in each package of a configuration language that holds it,
@@ -422,9 +514,14 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
         "String package language is {}, HdrSize {hdr_size}, StringInfoOffset {string_info_offset}",
         language.0.escape_ascii()
     );
-    let strings = StringBlocks::new(string_information, language_window, length).read()?;
+    let (strings, replaced) =
+        StringBlocks::new(string_information, &language, language_window, length).read()?;
 
-    Ok(StringPackage { language, strings })
+    Ok(StringPackage {
+        language,
+        strings,
+        replaced,
+    })
 }
 
 /// UEFI 2.11 §33.3.6.2's string blocks of a strings package: "The blocks must be processed in
@@ -432,9 +529,13 @@ pub fn handle_string_package(data: &[u8]) -> Result<StringPackage> {
 struct StringBlocks<'a> {
     /// The string information from the next block on
     rest: &'a [u8],
+    /// The strings package's Language
+    language: &'a Language,
     language_window: LanguageWindow,
     string_id_current: StringIdCurrent,
     strings: StringMap,
+    /// The strings so far that held a character that UEFI rules out, each DUPLICATE's included
+    replaced: Replaced,
     /// The characters of the strings so far, each DUPLICATE's included
     characters: u64,
     /// The strings package's Length
@@ -444,22 +545,30 @@ struct StringBlocks<'a> {
 }
 
 impl<'a> StringBlocks<'a> {
-    fn new(string_information: &'a [u8], language_window: LanguageWindow, length: u64) -> Self {
+    fn new(
+        string_information: &'a [u8],
+        language: &'a Language,
+        language_window: LanguageWindow,
+        length: u64,
+    ) -> Self {
         Self {
             rest: string_information,
+            language,
             language_window,
             string_id_current: StringIdCurrent::FIRST,
             strings: StringMap::new(),
+            replaced: Replaced::new(),
             characters: 0,
             length,
             font_ids: BTreeSet::new(),
         }
     }
 
-    /// The strings of the blocks up to EFI_HII_SIBT_END. Fails at the first block that is
-    /// unknown, cut short, that breaks a rule of its block type, or that takes the strings past
-    /// MAX_CHARACTERS_PER_LENGTH_BYTE characters per byte of the package's Length.
-    fn read(mut self) -> Result<StringMap> {
+    /// The strings of the blocks up to EFI_HII_SIBT_END, and those of them that held a character
+    /// that UEFI rules out. Fails at the first block that is unknown, cut short, that breaks a
+    /// rule of its block type, or that takes the strings past MAX_CHARACTERS_PER_LENGTH_BYTE
+    /// characters per byte of the package's Length.
+    fn read(mut self) -> Result<(StringMap, Replaced)> {
         loop {
             let (&code, rest) = self
                 .rest
@@ -470,7 +579,7 @@ impl<'a> StringBlocks<'a> {
             debug!("Blocktype is {:?}", block_type);
 
             match block_type {
-                StringBlockType::End => return Ok(self.strings),
+                StringBlockType::End => return Ok((self.strings, self.replaced)),
                 StringBlockType::StringScsu => self.scsu_strings(1)?,
                 StringBlockType::StringScsuFont => {
                     self.font_identifier("EFI_HII_SIBT_STRING_SCSU_FONT")?;
@@ -558,6 +667,29 @@ impl<'a> StringBlocks<'a> {
         Ok(())
     }
 
+    /// Assigns to `id` the text of `string` (string_text), warning of the first character of it
+    /// that UEFI rules out of strings, and keeping such a string in `replaced`.
+    fn insert_text(&mut self, id: u16, string: EncodedString<'_>) -> Result<()> {
+        let (text, ruled_out) = match string {
+            EncodedString::Ucs2(units) => string_text(units.iter().copied()),
+            // decode's characters fit UCS-2, one CHAR16 each
+            EncodedString::Scsu(characters) => string_text(characters.encode_utf16()),
+        };
+        if let Some((unit, rule)) = ruled_out {
+            warn!(
+                "string {id} of the \"{}\" strings package holds U+{unit:04X}, which is {rule}: \
+                 it reads as U+FFFD",
+                self.language
+            );
+            let units = match string {
+                EncodedString::Ucs2(units) => Some(Rc::from(units)),
+                EncodedString::Scsu(_) => None,
+            };
+            self.replaced.insert(id, units);
+        }
+        self.insert(id, text.into())
+    }
+
     /// The StringCount of the `block` block at the start of the rest.
     fn string_count(&mut self, block: &str) -> Result<u16> {
         Ok(u16::from_le_bytes(take(
@@ -602,7 +734,7 @@ impl<'a> StringBlocks<'a> {
                      HiiDatabase ends it (AsciiStrSize), so the firmware may show other strings"
                 );
             }
-            self.insert(id, string.into())?;
+            self.insert_text(id, EncodedString::Scsu(&string))?;
             self.rest = rest;
         }
         Ok(())
@@ -613,17 +745,17 @@ impl<'a> StringBlocks<'a> {
     fn ucs2_strings(&mut self, block: &str, count: u16) -> Result<()> {
         for _ in 0..count {
             let id = self.string_id_current.assign()?;
-            let (string, rest) = ucs2_string(self.rest).with_context(|| {
+            let (units, rest) = ucs2_string(self.rest).with_context(|| {
                 format!("the StringText of an {block} block has no null terminator")
             })?;
-            self.insert(id, string.into())?;
+            self.insert_text(id, EncodedString::Ucs2(&units))?;
             self.rest = rest;
         }
         Ok(())
     }
 
     /// EFI_HII_SIBT_DUPLICATE: assigns the string of its StringId, "a previously defined string"
-    /// (UEFI 2.11 §33.3.6.2.1), sharing its text.
+    /// (UEFI 2.11 §33.3.6.2.1), sharing its text and what it held where that was replaced.
     fn duplicate(&mut self) -> Result<()> {
         const BLOCK: &str = "EFI_HII_SIBT_DUPLICATE";
         let string_id = u16::from_le_bytes(take(&mut self.rest, BLOCK, "StringId")?);
@@ -631,6 +763,10 @@ impl<'a> StringBlocks<'a> {
         let string = Rc::clone(self.strings.get(&string_id).with_context(|| {
             format!("{BLOCK} StringId {string_id} names no previously defined string")
         })?);
+        if let Some(units) = self.replaced.get(&string_id) {
+            let units = units.as_ref().map(Rc::clone);
+            self.replaced.insert(id, units);
+        }
         self.insert(id, string)
     }
 
@@ -660,6 +796,8 @@ impl<'a> StringBlocks<'a> {
         let font_style = u32::from_le_bytes(take(&mut fields, BLOCK, "FontStyle")?);
         let (font_name, after) = ucs2_string(fields)
             .with_context(|| format!("the FontName of an {BLOCK} block has no null terminator"))?;
+        // read as the strings are, though only the debug log below shows it
+        let (font_name, _) = string_text(font_name);
         ensure!(
             self.font_ids.insert(font_id),
             "{BLOCK} FontId {font_id} is not unique"
@@ -683,10 +821,10 @@ fn take<const N: usize>(bytes: &mut &[u8], block: &str, field: &str) -> Result<[
     Ok(*field_bytes)
 }
 
-/// The null-terminated CHAR16 string at the start of `bytes` and the bytes after its terminator;
-/// None if `bytes` end first, which binrw's NullWideString reported in words that name no block.
-/// It decodes as UTF-16 with U+FFFD for an unpaired surrogate, as NullWideString's Display does.
-fn ucs2_string(bytes: &[u8]) -> Option<(String, &[u8])> {
+/// The CHAR16s of the null-terminated string at the start of `bytes` and the bytes after its
+/// terminator; None if `bytes` end first, which binrw's NullWideString reported in words that
+/// name no block.
+fn ucs2_string(bytes: &[u8]) -> Option<(Vec<u16>, &[u8])> {
     let (units, _) = bytes.as_chunks::<2>();
     let length = units.iter().position(|&unit| unit == [0, 0])?;
     let units: Vec<u16> = units
@@ -695,7 +833,78 @@ fn ucs2_string(bytes: &[u8]) -> Option<(String, &[u8])> {
         .map(|&unit| u16::from_le_bytes(unit))
         .collect();
     let (_, rest) = bytes.split_at_checked(2 * (length + 1))?;
-    Some((String::from_utf16_lossy(&units), rest))
+    Some((units, rest))
+}
+
+/// A string's characters, as its string block encodes them.
+#[derive(Clone, Copy, Debug)]
+enum EncodedString<'s> {
+    /// The CHAR16s of a UCS-2 string
+    Ucs2(&'s [u16]),
+    /// The characters that the SCSU decoder yields
+    Scsu(&'s str),
+}
+
+/// Why UEFI rules a CHAR16 out of strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuledOut {
+    /// 0xD800-0xDFFF: "UEFI does not support surrogate characters" (UEFI 2.11 §33.2.6.2.2)
+    Surrogate,
+    /// PRIVATE_USE_AREA, 0xE000-0xF8FF
+    PrivateUse,
+    /// 0xF900-0xFCFF, the rest of "Characters between 0xF000 and 0xFCFF should be rejected" (UEFI
+    /// 2.11 §33.3.6.3.1, §33.3.6.3.2) past the private use area
+    F000ToFcff,
+}
+
+impl fmt::Display for RuledOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Surrogate => "a surrogate (UEFI 2.11 §33.2.6.2.2)",
+            Self::PrivateUse => "in the private use area (UEFI 2.11 §33.2.6.2.1)",
+            Self::F000ToFcff => "between 0xF000 and 0xFCFF (UEFI 2.11 §33.3.6.3.1, §33.3.6.3.2)",
+        })
+    }
+}
+
+/// Whether `code_point` is a common control code of UEFI 2.11 Table 33.3: 0xF620-0xF62B, 0xF7zz
+/// or 0xF8zz (§33.2.6.2.4).
+pub(crate) fn is_control_code(code_point: u32) -> bool {
+    matches!(code_point, 0xF620..=0xF62B | 0xF700..=0xF8FF)
+}
+
+/// The character of the CHAR16 `unit` of a string, or why UEFI rules it out. The common control
+/// codes lie in the private use area and between 0xF000 and 0xFCFF, yet strings may hold them
+/// (UEFI 2.11 §33.2.6.2.4), so they are taken first.
+fn character(unit: u16) -> Result<char, RuledOut> {
+    match unit {
+        _ if is_control_code(u32::from(unit)) => {}
+        unit if PRIVATE_USE_AREA.contains(&u32::from(unit)) => return Err(RuledOut::PrivateUse),
+        0xF900..=0xFCFF => return Err(RuledOut::F000ToFcff),
+        _ => {}
+    }
+    // char::from_u32 refuses exactly the surrogates of the BMP
+    char::from_u32(u32::from(unit)).ok_or(RuledOut::Surrogate)
+}
+
+/// The text of the string of the CHAR16s `units`, each its own character, and the first of them
+/// that UEFI rules out, with why (character). One that UEFI rules out reads as U+FFFD, as
+/// String::from_utf16_lossy reads an unpaired surrogate. A QUESTION or VALUE matches such a text
+/// only where no text as stored names a question or option (MatchTier), and texts equal after
+/// this replacement are then equal prompts, which select resolves to the first selectable match
+/// in IFR order.
+fn string_text(units: impl IntoIterator<Item = u16>) -> (String, Option<(u16, RuledOut)>) {
+    let mut first_ruled_out = None;
+    let text = units
+        .into_iter()
+        .map(|unit| {
+            character(unit).unwrap_or_else(|rule| {
+                first_ruled_out.get_or_insert((unit, rule));
+                char::REPLACEMENT_CHARACTER
+            })
+        })
+        .collect();
+    (text, first_ruled_out)
 }
 
 /// The index in a strings package's data, which starts after its package header, of the offset
@@ -804,11 +1013,37 @@ mod tests {
         }
     }
 
+    /// character takes each rule up to its bounds, the common control codes first, which lie in
+    /// the private use area.
+    #[test]
+    fn character_rules_out_each_range_up_to_its_bounds() {
+        let cases = [
+            (0xD7FF, Ok('\u{D7FF}')),
+            (0xD800, Err(RuledOut::Surrogate)),
+            (0xDFFF, Err(RuledOut::Surrogate)),
+            (0xE000, Err(RuledOut::PrivateUse)),
+            (0xF61F, Err(RuledOut::PrivateUse)),
+            (0xF620, Ok('\u{F620}')),
+            (0xF62B, Ok('\u{F62B}')),
+            (0xF62C, Err(RuledOut::PrivateUse)),
+            (0xF6FF, Err(RuledOut::PrivateUse)),
+            (0xF700, Ok('\u{F700}')),
+            (0xF8FF, Ok('\u{F8FF}')),
+            (0xF900, Err(RuledOut::F000ToFcff)),
+            (0xFCFF, Err(RuledOut::F000ToFcff)),
+            (0xFD00, Ok('\u{FD00}')),
+        ];
+        for (unit, want) in cases {
+            assert_eq!(character(unit), want, "U+{unit:04X}");
+        }
+    }
+
     /// A strings package of `language` without strings.
     fn package(language: &str) -> StringPackage {
         StringPackage {
             language: Language(language.as_bytes().to_vec()),
             strings: BTreeMap::new(),
+            replaced: Replaced::new(),
         }
     }
 }

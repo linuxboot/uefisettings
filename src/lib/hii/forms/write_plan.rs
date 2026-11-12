@@ -855,7 +855,7 @@ mod tests {
         let values = VarStoreValues::new(root, CheckedVarStores::NONE);
         let selection = find_question_in(
             root,
-            &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
+            &QuestionMatch::Prompt(&BTreeSet::from([prompt]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(strings, &[]),
                 &mut reader,
@@ -1037,7 +1037,7 @@ mod tests {
             let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
             let selection = find_question_in(
                 &root,
-                &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+                &QuestionMatch::Prompt(&BTreeSet::from(["Around"]), MatchTier::Stored),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&strings, &[]),
                     &mut reader,
@@ -1168,7 +1168,7 @@ mod tests {
         let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
         let selection = find_question_in(
             &root,
-            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+            &QuestionMatch::Prompt(&BTreeSet::from(["Around"]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(&strings, &[]),
                 &mut reader,
@@ -1318,7 +1318,7 @@ mod tests {
         let values = VarStoreValues::new(root, CheckedVarStores::NONE);
         let selection = find_question_in(
             root,
-            &QuestionMatch::Prompt(&BTreeSet::from(["Around"])),
+            &QuestionMatch::Prompt(&BTreeSet::from(["Around"]), MatchTier::Stored),
             &mut FormSetWalk::new(
                 &ListTexts::new(strings, &[]),
                 reader,
@@ -1727,7 +1727,7 @@ mod tests {
             let values = VarStoreValues::new(root, CheckedVarStores::NONE);
             selections.push(find_question_in(
                 root,
-                &QuestionMatch::Prompt(&BTreeSet::from(["Dup"])),
+                &QuestionMatch::Prompt(&BTreeSet::from(["Dup"]), MatchTier::Stored),
                 &mut FormSetWalk::new(
                     &ListTexts::new(&strings, &[]),
                     &mut reader,

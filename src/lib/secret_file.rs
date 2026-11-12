@@ -19,7 +19,6 @@
 use std::fmt;
 use std::io;
 use std::io::Read;
-use std::ops::RangeInclusive;
 use std::str;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -29,6 +28,8 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
+
+use crate::hii::PRIVATE_USE_AREA;
 
 /// The largest cap that the readers take: 64 KiB, for a PEM key or certificate.
 pub const MAX_SECRET_LEN: usize = 64 * 1024;
@@ -48,10 +49,6 @@ const BYTE_ORDER_MARK: u16 = 0xFEFF;
 /// `<a` reads a byte even at position 0, where it stores U+FEFF first (edk2-stable202608
 /// ShellPkg/Application/Shell/FileHandleWrappers.c:2004-2013).
 const SECOND_READ_LEN: usize = 4;
-
-/// The Private Use Area of the Basic Multilingual Plane, which UEFI prohibits (UEFI 2.11
-/// §33.2.6.2.1) and where its strings encode font display codes, 0xF6yy to 0xF8zz (§33.2.6.2.4).
-const PRIVATE_USE_AREA: RangeInclusive<u16> = 0xE000..=0xF8FF;
 
 /// The bytes of a secret, zeroized on drop. Debug and Display show only its length, and it
 /// compares only in constant time.
@@ -442,7 +439,12 @@ pub fn encode_ucs2(secret: &Secret, units: usize) -> Result<Secret, SecretError>
     for character in text.chars() {
         let unit = match u16::try_from(u32::from(character)) {
             Ok(0) => return Err(SecretError::Nul),
-            Ok(unit) if PRIVATE_USE_AREA.contains(&unit) => return Err(SecretError::PrivateUse),
+            // The Private Use Area of the Basic Multilingual Plane, which UEFI prohibits (UEFI
+            // 2.11 §33.2.6.2.1) and where its strings encode font display codes, 0xF6yy to 0xF8zz
+            // (§33.2.6.2.4)
+            Ok(unit) if PRIVATE_USE_AREA.contains(&u32::from(unit)) => {
+                return Err(SecretError::PrivateUse)
+            }
             Ok(unit) => unit,
             Err(_) => return Err(SecretError::OutsideBmp),
         };

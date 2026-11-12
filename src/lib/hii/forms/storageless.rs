@@ -1098,7 +1098,7 @@ mod get_and_set_tests {
                 let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                 let selection = find_question_in(
                     &root,
-                    &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
+                    &QuestionMatch::Prompt(&BTreeSet::from([prompt]), MatchTier::Stored),
                     &mut FormSetWalk::new(
                         &ListTexts::new(&strings, &[]),
                         &mut reader,
@@ -1229,7 +1229,7 @@ mod get_and_set_tests {
                 let values = VarStoreValues::new(&root, CheckedVarStores::NONE);
                 let selection = find_question_in(
                     &root,
-                    &QuestionMatch::Prompt(&BTreeSet::from([prompt])),
+                    &QuestionMatch::Prompt(&BTreeSet::from([prompt]), MatchTier::Stored),
                     &mut FormSetWalk::new(
                         &ListTexts::new(&strings, &[]),
                         &mut reader,

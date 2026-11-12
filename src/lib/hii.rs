@@ -147,6 +147,8 @@ pub use memory_access_denied::MemoryAccessDenied;
 pub use memory_access_denied::MemoryDevice;
 #[cfg(target_os = "linux")]
 pub use memory_access_denied::MemoryOperation;
+pub(crate) use strings::MatchTier;
+pub(crate) use strings::PRIVATE_USE_AREA;
 #[cfg(firmware_memory_maps)]
 pub(crate) use system_table::system_vendor_table;
 #[cfg(firmware_memory_maps)]

@@ -307,6 +307,7 @@ mod tests {
                 .iter()
                 .map(|&(id, text)| (id, text.into()))
                 .collect(),
+            replaced: Default::default(),
         };
         let packages = [
             package(b"x-UEFI-ns", &[(3, "Keyword"), (9, "OnlyKeyword")]),
