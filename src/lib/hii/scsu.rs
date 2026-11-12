@@ -13,7 +13,9 @@
 //! SCSU, the Standard Compression Scheme for Unicode (Unicode Technical Standard #6, revision 4),
 //! as UEFI 2.11 §33.3.6.3.1 extends it for the text of the SCSU string blocks (§33.3.6.2): the
 //! windows start from the strings package's LanguageWindow (§33.3.6.1) instead of UTS #6's fixed
-//! values, 0x7F introduces a control code of §33.2.6.2.4, and every character fits UCS-2.
+//! values, and 0x7F introduces a control code of §33.2.6.2.4. A character that UEFI rules out of
+//! strings, such as one beyond UCS-2 or a control code's 0xFxyy form, decodes as any other, and
+//! the strings package's reader reads it as U+FFFD.
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -26,18 +28,18 @@ const CONTROL_CODE: u8 = 0x7F;
 /// Decodes the SCSU string at the start of `bytes` up to its null terminator, the first decoded
 /// U+0000 (UEFI 2.11 §33.3.6.2 "null-terminated encoded string"), from `language_window`:
 /// static windows 0-7, then dynamic windows 0-7, the order of edk2's mLanguageWindow
-/// (edk2-stable202608 MdeModulePkg/Universal/HiiDatabaseDxe/String.c). Returns the string and
-/// the bytes after its terminator. A control code becomes its 0xFxyy form, as in UCS-2 strings
-/// (§33.2.6.2.4).
+/// (edk2-stable202608 MdeModulePkg/Universal/HiiDatabaseDxe/String.c). Returns the units of the
+/// string and the bytes after its terminator.
 ///
-/// Example: under edk2's LanguageWindow, `41 7F 00 01 42 00 43` is ("A\u{F701}B", `43`): Font
-/// Family 0x01 between "A" and "B", whose 0x00 byte is no terminator.
+/// Example: under edk2's LanguageWindow, `41 7F 00 01 42 00 43` is ([Character(0x41),
+/// ControlCode(0xF701), Character(0x42)], `43`): Font Family 0x01 between "A" and "B", whose
+/// 0x00 byte is no terminator.
 pub(super) fn decode<'a>(
     bytes: &'a [u8],
     language_window: &[u16; 16],
-) -> Result<(String, &'a [u8])> {
+) -> Result<(Vec<ScsuUnit>, &'a [u8])> {
     let mut decoder = Decoder::new(bytes, language_window);
-    let mut string = String::new();
+    let mut units = Vec::new();
     loop {
         let decoded = match decoder.mode {
             Mode::SingleByte => decoder.single_byte()?,
@@ -45,12 +47,22 @@ pub(super) fn decode<'a>(
         };
         match decoded {
             Decoded::State => {}
-            Decoded::ControlCode(code) => string.push(code),
+            Decoded::ControlCode(code) => units.push(ScsuUnit::ControlCode(code)),
             // the null terminator
-            Decoded::Character(0) => return Ok((string, decoder.bytes.as_slice())),
-            Decoded::Character(code_point) => string.push(ucs2_character(code_point)?),
+            Decoded::Character(0) => return Ok((units, decoder.bytes.as_slice())),
+            Decoded::Character(code_point) => units.push(ScsuUnit::Character(code_point)),
         }
     }
+}
+
+/// A unit of a decoded SCSU string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScsuUnit {
+    /// A character's code point, which may lie outside UCS-2
+    Character(u32),
+    /// A UEFI control code that 0x7F introduces, as its 0xFxyy form in UCS-2 strings (UEFI 2.11
+    /// §33.2.6.2.4)
+    ControlCode(u16),
 }
 
 /// UTS #6 §5's two modes.
@@ -68,7 +80,7 @@ enum Decoded {
     /// A tag that changed the mode or the windows.
     State,
     /// A UEFI control code, as its 0xFxyy form.
-    ControlCode(char),
+    ControlCode(u16),
     /// A character's code point, which may lie outside UCS-2.
     Character(u32),
 }
@@ -270,8 +282,6 @@ impl<'a> Decoder<'a> {
             style @ 0x20..=0x2B => 0xF600 | u16::from(style),
             code => bail!("unknown control code 0x7F {code:#04x} (UEFI 2.11 Table 33.3)"),
         };
-        // 0xF6xx-0xF8xx are no surrogates
-        let code = char::from_u32(u32::from(code)).ok_or_else(|| surrogate(code.into()))?;
         Ok(Decoded::ControlCode(code))
     }
 
@@ -284,8 +294,8 @@ impl<'a> Decoder<'a> {
     }
 
     /// SDX or UDX: positions a dynamic window in the supplementary code space by the next two
-    /// bytes (UTS #6 §6.1.3) and makes it the active one. Its characters do not fit UCS-2, so
-    /// the first one is refused.
+    /// bytes (UTS #6 §6.1.3) and makes it the active one. Its characters do not fit UCS-2 (UEFI
+    /// 2.11 §33.2.6.2.2).
     fn define_extended_window(&mut self) -> Result<Decoded> {
         let high = self.next()?;
         let low = self.next()?;
@@ -338,31 +348,10 @@ fn window_offset(index: u8) -> Result<u32> {
     })
 }
 
-/// The character of `code_point`, which must fit UCS-2 (UEFI 2.11 §33.2.6.2.2) and lie outside
-/// 0xF000-0xFCFF (§33.3.6.3.1).
-fn ucs2_character(code_point: u32) -> Result<char> {
-    match code_point {
-        0xF000..=0xFCFF => bail!(
-            "SCSU character U+{code_point:04X} is between 0xF000 and 0xFCFF (UEFI 2.11 \
-             §33.3.6.3.1)"
-        ),
-        0x1_0000.. => {
-            bail!("SCSU character U+{code_point:04X} is outside UCS-2 (UEFI 2.11 §33.2.6.2.2)")
-        }
-        // char::from_u32 refuses exactly the surrogates of the BMP
-        _ => char::from_u32(code_point).ok_or_else(|| surrogate(code_point)),
-    }
-}
-
-/// The refusal of the surrogate `code_point` (UEFI 2.11 §33.2.6.2.2 "UEFI does not support
-/// surrogate characters").
-fn surrogate(code_point: u32) -> anyhow::Error {
-    anyhow!("SCSU character U+{code_point:04X} is a surrogate (UEFI 2.11 §33.2.6.2.2)")
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::decode;
+    use super::ScsuUnit;
 
     /// edk2's mLanguageWindow (edk2-stable202608 MdeModulePkg/Universal/HiiDatabaseDxe/String.c):
     /// UTS #6's static windows (Table 4), then its dynamic windows (Table 5).
@@ -438,20 +427,36 @@ pub(crate) mod tests {
         0xDF, 0x14, 0x80, 0x15, 0xFF,
     ];
 
-    /// The string of `code_points`.
-    fn text(code_points: &[u32]) -> String {
+    /// decode's result for `bytes` under `language_window`, with the size of the string in bytes
+    /// in place of the bytes after it, and its error as it renders.
+    fn decoded(
+        bytes: &[u8],
+        language_window: &[u16; 16],
+    ) -> Result<(Vec<ScsuUnit>, usize), String> {
+        decode(bytes, language_window)
+            .map(|(units, rest)| (units, bytes.len() - rest.len()))
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    /// The characters of `code_points`.
+    fn characters(code_points: &[u32]) -> Vec<ScsuUnit> {
         code_points
             .iter()
-            .map(|&code_point| char::from_u32(code_point).expect("a code point of UTS #6"))
+            .copied()
+            .map(ScsuUnit::Character)
             .collect()
     }
 
-    /// decode's result for `bytes` under `language_window`, with the size of the string in bytes
-    /// in place of the bytes after it, and its error as it renders.
-    fn decoded(bytes: &[u8], language_window: &[u16; 16]) -> Result<(String, usize), String> {
-        decode(bytes, language_window)
-            .map(|(string, rest)| (string, bytes.len() - rest.len()))
-            .map_err(|err| format!("{err:#}"))
+    /// The units of `string`, whose U+F600-U+F8FF stand for control codes, which only 0x7F
+    /// introduces in decode_reads_every_tag.
+    fn units(string: &str) -> Vec<ScsuUnit> {
+        string
+            .chars()
+            .map(|character| match u16::try_from(u32::from(character)) {
+                Ok(code @ 0xF600..=0xF8FF) => ScsuUnit::ControlCode(code),
+                _ => ScsuUnit::Character(u32::from(character)),
+            })
+            .collect()
     }
 
     /// decode reads UTS #6's examples of German, Russian and Japanese, given a null terminator,
@@ -468,37 +473,91 @@ pub(crate) mod tests {
 
             assert_eq!(
                 decoded(&bytes, &EDK2_LANGUAGE_WINDOW),
-                Ok((text(code_points), bytes.len())),
+                Ok((characters(code_points), bytes.len())),
                 "UTS #6 §{example}"
             );
         }
     }
 
-    /// decode reads UTS #6 §9.4 up to its seventh code point, U+F000, which it refuses (UEFI
-    /// 2.11 §33.3.6.3.1).
+    /// decode reads UTS #6 §9.4, whose U+F000 and U+10FFFF UEFI rules out of strings (UEFI 2.11
+    /// §33.3.6.3.1, §33.2.6.2.2): the strings package's reader reads them as U+FFFD.
     #[test]
-    fn decode_refuses_the_uts_6_example_of_all_features_at_u_f000() {
-        // SD4 0x88: window 4 at 0x88 * 0x80 + 0xAC00 = 0xF000, then its first character
-        let before_f000 = [&ALL_SCSU[..11], &[0x00]].concat();
+    fn decode_reads_the_uts_6_example_of_all_features() {
         let all = [&ALL_SCSU[..], &[0x00]].concat();
 
         assert_eq!(
-            decoded(&before_f000, &EDK2_LANGUAGE_WINDOW),
-            Ok((text(&ALL_CODE_POINTS[..6]), before_f000.len())),
-            "the code points before U+F000"
-        );
-        assert_eq!(
-            ALL_CODE_POINTS[6], 0xF000,
-            "UTS #6 §9.4's seventh code point"
-        );
-        assert_eq!(
             decoded(&all, &EDK2_LANGUAGE_WINDOW),
-            Err(
-                "SCSU character U+F000 is between 0xF000 and 0xFCFF (UEFI 2.11 §33.3.6.3.1)"
-                    .to_string()
-            ),
+            Ok((characters(&ALL_CODE_POINTS), all.len())),
             "UTS #6 §9.4"
         );
+    }
+
+    /// decode yields the characters that UEFI rules out of strings as any other: surrogates
+    /// (UEFI 2.11 §33.2.6.2.2), those between 0xF000 and 0xFCFF (§33.3.6.3.1), and those beyond
+    /// UCS-2 (§33.2.6.2.2), which only SDX, UDX or a window past 0xFF80 reach.
+    #[test]
+    fn decode_yields_the_characters_that_uefi_rules_out() {
+        let e = &EDK2_LANGUAGE_WINDOW;
+        let cases: &[(&str, &[u16; 16], &[u8], u32)] = &[
+            ("SQU D800", e, &[0x0E, 0xD8, 0x00, 0x00], 0xD800),
+            (
+                "Unicode mode DFFF",
+                e,
+                &[0x0F, 0xDF, 0xFF, 0x00, 0x00],
+                0xDFFF,
+            ),
+            (
+                "SQ1 00 in static window 1 at 0xD800",
+                &WINDOWS_PAST_UCS2,
+                &[0x02, 0x00, 0x00],
+                0xD800,
+            ),
+            ("SQU F000", e, &[0x0E, 0xF0, 0x00, 0x00], 0xF000),
+            ("SQU FCFF", e, &[0x0E, 0xFC, 0xFF, 0x00], 0xFCFF),
+            (
+                "Unicode mode F620",
+                e,
+                &[0x0F, 0xF6, 0x20, 0x00, 0x00],
+                0xF620,
+            ),
+            (
+                "SDX of window 0 at 0x10000, then 80",
+                e,
+                &[0x0B, 0x00, 0x00, 0x80, 0x00],
+                0x1_0000,
+            ),
+            (
+                "SDX of window 5 at 0x10FF80, then SQ5 FF",
+                e,
+                &[0x0B, 0xBF, 0xFF, 0x06, 0xFF, 0x00],
+                0x10_FFFF,
+            ),
+            (
+                "UDX of window 0 at 0x10000, then 80",
+                e,
+                &[0x0F, 0xF1, 0x00, 0x00, 0x80, 0x00],
+                0x1_0000,
+            ),
+            (
+                "SQ2 7F in static window 2 at 0xFFF0",
+                &WINDOWS_PAST_UCS2,
+                &[0x03, 0x7F, 0x00],
+                0x1_006F,
+            ),
+            (
+                "FF in dynamic window 0 at 0xFFC0",
+                &WINDOWS_PAST_UCS2,
+                &[0xFF, 0x00],
+                0x1_003F,
+            ),
+        ];
+        for &(case, language_window, bytes, code_point) in cases {
+            assert_eq!(
+                decoded(bytes, language_window),
+                Ok((vec![ScsuUnit::Character(code_point)], bytes.len())),
+                "{case}: {bytes:02x?}"
+            );
+        }
     }
 
     /// decode reads each tag of UTS #6 Tables 6 and 7 and each control code of UEFI 2.11 Table
@@ -730,15 +789,15 @@ pub(crate) mod tests {
         for &(case, language_window, bytes, string, size) in cases {
             assert_eq!(
                 decoded(bytes, language_window),
-                Ok((string.to_string(), size)),
+                Ok((units(string), size)),
                 "{case}: {bytes:02x?}"
             );
         }
     }
 
     /// decode refuses a string whose bytes end first, a byte that static window 0 would read
-    /// otherwise than UTS #6's Basic Latin, an undefined control code, a reserved tag or window
-    /// offset, and a character outside UCS-2, a surrogate or one between 0xF000 and 0xFCFF.
+    /// otherwise than UTS #6's Basic Latin, an undefined control code, and a reserved tag or
+    /// window offset.
     #[test]
     fn decode_refuses_every_bad_string() {
         let e = &EDK2_LANGUAGE_WINDOW;
@@ -887,72 +946,6 @@ pub(crate) mod tests {
                 e,
                 &[0x0F, 0xE8, 0x00, 0x00],
                 "reserved SCSU window offset 0x00",
-            ),
-            (
-                "SQU D800",
-                e,
-                &[0x0E, 0xD8, 0x00, 0x00],
-                "SCSU character U+D800 is a surrogate (UEFI 2.11 §33.2.6.2.2)",
-            ),
-            (
-                "Unicode mode DFFF",
-                e,
-                &[0x0F, 0xDF, 0xFF, 0x00, 0x00],
-                "SCSU character U+DFFF is a surrogate (UEFI 2.11 §33.2.6.2.2)",
-            ),
-            (
-                "SQ1 00 in static window 1 at 0xD800",
-                &WINDOWS_PAST_UCS2,
-                &[0x02, 0x00, 0x00],
-                "SCSU character U+D800 is a surrogate (UEFI 2.11 §33.2.6.2.2)",
-            ),
-            (
-                "SQU F000",
-                e,
-                &[0x0E, 0xF0, 0x00, 0x00],
-                "SCSU character U+F000 is between 0xF000 and 0xFCFF (UEFI 2.11 §33.3.6.3.1)",
-            ),
-            (
-                "SQU FCFF",
-                e,
-                &[0x0E, 0xFC, 0xFF, 0x00],
-                "SCSU character U+FCFF is between 0xF000 and 0xFCFF (UEFI 2.11 §33.3.6.3.1)",
-            ),
-            (
-                "Unicode mode F620",
-                e,
-                &[0x0F, 0xF6, 0x20, 0x00, 0x00],
-                "SCSU character U+F620 is between 0xF000 and 0xFCFF (UEFI 2.11 §33.3.6.3.1)",
-            ),
-            (
-                "SDX of window 0 at 0x10000, then 80",
-                e,
-                &[0x0B, 0x00, 0x00, 0x80, 0x00],
-                "SCSU character U+10000 is outside UCS-2 (UEFI 2.11 §33.2.6.2.2)",
-            ),
-            (
-                "SDX of window 5 at 0x10FF80, then SQ5 FF",
-                e,
-                &[0x0B, 0xBF, 0xFF, 0x06, 0xFF, 0x00],
-                "SCSU character U+10FFFF is outside UCS-2 (UEFI 2.11 §33.2.6.2.2)",
-            ),
-            (
-                "UDX of window 0 at 0x10000, then 80",
-                e,
-                &[0x0F, 0xF1, 0x00, 0x00, 0x80, 0x00],
-                "SCSU character U+10000 is outside UCS-2 (UEFI 2.11 §33.2.6.2.2)",
-            ),
-            (
-                "SQ2 7F in static window 2 at 0xFFF0",
-                &WINDOWS_PAST_UCS2,
-                &[0x03, 0x7F, 0x00],
-                "SCSU character U+1006F is outside UCS-2 (UEFI 2.11 §33.2.6.2.2)",
-            ),
-            (
-                "FF in dynamic window 0 at 0xFFC0",
-                &WINDOWS_PAST_UCS2,
-                &[0xFF, 0x00],
-                "SCSU character U+1003F is outside UCS-2 (UEFI 2.11 §33.2.6.2.2)",
             ),
         ];
         for &(case, language_window, bytes, refusal) in cases {

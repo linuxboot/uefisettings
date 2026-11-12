@@ -32,6 +32,7 @@ use log::warn;
 
 use super::package::PACKAGE_HEADER_SIZE;
 use super::scsu;
+use super::scsu::ScsuUnit;
 use crate::parse_error::ReadParsed;
 
 /// LANGUAGE_OFFSET is the offset of Language in a strings package: the package header, HdrSize
@@ -694,13 +695,12 @@ impl<'a> StringBlocks<'a> {
     fn insert_text(&mut self, id: u16, string: EncodedString<'_>) -> Result<()> {
         let (text, ruled_out) = match string {
             EncodedString::Ucs2(units) => string_text(units.iter().copied()),
-            // decode's characters fit UCS-2, one CHAR16 each
-            EncodedString::Scsu(characters) => string_text(characters.encode_utf16()),
+            EncodedString::Scsu(units) => string_text(units.iter().copied()),
         };
-        if let Some((unit, rule)) = ruled_out {
+        if let Some((code_point, rule)) = ruled_out {
             warn!(
-                "string {id} of the \"{}\" strings package holds U+{unit:04X}, which is {rule}: \
-                 it reads as U+FFFD",
+                "string {id} of the \"{}\" strings package holds U+{code_point:04X}, which is \
+                 {rule}: it reads as U+FFFD",
                 self.language
             );
             let units = match string {
@@ -738,7 +738,7 @@ impl<'a> StringBlocks<'a> {
     fn scsu_strings(&mut self, count: u16) -> Result<()> {
         for _ in 0..count {
             let id = self.string_id_current.assign()?;
-            let (string, rest) = scsu::decode(self.rest, &self.language_window.0)
+            let (units, rest) = scsu::decode(self.rest, &self.language_window.0)
                 .with_context(|| format!("failed to decode SCSU string {id}"))?;
             // the string's bytes come before the rest that decode returns
             let size = self.rest.len() - rest.len();
@@ -756,7 +756,7 @@ impl<'a> StringBlocks<'a> {
                      HiiDatabase ends it (AsciiStrSize), so the firmware may show other strings"
                 );
             }
-            self.insert_text(id, EncodedString::Scsu(&string))?;
+            self.insert_text(id, EncodedString::Scsu(&units))?;
             self.rest = rest;
         }
         Ok(())
@@ -863,11 +863,56 @@ fn ucs2_string(bytes: &[u8]) -> Option<(Vec<u16>, &[u8])> {
 enum EncodedString<'s> {
     /// The CHAR16s of a UCS-2 string
     Ucs2(&'s [u16]),
-    /// The characters that the SCSU decoder yields
-    Scsu(&'s str),
+    /// The units that the SCSU decoder yields
+    Scsu(&'s [ScsuUnit]),
 }
 
-/// Why UEFI rules a CHAR16 out of strings.
+/// A unit of a string's text, as its string block encodes it.
+trait EncodedUnit: Copy {
+    /// The code point that a warning names
+    fn code_point(self) -> u32;
+
+    /// Its character, or why UEFI rules it out of strings
+    fn character(self) -> Result<char, RuledOut>;
+}
+
+/// A CHAR16 of a UCS-2 string. The common control codes lie in the private use area and between
+/// 0xF000 and 0xFCFF, yet UCS-2 strings may hold them (UEFI 2.11 §33.2.6.2.4), so they are taken
+/// first.
+impl EncodedUnit for u16 {
+    fn code_point(self) -> u32 {
+        u32::from(self)
+    }
+
+    fn character(self) -> Result<char, RuledOut> {
+        match is_control_code(self.code_point()) {
+            // char::from_u32 refuses exactly the surrogates of the BMP, which hold no control code
+            true => char::from_u32(self.code_point()).ok_or(RuledOut::Surrogate),
+            false => character(self.code_point()),
+        }
+    }
+}
+
+/// A unit of an SCSU string. SCSU encodes control codes through 0x7F alone (UEFI 2.11
+/// §33.2.6.2.4), so a character between 0xF000 and 0xFCFF, a control code's 0xFxyy form among
+/// them, is ruled out (§33.3.6.3.1).
+impl EncodedUnit for ScsuUnit {
+    fn code_point(self) -> u32 {
+        match self {
+            Self::Character(code_point) => code_point,
+            Self::ControlCode(code) => code.code_point(),
+        }
+    }
+
+    fn character(self) -> Result<char, RuledOut> {
+        match self {
+            Self::Character(code_point) => character(code_point),
+            Self::ControlCode(code) => code.character(),
+        }
+    }
+}
+
+/// Why UEFI rules a character out of strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuledOut {
     /// 0xD800-0xDFFF: "UEFI does not support surrogate characters" (UEFI 2.11 §33.2.6.2.2)
@@ -877,6 +922,9 @@ enum RuledOut {
     /// 0xF900-0xFCFF, the rest of "Characters between 0xF000 and 0xFCFF should be rejected" (UEFI
     /// 2.11 §33.3.6.3.1, §33.3.6.3.2) past the private use area
     F000ToFcff,
+    /// Past 0xFFFF, as an SCSU string may encode: "The UEFI specification uses UCS-2" (UEFI 2.11
+    /// §33.2.6.2.2)
+    OutsideUcs2,
 }
 
 impl fmt::Display for RuledOut {
@@ -885,6 +933,7 @@ impl fmt::Display for RuledOut {
             Self::Surrogate => "a surrogate (UEFI 2.11 §33.2.6.2.2)",
             Self::PrivateUse => "in the private use area (UEFI 2.11 §33.2.6.2.1)",
             Self::F000ToFcff => "between 0xF000 and 0xFCFF (UEFI 2.11 §33.3.6.3.1, §33.3.6.3.2)",
+            Self::OutsideUcs2 => "outside UCS-2 (UEFI 2.11 §33.2.6.2.2)",
         })
     }
 }
@@ -912,33 +961,34 @@ fn displayed(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// The character of the CHAR16 `unit` of a string, or why UEFI rules it out. The common control
-/// codes lie in the private use area and between 0xF000 and 0xFCFF, yet strings may hold them
-/// (UEFI 2.11 §33.2.6.2.4), so they are taken first.
-fn character(unit: u16) -> Result<char, RuledOut> {
-    match unit {
-        _ if is_control_code(u32::from(unit)) => {}
-        unit if PRIVATE_USE_AREA.contains(&u32::from(unit)) => return Err(RuledOut::PrivateUse),
+/// The character of the code point `code_point` of a string, or why UEFI rules it out, a common
+/// control code's code point included: only EncodedUnit takes control codes.
+fn character(code_point: u32) -> Result<char, RuledOut> {
+    match code_point {
+        code_point if PRIVATE_USE_AREA.contains(&code_point) => return Err(RuledOut::PrivateUse),
         0xF900..=0xFCFF => return Err(RuledOut::F000ToFcff),
+        0x1_0000.. => return Err(RuledOut::OutsideUcs2),
         _ => {}
     }
     // char::from_u32 refuses exactly the surrogates of the BMP
-    char::from_u32(u32::from(unit)).ok_or(RuledOut::Surrogate)
+    char::from_u32(code_point).ok_or(RuledOut::Surrogate)
 }
 
-/// The text of the string of the CHAR16s `units`, each its own character, and the first of them
-/// that UEFI rules out, with why (character). One that UEFI rules out reads as U+FFFD, as
-/// String::from_utf16_lossy reads an unpaired surrogate. A QUESTION or VALUE matches such a text
-/// only where no text as stored names a question or option (MatchTier), and texts equal after
-/// this replacement are then equal prompts, which select resolves to the first selectable match
-/// in IFR order.
-fn string_text(units: impl IntoIterator<Item = u16>) -> (String, Option<(u16, RuledOut)>) {
+/// The text of the string of `units`, each its own character, and the first of them that UEFI
+/// rules out, with its code point and why (EncodedUnit). One that UEFI rules out reads as
+/// U+FFFD, as String::from_utf16_lossy reads an unpaired surrogate. A QUESTION or VALUE matches
+/// such a text only where no text as stored names a question or option (MatchTier), and texts
+/// equal after this replacement are then equal prompts, which select resolves to the first
+/// selectable match in IFR order.
+fn string_text<U: EncodedUnit>(
+    units: impl IntoIterator<Item = U>,
+) -> (String, Option<(u32, RuledOut)>) {
     let mut first_ruled_out = None;
     let text = units
         .into_iter()
         .map(|unit| {
-            character(unit).unwrap_or_else(|rule| {
-                first_ruled_out.get_or_insert((unit, rule));
+            unit.character().unwrap_or_else(|rule| {
+                first_ruled_out.get_or_insert((unit.code_point(), rule));
                 char::REPLACEMENT_CHARACTER
             })
         })
@@ -1114,28 +1164,54 @@ mod tests {
         );
     }
 
-    /// character takes each rule up to its bounds, the common control codes first, which lie in
-    /// the private use area.
+    /// character takes each rule up to its bounds, for a CHAR16 of a UCS-2 string the common
+    /// control codes first, which lie in the private use area. An SCSU character is ruled out
+    /// there, and past UCS-2: only an SCSU control code, which 0x7F introduces, is one.
     #[test]
     fn character_rules_out_each_range_up_to_its_bounds() {
-        let cases = [
-            (0xD7FF, Ok('\u{D7FF}')),
-            (0xD800, Err(RuledOut::Surrogate)),
-            (0xDFFF, Err(RuledOut::Surrogate)),
-            (0xE000, Err(RuledOut::PrivateUse)),
-            (0xF61F, Err(RuledOut::PrivateUse)),
-            (0xF620, Ok('\u{F620}')),
-            (0xF62B, Ok('\u{F62B}')),
-            (0xF62C, Err(RuledOut::PrivateUse)),
-            (0xF6FF, Err(RuledOut::PrivateUse)),
-            (0xF700, Ok('\u{F700}')),
-            (0xF8FF, Ok('\u{F8FF}')),
-            (0xF900, Err(RuledOut::F000ToFcff)),
-            (0xFCFF, Err(RuledOut::F000ToFcff)),
-            (0xFD00, Ok('\u{FD00}')),
+        let private_use = Err(RuledOut::PrivateUse);
+        // the CHAR16 or code point, then its character in a UCS-2 string and in an SCSU one
+        let cases: &[(u16, _, _)] = &[
+            (0xD7FF, Ok('\u{D7FF}'), Ok('\u{D7FF}')),
+            (0xD800, Err(RuledOut::Surrogate), Err(RuledOut::Surrogate)),
+            (0xDFFF, Err(RuledOut::Surrogate), Err(RuledOut::Surrogate)),
+            (0xE000, private_use, private_use),
+            (0xF61F, private_use, private_use),
+            (0xF620, Ok('\u{F620}'), private_use),
+            (0xF62B, Ok('\u{F62B}'), private_use),
+            (0xF62C, private_use, private_use),
+            (0xF6FF, private_use, private_use),
+            (0xF700, Ok('\u{F700}'), private_use),
+            (0xF8FF, Ok('\u{F8FF}'), private_use),
+            (0xF900, Err(RuledOut::F000ToFcff), Err(RuledOut::F000ToFcff)),
+            (0xFCFF, Err(RuledOut::F000ToFcff), Err(RuledOut::F000ToFcff)),
+            (0xFD00, Ok('\u{FD00}'), Ok('\u{FD00}')),
+            (0xFFFF, Ok('\u{FFFF}'), Ok('\u{FFFF}')),
         ];
-        for (unit, want) in cases {
-            assert_eq!(character(unit), want, "U+{unit:04X}");
+        for &(unit, ucs2, scsu) in cases {
+            assert_eq!(unit.character(), ucs2, "CHAR16 {unit:#06x}");
+            let character = ScsuUnit::Character(u32::from(unit));
+            assert_eq!(character.character(), scsu, "SCSU U+{unit:04X}");
+        }
+
+        for code_point in [0x1_0000, 0x10_FFFF, 0x11_0000] {
+            let character = ScsuUnit::Character(code_point).character();
+            assert_eq!(
+                character,
+                Err(RuledOut::OutsideUcs2),
+                "SCSU U+{code_point:04X}"
+            );
+        }
+
+        let control_codes = [
+            (0xF620, '\u{F620}'),
+            (0xF62B, '\u{F62B}'),
+            (0xF700, '\u{F700}'),
+            (0xF8FF, '\u{F8FF}'),
+        ];
+        for (code, want) in control_codes {
+            let character = ScsuUnit::ControlCode(code).character();
+            assert_eq!(character, Ok(want), "SCSU control code {code:#06x}");
         }
     }
 

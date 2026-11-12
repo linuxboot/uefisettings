@@ -3774,4 +3774,63 @@ mod tests {
             "rule bounds"
         );
     }
+
+    /// read_db reads as U+FFFD, warning once per string, the SCSU characters that UEFI 2.11 rules
+    /// out of strings, as it does those of UCS-2 strings, and reads the strings after them: SQU
+    /// 0xF000, between 0xF000 and 0xFCFF (§33.3.6.3.1) and private use (§33.2.6.2.1), SQU 0xD800,
+    /// a surrogate, and U+10000, which SDX reaches, outside UCS-2 (§33.2.6.2.2). A control code
+    /// through 0x7F stays a control code without a warning (§33.2.6.2.4); SCSU encodes control
+    /// codes through 0x7F alone, so SQU 0xF620, a control code's 0xFxyy form, is ruled out
+    /// (§33.3.6.3.1).
+    #[test]
+    fn scsu_characters_that_uefi_rules_out_read_as_replacement_characters() {
+        let blocks = [
+            // EFI_HII_SIBT_STRING_SCSU of "A", SQU U+F000, then U+0000: 1
+            &[0x10, 0x41, 0x0E, 0xF0, 0x00, 0x00][..],
+            // EFI_HII_SIBT_STRING_SCSU of SQU U+D800, then U+0000: 2
+            &[0x10, 0x0E, 0xD8, 0x00, 0x00],
+            // EFI_HII_SIBT_STRING_SCSU of SDX of window 0 at 0x10000, 0x80, then U+0000: 3
+            &[0x10, 0x0B, 0x00, 0x00, 0x80, 0x00],
+            // EFI_HII_SIBT_STRING_UCS2 "Z": 4
+            &ucs2_string_block(&[0x5A]),
+            // EFI_HII_SIBT_STRING_SCSU of 0x7F 0x20, SQU U+F620, then U+0000: 5
+            &[0x10, 0x7F, 0x20, 0x0E, 0xF6, 0x20, 0x00],
+            // EFI_HII_SIBT_END
+            &[0x00],
+        ]
+        .concat();
+        let mut got = Vec::new();
+
+        let logged = logged_by(|| {
+            got = strings_packages_of(&[en_strings_package_with_blocks(&blocks)]);
+        });
+
+        let want = StringMap::from([
+            (1, "A\u{FFFD}".into()),
+            (2, "\u{FFFD}".into()),
+            (3, "\u{FFFD}".into()),
+            (4, "Z".into()),
+            (5, "\u{F620}\u{FFFD}".into()),
+        ]);
+        assert_eq!(got, [(language("en"), want)], "strings");
+        let warnings: Vec<&str> = logged
+            .iter()
+            .map(String::as_str)
+            .filter(|message| message.ends_with("it reads as U+FFFD"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "string 1 of the \"en\" strings package holds U+F000, which is in the private \
+                 use area (UEFI 2.11 §33.2.6.2.1): it reads as U+FFFD",
+                "string 2 of the \"en\" strings package holds U+D800, which is a surrogate (UEFI \
+                 2.11 §33.2.6.2.2): it reads as U+FFFD",
+                "string 3 of the \"en\" strings package holds U+10000, which is outside UCS-2 \
+                 (UEFI 2.11 §33.2.6.2.2): it reads as U+FFFD",
+                "string 5 of the \"en\" strings package holds U+F620, which is in the private \
+                 use area (UEFI 2.11 §33.2.6.2.1): it reads as U+FFFD",
+            ],
+            "warnings"
+        );
+    }
 }
